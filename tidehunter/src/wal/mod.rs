@@ -16,6 +16,7 @@ use crate::lookup::{FileRange, RandomRead};
 use crate::metrics::{MetricIntGauge, Metrics};
 use arc_swap::ArcSwap;
 use minibytes::Bytes;
+use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::ops::Range;
@@ -29,7 +30,7 @@ use crate::wal::mapper::WalMaps;
 use crate::wal_allocator::WalAllocator;
 use files::WalFiles;
 use layout::WalLayout;
-use mapper::WalMapper;
+use mapper::{INITIAL_MAPS_BUFFER, WalMapper};
 use position::{LastProcessed, MapId, WalPosition};
 use syncer::WalSyncer;
 use tracker::{WalGuard, WalTracker, WalTrackerLatch};
@@ -67,6 +68,11 @@ pub(crate) struct Map {
     id: MapId,
     pub data: Bytes,
     writeable: bool,
+    /// Whether the pages were pre-faulted at mmap time (`MAP_POPULATE`).
+    /// False only for the read-only historical maps restored by
+    /// `WalIterator::premap_live_fragments`; see `Wal::frame_source` for
+    /// how reads treat them.
+    populated: bool,
 }
 
 pub enum WalRandomRead {
@@ -206,11 +212,11 @@ impl WalWriter {
     }
 
     /// Requests deletion of a specific set of WAL files (gaps allowed).
-    /// Files that still have any map in `WalMaps` are skipped and will be
-    /// reconsidered on a later call once their map has been evicted.
-    /// Blocks until the mapper has removed the deletable entries from the
-    /// file map; the actual `remove_file` syscalls run on a background
-    /// unlink worker.
+    /// Read-only maps over those files are dropped; files that still have a
+    /// writeable map are skipped and will be reconsidered on a later call
+    /// once their maps have been evicted. Blocks until the mapper has
+    /// removed the deletable entries from the file map; the actual
+    /// `remove_file` syscalls run on a background unlink worker.
     pub fn delete_files(&self, files: Vec<position::WalFileId>) -> io::Result<()> {
         if files.is_empty() {
             return Ok(());
@@ -278,12 +284,12 @@ impl Wal {
     }
 
     /// Read the wal position.
-    /// If mapping exists, it is used for reading.
-    /// If mapping does not exist, the read syscall is used instead.
+    /// If a pre-faulted mapping exists, it is used for reading.
+    /// Otherwise the read syscall is used instead (see `frame_source`).
     ///
     /// This method returns what type of read was used along with bytes read.
     pub fn read(&self, pos: WalPosition) -> Result<(ReadType, Option<Bytes>), WalError> {
-        match self.frame_source(pos) {
+        match self.frame_source(pos, true) {
             Some(FrameSource::Mapped(map, offset)) => {
                 // using CrcFrame::read_from_slice to avoid holding the larger byte array
                 Ok((
@@ -323,7 +329,7 @@ impl Wal {
     /// for reclaimed positions (both go through [`Self::frame_source`]).
     /// Pure lookup — no I/O and no map creation.
     pub(crate) fn is_reachable(&self, pos: WalPosition) -> bool {
-        self.frame_source(pos).is_some()
+        self.frame_source(pos, false).is_some()
     }
 
     pub fn random_reader_at(
@@ -331,7 +337,7 @@ impl Wal {
         pos: WalPosition,
         inner_offset: usize,
     ) -> Result<WalRandomRead, WalError> {
-        match self.frame_source(pos) {
+        match self.frame_source(pos, false) {
             Some(FrameSource::Mapped(map, offset)) => {
                 let offset = offset as usize;
                 let header_end = offset + CrcFrame::CRC_HEADER_LENGTH;
@@ -363,14 +369,25 @@ impl Wal {
     /// position resolution — `read`, `random_reader_at` and `is_reachable`
     /// must agree on when a position is gone, so any new resolution
     /// dimension belongs here, not in a caller.
-    fn frame_source(&self, pos: WalPosition) -> Option<FrameSource> {
+    ///
+    /// `whole_frame` says the caller will copy the entire frame. A map whose
+    /// pages were not pre-faulted (see `WalMaps::map_readonly`) is then
+    /// resolved to the file instead: the WAL fd carries `POSIX_FADV_RANDOM`,
+    /// so copying a cold frame through such a map would fault it in one page
+    /// at a time, while a single `pread` fetches the whole range at once.
+    /// Partial reads keep using the map; they touch a handful of pages. The
+    /// file always exists while such a map does: premapping requires it at
+    /// open and `delete_files` skips files that have a map.
+    fn frame_source(&self, pos: WalPosition, whole_frame: bool) -> Option<FrameSource> {
         assert_ne!(
             pos,
             WalPosition::INVALID,
             "Trying to read invalid wal position"
         );
         let (map, offset) = self.layout.locate(pos.offset);
-        if let Some(map) = self.get_map(map) {
+        if let Some(map) = self.get_map(map)
+            && (map.populated || !whole_frame)
+        {
             return Some(FrameSource::Mapped(map, offset));
         }
         self.files
@@ -385,17 +402,25 @@ impl Wal {
 
     /// Resize file to fit the specified map id
     fn extend_to_map_id(layout: &WalLayout, file: &File, map_id: MapId) -> io::Result<()> {
-        let mut end = layout.offset_in_wal_file(layout.map_range(map_id).end);
-        if end == 0 {
-            // If the map range end equals wal_file_size, set the end explicitly instead of using 0
-            end = layout.wal_file_size;
-        }
-
+        let end = Self::map_end_in_file(layout, map_id);
         let len = file.metadata()?.len();
         if len < end {
             file.set_len(end)?;
         }
         Ok(())
+    }
+
+    /// Whether `file` is long enough to hold all of fragment `map_id`.
+    fn covers_map(layout: &WalLayout, file: &File, map_id: MapId) -> io::Result<bool> {
+        Ok(file.metadata()?.len() >= Self::map_end_in_file(layout, map_id))
+    }
+
+    /// Byte offset within its WAL file at which fragment `map_id` ends.
+    fn map_end_in_file(layout: &WalLayout, map_id: MapId) -> u64 {
+        let end = layout.offset_in_wal_file(layout.map_range(map_id).end);
+        // The last fragment of a file ends on the file boundary, which the
+        // modulo maps to 0.
+        if end == 0 { layout.wal_file_size } else { end }
     }
 
     /// Resize the file to fit the current layout
@@ -432,12 +457,25 @@ impl Wal {
         self: &Arc<Self>,
         position: Option<WalPosition>,
     ) -> Result<WalWriter, WalError> {
+        self.writer_after_premapped(position, std::iter::empty())
+    }
+
+    /// Like [`Self::writer_after`], but first restores read-only mmaps over
+    /// the most recent fragments below the writer that still hold `live`
+    /// positions. See [`WalIterator::premap_live_fragments`] for what gets
+    /// mapped and why.
+    pub fn writer_after_premapped(
+        self: &Arc<Self>,
+        position: Option<WalPosition>,
+        live: impl IntoIterator<Item = WalPosition>,
+    ) -> Result<WalWriter, WalError> {
         let position = if let Some(position) = position {
             self.layout.next_after_wal_position(position)
         } else {
             0
         };
-        let iterator = self.wal_iterator_for_writer(position)?;
+        let mut iterator = self.wal_iterator_for_writer(position)?;
+        iterator.premap_live_fragments(live)?;
         Ok(iterator.into_writer(None))
     }
 
@@ -596,12 +634,96 @@ impl WalIterator {
         }
     }
 
+    /// Restores the read window over historical fragments before this
+    /// iterator is turned into a writer.
+    ///
+    /// The mapper only maps forward from the writer's fragment and evicts the
+    /// lowest `MapId` first, so in steady state the mapped set is the
+    /// writer's fragment, [`INITIAL_MAPS_BUFFER`] unwritten lookahead
+    /// fragments, and the `max_maps - INITIAL_MAPS_BUFFER - 1` most recently
+    /// finalized ones. A writer created on an existing WAL starts with only
+    /// its own fragment plus whatever this iterator traversed to reach it:
+    /// for the replay WAL that is every fragment replay read, for the index
+    /// WAL (`Db::open` goes through `Wal::writer_after_premapped`) nothing,
+    /// so without this every index blob written before a restart is served
+    /// through the syscall read path until its cell happens to be flushed
+    /// again. This maps the most recent fragments below the writer's that
+    /// hold at least one position from `live`, as many as fit under
+    /// `max_maps` once the writer's fragment, the fragments already
+    /// retained, and the lookahead are accounted for.
+    ///
+    /// The maps are read-only and lazily faulted (see
+    /// [`WalMaps::map_readonly`]); partial reads use them, whole-frame copies
+    /// go through `pread` instead (see `Wal::frame_source`). Fragments whose
+    /// file has been garbage-collected, or which their file no longer fully
+    /// covers, are skipped. Eviction stays oldest-first, so these maps age
+    /// out as the writer advances; sparse GC also drops them as soon as it
+    /// deletes their file (see `WalMapperThread::delete_files`).
+    ///
+    /// Returns the number of fragments mapped.
+    pub fn premap_live_fragments(
+        &mut self,
+        live: impl IntoIterator<Item = WalPosition>,
+    ) -> Result<usize, WalError> {
+        assert!(
+            self.for_writer,
+            "premap_live_fragments called on a scan-mode WalIterator"
+        );
+        let layout = &self.wal.layout;
+        let budget = layout
+            .max_maps
+            .saturating_sub(INITIAL_MAPS_BUFFER + self.maps.len());
+        if budget == 0 {
+            return Ok(0);
+        }
+        let writer_map = self.map.id;
+        let candidates: BTreeSet<MapId> = live
+            .into_iter()
+            .filter(|pos| pos.is_valid())
+            .map(|pos| layout.locate(pos.offset()).0)
+            .filter(|map_id| *map_id < writer_map && !self.maps.contains(*map_id))
+            .collect();
+        let files = self.wal.files.load();
+        let mut mapped = 0;
+        for map_id in candidates.into_iter().rev() {
+            if mapped == budget {
+                break;
+            }
+            // Sparse GC may have removed the file; positions in it are
+            // unreadable regardless of mapping.
+            let Some(file) = files.get_checked(layout.file_for_map(map_id)) else {
+                continue;
+            };
+            // A live position in a fragment the file no longer covers is
+            // corruption. Leave it on the syscall path, which fails loudly
+            // on read, rather than growing the file with zeros and reporting
+            // every key in the fragment as missing.
+            if !Wal::covers_map(layout, file, map_id)? {
+                continue;
+            }
+            self.maps.map_readonly(
+                file,
+                layout,
+                map_id,
+                self.wal.metrics.wal_mmap_bytes.clone(),
+            );
+            mapped += 1;
+        }
+        Ok(mapped)
+    }
+
     pub fn into_writer(self, position_override: Option<u64>) -> WalWriter {
         assert!(
             self.for_writer,
             "into_writer called on a scan-mode WalIterator — construct via wal_iterator_for_writer"
         );
         let position = position_override.unwrap_or(self.position);
+        if let Some(map) = self.maps.get(self.wal.layout.locate(position).0) {
+            assert!(
+                map.writeable,
+                "writer start position {position} falls in a read-only premapped fragment"
+            );
+        }
 
         self.clear_fragment_from_position(position);
 
@@ -776,6 +898,7 @@ impl WalFailPoints {
 mod tests {
     use super::*;
     use crate::wal::layout::WalKind;
+    use crate::wal::position::WalFileId;
     use bytes::{BufMut, BytesMut};
     use std::collections::HashSet;
 
@@ -1152,6 +1275,291 @@ mod tests {
         let wal = Arc::new(Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap());
         assert_eq!(&[1, 2, 3], wal.read(pos1).unwrap().1.unwrap().as_ref());
         assert_eq!(&[4, 5, 6], wal.read(pos2).unwrap().1.unwrap().as_ref());
+    }
+
+    /// Fills `frags` fragments of a fresh WAL with 4 entries of `payload`
+    /// bytes each and returns their positions. With `payload` 200 an entry
+    /// occupies 208 bytes and the fourth leaves 192 bytes of slack in a
+    /// 1024-byte fragment; with 248 the four entries fill it exactly, so the
+    /// next write starts on the fragment boundary.
+    fn fill_fragments(
+        dir: &Path,
+        layout: &WalLayout,
+        frags: u64,
+        payload: usize,
+    ) -> Vec<WalPosition> {
+        let wal = Wal::open(dir, layout.clone(), Metrics::new()).unwrap();
+        let writer = wal.writer_after(None).unwrap();
+        (0..frags * 4)
+            .map(|i| {
+                writer
+                    .write(&PreparedWalWrite::new(&vec![i as u8; payload]))
+                    .unwrap()
+                    .into_wal_position()
+            })
+            .collect()
+    }
+
+    fn index_layout(max_maps: usize, wal_file_size: u64) -> WalLayout {
+        WalLayout {
+            frag_size: 1024,
+            max_maps,
+            direct_io: false,
+            wal_file_size,
+            kind: WalKind::Index,
+        }
+    }
+
+    /// Read type a partial (index lookup style) read of `pos` takes.
+    fn lookup_type(wal: &Wal, pos: WalPosition) -> ReadType {
+        wal.random_reader_at(pos, 0).unwrap().read_type()
+    }
+
+    /// Read type a whole-frame copy of `pos` takes.
+    fn load_type(wal: &Wal, pos: WalPosition) -> ReadType {
+        wal.read(pos).unwrap().0
+    }
+
+    /// Blocks until the mapper thread has processed every message the
+    /// writer's tracker has produced so far (fragment finalizations included).
+    fn mapper_barrier(writer: &WalWriter) {
+        writer.wal_tracker_barrier();
+        // `gc(0)` deletes nothing and round-trips through the mapper thread
+        // behind everything already queued to it.
+        writer.gc(0).unwrap();
+    }
+
+    #[test]
+    fn test_writer_after_premapped() {
+        let dir = tempdir::TempDir::new("test-writer-after-premapped").unwrap();
+        // writer's fragment + 2 lookahead + room for 2 historical maps
+        let layout = index_layout(5, 10 << 12);
+        let positions = fill_fragments(dir.path(), &layout, 8, 200);
+        let frag = |pos: &WalPosition| layout.locate(pos.offset()).0.as_u64();
+        let in_frag = |f: u64| *positions.iter().find(|p| frag(p) == f).unwrap();
+        let last = *positions.last().unwrap();
+        assert_eq!(frag(&last), 7);
+
+        let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
+        // Live positions in fragments 0, 2, 5 and in the writer's own
+        // fragment 7. Budget is 2, so the two most recent historical
+        // fragments (5 and 2) get mapped; 0 does not, and 3 has no live data.
+        let writer = wal
+            .writer_after_premapped(Some(last), [in_frag(0), in_frag(2), in_frag(5), in_frag(7)])
+            .unwrap();
+        assert_eq!(ReadType::Mapped, lookup_type(&wal, in_frag(7)));
+        assert_eq!(ReadType::Mapped, lookup_type(&wal, in_frag(5)));
+        assert_eq!(ReadType::Mapped, lookup_type(&wal, in_frag(2)));
+        assert_eq!(ReadType::Syscall, lookup_type(&wal, in_frag(0)));
+        assert_eq!(ReadType::Syscall, lookup_type(&wal, in_frag(3)));
+        // Whole-frame copies bypass the lazily faulted historical maps but
+        // still use the writer's pre-faulted one.
+        assert_eq!(ReadType::Mapped, load_type(&wal, in_frag(7)));
+        assert_eq!(ReadType::Syscall, load_type(&wal, in_frag(5)));
+        assert_eq!(ReadType::Syscall, load_type(&wal, in_frag(2)));
+        // Every path returns the same bytes.
+        for (i, p) in positions.iter().enumerate() {
+            assert_eq!(
+                &[i as u8; 200][..],
+                wal.read(*p).unwrap().1.unwrap().as_ref()
+            );
+            let reader = wal.random_reader_at(*p, 0).unwrap();
+            assert_eq!(&[i as u8; 200][..], reader.read(0..reader.len()).as_ref());
+        }
+
+        // The writer still lands in fragment 7 for the first write (there
+        // is room for one more entry), so reads of it are mapped.
+        let pos = writer
+            .write(&PreparedWalWrite::new(&vec![91u8; 100]))
+            .unwrap()
+            .into_wal_position();
+        assert_eq!(frag(&pos), 7);
+        assert_eq!(ReadType::Mapped, load_type(&wal, pos));
+        assert_eq!(&[91u8; 100][..], wal.read(pos).unwrap().1.unwrap().as_ref());
+
+        // Crossing into fragment 8 finalizes 7; the mapper then maps 10 and,
+        // with 6 maps over a budget of 5, evicts the oldest historical map
+        // (fragment 2). Fragment 5 stays mapped.
+        let pos = writer
+            .write(&PreparedWalWrite::new(&vec![92u8; 200]))
+            .unwrap()
+            .into_wal_position();
+        assert_eq!(frag(&pos), 8);
+        mapper_barrier(&writer);
+        assert_eq!(ReadType::Syscall, lookup_type(&wal, in_frag(2)));
+        assert_eq!(ReadType::Mapped, lookup_type(&wal, in_frag(5)));
+        assert_eq!(&[92u8; 200][..], wal.read(pos).unwrap().1.unwrap().as_ref());
+    }
+
+    #[test]
+    fn test_writer_after_premapped_no_budget() {
+        let dir = tempdir::TempDir::new("test-writer-after-premapped-nb").unwrap();
+        // writer's fragment + 2 lookahead: nothing left for history
+        let layout = index_layout(3, 10 << 12);
+        let positions = fill_fragments(dir.path(), &layout, 3, 200);
+        let last = *positions.last().unwrap();
+        let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
+        let _writer = wal
+            .writer_after_premapped(Some(last), positions.iter().copied())
+            .unwrap();
+        assert_eq!(ReadType::Syscall, lookup_type(&wal, positions[0]));
+        assert_eq!(ReadType::Syscall, lookup_type(&wal, positions[4]));
+        assert_eq!(ReadType::Mapped, lookup_type(&wal, last));
+    }
+
+    #[test]
+    fn test_writer_after_premapped_skips_deleted_files() {
+        let dir = tempdir::TempDir::new("test-writer-after-premapped-gc").unwrap();
+        // 4 fragments per file
+        let layout = index_layout(5, 4096);
+        let positions = fill_fragments(dir.path(), &layout, 12, 200);
+        let frag = |pos: &WalPosition| layout.locate(pos.offset()).0.as_u64();
+        let in_frag = |f: u64| *positions.iter().find(|p| frag(p) == f).unwrap();
+        let last = *positions.last().unwrap();
+        assert_eq!(frag(&last), 11);
+        // Sparse GC removed the middle file (fragments 4..8).
+        std::fs::remove_file(layout.wal_file_name(dir.path(), WalFileId(1))).unwrap();
+
+        let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
+        // Candidates are visited newest first: 9 is mapped, 6 sits in the
+        // deleted file and is skipped without consuming budget, so 1 is
+        // mapped as well.
+        let writer = wal
+            .writer_after_premapped(Some(last), [in_frag(1), in_frag(6), in_frag(9)])
+            .unwrap();
+        assert_eq!(ReadType::Mapped, lookup_type(&wal, in_frag(9)));
+        assert_eq!(ReadType::Mapped, lookup_type(&wal, in_frag(1)));
+        assert!(!wal.is_reachable(in_frag(6)));
+        assert!(wal.read(in_frag(6)).unwrap().1.is_none());
+        let pos = writer
+            .write(&PreparedWalWrite::new(&vec![7u8; 100]))
+            .unwrap()
+            .into_wal_position();
+        assert_eq!(&[7u8; 100][..], wal.read(pos).unwrap().1.unwrap().as_ref());
+    }
+
+    /// A writer whose restored position is exactly a fragment start
+    /// finalizes the fragment below it on its first write. Here that
+    /// fragment is a premapped read-only map, which must not be treated as
+    /// a finalized writer fragment: no extra lookahead map, no eviction.
+    #[test]
+    fn test_writer_after_premapped_at_fragment_boundary() {
+        let dir = tempdir::TempDir::new("test-writer-after-premapped-boundary").unwrap();
+        let layout = index_layout(5, 10 << 12);
+        let positions = fill_fragments(dir.path(), &layout, 4, 248);
+        let frag = |pos: &WalPosition| layout.locate(pos.offset()).0.as_u64();
+        let in_frag = |f: u64| *positions.iter().find(|p| frag(p) == f).unwrap();
+        let last = *positions.last().unwrap();
+        assert_eq!(frag(&last), 3);
+        assert_eq!(layout.next_after_wal_position(last), 4 * 1024);
+
+        let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
+        let writer = wal
+            .writer_after_premapped(Some(last), [in_frag(1), in_frag(3)])
+            .unwrap();
+        assert_eq!(ReadType::Mapped, lookup_type(&wal, in_frag(1)));
+        assert_eq!(ReadType::Mapped, lookup_type(&wal, in_frag(3)));
+
+        // The first write lands at the start of fragment 4 and finalizes 3.
+        let pos = writer
+            .write(&PreparedWalWrite::new(&vec![1u8; 200]))
+            .unwrap()
+            .into_wal_position();
+        assert_eq!(pos.offset(), 4 * 1024);
+        mapper_barrier(&writer);
+        // Lookahead is still fragments 5 and 6, and neither historical map
+        // was evicted to make room for a third.
+        assert!(wal.get_map(MapId::new(6)).is_some());
+        assert!(wal.get_map(MapId::new(7)).is_none());
+        assert_eq!(ReadType::Mapped, lookup_type(&wal, in_frag(1)));
+        assert_eq!(ReadType::Mapped, lookup_type(&wal, in_frag(3)));
+        assert_eq!(&[1u8; 200][..], wal.read(pos).unwrap().1.unwrap().as_ref());
+    }
+
+    #[test]
+    #[should_panic(expected = "read-only premapped fragment")]
+    fn test_into_writer_rejects_start_in_premapped_fragment() {
+        let dir = tempdir::TempDir::new("test-into-writer-premapped").unwrap();
+        let layout = index_layout(5, 10 << 12);
+        let positions = fill_fragments(dir.path(), &layout, 4, 200);
+        let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
+        let start = layout.next_after_wal_position(*positions.last().unwrap());
+        let mut iterator = wal.wal_iterator_for_writer(start).unwrap();
+        // positions[4] is in fragment 1.
+        assert_eq!(1, iterator.premap_live_fragments([positions[4]]).unwrap());
+        let _writer = iterator.into_writer(Some(positions[4].offset()));
+    }
+
+    /// A file truncated below a fragment the control region still
+    /// references is corruption; premapping must not grow it back with
+    /// zeros, which would turn loud read failures into silent misses.
+    #[test]
+    fn test_writer_after_premapped_skips_short_files() {
+        let dir = tempdir::TempDir::new("test-writer-after-premapped-short").unwrap();
+        // 4 fragments per file
+        let layout = index_layout(5, 4096);
+        let positions = fill_fragments(dir.path(), &layout, 12, 200);
+        let frag = |pos: &WalPosition| layout.locate(pos.offset()).0.as_u64();
+        let in_frag = |f: u64| *positions.iter().find(|p| frag(p) == f).unwrap();
+        let last = *positions.last().unwrap();
+        // Cut the middle file (fragments 4..8) down to fragments 4 and 5.
+        let short_file = layout.wal_file_name(dir.path(), WalFileId(1));
+        OpenOptions::new()
+            .write(true)
+            .open(&short_file)
+            .unwrap()
+            .set_len(2048)
+            .unwrap();
+
+        let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
+        // Budget 2, newest first: 9 is mapped, 6 is skipped because its file
+        // ends before it, so 5 is mapped as well.
+        let _writer = wal
+            .writer_after_premapped(Some(last), [in_frag(5), in_frag(6), in_frag(9)])
+            .unwrap();
+        assert_eq!(ReadType::Mapped, lookup_type(&wal, in_frag(9)));
+        assert_eq!(ReadType::Mapped, lookup_type(&wal, in_frag(5)));
+        assert_eq!(ReadType::Syscall, lookup_type(&wal, in_frag(6)));
+        assert_eq!(2048, std::fs::metadata(&short_file).unwrap().len());
+    }
+
+    /// Sparse GC must not be held up by read-only premapped maps: deleting a
+    /// file drops its historical maps instead of skipping the file, while a
+    /// file with a writeable map is still skipped.
+    #[test]
+    fn test_delete_files_drops_premapped_maps() {
+        let dir = tempdir::TempDir::new("test-delete-files-premapped").unwrap();
+        // 4 fragments per file
+        let layout = index_layout(5, 4096);
+        let positions = fill_fragments(dir.path(), &layout, 12, 200);
+        let frag = |pos: &WalPosition| layout.locate(pos.offset()).0.as_u64();
+        let in_frag = |f: u64| *positions.iter().find(|p| frag(p) == f).unwrap();
+        let last = *positions.last().unwrap();
+        assert_eq!(frag(&last), 11);
+
+        let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
+        let writer = wal
+            .writer_after_premapped(Some(last), [in_frag(1), in_frag(5)])
+            .unwrap();
+        assert_eq!(ReadType::Mapped, lookup_type(&wal, in_frag(1)));
+        assert_eq!(ReadType::Mapped, lookup_type(&wal, in_frag(5)));
+
+        // File 0 only has a premapped map: it goes, and the map with it.
+        writer.delete_files(vec![WalFileId(0)]).unwrap();
+        assert!(!wal.file_ids().contains(&WalFileId(0)));
+        assert!(!wal.is_reachable(in_frag(1)));
+        assert!(wal.read(in_frag(1)).unwrap().1.is_none());
+        assert_eq!(ReadType::Mapped, lookup_type(&wal, in_frag(5)));
+
+        // File 2 holds the writer's fragment 11 and stays.
+        writer.delete_files(vec![WalFileId(2)]).unwrap();
+        assert!(wal.file_ids().contains(&WalFileId(2)));
+        assert_eq!(ReadType::Mapped, lookup_type(&wal, last));
+        let pos = writer
+            .write(&PreparedWalWrite::new(&vec![9u8; 100]))
+            .unwrap()
+            .into_wal_position();
+        assert_eq!(&[9u8; 100][..], wal.read(pos).unwrap().1.unwrap().as_ref());
     }
 
     #[track_caller]

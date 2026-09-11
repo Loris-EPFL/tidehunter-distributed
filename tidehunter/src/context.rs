@@ -107,7 +107,7 @@ pub enum WalEntryKind {
     CompressedBatch,
 }
 
-#[derive(Clone, Copy, Debug, EnumIter, EnumCount, AsRefStr, FromRepr)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, EnumIter, EnumCount, AsRefStr, FromRepr)]
 #[repr(usize)]
 #[strum(serialize_all = "snake_case")]
 pub enum ReadType {

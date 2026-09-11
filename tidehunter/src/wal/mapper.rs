@@ -34,7 +34,9 @@ struct WalMapperThread {
     metrics: Arc<Metrics>,
     unlinker: UnlinkWorker,
 }
-const INITIAL_MAPS_BUFFER: usize = 2;
+/// Number of fragments past the writer's current one that the mapper keeps
+/// mmapped ahead of time so the writer never waits for a map to appear.
+pub(super) const INITIAL_MAPS_BUFFER: usize = 2;
 
 /// Background worker that performs `remove_file` calls and closes the
 /// underlying `File` off the mapper thread. Sparse GC can produce large
@@ -231,13 +233,15 @@ impl WalMapper {
         rx.recv().ok();
     }
 
-    /// Delete a specific set of WAL files. Files that still have any map in
-    /// `WalMaps` (writeable or finalized) are skipped by the mapper thread
-    /// and will be reconsidered by the next snapshot once their map has
-    /// been evicted. Blocks until the mapper has removed the deletable
-    /// entries from the file map; the actual `remove_file` syscalls run on
-    /// a background unlink worker, so subsequent `file_ids()` calls see the
-    /// deletion immediately even though the dirents may not be gone yet.
+    /// Delete a specific set of WAL files. Non-writeable maps over those
+    /// files are dropped along the way; files that still have a writeable
+    /// map (the writer's current file and its lookahead) are skipped by the
+    /// mapper thread and will be reconsidered by the next snapshot once
+    /// their maps have been evicted. Blocks until the mapper has removed the
+    /// deletable entries from the file map; the actual `remove_file`
+    /// syscalls run on a background unlink worker, so subsequent
+    /// `file_ids()` calls see the deletion immediately even though the
+    /// dirents may not be gone yet.
     pub fn delete_files(&self, files: Vec<WalFileId>) {
         let (tx, rx) = mpsc::sync_channel(1);
         self.sender
@@ -282,6 +286,16 @@ impl WalMapperThread {
                         // is already deleted.
                         continue;
                     };
+                    if !map_to_sync.writeable {
+                        // A read-only map restored by
+                        // `WalIterator::premap_live_fragments` for the
+                        // fragment right below a writer that started exactly
+                        // on a fragment boundary. Nothing was written through
+                        // it, so there is nothing to sync, and it did not
+                        // come out of the lookahead budget, so there is no
+                        // slot to refill.
+                        continue;
+                    }
                     map_to_sync.writeable = false;
                     self.syncer.send(
                         map_to_sync.clone(),
@@ -318,20 +332,39 @@ impl WalMapperThread {
         }
     }
 
-    /// Delete the specific set of files (gaps allowed). Files that still
-    /// have a map in `WalMaps` are skipped — that covers the writer's
-    /// current file and its lookahead (writeable maps) as well as any
-    /// finalized maps still in the LRU. Skipping is safe: the snapshot
-    /// path recomputes the deletable set each time it runs, so a file that
-    /// is reclaimable but currently mapped will be picked up by the next
-    /// snapshot once its map has been evicted by `WalMaps::pop_first`.
+    /// Delete the specific set of files (gaps allowed).
+    ///
+    /// Non-writeable maps over those files — read-only maps restored by
+    /// `WalIterator::premap_live_fragments` and finalized writer fragments
+    /// still in the LRU — are dropped first. Nothing writes through them,
+    /// in-flight readers hold their own `Map` clones (the mmap outlives the
+    /// unlink), and new readers resolve the position to a missing file, so
+    /// keeping a dead file around until such a map ages out of the LRU would
+    /// only delay GC. Premapped fragments can sit in old, sparse files that
+    /// are exactly the ones relocation empties, so this matters after a
+    /// restart.
+    ///
+    /// Files that still have a writeable map — the writer's current file
+    /// and its lookahead — are skipped. That is safe: the snapshot path
+    /// recomputes the deletable set each time it runs, so such a file is
+    /// picked up by a later snapshot once its maps have been evicted by
+    /// `WalMaps::pop_first`.
     fn delete_files(&mut self, to_delete: &[WalFileId]) {
         let wal_files = self.files.load();
+        let layout = &self.layout;
+        let deleting: HashSet<WalFileId> = to_delete.iter().copied().collect();
+        let maps_before = self.maps.maps.len();
+        self.maps.maps.retain(|map_id, map| {
+            map.writeable || !deleting.contains(&layout.file_for_map(*map_id))
+        });
+        if self.maps.maps.len() != maps_before {
+            self.publish_maps();
+        }
         let mapped_files: HashSet<WalFileId> = self
             .maps
             .maps
             .keys()
-            .map(|map_id| self.layout.file_for_map(*map_id))
+            .map(|map_id| layout.file_for_map(*map_id))
             .collect();
         let mut actual: Vec<WalFileId> = to_delete
             .iter()
@@ -360,9 +393,9 @@ impl WalMapperThread {
         for (path, file) in to_unlink {
             self.unlinker.unlink(path, file);
         }
-        // No `WalMaps` update needed: the `mapped_files` filter above already
-        // guarantees every entry in `actual` is unmapped, so there is nothing
-        // in `self.maps` referencing the just-deleted files.
+        // Every remaining map belongs to a file outside `actual`: the
+        // non-writeable maps over deleted files were dropped above, and files
+        // with writeable maps were filtered out.
     }
 
     fn make_map(&mut self, map_id: MapId) {
@@ -400,6 +433,14 @@ impl WalMaps {
         self.maps.get(&map_id)
     }
 
+    pub fn len(&self) -> usize {
+        self.maps.len()
+    }
+
+    pub fn contains(&self, map_id: MapId) -> bool {
+        self.maps.contains_key(&map_id)
+    }
+
     pub fn map(
         &mut self,
         file: &File,
@@ -415,6 +456,34 @@ impl WalMaps {
         self.maps.get(&map_id).unwrap()
     }
 
+    /// mmap an already-written fragment for reading only and insert it into
+    /// the cache. Unlike [`Self::map`] the pages are not pre-faulted: the
+    /// caller is restoring a read window over historical data, so paying
+    /// for every page up front (possibly from disk) would only delay open,
+    /// while partial reads (index lookups) touch a handful of pages per
+    /// blob. Whole-frame copies bypass such maps and use `pread` instead,
+    /// see `Wal::frame_source`. The map is marked non-writeable; the writer
+    /// never allocates below its start position, so nothing can write
+    /// through it.
+    ///
+    /// Never evicts. The caller sizes the set so that the writer's map plus
+    /// [`INITIAL_MAPS_BUFFER`] lookahead still fit under `max_maps`.
+    pub fn map_readonly(
+        &mut self,
+        file: &File,
+        layout: &WalLayout,
+        map_id: MapId,
+        wal_mmap_bytes: MetricIntGauge,
+    ) {
+        assert!(
+            self.maps.len() < layout.max_maps,
+            "map_readonly would exceed max_maps {}",
+            layout.max_maps
+        );
+        let map = Self::create_map_impl(file, layout, map_id, wal_mmap_bytes, false, false);
+        assert!(self.maps.insert(map_id, map).is_none());
+    }
+
     /// mmap a single WAL fragment without inserting it into the cache.
     /// Used by the scan-mode iterator that doesn't need the map handoff
     /// to a writer.
@@ -424,21 +493,33 @@ impl WalMaps {
         map_id: MapId,
         wal_mmap_bytes: MetricIntGauge,
     ) -> Map {
+        Self::create_map_impl(file, layout, map_id, wal_mmap_bytes, true, true)
+    }
+
+    fn create_map_impl(
+        file: &File,
+        layout: &WalLayout,
+        map_id: MapId,
+        wal_mmap_bytes: MetricIntGauge,
+        populate: bool,
+        writeable: bool,
+    ) -> Map {
         let range = layout.map_range(map_id);
         let data = unsafe {
             let mut options = memmap2::MmapOptions::new();
             options
                 .offset(layout.offset_in_wal_file(range.start))
                 .len(layout.frag_size as usize);
-            let mmap = options
-                .populate()
-                .map_mut(file)
-                .expect("Failed to mmap on wal file");
+            if populate {
+                options.populate();
+            }
+            let mmap = options.map_mut(file).expect("Failed to mmap on wal file");
             TrackingMMapMut::new(mmap, wal_mmap_bytes).into()
         };
         Map {
             id: map_id,
-            writeable: true,
+            writeable,
+            populated: populate,
             data,
         }
     }

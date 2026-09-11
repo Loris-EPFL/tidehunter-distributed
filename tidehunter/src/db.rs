@@ -120,7 +120,12 @@ impl Db {
             &metrics,
         )?;
         let last_index_position = control_region.last_index_wal_position();
-        let index_writer = indexes.writer_after(last_index_position)?;
+        // Restore the mapped window over the fragments holding live index
+        // blobs; see `WalIterator::premap_live_fragments` for why.
+        let index_writer = indexes.writer_after_premapped(
+            last_index_position,
+            control_region.snapshot().iter_valid_val_positions(),
+        )?;
         let control_region_store = Mutex::new(control_region_store);
 
         let commit_pool = if config.commit_pool_size > 0 {

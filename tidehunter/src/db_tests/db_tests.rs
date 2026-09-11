@@ -1,6 +1,7 @@
 use super::super::*;
 use crate::compressed_batch::BatchCodec;
 use crate::config::Config;
+use crate::context::ReadType;
 use crate::crc::CrcFrame;
 use crate::failpoints::FailPoint;
 use crate::index::index_format::IndexFormatType;
@@ -9,7 +10,7 @@ use crate::key_shape::{
     Compactor, KeyIndexing, KeyShape, KeyShapeBuilder, KeySpace, KeySpaceConfig, KeySpaces, KeyType,
 };
 use crate::latch::Latch;
-use crate::metrics::Metrics;
+use crate::metrics::{self, Metrics};
 use hex_literal::hex;
 use minibytes::Bytes;
 use rand::rngs::{StdRng, ThreadRng};
@@ -3220,6 +3221,86 @@ fn test_force_rebuild_control_region() {
     assert!(
         db.is_all_clean(),
         "All entries should be clean after second force_rebuild_control_region"
+    );
+}
+
+/// Opens the db at `path`, looks up the cell-3 key written by
+/// `test_reopen_premaps_live_index_fragments` (its index blob lives in the
+/// first index fragment), and returns how many disk lookups went through the
+/// mapped vs the syscall read path.
+fn lookup_read_types(path: &Path, key_shape: &KeyShape, config: Arc<Config>) -> (u64, u64) {
+    let db_metrics = Metrics::new();
+    let db = Db::open(path, key_shape.clone(), config, db_metrics.clone()).unwrap();
+    let ks = db.single_ks();
+    assert_eq!(
+        Some(vec![3].into()),
+        db.get(ks, &[3 << 4, 0, 0, 0]).unwrap()
+    );
+    let lookups = |read_type: ReadType| {
+        let histogram = db_metrics
+            .lookup_mcs
+            .with_label_values(&[read_type.as_ref(), db.ks_context(ks).name()]);
+        metrics::get_histogram_sum_count(&histogram)
+            .expect("metrics are enabled")
+            .1
+    };
+    (lookups(ReadType::Mapped), lookups(ReadType::Syscall))
+}
+
+/// After a restart, index blobs written before the restart must be served
+/// from mmapped fragments, not the syscall read path, as long as `max_maps`
+/// leaves room for them next to the writer's fragment and its lookahead.
+#[test]
+fn test_reopen_premaps_live_index_fragments() {
+    let dir = tempdir::TempDir::new("test-premap-index").unwrap();
+    let mut config = Config::small();
+    config.frag_size = 128 * 1024;
+    config.wal_file_size = 4 * 1024 * 1024;
+    // Writer's fragment + 2 lookahead: no room for historical maps.
+    config.max_maps = 3;
+    let config = Arc::new(config);
+    // 16 cells; a key's cell is its first byte >> 4.
+    let key_shape = KeyShape::new_single(4, 16, KeyType::uniform(1));
+    {
+        let db = Db::open(
+            dir.path(),
+            key_shape.clone(),
+            config.clone(),
+            Metrics::new(),
+        )
+        .unwrap();
+        let ks = db.single_ks();
+        // One key per cell, all flushed into the first index fragment.
+        for cell in 0..16u8 {
+            db.insert(ks, vec![cell << 4, 0, 0, 0], vec![cell]).unwrap();
+        }
+        db.force_rebuild_control_region().unwrap();
+        // Keep flushing fresh keys into the last cell only, until the index
+        // writer has moved at least two fragments past the blobs of the
+        // other cells. Those blobs stay live and are never rewritten.
+        let mut i = 0u32;
+        while db.index_writer.position() < 2 * config.frag_size {
+            for _ in 0..200 {
+                i += 1;
+                let [_, b1, b2, b3] = i.to_be_bytes();
+                db.insert(ks, vec![0xF0, b1, b2, b3], vec![1]).unwrap();
+            }
+            db.force_rebuild_control_region().unwrap();
+        }
+    }
+
+    // Sanity check of the setup: with no room to map history the lookup
+    // takes the syscall path.
+    assert_eq!(
+        (0, 1),
+        lookup_read_types(dir.path(), &key_shape, config.clone())
+    );
+
+    let mut config = Config::clone(&config);
+    config.max_maps = 8;
+    assert_eq!(
+        (1, 0),
+        lookup_read_types(dir.path(), &key_shape, Arc::new(config))
     );
 }
 
