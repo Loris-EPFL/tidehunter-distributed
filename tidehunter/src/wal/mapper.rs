@@ -54,7 +54,11 @@ struct UnlinkMessage {
 }
 
 impl UnlinkWorker {
-    fn start(metrics: Arc<Metrics>, kind: &'static str) -> Self {
+    fn start(
+        metrics: Arc<Metrics>,
+        kind: &'static str,
+        namespace_generation: Arc<parking_lot::Mutex<u64>>,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel::<UnlinkMessage>();
         let time_mcs = metrics.wal_unlinker_time_mcs.with_label_values(&[kind]);
         let retry_count = metrics
@@ -67,7 +71,14 @@ impl UnlinkWorker {
                     let _timer = time_mcs.clone().mcs_timer();
                     drop_arc_file(msg.file, &msg.path, &retry_count);
                     if msg.path.exists() {
+                        // Serialize completion with generation capture by
+                        // durability barriers. Registry removal alone does
+                        // not mean that the directory entry was unlinked.
+                        let mut generation = namespace_generation.lock();
                         std::fs::remove_file(&msg.path).expect("Failed to remove wal file");
+                        *generation = generation
+                            .checked_add(1)
+                            .expect("WAL namespace generation overflow");
                     }
                 }
             })
@@ -169,7 +180,11 @@ impl WalMapper {
         }
         let maps = WalMaps::clone(&maps);
         let (sender, receiver) = mpsc::sync_channel(5);
-        let unlinker = UnlinkWorker::start(metrics.clone(), layout.kind.name());
+        let unlinker = UnlinkWorker::start(
+            metrics.clone(),
+            layout.kind.name(),
+            files.load().namespace_generation.clone(),
+        );
         let this = WalMapperThread {
             maps,
             maps_arc,

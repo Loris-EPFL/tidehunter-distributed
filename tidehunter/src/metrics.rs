@@ -151,6 +151,10 @@ impl MetricIntGaugeVec {
 }
 
 pub struct Metrics {
+    // Retain the caller's registry so adapters can add in-memory collectors to
+    // the same exporter. Collectors must not own this Metrics or its registry.
+    registry: Option<Registry>,
+    detailed: Option<DetailedMetrics>,
     pub replayed_wal_records: MetricIntCounter,
     pub index_size: MetricHistogram,
     pub max_index_size: AtomicUsize,
@@ -283,6 +287,14 @@ pub struct Metrics {
     pub promote_flat_arc_miss: MetricIntCounter,
 }
 
+/// Opt-in diagnostics. Stages nest; their durations must not be summed.
+struct DetailedMetrics {
+    duration: MetricHistogramVec,
+    operations: MetricIntCounterVec,
+    durable_prefix: MetricIntGaugeVec,
+    durable_bytes: MetricIntCounterVec,
+}
+
 macro_rules! gauge (
     ($name:expr, $r:expr, $en:expr) => {
         $crate::metrics::MetricIntGauge {
@@ -362,7 +374,15 @@ impl Metrics {
         Self::new_in_enabled(registry, config.metrics_enabled())
     }
 
+    /// Ordinary metrics follow `enabled`. Additional persistence diagnostics
+    /// require `TIDEHUNTER_DETAILED_TIMINGS=1` when this handle is constructed.
+    /// The switch does not change synchronization or acknowledgement behavior.
     pub fn new_in_enabled(registry: &Registry, enabled: bool) -> Arc<Self> {
+        let detailed = std::env::var("TIDEHUNTER_DETAILED_TIMINGS").is_ok_and(|value| value == "1");
+        Self::new_in_options(registry, enabled, detailed)
+    }
+
+    pub(crate) fn new_in_options(registry: &Registry, enabled: bool, detailed: bool) -> Arc<Self> {
         let index_size_buckets = exponential_buckets(100., 2., 20).unwrap();
         let snapshot_buckets = exponential_buckets(500., 2., 12).unwrap();
         let rebuild_buckets = exponential_buckets(2000., 2., 12).unwrap();
@@ -372,6 +392,34 @@ impl Metrics {
         let lookup_iterations_buckets = linear_buckets(1., 1.0, 10).unwrap();
 
         let this = Metrics {
+            registry: enabled.then(|| registry.clone()),
+            detailed: (enabled && detailed).then(|| DetailedMetrics {
+                duration: histogram_vec!(
+                    "tidehunter_detailed_duration_seconds",
+                    &["stage", "kind"],
+                    exponential_buckets(0.000001, 2., 27).unwrap(),
+                    registry,
+                    true
+                ),
+                operations: counter_vec!(
+                    "tidehunter_detailed_operations_total",
+                    &["stage", "kind", "outcome"],
+                    registry,
+                    true
+                ),
+                durable_prefix: gauge_vec!(
+                    "tidehunter_detailed_durable_prefix_bytes",
+                    &["kind"],
+                    registry,
+                    true
+                ),
+                durable_bytes: counter_vec!(
+                    "tidehunter_detailed_durable_bytes_total",
+                    &["kind"],
+                    registry,
+                    true
+                ),
+            }),
             replayed_wal_records: counter!("replayed_wal_records", registry, enabled),
             max_index_size: AtomicUsize::new(0),
             index_size: histogram!("index_size", index_size_buckets, registry, enabled),
@@ -578,6 +626,96 @@ impl Metrics {
         };
         Arc::new(this)
     }
+
+    /// Register an adapter's in-memory collector on this database's registry.
+    /// Disabled metrics ignore registration. Collectors must not retain this
+    /// `Metrics`, its registry, or the database, and must not perform I/O during
+    /// collection. Such ownership would create cycles or block the exporter.
+    ///
+    /// # Errors
+    /// Returns invalid-descriptor and duplicate-registration errors unchanged.
+    pub fn register_collector(
+        &self,
+        collector: Box<dyn prometheus::core::Collector>,
+    ) -> prometheus::Result<()> {
+        match &self.registry {
+            Some(registry) => registry.register(collector),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn detailed_result<T, E>(
+        &self,
+        stage: &'static str,
+        kind: &'static str,
+        action: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.detailed_measure(stage, kind, action, Result::is_err)
+    }
+
+    pub(crate) fn detailed_wait<T>(
+        &self,
+        stage: &'static str,
+        kind: &'static str,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        self.detailed_measure(stage, kind, action, |_| false)
+    }
+
+    fn detailed_measure<T>(
+        &self,
+        stage: &'static str,
+        kind: &'static str,
+        action: impl FnOnce() -> T,
+        failed: impl FnOnce(&T) -> bool,
+    ) -> T {
+        let Some(metrics) = &self.detailed else {
+            return action();
+        };
+        metrics
+            .operations
+            .with_label_values(&[stage, kind, "attempt"])
+            .inc();
+        let started = Instant::now();
+        let result = action();
+        let elapsed = started.elapsed().as_secs_f64();
+        metrics
+            .duration
+            .with_label_values(&[stage, kind])
+            .observe(elapsed);
+        let outcome = if failed(&result) { "error" } else { "success" };
+        metrics
+            .operations
+            .with_label_values(&[stage, kind, outcome])
+            .inc();
+        result
+    }
+
+    pub(crate) fn detailed_skip(&self, kind: &'static str) {
+        self.detailed_skip_stage("wal_barrier", kind);
+    }
+
+    pub(crate) fn detailed_skip_stage(&self, stage: &'static str, kind: &'static str) {
+        if let Some(metrics) = &self.detailed {
+            metrics
+                .operations
+                .with_label_values(&[stage, kind, "skipped"])
+                .inc();
+        }
+    }
+
+    pub(crate) fn detailed_durable_prefix(&self, kind: &'static str, before: u64, after: u64) {
+        if let Some(metrics) = &self.detailed {
+            metrics
+                .durable_prefix
+                .with_label_values(&[kind])
+                .set(i64::try_from(after).unwrap_or(i64::MAX));
+            metrics
+                .durable_bytes
+                .with_label_values(&[kind])
+                .inc_by(after - before);
+        }
+    }
 }
 
 pub trait TimerExt {
@@ -660,4 +798,215 @@ pub fn get_histogram_sum_count(histogram: &MetricHistogram) -> Option<(f64, u64)
         .inner
         .as_ref()
         .map(|inner| (inner.get_sample_sum(), inner.get_sample_count()))
+}
+
+#[cfg(test)]
+mod detailed_tests {
+    use super::*;
+    use prometheus::core::{Collector, Desc};
+    use prometheus::proto::MetricFamily;
+
+    struct OwnedCollector {
+        counter: PromIntCounter,
+        _lifetime: Arc<()>,
+    }
+
+    impl Collector for OwnedCollector {
+        fn desc(&self) -> Vec<&Desc> {
+            self.counter.desc()
+        }
+
+        fn collect(&self) -> Vec<MetricFamily> {
+            self.counter.collect()
+        }
+    }
+
+    #[test]
+    fn detailed_metrics_are_independent_from_ordinary_metrics() {
+        for (enabled, detailed) in [(true, false), (true, true), (false, true)] {
+            let registry = Registry::new();
+            let metrics = Metrics::new_in_options(&registry, enabled, detailed);
+            metrics.replayed_wal_records.inc();
+            let result: Result<(), ()> = metrics.detailed_result("test", "wal", || Ok(()));
+            assert!(result.is_ok());
+            let families = registry.gather();
+            assert_eq!(
+                families
+                    .iter()
+                    .any(|family| family.name() == "replayed_wal_records"),
+                enabled
+            );
+            assert_eq!(
+                families
+                    .iter()
+                    .any(|family| family.name() == "tidehunter_detailed_duration_seconds"),
+                enabled && detailed
+            );
+        }
+    }
+
+    #[test]
+    fn detailed_results_count_errors_skips_and_completed_bytes() {
+        let metrics = Metrics::new_in_options(&Registry::new(), true, true);
+        let error = metrics.detailed_result("test", "wal", || Err::<(), _>(17));
+        assert_eq!(error, Err(17));
+        assert_eq!(metrics.detailed_wait("test", "wal", || 42), 42);
+        metrics.detailed_skip("wal");
+        metrics.detailed_durable_prefix("wal", 0, 80);
+        metrics.detailed_durable_prefix("wal", 80, 100);
+        let detailed = metrics.detailed.as_ref().unwrap();
+        for (outcome, expected) in [("attempt", 2), ("success", 1), ("error", 1)] {
+            assert_eq!(
+                detailed
+                    .operations
+                    .with_label_values(&["test", "wal", outcome])
+                    .get(),
+                expected
+            );
+        }
+        assert_eq!(
+            detailed
+                .operations
+                .with_label_values(&["wal_barrier", "wal", "skipped"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            detailed.durable_prefix.with_label_values(&["wal"]).get(),
+            100
+        );
+        assert_eq!(
+            detailed.durable_bytes.with_label_values(&["wal"]).get(),
+            100
+        );
+        assert_eq!(
+            get_histogram_sum_count(&detailed.duration.with_label_values(&["test", "wal"]))
+                .unwrap()
+                .1,
+            2
+        );
+    }
+
+    #[test]
+    fn collector_uses_callers_registry_without_an_ownership_cycle() {
+        let registry = Registry::new();
+        let metrics = Metrics::new_in_options(&registry, true, false);
+        let counter = PromIntCounter::new("adapter_calls", "adapter calls").unwrap();
+        let lifetime = Arc::new(());
+        let weak = Arc::downgrade(&lifetime);
+        metrics
+            .register_collector(Box::new(OwnedCollector {
+                counter: counter.clone(),
+                _lifetime: lifetime,
+            }))
+            .unwrap();
+        counter.inc();
+        assert!(
+            registry
+                .gather()
+                .iter()
+                .any(|family| family.name() == "adapter_calls")
+        );
+        assert!(
+            metrics
+                .register_collector(Box::new(counter.clone()))
+                .is_err()
+        );
+        drop(metrics);
+        assert!(weak.upgrade().is_some());
+        registry.unregister(Box::new(counter)).unwrap();
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn disabled_metrics_ignore_adapter_collectors() {
+        let registry = Registry::new();
+        let metrics = Metrics::new_in_options(&registry, false, true);
+        let counter = PromIntCounter::new("adapter_calls", "adapter calls").unwrap();
+        metrics.register_collector(Box::new(counter)).unwrap();
+        assert!(registry.gather().is_empty());
+    }
+
+    #[test]
+    fn database_registries_keep_distinct_labels_and_counts() {
+        for (name, expected) in [("first", 1), ("second", 2)] {
+            let registry =
+                Registry::new_custom(None, Some([("db".to_owned(), name.to_owned())].into()))
+                    .unwrap();
+            let metrics = Metrics::new_in_options(&registry, true, false);
+            let counter = PromIntCounter::new("adapter_calls", "adapter calls").unwrap();
+            metrics
+                .register_collector(Box::new(counter.clone()))
+                .unwrap();
+            counter.inc_by(expected);
+            let families = registry.gather();
+            let family = families
+                .iter()
+                .find(|family| family.name() == "adapter_calls")
+                .unwrap();
+            let value = &family.get_metric()[0];
+            assert_eq!(value.get_counter().value(), expected as f64);
+            assert!(
+                value
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == "db" && label.value() == name)
+            );
+        }
+    }
+
+    #[test]
+    fn native_batch_and_snapshot_export_real_durable_stages() {
+        use crate::{
+            db::Db,
+            key_shape::{KeyShape, KeyType},
+        };
+        let directory = tempdir::TempDir::new("detailed-durable-stages").unwrap();
+        let metrics = Metrics::new_in_options(&Registry::new(), true, true);
+        let db = Db::open(
+            directory.path(),
+            KeyShape::new_single(8, 1, KeyType::uniform(1)),
+            Arc::new(Config {
+                sync_writes: true,
+                ..Config::small()
+            }),
+            metrics.clone(),
+        )
+        .unwrap();
+        let mut batch = db.write_batch();
+        batch.write(db.single_ks(), vec![1; 8], vec![42]);
+        batch.commit().unwrap();
+        db.force_rebuild_control_region().unwrap();
+        let detailed = metrics.detailed.as_ref().unwrap();
+        for (stage, kind) in [
+            ("batch_commit", "wal"),
+            ("db_sync", "wal"),
+            ("db_latch_wait", "wal"),
+            ("control_lock_wait", "wal"),
+            ("wal_sync_lock_wait", "wal"),
+            ("wal_file_sync", "wal"),
+            ("wal_directory_sync", "wal"),
+            ("control_file_sync", "all"),
+            ("control_rename", "all"),
+            ("control_directory_sync", "all"),
+        ] {
+            assert!(
+                detailed
+                    .operations
+                    .with_label_values(&[stage, kind, "success"])
+                    .get()
+                    > 0,
+                "missing {stage}"
+            );
+            assert_eq!(
+                detailed
+                    .operations
+                    .with_label_values(&[stage, kind, "error"])
+                    .get(),
+                0
+            );
+        }
+        assert!(detailed.durable_prefix.with_label_values(&["wal"]).get() > 0);
+        db.wait_for_background_threads_to_finish();
+    }
 }

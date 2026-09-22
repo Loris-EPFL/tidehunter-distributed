@@ -60,7 +60,9 @@ impl WalSyncerThread {
                 .data
                 .downcast_ref::<TrackingMMapMut>()
                 .expect("Failed to downcast to TrackingMMapMut");
-            map.flush().expect("Wal sync failed");
+            self.metrics
+                .detailed_result("background_mmap_flush", self.kind, || map.flush())
+                .expect("Wal sync failed");
             // todo we can also monitor here number of dangling maps to make sure it does not happen
             self.metrics
                 .wal_synced_position

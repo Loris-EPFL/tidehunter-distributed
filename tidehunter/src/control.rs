@@ -8,7 +8,7 @@ use crate::wal::position::WalFileId;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 /// On-disk control-region format version.
@@ -304,7 +304,7 @@ impl ControlRegionStore {
         last_position: u64,
         key_shape: &KeyShape,
         metrics: &Metrics,
-    ) {
+    ) -> io::Result<()> {
         assert!(
             last_position >= self.last_position,
             "control region last_position regressed: new={last_position} < old={}",
@@ -316,28 +316,26 @@ impl ControlRegionStore {
         let mut serialized = Vec::with_capacity(CONTROL_REGION_V2_HEADER_LEN + 4 * 1024);
         serialized.extend_from_slice(&CONTROL_REGION_V2_SENTINEL.to_le_bytes());
         serialized.extend_from_slice(&CONTROL_REGION_V3_VERSION.to_le_bytes());
-        bincode::serialize_into(&mut serialized, &control_region)
-            .expect("Failed to serialize control region");
+        bincode::serialize_into(&mut serialized, &control_region).map_err(io::Error::other)?;
         let temp_file = self.path.with_extension(".bak");
-        fs::write(&temp_file, &serialized).unwrap_or_else(|e| {
-            panic!(
-                "Failed to write control region file {}: {}",
-                temp_file.display(),
-                e
-            )
-        });
+        let mut file = fs::File::create(&temp_file)?;
+        file.write_all(&serialized)?;
+        metrics.detailed_result("control_file_sync", "all", || file.sync_all())?;
         metrics
             .snapshot_written_bytes
             .inc_by(serialized.len() as u64);
-        fs::rename(&temp_file, &self.path).unwrap_or_else(|e| {
-            panic!(
-                "Failed to rename control region file from {} to {}: {}",
-                temp_file.display(),
-                self.path.display(),
-                e
-            )
-        });
+        metrics.detailed_result("control_rename", "all", || {
+            fs::rename(&temp_file, &self.path)
+        })?;
+        let directory = self.path.parent().ok_or_else(|| {
+            io::Error::new(ErrorKind::InvalidInput, "control region has no directory")
+        })?;
+        let directory = metrics.detailed_result("control_directory_open", "all", || {
+            fs::File::open(directory)
+        })?;
+        metrics.detailed_result("control_directory_sync", "all", || directory.sync_all())?;
         self.last_position = last_position;
+        Ok(())
     }
 
     /// The path to the control region file
@@ -551,7 +549,9 @@ mod tests {
         cr.last_position = 100;
 
         let mut store = ControlRegionStore::new(path.clone(), &cr);
-        store.store(cr.snapshot, cr.last_position, &shape, &Metrics::new());
+        store
+            .store(cr.snapshot, cr.last_position, &shape, &Metrics::new())
+            .unwrap();
 
         let read_cr = ControlRegion::read(&path, &shape).unwrap();
         assert_eq!(read_cr.last_position, 100);

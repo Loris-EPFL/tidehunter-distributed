@@ -3,6 +3,8 @@ pub(crate) mod allocator;
 pub(crate) mod files;
 pub mod layout;
 mod mapper;
+#[cfg(test)]
+mod namespace_tests;
 pub mod position;
 mod syncer;
 pub(crate) mod tracker;
@@ -47,6 +49,16 @@ pub struct Wal {
     layout: WalLayout,
     maps: Arc<ArcSwap<WalMaps>>,
     metrics: Arc<Metrics>,
+    /// Completed, synchronized prefix in this open generation. Never inferred
+    /// from background mmap metrics or the highest preallocated file.
+    synced: parking_lot::Mutex<SyncedPrefix>,
+    coalesce_directory_sync: bool,
+}
+
+#[derive(Default)]
+struct SyncedPrefix {
+    position: u64,
+    namespace_generation: u64,
 }
 
 pub struct WalIterator {
@@ -196,6 +208,23 @@ impl WalWriter {
         self.wal_tracker.release_latch(latch)
     }
 
+    /// Persist the contiguous completed prefix, including writes completed
+    /// before this call. A latch waits for earlier allocation gaps to close.
+    /// Concurrent callers share the synchronized prefix, without a timer.
+    pub(crate) fn sync(&self) -> io::Result<u64> {
+        let kind = self.wal.layout.kind.name();
+        self.wal.metrics.detailed_result("writer_sync", kind, || {
+            let latch = self
+                .wal
+                .metrics
+                .detailed_wait("writer_latch_wait", kind, || self.latch());
+            let position = latch.position().as_u64();
+            let result = self.wal.sync_through(position);
+            self.release_latch(latch);
+            result.map(|()| position)
+        })
+    }
+
     /// Requests deletion of WAL files that have been fully processed by the relocation process up to the watermark position.
     ///
     /// Given watermark positions will be preserved.
@@ -247,6 +276,15 @@ impl Wal {
         layout: WalLayout,
         metrics: Arc<Metrics>,
     ) -> io::Result<Arc<Self>> {
+        Self::open_with_directory_sync(base_path, layout, metrics, false)
+    }
+
+    pub(crate) fn open_with_directory_sync(
+        base_path: &Path,
+        layout: WalLayout,
+        metrics: Arc<Metrics>,
+        coalesce_directory_sync: bool,
+    ) -> io::Result<Arc<Self>> {
         layout.assert_layout();
         let files = WalFiles::new(base_path, &layout)?;
         let wal = Wal {
@@ -254,6 +292,8 @@ impl Wal {
             layout,
             maps: Default::default(),
             metrics,
+            synced: parking_lot::Mutex::new(SyncedPrefix::default()),
+            coalesce_directory_sync,
         };
         Ok(Arc::new(wal))
     }
@@ -479,9 +519,80 @@ impl Wal {
         Ok(iterator.into_writer(None))
     }
 
-    /// Ensure the file is written to disk (blocking call).
+    /// Synchronize all currently open files and their directory. This low-level
+    /// call does not wait for in-flight allocations; Db callers use the writer
+    /// barrier instead. Retained for callers that already exclude writes.
     pub fn fsync(&self) -> io::Result<()> {
-        self.files.load().current_file().sync_all()
+        let files = self.files.load();
+        let kind = self.layout.kind.name();
+        for file in files.files.values() {
+            self.metrics
+                .detailed_result("wal_file_sync", kind, || file.sync_all())?;
+        }
+        let directory = self
+            .metrics
+            .detailed_result("wal_directory_open", kind, || File::open(&files.base_path))?;
+        self.metrics
+            .detailed_result("wal_directory_sync", kind, || directory.sync_all())
+    }
+
+    /// Caller proves all allocated bytes below `through` are complete. WAL
+    /// files wholly below the previous synchronized prefix are immutable until
+    /// deletion; the partially covered file must be synchronized again.
+    pub(crate) fn sync_through(&self, through: u64) -> io::Result<()> {
+        self.metrics
+            .detailed_result("wal_barrier", self.layout.kind.name(), || {
+                self.sync_through_inner(through)
+            })
+    }
+
+    fn sync_through_inner(&self, through: u64) -> io::Result<()> {
+        self.sync_through_with_directory(through, |path| {
+            let kind = self.layout.kind.name();
+            let directory = self
+                .metrics
+                .detailed_result("wal_directory_open", kind, || File::open(path))?;
+            self.metrics
+                .detailed_result("wal_directory_sync", kind, || directory.sync_all())
+        })
+    }
+
+    fn sync_through_with_directory(
+        &self,
+        through: u64,
+        sync_directory: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let kind = self.layout.kind.name();
+        let mut synced = self
+            .metrics
+            .detailed_wait("wal_sync_lock_wait", kind, || self.synced.lock());
+        if through <= synced.position {
+            self.metrics.detailed_skip(kind);
+            return Ok(());
+        }
+        let files = self.files.load();
+        let first = self.layout.locate_file(synced.position);
+        let last = self.layout.locate_file(through - 1);
+        for (_, file) in files.files.range(first..=last) {
+            self.metrics
+                .detailed_result("wal_file_sync", kind, || file.sync_all())?;
+        }
+        // Creation is recorded before writable-map publication; completed
+        // background unlinks also advance this generation. Extensions of
+        // existing files are covered by their unchanged sync_all above.
+        let namespace_generation = *files.namespace_generation.lock();
+        if !self.coalesce_directory_sync || namespace_generation > synced.namespace_generation {
+            sync_directory(&files.base_path)?;
+            // Only certify the captured generation. Creation or unlink may
+            // have raced with sync_all and must trigger a later barrier.
+            synced.namespace_generation = namespace_generation;
+        } else {
+            self.metrics.detailed_skip_stage("wal_directory_sync", kind);
+        }
+        let before = synced.position;
+        synced.position = through;
+        self.metrics.detailed_durable_prefix(kind, before, through);
+        Ok(())
     }
 
     /// Get the minimum WAL position based on the oldest WAL file present.
@@ -901,6 +1012,119 @@ mod tests {
     use crate::wal::position::WalFileId;
     use bytes::{BufMut, BytesMut};
     use std::collections::HashSet;
+
+    pub(super) fn detailed_count(
+        registry: &prometheus::Registry,
+        stage: &str,
+        outcome: &str,
+    ) -> u64 {
+        registry
+            .gather()
+            .iter()
+            .filter(|family| family.name() == "tidehunter_detailed_operations_total")
+            .flat_map(|family| family.get_metric())
+            .filter(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == "stage" && label.value() == stage)
+                    && metric
+                        .get_label()
+                        .iter()
+                        .any(|label| label.name() == "outcome" && label.value() == outcome)
+            })
+            .map(|metric| metric.get_counter().value() as u64)
+            .sum()
+    }
+
+    #[test]
+    fn durability_sync_covers_multiple_files_and_advances_only_completed_bytes() {
+        let dir = tempdir::TempDir::new("wal-durability").unwrap();
+        let layout = WalLayout {
+            frag_size: 4096,
+            max_maps: 4,
+            direct_io: false,
+            wal_file_size: 8192,
+            kind: WalKind::Replay,
+        };
+        let registry = prometheus::Registry::new();
+        let metrics = Metrics::new_in_options(&registry, true, true);
+        let wal = Wal::open(dir.path(), layout, metrics).unwrap();
+        let writer = wal.wal_iterator_for_writer(0).unwrap().into_writer(None);
+        assert_eq!(writer.sync().unwrap(), 0);
+        assert_eq!(detailed_count(&registry, "wal_barrier", "skipped"), 1);
+        assert_eq!(detailed_count(&registry, "wal_file_sync", "attempt"), 0);
+        for i in 0_u8..24 {
+            drop(
+                writer
+                    .write(&PreparedWalWrite::new(&vec![i; 1024]))
+                    .unwrap(),
+            );
+        }
+        assert_eq!(wal.synced.lock().position, 0);
+        let end = writer.sync().unwrap();
+        assert_eq!(end, writer.position());
+        assert_eq!(wal.synced.lock().position, end);
+        assert!(wal.file_ids().len() >= 3);
+        let files_synced = (end - 1) / wal.layout.wal_file_size + 1;
+        assert_eq!(
+            detailed_count(&registry, "wal_file_sync", "success"),
+            files_synced
+        );
+        assert_eq!(
+            detailed_count(&registry, "wal_directory_sync", "success"),
+            1
+        );
+        assert_eq!(writer.sync().unwrap(), end);
+        assert_eq!(detailed_count(&registry, "wal_barrier", "skipped"), 2);
+        assert_eq!(
+            detailed_count(&registry, "wal_file_sync", "success"),
+            files_synced
+        );
+        drop(
+            writer
+                .write(&PreparedWalWrite::new(&vec![42; 128]))
+                .unwrap(),
+        );
+        assert!(writer.sync().unwrap() > end);
+        drop(writer);
+    }
+
+    #[test]
+    fn durability_sync_failure_does_not_publish_a_prefix() {
+        let dir = tempdir::TempDir::new("wal-durability-failure").unwrap();
+        let path = dir.path().join("db");
+        std::fs::create_dir(&path).unwrap();
+        let layout = WalLayout {
+            frag_size: 4096,
+            max_maps: 4,
+            direct_io: false,
+            wal_file_size: 8192,
+            kind: WalKind::Replay,
+        };
+        let registry = prometheus::Registry::new();
+        let metrics = Metrics::new_in_options(&registry, true, true);
+        let wal = Wal::open(&path, layout, metrics).unwrap();
+        let writer = wal.wal_iterator_for_writer(0).unwrap().into_writer(None);
+        drop(writer.write(&PreparedWalWrite::new(&vec![1; 128])).unwrap());
+        // Allow mapper lookahead to finish before making the directory lookup
+        // fail. Moving this test-owned directory keeps its open files intact.
+        writer.wal_tracker_barrier();
+        writer.wal_tracker.min_wal_position_updated(0);
+        let moved = dir.path().join("moved");
+        std::fs::rename(&path, &moved).unwrap();
+        assert!(writer.sync().is_err());
+        assert_eq!(wal.synced.lock().position, 0);
+        assert_eq!(detailed_count(&registry, "wal_barrier", "error"), 1);
+        assert_eq!(detailed_count(&registry, "wal_directory_open", "error"), 1);
+        assert_eq!(
+            detailed_count(&registry, "wal_directory_sync", "attempt"),
+            0
+        );
+        std::fs::rename(&moved, &path).unwrap();
+        assert!(writer.sync().unwrap() > 0);
+        drop(writer);
+    }
 
     #[test]
     fn test_wal() {

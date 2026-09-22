@@ -17,6 +17,10 @@ use std::sync::Arc;
 pub(crate) struct WalFiles {
     pub(crate) base_path: PathBuf,
     pub(crate) files: BTreeMap<WalFileId, Arc<File>>,
+    /// Shared by every registry snapshot and the background unlinker. A
+    /// completed unlink is counted before releasing the lock, so a later
+    /// barrier cannot miss a deletion that already completed.
+    pub(crate) namespace_generation: Arc<parking_lot::Mutex<u64>>,
 }
 
 impl WalFiles {
@@ -49,6 +53,8 @@ impl WalFiles {
         Ok(Self {
             base_path: base_path.to_path_buf(),
             files,
+            // Never infer namespace durability from files found on open.
+            namespace_generation: Arc::new(parking_lot::Mutex::new(1)),
         })
     }
 
@@ -65,6 +71,7 @@ impl WalFiles {
     }
 
     #[inline]
+    #[cfg(test)]
     pub(crate) fn current_file(&self) -> &Arc<File> {
         self.files
             .values()
@@ -99,6 +106,7 @@ impl WalFiles {
             Self {
                 base_path: self.base_path.clone(),
                 files,
+                namespace_generation: self.namespace_generation.clone(),
             },
             removed,
         )
@@ -113,9 +121,16 @@ impl WalFiles {
             files.insert(id, file).is_none(),
             "wal file {id:?} already in registry",
         );
+        // The file was created before this call. Publish its generation before
+        // publishing this registry and, subsequently, its writable maps.
+        let mut generation = self.namespace_generation.lock();
+        *generation = generation
+            .checked_add(1)
+            .expect("WAL namespace generation overflow");
         Self {
             base_path: self.base_path.clone(),
             files,
+            namespace_generation: self.namespace_generation.clone(),
         }
     }
 }

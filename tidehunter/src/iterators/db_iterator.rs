@@ -3,7 +3,7 @@ use crate::checkpoint::DbCheckpoint;
 use crate::db::{Db, DbResult};
 use crate::index::index_format::IndexIterCaches;
 use crate::iterators::IteratorResult;
-use crate::key_shape::{KeySpace, KeySpaceDesc};
+use crate::key_shape::{KeyIndexing, KeySpace, KeySpaceDesc};
 use minibytes::Bytes;
 use std::sync::Arc;
 
@@ -19,6 +19,13 @@ pub(crate) enum IterationSource {
 }
 
 impl IterationSource {
+    fn get(&self, ks: KeySpace, key: &[u8]) -> DbResult<Option<Bytes>> {
+        match self {
+            Self::Db(db) => db.get(ks, key),
+            Self::Checkpoint(checkpoint) => checkpoint.get(ks, key),
+        }
+    }
+
     fn ks(&self, ks: KeySpace) -> &KeySpaceDesc {
         match self {
             IterationSource::Db(db) => db.ks_desc(ks),
@@ -58,6 +65,9 @@ pub struct DbIterator {
     ks: KeySpace,
     cell: Option<CellId>,
     prev_key: Option<Bytes>,
+    /// Variable-length keys have no fixed-width lexicographic predecessor.
+    /// Read the inclusive bound once, then use it as the exclusive cursor.
+    pending_lower_bound: Option<Bytes>,
     full_lower_bound: Option<Bytes>,
     full_upper_bound: Option<Bytes>,
     with_key_reduction: bool,
@@ -79,6 +89,7 @@ impl DbIterator {
             ks,
             cell: Some(cell),
             prev_key: None,
+            pending_lower_bound: None,
             full_lower_bound: None,
             full_upper_bound: None,
             end_cell_exclusive: None,
@@ -92,6 +103,7 @@ impl DbIterator {
     /// Updating boundaries may reset the iterator.
     pub fn set_lower_bound(&mut self, lower_bound: impl Into<Bytes>) {
         self.iter_cache.clear();
+        self.pending_lower_bound = None;
         let full_lower_bound = lower_bound.into();
         let ks = self.source.ks(self.ks);
         ks.assert_supports_iterator_bound();
@@ -106,6 +118,10 @@ impl DbIterator {
                 self.cell = Some(ks.last_cell());
                 self.prev_key = None;
             }
+        } else if matches!(ks.key_indexing(), KeyIndexing::VariableLength) {
+            self.cell = Some(ks.cell_id(&reduced_lower_bound));
+            self.prev_key = Some(reduced_lower_bound);
+            self.pending_lower_bound = Some(full_lower_bound.clone());
         } else {
             let next_key = saturated_decrement_vec(&reduced_lower_bound);
 
@@ -128,6 +144,7 @@ impl DbIterator {
         ks.assert_supports_iterator_bound();
         let reduced_upper_bound = ks.reduced_key_bytes(full_upper_bound.clone());
         if self.reverse {
+            self.pending_lower_bound = None;
             let next_key = if self.with_key_reduction {
                 saturated_increment_vec(&reduced_upper_bound)
             } else {
@@ -149,6 +166,7 @@ impl DbIterator {
 
     pub fn reverse(&mut self) {
         self.iter_cache.clear();
+        self.pending_lower_bound = None;
         let ks = self.source.ks(self.ks);
         ks.assert_supports_iterator_bound();
         self.reverse = !self.reverse;
@@ -164,6 +182,17 @@ impl DbIterator {
     }
 
     fn try_next(&mut self) -> Result<Option<DbResult<(Bytes, Bytes)>>, IteratorAction> {
+        if let Some(key) = self.pending_lower_bound.take() {
+            self.check_bounds(&key)?;
+            match self.source.get(self.ks, &key) {
+                Ok(Some(value)) => return Ok(Some(Ok((key, value)))),
+                Ok(None) => {}
+                Err(error) => {
+                    self.cell = None;
+                    return Ok(Some(Err(error)));
+                }
+            }
+        }
         let Some(cell) = self.cell.take() else {
             return Ok(None);
         };
@@ -291,6 +320,108 @@ fn is_nonmax(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn variable_length_ranges_match_byte_order_in_live_and_checkpoint_views() {
+        use crate::{config::Config, key_shape::KeyShape, metrics::Metrics};
+
+        for prefixed in [false, true] {
+            let directory = tempdir::TempDir::new("variable-iterator-bounds").unwrap();
+            let key_type = if prefixed {
+                crate::key_shape::KeyType::prefix_uniform(1, 0)
+            } else {
+                crate::key_shape::KeyType::uniform(4)
+            };
+            let db = Db::open(
+                directory.path(),
+                KeyShape::new_single_config_indexing(
+                    KeyIndexing::variable_length(),
+                    1,
+                    key_type,
+                    Default::default(),
+                ),
+                Arc::new(Config::small()),
+                Metrics::new(),
+            )
+            .unwrap();
+            let ks = db.single_ks();
+            let mut keys = vec![
+                vec![],
+                vec![0],
+                vec![0, 0],
+                vec![0, 1],
+                vec![1],
+                vec![1, 0],
+                vec![1, 255],
+                vec![2],
+                vec![2, 0],
+                vec![255],
+                vec![255, 0],
+                vec![255, 255],
+            ];
+            if prefixed {
+                for key in &mut keys {
+                    key.insert(0, 7);
+                }
+            }
+            for key in &keys {
+                db.insert(ks, key.clone(), vec![1]).unwrap();
+            }
+            let checkpoint = db.checkpoint();
+            for key in &keys {
+                db.insert(ks, key.clone(), vec![2]).unwrap();
+            }
+            let mut bounds: Vec<Option<Vec<u8>>> = keys.iter().cloned().map(Some).collect();
+            bounds.push(Some(if prefixed { vec![7, 3] } else { vec![3] }));
+            bounds.push(None);
+            for lower in &bounds {
+                for upper in &bounds {
+                    for reverse in [false, true] {
+                        let mut expected: Vec<_> = keys
+                            .iter()
+                            .filter(|key| {
+                                lower.as_ref().is_none_or(|lower| *key >= lower)
+                                    && upper.as_ref().is_none_or(|upper| *key < upper)
+                            })
+                            .cloned()
+                            .collect();
+                        if reverse {
+                            expected.reverse();
+                        }
+                        for pinned in [false, true] {
+                            let mut iter = if pinned {
+                                checkpoint.iterator(ks)
+                            } else {
+                                db.iterator(ks)
+                            };
+                            if let Some(lower) = lower {
+                                iter.set_lower_bound(lower.clone());
+                            }
+                            if let Some(upper) = upper {
+                                iter.set_upper_bound(upper.clone());
+                            }
+                            if reverse {
+                                iter.reverse();
+                            }
+                            let actual: Vec<_> = iter
+                                .map(|row| {
+                                    let (key, value) = row.unwrap();
+                                    assert_eq!(value.as_ref(), &[if pinned { 1 } else { 2 }]);
+                                    key.to_vec()
+                                })
+                                .collect();
+                            assert_eq!(
+                                actual, expected,
+                                "prefixed={prefixed} lower={lower:?} upper={upper:?} reverse={reverse}"
+                            );
+                        }
+                    }
+                }
+            }
+            drop(checkpoint);
+            db.wait_for_background_threads_to_finish();
+        }
+    }
 
     #[test]
     fn test_saturated_decrement_vec() {

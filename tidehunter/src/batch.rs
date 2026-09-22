@@ -135,7 +135,11 @@ impl WriteBatch {
     }
 
     pub fn commit(self) -> DbResult<()> {
-        self.db.clone().do_write_batch(self)
+        let db = self.db.clone();
+        db.metrics.detailed_result("batch_commit", "wal", || {
+            db.do_write_batch(self)?;
+            db.sync_if_requested()
+        })
     }
 }
 

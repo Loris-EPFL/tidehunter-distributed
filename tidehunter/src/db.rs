@@ -49,7 +49,7 @@ pub struct Db {
     pub(crate) index_writer: WalWriter,
     pub(crate) control_region_store: Mutex<ControlRegionStore>,
     pub(crate) config: Arc<Config>,
-    metrics: Arc<Metrics>,
+    pub(crate) metrics: Arc<Metrics>,
     pub(crate) key_shape: KeyShape,
     /// Canonical name → handle map for the keyspaces the caller declared;
     /// resolved via [`Db::ks`] / [`Db::try_ks`] / [`Db::single_ks`].
@@ -82,8 +82,18 @@ impl Db {
         let lock = DbLock::acquire(&path, config.open_lock_retry_timeout)?;
         let (key_shape, keyspaces, registry_dirty) = Self::reconcile_key_shape(&path, key_shape)?;
         Self::maybe_create_config_file(&path, &config)?;
-        let wal = Wal::open(&path, config.wal_layout(WalKind::Replay), metrics.clone())?;
-        let indexes = Wal::open(&path, config.wal_layout(WalKind::Index), metrics.clone())?;
+        let wal = Wal::open_with_directory_sync(
+            &path,
+            config.wal_layout(WalKind::Replay),
+            metrics.clone(),
+            config.coalesce_wal_directory_sync,
+        )?;
+        let indexes = Wal::open_with_directory_sync(
+            &path,
+            config.wal_layout(WalKind::Index),
+            metrics.clone(),
+            config.coalesce_wal_directory_sync,
+        )?;
         let (control_region_store, control_region) =
             Self::read_or_create_control_region(path.join(CONTROL_REGION_FILE), &key_shape)?;
         if registry_dirty {
@@ -291,6 +301,7 @@ impl Db {
             file.sync_all()?;
         }
         std::fs::rename(&temp_file, &shape_file_path)?;
+        std::fs::File::open(path)?.sync_all()?;
         Ok(())
     }
 
@@ -339,6 +350,8 @@ impl Db {
                 DbError::Io(io::Error::other(format!("Failed to serialize config: {e}")))
             })?;
             std::fs::write(&config_file_path, yaml)?;
+            std::fs::File::open(&config_file_path)?.sync_all()?;
+            std::fs::File::open(path)?.sync_all()?;
         }
         Ok(())
     }
@@ -435,7 +448,46 @@ impl Db {
         let reduced_key = context.ks_config.reduced_key_bytes(k);
         self.large_table
             .insert(context, reduced_key, full_key, guard, &v, self)?;
+        self.sync_if_requested()
+    }
+
+    pub(crate) fn sync_if_requested(&self) -> DbResult<()> {
+        if self.config.sync_writes {
+            self.sync()?;
+        }
         Ok(())
+    }
+
+    /// Persist writes that completed before this call. Ordinary writes remain
+    /// asynchronous; callers can synchronize a batch of writes with one call.
+    /// A successful return makes that prefix recoverable after machine failure,
+    /// assuming the filesystem/device honor successful synchronization calls.
+    /// This does not provide replication or isolation from concurrent readers.
+    ///
+    /// Synchronization errors are returned and must prevent a durable ACK.
+    /// A caller must not hold an unfinished write or native checkpoint latch
+    /// while waiting for a write that depends on releasing that latch.
+    pub fn sync(&self) -> DbResult<()> {
+        self.metrics
+            .detailed_result("db_sync", "wal", || self.sync_inner())
+    }
+
+    fn sync_inner(&self) -> DbResult<()> {
+        // Capture before waiting for the shared sync lock: concurrent callers
+        // already covered by the preceding sync need no additional WAL fsync.
+        let latch = self
+            .metrics
+            .detailed_wait("db_latch_wait", "wal", || self.wal_writer.latch());
+        // Serialize with control-region publication/index reclamation. Normal
+        // writes remain lock-free on this path; no snapshot is forced per sync.
+        let result = {
+            let _control = self.metrics.detailed_wait("control_lock_wait", "wal", || {
+                self.control_region_store.lock()
+            });
+            self.wal.sync_through(latch.position().as_u64())
+        };
+        self.wal_writer.release_latch(latch);
+        result.map_err(DbError::Io)
     }
 
     pub fn remove(&self, ks: KeySpace, k: impl Into<Bytes>) -> DbResult<()> {
@@ -447,7 +499,8 @@ impl Db {
         context.inc_wal_written(WalEntryKind::Tombstone, w.len() as u64);
         let guard = self.wal_writer.write(&w)?;
         let reduced_key = context.ks_config.reduced_key_bytes(k);
-        self.large_table.remove(context, reduced_key, guard, self)
+        self.large_table.remove(context, reduced_key, guard, self)?;
+        self.sync_if_requested()
     }
 
     pub fn get(&self, ks: KeySpace, k: &[u8]) -> DbResult<Option<Bytes>> {
@@ -569,13 +622,15 @@ impl Db {
 
         let entry = WalEntry::DropCells(ks, from_cell.clone(), to_cell.clone());
         let w = PreparedWalWrite::new(&entry);
-        self.wal_writer.write(&w)?;
+        // A snapshot must not advance its replay boundary past the tombstone
+        // until the corresponding in-memory cells have actually been dropped.
+        let guard = self.wal_writer.write(&w)?;
 
         let context = self.ks_context(ks);
         self.large_table
             .drop_cells_in_range(context, &from_cell, &to_cell);
-
-        Ok(())
+        drop(guard);
+        self.sync_if_requested()
     }
 
     /// Destroys a retained keyspace: irreversibly deletes its data and frees
@@ -1348,8 +1403,8 @@ impl Db {
             // must keep every file the writer might traverse.
             None => Vec::new(),
         };
-        self.indexes.fsync()?;
-        self.wal.fsync()?;
+        self.index_writer.sync()?;
+        self.wal_writer.sync()?;
         // Persist the control region BEFORE unlinking files. A crash between
         // these steps must leave the on-disk CR consistent with the files
         // still present: extra (un-deleted) files are tolerated by the next
@@ -1359,7 +1414,7 @@ impl Db {
             snapshot.replay_from,
             &self.key_shape,
             &self.metrics,
-        );
+        )?;
         self.index_writer.delete_files(to_delete)?;
         Ok(snapshot.replay_from)
     }
@@ -1949,6 +2004,10 @@ impl From<bincode::Error> for DbError {
 #[cfg(test)]
 #[path = "db_tests/generated.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "db_tests/durability.rs"]
+mod durability_tests;
 
 #[cfg(test)]
 mod multi_flusher_tests {

@@ -38,6 +38,15 @@ pub struct Config {
     pub num_flusher_threads: usize,
     /// Whether to perform flushing synchronously instead of async (default: false)
     pub sync_flush: bool,
+    /// Wait for stable storage before public mutations acknowledge. Independent
+    /// of index `sync_flush`. False preserves the original asynchronous ACK.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sync_writes: bool,
+    /// Opt-in: persist the WAL directory only when its namespace changed since
+    /// the last successful barrier. File-data synchronization is unchanged.
+    /// The first advancing barrier after each open remains conservative.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub coalesce_wal_directory_sync: bool,
     /// Maximum size of a single WAL file
     pub wal_file_size: u64,
     /// Strategy to use for relocation (WalBased or IndexBased)
@@ -151,6 +160,8 @@ impl Default for Config {
             direct_io: false,
             num_flusher_threads: 1,
             sync_flush: false,
+            sync_writes: false,
+            coalesce_wal_directory_sync: false,
             wal_file_size: 10 * (1 << 30), // 10Gb
             relocation_strategy: RelocationStrategy::default(),
             relocation_max_reclaim_pct: default_relocation_max_reclaim_pct(),
@@ -182,6 +193,8 @@ impl Config {
             num_flusher_threads: 1,
             sync_flush: false,
             wal_file_size: 4 * 1024 * 1024,
+            sync_writes: false,
+            coalesce_wal_directory_sync: false,
             relocation_strategy: RelocationStrategy::default(),
             metrics_enabled: true,
             relocation_max_reclaim_pct: 100,
