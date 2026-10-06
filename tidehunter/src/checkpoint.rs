@@ -96,7 +96,7 @@ impl DbCheckpoint {
                 }
                 Ok(Some(value))
             }
-            GetResult::WalPosition(w) => db.read_record_check_key(context, k, w),
+            GetResult::WalPosition(w, _) => db.read_record_check_key(context, k, w),
             GetResult::NotFound => Ok(None),
         }
     }
@@ -157,7 +157,7 @@ impl DbCheckpoint {
                 // No LRU is consulted on the checkpoint path, so `Value` is never
                 // produced; handle it for completeness.
                 GetResult::Value(ref full_key, ref v) => (full_key.clone(), v.clone()),
-                GetResult::WalPosition(w) => {
+                GetResult::WalPosition(w, _) => {
                     match db.read_record_for_indexed_key(context, w, result.key.as_ref())? {
                         // Deliberately no `update_lru`: a checkpoint read must
                         // not seed the live value LRU with as-of values that

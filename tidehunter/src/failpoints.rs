@@ -19,6 +19,10 @@ impl Default for FailPoint {
 }
 
 impl FailPoint {
+    pub fn from_fn(fp: impl Fn() + Send + Sync + 'static) -> Self {
+        Self { fp: Box::new(fp) }
+    }
+
     pub fn sleep(range: Range<Duration>) -> Self {
         let fp = Box::new(move || {
             let mut rng = ThreadRng::default();
