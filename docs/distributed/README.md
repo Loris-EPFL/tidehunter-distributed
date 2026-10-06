@@ -5,6 +5,9 @@ Started 6 October 2026 in a separate checkout named `tidehunter-sharded-wal`.
 **Current implementation and test evidence:**
 [Implementation record](IMPLEMENTATION_2026-10-06.md).
 
+**Next work and coordinator hierarchy:**
+[Next implementation plan](NEXT_STEPS_2026-10-06.md).
+
 Run the local two-partition correctness example from the repository root:
 
 ```sh
