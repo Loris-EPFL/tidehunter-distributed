@@ -484,6 +484,41 @@ impl Wal {
         self.files.load().current_file().sync_all()
     }
 
+    /// Persist every file currently registered and its directory entry.
+    ///
+    /// The experimental partition service serializes append/persist and invokes
+    /// this only after its complete frame has been copied into a registered map.
+    /// Unlike `fsync`, this covers a completed frame in an older file even when
+    /// the mapper has already created a newer file ahead of the writer. This is
+    /// a conservative initial barrier, not an optimized dirty-file/group commit.
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn persist_registered_files(&self) -> io::Result<()> {
+        let files = self.files.load_full();
+        for file in files.files.values() {
+            file.sync_all()?;
+        }
+        File::open(&files.base_path)?.sync_all()
+    }
+
+    /// Persist the file containing a completed frame, even if mapping lookahead
+    /// has made another file `current_file`. The experimental caller admits one
+    /// unpersisted batch per stream and recovers fragments independently, so
+    /// previous frames are already durable and skip markers are not authority.
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn persist_frame_file(&self, position: WalPosition) -> io::Result<()> {
+        let files = self.files.load_full();
+        let file = files
+            .get_checked(self.layout.locate_file(position.offset()))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "completed WAL frame file disappeared",
+                )
+            })?;
+        file.sync_all()?;
+        File::open(&files.base_path)?.sync_all()
+    }
+
     /// Get the minimum WAL position based on the oldest WAL file present.
     /// For sparsely-GC'd WALs (index) this is the lowest still-live file id;
     /// it is not a guarantee that every byte below it has been reclaimed.

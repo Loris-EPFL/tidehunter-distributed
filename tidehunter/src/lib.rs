@@ -13,6 +13,8 @@ pub mod control;
 pub mod crc;
 pub mod db;
 mod decompress_cache;
+#[cfg(feature = "experimental-distributed")]
+pub mod distributed;
 #[cfg(test)]
 mod failpoints;
 pub mod file_reader;
