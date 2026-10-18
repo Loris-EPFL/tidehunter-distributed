@@ -788,12 +788,10 @@ repository/ref guards still forbid paid runs from `main`.
 Cost-only refresh and explicit recovery do not require another experiment:
 
 ```bash
-(
-  eval "$(aws configure export-credentials --profile tidehunter --format env)"
-  python3 experiments/aws-sharded-wal/ci_budget.py reconcile \
-    --bucket tidehunter-ci-354775971805-us-east-1 --account 354775971805 \
-    --region us-east-1 --budget-file experiments/aws-sharded-wal/budget.json --format github
-)
+# Trusted GitHub workflow; does not allocate EC2.
+gh workflow run aws-efa-benchmarks.yaml \
+  --repo Loris-EPFL/tidehunter-distributed --ref bench/aws-efa \
+  -f operation=cost-report
 # On the trusted GitHub runner, using the original run ID and current OIDC role:
 python3 experiments/aws-sharded-wal/ci_campaign.py cleanup \
   --config experiments/aws-sharded-wal/ci-config.json \
@@ -814,6 +812,20 @@ References:
 [cluster placement](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/placement-strategies.html),
 [cost-allocation tag activation](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/activating-tags.html).
 
+### Published compatibility pins
+
+| Input | Published source |
+|---|---|
+| Sui fork | `Loris-EPFL/sui-tidehunter-distributed`, branch `refactor/distributed-nvme`, commit `ef6dbadcdad795133ab114176957b7fcd33d7192` |
+| Sui's engine dependency | `Loris-EPFL/tidehunter-distributed`, commit `5bd2f5ee3cf7b837c4713b070e3de3cfcf2fe4e5` |
+| Repository Actions pin | `AWS_BENCH_SUI_SHA=ef6dbadcdad795133ab114176957b7fcd33d7192` |
+
+The published Sui manifest, remote branch, author/committer associations and
+Actions variable were verified through GitHub as `Loris-EPFL`. The campaign
+engine is the exact protected-branch workflow commit, not a separately moving
+engine branch. The frozen-copy Cargo patch described above binds Sui to that
+selected engine; the portable Sui checkout retains its immutable runtime pin.
+
 ### Local preparation verification and remaining activation gate
 
 | Executed verification | Observed result |
@@ -821,10 +833,12 @@ References:
 | Offline AWS/CI harness | 387 tests, 3 skipped; all executed tests passed |
 | Sui checkpoint/support/analysis harness | 105 passed, including real Cargo Git-to-staged dependency binding |
 | Native library and strict lint | 383 passed, 6 ignored; native/distributed/fabric `-D warnings` checks passed |
-| Distributed library | 775 passed, 7 ignored |
-| Fabric library/provider checks | Engine 775 passed, 13 ignored; fabric crate 43 passed, 1 ignored; all selected software-provider scenarios passed |
+| Distributed library | 776 passed, 7 ignored |
+| Fabric library/provider checks | Engine 776 passed, 13 ignored; fabric crate 43 passed, 1 ignored; all selected software-provider scenarios passed |
+| Sui native/fabric integration | Native `sui-node`/`sui-tool` and fabric-enabled `sui-node` checks passed against the published runtime pin; scoped strict `xclippy` passed |
+| Sui storage/core regressions | 34 typed-store tests passed; 19 changed core cases passed in isolated exact-filter processes |
 | Local five-process executable | Abrupt coordinator exit, reopen/recovery, fencing, node restart, TLS rejection, lost durable reply and exact retry verified; one shared SSD, no RDMA/AWS |
-| Workflow run-step shell syntax | 17 shell blocks passed `bash -n` |
+| Workflow run-step shell syntax | `bash -n` passed for the shell steps in all four workflows |
 | Default suite planner | 6 paired Sui cells and 51 paired KV cases |
 | Actual fixture extraction CLI | Exact archive verified; 1,306 files extracted into an owned temporary directory |
 | Cross-job package/restore CLI | Restored executable and internal symlink ran; altered SHA rejected before extraction |
@@ -842,6 +856,38 @@ The accounting scenario used an offline conditional-object store, not AWS
 charges or benchmark measurements. Generated examples and extracted copies were
 removed; no fake cost report is committed. This CI-only change did not rebuild
 the full Sui binaries locally or claim new native/TCP/EFA timings.
+
+The broad Sui-core test process failed after a shared `ProtocolConfig`
+override lock became poisoned; this is not a passing full Sui-core suite.
+The congestion cancellation `sim_test` remains unvalidated under its required
+simulator. Its ordinary Tokio execution rejected a timestamp-zero commit and
+compiled out the failpoint; `cargo-nextest` is unavailable locally. The
+repository simulator wrapper was not run on the modified checkout because
+its exit trap checks out `Cargo.lock`. These limits do not represent EFA
+hardware or distributed performance measurements.
+
+GitHub exposed a process-observation race in the lifecycle assertion: a child
+could disappear between `/proc/PID/stat` existence and content reads. The
+assertion now reads once and accepts only `FileNotFoundError`,
+`ProcessLookupError`, or the existing zombie state as proof of exit. The
+105-test checkpoint suite passed after the change. An opened proc descriptor
+from a real terminated child reproduced the kernel's `ProcessLookupError`;
+the assertion accepted that state without hiding permission or parsing errors.
+
+Codex review of PR #1 also found that zero read requests or a byte budget below
+one read-flight slot could open and fence an otherwise unusable authority.
+Configuration validation now requires a positive request limit and uses the
+same compile-time slot accounting as the read-service constructor. Rejection
+precedes authority-directory creation, manifest writes and remote fencing.
+The regression covers both a new directory and a retained authority, then
+checks an uncached value read and the unchanged next valid epoch.
+
+A full local run also exposed the native tracker ordering test's assumption
+that its background thread always publishes within 10 ms. Only the test
+changed: it observes the expected prefix with a five-second bound and retains
+the gap/order assertions. A barrier cannot acknowledge this intermediate
+prefix because it queues behind allocations whose guards the test still
+holds. No production tracker, WAL ordering or durability code changed.
 
 The initial local-only pass could not perform server-side validation because
 `hybr1d` lacked validation actions. A later live audit found inherited
