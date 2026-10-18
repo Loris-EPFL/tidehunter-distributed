@@ -166,7 +166,7 @@ fn benchmark_large_table_insert_with_overwrites(c: &mut Criterion) {
 
                 b.iter(|| {
                     // 50% chance of overwriting existing key vs inserting new key
-                    let key_num = if key_counter % 2 == 0 {
+                    let key_num = if key_counter.is_multiple_of(2) {
                         key_counter % 1000 // Overwrite existing key
                     } else {
                         1000 + key_counter // New key

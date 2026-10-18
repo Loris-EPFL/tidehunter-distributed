@@ -13,7 +13,7 @@ use crate::primitives::var_int::{MAX_U16_VARINT, deserialize_u16_varint, seriali
 use crate::wal::position::{HasOffset, LastProcessed, WalPosition};
 use bytes::{Buf, BufMut, BytesMut};
 use minibytes::Bytes;
-use smallvec::{SmallVec, smallvec};
+use smallvec::smallvec;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -21,18 +21,13 @@ use std::collections::HashSet;
 use std::collections::btree_map::Entry;
 use std::ops::Bound;
 
-/// Positions recorded in the `data` overlay for a single key, kept ascending by
-/// `IndexWalPosition` (so the last element is the latest). Inline capacity 1
-/// keeps the common single-write-per-key case allocation-free; the rare key
-/// rewritten again before promotion spills its extra positions to the heap.
-pub(super) type DataPositions = SmallVec<[IndexWalPosition; 1]>;
-
 /// The `data` write buffer: one entry per key, mapping the key to its ordered
 /// positions. A `BTreeMap` (vs. a flat `BTreeSet<(key, position)>`) lets the
 /// hot insert path reach a key with a single tree descent via `entry`, stores
 /// each key once, and makes `data.len()` the unique-key count the rest of the
-/// impl assumes.
-pub(super) type DataOverlay = BTreeMap<Bytes, DataPositions>;
+/// impl assumes. The shared inline version vector keeps the common single-write
+/// case allocation-free and orders native entries by `IndexWalPosition`.
+pub(super) type DataOverlay = crate::index::versioned_overlay::Overlay<IndexWalPosition>;
 
 #[derive(Default, Clone, Debug)]
 #[doc(hidden)]
@@ -1626,9 +1621,7 @@ impl IndexTable {
     /// path appends directly in `checked_insert`).
     fn data_insert_sorted(&mut self, key: Bytes, iwp: IndexWalPosition) {
         let positions = self.data.entry(key).or_default();
-        if let Err(pos) = positions.binary_search(&iwp) {
-            positions.insert(pos, iwp);
-        }
+        crate::index::versioned_overlay::insert_unique_by(positions, iwp, Ord::cmp);
     }
 
     /// The leading slice of `positions` processed relative to
@@ -1639,7 +1632,9 @@ impl IndexTable {
         positions: &[IndexWalPosition],
         last_processed: LastProcessed,
     ) -> &[IndexWalPosition] {
-        &positions[..positions.partition_point(|v| last_processed.is_processed(v))]
+        crate::index::versioned_overlay::matching_prefix(positions, |v| {
+            last_processed.is_processed(v)
+        })
     }
 
     /// Whether `positions` ascend strictly by offset (per-key offsets are

@@ -5,3 +5,4 @@ pub mod lookup_header;
 pub mod pending_table;
 pub mod uniform_lookup;
 pub mod utils;
+pub(crate) mod versioned_overlay;

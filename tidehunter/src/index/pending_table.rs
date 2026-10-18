@@ -6,21 +6,23 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// PendingTable stores key-value pairs that can be committed at once via Transaction.
 ///
-/// PendingTable::add_pending(key, transaction) can be used to insert pending value into this table.
+/// `insert` and `remove` install values associated with a shared `Transaction`.
+/// `Transaction::commit` makes those entries eligible for promotion together.
 ///
-/// Transaction::commit(values) can be then used to commit all pending updates at once.
-/// When committing transactions values are given in the same order as add_pending calls.
-///
-/// Transaction can be re-used multiple times for same or different keys.
+/// The same transaction may stage multiple updates to the same or different keys.
 /// Transaction can be used across different PendingTables.
 ///
 /// If transaction is dropped without call to Transaction::commit, pending updates are discarded.
-/// If transaction is committed via Transaction::Commit(values), corresponding values will be returned via PendingTable::take_committed()
+/// After commit, `take_committed` returns the corresponding values. Table access
+/// still requires exclusive ownership or the existing native cell synchronization;
+/// the transaction flag does not make this collection a concurrent map.
 ///
-/// See pending_table_tests for ane example.
-#[derive(Default)]
-pub struct PendingTable {
-    data: HashMap<Bytes, Vec<PendingUpdate>>,
+/// `V` separates publication from the representation of an index reference. Native
+/// callers retain `WalPosition` by default; the experimental backend can stage
+/// logical references through the same transaction machinery. This table does not
+/// compare versions, establish durability or implement a persistent index.
+pub struct PendingTable<V = WalPosition> {
+    data: HashMap<Bytes, Vec<PendingUpdate<V>>>,
     len: usize,
 }
 
@@ -31,18 +33,18 @@ pub struct Transaction {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct CommittedChange {
+pub struct CommittedChange<V = WalPosition> {
     pub key: Bytes,
     /// True if change was modification, false if change was deletion
     pub is_modified: bool,
-    pub value: WalPosition,
+    pub value: V,
     /// `(full_key, value)` for LRU cache updates. None for deletions or if LRU is not configured.
     pub lru_update: Option<(Bytes, Bytes)>,
 }
 
 #[derive(Clone)]
-struct PendingUpdateInner {
-    update: WalPosition,
+struct PendingUpdateInner<V> {
+    update: V,
     lru_update: Option<(Bytes, Bytes)>,
 }
 
@@ -56,24 +58,36 @@ const TRANSACTION_STATUS_COMMITTED: usize = 1;
 const TRANSACTION_STATUS_REVERTED: usize = 2;
 
 #[derive(Clone)]
-struct PendingUpdate {
+struct PendingUpdate<V> {
     transaction_status: TransactionStatus,
     is_modified: bool,
-    inner: PendingUpdateInner,
+    inner: PendingUpdateInner<V>,
 }
 
-impl PendingTable {
+// Deriving Default would unnecessarily require V: Default. A pending table has
+// no values until the caller supplies one, including logical references that
+// deliberately have no sentinel/default identity.
+impl<V> Default for PendingTable<V> {
+    fn default() -> Self {
+        Self {
+            data: HashMap::new(),
+            len: 0,
+        }
+    }
+}
+
+impl<V: Copy> PendingTable<V> {
     pub fn insert(
         &mut self,
         key: Bytes,
-        position: WalPosition,
+        position: V,
         lru_update: Option<(Bytes, Bytes)>,
         transaction: &Transaction,
     ) {
         self.insert_pending(key, true, position, lru_update, transaction);
     }
 
-    pub fn remove(&mut self, key: Bytes, position: WalPosition, transaction: &Transaction) {
+    pub fn remove(&mut self, key: Bytes, position: V, transaction: &Transaction) {
         self.insert_pending(key, false, position, None, transaction);
     }
 
@@ -81,7 +95,7 @@ impl PendingTable {
         &mut self,
         key: Bytes,
         is_modified: bool,
-        position: WalPosition,
+        position: V,
         lru_update: Option<(Bytes, Bytes)>,
         transaction: &Transaction,
     ) {
@@ -95,7 +109,7 @@ impl PendingTable {
         self.data.entry(key).or_default().push(update);
     }
 
-    pub fn take_committed_for(&mut self, key: &Bytes) -> (Vec<CommittedChange>, usize) {
+    pub fn take_committed_for(&mut self, key: &Bytes) -> (Vec<CommittedChange<V>>, usize) {
         let Some(updates) = self.data.get_mut(key) else {
             return (vec![], 0);
         };
@@ -108,7 +122,7 @@ impl PendingTable {
         (committed, removed)
     }
 
-    pub fn take_committed(&mut self) -> (Vec<CommittedChange>, usize) {
+    pub fn take_committed(&mut self) -> (Vec<CommittedChange<V>>, usize) {
         let mut committed = Vec::with_capacity(self.len);
         let mut total_removed = 0;
         self.data.retain(|key, updates| {
@@ -126,8 +140,8 @@ impl PendingTable {
     /// some transactions might be reverted.
     fn do_take_committed(
         key: &Bytes,
-        updates: &mut Vec<PendingUpdate>,
-        committed: &mut Vec<CommittedChange>,
+        updates: &mut Vec<PendingUpdate<V>>,
+        committed: &mut Vec<CommittedChange<V>>,
     ) -> usize {
         let mut removed = 0;
         updates.retain(|update| {
@@ -179,11 +193,11 @@ impl Drop for Transaction {
     }
 }
 
-impl PendingUpdate {
+impl<V> PendingUpdate<V> {
     fn new(
         transaction_status: TransactionStatus,
         is_modified: bool,
-        position: WalPosition,
+        position: V,
         lru_update: Option<(Bytes, Bytes)>,
     ) -> Self {
         let inner = PendingUpdateInner {
@@ -207,6 +221,69 @@ mod tests {
     use std::collections::{BTreeMap, HashSet};
     use std::sync::mpsc;
     use std::thread;
+
+    #[test]
+    fn typed_references_share_native_transaction_without_default_or_order_bounds() {
+        // Neither Default nor Ord is needed: version comparison belongs to the
+        // receiving index, not to this atomic-publication staging mechanism.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        struct Reference {
+            sequence: u64,
+            operation: u32,
+        }
+
+        let mut logical = PendingTable::<Reference>::default();
+        let mut native = PendingTable::<WalPosition>::default();
+        let tx = Transaction::default();
+        let first = Reference {
+            sequence: 9,
+            operation: 0,
+        };
+        let second = Reference {
+            sequence: 9,
+            operation: 1,
+        };
+        let third = Reference {
+            sequence: 9,
+            operation: 2,
+        };
+        logical.insert(b(1), first, Some((b(1), b(2))), &tx);
+        logical.remove(b(1), second, &tx);
+        logical.insert(b(1), third, None, &tx);
+        native.insert(b(2), WalPosition::test_value(7), None, &tx);
+        assert_eq!(logical.take_committed_for(&b(1)), (vec![], 0));
+        assert_eq!(native.take_committed(), (vec![], 0));
+
+        tx.commit();
+        let (changes, removed) = logical.take_committed_for(&b(1));
+        assert_eq!(removed, 3);
+        assert_eq!(logical.len(), 0);
+        assert_eq!(
+            changes.iter().map(|c| c.value).collect::<Vec<_>>(),
+            vec![first, second, third]
+        );
+        assert_eq!(
+            changes.iter().map(|c| c.is_modified).collect::<Vec<_>>(),
+            vec![true, false, true]
+        );
+        assert_eq!(changes[0].lru_update, Some((b(1), b(2))));
+        assert_eq!(changes[1].lru_update, None);
+        assert_eq!(
+            native.take_committed().0[0].value,
+            WalPosition::test_value(7)
+        );
+
+        // An abandoned transaction drops every reference, including a duplicate
+        // key deletion, while keeping the same count semantics as native.
+        let abandoned = Transaction::default();
+        logical.insert(b(1), first, None, &abandoned);
+        logical.remove(b(1), second, &abandoned);
+        native.remove(b(2), WalPosition::test_value(8), &abandoned);
+        drop(abandoned);
+        assert_eq!(logical.take_committed(), (vec![], 2));
+        assert_eq!(native.take_committed(), (vec![], 1));
+        assert_eq!(logical.len(), 0);
+    }
 
     #[test]
     fn pending_table_tests() {
@@ -297,7 +374,7 @@ mod tests {
         let num_mutators = 16;
         let iterations = 5000;
         let tables: Vec<_> = (0..num_tables)
-            .map(|_| Arc::new(Mutex::new(PendingTable::default())))
+            .map(|_| Arc::new(Mutex::new(PendingTable::<WalPosition>::default())))
             .collect();
         let (senders, receivers): (Vec<_>, Vec<_>) =
             tables.iter().map(|_| mpsc::channel::<Vec<u64>>()).unzip();
