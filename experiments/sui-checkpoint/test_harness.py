@@ -459,6 +459,17 @@ class CheckpointSourceBoundaries(unittest.TestCase):
 
 
 class EvidenceBoundaries(unittest.TestCase):
+    def assert_process_gone(self, pid, message):
+        for _ in range(100):
+            try:
+                state = Path(f'/proc/{pid}/stat').read_text().split()[2]
+            except (FileNotFoundError, ProcessLookupError):
+                return
+            if state == 'Z':
+                return
+            time.sleep(.01)
+        self.fail(message)
+
     def test_cargo_uses_emitted_executable_not_unqualified_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -505,13 +516,7 @@ class EvidenceBoundaries(unittest.TestCase):
             with self.assertRaises(subprocess.TimeoutExpired):
                 run.command_json([sys.executable, '-c', script, pidfile], root/'audit.json', os.environ.copy(), deadline=1)
             pid = int(pidfile.read_text())
-            for _ in range(100):
-                status = Path(f'/proc/{pid}/stat')
-                if not status.exists() or status.read_text().split()[2] == 'Z':
-                    break
-                time.sleep(.01)
-            else:
-                self.fail('audit descendant survived timeout cleanup')
+            self.assert_process_gone(pid, 'audit descendant survived timeout cleanup')
 
     def test_audit_interrupt_reaps_process_group(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -530,13 +535,7 @@ class EvidenceBoundaries(unittest.TestCase):
             finally:
                 signal.signal(signal.SIGTERM, previous)
             pid = int(pidfile.read_text())
-            for _ in range(100):
-                status = Path(f'/proc/{pid}/stat')
-                if not status.exists() or status.read_text().split()[2] == 'Z':
-                    break
-                time.sleep(.01)
-            else:
-                self.fail('audit descendant survived signal cleanup')
+            self.assert_process_gone(pid, 'audit descendant survived signal cleanup')
 
     def test_observed_exited_leader_stays_reserved_until_descendants_killed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -574,13 +573,7 @@ class EvidenceBoundaries(unittest.TestCase):
                         owner.stop(child)
                     signal_recycled_id.assert_not_called()
                 pid = int(pidfile.read_text())
-                for _ in range(100):
-                    status = Path(f'/proc/{pid}/stat')
-                    if not status.exists() or status.read_text().split()[2] == 'Z':
-                        break
-                    time.sleep(.01)
-                else:
-                    self.fail('descendant survived exited-leader cleanup')
+                self.assert_process_gone(pid, 'descendant survived exited-leader cleanup')
             finally:
                 owner.close()
 
@@ -614,13 +607,7 @@ class EvidenceBoundaries(unittest.TestCase):
                       "pathlib.Path(sys.argv[1]).write_text(str(p.pid))")
             build.bounded([sys.executable, '-c', script, pidfile], timeout=5)
             pid = int(pidfile.read_text())
-            for _ in range(100):
-                status = Path(f'/proc/{pid}/stat')
-                if not status.exists() or status.read_text().split()[2] == 'Z':
-                    break
-                time.sleep(.01)
-            else:
-                self.fail('successful command left a live descendant')
+            self.assert_process_gone(pid, 'successful command left a live descendant')
 
     def test_stage_history_and_bound_resource_handshake(self):
         with tempfile.TemporaryDirectory() as tmp:
