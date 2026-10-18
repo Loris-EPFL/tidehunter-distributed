@@ -513,11 +513,17 @@ mod tests {
                     guard2: WalGuardMaker,
                     guard3: WalGuardMaker| {
             drop(guard3);
-            thread::sleep(Duration::from_millis(10));
             assert_eq!(tracker.last_processed().as_u64(), 0);
 
             drop(guard1);
-            thread::sleep(Duration::from_millis(10));
+            // A barrier queues behind the still-held allocations. Observe the
+            // asynchronous prefix with a bound instead of assuming a 10 ms wake.
+            for _ in 0..500 {
+                if tracker.last_processed().as_u64() == a.next_position() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
             assert_eq!(tracker.last_processed().as_u64(), a.next_position());
 
             drop(guard2);
@@ -560,11 +566,9 @@ mod tests {
         let guard1 = tracker.allocated(a.clone());
 
         drop(guard3);
-        thread::sleep(Duration::from_millis(10));
         assert_eq!(tracker.last_processed().as_u64(), 0);
 
         drop(guard1);
-        thread::sleep(Duration::from_millis(10));
         // Even thought guard1 is dropped, because guard2
         // is sent before guard1, it blocks the tracker thread, and a message is not processed
         assert_eq!(tracker.last_processed().as_u64(), 0);
