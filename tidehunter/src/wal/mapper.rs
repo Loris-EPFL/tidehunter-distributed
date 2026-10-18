@@ -429,6 +429,25 @@ impl WalMapperThread {
 }
 
 impl WalMaps {
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    pub(super) fn discard_resident_pages_for_benchmark(&self) -> std::io::Result<()> {
+        for map in self.maps.values() {
+            // SAFETY: Map owns the complete, page-aligned MAP_SHARED mapping.
+            // Holding &self keeps it mapped. MADV_DONTNEED drops PTEs, not the
+            // shared file contents; callers sync files before advising eviction.
+            let status = unsafe {
+                libc::madvise(
+                    map.data.as_ptr().cast_mut().cast(),
+                    map.data.len(),
+                    libc::MADV_DONTNEED,
+                )
+            };
+            if status != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
     pub fn get(&self, map_id: MapId) -> Option<&Map> {
         self.maps.get(&map_id)
     }
@@ -439,6 +458,20 @@ impl WalMaps {
 
     pub fn contains(&self, map_id: MapId) -> bool {
         self.maps.contains_key(&map_id)
+    }
+
+    /// Remove future lookup admission; existing `Map`/`Bytes` read owners keep
+    /// their mappings alive until outstanding reads and completions retire.
+    #[cfg(feature = "experimental-distributed")]
+    pub(super) fn without_files(&self, layout: &WalLayout, files: &[WalFileId]) -> Self {
+        Self {
+            maps: self
+                .maps
+                .iter()
+                .filter(|(id, _)| files.binary_search(&layout.file_for_map(**id)).is_err())
+                .map(|(id, map)| (*id, map.clone()))
+                .collect(),
+        }
     }
 
     pub fn map(
@@ -494,6 +527,37 @@ impl WalMaps {
         wal_mmap_bytes: MetricIntGauge,
     ) -> Map {
         Self::create_map_impl(file, layout, map_id, wal_mmap_bytes, true, true)
+    }
+
+    /// Map only existing bytes in a sealed fragment, including a short crash tail.
+    pub(super) fn create_retained_map(
+        file: &File,
+        layout: &WalLayout,
+        map_id: MapId,
+        wal_mmap_bytes: MetricIntGauge,
+    ) -> std::io::Result<Option<Map>> {
+        let start = layout.offset_in_wal_file(layout.map_range(map_id).start);
+        let available = file.metadata()?.len().saturating_sub(start);
+        let length = available.min(layout.frag_size);
+        if length == 0 {
+            return Ok(None);
+        }
+        // SAFETY: the sealed WAL owner forbids writers, truncation and address
+        // reuse. The mapping covers only existing bytes; unlink retains the inode.
+        let mmap = unsafe {
+            memmap2::MmapOptions::new()
+                .offset(start)
+                .len(usize::try_from(length).map_err(|_| {
+                    std::io::Error::other("retained WAL mapping length exceeds address space")
+                })?)
+                .map_mut(file)?
+        };
+        Ok(Some(Map {
+            id: map_id,
+            writeable: false,
+            populated: false,
+            data: TrackingMMapMut::new(mmap, wal_mmap_bytes).into(),
+        }))
     }
 
     fn create_map_impl(

@@ -52,6 +52,41 @@ impl WalFiles {
         })
     }
 
+    /// Open a sealed distributed stream without recreating reclaimed file zero.
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn load_retained(base_path: &Path, layout: &WalLayout) -> io::Result<Self> {
+        let mut files = BTreeMap::new();
+        let prefix = format!("{}_", layout.kind.name());
+        for entry in std::fs::read_dir(base_path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(suffix) = name.to_str().and_then(|name| name.strip_prefix(&prefix)) else {
+                continue;
+            };
+            let invalid =
+                || io::Error::new(io::ErrorKind::InvalidData, "invalid retained WAL file");
+            if !entry.file_type()?.is_file() || suffix.len() != 16 {
+                return Err(invalid());
+            }
+            let id = WalFileId(u64::from_str_radix(suffix, 16).map_err(|_| invalid())?);
+            if id.0.checked_mul(layout.wal_file_size).is_none()
+                || entry.path() != layout.wal_file_name(base_path, id)
+            {
+                return Err(invalid());
+            }
+            // Existing scan mappings require read/write access, but retained
+            // opening and scanning never create, resize or write the files.
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true);
+            crate::file_reader::set_direct_options(&mut options, layout.direct_io);
+            files.insert(id, Arc::new(options.open(entry.path())?));
+        }
+        Ok(Self {
+            base_path: base_path.to_path_buf(),
+            files,
+        })
+    }
+
     pub(crate) fn min_file_id(&self) -> WalFileId {
         *self.files.keys().next().expect("WalFiles is never empty")
     }

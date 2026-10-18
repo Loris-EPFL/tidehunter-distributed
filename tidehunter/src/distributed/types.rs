@@ -49,3 +49,54 @@ pub struct PhysicalValueAddress {
 /// neither a caller nor its current fencing authority.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct PayloadDigest(pub [u8; 32]);
+
+/// Native user operation encoded in an independently readable batch member.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub enum RecordKind {
+    Put,
+    Delete,
+}
+
+/// Bounded metadata derived from a fully validated complete batch.
+///
+/// `offset` and `len` address the member (length, digest and native entry) inside
+/// the batch payload, excluding its outer native CRC header. `value_offset` is
+/// relative to that member. A delete has a zero-length value at the member end.
+/// The digest binds identity, original logical version, operation index, bounds
+/// and native entry bytes. It is an integrity check, not authentication.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct RecordDescriptor {
+    pub operation_index: u32,
+    pub offset: u32,
+    pub len: u32,
+    pub keyspace: u8,
+    pub kind: RecordKind,
+    pub key_len: u32,
+    pub value_offset: u32,
+    pub value_len: u32,
+    pub digest: PayloadDigest,
+}
+
+/// A scalar-read reference backed by a complete authoritative batch.
+///
+/// Accepting self-consistent bytes alone cannot prove batch membership. Storage
+/// must compare this reference to metadata retained from validated append/replay
+/// before serving it, including address generation and complete-batch digest.
+/// Possessing a reference does not prove durability, publication or a GC lease.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct ValueRecordReference {
+    pub batch_id: BatchId,
+    pub batch_version: BatchVersion,
+    pub batch_digest: PayloadDigest,
+    pub batch_address: PhysicalValueAddress,
+    pub descriptor: RecordDescriptor,
+}
+
+impl ValueRecordReference {
+    pub fn mutation_version(self) -> MutationVersion {
+        MutationVersion {
+            batch: self.batch_version,
+            operation_index: self.descriptor.operation_index,
+        }
+    }
+}

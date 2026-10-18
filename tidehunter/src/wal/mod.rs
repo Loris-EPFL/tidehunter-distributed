@@ -47,6 +47,21 @@ pub struct Wal {
     layout: WalLayout,
     maps: Arc<ArcSwap<WalMaps>>,
     metrics: Arc<Metrics>,
+    #[cfg(feature = "experimental-distributed")]
+    retained: bool,
+}
+
+/// Sampled native benchmark barrier work, not isolated device latency.
+/// Counts include failed attempts; nanoseconds cover the same attempts.
+#[cfg(feature = "experimental-distributed")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ValueWalPersistenceProfile {
+    pub file_calls: u64,
+    pub file_successes: u64,
+    pub file_ns: u64,
+    pub namespace_calls: u64,
+    pub namespace_successes: u64,
+    pub namespace_ns: u64,
 }
 
 pub struct WalIterator {
@@ -240,7 +255,50 @@ enum FrameSource {
     File(Arc<File>),
 }
 
+/// Explicit member-only read policy; native whole-record reads are unchanged.
+#[cfg(feature = "experimental-distributed")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WalMemberReadPolicy {
+    #[default]
+    Mapped,
+    Positional,
+    /// Kernel-submitted positional reads; only the asynchronous executor may
+    /// execute this policy. Synchronous member APIs reject it explicitly.
+    Async,
+}
+
+/// Validated member range retaining its exact file, never a pathname reopened
+/// after submission. Distributed readers additionally retain their PartitionLog
+/// authority/segment lifetime until the completion is retired.
+#[cfg(feature = "experimental-distributed")]
+pub(crate) struct WalMemberReadPlan {
+    pub(crate) file: Arc<File>,
+    pub(crate) offset: u64,
+    pub(crate) len: usize,
+}
+
 impl Wal {
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    pub(crate) fn read_evidence_for_benchmark(
+        &self,
+        evict: bool,
+    ) -> io::Result<crate::read_probe::ReadEvidence> {
+        let files = self.files.load();
+        if evict {
+            for file in files.files.values() {
+                file.sync_all()?;
+            }
+            self.maps.load().discard_resident_pages_for_benchmark()?;
+        }
+        let mut evidence = crate::read_probe::ReadEvidence::process()?;
+        for file in files.files.values() {
+            let (bytes, resident) = crate::read_probe::file_residency(file, evict)?;
+            evidence.file_bytes += bytes;
+            evidence.resident_bytes += resident;
+        }
+        Ok(evidence)
+    }
     #[doc(hidden)] // Used by tools/tideconsole to open WAL files directly
     pub fn open(
         base_path: &Path,
@@ -254,8 +312,41 @@ impl Wal {
             layout,
             maps: Default::default(),
             metrics,
+            #[cfg(feature = "experimental-distributed")]
+            retained: false,
         };
         Ok(Arc::new(wal))
+    }
+
+    /// Open a sealed distributed WAL without creating or extending files.
+    /// The caller validates its durable recovery root and missing-file proofs
+    /// first. An entirely reclaimed stream has an empty file registry.
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn open_retained(
+        base_path: &Path,
+        layout: WalLayout,
+        metrics: Arc<Metrics>,
+    ) -> io::Result<Arc<Self>> {
+        layout.assert_layout();
+        let files = WalFiles::load_retained(base_path, &layout)?;
+        Ok(Arc::new(Self {
+            files: Arc::new(ArcSwap::from_pointee(files)),
+            layout,
+            maps: Default::default(),
+            metrics,
+            retained: true,
+        }))
+    }
+
+    fn is_retained(&self) -> bool {
+        #[cfg(feature = "experimental-distributed")]
+        {
+            self.retained
+        }
+        #[cfg(not(feature = "experimental-distributed"))]
+        {
+            false
+        }
     }
 
     pub(crate) fn open_file(path: &Path, layout: &WalLayout) -> io::Result<File> {
@@ -318,6 +409,139 @@ impl Wal {
                     ReadType::Syscall,
                     Some(CrcFrame::read_from_bytes(&bytes, 0)?),
                 ))
+            }
+            None => Ok((ReadType::Syscall, None)),
+        }
+    }
+
+    /// Read a bounded member of an authoritative batch, without hashing/copying
+    /// its siblings. The caller MUST first prove membership from a fully validated
+    /// group and then verify the member's independent digest. This deliberately
+    /// does not validate the parent CRC and is not a general replacement for read.
+    /// Kept crate-private and opt-in so native Db reads retain their CRC contract.
+    #[cfg(feature = "experimental-distributed")]
+    fn checked_member_range(
+        &self,
+        parent: WalPosition,
+        range: Range<usize>,
+    ) -> Result<Range<usize>, WalError> {
+        let invalid = || {
+            WalError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid independently verified record range",
+            ))
+        };
+        let payload_len = parent
+            .frame_len()
+            .checked_sub(CrcFrame::CRC_HEADER_LENGTH)
+            .ok_or_else(invalid)?;
+        let frame_end = parent
+            .offset()
+            .checked_add(parent.frame_len() as u64)
+            .ok_or_else(invalid)?;
+        if !parent.is_valid()
+            || parent.frame_len() < CrcFrame::CRC_HEADER_LENGTH
+            || range.start > range.end
+            || range.end > payload_len
+            || frame_end == 0
+            || self.layout.locate(parent.offset()).0 != self.layout.locate(frame_end - 1).0
+            || self.layout.direct_io
+        {
+            // PartitionLog explicitly uses buffered I/O. Aligned subrecord
+            // direct-I/O support is a separate path, not a whole-batch fallback.
+            return Err(invalid());
+        }
+        Ok(CrcFrame::CRC_HEADER_LENGTH + range.start..CrcFrame::CRC_HEADER_LENGTH + range.end)
+    }
+
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn plan_record_payload_range(
+        &self,
+        parent: WalPosition,
+        range: Range<usize>,
+    ) -> Result<Option<WalMemberReadPlan>, WalError> {
+        let relative = self.checked_member_range(parent, range)?;
+        let file = self
+            .files
+            .load()
+            .get_checked(self.layout.locate_file(parent.offset()))
+            .cloned();
+        Ok(file.map(|file| WalMemberReadPlan {
+            file,
+            offset: self.layout.offset_in_wal_file(parent.offset()) + relative.start as u64,
+            len: relative.len(),
+        }))
+    }
+
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn read_record_payload_range(
+        &self,
+        parent: WalPosition,
+        range: Range<usize>,
+        policy: WalMemberReadPolicy,
+    ) -> Result<(ReadType, Option<Bytes>), WalError> {
+        let relative = self.checked_member_range(parent, range.clone())?;
+        let relative_start = relative.start;
+        let relative_end = relative.end;
+        let invalid = || {
+            WalError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid independently verified record range",
+            ))
+        };
+        let source = match policy {
+            WalMemberReadPolicy::Mapped => self.frame_source(parent, false),
+            WalMemberReadPolicy::Positional => self
+                .files
+                .load()
+                .get_checked(self.layout.locate_file(parent.offset()))
+                .cloned()
+                .map(FrameSource::File),
+            WalMemberReadPolicy::Async => {
+                return Err(WalError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "async WAL reads require the read executor",
+                )));
+            }
+        };
+        match source {
+            Some(FrameSource::Mapped(map, offset)) => {
+                let start = (offset as usize)
+                    .checked_add(relative_start)
+                    .ok_or_else(invalid)?;
+                let end = (offset as usize)
+                    .checked_add(relative_end)
+                    .ok_or_else(invalid)?;
+                let bytes = map.data.get(start..end).ok_or_else(invalid)?;
+                // Retain only the requested member, never the whole mmap.
+                Ok((ReadType::Mapped, Some(bytes.to_vec().into())))
+            }
+            Some(FrameSource::File(file)) => {
+                let offset =
+                    self.layout.offset_in_wal_file(parent.offset()) + relative_start as u64;
+                if policy == WalMemberReadPolicy::Mapped {
+                    if range.is_empty() {
+                        return Ok((ReadType::Mapped, Some(Bytes::new())));
+                    }
+                    let end = offset.checked_add(range.len() as u64).ok_or_else(invalid)?;
+                    if end > file.metadata()?.len() {
+                        return Err(invalid());
+                    }
+                    // Sealed history may have no resident WalMaps entry. Map
+                    // only the requested member, without touching its siblings.
+                    // PartitionLog retains the immutable file; it has no GC,
+                    // truncation or address reuse while references are live.
+                    let map = unsafe {
+                        memmap2::MmapOptions::new()
+                            .offset(offset)
+                            .len(range.len())
+                            .map(file.as_ref())?
+                    };
+                    return Ok((ReadType::Mapped, Some(map[..].to_vec().into())));
+                }
+                let mut bytes = vec![0; range.len()];
+                file.read_exact_at(&mut bytes, offset)?;
+                Ok((ReadType::Syscall, Some(bytes.into())))
             }
             None => Ok((ReadType::Syscall, None)),
         }
@@ -484,6 +708,50 @@ impl Wal {
         self.files.load().current_file().sync_all()
     }
 
+    /// Complete deletion authorized by a durable distributed recovery root.
+    ///
+    /// The caller must have sealed the stream, dropped its writer/mapper and
+    /// serialized retirement. No new writer may ever reopen this generation.
+    /// Removing lookup admission does not invalidate existing `Arc<File>` or
+    /// mapped `Bytes` owners; Unix keeps their inode/mapping alive after unlink.
+    /// A partial failure is retried from the already-durable retirement root.
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn retire_files(&self, ids: &[position::WalFileId]) -> io::Result<()> {
+        if ids.windows(2).any(|pair| pair[0] >= pair[1])
+            || ids
+                .iter()
+                .any(|id| id.0.checked_mul(self.layout.wal_file_size).is_none())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid WAL retirement IDs",
+            ));
+        }
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let files = self.files.load_full();
+        let maps = self.maps.load_full();
+        self.maps
+            .store(Arc::new(maps.without_files(&self.layout, ids)));
+        let (remaining, _removed) = files.without_files(ids);
+        self.files.store(Arc::new(remaining));
+        for id in ids {
+            match std::fs::remove_file(self.layout.wal_file_name(&files.base_path, *id)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        File::open(&files.base_path)?.sync_all()
+    }
+
+    /// Cold-path benchmark observation; it does not inspect or fault WAL pages.
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn registered_file_count(&self) -> usize {
+        self.files.load().files.len()
+    }
+
     /// Persist every file currently registered and its directory entry.
     ///
     /// The experimental partition service serializes append/persist and invokes
@@ -500,22 +768,62 @@ impl Wal {
         File::open(&files.base_path)?.sync_all()
     }
 
-    /// Persist the file containing a completed frame, even if mapping lookahead
-    /// has made another file `current_file`. The experimental caller admits one
-    /// unpersisted batch per stream and recovers fragments independently, so
-    /// previous frames are already durable and skip markers are not authority.
+    /// Profile the same conservative barrier without adding clocks to its
+    /// unprofiled path. A failing call still contributes its attempted work.
     #[cfg(feature = "experimental-distributed")]
-    pub(crate) fn persist_frame_file(&self, position: WalPosition) -> io::Result<()> {
+    pub(crate) fn persist_registered_files_profiled(
+        &self,
+        profile: &mut ValueWalPersistenceProfile,
+    ) -> io::Result<()> {
         let files = self.files.load_full();
-        let file = files
-            .get_checked(self.layout.locate_file(position.offset()))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "completed WAL frame file disappeared",
-                )
-            })?;
-        file.sync_all()?;
+        for file in files.files.values() {
+            let began = std::time::Instant::now();
+            let result = file.sync_all();
+            profile.file_ns += began.elapsed().as_nanos() as u64;
+            profile.file_calls += 1;
+            profile.file_successes += u64::from(result.is_ok());
+            result?;
+        }
+        let began = std::time::Instant::now();
+        let result = File::open(&files.base_path).and_then(|directory| directory.sync_all());
+        profile.namespace_ns += began.elapsed().as_nanos() as u64;
+        profile.namespace_calls += 1;
+        profile.namespace_successes += u64::from(result.is_ok());
+        result
+    }
+
+    /// Persist the file containing a completed frame, even if mapping lookahead
+    /// has made another file `current_file`. Returns its exact file identity.
+    /// The experimental caller must also call `persist_namespace` before its
+    /// first durable acknowledgement in that file. A prior successful namespace
+    /// sync for this exact file may be reused only while it cannot be removed or
+    /// replaced. `sync_data` also persists retrieval-required file-size changes
+    /// from mapper `set_len`; the separate directory barrier persists the name.
+    /// This changes no native `Db` durability path.
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn persist_frame_file(
+        &self,
+        position: WalPosition,
+    ) -> io::Result<position::WalFileId> {
+        let files = self.files.load_full();
+        let id = self.layout.locate_file(position.offset());
+        let file = files.get_checked(id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "completed WAL frame file disappeared",
+            )
+        })?;
+        // Linux fdatasync retains file size/allocation metadata needed to read
+        // data after extension; the caller separately syncs the directory name.
+        file.sync_data()?;
+        Ok(id)
+    }
+
+    /// Make existing WAL filenames durable. The caller must sync a referenced
+    /// file first and retain any successful proof only for this `Wal` handle.
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn persist_namespace(&self) -> io::Result<()> {
+        let files = self.files.load_full();
         File::open(&files.base_path)?.sync_all()
     }
 
@@ -564,6 +872,11 @@ impl WalIterator {
     }
 
     fn new_impl(wal: Arc<Wal>, position: u64, for_writer: bool) -> Result<Self, WalError> {
+        if for_writer && wal.is_retained() {
+            return Err(
+                io::Error::new(io::ErrorKind::PermissionDenied, "retained WAL is sealed").into(),
+            );
+        }
         let mut maps = WalMaps::default();
         let (map_id, _) = wal.layout.locate(position);
         let files = wal.files.load();
@@ -574,8 +887,9 @@ impl WalIterator {
             &mut maps,
             wal.metrics.wal_mmap_bytes.clone(),
             for_writer,
+            wal.is_retained(),
         )?
-        .expect("First map must be available"); // todo check this is actually true
+        .ok_or(WalError::EndOfWal)?;
         Ok(Self {
             maps,
             wal,
@@ -619,6 +933,7 @@ impl WalIterator {
                 &mut self.maps,
                 self.wal.metrics.wal_mmap_bytes.clone(),
                 self.for_writer,
+                self.wal.is_retained(),
             )?
             else {
                 return Err(WalError::EndOfWal);
@@ -649,6 +964,7 @@ impl WalIterator {
         maps: &mut WalMaps,
         wal_mmap_bytes: MetricIntGauge,
         for_writer: bool,
+        retained: bool,
     ) -> Result<Option<Map>, WalError> {
         // Check if the file still exists before trying to extend it.
         // GC may have removed the file asynchronously (via the mapper thread)
@@ -656,6 +972,10 @@ impl WalIterator {
         let Some(file) = files.get_checked(layout.file_for_map(map_id)) else {
             return Ok(None);
         };
+        if retained {
+            return WalMaps::create_retained_map(file, layout, map_id, wal_mmap_bytes)
+                .map_err(WalError::from);
+        }
         Wal::extend_to_map_id(layout, file, map_id)?;
         if for_writer {
             Ok(Some(maps.map(file, layout, map_id, wal_mmap_bytes).clone()))
@@ -996,6 +1316,70 @@ mod tests {
         }
         // we wrote into two frags
         // assert_eq!(2048, fs::metadata(file).unwrap().len());
+    }
+
+    #[cfg(feature = "experimental-distributed")]
+    #[test]
+    fn retained_file_unlink_preserves_inflight_read_owners_and_empty_reopen() {
+        let dir = tempdir::TempDir::new("retained-wal-pins").unwrap();
+        let layout = index_layout(3, 4096);
+        let wal = Wal::open(dir.path(), layout.clone(), Metrics::new()).unwrap();
+        let writer = wal.writer_after(None).unwrap();
+        let value = vec![91u8; 128];
+        let position = writer
+            .write(&PreparedWalWrite::new(&value))
+            .unwrap()
+            .into_wal_position();
+        wal.persist_registered_files().unwrap();
+        drop(writer);
+        let mapped = wal.random_reader_at(position, 0).unwrap();
+        let pinned = wal
+            .plan_record_payload_range(position, 0..value.len())
+            .unwrap()
+            .unwrap();
+        let ids = wal.file_ids();
+        wal.retire_files(&ids).unwrap();
+        assert!(wal.read(position).unwrap().1.is_none());
+        assert_eq!(mapped.read(0..value.len()).as_ref(), value);
+        let mut read = vec![0; pinned.len];
+        pinned.file.read_exact_at(&mut read, pinned.offset).unwrap();
+        assert_eq!(read, value);
+        for id in &ids {
+            assert!(!layout.wal_file_name(dir.path(), *id).exists());
+        }
+        // A crash after unlink but before the caller records completion may
+        // replay the durable retirement decision without resurrecting a file.
+        wal.retire_files(&ids).unwrap();
+        let reopened = Wal::open_retained(dir.path(), layout, Metrics::new()).unwrap();
+        assert!(reopened.file_ids().is_empty());
+        assert!(matches!(
+            reopened.wal_iterator_for_scan(0),
+            Err(WalError::EndOfWal)
+        ));
+        assert!(reopened.wal_iterator_for_writer(0).is_err());
+        assert!(reopened.read(position).unwrap().1.is_none());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(feature = "experimental-distributed")]
+    #[test]
+    fn retained_scan_never_extends_a_short_file_or_admits_a_writer() {
+        let dir = tempdir::TempDir::new("retained-wal-short").unwrap();
+        let layout = index_layout(3, 4096);
+        let positions = fill_fragments(dir.path(), &layout, 1, 200);
+        let path = layout.wal_file_name(dir.path(), WalFileId(0));
+        let original_len = std::fs::metadata(&path).unwrap().len();
+        let wal = Wal::open_retained(dir.path(), layout, Metrics::new()).unwrap();
+        assert_eq!(
+            wal.read(positions[0]).unwrap().1.unwrap().as_ref(),
+            vec![0u8; 200]
+        );
+        assert!(matches!(
+            wal.wal_iterator_for_scan(original_len),
+            Err(WalError::EndOfWal)
+        ));
+        assert!(wal.writer_after(Some(positions[0])).is_err());
+        assert_eq!(std::fs::metadata(path).unwrap().len(), original_len);
     }
 
     #[test]

@@ -29,6 +29,8 @@ pub mod lookup;
 mod math;
 pub mod metrics;
 mod primitives;
+#[cfg(all(target_os = "linux", feature = "test-utils"))]
+pub mod read_probe;
 mod relocation;
 mod replay_buffer;
 mod runtime;
