@@ -891,6 +891,13 @@ impl ReadRequest {
     }
 }
 impl ReadService {
+    const FLIGHT_SLOT_BYTES: usize = std::mem::size_of::<Weak<ReadFlight>>()
+        + std::mem::size_of::<ReadFlight>()
+        + std::mem::size_of::<FlightCompletion>()
+        + std::mem::size_of::<FlightSignal>()
+        + 2 * std::mem::size_of::<usize>();
+    pub(super) const MIN_FLIGHT_BYTES: usize = Self::FLIGHT_SLOT_BYTES + 512;
+
     pub(super) fn from_clients(
         config: &RemoteDatabaseConfig,
         epoch: u64,
@@ -902,15 +909,10 @@ impl ReadService {
         let busy = clients
             .iter()
             .any(|client| client.polling_policy() == super::super::tcp::PollingPolicy::Busy);
-        let flight_slot_bytes = std::mem::size_of::<Weak<ReadFlight>>()
-            + std::mem::size_of::<ReadFlight>()
-            + std::mem::size_of::<FlightCompletion>()
-            + std::mem::size_of::<FlightSignal>()
-            + 2 * std::mem::size_of::<usize>();
         let flight_slots = config
             .max_pending_reads
-            .min(config.max_pending_read_bytes / (flight_slot_bytes + 512));
-        let flight_metadata_bytes = flight_slots * flight_slot_bytes;
+            .min(config.max_pending_read_bytes / Self::MIN_FLIGHT_BYTES);
+        let flight_metadata_bytes = flight_slots * Self::FLIGHT_SLOT_BYTES;
         let state = Arc::new(State {
             failed: AtomicBool::new(false),
             stopped: AtomicBool::new(false),

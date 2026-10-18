@@ -714,6 +714,45 @@ fn explicit_cache_host_slice_accepts_large_budgets_and_rejects_overflow() {
 }
 
 #[test]
+fn unusable_read_capacity_is_rejected_before_authority_mutation() {
+    let mut fixture = Fixture::new();
+    fixture.config.max_pending_reads = 1;
+    fixture.config.max_pending_read_bytes = 4096;
+    fixture.config.read_cache_bytes = 0;
+    let root = fixture.temp.path().join("authority");
+    for existing in [false, true] {
+        if existing {
+            let mut db = fixture.open();
+            db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(0, 7)])
+                .unwrap();
+            db.shutdown().unwrap();
+        }
+        let before = existing.then(|| fs::read(root.join(MANIFEST)).unwrap());
+        for (requests, bytes) in [(0, 4096), (1, 512)] {
+            let mut config = fixture.config.clone();
+            config.max_pending_reads = requests;
+            config.max_pending_read_bytes = bytes;
+            assert!(
+                RemoteDatabase::open(&root, &fixture.shape, config, recovery_metrics()).is_err(),
+                "accepted unusable read capacity: requests={requests}, bytes={bytes}"
+            );
+            assert_eq!(root.exists(), existing);
+            if let Some(before) = &before {
+                assert_eq!(fs::read(root.join(MANIFEST)).unwrap(), *before);
+            }
+        }
+    }
+    let mut db = fixture.open();
+    assert_eq!(db.epoch(), 2);
+    assert_eq!(
+        db.get(KeySpace(0), &0u32.to_be_bytes()).unwrap(),
+        Some(vec![7; 32].into())
+    );
+    assert_eq!(db.read_rpc_count(), 1);
+    db.shutdown().unwrap();
+}
+
+#[test]
 fn preparation_pool_drop_joins_scheduled_work() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let completed = Arc::new(AtomicUsize::new(0));

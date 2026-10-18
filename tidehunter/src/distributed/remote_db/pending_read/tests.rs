@@ -196,7 +196,7 @@ fn external_read_pressure_does_not_poison_synchronous_conveniences() {
 #[test]
 fn oversized_scalar_read_does_not_poison_write_authority() {
     let mut fixture = Fixture::new();
-    fixture.config.max_pending_read_bytes = 1;
+    fixture.config.max_pending_read_bytes = ReadService::MIN_FLIGHT_BYTES;
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
         .unwrap();

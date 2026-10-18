@@ -228,8 +228,10 @@ impl RemoteDatabaseConfig {
                 .checked_add(self.max_pending_read_bytes)
                 .is_none_or(|bytes| bytes > self.read_memory_allowance_bytes)
             || !(1..=8).contains(&self.read_lanes)
+            || self.max_pending_reads == 0
             || self.write_profile_limit > 65_536
-            || !(1..=256 * 1024 * 1024).contains(&self.max_pending_read_bytes)
+            || !(ReadService::MIN_FLIGHT_BYTES..=256 * 1024 * 1024)
+                .contains(&self.max_pending_read_bytes)
             || self.timeout.is_zero()
             || self.timeout > Duration::from_secs(120)
         {
