@@ -11,3 +11,7 @@ CLAUDE.md
 # Nested crate build dirs (e.g. tests/antithesis_semantics), which the
 # root-anchored /target rule above does not match.
 target/
+
+# Python build and test caches are not source artifacts.
+__pycache__/
+*.py[cod]
