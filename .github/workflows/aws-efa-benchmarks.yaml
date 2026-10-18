@@ -51,9 +51,6 @@ jobs:
       RUST_TEST_THREADS: "2"
       CARGO_PROFILE_RELEASE_DEBUG: "0"
       CARGO_TERM_COLOR: always
-      TIDEHUNTER_LIBFABRIC_PREFIX: ${{ runner.temp }}/benchmark-libfabric-2.6.0
-      PKG_CONFIG_PATH: ${{ runner.temp }}/benchmark-libfabric-2.6.0/lib/pkgconfig
-      LD_LIBRARY_PATH: ${{ runner.temp }}/benchmark-libfabric-2.6.0/lib
     defaults:
       run:
         shell: bash
@@ -66,6 +63,12 @@ jobs:
       - name: Check exact branch and explicit activation
         id: settings
         run: python3 engine/experiments/aws-sharded-wal/ci_prepare.py settings
+      - name: Select the isolated libfabric prefix on the runner
+        if: steps.settings.outputs.enabled == 'true'
+        run: |
+          prefix="$RUNNER_TEMP/benchmark-libfabric-2.6.0"
+          printf 'TIDEHUNTER_LIBFABRIC_PREFIX=%s\nPKG_CONFIG_PATH=%s/lib/pkgconfig\nLD_LIBRARY_PATH=%s/lib\n' \
+            "$prefix" "$prefix" "$prefix" >> "$GITHUB_ENV"
       - name: Reclaim unused SDK space on a disposable GitHub runner
         if: steps.settings.outputs.enabled == 'true' && runner.environment == 'github-hosted'
         run: |
