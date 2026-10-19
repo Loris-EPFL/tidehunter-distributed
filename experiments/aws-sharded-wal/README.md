@@ -1,21 +1,52 @@
-## 19 October protected CI price admission
+## 19 October protected CI admission and reconciled costs
 
-The first protected CI attempt rebuilt all six binaries and completed the native
-and five-shard loopback checkpoint replay through checkpoint 1775 with equal
-store audits. It failed during read-only price discovery, before EC2 allocation.
-The cleanup receipt and independent AWS MCP audit confirmed no run-owned
-compute, EBS, network, or guest IAM resources remained.
+Two protected CI attempts rebuilt all six binaries and completed the native and
+five-shard loopback replay through checkpoint 1775 with equal store audits.
+Both stopped before EC2 allocation: the first used an invalid IPv4 price filter;
+the second generated a startup script larger than EC2's 16 KiB limit.
+Cleanup receipts and independent exact-run AWS audits confirmed no remaining
+compute, EBS, network, or guest IAM resources.
 
-`ci_campaign.py` now selects AmazonVPC prices by
-`group=VPCPublicIPv4Address`, then retains only the `PublicIPv4:InUseAddress`
-usage-type suffix. The queried AWS IPv4 products have no `productFamily` field;
-filtering for `productFamily=IP Address` returned no products. Missing or
-ambiguous paid rates still fail closed. The weekly budget, region fallback,
-six-host cluster placement, source bindings, and termination deadline are unchanged.
-The workflow action pins use Node 24; the credential action supports the configured
-`allowed-account-ids` guard.
+`ci_campaign.py` selects AmazonVPC prices by `group=VPCPublicIPv4Address`,
+then retains only the `PublicIPv4:InUseAddress` usage-type suffix. The queried
+IPv4 products have no `productFamily` field. Missing or ambiguous paid rates
+still fail closed. Official Node 24 action pins support `allowed-account-ids`.
 
-This is CI readiness evidence, not a new cloud performance result.
+The atomic startup capsule uses Python's standard-library LZMA and Base85.
+Replaying the actual failed launch metadata reduced the script from 16,871
+to 15,989 bytes; the generated decoder restored the exact contract and sources.
+The 16,384-byte guard, shutdown-first ordering, source checks, ownership fences,
+six-host cluster placement, region fallback, and deadline remain unchanged.
+This is local CI-readiness evidence, not a cloud performance result.
+
+`budget.json` remains the only editable weekly-limit file; the limit remains
+$60. Prelaunch reservations prevent concurrent overspending but are not expenses.
+Verified cleanup releases the unused active hold immediately. Unresolved or
+ambiguous resource ownership keeps its hold. Original reservations and corrected
+receipts remain in the versioned ledger; no counter or history is reset.
+
+Settlement separates priced observed resource usage from future retained-storage
+projections and unobserved components. Fixed request-count, transfer-multiplicity,
+and future-retention allowances remain admission forecasts, not booked usage.
+Unknown billing is unavailable/null, not zero. Late higher AWS bills remain
+accounted without adding the same usage estimate and bill twice.
+
+A closed legacy estimate can be corrected through the protected workflow:
+
+```sh
+gh workflow run aws-efa-benchmarks.yaml \
+  --repo Loris-EPFL/tidehunter-distributed --ref bench/aws-efa \
+  -f operation=cost-report -f reconcile_run_id="$RUN_ID" \
+  -f reconcile_previous_digest="$PREVIOUS_SETTLEMENT_DIGEST"
+```
+
+Use the prior settlement digest from the authoritative ledger. Reconciliation
+requires the configured account, owned immutable journal, completed cleanup, and
+matching prior digest before any cleanup mutation. It rejects live instances and
+unrelated stale requests. Corrections retain bounded append-only history and
+use conditional writes; exact replay does not charge the run again.
+The generated total/monthly/weekly/daily report is derived separately from that
+ledger and is not an editable spend counter.
 
 ## 12 October cluster-placement stage timing: completed and closed
 

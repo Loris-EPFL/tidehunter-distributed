@@ -10,6 +10,14 @@ on:
         type: choice
         options: [benchmark, cost-report]
         default: benchmark
+      reconcile_run_id:
+        description: "Optional closed campaign to remeasure during cost-report"
+        type: string
+        default: ""
+      reconcile_previous_digest:
+        description: "Expected prior settlement digest for the closed campaign"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -292,6 +300,18 @@ jobs:
           aws-region: ${{ vars.AWS_BENCH_BUCKET_REGION }}
           allowed-account-ids: "354775971805"
           role-duration-seconds: 3600
+      - name: Reconcile observed usage for an explicitly selected closed campaign
+        if: steps.settings.outputs.enabled == 'true' && inputs.operation == 'cost-report' && (inputs.reconcile_run_id != '' || inputs.reconcile_previous_digest != '')
+        env:
+          RECONCILE_RUN_ID: ${{ inputs.reconcile_run_id }}
+          RECONCILE_PREVIOUS_DIGEST: ${{ inputs.reconcile_previous_digest }}
+        run: |
+          python3 engine/experiments/aws-sharded-wal/ci_campaign.py cleanup \
+            --config engine/experiments/aws-sharded-wal/ci-config.json \
+            --budget-file engine/experiments/aws-sharded-wal/budget.json \
+            --output "$RUNNER_TEMP/cost-reconciliation" \
+            --run-id "$RECONCILE_RUN_ID" --expected-account 354775971805 \
+            --reconcile-usage --previous-settlement-digest "$RECONCILE_PREVIOUS_DIGEST"
       - name: Refresh delayed billing; unavailable data is not zero
         if: steps.settings.outputs.enabled == 'true'
         timeout-minutes: 5
@@ -315,5 +335,6 @@ jobs:
           path: |
             ${{ runner.temp }}/aggregate.json
             ${{ runner.temp }}/billing-refresh.json
+            ${{ runner.temp }}/cost-reconciliation/*.json
           retention-days: 30
           if-no-files-found: error

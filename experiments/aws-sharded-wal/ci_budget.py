@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Shared, fail-closed AWS benchmark admission and delayed billing accounting.
 
-Policy: admission charges max(reserved, usage-estimated, AWS-billed-to-date) for
-an unresolved run forever, and for seven days AFTER verified cleanup otherwise.
-Older cleaned runs still charge any recently observed billing. Settlement never
-releases a reservation early or declares an estimate to be a final AWS bill.
+Policy: unresolved runs charge max(reserved, usage-estimated, AWS-billed-to-date)
+until verified cleanup. Cleanup releases the admission hold immediately; recent
+closed runs charge max(usage-estimated, recent AWS billing), never the original
+reservation. Later increases to old usage bills are recognized when observed.
 Shared/unattributed/untracked recent billing is charged once, separately from
-known runs. Billed, reserved and usage-estimated totals are NOT additive totals.
+known runs. Billed, reserved, estimated and projected totals are NOT additive.
 
 Bootstrap must explicitly initialize the ledger; a missing, corrupt or unreachable
 object never creates an empty budget during admission. S3 conditional writes are
@@ -53,6 +53,7 @@ DEFAULT_BUDGET = Path(__file__).with_name('budget.json')
 WEEK = timedelta(days=7)
 ZERO = Decimal('0')
 QUANTUM = Decimal('0.000000000001')
+MAX_USAGE_RECONCILIATIONS = 16
 
 
 class BudgetError(RuntimeError):
@@ -209,6 +210,11 @@ def _run_id(value):
     return value
 
 
+def settlement_digest(run_id, usage_usd, receipt):
+    """Canonical public binding used by settle and guarded usage reconciliation."""
+    return _digest([_run_id(run_id), _money(usage_usd), _evidence(receipt)])
+
+
 class BudgetLedger:
     def __init__(self, s3, bucket, account, repository=REPOSITORY, branch=BRANCH,
                  budget_path=DEFAULT_BUDGET, *, key=None, max_attempts=8,
@@ -261,14 +267,51 @@ class BudgetLedger:
                     usage = _money(run['usage_estimated_usd'])
                     receipt = _evidence(run['receipt'])
                     self._validate_receipt(receipt)
+                    if receipt.get('usage_evidence', {}).get('accounting_basis') == 'observed-resources-v2':
+                        self._validate_measured_receipt(receipt, run_id, require_cleanup=False)
                     if (run['settlement_digest'] != _digest([run_id, usage, receipt])
                             or _utc(run['settled_at']) < reserved):
                         raise ValueError('settlement binding mismatch')
-                elif any(run.get(name) is not None for name in ('receipt', 'settled_at', 'settlement_digest')):
+                    history = run.get('usage_reconciliation_history', [])
+                    if not isinstance(history, list) or len(history) > MAX_USAGE_RECONCILIATIONS:
+                        raise ValueError('usage reconciliation history bounds exceeded')
+                    for index, previous in enumerate(history):
+                        previous_usage = _money(previous['usage_estimated_usd'])
+                        previous_receipt = _evidence(previous['receipt'])
+                        self._validate_receipt(previous_receipt)
+                        if (not previous_receipt['cleanup_complete']
+                                or previous['settlement_digest'] != _digest([run_id, previous_usage, previous_receipt])
+                                or previous['settled_at'] != run['settled_at']
+                                or _utc(previous['reconciled_at']) < _utc(previous['settled_at'])):
+                            raise ValueError('invalid prior settlement binding')
+                        following = history[index + 1] if index + 1 < len(history) else run
+                        if previous['replacement_settlement_digest'] != following['settlement_digest']:
+                            raise ValueError('broken usage reconciliation chain')
+                        self._validate_measured_receipt(following['receipt'], run_id)
+                        if index and _utc(previous['reconciled_at']) < _utc(history[index - 1]['reconciled_at']):
+                            raise ValueError('usage reconciliation time moved backwards')
+                elif (any(run.get(name) is not None for name in ('receipt', 'settled_at', 'settlement_digest'))
+                      or run.get('usage_reconciliation_history')):
                     raise ValueError('partial settlement')
             billing = ledger['billing']
             if not isinstance(billing, dict) or billing['status'] not in ('never_reconciled', 'available', 'partial', 'unavailable'):
                 raise ValueError('invalid billing status')
+            high_water = billing.get('run_billed_high_water_usd', {})
+            if not isinstance(high_water, dict) or len(high_water) > self.max_runs:
+                raise ValueError('invalid billed high-water bounds')
+            for identity, amount in high_water.items():
+                if identity not in ledger['runs']:
+                    raise ValueError('foreign billed high-water run')
+                _decimal(amount)
+            adjustments = billing.get('late_usage_adjustments', [])
+            if not isinstance(adjustments, list) or len(adjustments) > self.max_groups:
+                raise ValueError('late billing history bounds exceeded')
+            for adjustment in adjustments:
+                if adjustment['run_id'] not in ledger['runs']:
+                    raise ValueError('foreign late billing run')
+                if _utc(adjustment['observed_at']) < created:
+                    raise ValueError('late billing predates ledger')
+                _decimal(adjustment['amount_usd'])
             snapshot = billing.get('snapshot')
             if snapshot is not None:
                 if (snapshot['final'] is not False or snapshot['currency'] != 'USD'
@@ -302,7 +345,7 @@ class BudgetLedger:
                 if groups > self.max_groups:
                     raise ValueError('billing group bounds exceeded')
             return ledger
-        except (KeyError, TypeError, ValueError, OverflowError) as error:
+        except (KeyError, TypeError, ValueError, OverflowError, IdentityConflict) as error:
             raise LedgerMalformed('ledger malformed; refusing to reset budget: ' + str(error)) from error
 
     def _load(self, missing_ok=False):
@@ -434,6 +477,8 @@ class BudgetLedger:
     def _validate_receipt(receipt):
         if not isinstance(receipt.get('cleanup_complete'), bool):
             raise ValueError('settlement requires cleanup_complete boolean')
+        if 'usage_evidence' in receipt and not isinstance(receipt['usage_evidence'], dict):
+            raise ValueError('usage_evidence must be an object when supplied')
         if receipt['cleanup_complete']:
             _evidence(receipt.get('cleanup_evidence'))
             _evidence(receipt.get('usage_evidence'))
@@ -442,10 +487,30 @@ class BudgetLedger:
                 raise ValueError('verified settlement requires actual elapsed_seconds usage evidence')
             _decimal(usage['elapsed_seconds'])
 
+        usage = receipt.get('usage_evidence')
+        if isinstance(usage, dict) and usage.get('accounting_basis') == 'observed-resources-v2':
+            projections = usage.get('projections')
+            if projections is not None:
+                _evidence(projections)
+                if projections['amount_usd'] is not None:
+                    _decimal(projections['amount_usd'])
+
+    def _validate_measured_receipt(self, receipt, run_id, require_cleanup=True):
+        self._validate_receipt(receipt)
+        if ((require_cleanup and not receipt['cleanup_complete'])
+                or receipt.get('usage_evidence', {}).get('accounting_basis') != 'observed-resources-v2'):
+            raise ValueError('usage reconciliation requires verified cleanup and observed-resources-v2 evidence')
+        for name, expected in (('account', self.account), ('run_id', run_id),
+                               ('repository', self.repository), ('branch', self.branch)):
+            if receipt.get(name) != expected:
+                raise IdentityConflict('measured receipt identity mismatch: ' + name)
+
     def settle(self, run_id, usage_usd, receipt, now=None):
         run_id, now = _run_id(run_id), self._now(now)
         usage, evidence = _money(usage_usd), _evidence(receipt)
         self._validate_receipt(evidence)
+        if evidence.get('usage_evidence', {}).get('accounting_basis') == 'observed-resources-v2':
+            self._validate_measured_receipt(evidence, run_id, require_cleanup=False)
         binding = _digest([run_id, usage, evidence])
         def apply(ledger):
             if run_id not in ledger['runs']:
@@ -459,6 +524,48 @@ class BudgetLedger:
             if run['usage_estimated_usd'] is not None and _decimal(usage) < _decimal(run['usage_estimated_usd']):
                 raise IdentityConflict('cannot lower an existing incomplete usage estimate')
             run.update(usage_estimated_usd=usage, receipt=evidence, settled_at=_stamp(now), settlement_digest=binding)
+            return True, run
+        result = self._mutate(apply, now)
+        self._try_publish(now)
+        return result
+
+    def reconcile_usage(self, run_id, usage_usd, receipt, previous_settlement_digest, now=None):
+        """Explicit CAS correction of a completed estimate, retaining every prior receipt.
+
+        The expected digest is the existing settlement_digest, not a caller-created
+        receipt hash. History is append-only and bounded; exhaustion rejects the
+        correction rather than deleting audit evidence. An exact retry remains
+        idempotent even if a later correction has already been committed.
+        """
+        run_id, now = _run_id(run_id), self._now(now)
+        usage, evidence = _money(usage_usd), _evidence(receipt)
+        self._validate_measured_receipt(evidence, run_id)
+        if (not isinstance(previous_settlement_digest, str)
+                or not re.fullmatch(r'[a-f0-9]{64}', previous_settlement_digest)):
+            raise ValueError('expected previous settlement SHA256 digest required')
+        binding = _digest([run_id, usage, evidence])
+        def apply(ledger):
+            run = ledger['runs'].get(run_id)
+            if run is None or run['receipt'] is None or not run['receipt']['cleanup_complete']:
+                raise IdentityConflict('usage reconciliation requires an existing completed settlement')
+            history = run.get('usage_reconciliation_history', [])
+            for previous in history:
+                if (previous['settlement_digest'] == previous_settlement_digest
+                        and previous['replacement_settlement_digest'] == binding):
+                    return False, run
+            if run['settlement_digest'] != previous_settlement_digest:
+                raise IdentityConflict('previous settlement digest changed; reread before reconciliation')
+            if run['settlement_digest'] == binding:
+                return False, run
+            if len(history) >= MAX_USAGE_RECONCILIATIONS:
+                raise BudgetError('usage reconciliation history capacity exhausted; no evidence discarded')
+            reconciled_at = max(now, _utc(run['settled_at']),
+                _utc(history[-1]['reconciled_at']) if history else _utc(run['settled_at']))
+            previous = {name: copy.deepcopy(run[name]) for name in (
+                'usage_estimated_usd', 'receipt', 'settled_at', 'settlement_digest')}
+            previous.update(reconciled_at=_stamp(reconciled_at), replacement_settlement_digest=binding)
+            run['usage_reconciliation_history'] = history + [previous]
+            run.update(usage_estimated_usd=usage, receipt=evidence, settlement_digest=binding)
             return True, run
         result = self._mutate(apply, now)
         self._try_publish(now)
@@ -493,25 +600,35 @@ class BudgetLedger:
                     totals[category] = _sum([totals[category], amount])
                     if is_recent:
                         recent[category] = _sum([recent[category], amount])
+        late_recent = {}
+        for adjustment in billing.get('late_usage_adjustments', []):
+            if _utc(adjustment['observed_at']) >= cutoff:
+                identity = adjustment['run_id']
+                late_recent[identity] = _sum([late_recent.get(identity, ZERO), _decimal(adjustment['amount_usd'])])
         charge, reservations, usage_lifetime, usage_recent = ZERO, ZERO, ZERO, ZERO
-        selected, unresolved = {}, 0
+        selected, unresolved, estimated_runs = {}, 0, 0
         for identity, run in ledger['runs'].items():
             cleaned = run['receipt'] is not None and run['receipt']['cleanup_complete']
-            active = not cleaned or _utc(run['settled_at']) >= cutoff
             usage = _decimal(run['usage_estimated_usd'] or '0')
+            recent_usage = usage if run['settled_at'] and _utc(run['settled_at']) >= cutoff else ZERO
             billed = per_run.get(identity, ZERO)
             billed_recent = per_run_recent.get(identity, ZERO)
-            conservative = max(_decimal(run['reserved_usd']), usage, billed) if active else billed_recent
+            late = late_recent.get(identity, ZERO)
+            held = ZERO if cleaned else _decimal(run['reserved_usd'])
+            conservative = (_sum([max(recent_usage, billed_recent), late]) if cleaned
+                            else max(held, usage, billed, _sum([billed_recent, late])))
             charge = _sum([charge, conservative])
-            reservations = _sum([reservations, _decimal(run['reserved_usd']) if active else ZERO])
+            reservations = _sum([reservations, held])
             usage_lifetime = _sum([usage_lifetime, usage])
-            if _utc(run['settled_at'] or run['reserved_at']) >= cutoff:
-                usage_recent = _sum([usage_recent, usage])
+            usage_recent = _sum([usage_recent, recent_usage])
+            estimated_runs += run['usage_estimated_usd'] is not None
             if not cleaned:
                 unresolved += 1
             if run_id is None or run_id == identity:
-                selected[identity] = copy.deepcopy(run) | dict(cleanup_verified=cleaned,
+                selected[identity] = copy.deepcopy(run) | self._usage_presentation(run) | dict(cleanup_verified=cleaned,
+                    active_reservation_usd=_money(held), reservation_released=cleaned,
                     conservative_budget_charge_usd=_money(conservative),
+                    late_billing_adjustment_recent_usd=_money(late),
                     aws_billed_to_date_usd=_money(billed) if snapshot is not None else None,
                     aws_billed_recent_usd=_money(billed_recent) if snapshot is not None else None,
                     aws_billing_final=False)
@@ -533,22 +650,30 @@ class BudgetLedger:
             last_attempt=billing.get('last_attempt'), error=billing.get('error'),
             tag_coverage_complete=snapshot['tag_coverage_complete'] if snapshot is not None else False,
             conservative_merged_observations=snapshot.get('conservative_merge', False) if snapshot is not None else False,
+            late_usage_adjustments_recent_usd=_money(_sum(late_recent.values())),
             note=('Delayed tag-attributed AWS billed-to-date since ledger initialization, never final; '
                   'zero does not prove no spend. Missing RunId is unattributed. Costs lacking '
                   'Repository/BenchmarkBranch allocation tags, including unallocatable API overhead, are excluded. '
                   'Partial tag coverage conservatively retains higher earlier daily/group observations.'))
+        summary = self._costs_summary(ledger, now)
         return dict(account=self.account, repository=self.repository, branch=self.branch,
                     as_of=_stamp(now), ledger_key=self.key, revision=ledger['revision'],
                     budget_policy=policy, weekly_budget_usd=_money(limit),
                     conservative_budget_charge_usd=_money(charge), available_usd=_money(available),
-                    admission_reservations_usd=_money(reservations), usage_estimated_usd=_money(usage_lifetime),
-                    usage_estimated_recent_usd=_money(usage_recent), unresolved_runs=unresolved,
+                    admission_reservations_usd=_money(reservations),
+                    usage_estimated_usd=_money(usage_lifetime) if estimated_runs else None,
+                    usage_estimated_recent_usd=_money(usage_recent) if estimated_runs else None, unresolved_runs=unresolved,
+                    observed_usage_estimated_usd=summary['total']['observed_usage_estimated_usd'],
+                    legacy_usage_estimated_usd=summary['total']['legacy_usage_estimated_usd'],
+                    projected_usd=summary['total']['projected_usd'],
+                    usage_coverage_complete=summary['total']['usage_coverage_complete'],
+                    projection_coverage_complete=summary['total']['projection_coverage_complete'],
                     branch_billing=branch_billing, runs=selected,
                     generated_report_key=self.report_key,
                     generated_report_uri='s3://' + self.bucket + '/' + self.report_key,
                     aggregate_publication=copy.deepcopy(self.last_publication),
-                    costsSummary=self._costs_summary(ledger, now),
-                    policy='max(reserved,usage,billed) until cleanup+7d; unresolved forever; separate shared/recent billing once')
+                    costsSummary=summary,
+                    policy='unresolved max(reserved,usage,billed); verified cleanup releases hold; closed recent max(usage,billed), plus late old-bill increments once')
 
     def report(self, run_id=None, now=None):
         if run_id is not None:
@@ -557,6 +682,19 @@ class BudgetLedger:
         if run_id is not None and run_id not in ledger['runs']:
             raise IdentityConflict('unknown RunId')
         return self._report(ledger, run_id, self._now(now))
+
+    @staticmethod
+    def _usage_presentation(run):
+        evidence = (run['receipt'] or {}).get('usage_evidence') or {}
+        basis = evidence.get('accounting_basis', 'legacy-estimate' if run['usage_estimated_usd'] is not None else 'unavailable')
+        observed = basis == 'observed-resources-v2'
+        projections = evidence.get('projections') if observed else None
+        coverage = evidence.get('coverage', 'partial' if observed else 'unavailable')
+        return dict(usage_accounting_basis=basis, usage_coverage=coverage,
+            observed_usage_estimated_usd=run['usage_estimated_usd'] if observed else None,
+            legacy_usage_estimated_usd=run['usage_estimated_usd'] if not observed else None,
+            projected_usd=projections.get('amount_usd') if projections else None,
+            projections=copy.deepcopy(projections))
 
     def _costs_summary(self, ledger, now):
         """Derived calendar accounting; amounts of different kinds never sum."""
@@ -568,9 +706,14 @@ class BudgetLedger:
         daily = {}
         def bucket(start, end):
             return dict(start=start.isoformat(), end_exclusive=end.isoformat(),
-                        admission_reserved_usd='0', usage_estimated_usd=None,
+                        admission_reserved_usd='0', active_reservation_usd='0',
+                        usage_estimated_usd=None, observed_usage_estimated_usd=None,
+                        legacy_usage_estimated_usd=None, projected_usd=None,
                         aws_billed_to_date_usd=None, reservation_run_ids=[],
-                        usage_estimated_run_ids=[], aws_billing_final=False,
+                        active_reservation_run_ids=[], usage_estimated_run_ids=[],
+                        observed_usage_run_ids=[], legacy_usage_run_ids=[], projected_run_ids=[],
+                        unknown_usage_run_ids=[], partial_usage_run_ids=[], unknown_projection_run_ids=[],
+                        aws_billing_final=False,
                         aws_billing_status=ledger['billing']['status'],
                         aws_coverage_start=None, aws_coverage_end_exclusive=None)
         for offset in range((last - first).days + 1):
@@ -582,11 +725,33 @@ class BudgetLedger:
             item['admission_reserved_usd'] = _money(_sum([
                 _decimal(item['admission_reserved_usd']), _decimal(run['reserved_usd'])]))
             item['reservation_run_ids'].append(run_id)
+            cleaned = run['receipt'] is not None and run['receipt']['cleanup_complete']
+            if not cleaned:
+                item['active_reservation_usd'] = _money(_sum([
+                    _decimal(item['active_reservation_usd']), _decimal(run['reserved_usd'])]))
+                item['active_reservation_run_ids'].append(run_id)
+            presentation = self._usage_presentation(run)
+            if run['usage_estimated_usd'] is None:
+                item['unknown_usage_run_ids'].append(run_id)
+                item['unknown_projection_run_ids'].append(run_id)
             if run['usage_estimated_usd'] is not None:
                 item = daily[_utc(run['settled_at']).date().isoformat()]
                 item['usage_estimated_usd'] = _money(_sum([
                     _decimal(item['usage_estimated_usd'] or '0'), _decimal(run['usage_estimated_usd'])]))
                 item['usage_estimated_run_ids'].append(run_id)
+                observed = presentation['usage_accounting_basis'] == 'observed-resources-v2'
+                category = 'observed' if observed else 'legacy'
+                name = category + '_usage_estimated_usd'
+                item[name] = _money(_sum([_decimal(item[name] or '0'), _decimal(run['usage_estimated_usd'])]))
+                item[category + '_usage_run_ids'].append(run_id)
+                if presentation['usage_coverage'] != 'complete':
+                    item['partial_usage_run_ids'].append(run_id)
+                if presentation['projected_usd'] is not None:
+                    item['projected_usd'] = _money(_sum([
+                        _decimal(item['projected_usd'] or '0'), _decimal(presentation['projected_usd'])]))
+                    item['projected_run_ids'].append(run_id)
+                else:
+                    item['unknown_projection_run_ids'].append(run_id)
         if snapshot is not None:
             for day, groups in snapshot['daily'].items():
                 item = daily[day]
@@ -594,10 +759,14 @@ class BudgetLedger:
                 item['aws_coverage_start'] = day
                 item['aws_coverage_end_exclusive'] = (datetime.fromisoformat(day).date() + timedelta(days=1)).isoformat()
         def combine(target, item):
-            for name in ('admission_reserved_usd', 'usage_estimated_usd', 'aws_billed_to_date_usd'):
+            for name in ('admission_reserved_usd', 'active_reservation_usd', 'usage_estimated_usd',
+                         'observed_usage_estimated_usd', 'legacy_usage_estimated_usd', 'projected_usd',
+                         'aws_billed_to_date_usd'):
                 if item[name] is not None:
                     target[name] = _money(_sum([_decimal(target[name] or '0'), _decimal(item[name])]))
-            for name in ('reservation_run_ids', 'usage_estimated_run_ids'):
+            for name in ('reservation_run_ids', 'active_reservation_run_ids', 'usage_estimated_run_ids',
+                         'observed_usage_run_ids', 'legacy_usage_run_ids', 'projected_run_ids',
+                         'unknown_usage_run_ids', 'partial_usage_run_ids', 'unknown_projection_run_ids'):
                 target[name] = sorted(set(target[name]) | set(item[name]))
             if item['aws_coverage_start'] is not None:
                 target['aws_coverage_start'] = min(filter(None, [
@@ -620,6 +789,10 @@ class BudgetLedger:
             combine(weekly[week_key], item)
             combine(total, item)
         for item in [total, *monthly.values(), *weekly.values(), *daily.values()]:
+            item['usage_coverage_complete'] = bool(item['usage_estimated_run_ids']
+                and not item['unknown_usage_run_ids'] and not item['partial_usage_run_ids'])
+            item['projection_coverage_complete'] = bool(item['projected_run_ids']
+                and not item['unknown_projection_run_ids'])
             item['aws_coverage_complete'] = bool(snapshot is not None
                 and snapshot['tag_coverage_complete']
                 and item['aws_coverage_start'] == item['start']
@@ -627,9 +800,10 @@ class BudgetLedger:
         return dict(currency='USD', as_of=_stamp(now), total=total,
                     monthly=list(monthly.values()), weekly=list(weekly.values()),
                     daily=list(daily.values()), week_starts='Monday', timezone='UTC',
-                    estimate_attribution='usage recognized on settlement date; reservations on reservation date',
+                    estimate_attribution='latest corrected usage on original settlement UTC date; original reservations on reservation date; active holds are current as-of',
+                    projection_attribution='future estimates from latest receipt, displayed with its original settlement date; excluded from usage and admission charges',
                     billing_attribution='Cost Explorer UTC daily usage interval; delayed, never final',
-                    measures='Reservations, usage estimates and AWS bills are distinct; never add them together',
+                    measures='Historical reservations, current active holds, observed estimates, legacy estimates, projections and AWS bills are distinct; never add them together',
                     lifetime_start=first.isoformat(), initialized_at=ledger['created_at'],
                     unique_run_count=len(ledger['runs']))
 
@@ -662,7 +836,11 @@ class BudgetLedger:
     def _generated(self, ledger, now, policy):
         value = self._report(ledger, None, now, policy=policy)
         names = ('reserved_at', 'reserved_usd', 'settled_at', 'usage_estimated_usd',
-                 'budget_policy', 'cleanup_verified', 'aws_billed_to_date_usd', 'aws_billed_recent_usd')
+                 'budget_policy', 'cleanup_verified', 'active_reservation_usd', 'reservation_released',
+                 'usage_accounting_basis', 'usage_coverage', 'observed_usage_estimated_usd',
+                 'legacy_usage_estimated_usd', 'projected_usd', 'projections',
+                 'conservative_budget_charge_usd', 'late_billing_adjustment_recent_usd',
+                 'aws_billed_to_date_usd', 'aws_billed_recent_usd')
         value['runs'] = {run_id: {name: record[name] for name in names}
                          for run_id, record in value['runs'].items()}
         value.update(schema=1, generated=True, ledger_revision=ledger['revision'],
@@ -864,6 +1042,38 @@ class BudgetLedger:
                 merged['conservative_merge'] = True
                 merged['estimated'] = merged['estimated'] or previous['estimated']
                 update['snapshot'] = merged
+            update['run_billed_high_water_usd'] = copy.deepcopy(current['billing'].get('run_billed_high_water_usd', {}))
+            update['late_usage_adjustments'] = copy.deepcopy(current['billing'].get('late_usage_adjustments', []))
+            if update['status'] != 'unavailable':
+                previous_daily = (current['billing'].get('snapshot') or {}).get('daily', {})
+                cutoff_day = (now - WEEK).date().isoformat()
+                for identity, run in current['runs'].items():
+                    previous_total = _sum(_decimal(groups.get(identity, '0')) for groups in previous_daily.values())
+                    billed_total = _sum(_decimal(groups.get(identity, '0')) for groups in update['snapshot']['daily'].values())
+                    high_water = max(previous_total, _decimal(update['run_billed_high_water_usd'].get(identity, '0')))
+                    if (run['receipt'] is not None and run['receipt']['cleanup_complete']
+                            and _utc(run['settled_at']) < now - WEEK):
+                        # Estimates and ordinary recent usage bills already cover
+                        # their own dollars. Only newly observed excess for old
+                        # usage dates needs a separate rolling admission charge.
+                        # High-water marks prevent rebilling corrected/repeated
+                        # observations. The original CE snapshot remains intact.
+                        with localcontext() as context:
+                            context.prec = 60
+                            old_increases = _sum(max(ZERO, _decimal(groups.get(identity, '0'))
+                                - _decimal(previous_daily.get(day, {}).get(identity, '0')))
+                                for day, groups in update['snapshot']['daily'].items() if day < cutoff_day)
+                            billed_recent = _sum(_decimal(groups.get(identity, '0'))
+                                for day, groups in update['snapshot']['daily'].items() if day >= cutoff_day)
+                            excess = max(ZERO, billed_total - max(high_water,
+                                _sum([_decimal(run['usage_estimated_usd']), billed_recent])))
+                            adjustment = min(old_increases, excess)
+                        if adjustment:
+                            if len(update['late_usage_adjustments']) >= self.max_groups:
+                                raise BudgetError('late billing history capacity exhausted; no evidence discarded')
+                            update['late_usage_adjustments'].append(dict(run_id=identity,
+                                observed_at=_stamp(now), amount_usd=_money(adjustment)))
+                    update['run_billed_high_water_usd'][identity] = _money(max(high_water, billed_total))
             if current['billing'] == update:
                 return False, current['billing']
             # Do not replace a newer observation from a concurrent reconciler.
@@ -883,8 +1093,12 @@ def github_summary(report):
     rows = [('Weekly budget (budget file)', shown(report['weekly_budget_usd'])),
             ('Conservative budget charge', shown(report['conservative_budget_charge_usd'])),
             ('Available for admission', shown(report['available_usd'])),
-            ('Admission reservations (not additive)', shown(report['admission_reservations_usd'])),
-            ('Usage-estimated lifetime (not additive)', shown(report['usage_estimated_usd'])),
+            ('Admission reservations — active holds only (not additive)', shown(report['admission_reservations_usd'])),
+            ('Usage-estimated lifetime (not additive; not an AWS bill)', shown(report['usage_estimated_usd'])),
+            ('Observed-resource usage estimate', shown(report['observed_usage_estimated_usd'])),
+            ('Legacy usage estimate — uncorrected assumptions', shown(report['legacy_usage_estimated_usd'])),
+            ('Future projections — excluded from usage and admission', shown(report['projected_usd'])),
+            ('Usage coverage complete', str(report['usage_coverage_complete'])),
             ('AWS billed-to-date tracked branch lifetime', shown(billing['lifetime_total_usd'])),
             ('AWS billed-to-date branch recent', shown(billing['recent_total_usd'])),
             ('Billing status / final', billing['status'] + ' / never final'),
@@ -896,7 +1110,11 @@ def github_summary(report):
                         ('Current Monday UTC week', periods['weekly'][-1]),
                         ('Current UTC day', periods['daily'][-1])]:
         rows.append((label + ' (' + item['start'] + ' .. ' + item['end_exclusive'] + ')',
-                     'usage estimate ' + shown(item['usage_estimated_usd'])
+                     'observed usage estimate ' + shown(item['observed_usage_estimated_usd'])
+                     + '; legacy estimate ' + shown(item['legacy_usage_estimated_usd'])
+                     + '; future projection ' + shown(item['projected_usd'])
+                     + '; active holds ' + shown(item['active_reservation_usd'])
+                     + '; historical reservation ' + shown(item['admission_reserved_usd'])
                      + '; delayed AWS bill ' + shown(item['aws_billed_to_date_usd'])))
     rows.append(('Generated aggregate JSON', report['generated_report_uri']))
     text = '## AWS benchmark budget\n\n| Measure | Value |\n|---|---|\n'

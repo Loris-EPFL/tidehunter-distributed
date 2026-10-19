@@ -521,7 +521,25 @@ class AtomicStartupTests(unittest.TestCase):
             bindings[name] = hashlib.sha256(name.encode()).hexdigest()
         bindings['binaries'] = {name: hashlib.sha256(name.encode()).hexdigest()
                                 for name in bindings['binaries']}
-        bindings.update(repetitions=4, read_profile_limits=[0, 4096, 4096, 0])
+        plan['bucket'] = 'tidehunter-ci-354775971805-us-east-1'
+        plan['atomic_client_token'] = plan['run_id'] + '-' + hashlib.sha256(b'ci-candidate-token').hexdigest()[:24]
+        plan['ownership_tags'] = dict(Repository='Loris-EPFL/tidehunter-distributed',
+            BenchmarkBranch='bench/aws-efa', ExpiresAt='2026-10-19T13:18:31.767261+00:00')
+        plan['instance_profiles'] = {}
+        for role in atomic.ROLES:
+            name = f"tidehunter-ci-{plan['run_id']}-{role}"
+            plan['instance_profiles'][role] = dict(name=name, role_name=name,
+                arn=f"arn:aws:iam::{plan['account']}:instance-profile/{name}")
+        for name in ('build_bundle', 'fixture_bundle', 'verification_bundle'):
+            bindings[name].update(bucket=plan['bucket'],
+                budget_config_path='/home/runner/work/tidehunter-distributed/tidehunter-distributed/engine/experiments/aws-sharded-wal/budget.json',
+                budget_config_sha256=hashlib.sha256(b'budget').hexdigest(),
+                config_sha256=hashlib.sha256(b'config').hexdigest(),
+                budget_config_source='recorded-policy')
+        bindings.update(transports=['tcp', 'efa', 'efa-direct'], repetitions=2,
+            read_profile_limits=[0, 128], write_profile_limits=[0, 128],
+            native_write_profile_limits=[0, 128],
+            kv_suite=dict(scope='full', repetitions=1, diagnostics=True))
         script = control.user_data(plan)
         self.assertLessEqual(len(script.encode()), 16384)
         # The shell is parsed by bash itself; no cloud commands are executed.
