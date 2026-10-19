@@ -22,6 +22,9 @@ def identity():
         return json.load(response)
 
 
+INSTANCE_STORE_DISKS = {'i4i.xlarge': 1, 'c6id.32xlarge': 4, 'g5.8xlarge': 1, 'g6.8xlarge': 2, 'g6.16xlarge': 2, 'g6e.8xlarge': 2}
+
+
 def blank_instance_disk(devices, expected_count=1):
     candidates = [d for d in devices if (d.get('model') or '').strip() == 'Amazon EC2 NVMe Instance Storage']
     if expected_count not in [1, 2, 4] or len(candidates) != expected_count:
@@ -61,8 +64,7 @@ def bootstrap(args):
     subprocess.run(['systemctl', 'enable', '--now', name + '.timer'], check=True)
     subprocess.run(['systemctl', 'is-active', '--quiet', name + '.timer'], check=True)
     devices = json.loads(subprocess.check_output(['lsblk', '--json', '--output', 'PATH,MODEL,TYPE,FSTYPE,MOUNTPOINTS']))
-    expected_disks = {'i4i.xlarge': 1, 'c6id.32xlarge': 4, 'g5.8xlarge': 1, 'g6.8xlarge': 2, 'g6.16xlarge': 2, 'g6e.8xlarge': 2}[args.instance_type]
-    disk = blank_instance_disk(devices['blockdevices'], expected_disks)
+    disk = blank_instance_disk(devices['blockdevices'], INSTANCE_STORE_DISKS[args.instance_type])
     signatures = json.loads(subprocess.check_output(['wipefs', '--no-act', '--json', disk]))
     if signatures.get('signatures'):
         raise ValueError('refusing existing filesystem signatures')

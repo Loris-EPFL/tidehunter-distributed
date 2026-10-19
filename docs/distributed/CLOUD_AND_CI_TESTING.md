@@ -529,13 +529,18 @@ storage hosts, each with its own local NVMe. All six have the same instance type
 AZ and **cluster** placement group. There is no spread-placement or shared-host
 fallback. One `RunInstances` request has `MinCount=MaxCount=6`.
 
-Candidates are `g6.8xlarge`, `g6e.8xlarge` and `g6.16xlarge` in `us-east-1`,
-`us-east-2`, `eu-west-1` and `eu-central-1`. Discovery verifies current EFA,
-x86-64, SSD, AMI, subnet and routing capabilities, then prices compatible
+Candidates are `g6.8xlarge`, `g6e.8xlarge`, `g6.16xlarge` and the CPU-only
+`c6id.32xlarge` fallback in `us-west-2`, `us-east-1`, `us-east-2`, `eu-west-1`
+and `eu-central-1`. Oregon wins equal-price regional ties; Frankfurt remains a
+fallback. Discovery verifies current EFA, x86-64, exact per-type SSD
+inventory, AMI, subnet and routing capabilities, then prices compatible
 candidates. It prefers the cheapest compatible candidate; a larger type is a
 capacity fallback, not the default. Capacity and quota are not guaranteed.
-The bootstrap mounts one blank instance-store SSD on each host, not a shared
-network disk or a RAID assembled from every available disk.
+The bootstrap and discovery share `bootstrap.INSTANCE_STORE_DISKS`: G6 requires
+two SSDs and C6id requires four. Bootstrap validates the complete blank inventory
+but mounts only one instance-store SSD per host, not a shared network disk or
+RAID. Keep the launcher's generated exact-type IAM condition synchronized with
+`ci-config.json` before publishing a new candidate.
 Discovery queries approved instance types individually. A missing public Ubuntu
 SSM parameter, deregistered AMI, unsupported exact instance type or absent usable
 subnet/AZ offering records a regional/type rejection and permits other candidates.

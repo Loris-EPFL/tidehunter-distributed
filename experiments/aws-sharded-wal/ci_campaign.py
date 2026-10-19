@@ -32,11 +32,12 @@ import time
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 
+from bootstrap import INSTANCE_STORE_DISKS
 from ci_budget import DEFAULT_BUDGET, load_budget
 REPOSITORY = 'Loris-EPFL/tidehunter-distributed'
 BRANCH = 'bench/aws-efa'
-REGIONS = ('us-east-1', 'us-east-2', 'eu-west-1', 'eu-central-1')
-TYPES = ('g6.8xlarge', 'g6e.8xlarge', 'g6.16xlarge')
+REGIONS = ('us-west-2', 'us-east-1', 'us-east-2', 'eu-west-1', 'eu-central-1')
+TYPES = ('g6.8xlarge', 'g6e.8xlarge', 'g6.16xlarge', 'c6id.32xlarge')
 ROLES = {'controller', *(f'storage-{i}' for i in range(5))}
 BINARIES = {'sui-node-native', 'sui-node-remote', 'storage-node', 'state-audit', 'rocksdb-audit', 'transport-floor'}
 CHECKPOINT = 'EhUPyfwLGDEKH5Ssg3nFbVAHwi4XA87xNKvnFEo3ZJb6'
@@ -596,9 +597,9 @@ def discover_candidates(aws, cfg):
             if ('x86_64' not in hardware.get('ProcessorInfo', {}).get('SupportedArchitectures', [])
                     or not hardware.get('NetworkInfo', {}).get('EfaSupported')
                     or not hardware.get('InstanceStorageSupported') or len(disks) != 1
-                    or disks[0].get('Count') != 2 or disks[0].get('Type') != 'ssd'
+                    or disks[0].get('Count') != INSTANCE_STORE_DISKS[kind] or disks[0].get('Type') != 'ssd'
                     or 'cluster' not in hardware.get('PlacementGroupInfo', {}).get('SupportedStrategies', [])):
-                rejected.append(dict(region=region, instance_type=kind, reason='requires EFA, cluster and two blank local SSDs; bootstrap uses exactly one'))
+                rejected.append(dict(region=region, instance_type=kind, reason='requires EFA, cluster and the exact local SSD inventory; bootstrap uses exactly one'))
                 continue
             price = live_prices(pricing, region, kind)
             offered = {item['Location'] for page in pages(lambda **params: ec2.describe_instance_type_offerings(**params),
