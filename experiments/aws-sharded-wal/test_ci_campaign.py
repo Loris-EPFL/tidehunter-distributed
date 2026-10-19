@@ -1102,6 +1102,40 @@ class DiscoveryTests(unittest.TestCase):
         return dict(compute_usd_per_hour='1' if region == 'us-east-2' and kind == 'g6e.8xlarge' else '2',
                     ebs_usd_per_gib_month='0.08', ipv4_usd_per_hour='0.005')
 
+    def test_live_prices_select_in_use_ipv4_without_product_family(self):
+        def product(sku, service, attributes, unit, amount, family=None):
+            value = dict(sku=sku, attributes=dict(regionCode='us-east-1', **attributes))
+            if family is not None:
+                value['productFamily'] = family
+            return dict(serviceCode=service, product=value, terms={'OnDemand': {'term': {
+                'priceDimensions': {'dimension': dict(unit=unit, beginRange='0',
+                    endRange='Inf', pricePerUnit={'USD': amount})}}}})
+        catalog = [
+            product('compute', 'AmazonEC2', dict(instanceType='g6.8xlarge',
+                operatingSystem='Linux', tenancy='Shared', preInstalledSw='NA',
+                capacitystatus='Used'), 'Hrs', '2.0144', 'Compute Instance'),
+            product('gp3', 'AmazonEC2', dict(volumeApiName='gp3'), 'GB-Mo', '0.08', 'Storage'),
+            product('4GQUNXTFWVSGPUZK', 'AmazonVPC', dict(group='VPCPublicIPv4Address',
+                usagetype='USE1-PublicIPv4:InUseAddress'), 'Hrs', '0.005'),
+            product('idle', 'AmazonVPC', dict(group='VPCPublicIPv4Address',
+                usagetype='USE1-PublicIPv4:IdleAddress'), 'Hrs', '0.019')]
+        def get_products(**request):
+            def matches(item):
+                value = item['product']
+                return item['serviceCode'] == request['ServiceCode'] and all(
+                    value.get(row['Field'], value['attributes'].get(row['Field'])) == row['Value']
+                    for row in request['Filters'])
+            return {'PriceList': [json.dumps(item) for item in catalog if matches(item)]}
+        pricing = SimpleNamespace(get_products=get_products)
+        quoted = ci.live_prices(pricing, 'us-east-1', 'g6.8xlarge')
+        self.assertEqual(quoted['compute_usd_per_hour'], '2.0144')
+        self.assertEqual(quoted['ebs_usd_per_gib_month'], '0.08')
+        self.assertEqual(quoted['ipv4_usd_per_hour'], '0.005')
+        self.assertEqual([item['sku'] for item in quoted['evidence']['ipv4']], ['4GQUNXTFWVSGPUZK'])
+        catalog[:] = [item for item in catalog if item['product']['sku'] != '4GQUNXTFWVSGPUZK']
+        with self.assertRaises(ValueError):
+            ci.live_prices(pricing, 'us-east-1', 'g6.8xlarge')
+
     def test_live_priced_cheapest_compatible_region_wins_not_config_order(self):
         with patch.object(ci, 'live_prices', side_effect=self.prices), \
                 patch.object(ci, 'live_ancillary_prices', return_value={'reviewed': True}):

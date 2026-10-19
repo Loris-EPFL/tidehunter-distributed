@@ -496,7 +496,7 @@ def live_prices(pricing, region, instance_type):
                 productFamily='Compute Instance')), 'Hrs')
     storage, storage_proof = rate(products('AmazonEC2', dict(regionCode=region, volumeApiName='gp3',
                                                             productFamily='Storage')), 'GB-Mo')
-    ipv4_products = products('AmazonVPC', dict(regionCode=region, productFamily='IP Address'))
+    ipv4_products = products('AmazonVPC', dict(regionCode=region, group='VPCPublicIPv4Address'))
     ipv4_products = [item for item in ipv4_products if json.loads(item)['product']['attributes'].get(
                         'usagetype', '').endswith('PublicIPv4:InUseAddress')]
     ipv4, ipv4_proof = rate(ipv4_products, 'Hrs')
