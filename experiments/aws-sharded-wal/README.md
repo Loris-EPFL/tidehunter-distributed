@@ -1,3 +1,22 @@
+## 19 October protected CI price admission
+
+The first protected CI attempt rebuilt all six binaries and completed the native
+and five-shard loopback checkpoint replay through checkpoint 1775 with equal
+store audits. It failed during read-only price discovery, before EC2 allocation.
+The cleanup receipt and independent AWS MCP audit confirmed no run-owned
+compute, EBS, network, or guest IAM resources remained.
+
+`ci_campaign.py` now selects AmazonVPC prices by
+`group=VPCPublicIPv4Address`, then retains only the `PublicIPv4:InUseAddress`
+usage-type suffix. The queried AWS IPv4 products have no `productFamily` field;
+filtering for `productFamily=IP Address` returned no products. Missing or
+ambiguous paid rates still fail closed. The weekly budget, region fallback,
+six-host cluster placement, source bindings, and termination deadline are unchanged.
+The workflow action pins use Node 24; the credential action supports the configured
+`allowed-account-ids` guard.
+
+This is CI readiness evidence, not a new cloud performance result.
+
 ## 12 October cluster-placement stage timing: completed and closed
 
 Run `th-85e6e8a4dd7328b9` completed in `us-east-1b`: **68/68 API outputs and
