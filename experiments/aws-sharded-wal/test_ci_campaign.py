@@ -1877,14 +1877,16 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(str(raised.exception).count('describe_instance_types: InvalidInstanceType'), 4)
         self.assertTrue(all(not ec2.requests for ec2 in self.aws.ec2.values()))
 
-    def test_two_disk_hardware_agrees_with_one_disk_bootstrap_selection(self):
-        import bootstrap
-        disks = [dict(path=f'/dev/nvme{index}n1', model='Amazon EC2 NVMe Instance Storage',
-            type='disk', fstype=None, children=[], mountpoints=[]) for index in (2, 1)]
-        self.assertEqual(bootstrap.blank_instance_disk(disks, expected_count=2), '/dev/nvme1n1')
-        for item in self.hardware:
-            item['InstanceStorageInfo']['Disks'][0]['Count'] = 1
-        with patch.object(ci, 'live_prices', side_effect=AssertionError('wrong hardware cannot reach paid admission')):
+    def test_four_disk_hardware_requires_its_exact_bootstrap_inventory(self):
+        self.cfg['instance_types'] = ['c6id.32xlarge']
+        self.hardware[:] = [self.hardware[0]]
+        self.hardware[0]['InstanceType'] = 'c6id.32xlarge'
+        self.hardware[0]['InstanceStorageInfo']['Disks'][0]['Count'] = 4
+        discovered = self.discover()
+        self.assertEqual({(item['region'], item['instance_type']) for item in discovered['candidates']},
+                         {(region, 'c6id.32xlarge') for region in self.cfg['regions']})
+        self.hardware[0]['InstanceStorageInfo']['Disks'][0]['Count'] = 2
+        with patch.object(ci, 'live_prices', side_effect=AssertionError('wrong inventory cannot reach paid admission')):
             with self.assertRaisesRegex(ValueError, 'no live compatible'):
                 ci.discover_candidates(self.aws, self.cfg)
 

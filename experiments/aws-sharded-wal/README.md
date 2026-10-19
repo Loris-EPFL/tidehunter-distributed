@@ -1,10 +1,11 @@
 ## 19 October protected CI admission and reconciled costs
 
-Three protected CI attempts rebuilt all six binaries and completed the native and
+Four protected CI attempts rebuilt all six binaries and completed the native and
 five-shard loopback replay through checkpoint 1775 with equal store audits.
-All stopped before EC2 allocation: the first used an invalid IPv4 price filter;
-the second exceeded EC2's 16 KiB startup-script limit; the third hit a Lambda
-health-probe throttle.
+None allocated a fleet: the first used an invalid IPv4 price filter; the second
+exceeded EC2's 16 KiB startup-script limit; the third hit a Lambda health-probe
+throttle. The fourth, triggered by the protected-branch push, passed readiness
+and received definitive capacity/quota rejections for all 32 GPU-fleet attempts.
 Cleanup receipts and independent exact-run AWS audits confirmed no remaining
 compute, EBS, network, or guest IAM resources.
 
@@ -28,6 +29,20 @@ to 15,989 bytes; the generated decoder restored the exact contract and sources.
 The 16,384-byte guard, shutdown-first ordering, source checks, ownership fences,
 six-host cluster placement, region fallback, and deadline remain unchanged.
 This is local CI-readiness evidence, not a cloud performance result.
+
+The approved hardware list now includes the CPU-only `c6id.32xlarge` fallback.
+Discovery and bootstrap share one exact per-type SSD-count plan: G6 has two
+drives, C6id has four, and bootstrap uses only one drive per host. A mismatched
+inventory still blocks paid admission. The generated foundation adds only this
+exact type to the launcher's allowlist; apply its reviewed change set before
+merging the fallback configuration. Region fallback, price ordering, the $60
+weekly limit and the full Sui/KV suite remain unchanged. Catalog support does
+not establish allocation capacity or EFA/direct runtime qualification.
+Oregon (`us-west-2`) is the first equal-price regional choice; Virginia, Ohio,
+Ireland and Frankfurt remain fallbacks. The generated launcher, guest boundary
+and independent watchdog must all include the same five regions before the next
+protected-branch campaign. A region's advertised offerings are not a capacity
+reservation.
 
 The five-node prefix regression waits for the existing post-snapshot owner event
 before checking completed-wait metrics. Commit acknowledgements precede that
