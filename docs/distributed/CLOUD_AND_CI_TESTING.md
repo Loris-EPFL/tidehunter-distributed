@@ -826,6 +826,12 @@ engine is the exact protected-branch workflow commit, not a separately moving
 engine branch. The frozen-copy Cargo patch described above binds Sui to that
 selected engine; the portable Sui checkout retains its immutable runtime pin.
 
+Checkout/cache references use the official immutable Node 24 releases:
+[checkout v7.0.1](https://github.com/actions/checkout/releases/tag/v7.0.1) and
+[cache v6.1.0](https://github.com/actions/cache/releases/tag/v6.1.0). Their
+published action metadata supports every configured input. All 16 references
+remain SHA-pinned; permissions, branch gates and resource deadlines are unchanged.
+
 ### Local preparation verification and remaining activation gate
 
 | Executed verification | Observed result |

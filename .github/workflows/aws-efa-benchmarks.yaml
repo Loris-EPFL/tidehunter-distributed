@@ -55,7 +55,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           path: engine
@@ -80,7 +80,7 @@ jobs:
           df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
       - name: Check out the reviewed Sui commit
         if: steps.settings.outputs.enabled == 'true'
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Loris-EPFL/sui-tidehunter-distributed
           ref: ${{ vars.AWS_BENCH_SUI_SHA }}
@@ -98,7 +98,7 @@ jobs:
       - name: Cache the exact frozen checkpoint fixture
         if: steps.settings.outputs.enabled == 'true'
         id: fixture-cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/fixture.tar.gz
           key: sui-fixture-7eb43b71435547939760598e541d13b9a77f722c5a9d0f8c8ee5bd583b751f15
@@ -120,7 +120,7 @@ jobs:
             "$RUNNER_TEMP/fixture.tar.gz"
       - name: Cache Cargo downloads
         if: steps.settings.outputs.enabled == 'true'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -190,7 +190,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           path: engine
@@ -267,7 +267,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           path: engine

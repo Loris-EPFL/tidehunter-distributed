@@ -57,7 +57,7 @@ jobs:
             name: Harness Tests
             setup: core
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tidehunter_repo_ref || github.ref }}
           persist-credentials: false
@@ -73,7 +73,7 @@ jobs:
         run: echo "TIDEHUNTER_LIBFABRIC_PREFIX=$RUNNER_TEMP/tidehunter-libfabric-2.6.0" >> "$GITHUB_ENV"
 
       - name: Cache Cargo dependencies
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -82,7 +82,7 @@ jobs:
 
       - name: Cache profile build
         if: matrix.profile != 'format' && matrix.profile != 'harness'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
           key: ${{ runner.os }}-${{ runner.arch }}-rust-1.90-${{ matrix.profile }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('**/*.rs', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/**', '.github/scripts/**') }}
@@ -91,7 +91,7 @@ jobs:
 
       - name: Cache pinned software libfabric
         if: matrix.setup == 'fabric'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.TIDEHUNTER_LIBFABRIC_PREFIX }}
           key: ${{ runner.os }}-${{ runner.arch }}-libfabric-2.6.0-${{ hashFiles('.github/scripts/setup.sh') }}
