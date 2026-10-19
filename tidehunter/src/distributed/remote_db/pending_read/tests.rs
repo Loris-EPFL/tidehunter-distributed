@@ -194,6 +194,34 @@ fn external_read_pressure_does_not_poison_synchronous_conveniences() {
 }
 
 #[test]
+fn byte_bounded_reads_accept_request_limits_above_channel_capacity() {
+    let mut fixture = Fixture::new();
+    fixture.config.max_pending_reads = usize::MAX;
+    fixture.config.max_pending_read_bytes = 4096;
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    for batch in 0u32..2 {
+        db.write_batch(
+            fixture.operation(batch % 2, u64::from(batch)),
+            (batch * 4..batch * 4 + 4)
+                .map(|key| put(key, key as u8))
+                .collect(),
+        )
+        .unwrap();
+    }
+    let mut db = reopen_cold(&fixture, db);
+    let keys = (0u32..8)
+        .map(|key| key.to_be_bytes().to_vec())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        db.get_many(KeySpace(0), &keys).unwrap(),
+        (0..8).map(value).collect::<Vec<_>>()
+    );
+    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    db.shutdown().unwrap();
+}
+
+#[test]
 fn oversized_scalar_read_does_not_poison_write_authority() {
     let mut fixture = Fixture::new();
     fixture.config.max_pending_read_bytes = ReadService::MIN_FLIGHT_BYTES;

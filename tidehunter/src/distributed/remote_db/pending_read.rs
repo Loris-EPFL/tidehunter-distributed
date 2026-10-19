@@ -972,9 +972,9 @@ impl ReadService {
             }
             service.lanes.get_mut().push(lanes);
         }
-        let (sender, receiver) = mpsc::sync_channel(config.max_pending_reads);
+        // Each queued request owns a distinct, byte-bounded flight slot.
+        let (sender, receiver) = mpsc::sync_channel(flight_slots);
         let state = service.state.clone();
-        let max_requests = config.max_pending_reads;
         let fabric = config.tls.transport != super::super::tcp::Transport::Tcp;
         *service.thread.get_mut() = Some(
             thread::Builder::new()
@@ -985,7 +985,7 @@ impl ReadService {
                         receiver,
                         reactor_lanes,
                         epoch,
-                        max_requests,
+                        flight_slots,
                         fabric,
                         busy,
                     )
