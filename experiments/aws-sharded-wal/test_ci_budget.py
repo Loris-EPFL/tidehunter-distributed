@@ -27,6 +27,18 @@ def receipt(clean=True):
             'usage_evidence': {'elapsed_seconds': '600', 'hourly_rate_usd': '1.25', 'count': 6}}
 
 
+def measured_receipt(run_id=RUN_A, clean=True, projection='0.01'):
+    return dict(receipt(clean), account=ACCOUNT, run_id=run_id,
+        repository=budget.REPOSITORY, branch=budget.BRANCH,
+        usage_evidence=dict(accounting_basis='observed-resources-v2', elapsed_seconds='0',
+            coverage='partial', ec2={'instances': [], 'seconds': '0'},
+            s3={'input_bytes': 245450666, 'coverage': 'partial',
+                'unknown_components': ['request_counts', 'transfer_usage']},
+            projections={'amount_usd': projection, 's3_retention_days': 30,
+                'basis': 'future retained-current-bytes storage only; excluded from usage_usd'},
+            billing={'status': 'unavailable', 'amount_usd': None}))
+
+
 class ServiceError(Exception):
     def __init__(self, code):
         super().__init__(code)
@@ -377,7 +389,7 @@ class BudgetTests(unittest.TestCase):
         self.ledger.settle(RUN_A, '5', receipt(False), now=NOW)
         self.assertEqual(self.ledger.report(now=NOW + timedelta(days=30))['conservative_budget_charge_usd'], '20')
         self.ledger.settle(RUN_A, '5', receipt(True), now=NOW + timedelta(days=30))
-        self.assertEqual(self.ledger.report(now=NOW + timedelta(days=36))['conservative_budget_charge_usd'], '20')
+        self.assertEqual(self.ledger.report(now=NOW + timedelta(days=36))['conservative_budget_charge_usd'], '5')
         self.assertEqual(self.ledger.report(now=NOW + timedelta(days=38))['conservative_budget_charge_usd'], '0')
 
     def test_clean_settlement_is_evidence_bound_idempotent_and_not_final_bill(self):
@@ -385,7 +397,7 @@ class BudgetTests(unittest.TestCase):
         settled = self.ledger.settle(RUN_A, '5', receipt())
         self.assertEqual(self.ledger.settle(RUN_A, '5.0', receipt()), settled)
         report = self.ledger.report(run_id=RUN_A)
-        self.assertEqual(report['conservative_budget_charge_usd'], '20')
+        self.assertEqual(report['conservative_budget_charge_usd'], '5')
         self.assertEqual(report['usage_estimated_usd'], '5')
         self.assertFalse(report['runs'][RUN_A]['aws_billing_final'])
         self.assertIsNone(report['branch_billing']['lifetime_total_usd'])
@@ -400,6 +412,220 @@ class BudgetTests(unittest.TestCase):
                 self.ledger.settle(RUN_A, '0', bad)
         with self.assertRaises(budget.IdentityConflict):
             self.ledger.settle(RUN_B, '0', receipt())
+
+    def test_no_launch_completed_legacy_receipt_releases_hold_without_rewriting_history(self):
+        original_reservation = self.reserve(amount='41.266072308739')
+        legacy_receipt = receipt()
+        legacy_receipt['cleanup_evidence'] = {'regions_checked': [
+            'us-east-1', 'us-east-2', 'us-west-1', 'us-west-2'], 'remaining_instances': []}
+        legacy_receipt['usage_evidence'] = {'elapsed_seconds': '0',
+            'assumed_requests': 100000, 'assumed_input_transfers': 7, 'assumed_storage_days': 30}
+        settled = self.ledger.settle(RUN_A, '0.665648825373', legacy_receipt)
+        durable = self.s3.raw
+        report = self.ledger.report()
+        self.assertEqual(self.s3.raw, durable)
+        run = report['runs'][RUN_A]
+        self.assertEqual(run['reserved_usd'], original_reservation['reserved_usd'])
+        self.assertEqual(run['reservation_digest'], original_reservation['reservation_digest'])
+        self.assertEqual(run['settlement_digest'], settled['settlement_digest'])
+        self.assertEqual(run['receipt'], legacy_receipt)
+        self.assertTrue(run['reservation_released'])
+        self.assertEqual(run['active_reservation_usd'], '0')
+        self.assertEqual(report['admission_reservations_usd'], '0')
+        self.assertEqual(report['conservative_budget_charge_usd'], '0.665648825373')
+        self.assertEqual(report['legacy_usage_estimated_usd'], '0.665648825373')
+        self.assertIsNone(report['observed_usage_estimated_usd'])
+        self.assertIsNone(report['branch_billing']['lifetime_total_usd'])
+        self.assertEqual(report['costsSummary']['total']['admission_reserved_usd'], '41.266072308739')
+        self.reserve(RUN_B, '41.266072308739')
+
+    def test_measured_no_launch_correction_preserves_original_and_excludes_forecasts(self):
+        reservation = self.reserve(amount='41.266072308739')
+        original = self.ledger.settle(RUN_A, '0.665648825373', receipt())
+        evidence = measured_receipt(projection='12')
+        corrected = self.ledger.reconcile_usage(RUN_A, '0.0001', evidence,
+            original['settlement_digest'], now=NOW + timedelta(days=1))
+        self.assertEqual(corrected['reserved_usd'], reservation['reserved_usd'])
+        self.assertEqual(corrected['reservation_digest'], reservation['reservation_digest'])
+        self.assertEqual(corrected['settled_at'], original['settled_at'])
+        self.assertEqual(corrected['settlement_digest'], budget.settlement_digest(RUN_A, '0.00010', evidence))
+        history = corrected['usage_reconciliation_history']
+        self.assertEqual(len(history), 1)
+        self.assertEqual({name: history[0][name] for name in
+            ('usage_estimated_usd', 'receipt', 'settled_at', 'settlement_digest')},
+            {name: original[name] for name in
+            ('usage_estimated_usd', 'receipt', 'settled_at', 'settlement_digest')})
+        self.assertEqual(history[0]['replacement_settlement_digest'], corrected['settlement_digest'])
+        report = self.ledger.report(now=NOW + timedelta(days=1))
+        self.assertEqual(report['conservative_budget_charge_usd'], '0.0001')
+        self.assertEqual(report['admission_reservations_usd'], '0')
+        self.assertEqual(report['observed_usage_estimated_usd'], '0.0001')
+        self.assertIsNone(report['legacy_usage_estimated_usd'])
+        self.assertEqual(report['projected_usd'], '12')
+        self.assertFalse(report['usage_coverage_complete'])
+        self.assertIsNone(report['branch_billing']['lifetime_total_usd'])
+        self.assertIsNone(report['runs'][RUN_A]['receipt']['usage_evidence']['billing']['amount_usd'])
+        total = self.generated()['costsSummary']['total']
+        self.assertEqual(total['usage_estimated_usd'], '0.0001')
+        self.assertEqual(total['observed_usage_estimated_usd'], '0.0001')
+        self.assertEqual(total['projected_usd'], '12')
+        self.assertEqual(total['partial_usage_run_ids'], [RUN_A])
+        self.assertEqual(total['active_reservation_usd'], '0')
+        with self.assertRaises(budget.IdentityConflict):
+            self.ledger.settle(RUN_A, '0.0002', measured_receipt())
+
+    def test_usage_reconciliation_requires_completed_measured_bound_identity_and_prior_digest(self):
+        self.reserve()
+        with self.assertRaises(budget.IdentityConflict):
+            self.ledger.reconcile_usage(RUN_A, '0', measured_receipt(), 'f' * 64)
+        incomplete = self.ledger.settle(RUN_A, '1', receipt(False))
+        with self.assertRaises(budget.IdentityConflict):
+            self.ledger.reconcile_usage(RUN_A, '0', measured_receipt(), incomplete['settlement_digest'])
+        original = self.ledger.settle(RUN_A, '1', receipt())
+        before = self.s3.raw
+        for evidence in (receipt(), measured_receipt(clean=False)):
+            with self.subTest(evidence=evidence), self.assertRaises(ValueError):
+                self.ledger.reconcile_usage(RUN_A, '0', evidence, original['settlement_digest'])
+        for name, foreign in (('account', '999999999999'), ('run_id', RUN_B),
+                              ('repository', 'foreign/repo'), ('branch', 'foreign')):
+            evidence = measured_receipt()
+            evidence[name] = foreign
+            with self.subTest(name=name), self.assertRaises(budget.IdentityConflict):
+                self.ledger.reconcile_usage(RUN_A, '0', evidence, original['settlement_digest'])
+        with self.assertRaises(budget.IdentityConflict):
+            self.ledger.reconcile_usage(RUN_A, '0', measured_receipt(), 'f' * 64)
+        with self.assertRaises(ValueError):
+            self.ledger.reconcile_usage(RUN_A, '0', measured_receipt(), 'not-a-digest')
+        with self.assertRaises(budget.IdentityConflict):
+            self.ledger.reconcile_usage(RUN_B, '0', measured_receipt(RUN_B), original['settlement_digest'])
+        self.assertEqual(self.s3.raw, before)
+
+    def test_measured_incomplete_cleanup_keeps_hold_and_unknown_projection(self):
+        self.reserve(amount='41')
+        self.ledger.settle(RUN_A, '0.0001', measured_receipt(clean=False, projection=None))
+        report = self.ledger.report(now=NOW + timedelta(days=100))
+        self.assertEqual(report['admission_reservations_usd'], '41')
+        self.assertEqual(report['conservative_budget_charge_usd'], '41')
+        self.assertIsNone(report['projected_usd'])
+        self.assertEqual(report['costsSummary']['total']['unknown_projection_run_ids'], [RUN_A])
+        self.assertFalse(report['costsSummary']['total']['projection_coverage_complete'])
+        self.assertEqual(report['unresolved_runs'], 1)
+        with self.assertRaises(budget.BudgetExceeded):
+            self.reserve(RUN_B, '20', now=NOW + timedelta(days=100))
+
+    def test_competing_usage_reconciliations_compare_and_swap_previous_digest(self):
+        self.reserve()
+        original = self.ledger.settle(RUN_A, '5', receipt())
+        self.s3.barrier = threading.Barrier(2)
+        def attempt(amount):
+            try:
+                return self.make().reconcile_usage(RUN_A, amount, measured_receipt(),
+                    original['settlement_digest'])['usage_estimated_usd']
+            except budget.IdentityConflict:
+                return 'conflict'
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(attempt, ('1', '2')))
+        self.s3.barrier = None
+        self.assertEqual(outcomes.count('conflict'), 1)
+        run = self.ledger.report()['runs'][RUN_A]
+        self.assertIn(run['usage_estimated_usd'], ('1', '2'))
+        self.assertEqual(len(run['usage_reconciliation_history']), 1)
+        self.assertEqual(run['usage_reconciliation_history'][0]['settlement_digest'], original['settlement_digest'])
+
+    def test_usage_reconciliation_retries_are_idempotent_after_later_corrections(self):
+        self.reserve()
+        original = self.ledger.settle(RUN_A, '5', receipt())
+        self.s3.write_mode = 'unknown_committed'
+        first = self.ledger.reconcile_usage(RUN_A, '1', measured_receipt(), original['settlement_digest'])
+        revision = self.ledger.report()['revision']
+        repeated = self.ledger.reconcile_usage(RUN_A, '1.00', measured_receipt(), original['settlement_digest'])
+        self.assertEqual(repeated, first)
+        self.assertEqual(self.ledger.report()['revision'], revision)
+        second_evidence = measured_receipt(projection='0.02')
+        second = self.ledger.reconcile_usage(RUN_A, '2', second_evidence, first['settlement_digest'])
+        revision = self.ledger.report()['revision']
+        self.assertEqual(self.ledger.reconcile_usage(RUN_A, '1', measured_receipt(),
+            original['settlement_digest']), second)
+        self.assertEqual(self.ledger.report()['revision'], revision)
+        self.assertEqual(len(second['usage_reconciliation_history']), 2)
+        with self.assertRaises(budget.IdentityConflict):
+            self.ledger.reconcile_usage(RUN_A, '3', measured_receipt(), first['settlement_digest'])
+
+    def test_usage_reconciliation_history_is_bounded_without_discarding_evidence(self):
+        self.reserve()
+        run = self.ledger.settle(RUN_A, '50', receipt())
+        for index in range(budget.MAX_USAGE_RECONCILIATIONS):
+            run = self.ledger.reconcile_usage(RUN_A, str(index), measured_receipt(), run['settlement_digest'])
+        before = self.s3.raw
+        with self.assertRaises(budget.BudgetError):
+            self.ledger.reconcile_usage(RUN_A, '40', measured_receipt(), run['settlement_digest'])
+        self.assertEqual(self.s3.raw, before)
+        self.assertEqual(run['usage_reconciliation_history'][0]['usage_estimated_usd'], '50')
+        self.assertEqual(len(run['usage_reconciliation_history']), budget.MAX_USAGE_RECONCILIATIONS)
+
+    def test_tampered_usage_reconciliation_chain_fails_closed(self):
+        self.reserve()
+        original = self.ledger.settle(RUN_A, '5', receipt())
+        self.ledger.reconcile_usage(RUN_A, '1', measured_receipt(), original['settlement_digest'])
+        document = json.loads(self.s3.raw)
+        document['runs'][RUN_A]['usage_reconciliation_history'][0]['receipt']['usage_evidence']['elapsed_seconds'] = '1'
+        self.s3.replace(document)
+        with self.assertRaises(budget.LedgerMalformed):
+            self.ledger.report()
+        with self.assertRaises(budget.LedgerMalformed):
+            self.reserve(RUN_B)
+
+    def test_usage_correction_does_not_restart_rolling_window(self):
+        self.reserve()
+        original = self.ledger.settle(RUN_A, '5', receipt())
+        corrected_at = NOW + timedelta(days=6)
+        corrected = self.ledger.reconcile_usage(RUN_A, '2', measured_receipt(),
+            original['settlement_digest'], now=corrected_at)
+        self.assertEqual(corrected['settled_at'], original['settled_at'])
+        at_boundary = self.ledger.report(now=NOW + timedelta(days=7))
+        self.assertEqual(at_boundary['conservative_budget_charge_usd'], '2')
+        after_boundary = self.ledger.report(now=NOW + timedelta(days=7, microseconds=1))
+        self.assertEqual(after_boundary['conservative_budget_charge_usd'], '0')
+        self.assertEqual(after_boundary['usage_estimated_usd'], '2')
+        self.assertEqual(after_boundary['admission_reservations_usd'], '0')
+
+    def test_usage_correction_retains_calendar_attribution_across_months(self):
+        self.s3 = S3()
+        self.ledger = self.make()
+        reserved = datetime(2026, 8, 31, 23, 59, tzinfo=timezone.utc)
+        settled = datetime(2026, 9, 1, 0, 1, tzinfo=timezone.utc)
+        corrected_at = datetime(2026, 10, 1, 0, 1, tzinfo=timezone.utc)
+        self.ledger.initialize(now=reserved)
+        self.reserve(now=reserved)
+        original = self.ledger.settle(RUN_A, '5', receipt(), now=settled)
+        self.ledger.reconcile_usage(RUN_A, '2', measured_receipt(), original['settlement_digest'],
+            now=corrected_at)
+        report = self.ledger.report(now=corrected_at)
+        summary = report['costsSummary']
+        months = {item['start']: item for item in summary['monthly']}
+        weeks = {item['start']: item for item in summary['weekly']}
+        days = {item['start']: item for item in summary['daily']}
+        self.assertEqual(report['conservative_budget_charge_usd'], '0')
+        self.assertEqual(months['2026-08-01']['admission_reserved_usd'], '20')
+        self.assertEqual(months['2026-08-01']['active_reservation_usd'], '0')
+        self.assertEqual(months['2026-09-01']['observed_usage_estimated_usd'], '2')
+        self.assertIsNone(months['2026-09-01']['legacy_usage_estimated_usd'])
+        self.assertIsNone(months['2026-10-01']['usage_estimated_usd'])
+        self.assertEqual(weeks['2026-08-31']['usage_estimated_usd'], '2')
+        self.assertEqual(days['2026-09-01']['observed_usage_run_ids'], [RUN_A])
+        self.assertEqual(summary['total']['usage_estimated_usd'], '2')
+        self.assertEqual(summary['total']['admission_reserved_usd'], '20')
+        self.assertEqual(summary['total']['active_reservation_run_ids'], [])
+
+    def test_usage_reconciliation_unknown_uncommitted_write_leaves_prior_settlement(self):
+        self.reserve()
+        original = self.ledger.settle(RUN_A, '5', receipt())
+        before = self.s3.raw
+        self.s3.write_mode = 'unknown_uncommitted'
+        with self.assertRaises(budget.UnknownWrite):
+            self.ledger.reconcile_usage(RUN_A, '1', measured_receipt(), original['settlement_digest'])
+        self.assertEqual(self.s3.raw, before)
+        self.assertEqual(self.ledger.report()['runs'][RUN_A]['settlement_digest'], original['settlement_digest'])
 
     def test_history_capacity_is_bounded_without_discarding_costs(self):
         one = self.make(max_runs=1)
@@ -437,7 +663,7 @@ class BudgetTests(unittest.TestCase):
                           'unattributed': '2.5', 'untracked_runs': '3.75'})
         self.assertEqual(report['conservative_budget_charge_usd'], '32.625')
         self.assertEqual(report['usage_estimated_usd'], '10')
-        self.assertEqual(report['admission_reservations_usd'], '20')
+        self.assertEqual(report['admission_reservations_usd'], '0')
         self.assertFalse(billing['final'])
         with self.assertRaises(budget.BudgetExceeded):
             self.reserve(RUN_C, '27.375000000001')
@@ -446,7 +672,7 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(params['GroupBy'], [{'Type': 'TAG', 'Key': 'RunId'}])
         self.assertIn({'Dimensions': {'Key': 'LINKED_ACCOUNT', 'Values': [ACCOUNT]}}, params['Filter']['And'])
 
-    def test_old_cleaned_usage_and_lifetime_bills_are_not_recent_spend(self):
+    def test_old_usage_ages_out_but_late_old_bill_increases_charge_once(self):
         self.s3 = S3()
         self.ledger = self.make()
         self.ledger.initialize(now=NOW - timedelta(days=10))
@@ -460,10 +686,65 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(report['branch_billing']['recent_total_usd'], '4')
         self.assertEqual(report['usage_estimated_usd'], '7')
         self.assertEqual(report['usage_estimated_recent_usd'], '0')
-        self.assertEqual(report['conservative_budget_charge_usd'], '4')
+        self.assertEqual(report['conservative_budget_charge_usd'], '7')
+        self.assertEqual(report['branch_billing']['late_usage_adjustments_recent_usd'], '3')
         self.assertEqual(report['admission_reservations_usd'], '0')
 
-    def test_small_billing_never_releases_larger_recent_reservation(self):
+    def test_late_higher_bills_override_corrected_estimate_without_double_counting(self):
+        self.reserve(amount='41.266072308739')
+        original = self.ledger.settle(RUN_A, '0.665648825373', receipt())
+        corrected = self.ledger.reconcile_usage(RUN_A, '0.0001', measured_receipt(),
+            original['settlement_digest'])
+        first = self.ledger.reconcile(self.ce([group(RUN_A, '2')], estimated=False))
+        self.assertEqual(first['conservative_budget_charge_usd'], '2')
+        self.assertEqual(first['admission_reservations_usd'], '0')
+        self.ledger.reconcile_usage(RUN_A, '0.0002', measured_receipt(),
+            corrected['settlement_digest'])
+        self.assertEqual(self.ledger.report()['conservative_budget_charge_usd'], '2')
+        later = self.ledger.reconcile(self.ce([group(RUN_A, '5')], estimated=False))
+        self.assertEqual(later['conservative_budget_charge_usd'], '5')
+        self.assertEqual(later['observed_usage_estimated_usd'], '0.0002')
+        self.assertEqual(later['branch_billing']['lifetime_total_usd'], '5')
+        self.assertFalse(later['branch_billing']['final'])
+        self.assertEqual(later['runs'][RUN_A]['reserved_usd'], '41.266072308739')
+        self.assertEqual(later['costsSummary']['total']['aws_billed_to_date_usd'], '5')
+        self.assertEqual(later['costsSummary']['total']['usage_estimated_usd'], '0.0002')
+        with self.assertRaises(budget.BudgetExceeded):
+            self.reserve(RUN_B, '55.000000000001')
+
+    def test_late_old_usage_bill_adjustments_are_idempotent_bounded_and_age_out(self):
+        self.s3 = S3()
+        self.ledger = self.make()
+        self.ledger.initialize(now=NOW - timedelta(days=10))
+        self.reserve(now=NOW - timedelta(days=9))
+        self.ledger.settle(RUN_A, '2', measured_receipt(), now=NOW - timedelta(days=8))
+        def old_bill(amount):
+            days = [daily(NOW - timedelta(days=offset)) for offset in range(10, 0, -1)]
+            days[1]['Groups'] = [group(RUN_A, amount)]
+            return CE([{'ResultsByTime': days}])
+        first = self.ledger.reconcile(old_bill('5'))
+        self.assertEqual(first['conservative_budget_charge_usd'], '3')
+        self.assertEqual(first['branch_billing']['recent_total_usd'], '0')
+        repeated = self.ledger.reconcile(old_bill('5'))
+        self.assertEqual(first['revision'], repeated['revision'])
+        self.assertEqual(repeated['conservative_budget_charge_usd'], '3')
+        lowered = self.ledger.reconcile(old_bill('4'))
+        self.assertEqual(lowered['conservative_budget_charge_usd'], '3')
+        higher = self.ledger.reconcile(old_bill('7'))
+        self.assertEqual(higher['conservative_budget_charge_usd'], '5')
+        self.assertEqual(higher['branch_billing']['lifetime_total_usd'], '7')
+        persisted = json.loads(self.s3.raw)['billing']
+        self.assertEqual(persisted['run_billed_high_water_usd'][RUN_A], '7')
+        self.assertEqual(len(persisted['late_usage_adjustments']), 2)
+        unavailable = self.ledger.reconcile(CE([OSError('billing unavailable')]))
+        self.assertEqual(unavailable['branch_billing']['status'], 'unavailable')
+        self.assertEqual(unavailable['conservative_budget_charge_usd'], '5')
+        aged = self.ledger.report(now=NOW + timedelta(days=7, microseconds=1))
+        self.assertEqual(aged['conservative_budget_charge_usd'], '0')
+        self.assertEqual(aged['branch_billing']['lifetime_total_usd'], '7')
+        self.assertEqual(aged['usage_estimated_usd'], '2')
+
+    def test_small_billing_never_releases_unresolved_reservation(self):
         self.reserve(amount='40')
         report = self.ledger.reconcile(self.ce([group(RUN_A, '0.01')], estimated=False))
         self.assertEqual(report['conservative_budget_charge_usd'], '40')
@@ -612,15 +893,21 @@ class BudgetTests(unittest.TestCase):
 
     def test_report_distinguishes_usage_reservation_unknown_and_zero_bill(self):
         self.reserve()
-        self.ledger.settle(RUN_A, '4', receipt())
-        text = budget.github_summary(self.ledger.report())
-        self.assertIn('Usage-estimated lifetime', text)
-        self.assertIn('Admission reservations', text)
+        self.ledger.settle(RUN_A, '4', measured_receipt(projection='12'))
+        report = self.ledger.report()
+        self.assertEqual(report['admission_reservations_usd'], '0')
+        self.assertEqual(report['observed_usage_estimated_usd'], '4')
+        self.assertEqual(report['projected_usd'], '12')
+        self.assertIsNone(report['branch_billing']['lifetime_total_usd'])
+        self.assertFalse(report['branch_billing']['final'])
+        text = budget.github_summary(report)
         self.assertIn('unavailable', text)
-        self.assertIn('never final', text)
-        text = budget.github_summary(self.ledger.reconcile(self.ce()))
-        self.assertIn('$0', text)
-        self.assertIn('already included', text)
+        self.assertIn('$12', text)
+        billed = self.ledger.reconcile(self.ce())
+        self.assertEqual(billed['branch_billing']['lifetime_total_usd'], '0')
+        self.assertEqual(billed['conservative_budget_charge_usd'], '4')
+        self.assertFalse(billed['branch_billing']['final'])
+        self.assertIn('$0', budget.github_summary(billed))
 
     def generated(self):
         return json.loads(self.s3.report_objects[self.ledger.report_key]['raw'])
@@ -652,7 +939,7 @@ class BudgetTests(unittest.TestCase):
         self.budget_path.write_text('{"weekly_budget_usd":"10"}')
         read_only = self.ledger.report()
         self.assertEqual(read_only['weekly_budget_usd'], '10')
-        self.assertEqual(read_only['available_usd'], '0')
+        self.assertEqual(read_only['available_usd'], '7')
         after = self.ledger.publish_report()
         self.assertEqual(after['costsSummary'], before['costsSummary'])
         self.assertEqual(self.s3.raw, source_before)
@@ -688,7 +975,7 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(corrected['usage_estimated_usd'], '5')
         self.assertEqual(corrected['aws_billed_to_date_usd'], '6')
         self.assertFalse(corrected['aws_billing_final'])
-        self.assertEqual(self.generated()['conservative_budget_charge_usd'], '20')
+        self.assertEqual(self.generated()['conservative_budget_charge_usd'], '6')
 
     def test_generated_periods_use_utc_month_and_monday_week_boundaries(self):
         self.s3 = S3()
@@ -719,6 +1006,74 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(summary['total']['admission_reserved_usd'], '30')
         self.assertIsNone(summary['total']['aws_billed_to_date_usd'])
         self.assertFalse(summary['total']['aws_coverage_complete'])
+
+    def test_current_periods_include_older_unresolved_holds_and_release_after_cleanup(self):
+        cases = [
+            ('day', '2026-10-20T23:59:00+00:00', '2026-10-21T00:01:00+00:00',
+             '2026-10-19', '2026-10-01'),
+            ('Monday week', '2026-10-18T23:59:00+00:00', '2026-10-19T00:01:00+00:00',
+             '2026-10-19', '2026-10-01'),
+            ('month and year', '2026-12-31T23:59:00+00:00', '2027-01-01T00:01:00+00:00',
+             '2026-12-28', '2027-01-01'),
+        ]
+        for boundary, reserved_text, current_text, current_week, current_month in cases:
+            with self.subTest(boundary=boundary):
+                self.s3 = S3()
+                self.ledger = self.make()
+                reserved = datetime.fromisoformat(reserved_text)
+                current = datetime.fromisoformat(current_text)
+                self.ledger.initialize(now=reserved)
+                self.reserve(RUN_A, '20', now=reserved)
+                self.reserve(RUN_B, '10', now=reserved)
+                self.ledger.settle(RUN_B, '1', receipt(False), now=reserved)
+                durable = self.s3.raw
+                report = self.ledger.report(now=current)
+                published = self.ledger.publish_report(now=current)
+                self.assertEqual(self.s3.raw, durable)
+                self.assertEqual(published['costsSummary'], report['costsSummary'])
+                self.assertEqual(self.generated()['costsSummary'], report['costsSummary'])
+                self.assertEqual(report['admission_reservations_usd'], '30')
+                self.assertEqual(report['conservative_budget_charge_usd'], '30')
+                summary = published['costsSummary']
+                for period, current_key in (
+                        ('daily', current.date().isoformat()),
+                        ('weekly', current_week), ('monthly', current_month)):
+                    periods = {item['start']: item for item in summary[period]}
+                    active = periods[current_key]
+                    self.assertEqual(active['active_reservation_usd'], '30')
+                    self.assertEqual(active['active_reservation_run_ids'], [RUN_A, RUN_B])
+                    self.assertEqual(sum(Decimal(item['active_reservation_usd'])
+                                         for item in periods.values()), Decimal('30'))
+                    self.assertEqual([item['start'] for item in periods.values()
+                                      if item['active_reservation_run_ids']], [current_key])
+                    self.assertEqual(sum(Decimal(item['admission_reserved_usd'])
+                                         for item in periods.values()), Decimal('30'))
+                days = {item['start']: item for item in summary['daily']}
+                historical = days[reserved.date().isoformat()]
+                self.assertEqual(historical['admission_reserved_usd'], '30')
+                self.assertEqual(historical['reservation_run_ids'], [RUN_A, RUN_B])
+                self.assertEqual(historical['active_reservation_usd'], '0')
+                self.assertEqual(historical['active_reservation_run_ids'], [])
+                self.assertEqual(days[current.date().isoformat()]['admission_reserved_usd'], '0')
+                self.assertEqual(summary['total']['active_reservation_usd'],
+                                 report['admission_reservations_usd'])
+                self.assertEqual(summary['total']['active_reservation_run_ids'], [RUN_A, RUN_B])
+                for run_id, usage, held, identities in (
+                        (RUN_A, '2', '10', [RUN_B]), (RUN_B, '1', '0', [])):
+                    self.ledger.settle(run_id, usage, receipt(), now=current)
+                    released = self.ledger.report(now=current)
+                    aggregate = self.generated()
+                    self.assertEqual(aggregate['costsSummary'], released['costsSummary'])
+                    self.assertEqual(released['admission_reservations_usd'], held)
+                    for item in [aggregate['costsSummary']['total'],
+                                 aggregate['costsSummary']['daily'][-1],
+                                 aggregate['costsSummary']['weekly'][-1],
+                                 aggregate['costsSummary']['monthly'][-1]]:
+                        self.assertEqual(item['active_reservation_usd'], held)
+                        self.assertEqual(item['active_reservation_run_ids'], identities)
+                    self.assertEqual(aggregate['costsSummary']['total']['admission_reserved_usd'], '30')
+                    self.assertEqual(aggregate['costsSummary']['total']['reservation_run_ids'], [RUN_A, RUN_B])
+                    self.assertIsNone(aggregate['costsSummary']['total']['aws_billed_to_date_usd'])
 
     def test_report_publication_failure_never_prevents_persisted_settlement(self):
         self.reserve()

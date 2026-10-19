@@ -2,10 +2,10 @@
 """Source-bound, unattended GitHub/OIDC six-host benchmark operator.
 
 ``preflight`` performs local admission and live read-only discovery. ``plan
---offline --run-id th-...`` is the only non-GitHub path and never creates AWS
-clients. ``cleanup`` reconciles the stable S3 journal and exact run tags without
-building, uploading inputs or allocating compute. Guest IAM is restricted to
-six exact per-run roles/profiles under an immutable pre-provisioned boundary.
+--offline --run-id th-...`` never creates AWS clients. Explicit ``cleanup
+--run-id th-...`` also permits account-checked local recovery using the immutable
+owned journal, without building, uploading inputs or allocating compute. Guest IAM
+is restricted to six exact per-run roles/profiles under a pre-provisioned boundary.
 Every mutation intent precedes its request in an S3 conditional-write journal;
 ambiguous RunInstances acknowledgements are reconciled, never blindly retried.
 """
@@ -1027,6 +1027,20 @@ class Campaign:
             self.install_guest_policy(role, identity, region=candidate['region'], instances=instances)
         self.clock.sleep(10)
 
+    def observe_s3(self, operation=None, *, read_bytes=0, failed_download=False):
+        """Bounded, partial observations; managed-transfer and guest counts are unknown."""
+        if not self.journal.data:
+            return
+        counters = self.journal.data.setdefault('s3_observations', dict(
+            successful_local_read_bytes=0, successful_requests={}, failed_managed_downloads=0))
+        if operation is not None:
+            if operation not in ('ListObjectsV2', 'HeadObject', 'GetObject'):
+                raise ValueError('unreviewed S3 request counter')
+            requests = counters['successful_requests']
+            requests[operation] = requests.get(operation, 0) + 1
+        counters['successful_local_read_bytes'] += read_bytes
+        counters['failed_managed_downloads'] += int(failed_download)
+
     def upload(self, path, key):
         from boto3.s3.transfer import TransferConfig
         path = Path(path)
@@ -1035,6 +1049,7 @@ class Campaign:
             raise ValueError('input upload outside exact run prefix')
         try:
             head = self.s3.head_object(Bucket=self.cfg['bucket'], Key=key, ExpectedBucketOwner=self.cfg['account'])
+            self.observe_s3('HeadObject')
         except Exception as error:
             if error_code(error) not in MISSING:
                 raise
@@ -1044,14 +1059,22 @@ class Campaign:
                 Config=TransferConfig(multipart_threshold=16 << 20, multipart_chunksize=16 << 20,
                                       max_concurrency=4, use_threads=True))
             head = self.s3.head_object(Bucket=self.cfg['bucket'], Key=key, ExpectedBucketOwner=self.cfg['account'])
+            self.observe_s3('HeadObject')
         if head['ContentLength'] != size or head.get('Metadata', {}).get('sha256') != digest:
             raise ValueError('remote immutable object length/digest differs: ' + key)
         # Multipart SHA256 is composite, not the SHA256 of the complete file.
         # Read back the entire object to bind the full digest before allocation.
         response = self.s3.get_object(Bucket=self.cfg['bucket'], Key=key, ExpectedBucketOwner=self.cfg['account'])
+        self.observe_s3('GetObject')
+        remote_hash, read_bytes = hashlib.sha256(), 0
         with response['Body'] as body:
-            if hashlib.file_digest(body, 'sha256').hexdigest() != digest:
-                raise ValueError('remote full-object digest differs: ' + key)
+            while chunk := body.read(1024 * 1024):
+                read_bytes += len(chunk)
+                remote_hash.update(chunk)
+        self.observe_s3(read_bytes=read_bytes)
+        self.journal.save()
+        if read_bytes != size or remote_hash.hexdigest() != digest:
+            raise ValueError('remote full-object digest differs: ' + key)
         return dict(key=key, sha256=digest, bytes=size, bucket=self.cfg['bucket'],
                     **config_audit(self.cfg, self.journal.data))
 
@@ -1699,6 +1722,7 @@ class Campaign:
         inventory = []
         for page in pages(lambda **params: self.s3.list_objects_v2(**params), pagination='s3-objects',
                           Bucket=self.cfg['bucket'], Prefix=self.run_id + '/', ExpectedBucketOwner=self.cfg['account']):
+            self.observe_s3('ListObjectsV2')
             inventory.extend(page.get('Contents', []))
         manifest, errors = [], []
         for item in inventory:
@@ -1708,17 +1732,33 @@ class Campaign:
                 raise ValueError('unsafe full-prefix retrieval path')
             target = self.output / 's3' / rel
             target.parent.mkdir(parents=True, exist_ok=True)
+            downloaded = reused = download_attempted = False
             try:
-                self.s3.download_file(self.cfg['bucket'], key, str(target), ExtraArgs={'ExpectedBucketOwner': self.cfg['account']})
-                head = self.s3.head_object(Bucket=self.cfg['bucket'], Key=key, ExpectedBucketOwner=self.cfg['account'])
-                digest = sha(target)
+                if target.is_file() and not target.is_symlink():
+                    head = self.s3.head_object(Bucket=self.cfg['bucket'], Key=key, ExpectedBucketOwner=self.cfg['account'])
+                    self.observe_s3('HeadObject')
+                    expected_digest = head.get('Metadata', {}).get('sha256')
+                    if (expected_digest and target.stat().st_size == head['ContentLength'] == item['Size']
+                            and sha(target) == expected_digest):
+                        digest, reused = expected_digest, True
+                if not reused:
+                    download_attempted = True
+                    self.s3.download_file(self.cfg['bucket'], key, str(target), ExtraArgs={'ExpectedBucketOwner': self.cfg['account']})
+                    downloaded = True
+                    self.observe_s3(read_bytes=target.stat().st_size)
+                    head = self.s3.head_object(Bucket=self.cfg['bucket'], Key=key, ExpectedBucketOwner=self.cfg['account'])
+                    self.observe_s3('HeadObject')
+                    digest = sha(target)
                 if target.stat().st_size != head['ContentLength'] or target.stat().st_size != item['Size']:
                     raise ValueError('retrieved full-prefix object length changed')
                 if head.get('Metadata', {}).get('sha256') and head['Metadata']['sha256'] != digest:
                     raise ValueError('retrieved full-prefix object digest differs')
                 manifest.append(dict(key=key, bytes=target.stat().st_size, sha256=digest,
+                                     retrieval_mode='local-sha256-reuse' if reused else 'download',
                                      remote_etag=head.get('ETag'), inventory_etag=item.get('ETag')))
             except Exception as error:
+                if download_attempted and not downloaded:
+                    self.observe_s3(failed_download=True)
                 errors.append(dict(key=key, error=repr(error)))
         receipt = dict(run_id=self.run_id, complete=not errors, inventory=inventory, files=manifest, errors=errors,
                        **config_audit(self.cfg, self.journal.data))
@@ -1734,29 +1774,60 @@ class Campaign:
         return receipt
 
     def account_export(self, inventory):
+        """Price observed resources only; future retention never enters booked usage."""
         data = self.journal.data or {}
         if not data.get('overhead'):
             return None
-        overhead = data['overhead']
-        prices, assumptions = overhead['prices'], overhead['assumptions']
+        prices, assumptions = data['overhead']['prices'], data['overhead']['assumptions']
+        observed = datetime.fromtimestamp(self.clock.time(), timezone.utc)
         input_bytes = sum(item['Size'] for item in inventory if item['Key'].startswith(
             (self.run_id + '/inputs/', self.run_id + '/input/')))
         total_bytes = sum(item['Size'] for item in inventory)
         exported_bytes = total_bytes - input_bytes
+        counters = data.get('s3_observations')
+        unknown = ['historical/guest/managed-transfer requests and retries',
+                   'guest downloads and uploads, failed/partial reads, cross-region routing',
+                   'deleted/overwritten objects, versions, multipart and control-prefix storage',
+                   'final AWS billed charges, discounts and free tiers']
+        missing_timestamps = 0
         with localcontext() as context:
             context.prec, context.rounding = 60, ROUND_CEILING
-            input_gib = Decimal(input_bytes) / Decimal(1024 ** 3)
-            result_gib = Decimal(exported_bytes) / Decimal(1024 ** 3)
-            storage = usd_ceiling((input_gib + result_gib) * Decimal(prices['storage_usd_per_gib_month']) * Decimal(assumptions['retention_days']) / Decimal(28))
-            transfer = usd_ceiling((input_gib * 7 + result_gib * 2) * Decimal(prices['transfer_usd_per_gib']))
-            requests = usd_ceiling(Decimal(assumptions['request_count']) * Decimal(prices['request_usd']))
-            total = usd_ceiling(storage + transfer + requests)
-        record = dict(input_bytes=input_bytes, exported_bytes=exported_bytes, retained_bytes=total_bytes,
-            observed_utc=utc(), sizing_result_gib=assumptions['result_gib'],
+            byte_seconds = Decimal(0)
+            for item in inventory:
+                if not item.get('LastModified'):
+                    missing_timestamps += 1
+                    continue
+                duration = observed - parsed(item['LastModified'])
+                seconds = Decimal(duration.days * 86400 + duration.seconds) + Decimal(duration.microseconds) / Decimal(1000000)
+                if seconds < 0:
+                    raise ValueError('S3 object modification time is after accounting observation')
+                byte_seconds += Decimal(item['Size']) * seconds
+            storage = usd_ceiling(byte_seconds / Decimal(1024 ** 3) / Decimal(28 * 86400)
+                                  * Decimal(prices['storage_usd_per_gib_month']))
+            projection = usd_ceiling(Decimal(total_bytes) / Decimal(1024 ** 3)
+                * Decimal(prices['storage_usd_per_gib_month']) * Decimal(assumptions['retention_days']) / Decimal(28))
+            # These prices are highest paid tiers, not proof that a transfer/request
+            # was billable at that rate. Do not infer managed SDK or guest counts.
+            transfer = (usd_ceiling(Decimal(counters['successful_local_read_bytes']) / Decimal(1024 ** 3)
+                        * Decimal(prices['transfer_usd_per_gib'])) if counters else None)
+            requests = (usd_ceiling(Decimal(sum(counters['successful_requests'].values()))
+                        * Decimal(prices['request_usd'])) if counters else None)
+            total = usd_ceiling(storage + (transfer or Decimal(0)) + (requests or Decimal(0)))
+        if missing_timestamps:
+            unknown.append('elapsed storage for objects without LastModified')
+        record = dict(accounting_basis='observed-resources-v2', coverage='partial',
+            input_bytes=input_bytes, exported_bytes=exported_bytes, retained_bytes=total_bytes,
+            observed_utc=utc(observed), sizing_result_gib=assumptions['result_gib'],
             export_allowance_exceeded=exported_bytes > assumptions['result_gib'] * 1024 ** 3,
-            estimate_usd=str(total), storage_estimate_usd=str(storage),
-            transfer_estimate_usd=str(transfer), request_estimate_usd=str(requests), prices=prices,
-            assumptions=assumptions, scope='actual S3 retained bytes; conservatively assumed transfer multiplicity, request allowance and retention duration; not a final AWS bill',
+            estimate_usd=str(total), storage_estimate_usd=str(storage) if inventory and missing_timestamps < len(inventory) else None,
+            storage_observed_byte_seconds=str(byte_seconds), storage_missing_timestamps=missing_timestamps,
+            transfer_estimate_usd=str(transfer) if transfer is not None else None,
+            request_estimate_usd=str(requests) if requests is not None else None,
+            observations=json.loads(encoded(counters)) if counters else None,
+            unknown_components=unknown, prices=prices,
+            projections=dict(amount_usd=str(projection), s3_retention_days=assumptions['retention_days'],
+                             basis='future retained-current-bytes storage only; excluded from usage_usd'),
+            scope='priced upper-bound estimate for observed resources only; partial coverage, not a final AWS bill',
             **config_audit(self.cfg, data))
         data['s3_accounting'] = record
         self.journal.save()
@@ -1819,26 +1890,88 @@ class Campaign:
         dump(self.output / 'budget-report.json', dict(report, run_id=self.run_id, phase=phase,
              **config_audit(self.cfg, self.journal.data)))
 
-    def settle(self, cleanup):
+    def authorize_reconciliation(self, previous_digest):
+        """Read-only authorization before cleanup; the later ledger CAS still binds races."""
+        from ci_budget import BudgetLedger, settlement_digest
+        ledger = BudgetLedger(self.s3, self.cfg['bucket'], self.cfg['account'], repository=REPOSITORY,
+                              branch=BRANCH, budget_path=self.cfg.get('budget_path', DEFAULT_BUDGET))
+        run = ledger.report(run_id=self.run_id)['runs'].get(self.run_id)
+        if not run or not run.get('cleanup_verified') or not run.get('receipt', {}).get('cleanup_complete'):
+            raise ValueError('reconciliation requires a completed authoritative ledger settlement before cleanup')
+        data = self.journal.data or {}
+        pending = data.get('usage_reconciliation')
+        previous = pending.get('previous_settlement') if pending else data.get('settlement')
+        if (not previous or previous['receipt'].get('cleanup_complete') is not True
+                or previous['receipt'].get('usage_evidence', {}).get('accounting_basis') == 'observed-resources-v2'
+                or settlement_digest(self.run_id, previous['usage_usd'], previous['receipt']) != previous_digest):
+            raise ValueError('reconciliation requires the matching completed legacy journal settlement before cleanup')
+        if pending:
+            replacement = pending['replacement']
+            receipt = replacement['receipt']
+            if (pending['previous_settlement_digest'] != previous_digest
+                    or receipt.get('cleanup_complete') is not True
+                    or receipt.get('cleanup_evidence', {}).get('cleanup_complete') is not True
+                    or receipt.get('usage_evidence', {}).get('accounting_basis') != 'observed-resources-v2'
+                    or any(receipt.get(name) != expected for name, expected in (
+                        ('account', self.cfg['account']), ('run_id', self.run_id),
+                        ('repository', REPOSITORY), ('branch', BRANCH)))):
+                raise ValueError('pending reconciliation identity or cleanup binding differs')
+            replacement_digest = settlement_digest(self.run_id, replacement['usage_usd'], receipt)
+            committed = any(item['settlement_digest'] == previous_digest
+                and item['replacement_settlement_digest'] == replacement_digest
+                for item in run.get('usage_reconciliation_history', []))
+            if run.get('settlement_digest') != previous_digest and not committed:
+                raise ValueError('pending reconciliation is not bound to the authoritative settlement history')
+        elif run.get('settlement_digest') != previous_digest:
+            raise ValueError('reconciliation requires the matching completed authoritative ledger settlement before cleanup')
+        if self.active():
+            raise ValueError('cost reconciliation is closed-run only; active instances require ordinary authorized recovery')
+        return pending
+
+    def settle(self, cleanup, *, reconcile_digest=None):
         data = self.journal.data or {}
         if not data.get('budget_reserved'):
             return
-        from ci_budget import BudgetLedger, usage_cost_usd
+        from ci_budget import BudgetLedger, settlement_digest, usage_cost_usd
         ledger = BudgetLedger(self.s3, self.cfg['bucket'], self.cfg['account'], repository=REPOSITORY,
                               branch=BRANCH, budget_path=self.cfg.get('budget_path', DEFAULT_BUDGET))
         previous = data.get('settlement')
-        if previous and previous['receipt'].get('cleanup_complete') is True:
+        if reconcile_digest is not None:
+            if not re.fullmatch(r'[a-f0-9]{64}', reconcile_digest):
+                raise ValueError('reconciliation requires the previous ledger settlement digest')
+            if not cleanup.get('cleanup_complete'):
+                raise ValueError('reconciliation requires verified complete cleanup')
+            pending = data.get('usage_reconciliation')
+            if pending:
+                if pending['previous_settlement_digest'] != reconcile_digest:
+                    raise ValueError('reconciliation digest differs from immutable pending correction')
+                replacement = pending['replacement']
+                result = ledger.reconcile_usage(self.run_id, replacement['usage_usd'],
+                    replacement['receipt'], reconcile_digest)
+                if data.get('settlement') != replacement:
+                    data['settlement'] = replacement
+                    self.journal.save()
+                dump(self.output / 'settlement-receipt.json', replacement)
+                self.report_budget(ledger, 'reconcile-replay')
+                return result
+            if (not previous or previous['receipt'].get('cleanup_complete') is not True
+                    or previous['receipt'].get('usage_evidence', {}).get('accounting_basis') == 'observed-resources-v2'):
+                raise ValueError('explicit reconciliation requires a completed legacy estimate')
+            if settlement_digest(self.run_id, previous['usage_usd'], previous['receipt']) != reconcile_digest:
+                raise ValueError('previous settlement digest does not match immutable journal estimate')
+        if reconcile_digest is None and previous and previous['receipt'].get('cleanup_complete') is True:
             result = ledger.settle(self.run_id, previous['usage_usd'], previous['receipt'])
             dump(self.output / 'settlement-receipt.json', previous)
             self.report_budget(ledger, 'settle-replay')
             return result
         usage, evidence = Decimal(0), []
-        candidates = {item['instance_type']: item for item in data.get('candidates', [])}
         for item in cleanup['instances']:
             if item.get('final_state') != 'terminated' or not item.get('launch_time'):
                 continue
             candidate = next((candidate for candidate in data['candidates'] if candidate['region'] == item['region']
-                              and candidate['instance_type'] == item['instance_type']), candidates[item['instance_type']])
+                              and candidate['instance_type'] == item['instance_type']), None)
+            if candidate is None:
+                raise ValueError('observed instance has no exact regional price proof')
             duration = parsed(item['verified_utc']) - parsed(item['launch_time'])
             with localcontext() as context:
                 context.prec, context.rounding = 60, ROUND_CEILING
@@ -1848,19 +1981,37 @@ class Campaign:
                 usage += usage_cost_usd(charged_rate, elapsed)
             evidence.append(dict(instance_id=item['instance_id'], elapsed_seconds=str(elapsed),
                                  host_hourly_usd=str(charged_rate), price=candidate['price']))
-        s3_evidence = data.get('s3_accounting', data.get('overhead', {}))
+        s3_evidence = data.get('s3_accounting', {})
+        if s3_evidence.get('accounting_basis') != 'observed-resources-v2':
+            s3_evidence = dict(coverage='unavailable', estimate_usd=None,
+                               unknown_components=['S3 inventory, requests, transfers and elapsed storage unavailable'])
         with localcontext() as context:
             context.prec, context.rounding = 60, ROUND_CEILING
-            usage = usd_ceiling(usage + Decimal(s3_evidence.get('estimate_usd', '0')))
+            compute_usage = usd_ceiling(usage)
+            usage = usd_ceiling(usage + Decimal(s3_evidence.get('estimate_usd') or '0'))
         receipt = dict(cleanup_complete=cleanup['cleanup_complete'], cleanup_evidence=cleanup,
+            account=self.cfg['account'], run_id=self.run_id, repository=REPOSITORY, branch=BRANCH,
             **config_audit(self.cfg, data),
-            usage_evidence=dict(instances=evidence, s3=s3_evidence,
+            usage_evidence=dict(accounting_basis='observed-resources-v2', coverage='partial',
+                instances=evidence, compute_estimate_usd=str(compute_usage),
+                s3=s3_evidence, billing=dict(status='unavailable', amount_usd=None),
+                projections=s3_evidence.get('projections', dict(amount_usd=None,
+                    s3_retention_days=self.cfg['cost_assumptions']['retention_days'],
+                    basis='future retained-current-bytes storage only; excluded from usage_usd')),
                 elapsed_seconds=str(max((Decimal(item['elapsed_seconds']) for item in evidence), default=Decimal(0))),
-                components='EC2 Linux On-Demand, gp3, public IPv4, observed S3 bytes and reviewed request/transfer/retention assumptions; not final AWS bill'))
+                components='observed EC2 Linux On-Demand, gp3, public IPv4 lifetime; partial observed S3 priced upper bounds; not final AWS bill'))
         settlement = json.loads(encoded(dict(usage_usd=str(usage), receipt=receipt)))
-        data['settlement'] = settlement
-        self.journal.save()
-        result = ledger.settle(self.run_id, settlement['usage_usd'], settlement['receipt'])
+        if reconcile_digest is not None:
+            data['usage_reconciliation'] = dict(previous_settlement_digest=reconcile_digest,
+                previous_settlement=previous, replacement=settlement)
+            self.journal.save()
+            result = ledger.reconcile_usage(self.run_id, settlement['usage_usd'], settlement['receipt'], reconcile_digest)
+            data['settlement'] = settlement
+            self.journal.save()
+        else:
+            data['settlement'] = settlement
+            self.journal.save()
+            result = ledger.settle(self.run_id, settlement['usage_usd'], settlement['receipt'])
         dump(self.output / 'settlement-receipt.json', settlement)
         self.report_budget(ledger, 'settle')
         return result
@@ -1904,12 +2055,23 @@ def main():
     parser.add_argument('--budget-file', type=Path, default=DEFAULT_BUDGET)
     parser.add_argument('--offline', action='store_true')
     parser.add_argument('--run-id')
+    parser.add_argument('--expected-account', help='explicit configured owner for non-GitHub cleanup recovery')
+    parser.add_argument('--reconcile-usage', action='store_true', help='explicitly correct a completed legacy estimate')
+    parser.add_argument('--previous-settlement-digest', help='CAS digest from the existing ledger settlement')
     args = parser.parse_args()
     cfg, run_id, aws, campaign = None, None, None, None
     work_started = False
     try:
         cfg = load_config(args.config)
         cfg['budget_path'] = str(args.budget_file.absolute())
+        if args.reconcile_usage != bool(args.previous_settlement_digest):
+            raise ValueError('--reconcile-usage and --previous-settlement-digest are required together')
+        if args.reconcile_usage and (args.action != 'cleanup' or not args.run_id):
+            raise ValueError('reconciliation requires cleanup with an explicit old --run-id')
+        if args.previous_settlement_digest and not re.fullmatch(r'[a-f0-9]{64}', args.previous_settlement_digest):
+            raise ValueError('invalid previous settlement digest')
+        if args.expected_account is not None and (args.action != 'cleanup' or args.expected_account != cfg['account']):
+            raise ValueError('expected cleanup account must match configured owner')
         if args.action == 'plan':
             if not args.offline or not args.run_id:
                 raise ValueError('offline illustration requires plan --offline --run-id')
@@ -1918,10 +2080,15 @@ def main():
         else:
             if args.offline or (args.run_id and args.action != 'cleanup'):
                 raise ValueError('live allocation identity derives only from trusted GitHub environment')
-            run_id = trusted_run()
-            if args.run_id:
+            if args.action == 'cleanup' and args.run_id:
                 ownership(args.run_id)
+                if os.environ.get('GITHUB_ACTIONS') == 'true':
+                    trusted_run()
+                elif args.expected_account != cfg['account']:
+                    raise ValueError('local cleanup requires explicit --expected-account matching configured owner')
                 run_id = args.run_id
+            else:
+                run_id = trusted_run()
         if args.action != 'cleanup':
             if not all((args.build, args.fixture, args.verification)):
                 raise ValueError('build, fixture and local verification are required before admission')
@@ -1942,11 +2109,17 @@ def main():
             campaign = Campaign(aws, cfg, run_id, args.output, cleanup_only=True)
             if args.run_id and (not campaign.journal.data or campaign.journal_error):
                 raise ValueError('explicit old-run recovery requires its immutable same-account owned S3 journal')
+            if args.reconcile_usage:
+                pending = campaign.authorize_reconciliation(args.previous_settlement_digest)
+                if pending:
+                    cleanup = pending['replacement']['receipt']['cleanup_evidence']
+                    campaign.settle(cleanup, reconcile_digest=args.previous_settlement_digest)
+                    return 0
             cleanup = campaign.cleanup()
             try:
                 campaign.retrieve()
             finally:
-                campaign.settle(cleanup)
+                campaign.settle(cleanup, reconcile_digest=args.previous_settlement_digest)
             return 0 if cleanup['cleanup_complete'] else 1
         preflight = live_preflight(aws, cfg)
         dump(args.output / 'live-preflight.json', preflight)

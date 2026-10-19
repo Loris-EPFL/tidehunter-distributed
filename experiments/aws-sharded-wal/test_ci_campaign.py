@@ -680,6 +680,265 @@ class CampaignTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'matrix misses requested'):
             self.campaign.validate_results(cfg)
 
+    def no_launch_cleanup(self):
+        with patch.object(self.campaign, 'request', side_effect=ValueError('EC2 user data exceeds 16KiB')):
+            with self.assertRaisesRegex(ValueError, '16KiB'):
+                self.allocate()
+        receipt = self.campaign.cleanup()
+        self.assertTrue(receipt['cleanup_complete'], receipt['errors'])
+        self.assertEqual(receipt['instances'], [])
+        self.assertTrue(all(not ec2.requests for ec2 in self.aws.ec2.values()))
+        return receipt
+
+    def test_no_launch_books_only_observed_elapsed_storage_not_admission_assumptions(self):
+        cleanup = self.no_launch_cleanup()
+        inventory = [dict(Key=RUN + '/inputs/build-bundle.tar.gz', Size=245450666,
+                          LastModified=datetime.fromtimestamp(self.clock.time() - 120, timezone.utc))]
+        record = self.campaign.account_export(inventory)
+        self.campaign.settle(cleanup)
+        settled = Ledger.settlements[RUN]
+        evidence = settled['receipt']['usage_evidence']
+        self.assertEqual(evidence['accounting_basis'], 'observed-resources-v2')
+        self.assertEqual(Decimal(evidence['compute_estimate_usd']), 0)
+        self.assertEqual(evidence['instances'], [])
+        self.assertEqual(evidence['elapsed_seconds'], '0')
+        self.assertIsNone(record['request_estimate_usd'])
+        self.assertIsNone(record['transfer_estimate_usd'])
+        self.assertEqual(settled['usage_usd'], record['storage_estimate_usd'])
+        self.assertLess(Decimal(settled['usage_usd']), Decimal('0.50'))
+        self.assertGreater(Decimal(record['projections']['amount_usd']), Decimal(settled['usage_usd']))
+        self.assertEqual(evidence['billing'], dict(status='unavailable', amount_usd=None))
+        self.assertIn('historical/guest/managed-transfer requests and retries', record['unknown_components'])
+        self.assertEqual(self.campaign.journal.data['overhead']['assumptions']['request_count'], 100000)
+
+    def test_elapsed_storage_and_future_projection_are_separate_measures(self):
+        self.no_launch_cleanup()
+        inventory = [dict(Key=RUN + '/inputs/fixture.tar.gz', Size=1024**3,
+                          LastModified=datetime.fromtimestamp(self.clock.time() - 86400, timezone.utc))]
+        first = self.campaign.account_export(inventory)
+        with localcontext() as context:
+            context.prec = 60
+            expected = ci.usd_ceiling(Decimal('0.023') / Decimal(28))
+        self.assertEqual(Decimal(first['storage_estimate_usd']), expected)
+        self.assertEqual(Decimal(first['estimate_usd']), expected)
+        self.assertEqual(first['storage_observed_byte_seconds'], str(Decimal(1024**3 * 86400)))
+        self.clock.sleep(3600)
+        later = self.campaign.account_export(inventory)
+        self.assertGreater(Decimal(later['storage_estimate_usd']), Decimal(first['storage_estimate_usd']))
+        self.assertEqual(later['projections'], first['projections'])
+        self.assertIn('excluded from usage_usd', first['projections']['basis'])
+
+    def test_known_local_retrieval_bytes_are_cumulative_without_guest_multipliers(self):
+        self.no_launch_cleanup()
+        contents = {RUN + '/inputs/fixture.tar.gz': b'input-bytes',
+                    RUN + '/results/raw/partial.log': b'actual-result'}
+        for key, value in contents.items():
+            self.aws.s3.put_object(Bucket=self.cfg['bucket'], Key=key, Body=value,
+                ExpectedBucketOwner=ACCOUNT, ServerSideEncryption='AES256')
+        for count in (1, 2):
+            receipt = self.campaign.retrieve()
+            record = receipt['s3_accounting']
+            observed = record['observations']
+            byte_count = sum(map(len, contents.values()))
+            self.assertEqual(observed['successful_local_read_bytes'], byte_count)
+            self.assertEqual(observed['successful_requests'], dict(ListObjectsV2=count, HeadObject=count * len(contents)))
+            with localcontext() as context:
+                context.prec = 60
+                expected = ci.usd_ceiling(Decimal(byte_count) / Decimal(1024**3) * Decimal('0.09'))
+            self.assertEqual(Decimal(record['transfer_estimate_usd']), expected)
+            self.assertEqual(record['coverage'], 'partial')
+            self.assertEqual({item['key'] for item in receipt['files']}, set(contents))
+            self.assertEqual({item['retrieval_mode'] for item in receipt['files']},
+                             {'download' if count == 1 else 'local-sha256-reuse'})
+        restarted = ci.Campaign(self.aws, self.cfg, RUN, self.output, clock=self.clock, cleanup_only=True)
+        self.assertEqual(restarted.journal.data['s3_observations'], observed)
+        key = RUN + '/inputs/fixture.tar.gz'
+        (self.output / 's3' / key).write_bytes(b'changed-local-input')
+        fetched = restarted.retrieve()
+        self.assertEqual(fetched['s3_accounting']['observations']['successful_local_read_bytes'],
+                         byte_count + len(contents[key]))
+        modes = {item['key']: item['retrieval_mode'] for item in fetched['files']}
+        self.assertEqual(modes[key], 'download')
+        self.assertEqual(modes[RUN + '/results/raw/partial.log'], 'local-sha256-reuse')
+
+    def test_local_reuse_requires_remote_sha_metadata_not_just_size_or_etag(self):
+        self.no_launch_cleanup()
+        key, value = RUN + '/inputs/unbound.tar.gz', b'unbound-input'
+        self.aws.s3.put_object(Bucket=self.cfg['bucket'], Key=key, Body=value,
+            ExpectedBucketOwner=ACCOUNT, ServerSideEncryption='AES256')
+        target = self.output / 's3' / key
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(value)
+        original_head, original_download = self.aws.s3.head_object, self.aws.s3.download_file
+        def unbound_head(**kwargs):
+            head = original_head(**kwargs)
+            head['Metadata'] = {}
+            return head
+        with patch.object(self.aws.s3, 'head_object', side_effect=unbound_head), \
+                patch.object(self.aws.s3, 'download_file', wraps=original_download) as download:
+            receipt = self.campaign.retrieve()
+        download.assert_called_once()
+        self.assertEqual(receipt['files'][0]['retrieval_mode'], 'download')
+        self.assertEqual(receipt['s3_accounting']['observations']['successful_local_read_bytes'], len(value))
+
+    def test_input_verification_accounts_actual_completed_read_length(self):
+        self.no_launch_cleanup()
+        path, key = self.output / 'verified-input.tar.gz', RUN + '/inputs/verified-input.tar.gz'
+        path.write_bytes(b'expected-complete-input')
+        self.aws.s3.put_object(Bucket=self.cfg['bucket'], Key=key, Body=path.read_bytes(),
+            ExpectedBucketOwner=ACCOUNT, ServerSideEncryption='AES256')
+        # A complete shorter response must fail admission, not invent declared bytes.
+        with patch.object(self.aws.s3, 'get_object', return_value={'Body': io.BytesIO(b'short')}):
+            with self.assertRaisesRegex(ValueError, 'full-object digest differs'):
+                self.campaign.upload(path, key)
+        counters = self.campaign.journal.data['s3_observations']
+        self.assertEqual(counters['successful_local_read_bytes'], len(b'short'))
+        self.assertEqual(counters['successful_requests'], dict(HeadObject=1, GetObject=1))
+        binding = self.campaign.upload(path, key)
+        self.assertEqual(binding['bytes'], path.stat().st_size)
+        self.assertEqual(counters['successful_local_read_bytes'], len(b'short') + path.stat().st_size)
+
+    def test_partial_retrieval_does_not_book_failed_or_unverified_bytes_as_success(self):
+        self.no_launch_cleanup()
+        good, failed = RUN + '/results/complete.log', RUN + '/results/interrupted.log'
+        for key in (good, failed):
+            self.aws.s3.put_object(Bucket=self.cfg['bucket'], Key=key, Body=b'complete-value',
+                ExpectedBucketOwner=ACCOUNT, ServerSideEncryption='AES256')
+        original = self.aws.s3.download_file
+        def interrupted(bucket, key, destination, **kwargs):
+            if key == failed:
+                Path(destination).write_bytes(b'partial')
+                raise OSError('download interrupted')
+            return original(bucket, key, destination, **kwargs)
+        with patch.object(self.aws.s3, 'download_file', side_effect=interrupted):
+            with self.assertRaisesRegex(RuntimeError, 'retrieval failed'):
+                self.campaign.retrieve()
+        manifest = ci.read_json(self.output / 'retrieval-manifest.json')
+        observed = manifest['s3_accounting']['observations']
+        self.assertFalse(manifest['complete'])
+        self.assertEqual(observed['successful_local_read_bytes'], len(b'complete-value'))
+        self.assertEqual(observed['failed_managed_downloads'], 1)
+        self.assertEqual({item['key'] for item in manifest['files']}, {good})
+        self.assertIn('failed/partial reads', ' '.join(manifest['s3_accounting']['unknown_components']))
+
+    def test_completed_download_is_counted_even_when_later_integrity_check_fails(self):
+        self.no_launch_cleanup()
+        key, value = RUN + '/results/corrupt.log', b'completed-transfer'
+        self.aws.s3.put_object(Bucket=self.cfg['bucket'], Key=key, Body=value,
+            ExpectedBucketOwner=ACCOUNT, ServerSideEncryption='AES256')
+        with patch.object(self.aws.s3, 'head_object', return_value=dict(ContentLength=len(value),
+                          Metadata={'sha256': 'f' * 64})):
+            with self.assertRaisesRegex(RuntimeError, 'retrieval failed'):
+                self.campaign.retrieve()
+        manifest = ci.read_json(self.output / 'retrieval-manifest.json')
+        self.assertFalse(manifest['complete'])
+        self.assertEqual(manifest['s3_accounting']['observations']['successful_local_read_bytes'], len(value))
+        self.assertEqual(manifest['s3_accounting']['observations']['failed_managed_downloads'], 0)
+        self.assertEqual(manifest['files'], [])
+
+    def test_missing_observations_remain_unknown_and_never_fall_back_to_forecast(self):
+        cleanup = self.no_launch_cleanup()
+        self.campaign.settle(cleanup)
+        evidence = Ledger.settlements[RUN]['receipt']['usage_evidence']
+        self.assertEqual(Decimal(Ledger.settlements[RUN]['usage_usd']), 0)
+        self.assertEqual(evidence['s3']['coverage'], 'unavailable')
+        self.assertIsNone(evidence['s3']['estimate_usd'])
+        self.assertIsNone(evidence['projections']['amount_usd'])
+        # A later measured inventory with no timestamps cannot invent object ages.
+        record = self.campaign.account_export([dict(Key=RUN + '/inputs/fixture.tar.gz', Size=1024**3)])
+        self.assertIsNone(record['storage_estimate_usd'])
+        self.assertIsNone(record['request_estimate_usd'])
+        self.assertIsNone(record['transfer_estimate_usd'])
+        self.assertEqual(record['storage_missing_timestamps'], 1)
+        self.assertIn('elapsed storage for objects without LastModified', record['unknown_components'])
+
+    def test_legacy_reconciliation_uses_real_ledger_cas_history_and_idempotency(self):
+        with patch('ci_budget.BudgetLedger', ActualBudgetLedger):
+            ledger = ActualBudgetLedger(self.aws.s3, self.cfg['bucket'], ACCOUNT, budget_path=self.budget_file)
+            ledger.initialize()
+            cleanup = self.no_launch_cleanup()
+            old = dict(usage_usd='0.665648825373', receipt=dict(cleanup_complete=True, cleanup_evidence=cleanup,
+                usage_evidence=dict(instances=[], elapsed_seconds='0', s3=dict(request_estimate_usd='0.50'))))
+            ledger.settle(RUN, old['usage_usd'], old['receipt'])
+            self.campaign.journal.data['settlement'] = copy.deepcopy(old)
+            self.campaign.journal.save()
+            original = ledger.report(run_id=RUN)['runs'][RUN]
+            # Default settle never silently rewrites a legacy completed estimate.
+            self.campaign.account_export([dict(Key=RUN + '/inputs/fixture.tar.gz', Size=245450666,
+                LastModified=datetime.fromtimestamp(self.clock.time() - 120, timezone.utc))])
+            self.campaign.settle(cleanup)
+            self.assertEqual(ledger.report(run_id=RUN)['runs'][RUN]['receipt'], old['receipt'])
+            with self.assertRaisesRegex(ValueError, 'digest does not match'):
+                self.campaign.settle(cleanup, reconcile_digest='f' * 64)
+            self.assertNotIn('usage_reconciliation', self.campaign.journal.data)
+            digest = original['settlement_digest']
+            self.campaign.settle(cleanup, reconcile_digest=digest)
+            report = ledger.report(run_id=RUN)
+            corrected = report['runs'][RUN]
+            history = corrected['usage_reconciliation_history']
+            self.assertEqual(len(history), 1)
+            self.assertEqual(history[0]['receipt'], old['receipt'])
+            self.assertEqual(history[0]['usage_estimated_usd'], old['usage_usd'])
+            self.assertEqual(history[0]['settlement_digest'], digest)
+            self.assertEqual(corrected['reserved_usd'], original['reserved_usd'])
+            self.assertEqual(corrected['settled_at'], original['settled_at'])
+            self.assertEqual(corrected['active_reservation_usd'], '0')
+            self.assertIsNone(corrected['aws_billed_to_date_usd'])
+            self.assertEqual(report['weekly_budget_usd'], '60')
+            self.assertEqual(corrected['usage_accounting_basis'], 'observed-resources-v2')
+            self.assertLess(Decimal(corrected['usage_estimated_usd']), Decimal(old['usage_usd']))
+            self.clock.sleep(3600)
+            self.campaign.settle(cleanup, reconcile_digest=digest)
+            replayed = ledger.report(run_id=RUN)['runs'][RUN]
+            self.assertEqual(replayed, corrected)
+            self.assertEqual(self.campaign.journal.data['usage_reconciliation']['previous_settlement'], old)
+
+    def test_reconciliation_unknown_acknowledgement_replays_persisted_receipt(self):
+        with patch('ci_budget.BudgetLedger', ActualBudgetLedger):
+            ledger = ActualBudgetLedger(self.aws.s3, self.cfg['bucket'], ACCOUNT, budget_path=self.budget_file)
+            ledger.initialize()
+            cleanup = self.no_launch_cleanup()
+            old = dict(usage_usd='0.665648825373', receipt=dict(cleanup_complete=True, cleanup_evidence=cleanup,
+                usage_evidence=dict(instances=[], elapsed_seconds='0', s3=dict(request_estimate_usd='0.50'))))
+            ledger.settle(RUN, old['usage_usd'], old['receipt'])
+            self.campaign.journal.data['settlement'] = copy.deepcopy(old)
+            self.campaign.journal.save()
+            digest = ledger.report(run_id=RUN)['runs'][RUN]['settlement_digest']
+            self.campaign.account_export([dict(Key=RUN + '/inputs/fixture.tar.gz', Size=245450666,
+                LastModified=datetime.fromtimestamp(self.clock.time() - 120, timezone.utc))])
+            original = ActualBudgetLedger.reconcile_usage
+            def committed_but_unknown(owner, *args, **kwargs):
+                original(owner, *args, **kwargs)
+                raise OSError('acknowledgement unavailable after committed conditional write')
+            with patch.object(ActualBudgetLedger, 'reconcile_usage', new=committed_but_unknown):
+                with self.assertRaisesRegex(OSError, 'acknowledgement unavailable'):
+                    self.campaign.settle(cleanup, reconcile_digest=digest)
+            committed = ledger.report(run_id=RUN)['runs'][RUN]
+            self.assertEqual(self.campaign.journal.data['settlement'], old)
+            restarted = ci.Campaign(self.aws, self.cfg, RUN, self.output, clock=self.clock, cleanup_only=True)
+            self.clock.sleep(3600)
+            restarted.settle(cleanup, reconcile_digest=digest)
+            self.assertEqual(ledger.report(run_id=RUN)['runs'][RUN], committed)
+            self.assertEqual(restarted.journal.data['settlement']['receipt'], committed['receipt'])
+            self.assertEqual(len(committed['usage_reconciliation_history']), 1)
+
+    def test_reconciliation_cannot_release_unverified_cleanup_reservation(self):
+        with patch('ci_budget.BudgetLedger', ActualBudgetLedger):
+            ledger = ActualBudgetLedger(self.aws.s3, self.cfg['bucket'], ACCOUNT, budget_path=self.budget_file)
+            ledger.initialize()
+            self.allocate()
+            ec2 = self.aws.ec2['us-east-1']
+            ec2.never_terminates.add(ec2.instances[0]['InstanceId'])
+            cleanup = self.campaign.cleanup()
+            self.assertFalse(cleanup['cleanup_complete'])
+            self.campaign.settle(cleanup)
+            report = ledger.report(run_id=RUN)
+            run = report['runs'][RUN]
+            self.assertFalse(run['reservation_released'])
+            self.assertEqual(run['active_reservation_usd'], run['reserved_usd'])
+            with self.assertRaisesRegex(ValueError, 'verified complete cleanup'):
+                self.campaign.settle(cleanup, reconcile_digest=run['settlement_digest'])
+
     def test_actual_export_size_excess_is_recorded_with_live_price_assumptions(self):
         self.allocate()
         record = self.campaign.account_export([
@@ -688,7 +947,10 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(record['retained_bytes'], 4 * 1024**3)
         self.assertTrue(record['export_allowance_exceeded'])
         self.assertIn('not a final AWS bill', record['scope'])
-        self.assertEqual(record['assumptions']['retention_days'], 30)
+        self.assertEqual(record['projections']['s3_retention_days'], 30)
+        self.assertIsNone(record['request_estimate_usd'])
+        self.assertIsNone(record['transfer_estimate_usd'])
+        self.assertEqual(record['coverage'], 'partial')
 
     def test_journalled_ids_hidden_from_tag_listing_are_still_terminated(self):
         self.allocate()
@@ -840,8 +1102,8 @@ class CampaignTests(unittest.TestCase):
             cleanup = self.campaign.cleanup()
             self.assertTrue(cleanup['cleanup_complete'], cleanup['errors'])
             s3_cost = self.campaign.account_export([
-                dict(Key=RUN + '/inputs/build-bundle.tar.gz', Size=1024**3 + 17),
-                dict(Key=RUN + '/results/controller.tar.gz', Size=123456789)])
+                dict(Key=RUN + '/inputs/build-bundle.tar.gz', Size=1024**3 + 17, LastModified=launched),
+                dict(Key=RUN + '/results/controller.tar.gz', Size=123456789, LastModified=launched)])
             self.assertGreaterEqual(Decimal(s3_cost['storage_estimate_usd']).as_tuple().exponent, -12)
             self.campaign.settle(cleanup)
             settled = ledger.report(run_id=RUN)['runs'][RUN]
@@ -1030,14 +1292,17 @@ class CampaignTests(unittest.TestCase):
         self.assertNotIn('IamInstanceProfile', request)
         self.assertEqual(len({value['role_name'] for value in plan['instance_profiles'].values()}), 6)
 
-    def recovery_cli(self, run_id, env=None):
+    def recovery_cli(self, run_id, env=None, *, local=False, extra=()):
         environment = dict(GITHUB_ACTIONS='true', GITHUB_REPOSITORY=ci.REPOSITORY,
             GITHUB_REF='refs/heads/' + ci.BRANCH, GITHUB_EVENT_NAME='workflow_dispatch',
             GITHUB_RUN_ID='999999', GITHUB_RUN_ATTEMPT='1')
+        if local:
+            environment = {}
         if env:
             environment.update(env)
         argv = ['ci_campaign.py', 'cleanup', '--config', 'setup.json', '--output',
                 str(self.output / 'recovery'), '--budget-file', str(self.budget_file), '--run-id', run_id]
+        argv.extend(extra)
         with patch.dict(ci.os.environ, environment, clear=True), patch.object(ci.sys, 'argv', argv):
             with patch.object(ci, 'load_config', return_value=copy.deepcopy(self.cfg)), \
                     patch.object(ci, 'AWS', return_value=self.aws):
@@ -1068,6 +1333,188 @@ class CampaignTests(unittest.TestCase):
         self.allocate()
         self.assertEqual(self.recovery_cli(RUN, {'GITHUB_REF': 'refs/heads/main'}), 1)
         self.assertEqual(self.aws.ec2['us-east-1'].terminations, [])
+
+    def test_local_recovery_requires_explicit_expected_account_and_never_allocates(self):
+        self.allocate()
+        self.assertEqual(self.recovery_cli(RUN, local=True), 1)
+        self.assertEqual(self.aws.ec2['us-east-1'].terminations, [])
+        self.assertEqual(self.recovery_cli(RUN, local=True, extra=('--expected-account', ACCOUNT)), 0)
+        self.assertEqual(len(self.aws.ec2['us-east-1'].terminations), 6)
+        self.assertEqual(len(self.aws.ec2['us-east-1'].requests), 1)
+        self.assertEqual(self.aws.ec2['us-east-2'].requests, [])
+
+    def test_local_recovery_rejects_wrong_caller_before_any_mutation(self):
+        self.allocate()
+        identity = SimpleNamespace(get_caller_identity=lambda: {'Account': '999999999999'})
+        original = self.aws.client
+        with patch.object(self.aws, 'client', side_effect=lambda service, region:
+                          identity if service == 'sts' else original(service, region)):
+            self.assertEqual(self.recovery_cli(RUN, local=True, extra=('--expected-account', ACCOUNT)), 1)
+        self.assertEqual(self.aws.ec2['us-east-1'].terminations, [])
+        self.assertEqual(self.aws.iam.deleted, [])
+
+    def test_local_recovery_rejects_invalid_identity_and_foreign_repository_or_branch_journal(self):
+        self.allocate()
+        self.assertEqual(self.recovery_cli('th-invalid', local=True, extra=('--expected-account', ACCOUNT)), 1)
+        self.assertEqual(self.aws.ec2['us-east-1'].terminations, [])
+        for field, value in (('Repository', 'foreign/repository'), ('BenchmarkBranch', 'main')):
+            with self.subTest(field=field):
+                journal = copy.deepcopy(self.campaign.journal.data)
+                journal['ownership'][field] = value
+                self.aws.s3.objects[self.campaign.journal.key] = ci.encoded(journal)
+                self.assertEqual(self.recovery_cli(RUN, local=True, extra=('--expected-account', ACCOUNT)), 1)
+                self.assertEqual(self.aws.ec2['us-east-1'].terminations, [])
+                self.assertEqual(self.aws.iam.deleted, [])
+
+    def test_local_run_cannot_use_cleanup_authorization_to_allocate(self):
+        argv = ['ci_campaign.py', 'run', '--config', 'setup.json', '--output', str(self.output),
+                '--run-id', RUN, '--expected-account', ACCOUNT]
+        with patch.dict(ci.os.environ, {}, clear=True), patch.object(ci.sys, 'argv', argv), \
+                patch.object(ci, 'load_config', return_value=copy.deepcopy(self.cfg)), patch.object(ci, 'AWS') as aws:
+            self.assertEqual(ci.main(), 1)
+        aws.assert_not_called()
+
+    def test_stale_reconciliation_digest_aborts_before_any_cleanup_mutation(self):
+        with patch('ci_budget.BudgetLedger', ActualBudgetLedger):
+            ledger = ActualBudgetLedger(self.aws.s3, self.cfg['bucket'], ACCOUNT, budget_path=self.budget_file)
+            ledger.initialize()
+            cleanup = self.no_launch_cleanup()
+            previous = dict(usage_usd='0.665648825373', receipt=dict(cleanup_complete=True,
+                cleanup_evidence=cleanup, usage_evidence=dict(instances=[], elapsed_seconds='0')))
+            ledger.settle(RUN, previous['usage_usd'], previous['receipt'])
+            self.campaign.journal.data['settlement'] = previous
+            self.campaign.journal.save()
+            objects, deleted = copy.deepcopy(self.aws.s3.objects), list(self.aws.iam.deleted)
+            result = self.recovery_cli(RUN, local=True, extra=('--expected-account', ACCOUNT,
+                '--reconcile-usage', '--previous-settlement-digest', 'f' * 64))
+            self.assertEqual(result, 1)
+            self.assertEqual(self.aws.s3.objects, objects)
+            self.assertEqual(self.aws.iam.deleted, deleted)
+            self.assertTrue(all(not ec2.terminations for ec2 in self.aws.ec2.values()))
+            self.assertTrue(all(not ec2.requests for ec2 in self.aws.ec2.values()))
+
+    def test_reconciliation_cannot_shutdown_an_active_unsettled_campaign(self):
+        with patch('ci_budget.BudgetLedger', ActualBudgetLedger):
+            ledger = ActualBudgetLedger(self.aws.s3, self.cfg['bucket'], ACCOUNT, budget_path=self.budget_file)
+            ledger.initialize()
+            self.allocate()
+            objects = copy.deepcopy(self.aws.s3.objects)
+            result = self.recovery_cli(RUN, local=True, extra=('--expected-account', ACCOUNT,
+                '--reconcile-usage', '--previous-settlement-digest', 'a' * 64))
+            self.assertEqual(result, 1)
+            self.assertEqual(self.aws.s3.objects, objects)
+            self.assertEqual(self.aws.iam.deleted, [])
+            self.assertEqual(self.aws.ec2['us-east-1'].terminations, [])
+            self.assertTrue(all(item['State']['Name'] == 'running' for item in self.aws.ec2['us-east-1'].instances))
+
+    def test_reconciliation_rejects_live_instances_even_with_completed_settlement(self):
+        with patch('ci_budget.BudgetLedger', ActualBudgetLedger):
+            ledger = ActualBudgetLedger(self.aws.s3, self.cfg['bucket'], ACCOUNT, budget_path=self.budget_file)
+            ledger.initialize()
+            self.allocate()
+            cleanup = self.campaign.cleanup()
+            self.assertTrue(cleanup['cleanup_complete'], cleanup['errors'])
+            previous = dict(usage_usd='0.665648825373', receipt=dict(cleanup_complete=True,
+                cleanup_evidence=cleanup, usage_evidence=dict(instances=[], elapsed_seconds='0')))
+            ledger.settle(RUN, previous['usage_usd'], previous['receipt'])
+            self.campaign.journal.data['settlement'] = previous
+            self.campaign.journal.save()
+            digest = ledger.report(run_id=RUN)['runs'][RUN]['settlement_digest']
+            # A later live observation must override the older closed-run assumption.
+            self.aws.ec2['us-east-1'].instances[0]['State']['Name'] = 'running'
+            objects = copy.deepcopy(self.aws.s3.objects)
+            terminated, deleted = list(self.aws.ec2['us-east-1'].terminations), list(self.aws.iam.deleted)
+            result = self.recovery_cli(RUN, local=True, extra=('--expected-account', ACCOUNT,
+                '--reconcile-usage', '--previous-settlement-digest', digest))
+            self.assertEqual(result, 1)
+            self.assertEqual(self.aws.s3.objects, objects)
+            self.assertEqual(self.aws.ec2['us-east-1'].terminations, terminated)
+            self.assertEqual(self.aws.iam.deleted, deleted)
+            self.assertEqual(self.aws.ec2['us-east-1'].instances[0]['State']['Name'], 'running')
+
+    def test_local_closed_run_reconciliation_cli_uses_authoritative_digest(self):
+        with patch('ci_budget.BudgetLedger', ActualBudgetLedger):
+            ledger = ActualBudgetLedger(self.aws.s3, self.cfg['bucket'], ACCOUNT, budget_path=self.budget_file)
+            ledger.initialize()
+            cleanup = self.no_launch_cleanup()
+            previous = dict(usage_usd='0.665648825373', receipt=dict(cleanup_complete=True,
+                cleanup_evidence=cleanup, usage_evidence=dict(instances=[], elapsed_seconds='0')))
+            ledger.settle(RUN, previous['usage_usd'], previous['receipt'])
+            self.campaign.journal.data['settlement'] = previous
+            self.campaign.journal.save()
+            original = ledger.report(run_id=RUN)['runs'][RUN]
+            result = self.recovery_cli(RUN, local=True, extra=('--expected-account', ACCOUNT,
+                '--reconcile-usage', '--previous-settlement-digest', original['settlement_digest']))
+            self.assertEqual(result, 0)
+            report = ledger.report(run_id=RUN)
+            corrected = report['runs'][RUN]
+            self.assertEqual(corrected['usage_accounting_basis'], 'observed-resources-v2')
+            self.assertEqual(corrected['usage_reconciliation_history'][0]['receipt'], previous['receipt'])
+            self.assertEqual(corrected['reserved_usd'], original['reserved_usd'])
+            self.assertEqual(report['weekly_budget_usd'], '60')
+            self.assertTrue(all(not ec2.requests for ec2 in self.aws.ec2.values()))
+
+    def test_main_cli_replays_committed_unknown_acknowledgement_and_completed_retry(self):
+        with patch('ci_budget.BudgetLedger', ActualBudgetLedger):
+            ledger = ActualBudgetLedger(self.aws.s3, self.cfg['bucket'], ACCOUNT, budget_path=self.budget_file)
+            ledger.initialize()
+            cleanup = self.no_launch_cleanup()
+            previous = dict(usage_usd='0.665648825373', receipt=dict(cleanup_complete=True,
+                cleanup_evidence=cleanup, usage_evidence=dict(instances=[], elapsed_seconds='0')))
+            ledger.settle(RUN, previous['usage_usd'], previous['receipt'])
+            self.campaign.journal.data['settlement'] = previous
+            self.campaign.journal.save()
+            digest = ledger.report(run_id=RUN)['runs'][RUN]['settlement_digest']
+            key = RUN + '/inputs/retained-fixture.tar.gz'
+            self.aws.s3.put_object(Bucket=self.cfg['bucket'], Key=key, Body=b'actual-retained-input',
+                ExpectedBucketOwner=ACCOUNT, ServerSideEncryption='AES256')
+            extra = ('--expected-account', ACCOUNT, '--reconcile-usage', '--previous-settlement-digest', digest)
+            original_reconcile = ActualBudgetLedger.reconcile_usage
+            def committed_but_unknown(owner, *args, **kwargs):
+                original_reconcile(owner, *args, **kwargs)
+                raise OSError('committed reconciliation acknowledgement unavailable')
+            with patch.object(self.aws.s3, 'download_file', wraps=self.aws.s3.download_file) as download, \
+                    patch.object(self.aws.s3, 'list_objects_v2', wraps=self.aws.s3.list_objects_v2) as listing:
+                with patch.object(ActualBudgetLedger, 'reconcile_usage', new=committed_but_unknown):
+                    self.assertEqual(self.recovery_cli(RUN, local=True, extra=extra), 1)
+                committed = ledger.report(run_id=RUN)['runs'][RUN]
+                pending_journal = ci.Journal(self.aws.s3, self.cfg, RUN, self.output).data
+                self.assertEqual(pending_journal['settlement'], previous)
+                replacement = pending_journal['usage_reconciliation']['replacement']
+                self.assertEqual(replacement['receipt'], committed['receipt'])
+                self.assertEqual(len(committed['usage_reconciliation_history']), 1)
+                self.assertEqual(download.call_count, 1)
+                first_downloads, first_listings = download.call_count, listing.call_count
+                manifest = self.output / 'recovery' / 'retrieval-manifest.json'
+                manifest_bytes = manifest.read_bytes()
+                deleted = list(self.aws.iam.deleted)
+                terminations = {region: list(ec2.terminations) for region, ec2 in self.aws.ec2.items()}
+                for attempt in range(2):
+                    with self.subTest(retry=attempt):
+                        self.assertEqual(self.recovery_cli(RUN, local=True, extra=extra), 0)
+                        self.assertEqual(ledger.report(run_id=RUN)['runs'][RUN], committed)
+                        current_journal = ci.Journal(self.aws.s3, self.cfg, RUN, self.output).data
+                        self.assertEqual(current_journal['settlement'], replacement)
+                        self.assertEqual(current_journal['usage_reconciliation'], pending_journal['usage_reconciliation'])
+                        self.assertEqual(manifest.read_bytes(), manifest_bytes)
+                        self.assertEqual(download.call_count, first_downloads)
+                        self.assertEqual(listing.call_count, first_listings)
+                        self.assertEqual(self.aws.iam.deleted, deleted)
+                        self.assertEqual({region: list(ec2.terminations) for region, ec2 in self.aws.ec2.items()}, terminations)
+                # A different stale digest still cannot use the exact-retry path.
+                extra = ('--expected-account', ACCOUNT, '--reconcile-usage', '--previous-settlement-digest', 'f' * 64)
+                self.assertEqual(self.recovery_cli(RUN, local=True, extra=extra), 1)
+                self.assertEqual(download.call_count, first_downloads)
+                self.assertEqual(listing.call_count, first_listings)
+                self.assertEqual(ledger.report(run_id=RUN)['runs'][RUN], committed)
+
+    def test_reconciliation_cli_requires_explicit_cleanup_run_and_digest_pair(self):
+        for extra in (('--reconcile-usage',), ('--previous-settlement-digest', 'a' * 64),
+                      ('--reconcile-usage', '--previous-settlement-digest', 'invalid')):
+            with self.subTest(extra=extra), patch.object(ci, 'AWS') as aws:
+                self.assertEqual(self.recovery_cli(RUN, local=True,
+                    extra=('--expected-account', ACCOUNT, *extra)), 1)
+                aws.assert_not_called()
 
 
 

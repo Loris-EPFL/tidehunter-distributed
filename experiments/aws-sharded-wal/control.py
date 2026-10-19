@@ -14,6 +14,7 @@ import hashlib
 import importlib.util
 import ipaddress
 import json
+import lzma
 import os
 from pathlib import Path
 import re
@@ -22,7 +23,6 @@ import shlex
 import sys
 import subprocess
 import urllib.request
-import zlib
 import stage_timing
 
 HERE = Path(__file__).resolve().parent
@@ -857,17 +857,17 @@ with tarfile.open(archive) as stream:
     bootstrap_command = f'printf %s {shlex.quote(bootstrap)} | base64 -d > /root/sharded-wal-bootstrap.py'
     if p.get('atomic_controller') is True:
         from atomic_start import launch_contract
-        # One compressed capsule shares repeated metadata/code text. Base85
-        # keeps the raw ASCII EC2 payload below its 16 KiB boundary; boto3 owns
-        # API base64 encoding, so this must remain an ordinary shell script.
-        capsule = base64.b85encode(zlib.compress(encoded({
+        # LZMA and Base85 keep the complete source/metadata capsule within the
+        # checked EC2 wire limit. Boto3 owns API base64 encoding, so the result
+        # remains an ordinary shell script rather than pre-encoded user data.
+        capsule = base64.b85encode(lzma.compress(encoded({
             'bootstrap': (HERE / 'bootstrap.py').read_text(),
             'atomic': (HERE / 'atomic_start.py').read_text(),
             'plan': launch_contract(p),
-        }), 9)).decode()
+        }))).decode()
         bootstrap_command = '/usr/bin/python3 -c ' + shlex.quote(
-            "import base64,json,pathlib,zlib;"
-            f"data=json.loads(zlib.decompress(base64.b85decode({capsule!r})));"
+            "import base64,json,lzma,pathlib;"
+            f"data=json.loads(lzma.decompress(base64.b85decode({capsule!r})));"
             "pathlib.Path('/root/sharded-wal-bootstrap.py').write_text(data['bootstrap']);"
             "pathlib.Path('/root/sharded-wal-atomic-start.py').write_text(data['atomic']);"
             "pathlib.Path('/root/sharded-wal-atomic-plan.json').write_text(json.dumps(data['plan']))")
