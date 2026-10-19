@@ -343,12 +343,17 @@ class AWS:
         self.session = boto3.Session()
         self.config = Config(connect_timeout=5, read_timeout=20,
                              retries={'mode': 'standard', 'total_max_attempts': 1})
+        # Lambda is used only for readiness reads and the read-only health probe.
+        # Retry transient Lambda throttling without replaying EC2 mutation requests.
+        self.lambda_readiness_config = self.config.merge(Config(
+            retries={'mode': 'standard', 'total_max_attempts': 12}))
         self.clients = {}
 
     def client(self, service, region):
         key = service, region
         if key not in self.clients:
-            self.clients[key] = self.session.client(service, region_name=region, config=self.config)
+            config = self.lambda_readiness_config if service == 'lambda' else self.config
+            self.clients[key] = self.session.client(service, region_name=region, config=config)
         return self.clients[key]
 
 

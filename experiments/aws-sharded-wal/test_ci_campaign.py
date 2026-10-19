@@ -38,6 +38,179 @@ class Clock:
         self.now += seconds
 
 
+class SDKReadinessRetryTests(unittest.TestCase):
+    """Real botocore endpoints/parsers/retry handlers over a scripted HTTP transport."""
+
+    class Body(io.BytesIO):
+        def stream(self, amt=1024, decode_content=False):
+            while chunk := self.read(amt):
+                yield chunk
+
+    class HTTP:
+        def __init__(self, responses):
+            self.responses, self.requests = list(responses), []
+
+        def send(self, request):
+            from botocore.awsrequest import AWSResponse
+            self.requests.append(dict(method=request.method, url=request.url, body=request.body))
+            if not self.responses:
+                raise AssertionError('unexpected SDK HTTP attempt')
+            response = self.responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            status, headers, body = response
+            headers = dict(headers, **{'Content-Length': str(len(body))})
+            return AWSResponse(request.url, status, headers, SDKReadinessRetryTests.Body(body))
+
+    def setUp(self):
+        import ci_watchdog
+        from test_ci_watchdog import ACCOUNT as owner, BOUNDARY, REGION, function_configuration
+        self.watchdog, self.region = ci_watchdog, REGION
+        self.function = function_configuration()
+        self.rule = dict(Arn=f'arn:aws:events:{REGION}:{owner}:rule/janitor',
+                         State='ENABLED', ScheduleExpression=ci_watchdog.SCHEDULE)
+        self.targets = [dict(Id='janitor', Arn=self.function['FunctionArn'])]
+        self.arguments = dict(function_name='janitor', rule_name='janitor', account=owner,
+                              regions=[REGION], guest_boundary_arn=BOUNDARY)
+        self.verified = ci_watchdog.verify_readiness(self.function, self.rule, self.targets,
+            account=owner, regions=[REGION], guest_boundary_arn=BOUNDARY)
+        self.health = dict(schema=1, healthy=True, **self.verified['config'])
+        self.permission = json.dumps(dict(Statement=[dict(Effect='Allow',
+            Principal={'Service': 'events.amazonaws.com'}, Action='lambda:InvokeFunction',
+            Resource=self.function['FunctionArn'], Condition=dict(
+                ArnLike={'AWS:SourceArn': self.rule['Arn']}, StringEquals={'AWS:SourceAccount': owner}))]))
+        self.delays = []
+        sleeping = patch('botocore.endpoint.time.sleep', side_effect=self.delays.append)
+        sleeping.start()
+        self.addCleanup(sleeping.stop)
+
+    @staticmethod
+    def reply(body, status=200, error=None):
+        headers = {'Content-Type': 'application/json', 'x-amzn-RequestId': 'offline-request'}
+        if error:
+            headers['x-amzn-ErrorType'] = error
+        return status, headers, json.dumps(body).encode()
+
+    def throttle(self):
+        return self.reply({'message': 'reserved concurrency is occupied'}, 429, 'TooManyRequestsException')
+
+    def sdk(self):
+        import boto3
+        session = boto3.Session(aws_access_key_id='offline-test-key',
+            aws_secret_access_key='offline-test-secret', region_name=self.region)
+        with patch('boto3.Session', return_value=session):
+            aws = ci.AWS()
+        def close():
+            for client in aws.clients.values():
+                client.close()
+        self.addCleanup(close)
+        return aws
+
+    def transport(self, client, responses):
+        http = self.HTTP(responses)
+        sending = patch.object(client._endpoint.http_session, 'send', new=http.send)
+        sending.start()
+        self.addCleanup(sending.stop)
+        return http
+
+    def readiness(self, aws, responses):
+        lambda_client = aws.client('lambda', self.region)
+        events_client = aws.client('events', self.region)
+        http = self.transport(lambda_client, responses)
+        events = self.transport(events_client, [self.reply(self.rule), self.reply({'Targets': self.targets})])
+        return lambda: self.watchdog.validate_readiness(lambda_client, events_client, **self.arguments), http, events
+
+    def control_responses(self):
+        return [self.reply(self.function), self.reply({'Policy': self.permission})]
+
+    def test_transient_invoke_throttles_retry_real_sdk_then_accept_runtime_health(self):
+        aws = self.sdk()
+        validate, http, events = self.readiness(aws,
+            [*self.control_responses(), self.throttle(), self.throttle(), self.reply(self.health)])
+        self.assertEqual(validate(), self.verified)
+        self.assertEqual(len(http.requests), 5)
+        self.assertEqual(len(events.requests), 2)
+        invokes = [request for request in http.requests if request['method'] == 'POST']
+        self.assertEqual(len(invokes), 3)
+        self.assertTrue(all(json.loads(request['body']) == {'action': 'health'} for request in invokes))
+        self.assertEqual(len(self.delays), 2)
+        self.assertTrue(all(0 <= delay <= 20 for delay in self.delays))
+        self.assertEqual(http.responses, [])
+        self.assertIs(aws.client('lambda', self.region), aws.client('lambda', self.region))
+
+    def test_lambda_configuration_and_policy_reads_also_retry_transient_throttles(self):
+        for stage in (0, 1):
+            with self.subTest(stage=stage):
+                responses = self.control_responses()
+                responses.insert(stage, self.throttle())
+                aws = self.sdk()
+                validate, http, _ = self.readiness(aws, [*responses, self.reply(self.health)])
+                before = len(self.delays)
+                self.assertEqual(validate(), self.verified)
+                self.assertEqual(len(http.requests), 4)
+                self.assertEqual(len(self.delays) - before, 1)
+                self.assertEqual(http.requests[stage]['method'], 'GET')
+                self.assertEqual(http.requests[stage]['url'], http.requests[stage + 1]['url'])
+
+    def test_exhausted_throttle_fails_closed_after_twelve_attempts(self):
+        from botocore.exceptions import ClientError
+        validate, http, _ = self.readiness(self.sdk(),
+            [*self.control_responses(), *[self.throttle() for _ in range(12)]])
+        with self.assertRaises(ClientError) as rejected:
+            validate()
+        self.assertEqual(rejected.exception.response['Error']['Code'], 'TooManyRequestsException')
+        self.assertEqual(rejected.exception.response['ResponseMetadata']['RetryAttempts'], 11)
+        self.assertEqual(len([item for item in http.requests if item['method'] == 'POST']), 12)
+        self.assertEqual(len(self.delays), 11)
+        self.assertTrue(all(0 <= delay <= 20 for delay in self.delays))
+        self.assertLessEqual(sum(self.delays), 151)
+        self.assertEqual(http.responses, [])
+
+    def test_lambda_authorization_failure_is_not_retried_or_accepted(self):
+        from botocore.exceptions import ClientError
+        denied = self.reply({'message': 'not authorized'}, 403, 'AccessDeniedException')
+        validate, http, _ = self.readiness(self.sdk(), [*self.control_responses(), denied])
+        with self.assertRaises(ClientError) as rejected:
+            validate()
+        self.assertEqual(rejected.exception.response['Error']['Code'], 'AccessDeniedException')
+        self.assertEqual(rejected.exception.response['ResponseMetadata']['RetryAttempts'], 0)
+        self.assertEqual(len(http.requests), 3)
+        self.assertEqual(self.delays, [])
+
+    def test_invalid_runtime_identity_and_function_error_remain_fail_closed(self):
+        wrong = dict(self.health, account='999999999999')
+        function_error = self.reply(self.health)
+        function_error[1]['x-amz-function-error'] = 'Unhandled'
+        for response in (self.reply(wrong), function_error):
+            with self.subTest(response=response):
+                validate, http, _ = self.readiness(self.sdk(), [*self.control_responses(), response])
+                with self.assertRaisesRegex(ValueError, 'runtime version/config/account'):
+                    validate()
+                self.assertEqual(len(http.requests), 3)
+                self.assertEqual(self.delays, [])
+
+    def test_ec2_ambiguous_connection_and_transient_service_error_are_not_replayed(self):
+        from botocore.exceptions import ClientError, ConnectionClosedError
+        unavailable = (503, {'Content-Type': 'text/xml'}, b'<Response><Errors><Error>'
+            b'<Code>ServiceUnavailable</Code><Message>temporary</Message></Error></Errors>'
+            b'<RequestID>offline-request</RequestID></Response>')
+        success = (200, {'Content-Type': 'text/xml'}, b'<RunInstancesResponse>'
+            b'<requestId>offline-request</requestId><reservationId>r-offline</reservationId>'
+            b'<instancesSet/></RunInstancesResponse>')
+        for failure, expected in ((ConnectionClosedError(endpoint_url='https://ec2.us-east-1.amazonaws.com'),
+                                   ConnectionClosedError), (unavailable, ClientError)):
+            with self.subTest(failure=failure):
+                aws = self.sdk()
+                ec2 = aws.client('ec2', self.region)
+                http = self.transport(ec2, [failure, success])
+                with self.assertRaises(expected):
+                    ec2.run_instances(ImageId='ami-0123456789abcdef0', MinCount=6, MaxCount=6,
+                        InstanceType='g6.8xlarge', ClientToken='offline-immutable-candidate')
+                self.assertEqual(len(http.requests), 1)
+                self.assertEqual(http.responses, [success])
+                self.assertEqual(self.delays, [])
+
+
 class PaginationTests(unittest.TestCase):
     def scripted(self, responses):
         calls = []

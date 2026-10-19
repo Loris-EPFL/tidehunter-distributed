@@ -1,9 +1,10 @@
 ## 19 October protected CI admission and reconciled costs
 
-Two protected CI attempts rebuilt all six binaries and completed the native and
+Three protected CI attempts rebuilt all six binaries and completed the native and
 five-shard loopback replay through checkpoint 1775 with equal store audits.
-Both stopped before EC2 allocation: the first used an invalid IPv4 price filter;
-the second generated a startup script larger than EC2's 16 KiB limit.
+All stopped before EC2 allocation: the first used an invalid IPv4 price filter;
+the second exceeded EC2's 16 KiB startup-script limit; the third hit a Lambda
+health-probe throttle.
 Cleanup receipts and independent exact-run AWS audits confirmed no remaining
 compute, EBS, network, or guest IAM resources.
 
@@ -11,6 +12,15 @@ compute, EBS, network, or guest IAM resources.
 then retains only the `PublicIPv4:InUseAddress` usage-type suffix. The queried
 IPv4 products have no `productFamily` field. Missing or ambiguous paid rates
 still fail closed. Official Node 24 action pins support `allowed-account-ids`.
+
+The Lambda readiness client uses standard SDK retries, limited to **12 total
+attempts**, for configuration/policy reads and its read-only health probe. EC2
+and all other clients retain one total attempt; allocation requests are not
+silently replayed. Exhausted throttling, authorization errors, function errors,
+or a mismatched runtime attestation still block allocation.
+The watchdog deployment, reserved concurrency, minute schedule, and fleet
+deadline are unchanged. AWS documents [Invoke throttling](https://docs.aws.amazon.com/lambda/latest/api/API_Invoke.html);
+the captured minute-level metrics do not establish the exact throttle cause.
 
 The atomic startup capsule uses Python's standard-library LZMA and Base85.
 Replaying the actual failed launch metadata reduced the script from 16,871
