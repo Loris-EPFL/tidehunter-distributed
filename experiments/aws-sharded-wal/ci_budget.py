@@ -727,9 +727,10 @@ class BudgetLedger:
             item['reservation_run_ids'].append(run_id)
             cleaned = run['receipt'] is not None and run['receipt']['cleanup_complete']
             if not cleaned:
-                item['active_reservation_usd'] = _money(_sum([
-                    _decimal(item['active_reservation_usd']), _decimal(run['reserved_usd'])]))
-                item['active_reservation_run_ids'].append(run_id)
+                active = daily[now.date().isoformat()]
+                active['active_reservation_usd'] = _money(_sum([
+                    _decimal(active['active_reservation_usd']), _decimal(run['reserved_usd'])]))
+                active['active_reservation_run_ids'].append(run_id)
             presentation = self._usage_presentation(run)
             if run['usage_estimated_usd'] is None:
                 item['unknown_usage_run_ids'].append(run_id)

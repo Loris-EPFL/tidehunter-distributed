@@ -383,6 +383,9 @@ fn sui_shared_gate_allows_later_node_durability_without_bypassing_blocked_prefix
             if key < 3 { &[1; 32] } else { &[2; 32] }
         );
     }
+    // Commit acknowledgements precede the owner's local metrics snapshot.
+    // Wait for its post-snapshot event before inspecting completed wait counters.
+    wait_event(&events, |stats| stats.concurrent_completed == prefix + 2).unwrap();
     let mut write_metrics = None;
     db.remote_for_test()
         .visit_write_metrics(|snapshot| write_metrics = Some(snapshot));

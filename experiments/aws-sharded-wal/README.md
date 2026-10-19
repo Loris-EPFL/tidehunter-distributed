@@ -19,11 +19,18 @@ The 16,384-byte guard, shutdown-first ordering, source checks, ownership fences,
 six-host cluster placement, region fallback, and deadline remain unchanged.
 This is local CI-readiness evidence, not a cloud performance result.
 
+The five-node prefix regression waits for the existing post-snapshot owner event
+before checking completed-wait metrics. Commit acknowledgements precede that
+diagnostic snapshot. Publication, visibility, recovery, and timing assertions
+remain unchanged; no production lock or write-path ordering changed.
+
 `budget.json` remains the only editable weekly-limit file; the limit remains
 $60. Prelaunch reservations prevent concurrent overspending but are not expenses.
 Verified cleanup releases the unused active hold immediately. Unresolved or
 ambiguous resource ownership keeps its hold. Original reservations and corrected
 receipts remain in the versioned ledger; no counter or history is reset.
+Active holds appear in the current UTC day, week, and month, exactly once in the
+lifetime total. Original admission reservations keep their historical dates.
 
 Settlement separates priced observed resource usage from future retained-storage
 projections and unobserved components. Fixed request-count, transfer-multiplicity,

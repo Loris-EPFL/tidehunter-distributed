@@ -1007,6 +1007,74 @@ class BudgetTests(unittest.TestCase):
         self.assertIsNone(summary['total']['aws_billed_to_date_usd'])
         self.assertFalse(summary['total']['aws_coverage_complete'])
 
+    def test_current_periods_include_older_unresolved_holds_and_release_after_cleanup(self):
+        cases = [
+            ('day', '2026-10-20T23:59:00+00:00', '2026-10-21T00:01:00+00:00',
+             '2026-10-19', '2026-10-01'),
+            ('Monday week', '2026-10-18T23:59:00+00:00', '2026-10-19T00:01:00+00:00',
+             '2026-10-19', '2026-10-01'),
+            ('month and year', '2026-12-31T23:59:00+00:00', '2027-01-01T00:01:00+00:00',
+             '2026-12-28', '2027-01-01'),
+        ]
+        for boundary, reserved_text, current_text, current_week, current_month in cases:
+            with self.subTest(boundary=boundary):
+                self.s3 = S3()
+                self.ledger = self.make()
+                reserved = datetime.fromisoformat(reserved_text)
+                current = datetime.fromisoformat(current_text)
+                self.ledger.initialize(now=reserved)
+                self.reserve(RUN_A, '20', now=reserved)
+                self.reserve(RUN_B, '10', now=reserved)
+                self.ledger.settle(RUN_B, '1', receipt(False), now=reserved)
+                durable = self.s3.raw
+                report = self.ledger.report(now=current)
+                published = self.ledger.publish_report(now=current)
+                self.assertEqual(self.s3.raw, durable)
+                self.assertEqual(published['costsSummary'], report['costsSummary'])
+                self.assertEqual(self.generated()['costsSummary'], report['costsSummary'])
+                self.assertEqual(report['admission_reservations_usd'], '30')
+                self.assertEqual(report['conservative_budget_charge_usd'], '30')
+                summary = published['costsSummary']
+                for period, current_key in (
+                        ('daily', current.date().isoformat()),
+                        ('weekly', current_week), ('monthly', current_month)):
+                    periods = {item['start']: item for item in summary[period]}
+                    active = periods[current_key]
+                    self.assertEqual(active['active_reservation_usd'], '30')
+                    self.assertEqual(active['active_reservation_run_ids'], [RUN_A, RUN_B])
+                    self.assertEqual(sum(Decimal(item['active_reservation_usd'])
+                                         for item in periods.values()), Decimal('30'))
+                    self.assertEqual([item['start'] for item in periods.values()
+                                      if item['active_reservation_run_ids']], [current_key])
+                    self.assertEqual(sum(Decimal(item['admission_reserved_usd'])
+                                         for item in periods.values()), Decimal('30'))
+                days = {item['start']: item for item in summary['daily']}
+                historical = days[reserved.date().isoformat()]
+                self.assertEqual(historical['admission_reserved_usd'], '30')
+                self.assertEqual(historical['reservation_run_ids'], [RUN_A, RUN_B])
+                self.assertEqual(historical['active_reservation_usd'], '0')
+                self.assertEqual(historical['active_reservation_run_ids'], [])
+                self.assertEqual(days[current.date().isoformat()]['admission_reserved_usd'], '0')
+                self.assertEqual(summary['total']['active_reservation_usd'],
+                                 report['admission_reservations_usd'])
+                self.assertEqual(summary['total']['active_reservation_run_ids'], [RUN_A, RUN_B])
+                for run_id, usage, held, identities in (
+                        (RUN_A, '2', '10', [RUN_B]), (RUN_B, '1', '0', [])):
+                    self.ledger.settle(run_id, usage, receipt(), now=current)
+                    released = self.ledger.report(now=current)
+                    aggregate = self.generated()
+                    self.assertEqual(aggregate['costsSummary'], released['costsSummary'])
+                    self.assertEqual(released['admission_reservations_usd'], held)
+                    for item in [aggregate['costsSummary']['total'],
+                                 aggregate['costsSummary']['daily'][-1],
+                                 aggregate['costsSummary']['weekly'][-1],
+                                 aggregate['costsSummary']['monthly'][-1]]:
+                        self.assertEqual(item['active_reservation_usd'], held)
+                        self.assertEqual(item['active_reservation_run_ids'], identities)
+                    self.assertEqual(aggregate['costsSummary']['total']['admission_reserved_usd'], '30')
+                    self.assertEqual(aggregate['costsSummary']['total']['reservation_run_ids'], [RUN_A, RUN_B])
+                    self.assertIsNone(aggregate['costsSummary']['total']['aws_billed_to_date_usd'])
+
     def test_report_publication_failure_never_prevents_persisted_settlement(self):
         self.reserve()
         self.s3.report_error = OSError('derived report unavailable')
