@@ -2,7 +2,7 @@ name: Rust Tests
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "feat/sharded-value-wal"]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
@@ -13,42 +13,93 @@ on:
         required: false
         default: ""
 
+permissions:
+  contents: read
+
+concurrency:
+  group: correctness-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "2"
+  RUST_BACKTRACE: "1"
 
 jobs:
   test:
-    name: Run Tests
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - profile: format
+            name: Format
+            setup: core
+          - profile: lint
+            name: Lint
+            setup: core
+          - profile: native
+            name: Run Tests
+            setup: core
+          - profile: distributed
+            name: Distributed Tests
+            setup: core
+          - profile: fabric
+            name: Fabric Tests
+            setup: fabric
+          - profile: software-fabric
+            name: Software Fabric Tests
+            setup: fabric
+          - profile: harness
+            name: Harness Tests
+            setup: core
     steps:
-      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.inputs.tidehunter_repo_ref || github.ref }}
+          ref: ${{ inputs.tidehunter_repo_ref || github.ref }}
+          persist-credentials: false
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libfontconfig1-dev clang pkg-config
+      - name: Set up repository Rust
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7
+        with:
+          toolchain: "1.90"
+          components: rustfmt, clippy
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+      - name: Select isolated software provider prefix
+        if: matrix.setup == 'fabric'
+        run: echo "TIDEHUNTER_LIBFABRIC_PREFIX=$RUNNER_TEMP/tidehunter-libfabric-2.6.0" >> "$GITHUB_ENV"
 
-      - name: Install rustfmt and clippy
-        run: |
-          rustup component add rustfmt
-          rustup component add clippy
+      - name: Cache Cargo dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.90-deps-${{ hashFiles('Cargo.lock') }}
 
-      - name: Check formatting
-        run: cargo fmt --check
+      - name: Cache profile build
+        if: matrix.profile != 'format' && matrix.profile != 'harness'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.90-${{ matrix.profile }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('**/*.rs', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/**', '.github/scripts/**') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-rust-1.90-${{ matrix.profile }}-${{ hashFiles('Cargo.lock') }}-
 
-      - name: Check linting
-        run: cargo clippy -- -D warnings
+      - name: Cache pinned software libfabric
+        if: matrix.setup == 'fabric'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.TIDEHUNTER_LIBFABRIC_PREFIX }}
+          key: ${{ runner.os }}-${{ runner.arch }}-libfabric-2.6.0-${{ hashFiles('.github/scripts/setup.sh') }}
 
-      - name: Build
-        run: cargo build
+      - name: Prepare selected profile
+        run: bash .github/scripts/setup.sh "${{ matrix.setup }}"
 
-      - name: Check Cargo.lock
-        run:  git status | grep modified || exit 0 && (echo "Some files are not committed"; exit 1)
-
-      - name: Run unit tests
-        run: cargo test
+      # Software providers and deterministic fixtures are correctness checks,
+      # not evidence of EFA/RDMA hardware activity or network performance.
+      - name: Run selected profile
+        run: python3 .github/scripts/checks.py "${{ matrix.profile }}"

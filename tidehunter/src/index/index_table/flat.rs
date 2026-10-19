@@ -151,36 +151,18 @@ pub(super) fn flat_entry_at(
 /// Returns `flat_count(flat, key_size)` when all keys are less than `target`.
 pub(super) fn flat_lower_bound(flat: &[u8], key_size: Option<usize>, target: &[u8]) -> usize {
     let count = flat_count(flat, key_size);
-    let mut lo = 0usize;
-    let mut hi = count;
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        let (mid_key, _) = flat_entry_at(flat, key_size, mid);
-        if mid_key < target {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
+    crate::index::versioned_overlay::lower_bound_by(count, |mid| {
+        flat_entry_at(flat, key_size, mid).0 < target
+    })
 }
 
 /// Upper bound: the smallest index `i` such that `flat[i].key > target`.
 /// Returns `flat_count(flat, key_size)` when all keys are <= `target`.
 pub(super) fn flat_upper_bound(flat: &[u8], key_size: Option<usize>, target: &[u8]) -> usize {
     let count = flat_count(flat, key_size);
-    let mut lo = 0usize;
-    let mut hi = count;
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        let (mid_key, _) = flat_entry_at(flat, key_size, mid);
-        if mid_key <= target {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
+    crate::index::versioned_overlay::lower_bound_by(count, |mid| {
+        flat_entry_at(flat, key_size, mid).0 <= target
+    })
 }
 
 /// Build a flat buffer from a sorted list of `(key, IndexWalPosition)` pairs.

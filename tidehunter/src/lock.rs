@@ -33,8 +33,14 @@ fn open_dbs() -> &'static Mutex<HashSet<PathBuf>> {
 /// [RocksDB issue #1780]: https://github.com/facebook/rocksdb/issues/1780
 #[derive(Debug)]
 pub struct DbLock {
-    _file: File,
+    // Taken and closed under the registry guard before ownership is released.
+    file: Option<File>,
     canonical_path: PathBuf,
+    #[cfg(test)]
+    after_unregister: Option<(
+        std::sync::mpsc::SyncSender<()>,
+        Mutex<std::sync::mpsc::Receiver<()>>,
+    )>,
 }
 
 impl DbLock {
@@ -112,8 +118,13 @@ impl DbLock {
         };
         let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &mut flock) };
         if result == -1 {
-            open_dbs().lock().remove(&canonical);
             let err = io::Error::last_os_error();
+            // Close even an unsuccessful acquisition's fd before a competing
+            // same-process opener can register/acquire a replacement lock.
+            let mut open = open_dbs().lock();
+            drop(file);
+            open.remove(&canonical);
+            drop(open);
             if err.raw_os_error() == Some(libc::EWOULDBLOCK)
                 || err.raw_os_error() == Some(libc::EAGAIN)
             {
@@ -129,15 +140,29 @@ impl DbLock {
         }
 
         Ok(DbLock {
-            _file: file,
+            file: Some(file),
             canonical_path: canonical,
+            #[cfg(test)]
+            after_unregister: None,
         })
     }
 }
 
 impl Drop for DbLock {
     fn drop(&mut self) {
-        open_dbs().lock().remove(&self.canonical_path);
+        // POSIX record locks belong to the process: closing ANY fd for this
+        // inode releases them all. Keep the registry guard until the old fd is
+        // closed so a successor cannot acquire a lock that this Drop removes.
+        // https://man7.org/linux/man-pages/man2/fcntl_locking.2.html
+        let mut open = open_dbs().lock();
+        drop(self.file.take());
+        open.remove(&self.canonical_path);
+        drop(open);
+        #[cfg(test)]
+        if let Some((entered, resume)) = self.after_unregister.take() {
+            let _ = entered.send(());
+            let _ = resume.into_inner().recv();
+        }
     }
 }
 
@@ -182,6 +207,63 @@ mod tests {
         assert!(open_dbs().lock().contains(&canonical));
         drop(lock);
         assert!(!open_dbs().lock().contains(&canonical));
+    }
+
+    #[test]
+    fn _subprocess_lock_probe() {
+        let Ok(path) = std::env::var("TIDEHUNTER_TEST_PROBE_LOCK") else {
+            return;
+        };
+        let result = DbLock::acquire(Path::new(&path), Duration::ZERO);
+        match std::env::var("TIDEHUNTER_TEST_PROBE_EXPECT")
+            .unwrap()
+            .as_str()
+        {
+            "blocked" => assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists),
+            "free" => drop(result.unwrap()),
+            other => panic!("invalid lock probe expectation: {other}"),
+        }
+    }
+
+    fn probe_from_other_process(path: &Path, expected: &str) {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "lock::tests::_subprocess_lock_probe",
+                "--nocapture",
+            ])
+            .env("TIDEHUNTER_TEST_PROBE_LOCK", path)
+            .env("TIDEHUNTER_TEST_PROBE_EXPECT", expected)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child probe failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    fn test_lock_handoff_cannot_release_successors_process_lock() {
+        let dir = TempDir::new("test-lock-handoff").unwrap();
+        let mut first = DbLock::acquire(dir.path(), Duration::ZERO).unwrap();
+        let (entered, paused) = std::sync::mpsc::sync_channel(1);
+        let (resume, resumed) = std::sync::mpsc::sync_channel(1);
+        first.after_unregister = Some((entered, Mutex::new(resumed)));
+        let dropping = std::thread::spawn(move || drop(first));
+        paused.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // The predecessor's Drop has released its registry entry but has not
+        // returned to automatic field destruction. The previous implementation
+        // still held its File here: closing it AFTER this same-process acquire
+        // silently unlocked the successor. No timing loop is needed to force it.
+        let second = DbLock::acquire(dir.path(), Duration::ZERO).unwrap();
+        resume.send(()).unwrap();
+        dropping.join().unwrap();
+        probe_from_other_process(dir.path(), "blocked");
+        drop(second);
+        probe_from_other_process(dir.path(), "free");
     }
 
     // This "test" is actually a subprocess entrypoint used by test_lock_cross_process.

@@ -1,5 +1,11 @@
 # Sharded Value WAL: first local implementation slice
 
+**Historical first slice.** Current code and verification are recorded in
+[M1/M2 implementation progress](IMPLEMENTATION_M1_M2_2026-10-06.md). In particular,
+the one-pending-batch restriction and whole-batch-only reads described below have
+been replaced by one pending complete group and independently verified record
+reads. The measurements and completion limits below describe the earlier commits.
+
 Date: 6 October 2026. **Local experimental substrate, not a complete distributed database.**
 
 This record distinguishes implemented code from the research proposal in the

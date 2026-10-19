@@ -22,6 +22,8 @@ use crate::metrics::{Metrics, TimerExt};
 use crate::relocation::updates::RelocationUpdates;
 use crate::relocation::{RelocationCommand, RelocationDriver, RelocationStrategy, Relocator};
 use crate::state_snapshot;
+#[cfg(feature = "experimental-distributed")]
+pub use crate::wal::ValueWalPersistenceProfile;
 use crate::wal::layout::WalKind;
 use crate::wal::position::{LastProcessed, WalFileId, WalPosition};
 use crate::wal::tracker::WalGuard;
@@ -1262,6 +1264,102 @@ impl Db {
         let context = self.large_table.ks_context(ks);
         context.inc_read(kind, read_type);
         context.inc_read_bytes(kind, read_type, entry.len() as u64);
+    }
+
+    /// Conservative durability barrier for bounded comparisons with the
+    /// experimental distributed backend. Call after completed foreground writes;
+    /// this is not a concurrent-write snapshot or an index publication barrier.
+    ///
+    /// Synchronizes all currently registered Value WAL files and their directory.
+    /// Large benchmark cases can span multiple files; unlike the partition's
+    /// exact-frame-file barrier this can synchronize clean older files too.
+    /// Native asynchronous acknowledgement remains unchanged.
+    #[cfg(feature = "experimental-distributed")]
+    pub fn persist_value_wal_for_benchmark(&self) -> DbResult<()> {
+        self.wal.persist_registered_files()?;
+        Ok(())
+    }
+
+    /// Observe the conservative benchmark barrier's current file inventory
+    /// outside timed operations, without inspecting or faulting WAL pages.
+    #[cfg(feature = "experimental-distributed")]
+    pub fn registered_value_wal_files_for_benchmark(&self) -> usize {
+        self.wal.registered_file_count()
+    }
+
+    /// Sample the native benchmark barrier's file and namespace persistence.
+    /// This has the same durability scope as `persist_value_wal_for_benchmark`,
+    /// including failed attempts, and does not time ordinary native writes.
+    #[cfg(feature = "experimental-distributed")]
+    pub fn persist_value_wal_profiled_for_benchmark(
+        &self,
+        profile: &mut ValueWalPersistenceProfile,
+    ) -> DbResult<()> {
+        self.wal.persist_registered_files_profiled(profile)?;
+        Ok(())
+    }
+
+    /// Explicit Linux measurement hook. Use with completed writes and disabled
+    /// application caches. Eviction is advisory; verify physical I/O separately.
+    /// # Errors
+    /// Returns errors from file sync, cache advice or Linux process counters.
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    pub fn read_evidence_for_benchmark(
+        &self,
+        evict: bool,
+    ) -> std::io::Result<crate::read_probe::ReadEvidence> {
+        self.wal.read_evidence_for_benchmark(evict)
+    }
+
+    /// Diagnostic only: the same native lookup/record helpers and cache refill
+    /// rules as get. Ordinary gets do not execute these extra clocks.
+    /// # Errors
+    /// Returns the same index and WAL errors as [`Self::get`].
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    pub fn get_profiled_for_benchmark(
+        &self,
+        ks: KeySpace,
+        k: &[u8],
+    ) -> DbResult<(Option<Bytes>, crate::read_probe::NativeReadProfile)> {
+        use std::time::Instant;
+        let context = self.ks_context(ks);
+        let _timer = context.db_op_timer(DbOpKind::Get);
+        let began = Instant::now();
+        let reduced_key = context.ks_config.reduce_key(k);
+        let found = self.large_table.get(context, reduced_key.as_ref(), self)?;
+        let mut profile = crate::read_probe::NativeReadProfile {
+            index_ns: u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            ..Default::default()
+        };
+        let value = match found {
+            GetResult::Value(full_key, value) => {
+                profile.value_cache_hit = true;
+                if context.ks_config.need_check_index_key() && full_key.as_ref() != k {
+                    None
+                } else {
+                    Some(value)
+                }
+            }
+            GetResult::WalPosition(position, refill) => {
+                let began = Instant::now();
+                let value = self.read_record_check_key(context, k, position)?;
+                profile.wal_and_decode_ns =
+                    u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                if let Some(value) = &value {
+                    self.large_table.fp.fp_before_value_cache_refill();
+                    self.large_table.update_lru(
+                        context,
+                        reduced_key.to_vec().into(),
+                        Bytes::from(k.to_vec()),
+                        value.clone(),
+                        refill,
+                    );
+                }
+                value
+            }
+            GetResult::NotFound => None,
+        };
+        Ok((value, profile))
     }
 
     pub fn rebuild_control_region(&self) -> DbResult<u64> {

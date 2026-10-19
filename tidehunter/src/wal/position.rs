@@ -14,6 +14,17 @@ pub struct WalPosition {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct WalFileId(pub(super) u64);
 
+#[cfg(feature = "experimental-distributed")]
+impl WalFileId {
+    pub(crate) fn from_u64(id: u64) -> Self {
+        Self(id)
+    }
+
+    pub(crate) fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct MapId(pub(super) u64);
 

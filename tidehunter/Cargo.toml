@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tidehunter-fabric = { path = "../tidehunter-fabric", optional = true, features = ["native"] }
 arc-swap = "1.6.0"
 memmap2 = "0.7.0"
 minibytes = { path = "../third-party/minibytes", default-features = false, features = ["frommmap", "frombytes"] }
@@ -20,11 +21,18 @@ tokio = { version = "1.36.0", features = ["full"], optional = true}
 fastbloom = "0.17"
 lru = "0.12.2"
 blake2 = { version = "0.10.6" }
+blake2b_simd = { version = "1.0.2", optional = true }
+rustls = { version = "=0.23.31", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 rayon = "1.5.3"
 libc = {workspace = true}
 typenum = "1.16.0"
 strum = { version = "0.26", features = ["derive"] }
 lz4_flex = { version = "0.12", default-features = false, features = ["std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Reviewed low-level boundary: pinned buffers/files live through CQ retirement.
+# MIT OR Apache-2.0; tokio-rs/io-uring v0.7.14 (ba9149010ccda85bcdf28623d9268b10dd353a93).
+io-uring = { version = "=0.7.14", optional = true }
 
 [dev-dependencies]
 tempdir = "0.3.7"
@@ -34,13 +42,42 @@ hex = "0.4.3"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [features]
-experimental-distributed = []
+experimental-fabric = ["experimental-distributed", "dep:tidehunter-fabric"]
+experimental-distributed = ["dep:blake2b_simd", "dep:rustls", "dep:io-uring"]
 tokio = ["dep:tokio"]
 test_methods = []
 test-utils = []
 
 [[example]]
 name = "sharded_wal_local"
+required-features = ["experimental-distributed"]
+
+[[example]]
+name = "sharded_wal_bench"
+required-features = ["experimental-distributed"]
+
+[[example]]
+name = "sharded_wal_recovery_bench"
+required-features = ["experimental-distributed"]
+
+[[example]]
+name = "sharded_wal_cluster_check"
+required-features = ["experimental-distributed", "test-utils"]
+
+[[example]]
+name = "sharded_wal_transport_bench"
+required-features = ["experimental-distributed", "test-utils"]
+
+[[example]]
+name = "sharded_wal_adapter_bench"
+required-features = ["experimental-distributed", "test-utils"]
+
+[[example]]
+name = "sharded_wal_lifecycle_check"
+required-features = ["experimental-distributed", "test-utils"]
+
+[[example]]
+name = "sharded_wal_codec_probe"
 required-features = ["experimental-distributed"]
 
 [[bench]]

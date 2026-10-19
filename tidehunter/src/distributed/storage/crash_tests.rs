@@ -27,9 +27,14 @@ fn config(partitions: Vec<u32>, partition: u32) -> PartitionConfig {
             max_operations: 10,
             max_encoded_bytes: 500,
         },
-        fragment_bytes: 512,
-        wal_file_bytes: 1024,
+        group_limits: GroupLimits {
+            max_batches: 4,
+            max_encoded_bytes: 1008,
+        },
+        fragment_bytes: 1024,
+        wal_file_bytes: 2048,
         max_batches: 64,
+        max_reference_metadata_bytes: 1024 * 1024,
     }
 }
 
@@ -87,40 +92,50 @@ fn complete_next_fragment_survives_lost_skip_marker() {
     let config = config(vec![3], 3);
     let path = temp.path().join("stream");
     let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
-    let first = log
-        .append_complete_batch(authority(&config), &batch(&config, 0, 0))
-        .unwrap();
-    log.persist_through(first).unwrap();
-    let second = log
-        .append_complete_batch(authority(&config), &batch(&config, 1, 1))
-        .unwrap();
-    log.persist_through(second).unwrap();
-    let complete = log
-        .append_complete_batch(authority(&config), &batch(&config, 2, 2))
-        .unwrap();
-    assert_eq!(complete.address().offset, config.fragment_bytes);
-    let old_tail = (second.address().offset + u64::from(second.address().len)).div_ceil(8) * 8;
+    let mut receipts = Vec::new();
+    let mut old_tail = 0;
+    let complete = loop {
+        let n = receipts.len() as u64;
+        let receipt = log
+            .append_complete_batch(authority(&config), &batch(&config, n, n))
+            .unwrap();
+        receipts.push(receipt);
+        if receipt.address().offset >= config.fragment_bytes {
+            break receipt;
+        }
+        log.persist_through(receipt).unwrap();
+        old_tail = log.state.lock().appended_end;
+    };
+    assert_eq!(
+        complete.address().offset,
+        config.fragment_bytes + 8 + GROUP_HEADER_LEN as u64
+    );
     assert!(old_tail + 8 < config.fragment_bytes);
     drop(log);
 
     // The next-fragment frame survives, but the allocator's skip marker does
     // not. CRC failure in the old fragment must not hide eligible authority in
-    // the new fragment. The prior two complete records remain byte-for-byte.
+    // the new fragment. The prior complete groups remain byte-for-byte.
     let file = wal_file(&path, &config, old_tail);
     file.write_all_at(&[0; 8], old_tail % config.wal_file_bytes)
         .unwrap();
     file.sync_all().unwrap();
     let recovered = PartitionLog::recover_sealed(&path, &config, metrics()).unwrap();
-    assert_eq!(recovered.recovered_batches(), vec![first, second, complete]);
+    assert_eq!(recovered.receipt_page(0, 256).unwrap(), receipts);
     assert_eq!(
         recovered.read_batch(complete).unwrap().mutations(),
-        batch(&config, 2, 2).mutations()
+        batch(
+            &config,
+            receipts.len() as u64 - 1,
+            receipts.len() as u64 - 1
+        )
+        .mutations()
     );
     drop(recovered);
     // A second recovery agrees with the sealed result rather than depending on
     // a transient in-memory record list from the first pass.
     let again = PartitionLog::recover_sealed(&path, &config, metrics()).unwrap();
-    assert_eq!(again.recovered_batches(), vec![first, second, complete]);
+    assert_eq!(again.receipt_page(0, 256).unwrap(), receipts);
 }
 
 #[test]
@@ -143,8 +158,8 @@ fn truncated_final_frame_never_replays_a_subset_of_its_mutations() {
     file.set_len(truncated_end).unwrap();
     file.sync_all().unwrap();
     let recovered = PartitionLog::recover_sealed(&path, &config, metrics()).unwrap();
-    assert_eq!(recovered.recovered_batches(), vec![prior]);
-    assert_eq!(recovered.lookup(torn.id()), None);
+    assert_eq!(recovered.receipt_page(0, 256).unwrap(), vec![prior]);
+    assert_eq!(recovered.lookup(torn.id()).unwrap(), None);
     assert_eq!(recovered.read_batch(prior).unwrap().mutations().len(), 2);
 }
 
@@ -163,7 +178,7 @@ fn missing_durability_evidence_blocks_the_next_authoritative_batch() {
         log.append_complete_batch(authority(&config), &later),
         Err(StorageError::NeedsPersistence)
     ));
-    assert_eq!(log.lookup(later.id()), None);
+    assert_eq!(log.lookup(later.id()).unwrap(), None);
     assert_eq!(
         log.append_complete_batch(authority(&config), &original)
             .unwrap(),
@@ -173,7 +188,78 @@ fn missing_durability_evidence_blocks_the_next_authoritative_batch() {
     let second = log
         .append_complete_batch(authority(&config), &later)
         .unwrap();
-    assert_eq!(log.recovered_batches(), vec![first, second]);
+    assert_eq!(log.receipt_page(0, 256).unwrap(), vec![first, second]);
+}
+
+#[test]
+fn surviving_group_recovers_all_members_but_inner_frames_cannot_authorize_replay() {
+    for tear_outer_header in [false, true] {
+        let temp = tempdir::TempDir::new("sharded-group-crash").unwrap();
+        let config = config(vec![3], 3);
+        let path = temp.path().join("stream");
+        let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+        let group = CompleteGroup::new(
+            &shape(),
+            vec![batch(&config, 0, 0), batch(&config, 1, 1)],
+            config.batch_limits,
+            config.group_limits,
+        )
+        .unwrap();
+        let receipts = log.append_group(authority(&config), &group).unwrap();
+        // No explicit persist acknowledgement. Complete surviving bytes can
+        // still be irrevocable on recovery. Lost reply does not undo authority.
+        drop(log);
+        if tear_outer_header {
+            let file = wal_file(&path, &config, 0);
+            file.write_all_at(&[0; 8], 0).unwrap();
+            file.sync_all().unwrap();
+            // Inner batches remain byte-valid, but the complete containing
+            // authority frame is gone. Never scan inner magic as recovery input.
+            let bytes = fs::read(path.join("wal_0000000000000000")).unwrap();
+            for receipt in &receipts {
+                assert!(CrcFrame::read_from_slice(&bytes, receipt.address.offset as usize).is_ok());
+            }
+        }
+        let recovered = PartitionLog::recover_sealed(&path, &config, metrics()).unwrap();
+        if tear_outer_header {
+            assert_eq!(recovered.receipt_count(), 0);
+        } else {
+            assert_eq!(recovered.receipt_page(0, 256).unwrap(), receipts);
+        }
+    }
+}
+
+#[test]
+fn torn_sibling_discards_whole_unpersisted_group_and_retains_prior_durable_group() {
+    let temp = tempdir::TempDir::new("sharded-group-torn-body").unwrap();
+    let config = config(vec![3], 3);
+    let path = temp.path().join("stream");
+    let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+    let prior = log
+        .append_complete_batch(authority(&config), &batch(&config, 0, 0))
+        .unwrap();
+    log.persist_through(prior).unwrap();
+    let group = CompleteGroup::new(
+        &shape(),
+        vec![batch(&config, 1, 1), batch(&config, 2, 2)],
+        config.batch_limits,
+        config.group_limits,
+    )
+    .unwrap();
+    let receipts = log.append_group(authority(&config), &group).unwrap();
+    drop(log);
+    let last = receipts[1].address;
+    let file = wal_file(&path, &config, last.offset);
+    file.write_all_at(
+        &[0xff],
+        (last.offset + u64::from(last.len) - 1) % config.wal_file_bytes,
+    )
+    .unwrap();
+    file.sync_all().unwrap();
+    let recovered = PartitionLog::recover_sealed(&path, &config, metrics()).unwrap();
+    assert_eq!(recovered.receipt_page(0, 256).unwrap(), vec![prior]);
+    assert_eq!(recovered.lookup(receipts[0].id()).unwrap(), None);
+    assert_eq!(recovered.lookup(receipts[1].id()).unwrap(), None);
 }
 
 #[test]

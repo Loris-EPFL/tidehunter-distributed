@@ -1,0 +1,44 @@
+# Deployment-specific security contract, not a full compliance certification.
+# Registry reference: https://github.com/aws-cloudformation/aws-guard-rules-registry
+let buckets = Resources.*[ Type == 'AWS::S3::Bucket' ]
+let functions = Resources.*[ Type == 'AWS::Lambda::Function' ]
+let instance_resources = Resources.*[ Type == 'AWS::EC2::Instance' ]
+
+rule foundation_never_allocates_compute {
+    %instance_resources empty
+}
+
+rule evidence_bucket_is_private when %buckets !empty {
+    %buckets.Properties.PublicAccessBlockConfiguration.BlockPublicAcls == true
+    %buckets.Properties.PublicAccessBlockConfiguration.IgnorePublicAcls == true
+    %buckets.Properties.PublicAccessBlockConfiguration.BlockPublicPolicy == true
+    %buckets.Properties.PublicAccessBlockConfiguration.RestrictPublicBuckets == true
+    %buckets.Properties.OwnershipControls.Rules[*].ObjectOwnership == 'BucketOwnerEnforced'
+}
+
+rule evidence_is_encrypted_and_retained when %buckets !empty {
+    %buckets.Properties.BucketEncryption.ServerSideEncryptionConfiguration[*].ServerSideEncryptionByDefault.SSEAlgorithm == 'AES256'
+    %buckets.Properties.VersioningConfiguration.Status == 'Enabled'
+    %buckets.DeletionPolicy == 'Retain'
+    %buckets.UpdateReplacePolicy == 'Retain'
+}
+
+rule watchdog_is_bounded_and_independent when %functions !empty {
+    %functions.Properties.Timeout >= 60
+    %functions.Properties.Timeout <= 180
+    %functions.Properties.ReservedConcurrentExecutions == 1
+    Resources.ExpiryRule.Properties.ScheduleExpression == 'rate(1 minute)'
+    Resources.ExpiryRule.Properties.State == 'ENABLED'
+}
+
+rule no_static_access_keys {
+    Resources.*[ Type == 'AWS::IAM::AccessKey' ] empty
+}
+
+rule oidc_audience_is_sts {
+    Resources.GitHubOidc.Properties.ClientIdList[*] == 'sts.amazonaws.com'
+}
+
+rule boundary_is_present {
+    Resources.GuestBoundary.Type == 'AWS::IAM::ManagedPolicy'
+}

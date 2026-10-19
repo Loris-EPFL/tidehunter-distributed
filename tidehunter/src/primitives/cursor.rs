@@ -90,7 +90,7 @@ mod tests {
         assert_eq!(cur.offset(), 3);
 
         assert_eq!(&[4, 5], cur.take_slice(2));
-        assert_eq!(cur.chunk(), &[]);
+        assert!(cur.chunk().is_empty());
         assert_eq!(cur.remaining(), 0);
         assert_eq!(cur.offset(), 5);
     }

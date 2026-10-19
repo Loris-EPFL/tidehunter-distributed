@@ -10,7 +10,7 @@ implementation and paper section. Revisit them when changing the ownership, repl
 publication or retention boundary. Cite relevant primary project/paper mechanisms
 when adapting external designs; do not copy unrelated transaction machinery solely
 because another system uses it. The paper is available in the parent project at
-`../middleware/misc/tidehunter.pdf`; design documents link the external sources.
+`../papers/Tidehunter-2026-v2.pdf`; design documents link the external sources.
 
 Keep operation identity, logical batch version, current writer authority and
 physical address separate. A global logical position is not a durable or published

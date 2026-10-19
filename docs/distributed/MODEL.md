@@ -8,6 +8,23 @@ The model is independent of production Rust types and methods, so an implementat
 bug cannot automatically become its specification. It uses the standard library
 only and is compiled as test code in `distributed::model`.
 
+## Implementation boundary updated 15 October 2026
+
+The finite models below remain protocol checks, not a proof of the filesystem
+implementation. The RF1 implementation now has background cut capture/persist/
+adopt, bounded resident index/outcome windows backed by authenticated cold
+metadata, read-cut pins and explicit supported-history floors. A committed root
+can authorize deletion of wholly unreferenced files from sealed epochs. Old exact
+retry outcomes remain metadata authority even after payload retirement.
+
+No global counter allocates physical disk addresses. Every stream retains its
+own WAL and independent physical offsets; complete logical batches retain one
+globally ordered publication version. Async replication is modeled below but is
+not made lossless or enabled by these RF1 lifecycle changes. Active-file GC,
+live-value relocation, dynamic inventory and replicated failover remain outside
+this implementation. See the
+[source map, safety rules and local evidence](CONCURRENT_AUTHORITY_AND_TRANSPORT_2026-10-13.md#15-october-local-lifecycle-and-serving-path-implementation).
+
 ## Anchors and deliberate differences
 
 - Tidehunter's paper, §§3.1–3.4 and §4.4, separates whole-batch recovery, completed
@@ -173,6 +190,24 @@ by `--nocapture`; tests require nonempty fault/recovery coverage rather than fix
 an exact state count that would prevent future model expansion.
 
 ## What this gate permits and what remains
+
+### M2 refinement: complete persistence groups
+
+The separately documented [group model](GROUP_MODEL_2026-10-06.md) was run before
+implementing the group codec. It extends same-stream discovery from one pending
+batch to one pending **complete group** of whole batches. Both same-fragment and
+next-fragment cases explore 2,076 states and 3,889 transitions each. Seven unsafe
+variants are rejected: pipelining before persistence, continuing after uncertain
+I/O, recovering individual members from a torn group, requiring a skip marker,
+acknowledging before persistence, treating unknown outcomes as absent and
+reappending a lost-response retry. These counts are additional to the original
+models above. They do not imply physical implementation validation or Sui parity.
+
+The group remains the completeness boundary; one outer native CRC allocation
+contains independently readable inner native CRC batch frames. No later group is
+emitted before persistence, and uncertain errors fail-stop the stream. Recovery
+must enumerate known fragment boundaries independently. See the group record for
+exact coverage, format, sources, assumptions and the standalone test command.
 
 The checked state space supports implementing an experimental, static registered
 single-epoch storage backend. Its actual frame decoder, file ordering, filesystem

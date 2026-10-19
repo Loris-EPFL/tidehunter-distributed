@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "repository": "Loris-EPFL/tidehunter-distributed",
+  "branch": "bench/aws-efa",
+  "account": "354775971805",
+  "regions": ["us-east-1", "us-east-2", "eu-west-1", "eu-central-1"],
+  "instance_types": ["g6.8xlarge", "g6e.8xlarge", "g6.16xlarge"],
+  "ttl_seconds": 3600,
+  "export_reserve_seconds": 600,
+  "repetitions": 2,
+  "transports": ["tcp", "efa", "efa-direct"],
+  "read_profile_limits": [0, 128],
+  "write_profile_limits": [0, 128],
+  "native_write_profile_limits": [0, 128],
+  "kv_suite": {"scope": "full", "repetitions": 1, "diagnostics": true},
+  "coordinator_cache_mib": 8,
+  "shard_cache_mib": 0,
+  "replay_deadline_seconds": 900,
+  "cost_assumptions": {
+    "retention_days": 30,
+    "result_gib": 4,
+    "request_count": 100000,
+    "reconciliation_seconds": 600
+  },
+  "fixture_sha256": "7eb43b71435547939760598e541d13b9a77f722c5a9d0f8c8ee5bd583b751f15",
+  "fixture_key": "fixtures/sui-genesis-1775/fixture.tar.gz",
+  "checkpoint_limit": 1775,
+  "checkpoint_digest": "EhUPyfwLGDEKH5Ssg3nFbVAHwi4XA87xNKvnFEo3ZJb6"
+}

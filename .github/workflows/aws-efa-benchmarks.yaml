@@ -1,0 +1,319 @@
+name: AWS EFA benchmark campaign
+
+on:
+  push:
+    branches: ["bench/aws-efa"]
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "Complete campaign or delayed billing only"
+        type: choice
+        options: [benchmark, cost-report]
+        default: benchmark
+
+permissions:
+  contents: read
+
+# Preserve a paid run; coalesce pending pushes to the newest revision.
+concurrency:
+  group: aws-efa-benchmark-fleet
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  AWS_BENCH_ENABLED: ${{ vars.AWS_BENCH_ENABLED }}
+  AWS_BENCH_OPERATION: ${{ inputs.operation || 'benchmark' }}
+  AWS_BENCH_ROLE_ARN: ${{ vars.AWS_BENCH_ROLE_ARN }}
+  AWS_BENCH_INPUT_ROLE_ARN: ${{ vars.AWS_BENCH_INPUT_ROLE_ARN }}
+  AWS_BENCH_BUCKET: ${{ vars.AWS_BENCH_BUCKET }}
+  AWS_BENCH_BUCKET_REGION: ${{ vars.AWS_BENCH_BUCKET_REGION }}
+  AWS_BENCH_GUEST_BOUNDARY_ARN: ${{ vars.AWS_BENCH_GUEST_BOUNDARY_ARN }}
+  AWS_BENCH_WATCHDOG_FUNCTION: ${{ vars.AWS_BENCH_WATCHDOG_FUNCTION }}
+  AWS_BENCH_WATCHDOG_RULE: ${{ vars.AWS_BENCH_WATCHDOG_RULE }}
+  AWS_BENCH_SUI_SHA: ${{ vars.AWS_BENCH_SUI_SHA }}
+
+jobs:
+  prepare:
+    if: github.repository == 'Loris-EPFL/tidehunter-distributed' && github.ref == 'refs/heads/bench/aws-efa' && inputs.operation != 'cost-report'
+    runs-on: ${{ vars.AWS_BENCH_BUILD_RUNNER || 'ubuntu-24.04' }}
+    environment: rdma-bench-inputs
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      enabled: ${{ steps.settings.outputs.enabled }}
+      package_sha256: ${{ steps.package.outputs.package_sha256 }}
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUST_TEST_THREADS: "2"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_TERM_COLOR: always
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: engine
+          persist-credentials: false
+      - name: Check exact branch and explicit activation
+        id: settings
+        run: python3 engine/experiments/aws-sharded-wal/ci_prepare.py settings
+      - name: Select the isolated libfabric prefix on the runner
+        if: steps.settings.outputs.enabled == 'true'
+        run: |
+          prefix="$RUNNER_TEMP/benchmark-libfabric-2.6.0"
+          printf 'TIDEHUNTER_LIBFABRIC_PREFIX=%s\nPKG_CONFIG_PATH=%s/lib/pkgconfig\nLD_LIBRARY_PATH=%s/lib\n' \
+            "$prefix" "$prefix" "$prefix" >> "$GITHUB_ENV"
+      - name: Reclaim unused SDK space on a disposable GitHub runner
+        if: steps.settings.outputs.enabled == 'true' && runner.environment == 'github-hosted'
+        run: |
+          set -euo pipefail
+          test "$GITHUB_ACTIONS" = true
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          # Authorized only on this disposable VM, never a laptop/self-hosted runner.
+          sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/ghc
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+      - name: Check out the reviewed Sui commit
+        if: steps.settings.outputs.enabled == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Loris-EPFL/sui-tidehunter-distributed
+          ref: ${{ vars.AWS_BENCH_SUI_SHA }}
+          path: sui
+          token: ${{ secrets.SUI_CHECKOUT_TOKEN || github.token }}
+          persist-credentials: false
+      - name: Prepare isolated Python/native tools
+        if: steps.settings.outputs.enabled == 'true'
+        timeout-minutes: 10
+        run: |
+          python3 -m venv --system-site-packages "$RUNNER_TEMP/benchmark-tools"
+          "$RUNNER_TEMP/benchmark-tools/bin/pip" install --disable-pip-version-check --retries 2 --timeout 30 \
+            boto3==1.35.99 PyYAML==6.0.2 cmake==3.31.6 ninja==1.11.1.4 protoc-wheel-0==29.3
+          echo "$RUNNER_TEMP/benchmark-tools/bin" >> "$GITHUB_PATH"
+      - name: Cache the exact frozen checkpoint fixture
+        if: steps.settings.outputs.enabled == 'true'
+        id: fixture-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/fixture.tar.gz
+          key: sui-fixture-7eb43b71435547939760598e541d13b9a77f722c5a9d0f8c8ee5bd583b751f15
+      - name: Obtain input-only temporary credentials
+        if: steps.settings.outputs.enabled == 'true' && steps.fixture-cache.outputs.cache-hit != 'true'
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: ${{ vars.AWS_BENCH_INPUT_ROLE_ARN }}
+          role-session-name: input-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: ${{ vars.AWS_BENCH_BUCKET_REGION }}
+          allowed-account-ids: "354775971805"
+          role-duration-seconds: 3600
+      - name: Download the frozen fixture
+        if: steps.settings.outputs.enabled == 'true' && steps.fixture-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 10
+        run: |
+          timeout 540 aws s3api get-object --bucket "$AWS_BENCH_BUCKET" \
+            --key fixtures/sui-genesis-1775/fixture.tar.gz --expected-bucket-owner 354775971805 \
+            "$RUNNER_TEMP/fixture.tar.gz"
+      - name: Cache Cargo downloads
+        if: steps.settings.outputs.enabled == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: aws-bench-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('engine/Cargo.lock', 'sui/Cargo.lock') }}
+      - name: Prepare software build dependencies, not EFA hardware
+        if: steps.settings.outputs.enabled == 'true'
+        timeout-minutes: 35
+        run: |
+          bash engine/.github/scripts/setup.sh fabric
+          sui_toolchain=$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("sui/rust-toolchain.toml").read_text())["toolchain"]["channel"])')
+          timeout 900 rustup toolchain install "$sui_toolchain" --profile minimal
+      - name: Check native, distributed and offline campaign correctness
+        if: steps.settings.outputs.enabled == 'true'
+        timeout-minutes: 70
+        run: |
+          python3 engine/.github/scripts/checks.py native
+          python3 engine/.github/scripts/checks.py distributed
+          python3 engine/.github/scripts/checks.py harness
+      - name: Rebuild six binaries and audit the same build locally
+        if: steps.settings.outputs.enabled == 'true'
+        timeout-minutes: 185
+        run: |
+          python3 engine/experiments/aws-sharded-wal/ci_prepare.py build \
+            --engine "$GITHUB_WORKSPACE/engine" --sui "$GITHUB_WORKSPACE/sui" \
+            --fixture "$RUNNER_TEMP/fixture.tar.gz" --output "$RUNNER_TEMP/benchmark-inputs" \
+            --target "$RUNNER_TEMP/benchmark-release-target" --deadline 10800 --jobs 2
+      - name: Package only current build inputs and local proof
+        if: steps.settings.outputs.enabled == 'true'
+        id: package
+        run: |
+          python3 engine/experiments/aws-sharded-wal/ci_prepare.py package \
+            --inputs "$RUNNER_TEMP/benchmark-inputs" --fixture "$RUNNER_TEMP/fixture.tar.gz" \
+            --output "$RUNNER_TEMP/campaign-inputs.tar.gz"
+      - name: Transfer the hash-bound package to a separate orchestration VM
+        if: steps.settings.outputs.enabled == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: campaign-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/campaign-inputs.tar.gz
+          compression-level: 0
+          retention-days: 2
+          if-no-files-found: error
+      - name: Retain failed build diagnostics without databases
+        if: failure() && steps.settings.outputs.enabled == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: build-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/benchmark-inputs/build/*.log
+            ${{ runner.temp }}/benchmark-inputs/local-replay/receipt.json
+            ${{ runner.temp }}/benchmark-inputs/local-replay/experiment/*.log
+            ${{ runner.temp }}/benchmark-inputs/local-replay/experiment/results.json
+          retention-days: 7
+          if-no-files-found: warn
+
+  benchmark:
+    needs: prepare
+    if: github.repository == 'Loris-EPFL/tidehunter-distributed' && github.ref == 'refs/heads/bench/aws-efa' && needs.prepare.outputs.enabled == 'true'
+    runs-on: ubuntu-24.04
+    environment: rdma-bench
+    timeout-minutes: 105
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: engine
+          persist-credentials: false
+      - name: Prepare orchestration Python
+        timeout-minutes: 10
+        run: |
+          python3 -m venv "$RUNNER_TEMP/operator-tools"
+          "$RUNNER_TEMP/operator-tools/bin/pip" install --disable-pip-version-check --retries 2 --timeout 30 boto3==1.35.99 PyYAML==6.0.2
+          echo "$RUNNER_TEMP/operator-tools/bin" >> "$GITHUB_PATH"
+      - name: Retrieve only this workflow's current package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: campaign-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/incoming
+      - name: Verify and restore the source-bound package before AWS access
+        env:
+          PACKAGE_SHA256: ${{ needs.prepare.outputs.package_sha256 }}
+        run: |
+          python3 engine/experiments/aws-sharded-wal/ci_prepare.py restore \
+            --archive "$RUNNER_TEMP/incoming/campaign-inputs.tar.gz" --sha256 "$PACKAGE_SHA256" \
+            --output "$RUNNER_TEMP/benchmark-inputs"
+      # No Cargo/build script executes on this VM or receives these credentials.
+      - name: Obtain short-lived fleet credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: ${{ vars.AWS_BENCH_ROLE_ARN }}
+          role-session-name: fleet-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: ${{ vars.AWS_BENCH_BUCKET_REGION }}
+          allowed-account-ids: "354775971805"
+          role-duration-seconds: 7200
+      - name: Check the shared ledger against the versioned budget file
+        timeout-minutes: 5
+        run: |
+          python3 engine/experiments/aws-sharded-wal/ci_budget.py report \
+            --bucket "$AWS_BENCH_BUCKET" --account 354775971805 --region "$AWS_BENCH_BUCKET_REGION" \
+            --budget-file engine/experiments/aws-sharded-wal/budget.json
+      - name: Run one complete six-host campaign
+        id: campaign
+        timeout-minutes: 85
+        run: |
+          echo 'invoked=true' >> "$GITHUB_OUTPUT"
+          python3 engine/experiments/aws-sharded-wal/ci_campaign.py run \
+            --config engine/experiments/aws-sharded-wal/ci-config.json \
+            --build "$RUNNER_TEMP/benchmark-inputs/build" --fixture "$RUNNER_TEMP/benchmark-inputs/fixture.tar.gz" \
+            --verification "$RUNNER_TEMP/benchmark-inputs/verification" --output "$RUNNER_TEMP/aws-campaign" \
+            --budget-file engine/experiments/aws-sharded-wal/budget.json
+      - name: Reconcile exact-owned cleanup after success or failure
+        if: always() && steps.campaign.outputs.invoked == 'true'
+        timeout-minutes: 10
+        run: |
+          python3 engine/experiments/aws-sharded-wal/ci_campaign.py cleanup \
+            --config engine/experiments/aws-sharded-wal/ci-config.json --output "$RUNNER_TEMP/aws-campaign" \
+            --budget-file engine/experiments/aws-sharded-wal/budget.json
+      - name: Retain downloaded raw evidence and receipts
+        if: always() && steps.campaign.outputs.invoked == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: aws-efa-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/aws-campaign/
+          retention-days: 30
+          if-no-files-found: error
+
+  accounting:
+    needs: [prepare, benchmark]
+    if: always() && github.repository == 'Loris-EPFL/tidehunter-distributed' && github.ref == 'refs/heads/bench/aws-efa'
+    runs-on: ubuntu-24.04
+    environment: rdma-bench
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: engine
+          persist-credentials: false
+      - name: Check reporting activation
+        id: settings
+        env:
+          AWS_BENCH_OPERATION: cost-report
+        run: python3 engine/experiments/aws-sharded-wal/ci_prepare.py settings
+      - name: Prepare accounting Python
+        if: steps.settings.outputs.enabled == 'true'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/accounting-tools"
+          "$RUNNER_TEMP/accounting-tools/bin/pip" install --disable-pip-version-check --retries 2 --timeout 30 boto3==1.35.99
+          echo "$RUNNER_TEMP/accounting-tools/bin" >> "$GITHUB_PATH"
+      - name: Obtain temporary accounting credentials
+        if: steps.settings.outputs.enabled == 'true'
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: ${{ vars.AWS_BENCH_ROLE_ARN }}
+          role-session-name: costs-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: ${{ vars.AWS_BENCH_BUCKET_REGION }}
+          allowed-account-ids: "354775971805"
+          role-duration-seconds: 3600
+      - name: Refresh delayed billing; unavailable data is not zero
+        if: steps.settings.outputs.enabled == 'true'
+        timeout-minutes: 5
+        continue-on-error: true
+        run: |
+          python3 engine/experiments/aws-sharded-wal/ci_budget.py reconcile \
+            --bucket "$AWS_BENCH_BUCKET" --account 354775971805 --region "$AWS_BENCH_BUCKET_REGION" \
+            --budget-file engine/experiments/aws-sharded-wal/budget.json > "$RUNNER_TEMP/billing-refresh.json"
+      - name: Publish total, monthly, weekly and daily branch costs
+        if: always() && steps.settings.outputs.enabled == 'true'
+        run: |
+          python3 engine/experiments/aws-sharded-wal/ci_budget.py publish-report \
+            --bucket "$AWS_BENCH_BUCKET" --account 354775971805 --region "$AWS_BENCH_BUCKET_REGION" \
+            --budget-file engine/experiments/aws-sharded-wal/budget.json \
+            --output "$RUNNER_TEMP/aggregate.json" --format github >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain the generated accounting files, not an editable counter
+        if: always() && steps.settings.outputs.enabled == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: aws-costs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/aggregate.json
+            ${{ runner.temp }}/billing-refresh.json
+          retention-days: 30
+          if-no-files-found: error
