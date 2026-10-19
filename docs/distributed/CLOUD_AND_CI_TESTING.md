@@ -874,6 +874,13 @@ assertion now reads once and accepts only `FileNotFoundError`,
 from a real terminated child reproduced the kernel's `ProcessLookupError`;
 the assertion accepted that state without hiding permission or parsing errors.
 
+The 5,000-summary boundary case now checks the ordered digest without a
+shared `Mock.call_count` assertion. GitHub obtained 5,000 results while that
+counter reported 4,009 across eight workers. A stateless RPC fixture removes
+the incidental concurrent counter. A separate actual-HTTP exercise verified
+all 5,000 summaries, their ordered digest, and rejection of a missing summary;
+the full 387-case AWS and 105-case checkpoint harnesses passed afterward.
+
 Codex review of PR #1 also found that zero read requests or a byte budget below
 one read-flight slot could open and fence an otherwise unusable authority.
 Configuration validation now requires a positive request limit and uses the

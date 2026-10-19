@@ -82,10 +82,9 @@ class RpcContract(unittest.TestCase):
         def checkpoint(address, method, params):
             return {"sequenceNumber": params[0], "digest": params[0]}
 
-        with patch.object(support, "rpc", side_effect=checkpoint) as rpc:
+        with patch.object(support, "rpc", new=checkpoint):
             result = support.verify_source_range("source:1", 4999)
         self.assertEqual(result["checkpoint_count"], 5000)
-        self.assertEqual(rpc.call_count, 5000)
         self.assertEqual(result["range_sha256"],
                          hashlib.sha256(json.dumps([str(i) for i in range(5000)]).encode()).hexdigest())
 
