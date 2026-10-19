@@ -201,7 +201,7 @@ def _digest(value):
 
 
 def _error_code(error):
-    return getattr(error, 'response', {}).get('Error', {}).get('Code', type(error).__name__)
+    return (getattr(error, 'response', None) or {}).get('Error', {}).get('Code', type(error).__name__)
 
 
 def _run_id(value):

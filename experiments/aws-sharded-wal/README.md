@@ -1,13 +1,14 @@
 ## 19 October protected CI admission and reconciled costs
 
-Four protected CI attempts rebuilt all six binaries and completed the native and
+Five protected CI attempts rebuilt all six binaries and completed the native and
 five-shard loopback replay through checkpoint 1775 with equal store audits.
 None allocated a fleet: the first used an invalid IPv4 price filter; the second
 exceeded EC2's 16 KiB startup-script limit; the third hit a Lambda health-probe
-throttle. The fourth, triggered by the protected-branch push, passed readiness
-and received definitive capacity/quota rejections for all 32 GPU-fleet attempts.
-Cleanup receipts and independent exact-run AWS audits confirmed no remaining
-compute, EBS, network, or guest IAM resources.
+throttle. The fourth received definitive capacity/quota rejections for all 32
+GPU-fleet attempts. The fifth rejected 17 candidates, then lost an S3 journal
+response before reaching the CPU fallback; the retained error does not identify
+the HTTP method. Cleanup receipts and independent exact-run AWS audits confirmed
+no remaining compute, EBS, network, or guest IAM resources.
 
 `ci_campaign.py` selects AmazonVPC prices by `group=VPCPublicIPv4Address`,
 then retains only the `PublicIPv4:InUseAddress` usage-type suffix. The queried
@@ -15,13 +16,25 @@ IPv4 products have no `productFamily` field. Missing or ambiguous paid rates
 still fail closed. Official Node 24 action pins support `allowed-account-ids`.
 
 The Lambda readiness client uses standard SDK retries, limited to **12 total
-attempts**, for configuration/policy reads and its read-only health probe. EC2
-and all other clients retain one total attempt; allocation requests are not
-silently replayed. Exhausted throttling, authorization errors, function errors,
-or a mismatched runtime attestation still block allocation.
-The watchdog deployment, reserved concurrency, minute schedule, and fleet
-deadline are unchanged. AWS documents [Invoke throttling](https://docs.aws.amazon.com/lambda/latest/api/API_Invoke.html);
+attempts**, for configuration/policy reads and its read-only health probe. S3 uses
+**three total SDK attempts per request**. EC2 and the remaining clients retain
+one total attempt; allocation requests are not silently replayed. Exhausted
+throttling, authorization errors, function errors, or a mismatched runtime
+attestation still block allocation.
+The watchdog's reserved concurrency, minute schedule and fleet deadline remain
+unchanged. AWS documents [Invoke throttling](https://docs.aws.amazon.com/lambda/latest/api/API_Invoke.html);
 the captured minute-level metrics do not establish the exact throttle cause.
+
+Journal streaming reads permit at most three full-body attempts, close every
+response and retain the existing byte bound. After an ambiguous conditional PUT
+or a conditional conflict, only reading back the identical submitted bytes
+confirms success; that response's opaque ETag becomes the next CAS condition.
+A different or unreadable object still fails closed. SDK transport exceptions
+with `response=None` retain their original meaning in the launcher, budget,
+bootstrap and watchdog instead of being replaced by an attribute error.
+Local HTTP fault injection exercised both a committed PUT with a lost response
+and an interrupted GET body. This does not extend the original fleet deadline
+or establish cloud performance.
 
 The atomic startup capsule uses Python's standard-library LZMA and Base85.
 Replaying the actual failed launch metadata reduced the script from 16,871

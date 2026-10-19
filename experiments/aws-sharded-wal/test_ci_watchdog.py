@@ -432,6 +432,22 @@ class ReapTests(unittest.TestCase):
         self.assertIn(('delete_volumes', 'vol-orphan'), ec2.deletions)
         self.assertTrue(any(error['resource'] == 'i-denied' for error in regional(receipt)['errors']))
 
+    def test_sdk_transport_timeout_cannot_skip_independent_cleanup(self):
+        from botocore.exceptions import ReadTimeoutError
+        ec2 = EC2(instances=[instance('i-timeout'), instance('i-good')], volumes=[volume('vol-orphan')])
+        original = ec2.terminate_instances
+        def timeout_one_host(**request):
+            if request['InstanceIds'] == ['i-timeout']:
+                raise ReadTimeoutError(endpoint_url='https://ec2.invalid/')
+            return original(**request)
+        with patch.object(ec2, 'terminate_instances', side_effect=timeout_one_host):
+            receipt = reap(ec2)
+        self.assertFalse(receipt['complete'])
+        self.assertEqual(ec2.terminations, ['i-good'])
+        self.assertIn(('delete_volumes', 'vol-orphan'), ec2.deletions)
+        self.assertTrue(any(error['resource'] == 'i-timeout' and error['code'] == 'ReadTimeoutError'
+                            for error in regional(receipt)['errors']))
+
     def test_lost_termination_response_is_reconciled_by_terminal_proof(self):
         ec2 = EC2(instances=[instance('i-lost'), instance('i-good')])
         ec2.lost.add('i-lost')

@@ -156,7 +156,7 @@ class Guest:
                         Body=raw, ServerSideEncryption='AES256', ExpectedBucketOwner=self.plan['account'])
                     break
                 except Exception as error:
-                    code = getattr(error, 'response', {}).get('Error', {}).get('Code')
+                    code = (getattr(error, 'response', None) or {}).get('Error', {}).get('Code')
                     if code not in ('AccessDenied', 'AccessDeniedException'):
                         raise
                     self.pause(end, 'final guest IAM permission propagation deadline')
