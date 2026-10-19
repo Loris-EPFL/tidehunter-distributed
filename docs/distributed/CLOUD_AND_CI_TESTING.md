@@ -816,9 +816,9 @@ References:
 
 | Input | Published source |
 |---|---|
-| Sui fork | `Loris-EPFL/sui-tidehunter-distributed`, branch `refactor/distributed-nvme`, commit `ef6dbadcdad795133ab114176957b7fcd33d7192` |
-| Sui's engine dependency | `Loris-EPFL/tidehunter-distributed`, commit `5bd2f5ee3cf7b837c4713b070e3de3cfcf2fe4e5` |
-| Repository Actions pin | `AWS_BENCH_SUI_SHA=ef6dbadcdad795133ab114176957b7fcd33d7192` |
+| Sui fork | `Loris-EPFL/sui-tidehunter-distributed`, branch `refactor/distributed-nvme`, commit `3261f3be974c941584014438159110140a2885a7` |
+| Sui's engine dependency | `Loris-EPFL/tidehunter-distributed`, commit `6dffd324294670ac2e4cb5403ca8c774ef960423` |
+| Repository Actions pin | `AWS_BENCH_SUI_SHA=3261f3be974c941584014438159110140a2885a7` |
 
 The published Sui manifest, remote branch, author/committer associations and
 Actions variable were verified through GitHub as `Loris-EPFL`. The campaign
@@ -833,8 +833,8 @@ selected engine; the portable Sui checkout retains its immutable runtime pin.
 | Offline AWS/CI harness | 387 tests, 3 skipped; all executed tests passed |
 | Sui checkpoint/support/analysis harness | 105 passed, including real Cargo Git-to-staged dependency binding |
 | Native library and strict lint | 383 passed, 6 ignored; native/distributed/fabric `-D warnings` checks passed |
-| Distributed library | 776 passed, 7 ignored |
-| Fabric library/provider checks | Engine 776 passed, 13 ignored; fabric crate 43 passed, 1 ignored; all selected software-provider scenarios passed |
+| Distributed library | 777 passed, 7 ignored |
+| Fabric library/provider checks | Engine 777 passed, 13 ignored; fabric crate 43 passed, 1 ignored; all selected software-provider scenarios passed |
 | Sui native/fabric integration | Native `sui-node`/`sui-tool` and fabric-enabled `sui-node` checks passed against the published runtime pin; scoped strict `xclippy` passed |
 | Sui storage/core regressions | 34 typed-store tests passed; 19 changed core cases passed in isolated exact-filter processes |
 | Local five-process executable | Abrupt coordinator exit, reopen/recovery, fencing, node restart, TLS rejection, lost durable reply and exact retry verified; one shared SSD, no RDMA/AWS |
@@ -882,12 +882,26 @@ precedes authority-directory creation, manifest writes and remote fencing.
 The regression covers both a new directory and a retained authority, then
 checks an uncached value read and the unchanged next valid epoch.
 
+A second Codex review found that an extremely large request-count limit could
+overflow the channel allocation after fencing. The channel and reactor intake
+are now sized by the actual byte-bounded physical flight slots. A regression
+first reproduced `capacity overflow`, then verified eight exact values through
+cold bulk reads with `usize::MAX` requests and a 4,096-byte budget. No arbitrary
+new request ceiling, lock or production timeout was added.
+
 A full local run also exposed the native tracker ordering test's assumption
 that its background thread always publishes within 10 ms. Only the test
 changed: it observes the expected prefix with a five-second bound and retains
 the gap/order assertions. A barrier cannot acknowledge this intermediate
 prefix because it queues behind allocations whose guards the test still
 holds. No production tracker, WAL ordering or durability code changed.
+
+An unthrottled local run with 20 visible CPUs and no `RUST_TEST_THREADS` value
+hit the existing two-second fence-control RPC deadline. The final complete
+distributed and fabric profiles passed with two parallel cases, followed by
+the real five-process executable. The profile runner now defaults to two
+cases while retaining explicit caller overrides. The RPC deadlines and
+fencing assertions were not weakened.
 
 The initial local-only pass could not perform server-side validation because
 `hybr1d` lacked validation actions. A later live audit found inherited
