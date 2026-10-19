@@ -128,7 +128,7 @@ def config_audit(cfg, state=None):
 
 
 def error_code(error):
-    return getattr(error, 'response', {}).get('Error', {}).get('Code')
+    return (getattr(error, 'response', None) or {}).get('Error', {}).get('Code')
 
 
 def tag_map(resource):
@@ -348,12 +348,21 @@ class AWS:
         # Retry transient Lambda throttling without replaying EC2 mutation requests.
         self.lambda_readiness_config = self.config.merge(Config(
             retries={'mode': 'standard', 'total_max_attempts': 12}))
+        # S3 may lose a response after committing a conditional write. Journal
+        # readback confirms identical bytes; EC2 mutations still get one attempt.
+        self.s3_config = self.config.merge(Config(
+            retries={'mode': 'standard', 'total_max_attempts': 3}))
         self.clients = {}
 
     def client(self, service, region):
         key = service, region
         if key not in self.clients:
-            config = self.lambda_readiness_config if service == 'lambda' else self.config
+            if service == 'lambda':
+                config = self.lambda_readiness_config
+            elif service == 's3':
+                config = self.s3_config
+            else:
+                config = self.config
             self.clients[key] = self.session.client(service, region_name=region, config=config)
         return self.clients[key]
 
@@ -579,7 +588,7 @@ def discover_candidates(aws, cfg):
                 types = ec2.describe_instance_types(InstanceTypes=[kind])['InstanceTypes']
             except Exception as error:
                 code = error_code(error)
-                message = getattr(error, 'response', {}).get('Error', {}).get('Message')
+                message = (getattr(error, 'response', None) or {}).get('Error', {}).get('Message')
                 # InvalidParameterValue is otherwise too broad to treat as
                 # unavailability; recognize only EC2's exact singleton response.
                 if code != 'InvalidInstanceType' and not (
@@ -723,13 +732,11 @@ class Journal:
         if not load:
             return
         try:
-            response = s3.get_object(Bucket=cfg['bucket'], Key=self.key, ExpectedBucketOwner=cfg['account'])
+            response, raw = self._read(8 * 1024 * 1024 + 1)
         except Exception as error:
             if error_code(error) not in MISSING:
                 raise
         else:
-            with response['Body'] as body:
-                raw = body.read(8 * 1024 * 1024 + 1)
             if len(raw) > 8 * 1024 * 1024:
                 raise ValueError('oversized control journal')
             self.etag, self.data = response['ETag'], json.loads(raw)
@@ -737,13 +744,42 @@ class Journal:
                     or self.data.get('account') != cfg['account']):
                 raise ValueError('foreign control journal account or ownership')
 
+    def _read(self, limit):
+        from botocore.exceptions import HTTPClientError, IncompleteReadError
+        for attempt in range(3):
+            response = self.s3.get_object(Bucket=self.cfg['bucket'], Key=self.key,
+                ExpectedBucketOwner=self.cfg['account'])
+            stream = response['Body']
+            try:
+                with stream:
+                    raw = stream.read(limit)
+            except (HTTPClientError, IncompleteReadError):
+                # SDK retries stop once GetObject returns its streaming body.
+                if attempt == 2:
+                    raise
+            else:
+                return response, raw
+
     def save(self):
         self.data['updated_utc'] = utc()
         raw = encoded(self.data)
         condition = {'IfMatch': self.etag} if self.etag else {'IfNoneMatch': '*'}
-        response = self.s3.put_object(Bucket=self.cfg['bucket'], Key=self.key, Body=raw,
-            ExpectedBucketOwner=self.cfg['account'], ServerSideEncryption='AES256',
-            ChecksumSHA256=base64.b64encode(hashlib.sha256(raw).digest()).decode(), **condition)
+        try:
+            response = self.s3.put_object(Bucket=self.cfg['bucket'], Key=self.key, Body=raw,
+                ExpectedBucketOwner=self.cfg['account'], ServerSideEncryption='AES256',
+                ChecksumSHA256=base64.b64encode(hashlib.sha256(raw).digest()).decode(), **condition)
+        except Exception as error:
+            if error_code(error) not in ('PreconditionFailed', 'ConditionalRequestConflict', '412', '409'):
+                from botocore.exceptions import ConnectionError, HTTPClientError
+                status = (getattr(error, 'response', None) or {}).get('ResponseMetadata', {}).get('HTTPStatusCode', 0)
+                if not isinstance(error, (ConnectionError, HTTPClientError)) and not 500 <= status < 600:
+                    raise
+            try:
+                response, observed = self._read(len(raw) + 1)
+            except Exception as read_error:
+                raise error from read_error
+            if observed != raw:
+                raise
         self.etag = response['ETag']
         dump(self.output / 'resource-journal.json', self.data)
 

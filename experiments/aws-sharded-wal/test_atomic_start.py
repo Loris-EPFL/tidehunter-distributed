@@ -456,6 +456,14 @@ class AtomicStartupTests(unittest.TestCase):
             self.fleet.controller.execute()
         self.assert_owned_cleanup()
 
+    def test_sdk_export_timeout_preserves_error_and_terminates_owned_fleet(self):
+        from botocore.exceptions import ReadTimeoutError
+        timeout = ReadTimeoutError(endpoint_url='https://s3.invalid/startup.json')
+        with patch.object(self.fleet.s3, 'put_object', side_effect=timeout):
+            with self.assertRaises(ReadTimeoutError):
+                self.fleet.controller.execute()
+        self.assert_owned_cleanup()
+
     def test_bootstrap_deadline_cannot_be_extended(self):
         path = self.fleet.controller.root / 'bootstrap.json'
         record = json.loads(path.read_text())

@@ -44,7 +44,7 @@ class _Limit(RuntimeError):
 
 def _error_code(error):
     # Never log arbitrary exception text, response bodies, credentials or tags.
-    response = getattr(error, 'response', {})
+    response = getattr(error, 'response', None) or {}
     code = response.get('Error', {}).get('Code', type(error).__name__)
     return re.sub(r'[^A-Za-z0-9_.-]', '_', str(code))[:100]
 

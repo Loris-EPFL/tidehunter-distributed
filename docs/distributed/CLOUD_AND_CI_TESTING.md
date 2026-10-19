@@ -614,6 +614,16 @@ request. An unknown launch outcome is reconciled, not followed by a blind
 second allocation. Changing AMI/subnet/type/AZ creates a distinct candidate
 token; retrying that candidate keeps its token and original expiry.
 
+S3 requests have at most three SDK attempts; Lambda readiness retains twelve,
+and EC2 allocation retains one. Journal body reads restart at most twice after
+a streaming timeout or truncation, always closing the previous body and keeping
+the same size bound. A lost conditional-write response is accepted only when a
+fresh read returns the exact submitted bytes; its ETag binds the next write.
+Foreign, different, unreadable or unauthorized state still fails closed. The
+budget ledger keeps its existing operation-bound reconciliation, and transport
+errors with a null SDK response do not suppress independent cleanup. None of
+these recovery paths renews the absolute fleet expiry.
+
 Normal completion uploads and checks the complete S3 result inventory, downloads
 it to the orchestration runner, and verifies closure. Cleanup covers instances,
 run-owned EBS/ENIs, security/placement groups and temporary IAM identities.

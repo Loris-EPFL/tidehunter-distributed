@@ -210,6 +210,32 @@ class SDKReadinessRetryTests(unittest.TestCase):
                 self.assertEqual(http.responses, [success])
                 self.assertEqual(self.delays, [])
 
+    def test_s3_journal_read_retries_transient_response_failures(self):
+        from botocore.exceptions import ReadTimeoutError
+        s3 = self.sdk().client('s3', self.region)
+        data = dict(run_id=RUN, account=ACCOUNT, ownership=ci.ownership(RUN),
+                    mutations=[dict(operation='run_instances', client_token='pending-six-host-intent')])
+        slow = (503, {'Content-Type': 'application/xml'},
+                b'<Error><Code>SlowDown</Code><Message>temporary</Message></Error>')
+        success = (200, {'ETag': '"journal-version"'}, ci.encoded(data))
+        http = self.transport(s3, [ReadTimeoutError(endpoint_url=s3.meta.endpoint_url), slow, success])
+        with tempfile.TemporaryDirectory() as directory:
+            journal = ci.Journal(s3, dict(bucket='owned-results', account=ACCOUNT), RUN, Path(directory))
+        self.assertEqual(journal.data['mutations'], data['mutations'])
+        self.assertEqual(len(http.requests), 3)
+        self.assertTrue(all(request['method'] == 'GET' for request in http.requests))
+        self.assertEqual(http.responses, [])
+
+    def test_s3_journal_read_stops_after_bounded_transport_failures(self):
+        from botocore.exceptions import ReadTimeoutError
+        s3 = self.sdk().client('s3', self.region)
+        failure = ReadTimeoutError(endpoint_url=s3.meta.endpoint_url)
+        http = self.transport(s3, [failure, failure, failure])
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(ReadTimeoutError):
+            ci.Journal(s3, dict(bucket='owned-results', account=ACCOUNT), RUN, Path(directory))
+        self.assertEqual(len(http.requests), 3)
+        self.assertEqual(http.responses, [])
+
 
 class PaginationTests(unittest.TestCase):
     def scripted(self, responses):
@@ -772,6 +798,73 @@ class CampaignTests(unittest.TestCase):
         with self.assertRaisesRegex(ServiceError, 'PreconditionFailed'):
             stale.save()
         self.assertEqual(json.loads(self.aws.s3.objects[stale.key])['event'], 'new-write')
+
+    def test_persisted_capacity_rejection_with_lost_ack_continues_without_duplicate_fleet(self):
+        from botocore.exceptions import ReadTimeoutError
+        self.aws.ec2['us-east-1'].outcomes = ['capacity']
+        original = self.aws.s3.put_object
+        lost = []
+        def lose_capacity_ack(**request):
+            response = original(**request)
+            data = json.loads(request['Body'])
+            if (not lost and request['Key'] == self.campaign.journal.key
+                    and data.get('attempts') and data['attempts'][-1]['status'] == 'capacity-rejected'):
+                lost.append(True)
+                raise ReadTimeoutError(endpoint_url='https://s3.invalid/journal.json')
+            return response
+        with patch.object(self.aws.s3, 'put_object', side_effect=lose_capacity_ack):
+            instances, candidate, _ = self.allocate()
+        self.assertEqual(len(instances), 6)
+        self.assertEqual(candidate['region'], 'us-east-2')
+        self.assertEqual(len(lost), 1)
+        self.assertEqual([attempt['status'] for attempt in self.campaign.journal.data['attempts']],
+                         ['capacity-rejected', 'allocated'])
+        self.assertEqual([len(client.requests) for client in self.aws.ec2.values()], [1, 1])
+
+    def test_unconfirmed_launch_intent_timeout_stops_before_any_allocation(self):
+        from botocore.exceptions import ReadTimeoutError
+        original = self.aws.s3.put_object
+        def lose_uncommitted_intent(**request):
+            data = json.loads(request['Body'])
+            if (request['Key'] == self.campaign.journal.key and data.get('mutations')
+                    and data['mutations'][-1]['operation'] == 'run_instances'):
+                raise ReadTimeoutError(endpoint_url='https://s3.invalid/journal.json')
+            return original(**request)
+        with patch.object(self.aws.s3, 'put_object', side_effect=lose_uncommitted_intent):
+            with self.assertRaises(ReadTimeoutError):
+                self.allocate()
+        self.assertTrue(all(not client.requests for client in self.aws.ec2.values()))
+        stored = json.loads(self.aws.s3.objects[self.campaign.journal.key])
+        self.assertFalse(stored['attempts'])
+        self.assertTrue(all(item['operation'] != 'run_instances' for item in stored['mutations']))
+
+    def test_interrupted_journal_stream_restarts_bounded_and_closes_every_body(self):
+        from botocore.exceptions import ReadTimeoutError
+        self.allocate()
+        original = self.aws.s3.get_object
+        class Interrupted(io.BytesIO):
+            def read(self, size=-1):
+                super().read(1)
+                raise ReadTimeoutError(endpoint_url='https://s3.invalid/journal.json')
+        for interruptions in (1, 3):
+            with self.subTest(interruptions=interruptions):
+                bodies = []
+                def interrupted_read(**request):
+                    response = original(**request)
+                    if len(bodies) < interruptions:
+                        response['Body'].close()
+                        response['Body'] = Interrupted(self.aws.s3.objects[request['Key']])
+                    bodies.append(response['Body'])
+                    return response
+                with patch.object(self.aws.s3, 'get_object', side_effect=interrupted_read):
+                    if interruptions == 3:
+                        with self.assertRaises(ReadTimeoutError):
+                            ci.Journal(self.aws.s3, self.cfg, RUN, self.output)
+                    else:
+                        recovered = ci.Journal(self.aws.s3, self.cfg, RUN, self.output)
+                        self.assertEqual(recovered.data['attempts'], self.campaign.journal.data['attempts'])
+                self.assertEqual(len(bodies), 3 if interruptions == 3 else 2)
+                self.assertTrue(all(body.closed for body in bodies))
 
     def test_source_archive_mismatch_is_rejected_before_any_aws_client(self):
         build = self.output / 'build'

@@ -9,6 +9,7 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 
 import ci_budget as budget
 
@@ -308,6 +309,21 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(self.ledger.report()['conservative_budget_charge_usd'], '20')
         self.reserve()
         self.assertEqual(self.ledger.report()['revision'], 1)
+
+    def test_sdk_timeout_after_committed_reservation_cannot_double_charge(self):
+        from botocore.exceptions import ReadTimeoutError
+        original = self.s3.put_object
+        def lose_ledger_ack(**request):
+            response = original(**request)
+            if request['Key'] == self.ledger.key:
+                raise ReadTimeoutError(endpoint_url='https://s3.invalid/ledger.json')
+            return response
+        with patch.object(self.s3, 'put_object', side_effect=lose_ledger_ack):
+            self.assertEqual(self.reserve()['reserved_usd'], '20')
+        self.reserve()
+        report = self.ledger.report()
+        self.assertEqual(report['conservative_budget_charge_usd'], '20')
+        self.assertEqual(report['revision'], 1)
 
     def test_unknown_uncommitted_write_stops_without_retrying_spend(self):
         self.s3.write_mode = 'unknown_uncommitted'
