@@ -144,11 +144,14 @@ def main():
         "Prepare once: bash .github/scripts/setup.sh core|fabric. Checks never download dependencies; "
         "Cargo uses --locked --offline and rust-toolchain.toml. Set TIDEHUNTER_LIBFABRIC_PREFIX for a "
         "custom provider install; existing PKG_CONFIG_*/LD_LIBRARY_PATH and Cargo/Rust controls are retained. "
+        "Tests default to two parallel cases; an explicit RUST_TEST_THREADS is retained. "
         "all includes software-fabric and fails if tcp;ofi_rxm cannot execute. EFA hardware tests stay ignored."))
     parser.add_argument("profile", choices=PROFILES)
     args = parser.parse_args()
     env = os.environ.copy()
     env.setdefault("CARGO_TERM_COLOR", "always" if sys.stdout.isatty() else "never")
+    # Keep concurrent five-node fixtures bounded on a single local SSD.
+    env.setdefault("RUST_TEST_THREADS", "2")
     # Do not let rustup bootstrap a missing toolchain during ordinary checks.
     env["RUSTUP_AUTO_INSTALL"] = "0"
     try:
