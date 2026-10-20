@@ -1541,6 +1541,8 @@ class Campaign:
             discovered, previous = {}, {}
             receipt['errors'].append('cleanup identity reconciliation: ' + repr(error))
         keys = set(discovered) | {(item['region'], item['instance_id']) for item in previous.values()}
+        pending = {}
+        # Reconcile/request the whole fleet before spending any time waiting for one host.
         for region, instance_id in sorted(keys):
             item = discovered.get((region, instance_id))
             prior = previous.get(region + '/' + instance_id)
@@ -1557,23 +1559,46 @@ class Campaign:
                 current = self.exact_instance(region, instance_id)
                 if current is None:
                     raise ValueError('known allocation disappeared without observed terminal proof')
-                if current['State']['Name'] != 'terminated':
+                summary['final_state'] = current['State']['Name']
+                if current['State']['Name'] == 'terminated':
+                    summary['verified_utc'] = utc()
+                    continue
+                if current['State']['Name'] != 'shutting-down':
                     try:
                         self.aws.client('ec2', region).terminate_instances(InstanceIds=[instance_id])
                     except Exception as error:
                         if error_code(error) in {'UnauthorizedOperation', 'AccessDenied', 'AuthFailure'}:
                             raise
                         summary['termination_request_error'] = repr(error)
-                for _ in range(60):
-                    current = self.exact_instance(region, instance_id)
-                    if current is not None and current['State']['Name'] == 'terminated':
-                        summary.update(final_state='terminated', verified_utc=utc())
-                        break
-                    self.clock.sleep(5)
-                else:
-                    raise TimeoutError('EC2 did not confirm terminated')
+                pending[region, instance_id] = summary
             except Exception as error:
                 receipt['errors'].append(instance_id + ': ' + repr(error))
+        # One shared observation window: slow hosts must not delay requests to their peers
+        # or leave a sticky per-host timeout when they terminate within the fleet window.
+        end = self.clock.time() + 600
+        for _ in range(120):
+            remaining = end - self.clock.time()
+            if not pending or remaining <= 0:
+                break
+            for (region, instance_id), summary in list(pending.items()):
+                if self.clock.time() >= end:
+                    break
+                try:
+                    current = self.exact_instance(region, instance_id)
+                    if current is None:
+                        raise ValueError('known allocation disappeared without observed terminal proof')
+                    summary['final_state'] = current['State']['Name']
+                    if current['State']['Name'] == 'terminated':
+                        summary['verified_utc'] = utc()
+                        del pending[region, instance_id]
+                except Exception as error:
+                    receipt['errors'].append(instance_id + ': ' + repr(error))
+                    del pending[region, instance_id]
+            remaining = end - self.clock.time()
+            if pending and remaining > 0:
+                self.clock.sleep(min(5, remaining))
+        for region, instance_id in pending:
+            receipt['errors'].append(instance_id + ': ' + repr(TimeoutError('EC2 did not confirm terminated')))
         unknown = [attempt for attempt in data.get('attempts', []) if attempt['status'] == 'allocation-outcome-unknown']
         if unknown and len(receipt['instances']) != 6:
             receipt['errors'].append('allocation outcome still unknown; incomplete visibility is not proof of no mutation')

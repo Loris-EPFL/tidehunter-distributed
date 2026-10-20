@@ -248,7 +248,7 @@ jobs:
             --budget-file engine/experiments/aws-sharded-wal/budget.json
       - name: Reconcile exact-owned cleanup after success or failure
         if: always() && steps.campaign.outputs.invoked == 'true'
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           python3 engine/experiments/aws-sharded-wal/ci_campaign.py cleanup \
             --config engine/experiments/aws-sharded-wal/ci-config.json --output "$RUNNER_TEMP/aws-campaign" \

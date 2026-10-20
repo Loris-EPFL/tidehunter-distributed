@@ -410,10 +410,16 @@ class EC2:
         self.fail_termination = set()
         self.fail_inventory = False
         self.never_terminates = set()
+        self.termination_delays, self.termination_deadlines = {}, {}
         self.hide_tag_inventory = False
 
 
     def describe_instances(self, **kwargs):
+        for item in self.instances:
+            deadline = self.termination_deadlines.get(item['InstanceId'])
+            if (item['State']['Name'] == 'shutting-down' and deadline is not None
+                    and self.clock.time() >= deadline):
+                item['State']['Name'] = 'terminated'
         if self.fail_inventory:
             raise OSError('regional inventory unavailable')
         instances = self.instances
@@ -453,7 +459,14 @@ class EC2:
                 raise ServiceError('UnauthorizedOperation')
             for item in self.instances:
                 if item['InstanceId'] == instance_id:
-                    item['State']['Name'] = 'shutting-down' if instance_id in self.never_terminates else 'terminated'
+                    if instance_id in self.never_terminates:
+                        item['State']['Name'] = 'shutting-down'
+                    elif instance_id in self.termination_delays:
+                        item['State']['Name'] = 'shutting-down'
+                        self.termination_deadlines.setdefault(instance_id,
+                            self.clock.time() + self.termination_delays[instance_id])
+                    else:
+                        item['State']['Name'] = 'terminated'
         return {}
 
     def describe_network_interfaces(self, **kwargs):
@@ -740,6 +753,122 @@ class CampaignTests(unittest.TestCase):
         receipt = self.campaign.cleanup()
         self.assertFalse(receipt['cleanup_complete'])
         self.assertIn('did not confirm terminated', ' '.join(receipt['errors']))
+
+    def test_cleanup_observes_slow_first_host_in_shared_fleet_window_before_deleting_iam(self):
+        self.allocate()
+        ec2 = self.aws.ec2['us-east-1']
+        ids = sorted(item['InstanceId'] for item in ec2.instances)
+        ec2.termination_delays = dict(zip(ids, [420, 5, 10, 15, 20, 25]))
+        started = self.clock.time()
+        requests, profile_cleanup = [], []
+        terminate, cleanup_profiles, real_utc = ec2.terminate_instances, self.campaign.cleanup_profiles, ci.utc
+        def request(**params):
+            requests.append((self.clock.time(), params['InstanceIds']))
+            return terminate(**params)
+        def delete_profiles(receipt):
+            self.assertEqual({item['State']['Name'] for item in ec2.instances}, {'terminated'})
+            self.assertEqual(len(receipt['instances']), 6)
+            self.assertTrue(all(item.get('final_state') == 'terminated' and item.get('verified_utc')
+                                for item in receipt['instances']))
+            profile_cleanup.append(self.clock.time())
+            return cleanup_profiles(receipt)
+        def observed_utc(value=None):
+            return real_utc(value if value is not None else datetime.fromtimestamp(self.clock.time(), timezone.utc))
+        with patch.object(ec2, 'terminate_instances', side_effect=request), \
+                patch.object(self.campaign, 'cleanup_profiles', side_effect=delete_profiles), \
+                patch.object(ci, 'utc', side_effect=observed_utc):
+            receipt = self.campaign.cleanup()
+        self.assertTrue(receipt['cleanup_complete'], receipt['errors'])
+        self.assertEqual({tuple(instance_ids) for _, instance_ids in requests}, {(instance_id,) for instance_id in ids})
+        self.assertTrue(all(requested_at == started for requested_at, _ in requests))
+        self.assertEqual(profile_cleanup, [started + 420])
+        self.assertEqual(self.clock.time() - started, 420)
+        proofs = {item['instance_id']: item for item in receipt['instances']}
+        for instance_id, delay in ec2.termination_delays.items():
+            self.assertEqual(proofs[instance_id]['final_state'], 'terminated')
+            self.assertEqual(ci.parsed(proofs[instance_id]['verified_utc']).timestamp(), started + delay)
+        self.assertEqual(self.campaign.journal.data['terminal_proofs'],
+                         {'us-east-1/' + instance_id: proof for instance_id, proof in proofs.items()})
+        self.assertEqual(len(self.aws.iam.deleted), 6)
+        self.assertEqual(self.aws.iam.profiles, {})
+
+    def test_cleanup_multiple_nonterminal_hosts_share_one_bounded_window_and_keep_budget_and_iam(self):
+        with patch('ci_budget.BudgetLedger', ActualBudgetLedger):
+            ledger = ActualBudgetLedger(self.aws.s3, self.cfg['bucket'], ACCOUNT, budget_path=self.budget_file)
+            ledger.initialize()
+            self.allocate()
+            ec2 = self.aws.ec2['us-east-1']
+            ec2.never_terminates.update(item['InstanceId'] for item in ec2.instances)
+            started = self.clock.time()
+            with patch.object(self.clock, 'sleep', wraps=self.clock.sleep) as sleep:
+                receipt = self.campaign.cleanup()
+            self.assertFalse(receipt['cleanup_complete'])
+            self.assertFalse(receipt['compute_cleanup_complete'])
+            self.assertEqual(self.clock.time() - started, 600)
+            self.assertEqual(sleep.call_count, 120)
+            self.assertEqual(len(ec2.terminations), 6)
+            self.assertEqual(sum('did not confirm terminated' in error for error in receipt['errors']), 6)
+            self.assertEqual({item['final_state'] for item in receipt['instances']}, {'shutting-down'})
+            self.assertTrue(all('verified_utc' not in item for item in receipt['instances']))
+            self.assertEqual(self.campaign.journal.data['terminal_proofs'], {})
+            self.assertEqual(self.aws.iam.deleted, [])
+            self.assertEqual(len(self.aws.iam.roles), 6)
+            self.assertEqual(len(self.aws.iam.profiles), 6)
+            self.campaign.settle(receipt)
+            run = ledger.report(run_id=RUN)['runs'][RUN]
+            self.assertFalse(run['reservation_released'])
+            self.assertEqual(run['active_reservation_usd'], run['reserved_usd'])
+
+    def test_cleanup_observation_deadline_includes_time_spent_reading_ec2(self):
+        self.allocate()
+        ec2 = self.aws.ec2['us-east-1']
+        ec2.never_terminates.update(item['InstanceId'] for item in ec2.instances)
+        original = ec2.describe_instances
+        started = self.clock.time()
+        observations = []
+        def slow_read(**params):
+            if params.get('InstanceIds') and len(ec2.terminations) == 6:
+                observations.append(self.clock.time())
+                self.clock.now += 10
+            return original(**params)
+        with patch.object(ec2, 'describe_instances', side_effect=slow_read):
+            receipt = self.campaign.cleanup()
+        self.assertFalse(receipt['cleanup_complete'])
+        self.assertGreater(len(observations), 6)
+        self.assertLess(max(observations), started + 600)
+        self.assertLessEqual(self.clock.time() - started, 610)
+        # An already-started synchronous SDK read may finish after the deadline,
+        # but no further read or sleep may start once the shared window expires.
+        self.assertEqual(self.aws.iam.deleted, [])
+
+    def test_cleanup_observation_round_bound_survives_a_nonadvancing_clock(self):
+        self.allocate()
+        ec2 = self.aws.ec2['us-east-1']
+        ec2.never_terminates.update(item['InstanceId'] for item in ec2.instances)
+        started = self.clock.time()
+        with patch.object(self.clock, 'sleep') as sleep:
+            receipt = self.campaign.cleanup()
+        self.assertFalse(receipt['cleanup_complete'])
+        self.assertEqual(self.clock.time(), started)
+        self.assertEqual(sleep.call_count, 120)
+        self.assertTrue(all(call.args == (5,) for call in sleep.call_args_list))
+        self.assertEqual(sum('did not confirm terminated' in error for error in receipt['errors']), 6)
+        self.assertEqual(self.aws.iam.deleted, [])
+
+    def test_cleanup_reconciles_already_shutting_down_hosts_without_duplicate_termination(self):
+        self.allocate()
+        ec2 = self.aws.ec2['us-east-1']
+        started = self.clock.time()
+        for item in ec2.instances:
+            item['State']['Name'] = 'shutting-down'
+            ec2.termination_deadlines[item['InstanceId']] = started + 5
+        receipt = self.campaign.cleanup()
+        self.assertTrue(receipt['cleanup_complete'], receipt['errors'])
+        self.assertEqual(ec2.terminations, [])
+        self.assertEqual(self.clock.time() - started, 5)
+        self.assertEqual(len(receipt['instances']), 6)
+        self.assertTrue(all(item['final_state'] == 'terminated' and item['verified_utc']
+                            for item in receipt['instances']))
 
     def test_inaccessible_region_does_not_prevent_shutdown_in_other_region(self):
         self.allocate()
