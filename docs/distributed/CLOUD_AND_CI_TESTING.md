@@ -495,9 +495,12 @@ Publish every useful source file from both forks before a campaign. Develop and
 publish incremental commits on a work branch, then merge through the protected
 benchmark branch's correctness checks. Use `Loris-EPFL` for commit and push
 identity. Generated caches, credentials and local build databases are not source.
-For interactive AWS operations use the connected AWS MCP. If it disconnects,
-pause AWS operations and notify the user; do not switch to a local CLI/SDK
-fallback. The campaign's own SDK calls inside GitHub/EC2 are unchanged.
+For interactive AWS operations prefer the connected AWS MCP. If it is unavailable,
+use a local CLI/SDK fallback only when the user has authorized it and the caller's
+identity is verified in the expected account. Never bypass an IAM denial or
+extract another job's credentials. Without valid interactive credentials, report
+that limitation; retain the campaign's CI/EC2 cleanup guards and their receipts.
+The campaign's own SDK calls inside GitHub/EC2 are unchanged.
 
 | Maintained file | Responsibility |
 |---|---|
