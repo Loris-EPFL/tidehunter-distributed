@@ -3,7 +3,9 @@
 import argparse
 import json
 from pathlib import Path
+import sys
 import tarfile
+sys.dont_write_bytecode = True
 import build
 import deployment
 
