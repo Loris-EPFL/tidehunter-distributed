@@ -619,6 +619,10 @@ timeout after all hosts reach `terminated`. IAM removal still requires explicit
 terminal proof for the entire owned fleet. The separate GitHub cleanup step has
 15 minutes for this bounded observation and post-compute resource reconciliation;
 it does not extend the EC2 lease, controller cutoff or export reserve.
+The GitHub orchestration job has a separate 180-minute ceiling and explicit
+preparation, campaign, cleanup and artifact-transfer step limits. Their combined
+limits leave runner/post-action headroom, and fleet credentials cover the
+AWS-bearing cleanup window. This job ceiling is not an EC2 lease extension.
 
 Three independent paths enforce closure:
 
