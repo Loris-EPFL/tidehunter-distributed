@@ -574,6 +574,15 @@ a full 40-character Sui commit, runs correctness checks, rebuilds all six binari
 and completes the same-build five-process local TCP replay and state audit.
 Local timings do not establish independent-NVMe or EFA performance.
 
+External namespace preparation, like the replay entry point, disables Python
+bytecode writes before importing helpers from the frozen source tree. It must
+leave that tree unchanged even when `PYTHONDONTWRITEBYTECODE` is absent on a
+guest. Otherwise importing `build.py` creates an extra `__pycache__` file and
+the subsequent replay correctly rejects the changed inventory. The regression
+executes the real preparation CLI with the CI bytecode settings removed and
+checks the complete file inventory and all bound hashes. The source-integrity
+validator remains unchanged; generated caches are not exempted or deleted later.
+
 The build job uses the `rdma-bench-inputs` environment and an input-only OIDC
 role that can retrieve the exact fixture. Its OIDC subject is **not trusted by
 the fleet role**. Merely putting compilation on another VM would be insufficient

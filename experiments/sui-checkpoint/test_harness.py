@@ -218,6 +218,23 @@ class CheckpointSourceBoundaries(unittest.TestCase):
                 for path in base.rglob('*') if path.is_file()})
         return identities
 
+    def test_external_preparation_keeps_frozen_sources_immutable_without_ci_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identities = self.source_tree(root)
+            script = root / 'sources/tidehunter-sharded-wal/experiments/sui-checkpoint/prepare_external.py'
+            environment = {key: value for key, value in os.environ.items()
+                           if key not in ('PYTHONDONTWRITEBYTECODE', 'PYTHONPYCACHEPREFIX')}
+            subprocess.run([sys.executable, str(script), '--help'], env=environment,
+                           check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            for owner, identity in identities.items():
+                base = root / 'sources' / owner
+                actual = {str(path.relative_to(base)) for path in base.rglob('*') if path.is_file()}
+                self.assertEqual(actual, set(identity['files']))
+                for relative, entry in identity['files'].items():
+                    self.assertEqual(build.digest(base / relative), entry['sha256'])
+            build.verify_staged(root, identities)
+
     def cargo_sources(self, root, *, selected_version='0.1.0'):
         self.source_tree(root / 'inputs')
         sources = root / 'inputs/sources'
