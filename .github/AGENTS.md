@@ -41,10 +41,12 @@ root `AGENTS.md` or the containing project's working rules.
   GitHub integration is configured in Codex settings, outside workflow YAML.
 - Pin external actions/dependency sources. Scope caches to their actual toolchain,
   lockfile and provider inputs; a cache hit is not proof of current binary identity.
-- Use the connected AWS MCP for interactive AWS operations. If it disconnects,
-  pause AWS work and notify the user so they can reconnect it; do not switch to
-  local AWS CLI/SDK fallback. Retry through MCP after reconnection. This does not
-  replace the authorized campaign's own SDK calls inside GitHub/EC2.
+- Prefer the connected AWS MCP for interactive AWS operations. If it is
+  unavailable, use local CLI/SDK fallback only with explicit user authorization
+  and a verified identity in the expected account. Do not bypass IAM denials or
+  extract another job's credentials. Without valid interactive credentials,
+  report the limitation and preserve the CI/EC2 cleanup guards and receipts.
+  The authorized campaign's own SDK calls inside GitHub/EC2 are unchanged.
 
 ### Preserve existing campaigns
 

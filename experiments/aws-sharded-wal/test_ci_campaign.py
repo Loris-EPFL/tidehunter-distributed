@@ -14,7 +14,7 @@ import unittest
 from unittest.mock import patch
 
 import ci_campaign as ci
-from ci_budget import BudgetLedger as ActualBudgetLedger
+from ci_budget import BudgetExceeded, BudgetLedger as ActualBudgetLedger
 
 
 RUN = 'th-0123456789abcdef'
@@ -410,10 +410,16 @@ class EC2:
         self.fail_termination = set()
         self.fail_inventory = False
         self.never_terminates = set()
+        self.termination_delays, self.termination_deadlines = {}, {}
         self.hide_tag_inventory = False
 
 
     def describe_instances(self, **kwargs):
+        for item in self.instances:
+            deadline = self.termination_deadlines.get(item['InstanceId'])
+            if (item['State']['Name'] == 'shutting-down' and deadline is not None
+                    and self.clock.time() >= deadline):
+                item['State']['Name'] = 'terminated'
         if self.fail_inventory:
             raise OSError('regional inventory unavailable')
         instances = self.instances
@@ -453,7 +459,14 @@ class EC2:
                 raise ServiceError('UnauthorizedOperation')
             for item in self.instances:
                 if item['InstanceId'] == instance_id:
-                    item['State']['Name'] = 'shutting-down' if instance_id in self.never_terminates else 'terminated'
+                    if instance_id in self.never_terminates:
+                        item['State']['Name'] = 'shutting-down'
+                    elif instance_id in self.termination_delays:
+                        item['State']['Name'] = 'shutting-down'
+                        self.termination_deadlines.setdefault(instance_id,
+                            self.clock.time() + self.termination_delays[instance_id])
+                    else:
+                        item['State']['Name'] = 'terminated'
         return {}
 
     def describe_network_interfaces(self, **kwargs):
@@ -572,6 +585,7 @@ class Ledger:
     reservations = []
     settlements = {}
     policies = {}
+    available_usd = '60'
 
     def __init__(self, *args, **kwargs):
         self.budget_path = kwargs.get('budget_path', ci.DEFAULT_BUDGET)
@@ -590,7 +604,7 @@ class Ledger:
         return value
 
     def report(self, run_id=None):
-        return dict(budget_policy=ci.load_budget(self.budget_path),
+        return dict(available_usd=self.available_usd, budget_policy=ci.load_budget(self.budget_path),
                     runs={key: dict(budget_policy=value) for key, value in self.policies.items()
                           if run_id is None or key == run_id})
 
@@ -612,6 +626,8 @@ class CampaignTests(unittest.TestCase):
                         kv_suite=dict(scope='full', repetitions=1, diagnostics=True))
         Ledger.settlements = {}
         Ledger.policies = {}
+        Ledger.reservations = []
+        Ledger.available_usd = '60'
         self.aws = AWS(self.clock)
         self.campaign = ci.Campaign(self.aws, self.cfg, RUN, self.output, clock=self.clock)
         self.admission = dict(bindings={'source_archive_sha256': 'a' * 64}, inputs={},
@@ -641,6 +657,131 @@ class CampaignTests(unittest.TestCase):
 
     def allocate(self):
         return self.campaign.allocate(self.admission, self.preflight)
+
+    def test_admission_keeps_only_candidates_fitting_the_exact_available_boundary(self):
+        with patch('ci_budget.BudgetLedger', ActualBudgetLedger):
+            ledger = ActualBudgetLedger(self.aws.s3, self.cfg['bucket'], ACCOUNT, budget_path=self.budget_file)
+            ledger.initialize()
+            ledger.reserve('th-1111111111111111', '45.090714285714', {'purpose': 'other campaign'})
+            self.assertEqual(ledger.report()['available_usd'], '14.909285714286')
+            instances, candidate, _ = self.allocate()
+            self.assertEqual(len(instances), 6)
+            self.assertEqual(candidate, self.candidates[0])
+            self.assertEqual(self.campaign.journal.data['candidates'], [self.candidates[0]])
+            self.assertEqual(self.preflight['candidates'], self.candidates)
+            reservation = ledger.report(run_id=RUN)['runs'][RUN]
+            self.assertEqual(reservation['reserved_usd'], '14.909285714286')
+            self.assertEqual(reservation['provenance']['candidates'], ci.ledger_candidates([self.candidates[0]]))
+            self.assertEqual(self.aws.ec2['us-east-2'].requests, [])
+
+    def test_admission_one_decimal_unit_short_makes_no_paid_or_guest_mutation(self):
+        with patch('ci_budget.BudgetLedger', ActualBudgetLedger):
+            ledger = ActualBudgetLedger(self.aws.s3, self.cfg['bucket'], ACCOUNT, budget_path=self.budget_file)
+            ledger.initialize()
+            ledger.reserve('th-1111111111111111', '45.090714285715', {'purpose': 'other campaign'})
+            with self.assertRaises(BudgetExceeded):
+                self.allocate()
+            self.assertIsNone(self.campaign.journal.data)
+            self.assertEqual(set(ledger.report()['runs']), {'th-1111111111111111'})
+            self.assertEqual(self.aws.iam.roles, {})
+            self.assertEqual(self.aws.iam.profiles, {})
+            self.assertTrue(all(not ec2.requests for ec2 in self.aws.ec2.values()))
+            self.network.assert_not_called()
+
+    def test_capacity_failure_cannot_launch_an_unaffordable_fallback(self):
+        Ledger.available_usd = '20'
+        self.aws.ec2['us-east-1'].outcomes = ['capacity']
+        with self.assertRaises(RuntimeError):
+            self.allocate()
+        self.assertEqual(self.campaign.journal.data['candidates'], [self.candidates[0]])
+        self.assertEqual(len(self.aws.ec2['us-east-1'].requests), 1)
+        self.assertEqual(self.aws.ec2['us-east-2'].requests, [])
+        self.assertEqual(Ledger.reservations[0][1], Decimal('14.909285714286'))
+
+    def test_affordability_quote_rounds_up_under_low_ambient_precision(self):
+        Ledger.available_usd = '20'
+        self.candidates[0]['maximum_estimate_usd'] = '12.000000000001'
+        with localcontext() as context:
+            context.prec = 6
+            self.allocate()
+        _, estimate, provenance = Ledger.reservations[0]
+        self.assertEqual(estimate, Decimal('14.909285714288'))
+        self.assertEqual(provenance['reconciliation_usd'], '2.000000000001')
+        self.assertEqual(self.campaign.journal.data['candidates'], [self.candidates[0]])
+
+    def test_crash_after_reservation_reuses_selection_despite_its_own_hold(self):
+        with patch('ci_budget.BudgetLedger', ActualBudgetLedger):
+            ledger = ActualBudgetLedger(self.aws.s3, self.cfg['bucket'], ACCOUNT, budget_path=self.budget_file)
+            ledger.initialize()
+            save = self.campaign.journal.save
+            def crash_before_reserved_journal_write():
+                if self.campaign.journal.data.get('budget_reserved'):
+                    raise RuntimeError('interrupted after reservation')
+                return save()
+            with patch.object(self.campaign.journal, 'save', side_effect=crash_before_reserved_journal_write):
+                with self.assertRaises(RuntimeError):
+                    self.allocate()
+            stored = json.loads(self.aws.s3.objects[self.campaign.journal.key])
+            self.assertFalse(stored.get('budget_reserved', False))
+            original = ledger.report(run_id=RUN)['runs'][RUN]
+            ledger.reserve('th-1111111111111111', '20', {'purpose': 'other campaign'})
+            available = ledger.report()['available_usd']
+            self.assertLess(Decimal(available), Decimal(original['reserved_usd']))
+            self.campaign = ci.Campaign(self.aws, self.cfg, RUN, self.output, clock=self.clock)
+            with patch.object(self.campaign, 'network', return_value='sg-owned'), \
+                    patch.object(self.campaign, 'request', side_effect=self.request):
+                self.allocate()
+            replayed = ledger.report(run_id=RUN)['runs'][RUN]
+            self.assertEqual(replayed['reservation_digest'], original['reservation_digest'])
+            self.assertEqual(ledger.report()['available_usd'], available)
+            self.assertEqual(self.campaign.journal.data['candidates'], self.candidates)
+            self.assertEqual(len(self.aws.ec2['us-east-1'].requests), 1)
+
+    def test_crash_before_reservation_keeps_selection_and_denies_later_budget_loss(self):
+        with patch('ci_budget.BudgetLedger', ActualBudgetLedger):
+            ledger = ActualBudgetLedger(self.aws.s3, self.cfg['bucket'], ACCOUNT, budget_path=self.budget_file)
+            ledger.initialize()
+            with patch.object(ActualBudgetLedger, 'reserve', side_effect=RuntimeError('interrupted before reservation')):
+                with self.assertRaises(RuntimeError):
+                    self.allocate()
+            self.assertEqual(self.campaign.journal.data['candidates'], self.candidates)
+            ledger.reserve('th-1111111111111111', '45', {'purpose': 'other campaign'})
+            self.preflight['candidates'] = [self.candidates[0]]
+            self.campaign = ci.Campaign(self.aws, self.cfg, RUN, self.output, clock=self.clock)
+            with self.assertRaises(BudgetExceeded):
+                self.allocate()
+            self.assertEqual(self.campaign.journal.data['candidates'], self.candidates)
+            self.assertEqual(set(ledger.report()['runs']), {'th-1111111111111111'})
+            self.assertTrue(all(not ec2.requests for ec2 in self.aws.ec2.values()))
+            self.assertEqual(self.aws.iam.roles, {})
+
+    def test_budget_loss_after_selection_report_is_rejected_by_reservation_cas(self):
+        with patch('ci_budget.BudgetLedger', ActualBudgetLedger):
+            ledger = ActualBudgetLedger(self.aws.s3, self.cfg['bucket'], ACCOUNT, budget_path=self.budget_file)
+            ledger.initialize()
+            report, raced = ActualBudgetLedger.report, []
+            def consume_after_report(instance, run_id=None, now=None):
+                previous = report(instance, run_id=run_id, now=now)
+                if not raced:
+                    raced.append(True)
+                    ledger.reserve('th-1111111111111111', '45', {'purpose': 'concurrent campaign'})
+                return previous
+            with patch.object(ActualBudgetLedger, 'report', new=consume_after_report):
+                with self.assertRaises(BudgetExceeded):
+                    self.allocate()
+            self.assertEqual(self.campaign.journal.data['candidates'], self.candidates)
+            self.assertEqual(set(ledger.report()['runs']), {'th-1111111111111111'})
+            self.assertTrue(all(not ec2.requests for ec2 in self.aws.ec2.values()))
+            self.assertEqual(self.aws.iam.roles, {})
+
+    def test_authoritative_budget_report_failure_denies_fresh_admission(self):
+        with patch.object(Ledger, 'report', side_effect=RuntimeError('authoritative ledger unavailable')):
+            with self.assertRaises(RuntimeError):
+                self.allocate()
+        self.assertIsNone(self.campaign.journal.data)
+        self.assertEqual(Ledger.reservations, [])
+        self.assertTrue(all(not ec2.requests for ec2 in self.aws.ec2.values()))
+        self.assertEqual(self.aws.iam.roles, {})
 
     def test_atomic_six_count_stable_token_and_durable_intent(self):
         original = self.aws.ec2['us-east-1'].run_instances
@@ -740,6 +881,122 @@ class CampaignTests(unittest.TestCase):
         receipt = self.campaign.cleanup()
         self.assertFalse(receipt['cleanup_complete'])
         self.assertIn('did not confirm terminated', ' '.join(receipt['errors']))
+
+    def test_cleanup_observes_slow_first_host_in_shared_fleet_window_before_deleting_iam(self):
+        self.allocate()
+        ec2 = self.aws.ec2['us-east-1']
+        ids = sorted(item['InstanceId'] for item in ec2.instances)
+        ec2.termination_delays = dict(zip(ids, [420, 5, 10, 15, 20, 25]))
+        started = self.clock.time()
+        requests, profile_cleanup = [], []
+        terminate, cleanup_profiles, real_utc = ec2.terminate_instances, self.campaign.cleanup_profiles, ci.utc
+        def request(**params):
+            requests.append((self.clock.time(), params['InstanceIds']))
+            return terminate(**params)
+        def delete_profiles(receipt):
+            self.assertEqual({item['State']['Name'] for item in ec2.instances}, {'terminated'})
+            self.assertEqual(len(receipt['instances']), 6)
+            self.assertTrue(all(item.get('final_state') == 'terminated' and item.get('verified_utc')
+                                for item in receipt['instances']))
+            profile_cleanup.append(self.clock.time())
+            return cleanup_profiles(receipt)
+        def observed_utc(value=None):
+            return real_utc(value if value is not None else datetime.fromtimestamp(self.clock.time(), timezone.utc))
+        with patch.object(ec2, 'terminate_instances', side_effect=request), \
+                patch.object(self.campaign, 'cleanup_profiles', side_effect=delete_profiles), \
+                patch.object(ci, 'utc', side_effect=observed_utc):
+            receipt = self.campaign.cleanup()
+        self.assertTrue(receipt['cleanup_complete'], receipt['errors'])
+        self.assertEqual({tuple(instance_ids) for _, instance_ids in requests}, {(instance_id,) for instance_id in ids})
+        self.assertTrue(all(requested_at == started for requested_at, _ in requests))
+        self.assertEqual(profile_cleanup, [started + 420])
+        self.assertEqual(self.clock.time() - started, 420)
+        proofs = {item['instance_id']: item for item in receipt['instances']}
+        for instance_id, delay in ec2.termination_delays.items():
+            self.assertEqual(proofs[instance_id]['final_state'], 'terminated')
+            self.assertEqual(ci.parsed(proofs[instance_id]['verified_utc']).timestamp(), started + delay)
+        self.assertEqual(self.campaign.journal.data['terminal_proofs'],
+                         {'us-east-1/' + instance_id: proof for instance_id, proof in proofs.items()})
+        self.assertEqual(len(self.aws.iam.deleted), 6)
+        self.assertEqual(self.aws.iam.profiles, {})
+
+    def test_cleanup_multiple_nonterminal_hosts_share_one_bounded_window_and_keep_budget_and_iam(self):
+        with patch('ci_budget.BudgetLedger', ActualBudgetLedger):
+            ledger = ActualBudgetLedger(self.aws.s3, self.cfg['bucket'], ACCOUNT, budget_path=self.budget_file)
+            ledger.initialize()
+            self.allocate()
+            ec2 = self.aws.ec2['us-east-1']
+            ec2.never_terminates.update(item['InstanceId'] for item in ec2.instances)
+            started = self.clock.time()
+            with patch.object(self.clock, 'sleep', wraps=self.clock.sleep) as sleep:
+                receipt = self.campaign.cleanup()
+            self.assertFalse(receipt['cleanup_complete'])
+            self.assertFalse(receipt['compute_cleanup_complete'])
+            self.assertEqual(self.clock.time() - started, 600)
+            self.assertEqual(sleep.call_count, 120)
+            self.assertEqual(len(ec2.terminations), 6)
+            self.assertEqual(sum('did not confirm terminated' in error for error in receipt['errors']), 6)
+            self.assertEqual({item['final_state'] for item in receipt['instances']}, {'shutting-down'})
+            self.assertTrue(all('verified_utc' not in item for item in receipt['instances']))
+            self.assertEqual(self.campaign.journal.data['terminal_proofs'], {})
+            self.assertEqual(self.aws.iam.deleted, [])
+            self.assertEqual(len(self.aws.iam.roles), 6)
+            self.assertEqual(len(self.aws.iam.profiles), 6)
+            self.campaign.settle(receipt)
+            run = ledger.report(run_id=RUN)['runs'][RUN]
+            self.assertFalse(run['reservation_released'])
+            self.assertEqual(run['active_reservation_usd'], run['reserved_usd'])
+
+    def test_cleanup_observation_deadline_includes_time_spent_reading_ec2(self):
+        self.allocate()
+        ec2 = self.aws.ec2['us-east-1']
+        ec2.never_terminates.update(item['InstanceId'] for item in ec2.instances)
+        original = ec2.describe_instances
+        started = self.clock.time()
+        observations = []
+        def slow_read(**params):
+            if params.get('InstanceIds') and len(ec2.terminations) == 6:
+                observations.append(self.clock.time())
+                self.clock.now += 10
+            return original(**params)
+        with patch.object(ec2, 'describe_instances', side_effect=slow_read):
+            receipt = self.campaign.cleanup()
+        self.assertFalse(receipt['cleanup_complete'])
+        self.assertGreater(len(observations), 6)
+        self.assertLess(max(observations), started + 600)
+        self.assertLessEqual(self.clock.time() - started, 610)
+        # An already-started synchronous SDK read may finish after the deadline,
+        # but no further read or sleep may start once the shared window expires.
+        self.assertEqual(self.aws.iam.deleted, [])
+
+    def test_cleanup_observation_round_bound_survives_a_nonadvancing_clock(self):
+        self.allocate()
+        ec2 = self.aws.ec2['us-east-1']
+        ec2.never_terminates.update(item['InstanceId'] for item in ec2.instances)
+        started = self.clock.time()
+        with patch.object(self.clock, 'sleep') as sleep:
+            receipt = self.campaign.cleanup()
+        self.assertFalse(receipt['cleanup_complete'])
+        self.assertEqual(self.clock.time(), started)
+        self.assertEqual(sleep.call_count, 120)
+        self.assertTrue(all(call.args == (5,) for call in sleep.call_args_list))
+        self.assertEqual(sum('did not confirm terminated' in error for error in receipt['errors']), 6)
+        self.assertEqual(self.aws.iam.deleted, [])
+
+    def test_cleanup_reconciles_already_shutting_down_hosts_without_duplicate_termination(self):
+        self.allocate()
+        ec2 = self.aws.ec2['us-east-1']
+        started = self.clock.time()
+        for item in ec2.instances:
+            item['State']['Name'] = 'shutting-down'
+            ec2.termination_deadlines[item['InstanceId']] = started + 5
+        receipt = self.campaign.cleanup()
+        self.assertTrue(receipt['cleanup_complete'], receipt['errors'])
+        self.assertEqual(ec2.terminations, [])
+        self.assertEqual(self.clock.time() - started, 5)
+        self.assertEqual(len(receipt['instances']), 6)
+        self.assertTrue(all(item['final_state'] == 'terminated' and item['verified_utc']
+                            for item in receipt['instances']))
 
     def test_inaccessible_region_does_not_prevent_shutdown_in_other_region(self):
         self.allocate()
@@ -1438,7 +1695,12 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(settled['budget_policy']['sha256'], original_sha)
 
     def test_budget_report_failure_does_not_prevent_launch_cleanup_or_settlement(self):
-        with patch.object(Ledger, 'report', side_effect=RuntimeError('aggregate publication unavailable')):
+        original = Ledger.report
+        def unavailable_presentation(ledger, run_id=None):
+            if run_id is not None:
+                raise RuntimeError('aggregate publication unavailable')
+            return original(ledger)
+        with patch.object(Ledger, 'report', new=unavailable_presentation):
             self.allocate()
             cleanup = self.campaign.cleanup()
             self.assertTrue(cleanup['cleanup_complete'], cleanup['errors'])
