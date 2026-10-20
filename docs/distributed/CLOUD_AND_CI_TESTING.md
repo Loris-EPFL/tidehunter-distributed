@@ -320,13 +320,28 @@ cargo tree --locked --offline \
   -p typed-store --features tidehunter --depth 1
 ```
 
-A Git-pinned upstream dependency remains an upstream/native baseline. The local
-Sui manifest currently references
-`../../../tidehunter-sharded-wal/tidehunter` from `crates/typed-store`; the Cloud
-folder name `tidehunter-distributed` does not satisfy that layout automatically.
-Choose the compatible committed integration branch and workspace layout instead
-of patching dependencies during installation. The native `tidehunter` feature
-alone does not select remote shard storage.
+The current Sui `typed-store` manifest pins `Loris-EPFL/tidehunter-distributed`
+at `6dffd324294670ac2e4cb5403ca8c774ef960423`; it does not use a sibling path.
+The native `tidehunter` feature alone does not select remote shard storage.
+Remote storage needs `sharded-wal` and its exact namespace configuration.
+The checkpoint builder stages an explicit local-engine override in owned source
+copies and records the resolved revisions. Do not alter the Cloud installation's
+manifests or lockfiles merely to make a checkout layout fit.
+
+#### Distributed Sui cache-metrics cardinality
+
+In `sui/crates/typed-store/src/tidehunter_util.rs`, `AdapterCollector` registers
+gauges only for declared canonical keyspaces, while the cache snapshot contains
+all 256 possible keyspace IDs. Collection bounds the borrowed counter slice to
+the registered gauge count before `zip_debug_eq`; unused IDs are not an error.
+This preserves the gauge labels, counter values and equality check. It adds no
+lock or allocation and changes no storage, durability or cache policy.
+
+Local validation passed 34 Tidehunter-enabled `typed-store` library tests.
+A temporary exercise ran the production loop with 0, 1, 57 and 256 registered
+keyspaces over two successive snapshots and checked all exported series/values.
+The exercise source was removed. These checks are not a new checkpoint replay
+or RDMA validation; the existing AWS campaign used the pre-fix Sui revision.
 
 Save and republish the environment, then start a new task. Existing tasks retain
 their old environment. The copied install script requires validation in that
@@ -524,6 +539,101 @@ receives a Cargo source patch selecting the campaign's staged engine. Preparatio
 verifies resolved package paths/features and hashes the transformed manifests and
 lockfiles; the original checkouts stay unchanged. Cross-job restoration verifies
 and expands the hash-bound source archive before strict inventory admission.
+
+### Manual retries keep producer and execution identities separate
+
+The successful `prepare` job exports both `package_artifact_name` and
+`package_sha256`. It uploads exactly that name, computed from its own run ID
+and producer attempt. `benchmark` downloads that exact output from the same
+workflow run; it does not compute a name from its own incremented attempt.
+For example, if prepare succeeds on attempt 1 and benchmark fails, a benchmark
+retry on attempt 2 still reads `campaign-inputs-RUN_ID-1`. If prepare itself
+is rerun successfully on attempt 2, its consumers instead use the new
+`campaign-inputs-RUN_ID-2` and its matching SHA-256.
+
+This reuses immutable build inputs, not prior campaign results. Restoration
+still checks the producer's package digest and frozen-source inventory before
+fleet credentials. Campaign admission still verifies the current helper
+sources, six binary/build receipts, fixture and same-build local full-state
+audit before allocation. No cross-run/repository artifact selector, moving
+source ref, fallback artifact search or evidence relabeling is supported.
+The consumer's `GITHUB_RUN_ATTEMPT` remains unchanged: it derives a fresh
+campaign identity, budget admission, absolute lifetime and owned evidence.
+Prior unknown EC2 allocations remain fail-closed; retry does not authorize
+abandoning them or reset the ledger or the USD 60 budget.
+
+Only retry benchmark work after separate paid authorization and after the
+previous attempt's allocation/cleanup state is known. Re-running failed jobs
+may include `benchmark`; it is not a free retry mode. A completed campaign
+needs cost-only reporting, not another benchmark. The input artifact expires
+after two days; an expired/missing artifact or missing/mismatched digest must
+fail, not select another run's package.
+
+[GitHub reruns](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs)
+retain the original `GITHUB_SHA` and `GITHUB_REF`. Therefore a rerun of an old
+workflow does **not** acquire this workflow fix or a newly committed Sui fix.
+Changing `AWS_BENCH_SUI_SHA` does not replace a skipped successful prepare
+job's package. A changed engine/Sui source pair needs a new prepare/local
+audit in a separately authorized new campaign. Do not repack old build proof
+under the new source pin.
+
+### Non-benchmark publication and source-pin updates
+
+Publish reviewed source commits as `Loris-EPFL` to the engine work branch
+and Sui's `fix/sui-cache-metrics-cardinality`, not to `bench/aws-efa`. One small
+commit per affected repository is sufficient; this path needs no PR or
+benchmark-branch merge. Preserve Sui's counter-prefix bound in
+`crates/typed-store/src/tidehunter_util.rs`: the collector must zip only
+`counters[..gauges.len()]`, not all fixed-capacity counter slots.
+
+After those commits are published, from the engine checkout:
+
+```bash
+gh auth switch --user Loris-EPFL
+gh api user --jq .login
+ENGINE_BRANCH=fix/ci-benchmark-retries-2026-10-20
+ENGINE_SHA=$(git rev-parse HEAD)
+SUI_SHA=$(git -C ../sui rev-parse HEAD)
+gh api "repos/Loris-EPFL/tidehunter-distributed/commits/$ENGINE_SHA" --jq .sha
+gh api "repos/Loris-EPFL/sui-tidehunter-distributed/commits/$SUI_SHA" --jq .sha
+# Correctness only; requires rust-tests.yaml to exist on the default branch.
+gh workflow run rust-tests.yaml --repo Loris-EPFL/tidehunter-distributed \
+  --ref "$ENGINE_BRANCH" -f tidehunter_repo_ref="$ENGINE_SHA"
+```
+
+The engine correctness workflow accepts this exact checkout override, has
+read-only repository permission and no AWS credentials or EC2 launch path.
+A feature-branch push alone does not select it: its push filters are `main`
+and `feat/sharded-value-wal`; manual dispatch is the existing alternative.
+Inspect actual job conclusions; dispatch acceptance is not a passing check.
+Sui's fork-only `.github/workflows/typed-store-tidehunter.yml` runs on pushes
+to `fix/sui-cache-metrics-cardinality` and supports manual dispatch. It uses
+`ubuntu-24.04`, repository-selected Rust, pinned CMake/protobuf tools, two build
+jobs, no debug symbols and read-only contents permission, without AWS/OIDC or
+custom secrets. It checks typed-store formatting and runs
+`USE_TIDEHUNTER=1 SUI_SKIP_SIMTESTS=1 cargo test --locked -p typed-store --features tidehunter --lib`
+against the unchanged immutable engine dependency. It is a scoped native-adapter
+correctness check, not a new full Sui/checkpoint/fabric build.
+Do not dispatch Sui's broad upstream `rust.yml`: it fans out to unavailable
+`ubuntu-ghcloud`/`windows-ghcloud` runners. Publication of the focused workflow
+does not make those upstream jobs portable hosted CI.
+
+Updating the paid source pin is a **separate, authorized step**, not part of
+the non-benchmark publication/check commands above:
+
+1. Record the full published Sui commit SHA and its reviewed engine dependency.
+   Keep the compatibility table below truthful; an unpublished local fix is
+   not the existing published pin.
+2. After approval, set and read back the exact repository Actions variable:
+   `gh variable set AWS_BENCH_SUI_SHA --repo Loris-EPFL/tidehunter-distributed --body "$SUI_SHA"`,
+   then `gh variable get AWS_BENCH_SUI_SHA --repo Loris-EPFL/tidehunter-distributed`.
+3. Only after separate campaign authorization, publish the reviewed engine
+   state to the protected benchmark branch and require a new successful
+   prepare/build/local audit for that exact engine SHA and Sui pin.
+
+Do not change `AWS_BENCH_ENABLED`, dispatch the AWS campaign or merge/push
+the benchmark branch merely to validate these publication changes. The
+current publication request does not authorize EC2.
 
 ### Campaign and hardware contract
 

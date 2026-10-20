@@ -215,6 +215,17 @@ class FrozenSourceRestoreTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 ci_prepare.restore_inputs(package, digest, restored)
 
+    def test_restore_rejects_missing_or_wrong_package_digest_before_extraction(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / 'deployment.tar.gz'
+            package.write_bytes(b'not the admitted deployment package')
+            restored = root / 'fresh-vm'
+            for digest in ('', 'a' * 64, ci_prepare.sha(package).upper()):
+                with self.subTest(digest=digest), self.assertRaises(ValueError):
+                    ci_prepare.restore_inputs(package, digest, restored)
+                self.assertFalse(restored.exists())
+
     def test_restore_rejects_source_hash_inventory_and_escape_before_acceptance(self):
         for change in ('archive-hash', 'manifest-hash', 'inventory', 'escape', 'relocation-escape'):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
