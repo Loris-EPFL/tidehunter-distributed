@@ -14,7 +14,7 @@ import unittest
 from unittest.mock import patch
 
 import ci_campaign as ci
-from ci_budget import BudgetLedger as ActualBudgetLedger
+from ci_budget import BudgetExceeded, BudgetLedger as ActualBudgetLedger
 
 
 RUN = 'th-0123456789abcdef'
@@ -585,6 +585,7 @@ class Ledger:
     reservations = []
     settlements = {}
     policies = {}
+    available_usd = '60'
 
     def __init__(self, *args, **kwargs):
         self.budget_path = kwargs.get('budget_path', ci.DEFAULT_BUDGET)
@@ -603,7 +604,7 @@ class Ledger:
         return value
 
     def report(self, run_id=None):
-        return dict(budget_policy=ci.load_budget(self.budget_path),
+        return dict(available_usd=self.available_usd, budget_policy=ci.load_budget(self.budget_path),
                     runs={key: dict(budget_policy=value) for key, value in self.policies.items()
                           if run_id is None or key == run_id})
 
@@ -625,6 +626,8 @@ class CampaignTests(unittest.TestCase):
                         kv_suite=dict(scope='full', repetitions=1, diagnostics=True))
         Ledger.settlements = {}
         Ledger.policies = {}
+        Ledger.reservations = []
+        Ledger.available_usd = '60'
         self.aws = AWS(self.clock)
         self.campaign = ci.Campaign(self.aws, self.cfg, RUN, self.output, clock=self.clock)
         self.admission = dict(bindings={'source_archive_sha256': 'a' * 64}, inputs={},
@@ -654,6 +657,131 @@ class CampaignTests(unittest.TestCase):
 
     def allocate(self):
         return self.campaign.allocate(self.admission, self.preflight)
+
+    def test_admission_keeps_only_candidates_fitting_the_exact_available_boundary(self):
+        with patch('ci_budget.BudgetLedger', ActualBudgetLedger):
+            ledger = ActualBudgetLedger(self.aws.s3, self.cfg['bucket'], ACCOUNT, budget_path=self.budget_file)
+            ledger.initialize()
+            ledger.reserve('th-1111111111111111', '45.090714285714', {'purpose': 'other campaign'})
+            self.assertEqual(ledger.report()['available_usd'], '14.909285714286')
+            instances, candidate, _ = self.allocate()
+            self.assertEqual(len(instances), 6)
+            self.assertEqual(candidate, self.candidates[0])
+            self.assertEqual(self.campaign.journal.data['candidates'], [self.candidates[0]])
+            self.assertEqual(self.preflight['candidates'], self.candidates)
+            reservation = ledger.report(run_id=RUN)['runs'][RUN]
+            self.assertEqual(reservation['reserved_usd'], '14.909285714286')
+            self.assertEqual(reservation['provenance']['candidates'], ci.ledger_candidates([self.candidates[0]]))
+            self.assertEqual(self.aws.ec2['us-east-2'].requests, [])
+
+    def test_admission_one_decimal_unit_short_makes_no_paid_or_guest_mutation(self):
+        with patch('ci_budget.BudgetLedger', ActualBudgetLedger):
+            ledger = ActualBudgetLedger(self.aws.s3, self.cfg['bucket'], ACCOUNT, budget_path=self.budget_file)
+            ledger.initialize()
+            ledger.reserve('th-1111111111111111', '45.090714285715', {'purpose': 'other campaign'})
+            with self.assertRaises(BudgetExceeded):
+                self.allocate()
+            self.assertIsNone(self.campaign.journal.data)
+            self.assertEqual(set(ledger.report()['runs']), {'th-1111111111111111'})
+            self.assertEqual(self.aws.iam.roles, {})
+            self.assertEqual(self.aws.iam.profiles, {})
+            self.assertTrue(all(not ec2.requests for ec2 in self.aws.ec2.values()))
+            self.network.assert_not_called()
+
+    def test_capacity_failure_cannot_launch_an_unaffordable_fallback(self):
+        Ledger.available_usd = '20'
+        self.aws.ec2['us-east-1'].outcomes = ['capacity']
+        with self.assertRaises(RuntimeError):
+            self.allocate()
+        self.assertEqual(self.campaign.journal.data['candidates'], [self.candidates[0]])
+        self.assertEqual(len(self.aws.ec2['us-east-1'].requests), 1)
+        self.assertEqual(self.aws.ec2['us-east-2'].requests, [])
+        self.assertEqual(Ledger.reservations[0][1], Decimal('14.909285714286'))
+
+    def test_affordability_quote_rounds_up_under_low_ambient_precision(self):
+        Ledger.available_usd = '20'
+        self.candidates[0]['maximum_estimate_usd'] = '12.000000000001'
+        with localcontext() as context:
+            context.prec = 6
+            self.allocate()
+        _, estimate, provenance = Ledger.reservations[0]
+        self.assertEqual(estimate, Decimal('14.909285714288'))
+        self.assertEqual(provenance['reconciliation_usd'], '2.000000000001')
+        self.assertEqual(self.campaign.journal.data['candidates'], [self.candidates[0]])
+
+    def test_crash_after_reservation_reuses_selection_despite_its_own_hold(self):
+        with patch('ci_budget.BudgetLedger', ActualBudgetLedger):
+            ledger = ActualBudgetLedger(self.aws.s3, self.cfg['bucket'], ACCOUNT, budget_path=self.budget_file)
+            ledger.initialize()
+            save = self.campaign.journal.save
+            def crash_before_reserved_journal_write():
+                if self.campaign.journal.data.get('budget_reserved'):
+                    raise RuntimeError('interrupted after reservation')
+                return save()
+            with patch.object(self.campaign.journal, 'save', side_effect=crash_before_reserved_journal_write):
+                with self.assertRaises(RuntimeError):
+                    self.allocate()
+            stored = json.loads(self.aws.s3.objects[self.campaign.journal.key])
+            self.assertFalse(stored.get('budget_reserved', False))
+            original = ledger.report(run_id=RUN)['runs'][RUN]
+            ledger.reserve('th-1111111111111111', '20', {'purpose': 'other campaign'})
+            available = ledger.report()['available_usd']
+            self.assertLess(Decimal(available), Decimal(original['reserved_usd']))
+            self.campaign = ci.Campaign(self.aws, self.cfg, RUN, self.output, clock=self.clock)
+            with patch.object(self.campaign, 'network', return_value='sg-owned'), \
+                    patch.object(self.campaign, 'request', side_effect=self.request):
+                self.allocate()
+            replayed = ledger.report(run_id=RUN)['runs'][RUN]
+            self.assertEqual(replayed['reservation_digest'], original['reservation_digest'])
+            self.assertEqual(ledger.report()['available_usd'], available)
+            self.assertEqual(self.campaign.journal.data['candidates'], self.candidates)
+            self.assertEqual(len(self.aws.ec2['us-east-1'].requests), 1)
+
+    def test_crash_before_reservation_keeps_selection_and_denies_later_budget_loss(self):
+        with patch('ci_budget.BudgetLedger', ActualBudgetLedger):
+            ledger = ActualBudgetLedger(self.aws.s3, self.cfg['bucket'], ACCOUNT, budget_path=self.budget_file)
+            ledger.initialize()
+            with patch.object(ActualBudgetLedger, 'reserve', side_effect=RuntimeError('interrupted before reservation')):
+                with self.assertRaises(RuntimeError):
+                    self.allocate()
+            self.assertEqual(self.campaign.journal.data['candidates'], self.candidates)
+            ledger.reserve('th-1111111111111111', '45', {'purpose': 'other campaign'})
+            self.preflight['candidates'] = [self.candidates[0]]
+            self.campaign = ci.Campaign(self.aws, self.cfg, RUN, self.output, clock=self.clock)
+            with self.assertRaises(BudgetExceeded):
+                self.allocate()
+            self.assertEqual(self.campaign.journal.data['candidates'], self.candidates)
+            self.assertEqual(set(ledger.report()['runs']), {'th-1111111111111111'})
+            self.assertTrue(all(not ec2.requests for ec2 in self.aws.ec2.values()))
+            self.assertEqual(self.aws.iam.roles, {})
+
+    def test_budget_loss_after_selection_report_is_rejected_by_reservation_cas(self):
+        with patch('ci_budget.BudgetLedger', ActualBudgetLedger):
+            ledger = ActualBudgetLedger(self.aws.s3, self.cfg['bucket'], ACCOUNT, budget_path=self.budget_file)
+            ledger.initialize()
+            report, raced = ActualBudgetLedger.report, []
+            def consume_after_report(instance, run_id=None, now=None):
+                previous = report(instance, run_id=run_id, now=now)
+                if not raced:
+                    raced.append(True)
+                    ledger.reserve('th-1111111111111111', '45', {'purpose': 'concurrent campaign'})
+                return previous
+            with patch.object(ActualBudgetLedger, 'report', new=consume_after_report):
+                with self.assertRaises(BudgetExceeded):
+                    self.allocate()
+            self.assertEqual(self.campaign.journal.data['candidates'], self.candidates)
+            self.assertEqual(set(ledger.report()['runs']), {'th-1111111111111111'})
+            self.assertTrue(all(not ec2.requests for ec2 in self.aws.ec2.values()))
+            self.assertEqual(self.aws.iam.roles, {})
+
+    def test_authoritative_budget_report_failure_denies_fresh_admission(self):
+        with patch.object(Ledger, 'report', side_effect=RuntimeError('authoritative ledger unavailable')):
+            with self.assertRaises(RuntimeError):
+                self.allocate()
+        self.assertIsNone(self.campaign.journal.data)
+        self.assertEqual(Ledger.reservations, [])
+        self.assertTrue(all(not ec2.requests for ec2 in self.aws.ec2.values()))
+        self.assertEqual(self.aws.iam.roles, {})
 
     def test_atomic_six_count_stable_token_and_durable_intent(self):
         original = self.aws.ec2['us-east-1'].run_instances
@@ -1567,7 +1695,12 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(settled['budget_policy']['sha256'], original_sha)
 
     def test_budget_report_failure_does_not_prevent_launch_cleanup_or_settlement(self):
-        with patch.object(Ledger, 'report', side_effect=RuntimeError('aggregate publication unavailable')):
+        original = Ledger.report
+        def unavailable_presentation(ledger, run_id=None):
+            if run_id is not None:
+                raise RuntimeError('aggregate publication unavailable')
+            return original(ledger)
+        with patch.object(Ledger, 'report', new=unavailable_presentation):
             self.allocate()
             cleanup = self.campaign.cleanup()
             self.assertTrue(cleanup['cleanup_complete'], cleanup['errors'])

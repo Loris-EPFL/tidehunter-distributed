@@ -612,6 +612,14 @@ The fixed campaign lifetime is 3,600 seconds, with the final 600 seconds reserve
 for export. It is not reset by retries, controller handoff or a new cleanup
 process. Builds happen before this clock starts.
 
+Cleanup reconciles or requests termination for every exact owned host before
+observing the fleet in one shared 600-second, 120-round window. A slow first host
+does not delay termination requests to its peers or leave an earlier per-host
+timeout after all hosts reach `terminated`. IAM removal still requires explicit
+terminal proof for the entire owned fleet. The separate GitHub cleanup step has
+15 minutes for this bounded observation and post-compute resource reconciliation;
+it does not extend the EC2 lease, controller cutoff or export reserve.
+
 Three independent paths enforce closure:
 
 1. Parent `finally` and GitHub `always()` cleanup collect evidence and reconcile
@@ -636,11 +644,11 @@ budget ledger keeps its existing operation-bound reconciliation, and transport
 errors with a null SDK response do not suppress independent cleanup. None of
 these recovery paths renews the absolute fleet expiry.
 
-Normal completion uploads and checks the complete S3 result inventory, downloads
-it to the orchestration runner, and verifies closure. Cleanup covers instances,
-run-owned EBS/ENIs, security/placement groups and temporary IAM identities.
-Known instance IDs require explicit terminal proof; `NotFound`, missing pages
-or an API failure are not proof of termination. Foreign resources are untouched.
+Normal completion checks the complete S3 export before termination. Owned compute
+is reconciled before local downloads, archive analysis or billing can delay the
+runner. Cleanup covers instances, run-owned EBS/ENIs, security/placement groups
+and temporary IAM identities. Known instance IDs require explicit terminal proof;
+`NotFound`, missing pages or API failure are not proof. Foreign resources are untouched.
 
 At failure or expiry, cost safety takes priority: export available partial logs,
 then terminate rather than keep hosts running for analysis. Results may therefore
@@ -665,16 +673,24 @@ charges even though terminated instances no longer incur compute charges.
 
 This sets the **rolling seven-day shared branch limit**, not a per-run cap.
 There is no competing GitHub budget variable or direct dollar-value CLI override.
-Admission reserves a live-priced upper estimate before allocation. The estimate
-includes compute, root EBS, public IPv4 and bounded storage/request/transfer
-assumptions. Missing pricing, an absent/corrupt ledger or uncertain writes block
-allocation instead of becoming zero cost.
+Fresh admission retains only live-priced candidates whose all-in upper quote fits
+the authoritative ledger's current availability. Each quote includes the six-host
+fleet, root EBS, public IPv4, reconciliation allowance and bounded S3 overhead,
+with separate upward decimal rounding. The selected full candidate objects and
+overhead are journalled before the unchanged conditional reservation. A budget
+loss between selection and reservation still denies allocation; it does not
+silently select another set. Restarts reuse the persisted selection, including a
+crash after reservation, rather than filtering against their own active hold.
+This narrows unaffordable fallbacks only: region/type permissions, six hosts, the
+full Sui/KV matrix and original lifetime remain unchanged. Missing pricing or an
+absent, corrupt or unreadable ledger fails closed before paid allocation.
 
 The ledger uses conditional S3 writes and account/repository/branch identity.
-Unknown cleanup keeps its reservation. Verified cleanup still retains the
-conservative maximum of reservation, usage estimate and billed amount through
-seven days after settlement. Thus a short run can temporarily consume more
-admission capacity than its observed bill; the report shows these separately.
+Unknown cleanup keeps the conservative maximum of reservation, observed usage
+and billed amount. Verified cleanup releases the active reservation; recent
+closed runs retain the maximum of observed usage and billed cost, with late
+billing adjustments accounted separately. Reports distinguish historical
+reservations, active holds, observed estimates and conservative budget charges.
 Changing this file does not reset history or erase reservations.
 
 The separate CI-generated `aggregate.json` is published to the branch's
