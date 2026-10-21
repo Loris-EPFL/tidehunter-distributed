@@ -44,21 +44,26 @@ struct Stage {
 }
 struct StageTimer<'a> {
     stage: &'a Stage,
-    began: Instant,
+    began: Option<Instant>,
     failed: bool,
 }
 impl Stage {
-    fn record(&self, ns: u64, failed: bool) {
-        self.ns.fetch_add(ns, Ordering::Relaxed);
+    fn record(&self, ns: Option<u64>, failed: bool) {
+        if let Some(ns) = ns {
+            self.ns.fetch_add(ns, Ordering::Relaxed);
+        }
         if failed {
             self.errors.fetch_add(1, Ordering::Relaxed);
         }
         self.calls.fetch_add(1, Ordering::Relaxed);
     }
     fn start(&self) -> StageTimer<'_> {
+        self.start_if(true)
+    }
+    fn start_if(&self, timed: bool) -> StageTimer<'_> {
         StageTimer {
             stage: self,
-            began: Instant::now(),
+            began: timed.then(Instant::now),
             failed: true,
         }
     }
@@ -66,7 +71,14 @@ impl Stage {
         &self,
         f: impl FnOnce() -> std::result::Result<T, E>,
     ) -> std::result::Result<T, E> {
-        let mut timer = self.start();
+        self.run_if(true, f)
+    }
+    fn run_if<T, E>(
+        &self,
+        timed: bool,
+        f: impl FnOnce() -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        let mut timer = self.start_if(timed);
         let result = f();
         timer.failed = result.is_err();
         result
@@ -80,7 +92,9 @@ impl Stage {
 }
 impl Drop for StageTimer<'_> {
     fn drop(&mut self) {
-        let ns = self.began.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let ns = self
+            .began
+            .map(|began| began.elapsed().as_nanos().min(u64::MAX as u128) as u64);
         self.stage.record(ns, self.failed);
     }
 }
@@ -675,7 +689,13 @@ impl Db {
         set("read_profile_server_available", 0);
         set("read_profile_transport_progress_available", 0);
         set("read_profile_transport_cq_available", 0);
+        set("scalar_read_ns_available", 0);
+        set("read_index_ns_available", 0);
+        set("write_checkpoint_diagnostics_available", 0);
         if let Backend::Remote(remote) = &self.backend {
+            let read_timing_available = u64::from(remote.db.read_profile_enabled());
+            set("scalar_read_ns_available", read_timing_available);
+            set("read_index_ns_available", read_timing_available);
             let index = remote.db.index_stats();
             set(
                 "index_resident_metadata_bytes",
@@ -721,6 +741,68 @@ impl Db {
             );
             remote.profile.visit(&mut set);
             remote.db.visit_write_metrics(|snapshot| {
+                let checkpoint = snapshot.checkpoint_diagnostics;
+                set(
+                    "write_checkpoint_diagnostics_available",
+                    u64::from(checkpoint.available),
+                );
+                macro_rules! checkpoint_fields {
+                    ($($field:ident),+ $(,)?) => {
+                        $(set(
+                            concat!("write_checkpoint_diagnostic_", stringify!($field)),
+                            checkpoint.$field,
+                        );)+
+                    };
+                }
+                checkpoint_fields!(
+                    records,
+                    dropped_records,
+                    pressure_wait_ns,
+                    pressure_wait_count,
+                    drain_ns,
+                    drain_count,
+                    existing_capture_wait_ns,
+                    existing_capture_wait_count,
+                    new_capture_wait_ns,
+                    new_capture_wait_count,
+                    staging_manifest_ns,
+                    staging_manifest_count,
+                    receipt_history_ns,
+                    receipt_history_count,
+                    receipt_history_sync_ns,
+                    receipt_history_sync_count,
+                    node_prefix_wait_ns,
+                    node_prefix_wait_count,
+                    index_prepare_ns,
+                    index_prepare_count,
+                    index_persist_ns,
+                    index_persist_count,
+                    metadata_install_ns,
+                    metadata_install_count,
+                    owner_adoption_ns,
+                    owner_adoption_count,
+                    obsolete_cleanup_ns,
+                    obsolete_cleanup_count,
+                    history_io_checkpoint_count,
+                    history_stream_opens,
+                    history_previous_slot_reads,
+                    history_receipt_write_ops,
+                    history_receipt_write_bytes,
+                    history_buffer_flushes,
+                    history_node_write_ops,
+                    history_node_write_bytes,
+                    history_sync_operations,
+                    tail_pressure_count,
+                    known_identity_pressure_count,
+                    partition_window_pressure_count,
+                    index_reservation_pressure_count,
+                    already_available_count,
+                    after_drain_relief_count,
+                    after_existing_capture_relief_count,
+                    after_new_capture_relief_count,
+                    capacity_error_count,
+                    progress_error_count,
+                );
                 let authority = snapshot.authority;
                 set("write_storage_wait_ns", authority.storage_wait_ns);
                 set("write_publication_ns", authority.publication_ns);
@@ -874,7 +956,9 @@ impl Db {
             Backend::Native(db) => db.get(ks, key),
             Backend::Remote(remote) => remote
                 .scalar_read
-                .run(|| remote.db.get(ks, key).map_err(error)),
+                .run_if(remote.db.read_profile_enabled(), || {
+                    remote.db.get(ks, key).map_err(error)
+                }),
         }
     }
     pub fn exists(&self, ks: KeySpace, key: &[u8]) -> Result<bool> {
