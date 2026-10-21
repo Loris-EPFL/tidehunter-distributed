@@ -16,7 +16,7 @@ import transport_floor
 
 from checkpoint_matrix import efa_snapshot, efa_proof, validate_efa_proof, validate_provider
 from checkpoint_matrix import fabric_local_log, fabric_local_archive_log
-from guest import Campaign, upload, write_json, sha, benchmark_case_identity
+from guest import Campaign, upload, write_json, sha, benchmark_case_identity, kv_case_commands, kv_case_policy
 
 
 def validate_options(options):
@@ -302,14 +302,30 @@ def completed_case_ids(planned, completed):
     return case_ids
 
 
-def cold_owner_pid(path, endpoint, binary_sha256):
+def require_kv_policy(observed, expected):
+    """Compare the admitted effective policy, not two matching foreign receipts."""
+    if not isinstance(observed, dict):
+        raise ValueError('cold effective KV policy is missing or invalid')
+    for key, value in expected.items():
+        actual = observed.get(key)
+        if isinstance(value, dict):
+            require_kv_policy(actual, value)
+        elif type(actual) is not type(value) or actual != value:
+            raise ValueError(f'cold effective KV policy differs from admission: {key}')
+
+
+def cold_owner_pid(path, endpoint, binary_sha256, expected_policy, partition):
     """Read the original owner identity, never infer it from the IO being certified."""
     with tarfile.open(path, 'r:gz') as archive:
         members = list(islice(archive, 1025))
         starts = [member for member in members if member.name == 'start.json']
+        launches = [member for member in members if member.name == 'launch.yaml']
         if (len(members) > 1024 or len(starts) != 1 or not starts[0].isfile()
                 or not 0 < starts[0].size <= 4096):
             raise ValueError('cold owner archive lacks one bounded regular original start receipt')
+        if (len(launches) != 1 or not launches[0].isfile()
+                or not 0 < launches[0].size <= 64 * 1024):
+            raise ValueError('cold owner archive lacks one bounded regular original launch policy')
         def unique_pairs(pairs):
             result = dict(pairs)
             if len(result) != len(pairs):
@@ -317,6 +333,14 @@ def cold_owner_pid(path, endpoint, binary_sha256):
             return result
         with archive.extractfile(starts[0]) as stream:
             start = json.loads(stream.read(4097), object_pairs_hook=unique_pairs)
+        with archive.extractfile(launches[0]) as stream:
+            launches = transport_floor.yaml_documents(stream.read(64 * 1024 + 1).decode())
+        if len(launches) != 1 or not isinstance(launches[0], dict):
+            raise ValueError('cold original owner launch policy is missing or ambiguous')
+        launch = launches[0]
+        require_kv_policy(launch, expected_policy)
+        require_kv_policy(launch, dict(listen=endpoint, tls=dict(transport='efa-direct'),
+                                     node=dict(partition=dict(partition=partition))))
     if (not isinstance(start, dict) or type(start.get('pid')) is not int
             or not 0 < start['pid'] <= 2**32 - 1
             or start.get('ready') != endpoint or start.get('build') != 'current'
@@ -326,7 +350,7 @@ def cold_owner_pid(path, endpoint, binary_sha256):
     return start['pid']
 
 
-def cold_probe_certificate(directory, spec, nodes, client, expected_binary_sha256):
+def cold_probe_certificate(directory, spec, cfg, client):
     """Bind mixed cold-case stderr to the separately profiled certification pass.
 
     read_campaign::run enables these profiles only after the three primary cold
@@ -334,6 +358,8 @@ def cold_probe_certificate(directory, spec, nodes, client, expected_binary_sha25
     latency observations and must never be pooled with the primary population.
     """
     directory = Path(directory)
+    nodes = cfg['nodes']
+    expected_binary_sha256 = cfg['binaries']['storage-node']
     if spec['transport'] != 'efa-direct' or not spec['cold'] or spec['diagnostics']:
         raise ValueError('cold auxiliary attribution requires a clean direct cold case')
     if not directory.name.endswith('-tcp'):
@@ -344,6 +370,8 @@ def cold_probe_certificate(directory, spec, nodes, client, expected_binary_sha25
     if len(deployments) != 1 or not isinstance(deployments[0], dict):
         raise ValueError('cold auxiliary deployment configuration is missing or ambiguous')
     deployment = deployments[0]
+    remote_policy, owner_policy = kv_case_policy(cfg, spec)
+    require_kv_policy(deployment, remote_policy)
     expected_endpoints = {node['partition']: node['private_ip'] + ':7700' for node in nodes}
     endpoints = deployment.get('endpoints', [])
     if (len(endpoints) != len(nodes)
@@ -359,23 +387,14 @@ def cold_probe_certificate(directory, spec, nodes, client, expected_binary_sha25
             or not isinstance(command, list) or not command
             or any(not isinstance(value, str) for value in command)):
         raise ValueError('cold auxiliary lacks its successful original process receipt')
-    def argument(name, default=None):
-        positions = [position for position, value in enumerate(command) if value == name]
-        if not positions:
-            return default
-        if len(positions) != 1 or positions[0] + 1 == len(command):
-            raise ValueError('cold auxiliary command option is duplicate or incomplete')
-        return command[positions[0] + 1]
-    remote_argument = Path(argument('--remote-config', ''))
-    if remote_argument.name != 'remote.yaml' or remote_argument.parent.name != case_id:
-        raise ValueError('cold auxiliary process references a different deployment')
+    _, commands = kv_case_commands(cfg, spec)
+    if command != commands['tcp']:
+        raise ValueError('cold auxiliary original process differs from its complete admitted KV command')
     configured_lanes = deployment.get('read_lanes')
     if type(configured_lanes) is not int or not 1 <= configured_lanes <= 8:
         raise ValueError('cold auxiliary deployment read lane count is invalid')
-    lanes_argument = argument('--tcp-read-lanes', str(configured_lanes))
-    if lanes_argument not in tuple(str(value) for value in range(1, 9)):
-        raise ValueError('cold auxiliary process read lane override is invalid')
-    lanes = int(lanes_argument)
+    # KV preparation controls the deployment; measurement commands never override lanes.
+    lanes = configured_lanes
     metadata = {}
     for line in (directory / 'campaign.txt').read_text().splitlines():
         if '=' not in line:
@@ -391,10 +410,6 @@ def cold_probe_certificate(directory, spec, nodes, client, expected_binary_sha25
             or metadata.get('transport') != 'efa-direct'
             or metadata.get('point_reads') != str(reads)):
         raise ValueError('cold auxiliary metadata differs from the immutable plan')
-    if (argument('--reads') != str(reads) or argument('--cold-read-pass') != 'true'
-            or argument('--transport') != 'efa-direct'
-            or argument('--transport-diagnostics', 'false') != 'false'):
-        raise ValueError('cold auxiliary original process differs from its planned population')
     backend = 'experimental_efa_direct_authority'
     identity = dict(zip(('value_bytes', 'batch_size', 'window'), spec['shape'])) | {'repetition': 0}
     def same_case(row):
@@ -430,7 +445,7 @@ def cold_probe_certificate(directory, spec, nodes, client, expected_binary_sha25
     owner_pids = {
         partition: cold_owner_pid(
             directory.parent / 'nodes' / case_id / f'node-{partition}.tar.gz',
-            expected_endpoints[partition], expected_binary_sha256)
+            expected_endpoints[partition], expected_binary_sha256, owner_policy, partition)
         for partition in partitions}
     expected_io = {(phase, str(partition)) for phase in io_phases for partition in partitions}
     io_path = directory / 'read_io.csv'
@@ -476,9 +491,12 @@ def cold_probe_certificate(directory, spec, nodes, client, expected_binary_sha25
         selected = [row for row in remaining if row['peer'] is not None
                     and row['peer'].split('->')[-1] == endpoint]
         peers = validate_cold_probe_windows(selected, profiles[node['partition']]['client_transport'], lanes)
+        if profiles[node['partition']]['requests'] > 0 and sum(row['data_posts'] for row in selected) == 0:
+            raise ValueError('cold auxiliary requested reads lack client read-lane DATA posts')
         remaining = [row for row in remaining if row not in selected]
         owners[node['partition']] = dict(endpoint=endpoint, client_peers=peers,
-                                        storage_transport=profiles[node['partition']]['transport'])
+                                        storage_transport=profiles[node['partition']]['transport'],
+                                        requests=profiles[node['partition']]['requests'])
     if remaining:
         raise ValueError('cold auxiliary client windows include foreign or unattributable peers')
     return dict(phase='cache-evicted-read-diagnostics', api_state='cache-evicted',
@@ -515,6 +533,9 @@ def validate_cold_probe_storage(evidence, certificate, partition):
             or any(peer.split('->')[0] != owner['endpoint']
                    or peer.split('->')[1].rsplit(':', 1)[0] not in controller_hosts for peer in peers)):
         raise ValueError('cold auxiliary storage peers differ from its configured owner/client lanes')
+    if (owner['requests'] > 0 and sum(row['data_posts'] for row in evidence['records']
+                                     if row['peer'] in expected) == 0):
+        raise ValueError('cold auxiliary requested reads lack storage read-peer DATA posts')
 
 
 def validate_auxiliary(root, state, cfg):
@@ -545,8 +566,7 @@ def validate_auxiliary(root, state, cfg):
             evidence = fabric_local_log(log, required=direct_diagnostic or cold_auxiliary,
                                         forbidden=not (direct_diagnostic or cold_auxiliary))
             if cold_auxiliary:
-                cold_certificate = cold_probe_certificate(
-                    directory, spec, cfg['nodes'], evidence, cfg['binaries']['storage-node'])
+                cold_certificate = cold_probe_certificate(directory, spec, cfg, evidence)
             fabric.append(dict(case_id=case_id, role=mode,
                 population='mixed_primary_clean_and_auxiliary_profiled_cold_certificate' if cold_auxiliary
                            else 'diagnostic' if spec['diagnostics'] else 'clean',

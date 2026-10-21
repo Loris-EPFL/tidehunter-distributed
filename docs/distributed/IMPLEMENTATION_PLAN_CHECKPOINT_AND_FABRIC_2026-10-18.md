@@ -2163,3 +2163,48 @@ proof is `recovered-measurement-attestation-admitted-binary.json`; original
 failed receipts remain unchanged. No engine or wire code, workload timings,
 budget/admission policy or cloud resources changed for this correction.
 
+### 16.14 Complete command, effective-policy and DATA evidence authority
+
+The final review and independent audit tightened three remaining evidence
+boundaries without changing the benchmark workload or engine:
+
+- `guest.py::kv_case_commands` is the shared pure constructor for KV
+  preparation and both backend commands. Guest execution and
+  `checkpoint_kv.py::cold_probe_certificate` use the same admitted specification
+  and trusted `cfg['run_root']`, not captured argv or local extraction paths.
+  Exact argv comparison rejects changed load counts, mixed work, WAL presets,
+  caches, lanes, paths, unknown/duplicate switches and extra arguments.
+  Non-KV CLI controls remain unchanged.
+- `guest.py::kv_case_policy` binds saved remote and original owner launch
+  policies to the admitted case. Geometry, lifetime/resident limits, caches
+  and server read controls must match. The authority-32 adjustment changes
+  resident capacity to 32, not the separate 648-batch lifetime admission.
+  Mutually consistent foreign remote/owner policies do not establish authority.
+- `checkpoint_matrix.py::parse_fabric_local_diagnostics` requires
+  `piggyback_advances <= data_posts`. A credit-only window remains valid.
+  For a positive owner read population, cold certification additionally
+  requires DATA in its client read lanes and matched storage read peers.
+  Writer/control-session DATA cannot stand in for read traffic. No exact
+  packets-per-RPC ratio is inferred.
+
+The original archive exercises the changed paths directly: all **129
+preparation commands and 258 measurement commands** exactly match the shared
+constructor, and the stricter auxiliary validation returns the unchanged
+reduction, SHA-256
+`2c19cd7b6a78da11e7cbde889417342aae461c7fc1b4b39a8755a2b1bbc84704`.
+`complete-kv-command-validation.json` preserves the check and references the
+prior complete source/build/executable/Sui/archive attestation. Original
+failed receipts and timing samples remain unchanged. The before-fix parser
+accepted a piggyback-only record with zero successful DATA/CREDIT posts;
+the corrected parser rejects it and accepts valid credit-only boundaries.
+
+Permanent regressions check false certification, malformed owner policies,
+counter relabeling, writer-only DATA and valid zero-request populations.
+Duplicated argv-golden and mock-forwarding tests were removed; actual archived
+command equivalence is exercised by the separate verification program.
+
+Final local gates: **481 AWS-harness tests, 478 passed and 3 skipped**;
+**111 Sui-harness tests passed**. The independent final audit reported no
+remaining findings after the command, policy and DATA-population corrections.
+These are collector gates, not new hardware performance measurements.
+
