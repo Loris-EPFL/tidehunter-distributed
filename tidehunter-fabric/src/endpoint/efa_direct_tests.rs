@@ -136,6 +136,36 @@ fn reserved_control_lane_coalesces_without_data_credit_or_ack_loops() {
     controls.posted(2, 2).unwrap();
     assert!(controls.complete(1).is_err());
 }
+#[test]
+fn data_credit_suppresses_standalone_credit_without_regressing_on_old_completion() {
+    let mut controls = ControlWindow::default();
+    assert_eq!(controls.prepare(1).unwrap(), Some(1));
+    controls.posted(1, 1).unwrap();
+    controls.advertised_by_data(3);
+    controls.complete(1).unwrap();
+    assert!(!controls.needs_send(3));
+    assert_eq!(controls.prepare(3).unwrap(), None);
+    assert_eq!(controls.prepare(4).unwrap(), Some(2));
+    controls.posted(2, 4).unwrap();
+    controls.advertised_by_data(3);
+    assert!(!controls.needs_send(4));
+}
+
+#[test]
+fn direct_readiness_waits_for_head_and_tracks_partial_packet_consumption() {
+    let mut receiver = StreamReceiver::new(4096).unwrap();
+    assert!(!receiver.receive_ready());
+    receiver.accept_data(2, b"later").unwrap();
+    assert!(!receiver.receive_ready());
+    receiver.accept_data(1, b"first").unwrap();
+    assert!(receiver.receive_ready());
+    let mut first = [0; 2];
+    assert_eq!(receiver.read(&mut first).unwrap(), (2, None));
+    assert!(receiver.receive_ready());
+    let mut rest = [0; 3];
+    assert_eq!(receiver.read(&mut rest).unwrap(), (3, Some(1)));
+    assert!(receiver.receive_ready());
+}
 
 #[test]
 #[allow(
@@ -143,6 +173,40 @@ fn reserved_control_lane_coalesces_without_data_credit_or_ack_loops() {
     reason = "Keep the deterministic two-sided packet simulation in one executable test"
 )]
 fn software_packet_transport_reassembles_large_bidirectional_streams() {
+    fn enqueue(
+        send: &mut SendWindow,
+        offset: &mut usize,
+        input: &[u8],
+        output: &mut Vec<Vec<u8>>,
+        consumed: u64,
+        advertised: &mut ControlWindow,
+        mtu: usize,
+    ) {
+        for _ in 0..DATA_WINDOW {
+            if *offset == input.len() {
+                break;
+            }
+            let ordinal = match send.next_ordinal() {
+                Ok(ordinal) => ordinal,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("unexpected send-window failure: {error}"),
+            };
+            let len = (input.len() - *offset).min(mtu - HEADER_LEN);
+            let mut packet = vec![0; HEADER_LEN + len];
+            encode_data(
+                &mut packet,
+                ordinal,
+                consumed,
+                &input[*offset..*offset + len],
+                mtu,
+            )
+            .unwrap();
+            send.posted(ordinal).unwrap();
+            advertised.advertised_by_data(consumed);
+            *offset += len;
+            output.push(packet);
+        }
+    }
     let mtu = 4096;
     let expected_a: Vec<u8> = (0..1_000_003)
         .map(|i| u8::try_from(i % 239).unwrap())
@@ -165,48 +229,57 @@ fn software_packet_transport_reassembles_large_bidirectional_streams() {
     let mut chunk_a = [0; 1024];
     let mut chunk_b = [0; 1024];
 
-    while received_a.len() != expected_b.len() || received_b.len() != expected_a.len() {
-        for (send, offset, input, out) in [
-            (
-                &mut send_a,
-                &mut offset_a,
-                expected_a.as_slice(),
-                &mut queued_to_b,
-            ),
-            (
-                &mut send_b,
-                &mut offset_b,
-                expected_b.as_slice(),
-                &mut queued_to_a,
-            ),
-        ] {
-            for _ in 0..DATA_WINDOW {
-                if *offset == input.len() {
-                    break;
-                }
-                let ordinal = match send.next_ordinal() {
-                    Ok(ordinal) => ordinal,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(error) => panic!("unexpected send-window failure: {error}"),
-                };
-                let len = (input.len() - *offset).min(mtu - HEADER_LEN);
-                let mut packet = vec![0; HEADER_LEN + len];
-                encode_data(&mut packet, ordinal, 0, &input[*offset..*offset + len], mtu).unwrap();
-                send.posted(ordinal).unwrap();
-                *offset += len;
-                out.push(packet);
-            }
+    // A credit/liveness regression must fail instead of spinning without limit.
+    for _ in 0..4096 {
+        if received_a.len() == expected_b.len() && received_b.len() == expected_a.len() {
+            break;
         }
+        enqueue(
+            &mut send_a,
+            &mut offset_a,
+            &expected_a,
+            &mut queued_to_b,
+            recv_a.consumed(),
+            &mut control_a,
+            mtu,
+        );
+        enqueue(
+            &mut send_b,
+            &mut offset_b,
+            &expected_b,
+            &mut queued_to_a,
+            recv_b.consumed(),
+            &mut control_b,
+            mtu,
+        );
 
         // A software datagram queue deliberately reverses arrival order while
         // retaining every packet; it is not an EFA hardware/performance test.
         for packet in queued_to_a.drain(..).rev() {
-            recv_a.accept(&packet).unwrap();
+            let Packet::Data {
+                ordinal,
+                credit,
+                payload,
+            } = decode(&packet, mtu).unwrap()
+            else {
+                panic!("software data queue contains a control packet");
+            };
+            send_a.credit(credit).unwrap();
+            recv_a.accept_data(ordinal, payload).unwrap();
         }
         for packet in queued_to_b.drain(..).rev() {
-            recv_b.accept(&packet).unwrap();
+            let Packet::Data {
+                ordinal,
+                credit,
+                payload,
+            } = decode(&packet, mtu).unwrap()
+            else {
+                panic!("software data queue contains a control packet");
+            };
+            send_b.credit(credit).unwrap();
+            recv_b.accept_data(ordinal, payload).unwrap();
         }
-        loop {
+        for _ in 0..usize::try_from(DATA_WINDOW).unwrap() * (mtu.div_ceil(chunk_a.len()) + 1) {
             match recv_a.read(&mut chunk_a) {
                 Ok((len, credit)) => {
                     received_a.extend_from_slice(&chunk_a[..len]);
@@ -226,7 +299,7 @@ fn software_packet_transport_reassembles_large_bidirectional_streams() {
                 Err(error) => panic!("unexpected receive failure: {error}"),
             }
         }
-        loop {
+        for _ in 0..usize::try_from(DATA_WINDOW).unwrap() * (mtu.div_ceil(chunk_b.len()) + 1) {
             match recv_b.read(&mut chunk_b) {
                 Ok((len, credit)) => {
                     received_b.extend_from_slice(&chunk_b[..len]);

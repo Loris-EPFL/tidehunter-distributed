@@ -57,6 +57,12 @@ pub struct ProgressStats {
     pub cq_poll_gap_ns: u64,
     pub cq_poll_gap_samples: u64,
     pub cq_poll_gap_max_ns: u64,
+    /// Successful EFA-direct DATA packets, excluding EAGAIN attempts.
+    pub efa_direct_data_posts: u64,
+    /// Successful standalone EFA-direct CREDIT packets, excluding DATA-carried credit.
+    pub efa_direct_credit_posts: u64,
+    /// Successful DATA posts that advanced the advertised cumulative credit frontier.
+    pub efa_direct_credit_piggyback_advances: u64,
 }
 
 /// Successful endpoint setup stages, not an estimate of hardware latency.
@@ -253,7 +259,7 @@ impl Endpoint {
 
     fn direct_send_vectored(&mut self, slices: &[IoSlice<'_>], poll: bool) -> io::Result<usize> {
         if poll {
-            self.direct_progress()?;
+            self.direct_progress(true)?;
         }
         let direct = self
             .direct
@@ -276,13 +282,24 @@ impl Endpoint {
         if !state.post_send(slot, packet_len)? {
             return Err(io::ErrorKind::WouldBlock.into());
         }
+        let direct = self
+            .direct
+            .as_mut()
+            .ok_or_else(|| invalid("missing EFA-direct state"))?;
         direct.send.posted(ordinal)?;
+        let piggyback_advanced = direct.control.advertised_by_data(credit);
+        state.record_direct_data_post(piggyback_advanced);
         Ok(packet_len - efa_direct::HEADER_LEN)
     }
 
-    fn direct_receive(&mut self, output: &mut [u8], poll: bool) -> io::Result<usize> {
+    fn direct_receive(
+        &mut self,
+        output: &mut [u8],
+        poll: bool,
+        defer_credit: bool,
+    ) -> io::Result<usize> {
         if poll {
-            self.direct_progress()?;
+            self.direct_progress(true)?;
         }
         let result = self
             .direct
@@ -292,9 +309,12 @@ impl Endpoint {
             .read(output);
         match result {
             Ok((len, Some(_credit))) => {
-                // Application consumption earns peer credit. EAGAIN while
-                // posting the control packet is retried by later progress.
-                let _ = self.queue_direct_control()?;
+                // The reactor's sweep adapter defers CREDIT so queued DATA can
+                // piggyback its cumulative frontier. Blocking helpers retain
+                // eager control progress before returning consumed bytes.
+                if !defer_credit {
+                    let _ = self.queue_direct_control()?;
+                }
                 Ok(len)
             }
             Ok((len, None)) => Ok(len),
@@ -333,10 +353,11 @@ impl Endpoint {
         }
         direct.control.posted(ordinal, consumed)?;
         direct.pending_control = Some(ordinal);
+        state.record_direct_credit_post();
         Ok(true)
     }
 
-    fn direct_progress(&mut self) -> io::Result<bool> {
+    fn direct_progress(&mut self, flush_credit: bool) -> io::Result<bool> {
         let direct = self
             .direct
             .as_mut()
@@ -381,7 +402,7 @@ impl Endpoint {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error),
         }
-        if self.queue_direct_control()? {
+        if flush_credit && self.queue_direct_control()? {
             progressed = true;
         }
         Ok(progressed)
@@ -398,7 +419,8 @@ impl Endpoint {
     }
 
     /// Consumes one already-completed receive and attempts one repost, without
-    /// reading the CQ. Pair with `try_progress` once per bounded reactor sweep.
+    /// reading the CQ. Sweep callers pair this with
+    /// `try_progress_for_sweep`; standalone `try_progress` keeps eager control progress.
     /// # Errors
     /// Same ownership, `WouldBlock` and poisoning rules as `try_receive`.
     pub fn try_receive_no_poll(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
@@ -411,7 +433,7 @@ impl Endpoint {
             return Ok(0);
         }
         let result = if self.direct.is_some() {
-            self.direct_receive(bytes, poll)
+            self.direct_receive(bytes, poll, !poll)
         } else {
             (|| {
                 let state = self.inner();
@@ -439,7 +461,7 @@ impl Endpoint {
     pub fn try_progress(&mut self) -> io::Result<bool> {
         self.ready()?;
         let result = if self.direct.is_some() {
-            self.direct_progress()
+            self.direct_progress(true)
         } else {
             let state = self.inner();
             state
@@ -447,6 +469,50 @@ impl Endpoint {
                 .and_then(|completed| state.try_post_receive().map(|posted| completed || posted))
         };
         self.finish_try(result)
+    }
+
+    /// One CQ acquisition for a reactor sweep; direct credit is deferred until
+    /// DATA output has had an opportunity to carry the cumulative frontier.
+    /// # Errors
+    /// Returns nonpoisoning `WouldBlock` for receive repost backpressure; other
+    /// provider or packet errors poison the endpoint.
+    pub fn try_progress_for_sweep(&mut self) -> io::Result<bool> {
+        self.ready()?;
+        let result = if self.direct.is_some() {
+            self.direct_progress(false)
+        } else {
+            let state = self.inner();
+            state
+                .poll()
+                .and_then(|completed| state.try_post_receive().map(|posted| completed || posted))
+        };
+        self.finish_try(result)
+    }
+
+    /// Sends standalone EFA-direct credit debt without acquiring the CQ.
+    /// # Errors
+    /// Returns provider/packet errors; a nonfatal unavailable slot or EAGAIN
+    /// leaves credit debt pending for the next sweep.
+    pub fn finish_sweep_no_poll(&mut self) -> io::Result<bool> {
+        self.ready()?;
+        let result = if self.direct.is_some() {
+            self.queue_direct_control()
+        } else {
+            Ok(false)
+        };
+        self.finish_try(result)
+    }
+
+    /// Derived ordered-stream readiness; never polls, copies or posts.
+    /// # Errors
+    /// Fails if the endpoint is unbound or poisoned.
+    pub fn receive_ready(&mut self) -> io::Result<bool> {
+        self.ready()?;
+        if let Some(direct) = &self.direct {
+            Ok(direct.receive.receive_ready())
+        } else {
+            Ok(self.inner().receive_ready())
+        }
     }
 
     /// Whether a successful send post still owns any local TX slot. Application
@@ -561,7 +627,7 @@ impl Endpoint {
                 match self.direct_send_vectored(bytes, false) {
                     Ok(len) => return Ok(len),
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        self.direct_progress()?;
+                        self.direct_progress(true)?;
                     }
                     Err(error) => return Err(error),
                 }
@@ -598,7 +664,7 @@ impl Endpoint {
         self.ready()?;
         remaining(deadline)?;
         let result = if self.direct.is_some() {
-            self.direct_progress().map(|_| ())
+            self.direct_progress(true).map(|_| ())
         } else {
             self.inner().poll().map(|_| ())
         };
@@ -623,7 +689,7 @@ impl Endpoint {
         if self.direct.is_some() {
             for _ in 0..PROGRESS_LIMIT {
                 remaining(deadline)?;
-                self.direct_progress()?;
+                self.direct_progress(true)?;
                 let sends_pending = self.inner().sends_pending();
                 let control_pending = self
                     .direct
@@ -713,10 +779,10 @@ impl Endpoint {
                 if poll % 1024 == 0 {
                     check_peer()?;
                 }
-                match self.direct_receive(bytes, false) {
+                match self.direct_receive(bytes, false, false) {
                     Ok(len) => return Ok(len),
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        self.direct_progress()?;
+                        self.direct_progress(true)?;
                         if idle && poll >= 64 {
                             std::thread::sleep(Duration::from_micros(50));
                         } else {

@@ -543,6 +543,23 @@ impl Resources {
     pub(super) fn progress_stats(&self) -> ProgressStats {
         self.progress_stats
     }
+    pub(super) fn record_direct_data_post(&mut self, piggyback_advanced: bool) {
+        self.progress_stats.efa_direct_data_posts =
+            self.progress_stats.efa_direct_data_posts.saturating_add(1);
+        if piggyback_advanced {
+            self.progress_stats.efa_direct_credit_piggyback_advances = self
+                .progress_stats
+                .efa_direct_credit_piggyback_advances
+                .saturating_add(1);
+        }
+    }
+
+    pub(super) fn record_direct_credit_post(&mut self) {
+        self.progress_stats.efa_direct_credit_posts = self
+            .progress_stats
+            .efa_direct_credit_posts
+            .saturating_add(1);
+    }
 
     pub(super) fn configure_progress_stats(&mut self, enabled: bool, reset: bool) {
         self.time_progress = enabled;
@@ -619,6 +636,11 @@ impl Resources {
                 .send_copy_bytes
                 .saturating_add(len as u64);
         }
+    }
+
+    pub(super) fn receive_ready(&self) -> bool {
+        let slot = self.rx_read;
+        !self.rx_pending[slot] && self.rx_len[slot] > self.rx_offset
     }
 
     pub(super) fn copy_receive(&mut self, bytes: &mut [u8]) -> Option<usize> {
