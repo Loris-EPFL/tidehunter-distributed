@@ -1,6 +1,8 @@
 """Offline false-success gates; no AWS calls or provider/device assumptions."""
 import copy
+import csv
 import json
+import io
 from pathlib import Path
 import tempfile
 import unittest
@@ -38,6 +40,49 @@ class MatrixEvidenceTests(unittest.TestCase):
     def setUp(self):
         self.cfg = example_config()
         self.cells = completed_matrix(self.cfg)
+
+    def test_local_fabric_windows_keep_peer_absence_and_nonwire_scope(self):
+        records = [
+            dict(schema=1, reason='profile-disable', window=1, data_posts=8,
+                 credit_posts=2, piggyback_advances=3, peer=None),
+            dict(schema=1, reason='session-drop', window=2, data_posts=4,
+                 credit_posts=0, piggyback_advances=1, peer='127.0.0.1:1->127.0.0.1:2')]
+        blob = b'ordinary stderr\\n\n' + b''.join(
+            matrix.FABRIC_LOCAL_PREFIX + b' ' + json.dumps(record).encode() + b'\n' for record in records)
+        result = matrix.parse_fabric_local_diagnostics(io.BytesIO(blob))
+        self.assertEqual(result['records'], records)
+        self.assertEqual(result['totals'], dict(data_posts=12, credit_posts=2, piggyback_advances=4))
+        self.assertIsNone(result['records'][0]['peer'])
+        matrix.validate_fabric_local_population(result, 'controller.stderr', required=True)
+        with self.assertRaisesRegex(ValueError, 'clean'):
+            matrix.validate_fabric_local_population(result, 'controller.stderr', forbidden=True)
+        empty = matrix.parse_fabric_local_diagnostics(io.BytesIO(b'ordinary stderr\n'))
+        self.assertFalse(empty['available'])
+        with self.assertRaisesRegex(ValueError, 'required'):
+            matrix.validate_fabric_local_population(empty, 'controller.stderr', required=True)
+        self.assertIn('SIGTERM', empty['completeness'])
+
+    def test_local_fabric_window_parser_rejects_corruption_and_bounds(self):
+        record = dict(schema=1, reason='profile-reset', window=7, data_posts=1,
+                      credit_posts=0, piggyback_advances=0, peer=None)
+        def line(value):
+            return matrix.FABRIC_LOCAL_PREFIX + b' ' + json.dumps(value).encode() + b'\n'
+        for field, value in (('schema', True), ('window', 0), ('reason', 'unknown'),
+                             ('window', 2**64), ('data_posts', -1),
+                             ('credit_posts', True), ('piggyback_advances', 2**64),
+                             ('peer', 'x' * 257)):
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                matrix.parse_fabric_local_diagnostics(io.BytesIO(line(record | {field: value})))
+        for blob in (line(record)[:-1], line(record) + line(record),
+                     matrix.FABRIC_LOCAL_PREFIX + b' {\"schema\":1,\"schema\":1}\n'):
+            with self.assertRaises(ValueError):
+                matrix.parse_fabric_local_diagnostics(io.BytesIO(blob))
+        with self.assertRaises(ValueError):
+            matrix.parse_fabric_local_diagnostics(io.BytesIO(line(record)), max_bytes=32)
+        with self.assertRaises(ValueError):
+            matrix.parse_fabric_local_diagnostics(io.BytesIO(line(record)), max_records=0)
+        with self.assertRaises(ValueError):
+            matrix.parse_fabric_local_diagnostics(io.BytesIO(line(record | dict(data_posts=0))))
 
     def test_complete_counterbalanced_pairs_and_single_transport(self):
         self.assertEqual([cell['cell_id'] for cell in self.cells],
@@ -214,6 +259,211 @@ class MatrixEvidenceTests(unittest.TestCase):
                     self.assertEqual({case['transport'] for case in profiled}, set(transports))
                     self.assertTrue(all(case['repetition'] > max(row['repetition'] for row in clean)
                                         for case in profiled))
+
+    def test_full_plan_retains_shapes_and_separates_repeated_clean_controls(self):
+        transports = ['tcp', 'efa', 'efa-direct']
+        options = dict(scope='full', repetitions=3, diagnostics=True)
+        planned = checkpoint_kv.plan(options, transports)
+        self.assertEqual(len(planned), 129)
+        self.assertEqual(sum(not spec['diagnostics'] for spec in planned), 117)
+        for transport in transports:
+            clean = [spec for spec in planned if spec['transport'] == transport and not spec['diagnostics']]
+            for repetition in range(3):
+                rows = [spec for spec in clean if spec['repetition'] == repetition]
+                self.assertEqual(len(rows), 13)
+                self.assertEqual({tuple(spec['shape']) for spec in rows},
+                                 {(256, 1, 1), (256, 32, 32), (8192, 1, 1), (8192, 32, 32)})
+                tails = [spec for spec in rows if spec.get('workload_batches') == 3200]
+                self.assertEqual(len(tails), 1)
+                self.assertFalse(tails[0]['cold'] or tails[0]['cached'])
+                self.assertEqual(tails[0]['workload_batches'] // tails[0]['shape'][2], 100)
+                history = (3200 + 2 * 64) * 32 * 8192
+                self.assertLessEqual(history, 1024**3)
+                hits = [spec for spec in rows if spec.get('cache_hit_contention')]
+                self.assertEqual({spec['shape'][0] for spec in hits}, {256, 8192})
+                self.assertTrue(all(spec['cached'] and spec['shape'][1] == 1 for spec in hits))
+            floors = [spec for spec in clean if spec.get('transport_floor')]
+            self.assertEqual(len(floors), 1)
+            self.assertEqual(floors[0]['repetition'], 0)
+        self.assertTrue(all(spec['repetition'] == 3 for spec in planned if spec['diagnostics']))
+
+    def test_cache_contention_requires_real_overlap_and_exact_hit_population(self):
+        spec = dict(shape=[8192, 1, 1], transport='efa-direct')
+        rows = []
+        for callers in (1, 8):
+            intervals = [[round * 1000 + index * 10, round * 1000 + index * 10 + 5]
+                         for round in range(32) for index in range(32)]
+            writes = [[round * 1000, round * 1000 + 500] for round in range(32)]
+            rows.append(dict(api='distributed::sui::Db::get', value_bytes=8192,
+                backend='experimental_efa_direct_authority',
+                batch_size=1, window=1, repetition=0, transport='efa-direct',
+                observation=dict(callers=callers, reads_per_caller=1024,
+                    concurrent_durable_writes=32, phase_wall_ns=32000,
+                    get_api_intervals_ns_by_caller=[copy.deepcopy(intervals) for _ in range(callers)],
+                    write_api_intervals_ns=writes, overlapping_reads_by_caller=[1024] * callers,
+                    remote_cache_counter_available=True, remote_hits=callers * 1024,
+                    remote_misses=0, remote_read_rpcs=0)))
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'cache_contention.jsonl'
+            def save(values):
+                path.write_text(''.join(json.dumps(row) + '\n' for row in values))
+            save(rows)
+            checkpoint_kv.validate_contention(path, spec, 'tcp')
+            for field, value in (('remote_misses', 1), ('remote_read_rpcs', 1),
+                                 ('remote_hits', 1023), ('remote_cache_counter_available', False)):
+                changed = copy.deepcopy(rows)
+                changed[0]['observation'][field] = value
+                save(changed)
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    checkpoint_kv.validate_contention(path, spec, 'tcp')
+            changed = copy.deepcopy(rows)
+            changed[0]['observation']['write_api_intervals_ns'] = [
+                [round * 1000 + 600, round * 1000 + 900] for round in range(32)]
+            changed[0]['observation']['overlapping_reads_by_caller'] = [0]
+            save(changed)
+            with self.assertRaisesRegex(ValueError, 'overlap'):
+                checkpoint_kv.validate_contention(path, spec, 'tcp')
+            save(rows[:-1])
+            with self.assertRaises(ValueError):
+                checkpoint_kv.validate_contention(path, spec, 'tcp')
+
+    def test_async_submission_is_not_physical_device_io_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            fields = ['phase', 'role', 'partition', 'boundary', 'cache_hits', 'cache_misses',
+                      'wal_reads', 'resident_read_successes', 'async_read_submissions']
+            with (directory / 'read_path_evidence.csv').open('w') as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                for partition in range(5):
+                    for boundary in ('before', 'after'):
+                        writer.writerow(dict(phase='point_get', role='storage', partition=partition,
+                            boundary=boundary, cache_hits=0, cache_misses=0,
+                            wal_reads=8 if boundary == 'after' else 0,
+                            resident_read_successes=0,
+                            async_read_submissions=8 if boundary == 'after' else 0))
+            def physical(values):
+                with (directory / 'read_io.csv').open('w') as stream:
+                    writer = csv.DictWriter(stream, fieldnames=['phase', 'partition', 'physical_read_bytes'])
+                    writer.writeheader()
+                    for partition, value in enumerate(values):
+                        writer.writerow(dict(phase='point_get', partition=partition, physical_read_bytes=value))
+            physical([])
+            evidence = checkpoint_kv.read_service_evidence(directory, 'tcp')['point_get']
+            self.assertEqual(evidence['owner_async_submissions'], 40)
+            self.assertTrue(evidence['owner_counters_available'])
+            self.assertFalse(evidence['async_submissions_prove_device_io'])
+            self.assertIsNone(evidence['charged_physical_read_bytes'])
+            self.assertEqual(evidence['physical_io_scope'], 'unavailable')
+            physical([0] * 5)
+            evidence = checkpoint_kv.read_service_evidence(directory, 'tcp')['point_get']
+            self.assertEqual(evidence['charged_physical_read_bytes'], 0)
+            physical([4096, 0, 0, 0, 0])
+            evidence = checkpoint_kv.read_service_evidence(directory, 'tcp')['point_get']
+            self.assertEqual(evidence['charged_physical_read_bytes'], 4096)
+            self.assertEqual(evidence['physical_io_scope'], 'positive_process_interval_IO_not_per_value_device_latency')
+
+    def test_owner_counter_availability_requires_exact_configured_population(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            fields = ['phase', 'role', 'partition', 'boundary', 'cache_hits', 'cache_misses',
+                      'wal_reads', 'resident_read_successes', 'async_read_submissions']
+            def capture(owners, physical):
+                with (directory / 'read_path_evidence.csv').open('w') as stream:
+                    writer = csv.DictWriter(stream, fieldnames=fields)
+                    writer.writeheader()
+                    for partition in owners:
+                        for boundary in ('before', 'after'):
+                            writer.writerow(dict(phase='point_get', role='storage', partition=partition,
+                                boundary=boundary, cache_hits=0, cache_misses=0, wal_reads=0,
+                                resident_read_successes=0, async_read_submissions=0))
+                with (directory / 'read_io.csv').open('w') as stream:
+                    writer = csv.DictWriter(stream, fieldnames=['phase', 'partition', 'physical_read_bytes'])
+                    writer.writeheader()
+                    for partition in physical:
+                        writer.writerow(dict(phase='point_get', partition=partition, physical_read_bytes=4096))
+            capture([], [0])
+            native = checkpoint_kv.read_service_evidence(directory, 'native-sync')['point_get']
+            self.assertFalse(native['owner_counters_available'])
+            self.assertIsNone(native['owner_resident_read_successes'])
+            self.assertIsNone(native['owner_async_submissions'])
+            self.assertEqual(native['charged_physical_read_bytes'], 4096)
+            capture([], range(5))
+            remote = checkpoint_kv.read_service_evidence(directory, 'tcp')['point_get']
+            self.assertFalse(remote['owner_counters_available'])
+            self.assertIsNone(remote['owner_resident_read_successes'])
+            self.assertIsNone(remote['owner_async_submissions'])
+            capture(range(4), range(5))
+            with self.assertRaisesRegex(ValueError, 'configured owner'):
+                checkpoint_kv.read_service_evidence(directory, 'tcp')
+            capture([2, 3], [2, 3])
+            configured = checkpoint_kv.read_service_evidence(
+                directory, 'tcp', owner_partitions=[2, 3])['point_get']
+            self.assertTrue(configured['owner_counters_available'])
+            self.assertEqual(configured['owner_resident_read_successes'], 0)
+            self.assertEqual(configured['owner_async_submissions'], 0)
+            capture([2, 4], [2, 3])
+            with self.assertRaisesRegex(ValueError, 'configured owner'):
+                checkpoint_kv.read_service_evidence(directory, 'tcp', owner_partitions=[2, 3])
+
+    def test_checkpoint_records_join_completion_and_pressure_without_invented_spans(self):
+        spec = dict(diagnostics=True, transport='tcp')
+        identity = dict(backend='experimental_tcp_authority', transport='tcp',
+                        phase='load_write_window', sample=0, value_bytes=8192,
+                        batch_size=32, window=32, repetition=0)
+        cut = dict(batch=dict(epoch=3, sequence=17), operation_index=31)
+        complete = dict(cursor=0, epoch=3, generation=2, checkpoint_generation=None,
+                        trigger=None, outcome=None, pressure_wait_ns=None,
+                        requested_cut=None, captured_cut=cut, staging_manifest_ns=11)
+        pressure = dict(cursor=1, epoch=3, generation=None, checkpoint_generation=2,
+                        trigger='IndexReservation', outcome='AfterExistingCapture',
+                        pressure_wait_ns=100, requested_cut=cut, captured_cut=cut,
+                        staging_manifest_ns=None, existing_capture_wait_ns=75)
+        row = identity | dict(diagnostic_available=True, cursor_before=0, record_count=2,
+            snapshot=dict(next_cursor=2, dropped_records=0, records=[complete, pressure]))
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with (directory / 'write_windows.csv').open('w') as stream:
+                writer = csv.DictWriter(stream, fieldnames=list(identity))
+                writer.writeheader()
+                writer.writerow(identity)
+            path = directory / 'checkpoint_diagnostics.jsonl'
+            path.write_text(json.dumps(row) + '\n')
+            checkpoint_kv.validate_checkpoint_records(directory, spec, 'tcp')
+            for records in ([], [complete], [complete, complete]):
+                changed = copy.deepcopy(row)
+                changed['record_count'] = len(records)
+                changed['snapshot']['records'] = records
+                path.write_text(json.dumps(changed) + '\n')
+                with self.assertRaisesRegex(ValueError, 'retained suffix'):
+                    checkpoint_kv.validate_checkpoint_records(directory, spec, 'tcp')
+            # dropped_records is global. A late window need not start at zero,
+            # and requesting an older cut returns exactly the bounded suffix.
+            for before, retained in ((195, range(195, 200)), (70, range(72, 200)), (200, ())):
+                retained = [pressure | dict(cursor=cursor) for cursor in retained]
+                changed = row | dict(cursor_before=before, record_count=len(retained),
+                    snapshot=dict(next_cursor=200, dropped_records=72, records=retained))
+                path.write_text(json.dumps(changed) + '\n')
+                checkpoint_kv.validate_checkpoint_records(directory, spec, 'tcp')
+            for next_cursor, dropped in ((2, 1), (2**64 - 1, 0)):
+                changed = row | dict(record_count=0, snapshot=dict(
+                    next_cursor=next_cursor, dropped_records=dropped, records=[]))
+                path.write_text(json.dumps(changed) + '\n')
+                with self.assertRaisesRegex(ValueError, 'cardinality'):
+                    checkpoint_kv.validate_checkpoint_records(directory, spec, 'tcp')
+            changed = copy.deepcopy(row)
+            changed['snapshot']['records'][0]['pressure_wait_ns'] = 0
+            path.write_text(json.dumps(changed) + '\n')
+            with self.assertRaisesRegex(ValueError, 'completion'):
+                checkpoint_kv.validate_checkpoint_records(directory, spec, 'tcp')
+            changed = copy.deepcopy(row)
+            changed['snapshot']['records'][1]['captured_cut'] = dict(partition=0, offset=123)
+            path.write_text(json.dumps(changed) + '\n')
+            with self.assertRaisesRegex(ValueError, 'logical cut'):
+                checkpoint_kv.validate_checkpoint_records(directory, spec, 'tcp')
+            path.write_text(json.dumps(row) + '\n')
+            with self.assertRaisesRegex(ValueError, 'clean/native'):
+                checkpoint_kv.validate_checkpoint_records(directory, spec | dict(diagnostics=False), 'tcp')
 
     def test_cache_schedules_are_bound_to_each_cell_and_cannot_be_forged(self):
         cfg = self.cfg | dict(shard_cache_mib_by_repetition=[0, 16, 16, 0])

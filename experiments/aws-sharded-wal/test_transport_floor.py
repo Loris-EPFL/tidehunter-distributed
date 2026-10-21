@@ -335,6 +335,26 @@ class CloudEvidenceTests(unittest.TestCase):
                 self.assertEqual({r['value_bytes'] for r in rows}, {1024, 8192})
                 self.assertTrue(all(r['new_repetitions'] == 3 and r['phase'] == 'ram_response' for r in rows))
 
+    def test_ram_control_checks_interval_io_not_prior_wal_activity(self):
+        spec = next(s for s in profile.main_cases() if s.get('floor'))
+        name = self.evidence.floor(spec)
+        directory = self.root / name
+        for path in directory.glob('evidence-*.yaml'):
+            evidence = profile.yaml_one(path.read_text())
+            for boundary in evidence[:2]:
+                for partition in boundary:
+                    partition['wal_reads'] = 17
+                    partition['wal_read_bytes'] = 4096
+            save(path, evidence)
+        metrics = profile.read_floor_metrics(directory, spec)
+        self.assertEqual(metrics['floor_io', 'ram-v1024-r0', 'partition0.after.wal_reads'], 17)
+        path = directory / 'evidence-v1024-r0.yaml'
+        evidence = profile.yaml_one(path.read_text())
+        evidence[1][0]['wal_reads'] += 1
+        save(path, evidence)
+        with self.assertRaisesRegex(ValueError, 'measured interval'):
+            profile.read_floor_metrics(directory, spec)
+
     def test_wal_resident_activity_and_read_phase_counts_are_not_optional(self):
         for resident in (False, True):
             spec = next(s for s in profile.main_cases() if s['workload'] == 'scalar' and s['build'] == 'current'

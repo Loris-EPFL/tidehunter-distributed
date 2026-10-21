@@ -303,6 +303,21 @@ class ScalarEvidenceTests(unittest.TestCase):
         self.assertEqual(len(receipt['case_ids']), 4)
         self.assertEqual(receipt['expected_node_archives'], 20)
 
+    def test_foreground_checkpoint_wait_is_not_an_exclusive_checkpoint_subset(self):
+        spec = next(c for c in profile.qualification_cases() if c['build'] == 'current')
+        name = self.evidence.benchmark(spec)
+        path = self.root / name / 'write_windows.csv'
+        rows = audit.cluster_ram.read_csv(path)
+        for row in rows:
+            row['foreground_checkpoint_ns'] = '90'
+            row['checkpoint_ns'] = '1'
+        table(path, rows)
+        self.read(name)
+        rows[0]['checkpoint_ns'] = '101'
+        table(path, rows)
+        with self.assertRaisesRegex(ValueError, 'exclusive write parent spans'):
+            self.read(name)
+
     def test_current_qualification_rejects_missing_or_unsupported_endpoint_evidence(self):
         spec = next(c for c in profile.qualification_cases() if c['build'] == 'current')
         name = self.evidence.benchmark(spec)

@@ -106,6 +106,16 @@ def flags(spec, mode, external=False, prepare=False):
     return result
 
 
+def subsuite_floor_spec(transport, instrumented):
+    """Bounded independent RAM populations inside the existing full KV suite."""
+    if transport not in ('tcp', 'efa', 'efa-direct') or type(instrumented) is not bool:
+        raise ValueError('invalid subsuite RAM control population')
+    return dict(transport=transport, polling='adaptive', floor_values=[256, 8192],
+                samples=256 if instrumented else 512,
+                floor_repetitions=1 if instrumented else 3,
+                idle_us=0, profile=instrumented)
+
+
 def floor_flags(spec):
     return ['--transport', spec['transport'], '--polling', spec['polling'],
             '--values', ','.join(map(str, spec['floor_values'])), '--samples', str(spec['samples']),
@@ -307,8 +317,8 @@ def read_floor_metrics(path, spec):
                 for key, value in flatten_counters(counters).items():
                     metrics['floor_io', phase, f'partition{partition}.{boundary}.{key}'] = value
             for key in ('wal_reads', 'wal_read_bytes'):
-                if before[key] != 0 or after[key] != 0:
-                    raise ValueError('RAM floor accessed WAL members')
+                if after[key] != before[key]:
+                    raise ValueError('RAM floor accessed WAL members during its measured interval')
             if spec['profile'] and integer(profile['requests']) < (spec['samples'] + 4 - partition) // 5:
                 raise ValueError('profile omitted measured RAM requests')
             for key, value in validate_polling(profile, spec).items():
