@@ -1524,10 +1524,19 @@ Positive interval IO does not make every sampled key physically cold.
 
 The new hit-only contention control separately recorded 72 native/remote
 observations. The remote subset has 165888 reads/hits, zero misses/RPCs and
-135104 reads overlapping the paired durable-write API interval. Remote p99
-rises from 1.410–1.840 us with one caller to 32.941–36.351 us with eight callers.
-These are not additional repeats of the ordinary scalar rows or evidence
-that remote transport caused a cache-only contention tail.
+135104 reads overlapping the paired durable-write API interval. Its one-caller
+p99 is 1.410–1.840 us. Eight-caller populations have 8192 reads per repeat:
+
+| Hit-only p99 with eight callers, us | Native matched control | TCP | EFA | EFA-direct |
+|---|---:|---:|---:|---:|
+| 256 B | 3.380–4.351 | 34.541 | 33.912 | 32.941 |
+| 8 KiB | 3.500–4.160 | 36.351 | 34.901 | 34.101 |
+
+The contended cached tail is therefore still 7.6–10.4 times its matched native
+control. These are not additional ordinary scalar repeats, and zero read RPCs
+rules out a remote read exchange as the cause. Publication/index/cache waiting
+and scheduling need separate attribution; this experiment alone does not
+identify one mutex as the cause.
 
 #### Durable writes and lifecycle operations
 
@@ -1560,6 +1569,11 @@ and 16–18% checkpoint work. Storage wait includes the remote operation and
 durability wait, not just network transit. The enclosing foreground-checkpoint
 span overlaps drain/wait work; background worker spans are another population.
 Do not add those spans again.
+
+The diagnostic 8-KiB/B32/W32 cases retain 320 batches and ten load windows;
+the clean long cases retain 3200 batches and 100 windows. Detailed S0 spans
+from the smaller diagnostic state are not a per-tail causal trace of the
+clean long workload.
 
 The retained diagnostic write windows contain 13 unique capture-completion
 records, not all 18 session cursor advances. Five advances occur outside the
@@ -1625,7 +1639,9 @@ but not consistently faster for individual reads or write tails.
 1. Keep C0's bounded in-process hit path and its full reference/key, health,
    retention and publication checks. This follows the FASTER/Garnet locality
    mechanism in §16.1; it does not require caching the whole distributed DB.
-   Same order as native is observed; exact equality is not.
+   Same order is observed for single-caller hit p50, not equality or contended
+   p99 parity. Measure publication/index/cache waits separately from scheduling
+   under the disjoint writer before changing read-side synchronization.
 2. Investigate the measured full RPC/software floor before adding NVMe-oF.
    A diagnostic 8-KiB direct population has a 64.811-us mean client exchange
    and 5.599-us mean server handler; these are nested spans, not an additive
@@ -1678,6 +1694,15 @@ do not silently raise the policy to obtain another fleet.
 
 Full raw data remain in the workflow artifacts and
 `s3://tidehunter-ci-354775971805-us-east-1/th-77284b2a87c3fec5/results/`.
+The final reviewed reductions and recovery provenance are also retained as
+`s3://tidehunter-ci-354775971805-us-east-1/th-77284b2a87c3fec5/analysis/recovered-5f98dd57.tar.gz`,
+version `Co1ShQE_AExiZKZETs_DqoDkhCM6w2Wt`. The private AES256-encrypted
+archive is 11689754 bytes; its S3 **FULL_OBJECT SHA256** matches
+`d316c145f56d2aca171ff2c795f27f284980798ba337464e0a1569156fb21934`.
+The lifecycle expires this object at **2026-11-21 00:00 UTC**.
+`analysis-package-upload.json` records the conditional upload and verification;
+the original result objects were not overwritten.
+
 Workspace reductions are under `checkpoint-work/aws-ci-runs/39605310614-1/`:
 
 - `uploaded-inputs-proof.json`, `recovered-measurement-attestation.json`,
