@@ -15,6 +15,8 @@ bytes = {workspace = true}
 bincode = "1.3.3"
 serde = { version = "1.0.208", features = ["derive"] }
 serde_yaml = "0.9.21"
+# The existing locked serializer is used only for opt-in fabric diagnostic output.
+serde_json = { version = "1.0.140", optional = true }
 rand = {workspace = true}
 prometheus = {workspace = true}
 tokio = { version = "1.36.0", features = ["full"], optional = true}
@@ -40,9 +42,11 @@ hex-literal = "1.0.0"
 parking_lot = {workspace = true, features = ["arc_lock"]}
 hex = "0.4.3"
 criterion = { version = "0.5", features = ["html_reports"] }
+# Benchmark JSONL uses the same vetted version without adding a native runtime edge.
+serde_json = "1.0.140"
 
 [features]
-experimental-fabric = ["experimental-distributed", "dep:tidehunter-fabric"]
+experimental-fabric = ["experimental-distributed", "dep:tidehunter-fabric", "dep:serde_json"]
 experimental-distributed = ["dep:blake2b_simd", "dep:rustls", "dep:io-uring"]
 tokio = ["dep:tokio"]
 test_methods = []

@@ -84,7 +84,7 @@ fn work_profiles_disable_reset_and_preserve_live_frames() {
     assert_eq!(stats.frame_decode.calls, 2);
     assert_eq!(stats.frame_decode.errors, 1);
     assert_eq!(stats.frame_decode.bytes, frame.len() as u64);
-    assert!(pair.session.write_plaintext().unwrap());
+    assert!(pair.session.write_plaintext(PROGRESS_BYTES).unwrap() != 0);
     assert!(pair.session.transport_stats().plaintext_write.bytes > 0);
     let owned = pair.session.output_bytes;
     pair.session.configure_transport_stats(false, true);
@@ -105,8 +105,49 @@ fn send_tls_plaintext(pair: &mut Pair, bytes: &[u8]) {
     let mut encrypted = Cursor::new(encrypted);
     while encrypted.position() < encrypted.get_ref().len() as u64 {
         assert_ne!(pair.session.conn.read_tls(&mut encrypted).unwrap(), 0);
-        pair.session.conn.process_new_packets().unwrap();
+        let state = pair.session.conn.process_new_packets().unwrap();
+        pair.session.plaintext_pending = state.plaintext_bytes_to_read();
+        pair.session.peer_closed = state.peer_has_closed();
     }
+}
+#[test]
+fn output_only_turn_preserves_buffered_unread_tls_plaintext() {
+    let mut pair = pair();
+    let frame = encode_frame(
+        &Envelope {
+            protocol: PROTOCOL,
+            id: 1,
+            body: Response::Error("buffered".to_owned()),
+        },
+        8192,
+    )
+    .unwrap();
+    send_tls_plaintext(&mut pair, &frame);
+    let pending = pair.session.plaintext_pending;
+    assert!(pending > 0);
+    pair.session.queue(2, &0_u8, 1024).unwrap();
+    pair.session.progress_output().unwrap();
+    assert_eq!(pair.session.plaintext_pending, pending);
+    let (bytes, len) = pair.session.receive(8192).unwrap().unwrap();
+    let decoded: Envelope<Response> = pair.session.decode(&bytes[..len], 8192).unwrap();
+    assert_eq!(decoded.id, 1);
+    assert_eq!(pair.session.plaintext_pending, 0);
+}
+#[test]
+fn output_budget_is_shared_across_the_two_turns_of_one_sweep() {
+    let mut pair = pair();
+    for id in 1..=8 {
+        pair.session.queue(id, &id, 1024).unwrap();
+    }
+    let submitted_before = pair.session.stats.frames_submitted;
+    pair.session.progress().unwrap();
+    let submitted_after = pair.session.stats.frames_submitted;
+    assert_eq!(
+        submitted_after - submitted_before,
+        OUTPUT_FRAME_BUDGET as u64
+    );
+    pair.session.progress_output().unwrap();
+    assert_eq!(pair.session.stats.frames_submitted, submitted_after);
 }
 
 #[test]
@@ -191,7 +232,7 @@ impl Write for Wire {
     }
 }
 fn step(session: &mut Session, wire: &mut Wire, completed: u64) {
-    session.write_plaintext().unwrap();
+    session.write_plaintext(PROGRESS_BYTES).unwrap();
     if session.conn.wants_write() {
         match session.conn.write_tls(wire) {
             Ok(_) => {}
@@ -380,7 +421,7 @@ fn tcp_output_retires_at_ciphertext_acceptance_without_fabric_cq() {
         ..Wire::default()
     };
     for _ in 0..4096 {
-        pair.session.write_plaintext().unwrap();
+        pair.session.write_plaintext(PROGRESS_BYTES).unwrap();
         pair.session.conn.write_tls(&mut wire).unwrap();
         // Ordinary socket writes transfer ownership immediately: fence zero.
         pair.session.finish_output(0, 0);
