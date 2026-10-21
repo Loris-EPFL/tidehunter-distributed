@@ -303,18 +303,24 @@ def completed_case_ids(planned, completed):
 
 
 def require_kv_policy(observed, expected):
-    """Compare the admitted effective policy, not two matching foreign receipts."""
-    if not isinstance(observed, dict):
-        raise ValueError('cold effective KV policy is missing or invalid')
-    for key, value in expected.items():
-        actual = observed.get(key)
-        if isinstance(value, dict):
+    """Require the entire admitted semantic schema, including nested value types."""
+    if type(observed) is not type(expected):
+        raise ValueError('cold effective KV policy has a foreign value type')
+    if isinstance(expected, dict):
+        if observed.keys() != expected.keys():
+            raise ValueError('cold effective KV policy has missing or unadmitted fields')
+        for key, value in expected.items():
+            require_kv_policy(observed[key], value)
+    elif isinstance(expected, (list, tuple)):
+        if len(observed) != len(expected):
+            raise ValueError('cold effective KV policy has a foreign population')
+        for actual, value in zip(observed, expected, strict=True):
             require_kv_policy(actual, value)
-        elif type(actual) is not type(value) or actual != value:
-            raise ValueError(f'cold effective KV policy differs from admission: {key}')
+    elif observed != expected:
+        raise ValueError('cold effective KV policy differs from admission')
 
 
-def cold_owner_pid(path, endpoint, binary_sha256, expected_policy, partition):
+def cold_owner_pid(path, endpoint, binary_sha256, expected_policy):
     """Read the original owner identity, never infer it from the IO being certified."""
     with tarfile.open(path, 'r:gz') as archive:
         members = list(islice(archive, 1025))
@@ -338,9 +344,17 @@ def cold_owner_pid(path, endpoint, binary_sha256, expected_policy, partition):
         if len(launches) != 1 or not isinstance(launches[0], dict):
             raise ValueError('cold original owner launch policy is missing or ambiguous')
         launch = launches[0]
+        node_policy = launch.get('node')
+        if not isinstance(node_policy, dict):
+            raise ValueError('cold effective KV policy lacks its owner node configuration')
+        shape_text = node_policy.get('shape_yaml')
+        if not isinstance(shape_text, str):
+            raise ValueError('cold effective KV policy lacks its serialized keyspace shape')
+        shapes = transport_floor.yaml_documents(shape_text)
+        if len(shapes) != 1 or not isinstance(shapes[0], dict):
+            raise ValueError('cold effective KV policy has an ambiguous keyspace shape')
+        launch['node']['shape_yaml'] = shapes[0]
         require_kv_policy(launch, expected_policy)
-        require_kv_policy(launch, dict(listen=endpoint, tls=dict(transport='efa-direct'),
-                                     node=dict(partition=dict(partition=partition))))
     if (not isinstance(start, dict) or type(start.get('pid')) is not int
             or not 0 < start['pid'] <= 2**32 - 1
             or start.get('ready') != endpoint or start.get('build') != 'current'
@@ -383,13 +397,6 @@ def cold_probe_certificate(directory, spec, cfg, client):
     remote_policy, owner_policy = kv_case_policy(cfg, spec)
     require_kv_policy(deployment, remote_policy)
     expected_endpoints = {node['partition']: node['private_ip'] + ':7700' for node in nodes}
-    endpoints = deployment.get('endpoints', [])
-    if (len(endpoints) != len(nodes)
-            or {row['partition']: row['address'] for row in endpoints} != expected_endpoints
-            or deployment.get('tls', {}).get('transport') != 'efa-direct'
-            or len(deployment['storage']['partitions']) != len(nodes)
-            or set(deployment['storage']['partitions']) != set(expected_endpoints)):
-        raise ValueError('cold auxiliary deployment owners/transport differ from the admitted fleet')
     process = json.loads((directory.parent / (directory.name + '-process.command.json')).read_text())
     command = process.get('command')
     if (type(process.get('exit_code')) is not int or process['exit_code'] != 0
@@ -399,11 +406,8 @@ def cold_probe_certificate(directory, spec, cfg, client):
         raise ValueError('cold auxiliary lacks its successful original process receipt')
     if command != commands['tcp']:
         raise ValueError('cold auxiliary original process differs from its complete admitted KV command')
-    configured_lanes = deployment.get('read_lanes')
-    if type(configured_lanes) is not int or not 1 <= configured_lanes <= 8:
-        raise ValueError('cold auxiliary deployment read lane count is invalid')
-    # KV preparation controls the deployment; measurement commands never override lanes.
-    lanes = configured_lanes
+    # The observed deployment must match this independent source-bound policy.
+    lanes = remote_policy['read_lanes']
     metadata = {}
     for line in (directory / 'campaign.txt').read_text().splitlines():
         if '=' not in line:
@@ -454,7 +458,7 @@ def cold_probe_certificate(directory, spec, cfg, client):
     owner_pids = {
         partition: cold_owner_pid(
             directory.parent / 'nodes' / case_id / f'node-{partition}.tar.gz',
-            expected_endpoints[partition], expected_binary_sha256, owner_policy, partition)
+            expected_endpoints[partition], expected_binary_sha256, owner_policy[partition])
         for partition in partitions}
     expected_io = {(phase, str(partition)) for phase in io_phases for partition in partitions}
     io_path = directory / 'read_io.csv'

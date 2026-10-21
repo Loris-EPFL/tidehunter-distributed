@@ -2239,3 +2239,44 @@ tests: 481 passed, 3 skipped**, plus **111 Sui-harness tests passed**.
 The resumed independent audit reported no further finding in this boundary.
 No engine, timing sample, budget, live resource or hardware measurement changed.
 
+### 16.16 Complete effective runtime policy, not observed defaults
+
+The `8cd07d4` review found that a successful preparation receipt alone does
+not bind later edits to its generated YAML. The previous projection omitted
+lane, pipeline and other runtime controls; an obsolete test even accepted one
+or three observed lanes for the same admitted two-lane case.
+
+`guest.py::kv_case_policy` now defines the entire deterministic remote policy
+and a complete launch policy for each partition. Its values come from the
+admitted cfg/spec and the Rust benchmark constructor/defaults, not retrieved
+YAML. Source definitions are
+`tidehunter/examples/support/tcp_cluster.rs`,
+`tidehunter/examples/sharded_wal_bench.rs`,
+`tidehunter/src/distributed/remote_db.rs` and
+`tidehunter/src/distributed/tcp.rs`.
+
+| Admission boundary | Independently bound controls |
+|---|---|
+| Remote writes and index | Pipeline, preparation workers, pending counts/bytes, index/admission capacity and deadline |
+| Remote reads | Two lanes, queue limits, memory/cache budgets and scan prefetch |
+| Owner reads and transport | Workers, resident-first/async mode, memory/cache/inflight/device limits, frame/connection/read/recovery limits, polling and deadline |
+| WAL and identity | Batch/group/fragment/file limits, resident capacity, metadata/epoch limits, database/partition inventory, endpoints, TLS and owned paths |
+| Shape and instrumentation | Complete semantic keyspace geometry/configuration, profiling and fault-injection settings |
+
+`require_kv_policy` recursively requires exact keys, types and values,
+including lists and tagged-shape tuples. Missing or new controls fail closed.
+Embedded `shape_yaml` is compared semantically, not by formatting.
+The cold lane count comes from trusted expected policy. The old unadmitted
+lane-acceptance test was removed; consistent foreign diagnostic populations
+now exercise rejection. No new WorkerConfig/native-only evidence schema is
+introduced.
+
+The before/after program changed owner `read_max_device_reads` to 1 while
+keeping both successful command receipts unchanged: accepted at `8cd07d4`,
+rejected after the correction. The valid case and entire original archive
+still pass; all 387 commands and the auxiliary output remain unchanged.
+The separate proof is `complete-kv-runtime-policy-validation.json`.
+Local suites completed **487 AWS-harness tests: 484 passed, 3 skipped**,
+plus **111 Sui-harness tests passed**. No engine, argv, timing sample or
+cloud allocation changed; this makes future policy drift visible.
+

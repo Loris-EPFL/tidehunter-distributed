@@ -131,11 +131,12 @@ def kv_case_commands(cfg, spec):
 
 
 def kv_case_policy(cfg, spec):
-    """Project benchmark-meaningful effective YAML from the trusted KV command.
+    """Complete semantic admission policy for the source-bound KV deployment.
 
-    sharded_wal_bench's WalLayoutPreset and BackendParameters::new define
-    geometry and lifetime admission; prepare_authority_window changes only the
-    resident cap, not that lifetime limit. Unrelated Rust defaults are not pinned.
+    Values follow sharded_wal_bench::BackendParameters, tcp_cluster's external
+    constructor and the serialized runtime schemas/defaults. The authority-window
+    transform changes only resident caps. These defaults are admission constants,
+    not values learned from captured YAML; drift requires explicit readmission.
     """
     prepare, _ = kv_case_commands(cfg, spec)
     arguments = dict(zip(prepare[1::2], prepare[2::2], strict=True))
@@ -148,17 +149,53 @@ def kv_case_policy(cfg, spec):
                     wal_file_bytes=(256 if sui else 128) * 1024**2,
                     group_limits=dict(max_batches=32,
                                       max_encoded_bytes=12 * 1024**2 if sui else 1024**2 - 8))
-    remote = dict(storage=geometry | {'max_batches_per_partition': resident},
-                  max_admitted_batches=lifetime,
-                  read_cache_bytes=int(arguments['--tcp-read-cache-bytes']))
-    owner = dict(node=dict(
-        partition=geometry | {'max_batches': resident},
-        read_workers=int(arguments['--tcp-server-read-workers']),
-        wal_member_read=arguments['--tcp-wal-member-read'],
-        read_resident_first=arguments['--tcp-resident-first'] == 'true',
-        read_cache_bytes=int(arguments['--tcp-shard-cache-bytes'])),
-        limits=dict(polling=arguments['--tcp-polling']))
-    return remote, owner
+    partitions = sorted(node['partition'] for node in cfg['nodes'])
+    inventory = dict(database=[42] * 16, epoch=1, segment_generation=1, partitions=partitions)
+    batch_limits = dict(max_operations=32, max_encoded_bytes=320 * 1024)
+    common_partition = geometry | dict(batch_limits=batch_limits, max_reference_metadata_bytes=16 * 1024**2)
+    case_root = Path(arguments['--guest-case-root'])
+    def tls(identity, server_name):
+        return dict(transport=arguments['--transport'], ca=str(case_root / 'tls/ca.der'),
+                    cert=str(case_root / 'tls' / (identity + '.der')),
+                    key=str(case_root / 'tls' / (identity + '.pk8')), server_name=server_name)
+    remote = dict(
+        storage=common_partition | dict(database=[42] * 16, partitions=partitions,
+            max_batches_per_partition=resident, max_epochs=4),
+        endpoints=[dict(partition=node['partition'], address=node['private_ip'] + ':7700',
+                        server_name=f"tidehunter-node-{node['partition']}")
+                   for node in sorted(cfg['nodes'], key=lambda node: node['partition'])],
+        tls=tls('tidehunter-authority', 'unused-client-template'), timeout=dict(secs=10, nanos=0),
+        max_admitted_batches=lifetime, max_index_bytes=128 * 1024**2,
+        max_pending_batches=128, max_pending_bytes=64 * 1024**2, pipelined_writes=True,
+        read_cache_bytes=int(arguments['--tcp-read-cache-bytes']),
+        read_memory_allowance_bytes=512 * 1024**2, preparation_workers=2, scan_prefetch_pages=2,
+        read_lanes=2, max_pending_reads=256, max_pending_read_bytes=64 * 1024**2, write_profile_limit=0)
+    shape = dict(key_spaces=[dict(inner=dict(
+        id=0, name='root', key_indexing=('Fixed', 8), mutexes=16,
+        key_type=('Uniform', dict(cells_per_mutex=64)),
+        config=dict(disable_unload=False, max_dirty_keys=None, l0_max_entries=None, bloom_filter=None,
+                    value_cache_size=0, index_format='Header', unloaded_iterator=True), destroyed=False))])
+    owners = {}
+    for node in cfg['nodes']:
+        partition = node['partition']
+        node_root = case_root / f'node-{partition}'
+        owners[partition] = dict(
+            node=dict(root=str(node_root / 'storage'),
+                partition=common_partition | dict(inventory=inventory, partition=partition, max_batches=resident),
+                shape_yaml=shape, max_epochs=4,
+                read_workers=int(arguments['--tcp-server-read-workers']),
+                wal_member_read=arguments['--tcp-wal-member-read'],
+                read_resident_first=arguments['--tcp-resident-first'] == 'true',
+                read_cache_bytes=int(arguments['--tcp-shard-cache-bytes']),
+                read_memory_allowance_bytes=512 * 1024**2, read_max_inflight_requests=32,
+                read_max_inflight_bytes=64 * 1024**2, read_max_device_reads=128),
+            tls=tls(f'tidehunter-node-{partition}', f'tidehunter-node-{partition}'),
+            limits=dict(max_frame_bytes=16 * 1024**2, max_connections=16, max_reads=256,
+                        recovery_page_batches=128, io_timeout=dict(secs=60, nanos=0),
+                        polling=arguments['--tcp-polling']),
+            listen=node['private_ip'] + ':7700', ready_file=str(node_root / 'ready'),
+            stop_file=str(node_root / 'stop'), drop_first_append_response=False)
+    return remote, owners
 
 
 def sha(path):
