@@ -1653,11 +1653,13 @@ impl Db {
         receiver.recv().unwrap();
     }
 
-    /// Wait for all background threads to finish by polling until no strong references remain.
+    /// Wait for all other strong owners to release the database, then synchronously
+    /// destroy it. The WAL writer joins its tracker and mapper during destruction.
     ///
-    /// The caller is responsible to make sure there is no more alive Arc references to the Db held by the user.
+    /// The caller is responsible to make sure there are no other live user-owned
+    /// `Arc` references to the database.
     ///
-    /// This method panics after certain period to avoid hanging forever.
+    /// This method panics after a certain period to avoid hanging forever.
     pub fn wait_for_background_threads_to_finish(self: Arc<Self>) {
         use std::thread;
         use std::time::Duration;
@@ -1666,30 +1668,32 @@ impl Db {
         #[cfg(not(test))]
         const POLL_LIMIT: usize = 100_000;
 
-        // Take the lock out before releasing the Arc. This ensures the registry removal
-        // happens exactly once, here in the calling thread, after all background threads
-        // have finished — not racing with DbLock::drop in a background thread.
+        // Keep the database alive while transient background owners finish,
+        // then run its destructor here so field drops and worker joins complete
+        // before the database lock is released.
         let lock = self._lock.lock().take();
-
-        let weak_db = Arc::downgrade(&self);
-        drop(self);
-
+        let mut db = self;
         let mut poll_count = 0usize;
         loop {
-            if weak_db.upgrade().is_none() {
-                break;
+            match Arc::try_unwrap(db) {
+                Ok(db) => {
+                    drop(db);
+                    break;
+                }
+                Err(shared) => {
+                    db = shared;
+                    poll_count += 1;
+                    if poll_count > POLL_LIMIT {
+                        panic!(
+                            "Database shutdown timeout: background threads not terminating after {poll_count} polls"
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
             }
-            poll_count += 1;
-            if poll_count > POLL_LIMIT {
-                panic!(
-                    "Database shutdown timeout: background threads not terminating after {poll_count} polls"
-                );
-            }
-            thread::sleep(Duration::from_millis(10));
         }
 
-        // Drop the lock now that all background threads are done.
-        // DbLock::drop removes from the registry and releases the fcntl lock.
+        // Drop the lock only after the database and its workers are fully dropped.
         drop(lock);
     }
 

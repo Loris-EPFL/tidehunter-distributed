@@ -613,6 +613,7 @@ fn test_decompress_cache_does_not_resurrect_gcd_frames() {
 ///   3. Be able to materialise fragment M+1 on a fresh insert and
 ///      land it at the start of that fragment.
 ///   4. Persist that fresh insert across another close/open cycle.
+
 #[test]
 fn test_replay_recovers_from_missing_next_fragment_file() {
     let dir =
@@ -635,9 +636,8 @@ fn test_replay_recovers_from_missing_next_fragment_file() {
     let value_b = vec![0xBBu8; 5000];
     let value_c = vec![0xCCu8; 32];
 
-    // Phase 1: write two large records. Drop the Db so background
-    // threads (mapper, tracker, syncer, flusher) join cleanly before we
-    // touch on-disk WAL files.
+    // Phase 1: write two large records, then synchronously destroy the Db
+    // so WAL tracker/mapper teardown completes before changing the directory.
     {
         let db = Db::open(
             dir.path(),
@@ -649,6 +649,7 @@ fn test_replay_recovers_from_missing_next_fragment_file() {
         let ks = db.single_ks();
         db.insert(ks, key_a.clone(), value_a.clone()).unwrap();
         db.insert(ks, key_b.clone(), value_b.clone()).unwrap();
+        db.wait_for_background_threads_to_finish();
     }
 
     let file_0 = dir.path().join("wal_0000000000000000");
@@ -710,6 +711,7 @@ fn test_replay_recovers_from_missing_next_fragment_file() {
             Some(value_c.clone().into()),
             "fresh insert after recovery must be readable",
         );
+        db.wait_for_background_threads_to_finish();
     }
     assert!(
         file_1.exists(),
@@ -725,6 +727,7 @@ fn test_replay_recovers_from_missing_next_fragment_file() {
         assert_eq!(db.get(ks, &key_a).unwrap(), Some(value_a.into()));
         assert_eq!(db.get(ks, &key_b).unwrap(), None);
         assert_eq!(db.get(ks, &key_c).unwrap(), Some(value_c.into()));
+        db.wait_for_background_threads_to_finish();
     }
 }
 
