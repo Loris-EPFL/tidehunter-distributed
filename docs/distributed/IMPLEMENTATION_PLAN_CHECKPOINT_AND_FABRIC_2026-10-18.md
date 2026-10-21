@@ -930,6 +930,10 @@ an empty observed population.
   binds that certificate to the saved successful command, deployment, effective
   read lanes, exact owner/sample populations, primary read-path boundaries,
   auxiliary physical-IO interval, peer identities and successful post counters.
+  The controller case and every original owner start receipt must match the
+  **admitted** `cfg['binaries']['storage-node']` digest, not merely agree with
+  each other. The top-level KV receipt must match that same digest before
+  outer-case validation. Consistent foreign process/owner receipts fail.
   The auxiliary pass has its own clocks; its samples are not primary clean API
   latency. Its subsequent remote reopen profiles are `reopened-cache-cleared`,
   not native `reopened-warm`. The auxiliary IO recorder does not emit logical
@@ -2140,4 +2144,22 @@ tests. The hardware numbers in §16.10–16.11 remain measurements of engine
 No post-correction hardware result is claimed and no fleet was relaunched.
 The recorded metadata-only tree-identity proof remains scoped to its saved
 commits; it does not assert that this later native helper is unchanged.
+
+### 16.13 Final admitted-binary evidence correction
+
+The final Codex P2 review identified a collector authority gap, not a new
+hardware performance failure. The previous cold helper compared original
+owner hashes with the case-process receipt but did not independently bind
+both to the admitted storage executable. `cold_probe_certificate` now
+requires that expected digest from `validate_auxiliary`; the immutable
+top-level receipt is checked against it too. The regression keeps the
+process and all five owners mutually consistent while requiring a different
+admitted digest, and must reject the certificate.
+
+The full AWS evidence suite completed **472 tests: 469 passed, 3 skipped**.
+The actual closed archive also passed full source/executable/placement/KV/
+Sui/node evidence revalidation through this stricter validator. Its separate
+proof is `recovered-measurement-attestation-admitted-binary.json`; original
+failed receipts remain unchanged. No engine or wire code, workload timings,
+budget/admission policy or cloud resources changed for this correction.
 

@@ -326,7 +326,7 @@ def cold_owner_pid(path, endpoint, binary_sha256):
     return start['pid']
 
 
-def cold_probe_certificate(directory, spec, nodes, client):
+def cold_probe_certificate(directory, spec, nodes, client, expected_binary_sha256):
     """Bind mixed cold-case stderr to the separately profiled certification pass.
 
     read_campaign::run enables these profiles only after the three primary cold
@@ -355,6 +355,7 @@ def cold_probe_certificate(directory, spec, nodes, client):
     process = json.loads((directory.parent / (directory.name + '-process.command.json')).read_text())
     command = process.get('command')
     if (type(process.get('exit_code')) is not int or process['exit_code'] != 0
+            or process.get('binary_sha256') != expected_binary_sha256
             or not isinstance(command, list) or not command
             or any(not isinstance(value, str) for value in command)):
         raise ValueError('cold auxiliary lacks its successful original process receipt')
@@ -429,7 +430,7 @@ def cold_probe_certificate(directory, spec, nodes, client):
     owner_pids = {
         partition: cold_owner_pid(
             directory.parent / 'nodes' / case_id / f'node-{partition}.tar.gz',
-            expected_endpoints[partition], process.get('binary_sha256'))
+            expected_endpoints[partition], expected_binary_sha256)
         for partition in partitions}
     expected_io = {(phase, str(partition)) for phase in io_phases for partition in partitions}
     io_path = directory / 'read_io.csv'
@@ -523,6 +524,7 @@ def validate_auxiliary(root, state, cfg):
     completed = state.get('completed_cases', [])
     floors = state.get('completed_floor_cases', [])
     if (state.get('plan') != expected_plan
+            or state.get('binary_sha256') != cfg['binaries']['storage-node']
             or state.get('floor_binary_sha256') != cfg['binaries']['transport-floor']):
         raise ValueError('auxiliary controls differ from the immutable full KV plan/build')
     expected_floors, contention, read_service, fabric = [], [], [], []
@@ -543,7 +545,8 @@ def validate_auxiliary(root, state, cfg):
             evidence = fabric_local_log(log, required=direct_diagnostic or cold_auxiliary,
                                         forbidden=not (direct_diagnostic or cold_auxiliary))
             if cold_auxiliary:
-                cold_certificate = cold_probe_certificate(directory, spec, cfg['nodes'], evidence)
+                cold_certificate = cold_probe_certificate(
+                    directory, spec, cfg['nodes'], evidence, cfg['binaries']['storage-node'])
             fabric.append(dict(case_id=case_id, role=mode,
                 population='mixed_primary_clean_and_auxiliary_profiled_cold_certificate' if cold_auxiliary
                            else 'diagnostic' if spec['diagnostics'] else 'clean',

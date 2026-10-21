@@ -181,7 +181,7 @@ class MatrixEvidenceTests(unittest.TestCase):
                     process = json.loads(path.read_text())
                     process['command'] += ['--tcp-read-lanes', str(lanes)]
                     path.write_text(json.dumps(process))
-                certificate = checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client)
+                certificate = checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client, 'c' * 64)
                 self.assertEqual(certificate['read_lanes_per_owner'], lanes)
                 self.assertEqual(certificate['storage_sessions_per_owner'], lanes + 1)
                 for partition, evidence in servers.items():
@@ -190,7 +190,7 @@ class MatrixEvidenceTests(unittest.TestCase):
     def test_clean_cold_auxiliary_is_separate_and_bound_to_real_profile_artifacts(self):
         with tempfile.TemporaryDirectory() as root:
             directory, spec, nodes, client, servers = self.cold_probe_fixture(root)
-            certificate = checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client)
+            certificate = checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client, 'c' * 64)
             self.assertEqual(certificate['samples'], 256)
             self.assertEqual(certificate['phase'], 'cache-evicted-read-diagnostics')
             for partition, evidence in servers.items():
@@ -210,7 +210,7 @@ class MatrixEvidenceTests(unittest.TestCase):
                 matrix.validate_fabric_local_population(client, 'wholly-clean-warm', forbidden=True)
             for change in (dict(cold=False), dict(diagnostics=True), dict(transport='tcp')):
                 with self.subTest(change=change), self.assertRaises(ValueError):
-                    checkpoint_kv.cold_probe_certificate(directory, spec | change, nodes, client)
+                    checkpoint_kv.cold_probe_certificate(directory, spec | change, nodes, client, 'c' * 64)
 
     def test_cold_auxiliary_rejects_foreign_deployment_or_process_configuration(self):
         for change in ('deployment_owner', 'deployment_lanes', 'deployment_transport',
@@ -246,7 +246,7 @@ class MatrixEvidenceTests(unittest.TestCase):
                         process['exit_code'] = 1
                     path.write_text(json.dumps(process))
                 with self.assertRaises(ValueError):
-                    checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client)
+                    checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client, 'c' * 64)
 
     def test_cold_auxiliary_binds_physical_io_to_original_owner_and_case(self):
         changes = [('backend', 'experimental_tcp_authority'), ('value_bytes', '8192'),
@@ -281,7 +281,7 @@ class MatrixEvidenceTests(unittest.TestCase):
                     writer.writeheader()
                     writer.writerows(rows)
                 with self.assertRaises(ValueError):
-                    checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client)
+                    checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client, 'c' * 64)
 
     def test_cold_auxiliary_requires_positive_aggregate_io_in_every_cold_phase(self):
         phases = ('cache_evicted_get', 'cache_evicted_get_many',
@@ -301,11 +301,11 @@ class MatrixEvidenceTests(unittest.TestCase):
                     writer.writerows(rows)
                 if phase is None:
                     # One idle owner is valid; only the phase aggregate must be positive.
-                    certificate = checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client)
+                    certificate = checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client, 'c' * 64)
                     self.assertEqual(certificate['samples'], 256)
                 else:
                     with self.assertRaises(ValueError):
-                        checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client)
+                        checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client, 'c' * 64)
 
     def test_cold_auxiliary_requires_complete_positive_cold_and_reopened_api_samples(self):
         for change in ('tail_missing', 'tail_absent', 'tail_duplicate', 'tail_ordinal',
@@ -334,7 +334,14 @@ class MatrixEvidenceTests(unittest.TestCase):
                     writer.writeheader()
                     writer.writerows(rows)
                 with self.assertRaises(ValueError):
-                    checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client)
+                    checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client, 'c' * 64)
+
+    def test_cold_auxiliary_rejects_consistent_receipts_from_a_non_admitted_binary(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory, spec, nodes, client, _ = self.cold_probe_fixture(root)
+            # The process and every original owner agree on c, but admission requires d.
+            with self.assertRaises(ValueError):
+                checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client, 'd' * 64)
 
     def test_cold_auxiliary_requires_one_bounded_original_owner_start_record(self):
         for change in ('missing', 'duplicate', 'symlink', 'oversized', 'duplicate_pid',
@@ -371,7 +378,7 @@ class MatrixEvidenceTests(unittest.TestCase):
                                 member.size = len(payload)
                                 archive.addfile(member, io.BytesIO(payload))
                 with self.assertRaises(ValueError):
-                    checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client)
+                    checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client, 'c' * 64)
 
     def test_cold_auxiliary_rejects_missing_or_foreign_certification_artifacts(self):
         for change in ('missing_sample', 'duplicate_sample', 'state', 'profile_phase',
@@ -415,12 +422,12 @@ class MatrixEvidenceTests(unittest.TestCase):
                         lines = lines[:1] + lines[-12:] + lines[1:-12]
                     path.write_text('\n'.join(lines) + '\n')
                 with self.assertRaises(ValueError):
-                    checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client)
+                    checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client, 'c' * 64)
 
     def test_cold_auxiliary_rejects_unattributed_or_incomplete_local_windows(self):
         with tempfile.TemporaryDirectory() as root:
             directory, spec, nodes, client, servers = self.cold_probe_fixture(root)
-            certificate = checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client)
+            certificate = checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client, 'c' * 64)
             for change in ('missing', 'extra', 'reason', 'peer', 'post', 'absent_peer'):
                 changed = copy.deepcopy(client)
                 if change == 'missing':
@@ -436,7 +443,7 @@ class MatrixEvidenceTests(unittest.TestCase):
                 else:
                     changed['records'][0]['peer'] = None
                 with self.subTest(role='client', change=change), self.assertRaises(ValueError):
-                    checkpoint_kv.cold_probe_certificate(directory, spec, nodes, changed)
+                    checkpoint_kv.cold_probe_certificate(directory, spec, nodes, changed, 'c' * 64)
             for change in ('missing', 'extra', 'reason', 'peer', 'post'):
                 changed = copy.deepcopy(servers[0])
                 if change == 'missing':
