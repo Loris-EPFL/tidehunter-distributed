@@ -402,6 +402,8 @@ def wrapper_latencies(values):
     Quantiles are cumulative-histogram bucket bounds in microseconds, NOT raw
     sample quantiles. The unbounded +Inf upper endpoint is represented by null.
     No interpolation assumes a distribution within a bucket.
+    P99 additionally requires at least 100 observations in this histogram; cells
+    and other histogram populations are never pooled to satisfy that threshold.
     """
     groups = {}
     for metric, value in values.items():
@@ -456,7 +458,9 @@ def wrapper_latencies(values):
         for percentile in (50, 95, 99):
             quantile = dict(available=False, lower_us=None, upper_us=None,
                             upper_unbounded=False, reason='empty or incomplete histogram population')
-            if complete and count > 0:
+            if percentile == 99 and count is not None and 0 < count < 100:
+                quantile['reason'] = 'fewer than 100 observations; p99 unavailable'
+            elif complete and count > 0:
                 lower = 0.0
                 for upper, cumulative in buckets:
                     if cumulative >= count * percentile / 100:

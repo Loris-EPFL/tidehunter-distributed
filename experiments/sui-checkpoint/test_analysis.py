@@ -195,19 +195,73 @@ class HistogramPopulations(unittest.TestCase):
         self.assertTrue(row['quantiles']['p95']['upper_unbounded'])
         self.assertIn('not raw', row['quantile_method'])
 
+    def population_histogram(self, count):
+        return analyze.parse_metrics('\n'.join([
+            f'rocksdb_get_latency_seconds_sum{{cf_name="objects"}} {count * 0.00002}',
+            f'rocksdb_get_latency_seconds_count{{cf_name="objects"}} {count}',
+            f'rocksdb_get_latency_seconds_bucket{{le="0.00001",cf_name="objects"}} {count - 1}',
+            f'rocksdb_get_latency_seconds_bucket{{le="0.00005",cf_name="objects"}} {count}',
+            f'rocksdb_get_latency_seconds_bucket{{le="+Inf",cf_name="objects"}} {count}']))
+
+    def test_p99_requires_100_observations_in_its_own_histogram(self):
+        for count in (1, 3, 99, 100):
+            with self.subTest(count=count):
+                row, = analyze.wrapper_latencies(self.population_histogram(count))
+                self.assertTrue(row['available'])
+                self.assertAlmostEqual(row['mean_us'], 20)
+                tail = row['quantiles']['p99']
+                self.assertEqual(tail['available'], count >= 100)
+                if count < 100:
+                    self.assertIsNone(tail['lower_us'])
+                    self.assertIsNone(tail['upper_us'])
+                    self.assertFalse(tail['upper_unbounded'])
+                    self.assertIsNotNone(tail['reason'])
+                else:
+                    self.assertEqual(tail['lower_us'], 0)
+                    self.assertEqual(tail['upper_us'], 10)
+                    self.assertIsNone(tail['reason'])
+        row, = analyze.wrapper_latencies(self.population_histogram(99))
+        for percentile in ('p50', 'p95'):
+            self.assertTrue(row['quantiles'][percentile]['available'])
+            self.assertEqual(row['quantiles'][percentile]['upper_us'], 10)
+
+    def test_p99_does_not_pool_distinct_histogram_populations(self):
+        metrics = self.population_histogram(99)
+        metrics.update({
+            name.replace('cf_name="objects"', 'cf_name="certified_checkpoints"'): value
+            for name, value in self.population_histogram(3).items()
+        })
+        rows = analyze.wrapper_latencies(metrics)
+        self.assertEqual(sorted(row['count'] for row in rows), [3, 99])
+        for row in rows:
+            self.assertTrue(row['available'])
+            self.assertFalse(row['quantiles']['p99']['available'])
+            self.assertIsNone(row['quantiles']['p99']['upper_us'])
+
     def test_missing_buckets_preserve_mean_but_not_quantiles(self):
         metrics = {k: v for k, v in self.histogram().items() if '_bucket' not in k}
         row, = analyze.wrapper_latencies(metrics)
         self.assertEqual(row['mean_us'], 100)
         self.assertFalse(row['quantiles']['p50']['available'])
+        metrics = {k: v for k, v in self.population_histogram(100).items() if '_bucket' not in k}
+        row, = analyze.wrapper_latencies(metrics)
+        self.assertAlmostEqual(row['mean_us'], 20)
+        self.assertFalse(row['quantiles']['p99']['available'])
+        self.assertIsNone(row['quantiles']['p99']['upper_us'])
+        self.assertIsNotNone(row['quantiles']['p99']['reason'])
 
     def test_empty_and_missing_count_histograms_are_unavailable(self):
         row, = analyze.wrapper_latencies(dict.fromkeys(self.histogram(), 0))
         self.assertIsNone(row['mean_us'])
         self.assertFalse(row['quantiles']['p99']['available'])
+        self.assertIsNone(row['quantiles']['p99']['upper_us'])
+        self.assertIsNotNone(row['quantiles']['p99']['reason'])
         row, = analyze.wrapper_latencies({k: v for k, v in self.histogram().items() if '_count' not in k})
         self.assertIsNone(row['mean_us'])
         self.assertFalse(row['quantiles']['p50']['available'])
+        self.assertFalse(row['quantiles']['p99']['available'])
+        self.assertIsNone(row['quantiles']['p99']['upper_us'])
+        self.assertIsNotNone(row['quantiles']['p99']['reason'])
 
     def test_corrupt_buckets_and_duplicate_series_rejected(self):
         metrics = self.histogram()
