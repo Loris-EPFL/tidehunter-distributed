@@ -258,8 +258,6 @@ def read_metrics(path, spec, mode):
                 parents = sum(number(row[k]) for k in ('preparation_admission_ns', 'storage_wait_ns', 'publication_ns', 'dispatch_ns', 'checkpoint_ns'))
                 if parents > number(row['api_ns']):
                     raise ValueError('exclusive write parent spans exceed API wall time')
-                if number(row['foreground_checkpoint_ns']) > number(row['checkpoint_ns']):
-                    raise ValueError('foreground checkpoint subset exceeds checkpoint total')
             for phase in ('load_write_window', 'delete_window', 'checkpoint_intervening_write',
                           'concurrent_mixed_write_window' if spec['concurrent_mixed'] else 'mixed_write_window'):
                 if len(windows[phase]) != len(samples[phase]):

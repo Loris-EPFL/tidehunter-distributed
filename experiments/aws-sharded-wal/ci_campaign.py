@@ -1915,8 +1915,8 @@ class Campaign:
 
     def validate_results(self, cfg):
         import sui_checkpoint as supervisor
-        from checkpoint_matrix import validate_matrix
-        from checkpoint_kv import plan as kv_plan
+        from checkpoint_matrix import validate_matrix, fabric_local_log, fabric_local_archive_log
+        from checkpoint_kv import plan as kv_plan, validate_auxiliary
         root = self.output / 's3' / self.run_id / 'results'
         receipt = read_json(root / 'receipt.json')
         archive = root / 'controller.tar.gz'
@@ -1929,6 +1929,7 @@ class Campaign:
         if state.get('complete') is not True or state.get('failures') or state.get('run_id') != self.run_id:
             raise ValueError('controller campaign receipt incomplete')
         validate_matrix(cfg, state['cells'])
+        fabric_sui = []
         for cell in state['cells']:
             directory = results / 'cells' / cell['cell_id']
             if sha(directory / 'replay-evidence.tar.gz') != cell['replay_evidence_sha256'] or sha(directory / 'resources.json') != cell['resources_sha256']:
@@ -1941,11 +1942,27 @@ class Campaign:
                     or replay['binaries'] != cfg['binaries']
                     or any(replay[mode]['completed_checkpoint_digest'] != CHECKPOINT for mode in ('native', 'remote'))):
                 raise ValueError('requested cell missing real checkpoint/full-state audit proof')
+            diagnostic = bool(cell['read_profile_limit'] or cell.get('write_profile_limit', 0))
+            cell_fabric = dict(cell_id=cell['cell_id'], transport=cell['transport'],
+                population='diagnostic' if diagnostic else 'clean', clients=[], storage=[],
+                scope='emitted finalized local endpoint windows only; SIGTERM can bypass Drop; not packetization, RTT or latency')
+            for mode in ('native', 'remote'):
+                cell_fabric['clients'].append(fabric_local_log(
+                    directory / 'replay-logs' / (mode + '.log'),
+                    forbidden=mode == 'native' or not diagnostic))
             for node in cfg['nodes']:
                 expected = cell['node_archives'][node['instance_id']]
                 local = self.output / 's3' / expected['key']
                 if not local.is_file() or sha(local) != expected['sha256']:
                     raise ValueError('requested cell storage evidence missing/different')
+                with tarfile.open(local, 'r:gz') as stream:
+                    names = sorted(member.name for member in stream.getmembers()
+                        if re.fullmatch(r'cloud-node-logs/namespace-[0-9]+\.stderr\.log', member.name))
+                    if not names:
+                        raise ValueError('Sui node archive omitted namespace stderr logs')
+                    logs = [fabric_local_archive_log(stream, name, forbidden=not diagnostic) for name in names]
+                cell_fabric['storage'].append(dict(partition=node['partition'], archive=str(local), logs=logs))
+            fabric_sui.append(cell_fabric)
         kv = state.get('kv_suite', {})
         expected_plan = kv_plan(cfg['kv_suite'], cfg['transports'])
         if (kv.get('complete') is not True or kv.get('failures') or kv.get('plan') != expected_plan
@@ -1953,6 +1970,10 @@ class Campaign:
                 or kv.get('source_archive_sha256') != cfg['source_archive_sha256']
                 or kv.get('binary_sha256') != cfg['binaries']['storage-node']):
             raise ValueError('full requested KV suite missing or narrowed')
+        auxiliary = validate_auxiliary(results / 'kv', kv, cfg)
+        dump(self.output / 'auxiliary-measurements.json', auxiliary)
+        dump(self.output / 'fabric-local-diagnostics.json', dict(sui=fabric_sui,
+            kv=auxiliary['fabric_local_diagnostics']))
         dump(self.output / 'completion-proof.json', dict(run_id=self.run_id, complete=True,
              controller_sha256=sha(archive), cells=len(state['cells']), kv_cases=len(kv['completed_cases']),
              cleanup_sha256=sha(self.output / 'cleanup-receipt.json'), **config_audit(self.cfg, self.journal.data)))

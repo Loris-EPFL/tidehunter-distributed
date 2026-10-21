@@ -925,11 +925,14 @@ class Campaign:
                  resource_evidence=False, authority_resident_batches=None,
                  shard_cache_bytes=0, transport_floor_probe=False,
                  preparation_chunk_batches=16, workload_batches=None, workload_reads=None,
-                 wal_layout=None):
+                 wal_layout=None, cache_hit_contention=False):
         if ((shard_cache_bytes or transport_floor_probe or preparation_chunk_batches != 16
-                or workload_batches is not None or workload_reads is not None or wal_layout is not None) and not self.cfg.get('kv_subsuite')
+                or workload_batches is not None or workload_reads is not None or wal_layout is not None
+                or cache_hit_contention) and not self.cfg.get('kv_subsuite')
                 or type(shard_cache_bytes) is not int or not 0 <= shard_cache_bytes <= 128 * 1024**2
                 or type(transport_floor_probe) is not bool
+                or type(cache_hit_contention) is not bool
+                or (cache_hit_contention and (not cached or cold or diagnostics or shape[1] != 1))
                 or type(preparation_chunk_batches) is not int or not 1 <= preparation_chunk_batches <= 32
                 or any(value is not None and (type(value) is not int or not 1 <= value <= bound)
                        for value, bound in ((workload_batches, 4096), (workload_reads, 8192)))
@@ -1067,6 +1070,8 @@ class Campaign:
                            '--output', str(output), '--backend', mode] + shape_args
                 if resource_evidence:
                     command += ['--read-resource-evidence', 'true']
+                if cache_hit_contention:
+                    command += ['--cache-hit-contention', 'true']
                 if cold:
                     command += ['--cold-read-pass', 'true']
                 if diagnostics:
@@ -1124,16 +1129,22 @@ class Campaign:
                 for instrumented in (False, True):
                     suffix = '-transport-floor' + ('-profiled' if instrumented else '')
                     floor_output = self.results / (case_id + suffix)
+                    floor_spec = transport_floor.subsuite_floor_spec(transport, instrumented)
                     floor_command = [str(self.root / 'cloud-bin' / label / 'sharded_wal_transport_bench'),
-                        '--output', str(floor_output), '--remote-config', str(case_root / 'remote.yaml'),
-                        '--transport', transport, '--polling', 'adaptive', '--values', '256,8192',
-                        '--samples', '256' if instrumented else '512', '--warmup', '64',
-                        '--repetitions', '1' if instrumented else '3', '--shards', '5',
-                        '--profile', str(instrumented).lower()]
+                        '--output', str(floor_output), '--remote-config', str(case_root / 'remote.yaml')]
+                    floor_command += transport_floor.floor_flags(floor_spec)
                     run_recorded(floor_command, self.results / (case_id + suffix + '-process'),
                         self.deadline, expected_binary_sha256=self.state['floor_binary_sha256'])
                     if not (floor_output / 'COMPLETE').is_file():
                         raise ValueError('RAM transport floor omitted its completion receipt')
+                    transport_floor.read_floor_metrics(floor_output, floor_spec)
+                    self.state['completed_floor_cases'].append(dict(
+                        case_id=case_id, population='diagnostic' if instrumented else 'clean',
+                        output=floor_output.name, specification=floor_spec,
+                        binary_sha256=self.state['floor_binary_sha256'],
+                        files={path.name: sha(path) for path in sorted(floor_output.iterdir()) if path.is_file()},
+                        process_record=case_id + suffix + '-process.command.json'))
+                    self.progress('completed-' + case_id + suffix)
         finally:
             self.ssm_nodes(payload | {'action': 'stop'})
             self.collect_node_results(case_id)
