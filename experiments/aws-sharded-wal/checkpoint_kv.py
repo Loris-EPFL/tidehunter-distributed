@@ -8,6 +8,7 @@ import json
 import shutil
 import csv
 import tarfile
+from itertools import islice
 from pathlib import Path
 import math
 
@@ -301,6 +302,179 @@ def completed_case_ids(planned, completed):
     return case_ids
 
 
+def cold_probe_certificate(directory, spec, nodes, client):
+    """Bind mixed cold-case stderr to the separately profiled certification pass.
+
+    read_campaign::run enables these profiles only after the three primary cold
+    phases. The auxiliary API samples have their own clocks; they are not clean
+    latency observations and must never be pooled with the primary population.
+    """
+    directory = Path(directory)
+    if spec['transport'] != 'efa-direct' or not spec['cold'] or spec['diagnostics']:
+        raise ValueError('cold auxiliary attribution requires a clean direct cold case')
+    if not directory.name.endswith('-tcp'):
+        raise ValueError('cold auxiliary requires the original remote case output')
+    case_id = directory.name[:-4]
+    deployment_path = directory.parent / (case_id + '-remote.yaml')
+    deployments = transport_floor.yaml_documents(deployment_path.read_text())
+    if len(deployments) != 1 or not isinstance(deployments[0], dict):
+        raise ValueError('cold auxiliary deployment configuration is missing or ambiguous')
+    deployment = deployments[0]
+    expected_endpoints = {node['partition']: node['private_ip'] + ':7700' for node in nodes}
+    endpoints = deployment.get('endpoints', [])
+    if (len(endpoints) != len(nodes)
+            or {row['partition']: row['address'] for row in endpoints} != expected_endpoints
+            or deployment.get('tls', {}).get('transport') != 'efa-direct'
+            or len(deployment['storage']['partitions']) != len(nodes)
+            or set(deployment['storage']['partitions']) != set(expected_endpoints)):
+        raise ValueError('cold auxiliary deployment owners/transport differ from the admitted fleet')
+    process = json.loads((directory.parent / (directory.name + '-process.command.json')).read_text())
+    command = process.get('command')
+    if (type(process.get('exit_code')) is not int or process['exit_code'] != 0
+            or not isinstance(command, list) or not command
+            or any(not isinstance(value, str) for value in command)):
+        raise ValueError('cold auxiliary lacks its successful original process receipt')
+    def argument(name, default=None):
+        positions = [position for position, value in enumerate(command) if value == name]
+        if not positions:
+            return default
+        if len(positions) != 1 or positions[0] + 1 == len(command):
+            raise ValueError('cold auxiliary command option is duplicate or incomplete')
+        return command[positions[0] + 1]
+    remote_argument = Path(argument('--remote-config', ''))
+    if remote_argument.name != 'remote.yaml' or remote_argument.parent.name != case_id:
+        raise ValueError('cold auxiliary process references a different deployment')
+    configured_lanes = deployment.get('read_lanes')
+    if type(configured_lanes) is not int or not 1 <= configured_lanes <= 8:
+        raise ValueError('cold auxiliary deployment read lane count is invalid')
+    lanes_argument = argument('--tcp-read-lanes', str(configured_lanes))
+    if lanes_argument not in tuple(str(value) for value in range(1, 9)):
+        raise ValueError('cold auxiliary process read lane override is invalid')
+    lanes = int(lanes_argument)
+    metadata = {}
+    for line in (directory / 'campaign.txt').read_text().splitlines():
+        if '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        if key in metadata:
+            raise ValueError('duplicate cold auxiliary campaign metadata')
+        metadata[key] = value
+    reads = spec.get('workload_reads') or 4096  # CheckpointKvCampaign uses efa-cache defaults.
+    count = min(reads, 256)
+    if (metadata.get('cold_read_pass') != 'true'
+            or metadata.get('transport_diagnostics') != 'false'
+            or metadata.get('transport') != 'efa-direct'
+            or metadata.get('point_reads') != str(reads)):
+        raise ValueError('cold auxiliary metadata differs from the immutable plan')
+    if (argument('--reads') != str(reads) or argument('--cold-read-pass') != 'true'
+            or argument('--transport') != 'efa-direct'
+            or argument('--transport-diagnostics', 'false') != 'false'):
+        raise ValueError('cold auxiliary original process differs from its planned population')
+    backend = 'experimental_efa_direct_authority'
+    identity = dict(zip(('value_bytes', 'batch_size', 'window'), spec['shape'])) | {'repetition': 0}
+    def same_case(row):
+        return row.get('backend') == backend and all(
+            (type(row.get(key)) is int and row[key] == value)
+            or (type(row.get(key)) is str and row[key] == str(value))
+            for key, value in identity.items())
+    with (directory / 'remote_read_profiles.csv').open() as stream:
+        rows = list(islice(csv.DictReader(stream), 2 * count + 1))
+    auxiliary = [row for row in rows if row['state'] == 'cache-evicted']
+    if (len(rows) > 2 * count or not all(same_case(row) for row in rows)
+            or [row['state'] for row in rows] != (
+                ['cache-evicted'] * count + ['reopened-cache-cleared'] * (len(rows) - count))
+            or [int(row['sample']) for row in auxiliary] != list(range(count))
+            or any(int(row['whole_call_ns']) <= 0 for row in auxiliary)):
+        raise ValueError('cold auxiliary API samples lack exact case/state/sample evidence')
+    profiles = [row for row in transport_floor.yaml_documents(
+        (directory / 'node_profiles.yaml').read_text()) if row is not None]
+    partitions = {node['partition'] for node in nodes}
+    if (len(partitions) != len(nodes) or len(profiles) != 1
+            or not same_case(profiles[0])
+            or profiles[0].get('phase') != 'cache-evicted-read-diagnostics'
+            or len(profiles[0]['nodes']) != len(nodes)
+            or {partition for partition, _ in profiles[0]['nodes']} != partitions):
+        raise ValueError('cold auxiliary node profile phase/owner identity differs')
+    profiles = dict(profiles[0]['nodes'])
+    if (any(type(profile.get('requests')) is not int
+            or profile['requests'] < 0
+            or profile['client']['requests'] != profile['requests'] for profile in profiles.values())
+            or sum(profile['requests'] for profile in profiles.values()) != count):
+        raise ValueError('cold auxiliary node requests differ from the verified API samples')
+    phases = ('cache_evicted_get', 'cache_evicted_get_many', 'cache_evicted_get_window')
+    service = read_service_evidence(directory, 'tcp', partitions)
+    for phase in phases:
+        evidence = service.get(phase)
+        if (evidence is None or not evidence['owner_counters_available']
+                or evidence['frontend'] is None
+                or set(evidence['physical']) != {str(partition) for partition in partitions}):
+            raise ValueError('cold auxiliary lacks complete separate primary read evidence intervals')
+    # record() emits physical IO for the auxiliary probe, not read-path snapshots.
+    diagnostic_io = service.get('cache_evicted_diagnostics')
+    if (diagnostic_io is None
+            or set(diagnostic_io['physical']) != {str(partition) for partition in partitions}
+            or diagnostic_io['charged_physical_read_bytes'] <= 0):
+        raise ValueError('cold auxiliary lacks its separate positive physical IO interval')
+    with (directory / 'read_path_evidence.csv').open() as stream:
+        boundaries = [row for row in csv.DictReader(stream) if row['phase'] in phases]
+    expected_boundaries = {(boundary, role, partition) for boundary in ('before', 'after')
+                           for role, partition in [('frontend', ''), *(
+                               ('storage', str(partition)) for partition in partitions)]}
+    if ([row['phase'] for row in boundaries] != [
+            phase for phase in phases for _ in expected_boundaries]
+            or not all(same_case(row) for row in boundaries)
+            or any(len(selected := [row for row in boundaries if row['phase'] == phase]) != len(expected_boundaries)
+                   or {(row['boundary'], row['role'], row['partition']) for row in selected} != expected_boundaries
+                   for phase in phases)):
+        raise ValueError('cold auxiliary phase order or exact owner boundary population differs')
+    owners = {}
+    remaining = list(client['records'])
+    for node in nodes:
+        endpoint = expected_endpoints[node['partition']]
+        selected = [row for row in remaining if row['peer'] is not None
+                    and row['peer'].split('->')[-1] == endpoint]
+        peers = validate_cold_probe_windows(selected, profiles[node['partition']]['client_transport'], lanes)
+        remaining = [row for row in remaining if row not in selected]
+        owners[node['partition']] = dict(endpoint=endpoint, client_peers=peers,
+                                        storage_transport=profiles[node['partition']]['transport'])
+    if remaining:
+        raise ValueError('cold auxiliary client windows include foreign or unattributable peers')
+    return dict(phase='cache-evicted-read-diagnostics', api_state='cache-evicted',
+                evidence_phase='cache_evicted_diagnostics', samples=count, owners=owners,
+                read_lanes_per_owner=lanes, storage_sessions_per_owner=lanes + 1,
+                deployment_source=str(deployment_path),
+                scope='separately profiled auxiliary certification API calls; not primary clean latency')
+
+
+def validate_cold_probe_windows(records, transport, expected_count):
+    """Match finalized local windows to their existing aggregate profile snapshot."""
+    peers = [row['peer'] for row in records]
+    if (len(records) != expected_count or any(row['reason'] != 'profile-disable' for row in records)
+            or any(peer is None or len(peer.split('->')) != 2 for peer in peers)
+            or len(set(peers)) != expected_count):
+        raise ValueError('cold auxiliary profile window count/reason/peer identity differs')
+    keys = ('send_post_calls', 'send_post_would_block', 'send_post_errors')
+    if any(type(transport.get(key)) is not int or transport[key] < 0 for key in keys):
+        raise ValueError('cold auxiliary transport post counters are invalid')
+    successful = transport['send_post_calls'] - transport['send_post_would_block'] - transport['send_post_errors']
+    if successful < 0 or sum(row['data_posts'] + row['credit_posts'] for row in records) != successful:
+        raise ValueError('cold auxiliary local posts differ from the existing transport snapshot')
+    return peers
+
+
+def validate_cold_probe_storage(evidence, certificate, partition):
+    owner = certificate['owners'][partition]
+    # RemoteDatabase opens one writer/control session in addition to its read lanes.
+    peers = validate_cold_probe_windows(evidence['records'], owner['storage_transport'],
+                                       certificate['storage_sessions_per_owner'])
+    expected = {'->'.join(reversed(peer.split('->'))) for peer in owner['client_peers']}
+    controller_hosts = {peer.split('->')[0].rsplit(':', 1)[0] for peer in owner['client_peers']}
+    if (len(controller_hosts) != 1 or not expected <= set(peers)
+            or any(peer.split('->')[0] != owner['endpoint']
+                   or peer.split('->')[1].rsplit(':', 1)[0] not in controller_hosts for peer in peers)):
+        raise ValueError('cold auxiliary storage peers differ from its configured owner/client lanes')
+
+
 def validate_auxiliary(root, state, cfg):
     """Fail closed on added controls; never relax the original paired-case count."""
     root = Path(root)
@@ -312,6 +486,7 @@ def validate_auxiliary(root, state, cfg):
         raise ValueError('auxiliary controls differ from the immutable full KV plan/build')
     expected_floors, contention, read_service, fabric = [], [], [], []
     for spec, case_id in zip(expected_plan, completed_case_ids(expected_plan, completed), strict=True):
+        cold_certificate = None
         for mode in ('native-sync', 'tcp'):
             directory = root / (case_id + '-' + mode)
             if not (directory / 'COMPLETE').is_file():
@@ -321,20 +496,33 @@ def validate_auxiliary(root, state, cfg):
                 phases=read_service_evidence(directory, mode,
                     owner_partitions=[node['partition'] for node in cfg['nodes']])))
             direct_diagnostic = spec['transport'] == 'efa-direct' and spec['diagnostics'] and mode == 'tcp'
+            cold_auxiliary = (spec['transport'] == 'efa-direct' and spec['cold']
+                              and not spec['diagnostics'] and mode == 'tcp')
             log = root / (case_id + '-' + mode + '-process.stderr.log')
-            fabric.append(dict(case_id=case_id, role=mode, population='diagnostic' if spec['diagnostics'] else 'clean',
-                evidence=fabric_local_log(log, required=direct_diagnostic, forbidden=not direct_diagnostic)))
+            evidence = fabric_local_log(log, required=direct_diagnostic or cold_auxiliary,
+                                        forbidden=not (direct_diagnostic or cold_auxiliary))
+            if cold_auxiliary:
+                cold_certificate = cold_probe_certificate(directory, spec, cfg['nodes'], evidence)
+            fabric.append(dict(case_id=case_id, role=mode,
+                population='mixed_primary_clean_and_auxiliary_profiled_cold_certificate' if cold_auxiliary
+                           else 'diagnostic' if spec['diagnostics'] else 'clean',
+                auxiliary_certificate=None if cold_certificate is None or mode != 'tcp'
+                                      else {key: value for key, value in cold_certificate.items() if key != 'owners'},
+                evidence=evidence))
         # These five logs span the whole case. The first clean scalar case also
         # runs the later diagnostic RAM control; its node logs are mixed, never clean.
-        node_diagnostic = spec['diagnostics'] or spec.get('transport_floor', False)
+        node_diagnostic = spec['diagnostics'] or spec.get('transport_floor', False) or cold_certificate is not None
         for partition in range(5):
             archive_path = root / 'nodes' / case_id / f'node-{partition}.tar.gz'
             with tarfile.open(archive_path, 'r:gz') as archive:
                 evidence = fabric_local_archive_log(archive, 'node.stderr.log',
                     required=spec['transport'] == 'efa-direct' and node_diagnostic,
                     forbidden=spec['transport'] != 'efa-direct' or not node_diagnostic)
+            if cold_certificate is not None:
+                validate_cold_probe_storage(evidence, cold_certificate, partition)
             fabric.append(dict(case_id=case_id, role='storage', partition=partition,
                 population='mixed_clean_KV_and_diagnostic_RAM' if spec.get('transport_floor', False)
+                           else 'mixed_primary_clean_and_auxiliary_profiled_cold_certificate' if cold_certificate is not None
                            else 'diagnostic' if spec['diagnostics'] else 'clean',
                 archive=str(archive_path), evidence=evidence))
         if spec.get('cache_hit_contention', False):

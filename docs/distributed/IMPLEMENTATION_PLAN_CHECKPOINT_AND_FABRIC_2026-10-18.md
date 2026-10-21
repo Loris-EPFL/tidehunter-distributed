@@ -921,9 +921,22 @@ an empty observed population.
   overflowing u64 counters, all-zero records and oversized peer metadata.
   Current full KV admission requires finalized nonzero **EFA-direct diagnostic**
   client and explicit node-profile windows, including the diagnostic RAM
-  control. Exclusive clean and non-direct logs must not contain these records.
+  control. Wholly clean and non-direct logs must not contain these records.
   The node log of the first clean scalar case also contains its later diagnostic
   RAM control, so its population is explicitly mixed rather than called clean.
+  A clean cold case has another mixed population: the separate profiled
+  `cache-evicted-read-diagnostics` certificate after its three ordinary cold
+  API phases (`read_campaign.rs::run`). `checkpoint_kv.py::cold_probe_certificate`
+  binds that certificate to the saved successful command, deployment, effective
+  read lanes, exact owner/sample populations, primary read-path boundaries,
+  auxiliary physical-IO interval, peer identities and successful post counters.
+  The auxiliary pass has its own clocks; its samples are not primary clean API
+  latency. Its subsequent remote reopen profiles are `reopened-cache-cleared`,
+  not native `reopened-warm`. The auxiliary IO recorder does not emit logical
+  read-path snapshots; missing counters remain unavailable. DATA plus CREDIT
+  posts must equal post attempts minus WouldBlock and errors in the same
+  finalized profile window. No timing, source, owner or completeness guard is
+  replaced with a blanket permission for diagnostic records in clean logs.
 - Exact existing captures: controller
   `results/kv/<case>-tcp-process.stderr.log`, RAM
   `results/kv/<case>-transport-floor[-profiled]-process.stderr.log`, and KV

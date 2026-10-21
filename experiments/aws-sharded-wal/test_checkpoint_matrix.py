@@ -4,6 +4,7 @@ import csv
 import json
 import io
 from pathlib import Path
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -83,6 +84,237 @@ class MatrixEvidenceTests(unittest.TestCase):
             matrix.parse_fabric_local_diagnostics(io.BytesIO(line(record)), max_records=0)
         with self.assertRaises(ValueError):
             matrix.parse_fabric_local_diagnostics(io.BytesIO(line(record | dict(data_posts=0))))
+
+    def cold_probe_fixture(self, root, lanes=2):
+        directory = Path(root) / 'cold-example-tcp'
+        directory.mkdir()
+        spec = dict(transport='efa-direct', cold=True, diagnostics=False, shape=[256, 1, 1])
+        nodes = [dict(partition=p, private_ip=f'10.0.1.{p + 1}') for p in range(5)]
+        (directory.parent / 'cold-example-remote.yaml').write_text(json.dumps(dict(
+            read_lanes=lanes, tls=dict(transport='efa-direct'),
+            storage=dict(partitions=list(range(5))),
+            endpoints=[dict(partition=node['partition'], address=node['private_ip'] + ':7700') for node in nodes])))
+        (directory.parent / 'cold-example-tcp-process.command.json').write_text(json.dumps(dict(
+            exit_code=0, command=['/frozen/sharded_wal_bench', '--reads', '4096',
+                '--cold-read-pass', 'true', '--transport', 'efa-direct',
+                '--remote-config', '/frozen/cases/cold-example/remote.yaml'])))
+        (directory / 'campaign.txt').write_text(
+            'cold_read_pass=true\ntransport_diagnostics=false\ntransport=efa-direct\npoint_reads=4096\n')
+        identity = dict(backend='experimental_efa_direct_authority', value_bytes=256,
+                        batch_size=1, window=1, repetition=0)
+        def csv_file(name, rows):
+            with (directory / name).open('w') as stream:
+                writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+                writer.writeheader()
+                writer.writerows(rows)
+        csv_file('remote_read_profiles.csv', [
+            identity | dict(state=state, sample=sample, whole_call_ns=100)
+            for state in ('cache-evicted', 'reopened-cache-cleared') for sample in range(256)])
+        phases = ('cache_evicted_get', 'cache_evicted_get_many',
+                  'cache_evicted_get_window', 'cache_evicted_diagnostics')
+        fields = ('cache_hits', 'cache_misses', 'wal_reads',
+                  'resident_read_successes', 'async_read_submissions')
+        csv_file('read_path_evidence.csv', [
+            identity | dict(phase=phase, boundary=boundary, role=role, partition=partition)
+            | {field: int(boundary == 'after') for field in fields}
+            for phase in phases[:-1] for boundary in ('before', 'after')
+            for role, partition in [('frontend', ''), *(('storage', str(p)) for p in range(5))]])
+        csv_file('read_io.csv', [dict(phase=phase, partition=p, physical_read_bytes=4096)
+                               for phase in phases for p in range(5)])
+        records, servers, profiles = [], {}, []
+        for p, node in enumerate(nodes):
+            count = 52 if p == 0 else 51
+            endpoint = node['private_ip'] + ':7700'
+            server = []
+            for lane in range(lanes):
+                reads = (count + lanes - 1 - lane) // lanes
+                peer = f'10.0.0.1:{43000 + 8 * p + lane}->{endpoint}'
+                records.append(dict(schema=1, reason='profile-disable', window=1 + lanes * p + lane,
+                                    data_posts=reads, credit_posts=reads, piggyback_advances=0, peer=peer))
+                server.append(dict(schema=1, reason='profile-disable', window=lane + 1,
+                                   data_posts=reads + 1, credit_posts=1, piggyback_advances=reads,
+                                   peer='->'.join(reversed(peer.split('->')))))
+            server.append(dict(schema=1, reason='profile-disable', window=lanes + 1, data_posts=1,
+                               credit_posts=0, piggyback_advances=1,
+                               peer=f'{endpoint}->10.0.0.1:{45000 + p}'))
+            servers[p] = server
+            profiles.append([p, dict(requests=count, client=dict(requests=count),
+                client_transport=dict(send_post_calls=2 * count, send_post_would_block=0, send_post_errors=0),
+                transport=dict(send_post_calls=count + 2 * lanes + 1, send_post_would_block=0, send_post_errors=0))])
+        (directory / 'node_profiles.yaml').write_text(json.dumps(
+            identity | dict(phase='cache-evicted-read-diagnostics', nodes=profiles)))
+        def parsed(rows):
+            return matrix.parse_fabric_local_diagnostics(io.BytesIO(b''.join(
+                matrix.FABRIC_LOCAL_PREFIX + b' ' + json.dumps(row).encode() + b'\n' for row in rows)))
+        return directory, spec, nodes, parsed(records), {p: parsed(rows) for p, rows in servers.items()}
+
+    def test_cold_auxiliary_derives_lanes_and_matches_successful_not_attempted_posts(self):
+        for lanes in (1, 3):
+            with self.subTest(lanes=lanes), tempfile.TemporaryDirectory() as root:
+                directory, spec, nodes, client, servers = self.cold_probe_fixture(root, lanes)
+                path = directory / 'node_profiles.yaml'
+                profiles = json.loads(path.read_text())
+                for _, profile in profiles['nodes']:
+                    for key in ('client_transport', 'transport'):
+                        profile[key]['send_post_calls'] += 4
+                        profile[key]['send_post_would_block'] = 3
+                        profile[key]['send_post_errors'] = 1
+                path.write_text(json.dumps(profiles))
+                if lanes == 3:
+                    # The source applies an explicit CLI override after loading deployment YAML.
+                    path = directory.parent / 'cold-example-remote.yaml'
+                    deployment = json.loads(path.read_text())
+                    deployment['read_lanes'] = 2
+                    path.write_text(json.dumps(deployment))
+                    path = directory.parent / 'cold-example-tcp-process.command.json'
+                    process = json.loads(path.read_text())
+                    process['command'] += ['--tcp-read-lanes', str(lanes)]
+                    path.write_text(json.dumps(process))
+                certificate = checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client)
+                self.assertEqual(certificate['read_lanes_per_owner'], lanes)
+                self.assertEqual(certificate['storage_sessions_per_owner'], lanes + 1)
+                for partition, evidence in servers.items():
+                    checkpoint_kv.validate_cold_probe_storage(evidence, certificate, partition)
+
+    def test_clean_cold_auxiliary_is_separate_and_bound_to_real_profile_artifacts(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory, spec, nodes, client, servers = self.cold_probe_fixture(root)
+            certificate = checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client)
+            self.assertEqual(certificate['samples'], 256)
+            self.assertEqual(certificate['phase'], 'cache-evicted-read-diagnostics')
+            for partition, evidence in servers.items():
+                # Exercise the real bounded archive/log consumer as well as phase attribution.
+                blob = b''.join(matrix.FABRIC_LOCAL_PREFIX + b' ' + json.dumps(row).encode() + b'\n'
+                                for row in evidence['records'])
+                archive_bytes = io.BytesIO()
+                with tarfile.open(fileobj=archive_bytes, mode='w:gz') as archive:
+                    member = tarfile.TarInfo('node.stderr.log')
+                    member.size = len(blob)
+                    archive.addfile(member, io.BytesIO(blob))
+                archive_bytes.seek(0)
+                with tarfile.open(fileobj=archive_bytes, mode='r:gz') as archive:
+                    parsed = matrix.fabric_local_archive_log(archive, 'node.stderr.log', required=True)
+                checkpoint_kv.validate_cold_probe_storage(parsed, certificate, partition)
+            with self.assertRaises(ValueError):
+                matrix.validate_fabric_local_population(client, 'wholly-clean-warm', forbidden=True)
+            for change in (dict(cold=False), dict(diagnostics=True), dict(transport='tcp')):
+                with self.subTest(change=change), self.assertRaises(ValueError):
+                    checkpoint_kv.cold_probe_certificate(directory, spec | change, nodes, client)
+
+    def test_cold_auxiliary_rejects_foreign_deployment_or_process_configuration(self):
+        for change in ('deployment_owner', 'deployment_lanes', 'deployment_transport',
+                       'process_profiled', 'process_owner', 'process_reads', 'process_lanes',
+                       'process_duplicate', 'process_exit'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as root:
+                directory, spec, nodes, client, _ = self.cold_probe_fixture(root)
+                if change.startswith('deployment'):
+                    path = directory.parent / 'cold-example-remote.yaml'
+                    deployment = json.loads(path.read_text())
+                    if change == 'deployment_owner':
+                        deployment['endpoints'][0]['address'] = '10.9.9.9:7700'
+                    elif change == 'deployment_lanes':
+                        deployment['read_lanes'] = 0
+                    else:
+                        deployment['tls']['transport'] = 'tcp'
+                    path.write_text(json.dumps(deployment))
+                else:
+                    path = directory.parent / 'cold-example-tcp-process.command.json'
+                    process = json.loads(path.read_text())
+                    command = process['command']
+                    if change == 'process_profiled':
+                        command += ['--transport-diagnostics', 'true']
+                    elif change == 'process_owner':
+                        command[-1] = '/frozen/cases/foreign/remote.yaml'
+                    elif change == 'process_reads':
+                        command[command.index('--reads') + 1] = '8192'
+                    elif change == 'process_lanes':
+                        command += ['--tcp-read-lanes', '3']
+                    elif change == 'process_duplicate':
+                        command += ['--reads', '4096']
+                    else:
+                        process['exit_code'] = 1
+                    path.write_text(json.dumps(process))
+                with self.assertRaises(ValueError):
+                    checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client)
+
+    def test_cold_auxiliary_rejects_missing_or_foreign_certification_artifacts(self):
+        for change in ('missing_sample', 'duplicate_sample', 'state', 'profile_phase',
+                       'profile_owner', 'profile_requests', 'metadata', 'boundary', 'phase_order'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as root:
+                directory, spec, nodes, client, _ = self.cold_probe_fixture(root)
+                if change in ('missing_sample', 'duplicate_sample', 'state'):
+                    path = directory / 'remote_read_profiles.csv'
+                    with path.open() as stream:
+                        rows = list(csv.DictReader(stream))
+                    if change == 'missing_sample':
+                        rows.pop(0)
+                    elif change == 'duplicate_sample':
+                        rows[1]['sample'] = '0'
+                    else:
+                        rows[0]['state'] = 'primary-clean'
+                    with path.open('w') as stream:
+                        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+                        writer.writeheader()
+                        writer.writerows(rows)
+                elif change.startswith('profile_'):
+                    path = directory / 'node_profiles.yaml'
+                    profile = json.loads(path.read_text())
+                    if change == 'profile_phase':
+                        profile['phase'] = 'warm-scalar-read-diagnostics'
+                    elif change == 'profile_owner':
+                        profile['nodes'].pop()
+                    else:
+                        profile['nodes'][0][1]['requests'] -= 1
+                    path.write_text(json.dumps(profile))
+                elif change == 'metadata':
+                    path = directory / 'campaign.txt'
+                    path.write_text(path.read_text().replace('transport_diagnostics=false', 'transport_diagnostics=true'))
+                else:
+                    path = directory / 'read_path_evidence.csv'
+                    lines = path.read_text().splitlines()
+                    if change == 'boundary':
+                        lines.pop()
+                    else:
+                        # Move the window phase before the other ordinary cold phases.
+                        lines = lines[:1] + lines[-12:] + lines[1:-12]
+                    path.write_text('\n'.join(lines) + '\n')
+                with self.assertRaises(ValueError):
+                    checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client)
+
+    def test_cold_auxiliary_rejects_unattributed_or_incomplete_local_windows(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory, spec, nodes, client, servers = self.cold_probe_fixture(root)
+            certificate = checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client)
+            for change in ('missing', 'extra', 'reason', 'peer', 'post', 'absent_peer'):
+                changed = copy.deepcopy(client)
+                if change == 'missing':
+                    changed['records'].pop()
+                elif change == 'extra':
+                    changed['records'].append(changed['records'][0] | dict(window=99, peer='10.0.0.1:49999->10.0.1.1:7700'))
+                elif change == 'reason':
+                    changed['records'][0]['reason'] = 'session-drop'
+                elif change == 'peer':
+                    changed['records'][0]['peer'] = '10.0.0.1:43000->10.9.9.9:7700'
+                elif change == 'post':
+                    changed['records'][0]['data_posts'] += 1
+                else:
+                    changed['records'][0]['peer'] = None
+                with self.subTest(role='client', change=change), self.assertRaises(ValueError):
+                    checkpoint_kv.cold_probe_certificate(directory, spec, nodes, changed)
+            for change in ('missing', 'extra', 'reason', 'peer', 'post'):
+                changed = copy.deepcopy(servers[0])
+                if change == 'missing':
+                    changed['records'].pop()
+                elif change == 'extra':
+                    changed['records'].append(changed['records'][0] | dict(window=99, peer='10.0.1.1:7700->10.0.0.1:49999'))
+                elif change == 'reason':
+                    changed['records'][0]['reason'] = 'profile-reset'
+                elif change == 'peer':
+                    changed['records'][0]['peer'] = '10.0.1.1:7700->10.0.0.2:43000'
+                else:
+                    changed['records'][0]['credit_posts'] += 1
+                with self.subTest(role='storage', change=change), self.assertRaises(ValueError):
+                    checkpoint_kv.validate_cold_probe_storage(changed, certificate, 0)
 
     def test_complete_counterbalanced_pairs_and_single_transport(self):
         self.assertEqual([cell['cell_id'] for cell in self.cells],
