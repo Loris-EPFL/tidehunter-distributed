@@ -1716,3 +1716,428 @@ Workspace reductions are under `checkpoint-work/aws-ci-runs/39605310614-1/`:
 - the final independent operations receipt under
   `checkpoint-work/final-performance-2026-10-20/`.
 
+### 16.11 Explicit comparison with retained previous experiments
+
+**Against the closest 20 October baseline: cache-fitting reads improved;
+mandatory remote scalar service did not materially improve; some cold batch
+reads were slower. Sui has no substantial latest-step end-to-end parity gain.**
+Absolute elapsed alone hides changes in native controls. The following is a
+descriptive before/after comparison, not causal isolation or a
+statistical-significance claim.
+Against the separately qualified 18 October A2 **matched 100-window load**,
+current durable-write p99 is 46–55% lower and its native-relative tail gap
+narrows. That older long-state comparator is distinct from the primary
+20 October ten-window case excluded below.
+
+#### Which previous cluster is the baseline?
+
+Paths in this section are relative to the project workspace, not the engine
+checkout. The primary old result is a **locally retained cluster report**,
+not a laptop benchmark:
+
+| Retained report / date | Actual topology and source | Comparison role |
+|---|---|---|
+| `checkpoint-work/aws-ci-runs/39378783532-1/RESULTS-39378783532.md`, 20 October 2026, completed success at 07:46:24 UTC | Six `g6.8xlarge`, `us-east-1a`, cluster placement; one controller/native host and five distinct storage hosts; engine `b3ca2f03c5d7e3274f2aa22d7543b5b82bbefcee`, Sui `3261f3be974c941584014438159110140a2885a7` | Primary old cluster control: RF1, same certified private-chain genesis–1775 fixture, same recorded hardware/placement shape and 8-MiB coordinator cache |
+| This plan §16.10, 21 October 2026; `checkpoint-work/aws-ci-runs/39605310614-1/recovered-measurement-attestation.json` | Same six-host type/AZ/cluster shape, different actual hosts/time; engine `3f71aceaf0e9c9ba28a8c9a661d729d1d635f909`, Sui `6d4b704bb6b9af6e3d836e08ac3aa2161d443b2d` | Current cluster data; original workflow remains failed, measurements separately recovered |
+| `checkpoint-work/aws-ci-runs/39366964056-1/`, described in the successful old report line 24 and `campaign-handoff.json` lines 90–97 | Earlier failed campaign retained separately | Not substituted, relabelled, or pooled into the completed old baseline |
+| Engine `docs/distributed/EFA_CLUSTER_RESULTS_2026-10-07.md`, 7 October 2026 | Six `c6id.32xlarge`, `us-east-1b`, cluster placement, RF1; no application value cache or Sui; 68 API cases, three warm repeats per current TCP/EFA shape | Historical hardware context, not controlled latest-source regression: different hardware, cache/state/API populations and no direct transport |
+| Engine `docs/distributed/HOT_READS_AND_CHECKPOINT_ADMISSION_2026-10-16.md#18-october-completed-hardware-comparison`, completed 18 October 2026 | Two completed six-`g6.8xlarge`, `us-east-1a` cluster fleets; frozen source archive `70454d0113ff49df6abfedd38865f3d7f0adc215c5afa6ece1a0431b08a921aa`; retained raw root `checkpoint-work/2026-10-18-efa-direct-hardware/` | Earlier TCP/EFA/direct hardware context with its own native controls and workload scopes; the completed 20 October campaign is the closest old/new match used numerically here |
+
+The old report lines 5–11 and 24–28 establish completion, topology, fixture,
+actual source/build/archive identities and the distinct failed prior run.
+Its selected storage path was `/mnt/tidehunter` on `/dev/nvme1n1`
+(`ext4,rw,noatime`); this does **not** prove use of both advertised NVMes.
+Recorded old process/host swap observations were zero. The old campaign had
+51 KV pairs / 102 executions (39 clean, 12 diagnostic); the current campaign
+has 129 / 258. Old Sui has six replay pairs / 30 node archives, current Sui
+12 / 60. Each transport has **one old clean repeat versus three current clean
+repeats**; diagnostic repeats are separate.
+
+The 18 October retention plan,
+`docs/distributed/POST_CAMPAIGN_PERFORMANCE_PLAN_2026-10-18.md` §2,
+distinguishes that retained hardware dataset from older removed raw trees.
+Its `historical-benchmark-trace.tar.gz` retains 227 shallow reports, receipts,
+comparisons and tool-source files in 724024 compressed bytes, with
+`retention-plan-2026-10-18.json` member hashes. Historical raw-directory links
+are not automatically live datasets and are not silently used as extra
+old repeats.
+
+#### Matched KV API durations and the native-relative gap
+
+All durations below are microseconds per complete API call/window, old → new.
+Current values are medians of three repeat p50s; old values have one repeat.
+The native column is **remote median / its matched native median**, old → new,
+not the median of paired ratios. Both definitions remain separately available
+in the full numeric report. Ratios below one are not general parity claims.
+
+`C256`/`C8K` are cache-fitting B1 hot scalar populations; `CM32` is a complete
+32-key 8-KiB call in the cache-fitting B1 workload, not B32 write-state size.
+Their scalar/call sample counts per repeat are 4096/128 on both sides.
+`R256`/`R8K` are mandatory remote warm scalar populations with 4096 samples.
+`CB32` is the cold-family 8-KiB B32 `point_get_many`, while `CE32` is its
+separate explicit `cache_evicted_get_many` phase, each 128 complete calls.
+
+| Population | Transport | Old → new p50, us | Absolute change | Old → new native multiple |
+|---|---|---:|---:|---:|
+| C256 | TCP | 0.510 → 0.410 | −19.61% | 3.400 → 2.929 |
+| C256 | EFA | 0.510 → 0.420 | −17.65% | 3.423 → 3.000 |
+| C256 | Direct | 0.500 → 0.420 | −16.00% | 3.333 → 3.000 |
+| C8K | TCP | 0.570 → 0.460 | −19.30% | 2.591 → 2.300 |
+| C8K | EFA | 0.550 → 0.460 | −16.36% | 2.619 → 2.421 |
+| C8K | Direct | 0.570 → 0.460 | −19.30% | 2.714 → 2.300 |
+| CM32 | TCP | 14.401 → 11.300 | −21.53% | 1.125 → 0.950 |
+| CM32 | EFA | 14.041 → 11.621 | −17.24% | 1.141 → 0.960 |
+| CM32 | Direct | 14.651 → 11.421 | −22.05% | 1.174 → 0.952 |
+| R256 | TCP | 135.208 → 135.376 | +0.12% | 375.578 → 398.165 |
+| R256 | EFA | 45.093 → 45.062 | −0.07% | 128.837 → 132.535 |
+| R256 | Direct | 45.483 → 45.002 | −1.06% | 129.951 → 132.359 |
+| R8K | TCP | 165.980 → 166.026 | +0.03% | 133.855 → 140.700 |
+| R8K | EFA | 61.364 → 62.113 | +1.22% | 50.298 → 52.152 |
+| R8K | Direct | 62.864 → 63.032 | +0.27% | 51.911 → 52.968 |
+| CB32 | TCP | 615.316 → 663.535 | +7.84% | 6.676 → 7.547 |
+| CB32 | EFA | 383.022 → 485.199 | +26.68% | 4.280 → 5.504 |
+| CB32 | Direct | 514.930 → 516.830 | +0.37% | 5.935 → 5.834 |
+| CE32 | TCP | 860.981 → 882.754 | +2.53% | 0.326 → 0.303 |
+| CE32 | EFA | 560.253 → 644.555 | +15.05% | 0.198 → 0.218 |
+| CE32 | Direct | 702.791 → 679.036 | −3.38% | 0.244 → 0.233 |
+
+Thus hit-supported scalar p50 is 16–20% lower and the cache-fitting bulk
+gap narrows. Remote scalar absolute p50 remains within ±5%, while most
+native-relative gaps widen. EFA cold-family batch service regresses in both
+the ordinary and explicitly evicted phases. Do not equate their native
+controls: the explicit eviction phase has a much slower native population.
+Neither a `cold` family nor positive interval IO proves all keys fetched
+from NVMe. Likewise a `cache` family is not hit proof: the larger B32 working
+set mixes misses; these cache-fitting B1 rows have recorded no read RPCs.
+
+The ±5% band is only a descriptive deadband for the machine-readable verdict,
+not uncertainty bounds. Lower durations and higher rates are better.
+
+#### Matched durable writes, not the changed long workload
+
+The following unchanged 256-B warm write shapes retain 320 singleton windows
+or ten B32/W32 windows per repeat on both sides. P50 is per complete durable
+window; rate is logical keys/s over the phase wall time, not reciprocal p50.
+Ten windows cannot support p99.
+
+| Batch/window | Transport | Old → new p50, us | Old → new native p50 multiple | Old → new keys/s |
+|---|---|---:|---:|---:|
+| B1/W1 | TCP | 287.857 → 283.530 | 4.604 → 4.962 | 3191.3 → 3271.2 |
+| B1/W1 | EFA | 139.948 → 136.476 | 2.164 → 2.387 | 5111.7 → 5317.7 |
+| B1/W1 | Direct | 137.488 → 134.395 | 2.047 → 2.325 | 5156.8 → 5416.6 |
+| B32/W32 | TCP | 3949.004 → 3523.435 | 1.334 → 1.047 | 230909.7 → 241154.1 |
+| B32/W32 | EFA | 3102.894 → 3149.092 | 0.927 → 1.100 | 262688.3 → 261724.0 |
+| B32/W32 | Direct | 3434.863 → 3247.185 | 1.179 → 1.110 | 247393.3 → 260359.3 |
+
+Singleton absolute duration is slightly lower but its native-relative gap
+widens. TCP B32 window p50 improves 10.78%; direct improves 5.46%; EFA is
+1.49% slower and its native-relative result also worsens. The rate column
+does not support claiming an equal percentage throughput gain.
+
+**Exclude the clean warm 8-KiB B32/W32 old/new comparison in its entirety:**
+320 → 3200 batches, ten → 100 windows and tenfold state change affect load,
+reads and lifecycle operations. Old ten-window tails have no p99. The new
+100-window p99 and larger-state scan/flush/reopen in §16.10 are current
+measurements, not measured old/new regressions. New S0 diagnostic cases
+still use 320 batches; their own counts are nonadditive and do not identify
+the cause of the clean long tail. Coordinator ReceiptHistory node writes
+are not shard spill, and later `prepared.persist` is another stage.
+
+#### Real Sui: absolute progress is not native-relative progress
+
+Replay seconds include startup. Native multiples here are **medians of
+per-cell paired remote/native ratios**, as in §16.10.
+
+| Transport | Old → new native seconds | Old → new distributed seconds | Distributed change | Old → new paired native multiple |
+|---|---:|---:|---:|---:|
+| TCP | 6.525971 → 6.258751 | 10.436087 → 10.346682 | −0.857% | 1.599162 → 1.650971 |
+| EFA | 6.533577 → 6.257413 | 9.491106 → 9.431054 | −0.633% | 1.452666 → 1.506390 |
+| Direct | 6.257471 → 6.270346 | 9.341432 → 9.259837 | −0.873% | 1.492845 → 1.476767 |
+
+TCP/EFA native-relative slowdown worsens 3.240%/3.698%; direct improves
+1.077%. All these small changes remain inside the descriptive ±5% band.
+This is not evidence of substantial end-to-end convergence to native.
+
+Wrapper values below are **medians of per-cell means**, not p50s or pooled
+quantiles. Their native multiple is the ratio of those medians. Counts per
+cell on both sides are 1777 certified-checkpoint gets, 1775 shared-version
+multigets and 5329 perpetual batch commits.
+
+| Wrapper / transport | Old → new distributed mean, us | Absolute change | Old → new native multiple |
+|---|---:|---:|---:|
+| Certified checkpoint get / TCP | 28.154 → 25.482 | −9.49% | 1.423 → 1.269 |
+| Certified checkpoint get / EFA | 20.603 → 21.791 | +5.76% | 1.091 → 1.137 |
+| Certified checkpoint get / Direct | 22.016 → 21.447 | −2.58% | 1.176 → 1.115 |
+| Shared-version multiget / TCP | 7.208 → 6.074 | −15.74% | 2.296 → 2.021 |
+| Shared-version multiget / EFA | 6.163 → 5.656 | −8.23% | 2.042 → 1.879 |
+| Shared-version multiget / Direct | 5.572 → 5.421 | −2.70% | 1.786 → 1.834 |
+| Perpetual batch commit / TCP | 1243.105 → 1196.864 | −3.72% | 1.909 → 1.991 |
+| Perpetual batch commit / EFA | 1008.004 → 986.616 | −2.12% | 1.552 → 1.672 |
+| Perpetual batch commit / Direct | 1020.560 → 983.466 | −3.63% | 1.595 → 1.651 |
+
+There are improvements and regressions within Sui: EFA certified-checkpoint
+get worsens, direct shared-version native-relative service worsens despite
+a lower absolute mean, and all three commit native-relative gaps widen.
+Old Sui logged 605 remote ERROR entries versus zero now after the metrics
+cardinality fix. Engine/Sui sources changed and the runs were nonrandom,
+three versus one clean repeats. Do not attribute these differences solely
+to caching or transport. Histogram p99 is a bucket bound, not a raw
+quantile, and is unavailable below 100 observations per cell.
+
+#### Complete coverage and separate local evidence
+
+Numeric outputs are in
+`checkpoint-work/aws-ci-runs/39605310614-1/analysis-previous-comparison/`:
+`comparison-summary.json`, `representative-kv-comparisons.csv`,
+`sui-replay-comparisons.csv`, `sui-wrapper-comparisons.csv`, and
+`all-kv-metric-comparisons.csv`. The last file expands **all 2400 source
+comparison rows / all 27 phases into 24000 metric rows**: wall/API duration,
+mean, p50/p95/p99/max, logical-operation rate, API-sample rate and byte rate.
+It retains native rows, diagnostics, unsupported/null metrics and changed
+workloads rather than selecting only favorable read results. Its
+`source_row` identifies the CSV line in `analysis-kv/kv-all-metrics.csv`,
+which holds original raw/summary/old/native paths. There are 2262
+outer-workload-comparable source rows and 138 changed-workload rows;
+“comparable” does not remove source/version confounds.
+
+As a balanced cross-check, 411 clean remote p50 groups have matching outer
+workloads and at least 100 observations in every old/current repeat. Their
+native-relative p50 ratio improved by more than 5% in **86** groups, worsened
+by more than 5% in **98**, and stayed within ±5% in **227**. These related API
+and family groups are correlated, not independent repeats or an overall
+performance score. `native-gap-descriptive-counts.json` records the exact
+selection and unrounded deadband; `comparison-verification.json` records
+independent reconciliation of all 24000 metric rows with zero mismatches.
+
+The full Sui old/new tables remain
+`analysis-sui/old-new-summary.csv` and `old-new-wrapper-summary.csv`
+(306 native/remote wrapper rows), with raw provenance and archive checks in
+`analysis-details.json` and `historical-details.json`. Representative wrapper
+tables above do not replace those full populations.
+
+The matched **local** evidence in §16.8–16.9 remains separate: frozen
+`b7123d...` baseline, matched-feature adapter candidate and final `4c74...`
+six-binary readiness build. Local cached scalar p50 fell 601 → 376 ns
+(256 B) and 672 → 442 ns (8 KiB); local bulk fell 13717 → 9618 ns and
+13663 → 9170 ns. Yet 8-KiB bulk/native widened from
+13663/3859 = 3.541 to 9170/2424 = 3.783. Local uncached TCP scalar
+was essentially flat (12223 → 12384 ns, 23149 → 23439 ns).
+One shared SSD, unpinned scheduling and the candidate Sui host-swap
+confound prohibit pooling laptop and cluster timing or claiming a controlled
+local Sui replay speedup.
+
+Finally, the new RAM-only RPC floor and 72 hardware cache-contention
+observations have **no old baseline**. Current eight-caller cached p99
+remaining 7.6–10.4 times its own native is an unresolved gap, **not a
+measured regression**. No historical run was relaunched for this comparison;
+the failed-workflow truth and paper/source mappings in earlier sections
+remain unchanged.
+
+#### Secondary 18 October A2 comparator: matched long durable load
+
+The earlier A2 campaign supplies a **different, valid 100-window load
+baseline**. It must not be confused with B2 or the primary 20 October
+ten-window case. Its default `storage` cases, not its preparation32,
+shard-cache or Sui-WAL variants, match the current clean warm long load:
+
+- Old run `th-7ffe878d1f51852d`; cases
+  `storage-current-v8192-b32-w32-r0`,
+  `storage-efa-current-v8192-b32-w32-r0` and
+  `storage-efa-direct-current-v8192-b32-w32-r0`.
+  Current cases have the same stems and repeats `r0`, `r1`, `r2`.
+- Both execute 3200 atomic 32-key batches, 102400 keys, window 32,
+  100 complete load windows, 8-KiB values and preparation chunks of **16**.
+  Native, frontend and owner value-cache budgets are zero.
+- Both use 1-MiB WAL fragments, 128-MiB files, group limit 32 batches /
+  1048568 encoded bytes, five owners and RF1. Native uses the synchronous
+  `value_wal_file_and_directory_barrier` control; each remote window also
+  returns only after all its batches are durable. Both use mTLS.
+- Executed command JSON, `campaign.txt`, remote YAML and all five archived
+  owner `launch.yaml` files were compared for each current repeat/transport.
+  Remote semantic settings match. Owner YAML differences are limited to
+  host/listen addresses and deployment/TLS paths; cache/read policies,
+  geometry, admission bounds and shape YAML match. `--wal-layout small`
+  is explicit in A2; current remote geometry comes from external YAML
+  and native uses the equivalent default-small preset.
+
+This is **matched load/state, not an identical full workload**: old
+`--reads 8192` becomes 4096. Load runs before those point-read phases.
+Changed-count read populations are not controlled before/after comparisons;
+later same-count operations retain different preceding read histories.
+Both fleets used six `g6.8xlarge` in `us-east-1a` cluster placement, but
+different hosts/time and source versions, with one old versus three current
+clean repeats. Old owner-specific model/findmnt snapshots were not retained;
+the bootstrap receipts record selected NVMe. These are descriptive results,
+not randomized causal attribution.
+
+All values below are **old → new**. Durations are milliseconds. New
+durations are medians of three per-repeat quantiles, not pooled samples.
+P99 has 100 windows in the old population and each current population.
+
+| Transport | Native p50, ms | Remote p50, ms | Native p99, ms | Remote p99, ms |
+|---|---:|---:|---:|---:|
+| TCP | 21.597038 → 19.948439 | 23.239169 → 21.364626 | 22.752007 → 20.965949 | 192.435258 → 85.848255 |
+| EFA | 21.108440 → 20.696789 | 21.996344 → 20.562284 | 22.302480 → 21.395709 | 165.062056 → 89.121607 |
+| Direct | 21.892080 → 20.332894 | 23.308434 → 22.144165 | 23.477893 → 21.367325 | 176.868526 → 93.568753 |
+
+| Transport | Remote p50 change | Remote p99 change | Remote/native p50 multiple | Remote/native p99 multiple | Remote keys/s | Remote/native rate fraction |
+|---|---:|---:|---:|---:|---:|---:|
+| TCP | −8.07% | −55.39% | 1.076 → 1.071 | 8.458 → 4.095 | 32390.7 → 36924.1 | 0.684 → 0.723 |
+| EFA | −6.52% | −46.01% | 1.042 → 0.994 | 7.401 → 4.165 | 34271.5 → 37427.6 | 0.703 → 0.759 |
+| Direct | −5.00% | −47.10% | 1.065 → 1.089 | 7.533 → 4.379 | 32612.1 → 36371.4 | 0.698 → 0.725 |
+
+The matched long tail is **substantially lower than A2**, including after
+native normalization; it remains 4.1–4.4 times native at p99. Remote phase
+throughput rises 14.00% / 9.21% / 11.53% for TCP/EFA/direct, with a narrower
+native-relative throughput gap. Direct's absolute p50 is 4.995% lower
+(inside the unrounded ±5% deadband), but its native-relative median
+**worsens**. Thus this secondary comparison supports a real descriptive
+long-tail improvement, not universal latency parity. It does not change
+the primary 20 October long-case exclusion.
+
+Source qualification and **all available phases**, including the
+noncomparable read counts and later history-confounded lifecycle rows,
+are retained in `analysis-previous-comparison/`:
+
+- `oct18-a2-long-source-qualified.json`: exact commands/config differences,
+  source/build/archive identities, counts, bounds and load metrics.
+- `oct18-a2-long-all-metrics.csv`: **138 backend/phase rows across 24
+  phase names, expanded to 1380 metric rows**, including each native control,
+  rates, p50/p95/p99 and unsupported nulls. Changed-count/history rows
+  receive no better/regressed classification. Single-observation lifecycle
+  rows remain without p99.
+- Old source API table:
+  `checkpoint-work/2026-10-18-efa-direct-hardware/analysis-a2-kv/api_metrics.csv`;
+  its original summary/sample populations are in
+  `th-7ffe878d1f51852d/retrieved/results/controller.tar.gz`
+  below that hardware root: 165428831 bytes, SHA-256
+  `b3c0aeb0698494b8c501e9a8b0eba9079e319fe4cfe10ad1374c8886b7295ab0`.
+  `controller-archive-resume.json` records the verified size/hash.
+- Archive `results/input-receipt.json` binds source archive
+  `70454d0113ff49df6abfedd38865f3d7f0adc215c5afa6ece1a0431b08a921aa`
+  and build manifest
+  `10923917786e2b598c03fa970801300e80826290d73edcaac3b5d88cf2642593`;
+  KV binary receipt/commands bind executable
+  `1309b2dd05251dfc5dd48a7e2d42daba1318fa659da36ef0f6b5e7b9bdd2a0c7`.
+  `results/kv/receipt.json` records complete execution; original
+  `summary.csv`, `samples.csv`, command records and node launch archives
+  remain the source evidence.
+
+#### Additional historical cluster evidence and sensitivity
+
+The wider crawl found more real cluster measurements, not more laptop
+repetitions. The following older Sui populations use the same private
+checkpoint prefix 0–1775, six `g6.8xlarge` hosts in `us-east-1a` cluster
+placement, RF1, configured 8-MiB coordinator cache and zero owner value cache.
+Numbers are median **paired remote/native elapsed ratios**; each source
+keeps its own native controls. They are not raw-KV read latencies.
+
+| Earlier experiment | Clean pairs per transport | TCP/native | EFA/native | Direct/native |
+|---|---:|---:|---:|---:|
+| 16 October targeted, `th-8e4b69e7c9d2b99f` | 2 | 1.808 | 1.634 | unavailable |
+| 17 October full, `th-ead85e09b7458326` | 2 | 1.904527 | 1.675769 | unavailable |
+| 18 October B2, `th-1819bd4b6691868e` | 1 | 1.660118 | 1.497908 | 1.551312 |
+
+Against the 17 October full result, the current paired slowdown is
+descriptively 13.31% lower for TCP and 10.11% lower for EFA. Thus there is
+longer-term progress, despite the much smaller latest-step change in the
+primary comparison. Different sources, hosts/time, order and small counts
+prevent assigning that trend to one fix. Ordinary EFA mandatory-remote
+8-KiB scalar service has nevertheless stayed near 61–63 us since 16 October.
+
+Sources:
+
+- `historical-benchmark-trace.tar.gz` under the 18 October hardware root,
+  members `checkpoint-work/2026-10-16-targeted-metadata-residency/REPORT.md`
+  and `checkpoint-work/2026-10-16-cache-checkpoint-parity/REPORT.md` plus its
+  `analysis-cloud-sui/findings.json`. The archive's recomputed SHA-256 is
+  `ab2a3ea5d88c5f8fd41da4ee4b0961bb9c4b09557ad77070f94834218858d1cf`.
+  Those shallow records survive; their deleted old raw links are not live.
+- `HOT_READS_AND_CHECKPOINT_ADMISSION_2026-10-16.md`,
+  “18 October completed hardware comparison”, and the retained B2 raw
+  controller archive/interpretation tables.
+- Earlier 6–12 October raw archives also survive under the engine's `logs/`.
+  Their hardware, placement, payload and cache populations differ; they
+  are catalogued as context, not pooled into this comparison.
+
+The failed-workflow Frankfurt predecessor `39366964056` is also a genuine,
+separately measured six-`g6.8xlarge` cluster, not a copy of the successful
+Virginia baseline. Its workload/export receipts are complete and its
+controller archive hash was verified; the workflow failed initial cleanup
+reconciliation. That failed status and the incomplete outer-ZIP verification
+scope remain explicit. It supplies this useful **independent sensitivity
+check**, not extra repetitions of the primary baseline:
+
+| 8-KiB B32 EFA population | Frankfurt old p50, us | Frankfurt old/native | Current versus Frankfurt duration |
+|---|---:|---:|---:|
+| Ordinary `point_get_many` | 491.481 | 5.499273 | −1.28% |
+| Explicit `cache_evicted_get_many` | 660.674 | 0.227654 | −2.44% |
+
+These changes are near-flat, whereas the selected later Virginia baseline
+shows slower current cold batch service. Do not hide that observed regression
+or present it as established code causality: old single-run fleet, region,
+storage/read-state and source differences remain. Per-fleet native controls
+must not be exchanged. The exact raw summaries, counts and qualifications are
+in `cold-efa-independent-fleet-sensitivity.json`; the run catalog is in
+`historical-campaign-catalog.json`. Preparation failures, rejected capacities,
+accounting-only retries and duplicate recovery/extraction directories add no
+independent performance observations.
+
+The secondary A2 comparison was independently reconciled across all 1380
+metric rows. Byte rates were re-summed from the six original
+`samples.csv:value_bytes_processed` members, including zero payload for
+missing/deleted values; they are not nominal size multiplied by operations.
+`oct18-a2-long-verification.json` preserves that check. No cloud benchmark
+was rerun to produce any of these historical comparisons.
+
+### 16.12 Post-campaign native shutdown correctness follow-up
+
+The final ordinary GitHub native check exposed an existing fixture/shutdown
+race after the hardware campaign was closed. Run `39634369640`, job
+`119340775246`, failed in
+`test_replay_recovers_from_missing_next_fragment_file`: the mapper tried to
+open fragment/file 1 from a sparse file set. This is not a new performance
+measurement or evidence that the completed cloud workloads failed.
+
+Dropping the test's `Arc<Db>` did not establish that lookahead-file creation
+had stopped before the directory snapshot and simulated crash deletion.
+The existing explicit shutdown helper also polled `Weak::upgrade()`: that
+can return `None` after the final strong decrement but before the database
+destructor, field destruction and mapper joins finish on another thread.
+
+Commit `d16c9ee1f3ed707270f4006e70f998e2f847e4aa` corrects both:
+
+- `tidehunter/src/db.rs:1663–1697`,
+  `Db::wait_for_background_threads_to_finish`, retains its owned `Arc`,
+  retries `Arc::try_unwrap` until ownership is exclusive, and synchronously
+  drops the database before releasing the extracted directory/process lock.
+  The existing bounded wait remains. No API signature, append allocator,
+  WAL format, replay ordering, native hashing, or hot read/write lock changes.
+- `tidehunter/src/db_tests/db_tests.rs:618–732` uses that completion barrier
+  before the filesystem mutation and between reopen phases. The test still
+  checks missing-fragment recovery, a fresh insert and persistence after the
+  next reopen. No test was ignored, retried until success or weakened.
+
+Local verification after this correction: the targeted recovery test passed;
+the native library suite passed **383 tests / 6 ignored**; the
+`experimental-distributed,test-utils` library suite passed **785 / 7 ignored**.
+Each full invocation also retained the pre-existing ignored documentation
+example. Workspace format checking and distributed all-target Clippy with
+`-D warnings` passed.
+
+The maintained `sharded_wal_bench` executable also completed a fresh native
+file-and-directory-barrier case, then verified every selected key after
+reopen. This two-key local debug run is correctness evidence only, not a
+performance comparison. Its command, completion marker and actual audit
+output are retained in `postflight-native-close-verification.json` and
+`postflight-native-executable/` beside the campaign analysis. All eight
+ordinary GitHub checks passed for the isolated correction commit in runs
+`39637612768` and `39637612917`.
+
+This is a change to the native **explicit shutdown helper**, not only to
+tests. The hardware numbers in §16.10–16.11 remain measurements of engine
+`3f71aceaf0e9c9ba28a8c9a661d729d1d635f909`, not this later correction.
+No post-correction hardware result is claimed and no fleet was relaunched.
+The recorded metadata-only tree-identity proof remains scoped to its saved
+commits; it does not assert that this later native helper is unchanged.
+
