@@ -46,6 +46,59 @@ class NativeProfileContract(unittest.TestCase):
                 run.validate_native_profiles({'live/checkpoints': sampled | changed}, 8)
 
 
+class CheckpointDiagnosticContract(unittest.TestCase):
+    def test_empty_diagnostics_are_available_but_not_zero_latency_samples(self):
+        stats = dict(write_checkpoint_diagnostics_available=1,
+                     write_checkpoint_diagnostic_records=0,
+                     write_checkpoint_diagnostic_dropped_records=0,
+                     write_checkpoint_diagnostic_history_io_checkpoint_count=0)
+        for phase in analyze.CHECKPOINT_DIAGNOSTIC_PHASES:
+            stats['write_checkpoint_diagnostic_' + phase + '_ns'] = 0
+            stats['write_checkpoint_diagnostic_' + phase + '_count'] = 0
+        for counter in analyze.CHECKPOINT_HISTORY_COUNTERS:
+            stats['write_checkpoint_diagnostic_' + counter] = 0
+        run.validate_checkpoint_diagnostics({'db': stats}, 128)
+        mean = analyze.adapter_means(stats)['write_checkpoint_diagnostic_pressure_wait']
+        self.assertFalse(mean['available'])
+        self.assertIsNone(mean['mean_us'])
+        measured = stats | dict(write_checkpoint_diagnostic_records=3,
+            write_checkpoint_diagnostic_pressure_wait_ns=20000,
+            write_checkpoint_diagnostic_pressure_wait_count=2,
+            write_checkpoint_diagnostic_owner_adoption_ns=5000,
+            write_checkpoint_diagnostic_owner_adoption_count=1)
+        run.validate_checkpoint_diagnostics({'db': measured}, 128)
+        means = analyze.adapter_means(measured)
+        self.assertEqual(means['write_checkpoint_diagnostic_pressure_wait']['mean_us'], 10)
+        self.assertEqual(means['write_checkpoint_diagnostic_owner_adoption']['mean_us'], 5)
+        with self.assertRaises(ValueError):
+            run.validate_checkpoint_diagnostics({'db': measured}, 0)
+        with self.assertRaises(ValueError):
+            run.validate_checkpoint_diagnostics({'db': measured | dict(
+                write_checkpoint_diagnostic_pressure_wait_count=4)}, 128)
+        with self.assertRaises(ValueError):
+            run.validate_checkpoint_diagnostics({'db': stats | dict(
+                write_checkpoint_diagnostic_pressure_wait_ns=1)}, 128)
+
+    def test_disabled_checkpoint_diagnostics_do_not_preserve_stale_spans(self):
+        values = dict(write_checkpoint_diagnostics_available=0,
+                      write_checkpoint_diagnostic_records=0,
+                      write_checkpoint_diagnostic_dropped_records=0,
+                      write_checkpoint_diagnostic_history_io_checkpoint_count=0)
+        for phase in analyze.CHECKPOINT_DIAGNOSTIC_PHASES:
+            values['write_checkpoint_diagnostic_' + phase + '_ns'] = 12345
+            values['write_checkpoint_diagnostic_' + phase + '_count'] = 0
+        for counter in analyze.CHECKPOINT_HISTORY_COUNTERS:
+            values['write_checkpoint_diagnostic_' + counter] = 12345
+        metrics = {f'tidehunter_adapter{{namespace="db",stat="{key}"}}': value
+                   for key, value in values.items()}
+        stats = analyze.adapter_stats(metrics)['db']
+        run.validate_checkpoint_diagnostics({'db': stats}, 0)
+        for phase in analyze.CHECKPOINT_DIAGNOSTIC_PHASES:
+            self.assertIsNone(stats['write_checkpoint_diagnostic_' + phase + '_ns'])
+        for counter in analyze.CHECKPOINT_HISTORY_COUNTERS:
+            self.assertIsNone(stats['write_checkpoint_diagnostic_' + counter])
+
+
 class DeploymentContract(unittest.TestCase):
     def test_each_namespace_gets_five_physical_nodes(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(deployment,'certificates',lambda path:path.mkdir()):

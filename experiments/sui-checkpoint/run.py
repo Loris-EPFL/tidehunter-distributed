@@ -3,6 +3,7 @@
 import argparse
 import ctypes
 import fcntl
+import math
 import json
 import os
 from pathlib import Path
@@ -321,6 +322,36 @@ def validate_native_profiles(counters, limit):
             raise ValueError('native persistence profile is incomplete or contains failed barriers')
 
 
+def validate_checkpoint_diagnostics(counters, write_limit):
+    from analyze import CHECKPOINT_DIAGNOSTIC_PHASES, CHECKPOINT_HISTORY_COUNTERS
+    enabled = int(write_limit > 0)
+    def count(value):
+        return (not isinstance(value, bool) and isinstance(value, (int, float))
+                and math.isfinite(value) and value >= 0 and value == int(value))
+    for stats in counters.values():
+        if stats.get('write_checkpoint_diagnostics_available') != enabled:
+            raise ValueError('checkpoint diagnostic availability differs from selected population')
+        records = stats.get('write_checkpoint_diagnostic_records')
+        dropped = stats.get('write_checkpoint_diagnostic_dropped_records')
+        if not count(records) or not count(dropped) or dropped > records or (not enabled and records):
+            raise ValueError('checkpoint diagnostic record/drop cardinality is invalid')
+        for phase in CHECKPOINT_DIAGNOSTIC_PHASES:
+            prefix = 'write_checkpoint_diagnostic_' + phase
+            samples, total = stats.get(prefix + '_count'), stats.get(prefix + '_ns')
+            if (not count(samples) or samples > records or (not enabled and samples)
+                    or (enabled and (not count(total) or (samples == 0 and total != 0)))
+                    or (not enabled and total not in (None, 0))):
+                raise ValueError('checkpoint diagnostic phase population/span is invalid: ' + phase)
+        history_count = stats.get('write_checkpoint_diagnostic_history_io_checkpoint_count')
+        if (not count(history_count) or history_count > records or (not enabled and history_count)):
+            raise ValueError('checkpoint history IO population is invalid')
+        for counter in CHECKPOINT_HISTORY_COUNTERS:
+            total = stats.get('write_checkpoint_diagnostic_' + counter)
+            if ((enabled and (not count(total) or (history_count == 0 and total != 0)))
+                    or (not enabled and total not in (None, 0))):
+                raise ValueError('checkpoint history IO counter unavailable or malformed: ' + counter)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', type=Path, required=True)
@@ -499,6 +530,7 @@ def main():
         counters = adapter_stats(metrics(output/'remote-foreground.prom'))
         required = {'read_calls','read_keys','read_rpcs','cache_hits','cache_misses','shard_sample_available',
                     'remote_timing_available','write_gate_wait_calls','scalar_read_calls','bulk_read_calls','write_commit_calls',
+                    'scalar_read_ns_available','read_index_ns_available',
                     'read_submit_calls','read_detached_wait_calls','read_finish_calls',
                     'write_append_requests','write_peak_inflight_nodes','write_durable_batches',
                     'write_concurrent_admitted','write_concurrent_completed','write_concurrent_pending_peak',
@@ -516,7 +548,12 @@ def main():
                        or stats['read_profile_limit'] != args.read_profile_limit
                        or stats['write_profile_limit'] != args.write_profile_limit for stats in counters.values())):
             raise ValueError('API/key/RPC/cache/stage instrumentation lacks selected DB coverage')
+        if any(stats['scalar_read_ns_available'] != int(args.read_profile_limit > 0)
+               or stats['read_index_ns_available'] != int(args.read_profile_limit > 0)
+               for stats in counters.values()):
+            raise ValueError('scalar/index diagnostic timing availability differs from selected population')
         validate_profiles(counters, config['databases'], args.read_profile_limit, args.write_profile_limit)
+        validate_checkpoint_diagnostics(counters, args.write_profile_limit)
         native_counters = adapter_stats(metrics(output/'native-foreground.prom'))
         if set(native_counters) != set(schema) or any(
                 stats.get('remote_timing_available') != 0 or 'write_gate_wait_calls' not in stats
