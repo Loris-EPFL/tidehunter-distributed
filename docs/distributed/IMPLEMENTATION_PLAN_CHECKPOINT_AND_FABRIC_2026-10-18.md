@@ -1319,3 +1319,108 @@ private-chain replay/full-state audit or matched hardware suite. It establishes
 only the exercised local API/cache/concurrency observations under the stated
 source, feature, sample and scheduling limits.
 
+
+### 16.9 Final local readiness and outer-artifact identity
+
+The parent built all six release executables from a new, clean detached engine
+checkout at `4c74bcc903d01e8177cf717270e0acc43bdf3706` and published Sui commit
+`6d4b704bb6b9af6e3d836e08ac3aa2161d443b2d`. The build used the independent
+libfabric 2.6.0 prefix, two build jobs and protocol 8. All six actual executable
+file hashes match the successful-Cargo-artifact build manifest:
+
+- Frozen source archive:
+  `4c342dfd86efaac0b08cf4a1fe462bbe6f62894376c6fa5b2cc9ef375f230177`.
+- Source manifest:
+  `15d2632640028a69d658e998e8ba39e6259e6739da8ed1a6aa61e21f447a1aeb`.
+- Build manifest:
+  `a402a3d3419061d5f855928272c5f3fae11185bec244b0f06b0ddbd6bf1ea4e7`.
+
+The user's untracked supervisor brief is absent from the detached checkout,
+both frozen source-owner inventories and the source archive. It remains local;
+no product ignore/exclusion rule was added. The later `01a4397` change is only
+Python campaign identity admission and its tests, not Rust runtime code.
+The protected cloud pipeline must still rebuild its exact final merged source;
+these local executables are not an authorization to reuse an older cloud build.
+
+Actual local certified-checkpoint validation completed:
+
+- Three clean native/TCP pairs with all timing-profile limits zero.
+- One separate native/TCP diagnostic pair with read/write/native-write limits
+  128, kept out of clean performance comparisons.
+- One full native/software-libfabric-TCP pair, with no EFA hardware claim.
+- Every pair reached checkpoint 1775, retained the expected certified digest,
+  and passed the complete state comparison: **57 tables / 167858 rows** on each
+  side across checkpoints, epoch and perpetual databases, plus the maintained
+  RocksDB/RPC-index checks.
+- The frozen `transport-floor` executable also ran the real software-provider
+  RAM control for both value sizes; it reported zero WAL-record reads. This
+  checks the sixth packaged executable, not hardware latency.
+
+Both real replay backends use synchronous durability. In particular, maintained
+`run.py` sets `TH_SYNC_WRITES=true`; native batch commit calls
+`native_barrier(true)`, while remote publication follows durable shard receipts.
+No faster asynchronous-native control is substituted for this comparison.
+
+The local clean elapsed observations below include startup. They are not
+individual checkpoint service-time measurements:
+
+| Repeat | Baseline native, s | Baseline TCP, s | Candidate native, s | Candidate TCP, s |
+|---|---:|---:|---:|---:|
+| 1 | 13.275098 | 10.242821 | 13.271030 | 10.385648 |
+| 2 | 13.546169 | 11.341606 | 13.548124 | 11.084891 |
+| 3 | 13.546933 | 12.202069 | 17.025516 | 16.866909 |
+
+**Do not infer a controlled Sui speedup from these laptop replays.** Every
+candidate interval had host swap activity, although the final Sui node and all
+15 local partition-process `VmSwap` observations were zero. For example, the
+third remote interval recorded 68 host swap-in pages and 60326 swap-out pages.
+The baseline replay intervals did not have those host swap deltas. The
+diagnostic native/remote elapsed values were 28.456091/10.867505 seconds; neither
+that ratio nor the software-provider elapsed time establishes a performance
+gain. There is one shared SSD, unpinned scheduling and different background
+memory pressure. These runs prove local correctness and source compatibility;
+independent-NVMe and EFA timing remain hardware questions.
+
+Local evidence is retained under the project workspace's
+`checkpoint-work/final-performance-2026-10-20/`:
+`candidate-six-binary-proof.json`, `candidate-source-admission.json`,
+`candidate-sui-summary.json`, `candidate-sui-swap.json`,
+`candidate-sui-audit-coverage.json`, `candidate-sui-software-proof.json`, and the
+complete per-run logs, receipts and evidence archives. These generated outputs
+are not committed product files.
+
+Review also checked the distinction between **outer campaign repetition** and
+**internal benchmark repetition**. Each outer native/remote case starts a fresh
+process with `--repetitions 1`. Rust therefore emits internal repetition zero,
+even when the enclosing case directory is `...-r2-*`. Comparing that row with
+outer repetition two would reject correct data.
+
+The real defect was weaker outer identity binding. `guest.py` now shares
+`benchmark_case_identity` with `checkpoint_kv.py`. The latter's
+`completed_case_ids` requires each pair's exact planned outer case ID, workload
+variant, build, native/local versus remote transport and distinctness. It runs
+after execution and before auxiliary files are opened. Reusing the r0 pair as
+r1/r2 or relabelling cached data as an uncached family is rejected. Internal
+repetition zero remains unchanged.
+
+The actual native and TCP producers were exercised in fresh outer-r2 output
+roots. Both passed full reopen/value audits and emitted internal zero for the
+one/eight-caller observations. TCP recorded exactly 1024/8192 hits, zero misses
+and zero read RPCs, with positive actual writer overlap for every caller.
+Relabelling their outer identity was rejected. This functional proof is
+`outer-repetition-proof.json`; its timings are not performance evidence.
+The semantic Python suites then passed **462 AWS cases, three skipped**, and
+**109 Sui cases, none skipped**. The follow-up read-only review found no
+full/targeted false rejection or weakened deadline, budget, export or cleanup
+gate. Required GitHub checks also passed at `01a4397`; later source revisions
+must satisfy the normal protected-branch checks again.
+
+At the 21 October 12:14:16Z read-only MCP refresh, there were no exact-owned
+instances in the five configured regions. The authoritative prior-day ledger
+remained revision 26: USD60 weekly cap, USD14.481852185325 recorded charge,
+USD45.518147814675 reported available and zero unresolved runs. Billed-to-date
+was unavailable under the account's permissions. No paid fleet had been
+launched at that readiness checkpoint. Cloud execution remains the normal
+protected `bench/aws-efa` merge workflow, with automatic export/termination and
+MCP verification afterward.
+
