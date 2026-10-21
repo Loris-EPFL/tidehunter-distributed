@@ -1437,3 +1437,257 @@ launched at that readiness checkpoint. Cloud execution remains the normal
 protected `bench/aws-efa` merge workflow, with automatic export/termination and
 MCP verification afterward.
 
+
+### 16.10 Closed hardware campaign and measured remaining gaps
+
+**Coordinator cache hits improved and remain in the native sub-microsecond
+range. Mandatory remote reads and complete Sui replay did not reach parity.**
+The transport changes must not be described as a demonstrated reduction of
+the scalar remote-fetch floor.
+
+#### Actual deployment and source admission
+
+- Protected push/run:
+  [`39605310614`, attempt 1](https://github.com/Loris-EPFL/tidehunter-distributed/actions/runs/39605310614).
+  Engine: `3f71aceaf0e9c9ba28a8c9a661d729d1d635f909`; Sui:
+  `6d4b704bb6b9af6e3d836e08ac3aa2161d443b2d`.
+- Six On-Demand `g6.8xlarge`, `us-east-1a`, one **cluster** placement group:
+  one controller/native control and five distinct storage hosts with their
+  own local NVMe. The west-region placement attempts did not obtain capacity.
+  This is RF1, not a replication/HA measurement.
+- All six executables were rebuilt by the protected prepare job. The actual
+  uploaded executable bytes, not filenames alone, match the controller
+  manifest. Build manifest:
+  `6507071578acd81d88359ee018dd209f3daba8a528a9b136a4caae6e9b3cdc94`;
+  source archive:
+  `3c99b00096a6e70f5b90509adee6d17aec27b78f94fb2578e19f316b6103f4c4`.
+- The full KV plan executed **129 native/remote pairs / 258 backend executions**,
+  including three clean repeats and separate diagnostic populations. All
+  **6048 primary summary rows** were recomputed from **12,658,677 raw samples**:
+  count, p50, p95, p99 and maximum all match.
+- The Sui matrix executed **12 pairs**: three clean and one profiled repeat per
+  TCP/EFA/EFA-direct transport. All replay archives and 60 node archives are
+  retained and hash-bound. Each pair reached the certified private-chain
+  checkpoint 1775 and passed exact comparison of **57 tables / 167858 rows**
+  across the three migrated databases, plus the retained RocksDB/RPC-index
+  audits. This is not mainnet or a live multi-validator campaign.
+- The controller archive is 197267700 bytes, SHA-256
+  `15474bf06cff4c2752b7e27ed5df6220b9ddfa0ab4dd24940ec59203899719e0`.
+
+The original workflow is **failed**, not retroactively successful. Its final
+collector incorrectly forbade the explicitly profiled cold verification pass
+described in §16.3. No workload or audit failed in the retained case records.
+The corrected collector revalidates the unchanged archive and writes a
+**separate recovered measurement attestation**; original `complete=false`
+receipts and their failure text remain intact. Missing/foreign case, owner,
+profile or physical-IO evidence is not waived.
+
+#### Clean KV API results
+
+Values below are medians of three per-repeat p50s, in microseconds. Scalar
+populations contain 4096 calls per repeat; `get_many` contains 128 complete
+up-to-32-key calls per repeat. Native ranges span the three matched controls,
+not error bars or one pooled native control.
+
+| API population | Native matched control | TCP | EFA | EFA-direct |
+|---|---:|---:|---:|---:|
+| Coordinator-hit hot scalar, 256 B | 0.140 | 0.410 | 0.420 | 0.420 |
+| Coordinator-hit hot scalar, 8 KiB | 0.190–0.200 | 0.460 | 0.460 | 0.460 |
+| Cache-fitting 32-key `get_many`, 8 KiB | 11.901–12.100 | 11.300 | 11.621 | 11.421 |
+| Mandatory remote warm scalar, 256 B | 0.340 | 135.376 | 45.062 | 45.002 |
+| Mandatory remote warm scalar, 8 KiB | 1.180–1.191 | 166.026 | 62.113 | 63.032 |
+| RAM-only full RPC control, 256 B | Not a local-DB control | 102.893 | 37.352 | 37.871 |
+| RAM-only full RPC control, 8 KiB | Not a local-DB control | 130.096 | 53.702 | 55.152 |
+
+The scalar hit rows have recorded hits and no owner record reads. Their value
+cache is bounded at 8 MiB. A `cache` family name or `_hot` phase alone does
+**not** prove that a larger workload fits: use the recorded hit/miss/RPC
+population. The RAM control actually executed all five owners, with 512
+requests per value size per repeat and zero WAL-record work. It includes
+TLS, protocol, progress and full payload validation; it is **not pure wire,
+device latency, or an immutable hardware lower bound**.
+
+Against completed run `39378783532` on the same host type/AZ/placement policy,
+the direct hot scalar p50 changed from 0.500 to 0.420 us for 256 B and from
+0.570 to 0.460 us for 8 KiB. Its matched native-normalized ratios changed from
+3.333 to 3.000 and 2.714 to 2.300. Cached 8-KiB `get_many` changed from
+14.65 to 11.42 us. These are descriptive before/after results, not randomized
+causal isolation. The old campaign had only one clean repeat.
+
+Mandatory remote scalar service is essentially unchanged. The new 8-KiB
+EFA/direct p50 remains about 52–53 times its own native control. Ordinary
+remote warm reads have owner-resident-page service evidence; they must not
+be called NVMe-fetch latency. The evicted phases charge positive process IO,
+but still contain many resident reads: one 8-KiB scalar population has
+3776 resident successes out of 4096 and 320 asynchronous submissions.
+Positive interval IO does not make every sampled key physically cold.
+
+The new hit-only contention control separately recorded 72 native/remote
+observations. The remote subset has 165888 reads/hits, zero misses/RPCs and
+135104 reads overlapping the paired durable-write API interval. Remote p99
+rises from 1.410–1.840 us with one caller to 32.941–36.351 us with eight callers.
+These are not additional repeats of the ordinary scalar rows or evidence
+that remote transport caused a cache-only contention tail.
+
+#### Durable writes and lifecycle operations
+
+The long load uses 8-KiB values, 32-key atomic batches and window 32:
+3200 batches, 102400 keys, **100 complete 1024-key windows per execution**.
+The matched native controls remain separate in the raw table.
+
+| Measurement | Native matched control | TCP | EFA | EFA-direct |
+|---|---:|---:|---:|---:|
+| Long durable load, keys/s | 49,315–51,080 | 36,924 | 37,428 | 36,371 |
+| Long write-window p50, ms | 19.948–20.697 | 21.365 | 20.562 | 22.144 |
+| Long write-window p99, ms | 20.966–21.396 | 85.848 | 89.122 | 93.569 |
+| Single 256-B durable write p50, us | 57.143–57.793 | 283.530 | 136.476 | 134.395 |
+| Single 256-B durable writes, keys/s | 14,149–14,320 | 3,271 | 5,318 | 5,417 |
+| Large-state full scan, s | 0.373–0.376 | 1.477 | 1.362 | 1.430 |
+| Large-state index flush, ms | 94.048–95.821 | 149.692 | 145.888 | 148.643 |
+| Large-state fresh reopen, ms | 1.985–2.041 | 40.125 | 67.532 | 58.025 |
+| Reopen with reused transport, ms | No native analogue | 35.884 | 33.699 | 34.350 |
+
+The previous long-load control had only 320 batches and ten windows, with
+one-tenth the state. Its write tail, full scan, flush and reopen values are
+**not a controlled old/new performance comparison**. Lifecycle rows above
+are medians of three single observations, not p99 distributions. The new
+long-load p99 is supported by 100 windows in each repeat; do not replace it
+with the old ten-window maximum.
+
+The measured exclusive parent spans in the long remote write windows are
+approximately 30–31% preparation/admission, 40–44% storage wait, 9% publication
+and 16–18% checkpoint work. Storage wait includes the remote operation and
+durability wait, not just network transit. The enclosing foreground-checkpoint
+span overlaps drain/wait work; background worker spans are another population.
+Do not add those spans again.
+
+The retained diagnostic write windows contain 13 unique capture-completion
+records, not all 18 session cursor advances. Five advances occur outside the
+sampled windows. Across those 13 records the coordinator ReceiptHistory
+exports 14784 successful immutable-node write calls / 3784704 bytes, with
+nonnull own count 13. Mean receipt-history construction/append is 3.286 ms;
+its subsequent sync is 1.382 ms, and later index persistence is 5.493 ms.
+These are coordinator retry-authority Merkle/Patricia-tree writes, **not
+storage-shard history spill counters**. Node writes lack an isolated timer.
+
+#### Real Sui checkpoint comparison
+
+Full replay elapsed includes startup. Each ratio below is the median of
+three paired remote/native ratios, not a ratio obtained by pooling native
+controls across transports.
+
+| Transport | Native elapsed median, s | Distributed elapsed median, s | Paired slowdown median |
+|---|---:|---:|---:|
+| TCP | 6.258751 | 10.346682 | 1.650971 |
+| EFA | 6.257413 | 9.431054 | 1.506390 |
+| EFA-direct | 6.270346 | 9.259837 | 1.476767 |
+
+The following are **medians of per-cell wrapper means**, in microseconds,
+not p50s. The historic `rocksdb_*_latency_seconds` names are typed-store
+wrapper metrics even when the backing database is Tidehunter.
+
+| Wrapper operation | Calls/cell | Native matched mean range | TCP | EFA | EFA-direct |
+|---|---:|---:|---:|---:|---:|
+| `certified_checkpoints` get | 1777 | 19.158–20.083 | 25.482 | 21.791 | 21.447 |
+| `next_shared_object_versions_v2` multiget | 1775 | 2.955–3.011 | 6.074 | 5.656 | 5.421 |
+| Perpetual write-batch commit | 5329 | 589.928–601.163 | 1196.864 | 986.616 | 983.466 |
+
+These wrapper populations can mix hits and misses and include work above
+the raw KV cache. Histograms provide bucket bounds, not raw quantiles;
+p99 is unavailable below 100 observations in a cell. Clean distributed
+scalar/index substage clocks and unsupported native remote-engine fields
+remain null, not zero-duration measurements.
+
+Across the three diagnostic Sui cells there are 126 captured checkpoints,
+zero recorded foreground-checkpoint events, zero pressure-wait samples and
+zero ring evictions. The perpetual namespace has ten captures per transport:
+index preparation means are 7.977–8.281 ms; **index persistence means are
+117.448–119.899 ms**. This later `prepared.persist` span is distinct from
+ReceiptHistory construction, immutable-node writes and `history.sync`
+(`remote_db/checkpoint_lifecycle.rs`). The nine namespace/cell observations
+report 722763 coordinator node writes / 185027328 bytes. Buffering those
+nodes cannot be claimed to fix the separately measured index-persist span.
+
+All 60 storage-process IO brackets show zero charged read bytes during Sui
+replay, despite logical WAL reads. These are resident-data observations, not
+tests of fully cold per-shard NVMe fetches. Server CPU estimates use
+independently bracketing intervals, not synchronized cluster-wide utilization.
+
+Absolute distributed Sui elapsed improved only about 0.6–0.9% from the prior
+completed campaign; that campaign used another engine/Sui source pair and
+logged 605 remote ERROR entries. The new pair logs zero. Native timing also
+changed. **There is no substantial demonstrated end-to-end parity gain.**
+The direct path is modestly faster than regular EFA for this full replay,
+but not consistently faster for individual reads or write tails.
+
+#### What the evidence supports next
+
+1. Keep C0's bounded in-process hit path and its full reference/key, health,
+   retention and publication checks. This follows the FASTER/Garnet locality
+   mechanism in §16.1; it does not require caching the whole distributed DB.
+   Same order as native is observed; exact equality is not.
+2. Investigate the measured full RPC/software floor before adding NVMe-oF.
+   A diagnostic 8-KiB direct population has a 64.811-us mean client exchange
+   and 5.599-us mean server handler; these are nested spans, not an additive
+   pure-network decomposition. The RAM control already excludes WAL work.
+   eRPC's endpoint/progress design motivates this investigation, but its
+   hardware results do not guarantee those numbers on this AWS fleet.
+3. Separate encoding/hash/write/barrier costs within index persistence before
+   selecting another checkpoint optimization. C2b concerns the earlier
+   ReceiptHistory node append path. It is not a substitute for attribution
+   of the dominant Sui persistence span. Do not remove a durability barrier.
+4. Retain whole-batch placement on one owner, physical WAL authority, exact
+   retry evidence and contiguous durable publication. No native mutex was
+   removed, no checksum/fence/TLS guarantee was relaxed and no global physical
+   WAL or RDMA-only correctness path was introduced.
+
+T3 idle CQ notification/parking and C2b immutable-node buffering remain
+conditional work, not implemented or benchmarked speedups in this revision.
+The mapping of each implemented mechanism to its exact native/paper/project
+source remains §16.1. The hardware observations narrow the next bottleneck;
+they do not justify promising 5-us mandatory remote reads.
+
+#### Retention, termination and cost
+
+The automatic workflow closed its fleet after exporting evidence. An
+independent final AWS MCP observation at **2026-10-21 15:48:22 UTC** found
+the exact six run-owned instance IDs terminated. Exact-tag scans across the
+five configured regions found no run-owned EBS volumes/snapshots, ENIs,
+security groups or placement groups; all six per-run IAM roles and profiles
+were absent. No manual cleanup was needed; other users were not selected.
+The shared foundation and S3 evidence remain intentionally retained.
+
+The retained generated report separates observed estimates from reservations
+and projections. The following UTC periods contain estimated usage, not
+invoices or the sum of historical reservation amounts:
+
+| Scope | Estimated usage, USD |
+|---|---:|
+| This run / 21 October 2026 | 8.626242 |
+| Week beginning 19 October 2026 | 23.108094 |
+| October 2026 | 23.108094 |
+| Reported branch lifetime, from 18 October 2026 | 23.108094 |
+
+The final MCP refresh verified ledger revision 29, available weekly headroom
+USD36.891906, weekly cap unchanged at USD60, no unresolved runs and no active
+reservations. Billed-to-date is unavailable. The run's compute-related estimate
+is USD8.528800; its settlement also includes S3. A later S3 estimate differs by
+USD0.012773; no double charge or reconciliation was added.
+An identical USD41.266222 worst-case reservation exceeds current headroom;
+do not silently raise the policy to obtain another fleet.
+
+Full raw data remain in the workflow artifacts and
+`s3://tidehunter-ci-354775971805-us-east-1/th-77284b2a87c3fec5/results/`.
+Workspace reductions are under `checkpoint-work/aws-ci-runs/39605310614-1/`:
+
+- `uploaded-inputs-proof.json`, `recovered-measurement-attestation.json`,
+  `recovered-auxiliary-measurements.json`;
+- `analysis-kv/kv-all-metrics.csv` and `.json`: **2400 comparisons / all
+  27 primary phases**, including native controls, raw-source links, counts,
+  ranges, rate denominators and old/new comparability flags;
+- `analysis-kv/` contention, RAM-floor, S0, lifecycle and CQ/post reductions;
+- `analysis-sui/` all 12 cells, all wrapper/adapter metrics, exact table and
+  node-archive bindings, resources, per-namespace counters and old/new tables;
+- the final independent operations receipt under
+  `checkpoint-work/final-performance-2026-10-20/`.
+
