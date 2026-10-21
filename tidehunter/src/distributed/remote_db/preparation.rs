@@ -204,6 +204,7 @@ impl RemoteDatabase {
         // this window. Distinct contents under one identity are always rejected.
         let mut seen = HashMap::new();
         let mut index_bytes = self.reserved_index_bytes;
+        let mut additional_index_bytes = 0usize;
         let mut pending_bytes = self.pending_bytes;
         for prepared in &prepared {
             let batch = &prepared.batch;
@@ -227,15 +228,21 @@ impl RemoteDatabase {
             // every indivisible batch now; actual group construction enforces
             // the combined fresh-window count/descriptor budget before I/O.
             self.check_storage_group_capacity(1, batch.mutations().len())?;
+            additional_index_bytes = additional_index_bytes
+                .checked_add(prepared.metadata_bytes)
+                .ok_or_else(|| LocalDbError::new("index reservation overflow"))?;
             index_bytes = index_bytes
                 .checked_add(prepared.metadata_bytes)
                 .ok_or_else(|| LocalDbError::new("index reservation overflow"))?;
         }
-        let needs_checkpoint = self.index.read().check_capacity(index_bytes).is_err();
-        if needs_checkpoint {
-            let previously_reserved = self.reserved_index_bytes;
-            self.force_admission_checkpoint()?;
-            index_bytes -= previously_reserved;
+        if self.index.read().check_capacity(index_bytes).is_err() {
+            self.ensure_admission_pressure(AdmissionPressure::Index {
+                additional_bytes: additional_index_bytes,
+            })?;
+            index_bytes = self
+                .reserved_index_bytes
+                .checked_add(additional_index_bytes)
+                .ok_or_else(|| LocalDbError::new("index reservation overflow"))?;
         }
         self.index
             .read()

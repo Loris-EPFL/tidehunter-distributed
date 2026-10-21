@@ -206,6 +206,208 @@ fn absent_or_corrupt_pageable_retry_authority_fails_closed() {
 }
 
 #[test]
+fn index_pressure_waits_for_existing_capture_before_rejecting_live_residency() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 1), vec![put(1)])
+        .unwrap();
+
+    let resident = db.index_stats().charged_metadata_bytes;
+    let additional_bytes = db
+        .config
+        .max_index_bytes
+        .checked_sub(resident)
+        .unwrap()
+        .checked_add(1)
+        .unwrap();
+    assert!(db.index.read().check_capacity(additional_bytes).is_err());
+
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (resume, gate) = mpsc::sync_channel(1);
+    db.checkpoint_pause = Some((entered, gate));
+    db.start_checkpoint().unwrap();
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    let generation = db.snapshot_generation;
+    let release = std::thread::spawn(move || resume.send(()).unwrap());
+
+    db.ensure_admission_pressure(AdmissionPressure::Index { additional_bytes })
+        .unwrap();
+    release.join().unwrap();
+
+    assert_eq!(db.snapshot_generation, generation);
+    assert!(db.background_checkpoint.is_none());
+    db.index.read().check_capacity(additional_bytes).unwrap();
+}
+
+#[test]
+fn drained_partition_pressure_does_not_wait_for_an_unrelated_capture() {
+    let mut fixture = Fixture::new_with_capacity(1);
+    fixture.config.max_admitted_batches = 4;
+    fixture.config.max_pending_batches = 4;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 1), vec![put(1)])
+        .unwrap();
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (resume, gate) = mpsc::sync_channel(1);
+    db.checkpoint_pause = Some((entered, gate));
+    db.start_checkpoint().unwrap();
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    let connection = Arc::clone(&db.clients[1].client);
+    let held = connection.lock();
+    db.submit(fixture.operation(1, 2), vec![put(2)]).unwrap();
+    let pressure = AdmissionPressure::Partition {
+        partition: 1,
+        records: 1,
+    };
+    assert!(!db.admission_pressure_fits(pressure));
+    let (finished, completion) = mpsc::sync_channel(1);
+    let owner = thread::spawn(move || {
+        let result = db.ensure_admission_pressure(pressure);
+        finished.send(result.is_ok()).unwrap();
+        (db, result)
+    });
+    drop(held);
+    // The channel bounds a dependency deadlock, not a device-latency target.
+    let observed = completion.recv_timeout(Duration::from_secs(5));
+    resume.send(()).unwrap();
+    let (mut db, result) = owner.join().unwrap();
+    assert!(observed.unwrap());
+    result.unwrap();
+    assert_eq!(
+        db.get(KeySpace(0), &1u32.to_be_bytes())
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        &[2; 32]
+    );
+    db.flush_index().unwrap();
+}
+
+#[test]
+fn adopted_capture_releases_identity_pressure_without_waiting_for_another_cut() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 1), vec![put(1)])
+        .unwrap();
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (resume, gate) = mpsc::sync_channel(1);
+    db.checkpoint_pause = Some((entered, gate));
+    db.start_checkpoint().unwrap();
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut suffix = None;
+    for sequence in 1..fixture.config.max_admitted_batches {
+        let operation = fixture.operation((sequence % 5) as u32, sequence as u64 + 1);
+        let version = db.write_batch(operation, vec![put(2)]).unwrap();
+        suffix = Some((operation, version));
+    }
+    let pressure = AdmissionPressure::Tail {
+        encoded_bytes: fixture.config.storage.batch_limits.max_encoded_bytes,
+        identity: true,
+    };
+    assert!(!db.admission_pressure_fits(pressure));
+    let (next_entered, _next_waiting) = mpsc::sync_channel(1);
+    let (next_resume, next_gate) = mpsc::sync_channel(1);
+    db.checkpoint_pause = Some((next_entered, next_gate));
+    let (finished, completion) = mpsc::sync_channel(1);
+    let owner = thread::spawn(move || {
+        let result = db.ensure_admission_pressure(pressure);
+        finished.send(result.is_ok()).unwrap();
+        (db, result)
+    });
+    resume.send(()).unwrap();
+    // An unnecessary full catch-up would now depend on next_resume.
+    let observed = completion.recv_timeout(Duration::from_secs(5));
+    next_resume.send(()).unwrap();
+    let (mut db, result) = owner.join().unwrap();
+    assert!(observed.unwrap());
+    result.unwrap();
+    assert_eq!(
+        db.checkpoint_tail_batches,
+        fixture.config.max_admitted_batches - 1
+    );
+    db.healthy = false;
+    drop(db);
+    let mut reopened = fixture.open();
+    assert_eq!(
+        reopened
+            .get(KeySpace(0), &1u32.to_be_bytes())
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        &[2; 32]
+    );
+    let (operation, version) = suffix.unwrap();
+    assert_eq!(
+        reopened.write_batch(operation, vec![put(2)]).unwrap(),
+        version
+    );
+}
+
+#[test]
+fn remaining_index_pressure_requires_one_new_capture_after_the_existing_cut() {
+    let mut fixture = Fixture::new();
+    let mut db = fixture.open();
+    let mutations = |value| {
+        (1u32..=3)
+            .map(|key| Mutation::Put {
+                keyspace: KeySpace(0),
+                key: key.to_be_bytes().to_vec().into(),
+                value: vec![value; 32].into(),
+            })
+            .collect::<Vec<_>>()
+    };
+    db.write_batch(fixture.operation(0, 1), mutations(0))
+        .unwrap();
+    db.flush_index().unwrap();
+    let resident_directory = db.index_stats().charged_metadata_bytes;
+    let incoming = CompleteBatch::new(
+        &fixture.shape,
+        BatchId {
+            database: fixture.config.storage.database,
+            operation: fixture.operation(2, 4),
+        },
+        BatchVersion {
+            epoch: db.epoch,
+            sequence: db.submission_next(),
+        },
+        mutations(3),
+        fixture.config.storage.batch_limits,
+    )
+    .unwrap();
+    let additional_bytes = db.index.read().estimated_batch_bytes(&incoming).unwrap();
+    db.shutdown().unwrap();
+    drop(db);
+    fixture.config.max_index_bytes = resident_directory.checked_add(additional_bytes).unwrap();
+    let mut db = fixture.open();
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (resume, gate) = mpsc::sync_channel(1);
+    db.checkpoint_pause = Some((entered, gate));
+    db.write_batch(fixture.operation(0, 2), vec![put(1)])
+        .unwrap();
+    db.start_checkpoint().unwrap();
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    db.write_batch(fixture.operation(1, 3), vec![put(2)])
+        .unwrap();
+    let generation = db.snapshot_generation;
+    let pressure = AdmissionPressure::Index { additional_bytes };
+    assert!(!db.admission_pressure_fits(pressure));
+    resume.send(()).unwrap();
+    db.ensure_admission_pressure(pressure).unwrap();
+    assert_eq!(db.snapshot_generation, generation + 1);
+    assert!(db.background_checkpoint.is_none());
+    db.index.read().check_capacity(additional_bytes).unwrap();
+    assert_eq!(
+        db.get(KeySpace(0), &1u32.to_be_bytes())
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        &[2; 32]
+    );
+    db.flush_index().unwrap();
+}
+
+#[test]
 fn unchanged_flush_waits_for_captured_cut_and_then_covers_its_acknowledged_suffix() {
     let fixture = Fixture::new();
     let mut db = fixture.open();
