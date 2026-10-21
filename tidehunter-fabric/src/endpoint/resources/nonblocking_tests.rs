@@ -316,6 +316,191 @@ fn direct_ack_eagain_is_retried_by_empty_flush_until_its_cq_completes() {
     assert!(!direct.control.needs_send(1));
 }
 #[test]
+fn sweep_data_send_piggybacks_consumed_credit_without_control_packet() {
+    let mut fixture = Fixture::new_direct();
+    fixture
+        .endpoint()
+        .direct
+        .as_mut()
+        .unwrap()
+        .receive
+        .accept_data(1, b"reply")
+        .unwrap();
+    assert!(fixture.endpoint().try_progress_for_sweep().unwrap());
+    assert_eq!(fixture.state().polls, 1);
+    assert_eq!(fixture.state().sends, 0);
+    let mut received = [0; 5];
+    assert_eq!(
+        fixture
+            .endpoint()
+            .try_receive_no_poll(&mut received)
+            .unwrap(),
+        5
+    );
+    assert_eq!(&received, b"reply");
+    assert_eq!(fixture.state().polls, 1);
+    fixture.state().send_result = -isize::try_from(ffi::FI_EAGAIN).unwrap();
+    assert_eq!(
+        fixture
+            .endpoint()
+            .try_send_vectored_no_poll(&[std::io::IoSlice::new(b"discarded")])
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert!(
+        fixture
+            .endpoint()
+            .direct
+            .as_ref()
+            .unwrap()
+            .control
+            .needs_send(1)
+    );
+    assert_eq!(
+        fixture
+            .endpoint()
+            .direct
+            .as_ref()
+            .unwrap()
+            .send
+            .next_ordinal()
+            .unwrap(),
+        1
+    );
+    fixture.state().send_result = 0;
+    assert_eq!(
+        fixture
+            .endpoint()
+            .try_send_vectored_no_poll(&[std::io::IoSlice::new(b"request")])
+            .unwrap(),
+        7
+    );
+    let (sent, len) = {
+        let state = fixture.state();
+        (state.sent, state.sent_len)
+    };
+    // SAFETY: Successful provider post owns this fixed send slot.
+    let packet = unsafe { std::slice::from_raw_parts(sent, len) };
+    let super::super::efa_direct::Packet::Data {
+        ordinal,
+        credit,
+        payload,
+    } = super::super::efa_direct::decode(packet, 4096).unwrap()
+    else {
+        panic!("expected DATA packet");
+    };
+    assert_eq!(ordinal, 1);
+    assert_eq!(credit, 1);
+    assert_eq!(payload, b"request");
+    assert!(
+        !fixture
+            .endpoint()
+            .direct
+            .as_ref()
+            .unwrap()
+            .control
+            .needs_send(1)
+    );
+    assert!(!fixture.endpoint().finish_sweep_no_poll().unwrap());
+    assert_eq!(fixture.state().sends, 2);
+}
+
+#[test]
+fn sweep_without_data_output_retries_standalone_credit_after_eagain() {
+    let mut fixture = Fixture::new_direct();
+    fixture
+        .endpoint()
+        .direct
+        .as_mut()
+        .unwrap()
+        .receive
+        .accept_data(1, b"reply")
+        .unwrap();
+    let mut received = [0; 5];
+    assert_eq!(
+        fixture
+            .endpoint()
+            .try_receive_no_poll(&mut received)
+            .unwrap(),
+        5
+    );
+    fixture.state().send_result = -isize::try_from(ffi::FI_EAGAIN).unwrap();
+    assert!(!fixture.endpoint().finish_sweep_no_poll().unwrap());
+    assert!(
+        fixture
+            .endpoint()
+            .direct
+            .as_ref()
+            .unwrap()
+            .control
+            .needs_send(1)
+    );
+    fixture.state().send_result = 0;
+    assert!(fixture.endpoint().finish_sweep_no_poll().unwrap());
+    assert_eq!(fixture.state().polls, 0);
+    let (sent, len) = {
+        let state = fixture.state();
+        (state.sent, state.sent_len)
+    };
+    // SAFETY: Successful provider post owns the reserved control slot.
+    let packet = unsafe { std::slice::from_raw_parts(sent, len) };
+    assert!(matches!(
+        super::super::efa_direct::decode(packet, 4096).unwrap(),
+        super::super::efa_direct::Packet::Credit {
+            ordinal: 1,
+            consumed: 1
+        }
+    ));
+}
+
+#[test]
+fn blocking_receive_posts_credit_for_sweep_resident_direct_data() {
+    let mut fixture = Fixture::new_direct();
+    assert!(fixture.endpoint().try_progress_for_sweep().unwrap());
+    let (receive_buffer, receive_context) = {
+        let state = fixture.state();
+        (state.received, state.received_context)
+    };
+    let mut incoming = [0; 4096];
+    let len = super::super::efa_direct::encode_data(&mut incoming, 1, 0, b"reply", 4096)
+        .unwrap()
+        .len();
+    // SAFETY: The fixture's receive post owns a full CHUNK slot.
+    unsafe { std::ptr::copy_nonoverlapping(incoming.as_ptr(), receive_buffer, len) };
+    fixture.state().completion = Some(ffi::fi_cq_msg_entry {
+        op_context: receive_context,
+        len,
+        ..ffi::fi_cq_msg_entry::default()
+    });
+    assert!(fixture.endpoint().try_progress_for_sweep().unwrap());
+    assert_eq!(fixture.state().sends, 0);
+
+    let mut output = [0; 5];
+    assert_eq!(
+        fixture
+            .endpoint()
+            .receive(&mut output, Instant::now() + Duration::from_secs(1))
+            .unwrap(),
+        output.len()
+    );
+    assert_eq!(&output, b"reply");
+    assert_eq!(fixture.state().sends, 1);
+    let (sent, sent_len) = {
+        let state = fixture.state();
+        (state.sent, state.sent_len)
+    };
+    // SAFETY: The successful CREDIT post owns the reserved control slot.
+    let packet = unsafe { std::slice::from_raw_parts(sent, sent_len) };
+    assert!(matches!(
+        super::super::efa_direct::decode(packet, 4096).unwrap(),
+        super::super::efa_direct::Packet::Credit {
+            ordinal: 1,
+            consumed: 1
+        }
+    ));
+}
+#[test]
 #[ignore = "requires libfabric tcp;ofi_rxm and local network permission"]
 #[allow(
     clippy::too_many_lines,
@@ -871,6 +1056,7 @@ fn no_poll_partial_receive_keeps_unread_bytes_until_repost() {
         len: 4,
         ..ffi::fi_cq_msg_entry::default()
     });
+    assert!(!fixture.endpoint().receive_ready().unwrap());
     let mut bytes = [0; 2];
     assert_eq!(
         fixture
@@ -882,12 +1068,13 @@ fn no_poll_partial_receive_keeps_unread_bytes_until_repost() {
     );
     assert_eq!(fixture.state().polls, 0);
     fixture.endpoint().try_progress().unwrap();
+    assert!(fixture.endpoint().receive_ready().unwrap());
     assert_eq!(
         fixture.endpoint().try_receive_no_poll(&mut bytes).unwrap(),
         2
     );
+    assert!(fixture.endpoint().receive_ready().unwrap());
     assert_eq!(&bytes, b"ab");
-    assert_eq!(fixture.state().receives, 0);
     fixture.state().receive_result = -isize::try_from(ffi::FI_EAGAIN).unwrap();
     assert_eq!(
         fixture.endpoint().try_receive_no_poll(&mut bytes).unwrap(),
@@ -895,6 +1082,7 @@ fn no_poll_partial_receive_keeps_unread_bytes_until_repost() {
     );
     assert_eq!(&bytes, b"cd");
     assert_eq!(fixture.state().receives, 1);
+    assert!(!fixture.endpoint().receive_ready().unwrap());
     assert_eq!(fixture.endpoint().inner().rx_post, 0);
     fixture.state().receive_result = 0;
     fixture.endpoint().try_progress().unwrap();

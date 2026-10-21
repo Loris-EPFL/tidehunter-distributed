@@ -92,6 +92,7 @@ struct Snapshot {
     pipeline: PipelineStats,
     authority: AuthorityWriteStats,
     metadata_history_bytes: usize,
+    checkpoint_diagnostics: CheckpointDiagnosticSummary,
 }
 
 /// Consumes one opened authority. Reads never borrow or lock its write owner.
@@ -142,6 +143,7 @@ impl ConcurrentRemoteDatabase {
             pipeline: db.pipeline_stats(),
             authority: db.authority_write_stats(),
             metadata_history_bytes: db.metadata_history_bytes(),
+            checkpoint_diagnostics: db.checkpoint_diagnostic_summary(),
         }));
         let (sender, receiver) = mpsc::sync_channel(db.config.max_pending_batches);
         let mut owner = Self {
@@ -472,6 +474,7 @@ impl ConcurrentRemoteDatabase {
     pub fn stats(&self) -> LocalDbStats {
         let mut stats = self.snapshot.lock().stats;
         stats.read_resolve_ns += self.read_resolve_ns.load(Ordering::Relaxed);
+        stats.read_resolve_ns_available = self.read_profile_enabled();
         stats.value_read_ns += self.value_read_ns.load(Ordering::Relaxed);
         stats
     }
@@ -492,6 +495,7 @@ impl ConcurrentRemoteDatabase {
             pipeline: self.pipeline_stats(),
             read_cache: self.cache.lock().stats(),
             write_profile: *self.write_profile.lock(),
+            checkpoint_diagnostics: snapshot.checkpoint_diagnostics,
         });
     }
     pub fn read_io_monitor(&self) -> ReadIoMonitor {
@@ -610,6 +614,7 @@ fn drive_owner(
             pipeline: db.pipeline_stats(),
             authority: db.authority_write_stats(),
             metadata_history_bytes: db.metadata_history_bytes(),
+            checkpoint_diagnostics: db.checkpoint_diagnostic_summary(),
         };
         #[cfg(test)]
         if let Some(events) = db.concurrent_progress.lock().as_ref() {

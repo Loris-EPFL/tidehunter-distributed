@@ -51,6 +51,8 @@ pub struct LocalDbStats {
     pub storage_wait_ns: u64,
     pub publication_ns: u64,
     pub read_resolve_ns: u64,
+    /// True only when the cumulative resolution timer was enabled for this sample.
+    pub read_resolve_ns_available: bool,
     pub value_read_ns: u64,
 }
 

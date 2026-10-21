@@ -32,6 +32,18 @@ const SESSION_REQUESTS: usize = 32;
 const SESSION_BYTES: usize = 256 * 1024 * 1024;
 const PROGRESS_BYTES: usize = 64 * 1024;
 
+#[cfg(feature = "experimental-fabric")]
+static NEXT_DIRECT_DIAGNOSTIC_WINDOW: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(feature = "experimental-fabric")]
+struct DirectDiagnosticWindow {
+    id: u64,
+    data_posts: u64,
+    credit_posts: u64,
+    piggyback_advances: u64,
+}
+
 /// A live fabric control socket is checked at least once per millisecond of
 /// active progress, plus one bounded sweep/scheduler delay. An idle established
 /// session has no silent-partition detection deadline; pending work and partial
@@ -155,6 +167,26 @@ struct Output {
     stage_started: Option<Instant>,
 }
 
+const OUTPUT_FRAME_BUDGET: usize = 4;
+const OUTPUT_TLS_WRITE_BUDGET: usize = 8;
+
+#[derive(Clone, Copy, Debug)]
+struct OutputBudget {
+    plaintext: usize,
+    tls_writes: usize,
+    frames: usize,
+    frame_gate_observed: bool,
+}
+
+impl OutputBudget {
+    fn reset(&mut self) {
+        self.plaintext = PROGRESS_BYTES;
+        self.tls_writes = OUTPUT_TLS_WRITE_BUDGET;
+        self.frames = OUTPUT_FRAME_BUDGET;
+        self.frame_gate_observed = false;
+    }
+}
+
 /// TLS state and framing have one mutable owner. Only ciphertext copied into
 /// Endpoint's fixed slots is DMA-visible; request/result vectors never are.
 pub(super) struct Session {
@@ -163,6 +195,7 @@ pub(super) struct Session {
     output: VecDeque<Output>,
     /// Prefix already accepted by transport, still charged until fence retirement.
     submitted: usize,
+    output_budget: OutputBudget,
     closed: bool,
     stats: TransportProgressStats,
     time_work: bool,
@@ -174,16 +207,27 @@ pub(super) struct Session {
     input_used: usize,
     input_len: usize,
     input_started: Option<Instant>,
+    plaintext_pending: usize,
+    peer_closed: bool,
     control_peer: ControlPeerHealth,
+    #[cfg(feature = "experimental-fabric")]
+    direct_diagnostic: Option<DirectDiagnosticWindow>,
 }
 impl Session {
-    pub(super) fn new(conn: rustls::Connection, sock: DeadlineIo) -> Result<Self, TcpError> {
+    pub(super) fn new(mut conn: rustls::Connection, sock: DeadlineIo) -> Result<Self, TcpError> {
         sock.socket.set_nonblocking(true)?;
+        let tls_state = conn.process_new_packets().map_err(TcpError::component)?;
         Ok(Self {
             conn,
             sock,
             output: VecDeque::new(),
             submitted: 0,
+            output_budget: OutputBudget {
+                plaintext: PROGRESS_BYTES,
+                tls_writes: OUTPUT_TLS_WRITE_BUDGET,
+                frames: OUTPUT_FRAME_BUDGET,
+                frame_gate_observed: false,
+            },
             closed: false,
             stats: TransportProgressStats::default(),
             time_work: false,
@@ -194,10 +238,14 @@ impl Session {
             input_used: 0,
             input_len: 0,
             input_started: None,
+            plaintext_pending: tls_state.plaintext_bytes_to_read(),
+            peer_closed: tls_state.peer_has_closed(),
             spare_output: Vec::new(),
             control_peer: ControlPeerHealth {
                 next_check: Instant::now(),
             },
+            #[cfg(feature = "experimental-fabric")]
+            direct_diagnostic: None,
         })
     }
     fn queue<T: Serialize>(&mut self, id: u64, body: &T, limit: usize) -> Result<(), TcpError> {
@@ -250,6 +298,8 @@ impl Session {
         Ok(())
     }
     fn abort(&mut self) {
+        #[cfg(feature = "experimental-fabric")]
+        self.finish_direct_diagnostic("session-abort");
         self.stats = self.transport_stats();
         self.closed = true;
         let _ = self.sock.socket.shutdown(Shutdown::Both);
@@ -263,14 +313,22 @@ impl Session {
         self.stats.retained_reply_credit_bytes = 0;
         self.input.clear();
     }
-    fn write_plaintext(&mut self) -> Result<bool, TcpError> {
+    fn write_plaintext(&mut self, budget: usize) -> Result<usize, TcpError> {
+        if budget == 0 {
+            return Ok(0);
+        }
         let Some(output) = self.output.get_mut(self.submitted) else {
-            return Ok(false);
+            return Ok(0);
         };
         if output.offset == output.bytes.len() {
-            return Ok(false);
+            return Ok(0);
         }
-        let end = output.bytes.len().min(output.offset + PROGRESS_BYTES);
+        let end = output.bytes.len().min(
+            output
+                .offset
+                .saturating_add(budget)
+                .min(output.offset + PROGRESS_BYTES),
+        );
         let began = self.time_work.then(Instant::now);
         let result = self.conn.writer().write(&output.bytes[output.offset..end]);
         self.stats.plaintext_write.record(began, &result);
@@ -292,9 +350,9 @@ impl Session {
                     output.stage_started = Some(started);
                 }
                 output.offset += n;
-                Ok(n != 0)
+                Ok(n)
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
             Err(e) => Err(e.into()),
         }
     }
@@ -323,6 +381,8 @@ impl Session {
             || work_pending
             || !self.output.is_empty()
             || self.conn.wants_write()
+            || self.plaintext_pending != 0
+            || self.peer_closed
         {
             return None;
         }
@@ -350,7 +410,7 @@ impl Session {
     fn progress_fabric_data(&mut self) -> Result<bool, TcpError> {
         #[cfg(feature = "experimental-fabric")]
         if let Some(endpoint) = &mut self.sock.fabric {
-            return match endpoint.try_progress() {
+            return match endpoint.try_progress_for_sweep() {
                 Ok(changed) => Ok(changed),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
                 Err(error) => Err(error.into()),
@@ -358,47 +418,95 @@ impl Session {
         }
         Ok(false)
     }
+    fn fabric_receive_ready(&mut self) -> Result<bool, TcpError> {
+        #[cfg(feature = "experimental-fabric")]
+        if let Some(endpoint) = &mut self.sock.fabric {
+            return Ok(endpoint.receive_ready()?);
+        }
+        Ok(true)
+    }
     /// One bounded output turn, without another CQ poll or empty transport read.
     /// A newly ready reply can use this turn immediately in its dispatch sweep.
     fn progress_output(&mut self) -> Result<bool, TcpError> {
         if self.closed {
             return Err(TcpError::new("session is closed"));
         }
-        let mut changed = self.write_plaintext()?;
-        if self.conn.wants_write() {
-            let began = self.time_work.then(Instant::now);
-            let result = self.conn.write_tls(&mut NonblockingIo(&mut self.sock));
-            self.stats.tls_write.record(began, &result);
-            match result {
-                Ok(n) => changed |= n != 0,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(e.into()),
+        let mut changed = false;
+        loop {
+            if self.output_budget.frames == 0 {
+                break;
+            }
+            let plaintext = self.write_plaintext(self.output_budget.plaintext)?;
+            self.output_budget.plaintext -= plaintext;
+            changed |= plaintext != 0;
+
+            let mut transport_progress = false;
+            let mut transport_blocked = false;
+            if self.conn.wants_write() && self.output_budget.tls_writes != 0 {
+                self.output_budget.tls_writes -= 1;
+                let began = self.time_work.then(Instant::now);
+                let result = self.conn.write_tls(&mut NonblockingIo(&mut self.sock));
+                self.stats.tls_write.record(began, &result);
+                match result {
+                    Ok(n) => {
+                        transport_progress = n != 0;
+                        transport_blocked = n == 0;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        transport_blocked = true;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+                changed |= transport_progress;
+            }
+            // A fence covers accepted ciphertext, never plaintext still in rustls.
+            // This turn shares the sweep's single CQ acquisition and budget.
+            #[cfg(feature = "experimental-fabric")]
+            let (accepted, completed) = if let Some(endpoint) = &mut self.sock.fabric {
+                (
+                    endpoint.accepted_send_fence()?,
+                    endpoint.completed_send_fence()?,
+                )
+            } else {
+                (0, 0)
+            };
+            #[cfg(not(feature = "experimental-fabric"))]
+            let (accepted, completed) = (0, 0);
+            let submitted_before = self.stats.frames_submitted;
+            changed |= self.finish_output(accepted, completed);
+            let submitted_now =
+                usize::try_from(self.stats.frames_submitted.saturating_sub(submitted_before))
+                    .unwrap_or(usize::MAX);
+            self.output_budget.frames = self.output_budget.frames.saturating_sub(submitted_now);
+            if transport_blocked {
+                break;
+            }
+
+            if plaintext == 0 && !transport_progress && submitted_now == 0 {
+                break;
+            }
+            if self.output_budget.plaintext == 0
+                || self.output_budget.tls_writes == 0 && self.conn.wants_write()
+                || self.output_budget.frames == 0
+            {
+                break;
             }
         }
-        // A fence covers accepted ciphertext, never plaintext still in rustls.
-        // The regular progress sweep remains responsible for manual EFA CQ work.
-        #[cfg(feature = "experimental-fabric")]
-        let (accepted, completed) = if let Some(endpoint) = &mut self.sock.fabric {
-            (
-                endpoint.accepted_send_fence()?,
-                endpoint.completed_send_fence()?,
-            )
-        } else {
-            (0, 0)
-        };
-        #[cfg(not(feature = "experimental-fabric"))]
-        let (accepted, completed) = (0, 0);
-        changed |= self.finish_output(accepted, completed);
         Ok(changed)
     }
     fn progress(&mut self) -> Result<bool, TcpError> {
         if self.closed {
             return Err(TcpError::new("session is closed"));
         }
+        self.output_budget.reset();
         self.check_control_peer(false)?;
         let mut changed = self.progress_fabric_data()?;
         changed |= self.progress_output()?;
-        if self.conn.wants_read() {
+        if self.conn.wants_read()
+            && self.plaintext_pending == 0
+            && !self.peer_closed
+            && (!self.is_fabric() || self.fabric_receive_ready()?)
+        {
             let began = self.time_work.then(Instant::now);
             let result = self.conn.read_tls(&mut NonblockingIo(&mut self.sock));
             self.stats.tls_read.record(began, &result);
@@ -410,7 +518,9 @@ impl Session {
                     self.stats
                         .tls_process
                         .record(began, &result.as_ref().map(|_| n));
-                    result.map_err(TcpError::component)?;
+                    let state = result.map_err(TcpError::component)?;
+                    self.plaintext_pending = state.plaintext_bytes_to_read();
+                    self.peer_closed = state.peer_has_closed();
                     self.input_started.get_or_insert_with(Instant::now);
                     changed = true;
                 }
@@ -420,11 +530,27 @@ impl Session {
         }
         Ok(changed)
     }
+    fn finish_fabric_sweep(&mut self) -> Result<bool, TcpError> {
+        #[cfg(feature = "experimental-fabric")]
+        if let Some(endpoint) = &mut self.sock.fabric {
+            return Ok(endpoint.finish_sweep_no_poll()?);
+        }
+        Ok(false)
+    }
     /// Keep the submission cursor separate from the retirement cursor. No later
     /// plaintext enters TLS until this frame's ciphertext has all been accepted;
     /// earlier CQEs need not have arrived. Output allocations and reply leases
     /// stay charged until the contiguous local completion frontier covers them.
     fn finish_output(&mut self, accepted: u64, completed: u64) -> bool {
+        if !self.output_budget.frame_gate_observed
+            && self.output.len() > self.submitted + 1
+            && self.conn.wants_write()
+        {
+            // Only the active frame's pending TLS ciphertext blocks the next
+            // plaintext frame here; CQ retirement is not a submission gate.
+            self.stats.frame_gate_stalls = self.stats.frame_gate_stalls.saturating_add(1);
+            self.output_budget.frame_gate_observed = true;
+        }
         let mut changed = false;
         let mut transition_time = None;
         if !self.conn.wants_write()
@@ -444,9 +570,6 @@ impl Session {
             self.submitted += 1;
             self.stats.frames_submitted = self.stats.frames_submitted.saturating_add(1);
             changed = true;
-        }
-        if !changed && self.output.len() > self.submitted + 1 {
-            self.stats.frame_gate_stalls = self.stats.frame_gate_stalls.saturating_add(1);
         }
         while self
             .output
@@ -492,6 +615,14 @@ impl Session {
         stats
     }
     pub(super) fn configure_transport_stats(&mut self, enabled: bool, reset: bool) {
+        #[cfg(feature = "experimental-fabric")]
+        if reset || !enabled {
+            self.finish_direct_diagnostic(if reset {
+                "profile-reset"
+            } else {
+                "profile-disable"
+            });
+        }
         self.time_work = enabled;
         if reset || !enabled {
             // Never attribute a frame crossing a reset/disable to the new window.
@@ -513,13 +644,95 @@ impl Session {
                 ..TransportProgressStats::default()
             };
         }
+        #[cfg(feature = "experimental-fabric")]
+        if enabled
+            && self.direct_diagnostic.is_none()
+            && let Some(endpoint) = &self.sock.fabric
+            && let Ok(id) = NEXT_DIRECT_DIAGNOSTIC_WINDOW.fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |next| next.checked_add(1),
+            )
+        {
+            let stats = endpoint.progress_stats();
+            self.direct_diagnostic = Some(DirectDiagnosticWindow {
+                id,
+                data_posts: stats.efa_direct_data_posts,
+                credit_posts: stats.efa_direct_credit_posts,
+                piggyback_advances: stats.efa_direct_credit_piggyback_advances,
+            });
+        }
+    }
+    /// Local observer output, never a protocol-v8 field or durability receipt.
+    /// Profile boundaries occur outside clean API timing; no CQ is acquired here.
+    #[cfg(feature = "experimental-fabric")]
+    fn finish_direct_diagnostic(&mut self, reason: &'static str) {
+        let Some(window) = self.direct_diagnostic.take() else {
+            return;
+        };
+        let Some(endpoint) = &self.sock.fabric else {
+            return;
+        };
+        let stats = endpoint.progress_stats();
+        let data_posts = stats
+            .efa_direct_data_posts
+            .saturating_sub(window.data_posts);
+        let credit_posts = stats
+            .efa_direct_credit_posts
+            .saturating_sub(window.credit_posts);
+        let piggyback_advances = stats
+            .efa_direct_credit_piggyback_advances
+            .saturating_sub(window.piggyback_advances);
+        if data_posts == 0 && credit_posts == 0 && piggyback_advances == 0 {
+            return;
+        }
+        let peer = self
+            .sock
+            .socket
+            .local_addr()
+            .and_then(|local| {
+                self.sock
+                    .socket
+                    .peer_addr()
+                    .map(|remote| format!("{local}->{remote}"))
+            })
+            .ok();
+        let record = serde_json::json!({
+            "schema": 1,
+            "reason": reason,
+            "window": window.id,
+            "data_posts": data_posts,
+            "credit_posts": credit_posts,
+            "piggyback_advances": piggyback_advances,
+            "peer": peer,
+        });
+        // Observer IO must not change authority or panic during endpoint teardown.
+        // The campaign collector rejects missing required diagnostic records.
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "TIDEHUNTER_FABRIC_LOCAL_DIAGNOSTICS {record}"
+        );
     }
     fn recycle_input(&mut self, bytes: Vec<u8>) {
         if bytes.capacity() <= 1024 * 1024 {
             self.input = bytes;
         }
     }
+    fn consume_plaintext(&mut self, bytes: usize) -> Result<(), TcpError> {
+        self.plaintext_pending = self
+            .plaintext_pending
+            .checked_sub(bytes)
+            .ok_or_else(|| TcpError::new("rustls plaintext readiness underflow"))?;
+        Ok(())
+    }
     fn receive(&mut self, limit: usize) -> Result<Option<(Vec<u8>, usize)>, TcpError> {
+        if self.plaintext_pending == 0 {
+            return if self.peer_closed {
+                Err(TcpError::new("truncated authenticated frame"))
+            } else {
+                Ok(None)
+            };
+        }
         if self.header_used < 4 {
             let began = self.time_work.then(Instant::now);
             let result = self
@@ -530,6 +743,7 @@ impl Session {
             match result {
                 Ok(0) => return Err(TcpError::new("truncated authenticated frame")),
                 Ok(n) => {
+                    self.consume_plaintext(n)?;
                     self.input_started.get_or_insert_with(Instant::now);
                     self.header_used += n;
                 }
@@ -552,6 +766,13 @@ impl Session {
             }
             self.input_len = len;
         }
+        if self.plaintext_pending == 0 {
+            return if self.peer_closed {
+                Err(TcpError::new("truncated authenticated frame"))
+            } else {
+                Ok(None)
+            };
+        }
         let began = self.time_work.then(Instant::now);
         let result = self
             .conn
@@ -560,7 +781,10 @@ impl Session {
         self.stats.plaintext_read.record(began, &result);
         match result {
             Ok(0) => return Err(TcpError::new("truncated authenticated frame")),
-            Ok(n) => self.input_used += n,
+            Ok(n) => {
+                self.consume_plaintext(n)?;
+                self.input_used += n;
+            }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
             Err(e) => return Err(e.into()),
         }
@@ -597,6 +821,13 @@ impl Session {
             .frame_decode
             .record(began, &result.as_ref().map(|_| frame.len()));
         result
+    }
+}
+
+#[cfg(feature = "experimental-fabric")]
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.finish_direct_diagnostic("session-drop");
     }
 }
 
@@ -744,6 +975,8 @@ impl Client {
             || self.stream.header_used != 0
             || self.stream.input_used != 0
             || self.stream.input_started.is_some()
+            || self.stream.plaintext_pending != 0
+            || self.stream.peer_closed
         {
             return Err(TcpError::new("connection is not quiescent for reuse"));
         }
@@ -1132,6 +1365,8 @@ impl Client {
                 ));
             }
         }
+        self.reactor.progressed |= self.stream.progress_output()?;
+        self.reactor.progressed |= self.stream.finish_fabric_sweep()?;
         Ok(())
     }
     pub(super) fn read_records_correlated(
@@ -1902,6 +2137,7 @@ pub(super) fn serve_session(
                 stream.progress_output()?;
                 progressed = true;
             }
+            progressed |= stream.finish_fabric_sweep()?;
             if progressed {
                 idle_since = Instant::now();
             }

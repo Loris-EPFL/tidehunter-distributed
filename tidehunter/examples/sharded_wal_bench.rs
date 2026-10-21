@@ -2,6 +2,8 @@
 //! The spawned topology shares one SSD; no claimed independent-NVMe or Sui result.
 //! See docs/distributed/LOCAL_BACKEND_BENCHMARK_2026-10-06.md.
 
+#[path = "support/cache_contention.rs"]
+mod cache_contention;
 #[path = "support/cache_workloads.rs"]
 mod cache_workloads;
 #[cfg(feature = "experimental-fabric")]
@@ -156,6 +158,7 @@ struct Args {
     hot_read_pass: bool,
     cold_read_pass: bool,
     cache_probe_keys: usize,
+    cache_hit_contention: bool,
     concurrent_mixed: bool,
     transport_diagnostics: bool,
     remote_config: Option<PathBuf>,
@@ -206,6 +209,7 @@ impl Args {
             hot_read_pass: false,
             cold_read_pass: false,
             cache_probe_keys: 0,
+            cache_hit_contention: false,
             concurrent_mixed: false,
             transport_diagnostics: false,
             remote_config: None,
@@ -241,7 +245,7 @@ impl Args {
                     "Native window: --native-read-workers 1..32 (default 1, shared Db/cache, effective concurrency min(workers, read-window)); --read-resource-evidence true|false (default false, Linux test-utils, outside measured timers)"
                 );
                 println!(
-                    "Workloads: --cache-probe-keys 0..8192 (0 disables recorded fill/hot/scan/hot probe); --concurrent-mixed true|false (default false, bounded reads overlap writes on disjoint keys; retirement includes caller write work)"
+                    "Workloads: --cache-probe-keys 0..8192 (0 disables recorded fill/hot/scan/hot probe); --concurrent-mixed true|false (default false, bounded reads overlap writes on disjoint keys; retirement includes caller write work); --cache-hit-contention true|false (default false, separate Sui-adapter 1/8-caller verified hit-only reads overlapping disjoint durable writes)"
                 );
                 std::process::exit(0);
             }
@@ -326,6 +330,7 @@ impl Args {
                 "--hot-read-pass" => args.hot_read_pass = value.parse()?,
                 "--cold-read-pass" => args.cold_read_pass = value.parse()?,
                 "--cache-probe-keys" => args.cache_probe_keys = value.parse()?,
+                "--cache-hit-contention" => args.cache_hit_contention = value.parse()?,
                 "--concurrent-mixed" => args.concurrent_mixed = value.parse()?,
                 "--transport-diagnostics" => args.transport_diagnostics = value.parse()?,
                 "--remote-config" => args.remote_config = Some(value.into()),
@@ -467,6 +472,8 @@ impl Args {
             .into());
         }
         if args.cache_probe_keys > 8192
+            || (args.cache_hit_contention
+                && (args.kinds.contains(&Kind::Sharded) || args.kinds.contains(&Kind::NativeAsync)))
             || args
                 .batch_sizes
                 .iter()
@@ -874,6 +881,26 @@ impl Backend {
             _ => None,
         }
     }
+    fn checkpoint_cursor(&self, enabled: bool) -> Option<u64> {
+        match self {
+            Self::Tcp(db) if enabled => Some(db.checkpoint_diagnostic_cursor()),
+            _ => None,
+        }
+    }
+    fn checkpoint_snapshot(
+        &self,
+        cursor: Option<u64>,
+    ) -> Option<(
+        u64,
+        tidehunter::distributed::remote_db::CheckpointDiagnosticsSnapshot,
+    )> {
+        match (self, cursor) {
+            (Self::Tcp(db), Some(cursor)) => {
+                Some((cursor, db.checkpoint_diagnostics_since(cursor)))
+            }
+            _ => None,
+        }
+    }
     fn counters(&self) -> Result<BTreeMap<&'static str, u64>> {
         Ok(match self {
             Self::Native { timings, .. } => timings.clone(),
@@ -1257,6 +1284,8 @@ struct Output {
     read_path_evidence: BufWriter<File>,
     native_read_profiles: BufWriter<File>,
     read_resources: Option<BufWriter<File>>,
+    cache_contention: BufWriter<File>,
+    checkpoint_diagnostics: BufWriter<File>,
 }
 impl Output {
     fn new(path: &Path, resource_evidence: bool) -> Result<Self> {
@@ -1281,6 +1310,8 @@ impl Output {
             read_io: create("read_io.csv")?,
             read_path_evidence: create("read_path_evidence.csv")?,
             native_read_profiles: create("native_read_profiles.csv")?,
+            cache_contention: create("cache_contention.jsonl")?,
+            checkpoint_diagnostics: create("checkpoint_diagnostics.jsonl")?,
             read_resources: if resource_evidence {
                 Some(create("read_resources.csv")?)
             } else {
@@ -1439,6 +1470,32 @@ impl Output {
             )?;
         }
         self.stages.flush()?;
+        Ok(())
+    }
+    fn checkpoint_records(
+        &mut self,
+        case: &Case,
+        phase: &str,
+        sample: usize,
+        diagnostic: Option<(
+            u64,
+            tidehunter::distributed::remote_db::CheckpointDiagnosticsSnapshot,
+        )>,
+    ) -> Result<()> {
+        if let Some((cursor, snapshot)) = diagnostic {
+            serde_json::to_writer(
+                &mut self.checkpoint_diagnostics,
+                &serde_json::json!({
+                    "backend": case.label(), "transport": case.transport.label(),
+                    "value_bytes": case.value_bytes, "batch_size": case.batch_size,
+                    "window": case.window, "repetition": case.repetition,
+                    "phase": phase, "sample": sample, "diagnostic_available": true,
+                    "cursor_before": cursor, "record_count": snapshot.records.len(), "snapshot": snapshot,
+                    "scope": "owner_process_monotonic_spans;foreground_wait_encloses_drain;worker_phases_not_additive_to_owner_wait",
+                }),
+            )?;
+            writeln!(self.checkpoint_diagnostics)?;
+        }
         Ok(())
     }
 
@@ -1635,6 +1692,7 @@ struct Case {
     window: usize,
     repetition: usize,
     preparation_chunk_batches: usize,
+    diagnostic: bool,
 }
 
 impl Case {
@@ -1677,13 +1735,18 @@ fn writes(
             .map(|(offset, batch)| (*operation + offset as u64, batch.mutations.clone()))
             .collect();
         let before = backend.authority_write_stats();
+        let checkpoint_cursor = backend.checkpoint_cursor(case.diagnostic);
         let start = Instant::now();
         backend.submit_window(ready, case.preparation_chunk_batches)?;
         *operation += window.len() as u64;
         backend.drain()?;
         let elapsed_ns = ns(start);
         if let (Some(before), Some(after)) = (before, backend.authority_write_stats()) {
-            timings.push((before, after));
+            timings.push((
+                before,
+                after,
+                backend.checkpoint_snapshot(checkpoint_cursor),
+            ));
         }
         samples.push(Sample {
             elapsed_ns,
@@ -1704,9 +1767,11 @@ fn writes(
         }
     }
     output.phase(case, phase, ns(wall), &samples)?;
-    for (index, (before, after)) in timings.into_iter().enumerate() {
+    for (index, (before, after, diagnostic)) in timings.into_iter().enumerate() {
         output.write_window(case, phase, index, samples[index].elapsed_ns, before, after)?;
+        output.checkpoint_records(case, phase, index, diagnostic)?;
     }
+    output.checkpoint_diagnostics.flush()?;
     output.write_windows.flush()?;
     output.stages(case, phase, counters, backend.counters()?)
 }
@@ -2036,6 +2101,7 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
     }
     if let Some(remote) = &mut parameters.remote {
         remote.read_memory_allowance_bytes = args.read_memory_allowance_bytes;
+        remote.write_profile_limit = if args.transport_diagnostics { 128 } else { 0 };
         if remote.tls.transport != args.transport {
             return Err(
                 invalid("remote transport differs from explicit benchmark transport").into(),
@@ -2412,6 +2478,7 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
             }
             let ready: Vec<_> = window.iter().map(|b| b.mutations.clone()).collect();
             let before = backend.authority_write_stats();
+            let checkpoint_cursor = backend.checkpoint_cursor(case.diagnostic);
             let start = Instant::now();
             let ready = ready
                 .into_iter()
@@ -2423,7 +2490,11 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
             backend.drain()?;
             let elapsed_ns = ns(start);
             if let (Some(before), Some(after)) = (before, backend.authority_write_stats()) {
-                write_timings.push((before, after));
+                write_timings.push((
+                    before,
+                    after,
+                    backend.checkpoint_snapshot(checkpoint_cursor),
+                ));
             }
             write_samples.push(Sample {
                 elapsed_ns,
@@ -2439,7 +2510,7 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
         let mixed_wall = ns(wall);
         output.phase(case, "mixed_get", mixed_wall, &read_samples)?;
         output.phase(case, "mixed_write_window", mixed_wall, &write_samples)?;
-        for (index, (before, after)) in write_timings.into_iter().enumerate() {
+        for (index, (before, after, diagnostic)) in write_timings.into_iter().enumerate() {
             output.write_window(
                 case,
                 "mixed_write_window",
@@ -2448,8 +2519,10 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
                 before,
                 after,
             )?;
+            output.checkpoint_records(case, "mixed_write_window", index, diagnostic)?;
         }
         output.write_windows.flush()?;
+        output.checkpoint_diagnostics.flush()?;
         output.stages(case, "mixed", counters, backend.counters()?)?;
     }
     drop(mixed);
@@ -2642,6 +2715,9 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
     if let Some(pool) = &parameters.transports {
         pool.clear();
     }
+    if args.cache_hit_contention {
+        cache_workloads::hit_only_adapter(&parameters, case, output, ks, &oracle, operation)?;
+    }
     if let Some(cluster) = &mut cluster {
         let start = Instant::now();
         cluster.shutdown()?;
@@ -2802,8 +2878,13 @@ fn main() -> Result<()> {
     )?;
     writeln!(
         metadata,
-        "cache_probe_keys={}\nconcurrent_mixed={}\nconcurrent_mixed_scope=disjoint_keys_read_service_overlaps_write_window_retirement_includes_caller_write_work\npercentile_minimum_samples=p95:20;p99:100\nwrite_window_parent_spans=preparation_admission_ns+storage_wait_ns+publication_ns+dispatch_ns+checkpoint_ns\nforeground_checkpoint_is_subset=true\nworker_elapsed_sums_are_not_cpu_or_wall=true\ncache_served_byte_scope=frontend_charged_detached_payload_storage_encoded_hit_length\ncache_plus_reply_accounting=conservative_shared_ownership_not_unique_RSS",
+        "cache_probe_keys={}\nconcurrent_mixed={}\nconcurrent_mixed_scope=disjoint_keys_read_service_overlaps_write_window_retirement_includes_caller_write_work\npercentile_minimum_samples=p95:20;p99:100\nwrite_window_parent_spans=preparation_admission_ns+storage_wait_ns+publication_ns+dispatch_ns+checkpoint_ns\nforeground_checkpoint_span=enclosing_drain_and_checkpoint_wait_not_subset_of_exclusive_checkpoint_ns\nworker_elapsed_sums_are_not_cpu_or_wall=true\ncache_served_byte_scope=frontend_charged_detached_payload_storage_encoded_hit_length\ncache_plus_reply_accounting=conservative_shared_ownership_not_unique_RSS",
         args.cache_probe_keys, args.concurrent_mixed,
+    )?;
+    writeln!(
+        metadata,
+        "cache_hit_contention={}\ncache_hit_contention_api=distributed::sui::Db::get\ncache_hit_contention_units=common_process_monotonic_nanoseconds\ncache_hit_contention_population=callers:1,8;reads_per_caller:1024;overlapping_disjoint_durable_writes:32\ncache_hit_contention_native_hit_count=unavailable\ncheckpoint_diagnostics_schema=1\ncheckpoint_diagnostics_requested={}\ncheckpoint_diagnostic_capacity=128\ncheckpoint_diagnostics_unavailable_span=null",
+        args.cache_hit_contention, args.transport_diagnostics,
     )?;
     writeln!(
         metadata,
@@ -2847,6 +2928,7 @@ fn main() -> Result<()> {
                             &Case {
                                 transport: args.transport,
                                 preparation_chunk_batches: args.tcp_preparation_chunk_batches,
+                                diagnostic: args.transport_diagnostics,
                                 kind,
                                 value_bytes,
                                 batch_size,

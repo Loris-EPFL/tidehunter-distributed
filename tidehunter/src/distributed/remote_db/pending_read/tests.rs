@@ -363,9 +363,10 @@ fn cached_hit_and_same_shard_miss_progress_while_first_miss_is_blocked() {
     let held = lane.lock();
     let mut first = db.submit_get(KeySpace(0), &0u32.to_be_bytes()).unwrap();
     assert!(db.poll_get(&mut first).unwrap().is_none());
+    let rpcs_before_hit = db.read_rpc_count();
     let mut hit = db.submit_get(KeySpace(0), &2u32.to_be_bytes()).unwrap();
     assert_eq!(db.poll_get(&mut hit).unwrap(), Some(value(9)));
-    assert!(db.poll_get(&mut hit).is_err());
+    assert_eq!(db.read_rpc_count(), rpcs_before_hit);
     let second = db.submit_get(KeySpace(0), &1u32.to_be_bytes()).unwrap();
     assert_eq!(db.finish_get(second).unwrap(), value(8));
     assert!(db.poll_get(&mut first).unwrap().is_none());

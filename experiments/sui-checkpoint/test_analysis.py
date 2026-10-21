@@ -64,7 +64,7 @@ class TimingPopulations(unittest.TestCase):
 
     def test_scalar_bulk_and_commit_means_use_stage_calls(self):
         stats = dict(remote_timing_available=1, read_calls=100, read_keys=1000,
-                     scalar_read_ns=6000, scalar_read_calls=3,
+                     scalar_read_ns=6000, scalar_read_calls=3, scalar_read_ns_available=1,
                      bulk_read_ns=20000, bulk_read_calls=4,
                      write_commit_ns=9000, write_commit_calls=3)
         means = analyze.adapter_means(stats)
@@ -79,6 +79,43 @@ class TimingPopulations(unittest.TestCase):
         stats = analyze.adapter_stats(values)['db']
         self.assertIsNone(stats['shard_cache_hits'])
         self.assertIsNone(stats['read_profile_exchange_ns'])
+        for enabled in (None, 0, 1):
+            raw = dict(remote_timing_available=1, scalar_read_calls=3,
+                       scalar_read_ns=9000, read_index_ns=6000, read_index_calls=3)
+            if enabled is not None:
+                raw.update(scalar_read_ns_available=enabled, read_index_ns_available=enabled)
+            metrics = {f'tidehunter_adapter{{namespace="db",stat="{key}"}}': value
+                       for key, value in raw.items()}
+            decoded = analyze.adapter_stats(metrics)['db']
+            means = analyze.adapter_means(decoded)
+            for stage, expected in (('scalar_read', 3), ('read_index', 2)):
+                if enabled == 1:
+                    self.assertEqual(means[stage]['mean_us'], expected)
+                else:
+                    self.assertIsNone(decoded[stage + '_ns'])
+                    self.assertIsNone(means[stage]['mean_us'])
+
+    def test_sui_local_window_absence_is_not_server_drop_completeness(self):
+        record = dict(schema=1, reason='profile-disable', window=1, peer=None,
+                      data_posts=9, credit_posts=2, piggyback_advances=3)
+        payload = b'TIDEHUNTER_FABRIC_LOCAL_DIAGNOSTICS ' + json.dumps(record).encode() + b'\n'
+        blob = io.BytesIO()
+        with tarfile.open(fileobj=blob, mode='w') as archive:
+            for name, data in [('experiment/remote.log', payload),
+                               ('experiment/native.log', b'native startup\n'),
+                               ('experiment/storage-0.log', b'process terminated by SIGTERM\n')]:
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                archive.addfile(member, io.BytesIO(data))
+        blob.seek(0)
+        with tarfile.open(fileobj=blob, mode='r:') as archive:
+            evidence = analyze.fabric_local_replay(archive, dict(read_profile_limit=128))
+            observed = {row['source']: row for row in evidence['logs']}
+            self.assertTrue(observed['experiment/remote.log']['available'])
+            self.assertFalse(observed['experiment/storage-0.log']['available'])
+            self.assertIn('SIGTERM', evidence['completeness'])
+            with self.assertRaisesRegex(ValueError, 'clean'):
+                analyze.fabric_local_replay(archive, dict(read_profile_limit=0, write_profile_limit=0))
 
     def test_write_stages_use_their_own_persistence_populations(self):
         stats = dict(remote_timing_available=1, write_profile_available=1,

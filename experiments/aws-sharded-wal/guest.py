@@ -44,6 +44,30 @@ TRANSFER = TransferConfig(max_concurrency=2, multipart_threshold=8 * 1024 * 1024
 CACHE_BYTES = 8 * 1024 * 1024
 
 
+def benchmark_case_identity(label, shape, repetition, *, storage=False, capacity=False,
+                            chunk_control=False, cold=False, diagnostics=False, transport='tcp',
+                            cached=False, authority_resident_batches=None, shard_cache_bytes=0,
+                            preparation_chunk_batches=16, wal_layout=None):
+    """Canonical outer identity, shared by execution and closed evidence admission."""
+    value, batch, window = shape
+    prefix = 'chunk32' if chunk_control else ('capacity4m' if capacity else ('storage' if storage else 'warm'))
+    if cold or diagnostics:
+        prefix = 'diagnostic' if diagnostics else 'cold'
+    if cached:
+        prefix = 'cache'
+    if transport in ('efa', 'efa-direct'):
+        prefix += '-' + transport
+    if shard_cache_bytes:
+        prefix = f'shardcache{shard_cache_bytes}-' + prefix
+    if preparation_chunk_batches != 16:
+        prefix = f'preparation{preparation_chunk_batches}-' + prefix
+    if wal_layout == 'sui':
+        prefix = 'wal-sui-' + prefix
+    if authority_resident_batches is not None:
+        prefix = f'authority{authority_resident_batches}-' + prefix
+    return f'{prefix}-{label}-v{value}-b{batch}-w{window}-r{repetition}', prefix
+
+
 def sha(path):
     with Path(path).open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
@@ -925,11 +949,14 @@ class Campaign:
                  resource_evidence=False, authority_resident_batches=None,
                  shard_cache_bytes=0, transport_floor_probe=False,
                  preparation_chunk_batches=16, workload_batches=None, workload_reads=None,
-                 wal_layout=None):
+                 wal_layout=None, cache_hit_contention=False):
         if ((shard_cache_bytes or transport_floor_probe or preparation_chunk_batches != 16
-                or workload_batches is not None or workload_reads is not None or wal_layout is not None) and not self.cfg.get('kv_subsuite')
+                or workload_batches is not None or workload_reads is not None or wal_layout is not None
+                or cache_hit_contention) and not self.cfg.get('kv_subsuite')
                 or type(shard_cache_bytes) is not int or not 0 <= shard_cache_bytes <= 128 * 1024**2
                 or type(transport_floor_probe) is not bool
+                or type(cache_hit_contention) is not bool
+                or (cache_hit_contention and (not cached or cold or diagnostics or shape[1] != 1))
                 or type(preparation_chunk_batches) is not int or not 1 <= preparation_chunk_batches <= 32
                 or any(value is not None and (type(value) is not int or not 1 <= value <= bound)
                        for value, bound in ((workload_batches, 4096), (workload_reads, 8192)))
@@ -965,22 +992,11 @@ class Campaign:
             raise ValueError('capacity supplement requires current TCP 8KiB/B32/W32')
         if chunk_control and (label != 'current' or not storage or capacity):
             raise ValueError('chunk control requires current storage shape')
-        prefix = 'chunk32' if chunk_control else ('capacity4m' if capacity else ('storage' if storage else 'warm'))
-        if cold or diagnostics:
-            prefix = 'diagnostic' if diagnostics else 'cold'
-        if cached:
-            prefix = 'cache'
-        if transport in ('efa', 'efa-direct'):
-            prefix += '-' + transport
-        if shard_cache_bytes:
-            prefix = f'shardcache{shard_cache_bytes}-' + prefix
-        if preparation_chunk_batches != 16:
-            prefix = f'preparation{preparation_chunk_batches}-' + prefix
-        if wal_layout == 'sui':
-            prefix = 'wal-sui-' + prefix
-        if authority_resident_batches is not None:
-            prefix = f'authority{authority_resident_batches}-' + prefix
-        case_id = f'{prefix}-{label}-v{value}-b{batch}-w{window}-r{rep}'
+        case_id, prefix = benchmark_case_identity(label, shape, rep,
+            storage=storage, capacity=capacity, chunk_control=chunk_control, cold=cold,
+            diagnostics=diagnostics, transport=transport, cached=cached,
+            authority_resident_batches=authority_resident_batches, shard_cache_bytes=shard_cache_bytes,
+            preparation_chunk_batches=preparation_chunk_batches, wal_layout=wal_layout)
         if progress:
             case_id, prefix = spec['case_id'], spec['family']
         self.progress('preparing-' + case_id)
@@ -1067,6 +1083,8 @@ class Campaign:
                            '--output', str(output), '--backend', mode] + shape_args
                 if resource_evidence:
                     command += ['--read-resource-evidence', 'true']
+                if cache_hit_contention:
+                    command += ['--cache-hit-contention', 'true']
                 if cold:
                     command += ['--cold-read-pass', 'true']
                 if diagnostics:
@@ -1124,16 +1142,22 @@ class Campaign:
                 for instrumented in (False, True):
                     suffix = '-transport-floor' + ('-profiled' if instrumented else '')
                     floor_output = self.results / (case_id + suffix)
+                    floor_spec = transport_floor.subsuite_floor_spec(transport, instrumented)
                     floor_command = [str(self.root / 'cloud-bin' / label / 'sharded_wal_transport_bench'),
-                        '--output', str(floor_output), '--remote-config', str(case_root / 'remote.yaml'),
-                        '--transport', transport, '--polling', 'adaptive', '--values', '256,8192',
-                        '--samples', '256' if instrumented else '512', '--warmup', '64',
-                        '--repetitions', '1' if instrumented else '3', '--shards', '5',
-                        '--profile', str(instrumented).lower()]
+                        '--output', str(floor_output), '--remote-config', str(case_root / 'remote.yaml')]
+                    floor_command += transport_floor.floor_flags(floor_spec)
                     run_recorded(floor_command, self.results / (case_id + suffix + '-process'),
                         self.deadline, expected_binary_sha256=self.state['floor_binary_sha256'])
                     if not (floor_output / 'COMPLETE').is_file():
                         raise ValueError('RAM transport floor omitted its completion receipt')
+                    transport_floor.read_floor_metrics(floor_output, floor_spec)
+                    self.state['completed_floor_cases'].append(dict(
+                        case_id=case_id, population='diagnostic' if instrumented else 'clean',
+                        output=floor_output.name, specification=floor_spec,
+                        binary_sha256=self.state['floor_binary_sha256'],
+                        files={path.name: sha(path) for path in sorted(floor_output.iterdir()) if path.is_file()},
+                        process_record=case_id + suffix + '-process.command.json'))
+                    self.progress('completed-' + case_id + suffix)
         finally:
             self.ssm_nodes(payload | {'action': 'stop'})
             self.collect_node_results(case_id)

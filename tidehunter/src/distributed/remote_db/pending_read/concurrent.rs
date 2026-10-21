@@ -28,6 +28,9 @@ impl ConcurrentRemoteDatabase {
             .remaining
             .store(limit, Ordering::Relaxed);
     }
+    pub(crate) fn read_profile_enabled(&self) -> bool {
+        self.reads.state.diagnostics.limit.load(Ordering::Relaxed) != 0
+    }
     pub fn read_profile_monitor(&self) -> ReadProfileMonitor {
         ReadProfileMonitor {
             state: self.reads.state.clone(),
@@ -94,7 +97,7 @@ impl ConcurrentRemoteDatabase {
         if keys.len() > 256 {
             return Err(LocalDbError::new("read batch exceeds 256 keys"));
         }
-        let started = Instant::now();
+        let started = self.read_profile_enabled().then(Instant::now);
         let mut values = vec![None; keys.len()];
         let mut missing = Vec::new();
         let mut groups = vec![Vec::new(); self.partition_indexes.len()];
@@ -129,8 +132,10 @@ impl ConcurrentRemoteDatabase {
             };
             (references, pin)
         };
-        self.read_resolve_ns
-            .fetch_add(elapsed(started), Ordering::Relaxed);
+        if let Some(started) = started {
+            self.read_resolve_ns
+                .fetch_add(elapsed(started), Ordering::Relaxed);
+        }
         let mut batch = ReadBatch::new(&self.reads, values, groups)?;
         batch.pin = pin;
         while !batch.complete() {
@@ -206,7 +211,7 @@ impl ConcurrentRemoteDatabase {
         cut: IndexReadCut,
     ) -> Result<GetResolution, LocalDbError> {
         self.ensure_healthy()?;
-        let started = Instant::now();
+        let started = self.read_profile_enabled().then(Instant::now);
         let resolution = {
             // A cache-only result already owns its Bytes before releasing the
             // index guard. Only asynchronous/storage work needs an allocated pin.
@@ -222,8 +227,10 @@ impl ConcurrentRemoteDatabase {
                 },
             }
         };
-        self.read_resolve_ns
-            .fetch_add(elapsed(started), Ordering::Relaxed);
+        if let Some(started) = started {
+            self.read_resolve_ns
+                .fetch_add(elapsed(started), Ordering::Relaxed);
+        }
         self.ensure_healthy()?;
         Ok(resolution)
     }

@@ -7,6 +7,18 @@ use super::*;
 use std::fs::OpenOptions;
 use std::os::unix::fs::FileExt;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct HistoryIoStats {
+    pub stream_opens: u64,
+    pub previous_slot_reads: u64,
+    pub receipt_write_ops: u64,
+    pub receipt_write_bytes: u64,
+    pub buffer_flushes: u64,
+    pub node_write_ops: u64,
+    pub node_write_bytes: u64,
+    pub sync_operations: u64,
+}
+
 const SLOT_BYTES: usize = 256;
 const NODE_CACHE_ENTRIES: usize = 64;
 type NodeCache = lru::LruCache<HistoryPointer, Node>;
@@ -53,6 +65,7 @@ pub(super) struct ReceiptHistory {
     pub(super) root: Option<HistoryPointer>,
     pub(super) counts: BTreeMap<(u32, u64), usize>,
     pub(super) chains: BTreeMap<(u32, u64), [u8; 32]>,
+    pub(super) io_stats: HistoryIoStats,
 }
 
 fn encode_slot(value: &impl Serialize) -> Result<[u8; SLOT_BYTES], LocalDbError> {
@@ -135,6 +148,7 @@ impl ReceiptHistory {
             cache: Arc::new(Mutex::new(NodeCache::new(capacity))),
             counts: BTreeMap::new(),
             chains: BTreeMap::new(),
+            io_stats: HistoryIoStats::default(),
         })
     }
 
@@ -183,6 +197,8 @@ impl ReceiptHistory {
         self.nodes
             .write_all_at(&slot, offset)
             .map_err(LocalDbError::component)?;
+        self.io_stats.node_write_ops += 1;
+        self.io_stats.node_write_bytes += SLOT_BYTES as u64;
         let pointer = HistoryPointer {
             offset,
             digest: node_digest(&slot),
@@ -355,21 +371,19 @@ impl ReceiptHistory {
         }
         Ok(receipt)
     }
-
-    pub(super) fn append(&mut self, receipt: CheckpointReceipt) -> Result<(), LocalDbError> {
-        let stream = (receipt.address.partition, receipt.version.epoch);
-        let ordinal = self.counts.get(&stream).copied().unwrap_or(0);
-        let next = ordinal
-            .checked_add(1)
-            .ok_or_else(|| LocalDbError::new("retained receipt count exhausted"))?;
-        let state = self.state(stream.0, stream.1)?;
-        let mut digest = PrefixDigest::from_state(ordinal, state);
-        digest.push(receipt);
-        let entry = HistoryEntry {
-            receipt,
-            ordinal,
-            prefix_state: digest.state(),
+    /// Append one already ordered stream as contiguous receipt slots. The
+    /// coordinator processes one stream at a time, so the fixed buffer is the
+    /// complete per-writer staging bound.
+    pub(super) fn append_stream(
+        &mut self,
+        receipts: &[CheckpointReceipt],
+    ) -> Result<(), LocalDbError> {
+        let Some(first) = receipts.first() else {
+            return Ok(());
         };
+        let stream = (first.address.partition, first.version.epoch);
+        let mut ordinal = self.counts.get(&stream).copied().unwrap_or(0);
+        let mut state = self.state(stream.0, stream.1)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -377,42 +391,94 @@ impl ReceiptHistory {
             .truncate(false)
             .open(self.stream_path(stream.0, stream.1))
             .map_err(LocalDbError::component)?;
-        let offset = (ordinal as u64)
-            .checked_mul(SLOT_BYTES as u64)
-            .ok_or_else(|| LocalDbError::new("retained receipt offset exhausted"))?;
-        offset
-            .checked_add(SLOT_BYTES as u64)
-            .ok_or_else(|| LocalDbError::new("retained receipt end exhausted"))?;
+        self.io_stats.stream_opens += 1;
         if ordinal != 0 {
+            self.io_stats.previous_slot_reads += 1;
             let previous = Self::read_receipt(&file, ordinal - 1)?;
             if previous.prefix_state != state {
                 return Err(LocalDbError::new("retained receipt terminal state differs"));
             }
         }
-        // This ordinal is outside the adopted prefix. A crashed checkpoint may
-        // have left a full-length torn slot here; reconstruct it from the newly
-        // authenticated WAL receipt, never from the uncommitted bytes. Earlier
-        // rooted slots and all immutable tree pages remain untouched.
-        file.write_all_at(&encode_slot(&entry)?, offset)
+
+        const SLOTS_PER_WRITE: usize = 16;
+        let mut buffer = [0u8; SLOTS_PER_WRITE * SLOT_BYTES];
+        let mut buffered = 0usize;
+        let mut buffer_offset = None;
+        for receipt in receipts {
+            if (receipt.address.partition, receipt.version.epoch) != stream {
+                return Err(LocalDbError::new("receipt batch spans multiple streams"));
+            }
+            let next = ordinal
+                .checked_add(1)
+                .ok_or_else(|| LocalDbError::new("retained receipt count exhausted"))?;
+            let mut digest = PrefixDigest::from_state(ordinal, state);
+            digest.push(*receipt);
+            let entry = HistoryEntry {
+                receipt: *receipt,
+                ordinal,
+                prefix_state: digest.state(),
+            };
+            let offset = (ordinal as u64)
+                .checked_mul(SLOT_BYTES as u64)
+                .ok_or_else(|| LocalDbError::new("retained receipt offset exhausted"))?;
+            offset
+                .checked_add(SLOT_BYTES as u64)
+                .ok_or_else(|| LocalDbError::new("retained receipt end exhausted"))?;
+            if buffer_offset.is_none() {
+                buffer_offset = Some(offset);
+            }
+            let slot = encode_slot(&entry)?;
+            buffer[buffered..buffered + SLOT_BYTES].copy_from_slice(&slot);
+            buffered += SLOT_BYTES;
+            self.insert(entry)?;
+            ordinal = next;
+            state = entry.prefix_state;
+            self.counts.insert(stream, ordinal);
+            self.chains.insert(stream, state);
+            if buffered == buffer.len() {
+                file.write_all_at(&buffer, buffer_offset.expect("nonempty write buffer"))
+                    .map_err(LocalDbError::component)?;
+                self.io_stats.receipt_write_ops += 1;
+                self.io_stats.receipt_write_bytes += buffer.len() as u64;
+                self.io_stats.buffer_flushes += 1;
+                buffered = 0;
+                buffer_offset = None;
+            }
+        }
+        if buffered != 0 {
+            file.write_all_at(
+                &buffer[..buffered],
+                buffer_offset.expect("nonempty write buffer"),
+            )
             .map_err(LocalDbError::component)?;
-        self.insert(entry)?;
-        self.counts.insert(stream, next);
-        self.chains.insert(stream, entry.prefix_state);
+            self.io_stats.receipt_write_ops += 1;
+            self.io_stats.receipt_write_bytes += buffered as u64;
+            self.io_stats.buffer_flushes += 1;
+        }
         Ok(())
     }
 
-    pub(super) fn sync(&self) -> Result<(), LocalDbError> {
+    pub(super) fn reset_io_stats(&mut self) {
+        self.io_stats = HistoryIoStats::default();
+    }
+
+    pub(super) fn sync(&mut self) -> Result<(), LocalDbError> {
         self.nodes.sync_all().map_err(LocalDbError::component)?;
+        self.io_stats.sync_operations += 1;
         for (&(partition, epoch), &count) in &self.counts {
             if count != 0 {
+                self.io_stats.stream_opens += 1;
                 File::open(self.stream_path(partition, epoch))
                     .and_then(|file| file.sync_all())
                     .map_err(LocalDbError::component)?;
+                self.io_stats.sync_operations += 1;
             }
         }
         File::open(&self.path)
             .and_then(|directory| directory.sync_all())
-            .map_err(LocalDbError::component)
+            .map_err(LocalDbError::component)?;
+        self.io_stats.sync_operations += 1;
+        Ok(())
     }
 
     pub(super) fn prefix(
@@ -506,14 +572,39 @@ mod tests {
     }
 
     #[test]
+    fn stream_batch_preserves_receipt_sequence_and_exact_retry_authority() {
+        let temporary = tempdir::TempDir::new("batched-receipt-history").unwrap();
+        let mut history = ReceiptHistory::open(temporary.path(), [9; 16]).unwrap();
+        let receipts: Vec<_> = (0..35).map(receipt).collect();
+        history.append_stream(&receipts).unwrap();
+        history.sync().unwrap();
+
+        assert_eq!(
+            history.prefix(2, 1, receipts.len()).unwrap(),
+            crate::distributed::tcp::checkpoint::prefix_digest(
+                [9; 16],
+                2,
+                1,
+                receipts.iter().copied(),
+            ),
+        );
+        for expected in receipts {
+            assert_eq!(
+                history.lookup(expected.id).unwrap(),
+                Some(expected.authenticated())
+            );
+        }
+    }
+
+    #[test]
     fn immutable_roots_page_exact_outcomes_without_retaining_completed_maps() {
         let temporary = tempdir::TempDir::new("pageable-retry-authority").unwrap();
         let mut history = ReceiptHistory::open(temporary.path(), [9; 16]).unwrap();
-        history.append(receipt(0)).unwrap();
+        history.append_stream(&[receipt(0)]).unwrap();
         history.sync().unwrap();
         let first_root = history.clone();
         for sequence in 1..257 {
-            history.append(receipt(sequence)).unwrap();
+            history.append_stream(&[receipt(sequence)]).unwrap();
         }
         history.sync().unwrap();
         for sequence in 0..257 {
@@ -553,8 +644,8 @@ mod tests {
     fn retained_tree_pointer_never_turns_missing_or_corrupt_pages_into_absence() {
         let temporary = tempdir::TempDir::new("missing-retry-page").unwrap();
         let mut history = ReceiptHistory::open(temporary.path(), [9; 16]).unwrap();
-        history.append(receipt(0)).unwrap();
-        history.append(receipt(1)).unwrap();
+        history.append_stream(&[receipt(0)]).unwrap();
+        history.append_stream(&[receipt(1)]).unwrap();
         history.sync().unwrap();
         let pointer = history.root.unwrap();
         history
@@ -589,7 +680,7 @@ mod tests {
     fn immutable_node_hits_avoid_io_and_reopen_starts_untrusted() {
         let temporary = tempdir::TempDir::new("retry-node-cache").unwrap();
         let mut history = ReceiptHistory::open(temporary.path(), [9; 16]).unwrap();
-        history.append(receipt(0)).unwrap();
+        history.append_stream(&[receipt(0)]).unwrap();
         history.sync().unwrap();
         let root = history.root.unwrap();
         history.cache.lock().clear();

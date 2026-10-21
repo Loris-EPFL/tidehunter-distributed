@@ -367,23 +367,28 @@ impl StreamReceiver {
         Ok((len, Some(credit)))
     }
 
+    pub(super) fn receive_ready(&self) -> bool {
+        self.order.head().is_some_and(|index| {
+            let slot = &self.slots[index];
+            slot.ordinal.is_some() && slot.offset < slot.len
+        })
+    }
     pub(super) fn consumed(&self) -> u64 {
         self.order.consumed()
     }
 }
-
 /// One independent control lane. Updates coalesce while a control send owns
 /// the reserved slot; controls never spend data credit and never create ACKs.
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct ControlWindow {
     next_ordinal: u64,
-    last_sent_credit: u64,
+    advertised_credit: u64,
     in_flight: bool,
 }
 
 impl ControlWindow {
     pub(super) fn prepare(&self, consumed: u64) -> io::Result<Option<u64>> {
-        if self.in_flight || consumed <= self.last_sent_credit {
+        if self.in_flight || consumed <= self.advertised_credit {
             return Ok(None);
         }
         let next = self
@@ -403,14 +408,23 @@ impl ControlWindow {
                     .next_ordinal
                     .checked_add(1)
                     .ok_or_else(|| invalid("EFA-direct control ordinal exhausted"))?
-            || consumed < self.last_sent_credit
+            || consumed < self.advertised_credit
         {
             return Err(invalid("invalid EFA-direct control post"));
         }
         self.next_ordinal = ordinal;
-        self.last_sent_credit = consumed;
+        self.advertised_credit = consumed;
         self.in_flight = true;
         Ok(())
+    }
+
+    /// A successfully posted DATA packet advertises cumulative receive credit.
+    pub(super) fn advertised_by_data(&mut self, consumed: u64) -> bool {
+        if consumed <= self.advertised_credit {
+            return false;
+        }
+        self.advertised_credit = consumed;
+        true
     }
 
     pub(super) fn complete(&mut self, ordinal: u64) -> io::Result<()> {
@@ -421,7 +435,7 @@ impl ControlWindow {
         Ok(())
     }
     pub(super) fn needs_send(&self, consumed: u64) -> bool {
-        !self.in_flight && consumed > self.last_sent_credit
+        !self.in_flight && consumed > self.advertised_credit
     }
 }
 #[cfg(test)]

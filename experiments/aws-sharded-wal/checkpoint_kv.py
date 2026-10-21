@@ -6,10 +6,16 @@ Sui supervisor owns unconditional export and termination, including failures.
 """
 import json
 import shutil
+import csv
 import tarfile
+from pathlib import Path
+import math
+
+import transport_floor
 
 from checkpoint_matrix import efa_snapshot, efa_proof, validate_efa_proof, validate_provider
-from guest import Campaign, upload, write_json, sha
+from checkpoint_matrix import fabric_local_log, fabric_local_archive_log
+from guest import Campaign, upload, write_json, sha, benchmark_case_identity
 
 
 def validate_options(options):
@@ -70,7 +76,10 @@ def plan(options, transports):
                 for family in ('warm', 'cache', 'cold'):
                     cases.append(dict(shape=list(shape), repetition=repeat, transport=transport,
                                       cold=family == 'cold', cached=family == 'cache', diagnostics=False,
-                                      authority_resident_batches=None))
+                                      authority_resident_batches=None,
+                                      workload_batches=3200 if shape == (8192, 32, 32) and family == 'warm' else None,
+                                      cache_hit_contention=shape[1] == 1 and family == 'cache',
+                                      transport_floor=repeat == 0 and shape == (256, 1, 1) and family == 'warm'))
             cases.append(dict(shape=[8192, 1, 1], repetition=repeat, transport=transport,
                               cold=True, cached=False, diagnostics=False,
                               authority_resident_batches=32))
@@ -81,6 +90,302 @@ def plan(options, transports):
                                   cold=True, cached=False, diagnostics=True,
                                   authority_resident_batches=None))
     return cases
+
+
+def validate_contention(path, spec, mode):
+    """Recompute the opt-in hit-only population from raw per-caller API samples."""
+    # Each outer case starts a fresh --repetitions 1 process; its internal index is zero.
+    rows = [json.loads(line) for line in Path(path).read_text().splitlines()]
+    if len(rows) != 2:
+        raise ValueError('cache contention requires separate one/eight-caller populations')
+    backend = 'native_value_wal_barrier' if mode == 'native-sync' else {
+        'tcp': 'experimental_tcp_authority', 'efa': 'experimental_efa_authority',
+        'efa-direct': 'experimental_efa_direct_authority'}[spec['transport']]
+    for row, callers in zip(rows, (1, 8)):
+        if (row.get('api') != 'distributed::sui::Db::get'
+                or row.get('backend') != backend
+                or any(type(row.get(key)) is not int for key in
+                       ('value_bytes', 'batch_size', 'window', 'repetition'))
+                or [row.get(k) for k in ('value_bytes', 'batch_size', 'window')] != spec['shape']
+                or row.get('repetition') != 0
+                or (mode == 'tcp' and row.get('transport') != spec['transport'])):
+            raise ValueError('cache contention API/shape/transport identity differs')
+        observed = row['observation']
+        samples = observed['get_api_intervals_ns_by_caller']
+        writes = observed['write_api_intervals_ns']
+        wall = observed['phase_wall_ns']
+        if (observed['callers'] != callers or observed['reads_per_caller'] != 1024
+                or observed['concurrent_durable_writes'] != 32
+                or any(type(observed[key]) is not int for key in
+                       ('callers', 'reads_per_caller', 'concurrent_durable_writes'))
+                or len(samples) != callers or any(len(values) != 1024 for values in samples)
+                or len(writes) != 32 or type(wall) is not int or wall <= 0):
+            raise ValueError('cache contention raw sample population/time differs')
+        for intervals in [*samples, writes]:
+            previous_end = 0
+            for interval in intervals:
+                if (not isinstance(interval, list) or len(interval) != 2
+                        or any(type(ns) is not int for ns in interval)
+                        or not previous_end <= interval[0] < interval[1] <= wall):
+                    raise ValueError('cache contention API intervals are invalid or unordered')
+                previous_end = interval[1]
+        overlaps = [sum(start < writes[index // 32][1] and writes[index // 32][0] < end
+                        for index, (start, end) in enumerate(intervals)) for intervals in samples]
+        if any(count == 0 for count in overlaps) or overlaps != observed.get('overlapping_reads_by_caller'):
+            raise ValueError('cache contention has no verified read/write API overlap for each caller')
+        available = mode == 'tcp'
+        if observed['remote_cache_counter_available'] is not available:
+            raise ValueError('cache contention cache-counter availability differs')
+        expected = (callers * 1024, 0, 0) if available else (None, None, None)
+        if available and any(type(observed.get(key)) is not int for key in
+                             ('remote_hits', 'remote_misses', 'remote_read_rpcs')):
+            raise ValueError('cache contention counters must be nonnegative integers')
+        if tuple(observed.get(name) for name in ('remote_hits', 'remote_misses', 'remote_read_rpcs')) != expected:
+            raise ValueError('cache contention lacks verified hit-only, zero-RPC service')
+    return rows
+
+
+def validate_checkpoint_records(directory, spec, mode):
+    directory = Path(directory)
+    rows = [json.loads(line) for line in (directory / 'checkpoint_diagnostics.jsonl').read_text().splitlines()]
+    with (directory / 'write_windows.csv').open() as stream:
+        windows = list(csv.DictReader(stream))
+    if mode != 'tcp' or not spec['diagnostics']:
+        if rows:
+            raise ValueError('clean/native population contains checkpoint diagnostic captures')
+        return
+    if len(rows) != len(windows):
+        raise ValueError('diagnostic checkpoint windows are missing or duplicated')
+    for row, window in zip(rows, windows):
+        if (row.get('diagnostic_available') is not True or row.get('phase') != window['phase']
+                or row.get('sample') != int(window['sample'])
+                or row.get('backend') != window['backend'] or row.get('transport') != spec['transport']
+                or any(row.get(key) != int(window[key]) for key in
+                       ('value_bytes', 'batch_size', 'window', 'repetition'))):
+            raise ValueError('checkpoint diagnostics lost their exact timed-window identity')
+        snapshot = row['snapshot']
+        before, after = row['cursor_before'], snapshot['next_cursor']
+        records = snapshot['records']
+        dropped = snapshot['dropped_records']
+        if (type(before) is not int or type(after) is not int or not 0 <= before <= after <= 2**64 - 1
+                or type(dropped) is not int or dropped != max(0, after - 128)
+                or not isinstance(records, list) or len(records) > 128
+                or type(row.get('record_count')) is not int):
+            raise ValueError('invalid bounded checkpoint diagnostic cursor/cardinality')
+        # The producer starts at cursor zero and evicts exactly one oldest entry
+        # on each append to its full 128-entry ring. dropped is a global count,
+        # not the number lost since this particular window's before cursor.
+        retained_start = max(before, dropped)
+        retained_count = after - retained_start
+        if (not 0 <= retained_count <= 128 or len(records) != retained_count
+                or row['record_count'] != retained_count):
+            raise ValueError('checkpoint diagnostics omitted their exact retained suffix')
+        for ordinal, record in enumerate(records):
+            cursor = record['cursor']
+            if type(cursor) is not int or cursor != retained_start + ordinal:
+                raise ValueError('checkpoint diagnostic record outside its contiguous retained suffix')
+            if record['trigger'] is None:
+                if record.get('outcome') is not None or record.get('pressure_wait_ns') is not None:
+                    raise ValueError('checkpoint completion must not invent a pressure population')
+            elif (record['trigger'] not in ('Tail', 'KnownIdentities', 'PartitionWindow', 'IndexReservation')
+                    or record.get('outcome') not in ('AlreadyAvailable', 'AfterDrain', 'AfterExistingCapture',
+                                                   'AfterNewCapture', 'CapacityError', 'ProgressError')
+                    or type(record.get('pressure_wait_ns')) is not int):
+                raise ValueError('unknown or unavailable checkpoint pressure reason/outcome')
+            for key, value in record.items():
+                if key in ('trigger', 'outcome', 'requested_cut', 'captured_cut'):
+                    continue
+                if value is not None and (type(value) is not int or value < 0):
+                    raise ValueError('checkpoint diagnostic span/counter must be nonnegative or unavailable')
+            for key in ('requested_cut', 'captured_cut'):
+                cut = record.get(key)
+                if cut is None:
+                    continue
+                if (not isinstance(cut, dict) or set(cut) != {'batch', 'operation_index'}
+                        or type(cut['operation_index']) is not int or not 0 <= cut['operation_index'] <= 2**32 - 1
+                        or not isinstance(cut['batch'], dict) or set(cut['batch']) != {'epoch', 'sequence'}
+                        or any(type(value) is not int or not 0 <= value <= 2**64 - 1
+                               for value in cut['batch'].values())):
+                    raise ValueError('checkpoint diagnostic logical cut is malformed')
+
+
+def read_service_evidence(directory, mode, owner_partitions=range(5)):
+    """Keep page-cache evidence, queued reads and charged device IO distinct."""
+    directory = Path(directory)
+    expected_owners = {str(partition) for partition in owner_partitions}
+    if mode == 'tcp' and not expected_owners:
+        raise ValueError('remote read-service evidence needs its configured owner population')
+    with (directory / 'read_path_evidence.csv').open() as stream:
+        rows = list(csv.DictReader(stream))
+    boundaries = {}
+    for row in rows:
+        identity = (row['phase'], row['role'], row['partition'])
+        pair = boundaries.setdefault(identity, {})
+        if row['boundary'] in pair or row['boundary'] not in ('before', 'after'):
+            raise ValueError('duplicate or invalid read-service evidence boundary')
+        pair[row['boundary']] = row
+    phases = {}
+    fields = ('cache_hits', 'cache_misses', 'wal_reads', 'resident_read_successes', 'async_read_submissions')
+    for (phase, role, partition), pair in boundaries.items():
+        if set(pair) != {'before', 'after'}:
+            raise ValueError('read-service evidence lacks complete interval')
+        delta = {}
+        for field in fields:
+            before, after = int(pair['before'][field]), int(pair['after'][field])
+            if before < 0 or after < before:
+                raise ValueError('read-service counter reset or negative evidence')
+            delta[field] = after - before
+        phases.setdefault(phase, dict(owners={}, frontend=None, physical={}))
+        if role == 'frontend':
+            phases[phase]['frontend'] = delta
+        elif role == 'storage':
+            phases[phase]['owners'][partition] = delta
+        else:
+            raise ValueError('unknown read-service evidence role')
+    with (directory / 'read_io.csv').open() as stream:
+        for row in csv.DictReader(stream):
+            evidence = phases.setdefault(row['phase'], dict(owners={}, frontend=None, physical={}))
+            partition, value = row['partition'], int(row['physical_read_bytes'])
+            if value < 0 or partition in evidence['physical']:
+                raise ValueError('invalid/duplicate charged physical-read evidence')
+            evidence['physical'][partition] = value
+    for phase, evidence in phases.items():
+        physical = evidence['physical']
+        if physical and set(physical) != (expected_owners if mode == 'tcp' else {'0'}):
+            raise ValueError('physical-read interval lacks the exact owner process population')
+        charged = sum(physical.values()) if physical else None
+        owners = evidence['owners']
+        if owners and (mode != 'tcp' or set(owners) != expected_owners):
+            raise ValueError('read-service counters lack the exact configured owner population')
+        owner_available = mode == 'tcp' and set(owners) == expected_owners
+        evidence['owner_counters_available'] = owner_available
+        evidence['charged_physical_read_bytes'] = charged
+        evidence['physical_io_scope'] = (
+            'positive_process_interval_IO_not_per_value_device_latency' if charged else
+            'zero_charged_process_reads_in_this_interval' if charged == 0 else 'unavailable')
+        evidence['owner_resident_read_successes'] = (
+            sum(owner['resident_read_successes'] for owner in owners.values()) if owner_available else None)
+        evidence['owner_read_service_scope'] = (
+            'unavailable_owner_counters' if not owner_available else
+            'resident_RAM_pagecache_service_observed_not_device_latency'
+            if evidence['owner_resident_read_successes'] else 'cache_state_not_established')
+        evidence['owner_async_submissions'] = (
+            sum(owner['async_read_submissions'] for owner in owners.values()) if owner_available else None)
+        evidence['async_submissions_prove_device_io'] = False
+        evidence['api'] = phase
+    return phases
+
+
+def completed_case_ids(planned, completed):
+    """Bind each complete backend pair to one distinct planned outer case."""
+    if len(completed) != 2 * len(planned):
+        raise ValueError('KV case missing its exact native/distributed population')
+    case_ids, seen = [], set()
+    for ordinal, spec in enumerate(planned):
+        case_id, variant = benchmark_case_identity('current', spec['shape'], spec['repetition'],
+            storage=True, cold=spec['cold'], diagnostics=spec['diagnostics'],
+            transport=spec['transport'], cached=spec['cached'],
+            authority_resident_batches=spec['authority_resident_batches'],
+            shard_cache_bytes=spec.get('shard_cache_bytes', 0),
+            preparation_chunk_batches=spec.get('preparation_chunk_batches', 16),
+            wal_layout=spec.get('wal_layout'))
+        pair = completed[2 * ordinal:2 * ordinal + 2]
+        if (case_id in seen or {row['backend'] for row in pair} != {'native-sync', 'tcp'}
+                or any(row.get('case_id') != case_id or row.get('build') != 'current'
+                       or row.get('variant') != variant
+                       or row.get('transport') != (spec['transport'] if row['backend'] == 'tcp' else 'local')
+                       for row in pair)):
+            raise ValueError('KV completed pair differs from its planned outer case identity')
+        seen.add(case_id)
+        case_ids.append(case_id)
+    return case_ids
+
+
+def validate_auxiliary(root, state, cfg):
+    """Fail closed on added controls; never relax the original paired-case count."""
+    root = Path(root)
+    expected_plan = plan(cfg['kv_suite'], cfg['transports'])
+    completed = state.get('completed_cases', [])
+    floors = state.get('completed_floor_cases', [])
+    if (state.get('plan') != expected_plan
+            or state.get('floor_binary_sha256') != cfg['binaries']['transport-floor']):
+        raise ValueError('auxiliary controls differ from the immutable full KV plan/build')
+    expected_floors, contention, read_service, fabric = [], [], [], []
+    for spec, case_id in zip(expected_plan, completed_case_ids(expected_plan, completed), strict=True):
+        for mode in ('native-sync', 'tcp'):
+            directory = root / (case_id + '-' + mode)
+            if not (directory / 'COMPLETE').is_file():
+                raise ValueError('KV case omitted its original complete value/reopen audit')
+            validate_checkpoint_records(directory, spec, mode)
+            read_service.append(dict(case_id=case_id, mode=mode, diagnostic=spec['diagnostics'],
+                phases=read_service_evidence(directory, mode,
+                    owner_partitions=[node['partition'] for node in cfg['nodes']])))
+            direct_diagnostic = spec['transport'] == 'efa-direct' and spec['diagnostics'] and mode == 'tcp'
+            log = root / (case_id + '-' + mode + '-process.stderr.log')
+            fabric.append(dict(case_id=case_id, role=mode, population='diagnostic' if spec['diagnostics'] else 'clean',
+                evidence=fabric_local_log(log, required=direct_diagnostic, forbidden=not direct_diagnostic)))
+        # These five logs span the whole case. The first clean scalar case also
+        # runs the later diagnostic RAM control; its node logs are mixed, never clean.
+        node_diagnostic = spec['diagnostics'] or spec.get('transport_floor', False)
+        for partition in range(5):
+            archive_path = root / 'nodes' / case_id / f'node-{partition}.tar.gz'
+            with tarfile.open(archive_path, 'r:gz') as archive:
+                evidence = fabric_local_archive_log(archive, 'node.stderr.log',
+                    required=spec['transport'] == 'efa-direct' and node_diagnostic,
+                    forbidden=spec['transport'] != 'efa-direct' or not node_diagnostic)
+            fabric.append(dict(case_id=case_id, role='storage', partition=partition,
+                population='mixed_clean_KV_and_diagnostic_RAM' if spec.get('transport_floor', False)
+                           else 'diagnostic' if spec['diagnostics'] else 'clean',
+                archive=str(archive_path), evidence=evidence))
+        if spec.get('cache_hit_contention', False):
+            for mode in ('native-sync', 'tcp'):
+                output = root / (case_id + '-' + mode)
+                if not (output / 'COMPLETE').is_file():
+                    raise ValueError('cache contention omitted full-case completion/audit')
+                contention.append(dict(case_id=case_id, mode=mode,
+                    observations=validate_contention(output / 'cache_contention.jsonl', spec, mode)))
+        if spec.get('transport_floor', False):
+            for instrumented in (False, True):
+                suffix = '-transport-floor' + ('-profiled' if instrumented else '')
+                expected_floors.append((case_id, suffix, spec['transport'], instrumented))
+    if len(floors) != len(expected_floors):
+        raise ValueError('RAM floor control population is incomplete')
+    metrics = []
+    base = Path(cfg['run_root'])
+    for observed, (case_id, suffix, transport, instrumented) in zip(floors, expected_floors):
+        spec = transport_floor.subsuite_floor_spec(transport, instrumented)
+        output = case_id + suffix
+        process_name = output + '-process.command.json'
+        if (observed.get('case_id') != case_id or observed.get('output') != output
+                or observed.get('population') != ('diagnostic' if instrumented else 'clean')
+                or observed.get('specification') != spec
+                or observed.get('binary_sha256') != cfg['binaries']['transport-floor']
+                or observed.get('process_record') != process_name):
+            raise ValueError('RAM floor source/case/population identity differs')
+        directory = root / output
+        files = {path.name: sha(path) for path in sorted(directory.iterdir()) if path.is_file()}
+        if files != observed.get('files'):
+            raise ValueError('RAM floor raw evidence inventory/hash differs')
+        process = json.loads((root / process_name).read_text())
+        command = [str(base / 'cloud-bin/current/sharded_wal_transport_bench'),
+                   '--output', str(base / 'checkpoint-results/kv' / output),
+                   '--remote-config', str(base / 'cases' / case_id / 'remote.yaml')]
+        command += transport_floor.floor_flags(spec)
+        if (process.get('exit_code') != 0 or process.get('binary_sha256') != cfg['binaries']['transport-floor']
+                or not math.isfinite(process.get('elapsed_seconds', float('nan')))
+                or process['elapsed_seconds'] <= 0 or process.get('command') != command):
+            raise ValueError('RAM floor process command/build/completion differs')
+        values = transport_floor.read_floor_metrics(directory, spec)
+        fabric.append(dict(case_id=case_id, role='ram-control', population=observed['population'],
+            evidence=fabric_local_log(root / (output + '-process.stderr.log'),
+                required=transport == 'efa-direct' and instrumented,
+                forbidden=transport != 'efa-direct' or not instrumented)))
+        metrics.append(dict(case_id=case_id, population=observed['population'], specification=spec,
+            metrics=[dict(kind=kind, phase=phase, counter=counter, value=value)
+                     for (kind, phase, counter), value in sorted(values.items())]))
+    return dict(ram_controls=metrics, cache_contention=contention, read_service=read_service,
+                fabric_local_diagnostics=fabric,
+                scope='RAM exchange includes TLS/software/payload validation; not pure wire or device IO')
 
 
 class CheckpointKvCampaign(Campaign):
@@ -96,7 +401,7 @@ class CheckpointKvCampaign(Campaign):
         self.results.mkdir()
         self.session, self.s3, self.ssm, self.ec2 = parent.session, parent.s3, parent.ssm, parent.ec2
         self.deadline = parent.deadline
-        self.state = dict(complete=False, completed_cases=[], failures=[], plan=plan(
+        self.state = dict(complete=False, completed_cases=[], completed_floor_cases=[], failures=[], plan=plan(
             parent.cfg['kv_suite'], parent.cfg['transports']),
             source_archive_sha256=parent.cfg['source_archive_sha256'],
             binary_sha256=parent.cfg['binaries']['storage-node'],
@@ -167,18 +472,15 @@ class CheckpointKvCampaign(Campaign):
                       transport_floor_probe=spec.get('transport_floor', False),
                       preparation_chunk_batches=spec.get('preparation_chunk_batches', 16),
                       workload_batches=spec.get('workload_batches'),
+                      cache_hit_contention=spec.get('cache_hit_contention', False),
                       workload_reads=spec.get('workload_reads'), wal_layout=spec.get('wal_layout'))
         completed = self.state['completed_cases'][completed_before:]
-        if len(completed) != 2 or {row['backend'] for row in completed} != {'native-sync', 'tcp'}:
-            raise ValueError('KV case missing its native or distributed control')
+        case_id = completed_case_ids([spec], completed)[0]
         if before is not None:
             after = efa_snapshot(identity)
             write_json(self.results / f'efa-{ordinal}-after.json', after)
             write_json(self.results / f'efa-{ordinal}-proof.json', efa_proof(before, after, identity))
-            case_ids = {row['case_id'] for row in completed}
-            if len(case_ids) != 1:
-                raise ValueError('KV paired case identities differ')
-            self.verify_node_hardware(case_ids.pop(), spec['transport'])
+            self.verify_node_hardware(case_id, spec['transport'])
 
     def run(self):
         try:
@@ -188,6 +490,7 @@ class CheckpointKvCampaign(Campaign):
                 self.run_planned_case(ordinal, spec)
             if len(self.state['completed_cases']) != 2 * len(self.state['plan']):
                 raise ValueError('KV suite incomplete')
+            validate_auxiliary(self.results, self.state, self.cfg)
             self.state['complete'] = True
         except BaseException as error:
             self.state['failures'].append(repr(error))

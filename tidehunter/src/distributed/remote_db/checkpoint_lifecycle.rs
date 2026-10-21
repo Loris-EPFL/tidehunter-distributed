@@ -11,6 +11,14 @@ struct CompletedCheckpoint {
     bytes: usize,
     history: ReceiptHistory,
     cut: Option<MutationVersion>,
+    staging_manifest_ns: Option<u64>,
+    receipt_history_ns: Option<u64>,
+    receipt_history_sync_ns: Option<u64>,
+    node_prefix_wait_ns: Option<u64>,
+    index_prepare_ns: Option<u64>,
+    index_persist_ns: Option<u64>,
+    metadata_install_ns: Option<u64>,
+    history_io: super::receipt_history::HistoryIoStats,
 }
 
 pub(super) struct BackgroundCheckpoint {
@@ -49,14 +57,6 @@ impl RemoteDatabase {
                 .store(true, std::sync::atomic::Ordering::Release);
             self.reads.poison();
         }
-        result
-    }
-
-    pub(super) fn force_admission_checkpoint(&mut self) -> Result<(), LocalDbError> {
-        let started = Instant::now();
-        let result = self.drain().and_then(|()| self.commit_checkpoint());
-        self.write_stats.foreground_checkpoint_ns += elapsed(started);
-        self.write_stats.foreground_checkpoint_count += 1;
         result
     }
 
@@ -113,6 +113,8 @@ impl RemoteDatabase {
         };
         let cut = self.latest;
         let index_cut = cut.map_or(IndexReadCut::BeforeAll, IndexReadCut::At);
+        let diagnostics_enabled = self.checkpoint_diagnostics.is_some();
+        let index_prepare_started = diagnostics_enabled.then(Instant::now);
         let prepared = {
             let index = self.index.read();
             match floor {
@@ -121,6 +123,7 @@ impl RemoteDatabase {
             }
         }
         .map_err(LocalDbError::component)?;
+        let index_prepare_ns = index_prepare_started.map(elapsed);
         let staging = CheckpointFiles {
             epoch: commit.epoch,
             generation: commit.generation,
@@ -169,6 +172,7 @@ impl RemoteDatabase {
             })
             .collect();
         let mut history = self.receipt_history.clone();
+        history.reset_io_stats();
         let mut staging_manifest = self.manifest.clone();
         staging_manifest.checkpoint_staging = Some(staging.clone());
         let path = self.path.clone();
@@ -202,25 +206,30 @@ impl RemoteDatabase {
                     // Reserve output names durably before any checkpoint artifact
                     // can be written. This immutable snapshot cannot race owner
                     // appends, which do not replace the authority manifest.
+                    let phase_started = diagnostics_enabled.then(Instant::now);
                     persist_manifest(&path, &staging_manifest)?;
+                    let staging_manifest_ns = phase_started.map(elapsed);
                     #[cfg(test)]
                     if interruption == Some(0) {
                         return Err(LocalDbError::new(
                             "injected interruption after checkpoint intent",
                         ));
                     }
-                    for (_, receipts) in by_stream {
-                        for receipt in receipts {
-                            history.append(receipt)?;
-                        }
+                    let phase_started = diagnostics_enabled.then(Instant::now);
+                    for receipts in by_stream.values() {
+                        history.append_stream(receipts)?;
                     }
+                    let receipt_history_ns = phase_started.map(elapsed);
                     #[cfg(test)]
                     if interruption == Some(4) {
                         return Err(LocalDbError::new(
                             "injected interruption before receipt metadata sync",
                         ));
                     }
+                    let phase_started = diagnostics_enabled.then(Instant::now);
                     history.sync()?;
+                    let receipt_history_sync_ns = phase_started.map(elapsed);
+                    let phase_started = diagnostics_enabled.then(Instant::now);
                     let streams = endpoint_map(&mut jobs, |_, (client, partition, streams)| {
                         let mut client = client.lock();
                         let mut output = Vec::with_capacity(streams.len());
@@ -252,9 +261,12 @@ impl RemoteDatabase {
                     .into_iter()
                     .flatten()
                     .collect();
+                    let node_prefix_wait_ns = phase_started.map(elapsed);
+                    let phase_started = diagnostics_enabled.then(Instant::now);
                     let persisted = prepared
                         .persist(&path.join(commit.index_name()))
                         .map_err(LocalDbError::component)?;
+                    let index_persist_ns = phase_started.map(elapsed);
                     #[cfg(test)]
                     if interruption == Some(1) {
                         return Err(LocalDbError::new(
@@ -281,8 +293,10 @@ impl RemoteDatabase {
                     commit.index_files.dedup();
                     commit.metadata_bytes = encoded.len() as u64;
                     commit.metadata_digest = Blake2b::<U32>::digest(&encoded).into();
+                    let phase_started = diagnostics_enabled.then(Instant::now);
                     install_metadata(&path, &commit.metadata_name(), &encoded)
                         .map_err(LocalDbError::component)?;
+                    let metadata_install_ns = phase_started.map(elapsed);
                     #[cfg(test)]
                     if interruption == Some(2) {
                         return Err(LocalDbError::new(
@@ -294,8 +308,16 @@ impl RemoteDatabase {
                         persisted,
                         batches,
                         bytes,
+                        history_io: history.io_stats,
                         history,
                         cut,
+                        staging_manifest_ns,
+                        receipt_history_ns,
+                        receipt_history_sync_ns,
+                        node_prefix_wait_ns,
+                        index_prepare_ns,
+                        index_persist_ns,
+                        metadata_install_ns,
                     })
                 })();
                 let _ = sender.send(result);
@@ -341,6 +363,30 @@ impl RemoteDatabase {
         drop(background);
         let result = (|| {
             let completed = completed??;
+            let mut diagnostic = CheckpointDiagnostic {
+                epoch: completed.commit.epoch,
+                generation: Some(completed.commit.generation),
+                captured_cut: completed.cut,
+                captured_batches: Some(completed.batches),
+                captured_bytes: Some(completed.bytes),
+                staging_manifest_ns: completed.staging_manifest_ns,
+                receipt_history_ns: completed.receipt_history_ns,
+                receipt_history_sync_ns: completed.receipt_history_sync_ns,
+                history_stream_opens: Some(completed.history_io.stream_opens),
+                history_previous_slot_reads: Some(completed.history_io.previous_slot_reads),
+                history_receipt_write_ops: Some(completed.history_io.receipt_write_ops),
+                history_receipt_write_bytes: Some(completed.history_io.receipt_write_bytes),
+                history_buffer_flushes: Some(completed.history_io.buffer_flushes),
+                history_node_write_ops: Some(completed.history_io.node_write_ops),
+                history_node_write_bytes: Some(completed.history_io.node_write_bytes),
+                history_sync_operations: Some(completed.history_io.sync_operations),
+                node_prefix_wait_ns: completed.node_prefix_wait_ns,
+                index_prepare_ns: completed.index_prepare_ns,
+                index_persist_ns: completed.index_persist_ns,
+                metadata_install_ns: completed.metadata_install_ns,
+                ..CheckpointDiagnostic::default()
+            };
+            let adoption_started = self.checkpoint_diagnostics.is_some().then(Instant::now);
             // Durable adoption precedes both live installation and reclamation.
             // The worker never changes the root while this owner accepts writes.
             self.manifest.checkpoint_obsolete = self.manifest.checkpoint.replace(completed.commit);
@@ -361,17 +407,23 @@ impl RemoteDatabase {
                 .checkpoint_tail_bytes
                 .checked_sub(completed.bytes)
                 .ok_or_else(|| LocalDbError::new("checkpoint captured byte count exceeds tail"))?;
+            diagnostic.owner_adoption_ns = adoption_started.map(elapsed);
             #[cfg(test)]
             if self.checkpoint_interruption == Some(3) {
                 return Err(LocalDbError::new(
                     "checkpoint committed; injected interruption before obsolete-file cleanup",
                 ));
             }
+            let cleanup_started = self.checkpoint_diagnostics.is_some().then(Instant::now);
             cleanup_checkpoint_artifacts(&self.path, &mut self.manifest).map_err(|error| {
                 LocalDbError::new(format!(
                     "checkpoint committed; artifact cleanup incomplete: {error}"
                 ))
-            })
+            })?;
+            diagnostic.obsolete_cleanup_ns = cleanup_started.map(elapsed);
+            let diagnostic = self.record_checkpoint_diagnostic(diagnostic);
+            self.last_checkpoint_diagnostic = Some(diagnostic);
+            Ok(())
         })();
         self.write_stats.checkpoint_ns += elapsed(started);
         self.write_stats.background_checkpoint_ns += elapsed(checkpoint_started);

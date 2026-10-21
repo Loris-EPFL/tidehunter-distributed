@@ -52,6 +52,7 @@ jobs:
     outputs:
       enabled: ${{ steps.settings.outputs.enabled }}
       package_sha256: ${{ steps.package.outputs.package_sha256 }}
+      package_artifact_name: ${{ steps.package.outputs.package_artifact_name }}
     env:
       CARGO_BUILD_JOBS: "2"
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -159,15 +160,18 @@ jobs:
       - name: Package only current build inputs and local proof
         if: steps.settings.outputs.enabled == 'true'
         id: package
+        env:
+          PACKAGE_ARTIFACT_NAME: campaign-inputs-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           python3 engine/experiments/aws-sharded-wal/ci_prepare.py package \
             --inputs "$RUNNER_TEMP/benchmark-inputs" --fixture "$RUNNER_TEMP/fixture.tar.gz" \
             --output "$RUNNER_TEMP/campaign-inputs.tar.gz"
+          printf 'package_artifact_name=%s\n' "$PACKAGE_ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
       - name: Transfer the hash-bound package to a separate orchestration VM
         if: steps.settings.outputs.enabled == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: campaign-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ steps.package.outputs.package_artifact_name }}
           path: ${{ runner.temp }}/campaign-inputs.tar.gz
           compression-level: 0
           retention-days: 2
@@ -210,11 +214,12 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/operator-tools"
           "$RUNNER_TEMP/operator-tools/bin/pip" install --disable-pip-version-check --retries 2 --timeout 30 boto3==1.35.99 PyYAML==6.0.2
           echo "$RUNNER_TEMP/operator-tools/bin" >> "$GITHUB_PATH"
-      - name: Retrieve only this workflow's current package
+      # A partial rerun keeps the successful prepare job's outputs, not its attempt.
+      - name: Retrieve the successful prepare job's exact package
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         timeout-minutes: 10
         with:
-          name: campaign-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ needs.prepare.outputs.package_artifact_name }}
           path: ${{ runner.temp }}/incoming
       - name: Verify and restore the source-bound package before AWS access
         timeout-minutes: 10

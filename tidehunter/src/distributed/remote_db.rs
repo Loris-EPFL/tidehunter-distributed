@@ -496,6 +496,21 @@ enum OpenInterruption {
     AfterReadSetup,
 }
 
+#[derive(Clone, Copy)]
+enum AdmissionPressure {
+    Tail {
+        encoded_bytes: usize,
+        identity: bool,
+    },
+    Partition {
+        partition: usize,
+        records: usize,
+    },
+    Index {
+        additional_bytes: usize,
+    },
+}
+
 struct PendingAppend {
     first: BatchVersion,
     reply: Pending<Vec<DurableBatch>>,
@@ -554,12 +569,252 @@ pub struct AuthorityWriteStats {
     pub durable_receipt_publication_waiting_peak: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct CheckpointDiagnostic {
+    pub cursor: u64,
+    pub epoch: u64,
+    pub generation: Option<u64>,
+    pub checkpoint_generation: Option<u64>,
+    pub trigger: Option<CheckpointTrigger>,
+    pub requested_cut: Option<MutationVersion>,
+    pub captured_cut: Option<MutationVersion>,
+    pub captured_batches: Option<usize>,
+    pub captured_bytes: Option<usize>,
+    pub reserved_index_bytes_before: usize,
+    pub reserved_index_bytes_after: usize,
+    pub pressure_wait_ns: Option<u64>,
+    pub drain_ns: Option<u64>,
+    pub existing_capture_wait_ns: Option<u64>,
+    pub new_capture_wait_ns: Option<u64>,
+    pub staging_manifest_ns: Option<u64>,
+    pub receipt_history_ns: Option<u64>,
+    pub receipt_history_sync_ns: Option<u64>,
+    pub history_stream_opens: Option<u64>,
+    pub history_previous_slot_reads: Option<u64>,
+    pub history_receipt_write_ops: Option<u64>,
+    pub history_receipt_write_bytes: Option<u64>,
+    pub history_buffer_flushes: Option<u64>,
+    pub history_node_write_ops: Option<u64>,
+    pub history_node_write_bytes: Option<u64>,
+    pub history_sync_operations: Option<u64>,
+    pub node_prefix_wait_ns: Option<u64>,
+    pub index_prepare_ns: Option<u64>,
+    pub index_persist_ns: Option<u64>,
+    pub metadata_install_ns: Option<u64>,
+    pub owner_adoption_ns: Option<u64>,
+    pub obsolete_cleanup_ns: Option<u64>,
+    pub outcome: Option<CheckpointProgressOutcome>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CheckpointTrigger {
+    Tail,
+    KnownIdentities,
+    PartitionWindow,
+    IndexReservation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CheckpointProgressOutcome {
+    AlreadyAvailable,
+    AfterDrain,
+    AfterExistingCapture,
+    AfterNewCapture,
+    CapacityError,
+    ProgressError,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CheckpointDiagnosticsSnapshot {
+    pub next_cursor: u64,
+    pub dropped_records: u64,
+    pub records: Vec<CheckpointDiagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CheckpointDiagnosticSummary {
+    pub available: bool,
+    pub records: u64,
+    pub dropped_records: u64,
+    pub pressure_wait_ns: u64,
+    pub pressure_wait_count: u64,
+    pub drain_ns: u64,
+    pub drain_count: u64,
+    pub existing_capture_wait_ns: u64,
+    pub existing_capture_wait_count: u64,
+    pub new_capture_wait_ns: u64,
+    pub new_capture_wait_count: u64,
+    pub staging_manifest_ns: u64,
+    pub staging_manifest_count: u64,
+    pub receipt_history_ns: u64,
+    pub receipt_history_count: u64,
+    pub receipt_history_sync_ns: u64,
+    pub receipt_history_sync_count: u64,
+    pub node_prefix_wait_ns: u64,
+    pub node_prefix_wait_count: u64,
+    pub index_prepare_ns: u64,
+    pub index_prepare_count: u64,
+    pub index_persist_ns: u64,
+    pub index_persist_count: u64,
+    pub metadata_install_ns: u64,
+    pub metadata_install_count: u64,
+    pub owner_adoption_ns: u64,
+    pub owner_adoption_count: u64,
+    pub obsolete_cleanup_ns: u64,
+    pub obsolete_cleanup_count: u64,
+    pub history_io_checkpoint_count: u64,
+    pub history_stream_opens: u64,
+    pub history_previous_slot_reads: u64,
+    pub history_receipt_write_ops: u64,
+    pub history_receipt_write_bytes: u64,
+    pub history_buffer_flushes: u64,
+    pub history_node_write_ops: u64,
+    pub history_node_write_bytes: u64,
+    pub history_sync_operations: u64,
+    pub tail_pressure_count: u64,
+    pub known_identity_pressure_count: u64,
+    pub partition_window_pressure_count: u64,
+    pub index_reservation_pressure_count: u64,
+    pub already_available_count: u64,
+    pub after_drain_relief_count: u64,
+    pub after_existing_capture_relief_count: u64,
+    pub after_new_capture_relief_count: u64,
+    pub capacity_error_count: u64,
+    pub progress_error_count: u64,
+}
+
+impl CheckpointDiagnosticSummary {
+    fn record(&mut self, record: CheckpointDiagnostic) {
+        self.records = self.records.saturating_add(1);
+        match record.trigger {
+            Some(CheckpointTrigger::Tail) => {
+                self.tail_pressure_count = self.tail_pressure_count.saturating_add(1);
+            }
+            Some(CheckpointTrigger::KnownIdentities) => {
+                self.known_identity_pressure_count =
+                    self.known_identity_pressure_count.saturating_add(1);
+            }
+            Some(CheckpointTrigger::PartitionWindow) => {
+                self.partition_window_pressure_count =
+                    self.partition_window_pressure_count.saturating_add(1);
+            }
+            Some(CheckpointTrigger::IndexReservation) => {
+                self.index_reservation_pressure_count =
+                    self.index_reservation_pressure_count.saturating_add(1);
+            }
+            None => {}
+        }
+        match record.outcome {
+            Some(CheckpointProgressOutcome::AlreadyAvailable) => {
+                self.already_available_count = self.already_available_count.saturating_add(1);
+            }
+            Some(CheckpointProgressOutcome::AfterDrain) => {
+                self.after_drain_relief_count = self.after_drain_relief_count.saturating_add(1);
+            }
+            Some(CheckpointProgressOutcome::AfterExistingCapture) => {
+                self.after_existing_capture_relief_count =
+                    self.after_existing_capture_relief_count.saturating_add(1);
+            }
+            Some(CheckpointProgressOutcome::AfterNewCapture) => {
+                self.after_new_capture_relief_count =
+                    self.after_new_capture_relief_count.saturating_add(1);
+            }
+            Some(CheckpointProgressOutcome::CapacityError) => {
+                self.capacity_error_count = self.capacity_error_count.saturating_add(1);
+            }
+            Some(CheckpointProgressOutcome::ProgressError) => {
+                self.progress_error_count = self.progress_error_count.saturating_add(1);
+            }
+            None => {}
+        }
+        macro_rules! add_span {
+            ($source:ident, $sum:ident, $count:ident) => {
+                if let Some(ns) = record.$source {
+                    self.$sum = self.$sum.saturating_add(ns);
+                    self.$count = self.$count.saturating_add(1);
+                }
+            };
+        }
+        add_span!(pressure_wait_ns, pressure_wait_ns, pressure_wait_count);
+        add_span!(drain_ns, drain_ns, drain_count);
+        add_span!(
+            existing_capture_wait_ns,
+            existing_capture_wait_ns,
+            existing_capture_wait_count
+        );
+        add_span!(
+            new_capture_wait_ns,
+            new_capture_wait_ns,
+            new_capture_wait_count
+        );
+        add_span!(
+            staging_manifest_ns,
+            staging_manifest_ns,
+            staging_manifest_count
+        );
+        add_span!(
+            receipt_history_ns,
+            receipt_history_ns,
+            receipt_history_count
+        );
+        add_span!(
+            receipt_history_sync_ns,
+            receipt_history_sync_ns,
+            receipt_history_sync_count
+        );
+        add_span!(
+            node_prefix_wait_ns,
+            node_prefix_wait_ns,
+            node_prefix_wait_count
+        );
+        add_span!(index_prepare_ns, index_prepare_ns, index_prepare_count);
+        add_span!(index_persist_ns, index_persist_ns, index_persist_count);
+        add_span!(
+            metadata_install_ns,
+            metadata_install_ns,
+            metadata_install_count
+        );
+        add_span!(owner_adoption_ns, owner_adoption_ns, owner_adoption_count);
+        add_span!(
+            obsolete_cleanup_ns,
+            obsolete_cleanup_ns,
+            obsolete_cleanup_count
+        );
+        if let Some(stream_opens) = record.history_stream_opens {
+            self.history_io_checkpoint_count = self.history_io_checkpoint_count.saturating_add(1);
+            self.history_stream_opens = self.history_stream_opens.saturating_add(stream_opens);
+            self.history_previous_slot_reads = self
+                .history_previous_slot_reads
+                .saturating_add(record.history_previous_slot_reads.unwrap_or_default());
+            self.history_receipt_write_ops = self
+                .history_receipt_write_ops
+                .saturating_add(record.history_receipt_write_ops.unwrap_or_default());
+            self.history_receipt_write_bytes = self
+                .history_receipt_write_bytes
+                .saturating_add(record.history_receipt_write_bytes.unwrap_or_default());
+            self.history_buffer_flushes = self
+                .history_buffer_flushes
+                .saturating_add(record.history_buffer_flushes.unwrap_or_default());
+            self.history_node_write_ops = self
+                .history_node_write_ops
+                .saturating_add(record.history_node_write_ops.unwrap_or_default());
+            self.history_node_write_bytes = self
+                .history_node_write_bytes
+                .saturating_add(record.history_node_write_bytes.unwrap_or_default());
+            self.history_sync_operations = self
+                .history_sync_operations
+                .saturating_add(record.history_sync_operations.unwrap_or_default());
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WriteMetricsSnapshot {
     pub authority: AuthorityWriteStats,
     pub pipeline: PipelineStats,
     pub read_cache: ReadCacheStats,
     pub write_profile: WriteProfileSnapshot,
+    pub checkpoint_diagnostics: CheckpointDiagnosticSummary,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -646,6 +901,11 @@ pub struct RemoteDatabase {
     background_checkpoint: Option<BackgroundCheckpoint>,
     recovery_stats: RecoveryStats,
     write_stats: AuthorityWriteStats,
+    checkpoint_diagnostics: Option<VecDeque<CheckpointDiagnostic>>,
+    checkpoint_diagnostic_summary: CheckpointDiagnosticSummary,
+    next_checkpoint_diagnostic: u64,
+    dropped_checkpoint_diagnostics: u64,
+    last_checkpoint_diagnostic: Option<CheckpointDiagnostic>,
     shutdown_stats: ShutdownStats,
     #[cfg(test)]
     checkpoint_interruption: Option<u8>,
@@ -1022,6 +1282,8 @@ impl RemoteDatabase {
             .enumerate()
             .map(|(i, e)| (e.partition, i))
             .collect();
+        let checkpoint_diagnostics =
+            (config.write_profile_limit != 0).then(|| VecDeque::with_capacity(128));
         let mut database = Self {
             clients: workers,
             reads: Arc::new(reads),
@@ -1072,6 +1334,14 @@ impl RemoteDatabase {
             background_checkpoint: None,
             recovery_stats,
             write_stats: AuthorityWriteStats::default(),
+            checkpoint_diagnostic_summary: CheckpointDiagnosticSummary {
+                available: checkpoint_diagnostics.is_some(),
+                ..CheckpointDiagnosticSummary::default()
+            },
+            checkpoint_diagnostics,
+            next_checkpoint_diagnostic: 0,
+            dropped_checkpoint_diagnostics: 0,
+            last_checkpoint_diagnostic: None,
             shutdown_stats: ShutdownStats::default(),
             #[cfg(test)]
             checkpoint_interruption: None,
@@ -1345,6 +1615,197 @@ impl RemoteDatabase {
         )
         .map_err(LocalDbError::component)
     }
+    fn admission_pressure_fits(&self, pressure: AdmissionPressure) -> bool {
+        match pressure {
+            AdmissionPressure::Tail {
+                encoded_bytes,
+                identity,
+            } => {
+                !checkpoint_admission_requires_flush(
+                    self.checkpoint_tail_batches,
+                    self.checkpoint_tail_bytes,
+                    encoded_bytes,
+                ) && (!identity
+                    || self
+                        .known
+                        .len()
+                        .saturating_add(self.active_identities.len())
+                        < self.config.max_admitted_batches)
+            }
+            AdmissionPressure::Partition { partition, records } => self
+                .check_storage_group_capacity(
+                    self.partition_admissions[partition].saturating_add(1),
+                    self.partition_records[partition].saturating_add(records),
+                )
+                .is_ok(),
+            AdmissionPressure::Index { additional_bytes } => self
+                .reserved_index_bytes
+                .checked_add(additional_bytes)
+                .is_some_and(|reserved| self.index.read().check_capacity(reserved).is_ok()),
+        }
+    }
+
+    fn ensure_admission_pressure(
+        &mut self,
+        pressure: AdmissionPressure,
+    ) -> Result<(), LocalDbError> {
+        let enabled = self.checkpoint_diagnostics.is_some();
+        let started = Instant::now();
+        let requested_cut = self.latest;
+        let before_index = self.reserved_index_bytes;
+        let identity_pressure = self
+            .known
+            .len()
+            .saturating_add(self.active_identities.len())
+            >= self.config.max_admitted_batches;
+        let mut details = CheckpointDiagnostic::default();
+        let result =
+            self.ensure_admission_pressure_inner(pressure, enabled.then_some(&mut details));
+        let pressure_wait_ns = elapsed(started);
+        if result.is_err() && details.outcome.is_none() {
+            details.outcome = Some(CheckpointProgressOutcome::ProgressError);
+        }
+        if enabled {
+            let trigger = match pressure {
+                AdmissionPressure::Tail { identity: true, .. } if identity_pressure => {
+                    CheckpointTrigger::KnownIdentities
+                }
+                AdmissionPressure::Tail { .. } => CheckpointTrigger::Tail,
+                AdmissionPressure::Partition { .. } => CheckpointTrigger::PartitionWindow,
+                AdmissionPressure::Index { .. } => CheckpointTrigger::IndexReservation,
+            };
+            let record = CheckpointDiagnostic {
+                epoch: self.epoch,
+                generation: None,
+                trigger: Some(trigger),
+                requested_cut,
+                reserved_index_bytes_before: before_index,
+                reserved_index_bytes_after: self.reserved_index_bytes,
+                pressure_wait_ns: Some(pressure_wait_ns),
+                ..details
+            };
+            self.record_checkpoint_diagnostic(record);
+        }
+        self.write_stats.foreground_checkpoint_ns += pressure_wait_ns;
+        self.write_stats.foreground_checkpoint_count += 1;
+        result
+    }
+
+    fn ensure_admission_pressure_inner(
+        &mut self,
+        pressure: AdmissionPressure,
+        mut diagnostic: Option<&mut CheckpointDiagnostic>,
+    ) -> Result<(), LocalDbError> {
+        match pressure {
+            AdmissionPressure::Tail { encoded_bytes, .. }
+                if encoded_bytes > CHECKPOINT_MAX_TAIL_BYTES =>
+            {
+                return Err(LocalDbError::new(
+                    "batch exceeds checkpoint tail byte bound",
+                ));
+            }
+            AdmissionPressure::Partition { records, .. } => {
+                self.check_storage_group_capacity(1, records)?;
+            }
+            AdmissionPressure::Tail { .. } => {}
+            AdmissionPressure::Index { .. } => {}
+        }
+        if diagnostic.is_some() {
+            self.last_checkpoint_diagnostic = None;
+        }
+        if self.admission_pressure_fits(pressure) {
+            if let Some(diagnostic) = diagnostic.as_deref_mut() {
+                diagnostic.outcome = Some(CheckpointProgressOutcome::AlreadyAvailable);
+            }
+            return Ok(());
+        }
+
+        let drain_started = diagnostic.as_ref().map(|_| Instant::now());
+        self.drain()?;
+        if let (Some(diagnostic), Some(started)) = (diagnostic.as_deref_mut(), drain_started) {
+            diagnostic.drain_ns = Some(elapsed(started));
+        }
+        if self.admission_pressure_fits(pressure) {
+            if let Some(diagnostic) = diagnostic.as_deref_mut() {
+                diagnostic.outcome = Some(CheckpointProgressOutcome::AfterDrain);
+            }
+            return Ok(());
+        }
+        if self.background_checkpoint.is_some() {
+            let started = diagnostic.as_ref().map(|_| Instant::now());
+            self.progress_checkpoint(true)?;
+            if let (Some(diagnostic), Some(started)) = (diagnostic.as_deref_mut(), started) {
+                diagnostic.existing_capture_wait_ns = Some(elapsed(started));
+            }
+            if let Some(diagnostic) = diagnostic.as_deref_mut() {
+                self.include_checkpoint_diagnostic(diagnostic);
+            }
+        }
+        if self.admission_pressure_fits(pressure) {
+            if let Some(diagnostic) = diagnostic.as_deref_mut() {
+                diagnostic.outcome = Some(CheckpointProgressOutcome::AfterExistingCapture);
+            }
+            return Ok(());
+        }
+
+        let started = diagnostic.as_ref().map(|_| Instant::now());
+        self.start_checkpoint()?;
+        if self.background_checkpoint.is_some() {
+            self.progress_checkpoint(true)?;
+        }
+        if let (Some(diagnostic), Some(started)) = (diagnostic.as_deref_mut(), started) {
+            diagnostic.new_capture_wait_ns = Some(elapsed(started));
+        }
+        if let Some(diagnostic) = diagnostic.as_deref_mut() {
+            self.include_checkpoint_diagnostic(diagnostic);
+        }
+        if self.admission_pressure_fits(pressure) {
+            if let Some(diagnostic) = diagnostic.as_deref_mut() {
+                diagnostic.outcome = Some(CheckpointProgressOutcome::AfterNewCapture);
+            }
+            return Ok(());
+        }
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.outcome = Some(CheckpointProgressOutcome::CapacityError);
+        }
+        match pressure {
+            AdmissionPressure::Tail { identity: true, .. } => {
+                Err(LocalDbError::new("checkpoint identity capacity reached"))
+            }
+            AdmissionPressure::Tail { .. } => {
+                Err(LocalDbError::new("checkpoint tail capacity reached"))
+            }
+            AdmissionPressure::Partition { partition, records } => {
+                let batches = self.partition_admissions[partition]
+                    .checked_add(1)
+                    .ok_or_else(|| LocalDbError::new("partition reservation overflow"))?;
+                let records = self.partition_records[partition]
+                    .checked_add(records)
+                    .ok_or_else(|| LocalDbError::new("reference reservation overflow"))?;
+                self.check_storage_group_capacity(batches, records)
+            }
+            AdmissionPressure::Index { additional_bytes } => {
+                let reserved = self
+                    .reserved_index_bytes
+                    .checked_add(additional_bytes)
+                    .ok_or_else(|| LocalDbError::new("index reservation overflow"))?;
+                self.index
+                    .read()
+                    .check_capacity(reserved)
+                    .map_err(LocalDbError::component)
+            }
+        }
+    }
+
+    fn include_checkpoint_diagnostic(&self, diagnostic: &mut CheckpointDiagnostic) {
+        let Some(checkpoint) = self.last_checkpoint_diagnostic else {
+            return;
+        };
+        diagnostic.checkpoint_generation = checkpoint.generation;
+        diagnostic.captured_cut = checkpoint.captured_cut;
+        diagnostic.captured_batches = checkpoint.captured_batches;
+        diagnostic.captured_bytes = checkpoint.captured_bytes;
+    }
 
     // Only private, locally constructed CompleteBatch values reach this path.
     // Preparation does not allocate a logical slot or confer authority.
@@ -1385,11 +1846,6 @@ impl RemoteDatabase {
         // outstanding identities and worst-case future retained empty epochs.
         self.check_checkpoint_capacity(1)?;
         let encoded_bytes = batch.encoded().len();
-        if encoded_bytes > CHECKPOINT_MAX_TAIL_BYTES {
-            return Err(LocalDbError::new(
-                "batch exceeds checkpoint tail byte bound",
-            ));
-        }
         if checkpoint_admission_requires_flush(
             self.checkpoint_tail_batches,
             self.checkpoint_tail_bytes,
@@ -1401,7 +1857,10 @@ impl RemoteDatabase {
             >= self.config.max_admitted_batches
         {
             self.stats.validation_ns += elapsed(started);
-            self.force_admission_checkpoint()?;
+            self.ensure_admission_pressure(AdmissionPressure::Tail {
+                encoded_bytes,
+                identity: true,
+            })?;
             validation_excluded_ns = elapsed(started);
         }
         if id.database != self.config.storage.database
@@ -1418,32 +1877,34 @@ impl RemoteDatabase {
         // Whole batches must fit a fresh node window before logical allocation.
         // Successive groups may spill; cumulative reservations cause bounded
         // progress/backpressure, not a retained-history capacity rejection.
-        self.check_storage_group_capacity(1, batch.mutations().len())?;
-        let records = self.partition_records[partition]
-            .checked_add(batch.mutations().len())
+        let records = batch.mutations().len();
+        let total_records = self.partition_records[partition]
+            .checked_add(records)
             .ok_or_else(|| LocalDbError::new("reference reservation overflow"))?;
         if self
-            .check_storage_group_capacity(self.partition_admissions[partition] + 1, records)
+            .check_storage_group_capacity(
+                self.partition_admissions[partition].saturating_add(1),
+                total_records,
+            )
             .is_err()
         {
-            self.force_admission_checkpoint()?;
+            self.ensure_admission_pressure(AdmissionPressure::Partition { partition, records })?;
             validation_excluded_ns = elapsed(started);
         }
-        let mut reserved = self
+        let reserved = self
             .reserved_index_bytes
             .checked_add(metadata_bytes)
             .ok_or_else(|| LocalDbError::new("index reservation overflow"))?;
-        let needs_checkpoint = self.index.read().check_capacity(reserved).is_err();
-        if needs_checkpoint {
-            // Memory pressure is checkpoint backpressure, not a lifetime history
-            // ceiling. Do not reject an overwrite because its frozen capture has
-            // not installed yet.
-            self.force_admission_checkpoint()?;
-            reserved = self
-                .reserved_index_bytes
-                .checked_add(metadata_bytes)
-                .ok_or_else(|| LocalDbError::new("index reservation overflow"))?;
+        if self.index.read().check_capacity(reserved).is_err() {
+            self.ensure_admission_pressure(AdmissionPressure::Index {
+                additional_bytes: metadata_bytes,
+            })?;
+            validation_excluded_ns = elapsed(started);
         }
+        let reserved = self
+            .reserved_index_bytes
+            .checked_add(metadata_bytes)
+            .ok_or_else(|| LocalDbError::new("index reservation overflow"))?;
         self.index
             .read()
             .check_capacity(reserved)
@@ -2088,6 +2549,49 @@ impl RemoteDatabase {
             publication_ns: self.stats.publication_ns,
             dispatch_ns: self.stats.dispatch_ns,
             ..self.write_stats
+        }
+    }
+    pub fn checkpoint_diagnostic_summary(&self) -> CheckpointDiagnosticSummary {
+        self.checkpoint_diagnostic_summary
+    }
+
+    fn record_checkpoint_diagnostic(
+        &mut self,
+        mut record: CheckpointDiagnostic,
+    ) -> CheckpointDiagnostic {
+        let Some(records) = self.checkpoint_diagnostics.as_mut() else {
+            return record;
+        };
+        record.cursor = self.next_checkpoint_diagnostic;
+        if records.len() == 128 {
+            records.pop_front();
+            self.dropped_checkpoint_diagnostics =
+                self.dropped_checkpoint_diagnostics.saturating_add(1);
+        }
+        records.push_back(record);
+        self.next_checkpoint_diagnostic = self.next_checkpoint_diagnostic.saturating_add(1);
+        self.checkpoint_diagnostic_summary.record(record);
+        self.checkpoint_diagnostic_summary.dropped_records = self.dropped_checkpoint_diagnostics;
+        record
+    }
+    /// Cursor for bounded checkpoint diagnostics. A zero-profile database has
+    /// no diagnostic ring and returns an empty snapshot.
+    pub fn checkpoint_diagnostic_cursor(&self) -> u64 {
+        self.next_checkpoint_diagnostic
+    }
+
+    pub fn checkpoint_diagnostics_since(&self, cursor: u64) -> CheckpointDiagnosticsSnapshot {
+        CheckpointDiagnosticsSnapshot {
+            next_cursor: self.next_checkpoint_diagnostic,
+            dropped_records: self.dropped_checkpoint_diagnostics,
+            records: self
+                .checkpoint_diagnostics
+                .as_ref()
+                .into_iter()
+                .flat_map(|records| records.iter())
+                .filter(|record| record.cursor >= cursor)
+                .copied()
+                .collect(),
         }
     }
     /// Capture partial opt-in append profiles after all admitted writes have drained.

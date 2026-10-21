@@ -1,7 +1,84 @@
 """Bounded checkpoint cells and fail-closed EFA hardware activity evidence."""
 from pathlib import Path
+import json
 import re
 import time
+
+
+FABRIC_LOCAL_PREFIX = b'TIDEHUNTER_FABRIC_LOCAL_DIAGNOSTICS'
+
+
+def parse_fabric_local_diagnostics(stream, *, max_bytes=128 * 1024**2, max_records=4096):
+    """Parse finalized local provider windows, never infer wire or latency facts."""
+    records, windows, consumed = [], set(), 0
+    counters = ('data_posts', 'credit_posts', 'piggyback_advances')
+    reasons = {'profile-reset', 'profile-disable', 'session-abort', 'session-drop'}
+    def unique_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate fabric local diagnostic JSON key')
+            result[key] = value
+        return result
+    while True:
+        line = stream.readline(65537)
+        if not line:
+            break
+        consumed += len(line)
+        if consumed > max_bytes or len(line) > 65536:
+            raise ValueError('fabric local diagnostic log exceeds bounded scan/line size')
+        if not line.startswith(FABRIC_LOCAL_PREFIX):
+            continue
+        if not line.endswith(b'\n') or len(records) >= max_records:
+            raise ValueError('truncated or excessive fabric local diagnostic records')
+        try:
+            record = json.loads(line[len(FABRIC_LOCAL_PREFIX):].decode(), object_pairs_hook=unique_pairs)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError('malformed fabric local diagnostic JSON') from error
+        if (not isinstance(record, dict)
+                or set(record) != {'schema', 'reason', 'window', *counters, 'peer'}
+                or type(record['schema']) is not int or record['schema'] != 1
+                or not isinstance(record['reason'], str) or record['reason'] not in reasons
+                or any(type(record[key]) is not int or not 0 <= record[key] <= 2**64 - 1
+                       for key in ('window', *counters))
+                or record['window'] == 0 or record['window'] in windows
+                or not any(record[key] for key in counters)
+                or (record['peer'] is not None and (not isinstance(record['peer'], str)
+                    or not 1 <= len(record['peer']) <= 256
+                    or any(ord(char) < 32 for char in record['peer'])))):
+            raise ValueError('fabric local diagnostic schema/window/counter identity differs')
+        windows.add(record['window'])
+        records.append(record)
+    return dict(available=bool(records), records=records, record_count=len(records),
+                totals={key: sum(record[key] for record in records) for key in counters} if records else None,
+                scope='finalized local endpoint profile-window deltas; may include control messages; not packets per RPC, pure wire, RTT or latency',
+                completeness='only emitted finalized windows; SIGTERM may bypass abort/drop')
+
+
+def fabric_local_log(path, *, required=False, forbidden=False):
+    path = Path(path)
+    with path.open('rb') as stream:
+        result = parse_fabric_local_diagnostics(stream)
+    return validate_fabric_local_population(result, str(path), required, forbidden)
+
+
+def validate_fabric_local_population(result, source, required=False, forbidden=False):
+    if required and not result['available']:
+        raise ValueError('required finalized diagnostic EFA-direct window missing: ' + source)
+    if forbidden and result['available']:
+        raise ValueError('clean or non-direct population contains local fabric diagnostics: ' + source)
+    return result | dict(source=source, required=required,
+        unavailable_reason=None if result['available'] else
+        'no emitted nonzero finalized direct window; SIGTERM may bypass abort/drop')
+
+
+def fabric_local_archive_log(archive, name, *, required=False, forbidden=False):
+    members = [member for member in archive.getmembers() if member.name == name]
+    if len(members) != 1 or not members[0].isfile() or members[0].size > 128 * 1024**2:
+        raise ValueError('missing, duplicate, nonregular or oversized diagnostic stderr: ' + name)
+    with archive.extractfile(members[0]) as stream:
+        result = parse_fabric_local_diagnostics(stream)
+    return validate_fabric_local_population(result, name, required, forbidden)
 
 
 def matrix_plan(cfg):

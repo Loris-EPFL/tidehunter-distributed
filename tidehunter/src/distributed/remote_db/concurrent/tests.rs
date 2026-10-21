@@ -195,9 +195,11 @@ fn scalar_and_actor_samples_have_separate_populations_and_credit_wakeups() {
         .write_batch(fixture.operation(0, 30), vec![put(0, 5), put(1, 6)])
         .unwrap();
     let db = ConcurrentRemoteDatabase::new(original).unwrap();
+    assert!(!db.stats().read_resolve_ns_available);
     db.set_read_profile_limit(2);
     let monitor = db.read_profile_monitor();
     assert_eq!(get(&db, 0), Some(vec![5; 32]));
+    assert!(db.stats().read_resolve_ns_available);
     let pending = db.submit_get(KeySpace(0), &1u32.to_be_bytes()).unwrap();
     let generation = db.read_admission_generation();
     assert!(RemoteDatabase::read_backpressured(

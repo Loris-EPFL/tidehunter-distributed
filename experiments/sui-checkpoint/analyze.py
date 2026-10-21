@@ -22,7 +22,18 @@ import statistics
 import sys
 sys.dont_write_bytecode = True
 import tarfile
+import importlib.util
+from functools import cache
 import build
+
+CHECKPOINT_DIAGNOSTIC_PHASES = (
+    'pressure_wait', 'drain', 'existing_capture_wait', 'new_capture_wait',
+    'staging_manifest', 'receipt_history', 'receipt_history_sync', 'node_prefix_wait',
+    'index_prepare', 'index_persist', 'metadata_install', 'owner_adoption', 'obsolete_cleanup')
+CHECKPOINT_HISTORY_COUNTERS = (
+    'history_stream_opens', 'history_previous_slot_reads', 'history_receipt_write_ops',
+    'history_receipt_write_bytes', 'history_buffer_flushes', 'history_node_write_ops',
+    'history_node_write_bytes', 'history_sync_operations')
 
 
 def metrics(path):
@@ -83,6 +94,9 @@ def adapter_stats(values):
             for name in list(stats):
                 if name.startswith('shard_') and name != 'shard_sample_available':
                     stats[name] = None
+        for name in ('scalar_read_ns', 'read_index_ns'):
+            if name in stats and stats.get(name + '_available') != 1:
+                stats[name] = None
         for name in list(stats):
             if name.startswith('read_profile_') and name.endswith('_ns'):
                 unavailable = stats.get('read_profile_enabled') != 1
@@ -103,9 +117,44 @@ def adapter_stats(values):
                         unavailable |= not stats.get(prefix + 'cq_timed_calls')
                 if unavailable:
                     stats[name] = None
+            if (name.startswith('write_checkpoint_diagnostic_') and name.endswith('_ns')
+                    and stats.get('write_checkpoint_diagnostics_available') != 1):
+                stats[name] = None
+            if (name in {'write_checkpoint_diagnostic_' + counter for counter in CHECKPOINT_HISTORY_COUNTERS}
+                    and stats.get('write_checkpoint_diagnostics_available') != 1):
+                stats[name] = None
             if name.startswith('native_profile_') and name.endswith('_ns') and stats.get('native_profile_available') != 1:
                 stats[name] = None
     return result
+
+@cache
+def checkpoint_matrix_helpers():
+    path = Path(__file__).resolve().parents[1] / 'aws-sharded-wal/checkpoint_matrix.py'
+    spec = importlib.util.spec_from_file_location('checkpoint_analysis_matrix', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def fabric_local_replay(archive, result):
+    helpers = checkpoint_matrix_helpers()
+    names = {member.name for member in archive.getmembers()}
+    diagnostic = bool(result.get('read_profile_limit', 0) or result.get('write_profile_limit', 0))
+    selected = ['experiment/native.log', 'experiment/remote.log']
+    selected += sorted(name for name in names if re.fullmatch(r'experiment/storage-[0-9]+\.log', name))
+    logs = []
+    for name in selected:
+        if name not in names:
+            logs.append(dict(source=name, available=False, records=[], record_count=0, totals=None,
+                             unavailable_reason='log not retained in this replay evidence'))
+            continue
+        evidence = helpers.fabric_local_archive_log(archive, name,
+            forbidden=not diagnostic or name == 'experiment/native.log')
+        logs.append(evidence)
+    return dict(logs=logs,
+                completeness='only nonzero finalized endpoint windows emitted before exit; no SIGTERM/Drop completeness claim',
+                scope='local nonwire data/credit post deltas; not packets per RPC, RTT, payload packetization or latency')
+
 
 @contextmanager
 def evidence_archive(root):
@@ -174,7 +223,11 @@ def verified_replay(root):
 
 
 def summarize(root):
-    return summarize_verified(verified_replay(root))
+    verified = verified_replay(root)
+    summary = summarize_verified(verified)
+    with evidence_archive(root) as archive:
+        summary['fabric_local_diagnostics'] = fabric_local_replay(archive, verified[1])
+    return summary
 
 
 def summarize_verified(verified):
@@ -271,6 +324,8 @@ def adapter_means(stats):
         flags = (('write_profile_available',) if stage.startswith('write_profile_') else
                  ('native_profile_available',) if stage.startswith('native_profile_') else
                  () if stage == 'write_gate_wait' else ('remote_timing_available',))
+        if stage in ('scalar_read', 'read_index'):
+            flags += (stage + '_ns_available',)
         result[stage] = mean_span(stats, stage + '_ns', stage + '_calls', flags)
     profile_denominators = dict(
         inline='inline_completed', actor_queue='actor_completed',
@@ -303,6 +358,10 @@ def adapter_means(stats):
             ('write_foreground_checkpoint', 'write_foreground_checkpoint_count'),
             ('write_durable_receipt_publication_blocked', 'write_durable_receipt_publication_blocked_batches')):
         result[stage] = mean_span(stats, stage + '_ns', denominator, ('remote_timing_available',))
+    for phase in CHECKPOINT_DIAGNOSTIC_PHASES:
+        stage = 'write_checkpoint_diagnostic_' + phase
+        result[stage] = mean_span(stats, stage + '_ns', stage + '_count',
+                                  ('write_checkpoint_diagnostics_available',))
     write_denominators = {
         **{f'connection_append_{name}': 'sampled_requests' for name in
            ('inventory_wait', 'inventory_residence', 'decode', 'group_build', 'wal', 'persist')},
@@ -437,11 +496,7 @@ def validate_archive_members(archive):
 
 def verified_campaign(root):
     """Revalidate local receipts against immutable controller/replay/node archives."""
-    import importlib.util
-    module_path = Path(__file__).resolve().parents[1] / 'aws-sharded-wal/checkpoint_matrix.py'
-    spec = importlib.util.spec_from_file_location('checkpoint_analysis_matrix', module_path)
-    matrix = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(matrix)
+    matrix = checkpoint_matrix_helpers()
     closure = json.loads((root / 'cleanup-verified.json').read_text())
     local_cfg = json.loads((root / 'controller-config.json').read_text())
     # Input config gains coordinator identity only inside the archive. Check
@@ -643,6 +698,21 @@ def compare_campaign(root):
     cells = []
     for identity, replay in verified:
         summary = summarize_verified(replay)
+        with evidence_archive(root / 'paired-results' / identity['cell_id']) as archive:
+            fabric = fabric_local_replay(archive, replay[1])
+        fabric['storage'] = []
+        helpers = checkpoint_matrix_helpers()
+        diagnostic = bool(identity['read_profile_limit'] or identity.get('write_profile_limit', 0))
+        for node in cfg['nodes']:
+            path = root / 'retrieved/cells' / identity['cell_id'] / 'storage' / str(node['partition']) / 'final/evidence.tar.gz'
+            with tarfile.open(path, 'r:gz') as archive:
+                names = sorted(member.name for member in archive.getmembers()
+                    if re.fullmatch(r'cloud-node-logs/namespace-[0-9]+\.stderr\.log', member.name))
+                if not names:
+                    raise ValueError('Sui node archive omitted namespace stderr logs')
+                logs = [helpers.fabric_local_archive_log(archive, name, forbidden=not diagnostic)
+                        for name in names]
+            fabric['storage'].append(dict(partition=node['partition'], archive=str(path), logs=logs))
         _, raw, _, _ = replay
         row = {k: identity[k] for k in ('cell_id', 'transport', 'ordinal', 'repetition', 'read_profile_limit')}
         row['write_profile_limit'] = identity.get('write_profile_limit', 0)
@@ -659,6 +729,7 @@ def compare_campaign(root):
                    node_archives=identity['node_archives'], source_range=summary['source_range'],
                    durability=summary['durability'], cache=summary['cache'], table_counts=summary['table_counts'],
                    storage_physical_io=storage_io(raw), modes={})
+        row['fabric_local_diagnostics'] = fabric
         for field in ('native_seconds', 'remote_seconds'):
             if nonnegative(row[field], field) == 0:
                 raise ValueError('empty elapsed population')

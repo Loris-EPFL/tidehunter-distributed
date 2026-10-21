@@ -3,6 +3,8 @@
 //! thread rendezvous. Warm reads do not claim physical NVMe reads. All writes
 //! use the value-WAL durability barrier on both backends.
 
+#[path = "support/cache_contention.rs"]
+mod cache_contention;
 #[path = "support/tcp_cluster.rs"]
 mod tcp_cluster;
 
@@ -41,10 +43,11 @@ struct Row {
     operations: usize,
     elapsed_ns: u128,
     p50_ns: u64,
-    p99_ns: u64,
+    p99_ns: Option<u64>,
     mean_ns: u64,
     before: BTreeMap<&'static str, u64>,
     after: BTreeMap<&'static str, u64>,
+    api_samples_ns: Vec<u64>,
 }
 
 fn counters(db: &Db) -> BTreeMap<&'static str, u64> {
@@ -98,6 +101,7 @@ fn measure<T: Send>(
         }
         Ok::<_, String>((samples, start.elapsed().as_nanos()))
     })?;
+    let raw_samples = samples.clone();
     samples.sort_unstable();
     let operations = samples.len();
     let mean_ns =
@@ -109,10 +113,11 @@ fn measure<T: Send>(
         operations,
         elapsed_ns,
         p50_ns: samples[(operations - 1) / 2],
-        p99_ns: samples[(operations * 99).div_ceil(100) - 1],
+        p99_ns: (operations >= 100).then(|| samples[(operations * 99).div_ceil(100) - 1]),
         mean_ns,
         before,
         after: counters(db),
+        api_samples_ns: raw_samples,
     })
 }
 
@@ -333,6 +338,22 @@ fn run_case(output: &Path, backend: &str, value_bytes: usize, profile: bool) -> 
                 |()| true,
             )?);
         }
+    }
+    if cache_bytes != 0 {
+        let hot: Vec<_> = keys[..8]
+            .iter()
+            .zip(&expected[..8])
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let writer = (keys[KEYS - 1].clone(), expected[KEYS - 1].clone());
+        let observations = [1, 8]
+            .into_iter()
+            .map(|callers| cache_contention::measure(&db, ks, &hot, &writer, callers))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        serde_yaml::to_writer(
+            File::create(output.join("cache-contention.yaml"))?,
+            &observations,
+        )?;
     }
     for (key, expected) in keys.iter().zip(&expected) {
         if db.get(ks, key).map_err(adapter_error)?.as_deref() != Some(expected.as_ref()) {

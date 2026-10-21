@@ -29,6 +29,13 @@
 //! entry beats a first-touch candidate; repeated misses can earn admission.
 //! F2 §7's second chance is applied to exact references, not mutable key chains.
 //! <https://github.com/facebook/CacheLib/blob/a24370092f0bd6fa7145b2f01c3e50e63edd6a6e/cachelib/allocator/NvmAdmissionPolicy.h#L175-L249>.
+//! FASTER Appendix D and F2 §7 likewise use a bounded read-hot copy while the
+//! log/index remains authoritative. Placement hashes only the member digest and
+//! operation index; full immutable-reference equality still decides a hit,
+//! including when a physical generation differs.
+//! <https://doi.org/10.1145/3183713.3196898> (FASTER, Appendix D)
+//! <https://arxiv.org/abs/2305.01516v3> (F2, §7)
+//! <https://github.com/microsoft/garnet/blob/v1.0.82/libs/storage/Tsavorite/cs/src/core/Index/Tsavorite/Implementation/ReadCache.cs>
 
 use super::Mutation;
 use super::ValueRecordReference;
@@ -36,7 +43,7 @@ use crate::distributed::types::RecordKind;
 use minibytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::hash_map::RandomState;
-use std::hash::BuildHasher;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem::size_of;
 
 const WAYS: usize = 4;
@@ -234,6 +241,15 @@ impl ReadCache {
         (fingerprint as usize % (self.slots.len() / WAYS)) * WAYS
     }
 
+    // Placement is deliberately lossy; callers must compare the full reference.
+    // Operation identity plus member index separates identical-value versions.
+    fn fingerprint(&self, reference: &ValueRecordReference) -> u64 {
+        let mut hasher = self.hash.build_hasher();
+        reference.batch_id.operation.hash(&mut hasher);
+        reference.descriptor.operation_index.hash(&mut hasher);
+        hasher.finish()
+    }
+
     fn observe(&mut self, fingerprint: u64) -> u8 {
         let slot = fingerprint as usize % self.history.len();
         let history = &mut self.history[slot];
@@ -265,10 +281,9 @@ impl ReadCache {
         key: &[u8],
     ) -> Option<Bytes> {
         let found = if reference.descriptor.keyspace == keyspace.0 && !self.slots.is_empty() {
-            let fingerprint = self.hash.hash_one(reference);
-            self.observe(fingerprint);
+            let fingerprint = self.fingerprint(reference);
             let start = self.set_start(fingerprint);
-            self.slots[start..start + WAYS]
+            let found = self.slots[start..start + WAYS]
                 .iter_mut()
                 .flatten()
                 .find(|entry| entry.reference == *reference)
@@ -288,7 +303,13 @@ impl ReadCache {
                     } else {
                         None
                     }
-                })
+                });
+            // Resident hits update their entry benefit; history is for misses
+            // that may earn admission after repeated demand.
+            if found.is_none() {
+                self.observe(fingerprint);
+            }
+            found
         } else {
             None
         };
@@ -303,7 +324,7 @@ impl ReadCache {
 
     fn lookup(&mut self, reference: &ValueRecordReference, track_access: bool) -> Option<Mutation> {
         let found = if !self.slots.is_empty() {
-            let fingerprint = self.hash.hash_one(reference);
+            let fingerprint = self.fingerprint(reference);
             if track_access {
                 self.observe(fingerprint);
             }
@@ -376,7 +397,7 @@ impl ReadCache {
         if payload_bytes > limit {
             return None;
         }
-        let fingerprint = self.hash.hash_one(reference);
+        let fingerprint = self.fingerprint(reference);
         let history = &self.history[fingerprint as usize % self.history.len()];
         if history.observations != 0 && history.fingerprint == fingerprint {
             return Some(fingerprint);
@@ -690,7 +711,7 @@ impl ReadCache {
 
     #[cfg(test)]
     fn set_start_for_ref(&self, reference: &ValueRecordReference) -> usize {
-        self.set_start(self.hash.hash_one(reference))
+        self.set_start(self.fingerprint(reference))
     }
 }
 
@@ -866,6 +887,35 @@ mod tests {
         ] {
             assert!(cache.get(&altered).is_none());
         }
+    }
+
+    #[test]
+    fn point_lookup_checks_full_reference_after_fingerprint_collision() {
+        let mut cache = ReadCache::new(64 * 1024);
+        let (reference, mutation) = record(1, b"value");
+        assert!(cache.insert_verified(reference, &mutation));
+        let changed_generation = ValueRecordReference {
+            batch_address: PhysicalValueAddress {
+                segment_generation: reference.batch_address.segment_generation + 1,
+                ..reference.batch_address
+            },
+            ..reference
+        };
+        assert_eq!(
+            cache.fingerprint(&reference),
+            cache.fingerprint(&changed_generation)
+        );
+        let keyspace = crate::key_shape::KeySpace(reference.descriptor.keyspace);
+        assert_eq!(
+            cache.get_point(&changed_generation, keyspace, b"same-key"),
+            None
+        );
+        assert_eq!(
+            cache.get_point(&reference, keyspace, b"same-key"),
+            Some(Bytes::copy_from_slice(b"value"))
+        );
+        assert_eq!(cache.stats().hits, 1);
+        assert_eq!(cache.stats().misses, 1);
     }
 
     #[test]

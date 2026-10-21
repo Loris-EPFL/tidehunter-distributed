@@ -2513,6 +2513,7 @@ dependencies = [
  "rayon",
  "rustls",
  "serde",
+ "serde_json",
  "serde_yaml",
  "smallvec",
  "strum",
