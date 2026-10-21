@@ -161,13 +161,18 @@ pub(super) fn concurrent_mixed(
             .map(|(offset, batch)| (*operation + offset as u64, batch.mutations.clone()))
             .collect();
         let before = backend.authority_write_stats();
+        let checkpoint_cursor = backend.checkpoint_cursor(case.diagnostic);
         let start = Instant::now();
         backend.submit_window(ready, case.preparation_chunk_batches)?;
         *operation += window.len() as u64;
         backend.drain()?;
         let elapsed_ns = ns(start);
         if let (Some(before), Some(after)) = (before, backend.authority_write_stats()) {
-            timings.push((before, after));
+            timings.push((
+                before,
+                after,
+                backend.checkpoint_snapshot(checkpoint_cursor),
+            ));
         }
         write_samples.push(Sample {
             elapsed_ns,
@@ -220,7 +225,7 @@ pub(super) fn concurrent_mixed(
         elapsed,
         &write_samples,
     )?;
-    for (index, (before, after)) in timings.into_iter().enumerate() {
+    for (index, (before, after, diagnostic)) in timings.into_iter().enumerate() {
         output.write_window(
             case,
             "concurrent_mixed_write_window",
@@ -229,8 +234,10 @@ pub(super) fn concurrent_mixed(
             before,
             after,
         )?;
+        output.checkpoint_records(case, "concurrent_mixed_write_window", index, diagnostic)?;
     }
     output.write_windows.flush()?;
+    output.checkpoint_diagnostics.flush()?;
     output.stages(case, "concurrent_mixed", counters, backend.counters()?)?;
     output.stages(
         case,
@@ -242,4 +249,99 @@ pub(super) fn concurrent_mixed(
         ]),
     )?;
     output.read_path_evidence(case, backend, "concurrent_mixed", "after")
+}
+
+/// This tail phase uses the same adapter and shared measurement as
+/// sharded_wal_adapter_bench, without replacing any raw-engine lifecycle phase.
+pub(super) fn hit_only_adapter(
+    parameters: &super::BackendParameters,
+    case: &Case,
+    output: &mut Output,
+    ks: KeySpace,
+    oracle: &[Option<u64>],
+    operation: u64,
+) -> Result<()> {
+    use std::sync::Arc;
+    use tidehunter::distributed::sui::Db;
+    use tidehunter::metrics::Metrics;
+    use tidehunter::minibytes::Bytes;
+
+    let db = match parameters.kind {
+        super::Kind::NativeAsync | super::Kind::NativeBarrier => {
+            let db = Db::open_native(
+                &parameters.path,
+                parameters.shape.clone(),
+                Arc::clone(&parameters.native),
+                Metrics::new_in_enabled(&prometheus::Registry::new(), false),
+            )
+            .map_err(super::native_error)?;
+            db.set_native_durable(parameters.kind == super::Kind::NativeBarrier);
+            db
+        }
+        super::Kind::Tcp => Db::open_remote(
+            &parameters.path,
+            parameters.shape.clone(),
+            parameters
+                .remote
+                .clone()
+                .ok_or_else(|| invalid("missing adapter remote config"))?,
+        )
+        .map_err(super::native_error)?,
+        super::Kind::Sharded => {
+            return Err(invalid("cache-contention adapter requires native or remote").into());
+        }
+    };
+    let live: Vec<_> = oracle
+        .iter()
+        .enumerate()
+        .filter_map(|(index, generation)| generation.map(|generation| (index, generation)))
+        .collect();
+    if live.len() < 9 {
+        return Err(
+            invalid("cache-contention needs eight hot keys and a disjoint writer key").into(),
+        );
+    }
+    let hot: Vec<_> = live[..8]
+        .iter()
+        .map(|&(index, generation)| {
+            (
+                Bytes::copy_from_slice(&key(index)),
+                value(index, generation, case.value_bytes),
+            )
+        })
+        .collect();
+    let writer_index = live.last().expect("at least nine live keys").0;
+    let writer = (
+        Bytes::copy_from_slice(&key(writer_index)),
+        value(writer_index, operation, case.value_bytes),
+    );
+    for callers in [1, 8] {
+        let observation = super::cache_contention::measure(&db, ks, &hot, &writer, callers)
+            .map_err(std::io::Error::other)?;
+        serde_json::to_writer(
+            &mut output.cache_contention,
+            &serde_json::json!({
+                "backend": case.label(), "transport": case.transport.label(),
+                "value_bytes": case.value_bytes, "batch_size": case.batch_size,
+                "window": case.window, "repetition": case.repetition,
+                "api": "distributed::sui::Db::get", "observation": observation,
+            }),
+        )?;
+        writeln!(output.cache_contention)?;
+    }
+    output.cache_contention.flush()?;
+    // Cover every original key/tombstone again, with the new writer value, not
+    // merely the warmed subset. Durable commits above retain native barriers.
+    for (index, generation) in oracle.iter().enumerate() {
+        let expected = if index == writer_index {
+            Some(writer.1.clone())
+        } else {
+            generation.map(|generation| value(index, generation, case.value_bytes))
+        };
+        if db.get(ks, &key(index)).map_err(super::native_error)? != expected {
+            return Err(invalid("post-contention complete state audit differs").into());
+        }
+    }
+    db.wait_for_background_threads_to_finish()
+        .map_err(super::native_error)
 }
