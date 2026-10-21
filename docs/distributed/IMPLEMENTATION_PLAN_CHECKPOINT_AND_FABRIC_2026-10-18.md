@@ -2208,3 +2208,34 @@ Final local gates: **481 AWS-harness tests, 478 passed and 3 skipped**;
 remaining findings after the command, policy and DATA-population corrections.
 These are collector gates, not new hardware performance measurements.
 
+### 16.15 Preparation intent and executable authority
+
+The next exact-head Codex review found a separate omission at `320c358`:
+the archive verification program checked preparation argv, but the production
+cold certificate did not require its original successful preparation receipt.
+An unadmitted lane, pipeline or shard-memory control could therefore change
+the prepared deployment while leaving measurement argv valid.
+
+`checkpoint_kv.py::cold_probe_certificate` now checks
+`<case>-prepare.command.json` before reading deployment policy or lane evidence.
+The receipt must be an object, its exit status must be integer zero, its
+executable digest must be the admitted storage digest, and its entire command
+must equal `kv_case_commands(cfg, spec)[0]`. The measurement command reuses
+the same constructor call. There is no new whitelist, default override,
+compatibility path or metadata requirement absent from the original archive.
+
+The before/after verification exercised five false-success cases: unadmitted
+read lanes, unadmitted pipeline mode, foreign executable digest, failed
+preparation and missing preparation receipt. All were accepted at `320c358`;
+all are rejected after this correction, while the valid case still passes.
+Permanent negatives also cover full, targeted and authority-32 cases and
+self-consistent changed deployment controls with unchanged measurement receipts.
+
+The closed archive passed again: all 129 preparation and 258 execution argv
+match, and the reduced auxiliary evidence retains the SHA-256 recorded above.
+The separate proof is `complete-kv-preparation-validation.json`; original
+failed receipts remain unchanged. Local suites completed **484 AWS-harness
+tests: 481 passed, 3 skipped**, plus **111 Sui-harness tests passed**.
+The resumed independent audit reported no further finding in this boundary.
+No engine, timing sample, budget, live resource or hardware measurement changed.
+

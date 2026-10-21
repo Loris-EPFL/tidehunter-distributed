@@ -134,6 +134,16 @@ class MatrixEvidenceTests(unittest.TestCase):
                    '--reads', '8192' if targeted else '4096', '--repetitions', '1']
         if targeted:
             command += ['--wal-layout', 'small']
+        prepare = ['/frozen/cloud-bin/current/sharded_wal_bench',
+                   '--prepare-external-case', f'/frozen/cases/{case_id}',
+                   '--guest-case-root', f'/frozen/cases/{case_id}',
+                   '--remote-endpoints', '10.0.1.1:7700,10.0.1.2:7700,10.0.1.3:7700,10.0.1.4:7700,10.0.1.5:7700',
+                   '--tcp-read-cache-bytes', '0', '--transport', 'efa-direct',
+                   '--tcp-server-read-workers', '2', '--tcp-wal-member-read', 'async',
+                   '--tcp-resident-first', 'true', '--tcp-polling', 'adaptive',
+                   '--tcp-shard-cache-bytes', '0'] + command[5:]
+        (directory.parent / (case_id + '-prepare.command.json')).write_text(json.dumps(dict(
+            exit_code=0, binary_sha256='c' * 64, command=prepare)))
         command += ['--read-resource-evidence', 'true', '--cold-read-pass', 'true', '--read-window', '32',
                     '--remote-config', f'/frozen/cases/{case_id}/remote.yaml',
                     '--tcp-read-cache-bytes', '0', '--transport', 'efa-direct',
@@ -302,6 +312,123 @@ class MatrixEvidenceTests(unittest.TestCase):
                     ['efa-direct']))
                 certificate = checkpoint_kv.cold_probe_certificate(directory, spec, cfg, client)
                 self.assertEqual(certificate['samples'], 256)
+
+    def test_cold_auxiliary_requires_successful_original_admitted_preparation(self):
+        defects = ('missing', 'invalid_json', 'null', 'list', 'empty', 'failed', 'missing_exit',
+                   'boolean_exit', 'wrong_binary', 'missing_binary', 'missing_command',
+                   'empty_command', 'non_list_command', 'non_string_argument')
+        for defect in defects:
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as root:
+                directory, spec, cfg, client, _ = self.cold_probe_fixture(root)
+                checkpoint_kv.cold_probe_certificate(directory, spec, cfg, client)
+                measurement_path = directory.parent / (directory.name + '-process.command.json')
+                measurement = measurement_path.read_bytes()
+                path = directory.parent / (directory.name[:-4] + '-prepare.command.json')
+                receipt = json.loads(path.read_text())
+                if defect == 'missing':
+                    path.unlink()
+                elif defect == 'invalid_json':
+                    path.write_text('{')
+                else:
+                    if defect == 'null':
+                        receipt = None
+                    elif defect == 'list':
+                        receipt = []
+                    elif defect == 'empty':
+                        receipt = {}
+                    elif defect == 'failed':
+                        receipt['exit_code'] = 1
+                    elif defect == 'missing_exit':
+                        del receipt['exit_code']
+                    elif defect == 'boolean_exit':
+                        receipt['exit_code'] = False
+                    elif defect == 'wrong_binary':
+                        receipt['binary_sha256'] = 'd' * 64
+                    elif defect == 'missing_binary':
+                        del receipt['binary_sha256']
+                    elif defect == 'missing_command':
+                        del receipt['command']
+                    elif defect == 'empty_command':
+                        receipt['command'] = []
+                    elif defect == 'non_list_command':
+                        receipt['command'] = 'sharded_wal_bench'
+                    else:
+                        receipt['command'][0] = None
+                    path.write_text(json.dumps(receipt))
+                with self.assertRaises(ValueError):
+                    checkpoint_kv.cold_probe_certificate(directory, spec, cfg, client)
+                self.assertEqual(measurement_path.read_bytes(), measurement)
+
+    def test_cold_auxiliary_rejects_every_unadmitted_preparation_argument(self):
+        for targeted, authority in ((False, False), (True, False), (False, True)):
+            with self.subTest(targeted=targeted, authority=authority), tempfile.TemporaryDirectory() as root:
+                directory, spec, cfg, client, _ = self.cold_probe_fixture(
+                    root, targeted=targeted, authority=authority)
+                checkpoint_kv.cold_probe_certificate(directory, spec, cfg, client)
+                measurement_path = directory.parent / (directory.name + '-process.command.json')
+                measurement = measurement_path.read_bytes()
+                path = directory.parent / (directory.name[:-4] + '-prepare.command.json')
+                receipt = json.loads(path.read_text())
+                original = receipt['command']
+                mutations = [('binary', ['/foreign/sharded_wal_bench'] + original[1:])]
+                for position in range(1, len(original), 2):
+                    flag = original[position]
+                    changed = list(original)
+                    changed[position + 1] = 'foreign'
+                    mutations.append(('changed:' + flag, changed))
+                    mutations.append(('missing:' + flag, original[:position] + original[position + 2:]))
+                    mutations.append(('duplicate:' + flag, original + original[position:position + 2]))
+                mutations += [
+                    ('reordered', original[:1] + original[3:5] + original[1:3] + original[5:]),
+                    ('unknown', original + ['--unknown-control', 'true']),
+                    ('extra-positional', original + ['foreign']),
+                    ('incomplete', original + ['--tcp-read-lanes']),
+                    ('unadmitted-lanes', original + ['--tcp-read-lanes', '3']),
+                    ('unadmitted-pipeline', original + ['--tcp-pipeline', 'false']),
+                    ('unadmitted-shard-memory', original + ['--shard-read-memory-allowance-bytes', '134217728']),
+                    ('unadmitted-client-memory', original + ['--read-memory-allowance-bytes', '134217728'])]
+                for change, command in mutations:
+                    with self.subTest(change=change):
+                        path.write_text(json.dumps(receipt | {'command': command}))
+                        with self.assertRaises(ValueError):
+                            checkpoint_kv.cold_probe_certificate(directory, spec, cfg, client)
+                        self.assertEqual(measurement_path.read_bytes(), measurement)
+
+    def test_cold_auxiliary_rejects_preparation_overrides_with_consistent_effective_evidence(self):
+        for control, value in (('--tcp-read-lanes', '3'), ('--tcp-pipeline', 'false'),
+                               ('--shard-read-memory-allowance-bytes', '134217728')):
+            with self.subTest(control=control), tempfile.TemporaryDirectory() as root:
+                directory, spec, cfg, client, servers = self.cold_probe_fixture(
+                    root, lanes=3 if control == '--tcp-read-lanes' else 2)
+                certificate = checkpoint_kv.cold_probe_certificate(directory, spec, cfg, client)
+                for partition, evidence in servers.items():
+                    checkpoint_kv.validate_cold_probe_storage(evidence, certificate, partition)
+                measurement_path = directory.parent / (directory.name + '-process.command.json')
+                measurement = measurement_path.read_bytes()
+                path = directory.parent / (directory.name[:-4] + '-prepare.command.json')
+                receipt = json.loads(path.read_text())
+                receipt['command'] += [control, value]
+                path.write_text(json.dumps(receipt))
+                if control == '--tcp-pipeline':
+                    path = directory.parent / (directory.name[:-4] + '-remote.yaml')
+                    remote = json.loads(path.read_text())
+                    remote['pipelined_writes'] = False
+                    path.write_text(json.dumps(remote))
+                elif control == '--shard-read-memory-allowance-bytes':
+                    for partition in range(5):
+                        path = directory.parent / 'nodes' / directory.name[:-4] / f'node-{partition}.tar.gz'
+                        with tarfile.open(path) as archive:
+                            start = archive.extractfile('start.json').read()
+                            launch = json.load(archive.extractfile('launch.yaml'))
+                        launch['node']['read_memory_allowance_bytes'] = int(value)
+                        with tarfile.open(path, 'w:gz') as archive:
+                            for name, payload in (('start.json', start), ('launch.yaml', json.dumps(launch).encode())):
+                                member = tarfile.TarInfo(name)
+                                member.size = len(payload)
+                                archive.addfile(member, io.BytesIO(payload))
+                with self.assertRaises(ValueError):
+                    checkpoint_kv.cold_probe_certificate(directory, spec, cfg, client)
+                self.assertEqual(measurement_path.read_bytes(), measurement)
 
     def test_cold_auxiliary_rejects_foreign_effective_policy_even_when_receipts_agree(self):
         geometry_changes = [

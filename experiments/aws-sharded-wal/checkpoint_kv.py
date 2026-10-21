@@ -365,6 +365,16 @@ def cold_probe_certificate(directory, spec, cfg, client):
     if not directory.name.endswith('-tcp'):
         raise ValueError('cold auxiliary requires the original remote case output')
     case_id = directory.name[:-4]
+    expected_prepare, commands = kv_case_commands(cfg, spec)
+    try:
+        preparation = json.loads((directory.parent / (case_id + '-prepare.command.json')).read_text())
+    except (OSError, ValueError) as error:
+        raise ValueError('cold auxiliary lacks its original preparation receipt') from error
+    if (not isinstance(preparation, dict)
+            or type(preparation.get('exit_code')) is not int or preparation['exit_code'] != 0
+            or preparation.get('binary_sha256') != expected_binary_sha256
+            or preparation.get('command') != expected_prepare):
+        raise ValueError('cold auxiliary preparation differs from its successful admitted KV command/build')
     deployment_path = directory.parent / (case_id + '-remote.yaml')
     deployments = transport_floor.yaml_documents(deployment_path.read_text())
     if len(deployments) != 1 or not isinstance(deployments[0], dict):
@@ -387,7 +397,6 @@ def cold_probe_certificate(directory, spec, cfg, client):
             or not isinstance(command, list) or not command
             or any(not isinstance(value, str) for value in command)):
         raise ValueError('cold auxiliary lacks its successful original process receipt')
-    _, commands = kv_case_commands(cfg, spec)
     if command != commands['tcp']:
         raise ValueError('cold auxiliary original process differs from its complete admitted KV command')
     configured_lanes = deployment.get('read_lanes')
