@@ -42,6 +42,7 @@ def parse_fabric_local_diagnostics(stream, *, max_bytes=128 * 1024**2, max_recor
                 or any(type(record[key]) is not int or not 0 <= record[key] <= 2**64 - 1
                        for key in ('window', *counters))
                 or record['window'] == 0 or record['window'] in windows
+                or record['piggyback_advances'] > record['data_posts']
                 or not any(record[key] for key in counters)
                 or (record['peer'] is not None and (not isinstance(record['peer'], str)
                     or not 1 <= len(record['peer']) <= 256

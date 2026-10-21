@@ -68,6 +68,136 @@ def benchmark_case_identity(label, shape, repetition, *, storage=False, capacity
     return f'{prefix}-{label}-v{value}-b{batch}-w{window}-r{repetition}', prefix
 
 
+def kv_case_commands(cfg, spec):
+    """Build the admitted KV workload once for execution and offline admission.
+
+    Paths belong to the trusted guest configuration, never to captured receipts
+    or the local archive extraction directory. Other campaigns retain their own
+    command construction and CLI controls.
+    """
+    root = Path(cfg['run_root'])
+    case_id, _ = benchmark_case_identity('current', spec['shape'], spec['repetition'],
+        storage=True, cold=spec['cold'], diagnostics=spec['diagnostics'],
+        transport=spec['transport'], cached=spec['cached'],
+        authority_resident_batches=spec['authority_resident_batches'],
+        shard_cache_bytes=spec.get('shard_cache_bytes', 0),
+        preparation_chunk_batches=spec.get('preparation_chunk_batches', 16),
+        wal_layout=spec.get('wal_layout'))
+    case_root = root / 'cases' / case_id
+    binary = str(root / 'cloud-bin/current/sharded_wal_bench')
+    value, batch, window = spec['shape']
+    batches = 512 if spec['authority_resident_batches'] is not None else 320
+    if spec.get('workload_batches') is not None:
+        batches = spec['workload_batches']
+    reads = spec.get('workload_reads')
+    if reads is None:
+        reads = 4096
+    cache_bytes = CACHE_BYTES if spec['cached'] else 0
+    shape_args = ['--values', str(value), '--batch-sizes', str(batch), '--windows', str(window),
+                  '--batches', str(batches), '--mixed', '64', '--reads', str(reads), '--repetitions', '1']
+    if spec.get('wal_layout') is not None:
+        shape_args += ['--wal-layout', spec['wal_layout']]
+    endpoints = ','.join(node['private_ip'] + ':7700'
+                         for node in sorted(cfg['nodes'], key=lambda node: node['partition']))
+    prepare = [binary, '--prepare-external-case', str(case_root), '--guest-case-root', str(case_root),
+               '--remote-endpoints', endpoints, '--tcp-read-cache-bytes', str(cache_bytes),
+               '--transport', spec['transport'], '--tcp-server-read-workers', '2',
+               '--tcp-wal-member-read', 'async', '--tcp-resident-first', 'true',
+               '--tcp-polling', 'adaptive', '--tcp-shard-cache-bytes', str(spec.get('shard_cache_bytes', 0))]
+    prepare += shape_args
+    commands = {}
+    for mode in ('native-sync', 'tcp'):
+        output = root / 'checkpoint-results/kv' / (case_id + '-' + mode)
+        command = [binary, '--output', str(output), '--backend', mode] + shape_args
+        command += ['--read-resource-evidence', 'true']
+        if spec.get('cache_hit_contention', False):
+            command += ['--cache-hit-contention', 'true']
+        if spec['cold']:
+            command += ['--cold-read-pass', 'true']
+        if spec['diagnostics']:
+            command += ['--transport-diagnostics', 'true']
+        command += ['--read-window', '32']
+        if mode == 'native-sync':
+            command += ['--native-read-cache-bytes', str(cache_bytes)]
+        if not spec['cold']:
+            command += ['--hot-read-pass', 'true']
+        if mode == 'tcp':
+            command += ['--remote-config', str(case_root / 'remote.yaml'),
+                        '--tcp-read-cache-bytes', str(cache_bytes),
+                        '--transport', spec['transport'], '--tcp-preparation-chunk-batches',
+                        str(spec.get('preparation_chunk_batches', 16))]
+        commands[mode] = command
+    return prepare, commands
+
+
+def kv_case_policy(cfg, spec):
+    """Complete semantic admission policy for the source-bound KV deployment.
+
+    Values follow sharded_wal_bench::BackendParameters, tcp_cluster's external
+    constructor and the serialized runtime schemas/defaults. The authority-window
+    transform changes only resident caps. These defaults are admission constants,
+    not values learned from captured YAML; drift requires explicit readmission.
+    """
+    prepare, _ = kv_case_commands(cfg, spec)
+    arguments = dict(zip(prepare[1::2], prepare[2::2], strict=True))
+    lifetime = int(arguments['--batches']) + 2 * int(arguments['--mixed']) + 8
+    resident = spec['authority_resident_batches']
+    if resident is None:
+        resident = lifetime
+    sui = arguments.get('--wal-layout', 'small') == 'sui'
+    geometry = dict(fragment_bytes=(16 if sui else 1) * 1024**2,
+                    wal_file_bytes=(256 if sui else 128) * 1024**2,
+                    group_limits=dict(max_batches=32,
+                                      max_encoded_bytes=12 * 1024**2 if sui else 1024**2 - 8))
+    partitions = sorted(node['partition'] for node in cfg['nodes'])
+    inventory = dict(database=[42] * 16, epoch=1, segment_generation=1, partitions=partitions)
+    batch_limits = dict(max_operations=32, max_encoded_bytes=320 * 1024)
+    common_partition = geometry | dict(batch_limits=batch_limits, max_reference_metadata_bytes=16 * 1024**2)
+    case_root = Path(arguments['--guest-case-root'])
+    def tls(identity, server_name):
+        return dict(transport=arguments['--transport'], ca=str(case_root / 'tls/ca.der'),
+                    cert=str(case_root / 'tls' / (identity + '.der')),
+                    key=str(case_root / 'tls' / (identity + '.pk8')), server_name=server_name)
+    remote = dict(
+        storage=common_partition | dict(database=[42] * 16, partitions=partitions,
+            max_batches_per_partition=resident, max_epochs=4),
+        endpoints=[dict(partition=node['partition'], address=node['private_ip'] + ':7700',
+                        server_name=f"tidehunter-node-{node['partition']}")
+                   for node in sorted(cfg['nodes'], key=lambda node: node['partition'])],
+        tls=tls('tidehunter-authority', 'unused-client-template'), timeout=dict(secs=10, nanos=0),
+        max_admitted_batches=lifetime, max_index_bytes=128 * 1024**2,
+        max_pending_batches=128, max_pending_bytes=64 * 1024**2, pipelined_writes=True,
+        read_cache_bytes=int(arguments['--tcp-read-cache-bytes']),
+        read_memory_allowance_bytes=512 * 1024**2, preparation_workers=2, scan_prefetch_pages=2,
+        read_lanes=2, max_pending_reads=256, max_pending_read_bytes=64 * 1024**2, write_profile_limit=0)
+    shape = dict(key_spaces=[dict(inner=dict(
+        id=0, name='root', key_indexing=('Fixed', 8), mutexes=16,
+        key_type=('Uniform', dict(cells_per_mutex=64)),
+        config=dict(disable_unload=False, max_dirty_keys=None, l0_max_entries=None, bloom_filter=None,
+                    value_cache_size=0, index_format='Header', unloaded_iterator=True), destroyed=False))])
+    owners = {}
+    for node in cfg['nodes']:
+        partition = node['partition']
+        node_root = case_root / f'node-{partition}'
+        owners[partition] = dict(
+            node=dict(root=str(node_root / 'storage'),
+                partition=common_partition | dict(inventory=inventory, partition=partition, max_batches=resident),
+                shape_yaml=shape, max_epochs=4,
+                read_workers=int(arguments['--tcp-server-read-workers']),
+                wal_member_read=arguments['--tcp-wal-member-read'],
+                read_resident_first=arguments['--tcp-resident-first'] == 'true',
+                read_cache_bytes=int(arguments['--tcp-shard-cache-bytes']),
+                read_memory_allowance_bytes=512 * 1024**2, read_max_inflight_requests=32,
+                read_max_inflight_bytes=64 * 1024**2, read_max_device_reads=128),
+            tls=tls(f'tidehunter-node-{partition}', f'tidehunter-node-{partition}'),
+            limits=dict(max_frame_bytes=16 * 1024**2, max_connections=16, max_reads=256,
+                        recovery_page_batches=128, io_timeout=dict(secs=60, nanos=0),
+                        polling=arguments['--tcp-polling']),
+            listen=node['private_ip'] + ':7700', ready_file=str(node_root / 'ready'),
+            stop_file=str(node_root / 'stop'), drop_first_append_response=False)
+    return remote, owners
+
+
 def sha(path):
     with Path(path).open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
@@ -1002,43 +1132,53 @@ class Campaign:
         self.progress('preparing-' + case_id)
         case_root = self.root / 'cases' / case_id
         case_root.parent.mkdir(exist_ok=True)
-        batches, mixed = (320, 64) if storage else (128, 32)
-        reads = '4096' if self.cfg.get('campaign') in ['read-path', 'efa', 'efa-cache'] else '512'
-        if authority_resident_batches is not None:
-            batches = 512
-        if workload_batches is not None:
-            batches = workload_batches
-        if workload_reads is not None:
-            reads = str(workload_reads)
-        cache_bytes = CACHE_BYTES if cached else 0
-        if progress:
-            batches, mixed, reads, cache_bytes = spec['batches'], spec['mixed'], str(spec['reads']), spec['cache']
-        shape_args = ['--values', str(value), '--batch-sizes', str(batch), '--windows', str(window),
-                      '--batches', str(batches), '--mixed', str(mixed), '--reads', reads, '--repetitions', '1']
-        if wal_layout is not None:
-            shape_args += ['--wal-layout', wal_layout]
-        generator = self.root / 'cloud-bin' / (label if progress else 'current') / 'sharded_wal_bench'
-        endpoints = ','.join(n['private_ip'] + ':7700' for n in sorted(self.cfg['nodes'], key=lambda n: n['partition']))
-        prepare = [str(generator), '--prepare-external-case', str(case_root), '--guest-case-root', str(case_root),
-                   '--remote-endpoints', endpoints, '--tcp-read-cache-bytes', str(cache_bytes)]
-        if label == 'current' or progress:
-            prepare += ['--transport', transport]
-        if progress and (label == 'current' or checkpoint):
-            prepare += ['--tcp-read-lanes', str(spec['lanes']),
-                        '--tcp-server-read-workers', str(spec['workers']),
-                        '--tcp-wal-member-read', spec['member']]
+        kv_commands = None
         if self.cfg.get('kv_subsuite'):
-            prepare += ['--tcp-server-read-workers', '2', '--tcp-wal-member-read', 'async',
-                        '--tcp-resident-first', 'true', '--tcp-polling', 'adaptive',
-                        '--tcp-shard-cache-bytes', str(shard_cache_bytes)]
-        if checkpoint and label == 'current':
-            prepare += ['--tcp-shard-cache-bytes', str(spec['shard_cache'])]
-        if ram:
-            prepare = [str(generator), '--prepare-external-case', str(case_root),
-                       '--guest-case-root', str(case_root), '--remote-endpoints', endpoints]
-            prepare += profile.flags(spec, 'tcp', prepare=True)
+            if (self.cfg.get('campaign') != 'efa-cache' or label != 'current' or not storage
+                    or not resource_evidence or capacity or chunk_control or progress
+                    or self.root != Path(self.cfg['run_root'])
+                    or self.results != self.root / 'checkpoint-results/kv'):
+                raise ValueError('KV execution differs from its fixed admitted runner')
+            kv_spec = dict(shape=shape, repetition=rep, cold=cold, diagnostics=diagnostics,
+                transport=transport, cached=cached, authority_resident_batches=authority_resident_batches,
+                shard_cache_bytes=shard_cache_bytes, preparation_chunk_batches=preparation_chunk_batches,
+                workload_batches=workload_batches, workload_reads=workload_reads, wal_layout=wal_layout,
+                cache_hit_contention=cache_hit_contention)
+            prepare, kv_commands = kv_case_commands(self.cfg, kv_spec)
         else:
-            prepare += shape_args
+            batches, mixed = (320, 64) if storage else (128, 32)
+            reads = '4096' if self.cfg.get('campaign') in ['read-path', 'efa', 'efa-cache'] else '512'
+            if authority_resident_batches is not None:
+                batches = 512
+            if workload_batches is not None:
+                batches = workload_batches
+            if workload_reads is not None:
+                reads = str(workload_reads)
+            cache_bytes = CACHE_BYTES if cached else 0
+            if progress:
+                batches, mixed, reads, cache_bytes = spec['batches'], spec['mixed'], str(spec['reads']), spec['cache']
+            shape_args = ['--values', str(value), '--batch-sizes', str(batch), '--windows', str(window),
+                          '--batches', str(batches), '--mixed', str(mixed), '--reads', reads, '--repetitions', '1']
+            if wal_layout is not None:
+                shape_args += ['--wal-layout', wal_layout]
+            generator = self.root / 'cloud-bin' / (label if progress else 'current') / 'sharded_wal_bench'
+            endpoints = ','.join(n['private_ip'] + ':7700' for n in sorted(self.cfg['nodes'], key=lambda n: n['partition']))
+            prepare = [str(generator), '--prepare-external-case', str(case_root), '--guest-case-root', str(case_root),
+                       '--remote-endpoints', endpoints, '--tcp-read-cache-bytes', str(cache_bytes)]
+            if label == 'current' or progress:
+                prepare += ['--transport', transport]
+            if progress and (label == 'current' or checkpoint):
+                prepare += ['--tcp-read-lanes', str(spec['lanes']),
+                            '--tcp-server-read-workers', str(spec['workers']),
+                            '--tcp-wal-member-read', spec['member']]
+            if checkpoint and label == 'current':
+                prepare += ['--tcp-shard-cache-bytes', str(spec['shard_cache'])]
+            if ram:
+                prepare = [str(generator), '--prepare-external-case', str(case_root),
+                           '--guest-case-root', str(case_root), '--remote-endpoints', endpoints]
+                prepare += profile.flags(spec, 'tcp', prepare=True)
+            else:
+                prepare += shape_args
         run_recorded(prepare, self.results / (case_id + '-prepare'), self.deadline,
                      expected_binary_sha256=self.cloud_builds[label]['binary_sha256']
                      if self.cfg.get('campaign') in ('scalar-transport', 'transport-floor', 'stage-timing') or self.cfg.get('kv_subsuite') else None)
@@ -1079,42 +1219,44 @@ class Campaign:
                 if remaining(self.deadline) < 90:
                     raise TimeoutError('API admission reserve exhausted')
                 output = self.results / (case_id + '-' + mode)
-                command = [str(self.root / 'cloud-bin' / label / 'sharded_wal_bench'),
-                           '--output', str(output), '--backend', mode] + shape_args
-                if resource_evidence:
-                    command += ['--read-resource-evidence', 'true']
-                if cache_hit_contention:
-                    command += ['--cache-hit-contention', 'true']
-                if cold:
-                    command += ['--cold-read-pass', 'true']
-                if diagnostics:
-                    command += ['--transport-diagnostics', 'true']
-                if self.cfg.get('campaign') == 'efa-cache' and label == 'current':
-                    command += ['--read-window', '32']
-                    if mode == 'native-sync':
-                        command += ['--native-read-cache-bytes', str(cache_bytes)]
-                    if not cold:
-                        command += ['--hot-read-pass', 'true']
-                if progress:
-                    write_json(self.results / (case_id + '-plan.json'), spec)
-                    write_json(self.results / (case_id + '-' + mode + '-before.json'),
-                               self.controller_evidence())
-                    if label == 'current' or checkpoint:
-                        command += ['--read-window', str(spec['read_window']),
-                                    '--read-resource-evidence', 'true']
+                if kv_commands is not None:
+                    command = kv_commands[mode]
+                else:
+                    command = [str(self.root / 'cloud-bin' / label / 'sharded_wal_bench'),
+                               '--output', str(output), '--backend', mode] + shape_args
+                    if resource_evidence:
+                        command += ['--read-resource-evidence', 'true']
+                    if cache_hit_contention:
+                        command += ['--cache-hit-contention', 'true']
+                    if cold:
+                        command += ['--cold-read-pass', 'true']
+                    if diagnostics:
+                        command += ['--transport-diagnostics', 'true']
+                    if self.cfg.get('campaign') == 'efa-cache' and label == 'current':
+                        command += ['--read-window', '32']
                         if mode == 'native-sync':
-                            command += ['--native-read-cache-bytes', str(cache_bytes),
-                                        '--native-read-workers', str(spec['native_workers'])]
+                            command += ['--native-read-cache-bytes', str(cache_bytes)]
                         if not cold:
                             command += ['--hot-read-pass', 'true']
-                if mode == 'tcp':
-                    command += ['--remote-config', str(case_root / 'remote.yaml'),
-                                '--tcp-read-cache-bytes', str(cache_bytes)]
-                    if label == 'current' or progress:
-                        command += ['--transport', transport]
-                        command += ['--tcp-preparation-chunk-batches',
-                                    str(preparation_chunk_batches) if self.cfg.get('kv_subsuite') else
-                                    '32' if chunk_control else '16']
+                    if progress:
+                        write_json(self.results / (case_id + '-plan.json'), spec)
+                        write_json(self.results / (case_id + '-' + mode + '-before.json'),
+                                   self.controller_evidence())
+                        if label == 'current' or checkpoint:
+                            command += ['--read-window', str(spec['read_window']),
+                                        '--read-resource-evidence', 'true']
+                            if mode == 'native-sync':
+                                command += ['--native-read-cache-bytes', str(cache_bytes),
+                                            '--native-read-workers', str(spec['native_workers'])]
+                            if not cold:
+                                command += ['--hot-read-pass', 'true']
+                    if mode == 'tcp':
+                        command += ['--remote-config', str(case_root / 'remote.yaml'),
+                                    '--tcp-read-cache-bytes', str(cache_bytes)]
+                        if label == 'current' or progress:
+                            command += ['--transport', transport]
+                            command += ['--tcp-preparation-chunk-batches',
+                                        '32' if chunk_control else '16']
                 if ram and not spec.get('floor'):
                     command = [str(self.root / 'cloud-bin' / label / 'sharded_wal_bench'),
                                '--output', str(output), '--backend', mode]
