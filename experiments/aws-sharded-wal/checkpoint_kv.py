@@ -15,7 +15,7 @@ import transport_floor
 
 from checkpoint_matrix import efa_snapshot, efa_proof, validate_efa_proof, validate_provider
 from checkpoint_matrix import fabric_local_log, fabric_local_archive_log
-from guest import Campaign, upload, write_json, sha
+from guest import Campaign, upload, write_json, sha, benchmark_case_identity
 
 
 def validate_options(options):
@@ -94,6 +94,7 @@ def plan(options, transports):
 
 def validate_contention(path, spec, mode):
     """Recompute the opt-in hit-only population from raw per-caller API samples."""
+    # Each outer case starts a fresh --repetitions 1 process; its internal index is zero.
     rows = [json.loads(line) for line in Path(path).read_text().splitlines()]
     if len(rows) != 2:
         raise ValueError('cache contention requires separate one/eight-caller populations')
@@ -275,24 +276,42 @@ def read_service_evidence(directory, mode, owner_partitions=range(5)):
     return phases
 
 
+def completed_case_ids(planned, completed):
+    """Bind each complete backend pair to one distinct planned outer case."""
+    if len(completed) != 2 * len(planned):
+        raise ValueError('KV case missing its exact native/distributed population')
+    case_ids, seen = [], set()
+    for ordinal, spec in enumerate(planned):
+        case_id, variant = benchmark_case_identity('current', spec['shape'], spec['repetition'],
+            storage=True, cold=spec['cold'], diagnostics=spec['diagnostics'],
+            transport=spec['transport'], cached=spec['cached'],
+            authority_resident_batches=spec['authority_resident_batches'],
+            shard_cache_bytes=spec.get('shard_cache_bytes', 0),
+            preparation_chunk_batches=spec.get('preparation_chunk_batches', 16),
+            wal_layout=spec.get('wal_layout'))
+        pair = completed[2 * ordinal:2 * ordinal + 2]
+        if (case_id in seen or {row['backend'] for row in pair} != {'native-sync', 'tcp'}
+                or any(row.get('case_id') != case_id or row.get('build') != 'current'
+                       or row.get('variant') != variant
+                       or row.get('transport') != (spec['transport'] if row['backend'] == 'tcp' else 'local')
+                       for row in pair)):
+            raise ValueError('KV completed pair differs from its planned outer case identity')
+        seen.add(case_id)
+        case_ids.append(case_id)
+    return case_ids
+
+
 def validate_auxiliary(root, state, cfg):
     """Fail closed on added controls; never relax the original paired-case count."""
     root = Path(root)
     expected_plan = plan(cfg['kv_suite'], cfg['transports'])
     completed = state.get('completed_cases', [])
     floors = state.get('completed_floor_cases', [])
-    if (state.get('plan') != expected_plan or len(completed) != 2 * len(expected_plan)
+    if (state.get('plan') != expected_plan
             or state.get('floor_binary_sha256') != cfg['binaries']['transport-floor']):
         raise ValueError('auxiliary controls differ from the immutable full KV plan/build')
     expected_floors, contention, read_service, fabric = [], [], [], []
-    for ordinal, spec in enumerate(expected_plan):
-        pair = completed[2 * ordinal:2 * ordinal + 2]
-        if ({row['backend'] for row in pair} != {'native-sync', 'tcp'}
-                or pair[0]['case_id'] != pair[1]['case_id']):
-            raise ValueError('auxiliary control lost its exact native/remote pair')
-        case_id = pair[0]['case_id']
-        if not isinstance(case_id, str) or Path(case_id).name != case_id or case_id in ('.', '..'):
-            raise ValueError('invalid KV control case path')
+    for spec, case_id in zip(expected_plan, completed_case_ids(expected_plan, completed), strict=True):
         for mode in ('native-sync', 'tcp'):
             directory = root / (case_id + '-' + mode)
             if not (directory / 'COMPLETE').is_file():
@@ -456,16 +475,12 @@ class CheckpointKvCampaign(Campaign):
                       cache_hit_contention=spec.get('cache_hit_contention', False),
                       workload_reads=spec.get('workload_reads'), wal_layout=spec.get('wal_layout'))
         completed = self.state['completed_cases'][completed_before:]
-        if len(completed) != 2 or {row['backend'] for row in completed} != {'native-sync', 'tcp'}:
-            raise ValueError('KV case missing its native or distributed control')
+        case_id = completed_case_ids([spec], completed)[0]
         if before is not None:
             after = efa_snapshot(identity)
             write_json(self.results / f'efa-{ordinal}-after.json', after)
             write_json(self.results / f'efa-{ordinal}-proof.json', efa_proof(before, after, identity))
-            case_ids = {row['case_id'] for row in completed}
-            if len(case_ids) != 1:
-                raise ValueError('KV paired case identities differ')
-            self.verify_node_hardware(case_ids.pop(), spec['transport'])
+            self.verify_node_hardware(case_id, spec['transport'])
 
     def run(self):
         try:

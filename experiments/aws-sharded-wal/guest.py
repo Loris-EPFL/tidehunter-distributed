@@ -44,6 +44,30 @@ TRANSFER = TransferConfig(max_concurrency=2, multipart_threshold=8 * 1024 * 1024
 CACHE_BYTES = 8 * 1024 * 1024
 
 
+def benchmark_case_identity(label, shape, repetition, *, storage=False, capacity=False,
+                            chunk_control=False, cold=False, diagnostics=False, transport='tcp',
+                            cached=False, authority_resident_batches=None, shard_cache_bytes=0,
+                            preparation_chunk_batches=16, wal_layout=None):
+    """Canonical outer identity, shared by execution and closed evidence admission."""
+    value, batch, window = shape
+    prefix = 'chunk32' if chunk_control else ('capacity4m' if capacity else ('storage' if storage else 'warm'))
+    if cold or diagnostics:
+        prefix = 'diagnostic' if diagnostics else 'cold'
+    if cached:
+        prefix = 'cache'
+    if transport in ('efa', 'efa-direct'):
+        prefix += '-' + transport
+    if shard_cache_bytes:
+        prefix = f'shardcache{shard_cache_bytes}-' + prefix
+    if preparation_chunk_batches != 16:
+        prefix = f'preparation{preparation_chunk_batches}-' + prefix
+    if wal_layout == 'sui':
+        prefix = 'wal-sui-' + prefix
+    if authority_resident_batches is not None:
+        prefix = f'authority{authority_resident_batches}-' + prefix
+    return f'{prefix}-{label}-v{value}-b{batch}-w{window}-r{repetition}', prefix
+
+
 def sha(path):
     with Path(path).open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
@@ -968,22 +992,11 @@ class Campaign:
             raise ValueError('capacity supplement requires current TCP 8KiB/B32/W32')
         if chunk_control and (label != 'current' or not storage or capacity):
             raise ValueError('chunk control requires current storage shape')
-        prefix = 'chunk32' if chunk_control else ('capacity4m' if capacity else ('storage' if storage else 'warm'))
-        if cold or diagnostics:
-            prefix = 'diagnostic' if diagnostics else 'cold'
-        if cached:
-            prefix = 'cache'
-        if transport in ('efa', 'efa-direct'):
-            prefix += '-' + transport
-        if shard_cache_bytes:
-            prefix = f'shardcache{shard_cache_bytes}-' + prefix
-        if preparation_chunk_batches != 16:
-            prefix = f'preparation{preparation_chunk_batches}-' + prefix
-        if wal_layout == 'sui':
-            prefix = 'wal-sui-' + prefix
-        if authority_resident_batches is not None:
-            prefix = f'authority{authority_resident_batches}-' + prefix
-        case_id = f'{prefix}-{label}-v{value}-b{batch}-w{window}-r{rep}'
+        case_id, prefix = benchmark_case_identity(label, shape, rep,
+            storage=storage, capacity=capacity, chunk_control=chunk_control, cold=cold,
+            diagnostics=diagnostics, transport=transport, cached=cached,
+            authority_resident_batches=authority_resident_batches, shard_cache_bytes=shard_cache_bytes,
+            preparation_chunk_batches=preparation_chunk_batches, wal_layout=wal_layout)
         if progress:
             case_id, prefix = spec['case_id'], spec['family']
         self.progress('preparing-' + case_id)

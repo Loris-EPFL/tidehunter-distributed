@@ -287,6 +287,49 @@ class MatrixEvidenceTests(unittest.TestCase):
             self.assertEqual(floors[0]['repetition'], 0)
         self.assertTrue(all(spec['repetition'] == 3 for spec in planned if spec['diagnostics']))
 
+    def test_completed_pairs_reject_reused_repetitions_and_workload_families(self):
+        planned = [dict(shape=[256, 1, 1], repetition=rep, transport='tcp',
+            cold=False, diagnostics=False, cached=cached, authority_resident_batches=None)
+            for rep, cached in ((0, True), (1, True), (1, False))]
+        completed = []
+        for case_id, variant, modes in (
+                ('cache-current-v256-b1-w1-r0', 'cache', ('native-sync', 'tcp')),
+                ('cache-current-v256-b1-w1-r1', 'cache', ('tcp', 'native-sync')),
+                ('storage-current-v256-b1-w1-r1', 'storage', ('native-sync', 'tcp'))):
+            completed.extend(dict(case_id=case_id, variant=variant, backend=mode,
+                build='current', transport='tcp' if mode == 'tcp' else 'local') for mode in modes)
+        checkpoint_kv.completed_case_ids(planned, completed)
+        for source, destination in ((0, 2), (2, 4)):
+            changed = copy.deepcopy(completed)
+            changed[destination:destination + 2] = copy.deepcopy(completed[source:source + 2])
+            with self.subTest(source=source, destination=destination), self.assertRaises(ValueError):
+                checkpoint_kv.completed_case_ids(planned, changed)
+        for field, value in (('build', 'baseline'), ('variant', 'cold'), ('transport', 'efa')):
+            changed = copy.deepcopy(completed)
+            changed[2][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                checkpoint_kv.completed_case_ids(planned, changed)
+
+    def test_completed_pairs_bind_direct_transport_and_storage_layout(self):
+        planned = [dict(shape=[8192, 32, 32], repetition=2, transport='efa-direct',
+            cold=False, diagnostics=False, cached=False, authority_resident_batches=None,
+            shard_cache_bytes=64 * 1024**2, preparation_chunk_batches=32, wal_layout='sui')]
+        variant = 'wal-sui-preparation32-shardcache67108864-storage-efa-direct'
+        case_id = variant + '-current-v8192-b32-w32-r2'
+        completed = [dict(case_id=case_id, variant=variant, backend=mode, build='current',
+            transport='efa-direct' if mode == 'tcp' else 'local') for mode in ('tcp', 'native-sync')]
+        checkpoint_kv.completed_case_ids(planned, completed)
+        changed = copy.deepcopy(completed)
+        changed[0]['transport'] = 'efa'
+        with self.assertRaises(ValueError):
+            checkpoint_kv.completed_case_ids(planned, changed)
+        changed = copy.deepcopy(completed)
+        for row in changed:
+            row['case_id'] = row['case_id'].removeprefix('wal-sui-')
+            row['variant'] = row['variant'].removeprefix('wal-sui-')
+        with self.assertRaises(ValueError):
+            checkpoint_kv.completed_case_ids(planned, changed)
+
     def test_cache_contention_requires_real_overlap_and_exact_hit_population(self):
         spec = dict(shape=[8192, 1, 1], transport='efa-direct')
         rows = []
