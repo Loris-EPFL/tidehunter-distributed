@@ -95,7 +95,7 @@ class MatrixEvidenceTests(unittest.TestCase):
             storage=dict(partitions=list(range(5))),
             endpoints=[dict(partition=node['partition'], address=node['private_ip'] + ':7700') for node in nodes])))
         (directory.parent / 'cold-example-tcp-process.command.json').write_text(json.dumps(dict(
-            exit_code=0, command=['/frozen/sharded_wal_bench', '--reads', '4096',
+            exit_code=0, binary_sha256='c' * 64, command=['/frozen/sharded_wal_bench', '--reads', '4096',
                 '--cold-read-pass', 'true', '--transport', 'efa-direct',
                 '--remote-config', '/frozen/cases/cold-example/remote.yaml'])))
         (directory / 'campaign.txt').write_text(
@@ -119,8 +119,19 @@ class MatrixEvidenceTests(unittest.TestCase):
             | {field: int(boundary == 'after') for field in fields}
             for phase in phases[:-1] for boundary in ('before', 'after')
             for role, partition in [('frontend', ''), *(('storage', str(p)) for p in range(5))]])
-        csv_file('read_io.csv', [dict(phase=phase, partition=p, physical_read_bytes=4096)
-                               for phase in phases for p in range(5)])
+        csv_file('read_io.csv', [identity | dict(
+            phase=phase, partition=p, pid=16000 + p, physical_read_bytes=4096)
+            for phase in phases for p in range(5)])
+        node_root = directory.parent / 'nodes' / 'cold-example'
+        node_root.mkdir(parents=True)
+        for node in nodes:
+            partition = node['partition']
+            start = json.dumps(dict(pid=16000 + partition, ready=node['private_ip'] + ':7700',
+                                    build='current', binary_sha256='c' * 64)).encode()
+            with tarfile.open(node_root / f'node-{partition}.tar.gz', 'w:gz') as archive:
+                member = tarfile.TarInfo('start.json')
+                member.size = len(start)
+                archive.addfile(member, io.BytesIO(start))
         records, servers, profiles = [], {}, []
         for p, node in enumerate(nodes):
             count = 52 if p == 0 else 51
@@ -234,6 +245,131 @@ class MatrixEvidenceTests(unittest.TestCase):
                     else:
                         process['exit_code'] = 1
                     path.write_text(json.dumps(process))
+                with self.assertRaises(ValueError):
+                    checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client)
+
+    def test_cold_auxiliary_binds_physical_io_to_original_owner_and_case(self):
+        changes = [('backend', 'experimental_tcp_authority'), ('value_bytes', '8192'),
+                   ('batch_size', '32'), ('window', '32'), ('repetition', '1'),
+                   ('pid', '16001'), ('all_owner_pid', '99999'), ('auxiliary_pid', '99999'),
+                   ('phase', 'foreign-phase'), ('partition', '5'),
+                   ('missing', None), ('duplicate', None), ('extra', None), ('oversized', None)]
+        for field, value in changes:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as root:
+                directory, spec, nodes, client, _ = self.cold_probe_fixture(root)
+                path = directory / 'read_io.csv'
+                with path.open() as stream:
+                    rows = list(csv.DictReader(stream))
+                if field == 'missing':
+                    rows.pop()
+                elif field == 'duplicate':
+                    rows[1] = dict(rows[0])
+                elif field == 'extra':
+                    rows.append(dict(rows[0]))
+                elif field == 'oversized':
+                    rows[0]['padding'] = 'x' * (4096 * (len(rows) + 1))
+                elif field == 'all_owner_pid':
+                    for row in rows:
+                        if row['partition'] == '0':
+                            row['pid'] = value
+                elif field == 'auxiliary_pid':
+                    rows[-1]['pid'] = value
+                else:
+                    rows[0][field] = value
+                with path.open('w') as stream:
+                    writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+                    writer.writeheader()
+                    writer.writerows(rows)
+                with self.assertRaises(ValueError):
+                    checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client)
+
+    def test_cold_auxiliary_requires_positive_aggregate_io_in_every_cold_phase(self):
+        phases = ('cache_evicted_get', 'cache_evicted_get_many',
+                  'cache_evicted_get_window', 'cache_evicted_diagnostics')
+        for phase in (*phases, None):
+            with self.subTest(zero_phase=phase), tempfile.TemporaryDirectory() as root:
+                directory, spec, nodes, client, _ = self.cold_probe_fixture(root)
+                path = directory / 'read_io.csv'
+                with path.open() as stream:
+                    rows = list(csv.DictReader(stream))
+                for row in rows:
+                    if row['phase'] == phase or (phase is None and row['partition'] == '0'):
+                        row['physical_read_bytes'] = '0'
+                with path.open('w') as stream:
+                    writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+                    writer.writeheader()
+                    writer.writerows(rows)
+                if phase is None:
+                    # One idle owner is valid; only the phase aggregate must be positive.
+                    certificate = checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client)
+                    self.assertEqual(certificate['samples'], 256)
+                else:
+                    with self.assertRaises(ValueError):
+                        checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client)
+
+    def test_cold_auxiliary_requires_complete_positive_cold_and_reopened_api_samples(self):
+        for change in ('tail_missing', 'tail_absent', 'tail_duplicate', 'tail_ordinal',
+                       'tail_zero', 'tail_negative', 'cold_zero', 'extra'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as root:
+                directory, spec, nodes, client, _ = self.cold_probe_fixture(root)
+                path = directory / 'remote_read_profiles.csv'
+                with path.open() as stream:
+                    rows = list(csv.DictReader(stream))
+                if change == 'tail_missing':
+                    rows.pop()
+                elif change == 'tail_absent':
+                    rows = rows[:256]
+                elif change == 'tail_duplicate':
+                    rows[-1]['sample'] = '0'
+                elif change == 'tail_ordinal':
+                    rows[-1]['sample'] = '256'
+                elif change in ('tail_zero', 'tail_negative'):
+                    rows[-1]['whole_call_ns'] = '0' if change == 'tail_zero' else '-1'
+                elif change == 'cold_zero':
+                    rows[0]['whole_call_ns'] = '0'
+                else:
+                    rows.append(dict(rows[-1]))
+                with path.open('w') as stream:
+                    writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+                    writer.writeheader()
+                    writer.writerows(rows)
+                with self.assertRaises(ValueError):
+                    checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client)
+
+    def test_cold_auxiliary_requires_one_bounded_original_owner_start_record(self):
+        for change in ('missing', 'duplicate', 'symlink', 'oversized', 'duplicate_pid',
+                       'pid_bool', 'pid_zero', 'pid_negative', 'pid_foreign',
+                       'endpoint', 'build', 'binary'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as root:
+                directory, spec, nodes, client, _ = self.cold_probe_fixture(root)
+                path = directory.parent / 'nodes' / 'cold-example' / 'node-0.tar.gz'
+                with tarfile.open(path, 'r:gz') as archive:
+                    start = json.load(archive.extractfile('start.json'))
+                if change.startswith('pid_'):
+                    start['pid'] = {'pid_bool': True, 'pid_zero': 0,
+                                    'pid_negative': -1, 'pid_foreign': 99999}[change]
+                elif change == 'endpoint':
+                    start['ready'] = '10.9.9.9:7700'
+                elif change == 'build':
+                    start['build'] = 'baseline'
+                elif change == 'binary':
+                    start['binary_sha256'] = 'd' * 64
+                payload = json.dumps(start).encode()
+                if change == 'oversized':
+                    payload = b' ' * 4097
+                elif change == 'duplicate_pid':
+                    payload = payload[:-1] + b', "pid": 16000}'
+                with tarfile.open(path, 'w:gz') as archive:
+                    if change != 'missing':
+                        for _ in range(2 if change == 'duplicate' else 1):
+                            member = tarfile.TarInfo('start.json')
+                            if change == 'symlink':
+                                member.type = tarfile.SYMTYPE
+                                member.linkname = 'foreign.json'
+                                archive.addfile(member)
+                            else:
+                                member.size = len(payload)
+                                archive.addfile(member, io.BytesIO(payload))
                 with self.assertRaises(ValueError):
                     checkpoint_kv.cold_probe_certificate(directory, spec, nodes, client)
 

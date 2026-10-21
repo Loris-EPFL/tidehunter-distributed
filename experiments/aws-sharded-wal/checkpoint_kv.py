@@ -302,6 +302,30 @@ def completed_case_ids(planned, completed):
     return case_ids
 
 
+def cold_owner_pid(path, endpoint, binary_sha256):
+    """Read the original owner identity, never infer it from the IO being certified."""
+    with tarfile.open(path, 'r:gz') as archive:
+        members = list(islice(archive, 1025))
+        starts = [member for member in members if member.name == 'start.json']
+        if (len(members) > 1024 or len(starts) != 1 or not starts[0].isfile()
+                or not 0 < starts[0].size <= 4096):
+            raise ValueError('cold owner archive lacks one bounded regular original start receipt')
+        def unique_pairs(pairs):
+            result = dict(pairs)
+            if len(result) != len(pairs):
+                raise ValueError('duplicate original owner start identity key')
+            return result
+        with archive.extractfile(starts[0]) as stream:
+            start = json.loads(stream.read(4097), object_pairs_hook=unique_pairs)
+    if (not isinstance(start, dict) or type(start.get('pid')) is not int
+            or not 0 < start['pid'] <= 2**32 - 1
+            or start.get('ready') != endpoint or start.get('build') != 'current'
+            or not isinstance(binary_sha256, str) or len(binary_sha256) != 64
+            or start.get('binary_sha256') != binary_sha256):
+        raise ValueError('cold original owner PID/endpoint/build identity differs')
+    return start['pid']
+
+
 def cold_probe_certificate(directory, spec, nodes, client):
     """Bind mixed cold-case stderr to the separately profiled certification pass.
 
@@ -379,12 +403,11 @@ def cold_probe_certificate(directory, spec, nodes, client):
             for key, value in identity.items())
     with (directory / 'remote_read_profiles.csv').open() as stream:
         rows = list(islice(csv.DictReader(stream), 2 * count + 1))
-    auxiliary = [row for row in rows if row['state'] == 'cache-evicted']
-    if (len(rows) > 2 * count or not all(same_case(row) for row in rows)
+    if (len(rows) != 2 * count or not all(same_case(row) for row in rows)
             or [row['state'] for row in rows] != (
-                ['cache-evicted'] * count + ['reopened-cache-cleared'] * (len(rows) - count))
-            or [int(row['sample']) for row in auxiliary] != list(range(count))
-            or any(int(row['whole_call_ns']) <= 0 for row in auxiliary)):
+                ['cache-evicted'] * count + ['reopened-cache-cleared'] * count)
+            or [int(row['sample']) for row in rows] != list(range(count)) * 2
+            or any(int(row['whole_call_ns']) <= 0 for row in rows)):
         raise ValueError('cold auxiliary API samples lack exact case/state/sample evidence')
     profiles = [row for row in transport_floor.yaml_documents(
         (directory / 'node_profiles.yaml').read_text()) if row is not None]
@@ -402,12 +425,30 @@ def cold_probe_certificate(directory, spec, nodes, client):
             or sum(profile['requests'] for profile in profiles.values()) != count):
         raise ValueError('cold auxiliary node requests differ from the verified API samples')
     phases = ('cache_evicted_get', 'cache_evicted_get_many', 'cache_evicted_get_window')
+    io_phases = (*phases, 'cache_evicted_diagnostics')
+    owner_pids = {
+        partition: cold_owner_pid(
+            directory.parent / 'nodes' / case_id / f'node-{partition}.tar.gz',
+            expected_endpoints[partition], process.get('binary_sha256'))
+        for partition in partitions}
+    expected_io = {(phase, str(partition)) for phase in io_phases for partition in partitions}
+    io_path = directory / 'read_io.csv'
+    if io_path.stat().st_size > 4096 * (len(expected_io) + 1):
+        raise ValueError('cold physical IO CSV exceeds its bounded owner/phase scan')
+    with io_path.open() as stream:
+        io_rows = list(islice(csv.DictReader(stream), len(expected_io) + 1))
+    if (len(io_rows) != len(expected_io)
+            or {(row['phase'], row['partition']) for row in io_rows} != expected_io
+            or not all(same_case(row) for row in io_rows)
+            or any(row.get('pid') != str(owner_pids[int(row['partition'])]) for row in io_rows)):
+        raise ValueError('cold physical IO lacks the exact case/phase/original owner PID population')
     service = read_service_evidence(directory, 'tcp', partitions)
     for phase in phases:
         evidence = service.get(phase)
         if (evidence is None or not evidence['owner_counters_available']
                 or evidence['frontend'] is None
-                or set(evidence['physical']) != {str(partition) for partition in partitions}):
+                or set(evidence['physical']) != {str(partition) for partition in partitions}
+                or evidence['charged_physical_read_bytes'] <= 0):
             raise ValueError('cold auxiliary lacks complete separate primary read evidence intervals')
     # record() emits physical IO for the auxiliary probe, not read-path snapshots.
     diagnostic_io = service.get('cache_evicted_diagnostics')
