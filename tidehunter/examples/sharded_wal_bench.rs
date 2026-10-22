@@ -1352,7 +1352,7 @@ impl Output {
         )?;
         writeln!(
             output.read_path_evidence,
-            "backend,value_bytes,batch_size,window,repetition,phase,boundary,role,partition,cache_budget_bytes,cache_retained_bytes,cache_metadata_bytes,cache_entries,cache_hits,cache_misses,cache_evictions,wal_reads,wal_read_bytes,inflight_requests,inflight_bytes,inflight_reads,peak_inflight_requests,peak_inflight_bytes,peak_inflight_reads,peak_device_reads,cache_bypass_disabled,cache_bypass_eviction_limit,cache_bypass_scan,cache_bypass_generation,cache_admitted_charge_bytes,cache_served_accounted_bytes,idle_buffer_bytes,idle_buffers,buffer_reuses,buffer_allocations,resident_read_attempts,resident_read_successes,resident_read_fallbacks,resident_read_unsupported,async_read_submissions,resident_read_partial"
+            "backend,value_bytes,batch_size,window,repetition,phase,boundary,role,partition,cache_budget_bytes,cache_retained_bytes,cache_metadata_bytes,cache_entries,cache_hits,cache_misses,cache_evictions,wal_reads,wal_read_bytes,inflight_requests,inflight_bytes,inflight_reads,peak_inflight_requests,peak_inflight_bytes,peak_inflight_reads,peak_device_reads,cache_bypass_disabled,cache_bypass_eviction_limit,cache_bypass_scan,cache_bypass_generation,cache_admitted_charge_bytes,cache_served_accounted_bytes,idle_buffer_bytes,idle_buffers,buffer_reuses,buffer_allocations,resident_read_attempts,resident_read_successes,resident_read_fallbacks,resident_read_unsupported,async_read_submissions,resident_read_partial,resident_read_deferred"
         )?;
         writeln!(
             output.native_read_profiles,
@@ -1574,7 +1574,7 @@ impl Output {
         )?;
         writeln!(
             self.read_path_evidence,
-            ",{},{},0,0,{},{},0,0,0,0,0,0,0,0,0,0",
+            ",{},{},0,0,{},{},0,0,0,0,0,0,0,0,0,0,0",
             cache.bypass_disabled,
             cache.bypass_eviction_limit,
             cache.admitted_bytes,
@@ -1611,7 +1611,7 @@ impl Output {
             )?;
             writeln!(
                 self.read_path_evidence,
-                ",{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                ",{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 stats.cache_bypass_disabled,
                 stats.cache_bypass_eviction_limit,
                 stats.cache_bypass_scan,
@@ -1628,6 +1628,7 @@ impl Output {
                 stats.resident_read_unsupported,
                 stats.async_read_submissions,
                 stats.resident_read_partial,
+                stats.resident_read_deferred,
             )?;
         }
         self.read_path_evidence.flush()?;

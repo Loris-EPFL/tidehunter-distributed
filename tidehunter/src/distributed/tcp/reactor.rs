@@ -1614,6 +1614,9 @@ pub(super) fn serve_session(
     let mut ram_probe = None::<minibytes::Bytes>;
     let result = (|| {
         while !shutdown.load(Ordering::Acquire) {
+            if let Some(executor) = executor.as_mut() {
+                executor.begin_sweep();
+            }
             let now = Instant::now();
             let sweep_gap = if let Some(profile) = diagnostics.as_mut() {
                 profile.polling.progress_sweeps += 1;
