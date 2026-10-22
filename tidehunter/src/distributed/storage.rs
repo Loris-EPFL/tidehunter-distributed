@@ -208,11 +208,11 @@ impl DurableBatch {
         self.0
     }
 
-    /// Only the authenticated transport boundary may reconstruct this proof.
+    /// Only the validated transport boundary may reconstruct this proof.
     /// It must first bind the reply to the requested database, version, digest,
     /// registered partition/generation and physical bounds. Deserializing an
     /// arbitrary peer receipt is not evidence of persistence.
-    pub(crate) fn from_authenticated_parts(
+    pub(crate) fn from_validated_parts(
         id: BatchId,
         version: BatchVersion,
         digest: PayloadDigest,

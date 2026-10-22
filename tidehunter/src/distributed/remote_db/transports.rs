@@ -1,7 +1,7 @@
 //! Transport lifetime is independent of the durable authority epoch.
 //!
 //! eRPC §§3.1/4.2.2 retains endpoint/buffer ownership across logical sessions.
-//! Here only a successfully drained, sealed database returns its authenticated
+//! Here only a successfully drained, sealed database returns its mode-validated
 //! connections. Reopen still refreshes status, fences every node and recovers
 //! the complete checkpoint/tail. No failed connection is retried in place.
 use super::*;

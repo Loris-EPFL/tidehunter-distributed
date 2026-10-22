@@ -3,17 +3,20 @@ use crate::distributed::storage::WalMemberReadPolicy;
 use crate::distributed::tcp::reactor::Envelope;
 use std::sync::mpsc;
 
-struct Running {
+pub(in crate::distributed::tcp) struct Running {
     _temp: tempdir::TempDir,
-    config: NodeConfig,
+    pub(in crate::distributed::tcp) config: NodeConfig,
     tls: TlsFiles,
-    node: Arc<StorageNode>,
+    pub(in crate::distributed::tcp) node: Arc<StorageNode>,
     endpoint: String,
     shutdown: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 impl Running {
-    fn new(transport: Transport, policy: WalMemberReadPolicy) -> Self {
+    pub(in crate::distributed::tcp) fn new(
+        transport: Transport,
+        policy: WalMemberReadPolicy,
+    ) -> Self {
         Self::with_bounds(
             transport,
             policy,
@@ -76,9 +79,20 @@ impl Running {
         limits: TcpLimits,
         configure: impl FnOnce(&mut NodeConfig),
     ) -> Self {
-        let temp = tempdir::TempDir::new("multiplexed-tls").unwrap();
-        let mut tls = certificates(temp.path());
-        tls.transport = transport;
+        let temp = tempdir::TempDir::new("multiplexed-session").unwrap();
+        let tls = if transport.is_native() {
+            TlsFiles {
+                transport,
+                ca: PathBuf::new(),
+                cert: PathBuf::new(),
+                key: PathBuf::new(),
+                server_name: "trusted-test-cluster".to_owned(),
+            }
+        } else {
+            let mut tls = certificates(temp.path());
+            tls.transport = transport;
+            tls
+        };
         let mut config = config(&temp.path().join("node"));
         config.wal_member_read = policy;
         config.read_max_inflight_bytes = bytes;
@@ -104,7 +118,7 @@ impl Running {
             worker: Some(worker),
         }
     }
-    fn client(&self) -> Client {
+    pub(in crate::distributed::tcp) fn client(&self) -> Client {
         Client::connect(
             &self.endpoint,
             &self.tls,
@@ -333,7 +347,78 @@ fn one_tcp_connection_completes_ready_read_before_delayed_read() {
 fn one_software_fabric_connection_completes_out_of_order() {
     delayed_independent(Transport::FabricTcp);
 }
+#[cfg(feature = "experimental-fabric")]
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm software provider"]
+fn native_software_provider_mixed_rpc_reads_complete_out_of_order() {
+    delayed_independent(Transport::FabricTcpNative);
+}
 
+#[cfg(feature = "experimental-fabric")]
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm software provider"]
+fn fabric_tcp_native_rejects_invalid_reference_and_epoch_without_tls() {
+    let server = Running::new(Transport::FabricTcpNative, WalMemberReadPolicy::Positional);
+    let mut client = server.client();
+    let (batches, references) = server.data(&mut client);
+
+    let mut forged_offset = references[0];
+    forged_offset.descriptor.offset += 1;
+    assert!(client.read_record(1, &forged_offset).is_err());
+
+    let mut forged_checksum = references[0];
+    forged_checksum.descriptor.checksum.0 ^= 1;
+    assert!(client.read_record(1, &forged_checksum).is_err());
+    assert!(client.read_record(2, &references[0]).is_err());
+
+    assert_eq!(
+        client.read_record(1, &references[0]).unwrap(),
+        batches[0].mutations()[0],
+        "rejected references and epochs must not poison a valid native session",
+    );
+}
+#[cfg(feature = "experimental-fabric")]
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm software provider"]
+fn fabric_tcp_native_mode_mismatch_with_tls_fails_closed() {
+    let native_server = Running::new(Transport::FabricTcpNative, WalMemberReadPolicy::Positional);
+    let tls_dir = native_server._temp.path().join("tls-client");
+    fs::create_dir(&tls_dir).unwrap();
+    let mut tls_client = certificates(&tls_dir);
+    tls_client.transport = Transport::Tcp;
+    assert!(
+        Client::connect(
+            &native_server.endpoint,
+            &tls_client,
+            Duration::from_secs(2),
+            native_server.config.partition.clone(),
+            &shape(),
+        )
+        .is_err(),
+        "a TLS client must not be accepted by the native listener",
+    );
+    drop(native_server);
+
+    let tls_server = Running::new(Transport::Tcp, WalMemberReadPolicy::Positional);
+    let native_client = TlsFiles {
+        transport: Transport::FabricTcpNative,
+        ca: PathBuf::new(),
+        cert: PathBuf::new(),
+        key: PathBuf::new(),
+        server_name: "trusted-test-cluster".into(),
+    };
+    assert!(
+        Client::connect(
+            &tls_server.endpoint,
+            &native_client,
+            Duration::from_secs(2),
+            tls_server.config.partition.clone(),
+            &shape(),
+        )
+        .is_err(),
+        "a native client must not downgrade to the TLS listener",
+    );
+}
 #[test]
 fn fence_while_read_pending_is_rechecked_before_reply() {
     let server = Running::new(Transport::Tcp, WalMemberReadPolicy::Mapped);
@@ -480,9 +565,49 @@ enum Fault {
     CorruptMember,
     WrongMemberCount,
 }
-fn faulty_peer(fault: Fault) {
+trait FaultPeerIo: Read + Write {}
+impl<T: Read + Write> FaultPeerIo for T {}
+
+#[cfg(feature = "experimental-fabric")]
+struct NativeFaultPeer {
+    endpoint: tidehunter_fabric::Endpoint,
+    _control: DeadlineIo,
+    deadline: Instant,
+}
+#[cfg(feature = "experimental-fabric")]
+impl Read for NativeFaultPeer {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.endpoint.receive(bytes, self.deadline)
+    }
+}
+#[cfg(feature = "experimental-fabric")]
+impl Write for NativeFaultPeer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.endpoint.send(bytes, self.deadline)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        let fence = self.endpoint.accepted_send_fence()?;
+        while self.endpoint.completed_send_fence()? < fence {
+            self.endpoint.progress(self.deadline)?;
+            thread::yield_now();
+        }
+        Ok(())
+    }
+}
+
+fn faulty_peer(fault: Fault, transport: Transport) {
     let temp = tempdir::TempDir::new("correlated-reply-fault").unwrap();
-    let tls = certificates(temp.path());
+    let tls = if transport.is_native() {
+        TlsFiles {
+            transport,
+            ca: PathBuf::new(),
+            cert: PathBuf::new(),
+            key: PathBuf::new(),
+            server_name: "trusted-test-cluster".to_owned(),
+        }
+    } else {
+        certificates(temp.path())
+    };
     let config = config(&temp.path().join("node"));
     let node = StorageNode::open(config.clone(), metrics()).unwrap();
     node.inventory.lock().fence_to(1).unwrap();
@@ -514,14 +639,30 @@ fn faulty_peer(fault: Fault) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = listener.local_addr().unwrap().to_string();
     let server_config = tls.server_config().unwrap().config;
+    let (finished, completed) = mpsc::sync_channel(1);
     let worker = thread::spawn(move || {
         let (socket, _) = listener.accept().unwrap();
         let mut io = DeadlineIo::new(socket, Duration::from_secs(2)).unwrap();
-        let mut conn = ServerConnection::new(server_config).unwrap();
-        while conn.is_handshaking() {
-            conn.complete_io(&mut io).unwrap();
-        }
-        let mut stream = StreamOwned::new(conn, io);
+        let mut stream: Box<dyn FaultPeerIo> = if transport.is_native() {
+            #[cfg(feature = "experimental-fabric")]
+            {
+                read_transport_mode(&mut io, transport).unwrap();
+                let endpoint = fabric::bootstrap(&mut io, transport).unwrap();
+                Box::new(NativeFaultPeer {
+                    endpoint,
+                    _control: io,
+                    deadline: Instant::now() + Duration::from_secs(3),
+                })
+            }
+            #[cfg(not(feature = "experimental-fabric"))]
+            unreachable!("native fault peer requires experimental-fabric")
+        } else {
+            let mut conn = ServerConnection::new(server_config.unwrap()).unwrap();
+            while conn.is_handshaking() {
+                conn.complete_io(&mut io).unwrap();
+            }
+            Box::new(StreamOwned::new(conn, io))
+        };
         let hello: Envelope<Request> = read_frame(&mut stream, HARD_FRAME_LIMIT).unwrap();
         write_frame(
             &mut stream,
@@ -550,22 +691,23 @@ fn faulty_peer(fault: Fault) {
             | Fault::CorruptMember
             | Fault::WrongMemberCount => {
                 write_frame(&mut stream, &reply, HARD_FRAME_LIMIT).unwrap();
-                thread::sleep(Duration::from_millis(100));
             }
             Fault::Truncated => {
                 stream.write_all(&encoded[..encoded.len() - 1]).unwrap();
                 stream.flush().unwrap();
             }
-            Fault::Deadline => thread::sleep(Duration::from_millis(150)),
+            Fault::Deadline => {}
             Fault::PartialValid => {
                 for byte in encoded {
                     stream.write_all(&[byte]).unwrap();
                     stream.flush().unwrap();
                 }
-                // Keep the authenticated connection alive until the full frame
-                // can be consumed; a raw EOF itself remains a transport error.
-                thread::sleep(Duration::from_millis(100));
             }
+        }
+        if !matches!(fault, Fault::Truncated) {
+            // Keep the peer live until the client accepts/rejects the actual
+            // reply. EOF must not make an integrity failure appear to pass.
+            completed.recv_timeout(Duration::from_secs(3)).unwrap();
         }
     });
     let mut client = Client::connect(
@@ -612,37 +754,47 @@ fn faulty_peer(fault: Fault) {
         assert!(Instant::now() < deadline);
         thread::yield_now();
     }
+    if !matches!(fault, Fault::Truncated) {
+        finished.send(()).unwrap();
+    }
     worker.join().unwrap();
 }
 #[test]
 fn unknown_reply_id_fails_connection() {
-    faulty_peer(Fault::BadId);
+    faulty_peer(Fault::BadId, Transport::Tcp);
 }
 #[test]
 fn stale_v2_reply_fails_connection() {
-    faulty_peer(Fault::StaleProtocol);
+    faulty_peer(Fault::StaleProtocol, Transport::Tcp);
 }
 #[test]
 fn truncated_reply_fails_connection() {
-    faulty_peer(Fault::Truncated);
+    faulty_peer(Fault::Truncated, Transport::Tcp);
 }
 #[test]
 fn expired_inflight_deadline_fails_connection() {
-    faulty_peer(Fault::Deadline);
+    faulty_peer(Fault::Deadline, Transport::Tcp);
 }
 #[test]
 fn tls_records_and_frame_header_can_arrive_one_byte_at_a_time() {
-    faulty_peer(Fault::PartialValid);
+    faulty_peer(Fault::PartialValid, Transport::Tcp);
 }
 
 #[test]
 fn authenticated_scalar_payload_corruption_fails_connection() {
-    faulty_peer(Fault::CorruptMember);
+    faulty_peer(Fault::CorruptMember, Transport::Tcp);
 }
 
 #[test]
 fn authenticated_scalar_wrong_member_count_fails_connection() {
-    faulty_peer(Fault::WrongMemberCount);
+    faulty_peer(Fault::WrongMemberCount, Transport::Tcp);
+}
+
+#[cfg(feature = "experimental-fabric")]
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm software provider"]
+fn fabric_tcp_native_rejects_corrupt_member_reply_without_tls() {
+    faulty_peer(Fault::CorruptMember, Transport::FabricTcpNative);
 }
 
 #[test]
@@ -898,17 +1050,23 @@ fn ram_probe_round_trip(transport: Transport, polling: PollingPolicy) {
     );
     assert!(profile.control_execution_ns > 0);
     assert!(profile.handler_ns >= profile.control_execution_ns);
-    for transport in [profile.transport, profile.client_transport] {
-        assert!(transport.frame_encode.calls > 0);
-        assert!(transport.frame_decode.calls > 0);
-        assert!(transport.plaintext_write.bytes > 0);
-        assert!(transport.plaintext_read.bytes > 0);
-        assert!(transport.tls_read.calls > 0);
-        assert!(transport.tls_write.calls > 0);
-        assert!(transport.tls_process.calls > 0);
-        assert!(transport.output_queue_samples > 0);
-        assert!(transport.output_submit_samples > 0);
-        assert!(transport.output_retire_samples > 0);
+    for stats in [profile.transport, profile.client_transport] {
+        assert!(stats.frame_encode.calls > 0);
+        assert!(stats.frame_decode.calls > 0);
+        assert!(stats.plaintext_write.bytes > 0);
+        assert!(stats.plaintext_read.bytes > 0);
+        if transport.is_native() {
+            assert_eq!(stats.tls_read.calls, 0);
+            assert_eq!(stats.tls_write.calls, 0);
+            assert_eq!(stats.tls_process.calls, 0);
+        } else {
+            assert!(stats.tls_read.calls > 0);
+            assert!(stats.tls_write.calls > 0);
+            assert!(stats.tls_process.calls > 0);
+        }
+        assert!(stats.output_queue_samples > 0);
+        assert!(stats.output_submit_samples > 0);
+        assert!(stats.output_retire_samples > 0);
     }
     if transport != Transport::Tcp {
         assert_eq!(profile.polling.idle_wait_calls, 0);
@@ -951,6 +1109,14 @@ fn authenticated_ram_probe_boundaries_and_busy_shutdown() {
 fn fabric_authenticated_ram_probe_boundaries_and_busy_shutdown() {
     for polling in [PollingPolicy::Adaptive, PollingPolicy::Busy] {
         ram_probe_round_trip(Transport::FabricTcp, polling);
+    }
+}
+#[cfg(all(feature = "test-utils", feature = "experimental-fabric"))]
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm software provider"]
+fn fabric_tcp_native_large_partial_frames_bypass_tls() {
+    for polling in [PollingPolicy::Adaptive, PollingPolicy::Busy] {
+        ram_probe_round_trip(Transport::FabricTcpNative, polling);
     }
 }
 
@@ -1151,10 +1317,9 @@ fn software_fabric_cold_authority_preserves_hot_progress_and_rechecks_fencing() 
     }
 }
 
-#[test]
-fn disconnect_retains_cold_planning_credits_until_the_worker_retires() {
+fn disconnect_retains_cold_planning_credits_until_the_worker_retires_for(transport: Transport) {
     let server = Running::with_config(
-        Transport::Tcp,
+        transport,
         WalMemberReadPolicy::Async,
         default_read_bytes(),
         default_device_reads(),
@@ -1184,14 +1349,9 @@ fn disconnect_retains_cold_planning_credits_until_the_worker_retires() {
     let log = server.node.inventory.lock().active(1).unwrap();
     log.evict_authority_cache();
     let (entered, release) = log.pause_next_authority_load();
+    let read_deadline = Instant::now() + Duration::from_secs(2);
     client
-        .submit_read(
-            1,
-            vec![reference],
-            Instant::now() + Duration::from_secs(2),
-            ReadClass::Point,
-            false,
-        )
+        .submit_read(1, vec![reference], read_deadline, ReadClass::Point, false)
         .unwrap()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -1210,6 +1370,23 @@ fn disconnect_retains_cold_planning_credits_until_the_worker_retires() {
     assert!(charged > 0);
     assert_eq!(server.node.read_admission.stats().inflight_requests, 1);
     assert_eq!(server.node.read_admission.stats().wal_reads, 0);
+    if transport.is_native() {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match client.progress_reads() {
+                Err(_) => {
+                    assert!(Instant::now() >= read_deadline);
+                    break;
+                }
+                Ok(completed) => assert!(completed.is_empty()),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native outstanding read did not expire at its absolute deadline"
+            );
+        }
+        assert_eq!(server.node.read_admission.stats().inflight_bytes, charged);
+    }
     drop(client);
     assert_eq!(server.node.read_admission.stats().inflight_bytes, charged);
     release.send(()).unwrap();
@@ -1223,4 +1400,17 @@ fn disconnect_retains_cold_planning_credits_until_the_worker_retires() {
     }
     assert_eq!(server.node.read_admission.stats().inflight_bytes, 0);
     assert_eq!(server.node.read_admission.stats().inflight_reads, 0);
+}
+#[test]
+fn disconnect_retains_cold_planning_credits_until_the_worker_retires() {
+    disconnect_retains_cold_planning_credits_until_the_worker_retires_for(Transport::Tcp);
+}
+
+#[cfg(feature = "experimental-fabric")]
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm software provider"]
+fn fabric_tcp_native_disconnect_retains_owned_reply_credits_until_retirement() {
+    disconnect_retains_cold_planning_credits_until_the_worker_retires_for(
+        Transport::FabricTcpNative,
+    );
 }

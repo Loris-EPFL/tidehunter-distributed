@@ -884,7 +884,8 @@ pub struct RemoteDatabase {
     durable_wait_started: VecDeque<Option<Instant>>,
     staged: Vec<VecDeque<usize>>,
     staged_bytes: Vec<usize>,
-    inflight: Vec<Option<PendingAppend>>,
+    inflight: Vec<VecDeque<PendingAppend>>,
+    unresolved_append: Option<BatchVersion>,
     completion_wake: mpsc::Receiver<()>,
     preparation_wake: mpsc::SyncSender<()>,
     pipeline_stats: PipelineStats,
@@ -1249,7 +1250,7 @@ impl RemoteDatabase {
             workers.push(
                 ClientWorker::start(
                     client,
-                    config.storage.group_limits,
+                    config.max_pending_batches,
                     wake_sender.clone(),
                     concurrent_failure.clone(),
                     config.write_profile_limit,
@@ -1311,7 +1312,8 @@ impl RemoteDatabase {
             durable_wait_started: VecDeque::new(),
             staged: (0..count).map(|_| VecDeque::new()).collect(),
             staged_bytes: vec![0; count],
-            inflight: (0..count).map(|_| None).collect(),
+            inflight: (0..count).map(|_| VecDeque::new()).collect(),
+            unresolved_append: None,
             completion_wake,
             preparation_wake: wake_sender,
             pipeline_stats: PipelineStats::default(),
@@ -1383,6 +1385,12 @@ impl RemoteDatabase {
             super::tcp::Transport::EfaDirect => {
                 "experimental-native-cell-sharded-value-wal-efa-direct-rf1"
             }
+            super::tcp::Transport::EfaNative => {
+                "trusted-native-cell-sharded-value-wal-efa-native-rf1"
+            }
+            super::tcp::Transport::FabricTcpNative => {
+                "native-cell-sharded-value-wal-software-fabric-rf1"
+            }
         }
     }
     pub fn epoch(&self) -> u64 {
@@ -1447,7 +1455,13 @@ impl RemoteDatabase {
                 .concurrent_failure
                 .load(std::sync::atomic::Ordering::Acquire)
         {
-            if let Some(pending) = self.inflight.iter().flatten().next() {
+            if let Some(version) = self.unresolved_append {
+                return Err(LocalDbError::unknown(
+                    version,
+                    "TCP authority requires recovery with unresolved append",
+                ));
+            }
+            if let Some(pending) = self.inflight.iter().find_map(|queue| queue.front()) {
                 return Err(LocalDbError::unknown(
                     pending.first,
                     "TCP authority requires recovery with unresolved append",
@@ -1822,7 +1836,7 @@ impl RemoteDatabase {
             group_charge,
         } = prepared;
         self.ensure_healthy()?;
-        if self.config.pipelined_writes && self.inflight.iter().any(Option::is_some) {
+        if self.config.pipelined_writes && self.inflight.iter().any(|queue| !queue.is_empty()) {
             self.progress_pipeline(false)?;
         }
         let started = Instant::now();
@@ -1965,12 +1979,19 @@ impl RemoteDatabase {
     /// durable ordered visibility. Earlier submit calls may already have appended.
     pub fn drain(&mut self) -> Result<(), LocalDbError> {
         if let Err(error) = self.ensure_healthy() {
+            if self.unresolved_append.is_none() {
+                self.unresolved_append = self
+                    .inflight
+                    .iter()
+                    .find_map(|queue| queue.front().map(|pending| pending.first));
+            }
             self.healthy = false;
+            self.inflight.iter_mut().for_each(VecDeque::clear);
             return Err(error);
         }
         if self.config.pipelined_writes
             && self.submissions.len() == 1
-            && self.inflight.iter().all(Option::is_none)
+            && self.inflight.iter().all(VecDeque::is_empty)
         {
             return self.drain_single();
         }
@@ -1979,7 +2000,7 @@ impl RemoteDatabase {
             if self.submissions.is_empty() {
                 return Ok(());
             }
-            if self.inflight.iter().all(Option::is_none) {
+            if self.inflight.iter().all(VecDeque::is_empty) {
                 self.healthy = false;
                 return Err(LocalDbError::new(
                     "unresolved publication without storage work",
@@ -2025,11 +2046,17 @@ impl RemoteDatabase {
         self.pipeline_stats.direct_appends += 1;
         self.pipeline_stats.peak_inflight_nodes = self.pipeline_stats.peak_inflight_nodes.max(1);
         let started = Instant::now();
-        let receipts = self.clients[node]
+        let receipts = match self.clients[node]
             .client
             .lock()
             .append_many(self.epoch, std::slice::from_ref(batch))
-            .map_err(|error| LocalDbError::unknown(version, error))?;
+        {
+            Ok(receipts) => receipts,
+            Err(error) => {
+                self.unresolved_append = Some(version);
+                return Err(LocalDbError::unknown(version, error));
+            }
+        };
         self.stats.storage_wait_ns += elapsed(started);
         self.staged[node].pop_front();
         self.staged_bytes[node] = 0;
@@ -2085,8 +2112,7 @@ impl RemoteDatabase {
 
     fn ready_group(&self, node: usize) -> bool {
         let limits = self.config.storage.group_limits;
-        self.inflight[node].is_none()
-            && !self.staged[node].is_empty()
+        !self.staged[node].is_empty()
             && (self.staged[node].len() >= limits.max_batches as usize
                 || self.staged_bytes[node] + GROUP_HEADER_LEN
                     >= limits.max_encoded_bytes - limits.max_encoded_bytes / 4)
@@ -2096,34 +2122,46 @@ impl RemoteDatabase {
         self.healthy = false;
         let result = (|| {
             for node in 0..self.inflight.len() {
-                let completed = match &self.inflight[node] {
-                    None => continue,
-                    Some(pending) => match pending.reply.try_recv() {
-                        Ok(result) => {
-                            Some(result.map_err(|e| LocalDbError::unknown(pending.first, e)))
-                        }
+                let mut position = 0;
+                while position < self.inflight[node].len() {
+                    let pending = &self.inflight[node][position];
+                    let completed = match pending.reply.try_recv() {
+                        Ok(result) => Some(
+                            result.map_err(|error| LocalDbError::unknown(pending.first, error)),
+                        ),
                         Err(mpsc::TryRecvError::Empty) => None,
                         Err(mpsc::TryRecvError::Disconnected) => Some(Err(LocalDbError::unknown(
                             pending.first,
                             "TCP worker lost request outcome",
                         ))),
-                    },
-                };
-                if let Some(receipts) = completed {
-                    self.inflight[node].take();
-                    self.accept_receipts(receipts?)?;
-                    if !flush_tails {
-                        self.pipeline_stats.completions_before_drain += 1;
+                    };
+                    if let Some(receipts) = completed {
+                        let first = pending.first;
+                        self.inflight[node].remove(position);
+                        match receipts {
+                            Ok(receipts) => {
+                                if let Err(error) = self.accept_receipts(receipts) {
+                                    self.unresolved_append = Some(first);
+                                    return Err(error);
+                                }
+                                if !flush_tails {
+                                    self.pipeline_stats.completions_before_drain += 1;
+                                }
+                            }
+                            Err(error) => {
+                                self.unresolved_append = Some(first);
+                                return Err(error);
+                            }
+                        }
+                    } else {
+                        position += 1;
                     }
                 }
             }
 
             let started = Instant::now();
             for node in 0..self.clients.len() {
-                if self.inflight[node].is_some()
-                    || self.staged[node].is_empty()
-                    || (!flush_tails && !self.ready_group(node))
-                {
+                if self.staged[node].is_empty() || (!flush_tails && !self.ready_group(node)) {
                     continue;
                 }
                 let count = {
@@ -2183,20 +2221,26 @@ impl RemoteDatabase {
                             .map_err(LocalDbError::component)?;
                 }
                 let first = batches[0].version();
-                let reply = self.clients[node]
-                    .append(self.epoch, batches)
-                    .map_err(|e| LocalDbError::unknown(first, e))?;
-                self.inflight[node] = Some(PendingAppend { first, reply });
+                let reply = match self.clients[node].append(self.epoch, batches) {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        self.unresolved_append = Some(first);
+                        return Err(LocalDbError::unknown(first, error));
+                    }
+                };
+                self.inflight[node].push_back(PendingAppend { first, reply });
                 self.pipeline_stats.append_requests += 1;
                 if !flush_tails {
                     self.pipeline_stats.early_dispatches += 1;
                 }
             }
             self.stats.dispatch_ns += elapsed(started);
-            self.pipeline_stats.peak_inflight_nodes = self
-                .pipeline_stats
-                .peak_inflight_nodes
-                .max(self.inflight.iter().filter(|p| p.is_some()).count());
+            self.pipeline_stats.peak_inflight_nodes = self.pipeline_stats.peak_inflight_nodes.max(
+                self.inflight
+                    .iter()
+                    .filter(|queue| !queue.is_empty())
+                    .count(),
+            );
             self.publish_completed()?;
             Ok(())
         })();
@@ -2206,6 +2250,7 @@ impl RemoteDatabase {
             self.concurrent_failure
                 .store(true, std::sync::atomic::Ordering::Release);
             self.reads.poison();
+            self.inflight.iter_mut().for_each(VecDeque::clear);
         }
         if result.is_ok() {
             self.progress_checkpoint(false)?;
@@ -3376,7 +3421,7 @@ struct ClientWorker {
 impl ClientWorker {
     fn start(
         client: Client,
-        limits: super::group::GroupLimits,
+        queue_capacity: usize,
         wake: mpsc::SyncSender<()>,
         failure: Arc<std::sync::atomic::AtomicBool>,
         write_profile_limit: usize,
@@ -3384,111 +3429,187 @@ impl ClientWorker {
     ) -> std::io::Result<Self> {
         let client = Arc::new(Mutex::new(client));
         let worker_client = Arc::clone(&client);
-        let (sender, receiver) = mpsc::sync_channel(1);
+        let (sender, receiver) = mpsc::sync_channel(queue_capacity);
         let thread = thread::Builder::new()
             .name("value-wal-tcp".into())
             .spawn(move || {
                 let mut profile_attempted = false;
                 let mut profile_enabled = false;
                 let mut profile_requests = 0usize;
-                while let Ok(command) = receiver.recv() {
-                    // Exclusivity belongs to one TLS stream, never the cluster.
+                let mut queued = VecDeque::new();
+                let mut appends: HashMap<u64, (BatchVersion, Reply<Vec<DurableBatch>>)> =
+                    HashMap::new();
+                let mut disconnected = false;
+                loop {
                     let mut client = worker_client.lock();
-                    match command {
-                        Command::Append(epoch, batches, reply) => {
-                            let result = (|| {
-                                let mut output = Vec::with_capacity(batches.len());
-                                let mut start = 0;
-                                while start < batches.len() {
-                                    let mut end = start;
-                                    let mut bytes = GROUP_HEADER_LEN;
-                                    while end < batches.len()
-                                        && end - start < limits.max_batches as usize
-                                    {
-                                        let next = CompleteGroup::encoded_member_len(
-                                            batches[end].encoded().len(),
-                                        )
-                                        .map_err(LocalDbError::component)?;
-                                        if bytes + next > limits.max_encoded_bytes {
-                                            break;
-                                        }
-                                        bytes += next;
-                                        end += 1;
-                                    }
-                                    if end == start {
-                                        return Err(LocalDbError::new(
-                                            "batch cannot fit configured remote group",
-                                        ));
-                                    }
-                                    if write_profile_limit > 0 && !profile_attempted {
-                                        profile_attempted = true;
-                                        profile_enabled =
-                                            client.connection_profile(true, false).is_ok();
-                                    }
-                                    let append_result =
-                                        client.append_many(epoch, &batches[start..end]);
-                                    if profile_enabled {
-                                        profile_requests += 1;
-                                        write_profile.lock().sampled_requests += 1;
-                                        if profile_requests == write_profile_limit {
-                                            if let Ok(profile) =
-                                                client.connection_profile(false, false)
-                                            {
-                                                capture_write_profile(&write_profile, profile);
-                                            }
-                                            profile_enabled = false;
-                                        }
-                                    }
-                                    let receipts =
-                                        append_result.map_err(LocalDbError::component)?;
-                                    if receipts.len() != end - start {
-                                        return Err(LocalDbError::new(
-                                            "remote receipt count mismatch",
-                                        ));
-                                    }
-                                    output.extend(receipts);
-                                    start = end;
-                                }
-                                Ok(output)
-                            })();
-                            if result.is_err() {
-                                failure.store(true, std::sync::atomic::Ordering::Release);
-                            }
-                            // Publication may refund admission credit as soon
-                            // as the reply is observed. Release the actor's
-                            // payload/metadata ownership before that can happen.
-                            drop(batches);
-                            let _ = reply.send(result);
-                            // Publish the exact result before the wake hint. A
-                            // full hint queue already guarantees another poll.
-                            let _ = wake.try_send(());
-                        }
-                        Command::Stats(reply) => {
-                            let _ = reply.send(client.stats().map_err(LocalDbError::component));
-                        }
-                        Command::Seal(epoch, reply) => {
-                            let _ = reply.send(client.seal(epoch).map_err(LocalDbError::component));
-                        }
-                        Command::FinishProfile(reply) => {
-                            let result = if profile_enabled {
-                                client
-                                    .connection_profile(false, false)
-                                    .map(|profile| {
-                                        capture_write_profile(&write_profile, profile);
-                                        profile_enabled = false;
-                                    })
-                                    .map_err(LocalDbError::component)
-                            } else {
-                                Ok(())
-                            };
-                            let _ = reply.send(result);
+                    while !disconnected {
+                        match receiver.try_recv() {
+                            Ok(command) => queued.push_back(command),
+                            Err(mpsc::TryRecvError::Empty) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => disconnected = true,
                         }
                     }
+
+                    if !disconnected
+                        && queued.is_empty()
+                        && appends.is_empty()
+                        && !client.has_pending_io()
+                    {
+                        drop(client);
+                        match receiver.recv() {
+                            Ok(command) => queued.push_back(command),
+                            Err(_) => disconnected = true,
+                        }
+                        continue;
+                    }
+
+                    let mut progressed = false;
+                    if let Some(Command::Append(epoch, batches, _)) = queued.front()
+                        && (!profile_enabled || profile_requests < write_profile_limit)
+                    {
+                        if write_profile_limit > 0 && !profile_attempted && appends.is_empty() {
+                            profile_attempted = true;
+                            profile_enabled = client.connection_profile(true, false).is_ok();
+                        }
+                        let first = batches[0].version();
+                        match client.submit_append_many(*epoch, batches) {
+                            Ok(Some(id)) => {
+                                let Command::Append(_, _, reply) =
+                                    queued.pop_front().expect("front append exists")
+                                else {
+                                    unreachable!("append queue front changed");
+                                };
+                                appends.insert(id, (first, reply));
+                                if profile_enabled {
+                                    profile_requests += 1;
+                                    write_profile.lock().sampled_requests += 1;
+                                }
+                                progressed = true;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                let Command::Append(_, _, reply) =
+                                    queued.pop_front().expect("front append exists")
+                                else {
+                                    unreachable!("append queue front changed");
+                                };
+                                failure.store(true, std::sync::atomic::Ordering::Release);
+                                let _ = reply.send(Err(LocalDbError::unknown(first, error)));
+                                let _ = wake.try_send(());
+                                progressed = true;
+                            }
+                        }
+                    }
+
+                    if !appends.is_empty() || client.has_pending_io() {
+                        match client.progress_appends() {
+                            Ok(completions) => {
+                                if !completions.is_empty() {
+                                    progressed = true;
+                                }
+                                for completion in completions {
+                                    if let Some((first, reply)) = appends.remove(&completion.id) {
+                                        let result = completion
+                                            .result
+                                            .map_err(|error| LocalDbError::unknown(first, error));
+                                        if result.is_err() {
+                                            failure
+                                                .store(true, std::sync::atomic::Ordering::Release);
+                                        }
+                                        let _ = reply.send(result);
+                                        let _ = wake.try_send(());
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                failure.store(true, std::sync::atomic::Ordering::Release);
+                                for (_, (first, reply)) in appends.drain() {
+                                    let _ = reply
+                                        .send(Err(LocalDbError::unknown(first, error.to_string())));
+                                    let _ = wake.try_send(());
+                                }
+                                let message = error.to_string();
+                                for command in queued.drain(..) {
+                                    match command {
+                                        Command::Append(_, batches, reply) => {
+                                            let first = batches[0].version();
+                                            let _ = reply
+                                                .send(Err(LocalDbError::unknown(first, &message)));
+                                            let _ = wake.try_send(());
+                                        }
+                                        Command::Stats(reply) => {
+                                            let _ = reply.send(Err(LocalDbError::new(&message)));
+                                        }
+                                        Command::Seal(_, reply) | Command::FinishProfile(reply) => {
+                                            let _ = reply.send(Err(LocalDbError::new(&message)));
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    if profile_enabled
+                        && profile_requests >= write_profile_limit
+                        && appends.is_empty()
+                    {
+                        if let Ok(profile) = client.connection_profile(false, false) {
+                            capture_write_profile(&write_profile, profile);
+                        }
+                        profile_enabled = false;
+                        progressed = true;
+                    }
+
+                    if appends.is_empty() {
+                        match queued.front() {
+                            Some(Command::Stats(_))
+                            | Some(Command::Seal(_, _))
+                            | Some(Command::FinishProfile(_)) => {
+                                match queued.pop_front().expect("front control exists") {
+                                    Command::Stats(reply) => {
+                                        let _ = reply
+                                            .send(client.stats().map_err(LocalDbError::component));
+                                    }
+                                    Command::Seal(epoch, reply) => {
+                                        let _ = reply.send(
+                                            client.seal(epoch).map_err(LocalDbError::component),
+                                        );
+                                    }
+                                    Command::FinishProfile(reply) => {
+                                        let result = if profile_enabled {
+                                            client
+                                                .connection_profile(false, false)
+                                                .map(|profile| {
+                                                    capture_write_profile(&write_profile, profile);
+                                                    profile_enabled = false;
+                                                })
+                                                .map_err(LocalDbError::component)
+                                        } else {
+                                            Ok(())
+                                        };
+                                        let _ = reply.send(result);
+                                    }
+                                    Command::Append(..) => unreachable!(),
+                                }
+                                progressed = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if disconnected && queued.is_empty() && appends.is_empty() {
+                        break;
+                    }
+                    drop(client);
+                    if !progressed {
+                        thread::yield_now();
+                    }
                 }
-                if profile_enabled
-                    && let Ok(profile) = worker_client.lock().connection_profile(false, false)
-                {
-                    capture_write_profile(&write_profile, profile);
+                if profile_enabled {
+                    let mut client = worker_client.lock();
+                    if let Ok(profile) = client.connection_profile(false, false) {
+                        capture_write_profile(&write_profile, profile);
+                    }
                 }
             })?;
         Ok(Self {

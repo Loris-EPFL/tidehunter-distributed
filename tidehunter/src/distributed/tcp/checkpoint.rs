@@ -49,7 +49,7 @@ impl CheckpointReceipt {
     /// from the fenced, authenticated owning shard. Local metadata alone is not
     /// a durability receipt.
     pub(crate) fn authenticated(self) -> AppendedBatch {
-        DurableBatch::from_authenticated_parts(self.id, self.version, self.digest, self.address)
+        DurableBatch::from_validated_parts(self.id, self.version, self.digest, self.address)
             .appended()
     }
 }

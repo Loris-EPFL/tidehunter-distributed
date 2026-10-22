@@ -486,11 +486,12 @@ fn publication_failure_fences_and_recovers_dispatched_successor_group() {
         let version = db.submit(operation, vec![put(key as u8)]).unwrap();
         identities.push((operation, version));
     }
-    assert_eq!(db.staged[0].len(), 2);
+    assert_eq!(db.inflight[0].len(), 2);
+    assert!(db.staged[0].is_empty());
     drop(held);
 
-    // A missing prepared route makes the first ordered publication fail after
-    // progress_pipeline has dispatched the already-admitted successor group.
+    // progress_pipeline dispatches every admitted group in the bounded window
+    // before ordered publication fails.
     db.submissions[0].routing = None;
     assert!(db.drain().is_err());
     assert!(!db.healthy);
@@ -498,15 +499,7 @@ fn publication_failure_fences_and_recovers_dispatched_successor_group() {
     assert_eq!(db.publication.published_prefix().next_sequence(), 0);
     assert!(db.pending_bytes > 0);
 
-    let successor = db.inflight[0].take().unwrap();
-    let receipts = successor
-        .reply
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .unwrap()
-        .unwrap();
-    assert_eq!(receipts.len(), 2);
-    assert_eq!(receipts[0].appended().version().sequence, 2);
-    assert_eq!(receipts[1].appended().version().sequence, 3);
+    assert!(db.inflight.iter().all(VecDeque::is_empty));
     drop(db);
 
     let mut reopened = fixture.open();

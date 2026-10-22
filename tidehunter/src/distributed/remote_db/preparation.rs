@@ -40,7 +40,7 @@ impl RemoteDatabase {
         if batches.len() > self.config.max_pending_batches {
             return Err(LocalDbError::new("preparation window exceeds batch budget"));
         }
-        if self.config.pipelined_writes && self.inflight.iter().any(Option::is_some) {
+        if self.config.pipelined_writes && self.inflight.iter().any(|queue| !queue.is_empty()) {
             self.progress_pipeline(false)?;
         }
         let validation_started = Instant::now();

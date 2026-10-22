@@ -89,13 +89,12 @@ fn profile_tcp_primitives() {
             );
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let endpoint = listener.local_addr().unwrap();
-            let config = tls.server_config().unwrap();
+            let server_config = tls.server_config().unwrap().config.unwrap();
             let network_iterations = 200;
             let server = thread::spawn(move || {
                 let (socket, _) = listener.accept().unwrap();
                 let mut io = DeadlineIo::new(socket, Duration::from_secs(60)).unwrap();
-                let mut conn = ServerConnection::new(config.config).unwrap();
-                conn.set_buffer_limit(Some(HARD_FRAME_LIMIT));
+                let mut conn = ServerConnection::new(server_config).unwrap();
                 while conn.is_handshaking() {
                     conn.complete_io(&mut io).unwrap();
                 }
