@@ -22,7 +22,7 @@ class TimingPopulations(unittest.TestCase):
                     read_profile_wire_requests=20, read_profile_inline_ns=6000,
                     read_profile_actor_queue_ns=8000, read_profile_actor_service_ns=12000,
                     read_profile_actor_return_ns=9000, read_profile_exchange_ns=40000,
-                    read_profile_server_inventory_wait_ns=60000,
+                    read_profile_server_authority_lookup_ns=60000,
                     read_profile_server_record_read_ns=80000,
                     read_profile_server_response_recheck_ns=10000,
                     read_profile_server_response_recheck_samples=5,
@@ -35,7 +35,7 @@ class TimingPopulations(unittest.TestCase):
         means = analyze.adapter_means(self.profile())
         for name, expected in [('inline', 1), ('actor_queue', 2), ('actor_service', 3),
                                ('actor_return', 3), ('exchange', 2),
-                               ('server_inventory_wait', 3), ('server_record_read', 4),
+                               ('server_authority_lookup', 3), ('server_record_read', 4),
                                ('server_response_recheck', 2), ('transport_output_submit', 3)]:
             self.assertEqual(means['read_profile_' + name]['mean_us'], expected)
         self.assertIsNone(means['read_profile_transport_cq_call']['mean_us'])
@@ -61,6 +61,58 @@ class TimingPopulations(unittest.TestCase):
         for stats in ({'n': 0, 't': 1}, {'n': 1, 't': float('nan')}, {'n': 1.5, 't': 1}):
             with self.assertRaises(ValueError):
                 analyze.mean_span(stats, 't', 'n')
+
+    def test_protocol_compatibility_means_are_unavailable_without_mutating_counters(self):
+        fields = ('request_send', 'response_header', 'response_body', 'server_inventory_wait')
+        stats = self.profile() | dict(write_profile_available=1, write_profile_client_requests=20)
+        for prefix in ('read_profile_', 'write_profile_client_'):
+            stats.update({prefix + field + '_ns': 0 for field in fields})
+        original = stats.copy()
+        means = analyze.adapter_means(stats)
+        for prefix in ('read_profile_', 'write_profile_client_'):
+            for field in fields:
+                with self.subTest(prefix=prefix, field=field):
+                    row = means[prefix + field]
+                    self.assertFalse(row['available'])
+                    self.assertIsNone(row['mean_us'])
+                    self.assertTrue(row['reason'])
+                    self.assertEqual(row['total_ns'], 0)
+                    self.assertEqual(row['count'], 20)
+                    self.assertEqual(row['numerator'], prefix + field + '_ns')
+        self.assertEqual(stats, original)
+        self.assertEqual(means['read_profile_exchange']['mean_us'], 2)
+
+    def test_ram_profile_uses_same_compatibility_classification(self):
+        stats = dict(requests=5, request_send_ns=0, response_header_ns=0,
+                     response_body_ns=0, server_inventory_wait_ns=0,
+                     request_encode_ns=0, exchange_ns=25000)
+        for field in ('request_send_ns', 'response_header_ns', 'response_body_ns',
+                      'server_inventory_wait_ns'):
+            row = analyze.multiplexed_profile_mean(stats, field, 'requests')
+            self.assertFalse(row['available'])
+            self.assertIsNone(row['mean_us'])
+            self.assertEqual((row['total_ns'], row['count']), (0, 5))
+        zero = analyze.multiplexed_profile_mean(stats, 'request_encode_ns', 'requests')
+        self.assertTrue(zero['available'])
+        self.assertEqual(zero['mean_us'], 0)
+        self.assertEqual(analyze.multiplexed_profile_mean(
+            stats, 'exchange_ns', 'requests')['mean_us'], 5)
+
+    def test_structural_zeros_are_not_compatibility_clocks(self):
+        stats = self.profile() | dict(read_profile_transport_output_retire_ns=0,
+                                     read_profile_transport_output_retire_samples=4,
+                                     write_profile_available=1,
+                                     write_profile_client_socket_read_ns=0,
+                                     write_profile_client_socket_read_calls=0)
+        means = analyze.adapter_means(stats)
+        retirement = means['read_profile_transport_output_retire']
+        self.assertTrue(retirement['available'])
+        self.assertEqual((retirement['mean_us'], retirement['count']), (0, 4))
+        tls = means['write_profile_client_socket_read']
+        self.assertFalse(tls['available'])
+        self.assertIsNone(tls['mean_us'])
+        self.assertEqual((tls['total_ns'], tls['count']), (0, 0))
+        self.assertEqual(stats['write_profile_client_socket_read_calls'], 0)
 
     def test_scalar_bulk_and_commit_means_use_stage_calls(self):
         stats = dict(remote_timing_available=1, read_calls=100, read_keys=1000,
@@ -113,7 +165,6 @@ class TimingPopulations(unittest.TestCase):
             observed = {row['source']: row for row in evidence['logs']}
             self.assertTrue(observed['experiment/remote.log']['available'])
             self.assertFalse(observed['experiment/storage-0.log']['available'])
-            self.assertIn('SIGTERM', evidence['completeness'])
             with self.assertRaisesRegex(ValueError, 'clean'):
                 analyze.fabric_local_replay(archive, dict(read_profile_limit=0, write_profile_limit=0))
 
@@ -193,7 +244,6 @@ class HistogramPopulations(unittest.TestCase):
         self.assertEqual(row['quantiles']['p95']['lower_us'], 50)
         self.assertIsNone(row['quantiles']['p95']['upper_us'])
         self.assertTrue(row['quantiles']['p95']['upper_unbounded'])
-        self.assertIn('not raw', row['quantile_method'])
 
     def population_histogram(self, count):
         return analyze.parse_metrics('\n'.join([

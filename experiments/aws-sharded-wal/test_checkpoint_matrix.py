@@ -1156,6 +1156,253 @@ class MatrixEvidenceTests(unittest.TestCase):
             self.assertEqual(len(rows), 10)
             self.assertEqual(sum(spec['transport_floor'] for spec in rows), 1)
 
+    def diagnostic_fixture(self, root, transport='efa-native', mode='tcp', cold=True):
+        directory = Path(root)
+        spec = dict(shape=[256, 1, 1], repetition=3, transport=transport,
+                    cold=cold, diagnostics=True, cached=False, authority_resident_batches=None)
+        native = mode == 'native-sync'
+        identity = dict(backend='native_value_wal_barrier' if native else matrix.TRANSPORT_BACKENDS[transport],
+                        value_bytes=256, batch_size=1, window=1, repetition=0)
+        def table(filename, fields, applicable):
+            states = ['warm'] + (['cache-evicted'] if cold else []) + [
+                'reopened-warm' if native else 'reopened-cache-cleared']
+            with (directory / filename).open('w') as stream:
+                writer = csv.DictWriter(stream, fieldnames=[*identity, 'state', 'sample', *fields])
+                writer.writeheader()
+                if applicable:
+                    for state in states:
+                        for sample in range(256):
+                            values = dict.fromkeys(fields, 0)
+                            values.update(index_ns=1, whole_call_ns=100)
+                            if native:
+                                values.update(wal_and_decode_ns=2, value_cache_hit='false')
+                            else:
+                                values.update(cache_misses=1, exchange_ns=10, server_record_read_ns=2)
+                            writer.writerow(identity | dict(state=state, sample=sample) | values)
+        table('native_read_profiles.csv',
+              ['index_ns', 'wal_and_decode_ns', 'value_cache_hit', 'whole_call_ns'], native)
+        table('remote_read_profiles.csv', [
+            'index_ns', 'dispatch_ns', 'wait_ns', 'actor_queue_ns', 'actor_service_ns', 'actor_return_ns',
+            'request_encode_ns', 'exchange_ns', 'response_decode_ns', 'record_verify_ns',
+            'server_handler_ns', 'server_inventory_wait_ns', 'server_authority_lookup_ns',
+            'server_record_read_ns', 'cache_hits', 'cache_misses', 'whole_call_ns', 'inline_read_ns',
+            'server_response_recheck_wait_ns', 'server_response_recheck_ns',
+            'server_response_recheck_samples', 'server_response_recheck_deferrals'], not native)
+        phases = ['load-write-diagnostics', 'warm-scalar-read-diagnostics',
+                  'warm-profiled-read-diagnostics', 'warm-window-read-diagnostics',
+                  'warm-batched-read-diagnostics']
+        if cold:
+            phases += ['cache_evicted_get-diagnostics', 'cache_evicted_get_many-diagnostics',
+                       'cache_evicted_get_window-diagnostics', 'cache-evicted-read-diagnostics']
+        phases += ['reopened-read-diagnostics']
+        transport_profile = dict.fromkeys(
+            ('cq_polls', 'cq_completions', 'cq_call_ns', 'cq_timed_calls',
+             'cq_dispatch_ns', 'cq_dispatch_calls'), 1)
+        for name in ('tls_read', 'tls_write', 'tls_process'):
+            transport_profile[name] = dict.fromkeys(('ns', 'calls', 'bytes', 'errors'), 0)
+        profile = dict(requests=1, request_decode_ns=1, handler_ns=1, response_encode_ns=1,
+                       response_send_ns=1, append_wal_ns=1, append_persist_ns=1,
+                       read_response_recheck_samples=1, read_response_recheck_ns=1,
+                       receive_frame_including_idle_ns=0,
+                       storage_write=dict(append_calls=1, persist_calls=1),
+                       client=dict(requests=1, exchange_ns=1, server_handler_ns=1,
+                                   server_record_read_ns=1, server_inventory_wait_ns=0),
+                       polling=dict(progress_sweeps=1, request_first_poll_samples=1),
+                       transport=transport_profile, client_transport=transport_profile)
+        records = [] if native else [
+            identity | dict(phase=phase, nodes=[[partition, copy.deepcopy(profile)] for partition in range(5)])
+            for phase in phases]
+        for record in records:
+            if record['phase'] not in ('warm-profiled-read-diagnostics',
+                                       'cache-evicted-read-diagnostics', 'reopened-read-diagnostics'):
+                for _, node in record['nodes']:
+                    node['client']['server_handler_ns'] = 0
+                    node['client']['server_record_read_ns'] = 0
+        (directory / 'node_profiles.yaml').write_text(
+            ''.join('---\n' + json.dumps(record) + '\n' for record in records))
+        return spec, records
+
+    def test_diagnostic_profiles_admit_actual_backend_schemas_and_structural_zeros(self):
+        for transport in ('tcp', 'efa', 'efa-direct', 'efa-native'):
+            for mode in ('tcp', 'native-sync'):
+                for cold in (False, True):
+                    with self.subTest(transport=transport, mode=mode, cold=cold), tempfile.TemporaryDirectory() as root:
+                        spec, _ = self.diagnostic_fixture(root, transport, mode, cold)
+                        checkpoint_kv.validate_diagnostic_evidence(root, spec, mode, list(range(5)))
+
+    def test_diagnostic_cold_samples_cannot_stop_at_the_local_index(self):
+        with tempfile.TemporaryDirectory() as root:
+            spec, _ = self.diagnostic_fixture(root)
+            path = Path(root) / 'remote_read_profiles.csv'
+            with path.open() as stream:
+                reader = csv.DictReader(stream)
+                fields, rows = reader.fieldnames, list(reader)
+            cold = next(row for row in rows if row['state'] == 'cache-evicted')
+            cold.update(cache_misses='0', exchange_ns='0', server_record_read_ns='0')
+            with path.open('w') as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+            with self.assertRaises(ValueError):
+                checkpoint_kv.validate_diagnostic_evidence(root, spec, 'tcp', list(range(5)))
+
+    def test_diagnostic_idle_owners_are_not_missing_active_owner_profiles(self):
+        def idle(profile):
+            return {key: idle(value) if isinstance(value, dict) else 0
+                    for key, value in profile.items()}
+        for transport in ('tcp', 'efa', 'efa-direct', 'efa-native'):
+            with self.subTest(transport=transport), tempfile.TemporaryDirectory() as root:
+                spec, records = self.diagnostic_fixture(root, transport=transport)
+                path = Path(root) / 'node_profiles.yaml'
+                owner = records[2]['nodes'][0]
+                owner[1] = idle(owner[1])
+                def save():
+                    path.write_text(''.join('---\n' + json.dumps(row) + '\n' for row in records))
+                save()
+                checkpoint_kv.validate_diagnostic_evidence(root, spec, 'tcp', list(range(5)))
+                owner[1]['client']['requests'] = 1
+                save()
+                with self.assertRaises(ValueError):
+                    checkpoint_kv.validate_diagnostic_evidence(root, spec, 'tcp', list(range(5)))
+                owner[1]['requests'] = 1
+                save()
+                with self.assertRaises(ValueError):
+                    checkpoint_kv.validate_diagnostic_evidence(root, spec, 'tcp', list(range(5)))
+
+    def test_diagnostic_active_owner_clocks_cannot_hide_in_fleet_totals(self):
+        for field in ('handler_ns', 'append_persist_ns', 'cq_timed_calls'):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as root:
+                spec, records = self.diagnostic_fixture(root)
+                profile = records[0]['nodes'][0][1]
+                if field == 'cq_timed_calls':
+                    profile['transport'][field] = 0
+                else:
+                    profile[field] = 0
+                path = Path(root) / 'node_profiles.yaml'
+                path.write_text(''.join('---\n' + json.dumps(row) + '\n' for row in records))
+                with self.assertRaises(ValueError):
+                    checkpoint_kv.validate_diagnostic_evidence(root, spec, 'tcp', list(range(5)))
+
+    def test_diagnostic_load_and_drained_owner_populations_must_be_complete(self):
+        for change in ('idle_load', 'truncated_server', 'truncated_client'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as root:
+                spec, records = self.diagnostic_fixture(root)
+                profile = records[0 if change == 'idle_load' else 2]['nodes'][0][1]
+                if change == 'idle_load':
+                    profile['requests'] = profile['client']['requests'] = 0
+                elif change == 'truncated_server':
+                    profile['client']['requests'] = 2
+                else:
+                    profile['requests'] = 2
+                path = Path(root) / 'node_profiles.yaml'
+                path.write_text(''.join('---\n' + json.dumps(row) + '\n' for row in records))
+                with self.assertRaises(ValueError):
+                    checkpoint_kv.validate_diagnostic_evidence(root, spec, 'tcp', list(range(5)))
+
+    def test_diagnostic_profiles_reject_missing_malformed_and_tampered_populations(self):
+        for change in ('missing', 'malformed', 'phase', 'duplicate_phase', 'owner', 'repetition',
+                       'backend', 'counter', 'clock', 'read_counter', 'read_clock',
+                       'cq', 'tls', 'negative', 'bool'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as root:
+                spec, records = self.diagnostic_fixture(root)
+                path = Path(root) / 'node_profiles.yaml'
+                if change == 'missing':
+                    path.unlink()
+                elif change == 'malformed':
+                    path.write_text('---\n{broken')
+                else:
+                    if change == 'phase':
+                        records.pop()
+                    elif change == 'duplicate_phase':
+                        records[-1] = copy.deepcopy(records[0])
+                    elif change == 'owner':
+                        records[0]['nodes'][-1][0] = 0
+                    elif change in ('backend', 'repetition'):
+                        records[0][change] = 'foreign' if change == 'backend' else 3
+                    elif change in ('read_counter', 'read_clock'):
+                        for _, profile in records[2]['nodes']:
+                            if change == 'read_counter':
+                                profile['read_response_recheck_samples'] = 0
+                            else:
+                                profile['client']['server_record_read_ns'] = 0
+                    else:
+                        for _, profile in records[0]['nodes']:
+                            if change == 'counter':
+                                profile['storage_write']['persist_calls'] = 0
+                            elif change == 'clock':
+                                del profile['handler_ns']
+                            elif change == 'cq':
+                                profile['transport']['cq_timed_calls'] = 0
+                            elif change == 'tls':
+                                profile['client_transport']['tls_read']['calls'] = 1
+                            else:
+                                profile['requests'] = -1 if change == 'negative' else True
+                    path.write_text(''.join('---\n' + json.dumps(record) + '\n' for record in records))
+                with self.assertRaises((ValueError, FileNotFoundError)):
+                    checkpoint_kv.validate_diagnostic_evidence(root, spec, 'tcp', list(range(5)))
+
+    def test_diagnostic_read_profiles_reject_false_complete_rows(self):
+        for mode in ('tcp', 'native-sync'):
+            for change in ('missing', 'schema', 'sample', 'state', 'backend', 'repetition',
+                           'whole', 'nested', 'negative', 'missing_clock', 'duplicate'):
+                with self.subTest(mode=mode, change=change), tempfile.TemporaryDirectory() as root:
+                    spec, _ = self.diagnostic_fixture(root, mode=mode)
+                    path = Path(root) / ('native_read_profiles.csv' if mode == 'native-sync' else 'remote_read_profiles.csv')
+                    with path.open() as stream:
+                        reader = csv.DictReader(stream)
+                        fields, rows = reader.fieldnames, list(reader)
+                    if change == 'missing':
+                        path.unlink()
+                    else:
+                        if change == 'schema':
+                            fields.remove('index_ns')
+                            for row in rows:
+                                del row['index_ns']
+                        elif change == 'duplicate':
+                            rows.append(rows[-1])
+                        else:
+                            key, value = {
+                                'sample': ('sample', '1'), 'state': ('state', 'reopened'),
+                                'backend': ('backend', 'experimental_tcp_authority'),
+                                'repetition': ('repetition', '3'), 'whole': ('whole_call_ns', '0'),
+                                'nested': ('index_ns', '101'), 'negative': ('index_ns', '-1'),
+                                'missing_clock': ('index_ns', '')}[change]
+                            rows[0][key] = value
+                        with path.open('w') as stream:
+                            writer = csv.DictWriter(stream, fieldnames=fields)
+                            writer.writeheader()
+                            writer.writerows(rows)
+                    with self.assertRaises((ValueError, FileNotFoundError)):
+                        checkpoint_kv.validate_diagnostic_evidence(root, spec, mode, list(range(5)))
+
+    def test_diagnostic_missing_profiles_cannot_pass_complete_marker(self):
+        with tempfile.TemporaryDirectory() as root:
+            spec = checkpoint_kv.plan(dict(repetitions=1, diagnostics=True), ['tcp'])[0]
+            directory = Path(root) / 'case-native-sync'
+            directory.mkdir()
+            (directory / 'COMPLETE').touch()
+            cfg = dict(kv_suite=dict(repetitions=1, diagnostics=True), transports=['tcp'],
+                       binaries={'storage-node': 'a', 'transport-floor': 'b'},
+                       nodes=[dict(partition=p) for p in range(5)])
+            state = dict(plan=[spec], completed_cases=[], binary_sha256='a', floor_binary_sha256='b')
+            with patch.object(checkpoint_kv, 'plan', return_value=[spec]), patch.object(
+                    checkpoint_kv, 'completed_case_ids', return_value=['case']):
+                with self.assertRaises(FileNotFoundError):
+                    checkpoint_kv.validate_auxiliary(root, state, cfg)
+
+    def test_full_diagnostics_are_first_without_changing_clean_order_or_controls(self):
+        transports = ['tcp', 'efa', 'efa-direct', 'efa-native']
+        options = dict(scope='full', repetitions=3, diagnostics=False)
+        clean = checkpoint_kv.plan(options, transports)
+        combined = checkpoint_kv.plan(options | dict(diagnostics=True), transports)
+        self.assertEqual(len(combined), 172)
+        self.assertTrue(all(case['diagnostics'] for case in combined[:16]))
+        self.assertEqual(combined[16:], clean)
+        self.assertEqual(sum(case.get('transport_floor', False) for case in clean), 4)
+        self.assertEqual([(case['transport'], case['shape']) for case in combined[:16]],
+                         [(transport, shape) for transport in transports for shape in
+                          ([256, 1, 1], [256, 32, 32], [8192, 1, 1], [8192, 32, 32])])
+
     def test_targeted_diagnostics_leave_clean_comparison_populations_unchanged(self):
         for repetitions in (1, 3):
             for transports in (['tcp'], ['tcp', 'efa'], ['tcp', 'efa', 'efa-direct']):

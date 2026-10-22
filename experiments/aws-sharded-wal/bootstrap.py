@@ -42,8 +42,8 @@ def blank_instance_disk(devices, expected_count=1):
 def bootstrap(args):
     if os.geteuid() != 0 or not re.fullmatch(r'th-[a-f0-9]{16}', args.run_id):
         raise ValueError('root and an exact fresh run ID required')
-    if not 600 <= args.ttl_seconds <= 3600:
-        raise ValueError('guest lifetime must be 600..3600 seconds')
+    if type(args.ttl_seconds) is not int or not 600 <= args.ttl_seconds <= 7200:
+        raise ValueError('guest lifetime must be an integer in 600..7200 seconds')
     info = identity()
     if info['accountId'] != args.account or info['instanceType'] != args.instance_type:
         raise ValueError('unexpected account or instance hardware')

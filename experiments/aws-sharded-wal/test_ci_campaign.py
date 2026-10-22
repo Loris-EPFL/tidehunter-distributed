@@ -664,7 +664,7 @@ class CampaignTests(unittest.TestCase):
         self.budget_file = self.output / 'budget.json'
         ci.dump(self.budget_file, {'weekly_budget_usd': '60'})
         self.cfg = dict(account=ACCOUNT, bucket='owned-results', bucket_region='us-east-1',
-            regions=['us-east-1', 'us-east-2'], budget_path=str(self.budget_file),
+            regions=['us-east-1', 'us-east-2'], budget_path=str(self.budget_file), ttl_seconds=3600,
             cost_assumptions=dict(retention_days=30, result_gib=2, request_count=100000, reconciliation_seconds=600))
         self.cfg['guest_boundary_arn'] = f'arn:aws:iam::{ACCOUNT}:policy/tidehunter-aws-benchmarks-guest-boundary'
         self.cfg.update(transports=['tcp', 'efa', 'efa-direct', 'efa-native'], repetitions=1,
@@ -703,6 +703,53 @@ class CampaignTests(unittest.TestCase):
 
     def allocate(self):
         return self.campaign.allocate(self.admission, self.preflight)
+
+    def test_two_hour_reservation_prices_full_lifetime_and_fixed_cleanup_reserve(self):
+        self.cfg['ttl_seconds'] = 7200
+        for candidate in self.candidates:
+            candidate['maximum_estimate_usd'] = str(Decimal(candidate['host_hourly_usd']) * 12)
+        started = self.clock.time()
+        self.allocate()
+        _, reserved, provenance = Ledger.reservations[0]
+        self.assertEqual(provenance['ttl_seconds'], 7200)
+        self.assertEqual(provenance['reconciliation_usd'], '3.000000000000')
+        self.assertEqual(reserved, Decimal('39.909285714286'))
+        self.assertEqual(ci.parsed(self.campaign.journal.data['expires_at']).timestamp(), started + 7200)
+
+    def test_two_hour_cost_cannot_be_admitted_with_only_one_hour_headroom(self):
+        self.cfg['ttl_seconds'] = 7200
+        for candidate in self.candidates:
+            candidate['maximum_estimate_usd'] = str(Decimal(candidate['host_hourly_usd']) * 12)
+        Ledger.available_usd = '20'
+        with self.assertRaises(BudgetExceeded):
+            self.allocate()
+        self.assertIsNone(self.campaign.journal.data)
+        self.assertEqual(self.aws.iam.roles, {})
+        self.assertEqual(self.aws.iam.profiles, {})
+        self.assertTrue(all(not ec2.requests for ec2 in self.aws.ec2.values()))
+        self.network.assert_not_called()
+
+    def test_two_hour_fallback_does_not_restart_the_absolute_lifetime(self):
+        self.cfg['ttl_seconds'] = 7200
+        for candidate in self.candidates:
+            candidate['maximum_estimate_usd'] = str(Decimal(candidate['host_hourly_usd']) * 12)
+        first = self.aws.ec2['us-east-1']
+        first.outcomes = ['capacity']
+        original = first.run_instances
+        def delayed_capacity(**request):
+            self.clock.sleep(755)
+            return original(**request)
+        started = self.clock.time()
+        with patch.object(first, 'run_instances', side_effect=delayed_capacity):
+            instances, candidate, _ = self.allocate()
+        self.assertEqual(len(instances), 6)
+        self.assertEqual(candidate['region'], 'us-east-2')
+        self.assertEqual(ci.parsed(self.campaign.journal.data['expires_at']).timestamp(), started + 7200)
+        self.clock.sleep(100)
+        self.allocate()
+        self.assertEqual(ci.parsed(self.campaign.journal.data['expires_at']).timestamp(), started + 7200)
+        self.assertEqual(len(first.requests), 1)
+        self.assertEqual(len(self.aws.ec2['us-east-2'].requests), 1)
 
     def test_admission_keeps_only_candidates_fitting_the_exact_available_boundary(self):
         with patch('ci_budget.BudgetLedger', ActualBudgetLedger):
@@ -2097,7 +2144,7 @@ class DiscoveryTests(unittest.TestCase):
         self.clock = Clock()
         self.aws = AWS(self.clock)
         self.cfg = dict(regions=['us-east-1', 'us-east-2'], instance_types=['g6.8xlarge', 'g6e.8xlarge'],
-                        bucket_region='us-east-1', account=ACCOUNT)
+                        bucket_region='us-east-1', account=ACCOUNT, ttl_seconds=3600)
         self.hardware = [dict(InstanceType=kind, ProcessorInfo={'SupportedArchitectures': ['x86_64']},
             NetworkInfo={'EfaSupported': True}, InstanceStorageSupported=True,
             InstanceStorageInfo={'Disks': [dict(Count=2, Type='ssd')]},
@@ -2170,6 +2217,16 @@ class DiscoveryTests(unittest.TestCase):
         with patch.object(ci, 'live_prices', side_effect=self.prices), \
                 patch.object(ci, 'live_ancillary_prices', return_value={'reviewed': True}):
             return ci.discover_candidates(self.aws, self.cfg)
+
+    def test_two_hour_discovery_quotes_the_entire_fleet_not_just_an_hourly_rate(self):
+        hourly = self.discover()['candidates']
+        self.cfg['ttl_seconds'] = 7200
+        extended = self.discover()['candidates']
+        self.assertEqual(len(hourly), len(extended))
+        for one, two in zip(hourly, extended, strict=True):
+            with self.subTest(region=one['region'], kind=one['instance_type']):
+                self.assertEqual(one['host_hourly_usd'], two['host_hourly_usd'])
+                self.assertEqual(Decimal(two['maximum_estimate_usd']), 2 * Decimal(one['maximum_estimate_usd']))
 
     def test_singleton_type_unavailability_preserves_other_types_and_regions(self):
         ec2 = self.aws.ec2['us-east-1']

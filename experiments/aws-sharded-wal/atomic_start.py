@@ -65,7 +65,8 @@ def launch_contract(plan):
     if (not re.fullmatch(r'th-[a-f0-9]{16}', result['run_id'])
             or not re.fullmatch(r'[0-9]{12}', result['account'])
             or result['prefix'] != result['run_id'] or result['placement_group'] != result['run_id']
-            or not 600 <= result['ttl_seconds'] <= 3600
+            or type(result['ttl_seconds']) is not int or not 600 <= result['ttl_seconds'] <= 7200
+            or type(result['export_reserve_seconds']) is not int
             or not 300 <= result['export_reserve_seconds'] <= 900
             or not re.fullmatch(r'[a-f0-9]{64}', result['bundle_sha256'])
             or not 0 < result['bundle_bytes'] <= 512 * 1024 * 1024

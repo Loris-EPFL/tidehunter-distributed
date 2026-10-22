@@ -76,11 +76,11 @@ def usd_ceiling(value):
         return number.quantize(Decimal('0.000000000001'), rounding=ROUND_CEILING)
 
 
-def _reservation_quote(fleet_estimate, overhead):
+def _reservation_quote(fleet_estimate, overhead, *, ttl_seconds=3600):
     with localcontext() as context:
         context.prec, context.rounding = 60, ROUND_CEILING
         fleet_estimate = usd_ceiling(fleet_estimate)
-        reconciliation = usd_ceiling(fleet_estimate * Decimal(overhead['assumptions']['reconciliation_seconds']) / Decimal(3600))
+        reconciliation = usd_ceiling(fleet_estimate * Decimal(overhead['assumptions']['reconciliation_seconds']) / Decimal(ttl_seconds))
         return usd_ceiling(fleet_estimate + reconciliation + Decimal(overhead['estimate_usd'])), reconciliation
 
 
@@ -186,7 +186,8 @@ def load_config(path, env=None):
             cfg[name] = env.get('AWS_BENCH_' + name.upper())
     if (cfg.get('schema') != 1 or cfg.get('repository') != REPOSITORY or cfg.get('branch') != BRANCH
             or not re.fullmatch(r'[0-9]{12}', cfg.get('account', ''))
-            or cfg.get('ttl_seconds') != 3600 or cfg.get('export_reserve_seconds') != 600
+            or type(cfg.get('ttl_seconds')) is not int or cfg['ttl_seconds'] not in (3600, 7200)
+            or cfg.get('export_reserve_seconds') != 600
             or not isinstance(cfg.get('regions'), list) or not cfg['regions']
             or len(set(cfg['regions'])) != len(cfg['regions']) or not set(cfg['regions']) <= set(REGIONS)
             or not isinstance(cfg.get('instance_types'), list) or not cfg['instance_types']
@@ -637,7 +638,7 @@ def discover_candidates(aws, cfg):
                 context.prec, context.rounding = 60, ROUND_CEILING
                 host_rate = usd_ceiling(Decimal(price['compute_usd_per_hour']) + Decimal(price['ipv4_usd_per_hour'])
                     + Decimal(price['ebs_usd_per_gib_month']) * root_gib / Decimal(730))
-                fleet_rate = usd_ceiling(host_rate * 6)
+                fleet_estimate = usd_ceiling(host_rate * 6 * Decimal(cfg['ttl_seconds']) / Decimal(3600))
             if not any(subnet['AvailabilityZone'] in offered for subnet in usable):
                 rejected.append(dict(region=region, instance_type=kind,
                     reason='no instance type offering in a usable subnet availability zone'))
@@ -646,7 +647,7 @@ def discover_candidates(aws, cfg):
                     candidates.append(dict(region=region, az=subnet['AvailabilityZone'], subnet=subnet['SubnetId'],
                         vpc=subnet['VpcId'], ami=image_id, ami_proof=image_proof, root_device=image['RootDeviceName'],
                         root_gib=root_gib, instance_type=kind, price=price, host_hourly_usd=str(host_rate),
-                        maximum_estimate_usd=str(fleet_rate), capability=hardware))
+                        maximum_estimate_usd=str(fleet_estimate), capability=hardware))
     candidates.sort(key=lambda item: (Decimal(item['host_hourly_usd']), cfg['instance_types'].index(item['instance_type']),
                                        cfg['regions'].index(item['region']), item['az'], item['subnet']))
     if not candidates:
@@ -1200,7 +1201,7 @@ class Campaign:
                          'write_profile_limits', 'native_write_profile_limits', 'kv_suite')})
         runner = admission['inputs']['runner_bundle']
         plan = dict(run_id=self.run_id, account=self.cfg['account'], region=candidate['region'],
-            bucket=self.cfg['bucket'], prefix=self.run_id, ttl_seconds=3600, export_reserve_seconds=600,
+            bucket=self.cfg['bucket'], prefix=self.run_id, ttl_seconds=self.cfg['ttl_seconds'], export_reserve_seconds=600,
             instance_type=candidate['instance_type'], placement_group=self.run_id, az=candidate['az'],
             protected_instances=[], bundle_sha256=runner['sha256'], bundle_bytes=runner['bytes'],
             atomic_bindings=bindings, atomic_controller=True, atomic_client_token=candidate_token(self.run_id, candidate),
@@ -1266,7 +1267,8 @@ class Campaign:
             overhead = overhead_estimate(admission, preflight['ancillary_prices'], self.cfg.get('cost_assumptions', {}))
             available = Decimal(ledger.report()['available_usd'])
             candidates = [candidate for candidate in preflight['candidates']
-                          if _reservation_quote(candidate['maximum_estimate_usd'], overhead)[0] <= available]
+                          if _reservation_quote(candidate['maximum_estimate_usd'], overhead,
+                                                ttl_seconds=self.cfg['ttl_seconds'])[0] <= available]
             if not candidates:
                 raise BudgetExceeded('no full six-host candidate fits the remaining weekly budget')
             self.journal.data = data = dict(schema=1, run_id=self.run_id, ownership=ownership(self.run_id),
@@ -1278,10 +1280,11 @@ class Campaign:
                 budget_policy=preflight.get('budget_policy'), overhead=overhead)
             self.journal.save()
         estimate, reconciliation = _reservation_quote(
-            max(Decimal(candidate['maximum_estimate_usd']) for candidate in data['candidates']), data['overhead'])
+            max(Decimal(candidate['maximum_estimate_usd']) for candidate in data['candidates']), data['overhead'],
+            ttl_seconds=self.cfg['ttl_seconds'])
         reserved = ledger.reserve(self.run_id, estimate, dict(input_bindings=admission['bindings'],
             candidates=ledger_candidates(data['candidates']), overhead=data['overhead'],
-            reconciliation_usd=str(reconciliation), ttl_seconds=3600, instance_count=6))
+            reconciliation_usd=str(reconciliation), ttl_seconds=self.cfg['ttl_seconds'], instance_count=6))
         data['budget_policy'] = reserved['budget_policy']
         data.update(config_audit(self.cfg, data))
         data['budget_reserved'] = True
@@ -1294,7 +1297,7 @@ class Campaign:
             data['uploads'][name] = self.upload(item['path'], key)
             self.journal.save()
         if not data['expires_at']:
-            data['expires_at'] = utc(datetime.fromtimestamp(self.clock.time(), timezone.utc) + timedelta(seconds=3600))
+            data['expires_at'] = utc(datetime.fromtimestamp(self.clock.time(), timezone.utc) + timedelta(seconds=self.cfg['ttl_seconds']))
             self.journal.save()
         self.provision_profiles()
         for candidate in data['candidates']:
@@ -1399,7 +1402,7 @@ class Campaign:
         else:
             raise TimeoutError('final exact per-run profiles did not converge')
         deadline = min(parsed(self.journal.data['expires_at']),
-                       *(parsed(item['LaunchTime']) + timedelta(seconds=3600) for item in current))
+                       *(parsed(item['LaunchTime']) + timedelta(seconds=self.cfg['ttl_seconds']) for item in current))
         cfg = {key: self.cfg[key] for key in ('transports', 'repetitions', 'read_profile_limits',
             'write_profile_limits', 'native_write_profile_limits', 'kv_suite', 'coordinator_cache_mib',
             'shard_cache_mib', 'replay_deadline_seconds')}

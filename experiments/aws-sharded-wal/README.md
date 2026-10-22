@@ -1,3 +1,57 @@
+## 22 October complete-matrix deadline and timing admission
+
+Run `39830242085` completed all 16 Sui cells, 49 of 172 paired KV
+specifications, and eight RAM controls. The original fixed work deadline then
+rejected the next backend. Its failed receipt remains failed. All six hosts
+and their temporary resources were independently verified terminated.
+
+The next campaign uses **one workflow, one six-host fleet and one complete
+matrix**. There is no continuation, cross-run completion or second benchmark
+workflow. The configured absolute lifetime is **7,200 seconds**, including
+capacity fallback and bootstrap; **600 seconds** remain reserved for export.
+Completion still triggers immediate export and exact-owned termination.
+Reentry, reboot and candidate fallback cannot reset that deadline.
+
+The matrix retains 16 paired Sui cells, 156 clean KV specifications, 16
+dedicated KV diagnostic specifications, and eight separate clean/profiled RAM
+controls. The existing diagnostics now run before the clean KV specifications;
+the clean relative order, workloads and per-case isolation are unchanged.
+This prioritizes the previously missing component clocks, not extra workloads.
+The Sui fixture is the frozen certified private chain through checkpoint 1775,
+not a mainnet or larger-than-RAM result.
+
+Dedicated diagnostics must retain the native and remote read-profile CSVs and
+all applicable node-profile phases. Admission checks case identity, all five
+owner records, warm/cold/reopen populations, append/persist and read timings,
+EFA CQ evidence and native-message zero-TLS work. Every remote diagnostic
+sample must have exactly one cache miss, including the cold pass, which runs
+before mixed writes and deletions. Bounded profiled reads can select only some
+batch owners: inactive owners remain explicit, while every active owner's
+required counters must be positive. After draining, each owner's client/server
+request counts must match exactly. The full load must exercise all five owners.
+Another owner's clocks cannot conceal a missing active-owner profile.
+`COMPLETE` alone is insufficient.
+Per-request send/header/body and compatibility inventory-wait clocks that the
+multiplexed protocol does not measure are unavailable, not observed zero
+latency. Nested clocks are not an additive network-time decomposition.
+
+Local execution exercised native and five-node TCP diagnostic paths, verified
+all reopened values, and admitted their actual phase profiles. These nodes
+shared one SSD; this proves the evidence path, not EFA hardware or performance.
+The complete cloud run still requires six newly built, source-bound binaries
+and a successful same-build Sui audit before allocation.
+
+`budget.json` is the sole editable limit; the approved weekly limit is **$100**.
+Live fleet estimates cover the full configured lifetime. The additional
+reconciliation interval is charged at the hourly rate, not multiplied by the
+longer lifetime again. Reservations remain holds, not booked expenses.
+Generated daily/weekly/monthly/total reports remain separate from that file.
+The launcher role/session ceiling is **10,800 seconds** so credentials cover the
+two-hour fleet and cleanup; input/watchdog role ceilings are unchanged.
+The campaign step is bounded at 150 minutes inside a 225-minute job, with
+unconditional cleanup and artifact retention. This does not extend guest TTLs.
+Earlier dated sections below retain their historical settings and results.
+
 ## 22 October read-only Pricing throttling
 
 Run `39814797884` rebuilt all six executables and passed its same-build Sui
@@ -80,8 +134,9 @@ before checking completed-wait metrics. Commit acknowledgements precede that
 diagnostic snapshot. Publication, visibility, recovery, and timing assertions
 remain unchanged; no production lock or write-path ordering changed.
 
-`budget.json` remains the only editable weekly-limit file; the limit remains
-$60. Prelaunch reservations prevent concurrent overspending but are not expenses.
+`budget.json` remains the only editable weekly-limit file; the latest dated
+campaign settings above state its approved limit. Prelaunch reservations prevent
+concurrent overspending but are not expenses.
 Verified cleanup releases the unused active hold immediately. Unresolved or
 ambiguous resource ownership keeps its hold. Original reservations and corrected
 receipts remain in the versioned ledger; no counter or history is reset.

@@ -13,6 +13,7 @@ import sys
 from unittest.mock import Mock, patch
 
 import sui_checkpoint as supervisor
+import guest as kv_guest
 
 
 def encoded(value):
@@ -344,16 +345,57 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             supervisor.validate_cfg(cfg | {'nodes': bad_nodes})
 
-    def test_four_repetition_deadline_is_bounded_to_one_hour(self):
+    def test_full_matrix_deadline_accepts_exact_two_hours_and_preserves_export_window(self):
         cfg = example_config()
         self.assertEqual(cfg['repetitions'], 4)
         self.assertEqual(cfg['read_profile_limits'], [0, 4096, 4096, 0])
-        with patch.object(supervisor, 'remaining', return_value=3600):
-            supervisor.validate_cfg(cfg)
-        for left in (3600.001, cfg['export_reserve_seconds'] + 180, 0):
-            with self.subTest(left=left), patch.object(supervisor, 'remaining', return_value=left):
-                with self.assertRaisesRegex(ValueError, 'bounded export reserve'):
-                    supervisor.validate_cfg(cfg)
+        now = datetime(2026, 10, 22, 12, tzinfo=timezone.utc)
+        for left in (3600, 7200, cfg['export_reserve_seconds'] + 180.000001):
+            candidate = cfg | {'deadline_utc': (now + timedelta(seconds=left)).isoformat()}
+            with self.subTest(left=left), patch.object(kv_guest.time, 'time', return_value=now.timestamp()):
+                root, ids = supervisor.validate_cfg(candidate)
+                self.assertEqual(root, Path(cfg['run_root']))
+                self.assertEqual(len(ids), 6)
+        for left in (7200.000001, cfg['export_reserve_seconds'] + 180,
+                     cfg['export_reserve_seconds'], 0, -1):
+            candidate = cfg | {'deadline_utc': (now + timedelta(seconds=left)).isoformat()}
+            with self.subTest(left=left), patch.object(kv_guest.time, 'time', return_value=now.timestamp()):
+                with self.assertRaises(ValueError):
+                    supervisor.validate_cfg(candidate)
+
+    def test_kv_guest_admission_accepts_old_and_two_hour_absolute_deadlines(self):
+        cfg = example_config() | {'campaign': 'overlap', 'repetitions': 2}
+        now = datetime(2026, 10, 22, 12, tzinfo=timezone.utc)
+        for left in (1800, 3600, 7200):
+            candidate = cfg | {'deadline_utc': (now + timedelta(seconds=left)).isoformat()}
+            with self.subTest(left=left), patch.object(kv_guest.time, 'time', return_value=now.timestamp()):
+                root, ids = kv_guest.validate_cfg(candidate)
+                self.assertEqual(root, Path(cfg['run_root']))
+                self.assertEqual(len(ids), 6)
+        for left in (7200.000001, 0, -1):
+            candidate = cfg | {'deadline_utc': (now + timedelta(seconds=left)).isoformat()}
+            with self.subTest(left=left), patch.object(kv_guest.time, 'time', return_value=now.timestamp()):
+                with self.assertRaises(ValueError):
+                    kv_guest.validate_cfg(candidate)
+
+    def test_malformed_deadline_or_export_reserve_is_not_admitted(self):
+        cfg = example_config()
+        for value in ('not-a-deadline', '2026-10-22T12:30:00', '2026-10-22T12:30:00+01:00'):
+            with self.subTest(deadline=value), self.assertRaises(ValueError):
+                supervisor.validate_cfg(cfg | {'deadline_utc': value})
+        for reserve in (299, 901, 600.0, True, None, '600'):
+            with self.subTest(reserve=reserve), self.assertRaises(ValueError):
+                supervisor.validate_cfg(cfg | {'export_reserve_seconds': reserve})
+
+    def test_replay_deadline_default_and_one_hour_maximum_do_not_follow_fleet_lifetime(self):
+        cfg = example_config()
+        self.assertEqual(cfg['replay_deadline_seconds'], 900)
+        without_replay = {name: value for name, value in cfg.items() if name != 'replay_deadline_seconds'}
+        supervisor.validate_cfg(without_replay)
+        supervisor.validate_cfg(cfg | {'replay_deadline_seconds': 3600})
+        for seconds in (29, 3600.000001, 7200):
+            with self.subTest(seconds=seconds), self.assertRaises(ValueError):
+                supervisor.validate_cfg(cfg | {'replay_deadline_seconds': seconds})
 
     def test_campaign_work_deadline_preserves_original_absolute_expiry(self):
         cfg = example_config()

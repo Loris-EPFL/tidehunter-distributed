@@ -194,7 +194,7 @@ jobs:
     if: github.repository == 'Loris-EPFL/tidehunter-distributed' && github.ref == 'refs/heads/bench/aws-efa' && needs.prepare.outputs.enabled == 'true'
     runs-on: ubuntu-24.04
     environment: rdma-bench
-    timeout-minutes: 180
+    timeout-minutes: 225
     permissions:
       contents: read
       id-token: write
@@ -238,7 +238,7 @@ jobs:
           role-session-name: fleet-${{ github.run_id }}-${{ github.run_attempt }}
           aws-region: ${{ vars.AWS_BENCH_BUCKET_REGION }}
           allowed-account-ids: "354775971805"
-          role-duration-seconds: 7200
+          role-duration-seconds: 10800
       - name: Check the shared ledger against the versioned budget file
         timeout-minutes: 5
         run: |
@@ -247,7 +247,7 @@ jobs:
             --budget-file engine/experiments/aws-sharded-wal/budget.json
       - name: Run one complete six-host campaign
         id: campaign
-        timeout-minutes: 85
+        timeout-minutes: 150
         run: |
           echo 'invoked=true' >> "$GITHUB_OUTPUT"
           python3 engine/experiments/aws-sharded-wal/ci_campaign.py run \
