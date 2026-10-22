@@ -1,9 +1,10 @@
 //! Bounded local caller grouping for the distributed Value WAL.
 //!
-//! NEXT_STEPS M2 and `group_model` require one complete, validated group to pass
-//! its persistence barrier before another group can be emitted. Tidehunter's
-//! paper §§3.1/3.3 preserves whole-batch replay; this worker does not publish the
-//! native index or establish a remote fencing lease.
+//! A FIFO appender feeds a dedicated serial flusher, so later complete groups
+//! can be appended while an earlier captured prefix is being persisted. The
+//! flusher publishes durable completions only after the captured prefix's file
+//! and namespace barriers. This worker does not publish the native index or
+//! establish a remote fencing lease.
 //!
 //! TiKV Raft Engine's write barrier motivates immediate service for an isolated
 //! caller and grouping callers that arrive behind active I/O:
@@ -16,7 +17,7 @@
 use super::codec::{CodecError, CompleteBatch};
 use super::group::{CompleteGroup, GROUP_HEADER_LEN, GroupError};
 use super::reference_directory::ReferenceDirectory;
-use super::storage::{DurableBatch, PartitionLog, StorageError};
+use super::storage::{AppendedBatch, DurableBatch, PartitionLog, StorageError};
 use super::types::{BatchId, BatchVersion, PayloadDigest, RequestAuthority};
 use crate::key_shape::KeyShape;
 use parking_lot::{Condvar, Mutex};
@@ -112,6 +113,7 @@ struct Job {
 struct Queue {
     jobs: VecDeque<Job>,
     stopped: bool,
+    flush_failed: bool,
     terminal_error: Option<WorkerError>,
     stats: WorkerStats,
 }
@@ -125,6 +127,18 @@ struct Shared {
     before_process: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
     #[cfg(test)]
     panic_after_append: std::sync::atomic::AtomicBool,
+    flush: mpsc::SyncSender<FlushCommand>,
+}
+
+struct PendingCommit {
+    listeners: Vec<Vec<Job>>,
+    receipts: Vec<AppendedBatch>,
+    batches: usize,
+}
+enum FlushCommand {
+    Commit(PendingCommit),
+    Barrier(mpsc::SyncSender<()>),
+    Stop,
 }
 
 /// One explicitly owned persistence worker for a partition. `Drop` drains and
@@ -132,6 +146,8 @@ struct Shared {
 pub struct GroupCommitWorker {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
+    flush_thread: Option<JoinHandle<()>>,
+    claim: Option<Claim>,
 }
 impl GroupCommitWorker {
     pub fn start(
@@ -154,10 +170,12 @@ impl GroupCommitWorker {
             .map_err(|_| WorkerError::InvalidConfig("invalid key shape"))?;
         log.claim_worker()
             .map_err(|error| WorkerError::StorageRejected(Arc::new(error)))?;
+        let (flush, receiver) = mpsc::sync_channel(config.max_pending_requests);
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
                 jobs: VecDeque::new(),
                 stopped: false,
+                flush_failed: false,
                 terminal_error: None,
                 stats: WorkerStats::default(),
             }),
@@ -169,14 +187,38 @@ impl GroupCommitWorker {
             before_process: Mutex::new(None),
             #[cfg(test)]
             panic_after_append: std::sync::atomic::AtomicBool::new(false),
+            flush,
         });
+        let flush_shared = shared.clone();
+        let flush_thread = match thread::Builder::new()
+            .name(format!("value-wal-flush-{}", log.config().partition))
+            .spawn(move || {
+                let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    flush_run(&flush_shared, &receiver)
+                }))
+                .is_err();
+                if panicked {
+                    flush_shared.log.poison_writer();
+                    {
+                        let mut queue = flush_shared.queue.lock();
+                        queue.flush_failed = true;
+                        queue.stopped = true;
+                        queue.terminal_error = Some(WorkerError::WorkerLostOutcome);
+                    }
+                    stop_pending(&flush_shared);
+                    fail_queued_flush(&flush_shared, &receiver, WorkerError::WorkerLostOutcome);
+                }
+            }) {
+            Ok(thread) => thread,
+            Err(error) => {
+                log.release_worker();
+                return Err(WorkerError::ThreadStart(Arc::new(error)));
+            }
+        };
         let thread_shared = shared.clone();
         let thread = match thread::Builder::new()
             .name(format!("value-wal-{}", log.config().partition))
             .spawn(move || {
-                let _claim = Claim(thread_shared.log.clone());
-                // A panic drops active senders (unknown outcomes) and drains all
-                // untouched queued jobs with an explicit before-effects result.
                 let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run(&thread_shared, &thread_shared.shape)
                 }))
@@ -188,8 +230,6 @@ impl GroupCommitWorker {
                 }
                 stop_pending(&thread_shared);
                 if panicked {
-                    // Unwinding dropped active jobs and their buffers/senders.
-                    // Their outcomes are unknown; their credits are no longer held.
                     let mut queue = thread_shared.queue.lock();
                     queue.stats.pending_requests = 0;
                     queue.stats.pending_bytes = 0;
@@ -197,6 +237,8 @@ impl GroupCommitWorker {
             }) {
             Ok(thread) => thread,
             Err(error) => {
+                let _ = shared.flush.send(FlushCommand::Stop);
+                let _ = flush_thread.join();
                 log.release_worker();
                 return Err(WorkerError::ThreadStart(Arc::new(error)));
             }
@@ -204,6 +246,8 @@ impl GroupCommitWorker {
         Ok(Self {
             shared,
             thread: Some(thread),
+            flush_thread: Some(flush_thread),
+            claim: Some(Claim(log)),
         })
     }
 
@@ -404,6 +448,14 @@ impl GroupCommitWorker {
             self.shared.log.poison_writer();
             self.shared.queue.lock().terminal_error = Some(WorkerError::WorkerLostOutcome);
         }
+        let _ = self.shared.flush.send(FlushCommand::Stop);
+        if let Some(thread) = self.flush_thread.take()
+            && thread.join().is_err()
+        {
+            self.shared.log.poison_writer();
+            self.shared.queue.lock().terminal_error = Some(WorkerError::WorkerLostOutcome);
+        }
+        self.claim.take();
         match self.shared.queue.lock().terminal_error.clone() {
             Some(error) => Err(error),
             None => Ok(()),
@@ -526,7 +578,7 @@ fn run(shared: &Shared, shape: &KeyShape) {
             let _ = entered.send(());
             let _ = resume.recv();
         }
-        let (results, fatal) = process(shared, shape, jobs);
+        let (results, fatal, commit) = process(shared, shape, jobs);
         if fatal {
             shared.queue.lock().terminal_error = results
                 .iter()
@@ -546,8 +598,130 @@ fn run(shared: &Shared, shape: &KeyShape) {
         for (job, result) in results {
             finish(shared, job, result);
         }
+        if let Some(commit) = commit {
+            let rejected = {
+                let queue = shared.queue.lock();
+                if queue.flush_failed {
+                    Some(commit)
+                } else {
+                    match shared.flush.send(FlushCommand::Commit(commit)) {
+                        Ok(()) => None,
+                        Err(error) => match error.0 {
+                            FlushCommand::Commit(commit) => Some(commit),
+                            FlushCommand::Barrier(_) | FlushCommand::Stop => None,
+                        },
+                    }
+                }
+            };
+            if let Some(commit) = rejected {
+                shared.log.poison_writer();
+                let failure = {
+                    let mut queue = shared.queue.lock();
+                    queue.flush_failed = true;
+                    queue
+                        .terminal_error
+                        .get_or_insert(WorkerError::WorkerLostOutcome);
+                    queue
+                        .terminal_error
+                        .clone()
+                        .unwrap_or(WorkerError::WorkerLostOutcome)
+                };
+                for job in commit.listeners.into_iter().flatten() {
+                    finish(shared, job, Err(failure.clone()));
+                }
+                stop_pending(shared);
+                return;
+            }
+        }
         if fatal {
+            stop_pending(shared);
             return;
+        }
+    }
+}
+fn flush_barrier(shared: &Shared) -> Result<(), ()> {
+    let (done, completed) = mpsc::sync_channel(0);
+    {
+        let queue = shared.queue.lock();
+        if queue.flush_failed {
+            return Err(());
+        }
+        shared
+            .flush
+            .send(FlushCommand::Barrier(done))
+            .map_err(|_| ())?;
+    }
+    completed.recv().map_err(|_| ())
+}
+fn flush_run(shared: &Shared, receiver: &mpsc::Receiver<FlushCommand>) {
+    while let Ok(command) = receiver.recv() {
+        let pending = match command {
+            FlushCommand::Commit(pending) => pending,
+            FlushCommand::Barrier(done) => {
+                let _ = done.send(());
+                continue;
+            }
+            FlushCommand::Stop => return,
+        };
+        let began = Instant::now();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            shared.log.persist_many(&pending.receipts)
+        }))
+        .unwrap_or_else(|_| {
+            shared.log.poison_writer();
+            Err(StorageError::Poisoned)
+        });
+        let persist_ns = elapsed_ns(began);
+        shared.queue.lock().stats.persist_ns += persist_ns;
+        match result {
+            Ok(receipts) => {
+                {
+                    let mut queue = shared.queue.lock();
+                    queue.stats.groups_persisted += 1;
+                    queue.stats.batches_persisted += pending.batches as u64;
+                }
+                for (jobs, receipt) in pending.listeners.into_iter().zip(receipts) {
+                    for job in jobs {
+                        finish(shared, job, Ok(receipt));
+                    }
+                }
+            }
+            Err(error) => {
+                let (error, fatal) = storage_error(error, true);
+                if fatal {
+                    shared.log.poison_writer();
+                    let mut queue = shared.queue.lock();
+                    queue.flush_failed = true;
+                    queue.terminal_error = Some(error.clone());
+                    queue.stopped = true;
+                    let queued = queue.jobs.drain(..).collect::<Vec<_>>();
+                    drop(queue);
+                    for job in queued {
+                        finish(shared, job, Err(WorkerError::StoppedBeforeEffects));
+                    }
+                }
+                for job in pending.listeners.into_iter().flatten() {
+                    finish(shared, job, Err(error.clone()));
+                }
+                if fatal {
+                    fail_queued_flush(shared, receiver, error);
+                    return;
+                }
+            }
+        }
+    }
+}
+fn fail_queued_flush(shared: &Shared, receiver: &mpsc::Receiver<FlushCommand>, error: WorkerError) {
+    loop {
+        match receiver.try_recv() {
+            Ok(FlushCommand::Commit(pending)) => {
+                for job in pending.listeners.into_iter().flatten() {
+                    finish(shared, job, Err(error.clone()));
+                }
+            }
+            Ok(FlushCommand::Barrier(done)) => drop(done),
+            Ok(FlushCommand::Stop)
+            | Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return,
         }
     }
 }
@@ -562,8 +736,8 @@ fn finish(shared: &Shared, job: Job, outcome: Result<DurableBatch, WorkerError>)
     drop(batch);
     {
         let mut queue = shared.queue.lock();
-        queue.stats.pending_requests -= 1;
-        queue.stats.pending_bytes -= credit;
+        queue.stats.pending_requests = queue.stats.pending_requests.saturating_sub(1);
+        queue.stats.pending_bytes = queue.stats.pending_bytes.saturating_sub(credit);
     }
     // Capacity one means completion never waits for the caller to receive.
     let _ = result.send(outcome);
@@ -596,7 +770,11 @@ fn elapsed_ns(started: Instant) -> u64 {
 }
 
 type JobResults = Vec<(Job, Result<DurableBatch, WorkerError>)>;
-fn process(shared: &Shared, shape: &KeyShape, jobs: Vec<Job>) -> (JobResults, bool) {
+fn process(
+    shared: &Shared,
+    shape: &KeyShape,
+    jobs: Vec<Job>,
+) -> (JobResults, bool, Option<PendingCommit>) {
     let config = shared.log.config();
     let authority = RequestAuthority {
         epoch: config.inventory.epoch,
@@ -698,33 +876,56 @@ fn process(shared: &Shared, shape: &KeyShape, jobs: Vec<Job>) -> (JobResults, bo
         shared.queue.lock().stats.persist_ns += retry_persist_ns;
     }
     if batches.is_empty() {
-        return (results, fatal);
+        return (results, fatal, None);
     }
     if fatal {
         for job in listeners.into_iter().flatten() {
             results.push((job, Err(WorkerError::StoppedBeforeEffects)));
         }
-        return (results, true);
+        return (results, true, None);
     }
     let count = batches.len();
     let started = Instant::now();
-    let group = CompleteGroup::new(shape, batches, config.batch_limits, config.group_limits);
+    let group = CompleteGroup::new(shape, batches, config.batch_limits, config.group_limits)
+        .map_err(|e| WorkerError::GroupRejected(Arc::new(e)));
     let group_build_ns = elapsed_ns(started);
-    let mut append_ns = 0;
-    let mut persist_ns = 0;
-    let outcome = group
-        .map_err(|e| WorkerError::GroupRejected(Arc::new(e)))
-        .and_then(|group| {
-            let started = Instant::now();
-            let appended = shared.log.append_group(authority, &group).map_err(|e| {
-                let (error, stop) = storage_error(e, false);
+    let mut append_ns = 0u64;
+    let outcome = group.and_then(|group| {
+        let started = Instant::now();
+        let first = shared.log.append_group(authority, &group);
+        append_ns = append_ns.saturating_add(elapsed_ns(started));
+        match first {
+            Err(StorageError::NeedsPersistence) => {
+                if flush_barrier(shared).is_err() {
+                    shared.log.poison_writer();
+                    fatal = true;
+                    Err(WorkerError::WorkerLostOutcome)
+                } else {
+                    let started = Instant::now();
+                    let retry = shared.log.append_group(authority, &group);
+                    append_ns = append_ns.saturating_add(elapsed_ns(started));
+                    retry.map_err(|error| {
+                        let (error, stop) = storage_error(error, false);
+                        fatal = stop;
+                        error
+                    })
+                }
+            }
+            Err(error) => {
+                let (error, stop) = storage_error(error, false);
                 fatal = stop;
-                error
-            });
-            append_ns = elapsed_ns(started);
-            appended
-        })
-        .and_then(|receipts| {
+                Err(error)
+            }
+            Ok(receipts) => Ok(receipts),
+        }
+    });
+    {
+        let mut queue = shared.queue.lock();
+        queue.stats.group_build_ns += group_build_ns;
+        queue.stats.append_ns += append_ns;
+    }
+    match outcome {
+        Ok(receipts) => {
             #[cfg(test)]
             if shared
                 .panic_after_append
@@ -732,43 +933,23 @@ fn process(shared: &Shared, shape: &KeyShape, jobs: Vec<Job>) -> (JobResults, bo
             {
                 panic!("injected panic after group append before persistence");
             }
-            // Exact receipts share one complete group's persistence proof.
-            // Validate them under one lock instead of reacquiring per member.
-            let started = Instant::now();
-            let durable = shared.log.persist_many(&receipts).map_err(|e| {
-                let (error, stop) = storage_error(e, true);
-                fatal = stop;
-                error
-            });
-            persist_ns += elapsed_ns(started);
-            durable
-        });
-    {
-        let mut queue = shared.queue.lock();
-        queue.stats.group_build_ns += group_build_ns;
-        queue.stats.append_ns += append_ns;
-        queue.stats.persist_ns += persist_ns;
-    }
-    match outcome {
-        Ok(receipts) => {
-            {
-                let mut queue = shared.queue.lock();
-                queue.stats.groups_persisted += 1;
-                queue.stats.batches_persisted += count as u64;
-            }
-            for (jobs, receipt) in listeners.into_iter().zip(receipts) {
-                for job in jobs {
-                    results.push((job, Ok(receipt)));
-                }
-            }
+            (
+                results,
+                fatal,
+                Some(PendingCommit {
+                    listeners,
+                    receipts,
+                    batches: count,
+                }),
+            )
         }
         Err(error) => {
             for job in listeners.into_iter().flatten() {
                 results.push((job, Err(error.clone())));
             }
+            (results, fatal, None)
         }
     }
-    (results, fatal)
 }
 
 #[cfg(test)]
@@ -960,7 +1141,7 @@ mod tests {
                 && stats.append_ns > 0
                 && stats.persist_ns > 0
         );
-        assert_eq!(log.stats().persistence_barriers, 2);
+        assert!((1..=2).contains(&log.stats().persistence_barriers));
     }
 
     #[test]
@@ -989,36 +1170,43 @@ mod tests {
         );
         pending.next().unwrap().wait().unwrap();
         assert_eq!(log.stats().persistence_barriers, 1);
-        log.fail_next_persist();
-        let pending = worker
+        worker.shutdown().unwrap();
+        let (_failure_dir, failure_log) = fixture();
+        let mut failure_worker =
+            GroupCommitWorker::start(failure_log.clone(), &shape(), worker_config()).unwrap();
+        let (entered, release) = failure_log.pause_next_persist();
+        failure_log.fail_next_inventory_witness(true);
+        let pending = failure_worker
             .try_submit_many((10..20).map(|n| batch(n, n as u64)).collect())
             .unwrap();
-        for (n, pending) in pending.into_iter().enumerate() {
-            if n < 8 {
-                assert!(matches!(
-                    pending.wait(),
-                    Err(WorkerError::OutcomeUnknown(_))
-                ));
-            } else {
-                assert!(matches!(
-                    pending.wait(),
-                    Err(WorkerError::StoppedBeforeEffects)
-                ));
-            }
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while failure_log.lookup(batch(19, 19).id()).unwrap().is_none() && Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+        assert!(failure_log.lookup(batch(19, 19).id()).unwrap().is_some());
+        release.send(()).unwrap();
+        for pending in pending {
+            assert!(matches!(
+                pending.wait(),
+                Err(WorkerError::OutcomeUnknown(_))
+            ));
         }
         assert!(matches!(
-            worker.shutdown(),
+            failure_worker.shutdown(),
             Err(WorkerError::OutcomeUnknown(_))
         ));
         assert_eq!(
             (
-                worker.stats().pending_requests,
-                worker.stats().pending_bytes
+                failure_worker.stats().pending_requests,
+                failure_worker.stats().pending_bytes
             ),
             (0, 0)
         );
-        assert!(log.lookup(batch(17, 17).id()).unwrap().is_some());
-        assert!(log.lookup(batch(18, 18).id()).unwrap().is_none());
+        assert_eq!(failure_log.stats().appended_groups, 2);
+        assert!(failure_log.lookup(batch(18, 18).id()).unwrap().is_some());
+        assert!(failure_log.lookup(batch(19, 19).id()).unwrap().is_some());
     }
 
     #[test]
@@ -1047,7 +1235,7 @@ mod tests {
         assert_eq!(log.receipt_count(), 9);
         let storage = log.stats();
         assert_eq!(storage.appended_groups, 2);
-        assert_eq!(storage.persistence_barriers, 2);
+        assert!((1..=2).contains(&storage.persistence_barriers));
     }
 
     #[test]
@@ -1119,6 +1307,79 @@ mod tests {
     }
 
     #[test]
+    fn pending_metadata_pressure_drains_prior_cohort_before_retrying_append() {
+        let dir = tempdir::TempDir::new("worker-pending-metadata-pressure").unwrap();
+        let metrics = Metrics::new_in_enabled(&prometheus::Registry::new(), false);
+        let mut storage_config = config();
+        storage_config.max_batches = 1;
+        let log = Arc::new(
+            PartitionLog::create(
+                &dir.path().join("stream"),
+                storage_config,
+                &shape(),
+                metrics,
+            )
+            .unwrap(),
+        );
+        let mut worker = GroupCommitWorker::start(log.clone(), &shape(), worker_config()).unwrap();
+        let (entered, release) = log.pause_next_persist();
+        let first = worker.try_submit(batch(0, 0)).unwrap();
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second = worker.try_submit(batch(1, 1)).unwrap();
+        assert!(log.lookup(batch(1, 1).id()).unwrap().is_none());
+        release.send(()).unwrap();
+        first.wait().unwrap();
+        second.wait().unwrap();
+        worker.shutdown().unwrap();
+        assert_eq!(log.stats().appended_groups, 2);
+        assert_eq!(log.stats().persistence_barriers, 2);
+        assert_eq!(
+            (
+                worker.stats().pending_requests,
+                worker.stats().pending_bytes
+            ),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn appender_advances_while_the_flusher_persists_a_captured_prefix() {
+        let (_dir, log) = fixture();
+        let mut worker = GroupCommitWorker::start(log.clone(), &shape(), worker_config()).unwrap();
+        let (entered, release) = log.pause_next_persist();
+        let first = worker.try_submit(batch(0, 0)).unwrap();
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let second_batch = batch(1, 1);
+        let second = worker.try_submit(second_batch.clone()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while log.lookup(second_batch.id()).unwrap().is_none() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        let second_receipt = log.lookup(second_batch.id()).unwrap();
+        assert!(
+            second_receipt.is_some(),
+            "appender stalled behind file sync"
+        );
+        assert!(matches!(
+            first.result.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            second.result.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(log.stats().persistence_barriers, 0);
+
+        release.send(()).unwrap();
+        first.wait().unwrap();
+        second.wait().unwrap();
+        assert_eq!(log.stats().appended_groups, 2);
+        assert_eq!(log.stats().persistence_barriers, 2);
+        assert_eq!(worker.stats().groups_persisted, 2);
+        worker.shutdown().unwrap();
+    }
+    #[test]
     fn shutdown_drains_accepted_and_dropped_handles_then_releases_worker_claim() {
         let (_dir, log) = fixture();
         let mut worker = GroupCommitWorker::start(log.clone(), &shape(), worker_config()).unwrap();
@@ -1126,12 +1387,29 @@ mod tests {
             GroupCommitWorker::start(log.clone(), &shape(), worker_config()),
             Err(WorkerError::StorageRejected(_))
         ));
-        let jobs: Vec<_> = (0..16)
+        let (entered, release) = log.pause_next_persist();
+        let first = worker.try_submit(batch(0, 0)).unwrap();
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let jobs: Vec<_> = (1..16)
             .map(|n| worker.try_submit(batch(n, n as u64)).unwrap())
             .collect();
+        drop(first);
         drop(jobs); // Response receivers are not required for draining persistence.
-        worker.shutdown().unwrap();
-        assert_eq!(log.receipt_count(), 16);
+        let (shutdown_done, shutdown_result) = mpsc::sync_channel(1);
+        let shutdown = thread::spawn(move || {
+            let result = worker.shutdown();
+            shutdown_done.send((worker, result)).unwrap();
+        });
+        assert!(matches!(
+            shutdown_result.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        release.send(()).unwrap();
+        let (worker, result) = shutdown_result
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        shutdown.join().unwrap();
+        result.unwrap();
         assert!(matches!(
             worker.try_submit(batch(20, 20)),
             Err(WorkerError::StoppedBeforeEffects)
@@ -1206,21 +1484,15 @@ mod tests {
     }
 
     #[test]
-    fn uncertain_persistence_fails_active_group_and_never_emits_queued_group() {
+    fn pre_wal_persistence_failure_keeps_append_unpublished_and_releases_capacity() {
         let (_dir, log) = fixture();
         let mut worker = GroupCommitWorker::start(log.clone(), &shape(), worker_config()).unwrap();
         log.fail_next_persist();
-        let gate = Gate::install(&worker);
-        let active = worker.try_submit(batch(0, 0)).unwrap();
-        gate.entered();
-        let untouched = worker.try_submit(batch(1, 1)).unwrap();
-        gate.release();
-        assert!(
-            matches!(active.wait(), Err(WorkerError::OutcomeUnknown(error)) if matches!(*error, StorageError::Unknown(_)))
-        );
+        let pending = worker.try_submit(batch(0, 0)).unwrap();
         assert!(matches!(
-            untouched.wait(),
-            Err(WorkerError::StoppedBeforeEffects)
+            pending.wait(),
+            Err(WorkerError::OutcomeUnknown(error))
+                if matches!(*error, StorageError::Unknown(_))
         ));
         assert!(matches!(
             worker.shutdown(),
@@ -1236,11 +1508,10 @@ mod tests {
         assert_eq!(log.stats().appended_groups, 1);
         assert_eq!(log.stats().persistence_barriers, 0);
         assert!(log.lookup(batch(0, 0).id()).unwrap().is_some());
-        assert!(log.lookup(batch(1, 1).id()).unwrap().is_none());
-        assert!(
-            matches!(GroupCommitWorker::start(log, &shape(), worker_config()),
-            Err(WorkerError::StorageRejected(error)) if matches!(*error, StorageError::Poisoned))
-        );
+        assert!(matches!(
+            GroupCommitWorker::start(log, &shape(), worker_config()),
+            Err(WorkerError::StorageRejected(error)) if matches!(*error, StorageError::Poisoned)
+        ));
     }
 
     #[test]
