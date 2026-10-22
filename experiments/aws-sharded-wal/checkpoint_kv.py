@@ -618,9 +618,9 @@ def validate_diagnostic_evidence(directory, spec, mode, owner_partitions):
             if native:
                 if row['value_cache_hit'] not in ('true', 'false'):
                     raise ValueError('native diagnostic cache-hit flag is invalid')
-            elif (values['cache_hits'] != 0 or values['cache_misses'] not in (0, 1)
-                  or (row['state'] != 'cache-evicted' and values['cache_misses'] != 1)):
-                # Cold queries include deleted keys; those stop at the local index.
+            elif values['cache_hits'] != 0 or values['cache_misses'] != 1:
+                # Cold profiling runs after the full load, before mixed writes
+                # and deletions. Every sampled key must fetch a WAL value.
                 raise ValueError('remote diagnostic did not force its uncached read')
         for state in states:
             selected = [row for row in rows if row['state'] == state]
@@ -658,9 +658,17 @@ def validate_diagnostic_evidence(directory, spec, mode, owner_partitions):
                 or {node[0] for node in nodes} != partitions):
             raise ValueError('diagnostic node profile case/owner identity differs')
         counters = [transport_floor.flatten_counters(profile) for _, profile in nodes]
+        if any('requests' not in profile or 'client.requests' not in profile for profile in counters):
+            raise ValueError('diagnostic owner request populations are missing')
+        if any(bool(profile['requests']) != bool(profile['client.requests']) for profile in counters):
+            raise ValueError('diagnostic owner/client activity differs')
+        # Bounded profiled reads can legitimately select only some batch owners.
+        # Require every active owner's clocks, not merely a positive fleet sum.
+        active = [profile for profile in counters if profile['client.requests'] > 0]
         def positive(*keys):
             for key in keys:
-                if any(key not in profile for profile in counters) or sum(profile[key] for profile in counters) <= 0:
+                if (any(key not in profile for profile in counters) or not active
+                        or any(profile[key] <= 0 for profile in active)):
                     raise ValueError('diagnostic node profile lacks positive timing population: ' + key)
         positive('requests', 'request_decode_ns', 'handler_ns', 'response_encode_ns',
                  'response_send_ns', 'client.requests', 'client.exchange_ns',

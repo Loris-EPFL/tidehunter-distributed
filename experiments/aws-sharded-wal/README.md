@@ -21,9 +21,15 @@ The Sui fixture is the frozen certified private chain through checkpoint 1775,
 not a mainnet or larger-than-RAM result.
 
 Dedicated diagnostics must retain the native and remote read-profile CSVs and
-all applicable node-profile phases. Admission checks case identity, the five
-owners, warm/cold/reopen populations, append/persist and read timings, EFA CQ
-evidence and native-message zero-TLS work. `COMPLETE` alone is insufficient.
+all applicable node-profile phases. Admission checks case identity, all five
+owner records, warm/cold/reopen populations, append/persist and read timings,
+EFA CQ evidence and native-message zero-TLS work. Every remote diagnostic
+sample must have exactly one cache miss, including the cold pass, which runs
+before mixed writes and deletions. Bounded profiled reads can select only some
+batch owners: inactive owners remain explicit, while every active owner's
+required counters must be positive and its client/server activity must agree.
+Another owner's clocks cannot conceal a missing active-owner profile.
+`COMPLETE` alone is insufficient.
 Per-request send/header/body and compatibility inventory-wait clocks that the
 multiplexed protocol does not measure are unavailable, not observed zero
 latency. Nested clocks are not an additive network-time decomposition.

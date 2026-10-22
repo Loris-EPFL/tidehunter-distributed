@@ -1230,6 +1230,59 @@ class MatrixEvidenceTests(unittest.TestCase):
                         spec, _ = self.diagnostic_fixture(root, transport, mode, cold)
                         checkpoint_kv.validate_diagnostic_evidence(root, spec, mode, list(range(5)))
 
+    def test_diagnostic_cold_samples_cannot_stop_at_the_local_index(self):
+        with tempfile.TemporaryDirectory() as root:
+            spec, _ = self.diagnostic_fixture(root)
+            path = Path(root) / 'remote_read_profiles.csv'
+            with path.open() as stream:
+                reader = csv.DictReader(stream)
+                fields, rows = reader.fieldnames, list(reader)
+            cold = next(row for row in rows if row['state'] == 'cache-evicted')
+            cold.update(cache_misses='0', exchange_ns='0', server_record_read_ns='0')
+            with path.open('w') as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+            with self.assertRaisesRegex(ValueError, 'uncached read'):
+                checkpoint_kv.validate_diagnostic_evidence(root, spec, 'tcp', list(range(5)))
+
+    def test_diagnostic_idle_owners_are_not_missing_active_owner_profiles(self):
+        def idle(profile):
+            return {key: idle(value) if isinstance(value, dict) else 0
+                    for key, value in profile.items()}
+        for transport in ('tcp', 'efa', 'efa-direct', 'efa-native'):
+            with self.subTest(transport=transport), tempfile.TemporaryDirectory() as root:
+                spec, records = self.diagnostic_fixture(root, transport=transport)
+                path = Path(root) / 'node_profiles.yaml'
+                owner = records[2]['nodes'][0]
+                owner[1] = idle(owner[1])
+                def save():
+                    path.write_text(''.join('---\n' + json.dumps(row) + '\n' for row in records))
+                save()
+                checkpoint_kv.validate_diagnostic_evidence(root, spec, 'tcp', list(range(5)))
+                owner[1]['client']['requests'] = 1
+                save()
+                with self.assertRaisesRegex(ValueError, 'owner/client activity'):
+                    checkpoint_kv.validate_diagnostic_evidence(root, spec, 'tcp', list(range(5)))
+                owner[1]['requests'] = 1
+                save()
+                with self.assertRaisesRegex(ValueError, 'positive timing population'):
+                    checkpoint_kv.validate_diagnostic_evidence(root, spec, 'tcp', list(range(5)))
+
+    def test_diagnostic_active_owner_clocks_cannot_hide_in_fleet_totals(self):
+        for field in ('handler_ns', 'append_persist_ns', 'cq_timed_calls'):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as root:
+                spec, records = self.diagnostic_fixture(root)
+                profile = records[0]['nodes'][0][1]
+                if field == 'cq_timed_calls':
+                    profile['transport'][field] = 0
+                else:
+                    profile[field] = 0
+                path = Path(root) / 'node_profiles.yaml'
+                path.write_text(''.join('---\n' + json.dumps(row) + '\n' for row in records))
+                with self.assertRaisesRegex(ValueError, 'positive timing population'):
+                    checkpoint_kv.validate_diagnostic_evidence(root, spec, 'tcp', list(range(5)))
+
     def test_diagnostic_profiles_reject_missing_malformed_and_tampered_populations(self):
         for change in ('missing', 'malformed', 'phase', 'duplicate_phase', 'owner', 'repetition',
                        'backend', 'counter', 'clock', 'read_counter', 'read_clock',
