@@ -20,13 +20,29 @@ fixture is at `project:checkpoint-fixtures/sui-genesis-1775/fixture/`.
 Software libfabric uses its owned cache rather than an archived `target/`.
 Earlier dated sections retain their historical paths and measurements.
 
+**Native-style distributed fast path, 22 October 2026:**
+[`perf/native-wal-fastpath`: exact mechanisms, source references and local evidence](../../tidehunter-fabric/DESIGN.md#native-style-distributed-wal-path-22-october).
+The distributed member format now uses a versioned CRC32/IEEE over identity,
+version, descriptor and native mutation bytes. Whole-batch BLAKE2b and native
+recovery CRC remain. This is an experimental format cutover, not a native `Db`
+format change: batch v3, group v2, index v4, history/checkpoint v2,
+registration/seal v5 and wire/ALPN v9. Old experimental data is rejected.
+Bounded synchronous resident reads avoid SQ/CQ work; incomplete or unavailable
+NOWAIT reads retain their owned prefix and fall back to asynchronous I/O.
+Append and persistence owners overlap bounded work, while durable publication
+still advances only through a complete contiguous prefix. Native-message output
+retains buffers and leases through actual send completion.
+These mechanisms do not implement one-sided RMA or NVMe-oF. The separate
+[registered-read proposal](ONE_SIDED_WAL_READS_2026-10-21.md) remains a design.
+No native Tidehunter lock was removed, and this cutover changes no Sui Rust API.
+
 **Local cache and checkpoint cutover, 16 October 2026:**
 [Exact source map, paper mechanisms, Sui changes and correctness boundaries](HOT_READS_AND_CHECKPOINT_ADMISSION_2026-10-16.md).
 Sequence-summary demand residency is separate from producer metadata; distributed
 scalar hits avoid extra ownership work, and checkpoint staging persistence runs
-on the existing worker. No native engine mutex was removed. Current protocol is
-v8. The dated sections below retain the limits and measurements of their own
-implementation stages, not necessarily those of the current source.
+on the existing worker. No native engine mutex was removed. That cutover used
+protocol v8. The dated sections below retain the limits and measurements of their
+own implementation stages, not necessarily those of the current source.
 
 **Local concurrency cutover, 13 October 2026:**
 [Concurrent authority, grouped reads, transport progress and lock inventory](CONCURRENT_AUTHORITY_AND_TRANSPORT_2026-10-13.md).

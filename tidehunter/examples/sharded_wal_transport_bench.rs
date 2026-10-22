@@ -1,6 +1,6 @@
-//! Persistent authenticated RAM-response floor, not a storage benchmark.
-//! No WAL/index work runs between the measured request and response. TLS,
-//! framing, reactor scheduling and client payload validation remain measured.
+//! Persistent RAM-response control, not a storage or pure-network benchmark.
+//! Framing, reactor scheduling and full client payload validation are measured.
+//! TLS work is included only for the explicitly authenticated transport modes.
 
 #[path = "support/tcp_cluster.rs"]
 mod tcp_cluster;
@@ -54,10 +54,10 @@ impl Args {
         while let Some(flag) = input.next() {
             if flag == "--help" {
                 println!(
-                    "sharded_wal_transport_bench --output NEW_DIR [--remote-config YAML] [--transport tcp|fabric-tcp|efa|efa-direct] [--polling adaptive|busy] [--samples 100..100000] [--warmup 1..10000] [--repetitions 1..10] [--shards 1..5] [--values 1024,8192] [--idle-us 0..10000] [--profile true|false]"
+                    "sharded_wal_transport_bench --output NEW_DIR [--remote-config YAML] [--transport tcp|fabric-tcp|efa|efa-direct|fabric-tcp-native|efa-native] [--polling adaptive|busy] [--samples 100..100000] [--warmup 1..10000] [--repetitions 1..10] [--shards 1..5] [--values 1024,8192] [--idle-us 0..10000] [--profile true|false]"
                 );
                 println!(
-                    "Local nodes are owned and stopped by this process. External nodes are operator-owned; their authenticated polling policy must match. Timed API includes full deterministic payload validation. Idle injection and result writing are outside each sample timer. Profiling adds clocks; compare unprofiled runs separately."
+                    "Local nodes are owned and stopped by this process. External nodes are operator-owned; their configured polling policy must match. efa-native/fabric-tcp-native omit application TLS and require a trusted isolated deployment. Timed API includes full deterministic payload validation. Idle injection and result writing are outside each sample timer. Profiling adds clocks; compare unprofiled runs separately."
                 );
                 std::process::exit(0);
             }
@@ -71,6 +71,8 @@ impl Args {
                         "fabric-tcp" => Transport::FabricTcp,
                         "efa" => Transport::Efa,
                         "efa-direct" => Transport::EfaDirect,
+                        "fabric-tcp-native" => Transport::FabricTcpNative,
+                        "efa-native" => Transport::EfaNative,
                         _ => return Err(invalid("unknown transport").into()),
                     };
                 }
@@ -182,10 +184,7 @@ fn run(args: &Args, clients: &mut [Client]) -> Result<()> {
     )?;
     for client in clients.iter() {
         if client.polling_policy() != args.polling {
-            return Err(invalid(
-                "authenticated server polling policy differs from requested policy",
-            )
-            .into());
+            return Err(invalid("server polling policy differs from requested policy").into());
         }
     }
     for repetition in 0..args.repetitions {
@@ -324,7 +323,7 @@ fn main() -> Result<()> {
     let mut metadata = File::create(args.output.join("metadata.txt"))?;
     writeln!(
         metadata,
-        "transport={}\npolling={:?}\ninstrumented={}\ntopology={}\nshards={}\ntimed_scope=authenticated_exchange_decode_and_full_payload_validation\nwall_scope=measured_requests_and_offered_idle_including_scheduler_delay\nwal_io=checked_zero_member_reads\nphysical_network_latency=not_isolated\nexternal_cleanup=operator_owned\nargv={:?}",
+        "transport={}\npolling={:?}\ninstrumented={}\ntopology={}\nshards={}\ntimed_scope={}\nwall_scope=measured_requests_and_offered_idle_including_scheduler_delay\nwal_io=checked_zero_member_reads\nphysical_network_latency=not_isolated\nexternal_cleanup=operator_owned\nargv={:?}",
         args.transport.label(),
         args.polling,
         args.profile,
@@ -334,6 +333,11 @@ fn main() -> Result<()> {
             "loopback_shared_host"
         },
         args.shards,
+        if args.transport.is_native() {
+            "trusted_native_exchange_decode_and_full_payload_validation"
+        } else {
+            "authenticated_exchange_decode_and_full_payload_validation"
+        },
         std::env::args().collect::<Vec<_>>()
     )?;
     let mut clients = connect(&config, &shape)?;

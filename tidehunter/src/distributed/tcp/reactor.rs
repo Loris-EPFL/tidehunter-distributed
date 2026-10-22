@@ -1,4 +1,4 @@
-//! Protocol-v8 exclusive-owner progress. Adapted mechanisms (not copied code):
+//! Protocol-v9 exclusive-owner progress. Adapted mechanisms (not copied code):
 //! eRPC §§3.1–3.2, 4.2.2, 4.3; erpc-io/eRPC at
 //! de83dab3eab4a0fb19bfc4881c11d4a6b89ff17d, src/session.h and
 //! src/rpc_impl/{rpc_ev_loop,rpc_resp}.cc. IDs name live slots, not durability.
@@ -26,6 +26,9 @@ use std::sync::mpsc;
 #[cfg(test)]
 #[path = "reactor_output_tests.rs"]
 mod output_tests;
+#[cfg(test)]
+#[path = "reactor_session_tests.rs"]
+mod session_tests;
 
 pub(super) const TLS_BUFFER_BYTES: usize = 256 * 1024;
 const SESSION_REQUESTS: usize = 32;
@@ -126,12 +129,17 @@ impl ControlPeerHealth {
 /// Scheduling policy affects only this bounded network-owner sweep, not locks
 /// in the storage engine, TLS, provider or OS.
 #[derive(Default)]
-struct ActivePoll {
+pub(super) struct ActivePoll {
     spins: u8,
 }
 impl ActivePoll {
     /// Returns (scheduler yield, spin hint) for opt-in diagnostics.
-    fn pause(&mut self, policy: PollingPolicy, fabric: bool, progressed: bool) -> (bool, bool) {
+    pub(super) fn pause(
+        &mut self,
+        policy: PollingPolicy,
+        fabric: bool,
+        progressed: bool,
+    ) -> (bool, bool) {
         if progressed {
             self.spins = 0;
             (false, false)
@@ -160,13 +168,84 @@ pub(super) struct Envelope<T> {
 struct Output {
     id: u64,
     bytes: Vec<u8>,
+    /// Native record replies retain owned frame segments until TX-slot copy.
+    segments: Option<Vec<minibytes::Bytes>>,
     offset: usize,
+    len: usize,
+    retained_bytes: usize,
+    #[cfg(feature = "experimental-fabric")]
+    segment_index: usize,
+    #[cfg(feature = "experimental-fabric")]
+    segment_offset: usize,
     fence: Option<u64>,
     /// Opt-in phase clock: offset zero = queued, no fence = submitting,
     /// fence present = awaiting local retirement. Reset never changes ownership.
     stage_started: Option<Instant>,
 }
+impl Output {
+    #[cfg(feature = "experimental-fabric")]
+    fn advance(&mut self, mut amount: usize) {
+        self.offset += amount;
+        let Some(segments) = &self.segments else {
+            return;
+        };
+        while amount != 0 {
+            let remaining = segments[self.segment_index].len() - self.segment_offset;
+            if amount < remaining {
+                self.segment_offset += amount;
+                return;
+            }
+            amount -= remaining;
+            self.segment_index += 1;
+            self.segment_offset = 0;
+        }
+    }
+    #[cfg(feature = "experimental-fabric")]
+    fn native_slices<'a>(
+        &'a self,
+        budget: usize,
+        slices: &mut [io::IoSlice<'a>],
+    ) -> (usize, usize) {
+        let mut count = 0;
+        let mut total = 0;
+        if let Some(segments) = &self.segments {
+            let mut index = self.segment_index;
+            let mut offset = self.segment_offset;
+            while count < slices.len() && total < budget && index < segments.len() {
+                let bytes = &segments[index][offset..];
+                let len = bytes.len().min(budget - total);
+                if len != 0 {
+                    slices[count] = io::IoSlice::new(&bytes[..len]);
+                    count += 1;
+                    total += len;
+                }
+                index += 1;
+                offset = 0;
+            }
+        } else if self.offset < self.bytes.len() && !slices.is_empty() {
+            let len = (self.bytes.len() - self.offset).min(budget);
+            slices[0] = io::IoSlice::new(&self.bytes[self.offset..self.offset + len]);
+            count = 1;
+            total = len;
+        }
+        (count, total)
+    }
+    #[cfg(test)]
+    fn flatten(&self) -> Vec<u8> {
+        if let Some(segments) = &self.segments {
+            let mut bytes = Vec::with_capacity(self.len);
+            for segment in segments {
+                bytes.extend_from_slice(segment.as_ref());
+            }
+            bytes
+        } else {
+            self.bytes.clone()
+        }
+    }
+}
 
+#[cfg(feature = "experimental-fabric")]
+const MAX_NATIVE_IOV: usize = 514;
 const OUTPUT_FRAME_BUDGET: usize = 4;
 const OUTPUT_TLS_WRITE_BUDGET: usize = 8;
 
@@ -187,10 +266,10 @@ impl OutputBudget {
     }
 }
 
-/// TLS state and framing have one mutable owner. Only ciphertext copied into
-/// Endpoint's fixed slots is DMA-visible; request/result vectors never are.
+/// Framing and optional TLS state have one mutable owner. Endpoint's fixed
+/// slots own DMA-visible copies; request/result vectors never are DMA targets.
 pub(super) struct Session {
-    conn: rustls::Connection,
+    conn: Option<rustls::Connection>,
     pub(super) sock: DeadlineIo,
     output: VecDeque<Output>,
     /// Prefix already accepted by transport, still charged until fence retirement.
@@ -218,7 +297,7 @@ impl Session {
         sock.socket.set_nonblocking(true)?;
         let tls_state = conn.process_new_packets().map_err(TcpError::component)?;
         Ok(Self {
-            conn,
+            conn: Some(conn),
             sock,
             output: VecDeque::new(),
             submitted: 0,
@@ -248,14 +327,264 @@ impl Session {
             direct_diagnostic: None,
         })
     }
+    #[cfg(feature = "experimental-fabric")]
+    pub(super) fn new_native(sock: DeadlineIo) -> Result<Self, TcpError> {
+        if sock.fabric.is_none() {
+            return Err(TcpError::new("native session requires a fabric endpoint"));
+        }
+        sock.socket.set_nonblocking(true)?;
+        Ok(Self {
+            conn: None,
+            sock,
+            output: VecDeque::new(),
+            submitted: 0,
+            output_budget: OutputBudget {
+                plaintext: PROGRESS_BYTES,
+                tls_writes: OUTPUT_TLS_WRITE_BUDGET,
+                frames: OUTPUT_FRAME_BUDGET,
+                frame_gate_observed: false,
+            },
+            closed: false,
+            stats: TransportProgressStats::default(),
+            time_work: false,
+            output_bytes: 0,
+            header: [0; 4],
+            header_used: 0,
+            input: Vec::new(),
+            input_used: 0,
+            input_len: 0,
+            input_started: None,
+            plaintext_pending: 0,
+            peer_closed: false,
+            spare_output: Vec::new(),
+            control_peer: ControlPeerHealth {
+                next_check: Instant::now(),
+            },
+            direct_diagnostic: None,
+        })
+    }
     fn queue<T: Serialize>(&mut self, id: u64, body: &T, limit: usize) -> Result<(), TcpError> {
         let began = self.time_work.then(Instant::now);
         let result = self.queue_inner(id, body, limit);
         let bytes = result
             .as_ref()
-            .map(|()| self.output.back().expect("queued frame").bytes.len());
+            .map(|()| self.output.back().expect("queued frame").len);
         self.stats.frame_encode.record(began, &bytes);
         result
+    }
+
+    fn queue_response(
+        &mut self,
+        id: u64,
+        response: Response,
+        limit: usize,
+    ) -> Result<(), TcpError> {
+        #[cfg(feature = "experimental-fabric")]
+        if self.conn.is_none() {
+            let began = self.time_work.then(Instant::now);
+            let result = match response {
+                Response::Records(records) => self.queue_native_records(id, records, None, limit),
+                Response::RecordsProfiled { records, profile } => {
+                    self.queue_native_records(id, records, Some(profile), limit)
+                }
+                response => return self.queue(id, &response, limit),
+            };
+            let measured = result
+                .as_ref()
+                .map(|_| self.output.back().map_or(0, |output| output.len));
+            self.stats.frame_encode.record(began, &measured);
+            return result;
+        }
+        self.queue(id, &response, limit)
+    }
+
+    #[cfg(feature = "experimental-fabric")]
+    fn queue_native_records(
+        &mut self,
+        id: u64,
+        records: Vec<WireBytes>,
+        profile: Option<ServerReadProfile>,
+        limit: usize,
+    ) -> Result<(), TcpError> {
+        if self.closed {
+            return Err(TcpError::new("session is closed"));
+        }
+        // Serialize an empty response to obtain its exact envelope and enum
+        // prefix. Remove only the fixed-width empty sequence count, then insert
+        // codec-encoded lengths alongside the original owned record buffers.
+        let (mut prefix, tail) = if let Some(profile) = profile {
+            let empty = Envelope {
+                protocol: PROTOCOL,
+                id,
+                body: Response::RecordsProfiled {
+                    records: Vec::new(),
+                    profile,
+                },
+            };
+            let mut encoded = wire_codec(limit)
+                .serialize(&empty)
+                .map_err(TcpError::component)?;
+            let tail = wire_codec(limit)
+                .serialize(&profile)
+                .map_err(TcpError::component)?;
+            let prefix_len = encoded
+                .len()
+                .checked_sub(tail.len() + 8)
+                .ok_or_else(|| TcpError::new("invalid profiled response encoding"))?;
+            let tail = encoded.split_off(prefix_len + 8);
+            encoded.truncate(prefix_len);
+            (encoded, tail)
+        } else {
+            let empty = Envelope {
+                protocol: PROTOCOL,
+                id,
+                body: Response::Records(Vec::new()),
+            };
+            let mut encoded = wire_codec(limit)
+                .serialize(&empty)
+                .map_err(TcpError::component)?;
+            let prefix_len = encoded
+                .len()
+                .checked_sub(8)
+                .ok_or_else(|| TcpError::new("invalid records response encoding"))?;
+            encoded.truncate(prefix_len);
+            (encoded, Vec::new())
+        };
+        let payload_bytes = records.iter().try_fold(0usize, |sum, record| {
+            sum.checked_add(record.as_slice().len())
+                .ok_or_else(|| TcpError::new("record response length overflow"))
+        })?;
+        let member_headers = records
+            .len()
+            .checked_mul(8)
+            .ok_or_else(|| TcpError::new("record response length overflow"))?;
+        let body_len = prefix
+            .len()
+            .checked_add(8)
+            .and_then(|size| size.checked_add(member_headers))
+            .and_then(|size| size.checked_add(payload_bytes))
+            .and_then(|size| size.checked_add(tail.len()))
+            .ok_or_else(|| TcpError::new("record response length overflow"))?;
+        if body_len == 0 || body_len > limit || body_len > u32::MAX as usize {
+            return Err(TcpError::new("frame length exceeds limit"));
+        }
+        let total_len = body_len + 4;
+        let segment_count = records
+            .len()
+            .checked_mul(2)
+            .and_then(|count| count.checked_add(1 + usize::from(!tail.is_empty())))
+            .ok_or_else(|| TcpError::new("record response metadata overflow"))?;
+        let owned_member_count = records
+            .iter()
+            .filter(|record| matches!(record, WireBytes::Owned(_)))
+            .count();
+        let owned_capacity_slack = records
+            .iter()
+            .try_fold(0usize, |sum, record| match record {
+                WireBytes::Owned(bytes) => {
+                    sum.checked_add(bytes.capacity().saturating_sub(bytes.len()))
+                }
+                WireBytes::Shared(_) => Some(sum),
+            })
+            .ok_or_else(|| TcpError::new("record response metadata overflow"))?;
+        let owner_count = owned_member_count
+            .checked_add(1)
+            .ok_or_else(|| TcpError::new("record response metadata overflow"))?;
+        let metadata_bytes = segment_count
+            .checked_mul(std::mem::size_of::<minibytes::Bytes>())
+            .and_then(|bytes| bytes.checked_add(owner_count.checked_mul(64)?))
+            .and_then(|bytes| bytes.checked_add(owned_capacity_slack))
+            .ok_or_else(|| TcpError::new("record response metadata overflow"))?;
+        let retained_bytes = total_len
+            .checked_add(metadata_bytes)
+            .ok_or_else(|| TcpError::new("record response length overflow"))?;
+        if self.output.len() == SESSION_REQUESTS
+            || retained_bytes > SESSION_BYTES.saturating_sub(self.output_bytes)
+        {
+            return Err(TcpError::new("session output credit exceeded"));
+        }
+
+        let metadata_len = total_len
+            .checked_sub(payload_bytes)
+            .ok_or_else(|| TcpError::new("record response length overflow"))?;
+        let mut metadata = Vec::with_capacity(metadata_len);
+        metadata.extend_from_slice(&(body_len as u32).to_be_bytes());
+        metadata.append(&mut prefix);
+        wire_codec(limit)
+            .serialize_into(&mut metadata, &(records.len() as u64))
+            .map_err(TcpError::component)?;
+        let records_start = metadata.len();
+        for record in &records {
+            wire_codec(limit)
+                .serialize_into(&mut metadata, &(record.as_slice().len() as u64))
+                .map_err(TcpError::component)?;
+        }
+        let profile_start = metadata.len();
+        metadata.extend_from_slice(&tail);
+        let metadata_slack = metadata.capacity().saturating_sub(metadata.len());
+        let metadata_owner = minibytes::Bytes::from(metadata);
+        let mut segments = Vec::with_capacity(segment_count);
+        let segment_slack = segments
+            .capacity()
+            .saturating_sub(segment_count)
+            .saturating_mul(std::mem::size_of::<minibytes::Bytes>());
+        // All lengths are fixed-width u64s under wire_codec's fixint encoding.
+        let mut record_length_offset = records_start;
+        segments.push(metadata_owner.slice(0..records_start));
+        for record in records {
+            let length_end = record_length_offset + 8;
+            segments.push(metadata_owner.slice(record_length_offset..length_end));
+            record_length_offset = length_end;
+            segments.push(record.into_bytes());
+        }
+        if profile_start < metadata_owner.len() {
+            segments.push(metadata_owner.slice(profile_start..metadata_owner.len()));
+        }
+        let retained_bytes = retained_bytes
+            .checked_add(metadata_slack)
+            .and_then(|bytes| bytes.checked_add(segment_slack))
+            .ok_or_else(|| TcpError::new("record response metadata overflow"))?;
+        if retained_bytes > SESSION_BYTES.saturating_sub(self.output_bytes) {
+            return Err(TcpError::new("session output credit exceeded"));
+        }
+        self.output_bytes += retained_bytes;
+        self.output.push_back(Output {
+            id,
+            bytes: Vec::new(),
+            segments: Some(segments),
+            len: total_len,
+            retained_bytes,
+            offset: 0,
+            segment_index: 0,
+            segment_offset: 0,
+            fence: None,
+            stage_started: self.time_work.then(Instant::now),
+        });
+        self.stats.peak_output_frames = self.stats.peak_output_frames.max(self.output.len() as u64);
+        self.stats.peak_output_bytes = self.stats.peak_output_bytes.max(self.output_bytes as u64);
+        Ok(())
+    }
+    fn queue_size<T: Serialize>(&self, id: u64, body: &T, limit: usize) -> Result<usize, TcpError> {
+        if self.closed {
+            return Err(TcpError::new("session is closed"));
+        }
+        let message = Envelope {
+            protocol: PROTOCOL,
+            id,
+            body,
+        };
+        let size = wire_codec(limit)
+            .serialized_size(&message)
+            .map_err(TcpError::component)? as usize;
+        if size == 0 || size > limit {
+            return Err(TcpError::new("frame length exceeds limit"));
+        }
+        Ok(size)
+    }
+    fn can_queue(&self, size: usize) -> bool {
+        self.output.len() < SESSION_REQUESTS
+            && self.spare_output.capacity().max(size.saturating_add(4))
+                <= SESSION_BYTES.saturating_sub(self.output_bytes)
     }
     fn queue_inner<T: Serialize>(
         &mut self,
@@ -285,11 +614,20 @@ impl Session {
         }
         let mut bytes = std::mem::take(&mut self.spare_output);
         encode_sized_frame_into(&message, limit, size, &mut bytes)?;
-        self.output_bytes += bytes.capacity();
+        let len = bytes.len();
+        let retained = bytes.capacity();
+        self.output_bytes += retained;
         self.output.push_back(Output {
             id,
             bytes,
+            segments: None,
+            len,
+            retained_bytes: retained,
             offset: 0,
+            #[cfg(feature = "experimental-fabric")]
+            segment_index: 0,
+            #[cfg(feature = "experimental-fabric")]
+            segment_offset: 0,
             fence: None,
             stage_started: self.time_work.then(Instant::now),
         });
@@ -313,7 +651,61 @@ impl Session {
         self.stats.retained_reply_credit_bytes = 0;
         self.input.clear();
     }
+    #[cfg(feature = "experimental-fabric")]
+    fn write_native(&mut self, budget: usize) -> Result<usize, TcpError> {
+        if budget == 0 {
+            return Ok(0);
+        }
+        let Some(output) = self.output.get(self.submitted) else {
+            return Ok(0);
+        };
+        if output.offset == output.len {
+            return Ok(0);
+        }
+        let start = output.offset;
+        let cap = budget.min(PROGRESS_BYTES);
+        let mut slices = [io::IoSlice::new(&[]); MAX_NATIVE_IOV];
+        let (count, _source_bytes) = output.native_slices(cap, &mut slices);
+        let began = self.time_work.then(Instant::now);
+        let result = self
+            .sock
+            .fabric
+            .as_mut()
+            .ok_or_else(|| TcpError::new("native session lost its fabric endpoint"))?
+            .try_send_vectored_no_poll(&slices[..count]);
+        self.stats.plaintext_write.record(began, &result);
+        match result {
+            Ok(n) => {
+                let output = &mut self.output[self.submitted];
+                if n != 0
+                    && start == 0
+                    && let Some(queued) = output.stage_started
+                {
+                    let started = began.expect("timed output requires enabled diagnostics");
+                    self.stats.output_queue_ns = self.stats.output_queue_ns.saturating_add(
+                        started
+                            .duration_since(queued)
+                            .as_nanos()
+                            .min(u64::MAX as u128) as u64,
+                    );
+                    self.stats.output_queue_samples =
+                        self.stats.output_queue_samples.saturating_add(1);
+                    output.stage_started = Some(started);
+                }
+                output.advance(n);
+                Ok(n)
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(0),
+            Err(error) => Err(error.into()),
+        }
+    }
     fn write_plaintext(&mut self, budget: usize) -> Result<usize, TcpError> {
+        if self.conn.is_none() {
+            #[cfg(feature = "experimental-fabric")]
+            return self.write_native(budget);
+            #[cfg(not(feature = "experimental-fabric"))]
+            return Err(TcpError::new("native session requires experimental-fabric"));
+        }
         if budget == 0 {
             return Ok(0);
         }
@@ -330,7 +722,11 @@ impl Session {
                 .min(output.offset + PROGRESS_BYTES),
         );
         let began = self.time_work.then(Instant::now);
-        let result = self.conn.writer().write(&output.bytes[output.offset..end]);
+        let conn = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| TcpError::new("TLS session lost its rustls connection"))?;
+        let result = conn.writer().write(&output.bytes[output.offset..end]);
         self.stats.plaintext_write.record(began, &result);
         match result {
             Ok(n) => {
@@ -356,6 +752,9 @@ impl Session {
             Err(e) => Err(e.into()),
         }
     }
+    fn wants_tls_write(&self) -> bool {
+        self.conn.as_ref().is_some_and(|conn| conn.wants_write())
+    }
     fn is_fabric(&self) -> bool {
         #[cfg(feature = "experimental-fabric")]
         return self.sock.fabric.is_some();
@@ -380,7 +779,7 @@ impl Session {
             || progressed
             || work_pending
             || !self.output.is_empty()
-            || self.conn.wants_write()
+            || self.wants_tls_write()
             || self.plaintext_pending != 0
             || self.peer_closed
         {
@@ -442,10 +841,13 @@ impl Session {
 
             let mut transport_progress = false;
             let mut transport_blocked = false;
-            if self.conn.wants_write() && self.output_budget.tls_writes != 0 {
+            if let Some(conn) = self.conn.as_mut()
+                && conn.wants_write()
+                && self.output_budget.tls_writes != 0
+            {
                 self.output_budget.tls_writes -= 1;
                 let began = self.time_work.then(Instant::now);
-                let result = self.conn.write_tls(&mut NonblockingIo(&mut self.sock));
+                let result = conn.write_tls(&mut NonblockingIo(&mut self.sock));
                 self.stats.tls_write.record(began, &result);
                 match result {
                     Ok(n) => {
@@ -486,7 +888,7 @@ impl Session {
                 break;
             }
             if self.output_budget.plaintext == 0
-                || self.output_budget.tls_writes == 0 && self.conn.wants_write()
+                || self.output_budget.tls_writes == 0 && self.wants_tls_write()
                 || self.output_budget.frames == 0
             {
                 break;
@@ -502,19 +904,23 @@ impl Session {
         self.check_control_peer(false)?;
         let mut changed = self.progress_fabric_data()?;
         changed |= self.progress_output()?;
-        if self.conn.wants_read()
+        if self.conn.as_ref().is_some_and(|conn| conn.wants_read())
             && self.plaintext_pending == 0
             && !self.peer_closed
             && (!self.is_fabric() || self.fabric_receive_ready()?)
         {
             let began = self.time_work.then(Instant::now);
-            let result = self.conn.read_tls(&mut NonblockingIo(&mut self.sock));
+            let conn = self
+                .conn
+                .as_mut()
+                .ok_or_else(|| TcpError::new("TLS session lost its rustls connection"))?;
+            let result = conn.read_tls(&mut NonblockingIo(&mut self.sock));
             self.stats.tls_read.record(began, &result);
             match result {
                 Ok(0) => return Err(TcpError::new("truncated TLS session")),
                 Ok(n) => {
                     let began = self.time_work.then(Instant::now);
-                    let result = self.conn.process_new_packets();
+                    let result = conn.process_new_packets();
                     self.stats
                         .tls_process
                         .record(began, &result.as_ref().map(|_| n));
@@ -537,14 +943,12 @@ impl Session {
         }
         Ok(false)
     }
-    /// Keep the submission cursor separate from the retirement cursor. No later
-    /// plaintext enters TLS until this frame's ciphertext has all been accepted;
-    /// earlier CQEs need not have arrived. Output allocations and reply leases
-    /// stay charged until the contiguous local completion frontier covers them.
+    /// Keep submission separate from retirement. Native and TLS output frames
+    /// share the same bounded provider ownership and contiguous completion rules.
     fn finish_output(&mut self, accepted: u64, completed: u64) -> bool {
         if !self.output_budget.frame_gate_observed
             && self.output.len() > self.submitted + 1
-            && self.conn.wants_write()
+            && self.wants_tls_write()
         {
             // Only the active frame's pending TLS ciphertext blocks the next
             // plaintext frame here; CQ retirement is not a submission gate.
@@ -553,9 +957,9 @@ impl Session {
         }
         let mut changed = false;
         let mut transition_time = None;
-        if !self.conn.wants_write()
+        if !self.wants_tls_write()
             && let Some(output) = self.output.get_mut(self.submitted)
-            && output.offset == output.bytes.len()
+            && output.offset == output.len
         {
             output.fence = Some(accepted);
             if let Some(started) = output.stage_started {
@@ -588,8 +992,9 @@ impl Session {
                     self.stats.output_retire_samples.saturating_add(1);
             }
             self.submitted -= 1;
-            self.output_bytes -= output.bytes.capacity();
-            if output.bytes.capacity() <= 1024 * 1024
+            self.output_bytes -= output.retained_bytes;
+            if output.segments.is_none()
+                && output.bytes.capacity() <= 1024 * 1024
                 && output.bytes.capacity() > self.spare_output.capacity()
             {
                 self.spare_output = output.bytes;
@@ -713,6 +1118,29 @@ impl Session {
             "TIDEHUNTER_FABRIC_LOCAL_DIAGNOSTICS {record}"
         );
     }
+    fn read_transport(
+        conn: &mut Option<rustls::Connection>,
+        sock: &mut DeadlineIo,
+        bytes: &mut [u8],
+    ) -> io::Result<usize> {
+        if let Some(conn) = conn {
+            return conn.reader().read(bytes);
+        }
+        #[cfg(feature = "experimental-fabric")]
+        {
+            sock.fabric
+                .as_mut()
+                .ok_or_else(|| io::Error::other("native session lost its fabric endpoint"))?
+                .try_receive_no_poll(bytes)
+        }
+        #[cfg(not(feature = "experimental-fabric"))]
+        {
+            let _ = sock;
+            Err(io::Error::other(
+                "native session requires experimental-fabric",
+            ))
+        }
+    }
     fn recycle_input(&mut self, bytes: Vec<u8>) {
         if bytes.capacity() <= 1024 * 1024 {
             self.input = bytes;
@@ -726,24 +1154,27 @@ impl Session {
         Ok(())
     }
     fn receive(&mut self, limit: usize) -> Result<Option<(Vec<u8>, usize)>, TcpError> {
-        if self.plaintext_pending == 0 {
+        if self.conn.is_some() && self.plaintext_pending == 0 {
             return if self.peer_closed {
-                Err(TcpError::new("truncated authenticated frame"))
+                Err(TcpError::new("truncated transport frame"))
             } else {
                 Ok(None)
             };
         }
         if self.header_used < 4 {
             let began = self.time_work.then(Instant::now);
-            let result = self
-                .conn
-                .reader()
-                .read(&mut self.header[self.header_used..]);
+            let result = Self::read_transport(
+                &mut self.conn,
+                &mut self.sock,
+                &mut self.header[self.header_used..],
+            );
             self.stats.plaintext_read.record(began, &result);
             match result {
-                Ok(0) => return Err(TcpError::new("truncated authenticated frame")),
+                Ok(0) => return Err(TcpError::new("truncated transport frame")),
                 Ok(n) => {
-                    self.consume_plaintext(n)?;
+                    if self.conn.is_some() {
+                        self.consume_plaintext(n)?;
+                    }
                     self.input_started.get_or_insert_with(Instant::now);
                     self.header_used += n;
                 }
@@ -766,23 +1197,26 @@ impl Session {
             }
             self.input_len = len;
         }
-        if self.plaintext_pending == 0 {
+        if self.conn.is_some() && self.plaintext_pending == 0 {
             return if self.peer_closed {
-                Err(TcpError::new("truncated authenticated frame"))
+                Err(TcpError::new("truncated transport frame"))
             } else {
                 Ok(None)
             };
         }
         let began = self.time_work.then(Instant::now);
-        let result = self
-            .conn
-            .reader()
-            .read(&mut self.input[self.input_used..self.input_len]);
+        let result = Self::read_transport(
+            &mut self.conn,
+            &mut self.sock,
+            &mut self.input[self.input_used..self.input_len],
+        );
         self.stats.plaintext_read.record(began, &result);
         match result {
-            Ok(0) => return Err(TcpError::new("truncated authenticated frame")),
+            Ok(0) => return Err(TcpError::new("truncated transport frame")),
             Ok(n) => {
-                self.consume_plaintext(n)?;
+                if self.conn.is_some() {
+                    self.consume_plaintext(n)?;
+                }
                 self.input_used += n;
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
@@ -888,6 +1322,22 @@ pub(crate) struct ReadCompletion {
     pub id: u64,
     pub result: Result<(Vec<Mutation>, TcpReadProfile), TcpError>,
 }
+pub(crate) struct AppendCompletion {
+    pub id: u64,
+    pub result: Result<Vec<super::DurableBatch>, TcpError>,
+}
+struct PendingAppend {
+    batches: Vec<CompleteBatch>,
+    deadline: Instant,
+    charge: usize,
+    exchange_began: Option<Instant>,
+    profile: Option<TcpReadProfile>,
+}
+struct QueuedAppendCompletion {
+    completion: AppendCompletion,
+    charge: usize,
+}
+
 struct PendingRead {
     epoch: u64,
     references: Vec<ValueRecordReference>,
@@ -909,6 +1359,10 @@ pub(super) struct ClientState {
     wire_reads: HashMap<u64, u64>,
     ready: VecDeque<(ReadCompletion, usize)>,
     retained_bytes: usize,
+    appends: HashMap<u64, PendingAppend>,
+    wire_appends: HashMap<u64, u64>,
+    append_ready: VecDeque<QueuedAppendCompletion>,
+    retained_append_bytes: usize,
     control: Option<(u64, Instant)>,
     control_result: Option<Response>,
     control_decode_ns: u64,
@@ -947,17 +1401,27 @@ impl Client {
         now: rustls::pki_types::UnixTime,
     ) -> Result<(), TcpError> {
         use rustls::client::danger::ServerCertVerifier;
-        let verifier = &self.reuse_verifier;
-        let certificates = self
-            .stream
-            .conn
+        let (Some(verifier), Some(server_name), Some(connection)) = (
+            self.reuse_verifier.as_ref(),
+            self.server_name.as_ref(),
+            self.stream.conn.as_ref(),
+        ) else {
+            if self.reuse_verifier.is_none()
+                && self.server_name.is_none()
+                && self.stream.conn.is_none()
+            {
+                return Ok(());
+            }
+            return Err(TcpError::new("incomplete TLS peer-revalidation state"));
+        };
+        let certificates = connection
             .peer_certificates()
             .ok_or_else(|| TcpError::new("missing authenticated peer certificate"))?;
         let (leaf, chain) = certificates
             .split_first()
             .ok_or_else(|| TcpError::new("empty authenticated peer certificate chain"))?;
         verifier
-            .verify_server_cert(leaf, chain, &self.server_name, &[], now)
+            .verify_server_cert(leaf, chain, server_name, &[], now)
             .map_err(TcpError::component)?;
         Ok(())
     }
@@ -970,6 +1434,10 @@ impl Client {
             || !self.reactor.wire_reads.is_empty()
             || !self.reactor.ready.is_empty()
             || self.reactor.retained_bytes != 0
+            || !self.reactor.appends.is_empty()
+            || !self.reactor.wire_appends.is_empty()
+            || !self.reactor.append_ready.is_empty()
+            || self.reactor.retained_append_bytes != 0
             || self.reactor.control.is_some()
             || self.reactor.control_result.is_some()
             || self.stream.header_used != 0
@@ -988,7 +1456,7 @@ impl Client {
             // Drain only its existing transport ownership, never new app work.
             let deadline = began + self.timeout;
             let mut polling = ActivePoll::default();
-            while !self.stream.output.is_empty() || self.stream.conn.wants_write() {
+            while !self.stream.output.is_empty() || self.stream.wants_tls_write() {
                 if Instant::now() >= deadline {
                     return Err(TcpError::new("reuse transport drain deadline expired"));
                 }
@@ -1052,10 +1520,37 @@ impl Client {
         self.reactor.reads.clear();
         self.reactor.wire_reads.clear();
         self.reactor.ready.clear();
+        self.reactor.appends.clear();
+        self.reactor.wire_appends.clear();
+        self.reactor.append_ready.clear();
+        self.reactor.retained_append_bytes = 0;
         self.reactor.retained_bytes = 0;
         self.reactor.control = None;
         self.reactor.control_result = None;
         self.reactor.control_profiled = false;
+    }
+    pub(crate) fn has_pending_io(&self) -> bool {
+        !self.stream.output.is_empty()
+            || !self.reactor.reads.is_empty()
+            || !self.reactor.wire_reads.is_empty()
+            || !self.reactor.ready.is_empty()
+            || !self.reactor.appends.is_empty()
+            || !self.reactor.wire_appends.is_empty()
+            || !self.reactor.append_ready.is_empty()
+            || self.reactor.control.is_some()
+    }
+    fn data_request_count(&self) -> usize {
+        self.reactor.reads.len()
+            + self.reactor.ready.len()
+            + self.reactor.appends.len()
+            + self.reactor.append_ready.len()
+    }
+    fn retained_data_bytes(&self) -> usize {
+        self.reactor
+            .retained_bytes
+            .saturating_add(self.reactor.retained_append_bytes)
+            .saturating_add(self.stream.output_bytes)
+            .saturating_add(self.stream.spare_output.capacity())
     }
     pub(crate) fn read_admission(
         &self,
@@ -1108,12 +1603,10 @@ impl Client {
                 "read exceeds session byte credits; split the call",
             ));
         }
-        Ok(
-            self.reactor.reads.len() + self.reactor.ready.len() < SESSION_REQUESTS
-                && self.stream.output.len() < SESSION_REQUESTS
-                && self.reactor.control.is_none()
-                && charge <= SESSION_BYTES.saturating_sub(self.reactor.retained_bytes),
-        )
+        Ok(self.data_request_count() < SESSION_REQUESTS
+            && self.stream.output.len() < SESSION_REQUESTS
+            && self.reactor.control.is_none()
+            && charge <= SESSION_BYTES.saturating_sub(self.retained_data_bytes()))
     }
     pub(crate) fn submit_read(
         &mut self,
@@ -1197,6 +1690,114 @@ impl Client {
         pending.profile.request_encode_ns += began.map_or(0, elapsed_ns);
         Ok(())
     }
+    pub(super) fn submit_append(
+        &mut self,
+        epoch: u64,
+        batches: &[CompleteBatch],
+        charge: usize,
+    ) -> Result<Option<u64>, TcpError> {
+        self.ensure_connection()?;
+        if charge > SESSION_BYTES {
+            return Err(TcpError::new("append exceeds session byte limit"));
+        }
+        if self.data_request_count() >= SESSION_REQUESTS
+            || self.stream.output.len() >= SESSION_REQUESTS
+            || charge > SESSION_BYTES.saturating_sub(self.retained_data_bytes())
+        {
+            return Ok(None);
+        }
+        let id = self.reactor.allocate_id()?;
+        let profile_started = self.diagnostics.is_some().then(Instant::now);
+        let request = Request::Append {
+            epoch,
+            batches: batches
+                .iter()
+                .map(|batch| batch.encoded().clone().into())
+                .collect(),
+        };
+        let current = self.retained_data_bytes();
+        let spare_capacity = self.stream.spare_output.capacity();
+        let retained_without_spare = current.saturating_sub(spare_capacity);
+        let output_reservation = spare_capacity.max(
+            self.stream
+                .queue_size(id, &request, self.frame_limit)?
+                .saturating_add(4),
+        );
+        if charge > SESSION_BYTES.saturating_sub(retained_without_spare)
+            || output_reservation
+                > SESSION_BYTES.saturating_sub(retained_without_spare.saturating_add(charge))
+        {
+            return Ok(None);
+        }
+        self.stream.queue(id, &request, self.frame_limit)?;
+        let request_encode_ns = profile_started.map_or(0, elapsed_ns);
+        self.reactor.wire_appends.insert(id, id);
+        self.reactor.appends.insert(
+            id,
+            PendingAppend {
+                batches: batches.to_vec(),
+                deadline: Instant::now() + self.timeout,
+                charge,
+                exchange_began: profile_started.map(|_| Instant::now()),
+                profile: profile_started.map(|_| TcpReadProfile {
+                    request_encode_ns,
+                    ..TcpReadProfile::default()
+                }),
+            },
+        );
+        self.reactor.retained_append_bytes += charge;
+        Ok(Some(id))
+    }
+    pub(crate) fn progress_appends(&mut self) -> Result<Vec<AppendCompletion>, TcpError> {
+        if let Err(error) = self.progress_correlated() {
+            self.fail_connection();
+            return Err(error);
+        }
+        let mut completions = Vec::with_capacity(self.reactor.append_ready.len());
+        while let Some(queued) = self.reactor.append_ready.pop_front() {
+            self.reactor.retained_append_bytes -= queued.charge;
+            completions.push(queued.completion);
+        }
+        Ok(completions)
+    }
+    pub(super) fn take_append_completion(
+        &mut self,
+        id: u64,
+    ) -> Result<Option<AppendCompletion>, TcpError> {
+        if let Err(error) = self.progress_correlated() {
+            self.fail_connection();
+            return Err(error);
+        }
+        let Some(index) = self
+            .reactor
+            .append_ready
+            .iter()
+            .position(|queued| queued.completion.id == id)
+        else {
+            return Ok(None);
+        };
+        let queued = self.reactor.append_ready.remove(index).unwrap();
+        self.reactor.retained_append_bytes -= queued.charge;
+        Ok(Some(queued.completion))
+    }
+    pub(super) fn pause_append_poll(&mut self, polling: &mut ActivePoll) {
+        polling.pause(
+            self.polling,
+            self.stream.is_fabric(),
+            self.reactor.progressed,
+        );
+    }
+    fn record_append_profile(&mut self, pending: &mut PendingAppend, decoded_ns: u64) {
+        let Some(mut profile) = pending.profile.take() else {
+            return;
+        };
+        profile.response_decode_ns += decoded_ns;
+        profile.requests += 1;
+        profile.exchange_ns = pending.exchange_began.map_or(0, elapsed_ns);
+        if let Some(diagnostics) = self.diagnostics.as_mut() {
+            diagnostics.add(profile);
+        }
+    }
     pub(crate) fn read_progress_made(&self) -> bool {
         self.reactor.progressed
     }
@@ -1215,6 +1816,14 @@ impl Client {
     fn progress_correlated(&mut self) -> Result<(), TcpError> {
         self.ensure_connection()?;
         let now = Instant::now();
+        if self
+            .reactor
+            .appends
+            .values()
+            .any(|append| now >= append.deadline)
+        {
+            return Err(TcpError::new("remote append deadline expired"));
+        }
         if self.reactor.reads.values().any(|read| now >= read.deadline)
             || self
                 .reactor
@@ -1250,7 +1859,12 @@ impl Client {
             self.reactor.progressed = true;
             let measured = self.diagnostics.is_some()
                 || self.reactor.control_profiled
-                || self.reactor.reads.values().any(|read| read.profiled);
+                || self.reactor.reads.values().any(|read| read.profiled)
+                || self
+                    .reactor
+                    .appends
+                    .values()
+                    .any(|append| append.profile.is_some());
             let began = measured.then(Instant::now);
             let envelope: Envelope<Response> =
                 self.stream.decode(&frame[..frame_len], self.frame_limit)?;
@@ -1269,6 +1883,45 @@ impl Client {
                 }
                 self.reactor.control_result = Some(envelope.body);
                 self.reactor.control_decode_ns += decoded;
+                continue;
+            }
+            if let Some(append_id) = self.reactor.wire_appends.remove(&envelope.id) {
+                let mut pending = self
+                    .reactor
+                    .appends
+                    .remove(&append_id)
+                    .ok_or_else(|| TcpError::new("missing append owner"))?;
+                let result = match envelope.body {
+                    Response::Appended(receipts) if receipts.len() == pending.batches.len() => {
+                        let verified = pending
+                            .batches
+                            .iter()
+                            .zip(receipts)
+                            .map(|(batch, receipt)| self.check_receipt(batch, receipt))
+                            .collect::<Result<Vec<_>, _>>();
+                        match verified {
+                            Ok(receipts) => Ok(receipts),
+                            Err(error) => {
+                                self.record_append_profile(&mut pending, decoded);
+                                self.fail_connection();
+                                return Err(error);
+                            }
+                        }
+                    }
+                    Response::Error(message) => Err(TcpError::new(message)),
+                    _ => {
+                        self.record_append_profile(&mut pending, decoded);
+                        return Err(TcpError::new("unexpected correlated append response"));
+                    }
+                };
+                self.record_append_profile(&mut pending, decoded);
+                self.reactor.append_ready.push_back(QueuedAppendCompletion {
+                    completion: AppendCompletion {
+                        id: append_id,
+                        result,
+                    },
+                    charge: pending.charge,
+                });
                 continue;
             }
             let aggregate = self
@@ -1423,16 +2076,36 @@ impl Client {
         }
         let id = self.reactor.allocate_id()?;
         let deadline = Instant::now() + self.timeout;
-        let began = profile.as_ref().map(|_| Instant::now());
+        let size_began = profile.as_ref().map(|_| Instant::now());
+        let queue_size = self.stream.queue_size(id, request, self.frame_limit)?;
+        let size_ns = size_began.map_or(0, elapsed_ns);
+        let mut polling = ActivePoll::default();
+        loop {
+            if self.stream.can_queue(queue_size) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(TcpError::new("control output admission deadline expired"));
+            }
+            if let Err(error) = self.progress_correlated() {
+                self.fail_connection();
+                return Err(error);
+            }
+            polling.pause(
+                self.polling,
+                self.stream.is_fabric(),
+                self.reactor.progressed,
+            );
+        }
+        let queue_began = profile.as_ref().map(|_| Instant::now());
         self.stream.queue(id, request, self.frame_limit)?;
         if let Some(profile) = profile.as_deref_mut() {
-            profile.request_encode_ns += began.map_or(0, elapsed_ns);
+            profile.request_encode_ns += size_ns + queue_began.map_or(0, elapsed_ns);
         }
         self.reactor.control = Some((id, deadline));
         self.reactor.control_decode_ns = 0;
         self.reactor.control_profiled = profile.is_some();
         let began = profile.as_ref().map(|_| Instant::now());
-        let mut polling = ActivePoll::default();
         loop {
             if let Err(error) = self.progress_correlated() {
                 self.fail_connection();
@@ -1478,6 +2151,7 @@ struct ServerPending {
     async_started: Option<Instant>,
     async_handler_ns: u64,
     control_queued: Option<Instant>,
+    is_append: bool,
 }
 pub(super) struct WorkCompletion {
     pub(super) id: u64,
@@ -1559,10 +2233,16 @@ fn load_read_plans(
 }
 
 fn revalidate_client_peer(
-    server: &rustls::Connection,
-    verifier: &dyn rustls::server::danger::ClientCertVerifier,
+    server: Option<&rustls::Connection>,
+    verifier: Option<&dyn rustls::server::danger::ClientCertVerifier>,
     now: rustls::pki_types::UnixTime,
 ) -> Result<(), TcpError> {
+    let (Some(server), Some(verifier)) = (server, verifier) else {
+        if server.is_none() && verifier.is_none() {
+            return Ok(());
+        }
+        return Err(TcpError::new("incomplete TLS peer-revalidation state"));
+    };
     let certificates = server
         .peer_certificates()
         .ok_or_else(|| TcpError::new("missing authenticated client certificate"))?;
@@ -1580,7 +2260,7 @@ pub(super) fn serve_session(
     mut stream: Session,
     limits: TcpLimits,
     shutdown: &AtomicBool,
-    client_verifier: &dyn rustls::server::danger::ClientCertVerifier,
+    client_verifier: Option<&dyn rustls::server::danger::ClientCertVerifier>,
 ) -> Result<(), TcpError> {
     let mut executor = if node.wal_member_read == super::super::storage::WalMemberReadPolicy::Async
     {
@@ -1601,7 +2281,8 @@ pub(super) fn serve_session(
     // One decoded input frame may await byte credits; never drain more input
     // behind it. Its original deadline and the negotiated frame bound apply.
     let mut held_request = None::<(Envelope<Request>, usize, Instant)>;
-    let mut control_active = false;
+    let mut active_appends = 0usize;
+    let mut barrier_active = false;
     let mut workers = 0usize;
     let mut retained_bytes = 0usize;
     let mut initialized = false;
@@ -1614,6 +2295,9 @@ pub(super) fn serve_session(
     let mut ram_probe = None::<minibytes::Bytes>;
     let result = (|| {
         while !shutdown.load(Ordering::Acquire) {
+            if let Some(executor) = executor.as_mut() {
+                executor.begin_sweep();
+            }
             let now = Instant::now();
             let sweep_gap = if let Some(profile) = diagnostics.as_mut() {
                 profile.polling.progress_sweeps += 1;
@@ -1653,7 +2337,16 @@ pub(super) fn serve_session(
                 progressed = true;
                 workers -= 1;
                 if completion.is_control {
-                    control_active = false;
+                    if pending
+                        .get(&completion.id)
+                        .is_some_and(|request| request.is_append)
+                    {
+                        active_appends = active_appends.checked_sub(1).ok_or_else(|| {
+                            TcpError::new("append completion without active session admission")
+                        })?;
+                    } else {
+                        barrier_active = false;
+                    }
                 }
                 if let Some(profile) = diagnostics.as_mut() {
                     profile.add(completion.profile);
@@ -1744,7 +2437,7 @@ pub(super) fn serve_session(
                     // credential create a new authority. Initial status already
                     // follows a fresh mTLS handshake; ordinary I/O stays unchanged.
                     revalidate_client_peer(
-                        &stream.conn,
+                        stream.conn.as_ref(),
                         client_verifier,
                         rustls::pki_types::UnixTime::now(),
                     )?;
@@ -1826,6 +2519,7 @@ pub(super) fn serve_session(
                         ready_response: None,
                         response_ready_at: None,
                         measured,
+                        is_append: matches!(&envelope.body, Request::Append { .. }),
                         control_queued: measured.then(Instant::now),
                         output_started: None,
                         _lease: None,
@@ -2027,14 +2721,19 @@ pub(super) fn serve_session(
                 // have completed. One bounded, nonblocking CQ harvest only.
                 progressed |= harvest_reads(executor.as_mut().unwrap(), &mut pending)?;
             }
+            let mut blocked_control = false;
             for _ in 0..controls.len() {
                 let (id, request) = controls.pop_front().unwrap();
+                let is_append = matches!(&request, Request::Append { .. });
                 let is_control = !matches!(
                     &request,
                     Request::Read { .. } | Request::ReadProfiled { .. }
                 );
-                if is_control && control_active {
+                if is_control
+                    && (blocked_control || barrier_active || (!is_append && active_appends != 0))
+                {
                     controls.push_back((id, request));
+                    blocked_control = true;
                     continue;
                 }
                 if !is_control && pending[&id]._lease.is_none() {
@@ -2089,14 +2788,19 @@ pub(super) fn serve_session(
                     };
                     match node.control.try_submit(work) {
                         Ok(()) => {
-                            control_active = true;
+                            if is_append {
+                                active_appends += 1;
+                            } else {
+                                barrier_active = true;
+                            }
                             workers += 1;
                         }
                         Err(work) => {
                             // Do not let a later fence/seal/checkpoint pass a
                             // backpressured append on this authenticated lane.
-                            controls.push_front((id, work.request));
-                            break;
+                            controls.push_back((id, work.request));
+                            blocked_control = true;
+                            continue;
                         }
                     }
                 } else {
@@ -2310,7 +3014,7 @@ fn flush_responses(
             return Err(TcpError::new("injected lost durable append response"));
         }
         let began = request.measured.then(Instant::now);
-        stream.queue(id, &response, limits.max_frame_bytes)?;
+        stream.queue_response(id, response, limits.max_frame_bytes)?;
         if let Some(profile) = diagnostics.as_deref_mut() {
             profile.response_encode_ns += began.map_or(0, elapsed_ns);
             profile.handler_ns += request.async_handler_ns;

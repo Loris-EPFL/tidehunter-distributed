@@ -221,7 +221,10 @@ impl Args {
         while let Some(flag) = input.next() {
             if flag == "--help" {
                 println!(
-                    "sharded_wal_bench [--transport tcp|efa|efa-direct|fabric-tcp] [--wal-layout small|sui (default small)] [--output DIR] [--backend all|local-all|native-sync|native-async|sharded|tcp] [--tcp-read-cache-bytes N] [--native-read-cache-bytes N (nominal value bytes, excludes metadata)] [--tcp-pipeline true|false] [--tcp-preparation-workers 1..8] [--tcp-preparation-chunk-batches 1..32] [--tcp-scan-prefetch-pages 1|2] [--hot-read-pass true|false] [--cold-read-pass true|false (Linux test-utils)] [--transport-diagnostics true|false] [--remote-config YAML] [--batches 128] [--mixed 32] [--reads 512] [--repetitions 1] [--values 1024,8192] [--batch-sizes 1,32] [--windows 1,8] [--prepare-external-case DIR --guest-case-root ABSOLUTE_PATH --remote-endpoints IP:PORT,...]"
+                    "sharded_wal_bench [--transport tcp|efa|efa-direct|fabric-tcp|efa-native|fabric-tcp-native] [--wal-layout small|sui (default small)] [--output DIR] [--backend all|local-all|native-sync|native-async|sharded|tcp] [--tcp-read-cache-bytes N] [--native-read-cache-bytes N (nominal value bytes, excludes metadata)] [--tcp-pipeline true|false] [--tcp-preparation-workers 1..8] [--tcp-preparation-chunk-batches 1..32] [--tcp-scan-prefetch-pages 1|2] [--hot-read-pass true|false] [--cold-read-pass true|false (Linux test-utils)] [--transport-diagnostics true|false] [--remote-config YAML] [--batches 128] [--mixed 32] [--reads 512] [--repetitions 1] [--values 1024,8192] [--batch-sizes 1,32] [--windows 1,8] [--prepare-external-case DIR --guest-case-root ABSOLUTE_PATH --remote-endpoints IP:PORT,...]"
+                );
+                println!(
+                    "efa-native/fabric-tcp-native require an isolated trusted deployment and empty TLS paths; they do not authenticate or encrypt application traffic."
                 );
                 println!(
                     "Campaign bounds: --batches 1..4096, --reads 1..8192; each case is limited to 1 GiB of checked value history."
@@ -264,9 +267,11 @@ impl Args {
                         "efa" => Transport::Efa,
                         "efa-direct" => Transport::EfaDirect,
                         "fabric-tcp" => Transport::FabricTcp,
+                        "efa-native" => Transport::EfaNative,
+                        "fabric-tcp-native" => Transport::FabricTcpNative,
                         _ => {
                             return Err(invalid(
-                                "transport must be tcp, efa, efa-direct or fabric-tcp",
+                                "transport must be tcp, efa, efa-direct, fabric-tcp, efa-native or fabric-tcp-native",
                             )
                             .into());
                         }
@@ -1352,7 +1357,7 @@ impl Output {
         )?;
         writeln!(
             output.read_path_evidence,
-            "backend,value_bytes,batch_size,window,repetition,phase,boundary,role,partition,cache_budget_bytes,cache_retained_bytes,cache_metadata_bytes,cache_entries,cache_hits,cache_misses,cache_evictions,wal_reads,wal_read_bytes,inflight_requests,inflight_bytes,inflight_reads,peak_inflight_requests,peak_inflight_bytes,peak_inflight_reads,peak_device_reads,cache_bypass_disabled,cache_bypass_eviction_limit,cache_bypass_scan,cache_bypass_generation,cache_admitted_charge_bytes,cache_served_accounted_bytes,idle_buffer_bytes,idle_buffers,buffer_reuses,buffer_allocations,resident_read_attempts,resident_read_successes,resident_read_fallbacks,resident_read_unsupported,async_read_submissions,resident_read_partial"
+            "backend,value_bytes,batch_size,window,repetition,phase,boundary,role,partition,cache_budget_bytes,cache_retained_bytes,cache_metadata_bytes,cache_entries,cache_hits,cache_misses,cache_evictions,wal_reads,wal_read_bytes,inflight_requests,inflight_bytes,inflight_reads,peak_inflight_requests,peak_inflight_bytes,peak_inflight_reads,peak_device_reads,cache_bypass_disabled,cache_bypass_eviction_limit,cache_bypass_scan,cache_bypass_generation,cache_admitted_charge_bytes,cache_served_accounted_bytes,idle_buffer_bytes,idle_buffers,buffer_reuses,buffer_allocations,resident_read_attempts,resident_read_successes,resident_read_fallbacks,resident_read_unsupported,async_read_submissions,resident_read_partial,resident_read_deferred"
         )?;
         writeln!(
             output.native_read_profiles,
@@ -1574,7 +1579,7 @@ impl Output {
         )?;
         writeln!(
             self.read_path_evidence,
-            ",{},{},0,0,{},{},0,0,0,0,0,0,0,0,0,0",
+            ",{},{},0,0,{},{},0,0,0,0,0,0,0,0,0,0,0",
             cache.bypass_disabled,
             cache.bypass_eviction_limit,
             cache.admitted_bytes,
@@ -1611,7 +1616,7 @@ impl Output {
             )?;
             writeln!(
                 self.read_path_evidence,
-                ",{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                ",{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 stats.cache_bypass_disabled,
                 stats.cache_bypass_eviction_limit,
                 stats.cache_bypass_scan,
@@ -1628,6 +1633,7 @@ impl Output {
                 stats.resident_read_unsupported,
                 stats.async_read_submissions,
                 stats.resident_read_partial,
+                stats.resident_read_deferred,
             )?;
         }
         self.read_path_evidence.flush()?;
@@ -1703,6 +1709,8 @@ impl Case {
                 Transport::Efa => "experimental_efa_authority",
                 Transport::EfaDirect => "experimental_efa_direct_authority",
                 Transport::FabricTcp => "experimental_fabric_tcp_authority",
+                Transport::EfaNative => "trusted_experimental_efa_native_authority",
+                Transport::FabricTcpNative => "experimental_fabric_tcp_native_authority",
             }
         } else {
             self.kind.label()
@@ -2828,7 +2836,10 @@ fn main() -> Result<()> {
         metadata,
         "transport={}\nrdma_hardware_requested={}\none_sided_wal_reads=false\nnative_async_is_not_durability_equivalent=true\nlatency_unit=api_call_or_complete_window\nthroughput_includes_driver_and_verification_overhead=true\nvalues={:?}\nbatch_sizes={:?}\nwindows={:?}\nload_batches={}\nmixed_batches={}\npoint_reads={}\nrepetitions={}\nmax_value_history_per_case_bytes={}\nsource_and_binary_hashes=must_be_captured_by_orchestrator",
         args.transport.label(),
-        matches!(args.transport, Transport::Efa | Transport::EfaDirect),
+        matches!(
+            args.transport,
+            Transport::Efa | Transport::EfaDirect | Transport::EfaNative
+        ),
         args.values,
         args.batch_sizes,
         args.windows,

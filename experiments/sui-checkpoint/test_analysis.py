@@ -345,6 +345,27 @@ class CampaignComparison(unittest.TestCase):
         self.assertEqual(len(unavailable), 2)
         self.assertTrue(all(pair['candidate_transport'] == 'efa-direct' for pair in unavailable))
 
+    def test_native_efa_keeps_its_own_controls_and_all_matched_pairs(self):
+        cells = self.cells()
+        for transport, native, remote in (('efa-direct', 4, 8), ('efa-native', 5, 5)):
+            for repetition in range(1, 5):
+                cells.append(dict(cell_id=f'r{repetition:02d}-{transport}', ordinal=len(cells),
+                    repetition=repetition, transport=transport,
+                    read_profile_limit=4096 if repetition in (2, 3) else 0,
+                    population='profiled' if repetition in (2, 3) else 'clean',
+                    native_seconds=native, remote_seconds=remote, remote_over_native=remote/native))
+        pairs = analyze.transport_comparison(cells)['pairs']
+        native_pairs = [pair for pair in pairs if pair['candidate_transport'] == 'efa-native']
+        self.assertEqual(len(native_pairs), 12)
+        self.assertTrue(all(pair['candidate_native_seconds'] == 5 for pair in native_pairs))
+        direct_pairs = [pair for pair in native_pairs if pair['reference_transport'] == 'efa-direct']
+        self.assertEqual([pair['candidate_over_reference_elapsed'] for pair in direct_pairs], [5/8] * 4)
+        self.assertEqual([pair['candidate_over_reference_native_normalized'] for pair in direct_pairs], [1/2] * 4)
+        missing = [cell for cell in cells if cell['cell_id'] != 'r01-efa-native']
+        unavailable = [pair for pair in analyze.transport_comparison(missing)['pairs'] if not pair['available']]
+        self.assertEqual(len(unavailable), 3)
+        self.assertTrue(all(pair['candidate_transport'] == 'efa-native' for pair in unavailable))
+
     def test_duplicate_and_cross_source_or_population_comparisons_fail(self):
         cells = self.cells()
         with self.assertRaises(ValueError):

@@ -24,8 +24,8 @@ use minibytes::Bytes;
 use std::collections::BTreeSet;
 use std::fmt;
 
-const MAGIC: &[u8; 8] = b"THGROUP1";
-const FORMAT_VERSION: u16 = 1;
+const MAGIC: &[u8; 8] = b"THGROUP2";
+const FORMAT_VERSION: u16 = 2;
 /// Magic, format version, zero reserved field and member count.
 pub const GROUP_HEADER_LEN: usize = 16;
 const FRAME_HEADER_LEN: usize = CrcFrame::CRC_HEADER_LENGTH;
@@ -473,6 +473,12 @@ mod tests {
     fn every_outer_and_inner_truncation_rejects_partial_group() {
         let (bl, gl) = limits();
         let group = CompleteGroup::new(&shape(), vec![batch(3, 1), batch(4, 2)], bl, gl).unwrap();
+        let mut old_group = group.encoded().to_vec();
+        old_group[..8].copy_from_slice(b"THGROUP1");
+        assert_eq!(
+            CompleteGroup::decode(&shape(), old_group.into(), bl, gl).unwrap_err(),
+            GroupError::InvalidFormat
+        );
         let outer = CrcFrame::new(&group);
         for cut in 0..outer.as_ref().len() {
             assert!(

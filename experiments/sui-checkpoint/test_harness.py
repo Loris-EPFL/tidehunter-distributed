@@ -123,20 +123,6 @@ class DeploymentContract(unittest.TestCase):
             self.assertTrue(config['databases']['live/perpetual']['tls']['key'].startswith(str(root)))
             self.assertTrue(nodes[0]['ready'].startswith('/owned/remote'))
 
-    def test_external_direct_is_preserved_in_every_namespace_and_node(self):
-        with tempfile.TemporaryDirectory() as tmp, patch.object(deployment, 'certificates', lambda path: path.mkdir()):
-            root = Path(tmp)
-            config, nodes = deployment.prepare(root / 'deployment',
-                {'live/perpetual': {'key_spaces': []}}, root / 'remote',
-                shape_yamls={'live/perpetual': 'key_spaces: []\n'},
-                hosts=[f'10.0.0.{i}' for i in range(1, 6)], port=24000,
-                transport='efa-direct', coordinator_cache=0, shard_cache=0,
-                guest_root=Path('/owned/direct'))
-            self.assertEqual(config['databases']['live/perpetual']['tls']['transport'], 'efa-direct')
-            import yaml
-            for node in nodes:
-                self.assertEqual(yaml.safe_load(Path(node['launch']).read_text())['tls']['transport'], 'efa-direct')
-
     def test_invalid_schema_namespace_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)
@@ -175,20 +161,21 @@ class DeploymentContract(unittest.TestCase):
                 deployment.schemas(Path(tmp))
 
     def test_hardware_transport_cannot_run_loopback(self):
-        for transport in ('efa', 'efa-direct'):
+        for transport in ('efa', 'efa-direct', 'efa-native'):
             with self.subTest(transport=transport), tempfile.TemporaryDirectory() as tmp:
                 with self.assertRaises(ValueError):
                     deployment.prepare(Path(tmp)/'x',{},Path(tmp),shape_yamls={},hosts=['127.0.0.1']*5,
                         port=24000,transport=transport,coordinator_cache=0,shard_cache=0)
 
     def test_software_fabric_rejects_nonloopback_hosts(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / 'deployment'
-            with self.assertRaisesRegex(ValueError, 'loopback-only'):
-                deployment.prepare(root, {}, Path(tmp), shape_yamls={},
-                    hosts=['127.0.0.1'] * 4 + ['10.0.0.1'], port=24000,
-                    transport='fabric-tcp', coordinator_cache=0, shard_cache=0)
-            self.assertFalse(root.exists())
+        for transport in ('fabric-tcp', 'fabric-tcp-native'):
+            with self.subTest(transport=transport), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / 'deployment'
+                with self.assertRaisesRegex(ValueError, 'loopback-only'):
+                    deployment.prepare(root, {}, Path(tmp), shape_yamls={},
+                        hosts=['127.0.0.1'] * 4 + ['10.0.0.1'], port=24000,
+                        transport=transport, coordinator_cache=0, shard_cache=0)
+                self.assertFalse(root.exists())
 
     def test_invalid_write_profile_budget_fails_before_deployment(self):
         for limit in (-1, 65537, True, 1.0, None):
@@ -481,7 +468,7 @@ class CheckpointSourceBoundaries(unittest.TestCase):
         identities = self.source_tree(root)
         build.save(root / 'source-manifest.json', identities)
         (root / 'sources.tar.gz').write_bytes(b'bound archive')
-        manifest = dict(protocol=8, fabric=False,
+        manifest = dict(protocol=9, fabric=False,
             source_archive_sha256=build.digest(root / 'sources.tar.gz'),
             source_manifest_sha256=build.digest(root / 'source-manifest.json'),
             binaries={name: 'unused' for name in ('sui-node-native', 'sui-node-remote',

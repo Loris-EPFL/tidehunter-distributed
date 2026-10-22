@@ -621,7 +621,7 @@ class CampaignTests(unittest.TestCase):
             regions=['us-east-1', 'us-east-2'], budget_path=str(self.budget_file),
             cost_assumptions=dict(retention_days=30, result_gib=2, request_count=100000, reconciliation_seconds=600))
         self.cfg['guest_boundary_arn'] = f'arn:aws:iam::{ACCOUNT}:policy/tidehunter-aws-benchmarks-guest-boundary'
-        self.cfg.update(transports=['tcp', 'efa', 'efa-direct'], repetitions=1,
+        self.cfg.update(transports=['tcp', 'efa', 'efa-direct', 'efa-native'], repetitions=1,
                         read_profile_limits=[0], write_profile_limits=[0], native_write_profile_limits=[0],
                         kv_suite=dict(scope='full', repetitions=1, diagnostics=True))
         Ledger.settlements = {}
@@ -1128,7 +1128,7 @@ class CampaignTests(unittest.TestCase):
         build.mkdir()
         (build / 'sources.tar.gz').write_bytes(b'not-the-admitted-source')
         ci.dump(build / 'source-manifest.json', {})
-        ci.dump(build / 'build-manifest.json', dict(protocol=8, fabric=True,
+        ci.dump(build / 'build-manifest.json', dict(protocol=9, fabric=True,
             binaries={name: 'a' * 64 for name in ci.BINARIES}, source_archive_sha256='0' * 64,
             source_manifest_sha256=ci.sha(build / 'source-manifest.json')))
         fixture = self.output / 'fixture.tar.gz'

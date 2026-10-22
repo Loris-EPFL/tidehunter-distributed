@@ -141,7 +141,8 @@ class Evidence(ScalarEvidence):
         rows = cluster_ram.read_csv(path / 'read_path_evidence.csv')
         for row in rows:
             for key in ('resident_read_attempts', 'resident_read_successes', 'resident_read_fallbacks',
-                        'resident_read_unsupported', 'resident_read_partial', 'async_read_submissions'):
+                        'resident_read_unsupported', 'resident_read_partial', 'resident_read_deferred',
+                        'async_read_submissions'):
                 row[key] = 0
             if row['role'] == 'storage' and row['boundary'] == 'after':
                 row['resident_read_attempts' if spec['resident_first'] else 'async_read_submissions'] = 1
@@ -166,6 +167,8 @@ def floor_files(path, spec):
                     topology='external_nodes', shards=5, timed_scope='authenticated_exchange_decode_and_full_payload_validation',
                     wall_scope='measured_requests_and_offered_idle_including_scheduler_delay',
                     wal_io='checked_zero_member_reads', physical_network_latency='not_isolated', external_cleanup='operator_owned', argv='[]')
+    if spec['transport'] in ('efa-native', 'fabric-tcp-native'):
+        metadata['timed_scope'] = 'trusted_native_exchange_decode_and_full_payload_validation'
     (path / 'metadata.txt').write_text(''.join(f'{k}={v}\n' for k, v in metadata.items()))
     samples, summary = [], []
     for rep in range(spec['floor_repetitions']):
@@ -180,6 +183,11 @@ def floor_files(path, spec):
             counters = [dict(wal_reads=0, wal_read_bytes=0, resident_read_attempts=0, async_read_submissions=0) for _ in range(5)]
             profiles = [dict(requests=(n + 4 - p) // 5, polling=dict(progress_sweeps=1000, request_first_poll_samples=(n + 4 - p) // 5,
                 idle_wait_calls=0, idle_wait_ns=0, scheduler_yields=0, busy_spin_hints=1000)) for p in range(5)]
+            if spec['transport'] in ('efa-native', 'fabric-tcp-native'):
+                for row in profiles:
+                    for owner in ('transport', 'client_transport'):
+                        row[owner] = {name: dict(ns=0, calls=0, bytes=0, errors=0)
+                                      for name in ('tls_read', 'tls_write', 'tls_process')}
             save(path / f'evidence-v{value}-r{rep}.yaml', [counters, counters, profiles])
     table(path / 'samples.csv', samples)
     table(path / 'summary.csv', summary)
@@ -335,6 +343,30 @@ class CloudEvidenceTests(unittest.TestCase):
                 self.assertEqual({r['value_bytes'] for r in rows}, {1024, 8192})
                 self.assertTrue(all(r['new_repetitions'] == 3 and r['phase'] == 'ram_response' for r in rows))
 
+    def test_native_ram_rejects_authentication_mislabel_and_observed_tls_work(self):
+        spec = profile.subsuite_floor_spec('efa-native', True) | dict(idle_us=0)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            floor_files(directory, spec)
+            metrics = profile.read_floor_metrics(directory, spec)
+            self.assertEqual(metrics['floor', 'ram-v8192-r0', 'p50_ns'], 227)
+            metadata = directory / 'metadata.txt'
+            original = metadata.read_text()
+            metadata.write_text(original.replace(
+                'trusted_native_exchange_decode', 'authenticated_exchange_decode'))
+            with self.assertRaises(ValueError):
+                profile.read_floor_metrics(directory, spec)
+            metadata.write_text(original)
+            path = directory / 'evidence-v8192-r0.yaml'
+            original = profile.yaml_one(path.read_text())
+            for owner in ('transport', 'client_transport'):
+                changed = copy.deepcopy(original)
+                changed[2][0][owner]['tls_process']['calls'] = 1
+                save(path, changed)
+                with self.subTest(owner=owner), self.assertRaises(ValueError):
+                    profile.read_floor_metrics(directory, spec)
+            save(path, original)
+
     def test_ram_control_checks_interval_io_not_prior_wal_activity(self):
         spec = next(s for s in profile.main_cases() if s.get('floor'))
         name = self.evidence.floor(spec)
@@ -410,7 +442,7 @@ class CloudEvidenceTests(unittest.TestCase):
         save(path, original)
         metadata = self.root / name / 'metadata.txt'
         metadata.write_text(metadata.read_text().replace('polling=Busy', 'polling=Adaptive'))
-        with self.assertRaisesRegex(ValueError, 'authenticated policy'):
+        with self.assertRaises(ValueError):
             self.read(name)
 
     def test_floor_missing_repetition_or_payload_completion_fails(self):

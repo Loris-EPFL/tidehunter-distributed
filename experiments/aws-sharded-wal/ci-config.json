@@ -8,7 +8,7 @@
   "ttl_seconds": 3600,
   "export_reserve_seconds": 600,
   "repetitions": 4,
-  "transports": ["tcp", "efa", "efa-direct"],
+  "transports": ["tcp", "efa", "efa-direct", "efa-native"],
   "read_profile_limits": [0, 0, 0, 128],
   "write_profile_limits": [0, 0, 0, 128],
   "native_write_profile_limits": [0, 0, 0, 128],

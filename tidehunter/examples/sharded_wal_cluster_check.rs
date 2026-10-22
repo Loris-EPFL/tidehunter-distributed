@@ -493,7 +493,7 @@ fn main() -> Result<()> {
         return Err(error("direct checked record read mismatch").into());
     }
     let mut forged = reference;
-    forged.descriptor.digest.0[0] ^= 1;
+    forged.descriptor.checksum.0 ^= 1;
     if client.read_record(1, &forged).is_ok() {
         return Err(error("forged record membership accepted").into());
     }

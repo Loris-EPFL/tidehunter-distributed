@@ -79,6 +79,45 @@ fn isolated_append_does_not_visit_the_blocked_diagnostic_pool() {
 }
 
 #[test]
+fn appender_services_next_group_while_captured_persistence_is_paused() {
+    let temp = tempdir::TempDir::new("control-captured-prefix").unwrap();
+    let config = config(&temp.path().join("node"));
+    let node = StorageNode::open(config.clone(), metrics()).unwrap();
+    node.inventory.lock().fence_to(1).unwrap();
+    let log = node.inventory.lock().active(1).unwrap();
+    let (entered, release) = log.pause_next_persist();
+    let (completed, completions) = mpsc::sync_channel(3);
+    assert!(command(&node, 1, append_request(&config, 1, 0), 4096, &completed).is_ok());
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(command(&node, 2, append_request(&config, 1, 1), 4096, &completed).is_ok());
+    let second = batch(&config, 1, 1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while log.lookup(second.id()).unwrap().is_none() && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(log.lookup(second.id()).unwrap().is_some());
+    assert!(matches!(
+        completions.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    assert!(command(&node, 3, Request::Fence { epoch: 2 }, 1, &completed).is_ok());
+    release.send(()).unwrap();
+    assert!(matches!(
+        receive(&completions, 1).response.unwrap(),
+        Response::Appended(_)
+    ));
+    assert!(matches!(
+        receive(&completions, 2).response.unwrap(),
+        Response::Appended(_)
+    ));
+    assert!(matches!(
+        receive(&completions, 3).response.unwrap(),
+        Response::Status(_)
+    ));
+    assert_eq!(log.stats().appended_groups, 2);
+    assert_eq!(log.stats().persistence_barriers, 2);
+}
+#[test]
 fn append_checkpoint_seal_and_fence_keep_fifo_and_exact_durable_receipts() {
     let temp = tempdir::TempDir::new("control-fifo").unwrap();
     let config = config(&temp.path().join("node"));
@@ -208,7 +247,17 @@ fn caller_cancellation_and_owner_drop_drain_accepted_writes() {
     assert!(command(&node, 1, append_request(&config, 1, 0), 4096, &completed).is_ok());
     entered.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(command(&node, 2, append_request(&config, 1, 1), 4096, &completed).is_ok());
-    assert!(log.lookup(batch(&config, 1, 1).id()).unwrap().is_none());
+    let second = batch(&config, 1, 1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while log.lookup(second.id()).unwrap().is_none() && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    let appended = log.lookup(second.id()).unwrap().unwrap();
+    let reference = second.record_reference(appended.address(), 0).unwrap();
+    assert!(matches!(
+        log.validate_durable_record_reference(&reference),
+        Err(StorageError::NeedsPersistence)
+    ));
     drop(completions); // Delivery cancellation must not cancel the admitted WAL write.
     let (stopped, stopping) = mpsc::sync_channel(1);
     let dropping = thread::spawn(move || {

@@ -220,6 +220,10 @@ pub enum Transport {
     FabricTcp,
     /// Hardware direct fabric with explicit bounded stream ordering and credits.
     EfaDirect,
+    /// Trusted isolated-cluster native data plane over EFA-direct, without TLS.
+    EfaNative,
+    /// Certificate-free software-provider counterpart for the native data plane.
+    FabricTcpNative,
 }
 
 impl Transport {
@@ -241,6 +245,8 @@ impl Transport {
             Self::Efa => "efa",
             Self::EfaDirect => "efa-direct",
             Self::FabricTcp => "fabric-tcp",
+            Self::EfaNative => "efa-native",
+            Self::FabricTcpNative => "fabric-tcp-native",
         }
     }
 
@@ -256,20 +262,28 @@ impl Transport {
         }
     }
 
+    /// Whether application TLS is disabled for an explicitly trusted fabric mode.
+    #[must_use]
+    pub fn is_native(self) -> bool {
+        matches!(self, Self::EfaNative | Self::FabricTcpNative)
+    }
+
     #[cfg(feature = "experimental-fabric")]
     fn open(self) -> io::Result<tidehunter_fabric::Endpoint> {
         match self {
             Self::Efa => tidehunter_fabric::Endpoint::open("efa", None),
-            Self::EfaDirect => tidehunter_fabric::Endpoint::open_efa_direct(None),
-            Self::FabricTcp => tidehunter_fabric::Endpoint::open("tcp;ofi_rxm", Some("lo")),
+            Self::EfaDirect | Self::EfaNative => tidehunter_fabric::Endpoint::open_efa_direct(None),
+            Self::FabricTcp | Self::FabricTcpNative => {
+                tidehunter_fabric::Endpoint::open("tcp;ofi_rxm", Some("lo"))
+            }
             Self::Tcp => Err(io::Error::other("TCP needs no fabric endpoint")),
         }
     }
 }
 
-// Both peers use the authenticated TCP TLS session to exchange bounded native
-// addresses and a ready marker. TLS continues across the new ordered stream;
-// authentication, confidentiality and record sequence numbers remain intact.
+// Both peers exchange bounded native addresses and a ready marker over the
+// control socket. TLS transports retain their authenticated TLS bootstrap;
+// trusted native transports use this only after exact mode negotiation.
 #[cfg(feature = "experimental-fabric")]
 pub(super) fn bootstrap(
     stream: &mut (impl Read + Write),
@@ -285,7 +299,7 @@ pub(super) fn bootstrap(
     stream.read_exact(&mut header)?;
     let len = usize::from(u16::from_be_bytes(header));
     if len == 0 || len > 512 {
-        return Err(TcpError::new("invalid authenticated fabric address length"));
+        return Err(TcpError::new("invalid fabric address length"));
     }
     let mut peer = [0; 512];
     stream.read_exact(&mut peer[..len])?;

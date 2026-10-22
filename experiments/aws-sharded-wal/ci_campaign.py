@@ -34,6 +34,7 @@ HERE = Path(__file__).resolve().parent
 
 from bootstrap import INSTANCE_STORE_DISKS
 from ci_budget import DEFAULT_BUDGET, load_budget
+from checkpoint_matrix import TRANSPORTS
 REPOSITORY = 'Loris-EPFL/tidehunter-distributed'
 BRANCH = 'bench/aws-efa'
 REGIONS = ('us-west-2', 'us-east-1', 'us-east-2', 'eu-west-1', 'eu-central-1')
@@ -191,11 +192,11 @@ def load_config(path, env=None):
             or not isinstance(cfg.get('instance_types'), list) or not cfg['instance_types']
             or not set(cfg['instance_types']) <= set(TYPES)
             or len(set(cfg['instance_types'])) != len(cfg['instance_types'])
-            or set(cfg.get('transports', [])) != {'tcp', 'efa', 'efa-direct'}
-            or len(cfg['transports']) != 3
+            or set(cfg.get('transports', [])) != set(TRANSPORTS)
+            or len(cfg['transports']) != len(TRANSPORTS)
             or cfg.get('kv_suite', {}).get('scope') != 'full'
             or cfg.get('kv_suite', {}).get('diagnostics') is not True):
-        raise ValueError('CI config must retain exact branch, approved hardware, fixed TTL and full TCP/EFA/Direct/Sui/KV suite')
+        raise ValueError('CI config must retain exact branch, approved hardware, fixed TTL and full TCP/EFA/Direct/Native/Sui/KV suite')
     from checkpoint_matrix import matrix_plan
     from checkpoint_kv import validate_options
     matrix_plan(cfg)
@@ -269,7 +270,7 @@ def admit_inputs(build, fixture, verification, output):
     output.mkdir(parents=True, exist_ok=True)
     manifest = read_json(build / 'build-manifest.json')
     identities = read_json(build / 'source-manifest.json')
-    if (manifest.get('protocol') != 8 or manifest.get('fabric') is not True
+    if (manifest.get('protocol') != 9 or manifest.get('fabric') is not True
             or set(manifest.get('binaries', {})) != BINARIES
             or sha(build / 'sources.tar.gz') != manifest['source_archive_sha256']
             or sha(build / 'source-manifest.json') != manifest['source_manifest_sha256']):
@@ -315,7 +316,8 @@ def admit_inputs(build, fixture, verification, output):
     bindings = dict(build_manifest_sha256=sha(build / 'build-manifest.json'),
                     source_archive_sha256=manifest['source_archive_sha256'],
                     source_manifest_sha256=manifest['source_manifest_sha256'],
-                    binaries=manifest['binaries'], checkpoint_digest=CHECKPOINT, checkpoint_limit=1775)
+                    binaries=manifest['binaries'], checkpoint_digest=CHECKPOINT, checkpoint_limit=1775,
+                    transports=list(TRANSPORTS))
     with tempfile.TemporaryDirectory(prefix='ci-admission-') as temporary:
         temporary = Path(temporary)
         archive_files(fixture)

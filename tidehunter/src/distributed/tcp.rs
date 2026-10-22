@@ -1,11 +1,10 @@
-//! Static RF1 storage transport over mutually authenticated TLS/TCP.
+//! Static RF1 storage transport with authenticated TLS and explicit trusted fabric modes.
 //!
 //! The Tidehunter paper's complete-batch replay and values-in-WAL rules remain
-//! the authority boundary. TCP is transport, not a global log or consensus
-//! service. A dedicated trusted CA authorizes the controlled single coordinator;
-//! all nodes must be fenced/recovered before that coordinator allocates versions.
-//! rustls validates both peers (including the server DNS name); no custom crypto.
-//! https://docs.rs/rustls/0.23.31/rustls/server/struct.WebPkiClientVerifier.html
+//! the authority boundary. Transport is not a global log or consensus service.
+//! TLS modes require a dedicated CA and validate both peers with rustls.
+//! Trusted native modes omit application authentication and encryption; deployment
+//! isolation is required. WAL integrity, fencing and durability checks remain.
 
 pub mod checkpoint;
 mod reactor;
@@ -25,8 +24,8 @@ mod probe;
 mod tests;
 
 use super::codec::{BatchLimits, CompleteBatch, Mutation};
-use super::group::{CompleteGroup, GroupLimits};
-use super::storage::{DurableBatch, PartitionConfig, PartitionStats, StorageError};
+use super::group::{CompleteGroup, GROUP_HEADER_LEN, GroupLimits};
+use super::storage::{AppendedBatch, DurableBatch, PartitionConfig, PartitionStats, StorageError};
 use super::types::{
     BatchId, BatchVersion, PayloadDigest, PhysicalValueAddress, RequestAuthority,
     ValueRecordReference,
@@ -52,8 +51,42 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub use inventory::NodeInventory;
-const PROTOCOL: u32 = 8;
+const PROTOCOL: u32 = 9;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
+const MODE_MAGIC: [u8; 4] = *b"THDP";
+
+fn transport_mode_id(transport: Transport) -> u8 {
+    match transport {
+        Transport::Tcp => 1,
+        Transport::Efa => 2,
+        Transport::EfaDirect => 3,
+        Transport::FabricTcp => 4,
+        Transport::EfaNative => 5,
+        Transport::FabricTcpNative => 6,
+    }
+}
+
+fn write_transport_mode(stream: &mut (impl Read + Write), transport: Transport) -> io::Result<()> {
+    let mut preface = [0; 8];
+    preface[..4].copy_from_slice(&MODE_MAGIC);
+    preface[4..6].copy_from_slice(&(PROTOCOL as u16).to_be_bytes());
+    preface[6] = transport_mode_id(transport);
+    stream.write_all(&preface)?;
+    stream.flush()
+}
+
+fn read_transport_mode(stream: &mut impl Read, expected: Transport) -> Result<(), TcpError> {
+    let mut preface = [0; 8];
+    stream.read_exact(&mut preface)?;
+    if preface[..4] != MODE_MAGIC
+        || u16::from_be_bytes([preface[4], preface[5]]) != PROTOCOL as u16
+        || preface[6] != transport_mode_id(expected)
+        || preface[7] != 0
+    {
+        return Err(TcpError::new("transport mode/protocol mismatch"));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeConfig {
@@ -114,16 +147,20 @@ fn default_device_reads() -> usize {
 pub(crate) fn default_read_memory_allowance_bytes() -> usize {
     512 * 1024 * 1024
 }
-/// DER trust anchor, single leaf certificate and unencrypted PKCS#8 DER key.
-/// Use a dedicated CA for the controlled coordinator/node deployment.
+/// TLS credentials and transport selection. Trusted native modes require empty
+/// credential paths and do not authenticate peers; TLS modes require a dedicated CA.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TlsFiles {
     #[serde(default)]
     pub transport: Transport,
+    #[serde(default)]
     pub ca: PathBuf,
+    #[serde(default)]
     pub cert: PathBuf,
+    #[serde(default)]
     pub key: PathBuf,
-    /// Expected server DNS name; ignored by the listener.
+    /// Expected server DNS name; ignored by the listener and trusted native modes.
+    #[serde(default)]
     pub server_name: String,
 }
 
@@ -428,7 +465,7 @@ impl Receipt {
         }
     }
     fn durable(self) -> DurableBatch {
-        DurableBatch::from_authenticated_parts(self.id, self.version, self.digest, self.address)
+        DurableBatch::from_validated_parts(self.id, self.version, self.digest, self.address)
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -600,6 +637,35 @@ impl StorageNode {
     pub fn inject_panic_after_next_append(&self) {
         self.panic_after_append.store(true, Ordering::Release);
     }
+    #[cfg(test)]
+    pub(crate) fn pause_next_persist(
+        &self,
+        epoch: u64,
+    ) -> Result<
+        (
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::SyncSender<()>,
+        ),
+        TcpError,
+    > {
+        let log = self
+            .inventory
+            .lock()
+            .active(epoch)
+            .map_err(TcpError::component)?;
+        Ok(log.pause_next_persist())
+    }
+    #[cfg(test)]
+    pub(crate) fn contains_batch(&self, epoch: u64, id: BatchId) -> Result<bool, TcpError> {
+        let log = self
+            .inventory
+            .lock()
+            .active(epoch)
+            .map_err(TcpError::component)?;
+        log.lookup(id)
+            .map(|batch| batch.is_some())
+            .map_err(TcpError::component)
+    }
 
     /// Bounded reusable session workers. Shutdown stops acceptance, drains the
     /// bounded socket queue and joins workers; frame I/O has absolute deadlines.
@@ -751,7 +817,30 @@ impl StorageNode {
         transport: Transport,
     ) -> Result<(), TcpError> {
         let mut io = DeadlineIo::new(socket, limits.io_timeout)?;
-        let mut conn = ServerConnection::new(config.config).map_err(TcpError::component)?;
+        if transport.is_native() {
+            read_transport_mode(&mut io, transport)?;
+            #[cfg(feature = "experimental-fabric")]
+            {
+                let endpoint = fabric::bootstrap(&mut io, transport)?;
+                io.fabric = Some(endpoint);
+                return reactor::serve_session(
+                    self,
+                    reactor::Session::new_native(io)?,
+                    limits,
+                    shutdown,
+                    None,
+                );
+            }
+            #[cfg(not(feature = "experimental-fabric"))]
+            return Err(TcpError::new("native transport was not compiled"));
+        }
+        let server_config = config
+            .config
+            .ok_or_else(|| TcpError::new("TLS transport has no server credentials"))?;
+        let verifier = config
+            .verifier
+            .ok_or_else(|| TcpError::new("TLS transport has no peer verifier"))?;
+        let mut conn = ServerConnection::new(server_config).map_err(TcpError::component)?;
         conn.set_buffer_limit(Some(reactor::TLS_BUFFER_BYTES));
         while conn.is_handshaking() {
             conn.complete_io(&mut io)?;
@@ -780,7 +869,7 @@ impl StorageNode {
             reactor::Session::new(stream.conn.into(), stream.sock)?,
             limits,
             shutdown,
-            config.verifier.as_ref(),
+            Some(verifier.as_ref()),
         )
     }
 
@@ -912,7 +1001,7 @@ impl StorageNode {
 pub struct ClientConnectProfile {
     pub connect_ns: u64,
     pub tls_ns: u64,
-    /// None for TCP; Some measures authenticated fabric bootstrap.
+    /// None for TCP; Some measures fabric bootstrap, including native mode setup.
     pub fabric_ns: Option<u64>,
     /// Fresh status RPC; reuse also includes certificate/control revalidation
     /// and retirement of already-owned transport fences.
@@ -922,23 +1011,23 @@ pub struct ClientConnectProfile {
     pub fabric_open: Option<tidehunter_fabric::OpenProfile>,
 }
 
-/// Config, verifier and fingerprint built from one bounded credential snapshot.
+/// Transport config and optional TLS identity built from one credential snapshot.
 #[derive(Clone)]
 pub(crate) struct ClientTlsConfig {
-    pub config: Arc<ClientConfig>,
-    pub verifier: Arc<rustls::client::WebPkiServerVerifier>,
+    pub config: Option<Arc<ClientConfig>>,
+    pub verifier: Option<Arc<rustls::client::WebPkiServerVerifier>>,
     pub identity: [u8; 32],
 }
 
 #[derive(Clone)]
 struct ServerTlsConfig {
-    config: Arc<ServerConfig>,
-    verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    config: Option<Arc<ServerConfig>>,
+    verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
 }
 
-/// Persistent authenticated multiplexed connection. Synchronous control APIs
-/// drive the same correlated protocol as the nonblocking read owner. Lost replies
-/// do not imply rejected writes; a failed connection must never be retried in place.
+/// Persistent multiplexed connection with explicit TLS or trusted-fabric mode.
+/// Synchronous control APIs drive the same correlated protocol as the read owner.
+/// Lost replies do not imply rejected writes; failed connections are not retried in place.
 pub struct Client {
     stream: reactor::Session,
     expected: PartitionConfig,
@@ -953,8 +1042,8 @@ pub struct Client {
     reactor: reactor::ClientState,
     connected_status: Option<NodeStatus>,
     connect_profile: ClientConnectProfile,
-    reuse_verifier: Arc<rustls::client::WebPkiServerVerifier>,
-    server_name: ServerName<'static>,
+    reuse_verifier: Option<Arc<rustls::client::WebPkiServerVerifier>>,
+    server_name: Option<ServerName<'static>>,
     polling: PollingPolicy,
     #[cfg(feature = "test-utils")]
     ram_probe_bytes: Option<usize>,
@@ -1037,50 +1126,80 @@ impl Client {
         expected: PartitionConfig,
         shape: &KeyShape,
     ) -> Result<Self, TcpError> {
-        tls.transport.validate()?;
         expected.validate().map_err(TcpError::component)?;
+        tls.transport.validate()?;
         if timeout.is_zero() || timeout > Duration::from_secs(300) {
             return Err(TcpError::new("invalid client timeout"));
         }
-        // Static deployment uses numeric addresses. DNS resolution in std has
-        // no bounded deadline; the separately supplied TLS name is still fully
-        // verified against the server certificate.
         let address: SocketAddr = endpoint.parse().map_err(|_| {
             TcpError::new("endpoint must be numeric IP:port; set TLS server_name separately")
         })?;
         let began = Instant::now();
         let socket = TcpStream::connect_timeout(&address, timeout)?;
         let connect_ns = elapsed_ns(began);
-        let began = Instant::now();
         let mut io = DeadlineIo::new(socket, timeout)?;
-        let name = ServerName::try_from(tls.server_name.clone()).map_err(TcpError::component)?;
-        let mut conn = ClientConnection::new(client_config.config, name.clone())
-            .map_err(TcpError::component)?;
-        conn.set_buffer_limit(Some(reactor::TLS_BUFFER_BYTES));
-        while conn.is_handshaking() {
-            conn.complete_io(&mut io)?;
+        let setup_started = Instant::now();
+        if tls.transport.is_native() {
+            write_transport_mode(&mut io, tls.transport)?;
         }
-        let tls_ns = elapsed_ns(began);
+        let (session, reuse_verifier, server_name, tls_ns, fabric_ns) = if tls.transport.is_native()
+        {
+            #[cfg(feature = "experimental-fabric")]
+            {
+                let endpoint = fabric::bootstrap(&mut io, tls.transport)?;
+                io.fabric = Some(endpoint);
+                let fabric_ns = Some(elapsed_ns(setup_started));
+                (reactor::Session::new_native(io)?, None, None, 0, fabric_ns)
+            }
+            #[cfg(not(feature = "experimental-fabric"))]
+            {
+                return Err(TcpError::new("native transport was not compiled"));
+            }
+        } else {
+            let name =
+                ServerName::try_from(tls.server_name.clone()).map_err(TcpError::component)?;
+            let client_tls_config = client_config
+                .config
+                .ok_or_else(|| TcpError::new("TLS transport has no client credentials"))?;
+            let verifier = client_config
+                .verifier
+                .ok_or_else(|| TcpError::new("TLS transport has no peer verifier"))?;
+            let mut conn = ClientConnection::new(client_tls_config, name.clone())
+                .map_err(TcpError::component)?;
+            conn.set_buffer_limit(Some(reactor::TLS_BUFFER_BYTES));
+            while conn.is_handshaking() {
+                conn.complete_io(&mut io)?;
+            }
+            let tls_ns = elapsed_ns(setup_started);
+            if conn.alpn_protocol() != Some(tls.transport.alpn().as_slice()) {
+                return Err(TcpError::new(
+                    "required authenticated transport was not negotiated",
+                ));
+            }
+            let stream = StreamOwned::new(conn, io);
+            #[cfg(feature = "experimental-fabric")]
+            let mut stream = stream;
+            #[cfg(feature = "experimental-fabric")]
+            let fabric_ns = if tls.transport == Transport::Tcp {
+                None
+            } else {
+                let began = Instant::now();
+                stream.sock.fabric = Some(fabric::bootstrap(&mut stream, tls.transport)?);
+                Some(elapsed_ns(began))
+            };
+            #[cfg(not(feature = "experimental-fabric"))]
+            let fabric_ns = None;
+            (
+                reactor::Session::new(stream.conn.into(), stream.sock)?,
+                Some(verifier),
+                Some(name),
+                tls_ns,
+                fabric_ns,
+            )
+        };
         let shape = shape.clone();
-        if conn.alpn_protocol() != Some(tls.transport.alpn().as_slice()) {
-            return Err(TcpError::new(
-                "required authenticated transport was not negotiated",
-            ));
-        }
-        let stream = StreamOwned::new(conn, io);
-        #[cfg(feature = "experimental-fabric")]
-        let mut stream = stream;
-        let fabric_ns = None;
-        #[cfg(feature = "experimental-fabric")]
-        let mut fabric_ns = fabric_ns;
-        #[cfg(feature = "experimental-fabric")]
-        if tls.transport != Transport::Tcp {
-            let began = Instant::now();
-            stream.sock.fabric = Some(fabric::bootstrap(&mut stream, tls.transport)?);
-            fabric_ns = Some(elapsed_ns(began));
-        }
         let mut client = Self {
-            stream: reactor::Session::new(stream.conn.into(), stream.sock)?,
+            stream: session,
             expected,
             shape,
             timeout,
@@ -1100,8 +1219,8 @@ impl Client {
                 #[cfg(feature = "experimental-fabric")]
                 fabric_open: None,
             },
-            reuse_verifier: client_config.verifier,
-            server_name: name,
+            reuse_verifier,
+            server_name,
             polling: PollingPolicy::Adaptive,
             #[cfg(feature = "test-utils")]
             ram_probe_bytes: None,
@@ -1312,9 +1431,27 @@ impl Client {
         epoch: u64,
         batches: &[CompleteBatch],
     ) -> Result<Vec<DurableBatch>, TcpError> {
+        let id = self
+            .submit_append_many(epoch, batches)?
+            .ok_or_else(|| TcpError::new("session append admission is full"))?;
+        let mut polling = reactor::ActivePoll::default();
+        loop {
+            if let Some(completion) = self.take_append_completion(id)? {
+                return completion.result;
+            }
+            self.pause_append_poll(&mut polling);
+        }
+    }
+    pub(crate) fn submit_append_many(
+        &mut self,
+        epoch: u64,
+        batches: &[CompleteBatch],
+    ) -> Result<Option<u64>, TcpError> {
         if batches.is_empty() || batches.len() > self.expected.group_limits.max_batches as usize {
             return Err(TcpError::new("invalid append group count"));
         }
+        let mut encoded_bytes = GROUP_HEADER_LEN;
+        let mut charge = 64usize;
         for batch in batches {
             batch
                 .validate_for(&self.shape, self.expected.batch_limits)
@@ -1330,28 +1467,20 @@ impl Client {
             {
                 return Err(TcpError::new("batch belongs to another epoch/partition"));
             }
+            encoded_bytes = encoded_bytes
+                .checked_add(
+                    CompleteGroup::encoded_member_len(batch.encoded().len())
+                        .map_err(TcpError::component)?,
+                )
+                .ok_or_else(|| TcpError::new("append group size overflow"))?;
+            charge = charge
+                .checked_add(batch.encoded().len().saturating_add(64))
+                .ok_or_else(|| TcpError::new("append session credit overflow"))?;
         }
-        let response = self.request(Request::Append {
-            epoch,
-            batches: batches
-                .iter()
-                .map(|batch| batch.encoded().clone().into())
-                .collect(),
-        })?;
-        match response {
-            Response::Appended(receipts) if receipts.len() == batches.len() => {
-                let result: Result<Vec<_>, TcpError> = batches
-                    .iter()
-                    .zip(receipts)
-                    .map(|(batch, receipt)| self.check_receipt(batch, receipt))
-                    .collect();
-                if result.is_err() {
-                    self.broken = true;
-                }
-                result
-            }
-            _ => self.wrong_response(),
+        if encoded_bytes > self.expected.group_limits.max_encoded_bytes {
+            return Err(TcpError::new("append group exceeds configured byte limit"));
         }
+        self.submit_append(epoch, batches, charge)
     }
     pub fn read_record(
         &mut self,
@@ -1473,6 +1602,20 @@ impl Client {
 }
 
 impl TlsFiles {
+    fn native_mode(&self) -> Result<bool, TcpError> {
+        self.transport.validate()?;
+        let native = self.transport.is_native();
+        if native
+            && [&self.ca, &self.cert, &self.key]
+                .iter()
+                .any(|path| !path.as_os_str().is_empty())
+        {
+            return Err(TcpError::new(
+                "trusted native transport requires empty TLS credential paths",
+            ));
+        }
+        Ok(native)
+    }
     fn material(
         &self,
     ) -> Result<
@@ -1517,6 +1660,12 @@ impl TlsFiles {
         ))
     }
     fn server_config(&self) -> Result<ServerTlsConfig, TcpError> {
+        if self.native_mode()? {
+            return Ok(ServerTlsConfig {
+                config: None,
+                verifier: None,
+            });
+        }
         let (roots, cert, key, _) = self.material()?;
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
@@ -1533,15 +1682,24 @@ impl TlsFiles {
             .map_err(TcpError::component)?;
         config.alpn_protocols = self.transport.server_alpn();
         Ok(ServerTlsConfig {
-            config: Arc::new(config),
-            verifier,
+            config: Some(Arc::new(config)),
+            verifier: Some(verifier),
         })
     }
     #[cfg(test)]
     pub(crate) fn client_config(&self) -> Result<Arc<ClientConfig>, TcpError> {
-        Ok(self.client_config_with_identity()?.config)
+        self.client_config_with_identity()?
+            .config
+            .ok_or_else(|| TcpError::new("native transport has no TLS client config"))
     }
     pub(crate) fn client_config_with_identity(&self) -> Result<ClientTlsConfig, TcpError> {
+        if self.native_mode()? {
+            return Ok(ClientTlsConfig {
+                config: None,
+                verifier: None,
+                identity: [0; 32],
+            });
+        }
         let (roots, cert, key, identity) = self.material()?;
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
@@ -1558,8 +1716,8 @@ impl TlsFiles {
             .map_err(TcpError::component)?;
         config.alpn_protocols = vec![self.transport.alpn()];
         Ok(ClientTlsConfig {
-            config: Arc::new(config),
-            verifier,
+            config: Some(Arc::new(config)),
+            verifier: Some(verifier),
             identity,
         })
     }

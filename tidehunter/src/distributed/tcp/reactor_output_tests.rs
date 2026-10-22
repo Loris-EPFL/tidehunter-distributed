@@ -23,7 +23,8 @@ fn pair() -> Pair {
         .unwrap(),
     );
     let config = tls.server_config().unwrap();
-    let mut server = rustls::Connection::Server(ServerConnection::new(config.config).unwrap());
+    let mut server =
+        rustls::Connection::Server(ServerConnection::new(config.config.unwrap()).unwrap());
     for _ in 0..64 {
         fn transfer(sender: &mut rustls::Connection, receiver: &mut rustls::Connection) {
             let mut bytes = Vec::new();
@@ -52,13 +53,64 @@ fn pair() -> Pair {
                 )
                 .unwrap(),
                 peer: server,
-                client_verifier: config.verifier,
+                client_verifier: config.verifier.unwrap(),
                 _control_peer: control_peer,
                 _temp: temp,
             };
         }
     }
     panic!("TLS handshake did not finish");
+}
+
+#[cfg(feature = "experimental-fabric")]
+#[test]
+fn owned_record_segments_preserve_protocol_wire_bytes() {
+    let mut pair = pair();
+    let members = vec![
+        WireBytes::from(vec![1, 2, 3]),
+        WireBytes::from(minibytes::Bytes::from(vec![4, 5, 6, 7])),
+    ];
+    pair.session
+        .queue_native_records(19, members, None, 4096)
+        .unwrap();
+    let output = pair.session.output.back().unwrap();
+    assert!(output.bytes.is_empty());
+    assert!(output.segments.is_some());
+    let mut sources = [std::io::IoSlice::new(&[]); MAX_NATIVE_IOV];
+    let (source_count, source_bytes) = output.native_slices(PROGRESS_BYTES, &mut sources);
+    assert!(output.len <= PROGRESS_BYTES);
+    assert_eq!(source_bytes, output.len);
+    assert_eq!(
+        source_bytes,
+        sources[..source_count]
+            .iter()
+            .map(|slice| slice.len())
+            .sum::<usize>()
+    );
+    let frame = output.flatten();
+    let response: Envelope<Response> = pair.session.decode(&frame[4..], 4096).unwrap();
+    assert_eq!(response.protocol, PROTOCOL);
+    assert_eq!(response.id, 19);
+    let Response::Records(records) = response.body else {
+        panic!("unexpected response variant")
+    };
+    assert_eq!(records[0].as_slice(), [1, 2, 3]);
+    assert_eq!(records[1].as_slice(), [4, 5, 6, 7]);
+    let output = pair.session.output.back_mut().unwrap();
+    output.advance(7);
+    assert_eq!(output.offset, 7);
+    assert_eq!(output.flatten(), frame);
+
+    let profile = ServerReadProfile::default();
+    pair.session
+        .queue_native_records(20, vec![WireBytes::from(vec![8; 64])], Some(profile), 4096)
+        .unwrap();
+    let frame = pair.session.output.back().unwrap().flatten();
+    let response: Envelope<Response> = pair.session.decode(&frame[4..], 4096).unwrap();
+    assert!(matches!(
+        response.body,
+        Response::RecordsProfiled { records, .. } if records[0].as_slice() == [8; 64]
+    ));
 }
 
 #[test]
@@ -68,7 +120,7 @@ fn work_profiles_disable_reset_and_preserve_live_frames() {
     assert_eq!(pair.session.transport_stats().frame_encode.calls, 0);
     pair.session.configure_transport_stats(true, true);
     pair.session.queue(2, &vec![8_u8; 32], 1024).unwrap();
-    let frame = pair.session.output.back().unwrap().bytes[4..].to_vec();
+    let frame = pair.session.output.back().unwrap().flatten()[4..].to_vec();
     let decoded: Envelope<Vec<u8>> = pair.session.decode(&frame, 1024).unwrap();
     assert_eq!(decoded.body, vec![8; 32]);
     assert!(
@@ -104,8 +156,9 @@ fn send_tls_plaintext(pair: &mut Pair, bytes: &[u8]) {
     pair.peer.write_tls(&mut encrypted).unwrap();
     let mut encrypted = Cursor::new(encrypted);
     while encrypted.position() < encrypted.get_ref().len() as u64 {
-        assert_ne!(pair.session.conn.read_tls(&mut encrypted).unwrap(), 0);
-        let state = pair.session.conn.process_new_packets().unwrap();
+        let conn = pair.session.conn.as_mut().unwrap();
+        assert_ne!(conn.read_tls(&mut encrypted).unwrap(), 0);
+        let state = conn.process_new_packets().unwrap();
         pair.session.plaintext_pending = state.plaintext_bytes_to_read();
         pair.session.peer_closed = state.peer_has_closed();
     }
@@ -201,13 +254,20 @@ fn recycled_plaintext_buffer_decodes_frames_without_stale_trailing_bytes() {
 fn reused_server_authentication_rejects_expired_client_credentials() {
     let pair = pair();
     revalidate_client_peer(
-        &pair.peer,
-        pair.client_verifier.as_ref(),
+        Some(&pair.peer),
+        Some(pair.client_verifier.as_ref()),
         rustls::pki_types::UnixTime::now(),
     )
     .unwrap();
     let expired = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(4_102_444_800));
-    assert!(revalidate_client_peer(&pair.peer, pair.client_verifier.as_ref(), expired).is_err());
+    assert!(
+        revalidate_client_peer(
+            Some(&pair.peer),
+            Some(pair.client_verifier.as_ref()),
+            expired
+        )
+        .is_err()
+    );
 }
 
 #[derive(Default)]
@@ -233,8 +293,8 @@ impl Write for Wire {
 }
 fn step(session: &mut Session, wire: &mut Wire, completed: u64) {
     session.write_plaintext(PROGRESS_BYTES).unwrap();
-    if session.conn.wants_write() {
-        match session.conn.write_tls(wire) {
+    if session.wants_tls_write() {
+        match session.conn.as_mut().unwrap().write_tls(wire) {
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => panic!("unexpected TLS write error: {error}"),
@@ -270,7 +330,7 @@ fn later_tls_frame_submits_before_earlier_fence_and_preserves_stream_order() {
         ..Wire::default()
     };
     step(&mut pair.session, &mut wire, 0);
-    assert!(pair.session.conn.wants_write());
+    assert!(pair.session.wants_tls_write());
     assert_eq!(pair.session.submitted, 0);
     assert_eq!(pair.session.output[1].offset, 0);
     assert_eq!(pair.session.output_bytes, retained);
@@ -349,6 +409,7 @@ fn stalled_fences_bound_output_and_keep_actual_reply_leases() {
                 async_started: None,
                 async_handler_ns: 0,
                 control_queued: None,
+                is_append: false,
             },
         );
         retained += charge;
@@ -422,7 +483,12 @@ fn tcp_output_retires_at_ciphertext_acceptance_without_fabric_cq() {
     };
     for _ in 0..4096 {
         pair.session.write_plaintext(PROGRESS_BYTES).unwrap();
-        pair.session.conn.write_tls(&mut wire).unwrap();
+        pair.session
+            .conn
+            .as_mut()
+            .unwrap()
+            .write_tls(&mut wire)
+            .unwrap();
         // Ordinary socket writes transfer ownership immediately: fence zero.
         pair.session.finish_output(0, 0);
         if pair.session.output.is_empty() {
@@ -445,7 +511,7 @@ fn previous_wire_protocol_is_rejected_before_request_dispatch() {
     let mut client =
         ClientConnection::new(Arc::new(config), ServerName::try_from("localhost").unwrap())
             .unwrap();
-    let mut server = ServerConnection::new(tls.server_config().unwrap().config).unwrap();
+    let mut server = ServerConnection::new(tls.server_config().unwrap().config.unwrap()).unwrap();
     let mut hello = Vec::new();
     client.write_tls(&mut hello).unwrap();
     server.read_tls(&mut Cursor::new(hello)).unwrap();
@@ -569,8 +635,14 @@ fn only_drained_adaptive_tcp_can_wait_for_socket_readiness() {
             .partial_expired(partial_started + limits.io_timeout, limits.io_timeout)
     );
     pair.session.input_started = None;
-    pair.session.conn.writer().write_all(b"TLS output").unwrap();
-    assert!(pair.session.conn.wants_write());
+    pair.session
+        .conn
+        .as_mut()
+        .unwrap()
+        .writer()
+        .write_all(b"TLS output")
+        .unwrap();
+    assert!(pair.session.wants_tls_write());
     assert_eq!(
         pair.session
             .idle_wait_deadline(limits, false, false, false, idle_since),
@@ -731,6 +803,7 @@ fn completed_read(measured: bool, profiled: bool) -> HashMap<u64, ServerPending>
             async_started: measured.then(Instant::now),
             async_handler_ns: 0,
             control_queued: None,
+            is_append: false,
         },
     )])
 }
@@ -768,7 +841,7 @@ fn completed_response_rejects_fenced_or_poisoned_authority() {
         assert_eq!(profile.read_response_recheck_deferrals, 0);
         assert_eq!(profile.read_response_recheck_errors, 1);
         assert_eq!(profile.response_send_ns, 0);
-        let frame = pair.session.output.front().unwrap().bytes[4..].to_vec();
+        let frame = pair.session.output.front().unwrap().flatten()[4..].to_vec();
         let reply: Envelope<Response> = pair.session.decode(&frame, 4096).unwrap();
         assert!(matches!(reply.body, Response::Error(_)));
         assert!(pending[&1]._lease.is_some());
@@ -802,7 +875,7 @@ fn recheck_profiles_success_and_preserves_member_errors() {
             )
             .unwrap()
         );
-        let frame = pair.session.output.front().unwrap().bytes[4..].to_vec();
+        let frame = pair.session.output.front().unwrap().flatten()[4..].to_vec();
         let reply: Envelope<Response> = pair.session.decode(&frame, 4096).unwrap();
         match reply.body {
             Response::RecordsProfiled { records, profile } if !failed_read => {
@@ -911,7 +984,7 @@ fn submitted_ready_cqes_share_rechecks_deadlines_and_reply_retirement() {
             continue;
         }
         assert!(queued.unwrap());
-        let frame = pair.session.output.front().unwrap().bytes[4..].to_vec();
+        let frame = pair.session.output.front().unwrap().flatten()[4..].to_vec();
         let reply: Envelope<Response> = pair.session.decode(&frame, 4096).unwrap();
         if fenced {
             assert!(matches!(reply.body, Response::Error(_)));

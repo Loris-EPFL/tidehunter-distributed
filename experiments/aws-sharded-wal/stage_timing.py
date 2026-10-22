@@ -14,6 +14,7 @@ from pathlib import Path
 import cluster_ram
 import prepare_bundle
 import transport_floor
+from checkpoint_matrix import HARDWARE_TRANSPORTS
 
 BASELINE_SOURCE_SHA256 = transport_floor.CURRENT_SOURCE_SHA256
 BASELINE_BINARY_SHA256 = transport_floor.CURRENT_BINARY_SHA256
@@ -381,10 +382,13 @@ def validate_stages(profile, transport, enabled, writes=False):
             raise ValueError('CQ gap time lacks samples')
         if transport == 'tcp' and any(counters[field] for field in PROVIDER_FIELDS):
             raise ValueError('TCP evidence contains provider work')
+        if transport == 'efa-native' and any(any(counters[field].values())
+                                            for field in ('tls_write', 'tls_read', 'tls_process')):
+            raise ValueError('trusted native transport recorded software TLS work')
         if enabled and profile['requests']:
             if not all(counters[field]['calls'] > 0 for field in ('frame_encode', 'frame_decode')):
                 raise ValueError('missing measured frame encode/decode work')
-            if transport == 'efa' and not all(counters[field] > 0 for field in ('cq_timed_calls', 'send_post_calls', 'receive_copy_calls')):
+            if transport in HARDWARE_TRANSPORTS and not all(counters[field] > 0 for field in ('cq_timed_calls', 'send_post_calls', 'receive_copy_calls')):
                 raise ValueError('missing measured provider work')
     storage = profile['storage_write']
     if (storage['append_calls'] != storage['append_errors'] + storage['append_retries'] + storage['appended_groups']
@@ -393,7 +397,9 @@ def validate_stages(profile, transport, enabled, writes=False):
     if (sum(storage[f'append_{stage}_ns'] for stage in APPEND_STAGES) > storage['append_total_ns']
             or sum(storage[f'persist_{stage}_ns'] for stage in PERSIST_STAGES) > storage['persist_total_ns']):
         raise ValueError('storage nested stage sum exceeds enclosing total')
-    bounds = (('file_persist_calls', 'persist_calls'), ('file_persist_successes', 'file_persist_calls'),
+    # One captured durable prefix can span several WAL files.
+    bounds = (('file_persist_successes', 'file_persist_calls'),
+              ('namespace_persist_calls', 'persist_calls'),
               ('namespace_persist_calls', 'file_persist_successes'),
               ('namespace_persist_successes', 'namespace_persist_calls'), ('durable_publications', 'file_persist_successes'))
     if any(storage[child] > storage[parent] for child, parent in bounds):

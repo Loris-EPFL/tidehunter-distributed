@@ -1,4 +1,4 @@
-"""Protocol-v5 polling/resident campaign and authenticated RAM transport floor.
+"""Protocol-v5 history and explicit TLS/trusted-native RAM transport controls.
 
 Native controls are measured once per matching workload/transport/repetition;
 policy variants reference those exact cases, never synthesized native artifacts.
@@ -14,6 +14,7 @@ import checkpoint_async
 import cluster_ram
 import efa_progress
 import scalar_transport
+from checkpoint_matrix import TRANSPORTS
 
 BASELINE_SOURCE_SHA256 = '2e694cb0be9fe0738c217b75afb9fe0ba5d2eef170573bd95f092fa40e93dc57'
 BASELINE_BINARY_SHA256 = '7f692391ec6b6acbc5c12c31cb64878764c0ef96d98d82e1b0dfb6a67594db2c'
@@ -99,7 +100,7 @@ def expected_cases(scope='full'):
 
 def flags(spec, mode, external=False, prepare=False):
     result = cluster_ram.flags(spec | {'build': 'current'}, mode, external, prepare)
-    # External node policy belongs to authenticated prepared servers, not an
+    # External node policy belongs to prepared servers, not an
     # ignored coordinator flag. The old binary predates these two options.
     if spec['build'] == 'current' and (prepare or not external):
         result += ['--tcp-polling', spec['polling'], '--tcp-resident-first', str(spec['resident_first']).lower()]
@@ -108,7 +109,7 @@ def flags(spec, mode, external=False, prepare=False):
 
 def subsuite_floor_spec(transport, instrumented):
     """Bounded independent RAM populations inside the existing full KV suite."""
-    if transport not in ('tcp', 'efa', 'efa-direct') or type(instrumented) is not bool:
+    if transport not in TRANSPORTS or type(instrumented) is not bool:
         raise ValueError('invalid subsuite RAM control population')
     return dict(transport=transport, polling='adaptive', floor_values=[256, 8192],
                 samples=256 if instrumented else 512,
@@ -253,6 +254,13 @@ def flatten_counters(value, prefix=''):
 
 def validate_polling(profile, spec):
     counters = flatten_counters(profile)
+    if spec['transport'] in ('efa-native', 'fabric-tcp-native'):
+        for owner in ('transport', 'client_transport'):
+            for name in ('tls_read', 'tls_write', 'tls_process'):
+                work = profile.get(owner, {}).get(name, {})
+                if any(type(work.get(key)) is not int or work[key] != 0
+                       for key in ('ns', 'calls', 'bytes', 'errors')):
+                    raise ValueError('native RAM evidence lacks zero-TLS work')
     if spec['profile']:
         polling = profile['polling']
         if integer(polling['progress_sweeps']) == 0 or integer(polling['request_first_poll_samples']) == 0:
@@ -266,19 +274,22 @@ def validate_polling(profile, spec):
 def read_floor_metrics(path, spec):
     path = Path(path)
     if not (path / 'COMPLETE').is_file():
-        raise ValueError('missing complete authenticated payload audit')
+        raise ValueError('missing complete payload audit')
     metadata = {}
     for line in (path / 'metadata.txt').read_text().splitlines():
         key, value = line.split('=', 1)
         if key in metadata:
             raise ValueError('duplicate floor metadata')
         metadata[key] = value
+    scope = ('trusted_native_exchange_decode_and_full_payload_validation'
+             if spec['transport'] in ('efa-native', 'fabric-tcp-native') else
+             'authenticated_exchange_decode_and_full_payload_validation')
     required = dict(transport=spec['transport'], polling=spec['polling'].title(), instrumented=str(spec['profile']).lower(),
-                    topology='external_nodes', shards='5', timed_scope='authenticated_exchange_decode_and_full_payload_validation',
+                    topology='external_nodes', shards='5', timed_scope=scope,
                     wall_scope='measured_requests_and_offered_idle_including_scheduler_delay',
                     wal_io='checked_zero_member_reads', physical_network_latency='not_isolated', external_cleanup='operator_owned')
     if any(metadata.get(key) != value for key, value in required.items()):
-        raise ValueError('floor authenticated policy/timing contract differs')
+        raise ValueError('floor security/policy/timing contract differs')
     expected = {(value, rep) for rep in range(spec['floor_repetitions']) for value in spec['floor_values']}
     samples = defaultdict(list)
     for row in cluster_ram.read_csv(path / 'samples.csv'):
@@ -374,8 +385,10 @@ def read_wal_metrics(path, spec, mode, expected_profiles=None):
             if boundary != 'before':
                 continue
             after = snapshots[phase, 'after', partition]
-            deltas = {key: int(after[key]) - int(before[key]) for key in keys}
-            if min(deltas.values()) < 0 or (not spec['resident_first'] and any(deltas[k] for k in keys[:-1])):
+            fields = keys + (('resident_read_deferred',) if 'resident_read_deferred' in before else ())
+            deltas = {key: int(after[key]) - int(before[key]) for key in fields}
+            if min(deltas.values()) < 0 or (not spec['resident_first'] and any(
+                    value for key, value in deltas.items() if key != 'async_read_submissions')):
                 raise ValueError('resident-read counters contradict requested policy')
             if deltas['resident_read_successes'] + deltas['resident_read_fallbacks'] > deltas['resident_read_attempts']:
                 raise ValueError('resident read outcomes exceed attempts')
@@ -383,8 +396,9 @@ def read_wal_metrics(path, spec, mode, expected_profiles=None):
                 identity = 'read_path', phase, 'storage-' + key
                 metrics[identity] = metrics.get(identity, 0) + value
         for phase in ('point_get', 'point_get_window'):
-            policy_counter = 'resident_read_attempts' if spec['resident_first'] else 'async_read_submissions'
-            if metrics.get(('read_path', phase, 'storage-' + policy_counter), 0) <= 0:
+            policy_counters = (('resident_read_attempts', 'resident_read_deferred')
+                               if spec['resident_first'] else ('async_read_submissions',))
+            if sum(metrics.get(('read_path', phase, 'storage-' + key), 0) for key in policy_counters) <= 0:
                 raise ValueError('missing actual selected resident/async read activity')
     if mode == 'tcp' and spec['diagnostics']:
         records = [r for r in yaml_documents((Path(path) / 'node_profiles.yaml').read_text()) if r is not None]

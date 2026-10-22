@@ -74,7 +74,7 @@ def validate_config(config_path):
         raise ValueError('invalid owned run ID')
     owner = OWNED_BASE / cfg['run_id']
     transport = cfg.get('transport')
-    if (transport not in ('tcp', 'efa', 'efa-direct') or not isinstance(cfg.get('cell_id'), str)
+    if (transport not in ('tcp', 'efa', 'efa-direct', 'efa-native') or not isinstance(cfg.get('cell_id'), str)
             or not re.fullmatch(r'r0[1-4]-' + transport, cfg['cell_id'])):
         raise ValueError('invalid matrix cell/transport identity')
     root = owner / 'checkpoint-cells' / cfg['cell_id'] / 'storage'
@@ -141,8 +141,12 @@ def validate_config(config_path):
         tls = document.get('tls')
         if not isinstance(tls, dict) or tls.get('transport') != transport:
             raise ValueError('storage TLS transport differs from matrix cell')
-        for key in ('ca', 'cert', 'key'):
-            inputs.add(owned_path(tls.get(key), root, 'file'))
+        if transport == 'efa-native':
+            if any(tls.get(key) != '' for key in ('ca', 'cert', 'key')):
+                raise ValueError('native transport requires explicit empty credentials')
+        else:
+            for key in ('ca', 'cert', 'key'):
+                inputs.add(owned_path(tls.get(key), root, 'file'))
         inputs.add(launch)
         outputs.extend((ready, stop))
         storage_roots.append(data)

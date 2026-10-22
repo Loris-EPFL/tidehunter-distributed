@@ -7,6 +7,10 @@ import uuid
 import yaml
 
 MIB = 1024 * 1024
+HARDWARE_TRANSPORTS = ('efa', 'efa-direct', 'efa-native')
+SOFTWARE_TRANSPORTS = ('fabric-tcp', 'fabric-tcp-native')
+TRUSTED_TRANSPORTS = ('efa-native', 'fabric-tcp-native')
+TRANSPORTS = ('tcp', *HARDWARE_TRANSPORTS, *SOFTWARE_TRANSPORTS)
 
 
 def dump(path, value):
@@ -56,21 +60,24 @@ def schemas(directory, expected_backend=None):
 def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, coordinator_cache, shard_cache, guest_root=None, write_profile_limit=0):
     if type(write_profile_limit) is not int or not 0 <= write_profile_limit <= 65536:
         raise ValueError('write profile limit must be an integer 0..65536')
-    if transport not in ('tcp', 'fabric-tcp', 'efa', 'efa-direct') or len(hosts) != 5:
+    if transport not in TRANSPORTS or len(hosts) != 5:
         raise ValueError('a supported transport and exactly five hosts are required')
-    if transport == 'fabric-tcp' and (guest_root is not None or any(host != '127.0.0.1' for host in hosts)):
-        raise ValueError('fabric-tcp is loopback-only in the native engine; use tcp or efa for external hosts')
-    if transport in ('efa', 'efa-direct') and guest_root is None:
+    if transport in SOFTWARE_TRANSPORTS and (guest_root is not None or any(host != '127.0.0.1' for host in hosts)):
+        raise ValueError('software fabric is loopback-only in the native engine; use tcp or EFA for external hosts')
+    if transport in HARDWARE_TRANSPORTS and guest_root is None:
         raise ValueError('hardware EFA needs explicit external mode')
     if set(shape_yamls) != set(schema):
         raise ValueError('canonical engine YAML must cover every selected namespace')
     directory.mkdir(mode=0o700)
-    certificates(directory / 'tls')
+    if transport not in TRUSTED_TRANSPORTS:
+        certificates(directory / 'tls')
     runtime = guest_root or directory
     tls_root = runtime / 'tls'
-    def tls(name):
-        return dict(transport=transport, ca=str(tls_root / 'ca.der'), cert=str(tls_root / f'{name}.der'),
-                    key=str(tls_root / f'{name}.pk8'), server_name=name)
+    def tls(name, base):
+        if transport in TRUSTED_TRANSPORTS:
+            return dict(transport=transport, ca='', cert='', key='', server_name=name)
+        return dict(transport=transport, ca=str(base / 'ca.der'), cert=str(base / f'{name}.der'),
+                    key=str(base / f'{name}.pk8'), server_name=name)
     databases, nodes = {}, []
     for number, (namespace, shape) in enumerate(schema.items()):
         identity = list(uuid.uuid4().bytes)
@@ -98,7 +105,7 @@ def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, 
                 read_max_inflight_requests=32, read_max_inflight_bytes=64*MIB, read_max_device_reads=128)
             # Adaptive parks drained TCP on readiness and keeps fabric CQ
             # progress live; neither transport uses periodic idle sleeps.
-            launch = dict(node=node, tls=tls(f'node-{partition}'),
+            launch = dict(node=node, tls=tls(f'node-{partition}', tls_root),
                 limits=dict(max_frame_bytes=16*MIB, max_connections=16, max_reads=256,
                     recovery_page_batches=128, io_timeout=dict(secs=60, nanos=0), polling='adaptive'),
                 listen=address, ready_file=str(runtime_node / 'ready'), stop_file=str(runtime_node / 'stop'),
@@ -107,9 +114,8 @@ def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, 
             nodes.append(dict(namespace=namespace, partition=partition, host=host,
                 launch=str(node_dir / 'launch.yaml'), ready=str(runtime_node / 'ready'), stop=str(runtime_node / 'stop')))
             endpoints.append(dict(partition=partition, address=address, server_name=f'node-{partition}'))
-        # Client TLS is coordinator-local even when the five node roots are remote.
-        client_tls = dict(transport=transport, ca=str(directory / 'tls/ca.der'),
-            cert=str(directory / 'tls/authority.der'), key=str(directory / 'tls/authority.pk8'), server_name='authority')
+        # Coordinator-local credentials are unnecessary in explicit trusted mode.
+        client_tls = tls('authority', directory / 'tls')
         # Retained epoch history is not the in-flight window: acknowledged
         # identities remain necessary for exact retries and crash recovery.
         databases[namespace] = dict(storage=storage, endpoints=endpoints, tls=client_tls,

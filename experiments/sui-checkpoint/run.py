@@ -361,7 +361,7 @@ def main():
     parser.add_argument('--port', type=int, default=24000)
     parser.add_argument('--coordinator-cache-mib', type=int, default=8)
     parser.add_argument('--shard-cache-mib', type=int, default=0)
-    parser.add_argument('--local-transport', choices=('tcp', 'fabric-tcp'), default='tcp',
+    parser.add_argument('--local-transport', choices=('tcp', *deployment.SOFTWARE_TRANSPORTS), default='tcp',
                         help='loopback correctness provider; never hardware EFA evidence')
     parser.add_argument('--read-profile-limit', type=int, default=0,
                         help='maximum profiled remote read RPCs per DB, 0 disables diagnostics')
@@ -390,11 +390,11 @@ def main():
         raise ValueError('local transport cannot override an external deployment')
     build_root, fixture, root = args.build.resolve(strict=True), args.fixture.resolve(strict=True), args.output.resolve()
     manifest = read_json(build_root / 'build-manifest.json')
-    if manifest['protocol'] != 8 or build.digest(build_root/'sources.tar.gz') != manifest['source_archive_sha256']:
+    if manifest['protocol'] != 9 or build.digest(build_root/'sources.tar.gz') != manifest['source_archive_sha256']:
         raise ValueError('wrong protocol or source archive binding')
     if set(manifest['binaries']) != {'sui-node-native','sui-node-remote','storage-node','state-audit','rocksdb-audit','transport-floor'}:
         raise ValueError('build manifest lacks the exact required executable set')
-    if args.local_transport == 'fabric-tcp' and not manifest['fabric']:
+    if args.local_transport in deployment.SOFTWARE_TRANSPORTS and not manifest['fabric']:
         raise ValueError('software fabric validation requires a fabric-enabled build')
     sources = read_json(build_root/'source-manifest.json')
     if build.digest(build_root/'source-manifest.json') != manifest['source_manifest_sha256']:
@@ -453,13 +453,14 @@ def main():
                SUI_TH_NATIVE_WRITE_PROFILE_LIMIT=str(args.native_write_profile_limit))
     owned=Owned(output,env)
     producer_env = checkpoint.source_environment(prior)
-    result=dict(schema=1,protocol=8,backend='tidehunter-sharded-wal',durability='synchronous durable whole-batch publication',
+    result=dict(schema=1,protocol=9,backend='tidehunter-sharded-wal',durability='synchronous durable whole-batch publication',
         fixture=str(fixture),fixture_files=fixture_files,checkpoint_limit=tip,checkpoint_digest=expected_digest,
         build_manifest_sha256=build.digest(build_root/'build-manifest.json'),source_archive_sha256=manifest['source_archive_sha256'],
         binaries=manifest['binaries'],configurations=configs,
         environment={k:v for k,v in env.items() if k.startswith(('RUST_LOG','TOKIO_','USE_TIDEHUNTER','TH_','SUI_TH_','LD_LIBRARY_PATH','FI_'))},
         cache=dict(coordinator_bytes=args.coordinator_cache_mib*deployment.MIB,shard_bytes=args.shard_cache_mib*deployment.MIB),
         topology='five physical shards per database; '+('external hosts' if args.external_config else 'loopback, one SSD/shared host memory'),
+        local_transport=None if args.external_config else args.local_transport,
         read_profile_limit=args.read_profile_limit,write_profile_limit=args.write_profile_limit,
         native_write_profile_limit=args.native_write_profile_limit,
         started_unix=time.time())
@@ -486,8 +487,8 @@ def main():
             if Path(config['root']) != remote_root or set(config['databases']) != set(schema):
                 raise ValueError('external namespace/root coverage differs')
             for database in config['databases'].values():
-                if database['tls']['transport'] == 'fabric-tcp':
-                    raise ValueError('external fabric-tcp is loopback-only in the native engine')
+                if database['tls']['transport'] in deployment.SOFTWARE_TRANSPORTS:
+                    raise ValueError('external software fabric is loopback-only in the native engine')
                 if len(database['endpoints']) != 5 or len(set(e['address'].rsplit(':',1)[0] for e in database['endpoints'])) != 5:
                     raise ValueError('external mode requires five distinct storage hosts per DB')
                 if database['read_cache_bytes'] != result['cache']['coordinator_bytes']:

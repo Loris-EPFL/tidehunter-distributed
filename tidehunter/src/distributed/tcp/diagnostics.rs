@@ -1,4 +1,4 @@
-//! Opt-in monotonic clocks. Protocol v8 interleaves requests: socket clocks are
+//! Opt-in monotonic clocks. Protocol v9 retains interleaved requests: socket clocks are
 //! connection-wide (including control traffic); they are not assigned to a read.
 //! Handler spans overlap. A completed read first awaits its authority recheck,
 //! then response encoding, then response-send (output queue/TLS/local retirement).
@@ -135,18 +135,18 @@ pub struct ConnectionProfile {
     /// Rechecks rejecting unhealthy, recovering or superseded authority.
     pub read_response_recheck_errors: u64,
     pub append_inventory_wait_ns: u64,
-    /// Inventory mutex residence through append and persistence; preparation is
-    /// completed before this serialized ownership begins.
+    /// Actual inventory-guard residence during append admission; excludes
+    /// off-lock preparation and persistence.
     pub append_inventory_residence_ns: u64,
     pub append_decode_ns: u64,
     pub append_group_build_ns: u64,
     pub append_wal_ns: u64,
     pub append_persist_ns: u64,
     pub storage_write: crate::distributed::storage::StorageWriteProfile,
-    /// Admission to worker start, including serialized-control and pool queues.
+    /// Per-request control/pool, flusher and barrier queue waits, summed once.
     pub control_queue_ns: u64,
     pub control_queue_samples: u64,
-    /// Worker execution only; nested within handler_ns, never queue residence.
+    /// Appender and persistence service, nested in handler_ns; excludes queue waits.
     pub control_execution_ns: u64,
     pub control_execution_samples: u64,
     pub socket: SocketProfile,

@@ -1563,10 +1563,10 @@ not unconditionally enabled performance claims.
 | `tidehunter/src/distributed/tcp.rs`, `tcp/inventory.rs` | `PollingPolicy::{Adaptive, Busy}` in `TcpLimits`; authenticated status advertises the server policy. `NodeConfig.read_resident_first` is opt-in. Wire protocol/ALPN is v5; do not mix old v4 binaries with this build. |
 | `tcp/reactor.rs`, `remote_db/pending_read.rs` | Busy established-session progress has no deliberate sleep or scheduler yield. Deadlines, bounded sweeps, shutdown, and peer health checks remain. Admission, storage, background workers, and the idle listener can still wait. |
 | `tcp/diagnostics.rs` | Opt-in server sweep, sleep count/time, yield, spin, and first-observed-frame polling-gap counters. A polling gap is not a packet-arrival timestamp or pure network latency. |
-| `tcp/read_executor.rs`, `tcp/read_executor/cache.rs` | Immediate owned cache hits before unused device/SQ admission. Optional `RWF_NOWAIT` attempt; at most one forced-async fallback, retaining the same resource credits and buffer. |
+| `tcp/read_executor.rs`, `tcp/read_executor/cache.rs` | Immediate owned cache hits before device/SQ admission. Opt-in resident-first uses at most four synchronous `preadv2(RWF_NOWAIT)` calls, 64 KiB total and 16 KiB/member per owner-loop sweep; exact hits complete without SQ/CQ. EAGAIN/EOPNOTSUPP/short results fall back exactly once to forced-async reads of the remaining suffix. `resident_read_deferred` counts reads skipped because the sweep budget is exhausted. |
 | `tcp/reactor_tests.rs`, `tcp/reactor_output_tests.rs`, `tcp/read_executor/tests.rs`, `tcp/tests.rs`, `remote_db/pipeline_tests.rs` | Payload/frame limits, session isolation, deadlines, cancellation, output ownership, software-fabric behavior, resident fallback and partial-read correctness. |
 | `tidehunter/examples/sharded_wal_transport_bench.rs` | New persistent authenticated RAM-response floor, with deterministic full-payload validation inside each API timer and zero WAL-member-read assertions. Local nodes are owned and stopped; external nodes remain operator-owned. |
-| `tidehunter/examples/sharded_wal_bench.rs` | `--tcp-polling adaptive\|busy`, `--tcp-resident-first true\|false`, resident/async read counters, and corrected per-operation concurrent-read sample labels. Historical raw files are unchanged. |
+| `tidehunter/examples/sharded_wal_bench.rs` | `--tcp-polling adaptive\|busy`, `--tcp-resident-first true\|false`, and resident-attempt/success/fallback/deferred plus async-SQE read counters. Historical raw files are unchanged. |
 | `tidehunter/examples/support/tcp_cluster.rs`, `sharded_wal_cluster_check.rs` | Propagate policies into owned/prepared nodes. External preparation writes `shape.yaml` beside `remote.yaml`, so the floor program can use the actual prepared cluster. |
 | `tidehunter/Cargo.toml` | Register the floor example behind existing experimental-distributed and test-utils features. No new dependency. |
 
@@ -1592,25 +1592,43 @@ sections 3.1–3.2 and 4.2–4.3, motivates short owner-thread handlers, offload
 work, and retaining buffers through completion. It does not justify performing a
 potentially cold blocking WAL read on the network reactor or removing durability.
 
-The [Linux `RWF_NOWAIT` contract](https://man7.org/linux/man-pages/man2/readv.2.html)
-permits a positive partial prefix. The first local cold-read experiment exposed
-that case being rejected as corruption. A regression failed before the fix and
-passed after it. The implemented state transitions are:
+The [Linux `preadv2(RWF_NOWAIT)` contract](https://man7.org/linux/man-pages/man2/preadv2.2.html)
+returns immediately rather than waiting for backing storage or a lock, and may
+return a positive partial prefix. The executor therefore uses no `mincore`
+prediction or blocking retry. The implemented state transitions are:
 
-1. A full resident result publishes the complete owned record.
-2. `EAGAIN` or unsupported NOWAIT behavior retries once through forced async I/O.
-3. A positive partial prefix remains initialized in the same buffer. Only the
-   missing suffix is submitted asynchronously, at matching file/buffer offsets.
-4. A zero read, real error, or incomplete final suffix remains an error. No partial
-   record is published or cached.
-5. Buffer, file/log owner, request generation, cancellation state, byte/device/SQ
-   accounting, and final record validation remain live across the transition.
+1. An exact-length resident result publishes its fully initialized owned record
+   immediately; it creates no io_uring SQE/CQE.
+2. `EAGAIN`, `EOPNOTSUPP`, or a short result (including zero bytes) falls back
+   exactly once to the existing forced-async read. A positive prefix remains
+   initialized in the same buffer; the SQE reads only the remaining suffix.
+3. The async completion must exactly fill the suffix. A short/error CQE never
+   publishes or caches a partial record.
+4. Synchronous attempts are limited per owner-loop sweep to four calls, 64 KiB
+   requested total and 16 KiB per member. Larger members and budget skips remain
+   asynchronous.
+5. Buffer, file/log owner, request generation, cancellation state, reply lease,
+   and device/byte/SQ accounting remain owned through completion/response
+   retirement. Full reference validation still precedes cache lookup.
 
-The [Linux 6.17 io_uring implementation](https://github.com/torvalds/linux/blob/v6.17/io_uring/rw.c)
-can normalize unsupported attempts to `EAGAIN`. Thus zero
-`resident_read_unsupported` events does not prove universal filesystem support.
-`wal_reads` counts logical member reads; resident attempts and async submissions
-count file-read submissions, not physical NVMe operations.
+eRPC's pinned [`process_small_req_st`](https://github.com/erpc-io/eRPC/blob/de83dab3eab4a0fb19bfc4881c11d4a6b89ff17d/src/rpc_impl/rpc_req.cc)
+keeps foreground request handlers on the dispatch thread and limits zero-copy
+RX ownership to handler duration. That owner-thread/short-work split informed
+the strict local attempt cap; it does not justify blocking reads on a reactor.
+TeRM's pinned `mr.cc` page bitmap and `rpc.cc` branch its custom Mellanox ODP
+resident accesses to registered memory from cold reads serviced through its
+RPC/file-I/O path. This executor adopts neither its page-bitmap proof nor its
+Mellanox driver hooks; the NOWAIT syscall itself determines whether bytes can
+be copied without waiting.
+
+`resident_read_attempts` counts actual synchronous NOWAIT syscalls;
+`resident_read_successes` counts exact-length completions;
+`resident_read_fallbacks` counts attempted syscalls followed by one async read;
+`resident_read_deferred` counts reads skipped due to the resident budget.
+`resident_read_unsupported` is an EOPNOTSUPP subset (unsupported behavior may
+also appear as EAGAIN), and `resident_read_partial` counts nonempty partial
+prefixes. `async_read_submissions` counts async SQEs actually admitted. None
+of these counters establishes physical NVMe I/O.
 
 This removes a redundant prefix read on partial fallback and avoids cold blocking
 work. It does not establish a universal latency improvement. Framing and verification

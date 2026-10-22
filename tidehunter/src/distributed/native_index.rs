@@ -13,8 +13,8 @@ use super::codec::CompleteBatch;
 use super::index_reference::LogicalValueId;
 use super::native_publication::NativePendingSink;
 use super::types::{
-    BatchId, BatchVersion, MutationVersion, PayloadDigest, PhysicalValueAddress, RecordDescriptor,
-    RecordKind, ValueRecordReference,
+    BatchId, BatchVersion, MemberChecksum, MutationVersion, PayloadDigest, PhysicalValueAddress,
+    RecordDescriptor, RecordKind, ValueRecordReference,
 };
 use crate::cell::CellId;
 use crate::crc::{CrcFrame, IntoBytesFixed};
@@ -41,8 +41,8 @@ use snapshot::FrozenCell;
 pub(crate) use snapshot::{PersistedIndexImage, PreparedIndexImage};
 
 const MAGIC: &[u8; 8] = b"THINDEX1";
-const FORMAT: u16 = 3;
-const REFERENCE_BYTES: usize = 162;
+const FORMAT: u16 = 4;
+const REFERENCE_BYTES: usize = 134;
 const MAX_IMAGE_BYTES: usize = 1 << 30;
 const VERSION_CHARGE: usize = std::mem::size_of::<ValueRecordReference>() + 32;
 const CELL_CHARGE: usize = std::mem::size_of::<CellIndex>() + 256;
@@ -1289,7 +1289,7 @@ fn encode_reference(reference: &ValueRecordReference, output: &mut Vec<u8>) {
     for value in [d.key_len, d.value_offset, d.value_len] {
         output.extend_from_slice(&value.to_be_bytes());
     }
-    output.extend_from_slice(&d.digest.0);
+    output.extend_from_slice(&d.checksum.0.to_be_bytes());
     debug_assert_eq!(output.len() - before, REFERENCE_BYTES);
 }
 fn decode_reference(bytes: &[u8]) -> Result<ValueRecordReference, NativeIndexError> {
@@ -1327,7 +1327,7 @@ fn decode_reference(bytes: &[u8]) -> Result<ValueRecordReference, NativeIndexErr
         key_len: c.u32()?,
         value_offset: c.u32()?,
         value_len: c.u32()?,
-        digest: PayloadDigest(c.take(32)?.try_into().unwrap()),
+        checksum: MemberChecksum(c.u32()?),
     };
     if c.remaining() != 0
         || address.len < 8

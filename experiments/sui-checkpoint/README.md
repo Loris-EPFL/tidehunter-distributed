@@ -216,16 +216,18 @@ namespace/key-shape inventory. This fixed order is recorded, not randomized.
 
 For every native-exported database the runner allocates a fresh UUID and starts
 five independent physical shard processes, each with its own WAL root, bounded
-read workers, per-node authenticated TLS identity and port. There is one local
+read workers and port. TLS modes also assign each node its own authenticated
+identity; explicit trusted-native modes use no certificate files. There is one local
 coordinator publication/index authority per DB, not a global WAL or NVMe-oF
 layer. Loopback is **five physical shards per selected DB**, not five processes
 shared across unrelated DB identities. It is one laptop SSD/RAM pool, not a
 multi-NVMe or RDMA performance claim.
 
-Use `--local-transport fabric-tcp` with a `--fabric` build for a complete paired
-replay through libfabric's loopback software provider. Plain TCP remains the
-default. Software-fabric deployment rejects non-loopback hosts and external
-guest roots; it validates the fabric path, not EFA hardware or RDMA speed.
+Use `--local-transport fabric-tcp` (TLS) or `--local-transport fabric-tcp-native`
+(explicit trusted, no TLS) with a `--fabric` build for a complete paired replay
+through libfabric's loopback software provider. TCP/TLS remains the default.
+Both software-fabric modes reject non-loopback hosts and external guest roots;
+they validate correctness, not EFA hardware or RDMA speed.
 The runtime must find the same libfabric ABI used for the build.
 
 `TH_SYNC_WRITES=true` requests a real durable barrier for each native write/batch;
@@ -338,14 +340,16 @@ python3 /absolute/owned/checkpoint-build/sources/tidehunter-sharded-wal/experime
 source/config hash and per-host payload hash. The existing parent controller
 creates the fresh root on each of the **five distinct hosts**, distributes only
 that host's archive, starts the listed bounded process groups, waits for its
-ready files and retains PID ownership. Each host receives only its own leaf key
-and public CA, never the coordinator identity or CA signing key. It then invokes
+ready files and retains PID ownership. TLS modes distribute only that host's leaf
+key and public CA, never the coordinator identity or CA signing key; trusted-native
+payloads contain no certificates. The controller then invokes
 the paired runner with `--external-config .../config.json`,
 `--external-resources .../resources.json`, and
 `--external-stage-dir .../stages` (all three are required together).
 Endpoint identity/config/cache/source bindings must match the exact manifest.
-External transport supports `tcp`, `efa`, or `efa-direct`; `fabric-tcp` is rejected
-because the native engine deliberately pins its correctness-test provider to loopback.
+External transport supports `tcp`, `efa`, `efa-direct` and explicit trusted
+`efa-native`. Both software-provider modes are rejected because the native
+engine deliberately pins them to loopback.
 
 The runner atomically publishes `stage.json` and durable `<stage>.json` markers
 for `remote-starting` before remote execution, `remote-finished` after its node
@@ -548,14 +552,30 @@ existing authenticated TLS stream. See the
 [transport contract](../../tidehunter-fabric/DESIGN.md). It is a two-sided message
 transport, not one-sided WAL access or NVMe-oF, and has no production fallback.
 
-New cell payloads bind `fabric_preflight_transport` in expected evidence. Their
-preflight runs `fi_info -p efa -f <efa-or-efa-direct> -t FI_EP_RDM`; every reported
-provider, fabric and endpoint must match. Direct cells always require this exact
-proof, including when older evidence has no marker. Six-host positive device
-traffic remains mandatory. Historical ordinary-EFA receipts are not rewritten.
+`efa-native` uses the same direct message adapter **without software TLS or
+application peer authentication**. It is not one-sided RMA or NVMe-oF.
+Its `ca`, `cert` and `key` paths must be empty; preparation generates and exports
+no certificates for these cells. Network isolation and trusted members are
+required. Default TCP and both older EFA modes retain TLS.
 
-Analysis emits available TCP/EFA, TCP/EFA-direct and EFA/EFA-direct pairs using
-generic reference/candidate transport fields. Each pair still requires matching
+The protected full CI configuration now requests
+`transports: ["tcp", "efa", "efa-direct", "efa-native"]`, with a separate native
+control in every cell. The manual schema's two-transport default is unchanged.
+Before paid allocation, CI must rebuild and complete a same-source real-checkpoint
+`fabric-tcp-native` local replay and full-state audit. This prerequisite is wired
+but is not a claim that a new Sui replay or hardware run occurred locally.
+
+See the [implemented native message contract](../../tidehunter-fabric/DESIGN.md#trusted-native-message-mode-21-october)
+and [one-sided WAL design](../../docs/distributed/ONE_SIDED_WAL_READS_2026-10-21.md).
+
+New cell payloads bind `fabric_preflight_transport` in expected evidence. Their
+preflight runs `fi_info -p efa -f <fabric> -t FI_EP_RDM`; `efa-native` selects
+fabric `efa-direct`, not a fabric named `efa-native`. Every provider/fabric/endpoint
+must match. Both direct modes always require exact proof and positive device
+traffic on all six hosts. Historical ordinary-EFA receipts are not rewritten.
+
+Analysis emits all available matched pairs among TCP, EFA, EFA-direct and
+EFA-native using generic reference/candidate transport fields. Each pair requires matching
 source, workload, budgets, profile limits and repetition; every remote cell has
 its own native control. Software protocol checks do not establish hardware
 availability, EFA-direct latency, or improvement over regular EFA.
@@ -603,8 +623,9 @@ exported before the exact-owned fleet termination attempt.
 * Every foreground sample records owned-PID RSS/high-water/swap and physical
   `/proc/PID/io` plus host swap/diskstats/meminfo. Host counters include desktop
   noise; OS read/write charges differ from logical WAL bytes and mapped reads.
-* Transport protocol is **8**, incompatible with prior endpoints. It adds
-  authenticated sealed-file retirement and separate inventory-witness counters.
+* Transport protocol is **9**, incompatible with prior endpoints. The current
+  experimental member format is batch v3 with CRC32/IEEE; whole-batch BLAKE2b,
+  sealed-file retirement and separate inventory-witness counters remain.
   Response recheck wait/work/deferrals and output queue/submit/retire spans are monotonic
   local residence, may overlap existing timing and are not one-way network,
   hardware RTT or pure NVMe latency.

@@ -117,9 +117,10 @@ def verification_bundle(source, destination):
     if (receipt.get('complete') is not True or result.get('complete') is not True
             or result.get('failure') or audit != result.get('audit') or audit.get('all_equal') is not True
             or not audit.get('databases') or not audit.get('rocksdb')
+            or result.get('local_transport') != 'fabric-tcp-native'
             or 'loopback' not in result.get('topology', '') or result.get('external_manifest')
             or sha(source / 'evidence.tar.gz') != receipt.get('evidence_sha256')):
-        raise ValueError('complete same-build loopback replay and full-state audit required')
+        raise ValueError('complete same-build trusted software-fabric loopback replay and full-state audit required')
     schema = source / 'experiment/native-schema'
     if not schema.is_dir() or not any(p.is_file() for p in schema.rglob('*')):
         raise ValueError('local replay did not retain native namespace schemas')
@@ -156,7 +157,7 @@ def prepare(args):
     commands = [
         [sys.executable, str(script), 'prepare', '--sui', str(sui), '--engine', str(engine), '--output', str(build), '--fabric', '--jobs', str(args.jobs)],
         [sys.executable, str(script), 'build', '--output', str(build), '--target', str(target), '--deadline', str(args.deadline)],
-        [sys.executable, str(engine / 'experiments/sui-checkpoint/run.py'), '--build', str(build), '--fixture', str(fixture), '--output', str(replay), '--deadline', '900'],
+        [sys.executable, str(engine / 'experiments/sui-checkpoint/run.py'), '--build', str(build), '--fixture', str(fixture), '--output', str(replay), '--deadline', '900', '--local-transport', 'fabric-tcp-native'],
     ]
     for command in commands:
         remaining = deadline - time.monotonic()
@@ -165,7 +166,7 @@ def prepare(args):
         module.bounded(command, timeout=remaining)
     verification = verification_bundle(replay, output / 'verification')
     manifest = json.loads((build / 'build-manifest.json').read_text())
-    if manifest.get('fabric') is not True or manifest.get('protocol') != 8:
+    if manifest.get('fabric') is not True or manifest.get('protocol') != 9:
         raise ValueError('current fabric-capable protocol build required')
     save(output / 'READY.json', {
         'complete': True, 'created_utc': datetime.now(timezone.utc).isoformat(),
@@ -175,7 +176,7 @@ def prepare(args):
         'source_archive_sha256': manifest['source_archive_sha256'],
         'source_manifest_sha256': manifest['source_manifest_sha256'],
         'binaries': manifest['binaries'],
-        'topology': 'same-build five-process local TCP correctness proof; not hardware performance evidence',
+        'topology': 'same-build five-process local trusted software-fabric correctness proof; not hardware performance evidence',
     })
     print(output / 'READY.json')
 

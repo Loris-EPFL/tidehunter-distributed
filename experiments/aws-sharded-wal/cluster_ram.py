@@ -7,6 +7,7 @@ from pathlib import Path
 
 import checkpoint_async
 import efa_progress
+from checkpoint_matrix import TRANSPORT_BACKENDS
 
 MIB = 1024 * 1024
 BASELINE_SOURCE_SHA256 = '84bf88b81410cbc82cfd59eb987b8012a887d9288f3b76e250b9678587efa7d0'
@@ -158,8 +159,7 @@ def read_metrics(path, spec, mode):
     if not (path / 'COMPLETE').is_file():
         raise ValueError('missing complete value/reopen audit')
     backend = ('native_value_wal_barrier' if mode == 'native-sync' else
-               {'tcp': 'experimental_tcp_authority', 'efa': 'experimental_efa_authority',
-                'fabric-tcp': 'experimental_fabric_tcp_authority'}[spec['transport']])
+               TRANSPORT_BACKENDS[spec['transport']])
     expected = (backend, spec['value'], spec['batch'], spec['window'], 0)
     def dimensions(row):
         actual = (row['backend'], int(row['value_bytes']), int(row['batch_size']), int(row['window']), int(row['repetition']))

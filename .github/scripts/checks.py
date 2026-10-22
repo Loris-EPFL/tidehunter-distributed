@@ -29,6 +29,12 @@ SOFTWARE_ENGINE_TESTS = (
     "fabric_control_violation_closes_a_live_session_without_waiting_for_rpc_deadline",
     "fabric_authenticated_ram_probe_boundaries_and_busy_shutdown",
     "software_fabric_cold_authority_preserves_hot_progress_and_rechecks_fencing",
+    "native_software_provider_mixed_rpc_reads_complete_out_of_order",
+    "fabric_tcp_native_rejects_invalid_reference_and_epoch_without_tls",
+    "fabric_tcp_native_mode_mismatch_with_tls_fails_closed",
+    "fabric_tcp_native_rejects_corrupt_member_reply_without_tls",
+    "fabric_tcp_native_large_partial_frames_bypass_tls",
+    "fabric_tcp_native_disconnect_retains_owned_reply_credits_until_retirement",
 )
 
 

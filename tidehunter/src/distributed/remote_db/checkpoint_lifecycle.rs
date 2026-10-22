@@ -439,7 +439,7 @@ impl RemoteDatabase {
     /// Complete every captured cut needed to cover the current drained prefix.
     pub(super) fn commit_checkpoint(&mut self) -> Result<(), LocalDbError> {
         self.ensure_healthy()?;
-        if !self.submissions.is_empty() || self.inflight.iter().any(Option::is_some) {
+        if !self.submissions.is_empty() || self.inflight.iter().any(|queue| !queue.is_empty()) {
             return Err(LocalDbError::new(
                 "checkpoint requires drained complete publication",
             ));

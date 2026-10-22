@@ -69,6 +69,18 @@ Python 3.11 or newer is required. Setup prepares PyYAML and boto3 for the exact
 interpreter used by the runner. `TIDEHUNTER_SETUP_SKIP_APT=1` is only for a machine
 with the required native/Python dependencies already available; it is not a
 dependency bootstrap mode. An existing isolated Python environment is suitable.
+Setup reuses `clang` and `cmake` executables already on `PATH`, including
+hosted-runner installations outside apt. It reuses a readable C `libclang` shared
+library in `LIBCLANG_PATH` or the standard LLVM/multiarch library directories;
+the C++-only `libclang-cpp` library does not qualify. Missing tools are still
+installed. This avoids downloading a second CMake or the static Clang SDK just
+because its apt metapackage is absent. The 300-second apt-update and 600-second
+apt-install limits remain unchanged.
+
+Concurrency fixtures use explicit gates and observable storage, publication and
+recovery state. Per-stage diagnostic completion counters are not scheduling
+barriers; a fast preparation may finish before a durable reply arrives.
+
 The optional MCP-SDK test and opt-in real-systemd exercise can be skipped by their
 existing test decorators; their skipped counts are not executed coverage. The
 offline profile rejects `TH_TEST_SYSTEMD=1` rather than touching a real service.

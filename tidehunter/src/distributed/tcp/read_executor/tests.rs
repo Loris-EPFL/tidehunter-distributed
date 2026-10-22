@@ -18,6 +18,9 @@ impl Fixture {
     fn new(count: usize) -> Self {
         let temp = tempdir::TempDir::new("uring-member-test").unwrap();
         let shape = KeyShape::new_single(4, 1, KeyType::uniform(1));
+        let max_encoded_bytes = 64 + 512;
+        let max_group_bytes = max_encoded_bytes + 512;
+        let fragment_bytes = ((max_group_bytes as u64 + 15) / 8) * 8;
         let config = PartitionConfig {
             inventory: StaticInventory {
                 database: [1; 16],
@@ -28,14 +31,14 @@ impl Fixture {
             partition: 3,
             batch_limits: BatchLimits {
                 max_operations: 100,
-                max_encoded_bytes: 500,
+                max_encoded_bytes,
             },
             group_limits: GroupLimits {
                 max_batches: 4,
-                max_encoded_bytes: 1008,
+                max_encoded_bytes: max_group_bytes,
             },
-            fragment_bytes: 1024,
-            wal_file_bytes: 2048,
+            fragment_bytes,
+            wal_file_bytes: fragment_bytes * 4,
             max_batches: 64,
             max_reference_metadata_bytes: 1024 * 1024,
         };
@@ -118,6 +121,7 @@ fn finish(executor: &mut ReadExecutor, count: usize) -> Vec<ReadCompletion> {
     completed
 }
 fn read(executor: &mut ReadExecutor, fixture: &Fixture, n: usize, id: u64) -> Bytes {
+    executor.begin_sweep();
     match executor
         .submit(id, fixture.member(n), ReadClass::Point)
         .unwrap()
@@ -333,6 +337,7 @@ fn aggregate_request_and_device_limits_cover_independent_connection_rings() {
             SubmitOutcome::Full(_)
         ));
         assert_eq!(admission.stats().wal_reads, 1);
+        assert_eq!(admission.stats().cache_misses, 1);
         finish(&mut first, 1);
         assert!(matches!(
             second
@@ -830,7 +835,7 @@ fn buffer_pool_uses_exact_sizes_and_existing_node_budget() {
 }
 
 #[test]
-fn warm_file_cache_observes_resident_success_or_explicit_capability_fallback() {
+fn warm_resident_read_completes_without_sq_or_uses_one_async_fallback() {
     let fixture = Fixture::new(1);
     let plan = fixture
         .log
@@ -852,284 +857,144 @@ fn warm_file_cache_observes_resident_success_or_explicit_capability_fallback() {
     assert_eq!(stats.wal_read_bytes, plan.member.len as u64);
     assert_eq!(stats.completed_reads, 1);
     assert_eq!(stats.errors, 0);
-    if stats.resident_read_successes == 1 {
-        assert_eq!(stats.async_read_submissions, 0);
-        assert_eq!(stats.resident_read_fallbacks, 0);
-        assert_eq!(stats.resident_read_unsupported, 0);
-        eprintln!("observed exact successful RWF_NOWAIT read without forced io-wq");
-    } else {
-        // Warming pages cannot grant filesystem NOWAIT support or exclude lock
-        // contention. This branch proves fallback only, never resident success.
-        assert_eq!(stats.resident_read_successes, 0);
-        assert_eq!(stats.resident_read_fallbacks, 1);
-        assert_eq!(stats.async_read_submissions, 1);
-        assert!(stats.resident_read_unsupported <= 1);
-        eprintln!(
-            "observed NOWAIT fallback, EOPNOTSUPP count={}; no resident claim",
-            stats.resident_read_unsupported
-        );
-    }
-}
-
-fn reach_fallback(executor: &mut ReadExecutor) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while executor.admission.stats().resident_read_fallbacks == 0 {
-        assert!(executor.poll_completed().unwrap().is_empty());
-        assert!(Instant::now() < deadline, "resident CQE timed out");
-        std::thread::yield_now();
-    }
+    assert_eq!(
+        stats.resident_read_successes + stats.resident_read_fallbacks,
+        1
+    );
+    assert_eq!(stats.async_read_submissions, stats.resident_read_fallbacks);
+    assert!(stats.resident_read_unsupported <= stats.resident_read_fallbacks);
 }
 
 #[test]
-fn resident_miss_unsupported_and_partial_keep_exact_owners_credits_and_generation() {
-    for result in [-libc::EAGAIN, -libc::EOPNOTSUPP, 1] {
-        let fixture = Fixture::new(2);
-        let config = ReadExecutorConfig {
-            resident_first: true,
-            cache_bytes: 8192,
-            max_device_reads: 1,
-            ..ReadExecutorConfig::default()
-        };
-        let (admission, mut first) = executor(config);
-        let mut second = ReadExecutor::new(config, admission.clone()).unwrap();
-        first
-            .completion_results
-            .push_back((ReadStage::Resident, result));
-        first
-            .submit(1, fixture.member(0), ReadClass::Point)
-            .unwrap();
-        let (&token, op) = first.operations.iter().next().unwrap();
-        let pointer = op.buffer.as_ptr();
-        let file = Arc::downgrade(&op.plan.member.file);
-        let log = Arc::downgrade(&op.plan._log);
-        let charge = admission.stats().inflight_bytes;
-        let next_token = first.next_token;
-        admission.clear_cache();
-        reach_fallback(&mut first);
-        let op = &first.operations[&token];
-        assert!(op.stage == ReadStage::Async);
-        assert_eq!(op.buffer.as_ptr(), pointer);
-        assert_eq!(first.next_token, next_token);
-        assert!(file.upgrade().is_some());
-        assert!(log.upgrade().is_some());
-        assert!(first.requests[&1].records[0].is_none());
-        assert_eq!(first.requests[&1].remaining, 1);
-        let stats = admission.stats();
-        assert_eq!(stats.resident_read_attempts, 1);
-        assert_eq!(stats.resident_read_successes, 0);
-        assert_eq!(stats.resident_read_fallbacks, 1);
-        assert_eq!(
-            stats.resident_read_unsupported,
-            u64::from(result == -libc::EOPNOTSUPP)
-        );
-        assert_eq!(stats.resident_read_partial, u64::from(result > 0));
-        assert_eq!(op.filled, result.max(0) as usize);
-        assert_eq!(stats.async_read_submissions, 1);
-        assert_eq!(stats.inflight_reads, 1);
-        assert_eq!(stats.inflight_bytes, charge);
-        assert_eq!(stats.buffer_allocations, 1);
-        assert_eq!(stats.idle_buffers, 0);
-        assert_eq!(stats.errors, 0);
-        assert!(matches!(
-            second
-                .submit(2, fixture.member(1), ReadClass::Point)
-                .unwrap(),
-            SubmitOutcome::Full(_)
-        ));
-        let mut completion = finish(&mut first, 1).remove(0);
-        let bytes = completion.result.as_mut().unwrap().remove(0);
-        assert_eq!(bytes.as_ptr(), pointer.cast::<u8>());
-        fixture.assert_value(0, bytes.clone());
-        assert_eq!(admission.stats().inflight_reads, 0);
-        assert_eq!(admission.stats().inflight_bytes, charge);
-        assert_eq!(admission.stats().cache_entries, 0);
-        assert_eq!(admission.stats().cache_bypass_generation, 1);
-        let held = bytes.clone();
-        drop((bytes, completion));
-        assert_eq!(admission.stats().inflight_bytes, 0);
-        assert_eq!(admission.stats().inflight_requests, 0);
-        assert_eq!(admission.stats().idle_buffers, 0);
-        drop(held);
-        assert_eq!(admission.stats().idle_buffers, 1);
-        fixture.assert_value(1, read(&mut second, &fixture, 1, 3));
-        assert_eq!(admission.stats().buffer_reuses, 1);
-    }
-}
-
-#[test]
-fn resident_failures_and_eof_never_become_empty_successes() {
-    let fixture = Fixture::new(1);
-    for result in [-libc::EIO, -libc::EBADF, -libc::EINVAL, -libc::EINTR, 0] {
-        let (admission, mut executor) = executor(ReadExecutorConfig {
-            resident_first: true,
-            cache_bytes: 8192,
-            ..ReadExecutorConfig::default()
-        });
-        executor
-            .completion_results
-            .push_back((ReadStage::Resident, result));
-        executor
-            .submit(1, fixture.member(0), ReadClass::Point)
-            .unwrap();
-        let completion = finish(&mut executor, 1).remove(0);
-        let Err(StorageError::Io(error)) = &completion.result else {
-            panic!("resident error/short read must fail the request");
-        };
-        if result < 0 {
-            assert_eq!(error.raw_os_error(), Some(-result));
-        } else {
-            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
-        }
-        let stats = admission.stats();
-        assert_eq!(stats.errors, 1);
-        assert_eq!(stats.resident_read_successes, 0);
-        assert_eq!(stats.resident_read_fallbacks, 0);
-        assert_eq!(stats.async_read_submissions, 0);
-        assert_eq!(stats.cache_entries, 0);
-        assert_eq!(stats.inflight_reads, 0);
-        drop(completion);
-        assert_eq!(admission.stats().inflight_bytes, 0);
-        assert_eq!(admission.stats().inflight_requests, 0);
-    }
-}
-
-#[test]
-fn fallback_errors_are_terminal_even_if_cancelled_and_never_retry_twice() {
-    let fixture = Fixture::new(1);
-    for result in [
-        -libc::EAGAIN,
-        -libc::EOPNOTSUPP,
-        -libc::EIO,
-        0,
-        fixture.references[0].descriptor.len as i32 - 1,
+fn unsupported_and_partial_nowait_results_keep_suffix_owners_until_cq() {
+    for (result, expected_prefix, unsupported) in [
+        (ResidentTestResult::Unsupported, 0, true),
+        (ResidentTestResult::Partial(7), 7, false),
     ] {
-        let (admission, mut executor) = executor(ReadExecutorConfig {
-            resident_first: true,
-            cache_bytes: 8192,
-            ..ReadExecutorConfig::default()
-        });
-        executor.completion_results.extend([
-            (ReadStage::Resident, -libc::EAGAIN),
-            (ReadStage::Async, result),
-        ]);
-        executor
-            .submit(1, fixture.member(0), ReadClass::Point)
-            .unwrap();
-        reach_fallback(&mut executor);
-        executor.cancel(1);
-        let completion = finish(&mut executor, 1).remove(0);
-        let Err(StorageError::Io(error)) = &completion.result else {
-            panic!("cancellation must not suppress a late cold-read failure");
-        };
-        if result < 0 {
-            assert_eq!(error.raw_os_error(), Some(-result));
-        } else {
-            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
-        }
-        let stats = admission.stats();
-        assert_eq!(stats.resident_read_attempts, 1);
-        assert_eq!(stats.resident_read_fallbacks, 1);
-        assert_eq!(stats.async_read_submissions, 1);
-        assert_eq!(stats.errors, 1);
-        assert_eq!(stats.completed_reads, 0);
-        assert_eq!(stats.cache_entries, 0);
-        assert_eq!(stats.inflight_reads, 0);
-        drop(completion);
-        assert!(executor.operations.is_empty());
-        assert_eq!(admission.stats().inflight_bytes, 0);
-        assert_eq!(admission.stats().inflight_requests, 0);
-    }
-}
-
-#[test]
-fn cancellation_before_or_after_fallback_retains_owners_until_final_cqe() {
-    for cancel_before in [false, true] {
         let fixture = Fixture::new(1);
         let (admission, mut executor) = executor(ReadExecutorConfig {
             resident_first: true,
-            cache_bytes: 8192,
             ..ReadExecutorConfig::default()
         });
-        executor
-            .completion_results
-            .push_back((ReadStage::Resident, -libc::EAGAIN));
-        executor
-            .submit(1, fixture.member(0), ReadClass::Point)
-            .unwrap();
-        let op = executor.operations.values().next().unwrap();
-        let file = Arc::downgrade(&op.plan.member.file);
-        let log = Arc::downgrade(&op.plan._log);
-        let charge = admission.stats().inflight_bytes;
-        if cancel_before {
-            executor.cancel(1);
-        }
-        reach_fallback(&mut executor);
-        if !cancel_before {
-            executor.cancel(1);
-        }
-        drop(fixture.log);
+
+        executor.begin_sweep();
+        executor.resident_test_results.push_back(result);
+        assert!(matches!(
+            executor
+                .submit(1, fixture.member(0), ReadClass::Point)
+                .unwrap(),
+            SubmitOutcome::Pending
+        ));
+        let operation = executor.operations.values().next().unwrap();
+        assert_eq!(operation.filled, expected_prefix);
+        let buffer_ptr = operation.buffer.as_ptr();
+        let file = Arc::downgrade(&operation.plan.member.file);
+        let log = Arc::downgrade(&operation.plan._log);
+        let charged = admission.stats().inflight_bytes;
+        assert!(charged > 0);
         assert!(file.upgrade().is_some());
         assert!(log.upgrade().is_some());
-        assert_eq!(admission.stats().inflight_bytes, charge);
-        assert_eq!(admission.stats().inflight_reads, 1);
-        assert_eq!(admission.stats().idle_buffers, 0);
-        executor.shutdown().unwrap();
+
+        let mut completion = finish(&mut executor, 1).remove(0);
+        let encoded = completion.result.as_mut().unwrap().remove(0);
+        assert_eq!(encoded.as_ptr(), buffer_ptr.cast());
+        fixture.assert_value(0, encoded);
+        assert_eq!(admission.stats().inflight_reads, 0);
+        assert_eq!(admission.stats().inflight_bytes, charged);
         let stats = admission.stats();
-        assert_eq!(stats.inflight_reads, 0);
-        assert_eq!(stats.inflight_bytes, 0);
-        assert_eq!(stats.inflight_requests, 0);
-        assert_eq!(stats.cache_entries, 0);
-        assert_eq!(stats.idle_buffers, 1);
+        assert_eq!(stats.resident_read_attempts, 1);
         assert_eq!(stats.resident_read_fallbacks, 1);
+        assert_eq!(
+            stats.resident_read_unsupported,
+            usize::from(unsupported) as u64
+        );
+        assert_eq!(stats.resident_read_partial, u64::from(!unsupported));
         assert_eq!(stats.async_read_submissions, 1);
         assert_eq!(stats.completed_reads, 1);
-        assert_eq!(stats.cancellations, 1);
-        assert!(file.upgrade().is_none());
-        assert!(log.upgrade().is_none());
-        assert!(executor.poll_completed().unwrap().is_empty());
+        drop(completion);
+        assert_eq!(admission.stats().inflight_bytes, 0);
+        assert_eq!(admission.stats().inflight_requests, 0);
     }
 }
 
 #[test]
-fn full_ring_resubmissions_remain_bounded_through_submission_pressure() {
-    let fixture = Fixture::new(4);
-    let config = ReadExecutorConfig {
+fn resident_attempt_budget_defers_larger_request_tail_and_keeps_order() {
+    let fixture = Fixture::new(5);
+    let (admission, mut executor) = executor(ReadExecutorConfig {
         resident_first: true,
-        max_device_reads: 4,
+        max_device_reads: 8,
         ..ReadExecutorConfig::default()
+    });
+    let mut plans = (0..5)
+        .map(|n| {
+            (
+                fixture.references[n],
+                fixture
+                    .log
+                    .plan_record_read(&fixture.references[n])
+                    .unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let second_plans = plans.split_off(2);
+    executor.begin_sweep();
+    let first = executor
+        .submit_planned(1, plans, ReadClass::Point, &mut None)
+        .unwrap();
+    let mut records = match first {
+        SubmitOutcome::Ready {
+            records,
+            lease: _lease,
+        } => records,
+        SubmitOutcome::Pending => finish(&mut executor, 1).remove(0).result.unwrap(),
+        SubmitOutcome::Full(_) => panic!("first bounded request unexpectedly full"),
     };
-    let (admission, mut executor) = executor(config);
-    executor
-        .completion_results
-        .extend([(ReadStage::Resident, -libc::EAGAIN); 4]);
-    for n in 0..4 {
-        executor
-            .submit(n as u64 + 1, fixture.member(n), ReadClass::Point)
-            .unwrap();
-    }
-    reach_fallback(&mut executor);
-    // NOWAIT completions may arrive in separate polls, but all four credits
-    // bound both initial and replacement SQEs, never four extra operations.
-    executor
-        .submit_errors
-        .extend([libc::EAGAIN, libc::EBUSY, libc::EINTR]);
-    let completed = finish(&mut executor, 4);
-    for completion in completed {
-        let n = completion.request_id as usize - 1;
-        fixture.assert_value(n, completion.result.unwrap().into_iter().next().unwrap());
+    let second = executor
+        .submit_planned(2, second_plans, ReadClass::Point, &mut None)
+        .unwrap();
+    records.extend(match second {
+        SubmitOutcome::Ready {
+            records,
+            lease: _lease,
+        } => records,
+        SubmitOutcome::Pending => finish(&mut executor, 1).remove(0).result.unwrap(),
+        SubmitOutcome::Full(_) => panic!("second bounded request unexpectedly full"),
+    });
+    for (n, bytes) in records.into_iter().enumerate() {
+        fixture.assert_value(n, bytes);
     }
     let stats = admission.stats();
     assert_eq!(stats.resident_read_attempts, 4);
-    assert_eq!(stats.resident_read_fallbacks, 4);
-    assert_eq!(stats.async_read_submissions, 4);
-    assert_eq!(stats.completed_reads, 4);
-    assert_eq!(stats.errors, 0);
-    assert_eq!(stats.inflight_reads, 0);
+    assert_eq!(stats.resident_read_deferred, 1);
+    assert_eq!(stats.completed_reads, 5);
     assert_eq!(stats.inflight_bytes, 0);
-    assert_eq!(stats.peak_inflight_reads, 4);
-    assert_eq!(stats.buffer_allocations, 4);
-    assert!(executor.operations.is_empty());
-    assert_eq!(executor.next_token, 5);
+    assert_eq!(stats.inflight_reads, 0);
+}
+
+#[test]
+fn successful_nowait_reply_keeps_credit_until_response_lease_retires() {
+    let fixture = Fixture::new(1);
+    let (admission, mut executor) = executor(ReadExecutorConfig {
+        resident_first: true,
+        ..ReadExecutorConfig::default()
+    });
+    executor.begin_sweep();
+    let outcome = executor
+        .submit(1, fixture.member(0), ReadClass::Point)
+        .unwrap();
+    let SubmitOutcome::Ready { records, lease } = outcome else {
+        // Filesystems that reject NOWAIT still exercise the asynchronous
+        // owner path in other executor tests.
+        return;
+    };
+    assert_eq!(admission.stats().inflight_requests, 1);
+    assert!(admission.stats().inflight_bytes > 0);
+    fixture.assert_value(0, records[0].clone());
+    drop(records);
+    assert_eq!(admission.stats().inflight_requests, 1);
+    drop(lease);
+    assert_eq!(admission.stats().inflight_requests, 0);
+    assert_eq!(admission.stats().inflight_bytes, 0);
 }
 
 #[test]

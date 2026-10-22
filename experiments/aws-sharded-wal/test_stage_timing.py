@@ -159,6 +159,21 @@ class StageTimingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'foreign'):
             campaign.check_owned_instances(record=False)
 
+    def test_captured_durable_prefix_can_sync_multiple_wal_files_once(self):
+        measured = stages(writes=True)
+        measured['storage_write'].update(
+            appended_groups=2, append_calls=2, appended_receipts=2, persisted_receipts=2,
+            file_persist_calls=2, file_persist_successes=2,
+            namespace_persist_calls=1, namespace_persist_successes=1)
+        profile.validate_stages(measured, 'tcp', True, writes=True)
+        measured['storage_write'].update(namespace_persist_calls=2, namespace_persist_successes=2)
+        with self.assertRaises(ValueError):
+            profile.validate_stages(measured, 'tcp', True, writes=True)
+        measured['storage_write'].update(namespace_persist_calls=1, namespace_persist_successes=1)
+        measured['storage_write']['file_persist_successes'] = 3
+        with self.assertRaises(ValueError):
+            profile.validate_stages(measured, 'tcp', True, writes=True)
+
     def test_stage_fields_counts_and_nested_scope_are_fail_closed(self):
         for transport in ('tcp', 'efa'):
             good = stages(transport=transport, writes=True)

@@ -34,7 +34,8 @@ from guest import (Campaign, SDK_CONFIG, download, evidence, remaining, sha,
 import boto3
 from botocore.config import Config
 from checkpoint_matrix import (matrix_plan, check_cell, validate_provider, efa_snapshot,
-                               efa_proof, validate_efa_proof, validate_matrix, validate_placement)
+                               efa_proof, validate_efa_proof, validate_matrix, validate_placement,
+                               HARDWARE_TRANSPORTS, DIRECT_TRANSPORTS, fabric_name)
 from checkpoint_kv import run_suite as run_kv_suite, validate_options as validate_kv_options
 
 # SendCommand has no idempotency token. An ambiguous HTTP acknowledgement must
@@ -92,9 +93,9 @@ def schema():
         'invocation': 'python3 /PATH/aws-sharded-wal/sui_checkpoint.py controller --config /mnt/tidehunter/<run_id>/sui-config.json',
         'outputs': '<prefix>/results/{controller.tar.gz,receipt.json,progress.json,cells/<cell_id>/storage/<partition>/{live,final}/...}; controller archive retains all cells, including partial failures.',
         'completion_admission': 'Each requested cell requires matching source/config/cell-bound final sampler resources and receipt, successful systemd owner exit, exact reaped namespace PID/starttime/commands and every stdout/stderr log. EFA stop/final receipts additionally require efa_proof; final archives include raw before/after counters. All final archives must match the runner resource handshake. Successful exact-unit release and absent old namespace processes are required before the next cell.',
-        'matrix': 'transports is a distinct nonempty tcp/efa/efa-direct list; the default remains tcp/efa. repetitions is 1..4. Each cell has its own native control. Odd repetitions use list order, even repetitions reverse it. No requested cell may be omitted.',
+        'matrix': 'transports is a distinct nonempty tcp/efa/efa-direct/efa-native list; the default remains tcp/efa. efa-native is explicitly trusted and omits application TLS. repetitions is 1..4. Each cell has its own native control. Odd repetitions use list order, even repetitions reverse it. No requested cell may be omitted.',
         'profiling': 'read_profile_limits is required; write_profile_limits and native_write_profile_limits default to disabled. All are per-repetition integers 0..65536. [0,4096,4096,0] read, [0,128,128,0] remote write and [0,640,640,0] native write give clean/diagnostic/diagnostic/clean repetitions. Remote writes sample append RPCs per owning connection; native writes sample foreground durability barriers per DB. These are distinct populations.',
-        'efa_proof': 'fi_info -p efa -f <transport> -t FI_EP_RDM must report exactly provider efa and requested fabric efa or efa-direct. Every hardware cell requires source/cell/host-bound before/after sysfs efa-driver send_bytes and recv_bytes, both positive on coordinator and all five storage hosts. No software, normal-EFA-for-Direct or TCP fallback; host-wide activity is not pure-wire timing.',
+        'efa_proof': 'fi_info -p efa -f <fabric> -t FI_EP_RDM must report exactly provider efa and the requested fabric; efa-native maps to efa-direct. Every hardware cell requires source/cell/host-bound before/after sysfs efa-driver send_bytes and recv_bytes, both positive on coordinator and all five storage hosts. No software, normal-EFA-for-Direct or TCP fallback; host-wide activity is not pure-wire timing.',
         'lifetime': 'deadline_utc must be timezone-aware UTC, <=1 hour away and <=every bootstrap deadline; measured work ends export_reserve_seconds earlier. No retries of unknown benchmark starts.',
     }
 
@@ -235,12 +236,12 @@ def preflight(binaries, output):
 
 def fabric_preflight(output, transport='efa'):
     import resource
-    if transport not in ('efa', 'efa-direct'):
+    if transport not in HARDWARE_TRANSPORTS:
         raise ValueError('hardware fabric preflight requires an EFA transport')
     resource.setrlimit(resource.RLIMIT_MEMLOCK, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
     os.environ.update(FI_EFA_USE_DEVICE_RDMA='1', FI_EFA_ENABLE_SHM_TRANSFER='0')
     executable = shutil.which('fi_info') or '/opt/amazon/efa/bin/fi_info'
-    result = subprocess.run([executable, '-p', 'efa', '-f', transport, '-t', 'FI_EP_RDM'],
+    result = subprocess.run([executable, '-p', 'efa', '-f', fabric_name(transport), '-t', 'FI_EP_RDM'],
                             capture_output=True, timeout=30)
     (output / 'efa-provider.txt').write_bytes(result.stdout + result.stderr)
     if result.returncode:
@@ -261,7 +262,7 @@ def systemd_status(unit):
 def completion_files(transport='tcp'):
     files = {'resources': 'resources.json', 'node_receipt': 'cloud-node-receipt.json',
              'node_config': 'node-config.json', 'systemd_status': 'systemd-status.json'}
-    if transport in ('efa', 'efa-direct'):
+    if transport in HARDWARE_TRANSPORTS:
         files['efa_proof'] = 'efa-proof.json'
     return files
 
@@ -270,7 +271,7 @@ def required_node_files(expected):
     names = {'bootstrap.json', 'supervisor-node.json', 'cloud-node-supervisor.log',
              'journal.log', 'preflight/platform.json', 'preflight/storage-node.ldd.txt'}
     names.update(completion_files(expected['cloud']['transport']).values())
-    if expected['campaign']['transport'] in ('efa', 'efa-direct'):
+    if expected['campaign']['transport'] in HARDWARE_TRANSPORTS:
         names.update(('preflight/efa-provider.txt', 'efa-before.json', 'efa-after.json'))
     for index in range(len(expected['cloud']['commands'])):
         names.update(f'cloud-node-logs/namespace-{index:02d}.{kind}.log' for kind in ('stdout', 'stderr'))
@@ -375,13 +376,13 @@ def validate_node_archive(archive, expected, resources):
             raise ValueError('archived bootstrap belongs to another host')
         if b'not found' in blob('preflight/storage-node.ldd.txt'):
             raise ValueError('archived dynamic dependency preflight failed')
-        if expected['cloud']['transport'] in ('efa', 'efa-direct'):
+        if expected['cloud']['transport'] in HARDWARE_TRANSPORTS:
             transport = expected['cloud']['transport']
             declared = expected['cloud'].get('fabric_preflight_transport')
             if declared is not None and declared != transport:
                 raise ValueError('archived preflight transport identity differs')
             validate_provider(blob('preflight/efa-provider.txt').decode(),
-                              transport if transport == 'efa-direct' or declared is not None else None)
+                              transport if transport in DIRECT_TRANSPORTS or declared is not None else None)
             proof = document('efa-proof.json')
             validate_efa_proof(proof, efa_identity(expected))
             if proof['before'] != document('efa-before.json') or proof['after'] != document('efa-after.json'):
@@ -416,7 +417,7 @@ def node_action(action, config):
         if sha(node_root / 'storage-node') != cloud['storage_binary_sha256']:
             raise ValueError('storage executable changed after deployment')
         preflight([node_root / 'storage-node'], node_root / 'preflight')
-        if cfg['transport'] in ('efa', 'efa-direct'):
+        if cfg['transport'] in HARDWARE_TRANSPORTS:
             fabric_preflight(node_root / 'preflight', cfg['transport'])
             write_json(node_root / 'efa-before.json', efa_snapshot(efa_identity(config)))
         write_json(node_root / 'node-config.json', cloud)
@@ -424,7 +425,7 @@ def node_action(action, config):
         if seconds < 60:
             raise TimeoutError('storage start lacks work reserve')
         fabric_args = (['--property=LimitMEMLOCK=infinity', '--setenv=FI_EFA_USE_DEVICE_RDMA=1',
-                        '--setenv=FI_EFA_ENABLE_SHM_TRANSFER=0'] if cfg['transport'] in ('efa', 'efa-direct') else [])
+                        '--setenv=FI_EFA_ENABLE_SHM_TRANSFER=0'] if cfg['transport'] in HARDWARE_TRANSPORTS else [])
         subprocess.run(['systemd-run', '--unit=' + unit, '--property=Type=exec',
             '--property=RemainAfterExit=yes', '--property=KillMode=control-group',
             '--property=TimeoutStopSec=15', '--property=RuntimeMaxSec=' + str(seconds),
@@ -454,7 +455,7 @@ def node_action(action, config):
             # Retain the observed exit before RuntimeMaxSec or guest TTL can
             # unload the unit. Never overwrite a failed/unknown terminal result.
             write_json(terminal, status)
-        if cfg['transport'] in ('efa', 'efa-direct') and not (node_root / 'efa-proof.json').exists():
+        if cfg['transport'] in HARDWARE_TRANSPORTS and not (node_root / 'efa-proof.json').exists():
             try:
                 after = efa_snapshot(efa_identity(config))
                 write_json(node_root / 'efa-after.json', after)
@@ -653,9 +654,9 @@ class SuiCampaign(Campaign):
         for name, key in [('sources.tar.gz', 'source_archive_sha256'), ('source-manifest.json', 'source_manifest_sha256')]:
             if sha(self.build / name) != self.cfg[key] or manifest[key] != self.cfg[key]:
                 raise ValueError('source archive/manifest binding differs')
-        if manifest['protocol'] != 8 or manifest['binaries'] != self.cfg['binaries']:
+        if manifest['protocol'] != 9 or manifest['binaries'] != self.cfg['binaries']:
             raise ValueError('wrong wire protocol or executable inventory')
-        if any(transport in ('efa', 'efa-direct') for transport in self.cfg['transports']) and not manifest.get('fabric'):
+        if any(transport in HARDWARE_TRANSPORTS for transport in self.cfg['transports']) and not manifest.get('fabric'):
             raise ValueError('transport requires fabric-enabled frozen binaries')
         for name, expected in manifest['binaries'].items():
             if sha(self.build / 'binaries' / name) != expected:
@@ -709,9 +710,9 @@ class SuiCampaign(Campaign):
         self.verify_local()
         preflight([self.build / 'binaries' / name for name in sorted(BINARIES)], self.results / 'preflight')
         for transport in self.cfg['transports']:
-            if transport in ('efa', 'efa-direct'):
+            if transport in HARDWARE_TRANSPORTS:
                 output = self.results / 'preflight'
-                if transport == 'efa-direct':
+                if transport in DIRECT_TRANSPORTS:
                     output = output / transport
                     output.mkdir()
                 fabric_preflight(output, transport)
@@ -747,6 +748,8 @@ class SuiCampaign(Campaign):
             raise ValueError('local successful replay used another executable or chain')
         if 'loopback' not in result['topology'] or result.get('external_manifest'):
             raise ValueError('a cloud replay cannot satisfy the prerequisite local replay')
+        if 'efa-native' in self.cfg['transports'] and result.get('local_transport') != 'fabric-tcp-native':
+            raise ValueError('trusted EFA requires same-build native software-fabric local proof')
         if audit != result['audit'] or audit.get('all_equal') is not True or not audit.get('databases') or not audit.get('rocksdb'):
             raise ValueError('local full-state audit is incomplete')
         for mode in ('native', 'remote'):
@@ -825,7 +828,7 @@ class SuiCampaign(Campaign):
                 config_sha256=self.external['config_sha256'], checkpoint_digest=CHECKPOINT,
                 root=str(self.cell_root / 'storage'), resource_path=str(self.cell_root / 'storage/resources.json'),
                 ready_path=str(self.cell_root / 'storage/ready'), stop_path=str(self.cell_root / 'storage/stop'))
-            if self.cell['transport'] in ('efa', 'efa-direct'):
+            if self.cell['transport'] in HARDWARE_TRANSPORTS:
                 cloud['fabric_preflight_transport'] = self.cell['transport']
             common = {k: self.cfg[k] for k in ('run_id', 'account', 'region', 'instance_type', 'deadline_utc', 'bucket', 's3_prefix')}
             common.update(cell_id=self.cell['cell_id'], transport=self.cell['transport'])
@@ -843,7 +846,8 @@ class SuiCampaign(Campaign):
     def install_node(self, node):
         # This tiny bootstrap cannot import the frozen supervisor until its own
         # per-host object is verified and safely extracted. No foreign key exists
-        # in this archive: only the selected leaf and public CA were packaged.
+        # in this archive: TLS modes package only the selected leaf/public CA;
+        # trusted native mode packages no certificate files.
         payload = dict(bucket=self.cfg['bucket'], account=self.cfg['account'], region=self.cfg['region'],
             root=str(self.root), cell_root=str(self.cell_root), key=node['payload']['key'], sha256=node['payload']['sha256'])
         code = '\n'.join([
@@ -1048,14 +1052,14 @@ class SuiCampaign(Campaign):
             identity = dict(run_id=self.cfg['run_id'], cell_id=self.cell['cell_id'],
                 instance_id=self.cfg['coordinator_instance_id'], config_sha256=self.external['config_sha256'],
                 build_manifest_sha256=self.cfg['build_manifest_sha256'])
-            if self.cell['transport'] in ('efa', 'efa-direct'):
+            if self.cell['transport'] in HARDWARE_TRANSPORTS:
                 fabric_preflight(self.results, self.cell['transport'])
                 write_json(self.results / 'efa-before.json', efa_snapshot(identity))
             self.parallel_nodes('deploy', self.install_node)
             self.parallel_nodes('initial resources', self.collect_node)
             self.replay()
             self.parallel_nodes('final cell logs/export', lambda node: self.collect_node(node, final=True, logs=True))
-            if self.cell['transport'] in ('efa', 'efa-direct'):
+            if self.cell['transport'] in HARDWARE_TRANSPORTS:
                 after = efa_snapshot(identity)
                 write_json(self.results / 'efa-after.json', after)
                 proof = efa_proof(read_json(self.results / 'efa-before.json'), after, identity)
@@ -1075,7 +1079,7 @@ class SuiCampaign(Campaign):
         self.state['complete'] = True
 
     def export(self):
-        if hasattr(self, 'cell') and self.cell['transport'] in ('efa', 'efa-direct') and (self.results / 'efa-before.json').exists() and not (self.results / 'efa-after.json').exists():
+        if hasattr(self, 'cell') and self.cell['transport'] in HARDWARE_TRANSPORTS and (self.results / 'efa-before.json').exists() and not (self.results / 'efa-after.json').exists():
             try:
                 before = read_json(self.results / 'efa-before.json')
                 write_json(self.results / 'efa-after.json', efa_snapshot(before['identity']))

@@ -55,14 +55,36 @@ pub fn prepare_external_case(
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
     }
-    let certs = tls_material::TestCertificates::generate(&directory.join("tls"), addresses.len())?;
+    let certs = if transport.is_native() {
+        None
+    } else {
+        Some(tls_material::TestCertificates::generate(
+            &directory.join("tls"),
+            addresses.len(),
+        )?)
+    };
     let rebase = |path: &Path| guest_root.join("tls").join(path.file_name().unwrap());
     let mut endpoints = Vec::new();
     for (i, (&partition, &address)) in storage.partitions.iter().zip(addresses).enumerate() {
         let local_node = directory.join(format!("node-{partition}"));
         fs::create_dir(&local_node)?;
         let node_root = guest_root.join(format!("node-{partition}"));
-        let identity = &certs.nodes[i];
+        let (ca, cert, key, server_name) = if let Some(certs) = certs.as_ref() {
+            let identity = &certs.nodes[i];
+            (
+                rebase(&certs.ca),
+                rebase(&identity.certificate),
+                rebase(&identity.private_key),
+                identity.server_name.clone(),
+            )
+        } else {
+            (
+                PathBuf::new(),
+                PathBuf::new(),
+                PathBuf::new(),
+                format!("tidehunter-node-{partition}"),
+            )
+        };
         let launch = NodeLaunch {
             node: NodeConfig {
                 root: node_root.join("storage"),
@@ -94,10 +116,10 @@ pub fn prepare_external_case(
             },
             tls: TlsFiles {
                 transport,
-                ca: rebase(&certs.ca),
-                cert: rebase(&identity.certificate),
-                key: rebase(&identity.private_key),
-                server_name: identity.server_name.clone(),
+                ca: ca.clone(),
+                cert: cert.clone(),
+                key: key.clone(),
+                server_name: server_name.clone(),
             },
             limits: TcpLimits {
                 io_timeout: Duration::from_secs(60),
@@ -116,19 +138,30 @@ pub fn prepare_external_case(
         endpoints.push(RemoteEndpoint {
             partition,
             address: address.to_string(),
-            server_name: identity.server_name.clone(),
+            server_name,
         });
     }
-    let config = RemoteDatabaseConfig {
-        storage,
-        endpoints,
-        tls: TlsFiles {
+    let client_tls = if let Some(certs) = certs.as_ref() {
+        TlsFiles {
             transport,
             ca: rebase(&certs.ca),
             cert: rebase(&certs.authority.certificate),
             key: rebase(&certs.authority.private_key),
             server_name: "unused-client-template".into(),
-        },
+        }
+    } else {
+        TlsFiles {
+            transport,
+            ca: PathBuf::new(),
+            cert: PathBuf::new(),
+            key: PathBuf::new(),
+            server_name: "unused-client-template".into(),
+        }
+    };
+    let config = RemoteDatabaseConfig {
+        storage,
+        endpoints,
+        tls: client_tls,
         timeout: Duration::from_secs(10),
         max_admitted_batches,
         max_index_bytes,
@@ -410,8 +443,14 @@ impl LoopbackCluster {
         fs::create_dir_all(data)?;
         fs::create_dir_all(evidence)?;
         let data = fs::canonicalize(data)?;
-        let certs =
-            tls_material::TestCertificates::generate(&data.join("tls"), storage.partitions.len())?;
+        let certs = if transport.is_native() {
+            None
+        } else {
+            Some(tls_material::TestCertificates::generate(
+                &data.join("tls"),
+                storage.partitions.len(),
+            )?)
+        };
         let limits = TcpLimits {
             io_timeout: Duration::from_secs(60),
             polling,
@@ -424,7 +463,22 @@ impl LoopbackCluster {
             fs::create_dir(&node_data)?;
             let node_evidence = evidence.join(format!("node-{partition}"));
             fs::create_dir(&node_evidence)?;
-            let identity = &certs.nodes[i];
+            let (ca, cert, key, server_name) = if let Some(certs) = certs.as_ref() {
+                let identity = &certs.nodes[i];
+                (
+                    certs.ca.clone(),
+                    identity.certificate.clone(),
+                    identity.private_key.clone(),
+                    identity.server_name.clone(),
+                )
+            } else {
+                (
+                    PathBuf::new(),
+                    PathBuf::new(),
+                    PathBuf::new(),
+                    format!("tidehunter-node-{partition}"),
+                )
+            };
             let launch = NodeLaunch {
                 node: NodeConfig {
                     root: node_data.join("storage"),
@@ -456,10 +510,10 @@ impl LoopbackCluster {
                 },
                 tls: TlsFiles {
                     transport,
-                    ca: certs.ca.clone(),
-                    cert: identity.certificate.clone(),
-                    key: identity.private_key.clone(),
-                    server_name: identity.server_name.clone(),
+                    ca: ca.clone(),
+                    cert: cert.clone(),
+                    key: key.clone(),
+                    server_name: server_name.clone(),
                 },
                 limits,
                 listen: "127.0.0.1:0".parse()?,
@@ -478,20 +532,31 @@ impl LoopbackCluster {
             endpoints.push(RemoteEndpoint {
                 partition,
                 address: address.to_string(),
-                server_name: identity.server_name.clone(),
+                server_name: server_name.clone(),
             });
             nodes.push(node);
         }
-        let config = RemoteDatabaseConfig {
-            storage,
-            endpoints,
-            tls: TlsFiles {
+        let client_tls = if let Some(certs) = certs {
+            TlsFiles {
                 transport,
                 ca: certs.ca,
                 cert: certs.authority.certificate,
                 key: certs.authority.private_key,
                 server_name: "unused-client-template".to_owned(),
-            },
+            }
+        } else {
+            TlsFiles {
+                transport,
+                ca: PathBuf::new(),
+                cert: PathBuf::new(),
+                key: PathBuf::new(),
+                server_name: "unused-client-template".to_owned(),
+            }
+        };
+        let config = RemoteDatabaseConfig {
+            storage,
+            endpoints,
+            tls: client_tls,
             timeout: Duration::from_secs(5),
             max_admitted_batches,
             max_index_bytes,

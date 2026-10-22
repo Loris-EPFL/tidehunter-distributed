@@ -1,19 +1,25 @@
-//! Bounded kernel-asynchronous immutable member reads; no blocking-pool fallback.
+//! Bounded nonblocking resident reads plus kernel-asynchronous immutable reads;
+//! no blocking-pool fallback.
 //!
-//! KVell §5.4 supplies the submit/poll and immediate resident-hit mechanism, not
-//! its placement or whole-database cache assumptions. Unlike its wait-for-batch
-//! io_getevents loop, ordinary progress here never waits for disk completion.
-//! Source: BLepers/KVell a6cbc0cb186c7934dc6be785225d809f62730fea,
-//! ioengine.c::read_page_async/worker_do_io and slabworker.c.
-//! io-uring 0.7.14 (MIT OR Apache-2.0), tokio-rs/io-uring
-//! ba9149010ccda85bcdf28623d9268b10dd353a93: src/squeue.rs::push_multiple
-//! requires buffers and fds alive through completion. Its IoUring::drop does NOT
+//! Resident-first reads use a small synchronous preadv2(RWF_NOWAIT) budget on
+//! already-authoritative plans. The eRPC short-handler split motivates keeping
+//! only this tightly bounded work on the serving thread; TeRM's page-residency
+//! metadata is not used as proof and its custom RDMA ODP mechanism is unrelated.
+//! NOWAIT never waits for backing storage/locks, but may return a resident prefix.
+//! https://man7.org/linux/man-pages/man2/preadv2.2.html
+//! https://github.com/erpc-io/eRPC/blob/de83dab3eab4a0fb19bfc4881c11d4a6b89ff17d/src/rpc_impl/rpc_req.cc
+//! https://github.com/thustorage/TeRM/blob/a94d44a59238d8d51266a7a2ea8bbf2daf3151d9/libterm/ibverbs-pdp/mr.cc
+//! The eRPC foreground request handler runs on its dispatch thread and limits
+//! borrowed RX-buffer lifetime to the handler; this path likewise keeps its
+//! bounded synchronous work on the executor owner and transfers owned buffers.
+//! Remaining reads use io_uring. io-uring 0.7.14 (MIT OR Apache-2.0),
+//! tokio-rs/io-uring ba9149010ccda85bcdf28623d9268b10dd353a93: src/squeue.rs
+//! requires buffers and fds alive through completion. IoUring::drop does NOT
 //! drain operations. This module owns that lifetime explicitly, including Drop.
-//! Resident-first reads follow eRPC §§3.1–3.2's short-handler/offloaded-work
-//! split, not its RAM-only workload: RWF_NOWAIT never waits for file data/locks.
-//! Linux v6.17 io_uring/rw.c::__io_read returns NOWAIT misses without reissue;
-//! only EAGAIN/EOPNOTSUPP retry once with IOSQE_ASYNC and the same owners.
-//! https://github.com/torvalds/linux/blob/v6.17/io_uring/rw.c
+// Shared across all submit_planned calls until the owner loop begins its next sweep.
+const RESIDENT_NOWAIT_MAX_CALLS: usize = 4;
+const RESIDENT_NOWAIT_MAX_BYTES: usize = 64 * 1024;
+const RESIDENT_NOWAIT_MAX_MEMBER_BYTES: usize = 16 * 1024;
 mod cache;
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
@@ -33,6 +39,8 @@ use std::io;
 use std::mem::{MaybeUninit, size_of};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+#[cfg(all(test, target_os = "linux"))]
+use std::os::unix::fs::FileExt;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -111,20 +119,20 @@ pub struct ReadExecutorStats {
     /// Retries do not add another member/byte count; these are not disk IOPS.
     pub wal_reads: u64,
     pub wal_read_bytes: u64,
-    /// RWF_NOWAIT SQEs admitted, without forced io-wq offload.
+    /// Synchronous preadv2(RWF_NOWAIT) calls on bounded resident-first reads.
     pub resident_read_attempts: u64,
-    /// Exact-length successful NOWAIT CQEs, not explicit-cache hits.
+    /// Exact-length successful NOWAIT calls; these created no SQE/CQE.
     pub resident_read_successes: u64,
-    /// NOWAIT misses, non-support or partial prefixes followed by one async read.
+    /// EAGAIN/EOPNOTSUPP/short NOWAIT results followed by exactly one async read.
     pub resident_read_fallbacks: u64,
-    /// EOPNOTSUPP subset of fallbacks. Linux can also report non-support as
-    /// EAGAIN, so zero does not establish filesystem support.
+    /// EOPNOTSUPP subset of attempted fallbacks. EAGAIN may mean unsupported too.
     pub resident_read_unsupported: u64,
-    /// Partial resident prefixes completed by asynchronously reading only the suffix.
+    /// Partial NOWAIT prefixes completed by asynchronously reading only the suffix.
     pub resident_read_partial: u64,
-    /// IOSQE_ASYNC SQEs admitted directly or after a resident fallback.
-    /// This plus resident_read_attempts counts asynchronous-executor filesystem
-    /// read submissions, NOT physical NVMe I/O or synchronous diagnostics.
+    /// Members left async because the owner-loop sweep's call/byte/member bounds expired.
+    pub resident_read_deferred: u64,
+    /// IOSQE_ASYNC reads admitted directly or after a resident fallback. Not
+    /// a count of physical NVMe I/O.
     pub async_read_submissions: u64,
     pub completed_reads: u64,
     pub errors: u64,
@@ -370,18 +378,12 @@ impl Drop for ReadBuffer {
         }
     }
 }
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ReadStage {
-    Resident,
-    Async,
-}
 struct Operation {
     request_id: u64,
     index: usize,
     reference: ValueRecordReference,
     plan: RecordReadPlan,
     buffer: Box<[MaybeUninit<u8>]>,
-    stage: ReadStage,
     /// Initialized resident prefix; no Bytes is published until the suffix completes.
     filled: usize,
 }
@@ -395,15 +397,82 @@ impl Operation {
             (self.plan.member.len - self.filled) as u32,
         )
         .offset(self.plan.member.offset + self.filled as u64);
-        match self.stage {
-            // io-uring 0.7.14 opcode::Read::rw_flags uses preadv2(2) flags.
-            // Merely dropping ASYNC would allow kernel-managed blocking retry.
-            ReadStage::Resident => read.rw_flags(libc::RWF_NOWAIT).build(),
-            ReadStage::Async => read.build().flags(squeue::Flags::ASYNC),
-        }
-        .user_data(token)
+        read.build().flags(squeue::Flags::ASYNC).user_data(token)
     }
 }
+#[cfg(target_os = "linux")]
+fn resident_preadv2(
+    plan: &RecordReadPlan,
+    buffer: &mut [MaybeUninit<u8>],
+    attempted: &mut bool,
+) -> io::Result<usize> {
+    let offset = libc::off_t::try_from(plan.member.offset)
+        .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+    let iovec = libc::iovec {
+        iov_base: buffer.as_mut_ptr().cast(),
+        iov_len: buffer.len(),
+    };
+    // SAFETY: the iovec points to this exclusively borrowed owned allocation
+    // for the duration of preadv2; the kernel initializes at most iov_len
+    // bytes. No bytes are read or exposed unless the exact requested length
+    // was returned. The plan pins the file and its immutable authorized range.
+    *attempted = true;
+    let result = unsafe {
+        libc::preadv2(
+            plan.member.file.as_raw_fd(),
+            &iovec,
+            1,
+            offset,
+            libc::RWF_NOWAIT,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(result as usize)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn resident_test_preadv2(
+    result: ResidentTestResult,
+    plan: &RecordReadPlan,
+    buffer: &mut [MaybeUninit<u8>],
+    attempted: &mut bool,
+) -> io::Result<usize> {
+    // Model a NOWAIT call result so attempt accounting follows the production path.
+    *attempted = true;
+    match result {
+        ResidentTestResult::Unsupported => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+        ResidentTestResult::Partial(read) if read > 0 && read < buffer.len() => {
+            let mut prefix = vec![0; read];
+            plan.member
+                .file
+                .read_exact_at(&mut prefix, plan.member.offset)?;
+            for (slot, byte) in buffer.iter_mut().zip(prefix) {
+                slot.write(byte);
+            }
+            Ok(read)
+        }
+        ResidentTestResult::Partial(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "test partial NOWAIT result must be a nonempty prefix",
+        )),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resident_preadv2(
+    _plan: &RecordReadPlan,
+    _buffer: &mut [MaybeUninit<u8>],
+    _attempted: &mut bool,
+) -> io::Result<usize> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "resident NOWAIT reads require Linux",
+    ))
+}
+
 const REQUEST_METADATA_BYTES: usize = 4 * (size_of::<PendingRequest>() + 2 * size_of::<u64>());
 const MEMBER_METADATA_BYTES: usize = 4
     * (size_of::<Operation>() + size_of::<Option<Bytes>>() + 4 * size_of::<u64>())
@@ -412,20 +481,28 @@ const MEMBER_METADATA_BYTES: usize = 4
 // conservative contract valid if internal owner layouts change on any target.
 const _: () = assert!(REQUEST_METADATA_BYTES <= 4096 && MEMBER_METADATA_BYTES <= 4096);
 
+#[cfg(all(test, target_os = "linux"))]
+enum ResidentTestResult {
+    Unsupported,
+    Partial(usize),
+}
+
 pub(crate) struct ReadExecutor {
     #[cfg(target_os = "linux")]
     ring: IoUring,
     #[cfg(target_os = "linux")]
     entries: Vec<squeue::Entry>,
     #[cfg(all(test, target_os = "linux"))]
-    submit_errors: std::collections::VecDeque<i32>,
+    resident_test_results: std::collections::VecDeque<ResidentTestResult>,
     #[cfg(all(test, target_os = "linux"))]
-    completion_results: std::collections::VecDeque<(ReadStage, i32)>,
+    submit_errors: std::collections::VecDeque<i32>,
     admission: Arc<ReadAdmission>,
     config: ReadExecutorConfig,
     requests: HashMap<u64, PendingRequest>,
     operations: HashMap<u64, Operation>,
     next_token: u64,
+    resident_calls_remaining: usize,
+    resident_bytes_remaining: usize,
     closed: bool,
     failed: bool,
 }
@@ -451,19 +528,28 @@ impl ReadExecutor {
             Ok(Self {
                 ring,
                 entries: Vec::with_capacity(config.max_device_reads),
-                #[cfg(test)]
+                #[cfg(all(test, target_os = "linux"))]
+                resident_test_results: std::collections::VecDeque::new(),
+                #[cfg(all(test, target_os = "linux"))]
                 submit_errors: std::collections::VecDeque::new(),
-                #[cfg(test)]
-                completion_results: std::collections::VecDeque::new(),
                 admission,
                 config,
                 requests: HashMap::with_capacity(config.max_requests),
                 operations: HashMap::with_capacity(config.max_device_reads),
                 next_token: 1,
+                resident_calls_remaining: RESIDENT_NOWAIT_MAX_CALLS,
+                resident_bytes_remaining: RESIDENT_NOWAIT_MAX_BYTES,
                 closed: false,
                 failed: false,
             })
         }
+    }
+
+    /// Reset the bounded synchronous NOWAIT allowance for one owner-loop sweep.
+    /// Outstanding async operations are unaffected.
+    pub(crate) fn begin_sweep(&mut self) {
+        self.resident_calls_remaining = RESIDENT_NOWAIT_MAX_CALLS;
+        self.resident_bytes_remaining = RESIDENT_NOWAIT_MAX_BYTES;
     }
 
     #[cfg(test)]
@@ -529,35 +615,150 @@ impl ReadExecutor {
                 "read plan exceeds its reply reservation",
             ));
         }
-        let mut records = Vec::with_capacity(plans.len());
-        let mut devices = Vec::<(u64, usize)>::new();
-        let mut wal_bytes = 0u64;
-        let mut misses = 0;
-        let mut served_bytes = 0u64;
         let mut cache = self.admission.cache.lock();
         let generation = cache.generation;
-        for (reference, plan) in &plans {
-            let bytes = cache.cache.get(reference);
-            if bytes.is_none() {
-                misses += 1;
+        let mut records = plans
+            .iter()
+            .map(|(reference, _)| cache.cache.get(reference))
+            .collect::<Vec<_>>();
+        let initial_misses = records.iter().filter(|record| record.is_none()).count();
+        let cache_hits = records.len() - initial_misses;
+
+        let mut wal_bytes = 0u64;
+        let mut served_bytes = 0u64;
+        for (record, (_, plan)) in records.iter().zip(&plans) {
+            if let Some(bytes) = record {
+                served_bytes += bytes.len() as u64;
+            } else {
                 wal_bytes += plan.member.len as u64;
+            }
+        }
+        drop(cache);
+
+        // The NOWAIT budget applies only to plans already pinned and authorized
+        // by the caller. Buffers stay private until fully initialized.
+        let mut resident_buffers = if self.config.resident_first {
+            (0..plans.len()).map(|_| None).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let mut resident_attempts = 0usize;
+        let mut resident_successes = 0usize;
+        let mut resident_fallbacks = 0usize;
+        let mut resident_unsupported = 0usize;
+        let mut resident_partial = 0usize;
+        let mut resident_deferred = 0usize;
+        if self.config.resident_first {
+            for (index, (reference, plan)) in plans.iter().enumerate() {
+                if records[index].is_some() {
+                    continue;
+                }
+                let len = plan.member.len;
+                if len > RESIDENT_NOWAIT_MAX_MEMBER_BYTES
+                    || self.resident_calls_remaining == 0
+                    || self.resident_bytes_remaining < len
+                {
+                    resident_deferred += 1;
+                    continue;
+                }
+                let mut buffer = self.admission.take_buffer(len);
+
+                let mut syscall_attempted = false;
+                let result = {
+                    #[cfg(all(test, target_os = "linux"))]
+                    {
+                        if let Some(injected) = self.resident_test_results.pop_front() {
+                            resident_test_preadv2(
+                                injected,
+                                plan,
+                                &mut buffer,
+                                &mut syscall_attempted,
+                            )
+                        } else {
+                            resident_preadv2(plan, &mut buffer, &mut syscall_attempted)
+                        }
+                    }
+                    #[cfg(not(all(test, target_os = "linux")))]
+                    {
+                        resident_preadv2(plan, &mut buffer, &mut syscall_attempted)
+                    }
+                };
+                if syscall_attempted {
+                    resident_attempts += 1;
+                    self.resident_calls_remaining -= 1;
+                    self.resident_bytes_remaining -= len;
+                }
+                match result {
+                    Ok(read) if read == len => {
+                        resident_successes += 1;
+                        let bytes = Bytes::from_owner(ReadBuffer {
+                            buffer: Some(buffer),
+                            admission: Arc::downgrade(&self.admission),
+                        });
+                        records[index] = Some(bytes);
+                        let mut cache = self.admission.cache.lock();
+                        if generation != cache.generation {
+                            cache.stats.cache_bypass_generation += 1;
+                        } else if class == ReadClass::ScanNoFill {
+                            cache.stats.cache_bypass_scan += 1;
+                        } else {
+                            let CacheState { cache, stats, .. } = &mut *cache;
+                            cache.insert(*reference, records[index].as_ref().unwrap(), stats);
+                        }
+                        self.admission.state.lock().stats.completed_reads += 1;
+                    }
+                    Ok(read) => {
+                        resident_fallbacks += 1;
+                        resident_partial += usize::from(read > 0);
+                        resident_buffers[index] = Some((buffer, read));
+                    }
+                    Err(error)
+                        if matches!(
+                            error.raw_os_error(),
+                            Some(libc::EAGAIN) | Some(libc::EOPNOTSUPP)
+                        ) =>
+                    {
+                        resident_fallbacks += 1;
+                        resident_unsupported +=
+                            usize::from(error.raw_os_error() == Some(libc::EOPNOTSUPP));
+                        resident_buffers[index] = Some((buffer, 0));
+                    }
+                    Err(error) => {
+                        self.admission.return_buffer(buffer);
+                        let mut state = self.admission.state.lock();
+                        state.stats.resident_read_attempts += resident_attempts as u64;
+                        state.stats.resident_read_successes += resident_successes as u64;
+                        state.stats.resident_read_deferred += resident_deferred as u64;
+                        state.stats.errors += 1;
+                        return Err(error.into());
+                    }
+                }
+            }
+        }
+        let misses = records.iter().filter(|record| record.is_none()).count();
+        let mut devices = Vec::<(u64, usize)>::new();
+        for (index, (_, plan)) in plans.iter().enumerate() {
+            if records[index].is_none() {
                 if let Some((_, count)) = devices.iter_mut().find(|(id, _)| *id == plan.device) {
                     *count += 1;
                 } else {
                     devices.push((plan.device, 1));
                 }
-            } else if let Some(bytes) = &bytes {
-                served_bytes += bytes.len() as u64;
             }
-            records.push(bytes);
         }
-        drop(cache);
         let mut state = self.admission.state.lock();
+        state.stats.resident_read_attempts += resident_attempts as u64;
+        state.stats.resident_read_successes += resident_successes as u64;
+        state.stats.resident_read_deferred += resident_deferred as u64;
         if misses == 0 {
-            // The reply reservation and full-reference checks still apply.
-            // No SQ access, token arithmetic or device-table work on a hit.
-            state.stats.cache_hits += records.len() as u64;
+            state.stats.cache_hits += cache_hits as u64;
+
+            state.stats.cache_misses += initial_misses as u64;
             state.stats.cache_served_bytes += served_bytes;
+            state.stats.wal_reads += initial_misses as u64;
+            state.stats.wal_read_bytes += wal_bytes;
+        }
+        if misses == 0 {
             drop(state);
             return Ok(SubmitOutcome::Ready {
                 records: records.into_iter().map(Option::unwrap).collect(),
@@ -589,9 +790,6 @@ impl ReadExecutor {
         self.next_token
             .checked_add(misses as u64)
             .ok_or(StorageError::Capacity)?;
-        state.stats.cache_hits += (records.len() - misses) as u64;
-        state.stats.cache_misses += misses as u64;
-        state.stats.cache_served_bytes += served_bytes;
         state.stats.inflight_reads += misses;
         state.stats.peak_inflight_reads = state
             .stats
@@ -625,18 +823,17 @@ impl ReadExecutor {
             }
             let token = self.next_token;
             self.next_token += 1;
+            let (buffer, filled) = resident_buffers
+                .get_mut(index)
+                .and_then(Option::take)
+                .unwrap_or_else(|| (self.admission.take_buffer(plan.member.len), 0));
             let mut op = Operation {
                 request_id,
                 index,
                 reference,
-                buffer: self.admission.take_buffer(plan.member.len),
+                buffer,
                 plan,
-                stage: if self.config.resident_first {
-                    ReadStage::Resident
-                } else {
-                    ReadStage::Async
-                },
-                filled: 0,
+                filled,
             };
             #[cfg(target_os = "linux")]
             self.entries.push(op.entry(token));
@@ -660,13 +857,15 @@ impl ReadExecutor {
         }
         {
             let mut state = self.admission.state.lock();
-            state.stats.wal_reads += misses as u64;
+            state.stats.cache_hits += cache_hits as u64;
+            state.stats.cache_misses += initial_misses as u64;
+            state.stats.cache_served_bytes += served_bytes;
+            state.stats.wal_reads += initial_misses as u64;
             state.stats.wal_read_bytes += wal_bytes;
-            if self.config.resident_first {
-                state.stats.resident_read_attempts += misses as u64;
-            } else {
-                state.stats.async_read_submissions += misses as u64;
-            }
+            state.stats.resident_read_fallbacks += resident_fallbacks as u64;
+            state.stats.resident_read_unsupported += resident_unsupported as u64;
+            state.stats.resident_read_partial += resident_partial as u64;
+            state.stats.async_read_submissions += misses as u64;
         }
         self.flush()?;
         Ok(SubmitOutcome::Pending)
@@ -717,68 +916,11 @@ impl ReadExecutor {
                 break;
             };
             let token = cqe.user_data();
-            let Some(mut op) = self.operations.remove(&token) else {
+            let Some(op) = self.operations.remove(&token) else {
                 self.failed = true;
                 return Err(StorageError::Invalid("unknown read completion token"));
             };
             let result = cqe.result();
-            // Inject only after the real CQE retires kernel ownership. A
-            // positive resident injection must initialize its promised prefix.
-            #[cfg(test)]
-            let result = if self
-                .completion_results
-                .front()
-                .is_some_and(|(stage, _)| *stage == op.stage)
-            {
-                let (_, injected) = self.completion_results.pop_front().unwrap();
-                assert!(injected < op.plan.member.len as i32);
-                if op.stage == ReadStage::Resident && injected > 0 {
-                    use std::os::unix::fs::FileExt;
-                    let mut prefix = vec![0; injected as usize];
-                    op.plan
-                        .member
-                        .file
-                        .read_exact_at(&mut prefix, op.plan.member.offset)
-                        .unwrap();
-                    for (slot, byte) in op.buffer.iter_mut().zip(prefix) {
-                        slot.write(byte);
-                    }
-                }
-                injected
-            } else {
-                result
-            };
-            // NOWAIT may copy resident pages before reaching an absent page.
-            // Preserve that prefix and submit only the missing suffix.
-            let partial = result > 0 && (result as usize) < op.plan.member.len;
-            if op.stage == ReadStage::Resident
-                && (result == -libc::EAGAIN || result == -libc::EOPNOTSUPP || partial)
-            {
-                op.stage = ReadStage::Async;
-                op.filled = if partial { result as usize } else { 0 };
-                let entry = op.entry(token);
-                // The removed slot preserves table capacity; restore ownership
-                // before publishing another kernel-visible pointer.
-                self.operations.insert(token, op);
-                // A completed operation has consumed its old SQ slot. With
-                // <= max_device_reads operations and a ring at least that big,
-                // one replacement fits even if all other SQEs are still queued.
-                // SAFETY: keep the same buffer, fd/log, token and all credits.
-                // The retired CQE initializes filled bytes; the replacement
-                // targets the disjoint remaining suffix within that allocation.
-                if unsafe { self.ring.submission().push(&entry) }.is_err() {
-                    self.failed = true;
-                    return Err(StorageError::Invalid(
-                        "read fallback submission queue unexpectedly full",
-                    ));
-                }
-                let mut state = self.admission.state.lock();
-                state.stats.resident_read_fallbacks += 1;
-                state.stats.resident_read_unsupported += u64::from(result == -libc::EOPNOTSUPP);
-                state.stats.resident_read_partial += u64::from(partial);
-                state.stats.async_read_submissions += 1;
-                continue;
-            }
             let request = self
                 .requests
                 .get_mut(&op.request_id)
@@ -803,12 +945,7 @@ impl ReadExecutor {
                     buffer: Some(op.buffer),
                     admission: Arc::downgrade(&self.admission),
                 });
-                {
-                    let mut state = self.admission.state.lock();
-                    state.stats.completed_reads += 1;
-                    state.stats.resident_read_successes +=
-                        u64::from(op.stage == ReadStage::Resident);
-                }
+                self.admission.state.lock().stats.completed_reads += 1;
                 if !request.cancelled {
                     let mut state = self.admission.cache.lock();
                     if request.generation != state.generation {

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Read;
 
-pub(super) const ROOT: &str = "local-index-root-v1";
+pub(super) const ROOT: &str = "local-index-root-v2";
 #[derive(Serialize, Deserialize)]
 pub(super) struct RootPrefix {
     pub epoch: u64,
@@ -35,6 +35,13 @@ impl LocalRoot {
             .try_exists()
             .map_err(LocalDbError::component)?
         {
+            if path
+                .join("local-index-root-v1")
+                .try_exists()
+                .map_err(LocalDbError::component)?
+            {
+                return Err(LocalDbError::new("obsolete local recovery root format"));
+            }
             return Ok(None);
         }
         let root: Self = read_metadata(&path.join(ROOT)).map_err(LocalDbError::component)?;
@@ -47,7 +54,7 @@ impl LocalRoot {
                 "unordered local storage recovery prefixes",
             ));
         }
-        if root.format != 1 || Path::new(&root.image).components().count() != 1 {
+        if root.format != 2 || Path::new(&root.image).components().count() != 1 {
             return Err(LocalDbError::new("invalid local recovery root"));
         }
         let mut file = File::open(path.join(&root.image)).map_err(LocalDbError::component)?;
@@ -124,7 +131,7 @@ impl LocalDatabase {
         }
         prefixes.sort_by_key(|prefix| (prefix.epoch, prefix.partition));
         let root = LocalRoot {
-            format: 1,
+            format: 2,
             image: name.clone(),
             bytes: persisted.metadata.bytes,
             digest: persisted.metadata.digest,

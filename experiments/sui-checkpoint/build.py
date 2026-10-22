@@ -292,7 +292,7 @@ def prepare(args):
         archive.add(sources, arcname='sources')
     save(output / 'plan.json', {'schema': 1, 'source_archive_sha256': digest(output / 'sources.tar.gz'),
           'source_manifest_sha256': digest(output / 'source-manifest.json'), 'fabric': args.fabric,
-          'jobs': args.jobs, 'profile': 'release', 'protocol': 8,
+          'jobs': args.jobs, 'profile': 'release', 'protocol': 9,
           'native_features': ['typed-store/tidehunter'], 'remote_features': ['sui-node/sharded-wal' + ('-fabric' if args.fabric else '')]})
     print(output / 'plan.json')
 

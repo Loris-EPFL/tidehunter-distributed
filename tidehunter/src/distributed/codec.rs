@@ -6,35 +6,34 @@
 //! that frame can exist. CORFU's multi-object entry motivates the authority
 //! boundary, but does not supply Tidehunter's index or relocation semantics.
 //!
-//! Version 2 adds independently verifiable native members. Whole-container
-//! validation still establishes completeness at append/replay; point reads use
-//! trusted membership metadata and verify only the selected member. This keeps
-//! the paper's direct index-to-Value-WAL read path (§3) without reading sibling
-//! values or creating another permanent value representation.
+//! Version 3 frames each native member with its length and canonical IEEE CRC-32.
+//! Whole-container validation still establishes completeness at append/replay;
+//! point reads use trusted membership metadata and verify only the selected
+//! member. This keeps the paper's direct index-to-Value-WAL read path (§3)
+//! without reading sibling values or creating another permanent value representation.
 
 use super::types::{
-    BatchId, BatchVersion, MutationVersion, PayloadDigest, PhysicalValueAddress, RecordDescriptor,
-    RecordKind, ValueRecordReference,
+    BatchId, BatchVersion, MemberChecksum, MutationVersion, PayloadDigest, PhysicalValueAddress,
+    RecordDescriptor, RecordKind, ValueRecordReference,
 };
 use crate::crc::IntoBytesFixed;
 use crate::db::{MAX_KEY_LEN, WalEntry};
 use crate::key_shape::{KeyIndexing, KeyShape, KeySpace};
 use bytes::{BufMut, BytesMut};
 use minibytes::Bytes;
-use smallvec::SmallVec;
 use std::fmt;
 
-const MAGIC: &[u8; 8] = b"THBATCH2";
-pub const FORMAT_VERSION: u16 = 2;
-// magic, format, reserved, stable identity, original version, count, digest.
+const MAGIC: &[u8; 8] = b"THBATCH3";
+pub const FORMAT_VERSION: u16 = 3;
+// magic, format, reserved, stable identity, original version, count, payload digest.
 const DIGEST_OFFSET: usize = 8 + 2 + 2 + 32 + 16 + 4;
 pub(crate) const HEADER_LEN: usize = DIGEST_OFFSET + 32;
-const MEMBER_HEADER_LEN: usize = 4 + 32;
+const MEMBER_HEADER_LEN: usize = 4 + 4;
 const MIN_MEMBER_LEN: usize = MEMBER_HEADER_LEN + 2;
 const NATIVE_FRAME_MAX_EXCLUSIVE: usize = 1 << 30;
 const NATIVE_CRC_HEADER_LEN: usize = 8;
 const NATIVE_BATCH_MAX_EXCLUSIVE: u32 = 1_000_000;
-
+const MEMBER_CHECKSUM_DOMAIN: &[u8] = b"tidehunter-batch-member-v3\0";
 /// Explicit admission bounds for the experimental record API only.
 /// Native `Db` and its accepted batch sizes are unaffected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -243,24 +242,17 @@ impl CompleteBatch {
             let entry = mutation.native_entry();
             let offset = encoded.len();
             encoded.put_u32(entry.len() as u32);
-            encoded.put_slice(&[0; 32]);
+            encoded.put_u32(0);
             entry.write_into_bytes(&mut encoded);
             descriptors.push(describe_mutation(operation_index as u32, offset, mutation));
         }
-        // Independent members keep their original hashes; SIMD merely computes
-        // several at once. Bound scratch by the CPU's supported lane count.
-        for chunk in descriptors.chunks_mut(blake2b_simd::many::degree()) {
-            let digests = member_digests(chunk.iter().map(|descriptor| MemberDigestInput {
-                id,
-                version,
-                descriptor,
-                native: native_member(&encoded, descriptor),
-            }));
-            for (descriptor, digest) in chunk.iter_mut().zip(digests) {
-                descriptor.digest = digest;
-                let offset = descriptor.offset as usize;
-                encoded[offset + 4..offset + MEMBER_HEADER_LEN].copy_from_slice(&digest.0);
-            }
+        for descriptor in &mut descriptors {
+            let checksum =
+                member_checksum(id, version, descriptor, native_member(&encoded, descriptor));
+            descriptor.checksum = checksum;
+            let offset = descriptor.offset as usize;
+            encoded[offset + 4..offset + MEMBER_HEADER_LEN]
+                .copy_from_slice(&checksum.0.to_be_bytes());
         }
         let digest = record_digest(&encoded);
         encoded[DIGEST_OFFSET..HEADER_LEN].copy_from_slice(&digest.0);
@@ -332,7 +324,7 @@ impl CompleteBatch {
         };
         let count = cursor.u32()? as usize;
         check_count(count, limits)?;
-        // Every member needs bounds, digest and at least a native tag/keyspace.
+        // Every member needs bounds, checksum and at least a native tag/keyspace.
         // Check this before allocating a count-sized vector supplied by a peer.
         if count > (encoded.len() - HEADER_LEN) / MIN_MEMBER_LEN {
             return Err(CodecError::Truncated);
@@ -346,32 +338,23 @@ impl CompleteBatch {
         for operation_index in 0..count {
             let offset = cursor.position;
             let len = cursor.u32()? as usize;
-            let member_hash =
-                PayloadDigest(cursor.take(32)?.try_into().expect("checked 32-byte slice"));
+            let checksum = MemberChecksum(cursor.u32()?);
             let start = cursor.position;
             cursor.take(len)?;
             let mutation = decode_native(shape, encoded.slice(start..start + len))?;
             let mut descriptor = describe_mutation(operation_index as u32, offset, &mutation);
-            descriptor.digest = member_hash;
+            descriptor.checksum = checksum;
             mutations.push(mutation);
             descriptors.push(descriptor);
         }
         if cursor.position != encoded.len() {
             return Err(CodecError::TrailingBytes);
         }
-        for chunk in descriptors.chunks(blake2b_simd::many::degree()) {
-            let digests = member_digests(chunk.iter().map(|descriptor| MemberDigestInput {
-                id,
-                version,
-                descriptor,
-                native: native_member(&encoded, descriptor),
-            }));
-            if chunk
-                .iter()
-                .zip(digests)
-                .any(|(d, digest)| d.digest != digest)
+        for descriptor in &descriptors {
+            if descriptor.checksum
+                != member_checksum(id, version, descriptor, native_member(&encoded, descriptor))
             {
-                return Err(CodecError::DigestMismatch);
+                return Err(CodecError::ChecksumMismatch);
             }
         }
         Ok(Self {
@@ -486,54 +469,32 @@ impl CompleteBatch {
         encoded_member: Bytes,
     ) -> Result<Mutation, CodecError> {
         let native = checked_record_native(reference, &encoded_member)?;
-        if reference.descriptor.digest
-            != member_digest(
+        if reference.descriptor.checksum
+            != member_checksum(
                 reference.batch_id,
                 reference.batch_version,
                 &reference.descriptor,
                 native,
             )
         {
-            return Err(CodecError::DigestMismatch);
+            return Err(CodecError::ChecksumMismatch);
         }
         decode_record_mutation(shape, reference, &encoded_member)
     }
 
-    /// Verify independently addressed members with bounded SIMD hash scratch.
-    /// Every member receives the same checks as `decode_record`, even when its
-    /// batch or physical address differs from the other members. Results retain
-    /// input order and duplicates. No partial result escapes on any failure.
+    /// Verify each independently addressed member. Every member receives the
+    /// same checks as `decode_record`; results retain order and duplicates.
+    /// No partial result escapes on any failure.
     ///
     /// The caller must authenticate membership exactly as for `decode_record`.
-    /// Values share their input buffers; the caller's inputs and returned values
-    /// remain proportional to the requested output, not the SIMD scratch bound.
+    /// Values share their input buffers; no sibling bytes are read or copied.
     pub fn decode_records(
         shape: &KeyShape,
         records: &[(ValueRecordReference, Bytes)],
     ) -> Result<Vec<Mutation>, CodecError> {
-        if let [(reference, bytes)] = records {
-            return Ok(vec![Self::decode_record(shape, reference, bytes.clone())?]);
-        }
         let mut mutations = Vec::with_capacity(records.len());
-        for chunk in records.chunks(blake2b_simd::many::degree()) {
-            let inputs: Result<SmallVec<[_; blake2b_simd::many::MAX_DEGREE]>, _> = chunk
-                .iter()
-                .map(|(reference, bytes)| {
-                    Ok(MemberDigestInput {
-                        id: reference.batch_id,
-                        version: reference.batch_version,
-                        descriptor: &reference.descriptor,
-                        native: checked_record_native(reference, bytes)?,
-                    })
-                })
-                .collect();
-            let digests = member_digests(inputs?.into_iter());
-            for ((reference, bytes), digest) in chunk.iter().zip(digests) {
-                if digest != reference.descriptor.digest {
-                    return Err(CodecError::DigestMismatch);
-                }
-                mutations.push(decode_record_mutation(shape, reference, bytes)?);
-            }
+        for (reference, bytes) in records {
+            mutations.push(Self::decode_record(shape, reference, bytes.clone())?);
         }
         Ok(mutations)
     }
@@ -571,7 +532,7 @@ fn describe_mutation(operation_index: u32, offset: usize, mutation: &Mutation) -
         key_len: mutation.key().len() as u32,
         value_offset: value_offset as u32,
         value_len: value_len as u32,
-        digest: PayloadDigest([0; 32]),
+        checksum: MemberChecksum(0),
     }
 }
 
@@ -651,13 +612,13 @@ fn checked_record_native<'a>(
     }
     let mut cursor = Cursor::new(encoded_member);
     let native_len = cursor.u32()? as usize;
-    let digest = PayloadDigest(cursor.take(32)?.try_into().expect("checked 32-byte slice"));
+    let checksum = MemberChecksum(cursor.u32()?);
     let native = cursor.take(native_len)?;
     if cursor.position != encoded_member.len() {
         return Err(CodecError::TrailingBytes);
     }
-    if digest != reference.descriptor.digest {
-        return Err(CodecError::DigestMismatch);
+    if checksum != reference.descriptor.checksum {
+        return Err(CodecError::ChecksumMismatch);
     }
     Ok(native)
 }
@@ -674,7 +635,7 @@ fn decode_record_mutation(
         descriptor.offset as usize,
         &mutation,
     );
-    expected.digest = descriptor.digest;
+    expected.checksum = descriptor.checksum;
     if *descriptor != expected {
         return Err(CodecError::InvalidReference);
     }
@@ -688,10 +649,7 @@ fn native_member<'a>(encoded: &'a [u8], descriptor: &RecordDescriptor) -> &'a [u
         ..descriptor.offset as usize + descriptor.len as usize]
 }
 
-/// Same unkeyed BLAKE2b-256 as codec v2's original RustCrypto provider.
-/// Runtime SIMD detection accelerates verification without changing the digest,
-/// the integrity boundary, or requiring a CPU-specific binary. In particular,
-/// BLAKE2b with a 32-byte output is NOT truncated BLAKE2b-512.
+/// BLAKE2b-256 complete-batch hasher used for root and retry identity.
 struct PayloadHasher(blake2b_simd::State);
 
 impl PayloadHasher {
@@ -712,77 +670,39 @@ impl PayloadHasher {
     }
 }
 
-fn member_digest(
+fn member_checksum(
     id: BatchId,
     version: BatchVersion,
     descriptor: &RecordDescriptor,
     native: &[u8],
-) -> PayloadDigest {
-    let mut hash = member_hasher(id, version, descriptor);
-    hash.update(native);
-    PayloadDigest(hash.finalize())
-}
-
-fn member_hasher(
-    id: BatchId,
-    version: BatchVersion,
-    descriptor: &RecordDescriptor,
-) -> PayloadHasher {
-    // Exactly the existing v2 hash prefix, packed only to avoid thirteen small
-    // State::update calls. This is not a new digest or an on-disk structure.
-    let mut prefix = [0u8; 101];
-    prefix[..27].copy_from_slice(b"tidehunter-batch-member-v2\0");
-    prefix[27..43].copy_from_slice(&id.database);
-    prefix[43..59].copy_from_slice(&id.operation);
-    prefix[59..67].copy_from_slice(&version.epoch.to_be_bytes());
-    prefix[67..75].copy_from_slice(&version.sequence.to_be_bytes());
-    prefix[75..79].copy_from_slice(&descriptor.operation_index.to_be_bytes());
-    prefix[79..83].copy_from_slice(&descriptor.offset.to_be_bytes());
-    prefix[83..87].copy_from_slice(&descriptor.len.to_be_bytes());
-    prefix[87] = descriptor.keyspace;
-    prefix[88] = match descriptor.kind {
+) -> MemberChecksum {
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(MEMBER_CHECKSUM_DOMAIN);
+    crc.update(&id.database);
+    crc.update(&id.operation);
+    crc.update(&version.epoch.to_be_bytes());
+    crc.update(&version.sequence.to_be_bytes());
+    crc.update(&descriptor.operation_index.to_be_bytes());
+    crc.update(&descriptor.offset.to_be_bytes());
+    crc.update(&descriptor.len.to_be_bytes());
+    crc.update(&[descriptor.keyspace]);
+    crc.update(&[match descriptor.kind {
         RecordKind::Put => 1,
         RecordKind::Delete => 3,
-    };
-    prefix[89..93].copy_from_slice(&descriptor.key_len.to_be_bytes());
-    prefix[93..97].copy_from_slice(&descriptor.value_offset.to_be_bytes());
-    prefix[97..101].copy_from_slice(&descriptor.value_len.to_be_bytes());
+    }]);
+    crc.update(&descriptor.key_len.to_be_bytes());
+    crc.update(&descriptor.value_offset.to_be_bytes());
+    crc.update(&descriptor.value_len.to_be_bytes());
+    crc.update(native);
+    MemberChecksum(crc.finalize())
+}
+
+fn record_digest(encoded: &[u8]) -> PayloadDigest {
     let mut hash = PayloadHasher::new();
-    hash.update(prefix);
-    hash
-}
-
-struct MemberDigestInput<'a> {
-    id: BatchId,
-    version: BatchVersion,
-    descriptor: &'a RecordDescriptor,
-    native: &'a [u8],
-}
-
-fn member_digests<'a>(
-    mut inputs: impl ExactSizeIterator<Item = MemberDigestInput<'a>>,
-) -> SmallVec<[PayloadDigest; blake2b_simd::many::MAX_DEGREE]> {
-    assert!(inputs.len() <= blake2b_simd::many::MAX_DEGREE);
-    if inputs.len() == 1 {
-        let input = inputs.next().expect("one member");
-        return smallvec::smallvec![member_digest(
-            input.id,
-            input.version,
-            input.descriptor,
-            input.native,
-        )];
-    }
-    let mut states: SmallVec<[_; blake2b_simd::many::MAX_DEGREE]> = SmallVec::new();
-    let mut native: SmallVec<[_; blake2b_simd::many::MAX_DEGREE]> = SmallVec::new();
-    for input in inputs {
-        states.push(member_hasher(input.id, input.version, input.descriptor));
-        native.push(input.native);
-    }
-    blake2b_simd::many::update_many(states.iter_mut().map(|s| &mut s.0).zip(native));
-    states
-        .into_iter()
-        .map(|state| PayloadDigest(state.finalize()))
-        .collect()
+    hash.update(b"tidehunter-complete-batch-v2\0");
+    hash.update(&encoded[..DIGEST_OFFSET]);
+    hash.update(&encoded[HEADER_LEN..]);
+    PayloadDigest(hash.finalize())
 }
 
 fn check_count(count: usize, limits: BatchLimits) -> Result<(), CodecError> {
@@ -868,14 +788,6 @@ fn validate_mutation(shape: &KeyShape, mutation: &Mutation) -> Result<(), CodecE
     Ok(())
 }
 
-fn record_digest(encoded: &[u8]) -> PayloadDigest {
-    let mut hash = PayloadHasher::new();
-    hash.update(b"tidehunter-complete-batch-v2\0");
-    hash.update(&encoded[..DIGEST_OFFSET]);
-    hash.update(&encoded[HEADER_LEN..]);
-    PayloadDigest(hash.finalize())
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CodecError {
     InvalidLimits,
@@ -885,12 +797,20 @@ pub enum CodecError {
     InvalidFormat,
     InvalidMutation,
     InvalidReference,
+    /// Whole-batch BLAKE2b payload digest mismatch.
     DigestMismatch,
+    /// Per-member canonical CRC-32 mismatch.
+    ChecksumMismatch,
     TrailingBytes,
     UnknownKeySpace(u8),
     DestroyedKeySpace(u8),
-    InvalidKeyLength { keyspace: u8, actual: usize },
-    InvalidRouting { keyspace: u8 },
+    InvalidKeyLength {
+        keyspace: u8,
+        actual: usize,
+    },
+    InvalidRouting {
+        keyspace: u8,
+    },
 }
 
 impl fmt::Display for CodecError {
@@ -995,7 +915,13 @@ mod tests {
         let validated = CompleteBatch::validated_mutations(&shape(), &mutations, limits()).unwrap();
         let prepared = validated.encode(identity(), version()).unwrap();
         let ordinary = batch(mutations.clone());
-        assert_eq!(prepared.encoded(), ordinary.encoded());
+        let mut legacy = prepared.encoded().to_vec();
+        legacy[..8].copy_from_slice(b"THBATCH2");
+        legacy[8..10].copy_from_slice(&2u16.to_be_bytes());
+        assert_eq!(
+            CompleteBatch::decode(&shape(), with_valid_digest(legacy), limits()).unwrap_err(),
+            CodecError::InvalidFormat
+        );
         assert_eq!(prepared.digest(), ordinary.digest());
         assert_eq!(validated.encoded_len(), prepared.encoded().len());
         let mut corrupt = prepared.encoded().to_vec();
@@ -1128,7 +1054,7 @@ mod tests {
     }
 
     #[test]
-    fn simd_digest_matches_original_provider_across_block_and_update_boundaries() {
+    fn payload_hasher_matches_blake2b256_across_update_boundaries() {
         use blake2::{Blake2b, Digest, digest::consts::U32};
 
         for len in [0, 1, 31, 32, 63, 64, 127, 128, 129, 255, 256, 1024, 8192] {
@@ -1145,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn codec_v2_members_and_batches_keep_original_blake2b_256_digests() {
+    fn codec_v3_batches_preserve_the_complete_payload_digest() {
         use blake2::{Blake2b, Digest, digest::consts::U32};
 
         for len in [0, 1, 127, 128, 129, 1024, 8192] {
@@ -1175,32 +1101,6 @@ mod tests {
                 };
                 let batch =
                     CompleteBatch::new(&shape(), identity(), version(), mutations, bounds).unwrap();
-
-                // Reconstruct the v2 member digest inputs independently of the new
-                // provider wrapper, including identity, order and physical bounds.
-                for d in batch.record_descriptors() {
-                    let mut input = Vec::from(&b"tidehunter-batch-member-v2\0"[..]);
-                    input.extend_from_slice(&batch.id().database);
-                    input.extend_from_slice(&batch.id().operation);
-                    input.extend_from_slice(&batch.version().epoch.to_be_bytes());
-                    input.extend_from_slice(&batch.version().sequence.to_be_bytes());
-                    input.extend_from_slice(&d.operation_index.to_be_bytes());
-                    input.extend_from_slice(&d.offset.to_be_bytes());
-                    input.extend_from_slice(&d.len.to_be_bytes());
-                    input.push(d.keyspace);
-                    input.push(match d.kind {
-                        RecordKind::Put => 1,
-                        RecordKind::Delete => 3,
-                    });
-                    input.extend_from_slice(&d.key_len.to_be_bytes());
-                    input.extend_from_slice(&d.value_offset.to_be_bytes());
-                    input.extend_from_slice(&d.value_len.to_be_bytes());
-                    let start = d.offset as usize + MEMBER_HEADER_LEN;
-                    let end = d.offset as usize + d.len as usize;
-                    input.extend_from_slice(&batch.encoded()[start..end]);
-                    let old_digest: [u8; 32] = Blake2b::<U32>::digest(&input).into();
-                    assert_eq!(d.digest.0, old_digest);
-                }
 
                 let mut old_batch = Blake2b::<U32>::new();
                 old_batch.update(b"tidehunter-complete-batch-v2\0");
@@ -1358,7 +1258,7 @@ mod tests {
         let mut cursor = Cursor::new(&payload[HEADER_LEN..]);
         for mutation in original.mutations() {
             let len = cursor.u32().unwrap() as usize;
-            cursor.take(32).unwrap();
+            cursor.take(4).unwrap();
             let native = WalEntry::from_bytes(cursor.take(len).unwrap().to_vec().into());
             match (native, mutation) {
                 (
@@ -1687,8 +1587,7 @@ mod tests {
                 );
             }
         }
-        // Exercise every lane and incomplete final SIMD group. No partial Vec
-        // may escape even when the corrupted member follows successful groups.
+        // No partial Vec may escape when a later member fails.
         for bad in 0..records.len() {
             let mut input = records.clone();
             let mut bytes = input[bad].1.to_vec();
@@ -1716,6 +1615,12 @@ mod tests {
                 CompleteBatch::decode_record(&shape(), &reference, member.slice(..end)).is_err()
             );
         }
+        let mut corrupt = member.to_vec();
+        corrupt[MEMBER_HEADER_LEN] ^= 1;
+        assert_eq!(
+            CompleteBatch::decode_record(&shape(), &reference, corrupt.into()).unwrap_err(),
+            CodecError::ChecksumMismatch
+        );
         for byte in 0..member.len() {
             let mut corrupt = member.to_vec();
             corrupt[byte] ^= 1;
@@ -1723,8 +1628,8 @@ mod tests {
         }
         // Same-key, same-value records are still distinct logical operations.
         assert_ne!(
-            original.record_descriptors()[0].digest,
-            original.record_descriptors()[1].digest
+            original.record_descriptors()[0].checksum,
+            original.record_descriptors()[1].checksum
         );
         assert!(
             CompleteBatch::decode_record(

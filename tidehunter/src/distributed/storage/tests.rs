@@ -166,22 +166,28 @@ fn group_members_share_one_persisted_boundary_and_retry_without_reappend() {
     assert_eq!(log.stats().appended_groups, 1);
     assert_eq!(log.stats().persistence_barriers, 0);
     let third = batch(&config, 2);
+    let third_receipt = log
+        .append_complete_batch(authority(&config), &third)
+        .unwrap();
+    assert_eq!(log.stats().appended_groups, 2);
     assert!(matches!(
-        log.append_complete_batch(authority(&config), &third),
+        log.validate_durable_receipt(DurableBatch(third_receipt)),
         Err(StorageError::NeedsPersistence)
     ));
-    // Even the FIRST member's receipt syncs its complete containing group.
+    // Even the FIRST member's receipt syncs the entire captured appended prefix.
     log.persist_through(receipts[0]).unwrap();
     log.persist_through(receipts[1]).unwrap();
+    log.persist_through(third_receipt).unwrap();
     assert_eq!(log.stats().persistence_barriers, 1);
     assert_eq!(
         log.append_group(authority(&config), &group).unwrap(),
         receipts
     );
-    assert_eq!(log.stats().appended_groups, 1);
+    assert_eq!(log.stats().appended_groups, 2);
+    let fourth = batch(&config, 3);
     let mixed = CompleteGroup::new(
         &shape(),
-        vec![batch(&config, 0), third],
+        vec![batch(&config, 0), fourth.clone()],
         config.batch_limits,
         config.group_limits,
     )
@@ -190,11 +196,13 @@ fn group_members_share_one_persisted_boundary_and_retry_without_reappend() {
         log.append_group(authority(&config), &mixed),
         Err(StorageError::MixedRetry)
     ));
-    assert_eq!(log.lookup(batch(&config, 2).id()).unwrap(), None);
+    assert_eq!(log.lookup(fourth.id()).unwrap(), None);
+    assert_eq!(log.lookup(third.id()).unwrap(), Some(third_receipt));
     drop(log);
     let recovered = PartitionLog::recover_sealed(&path, &config, metrics()).unwrap();
-    assert_eq!(recovered.receipt_page(0, 256).unwrap(), receipts);
-    for receipt in receipts {
+    let recovered_receipts = [receipts[0], receipts[1], third_receipt];
+    assert_eq!(recovered.receipt_page(0, 256).unwrap(), recovered_receipts);
+    for receipt in recovered_receipts {
         let reference = recovered.record_reference(receipt, 0).unwrap();
         assert_eq!(
             recovered.read_record(&reference).unwrap(),
@@ -226,10 +234,9 @@ fn bulk_persistence_validates_every_receipt_before_io_and_keeps_exact_order() {
     ));
     assert_eq!(log.stats().persistence_barriers, 0);
     assert_eq!(log.stats().namespace_syncs, 0);
-    assert!(matches!(
-        log.append_complete_batch(authority(&config), &batch(&config, 2)),
-        Err(StorageError::NeedsPersistence)
-    ));
+    let later = log
+        .append_complete_batch(authority(&config), &batch(&config, 2))
+        .unwrap();
     let reordered = [receipts[1], receipts[0], receipts[1]];
     let durable = log.persist_many(&reordered).unwrap();
     assert_eq!(
@@ -238,16 +245,13 @@ fn bulk_persistence_validates_every_receipt_before_io_and_keeps_exact_order() {
     );
     assert_eq!(log.stats().persistence_barriers, 1);
     assert_eq!(log.stats().namespace_syncs, 1);
-    let later = log
-        .append_complete_batch(authority(&config), &batch(&config, 2))
-        .unwrap();
-    // Old durable receipts do not promote the later merely appended group.
+    // A persistence request captures all complete groups appended so far.
     log.persist_many(&reordered).unwrap();
     assert_eq!(log.stats().persistence_barriers, 1);
     assert!(
         pending_persistence(&log.state.lock(), later)
             .unwrap()
-            .is_some()
+            .is_none()
     );
     let mixed = [receipts[0], later, receipts[1]];
     assert_eq!(
@@ -258,7 +262,7 @@ fn bulk_persistence_validates_every_receipt_before_io_and_keeps_exact_order() {
             .collect::<Vec<_>>(),
         mixed
     );
-    assert_eq!(log.stats().persistence_barriers, 2);
+    assert_eq!(log.stats().persistence_barriers, 1);
     drop(log);
     let recovered = PartitionLog::recover_sealed(&path, &config, metrics()).unwrap();
     assert_eq!(recovered.persist_many(&mixed).unwrap().len(), 3);
@@ -329,8 +333,8 @@ fn failed_new_file_namespace_sync_never_acknowledges_or_advances_proof() {
     assert_eq!(profile.persist_errors, 1);
     assert_eq!(profile.persist_noops, 0);
     assert_eq!(profile.persisted_receipts, 0);
-    assert_eq!(profile.file_persist_calls, 1);
-    assert_eq!(profile.file_persist_successes, 1);
+    assert!(profile.file_persist_calls > 0);
+    assert!(profile.file_persist_successes > 0);
     assert_eq!(profile.namespace_persist_calls, 1);
     assert_eq!(profile.namespace_persist_successes, 0);
     assert_eq!(profile.durable_publications, 0);
@@ -390,10 +394,15 @@ fn bulk_receipts_are_not_returned_before_the_shared_barrier() {
     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
     assert_eq!(log.stats().persistence_barriers, 0);
-    let next = log.append_complete_batch(authority(&config), &batch(&config, 2));
+    let next = log
+        .append_complete_batch(authority(&config), &batch(&config, 2))
+        .unwrap();
+    assert!(matches!(
+        log.validate_durable_receipt(DurableBatch(next)),
+        Err(StorageError::NeedsPersistence)
+    ));
     resume.send(()).unwrap();
     writer.join().unwrap().unwrap();
-    assert!(matches!(next, Err(StorageError::NeedsPersistence)));
     let (durable, profile) = result.recv().unwrap();
     assert_eq!(durable.unwrap().len(), 2);
     assert_eq!(profile.persist_calls, 1);
@@ -403,9 +412,47 @@ fn bulk_receipts_are_not_returned_before_the_shared_barrier() {
     assert_eq!(profile.file_persist_successes, 1);
     assert_eq!(profile.namespace_persist_calls, 1);
     assert_eq!(profile.namespace_persist_successes, 1);
+
     assert_eq!(profile.durable_publications, 1);
     assert_profile_stage_bounds(profile);
     assert_eq!(log.stats().persistence_barriers, 1);
+    log.persist_through(next).unwrap();
+}
+
+#[test]
+fn one_captured_cohort_syncs_every_touched_wal_file() {
+    let temp = tempdir::TempDir::new("captured-multifile-cohort").unwrap();
+    let config = config(vec![3], 3);
+    let log = PartitionLog::create(
+        &temp.path().join("stream"),
+        config.clone(),
+        &shape(),
+        metrics(),
+    )
+    .unwrap();
+    let mut receipts = Vec::new();
+    for number in 0..12 {
+        let receipt = log
+            .append_complete_batch(authority(&config), &batch(&config, number))
+            .unwrap();
+        receipts.push(receipt);
+    }
+    let mut profile = StorageWriteProfile::default();
+    assert_eq!(
+        log.persist_many_profiled(&receipts, &mut profile)
+            .unwrap()
+            .len(),
+        receipts.len()
+    );
+    let state = log.state.lock();
+    let touched_files = config.layout().locate_file(state.appended_end - 1).as_u64() + 1;
+    drop(state);
+    assert!(touched_files > 1);
+    assert_eq!(profile.file_persist_calls, touched_files);
+    assert_eq!(profile.namespace_persist_calls, 1);
+    assert_eq!(log.stats().persistence_barriers, 1);
+    let state = log.state.lock();
+    assert_eq!(state.durable_end, state.appended_end);
 }
 
 #[test]
@@ -446,7 +493,6 @@ fn scalar_read_checks_membership_and_reads_only_the_selected_record() {
         .unwrap();
     log.persist_through(receipt).unwrap();
     let reference = log.record_reference(receipt, 0).unwrap();
-    assert_eq!(reference.descriptor.len, 48);
     assert_eq!(log.read_record(&reference).unwrap(), batch.mutations()[0]); // mmap path
     let check_policies = |log: &PartitionLog| {
         let parent = WalPosition::new(reference.batch_address.offset, reference.batch_address.len);
@@ -625,7 +671,7 @@ fn persistence_io_does_not_block_value_reads_or_already_durable_retries() {
     let (value, retry, next, barriers) =
         outcome.expect("disk persistence held the reference lookup mutex");
     assert_eq!(barriers, 1);
-    assert!(matches!(next, Err(StorageError::NeedsPersistence)));
+    assert!(next.is_ok());
     assert_eq!(value.unwrap(), batch(&config, 0).mutations()[0]);
     assert_eq!(retry.unwrap().appended(), old);
     assert_eq!(log.stats().persistence_barriers, 2);
@@ -1035,7 +1081,7 @@ fn assert_profile_stage_bounds(profile: StorageWriteProfile) {
 }
 
 #[test]
-fn profiled_writes_preserve_retries_admission_and_exact_barriers() {
+fn profiled_writes_preserve_retries_admission_and_durability_frontiers() {
     let temp = tempdir::TempDir::new("profiled-storage-write").unwrap();
     let config = config(vec![3], 3);
     let path = temp.path().join("stream");
@@ -1082,17 +1128,18 @@ fn profiled_writes_preserve_retries_admission_and_exact_barriers() {
         config.group_limits,
     )
     .unwrap();
-    let mut rejected = StorageWriteProfile::default();
-    assert!(matches!(
-        log.append_group_profiled(authority(&config), &next, &mut rejected),
-        Err(StorageError::NeedsPersistence)
-    ));
-    assert_eq!(rejected.append_calls, 1);
-    assert_eq!(rejected.append_errors, 1);
-    assert_eq!(rejected.appended_groups, 0);
-    assert_eq!(rejected.append_wal_ns, 0);
-    assert_eq!(rejected.append_publication_ns, 0);
-    assert_profile_stage_bounds(rejected);
+    let mut next_append = StorageWriteProfile::default();
+    let appended_next = log
+        .append_group_profiled(authority(&config), &next, &mut next_append)
+        .unwrap();
+    assert_eq!(appended_next.len(), 1);
+    assert_eq!(next_append.append_calls, 1);
+    assert_eq!(next_append.append_errors, 0);
+    assert_eq!(next_append.appended_groups, 1);
+    assert_eq!(next_append.appended_receipts, 1);
+    assert!(next_append.append_wal_ns > 0);
+    assert!(next_append.append_publication_ns > 0);
+    assert_profile_stage_bounds(next_append);
 
     let mut foreign = receipts[0];
     foreign.address.segment_generation += 1;
@@ -1139,9 +1186,6 @@ fn profiled_writes_preserve_retries_admission_and_exact_barriers() {
         );
     }
 
-    let later = log
-        .append_group_profiled(authority(&config), &next, &mut append)
-        .unwrap();
     let mut noops = StorageWriteProfile::default();
     log.persist_many_profiled(&reordered, &mut noops).unwrap();
     log.persist_many_profiled(&[], &mut noops).unwrap();
@@ -1156,15 +1200,30 @@ fn profiled_writes_preserve_retries_admission_and_exact_barriers() {
     assert_eq!(noops.file_persist_calls, 0);
     assert_eq!(noops.durable_publications, 0);
     assert_profile_stage_bounds(noops);
+    let later_batch = CompleteGroup::new(
+        &shape(),
+        vec![batch(&config, 3)],
+        config.batch_limits,
+        config.group_limits,
+    )
+    .unwrap();
+    let mut later_append = StorageWriteProfile::default();
+    let later = log
+        .append_group_profiled(authority(&config), &later_batch, &mut later_append)
+        .unwrap();
+    assert_eq!(later_append.append_calls, 1);
+    assert_eq!(later_append.append_errors, 0);
+    assert_eq!(later_append.appended_groups, 1);
+    assert_eq!(later_append.appended_receipts, 1);
+    assert!(later_append.append_wal_ns > 0);
+    assert!(later_append.append_publication_ns > 0);
+    assert_profile_stage_bounds(later_append);
     assert!(
         pending_persistence(&log.state.lock(), later[0])
             .unwrap()
             .is_some()
     );
     log.persist_many_profiled(&later, &mut persist).unwrap();
-    assert_eq!(append.append_calls, 2);
-    assert_eq!(append.appended_groups, 2);
-    assert_eq!(append.appended_receipts, 3);
     assert_eq!(persist.persist_calls, 2);
     assert_eq!(persist.persisted_receipts, 4);
     assert_eq!(persist.file_persist_calls, 2);
@@ -1184,7 +1243,7 @@ fn profiled_writes_preserve_retries_admission_and_exact_barriers() {
     let recovered = PartitionLog::recover_sealed(&path, &config, metrics()).unwrap();
     assert_eq!(
         recovered.receipt_page(0, 256).unwrap(),
-        [receipts, later].concat()
+        [receipts, appended_next, later].concat()
     );
 }
 

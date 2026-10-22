@@ -17,6 +17,10 @@ spec = importlib.util.spec_from_file_location(
 local = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(local)
 MIB = 1024 * 1024
+READ_COUNTERS = ("cache_hits", "cache_misses", "cache_evictions", "wal_reads", "wal_read_bytes",
+                 "resident_read_attempts", "resident_read_successes", "resident_read_fallbacks",
+                 "resident_read_unsupported", "resident_read_partial", "resident_read_deferred",
+                 "async_read_submissions")
 
 
 def digest(path):
@@ -92,7 +96,8 @@ def read_path_evidence(path, case):
             if row["role"] == "storage" and not 0 <= int(row[field]) <= limit:
                 raise ValueError(f"shard read admission bound exceeded: {path}: {field}")
     output = {}
-    counters = ("cache_hits", "cache_misses", "cache_evictions", "wal_reads", "wal_read_bytes")
+    counters = READ_COUNTERS[:5] + tuple(
+        counter for counter in READ_COUNTERS[5:] if snapshots and counter in snapshots[0])
     for phase, boundaries in phases.items():
         if set(boundaries) != {"before", "after"} or any(set(rows) != expected for rows in boundaries.values()):
             raise ValueError(f"incomplete read-path evidence: {path}: {phase}")
@@ -155,6 +160,7 @@ def collect(path, case, value_bytes, repetition, reads):
                          backend=row["backend"], phase=row["phase"],
                          cache_bytes=case["cache"], read_window=case["read_window"],
                          wal_member_read=case.get("policy") if case["backend"] == "tcp" else "native",
+                         resident_first=case.get("resident_first") if case["backend"] == "tcp" else None,
                          shard_cache_bytes=case.get("shard_cache", 0),
                          native_read_workers=case.get("native_workers", 1),
                          read_lanes=case.get("lanes") if case["backend"] == "tcp" else None,
@@ -166,7 +172,7 @@ def collect(path, case, value_bytes, repetition, reads):
                             for key in ("physical_read_bytes", "minor_faults", "major_faults")},
                          **{f"{role}_{counter}": paths.get(row["phase"], {}).get(f"{role}_{counter}")
                             for role in ("frontend", "storage")
-                            for counter in ("cache_hits", "cache_misses", "cache_evictions", "wal_reads", "wal_read_bytes")}))
+                            for counter in READ_COUNTERS}))
     return rows
 
 
@@ -175,7 +181,8 @@ def main():
     parser.add_argument("--candidate", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--suite", choices=("all", "cold", "warm", "pressure", "resident"), default="all")
-    parser.add_argument("--transport", choices=("tcp", "fabric-tcp"), default="tcp")
+    parser.add_argument("--transport", choices=("tcp", "fabric-tcp", "fabric-tcp-native"), default="tcp")
+    parser.add_argument("--resident-first", choices=("true", "false"), default="true")
     parser.add_argument("--values", default="1024,8192")
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--batches", type=int, default=320)
@@ -193,6 +200,8 @@ def main():
     identity = digest(binary)
     cases = configurations(args.suite)
     for case in cases:
+        if case["backend"] == "tcp":
+            case["resident_first"] = args.resident_first == "true" and case["policy"] == "async"
         combined_cache = case["cache"] + 5 * case.get("shard_cache", 0)
         if case.get("pressure") and min(values) * args.batches * 32 <= 4 * combined_cache:
             raise ValueError("cache-pressure dataset must exceed combined application caches by 4x")
@@ -238,7 +247,8 @@ def main():
                     flags += ["--tcp-read-lanes", str(case["lanes"]),
                               "--tcp-server-read-workers", str(case["workers"]),
                               "--tcp-wal-member-read", case["policy"],
-                              "--tcp-shard-cache-bytes", str(case.get("shard_cache", 0))]
+                              "--tcp-shard-cache-bytes", str(case.get("shard_cache", 0)),
+                              "--tcp-resident-first", str(case["resident_first"]).lower()]
                 local.run([timeout, "--signal=TERM", "--kill-after=5s", "600s",
                            str(binary), "--output", str(output), *flags], output)
                 rows.extend(collect(output, case, value, repetition, args.reads))

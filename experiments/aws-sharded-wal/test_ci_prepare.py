@@ -81,8 +81,11 @@ class PreparationAdmissionTests(unittest.TestCase):
             audit = {'all_equal': True, 'databases': {'db': True}, 'rocksdb': {'db': True}}
             (source / 'receipt.json').write_text(json.dumps({'complete': True, 'evidence_sha256': evidence_sha}))
             (source / 'experiment/audit.json').write_text(json.dumps(audit))
-            for change in ({'complete': False}, {'external_manifest': {'transport': 'efa'}}, {'topology': 'six AWS hosts'}):
-                result = {'complete': True, 'topology': 'five-process loopback', 'audit': audit} | change
+            for change in ({'complete': False}, {'external_manifest': {'transport': 'efa'}},
+                           {'topology': 'six AWS hosts'}, {'local_transport': 'tcp'},
+                           {'local_transport': 'fabric-tcp'}, {'local_transport': None}):
+                result = {'complete': True, 'topology': 'five-process loopback',
+                          'local_transport': 'fabric-tcp-native', 'audit': audit} | change
                 (source / 'experiment/results.json').write_text(json.dumps(result))
                 with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'loopback replay'):
                     ci_prepare.verification_bundle(source, root / 'verification')
@@ -134,7 +137,7 @@ class FrozenSourceRestoreTests(unittest.TestCase):
             commands.append(dict(label=name, sha256=ci_prepare.sha(binary),
                 log_sha256=ci_prepare.sha(log), messages_sha256=ci_prepare.sha(messages),
                 started_ns=1, finished_ns=2))
-        manifest = dict(protocol=8, fabric=True, commands=commands,
+        manifest = dict(protocol=9, fabric=True, commands=commands,
             binaries={path.name: ci_prepare.sha(path) for path in binaries.iterdir()},
             source_archive_sha256=ci_prepare.sha(build / 'sources.tar.gz'),
             source_manifest_sha256=ci_prepare.sha(build / 'source-manifest.json'))
@@ -171,7 +174,7 @@ class FrozenSourceRestoreTests(unittest.TestCase):
         result = dict(bindings, complete=True, binaries=manifest['binaries'],
             checkpoint_digest=ci_prepare.CHECKPOINT, checkpoint_limit=ci_prepare.TIP,
             source_range=source_range, fixture_files=fixture_files,
-            topology='five-process loopback', audit=audit,
+            topology='five-process loopback', local_transport='fabric-tcp-native', audit=audit,
             native={'completed_checkpoint_digest': ci_prepare.CHECKPOINT},
             remote={'completed_checkpoint_digest': ci_prepare.CHECKPOINT})
         ci_prepare.save(experiment / 'results.json', result)
