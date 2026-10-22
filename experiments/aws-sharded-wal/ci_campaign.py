@@ -358,6 +358,9 @@ class AWS:
         # Retry transient Lambda throttling without replaying EC2 mutation requests.
         self.lambda_readiness_config = self.config.merge(Config(
             retries={'mode': 'standard', 'total_max_attempts': 12}))
+        # Price List calls are read-only; throttling must not replay EC2 mutations.
+        self.pricing_config = self.config.merge(Config(
+            retries={'mode': 'standard', 'total_max_attempts': 6}))
         # S3 may lose a response after committing a conditional write. Journal
         # readback confirms identical bytes; EC2 mutations still get one attempt.
         self.s3_config = self.config.merge(Config(
@@ -369,6 +372,8 @@ class AWS:
         if key not in self.clients:
             if service == 'lambda':
                 config = self.lambda_readiness_config
+            elif service == 'pricing':
+                config = self.pricing_config
             elif service == 's3':
                 config = self.s3_config
             else:
