@@ -91,7 +91,9 @@ def plan(options, transports):
                 cases.append(dict(shape=list(shape), repetition=options['repetitions'], transport=transport,
                                   cold=True, cached=False, diagnostics=True,
                                   authority_resident_batches=None))
-    return cases
+    # Prioritize the same bounded diagnostic cases; preserve every clean case's order.
+    return [case for case in cases if case['diagnostics']] + [
+        case for case in cases if not case['diagnostics']]
 
 
 def validate_contention(path, spec, mode):
@@ -556,6 +558,135 @@ def validate_cold_probe_storage(evidence, certificate, partition):
         raise ValueError('cold auxiliary requested reads lack storage read-peer DATA posts')
 
 
+def validate_diagnostic_evidence(directory, spec, mode, owner_partitions):
+    """Admit the producer's separate clock populations, never clean latency rows."""
+    directory = Path(directory)
+    native = mode == 'native-sync'
+    backend = 'native_value_wal_barrier' if native else TRANSPORT_BACKENDS[spec['transport']]
+    identity = dict(zip(('value_bytes', 'batch_size', 'window'), spec['shape']))
+    identity.update(backend=backend, repetition=0)
+    # These producers have no transport column: the exact backend label binds it.
+    def same_case(row, csv_row=False):
+        return isinstance(row, dict) and all(
+            row.get(key) == (str(value) if csv_row else value)
+            and (csv_row or not isinstance(value, int) or type(row.get(key)) is int)
+            for key, value in identity.items())
+
+    native_fields = ('index_ns', 'wal_and_decode_ns', 'whole_call_ns')
+    remote_fields = (
+        'index_ns', 'dispatch_ns', 'wait_ns', 'actor_queue_ns', 'actor_service_ns',
+        'actor_return_ns', 'request_encode_ns', 'exchange_ns', 'response_decode_ns',
+        'record_verify_ns', 'server_handler_ns', 'server_inventory_wait_ns',
+        'server_authority_lookup_ns', 'server_record_read_ns', 'cache_hits', 'cache_misses',
+        'whole_call_ns', 'inline_read_ns', 'server_response_recheck_wait_ns',
+        'server_response_recheck_ns', 'server_response_recheck_samples',
+        'server_response_recheck_deferrals')
+    count = min(spec.get('workload_reads') or 4096, 256)
+    reopened = 'reopened-warm' if native else 'reopened-cache-cleared'
+    states = ['warm'] + (['cache-evicted'] if spec['cold'] else []) + [reopened]
+    for filename, applicable, fields in (
+            ('native_read_profiles.csv', native, native_fields),
+            ('remote_read_profiles.csv', not native, remote_fields)):
+        with (directory / filename).open() as stream:
+            reader = csv.DictReader(stream)
+            required = {*identity, 'state', 'sample', *fields}
+            if filename == 'native_read_profiles.csv':
+                required.add('value_cache_hit')
+            if (reader.fieldnames is None or len(set(reader.fieldnames)) != len(reader.fieldnames)
+                    or not required <= set(reader.fieldnames)):
+                raise ValueError('diagnostic read profile schema is missing or ambiguous')
+            rows = list(islice(reader, count * len(states) + 1))
+        if not applicable:
+            if rows:
+                raise ValueError('diagnostic profile contains a foreign backend population')
+            continue
+        if (len(rows) != count * len(states)
+                or [row['state'] for row in rows] != [state for state in states for _ in range(count)]):
+            raise ValueError('diagnostic read profile state/population differs')
+        for index, row in enumerate(rows):
+            if (None in row or not same_case(row, True)
+                    or row['sample'] != str(index % count)):
+                raise ValueError('diagnostic read profile case/sample identity differs')
+            if any(not isinstance(row.get(field), str) or not row[field].isascii()
+                   or not row[field].isdigit() for field in fields):
+                raise ValueError('diagnostic read clocks/counters must be nonnegative integers')
+            values = {field: int(row[field]) for field in fields}
+            whole = values['whole_call_ns']
+            # Nested spans overlap: bound individually, never add them as a budget.
+            if whole <= 0 or any(value > whole for field, value in values.items() if field.endswith('_ns')):
+                raise ValueError('diagnostic read whole-call interval is invalid')
+            if native:
+                if row['value_cache_hit'] not in ('true', 'false'):
+                    raise ValueError('native diagnostic cache-hit flag is invalid')
+            elif (values['cache_hits'] != 0 or values['cache_misses'] not in (0, 1)
+                  or (row['state'] != 'cache-evicted' and values['cache_misses'] != 1)):
+                # Cold queries include deleted keys; those stop at the local index.
+                raise ValueError('remote diagnostic did not force its uncached read')
+        for state in states:
+            selected = [row for row in rows if row['state'] == state]
+            measured = ('index_ns', 'wal_and_decode_ns') if native else (
+                'index_ns', 'exchange_ns', 'server_record_read_ns')
+            if any(sum(int(row[field]) for row in selected) <= 0 for field in measured):
+                raise ValueError('diagnostic read state lacks its measured clock population')
+
+    records = [row for row in transport_floor.yaml_documents(
+        (directory / 'node_profiles.yaml').read_text()) if row is not None]
+    phases = [
+        'load-write-diagnostics', 'warm-scalar-read-diagnostics',
+        'warm-profiled-read-diagnostics', 'warm-window-read-diagnostics',
+        'warm-batched-read-diagnostics']
+    if spec['cold']:
+        phases += ['cache_evicted_get-diagnostics', 'cache_evicted_get_many-diagnostics',
+                   'cache_evicted_get_window-diagnostics', 'cache-evicted-read-diagnostics']
+    phases += ['reopened-read-diagnostics']
+    if native:
+        if records:
+            raise ValueError('native diagnostic unexpectedly contains remote node profiles')
+        return
+    partitions = set(owner_partitions)
+    if (len(owner_partitions) != 5 or len(partitions) != 5
+            or any(type(partition) is not int for partition in owner_partitions)):
+        raise ValueError('diagnostic requires exactly five configured owner partitions')
+    if (len(records) != len(phases) or any(not isinstance(row, dict) for row in records)
+            or [row.get('phase') for row in records] != phases):
+        raise ValueError('diagnostic node profile phase population differs')
+    for row in records:
+        nodes = row.get('nodes')
+        if (not same_case(row) or not isinstance(nodes, list) or len(nodes) != 5
+                or any(not isinstance(node, list) or len(node) != 2
+                       or type(node[0]) is not int for node in nodes)
+                or {node[0] for node in nodes} != partitions):
+            raise ValueError('diagnostic node profile case/owner identity differs')
+        counters = [transport_floor.flatten_counters(profile) for _, profile in nodes]
+        def positive(*keys):
+            for key in keys:
+                if any(key not in profile for profile in counters) or sum(profile[key] for profile in counters) <= 0:
+                    raise ValueError('diagnostic node profile lacks positive timing population: ' + key)
+        positive('requests', 'request_decode_ns', 'handler_ns', 'response_encode_ns',
+                 'response_send_ns', 'client.requests', 'client.exchange_ns',
+                 'polling.progress_sweeps', 'polling.request_first_poll_samples')
+        if row['phase'] == 'load-write-diagnostics':
+            positive('storage_write.append_calls', 'storage_write.persist_calls',
+                     'append_wal_ns', 'append_persist_ns')
+        else:
+            positive('read_response_recheck_samples', 'read_response_recheck_ns')
+            # Ordinary Read replies lack ReadProfiled's returned server spans.
+            if row['phase'] in ('warm-profiled-read-diagnostics',
+                                'cache-evicted-read-diagnostics', 'reopened-read-diagnostics'):
+                positive('client.server_handler_ns', 'client.server_record_read_ns')
+        for _, profile in nodes:
+            if spec['transport'] in ('efa-native', 'fabric-tcp-native'):
+                # Reuse the native zero-TLS contract without imposing another polling policy.
+                transport_floor.validate_polling(profile, dict(transport=spec['transport'], profile=False))
+        if spec['transport'] != 'tcp':
+            for owner in ('transport', 'client_transport'):
+                positive(*(owner + '.' + key for key in
+                           ('cq_polls', 'cq_completions', 'cq_call_ns', 'cq_timed_calls',
+                            'cq_dispatch_ns', 'cq_dispatch_calls')))
+        # Async submission is not a physical IO counter; partial/resident paths and
+        # multiplexing compatibility zeros are intentionally not positive clocks.
+
+
 def validate_auxiliary(root, state, cfg):
     """Fail closed on added controls; never relax the original paired-case count."""
     root = Path(root)
@@ -573,6 +704,9 @@ def validate_auxiliary(root, state, cfg):
             directory = root / (case_id + '-' + mode)
             if not (directory / 'COMPLETE').is_file():
                 raise ValueError('KV case omitted its original complete value/reopen audit')
+            if spec['diagnostics']:
+                validate_diagnostic_evidence(directory, spec, mode,
+                    [node['partition'] for node in cfg['nodes']])
             validate_checkpoint_records(directory, spec, mode)
             read_service.append(dict(case_id=case_id, mode=mode, diagnostic=spec['diagnostics'],
                 phases=read_service_evidence(directory, mode,
