@@ -5,7 +5,7 @@
   "account": "354775971805",
   "regions": ["us-west-2", "us-east-1", "us-east-2", "eu-west-1", "eu-central-1"],
   "instance_types": ["g6.8xlarge", "g6e.8xlarge", "g6.16xlarge", "c6id.32xlarge"],
-  "ttl_seconds": 3600,
+  "ttl_seconds": 7200,
   "export_reserve_seconds": 600,
   "repetitions": 4,
   "transports": ["tcp", "efa", "efa-direct", "efa-native"],

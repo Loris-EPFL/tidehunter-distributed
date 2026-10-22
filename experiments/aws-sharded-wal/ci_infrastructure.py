@@ -281,11 +281,15 @@ def template(args, policies):
             trust = {'Version': '2012-10-17', 'Statement': [{'Effect': 'Allow',
                 'Principal': {'Service': 'lambda.amazonaws.com'}, 'Action': 'sts:AssumeRole'}]}
         props = {'RoleName': stack + '-' + role, 'AssumeRolePolicyDocument': trust,
-                 'MaxSessionDuration': 7200, 'Policies': [{'PolicyName': 'generated-and-owned-scope', 'PolicyDocument': policies[role]}], 'Tags': tags}
+                 'MaxSessionDuration': 10800 if role == 'launcher' else 7200, 'Policies': [{'PolicyName': 'generated-and-owned-scope', 'PolicyDocument': policies[role]}], 'Tags': tags}
         if role == 'watchdog':
             props['ManagedPolicyArns'] = ['arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole']
-        add(logical, 'AWS::IAM::Role', props, 'Generated and scoped actions; guest creation requires the fixed boundary.',
-            ['Only temporary tidehunter-ci-th-* guest identities may be managed.'])
+        why = 'Generated and scoped actions; guest creation requires the fixed boundary.'
+        must = ['Only temporary tidehunter-ci-th-* guest identities may be managed.']
+        if role == 'launcher':
+            why += ' Session covers the complete benchmark and exact-owned cleanup.'
+            must.append('Credential expiry must leave time to terminate and reconcile the fleet.')
+        add(logical, 'AWS::IAM::Role', props, why, must)
     watchdog_source = (HERE / 'ci_watchdog.py').read_bytes()
     source_hash = hashlib.sha256(watchdog_source).hexdigest()
     payload = base64.b64encode(zlib.compress(watchdog_source, 9)).decode('ascii')
