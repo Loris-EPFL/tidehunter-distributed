@@ -38,11 +38,27 @@ if [[ ${TIDEHUNTER_SETUP_SKIP_APT:-0} != 1 ]]; then
     fi
     privileged=()
     if [[ $(id -u) != 0 ]]; then privileged=(sudo -n); fi
+    packages=(build-essential pkg-config libfontconfig1-dev libssl-dev
+        python3 python3-pip python3-yaml python3-boto3 openssl ca-certificates curl bzip2)
+    # Hosted runners also install tools outside apt; do not download duplicates.
+    for tool in clang cmake; do
+        if ! command -v "$tool" >/dev/null; then packages+=("$tool"); fi
+    done
+    # Bindgen loads the C shared library, not the much larger static Clang SDK.
+    libclang_found=0
+    for library in "${LIBCLANG_PATH:-/usr/lib}"/libclang.so* \
+                   "${LIBCLANG_PATH:-/usr/lib}"/libclang-[0-9]*.so* \
+                   /usr/lib/llvm-*/lib/libclang.so* \
+                   /usr/lib/llvm-*/lib/libclang-[0-9]*.so* \
+                   /usr/lib/*-linux-gnu/libclang.so* \
+                   /usr/lib/*-linux-gnu/libclang-[0-9]*.so*; do
+        if [[ -f $library && -r $library ]]; then libclang_found=1; break; fi
+    done
+    if [[ $libclang_found == 0 ]]; then packages+=(libclang-dev); fi
     timeout 300 "${privileged[@]}" apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 update
     timeout 600 "${privileged[@]}" env DEBIAN_FRONTEND=noninteractive apt-get \
         -o Acquire::Retries=2 -o Acquire::http::Timeout=30 install -y --no-install-recommends \
-        build-essential clang libclang-dev pkg-config libfontconfig1-dev libssl-dev \
-        cmake python3 python3-pip python3-yaml python3-boto3 openssl ca-certificates curl bzip2
+        "${packages[@]}"
 fi
 for tool in python3 timeout curl make cc pkg-config; do
     command -v "$tool" >/dev/null || { echo "Missing setup dependency: $tool" >&2; exit 1; }
