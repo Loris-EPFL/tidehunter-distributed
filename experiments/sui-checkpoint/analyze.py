@@ -309,6 +309,27 @@ def mean_span(stats, numerator, denominator, flags=()):
     return result | dict(available=True, reason=None, mean_us=total / count / 1000)
 
 
+def multiplexed_profile_mean(stats, field, denominator, flags=(), prefix=''):
+    """TcpReadProfile protocol-v2 means, preserving raw counters and totals.
+
+    TCP, EFA TLS and EFA native share these multiplexed protocol fields.
+    Compatibility clocks are not observations, even with a positive population.
+    Other zero-valued clocks retain ordinary measured/empty-population semantics.
+    """
+    row = mean_span(stats, prefix + field, prefix + denominator, flags)
+    if field in ('request_send_ns', 'response_header_ns', 'response_body_ns'):
+        row.update(unavailable(
+            'multiplexed protocol v2 (TCP/EFA TLS/EFA native): per-request '
+            'request-write/response-header/body clocks are not attributable; '
+            'socket I/O is connection-scoped, not observed zero latency'))
+    elif field == 'server_inventory_wait_ns':
+        row.update(unavailable(
+            'multiplexed protocol v2 TcpReadProfile: server inventory wait is a '
+            'compatibility field after reader authority moved to a separate lock; '
+            'not an observed wait (TCP/EFA TLS/EFA native)'))
+    return row
+
+
 def adapter_means(stats):
     """Use observed inline/actor populations, never guess historical splits.
 
@@ -332,6 +353,8 @@ def adapter_means(stats):
         inline='inline_completed', actor_queue='actor_completed',
         actor_service='actor_completed', actor_return='returned',
         request_encode='wire_requests', exchange='wire_requests',
+        request_send='wire_requests', response_header='wire_requests',
+        response_body='wire_requests',
         response_decode='wire_requests', record_verify='wire_requests',
         server_handler='wire_requests', server_inventory_wait='wire_requests',
         server_authority_lookup='wire_requests', server_record_read='wire_requests',
@@ -349,8 +372,8 @@ def adapter_means(stats):
             flags.append('read_profile_transport_progress_available')
         if stage.startswith('transport_cq_'):
             flags.append('read_profile_transport_cq_available')
-        row = mean_span(stats, 'read_profile_' + stage + '_ns',
-                        'read_profile_' + denominator, flags)
+        row = multiplexed_profile_mean(
+            stats, stage + '_ns', denominator, flags, prefix='read_profile_')
         if stage in ('actor_queue', 'actor_service') and stats.get('read_profile_errors') != 0:
             row.update(unavailable('sampled errors absent or nonzero; successful actor population cannot be isolated'))
         result['read_profile_' + stage] = row
@@ -370,6 +393,7 @@ def adapter_means(stats):
            ('request_decode', 'handler', 'response_encode', 'response_send')},
         **{f'client_{name}': 'client_requests' for name in
            ('request_encode', 'exchange', 'request_send', 'response_header', 'response_body', 'response_decode')},
+        'client_server_inventory_wait': 'client_requests',
         **{f'storage_append_{name}': 'storage_append_calls' for name in
            ('total', 'state_lock_wait', 'validation', 'history', 'wal', 'publication')},
         **{f'storage_persist_{name}': 'storage_persist_calls' for name in
@@ -391,9 +415,15 @@ def adapter_means(stats):
             f'{prefix}_cq_poll_gap': f'{prefix}_cq_poll_gap_samples',
         })
     for stage, denominator in write_denominators.items():
-        result['write_profile_' + stage] = mean_span(
-            stats, 'write_profile_' + stage + '_ns', 'write_profile_' + denominator,
-            ('write_profile_available',))
+        if stage.startswith('client_'):
+            row = multiplexed_profile_mean(
+                stats, stage.removeprefix('client_') + '_ns',
+                denominator.removeprefix('client_'), ('write_profile_available',),
+                prefix='write_profile_client_')
+        else:
+            row = mean_span(stats, 'write_profile_' + stage + '_ns',
+                            'write_profile_' + denominator, ('write_profile_available',))
+        result['write_profile_' + stage] = row
     return result
 
 
