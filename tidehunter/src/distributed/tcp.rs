@@ -26,7 +26,7 @@ mod tests;
 
 use super::codec::{BatchLimits, CompleteBatch, Mutation};
 use super::group::{CompleteGroup, GroupLimits};
-use super::storage::{DurableBatch, PartitionConfig, PartitionStats, StorageError};
+use super::storage::{AppendedBatch, DurableBatch, PartitionConfig, PartitionStats, StorageError};
 use super::types::{
     BatchId, BatchVersion, PayloadDigest, PhysicalValueAddress, RequestAuthority,
     ValueRecordReference,
