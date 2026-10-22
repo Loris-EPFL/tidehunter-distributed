@@ -96,7 +96,7 @@ def schema():
         'matrix': 'transports is a distinct nonempty tcp/efa/efa-direct/efa-native list; the default remains tcp/efa. efa-native is explicitly trusted and omits application TLS. repetitions is 1..4. Each cell has its own native control. Odd repetitions use list order, even repetitions reverse it. No requested cell may be omitted.',
         'profiling': 'read_profile_limits is required; write_profile_limits and native_write_profile_limits default to disabled. All are per-repetition integers 0..65536. [0,4096,4096,0] read, [0,128,128,0] remote write and [0,640,640,0] native write give clean/diagnostic/diagnostic/clean repetitions. Remote writes sample append RPCs per owning connection; native writes sample foreground durability barriers per DB. These are distinct populations.',
         'efa_proof': 'fi_info -p efa -f <fabric> -t FI_EP_RDM must report exactly provider efa and the requested fabric; efa-native maps to efa-direct. Every hardware cell requires source/cell/host-bound before/after sysfs efa-driver send_bytes and recv_bytes, both positive on coordinator and all five storage hosts. No software, normal-EFA-for-Direct or TCP fallback; host-wide activity is not pure-wire timing.',
-        'lifetime': 'deadline_utc must be timezone-aware UTC, <=1 hour away and <=every bootstrap deadline; measured work ends export_reserve_seconds earlier. No retries of unknown benchmark starts.',
+        'lifetime': 'deadline_utc must be timezone-aware UTC, <=2 hours away and <=every bootstrap deadline; measured work ends export_reserve_seconds earlier. Per-replay deadline defaults to 900 seconds and cannot exceed 3600 seconds. No retries of unknown benchmark starts.',
     }
 
 
@@ -168,7 +168,7 @@ def validate_cfg(cfg):
     if deadline.utcoffset() is None or deadline.utcoffset().total_seconds() != 0:
         raise ValueError('deadline must be absolute UTC')
     reserve = cfg.get('export_reserve_seconds', 600)
-    if not 300 <= reserve <= 900 or not reserve + 180 < remaining(cfg['deadline_utc']) <= 3600:
+    if type(reserve) is not int or not 300 <= reserve <= 900 or not reserve + 180 < remaining(cfg['deadline_utc']) <= 7200:
         raise ValueError('deadline must preserve measured work and bounded export reserve')
     matrix_plan(cfg)
     validate_kv_options(cfg.get('kv_suite'))

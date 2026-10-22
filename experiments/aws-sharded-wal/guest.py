@@ -321,8 +321,8 @@ def validate_cfg(cfg):
         raise ValueError('capacity repetitions must be zero to two')
     if cfg.get('chunk_control_repetitions', 0) not in [0, 1, 2, 3]:
         raise ValueError('chunk controls must be zero to three')
-    if not 0 < remaining(cfg['deadline_utc']) <= 3600:
-        raise ValueError('fixed campaign deadline expired or exceeds one hour')
+    if not 0 < remaining(cfg['deadline_utc']) <= 7200:
+        raise ValueError('fixed campaign deadline expired or exceeds two hours')
     return root, ids
 
 

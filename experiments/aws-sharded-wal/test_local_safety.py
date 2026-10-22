@@ -43,7 +43,7 @@ class SafetyTests(unittest.TestCase):
         for key, value in [('run_root', '/mnt/other'), ('s3_prefix', 'unrelated'),
                            ('campaign', 'unknown'),
                            ('capacity_repetitions', 3), ('chunk_control_repetitions', 4),
-                           ('deadline_utc', (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat())]:
+                           ('deadline_utc', (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat())]:
             with self.assertRaises(ValueError):
                 guest.validate_cfg(cfg | {key: value})
         nodes = cfg['nodes'].copy()

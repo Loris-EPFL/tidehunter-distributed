@@ -1,4 +1,5 @@
 """Offline six-guest startup exercise; no real AWS, IMDS, poweroff or benchmark."""
+import configparser
 import copy
 from datetime import datetime, timezone
 import hashlib
@@ -14,6 +15,7 @@ import unittest
 from unittest.mock import patch
 
 import atomic_start as atomic
+import bootstrap as boot
 import control
 import sui_checkpoint as supervisor
 
@@ -164,10 +166,11 @@ class SSM:
 
 class Fleet:
     """Fake infrastructure around the production Guest.execute entrypoint."""
-    def __init__(self, directory):
+    def __init__(self, directory, ttl_seconds=1800, export_reserve_seconds=300):
         self.directory, self.clock = Path(directory), Clock()
         self.cfg = supervisor.schema()['config']
-        self.cfg.update(deadline_utc=utc(self.clock.now + 1800), export_reserve_seconds=300)
+        self.cfg.update(deadline_utc=utc(self.clock.now + ttl_seconds),
+                        export_reserve_seconds=export_reserve_seconds)
         for name in ('build_bundle', 'fixture_bundle', 'verification_bundle'):
             self.cfg[name]['sha256'] = 'a' * 64
         for name in ('build_manifest_sha256', 'source_archive_sha256', 'source_manifest_sha256'):
@@ -179,9 +182,10 @@ class Fleet:
                 archive.add(Path(atomic.__file__).parent / name, arcname='runner/' + name)
         self.archive = buffer.getvalue()
         self.plan = dict(run_id=self.cfg['run_id'], account=self.cfg['account'], region=self.cfg['region'],
-            bucket=self.cfg['bucket'], prefix=self.cfg['s3_prefix'], ttl_seconds=1800,
+            bucket=self.cfg['bucket'], prefix=self.cfg['s3_prefix'], ttl_seconds=ttl_seconds,
             instance_type=self.cfg['instance_type'], placement_group=self.cfg['placement_group'],
-            az=self.cfg['availability_zone'], export_reserve_seconds=300, protected_instances=['i-' + 'f' * 17],
+            az=self.cfg['availability_zone'], export_reserve_seconds=export_reserve_seconds,
+            protected_instances=['i-' + 'f' * 17],
             bundle_sha256=hashlib.sha256(self.archive).hexdigest(), bundle_bytes=len(self.archive),
             atomic_bindings={name: copy.deepcopy(self.cfg[name]) for name in atomic.BINDINGS},
             atomic_client_token=self.cfg['run_id'] + '-atomic')
@@ -253,6 +257,89 @@ class Fleet:
             self.started_storage.add(instance)
 
 
+class BootstrapDeadlineTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.units = self.root / 'units'
+        self.units.mkdir()
+        self.mount = self.root / 'mount'
+        self.launched = datetime(2026, 10, 22, 12, tzinfo=timezone.utc)
+        self.args = SimpleNamespace(run_id='th-0123456789abcdef', account='123456789012',
+                                    instance_type='i4i.xlarge', ttl_seconds=7200)
+        self.identity = dict(accountId=self.args.account, instanceType=self.args.instance_type,
+                             instanceId='i-' + '1' * 17, pendingTime=self.launched.isoformat())
+        self.command = self.enter_patch(patch.object(boot.subprocess, 'run'))
+        self.devices = self.enter_patch(patch.object(boot.subprocess, 'check_output', side_effect=[
+            json.dumps({'blockdevices': [dict(path='/dev/nvme1n1', type='disk',
+                model='Amazon EC2 NVMe Instance Storage', fstype=None, mountpoints=[])]}),
+            json.dumps({'signatures': []}),
+        ]))
+        self.enter_patch(patch.object(boot.os, 'geteuid', return_value=0))
+        self.metadata = self.enter_patch(patch.object(boot, 'identity', return_value=self.identity))
+        self.enter_patch(patch.object(boot, 'Path', side_effect=lambda path:
+            self.units if path == '/etc/systemd/system' else self.mount if path == '/mnt/tidehunter' else Path(path)))
+        self.clock = self.enter_patch(patch.object(boot, 'datetime', wraps=datetime))
+        self.clock.now.return_value = self.launched
+        self.enter_patch(patch('builtins.print'))
+
+    def enter_patch(self, patcher):
+        result = patcher.start()
+        self.addCleanup(patcher.stop)
+        return result
+
+    def test_two_hour_boot_arms_persistent_absolute_timer(self):
+        boot.bootstrap(self.args)
+        record = json.loads((self.mount / self.args.run_id / 'bootstrap.json').read_text())
+        deadline = datetime.fromisoformat(record['deadline_utc'])
+        self.assertEqual(deadline.timestamp(), self.launched.timestamp() + 7200)
+        self.assertEqual(record['shutdown_behavior_required'], 'terminate')
+        name = 'sharded-wal-expire-' + self.args.run_id
+        timer = configparser.ConfigParser()
+        timer.read(self.units / (name + '.timer'))
+        self.assertEqual(datetime.strptime(timer['Timer']['OnCalendar'], '%Y-%m-%d %H:%M:%S UTC')
+                         .replace(tzinfo=timezone.utc), deadline)
+        self.assertTrue(timer['Timer'].getboolean('Persistent'))
+        self.assertEqual(timer['Timer']['Unit'], name + '.service')
+        service = configparser.ConfigParser()
+        service.read(self.units / (name + '.service'))
+        self.assertEqual(service['Service']['ExecStart'], '/usr/sbin/poweroff')
+        self.assertEqual([call.args[0] for call in self.command.call_args_list[:3]], [
+            ['systemctl', 'daemon-reload'],
+            ['systemctl', 'enable', '--now', name + '.timer'],
+            ['systemctl', 'is-active', '--quiet', name + '.timer']])
+
+    def test_rebootstrap_after_reboot_does_not_reset_launch_expiry(self):
+        boot.bootstrap(self.args)
+        record = (self.mount / self.args.run_id / 'bootstrap.json').read_bytes()
+        timer = self.units / ('sharded-wal-expire-' + self.args.run_id + '.timer')
+        original_timer = timer.read_bytes()
+        self.clock.now.return_value = datetime.fromtimestamp(self.launched.timestamp() + 1800, timezone.utc)
+        self.command.reset_mock()
+        with self.assertRaises(FileExistsError):
+            boot.bootstrap(self.args)
+        self.command.assert_not_called()
+        self.assertEqual(timer.read_bytes(), original_timer)
+        self.assertEqual((self.mount / self.args.run_id / 'bootstrap.json').read_bytes(), record)
+
+    def test_malformed_or_excess_lifetimes_fail_before_metadata_or_timer_creation(self):
+        for value in (599, 7201, 7200.001, 7200.0, True, None, '7200'):
+            with self.subTest(lifetime=value), self.assertRaises(ValueError):
+                boot.bootstrap(SimpleNamespace(**(vars(self.args) | {'ttl_seconds': value})))
+        self.metadata.assert_not_called()
+        self.command.assert_not_called()
+        self.assertEqual(list(self.units.iterdir()), [])
+
+    def test_expired_original_launch_powers_off_without_rearming(self):
+        self.clock.now.return_value = datetime.fromtimestamp(self.launched.timestamp() + 7200, timezone.utc)
+        with self.assertRaises(ValueError):
+            boot.bootstrap(self.args)
+        self.command.assert_called_once_with(['/usr/sbin/poweroff'], check=True)
+        self.devices.assert_not_called()
+        self.assertEqual(list(self.units.iterdir()), [])
+
+
 class AtomicStartupTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -262,6 +349,50 @@ class AtomicStartupTests(unittest.TestCase):
     def assert_owned_cleanup(self):
         self.assertEqual(self.fleet.ec2.terminated, [sorted(self.fleet.guests)])
         self.assertTrue(all(item not in self.fleet.plan['protected_instances'] for item in self.fleet.ec2.terminated[0]))
+
+    def test_lifecycle_contract_accepts_old_lifetimes_and_exact_two_hours(self):
+        for lifetime in (600, 1800, 3600, 7200):
+            with self.subTest(lifetime=lifetime):
+                contract = atomic.launch_contract(self.fleet.plan | {'ttl_seconds': lifetime})
+                self.assertEqual(contract['ttl_seconds'], lifetime)
+        for lifetime in (599, 7201, 7200.000001, 7200.0, True, None, '7200'):
+            with self.subTest(lifetime=lifetime), self.assertRaises(ValueError):
+                atomic.launch_contract(self.fleet.plan | {'ttl_seconds': lifetime})
+
+    def test_two_hour_fleet_handoff_preserves_absolute_expiry_reserve_and_exact_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fleet = Fleet(directory, ttl_seconds=7200, export_reserve_seconds=600)
+            original = fleet.cfg['deadline_utc']
+            with patch.object(supervisor, 'remaining', side_effect=lambda deadline:
+                              atomic.stamp(deadline) - fleet.clock.time()):
+                fleet.storage()
+                status = fleet.controller.execute()
+            self.assertEqual(status['stage'], 'campaign-returned')
+            self.assertEqual(status['deadline_utc'], original)
+            self.assertEqual(fleet.ec2.terminated, [sorted(fleet.guests)])
+            self.assertEqual(len(fleet.handoffs), 1)
+            self.assertEqual(fleet.handoffs[0][1]['deadline_utc'], original)
+            self.assertEqual(fleet.handoffs[0][1]['export_reserve_seconds'], 600)
+            self.assertEqual(fleet.handoffs[0][2], atomic.stamp(original) - fleet.clock.time() - 30)
+            self.assertEqual(len(fleet.ssm.proofs), 5)
+            fleet.clock.elapsed += 600
+            rebooted = atomic.Guest(fleet.plan, root=fleet.controller.root,
+                                   clock=fleet.clock, command=fleet.controller.command)
+            rebooted.bootstrap()
+            self.assertEqual(rebooted.deadline, atomic.stamp(original))
+            self.assertEqual(rebooted.startup_deadline, atomic.stamp(original) - 600 - 180)
+            with self.assertRaises(FileExistsError):
+                fleet.controller.execute()
+            self.assertEqual(len(fleet.handoffs), 1)
+
+    def test_two_hour_export_failure_still_terminates_exact_owned_fleet(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fleet = Fleet(directory, ttl_seconds=7200, export_reserve_seconds=600)
+            fleet.s3.fail_put = True
+            with self.assertRaises(OSError):
+                fleet.controller.execute()
+            self.assertEqual(fleet.handoffs, [])
+            self.assertEqual(fleet.ec2.terminated, [sorted(fleet.guests)])
 
     def test_six_guest_eventual_role_config_handoff_export_and_cleanup(self):
         fleet = self.fleet
