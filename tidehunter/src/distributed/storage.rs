@@ -32,8 +32,9 @@ use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-const REGISTRATION: &str = "partition-registration-v4";
-const SEAL: &str = "partition-seal-v4";
+const REGISTRATION: &str = "partition-registration-v5";
+const OLD_REGISTRATION: &str = "partition-registration-v4";
+const SEAL: &str = "partition-seal-v5";
 const MAX_METADATA_BYTES: u64 = 1024 * 1024;
 
 mod file_inventory;
@@ -582,7 +583,7 @@ impl PartitionLog {
             .to_yaml()
             .map_err(|_| StorageError::Invalid("invalid key shape"))?;
         let registration = Registration {
-            format: 4,
+            format: 5,
             config,
             shape_yaml,
         };
@@ -653,8 +654,14 @@ impl PartitionLog {
         expected.validate()?;
         let path = path.canonicalize()?;
         let lock = DbLock::acquire(&path, Duration::ZERO)?;
-        let registration: Registration = read_metadata(&path.join(REGISTRATION))?;
-        if registration.format != 4 || registration.config != *expected {
+        let registration_path = path.join(REGISTRATION);
+        if !registration_path.exists() && path.join(OLD_REGISTRATION).exists() {
+            return Err(StorageError::Invalid(
+                "obsolete partition registration format; recreate the experimental database",
+            ));
+        }
+        let registration: Registration = read_metadata(&registration_path)?;
+        if registration.format != 5 || registration.config != *expected {
             return Err(StorageError::Invalid(
                 "registration differs from expected inventory/configuration",
             ));
@@ -776,7 +783,7 @@ impl PartitionLog {
         reference_writer.persist_pending(scan_end.div_ceil(expected.wal_file_bytes))?;
         file_inventory::remove_covered(&path, references.root().file_count)?;
         let end = SealedEnd {
-            format: 4,
+            format: 5,
             epoch: expected.inventory.epoch,
             generation: expected.inventory.segment_generation,
             frame_count: references.len(),
@@ -1793,7 +1800,7 @@ impl PartitionLog {
             state.references.persist_pending(file_count)?;
             file_inventory::remove_covered(&self.path, self.references.root().file_count)?;
             let end = SealedEnd {
-                format: 4,
+                format: 5,
                 epoch: authority.epoch,
                 generation: self.config().inventory.segment_generation,
                 frame_count: self.references.len(),

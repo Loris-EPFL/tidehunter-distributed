@@ -134,7 +134,7 @@ class FrozenSourceRestoreTests(unittest.TestCase):
             commands.append(dict(label=name, sha256=ci_prepare.sha(binary),
                 log_sha256=ci_prepare.sha(log), messages_sha256=ci_prepare.sha(messages),
                 started_ns=1, finished_ns=2))
-        manifest = dict(protocol=8, fabric=True, commands=commands,
+        manifest = dict(protocol=9, fabric=True, commands=commands,
             binaries={path.name: ci_prepare.sha(path) for path in binaries.iterdir()},
             source_archive_sha256=ci_prepare.sha(build / 'sources.tar.gz'),
             source_manifest_sha256=ci_prepare.sha(build / 'source-manifest.json'))

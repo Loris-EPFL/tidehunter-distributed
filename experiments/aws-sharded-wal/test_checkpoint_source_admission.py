@@ -63,7 +63,7 @@ class CheckpointSourceAdmission(unittest.TestCase):
             messages.write_text('{}\n')
             commands.append(dict(label=name, sha256=supervisor.sha(binary),
                 log_sha256=supervisor.sha(log), messages_sha256=supervisor.sha(messages)))
-        manifest = dict(protocol=8, fabric=False, commands=commands,
+        manifest = dict(protocol=9, fabric=False, commands=commands,
             binaries={path.name: supervisor.sha(path) for path in binaries.iterdir()},
             source_archive_sha256=supervisor.sha(bundle / 'sources.tar.gz'),
             source_manifest_sha256=supervisor.sha(bundle / 'source-manifest.json'))

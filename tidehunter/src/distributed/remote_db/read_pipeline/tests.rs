@@ -1,7 +1,8 @@
 use super::*;
 use crate::distributed::remote_db::pipeline_tests::Fixture;
 use crate::distributed::types::{
-    BatchId, BatchVersion, PayloadDigest, PhysicalValueAddress, RecordDescriptor, RecordKind,
+    BatchId, BatchVersion, MemberChecksum, PayloadDigest, PhysicalValueAddress, RecordDescriptor,
+    RecordKind,
 };
 use crate::key_shape::{KeyShape, KeyType};
 use std::collections::BTreeMap;
@@ -39,7 +40,7 @@ fn reference(sequence: u64, len: u32) -> (Bytes, ValueRecordReference) {
                 key_len: 4,
                 value_offset: 8,
                 value_len: len.saturating_sub(8),
-                digest: PayloadDigest([1; 32]),
+                checksum: MemberChecksum(1),
             },
         },
     )

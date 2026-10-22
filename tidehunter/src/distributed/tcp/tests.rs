@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::Command;
 
 #[path = "reactor_tests.rs"]
-mod multiplexed;
+pub(in crate::distributed::tcp) mod multiplexed;
 fn shape() -> KeyShape {
     KeyShape::new_single(4, 1, KeyType::uniform(1))
 }
@@ -428,7 +428,7 @@ fn profiled_reads_preserve_authority_membership_and_frame_bounds() {
     );
     assert!(node.handle(request(2, vec![reference]), limits).is_err());
     let mut forged = reference;
-    forged.descriptor.digest.0[0] ^= 1;
+    forged.descriptor.checksum.0 ^= 1;
     assert!(node.handle(request(1, vec![forged]), limits).is_err());
     let mut outside = reference;
     outside.descriptor.len = u32::MAX;

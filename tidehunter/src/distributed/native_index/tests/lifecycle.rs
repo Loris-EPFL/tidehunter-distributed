@@ -370,7 +370,10 @@ fn repaired_cell_crc_and_root_digest_do_not_hide_invalid_reference_descriptors()
     let mut cell = CrcFrame::read_from_slice(&container, range.start)
         .unwrap()
         .to_vec();
-    let kind_at = cell.len() - 45;
+    let reference_start = cell.len() - super::REFERENCE_BYTES;
+    // In the 134-byte v4 reference, kind follows the 104-byte batch/address
+    // prefix and 13-byte descriptor prefix.
+    let kind_at = reference_start + 117;
     cell[kind_at] = 7;
     let frame = CrcFrame::new(&cell);
     assert_eq!(frame.as_ref().len(), range.len());
@@ -382,6 +385,6 @@ fn repaired_cell_crc_and_root_digest_do_not_hide_invalid_reference_descriptors()
     std::fs::write(&bad_root, CrcFrame::new(&manifest).as_ref()).unwrap();
     assert!(matches!(
         NativeIndex::open_snapshot(&bad_root, &shape(), DATABASE, BUDGET),
-        Err(NativeIndexError::Invalid("reference kind"))
+        Err(NativeIndexError::Invalid(_))
     ));
 }

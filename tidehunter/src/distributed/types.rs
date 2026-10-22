@@ -50,7 +50,11 @@ pub struct PhysicalValueAddress {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct PayloadDigest(pub [u8; 32]);
 
-/// Native user operation encoded in an independently readable batch member.
+/// IEEE CRC-32 over a canonical batch-member identity and its native entry.
+/// This detects accidental corruption; it is not authentication.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct MemberChecksum(pub u32);
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum RecordKind {
     Put,
@@ -59,10 +63,10 @@ pub enum RecordKind {
 
 /// Bounded metadata derived from a fully validated complete batch.
 ///
-/// `offset` and `len` address the member (length, digest and native entry) inside
-/// the batch payload, excluding its outer native CRC header. `value_offset` is
-/// relative to that member. A delete has a zero-length value at the member end.
-/// The digest binds identity, original logical version, operation index, bounds
+/// `offset` and `len` address the member (native length, checksum and entry)
+/// inside the batch payload, excluding its outer native CRC header. `value_offset`
+/// is relative to that member. A delete has a zero-length value at the member end.
+/// The checksum binds identity, original logical version, operation index, bounds
 /// and native entry bytes. It is an integrity check, not authentication.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct RecordDescriptor {
@@ -74,7 +78,7 @@ pub struct RecordDescriptor {
     pub key_len: u32,
     pub value_offset: u32,
     pub value_len: u32,
-    pub digest: PayloadDigest,
+    pub checksum: MemberChecksum,
 }
 
 /// A scalar-read reference backed by a complete authoritative batch.

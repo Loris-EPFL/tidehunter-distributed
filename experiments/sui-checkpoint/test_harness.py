@@ -481,7 +481,7 @@ class CheckpointSourceBoundaries(unittest.TestCase):
         identities = self.source_tree(root)
         build.save(root / 'source-manifest.json', identities)
         (root / 'sources.tar.gz').write_bytes(b'bound archive')
-        manifest = dict(protocol=8, fabric=False,
+        manifest = dict(protocol=9, fabric=False,
             source_archive_sha256=build.digest(root / 'sources.tar.gz'),
             source_manifest_sha256=build.digest(root / 'source-manifest.json'),
             binaries={name: 'unused' for name in ('sui-node-native', 'sui-node-remote',

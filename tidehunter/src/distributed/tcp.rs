@@ -52,7 +52,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub use inventory::NodeInventory;
-const PROTOCOL: u32 = 8;
+const PROTOCOL: u32 = 9;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

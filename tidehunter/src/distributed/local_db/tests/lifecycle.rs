@@ -183,7 +183,7 @@ fn corrupted_claimed_root_or_stream_proof_never_falls_back_to_full_replay() {
         db.flush_index().unwrap();
         db.shutdown().unwrap();
         drop(db);
-        let root_path = path.join("local-index-root-v1");
+        let root_path = path.join("local-index-root-v2");
         if corrupt_crc {
             let mut bytes = std::fs::read(&root_path).unwrap();
             bytes[0] ^= 1;
@@ -193,9 +193,27 @@ fn corrupted_claimed_root_or_stream_proof_never_falls_back_to_full_replay() {
                 super::super::super::storage::read_metadata(&root_path).unwrap();
             root.prefixes[0].digest[0] ^= 1;
             let bytes = super::super::super::storage::encode_metadata(&root).unwrap();
-            super::super::super::storage::install_metadata(&path, "local-index-root-v1", &bytes)
+            super::super::super::storage::install_metadata(&path, "local-index-root-v2", &bytes)
                 .unwrap();
         }
         assert!(LocalDatabase::open(&path, &shape(), config, metrics()).is_err());
     }
+}
+
+#[test]
+fn obsolete_checkpoint_root_does_not_trigger_fresh_recovery() {
+    let temp = tempdir::TempDir::new("local-root-old-format").unwrap();
+    let path = temp.path().join("db");
+    let config = config();
+    let mut db = LocalDatabase::open(&path, &shape(), config.clone(), metrics()).unwrap();
+    db.write_batch(operation(0), vec![put(0, 3)]).unwrap();
+    db.flush_index().unwrap();
+    db.shutdown().unwrap();
+    drop(db);
+    std::fs::rename(
+        path.join("local-index-root-v2"),
+        path.join("local-index-root-v1"),
+    )
+    .unwrap();
+    assert!(LocalDatabase::open(&path, &shape(), config, metrics()).is_err());
 }

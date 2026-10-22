@@ -345,7 +345,7 @@ fn root_bound_container_ranges_reject_overlap_overflow_wrong_cells_and_bad_diges
     unsafe_name[a.name_at] = b'/';
     cases.push(("unsafe-name", unsafe_name));
     let mut old_format = payload;
-    old_format[8..10].copy_from_slice(&2u16.to_be_bytes());
+    old_format[8..10].copy_from_slice(&3u16.to_be_bytes());
     cases.push(("old-format", old_format));
     for (case, payload) in cases {
         let bad = temp.path().join(format!("{case}.index"));

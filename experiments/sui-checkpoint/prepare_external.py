@@ -34,7 +34,7 @@ def main():
         raise ValueError('write profile limit must be 0..65536')
     manifest=json.loads((args.build/'build-manifest.json').read_text())
     binary=args.build/'binaries/storage-node'
-    if build.digest(binary)!=manifest['binaries']['storage-node'] or manifest['protocol']!=8:
+    if build.digest(binary)!=manifest['binaries']['storage-node'] or manifest['protocol']!=9:
         raise ValueError('storage binary/source binding differs')
     if args.transport!='tcp' and not manifest['fabric']:
         raise ValueError('hardware/fabric transport requires a fabric-enabled frozen build')
@@ -61,7 +61,7 @@ def main():
             commands=[[str(args.guest_root/'storage-node'),'--experimental-storage-node',
                        str(args.guest_root/Path(n['launch']).relative_to(output))] for n in selected],
             ready_files=[n['ready'] for n in selected],stop_files=[n['stop'] for n in selected]))
-    build.save(output/'external-manifest.json',dict(schema=1,protocol=8,transport=args.transport,
+    build.save(output/'external-manifest.json',dict(schema=1,protocol=9,transport=args.transport,
         config_sha256=build.digest(output/'config.json'),build_manifest_sha256=build.digest(args.build/'build-manifest.json'),
         source_archive_sha256=manifest['source_archive_sha256'],storage_binary_sha256=manifest['binaries']['storage-node'],
         shard_cache_bytes=args.shard_cache_mib*deployment.MIB,write_profile_limit=args.write_profile_limit,hosts=host_records,

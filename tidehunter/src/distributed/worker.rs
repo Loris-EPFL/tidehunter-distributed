@@ -1535,7 +1535,7 @@ mod tests {
         // Damage real cold authority, not the WAL payload or an injected result.
         // A failed lookup must not be interpreted as a never-before-seen ID.
         std::fs::write(
-            dir.path().join("stream/storage-history-v1/receipts.pages"),
+            dir.path().join("stream/storage-history-v2/receipts.pages"),
             b"corrupt",
         )
         .unwrap();

@@ -727,7 +727,8 @@ fn detach(bytes: &Bytes) -> Bytes {
 mod tests {
     use super::*;
     use crate::distributed::types::{
-        BatchId, BatchVersion, PayloadDigest, PhysicalValueAddress, RecordDescriptor,
+        BatchId, BatchVersion, MemberChecksum, PayloadDigest, PhysicalValueAddress,
+        RecordDescriptor,
     };
     use crate::key_shape::{KeyShapeBuilder, KeySpace, KeyType};
 
@@ -764,7 +765,7 @@ mod tests {
                 key_len: key.len() as u32,
                 value_offset: 32,
                 value_len: value.len() as u32,
-                digest: PayloadDigest([3; 32]),
+                checksum: MemberChecksum(3),
             },
         };
         (
@@ -872,7 +873,7 @@ mod tests {
             },
             ValueRecordReference {
                 descriptor: RecordDescriptor {
-                    digest: PayloadDigest([4; 32]),
+                    checksum: MemberChecksum(4),
                     ..old_ref.descriptor
                 },
                 ..old_ref

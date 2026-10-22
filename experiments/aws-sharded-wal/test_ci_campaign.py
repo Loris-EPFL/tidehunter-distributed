@@ -1128,7 +1128,7 @@ class CampaignTests(unittest.TestCase):
         build.mkdir()
         (build / 'sources.tar.gz').write_bytes(b'not-the-admitted-source')
         ci.dump(build / 'source-manifest.json', {})
-        ci.dump(build / 'build-manifest.json', dict(protocol=8, fabric=True,
+        ci.dump(build / 'build-manifest.json', dict(protocol=9, fabric=True,
             binaries={name: 'a' * 64 for name in ci.BINARIES}, source_archive_sha256='0' * 64,
             source_manifest_sha256=ci.sha(build / 'source-manifest.json')))
         fixture = self.output / 'fixture.tar.gz'

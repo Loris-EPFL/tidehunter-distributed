@@ -11,8 +11,8 @@ use bincode::Options;
 use std::os::unix::fs::FileExt;
 
 mod index;
-const ROOT: &str = "storage-history-root-v1";
-const DIRECTORY: &str = "storage-history-v1";
+const ROOT: &str = "storage-history-root-v2";
+const DIRECTORY: &str = "storage-history-v2";
 const SLOT_BYTES: usize = 256;
 const DESCRIPTOR_BYTES: usize = 80;
 
@@ -177,7 +177,7 @@ impl History {
             Ok(Arc::new(file))
         };
         let root = HistoryRoot {
-            format: 1,
+            format: 2,
             database: config.inventory.database,
             epoch: config.inventory.epoch,
             partition: config.partition,
@@ -215,7 +215,7 @@ impl History {
 
     pub(crate) fn open(path: &Path, config: &PartitionConfig) -> Result<Self, StorageError> {
         let root: HistoryRoot = read_metadata(&path.join(ROOT))?;
-        if root.format != 1
+        if root.format != 2
             || root.database != config.inventory.database
             || root.epoch != config.inventory.epoch
             || root.partition != config.partition

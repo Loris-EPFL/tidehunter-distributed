@@ -165,7 +165,7 @@ def prepare(args):
         module.bounded(command, timeout=remaining)
     verification = verification_bundle(replay, output / 'verification')
     manifest = json.loads((build / 'build-manifest.json').read_text())
-    if manifest.get('fabric') is not True or manifest.get('protocol') != 8:
+    if manifest.get('fabric') is not True or manifest.get('protocol') != 9:
         raise ValueError('current fabric-capable protocol build required')
     save(output / 'READY.json', {
         'complete': True, 'created_utc': datetime.now(timezone.utc).isoformat(),

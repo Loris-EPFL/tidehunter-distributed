@@ -390,7 +390,7 @@ def main():
         raise ValueError('local transport cannot override an external deployment')
     build_root, fixture, root = args.build.resolve(strict=True), args.fixture.resolve(strict=True), args.output.resolve()
     manifest = read_json(build_root / 'build-manifest.json')
-    if manifest['protocol'] != 8 or build.digest(build_root/'sources.tar.gz') != manifest['source_archive_sha256']:
+    if manifest['protocol'] != 9 or build.digest(build_root/'sources.tar.gz') != manifest['source_archive_sha256']:
         raise ValueError('wrong protocol or source archive binding')
     if set(manifest['binaries']) != {'sui-node-native','sui-node-remote','storage-node','state-audit','rocksdb-audit','transport-floor'}:
         raise ValueError('build manifest lacks the exact required executable set')
@@ -453,7 +453,7 @@ def main():
                SUI_TH_NATIVE_WRITE_PROFILE_LIMIT=str(args.native_write_profile_limit))
     owned=Owned(output,env)
     producer_env = checkpoint.source_environment(prior)
-    result=dict(schema=1,protocol=8,backend='tidehunter-sharded-wal',durability='synchronous durable whole-batch publication',
+    result=dict(schema=1,protocol=9,backend='tidehunter-sharded-wal',durability='synchronous durable whole-batch publication',
         fixture=str(fixture),fixture_files=fixture_files,checkpoint_limit=tip,checkpoint_digest=expected_digest,
         build_manifest_sha256=build.digest(build_root/'build-manifest.json'),source_archive_sha256=manifest['source_archive_sha256'],
         binaries=manifest['binaries'],configurations=configs,

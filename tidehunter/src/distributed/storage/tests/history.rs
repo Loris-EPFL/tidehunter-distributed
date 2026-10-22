@@ -164,7 +164,7 @@ fn missing_or_corrupt_authority_and_unknown_missing_payload_fail_closed() {
             .unwrap();
         log.persist_through(receipt).unwrap();
         log.seal_epoch(authority(&config)).unwrap();
-        let page = path.join("storage-history-v1/receipts.pages");
+        let page = path.join("storage-history-v2/receipts.pages");
         if corrupt_page {
             let file = OpenOptions::new().write(true).open(page).unwrap();
             file.write_all_at(&[0xff], 8).unwrap();
@@ -212,8 +212,8 @@ fn unadopted_history_pages_and_temporary_root_do_not_hide_durable_wal_suffix() {
     log.persist_through(receipt).unwrap();
     // No spill/seal: root count is still zero. These simulate interrupted
     // derived metadata writes, not independent authority for the inner record.
-    fs::write(path.join("storage-history-v1/receipts.pages"), [1, 2, 3]).unwrap();
-    fs::write(path.join(".storage-history-root-v1.pending"), [4, 5, 6]).unwrap();
+    fs::write(path.join("storage-history-v2/receipts.pages"), [1, 2, 3]).unwrap();
+    fs::write(path.join(".storage-history-root-v2.pending"), [4, 5, 6]).unwrap();
     drop(log);
     let log = PartitionLog::recover_sealed(&path, &config, metrics()).unwrap();
     assert_eq!(log.receipt_page(0, 1).unwrap(), vec![receipt]);
@@ -237,7 +237,7 @@ fn corrupt_storage_root_is_not_replaced_by_wal_inference() {
     log.persist_through(receipt).unwrap();
     log.seal_epoch(authority(&config)).unwrap();
     drop(log);
-    let root = path.join("storage-history-root-v1");
+    let root = path.join("storage-history-root-v2");
     let mut bytes = fs::read(&root).unwrap();
     bytes[0] ^= 1;
     fs::write(root, bytes).unwrap();
@@ -522,13 +522,13 @@ fn cold_pressure_never_reclaims_live_credit_or_repeats_an_empty_root() {
         log.append_complete_batch(authority(&config), &batch(&config, 1)),
         Err(StorageError::Capacity)
     ));
-    let before = fs::read(path.join("storage-history-root-v1")).unwrap();
+    let before = fs::read(path.join("storage-history-root-v2")).unwrap();
     assert!(matches!(
         log.plan_record_read(&reference),
         Err(StorageError::Capacity)
     ));
     assert_eq!(
-        fs::read(path.join("storage-history-root-v1")).unwrap(),
+        fs::read(path.join("storage-history-root-v2")).unwrap(),
         before
     );
     assert_eq!(
@@ -556,7 +556,7 @@ fn cold_pressure_root_io_error_is_unknown_and_closes_read_admission() {
         .append_complete_batch(authority(&config), &batch(&config, 1))
         .unwrap();
     log.persist_through(second).unwrap();
-    let temporary = path.join(".storage-history-root-v1.pending");
+    let temporary = path.join(".storage-history-root-v2.pending");
     fs::create_dir(&temporary).unwrap();
     assert!(matches!(
         log.plan_record_read(&reference),
@@ -603,7 +603,7 @@ fn pooled_history_has_constant_file_set_and_frozen_prefix_readers() {
     }
     log.seal_epoch(authority(&cfg)).unwrap();
     assert_eq!(
-        fs::read_dir(path.join("storage-history-v1"))
+        fs::read_dir(path.join("storage-history-v2"))
             .unwrap()
             .count(),
         4
@@ -635,7 +635,7 @@ fn unadopted_partial_pooled_tails_are_not_promoted_by_empty_recovery() {
     ] {
         let mut file = fs::OpenOptions::new()
             .append(true)
-            .open(path.join("storage-history-v1").join(name))
+            .open(path.join("storage-history-v2").join(name))
             .unwrap();
         std::io::Write::write_all(&mut file, b"bad").unwrap();
         file.sync_all().unwrap();
@@ -672,7 +672,7 @@ fn pooled_node_and_descriptor_corruption_fail_closed_on_cold_access() {
         };
         let file = fs::OpenOptions::new()
             .write(true)
-            .open(path.join("storage-history-v1").join(name))
+            .open(path.join("storage-history-v2").join(name))
             .unwrap();
         file.write_all_at(&[0xff], 8).unwrap();
         file.sync_all().unwrap();

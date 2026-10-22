@@ -269,7 +269,7 @@ def admit_inputs(build, fixture, verification, output):
     output.mkdir(parents=True, exist_ok=True)
     manifest = read_json(build / 'build-manifest.json')
     identities = read_json(build / 'source-manifest.json')
-    if (manifest.get('protocol') != 8 or manifest.get('fabric') is not True
+    if (manifest.get('protocol') != 9 or manifest.get('fabric') is not True
             or set(manifest.get('binaries', {})) != BINARIES
             or sha(build / 'sources.tar.gz') != manifest['source_archive_sha256']
             or sha(build / 'source-manifest.json') != manifest['source_manifest_sha256']):
