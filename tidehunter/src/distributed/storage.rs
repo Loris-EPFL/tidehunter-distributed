@@ -508,8 +508,8 @@ fn duration_ns(duration: Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
-/// A local storage node component; caller threads serialize on each partition.
-/// Different instances/partitions may append concurrently. It queues no payloads.
+/// A local storage node component; caller threads serialize appends per partition.
+/// Different instances/partitions may append concurrently.
 pub struct PartitionLog {
     state: Mutex<State>,
     references: Arc<ReferenceDirectory>,
@@ -906,10 +906,10 @@ impl PartitionLog {
 
     /// Append whole application batches under one recoverable group frame.
     /// Every batch becomes recovery-eligible together, never via an inner CRC
-    /// frame alone. Only one unpersisted GROUP is allowed per stream: caller
-    /// grouping amortizes a barrier without introducing undetectable torn gaps.
-    /// All-existing retries return their original receipts. Mixed old/new groups
-    /// are rejected before effects; the worker resolves retries before grouping.
+    /// frame alone. A bounded suffix of complete groups may await persistence;
+    /// the durable frontier advances only after a serial flusher syncs its
+    /// captured prefix. All-existing retries return their original receipts.
+    /// Mixed old/new groups are rejected before effects.
     pub fn append_group(
         &self,
         authority: RequestAuthority,
@@ -976,9 +976,6 @@ impl PartitionLog {
         if !previous.is_empty() {
             return Err(StorageError::MixedRetry);
         }
-        if physical_end(&state) > state.durable_end {
-            return Err(StorageError::NeedsPersistence);
-        }
         self.receipt_count()
             .checked_add(group.batches().len())
             .ok_or(StorageError::Capacity)?;
@@ -1017,6 +1014,11 @@ impl PartitionLog {
             .is_err()
             || predicted_end.saturating_sub(rooted_end) > 64 * 1024 * 1024
         {
+            // History pages may root only data at or below durable_end. Do not
+            // spill while an appended suffix is awaiting the flusher.
+            if physical_end(&state) > state.durable_end {
+                return Err(StorageError::NeedsPersistence);
+            }
             // Every buffered completed group already has its exact-file WAL
             // barrier. Root cold metadata before admitting another group.
             timing.stage(Some(WriteStage::AppendHistory));
@@ -1106,8 +1108,9 @@ impl PartitionLog {
         Ok(receipts)
     }
 
-    /// Persist the entire outstanding group containing this batch. Never promotes
-    /// durability based on allocation or the maximum logical sequence.
+    /// Persist the fully appended prefix captured by the serialized flusher.
+    /// Later concurrent appends are not covered by this publication.
+    /// Allocation alone never promotes durability.
     pub fn persist_through(&self, appended: AppendedBatch) -> Result<DurableBatch, StorageError> {
         self.persist_receipts(std::slice::from_ref(&appended), None)?;
         Ok(DurableBatch(appended))
@@ -1115,12 +1118,12 @@ impl PartitionLog {
 
     /// Validate and persist a set of exact receipts together, preserving input
     /// order (including duplicate retries). All receipts are checked before I/O.
-    /// Existing durable receipts may accompany members of the sole outstanding
-    /// complete group. This amortizes receipt locks, NOT group persistence
-    /// barriers; it does not permit another unpersisted group or relax recovery.
+    /// Already-durable receipts may accompany any pending prefix members.
+    /// Several complete groups may be appended before the flusher captures its
+    /// contiguous prefix; later appends are never inferred durable.
     ///
-    /// TiKV Raft Engine `Engine::write` returns its grouped writers only after
-    /// the shared sync; here each exact receipt shares our complete group's proof.
+    /// Like a write barrier, receipts complete after their shared sync; unlike
+    /// group-local barriers, this one may cover multiple captured groups.
     pub fn persist_many(
         &self,
         appended: &[AppendedBatch],
@@ -1153,7 +1156,7 @@ impl PartitionLog {
             timing.success(0);
             return Ok(());
         }
-        // Already durable retries do not wait behind another group's disk I/O.
+
         timing.stage(Some(WriteStage::PersistStateLock));
         let state = self.state.lock();
         timing.stage(Some(WriteStage::PersistValidation));
@@ -1166,14 +1169,14 @@ impl PartitionLog {
             timing.success(receipts.len());
             return Ok(());
         }
+
         timing.stage(Some(WriteStage::PersistSerializationLock));
         let _persistence = self.persistence.lock();
         timing.stage(Some(WriteStage::PersistStateLock));
-        let (appended, end, namespace_synced_file) = {
-            #[allow(unused_mut)]
+        let (start, end, namespace_synced_file) = {
             let mut state = self.state.lock();
             timing.stage(Some(WriteStage::PersistValidation));
-            let Some((appended, end)) = pending_receipts(&state, receipts)? else {
+            let Some(requested_end) = pending_receipts(&state, receipts)? else {
                 timing.record(|profile| {
                     profile.persist_noops = profile.persist_noops.saturating_add(1);
                 });
@@ -1187,32 +1190,49 @@ impl PartitionLog {
                     "injected persistence failure after append",
                 ))));
             }
-            (appended, end, state.namespace_synced_file)
+            if requested_end > state.appended_end {
+                state.poisoned = true;
+                return Err(StorageError::Unknown(WalError::Io(io::Error::other(
+                    "receipt exceeds appended frontier",
+                ))));
+            }
+            (
+                state.durable_end,
+                state.appended_end,
+                state.namespace_synced_file,
+            )
         };
-        // The test-only pause is not validation or disk service.
         timing.stage(None);
         #[cfg(test)]
         if let Some((entered, resume)) = self.before_persist.lock().take() {
             let _ = entered.send(());
             let _ = resume.recv();
         }
-        let mut witness_persisted = false;
-        let result = (|| {
-            // File data is synced for EVERY group. Only an exact prior file's
-            // successfully synced namespace can avoid the directory barrier.
-            timing.record(|profile| {
-                profile.file_persist_calls = profile.file_persist_calls.saturating_add(1);
-            });
-            timing.stage(Some(WriteStage::PersistFile));
-            let file = self.wal.persist_frame_file(WalPosition::new(
-                appended.address.offset,
-                appended.address.len,
-            ))?;
-            timing.stage(None);
-            timing.record(|profile| {
-                profile.file_persist_successes = profile.file_persist_successes.saturating_add(1);
-            });
-            let namespace_sync = namespace_synced_file != Some(file);
+
+        let first_file = self.config().layout().locate_file(start).as_u64();
+        let last_file = self
+            .config()
+            .layout()
+            .locate_file(end.saturating_sub(1))
+            .as_u64();
+        let previous_namespace = namespace_synced_file.map(|file| file.as_u64());
+        let namespace_sync = previous_namespace.is_none_or(|file| last_file > file);
+        let mut witness_persisted = 0u64;
+        let result = (|| -> io::Result<()> {
+            for file_id in first_file..=last_file {
+                timing.record(|profile| {
+                    profile.file_persist_calls = profile.file_persist_calls.saturating_add(1);
+                });
+                timing.stage(Some(WriteStage::PersistFile));
+                let offset = file_id
+                    .checked_mul(self.config().wal_file_bytes)
+                    .ok_or_else(|| io::Error::other("WAL file offset overflow"))?;
+                self.wal.persist_frame_file(WalPosition::new(offset, 1))?;
+                timing.record(|profile| {
+                    profile.file_persist_successes =
+                        profile.file_persist_successes.saturating_add(1);
+                });
+            }
             if namespace_sync {
                 timing.record(|profile| {
                     profile.namespace_persist_calls =
@@ -1226,48 +1246,51 @@ impl PartitionLog {
                     ));
                 }
                 self.wal.persist_namespace()?;
-                timing.stage(None);
                 timing.record(|profile| {
                     profile.namespace_persist_successes =
                         profile.namespace_persist_successes.saturating_add(1);
                 });
-                // Establish WAL data AND its pathname before a witness can
-                // survive. An interrupted pre-witness write remains unacknowledged.
-                #[cfg(test)]
-                let fail_witness = self.fail_inventory_witness.swap(0, Ordering::AcqRel);
-                #[cfg(test)]
-                if fail_witness == 1 {
-                    return Err(io::Error::other("injected crash before inventory witness"));
-                }
-                witness_persisted =
-                    file_inventory::persist(&self.path, self.config(), file.as_u64(), &mut timing)?;
-                #[cfg(test)]
-                if fail_witness == 2 {
-                    return Err(io::Error::other("injected crash after inventory witness"));
+                let witness_start = previous_namespace.map_or(0, |file| file + 1);
+                for file in witness_start..=last_file {
+                    #[cfg(test)]
+                    let fail_witness = self.fail_inventory_witness.swap(0, Ordering::AcqRel);
+                    #[cfg(test)]
+                    if fail_witness == 1 {
+                        return Err(io::Error::other("injected crash before inventory witness"));
+                    }
+                    if file_inventory::persist(&self.path, self.config(), file, &mut timing)? {
+                        witness_persisted += 1;
+                    }
+                    #[cfg(test)]
+                    if fail_witness == 2 {
+                        return Err(io::Error::other("injected crash after inventory witness"));
+                    }
                 }
             }
-            Ok((file, namespace_sync))
+            Ok(())
         })();
+
         timing.stage(Some(WriteStage::PersistStateLock));
         let mut state = self.state.lock();
         timing.stage(Some(WriteStage::PersistPublication));
-        state.stats.inventory_witnesses += u64::from(witness_persisted);
-        let (file, namespace_sync) = result.map_err(|error| {
+        state.stats.inventory_witnesses += witness_persisted;
+        result.map_err(|error| {
             state.poisoned = true;
             StorageError::Unknown(WalError::Io(error))
         })?;
-        state.stats.persistence_barriers += 1;
-        state.stats.namespace_syncs += u64::from(namespace_sync);
         if state.poisoned {
             return Err(StorageError::Poisoned);
         }
-        // Admission could resolve retries during I/O, but could not emit another
-        // group until this exact frontier became durable. Sealing shares our
-        // persistence lock. Never advance to a later merely allocated maximum.
-        debug_assert_eq!(state.appended_end, end);
+        debug_assert!(state.durable_end <= end);
+        debug_assert!(end <= state.appended_end);
+        state.stats.persistence_barriers += 1;
+        state.stats.namespace_syncs += u64::from(namespace_sync);
         state.durable_end = end;
         self.durable_frontier.store(end, Ordering::Release);
-        state.namespace_synced_file = Some(file);
+        if namespace_sync {
+            state.namespace_synced_file =
+                Some(crate::wal::position::WalFileId::from_u64(last_file));
+        }
         timing.record(|profile| {
             profile.durable_publications = profile.durable_publications.saturating_add(1);
         });
@@ -1878,17 +1901,14 @@ fn pending_persistence(state: &State, receipt: AppendedBatch) -> Result<Option<u
 fn pending_receipts(
     state: &State,
     receipts: &[AppendedBatch],
-) -> Result<Option<(AppendedBatch, u64)>, StorageError> {
-    let mut pending = None;
+) -> Result<Option<u64>, StorageError> {
+    let mut pending_end = None;
     for &receipt in receipts {
         if let Some(end) = pending_persistence(state, receipt)? {
-            if pending.is_some_and(|(_, previous_end)| previous_end != end) {
-                return Err(StorageError::Invalid("multiple unpersisted groups"));
-            }
-            pending = Some((receipt, end));
+            pending_end = Some(pending_end.map_or(end, |previous: u64| previous.max(end)));
         }
     }
-    Ok(pending)
+    Ok(pending_end)
 }
 
 fn physical_end(state: &State) -> u64 {

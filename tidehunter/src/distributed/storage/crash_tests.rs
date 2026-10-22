@@ -164,7 +164,7 @@ fn truncated_final_frame_never_replays_a_subset_of_its_mutations() {
 }
 
 #[test]
-fn missing_durability_evidence_blocks_the_next_authoritative_batch() {
+fn complete_unpersisted_prefix_recovers_without_skipping_group_boundaries() {
     let temp = tempdir::TempDir::new("sharded-persist-admission").unwrap();
     let config = config(vec![3], 3);
     let path = temp.path().join("stream");
@@ -174,21 +174,24 @@ fn missing_durability_evidence_blocks_the_next_authoritative_batch() {
         .append_complete_batch(authority(&config), &original)
         .unwrap();
     let later = batch(&config, 1, 1);
+    let second = log
+        .append_complete_batch(authority(&config), &later)
+        .unwrap();
+    assert_eq!(log.lookup(later.id()).unwrap(), Some(second));
     assert!(matches!(
-        log.append_complete_batch(authority(&config), &later),
+        log.validate_durable_receipt(DurableBatch(second)),
         Err(StorageError::NeedsPersistence)
     ));
-    assert_eq!(log.lookup(later.id()).unwrap(), None);
     assert_eq!(
         log.append_complete_batch(authority(&config), &original)
             .unwrap(),
         first
     );
     log.persist_through(first).unwrap();
-    let second = log
-        .append_complete_batch(authority(&config), &later)
-        .unwrap();
-    assert_eq!(log.receipt_page(0, 256).unwrap(), vec![first, second]);
+    drop(log);
+    let recovered = PartitionLog::recover_sealed(&path, &config, metrics()).unwrap();
+    assert_eq!(recovered.receipt_page(0, 256).unwrap(), vec![first, second]);
+    assert_eq!(recovered.lookup(later.id()).unwrap(), Some(second));
 }
 
 #[test]
