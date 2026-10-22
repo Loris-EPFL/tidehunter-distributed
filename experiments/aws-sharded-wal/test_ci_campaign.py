@@ -236,6 +236,52 @@ class SDKReadinessRetryTests(unittest.TestCase):
         self.assertEqual(len(http.requests), 3)
         self.assertEqual(http.responses, [])
 
+    def test_pricing_throttles_retry_real_sdk_then_preserve_live_cost_evidence(self):
+        def product(sku, unit, amount, attributes=None):
+            return self.reply({'PriceList': [json.dumps(dict(
+                product=dict(sku=sku, attributes=attributes or {}),
+                terms={'OnDemand': {'term': {'priceDimensions': {'dimension': dict(
+                    unit=unit, beginRange='0', endRange='Inf', pricePerUnit={'USD': amount})}}}}))]})
+        pricing = self.sdk().client('pricing', 'us-east-1')
+        throttle = self.reply({'__type': 'ThrottlingException', 'message': 'Rate exceeded'}, 400)
+        http = self.transport(pricing, [
+            throttle, throttle, product('compute', 'Hrs', '2.0144'),
+            product('gp3', 'GB-Mo', '0.08'),
+            product('in-use-ipv4', 'Hrs', '0.005',
+                    {'usagetype': 'USE1-PublicIPv4:InUseAddress'})])
+        quoted = ci.live_prices(pricing, 'us-east-1', 'g6.8xlarge')
+        self.assertEqual(quoted['compute_usd_per_hour'], '2.0144')
+        self.assertEqual(quoted['ebs_usd_per_gib_month'], '0.08')
+        self.assertEqual(quoted['ipv4_usd_per_hour'], '0.005')
+        self.assertEqual(quoted['evidence']['compute'][0]['sku'], 'compute')
+        self.assertEqual(len(http.requests), 5)
+        self.assertEqual(len(self.delays), 2)
+        self.assertEqual(http.responses, [])
+
+    def test_exhausted_pricing_throttles_fail_closed_after_six_attempts(self):
+        from botocore.exceptions import ClientError
+        pricing = self.sdk().client('pricing', 'us-east-1')
+        throttle = self.reply({'__type': 'ThrottlingException', 'message': 'Rate exceeded'}, 400)
+        http = self.transport(pricing, [throttle for _ in range(6)])
+        with self.assertRaises(ClientError) as rejected:
+            ci.live_prices(pricing, 'us-east-1', 'g6.8xlarge')
+        self.assertEqual(rejected.exception.response['Error']['Code'], 'ThrottlingException')
+        self.assertEqual(len(http.requests), 6)
+        self.assertEqual(len(self.delays), 5)
+        self.assertLessEqual(sum(self.delays), 31)
+        self.assertEqual(http.responses, [])
+
+    def test_pricing_authorization_failure_is_not_retried_or_quoted(self):
+        from botocore.exceptions import ClientError
+        pricing = self.sdk().client('pricing', 'us-east-1')
+        denied = self.reply({'__type': 'AccessDeniedException', 'message': 'not authorized'}, 403)
+        http = self.transport(pricing, [denied])
+        with self.assertRaises(ClientError) as rejected:
+            ci.live_prices(pricing, 'us-east-1', 'g6.8xlarge')
+        self.assertEqual(rejected.exception.response['Error']['Code'], 'AccessDeniedException')
+        self.assertEqual(len(http.requests), 1)
+        self.assertEqual(self.delays, [])
+
 
 class PaginationTests(unittest.TestCase):
     def scripted(self, responses):

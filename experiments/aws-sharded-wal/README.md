@@ -1,3 +1,21 @@
+## 22 October read-only Pricing throttling
+
+Run `39814797884` rebuilt all six executables and passed its same-build Sui
+checkpoint audit. Its first benchmark attempt then failed in `GetProducts` with
+`ThrottlingException` before reservation or fleet allocation. Independent AWS MCP
+checks found no resources in that run's exact ownership scope.
+
+The Pricing client now uses standard SDK backoff with **six total attempts per
+request**. Authorization errors and exhausted throttling still fail closed; no
+missing, stale, ambiguous or zero price is substituted. EC2 mutation requests
+retain one total attempt. Lambda readiness remains at 12, and S3 remains at three.
+Neither the fleet lifetime nor the export reserve changes.
+
+Eleven real-botocore offline fault cases passed, including Pricing recovery with
+retained cost evidence, bounded exhaustion, permission rejection, and the existing
+EC2 ambiguous-response non-replay checks. These cases execute the SDK serializers,
+parsers and retry handlers over a scripted HTTP transport; they do not call AWS.
+
 ## 19 October protected CI admission and reconciled costs
 
 Five protected CI attempts rebuilt all six binaries and completed the native and
