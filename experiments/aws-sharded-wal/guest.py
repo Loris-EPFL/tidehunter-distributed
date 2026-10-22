@@ -30,6 +30,7 @@ import transport_floor
 import stage_timing
 import prepare_bundle
 import local_compare
+from checkpoint_matrix import HARDWARE_TRANSPORTS, TRANSPORTS
 
 import boto3
 from boto3.s3.transfer import TransferConfig
@@ -55,7 +56,7 @@ def benchmark_case_identity(label, shape, repetition, *, storage=False, capacity
         prefix = 'diagnostic' if diagnostics else 'cold'
     if cached:
         prefix = 'cache'
-    if transport in ('efa', 'efa-direct'):
+    if transport in HARDWARE_TRANSPORTS:
         prefix += '-' + transport
     if shard_cache_bytes:
         prefix = f'shardcache{shard_cache_bytes}-' + prefix
@@ -155,6 +156,8 @@ def kv_case_policy(cfg, spec):
     common_partition = geometry | dict(batch_limits=batch_limits, max_reference_metadata_bytes=16 * 1024**2)
     case_root = Path(arguments['--guest-case-root'])
     def tls(identity, server_name):
+        if arguments['--transport'] == 'efa-native':
+            return dict(transport='efa-native', ca='', cert='', key='', server_name=server_name)
         return dict(transport=arguments['--transport'], ca=str(case_root / 'tls/ca.der'),
                     cert=str(case_root / 'tls' / (identity + '.der')),
                     key=str(case_root / 'tls' / (identity + '.pk8')), server_name=server_name)
@@ -1109,7 +1112,7 @@ class Campaign:
                 raise ValueError('broader campaign requires full hardware qualification')
         elif progress:
             raise ValueError('progress requires an explicit planned case')
-        if transport not in ['tcp', 'efa', 'efa-direct'] or (transport in ('efa', 'efa-direct') and
+        if transport not in TRANSPORTS or (transport in HARDWARE_TRANSPORTS and
                 ((label != 'current' and not progress) or not self.cfg.get('efa'))):
             raise ValueError('fabric cases require an EFA-enabled build and fleet')
         value, batch, window = shape
@@ -1195,14 +1198,17 @@ class Campaign:
             part = node['partition']
             archive = self.root / (case_id + f'-node-{part}.tar.gz')
             with tarfile.open(archive, 'w:gz') as stream:
-                for name in [f'node-{part}/launch.yaml', 'tls/ca.der', f'tls/tidehunter-node-{part}.der', f'tls/tidehunter-node-{part}.pk8']:
+                names = [f'node-{part}/launch.yaml']
+                if transport != 'efa-native':
+                    names += ['tls/ca.der', f'tls/tidehunter-node-{part}.der', f'tls/tidehunter-node-{part}.pk8']
+                for name in names:
                     stream.add(case_root / name, arcname=name, recursive=False)
             node_archives[str(part)] = upload(self.s3, archive, self.cfg,
                         f"{self.cfg['s3_prefix']}/case-artifacts/{case_id}/node-{part}.tar.gz")
         payload = {'config': self.cfg, 'case_id': case_id, 'action': 'start', 'build': label,
                    'binary_sha256': self.cloud_builds[label]['binary_sha256'], 'node_archives': node_archives}
         payload['transport'] = transport
-        payload['require_efa_proof'] = bool(self.cfg.get('kv_subsuite') and transport in ('efa', 'efa-direct'))
+        payload['require_efa_proof'] = bool(self.cfg.get('kv_subsuite') and transport in HARDWARE_TRANSPORTS)
         self.active_payload = payload
         self.ssm_nodes(payload)
         try:

@@ -65,7 +65,7 @@ def main():
     parser.add_argument('--baseline-source-sha256', default=cluster_ram.BASELINE_SOURCE_SHA256)
     parser.add_argument('--baseline-binary-sha256', default=cluster_ram.BASELINE_BINARY_SHA256)
     parser.add_argument('--suite', choices=('core', 'capacity', 'all'), default='core')
-    parser.add_argument('--transport', choices=('tcp', 'fabric-tcp'), default='tcp')
+    parser.add_argument('--transport', choices=('tcp', 'fabric-tcp', 'fabric-tcp-native'), default='tcp')
     parser.add_argument('--values', default='1024,8192')
     parser.add_argument('--repetitions', type=int, default=1)
     parser.add_argument('--reads', type=int, default=1024)

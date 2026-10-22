@@ -151,7 +151,7 @@ class EvidenceTests(unittest.TestCase):
                 'print("provider: efa\\n fabric: " + fabric + "\\n type: FI_EP_RDM")\n')
             executable.chmod(0o700)
             with patch.object(supervisor.shutil, 'which', return_value=str(executable)), patch.object(resource, 'setrlimit'):
-                for transport in ('efa', 'efa-direct'):
+                for transport in ('efa', 'efa-direct', 'efa-native'):
                     output = root / transport
                     output.mkdir()
                     supervisor.fabric_preflight(output, transport)
@@ -159,6 +159,8 @@ class EvidenceTests(unittest.TestCase):
                 executable.write_text('#!' + sys.executable + '\nprint("provider: efa\\n fabric: efa\\n type: FI_EP_RDM")\n')
                 with self.assertRaises(ValueError):
                     supervisor.fabric_preflight(root / 'efa-direct', 'efa-direct')
+                with self.assertRaises(ValueError):
+                    supervisor.fabric_preflight(root / 'efa-native', 'efa-native')
                 executable.write_text('#!' + sys.executable + '\nprint("provider: efa\\n fabric: efa-direct\\n type: FI_EP_RDM")\n')
                 with self.assertRaises(ValueError):
                     supervisor.fabric_preflight(root / 'efa', 'efa')

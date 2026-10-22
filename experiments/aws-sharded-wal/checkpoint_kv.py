@@ -16,6 +16,7 @@ import transport_floor
 
 from checkpoint_matrix import efa_snapshot, efa_proof, validate_efa_proof, validate_provider
 from checkpoint_matrix import fabric_local_log, fabric_local_archive_log
+from checkpoint_matrix import HARDWARE_TRANSPORTS, DIRECT_TRANSPORTS, TRANSPORT_BACKENDS
 from guest import Campaign, upload, write_json, sha, benchmark_case_identity, kv_case_commands, kv_case_policy
 
 
@@ -99,9 +100,7 @@ def validate_contention(path, spec, mode):
     rows = [json.loads(line) for line in Path(path).read_text().splitlines()]
     if len(rows) != 2:
         raise ValueError('cache contention requires separate one/eight-caller populations')
-    backend = 'native_value_wal_barrier' if mode == 'native-sync' else {
-        'tcp': 'experimental_tcp_authority', 'efa': 'experimental_efa_authority',
-        'efa-direct': 'experimental_efa_direct_authority'}[spec['transport']]
+    backend = 'native_value_wal_barrier' if mode == 'native-sync' else TRANSPORT_BACKENDS[spec['transport']]
     for row, callers in zip(rows, (1, 8)):
         if (row.get('api') != 'distributed::sui::Db::get'
                 or row.get('backend') != backend
@@ -227,6 +226,9 @@ def read_service_evidence(directory, mode, owner_partitions=range(5)):
         pair[row['boundary']] = row
     phases = {}
     fields = ('cache_hits', 'cache_misses', 'wal_reads', 'resident_read_successes', 'async_read_submissions')
+    deferred_available = bool(rows) and 'resident_read_deferred' in rows[0]
+    if deferred_available:
+        fields += ('resident_read_deferred',)
     for (phase, role, partition), pair in boundaries.items():
         if set(pair) != {'before', 'after'}:
             raise ValueError('read-service evidence lacks complete interval')
@@ -272,6 +274,9 @@ def read_service_evidence(directory, mode, owner_partitions=range(5)):
             if evidence['owner_resident_read_successes'] else 'cache_state_not_established')
         evidence['owner_async_submissions'] = (
             sum(owner['async_read_submissions'] for owner in owners.values()) if owner_available else None)
+        evidence['owner_resident_read_deferred'] = (
+            sum(owner['resident_read_deferred'] for owner in owners.values())
+            if owner_available and deferred_available else None)
         evidence['async_submissions_prove_device_io'] = False
         evidence['api'] = phase
     return phases
@@ -374,7 +379,7 @@ def cold_probe_certificate(directory, spec, cfg, client):
     directory = Path(directory)
     nodes = cfg['nodes']
     expected_binary_sha256 = cfg['binaries']['storage-node']
-    if spec['transport'] != 'efa-direct' or not spec['cold'] or spec['diagnostics']:
+    if spec['transport'] not in DIRECT_TRANSPORTS or not spec['cold'] or spec['diagnostics']:
         raise ValueError('cold auxiliary attribution requires a clean direct cold case')
     if not directory.name.endswith('-tcp'):
         raise ValueError('cold auxiliary requires the original remote case output')
@@ -420,10 +425,10 @@ def cold_probe_certificate(directory, spec, cfg, client):
     count = min(reads, 256)
     if (metadata.get('cold_read_pass') != 'true'
             or metadata.get('transport_diagnostics') != 'false'
-            or metadata.get('transport') != 'efa-direct'
+            or metadata.get('transport') != spec['transport']
             or metadata.get('point_reads') != str(reads)):
         raise ValueError('cold auxiliary metadata differs from the immutable plan')
-    backend = 'experimental_efa_direct_authority'
+    backend = TRANSPORT_BACKENDS[spec['transport']]
     identity = dict(zip(('value_bytes', 'batch_size', 'window'), spec['shape'])) | {'repetition': 0}
     def same_case(row):
         return row.get('backend') == backend and all(
@@ -572,8 +577,8 @@ def validate_auxiliary(root, state, cfg):
             read_service.append(dict(case_id=case_id, mode=mode, diagnostic=spec['diagnostics'],
                 phases=read_service_evidence(directory, mode,
                     owner_partitions=[node['partition'] for node in cfg['nodes']])))
-            direct_diagnostic = spec['transport'] == 'efa-direct' and spec['diagnostics'] and mode == 'tcp'
-            cold_auxiliary = (spec['transport'] == 'efa-direct' and spec['cold']
+            direct_diagnostic = spec['transport'] in DIRECT_TRANSPORTS and spec['diagnostics'] and mode == 'tcp'
+            cold_auxiliary = (spec['transport'] in DIRECT_TRANSPORTS and spec['cold']
                               and not spec['diagnostics'] and mode == 'tcp')
             log = root / (case_id + '-' + mode + '-process.stderr.log')
             evidence = fabric_local_log(log, required=direct_diagnostic or cold_auxiliary,
@@ -593,8 +598,8 @@ def validate_auxiliary(root, state, cfg):
             archive_path = root / 'nodes' / case_id / f'node-{partition}.tar.gz'
             with tarfile.open(archive_path, 'r:gz') as archive:
                 evidence = fabric_local_archive_log(archive, 'node.stderr.log',
-                    required=spec['transport'] == 'efa-direct' and node_diagnostic,
-                    forbidden=spec['transport'] != 'efa-direct' or not node_diagnostic)
+                    required=spec['transport'] in DIRECT_TRANSPORTS and node_diagnostic,
+                    forbidden=spec['transport'] not in DIRECT_TRANSPORTS or not node_diagnostic)
             if cold_certificate is not None:
                 validate_cold_probe_storage(evidence, cold_certificate, partition)
             fabric.append(dict(case_id=case_id, role='storage', partition=partition,
@@ -643,14 +648,14 @@ def validate_auxiliary(root, state, cfg):
         values = transport_floor.read_floor_metrics(directory, spec)
         fabric.append(dict(case_id=case_id, role='ram-control', population=observed['population'],
             evidence=fabric_local_log(root / (output + '-process.stderr.log'),
-                required=transport == 'efa-direct' and instrumented,
-                forbidden=transport != 'efa-direct' or not instrumented)))
+                required=transport in DIRECT_TRANSPORTS and instrumented,
+                forbidden=transport not in DIRECT_TRANSPORTS or not instrumented)))
         metrics.append(dict(case_id=case_id, population=observed['population'], specification=spec,
             metrics=[dict(kind=kind, phase=phase, counter=counter, value=value)
                      for (kind, phase, counter), value in sorted(values.items())]))
     return dict(ram_controls=metrics, cache_contention=contention, read_service=read_service,
                 fabric_local_diagnostics=fabric,
-                scope='RAM exchange includes TLS/software/payload validation; not pure wire or device IO')
+                scope='RAM exchange includes transport/software/payload validation; TLS only in authenticated modes; not pure wire or device IO')
 
 
 class CheckpointKvCampaign(Campaign):
@@ -658,7 +663,7 @@ class CheckpointKvCampaign(Campaign):
         # Deliberately do not call the generic executor/constructor: its output
         # root, two-source rebuild and fleet termination belong to another run.
         self.cfg = dict(parent.cfg, campaign='efa-cache', efa=any(
-                            transport in ('efa', 'efa-direct') for transport in parent.cfg['transports']),
+                            transport in HARDWARE_TRANSPORTS for transport in parent.cfg['transports']),
                         repetitions=parent.cfg['kv_suite']['repetitions'], kv_subsuite=True)
         self.root, self.ids = parent.root, parent.ids
         self.bundle = self.root  # The admitted atomic bootstrap installs root/runner/*.py.
@@ -721,7 +726,7 @@ class CheckpointKvCampaign(Campaign):
                         instance_id=self.cfg['coordinator_instance_id'],
                         binary_sha256=self.state['binary_sha256'], specification=spec)
         before = None
-        if spec['transport'] in ('efa', 'efa-direct'):
+        if spec['transport'] in HARDWARE_TRANSPORTS:
             from sui_checkpoint import fabric_preflight
             output = self.results / f"preflight-{ordinal}-{spec['transport']}"
             output.mkdir()

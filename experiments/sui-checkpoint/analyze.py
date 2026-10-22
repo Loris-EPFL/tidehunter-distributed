@@ -16,6 +16,7 @@ import csv
 import hashlib
 import json
 import math
+from itertools import combinations
 from pathlib import Path
 import re
 import statistics
@@ -654,13 +655,11 @@ def population_comparison(cells):
 def transport_comparison(cells):
     pairs = []
     transports = {cell['transport'] for cell in cells}
-    if transports - {'tcp', 'efa', 'efa-direct'}:
+    if transports - {'tcp', 'efa', 'efa-direct', 'efa-native'}:
         raise ValueError('unknown transport comparison label')
-    comparisons = [('tcp', 'efa')]
-    if 'efa-direct' in transports:
-        comparisons = [('tcp', 'efa'), ('tcp', 'efa-direct'), ('efa', 'efa-direct')]
-        comparisons = [(reference, candidate) for reference, candidate in comparisons
-                       if reference in transports or candidate in transports]
+    order = ['tcp', 'efa'] + [name for name in ('efa-direct', 'efa-native') if name in transports]
+    comparisons = [(reference, candidate) for reference, candidate in combinations(order, 2)
+                   if reference in transports or candidate in transports]
     for repetition in sorted({cell['repetition'] for cell in cells}):
         selected = [cell for cell in cells if cell['repetition'] == repetition]
         by_transport = {cell['transport']: cell for cell in selected}

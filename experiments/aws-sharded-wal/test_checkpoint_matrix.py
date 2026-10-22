@@ -28,7 +28,7 @@ def completed_matrix(cfg):
         for node in cfg['nodes']:
             cell['node_archives'][node['instance_id']] = dict(bucket=cfg['bucket'], sha256='f' * 64,
                 key=f"{cfg['s3_prefix']}/results/cells/{cell['cell_id']}/storage/{node['partition']}/final/evidence.tar.gz")
-        if cell['transport'] in ('efa', 'efa-direct'):
+        if cell['transport'] in ('efa', 'efa-direct', 'efa-native'):
             for instance_id in [cfg['coordinator_instance_id'], *(node['instance_id'] for node in cfg['nodes'])]:
                 identity = dict(run_id=cfg['run_id'], cell_id=cell['cell_id'], instance_id=instance_id,
                     config_sha256=cell['config_sha256'], build_manifest_sha256=cfg['build_manifest_sha256'])
@@ -996,14 +996,14 @@ class MatrixEvidenceTests(unittest.TestCase):
         self.assertEqual([cell['read_profile_limit'] for cell in self.cells],
                          [0, 0, 4096, 4096, 4096, 4096, 0, 0])
         matrix.validate_matrix(self.cfg, self.cells)
-        for transport in ('tcp', 'efa', 'efa-direct'):
+        for transport in ('tcp', 'efa', 'efa-direct', 'efa-native'):
             cfg = self.cfg | dict(transports=[transport], repetitions=1, read_profile_limits=[0],
                                   write_profile_limits=[0], native_write_profile_limits=[0])
             matrix.validate_matrix(cfg, completed_matrix(cfg))
 
     def test_cell_identity_accepts_four_repetitions_and_rejects_out_of_bounds(self):
         for repetition in range(1, 5):
-            for transport in ('tcp', 'efa', 'efa-direct'):
+            for transport in ('tcp', 'efa', 'efa-direct', 'efa-native'):
                 matrix.check_cell(f'r{repetition:02d}-{transport}', transport)
         for cell_id in ('r00-tcp', 'r05-tcp', 'r99-tcp', 'r4-tcp', 'r004-tcp',
                         'r04-efa', 'r04-tcp-extra', 'r04-tcp\n', None, 4):
@@ -1012,37 +1012,38 @@ class MatrixEvidenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             matrix.check_cell('r04-fabric-tcp', 'fabric-tcp')
 
-    def test_triplets_require_all_six_direct_host_source_and_cell_proofs(self):
-        cfg = self.cfg | dict(transports=['tcp', 'efa', 'efa-direct'])
-        cells = completed_matrix(cfg)
-        matrix.validate_matrix(cfg, cells)
-        self.assertEqual([cell['transport'] for cell in cells[:6]],
-                         ['tcp', 'efa', 'efa-direct', 'efa-direct', 'efa', 'tcp'])
-        for host in cells[2]['efa']:
-            for mutation in ('missing', 'source', 'cell', 'software'):
-                changed = copy.deepcopy(cells)
-                proof = changed[2]['efa'][host]
-                if mutation == 'missing':
-                    del changed[2]['efa'][host]
-                elif mutation == 'software':
-                    proof['after']['devices']['rdmap0s1']['driver'] = 'rxe'
-                else:
-                    field = 'build_manifest_sha256' if mutation == 'source' else 'cell_id'
-                    proof['before']['identity'][field] = 'foreign'
-                with self.subTest(host=host, mutation=mutation), self.assertRaises(ValueError):
+    def test_direct_modes_require_all_six_host_source_and_cell_proofs(self):
+        for transport in ('efa-direct', 'efa-native'):
+            cfg = self.cfg | dict(transports=['tcp', 'efa', transport])
+            cells = completed_matrix(cfg)
+            matrix.validate_matrix(cfg, cells)
+            self.assertEqual([cell['transport'] for cell in cells[:6]],
+                             ['tcp', 'efa', transport, transport, 'efa', 'tcp'])
+            for host in cells[2]['efa']:
+                for mutation in ('missing', 'source', 'cell', 'software'):
+                    changed = copy.deepcopy(cells)
+                    proof = changed[2]['efa'][host]
+                    if mutation == 'missing':
+                        del changed[2]['efa'][host]
+                    elif mutation == 'software':
+                        proof['after']['devices']['rdmap0s1']['driver'] = 'rxe'
+                    else:
+                        field = 'build_manifest_sha256' if mutation == 'source' else 'cell_id'
+                        proof['before']['identity'][field] = 'foreign'
+                    with self.subTest(transport=transport, host=host, mutation=mutation), self.assertRaises(ValueError):
+                        matrix.validate_matrix(cfg, changed)
+            for changed in (cells[:-1], cells + [cells[-1]]):
+                with self.assertRaises(ValueError):
                     matrix.validate_matrix(cfg, changed)
-        for changed in (cells[:-1], cells + [cells[-1]]):
-            with self.assertRaises(ValueError):
-                matrix.validate_matrix(cfg, changed)
 
     def test_exact_fabric_is_required_for_new_hardware_negotiation(self):
-        for transport in ('efa', 'efa-direct'):
-            text = f'provider: efa\n    fabric: {transport}\n    type: FI_EP_RDM\n'
+        for transport, fabric in (('efa', 'efa'), ('efa-direct', 'efa-direct'), ('efa-native', 'efa-direct')):
+            text = f'provider: efa\n    fabric: {fabric}\n    type: FI_EP_RDM\n'
             matrix.validate_provider(text, transport)
-            verbose = f'fi_info:\n    fi_ep_attr:\n        type: FI_EP_RDM\n    fi_fabric_attr:\n        name: {transport}\n        prov_name: efa\n'
+            verbose = f'fi_info:\n    fi_ep_attr:\n        type: FI_EP_RDM\n    fi_fabric_attr:\n        name: {fabric}\n        prov_name: efa\n'
             matrix.validate_provider(verbose, transport)
-            for invalid in (text.replace('fabric: ' + transport, 'fabric: tcp'),
-                            text.replace('    fabric: ' + transport + '\n', ''),
+            for invalid in (text.replace('fabric: ' + fabric, 'fabric: tcp'),
+                            text.replace('    fabric: ' + fabric + '\n', ''),
                             text.replace('provider: efa', 'provider: efa-direct'),
                             text + 'provider: tcp\n    fabric: tcp\n    type: FI_EP_RDM\n',
                             text + 'provider: efa\n    type: FI_EP_RDM\n',
@@ -1055,6 +1056,10 @@ class MatrixEvidenceTests(unittest.TestCase):
             matrix.validate_provider('provider: efa\n fabric: efa-direct\n type: FI_EP_RDM\n', 'efa')
         with self.assertRaises(ValueError):
             matrix.validate_provider('provider: efa\n fabric: efa-direct\n type: FI_EP_RDM\n')
+        with self.assertRaises(ValueError):
+            matrix.validate_provider('provider: efa\n fabric: efa\n type: FI_EP_RDM\n', 'efa-native')
+        with self.assertRaises(ValueError):
+            matrix.validate_provider('provider: efa\n fabric: efa-native\n type: FI_EP_RDM\n', 'efa-native')
 
     def test_missing_duplicate_reordered_incomplete_cells_fail(self):
         cases = [self.cells[:-1], self.cells + [self.cells[0]], self.cells[::-1],
@@ -1298,6 +1303,7 @@ class MatrixEvidenceTests(unittest.TestCase):
             physical([])
             evidence = checkpoint_kv.read_service_evidence(directory, 'tcp')['point_get']
             self.assertEqual(evidence['owner_async_submissions'], 40)
+            self.assertIsNone(evidence['owner_resident_read_deferred'])
             self.assertTrue(evidence['owner_counters_available'])
             self.assertFalse(evidence['async_submissions_prove_device_io'])
             self.assertIsNone(evidence['charged_physical_read_bytes'])
@@ -1352,6 +1358,32 @@ class MatrixEvidenceTests(unittest.TestCase):
             capture([2, 4], [2, 3])
             with self.assertRaisesRegex(ValueError, 'configured owner'):
                 checkpoint_kv.read_service_evidence(directory, 'tcp', owner_partitions=[2, 3])
+
+    def test_resident_budget_deferrals_are_not_cache_hits_or_device_io(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            fields = ['phase', 'role', 'partition', 'boundary', 'cache_hits', 'cache_misses',
+                      'wal_reads', 'resident_read_successes', 'async_read_submissions',
+                      'resident_read_deferred']
+            with (directory / 'read_path_evidence.csv').open('w') as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                for partition in range(5):
+                    for boundary in ('before', 'after'):
+                        after = boundary == 'after'
+                        writer.writerow(dict(phase='point_get', role='storage', partition=partition,
+                            boundary=boundary, cache_hits=0, cache_misses=3 if after else 0,
+                            wal_reads=3 if after else 0, resident_read_successes=1 if after else 0,
+                            async_read_submissions=2 if after else 0,
+                            resident_read_deferred=2 if after else 0))
+            (directory / 'read_io.csv').write_text('phase,partition,physical_read_bytes\n')
+            evidence = checkpoint_kv.read_service_evidence(directory, 'tcp')['point_get']
+            self.assertEqual(evidence['owner_resident_read_successes'], 5)
+            self.assertEqual(evidence['owner_async_submissions'], 10)
+            self.assertEqual(evidence['owner_resident_read_deferred'], 10)
+            self.assertEqual(sum(owner['cache_hits'] for owner in evidence['owners'].values()), 0)
+            self.assertIsNone(evidence['charged_physical_read_bytes'])
+            self.assertFalse(evidence['async_submissions_prove_device_io'])
 
     def test_checkpoint_records_join_completion_and_pressure_without_invented_spans(self):
         spec = dict(diagnostics=True, transport='tcp')

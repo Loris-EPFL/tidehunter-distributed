@@ -115,6 +115,35 @@ class CloudNodeContract(unittest.TestCase):
             with self.subTest(fallback=fallback), self.assertRaisesRegex(ValueError, 'transport differs'):
                 self.validate()
 
+    def test_native_without_credential_files_runs_and_reaps_owned_namespace(self):
+        old_root = self.root
+        self.root = old_root.parent.parent / 'r04-efa-native/storage'
+        self.root.parent.mkdir()
+        old_root.rename(self.root)
+        self.config_path = self.root / 'node-config.json'
+        self.binary = self.root / 'storage-node'
+        self.cfg = json.loads(json.dumps(self.cfg).replace(str(old_root), str(self.root))
+                              .replace('"r04-tcp"', '"r04-efa-native"').replace('"tcp"', '"efa-native"'))
+        launch = Path(self.cfg['commands'][0][2])
+        value = json.loads(launch.read_text().replace(str(old_root), str(self.root)))
+        value['tls'] = dict(transport='efa-native', ca='', cert='', key='',
+                            trusted_domain='isolated-test')
+        for credential in ('ca', 'cert', 'key'):
+            value['tls'][credential] = 'unexpected-credential'
+            launch.write_text(json.dumps(value))
+            with self.subTest(credential=credential), self.assertRaises(ValueError):
+                self.validate()
+            del value['tls'][credential]
+            launch.write_text(json.dumps(value))
+            with self.subTest(missing=credential), self.assertRaises(ValueError):
+                self.validate()
+            value['tls'][credential] = ''
+        launch.write_text(json.dumps(value))
+        for credential in (self.root / 'tls').iterdir():
+            credential.unlink()
+        (self.root / 'tls').rmdir()
+        self.check_live_samples_and_normal_controller_shutdown()
+
     def test_requires_exact_owned_root(self):
         self.cfg['root'] = str(self.root.parent)
         with self.assertRaises(ValueError):
@@ -252,6 +281,9 @@ class CloudNodeContract(unittest.TestCase):
             unrelated.wait(timeout=2)
 
     def test_live_samples_and_normal_controller_shutdown(self):
+        self.check_live_samples_and_normal_controller_shutdown()
+
+    def check_live_samples_and_normal_controller_shutdown(self):
         owner = self.owner()
         live = []
         errors = []

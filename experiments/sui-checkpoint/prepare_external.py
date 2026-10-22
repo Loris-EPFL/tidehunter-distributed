@@ -19,7 +19,7 @@ def main():
     parser.add_argument('--guest-root',type=Path,required=True,help='fresh absolute namespace root, identical path on all hosts')
     parser.add_argument('--hosts',required=True,help='five distinct private IPv4 addresses, comma separated')
     parser.add_argument('--port',type=int,default=24000)
-    parser.add_argument('--transport',choices=('tcp','efa','efa-direct','fabric-tcp'),default='tcp')
+    parser.add_argument('--transport',choices=('tcp', *deployment.HARDWARE_TRANSPORTS),default='tcp')
     parser.add_argument('--coordinator-cache-mib',type=int,default=8)
     parser.add_argument('--shard-cache-mib',type=int,default=0)
     parser.add_argument('--write-profile-limit',type=int,default=0,
@@ -51,8 +51,9 @@ def main():
         archive_path=output/f'host-{partition}.tar.gz'
         with tarfile.open(archive_path,'w:gz') as archive:
             archive.add(binary,arcname='storage-node')
-            for name in ('ca.der',f'node-{partition}.der',f'node-{partition}.pk8'):
-                archive.add(output/'tls'/name,arcname='tls/'+name)
+            if args.transport not in deployment.TRUSTED_TRANSPORTS:
+                for name in ('ca.der',f'node-{partition}.der',f'node-{partition}.pk8'):
+                    archive.add(output/'tls'/name,arcname='tls/'+name)
             for node in selected:
                 path=Path(node['launch'])
                 archive.add(path,arcname=str(path.relative_to(output)))
@@ -66,7 +67,9 @@ def main():
         source_archive_sha256=manifest['source_archive_sha256'],storage_binary_sha256=manifest['binaries']['storage-node'],
         shard_cache_bytes=args.shard_cache_mib*deployment.MIB,write_profile_limit=args.write_profile_limit,hosts=host_records,
         ownership='controller creates each fresh guest root, starts only listed process groups, bounds deadlines, collects /proc IO/RSS/swap and stops only owned groups',
-        security='each host receives its own leaf key plus public CA; no coordinator key or CA signing key'))
+        security=('trusted isolated cluster; no application TLS or certificate files'
+                  if args.transport in deployment.TRUSTED_TRANSPORTS else
+                  'each host receives its own leaf key plus public CA; no coordinator key or CA signing key')))
     print(output/'external-manifest.json')
 
 

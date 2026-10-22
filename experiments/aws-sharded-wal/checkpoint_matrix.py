@@ -7,6 +7,26 @@ import time
 
 FABRIC_LOCAL_PREFIX = b'TIDEHUNTER_FABRIC_LOCAL_DIAGNOSTICS'
 
+# Application transport names are not necessarily libfabric fabric names:
+# efa-native uses the direct adapter without the software TLS stream.
+HARDWARE_TRANSPORTS = ('efa', 'efa-direct', 'efa-native')
+DIRECT_TRANSPORTS = ('efa-direct', 'efa-native')
+TRANSPORTS = ('tcp', *HARDWARE_TRANSPORTS)
+TRANSPORT_BACKENDS = {
+    'tcp': 'experimental_tcp_authority',
+    'efa': 'experimental_efa_authority',
+    'efa-direct': 'experimental_efa_direct_authority',
+    'efa-native': 'trusted_experimental_efa_native_authority',
+    'fabric-tcp': 'experimental_fabric_tcp_authority',
+    'fabric-tcp-native': 'experimental_fabric_tcp_native_authority',
+}
+
+
+def fabric_name(transport):
+    if transport not in HARDWARE_TRANSPORTS:
+        raise ValueError('hardware fabric requires an EFA transport')
+    return 'efa-direct' if transport in DIRECT_TRANSPORTS else 'efa'
+
 
 def parse_fabric_local_diagnostics(stream, *, max_bytes=128 * 1024**2, max_records=4096):
     """Parse finalized local provider windows, never infer wire or latency facts."""
@@ -86,10 +106,10 @@ def matrix_plan(cfg):
     transports = cfg.get('transports')
     repetitions = cfg.get('repetitions')
     if ('transport' in cfg or not isinstance(transports, list) or not transports
-            or any(value not in ('tcp', 'efa', 'efa-direct') for value in transports)
+            or any(value not in TRANSPORTS for value in transports)
             or len(set(transports)) != len(transports)
             or type(repetitions) is not int or not 1 <= repetitions <= 4):
-        raise ValueError('require distinct transports [tcp, efa and/or efa-direct] and repetitions 1..4; singular transport is obsolete')
+        raise ValueError('require distinct TCP/EFA transports and repetitions 1..4; singular transport is obsolete')
     limits = cfg.get('read_profile_limits')
     if ('read_profile_limit' in cfg or not isinstance(limits, list)
             or len(limits) != repetitions
@@ -123,7 +143,7 @@ def matrix_plan(cfg):
 
 
 def check_cell(cell_id, transport):
-    if (transport not in ('tcp', 'efa', 'efa-direct') or not isinstance(cell_id, str)
+    if (transport not in TRANSPORTS or not isinstance(cell_id, str)
             or not re.fullmatch(r'r0[1-4]-' + transport, cell_id)):
         raise ValueError('invalid checkpoint cell identity')
 
@@ -131,7 +151,7 @@ def check_cell(cell_id, transport):
 def validate_provider(text, transport=None):
     # Omitted transport admits retained pre-fabric-name evidence only. New
     # executions always name their transport and require exact negotiation.
-    if transport not in (None, 'efa', 'efa-direct'):
+    if transport is not None and transport not in HARDWARE_TRANSPORTS:
         raise ValueError('hardware provider proof requires an EFA transport')
     providers = re.findall(r'^\s*(?:provider|prov_name):\s*(\S+)\s*$', text, re.MULTILINE)
     endpoints = re.findall(r'^\s*type:\s*(FI_EP_\S+)\s*$', text, re.MULTILINE)
@@ -140,8 +160,9 @@ def validate_provider(text, transport=None):
     if (not providers or any(provider != 'efa' for provider in providers)
             or not endpoints or any(endpoint != 'FI_EP_RDM' for endpoint in endpoints)):
         raise ValueError('requires hardware efa RDM provider, not software/layered fallback')
+    expected_fabric = fabric_name(transport) if transport is not None else 'efa'
     if ((transport is not None and (len(fabrics) != len(providers) or len(endpoints) != len(providers)))
-            or any(fabric != (transport or 'efa') for fabric in fabrics)):
+            or any(fabric != expected_fabric for fabric in fabrics)):
         raise ValueError('negotiated fabric differs from requested transport; no fallback')
 
 
@@ -252,7 +273,7 @@ def validate_matrix(cfg, cells):
             if receipt.get('key') != key or receipt.get('bucket') != cfg['bucket'] or not re.fullmatch(r'[0-9a-f]{64}', receipt.get('sha256', '')):
                 raise ValueError('matrix node archive belongs to another cell')
         proofs = cell.get('efa', {})
-        if set(proofs) != (expected_hosts if cell['transport'] in ('efa', 'efa-direct') else set()):
+        if set(proofs) != (expected_hosts if cell['transport'] in HARDWARE_TRANSPORTS else set()):
             raise ValueError('matrix EFA proof misses a host or contaminates TCP control')
         for instance_id, proof in proofs.items():
             identity = dict(run_id=cfg['run_id'], cell_id=cell['cell_id'], instance_id=instance_id,
@@ -275,7 +296,7 @@ def validate_placement(cfg, instances, groups):
                 or placement.get('GroupId') != groups[0]['GroupId']
                 or instance.get('InstanceType') != cfg['instance_type']):
             raise ValueError('fleet hardware/zone/cluster placement differs')
-        if any(transport in ('efa', 'efa-direct') for transport in cfg['transports']) and not any(
+        if any(transport in HARDWARE_TRANSPORTS for transport in cfg['transports']) and not any(
                 nic.get('InterfaceType') == 'efa' and nic.get('Status') == 'in-use'
                 and nic.get('Attachment', {}).get('Status') == 'attached'
                 for nic in instance.get('NetworkInterfaces', [])):
