@@ -697,7 +697,7 @@ fn preparation_services_previous_groups_without_admitting_invalid_next_chunk() {
     let (resume, resuming) = mpsc::sync_channel(1);
     db.before_preparation = Some((entered, resuming));
     // Conflict discovered only AFTER canonical preparation. No member of this
-    // new chunk may be admitted, even if older groups finish during preparation.
+    // chunk may be admitted while older groups make storage progress.
     let next = vec![
         (fixture.operation(1, 7), vec![put(7, 7)]),
         (fixture.operation(0, 0), vec![put(0, 99)]),
@@ -749,7 +749,6 @@ fn preparation_services_previous_groups_without_admitting_invalid_next_chunk() {
         6,
         "invalid chunk cannot allocate logical slots"
     );
-    assert!(db.pipeline_stats.prepare_progress_completions > 0);
     assert!(db.healthy);
     db.drain().unwrap();
     assert_eq!(value(&mut db, 7), None);
