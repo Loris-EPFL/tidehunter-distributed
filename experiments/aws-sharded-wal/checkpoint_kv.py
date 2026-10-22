@@ -660,11 +660,13 @@ def validate_diagnostic_evidence(directory, spec, mode, owner_partitions):
         counters = [transport_floor.flatten_counters(profile) for _, profile in nodes]
         if any('requests' not in profile or 'client.requests' not in profile for profile in counters):
             raise ValueError('diagnostic owner request populations are missing')
-        if any(bool(profile['requests']) != bool(profile['client.requests']) for profile in counters):
-            raise ValueError('diagnostic owner/client activity differs')
+        if any(profile['requests'] != profile['client.requests'] for profile in counters):
+            raise ValueError('diagnostic owner/client request populations differ')
         # Bounded profiled reads can legitimately select only some batch owners.
         # Require every active owner's clocks, not merely a positive fleet sum.
         active = [profile for profile in counters if profile['client.requests'] > 0]
+        if row['phase'] == 'load-write-diagnostics' and len(active) != len(counters):
+            raise ValueError('diagnostic load did not exercise every owner')
         def positive(*keys):
             for key in keys:
                 if (any(key not in profile for profile in counters) or not active

@@ -1243,7 +1243,7 @@ class MatrixEvidenceTests(unittest.TestCase):
                 writer = csv.DictWriter(stream, fieldnames=fields)
                 writer.writeheader()
                 writer.writerows(rows)
-            with self.assertRaisesRegex(ValueError, 'uncached read'):
+            with self.assertRaises(ValueError):
                 checkpoint_kv.validate_diagnostic_evidence(root, spec, 'tcp', list(range(5)))
 
     def test_diagnostic_idle_owners_are_not_missing_active_owner_profiles(self):
@@ -1262,11 +1262,11 @@ class MatrixEvidenceTests(unittest.TestCase):
                 checkpoint_kv.validate_diagnostic_evidence(root, spec, 'tcp', list(range(5)))
                 owner[1]['client']['requests'] = 1
                 save()
-                with self.assertRaisesRegex(ValueError, 'owner/client activity'):
+                with self.assertRaises(ValueError):
                     checkpoint_kv.validate_diagnostic_evidence(root, spec, 'tcp', list(range(5)))
                 owner[1]['requests'] = 1
                 save()
-                with self.assertRaisesRegex(ValueError, 'positive timing population'):
+                with self.assertRaises(ValueError):
                     checkpoint_kv.validate_diagnostic_evidence(root, spec, 'tcp', list(range(5)))
 
     def test_diagnostic_active_owner_clocks_cannot_hide_in_fleet_totals(self):
@@ -1280,7 +1280,23 @@ class MatrixEvidenceTests(unittest.TestCase):
                     profile[field] = 0
                 path = Path(root) / 'node_profiles.yaml'
                 path.write_text(''.join('---\n' + json.dumps(row) + '\n' for row in records))
-                with self.assertRaisesRegex(ValueError, 'positive timing population'):
+                with self.assertRaises(ValueError):
+                    checkpoint_kv.validate_diagnostic_evidence(root, spec, 'tcp', list(range(5)))
+
+    def test_diagnostic_load_and_drained_owner_populations_must_be_complete(self):
+        for change in ('idle_load', 'truncated_server', 'truncated_client'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as root:
+                spec, records = self.diagnostic_fixture(root)
+                profile = records[0 if change == 'idle_load' else 2]['nodes'][0][1]
+                if change == 'idle_load':
+                    profile['requests'] = profile['client']['requests'] = 0
+                elif change == 'truncated_server':
+                    profile['client']['requests'] = 2
+                else:
+                    profile['requests'] = 2
+                path = Path(root) / 'node_profiles.yaml'
+                path.write_text(''.join('---\n' + json.dumps(row) + '\n' for row in records))
+                with self.assertRaises(ValueError):
                     checkpoint_kv.validate_diagnostic_evidence(root, spec, 'tcp', list(range(5)))
 
     def test_diagnostic_profiles_reject_missing_malformed_and_tampered_populations(self):

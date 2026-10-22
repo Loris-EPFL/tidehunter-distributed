@@ -27,7 +27,8 @@ EFA CQ evidence and native-message zero-TLS work. Every remote diagnostic
 sample must have exactly one cache miss, including the cold pass, which runs
 before mixed writes and deletions. Bounded profiled reads can select only some
 batch owners: inactive owners remain explicit, while every active owner's
-required counters must be positive and its client/server activity must agree.
+required counters must be positive. After draining, each owner's client/server
+request counts must match exactly. The full load must exercise all five owners.
 Another owner's clocks cannot conceal a missing active-owner profile.
 `COMPLETE` alone is insufficient.
 Per-request send/header/body and compatibility inventory-wait clocks that the
