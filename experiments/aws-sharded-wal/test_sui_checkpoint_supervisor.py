@@ -6,6 +6,7 @@ import io
 import json
 from pathlib import Path
 import shutil
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -29,6 +30,12 @@ def example_config():
         cfg[name] = 'a' * 64
     cfg['binaries'] = {name: 'b' * 64 for name in supervisor.BINARIES}
     return cfg
+
+
+def resident_profile():
+    return supervisor.resident_read_config(dict(source_bytes=1024**2, source_regions=32,
+        destination_bytes=1024**2, destination_slots=4, max_read_bytes=65536,
+        max_handles=128, require_device_read=True))
 
 def traffic(identity, start=100, end=200):
     def snapshot(stamp, value):
@@ -327,6 +334,142 @@ class EvidenceTests(unittest.TestCase):
             with patch.object(supervisor, 'download', side_effect=download):
                 campaign.collect_node(node, final=True, logs=True)
             self.assertEqual(campaign.collected_final, {0})
+
+
+class PreparedResidentPolicyTests(unittest.TestCase):
+    def prepare_campaign(self, root, profile, transport='efa-native'):
+        """Execute the real preparation CLI; only the AWS upload is replaced."""
+        campaign = object.__new__(supervisor.SuiCampaign)
+        campaign.cfg = example_config()
+        campaign.deadline = campaign.cfg['deadline_utc']
+        campaign.cfg.update(transports=[transport], repetitions=1, read_profile_limits=[0],
+                            write_profile_limits=[0], native_write_profile_limits=[0])
+        if profile is not None:
+            campaign.cfg['kv_suite'] = dict(resident_reads=profile)
+        campaign.cell = supervisor.matrix_plan(campaign.cfg)[0]
+        campaign.root, campaign.cell_root = root, root / 'cell'
+        campaign.cell_root.mkdir()
+        campaign.results = root / 'results'
+        campaign.results.mkdir()
+        campaign.fixture = root / 'fixture'
+        campaign.fixture.mkdir()
+        (campaign.fixture / 'distributed.yaml').write_text('db-path: distributed/store\n')
+        campaign.build = root / 'build'
+        (campaign.build / 'binaries').mkdir(parents=True)
+        binary = campaign.build / 'binaries/storage-node'
+        binary.write_bytes(b'fixture executable bytes; preparation hashes and archives, never executes this file')
+        campaign.cfg['binaries']['storage-node'] = supervisor.sha(binary)
+        manifest = dict(protocol=9, fabric=True, binaries=campaign.cfg['binaries'],
+                        source_archive_sha256=campaign.cfg['source_archive_sha256'])
+        supervisor.write_json(campaign.build / 'build-manifest.json', manifest)
+        campaign.cfg['build_manifest_sha256'] = supervisor.sha(campaign.build / 'build-manifest.json')
+        campaign.verification = root / 'verification'
+        schema = campaign.verification / 'experiment/native-schema/perpetual'
+        schema.mkdir(parents=True)
+        supervisor.write_json(schema / 'manifest.json', dict(namespace='perpetual', backend='native'))
+        supervisor.write_json(schema / 'shape.json', {})
+        (schema / 'shape.yaml').write_text('{}\n')
+        campaign.scripts = Path(__file__).resolve().parents[1] / 'sui-checkpoint'
+        campaign.support = root / 'support'
+        campaign.support.mkdir()
+        campaign.nodes = copy.deepcopy(campaign.cfg['nodes'])
+        campaign.state, campaign.s3 = dict(uploads=[]), object()
+        commands, uploads = [], []
+        def execute(name, command, timeout):
+            commands.append([str(part) for part in command])
+            subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout)
+        def capture(s3, path, cfg, key):
+            uploads.append(Path(path))
+            return dict(bucket=cfg['bucket'], key=key, sha256=supervisor.sha(path))
+        campaign.run_command = execute
+        with patch.object(supervisor, 'upload', side_effect=capture):
+            campaign.prepare()
+        return campaign, commands, uploads
+
+    def test_cloud_prepare_passes_real_registered_profile_to_existing_producer(self):
+        import yaml
+        with tempfile.TemporaryDirectory() as temporary:
+            profile = resident_profile()
+            campaign, commands, uploads = self.prepare_campaign(Path(temporary), profile)
+            command = commands[0]
+            policy = Path(command[command.index('--resident-reads') + 1])
+            self.assertEqual(policy, campaign.cell_root / 'resident-reads.json')
+            self.assertEqual(supervisor.read_json(policy), profile)
+            self.assertEqual(supervisor.read_json(campaign.results / 'resident-reads.json'), profile)
+            self.assertEqual(campaign.cell['resident_reads'], profile)
+            self.assertEqual(campaign.external['resident_reads'], profile)
+            prepared = supervisor.read_json(campaign.deployment / 'config.json')
+            for database in prepared['databases'].values():
+                self.assertEqual(database['tls']['resident_reads'], profile)
+            self.assertEqual(len(uploads), 5)
+            for archive in uploads:
+                with tarfile.open(archive) as stream:
+                    launches = [member for member in stream.getmembers() if member.name.endswith('/launch.yaml')]
+                    self.assertEqual(len(launches), 1)
+                    with stream.extractfile(launches[0]) as source:
+                        launch = yaml.safe_load(source)
+                    self.assertEqual(launch['node']['resident_reads'], profile)
+                    self.assertEqual(launch['tls']['transport'], 'efa-native')
+                    self.assertEqual(launch['tls']['cert'], '')
+
+    def test_actual_coordinator_and_manifest_policy_cannot_be_silently_omitted_or_changed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            campaign, _, _ = self.prepare_campaign(Path(temporary), resident_profile())
+            prepared = supervisor.read_json(campaign.deployment / 'config.json')
+            namespace = next(iter(prepared['databases']))
+            for field in ('coordinator-missing', 'coordinator-changed', 'manifest-missing',
+                          'manifest-changed', 'cell-missing'):
+                config, external, cell = copy.deepcopy((prepared, campaign.external, campaign.cell))
+                if field == 'coordinator-missing':
+                    config['databases'][namespace]['tls'].pop('resident_reads')
+                elif field == 'coordinator-changed':
+                    config['databases'][namespace]['tls']['resident_reads']['max_handles'] += 1
+                elif field == 'manifest-missing':
+                    external.pop('resident_reads')
+                elif field == 'manifest-changed':
+                    external['resident_reads']['max_handles'] += 1
+                else:
+                    cell.pop('resident_reads')
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    supervisor.validate_prepared_cell(campaign.cfg, cell, config, external)
+
+    def test_missing_and_disabled_native_profile_keep_rpc_deployment_and_old_metadata(self):
+        for profile in (None, supervisor.resident_read_config()):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as temporary:
+                campaign, commands, _ = self.prepare_campaign(Path(temporary), profile)
+                self.assertNotIn('--resident-reads', commands[0])
+                self.assertFalse((campaign.cell_root / 'resident-reads.json').exists())
+                self.assertNotIn('resident_reads', campaign.cell)
+                prepared = supervisor.read_json(campaign.deployment / 'config.json')
+                self.assertTrue(all('resident_reads' not in database['tls']
+                                    for database in prepared['databases'].values()))
+                self.assertEqual(campaign.external['resident_reads'], supervisor.resident_read_config())
+
+    def test_enabled_profile_does_not_change_actual_tcp_tls_deployment(self):
+        import yaml
+        with tempfile.TemporaryDirectory() as temporary:
+            campaign, commands, uploads = self.prepare_campaign(Path(temporary), resident_profile(), 'tcp')
+            self.assertNotIn('--resident-reads', commands[0])
+            self.assertNotIn('resident_reads', campaign.cell)
+            prepared = supervisor.read_json(campaign.deployment / 'config.json')
+            database = next(iter(prepared['databases'].values()))
+            self.assertEqual(database['tls']['transport'], 'tcp')
+            self.assertNotIn('resident_reads', database['tls'])
+            self.assertTrue(all(database['tls'][name] for name in ('ca', 'cert', 'key')))
+            for archive in uploads:
+                with tarfile.open(archive) as stream:
+                    names = stream.getnames()
+                    self.assertIn('tls/ca.der', names)
+                    launch_name = next(name for name in names if name.endswith('/launch.yaml'))
+                    with stream.extractfile(launch_name) as source:
+                        launch = yaml.safe_load(source)
+                    self.assertNotIn('resident_reads', launch['node'])
+                    self.assertEqual(launch['tls']['transport'], 'tcp')
+            self.assertEqual(campaign.external['resident_reads'], supervisor.resident_read_config())
+            changed = copy.deepcopy(prepared)
+            next(iter(changed['databases'].values()))['tls']['resident_reads'] = resident_profile()
+            with self.assertRaises(ValueError):
+                supervisor.validate_prepared_cell(campaign.cfg, campaign.cell, changed, campaign.external)
 
 
 class LifecycleTests(unittest.TestCase):

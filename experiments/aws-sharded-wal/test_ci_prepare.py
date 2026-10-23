@@ -110,6 +110,8 @@ class FrozenSourceRestoreTests(unittest.TestCase):
             for path in (ci_prepare.ROOT / 'experiments' / directory).glob('*.py'):
                 if directory == 'sui-checkpoint' or not path.name.startswith('test_'):
                     shutil.copy2(path, target / path.name)
+        shutil.copy2(ci_prepare.ROOT / 'experiments/resident_config.py',
+                     engine / 'experiments/resident_config.py')
         identities = {}
         for owner in ('sui', 'tidehunter-sharded-wal'):
             base = sources / owner

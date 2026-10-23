@@ -109,6 +109,31 @@ def number(value):
     return value
 
 
+def remote_profile_observations(row):
+    """Only observed spans enter clock distributions; no RMA handler zeroes."""
+    available = row.get('server_timing_available')
+    if available not in (None, 'true', 'false'):
+        raise ValueError('invalid server timing availability')
+    wire = row.get('wire_read_requests')
+    if wire is not None and (not wire.isascii() or not wire.isdigit()):
+        raise ValueError('invalid wire read population')
+    result = {}
+    for key, value in row.items():
+        if key.endswith('_ns'):
+            if key.startswith('server_') and available == 'false':
+                if number(value) != 0:
+                    raise ValueError('unavailable server span contains a clock population')
+                continue
+            if wire == '0' and key in ('request_encode_ns', 'exchange_ns', 'response_decode_ns'):
+                continue
+            result[key] = number(value)
+        elif key in (READ_RECHECK_SAMPLES, 'wire_read_requests'):
+            result[key] = number(value)
+    if available is not None:
+        result['server_timing_available'] = int(available == 'true')
+    return result
+
+
 def read_json(path):
     value = json.loads(Path(path).read_text())
     if not isinstance(value, dict):
@@ -323,6 +348,12 @@ def read_case(root, name, info, campaign_profile="original"):
             metrics[key] = number(row["delta"])
     profile = path / "remote_read_profiles.csv"
     needs_profile = build == "current" and mode == "tcp"
+    metadata_path = path / 'campaign.txt'
+    metadata = (dict(line.split('=', 1) for line in metadata_path.read_text().splitlines() if '=' in line)
+                if metadata_path.is_file() else {})
+    current_clock_schema = metadata.get('diagnostic_timing_schema') == '7'
+    if current_clock_schema:
+        needs_profile = needs_profile and metadata.get('transport_diagnostics') == 'true'
     if needs_profile and not profile.is_file():
         raise ValueError("missing current TCP diagnostic profile")
     if profile.exists():
@@ -330,9 +361,10 @@ def read_case(root, name, info, campaign_profile="original"):
         with profile.open() as stream:
             for row in csv.DictReader(stream):
                 dimensions(row, legacy_diagnostic=row['state'] == 'cache-evicted')
-                for key, value in row.items():
-                    if key.endswith("_ns") or key == READ_RECHECK_SAMPLES:
-                        grouped[(row["state"], key)].append(number(value))
+                if current_clock_schema and metadata.get('transport_diagnostics') != 'true':
+                    raise ValueError('clean profile contains detailed clock samples')
+                for key, value in remote_profile_observations(row).items():
+                    grouped[(row["state"], key)].append(value)
         if needs_profile and not grouped:
             raise ValueError("empty current TCP diagnostic profile")
         for (state, key), values in grouped.items():

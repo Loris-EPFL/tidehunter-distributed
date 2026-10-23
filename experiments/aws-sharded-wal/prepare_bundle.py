@@ -105,6 +105,7 @@ def prepare(args):
     helpers.mkdir()
     for script in ['guest.py', 'bootstrap.py', 'analyze_cloud.py', 'efa_progress.py', 'checkpoint_async.py', 'cluster_ram.py', 'scalar_transport.py', 'transport_floor.py', 'stage_timing.py', 'local_compare.py', 'prepare_bundle.py']:
         shutil.copy2(Path(__file__).with_name(script), helpers / script)
+    shutil.copy2(repo / 'experiments/resident_config.py', helpers / 'resident_config.py')
     recovery_source = repo / 'tidehunter/examples/sharded_wal_recovery_bench.rs'
     overlay = payload / 'recovery-overlay'
     overlay.mkdir()

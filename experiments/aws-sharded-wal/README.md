@@ -1,3 +1,105 @@
+## 23 October focused hardware populations (current campaign policy)
+
+The current `ci-config.json` selects `kv_suite.scope=hardware-populations`,
+not the historical full Cartesian matrix described below. One existing
+`bench/aws-efa` fleet and its absolute 7,200-second lifetime are retained.
+No continuation, deadline reset, additional fleet or budget override is implied.
+`budget.json` remains the sole $100/week authority.
+
+The deterministic plan is **93 paired KV cases / 186 benchmark processes**:
+88 clean pairs (two repetitions, reversed transport order) and five fresh
+clock-diagnostic pairs. Each remote case retains its own actual native reference.
+All TCP/EFA/EFA-direct/efa-native RPC controls retain coordinator8MiB hits,
+coordinator0+encoded-owner8MiB hits, coordinator0+owner0 page-cache controls,
+and scalar256B/8KiB positive-physical-I/O controls. Page-cache controls additionally
+retain 8KiB/batch32 loads **320 and 3200 as distinct identities** on every transport.
+The efa-native registered arm adds all four matched shapes without replacing
+any efa-native RMA-OFF baseline. Registered RAM is a separately allocated,
+immutable grant population, not the encoded owner cache or disk service.
+
+Both native and remote commands bind `--bounded-hot-reads 32768`, independent
+of ordinary `--reads`: 32 hot keys, 32,768 scalar samples, **1,024 complete
+batch32 API calls**, and identical fixed `2*read_lanes+1` warm passes. Native
+commands never receive RMA configuration. The explicit count participates in
+case names and exact serialized policy matching; absent counts preserve legacy
+512/16 sampling. Native/cache service stays unclassified without actual evidence.
+RPC labels require measured frontend/owner counters and physical-I/O brackets;
+budgets, advisory eviction and async submissions are not tier proof.
+
+Cold cases additionally bind `--cold-single-probes 1024` on both backends:
+**32,768 single probes across the complete campaign**. Each actual API call has
+its own preceding eviction and process/residency bracket. Only an entire
+1024-probe population with positive accounted physical reads on the **expected
+owner** for every probe, with stable PID/start-ticks/boot identity, may qualify
+as physical-cold API latency; preserve every failed/unqualified sample.
+Preparation is outside per-API latency but inside the phase wall interval.
+Neither its wall rate nor bytes/keys division is NVMe device IOPS/latency.
+The older aggregate-positive eviction intervals remain separate controls.
+
+The same cold cases also bind independent `--cold-group-probes 1024`: a separate
+`physical_cold_get_many` phase and `cold_group_probes.jsonl` preserve **32,768
+complete32-member API calls /1,048,576 verified logical members** campaign-wide.
+Probe `i` starts at `mix64(i)%loaded_keys` and selects32 consecutive distinct
+present keys with wrap. Authoritative member owners, eviction and before
+evidence are prepared outside the one `get_many` timer; every returned value and
+member count/order is verified. Every expected owner must show positive process
+read bytes for every probe, with stable boot/PID/start identity. Missing owners,
+zero/unknown IO and incomplete verification leave the **whole unfiltered**
+population unqualified. A physical-IO interval on each owner does not establish
+that all32 individual members required device access. Report complete-call
+latency, never division by32 as per-member device latency. Native's actual
+scalar-loop `get_many` implementation remains unchanged. Scalar probes and legacy
+aggregate eviction controls remain independent. Both new probe populations require
+the producer's `identity_qualified:true` before/after proof plus positive start
+ticks and stable non-null boot/PID identity; a valid after-snapshot alone cannot
+establish process continuity. Positive-IO booleans remain honest even when identity
+is unavailable, but the whole population then remains unqualified.
+
+Every case still performs real WAL load/mixed/delete writes, checkpoint
+capture/intervening writes, flush/barriers, shutdown/reopen and value audits.
+`auxiliary-measurements.json` retains complete read/write timing populations,
+`write_io.csv` process/PID/start identities and interval byte evidence, rather than
+inventing RAM-only durable writes or per-key physical I/O.
+
+Sui retains the identical certified private checkpoint1775 fixture in **12 paired
+cells / 24 replays**: ten clean cells across coordinator0/8MiB schedules, plus
+two separate efa-native OFF/ON diagnostic cells. Owner cache8MiB is explicit.
+Only the distinct `*-efa-native-rma` cells receive the complete shared resident
+profile with `require_device_read:true`; ordinary transports and the native
+reference remain RMA-OFF. Source/config/namespace bindings and all original
+poison, grant, byte-owner, exact-stop, export and termination safeguards remain.
+The raw 256B/8KiB FI_READ floor requires actual endpoint native/non-emulated
+capability and terminal-drain proof, not merely `fi_info` or instance-type labels.
+Natural Sui replay remains explicitly mixed/unqualified for pure registered hits:
+actual per-owner FI_READ and wire-Read counters are retained separately. Bounded
+RPC profile clocks never become target-handler/FI_READ component timings.
+
+Offline command plans (use the final source-bound guest config for resolved paths):
+
+```bash
+python3 experiments/aws-sharded-wal/checkpoint_kv.py plan --config CONTROLLER_CONFIG
+python3 experiments/aws-sharded-wal/checkpoint_kv.py plan-budget --config experiments/aws-sharded-wal/ci-config.json --kv-pair-seconds 30
+python3 experiments/aws-sharded-wal/checkpoint_kv.py compare OFF_IDENTITY ON_IDENTITY --population registered-arm
+python3 experiments/aws-sharded-wal/checkpoint_kv.py compare NATIVE_COLD_IDENTITY REMOTE_COLD_IDENTITY --population physical-cold
+python3 experiments/aws-sharded-wal/checkpoint_kv.py compare NATIVE_GROUP_IDENTITY REMOTE_GROUP_IDENTITY --population physical-cold-group
+python3 experiments/aws-sharded-wal/checkpoint_kv.py cold-evidence COLD_DIRECTORY --config CONTROLLER_CONFIG --spec COLD_SPEC --mode tcp
+```
+
+`plan-budget` is an explicitly **unqualified sensitivity estimate**, not a runtime
+guarantee. With assumed600s setup,390s raw-floor reserve and155s per Sui cell
+(the observed local swapped native+remote replay), 6,600s available work leaves
+3,750s for93 KV pairs: mean40.32s/pair is the break-even bound. Assuming30s/pair
+gives5,640s work plus600s export; the extra scalar **and grouped** per-probe
+eviction work is included in that assumed mean, **not yet measured**.
+Historical run39877444431's observed
+campaign step was5,827.296s, but its old sample counts/source/cells are not a
+prediction for this campaign. Sui's per-replay hang cap is300s; summing hang
+caps is neither a runtime forecast nor permission to extend the absolute TTL.
+Do not weaken the existing90s API admission guard or600s export reserve to force
+completion. If measured current-source timings do not fit, resolve the lifecycle
+with the parent before dispatch rather than dropping populations or reporting
+a partial campaign complete.
+
 ## 23 October Sui node-supervisor deadline correction
 
 Run `39864855396` rebuilt all six binaries and passed the same-build local Sui
