@@ -545,11 +545,11 @@ fn software_provider_durable_grant_reads_real_member_without_read_rpc() {
     let (batch, reference) = fixture.publish(&mut client, 3);
     let expected = batch.mutations()[0].clone();
 
-    // A real durable member RPC opportunistically acquires its exact grant.
-    assert_eq!(
-        client.read_records(1, &[reference]).unwrap(),
-        vec![expected.clone()]
-    );
+    // A profiled durable RPC acquires its grant and returns measured server spans.
+    let (values, profile) = client.read_records_profiled(1, &[reference]).unwrap();
+    assert_eq!(values, vec![expected.clone()]);
+    assert!(profile.server_handler_ns > 0 && profile.server_record_read_ns > 0);
+    assert_eq!(profile.server_response_recheck_samples, profile.requests);
     let before = client.resident_read_stats();
     assert_eq!(before.grant_acquisitions, 1);
     assert_eq!(before.grants_live, 1);
@@ -579,8 +579,11 @@ fn software_provider_durable_grant_reads_real_member_without_read_rpc() {
         assert!(Instant::now() < deadline, "resident read did not complete");
         thread::yield_now();
     };
-    let (values, _) = completion.result.unwrap();
+    let (values, profile) = completion.result.unwrap();
     assert_eq!(values, vec![expected]);
+    assert_eq!(profile.server_response_recheck_samples, 0);
+    assert_eq!(profile.server_handler_ns, 0);
+    assert_eq!(profile.server_record_read_ns, 0);
     let after = client.resident_read_stats();
     assert_eq!(after.rma_posts - before.rma_posts, 1);
     assert_eq!(after.rma_completions - before.rma_completions, 1);

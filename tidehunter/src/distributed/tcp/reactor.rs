@@ -4274,7 +4274,9 @@ fn flush_responses(
                     request.read_profile.response_recheck_deferrals;
                 profile.read_response_recheck_errors += u64::from(recheck_error.is_some());
             }
-            if let Response::RecordsProfiled { profile, .. } = &mut response {
+            if let Response::RecordsProfiled { profile, .. }
+            | Response::ResidentRecordsProfiled { profile, .. } = &mut response
+            {
                 profile.response_recheck_wait_ns = wait_ns;
                 profile.response_recheck_ns = recheck_ns;
                 profile.response_recheck_samples = 1;

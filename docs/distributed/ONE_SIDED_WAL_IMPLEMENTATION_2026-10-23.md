@@ -8,13 +8,14 @@ This is a source/status guide, not a replacement for [D1](ONE_SIDED_WAL_READS_20
 
 ## Current hardware-campaign preparation
 
-Three source-review findings were corrected before hardware admission:
+Four source-review findings were corrected before hardware admission:
 
 | Defect | Correction and source | Required evidence |
 |---|---|---|
 | EFA registration hints could reject the provider's basic MR map before native-read validation | `tidehunter-fabric/src/endpoint/resources.rs`, `Info::hints` and selected-mode validation advertise/accept `FI_MR_LOCAL`, `FI_MR_PROV_KEY`, `FI_MR_VIRT_ADDR`, and `FI_MR_ALLOCATED` for EFA RMA | The actual selected endpoint must report non-emulated device reads; software-provider success is not this proof |
 | A message-only fallback could still request or promote resident grants | `tcp/reactor.rs` gates client acquisition and server promotion on negotiated `rma_capabilities`, not configured capacity alone | Regression uses a real committed record, current authority, original owner, and actual message-only endpoint; ordinary RPC must preserve the value |
 | Dropping the registry/node could release original WAL authority while an unresolved MR remained quarantined | `SourceRegion::retained_owner` retains the same admitted original-owner `Arc` beside the MR/source bytes; failed MR close retains its byte charge too | After all unrelated original owners are dropped, uncertain teardown must block same-root reopen; exact successful drain/retirement must permit it |
+| Profiled resident-grant RPC replies omitted response-recheck observations, making positive server spans appear unavailable and fail diagnostic qualification | `tcp/reactor.rs::flush_responses` updates both `RecordsProfiled` and `ResidentRecordsProfiled`; actual one-sided hits still report no target-handler timing | Real software-provider durable acquisition regression failed with zero recheck samples versus one request before the fix, then passed; reused `FI_READ` has no read RPC or server spans |
 
 The explicit software-fabric profile selects the new message-only fallback, strict device-read rejection, and original-owner quarantine/drain regressions. Selection is not an execution result; current verification results must be recorded separately from the historical ledger below.
 
@@ -30,7 +31,7 @@ The new release receipt is `project:tidehunter-sharded-wal/checkpoint-work/hardw
 
 The rebuilt raw software-floor receipt is under `raw-software/` in the same root: both 256-byte and 8-KiB payloads completed 1,000 clean plus 64 warmup `FI_READ`s, full payload validation and exact drain. Actual transfers include the 24-byte probe header. Its executable SHA256 is `9b203d8983560f34acaccbef8d83996c5de5dd0a99bf8dd9b607959a2faef550`; `hardware=false` is explicit.
 
-Observed current-source gates include native 385 passed/6 ignored, TCP-only distributed 803 passed/7 ignored, fabric-enabled engine 804 passed/38 ignored, native fabric primitive 49 passed/2 ignored, all 42 explicitly selected software-fabric cases, and final all-target strict Clippy. The AWS harness ran 584 cases with four explicit optional/environment skips; the Sui Python harness passed 132. A separate actual raw-evidence mutation run passed all 14 cases. Sui typed-store passed all 34 native tests with the exact published engine dependency; its sharded/fabric surface also type-checked. These suites overlap; their counts must not be summed into an independent-test total. The earlier ledger below remains historical.
+Pre-profile-fix full gates include native 385 passed/6 ignored, TCP-only distributed 803 passed/7 ignored, fabric-enabled engine 804 passed/38 ignored, native fabric primitive 49 passed/2 ignored, and all 42 explicitly selected software-fabric cases. Final preparation gates ran 590 AWS harness cases with four explicit optional/environment skips and passed all 137 Sui Python cases. A separate actual raw-evidence mutation run passed all 14 cases. Sui typed-store passed all 34 native tests with the published dependency; its sharded/fabric surface and full `sui-core` also type-checked. The additional profiled-grant regression and strict all-target fabric Clippy passed after the response-recheck correction. These suites overlap; their counts must not be summed into an independent-test total. The earlier ledger below remains historical.
 
 These runs validate functionality on one shared laptop SSD, not cloud latency, physical-device service time or independent-drive scaling. Local commands ran alongside correctness gates, so their timing files are not a controlled performance comparison. Current certified-Sui source binding and replay must still pass the pre-EC2 six-binary GitHub preparation gate.
 
