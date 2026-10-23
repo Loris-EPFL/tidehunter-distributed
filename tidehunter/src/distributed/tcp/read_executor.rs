@@ -89,13 +89,14 @@ impl ReadExecutorConfig {
 
 /// Node-wide counters. Bytes are requested retained allocation sizes, not RSS:
 /// cache includes fixed slots and exact payload/Arc owners; pending includes
-/// buffers and conservative request/member/map metadata. Idle reusable buffers
-/// share max_bytes with pending reservations, not an additional memory budget.
-/// Their bounded pointer table (at most min(max_device_reads, 128)) and reusable
-/// request tables/SQE scratch/kernel rings are metadata outside payload budgets.
-/// Allocator rounding is excluded. Leases retain credit through reply retirement.
-/// Cache and credit snapshots are sampled independently. Cache/response clones
-/// share storage; budgets remain conservative, not unique RSS.
+/// buffers, prepared Full-retry state and conservative request/member/map metadata.
+/// Idle reusable buffers share max_bytes with pending reservations, not an
+/// additional memory budget. Their bounded pointer table (at most
+/// min(max_device_reads, 128)) and reusable request tables/SQE scratch/kernel
+/// rings are metadata outside payload budgets. Allocator rounding is excluded.
+/// Leases retain credit through prepared retries and reply retirement. Cache
+/// and credit snapshots are sampled independently. Cache/response clones share
+/// storage; budgets remain conservative, not unique RSS.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReadExecutorStats {
     pub cache_hits: u64,
@@ -115,15 +116,18 @@ pub struct ReadExecutorStats {
     pub cache_bytes: usize,
     pub cache_metadata_bytes: usize,
     pub cache_budget: usize,
+    /// Shard authority-cache snapshot; `None` means unavailable, not zero.
+    pub authority: Option<super::super::storage::AuthorityCacheStats>,
     /// Logical WAL member reads admitted, including synchronous diagnostics.
     /// Retries do not add another member/byte count; these are not disk IOPS.
     pub wal_reads: u64,
     pub wal_read_bytes: u64,
-    /// Synchronous preadv2(RWF_NOWAIT) calls on bounded resident-first reads.
+    /// Synchronous preadv2(RWF_NOWAIT) calls actually issued on resident-first
+    /// reads. A later Full retry reuses prepared progress without repeating calls.
     pub resident_read_attempts: u64,
     /// Exact-length successful NOWAIT calls; these created no SQE/CQE.
     pub resident_read_successes: u64,
-    /// EAGAIN/EOPNOTSUPP/short NOWAIT results followed by exactly one async read.
+    /// EAGAIN/EOPNOTSUPP/short NOWAIT results ultimately followed by one async read.
     pub resident_read_fallbacks: u64,
     /// EOPNOTSUPP subset of attempted fallbacks. EAGAIN may mean unsupported too.
     pub resident_read_unsupported: u64,
@@ -246,6 +250,7 @@ impl ReadAdmission {
         Ok(Some(ReadLease {
             admission: self.clone(),
             charge: bytes,
+            prepared: None,
         }))
     }
     /// Diagnostic mapped/positional paths use the same evidence names, but do
@@ -322,16 +327,42 @@ impl ReadAdmission {
 pub(crate) struct ReadLease {
     admission: Arc<ReadAdmission>,
     charge: usize,
+    prepared: Option<PreparedRead>,
 }
 impl Drop for ReadLease {
     fn drop(&mut self) {
+        let prepared = self.prepared.take();
+        let cancelled = prepared.is_some();
+        if let Some(mut prepared) = prepared {
+            // Retire payload owners before releasing their lease charge. Bytes
+            // owners may recycle through admission, so none are dropped under
+            // its mutex.
+            drop(std::mem::take(&mut prepared.records));
+            for buffer in prepared
+                .resident_buffers
+                .iter_mut()
+                .filter_map(Option::take)
+            {
+                self.admission.return_buffer(buffer.bytes);
+            }
+            drop(prepared);
+        }
         let mut state = self.admission.state.lock();
         state.stats.inflight_requests -= 1;
         state.stats.inflight_bytes -= self.charge;
+        if cancelled {
+            state.stats.cancellations += 1;
+        }
     }
 }
 
 pub(crate) type PlannedRead = (ValueRecordReference, RecordReadPlan);
+fn read_plan_signature(plans: &[PlannedRead]) -> Vec<(ValueRecordReference, u64, usize, u64)> {
+    plans
+        .iter()
+        .map(|(reference, plan)| (*reference, plan.member.offset, plan.member.len, plan.device))
+        .collect()
+}
 
 pub(crate) enum SubmitOutcome {
     Ready {
@@ -355,6 +386,27 @@ struct PendingRequest {
     class: ReadClass,
     error: Option<StorageError>,
     cancelled: bool,
+}
+struct ResidentPrefix {
+    bytes: Box<[MaybeUninit<u8>]>,
+    filled: usize,
+}
+
+/// Resident progress held across async admission retries. The caller's reply
+/// lease charges this state while `SubmitOutcome::Full` leaves it unsubmitted.
+struct PreparedRead {
+    signature: Vec<(ValueRecordReference, u64, usize, u64)>,
+    records: Vec<Option<Bytes>>,
+    resident_buffers: Vec<Option<ResidentPrefix>>,
+    cache_hits: usize,
+    cache_misses: usize,
+    wal_bytes: u64,
+    served_bytes: u64,
+    resident_fallbacks: usize,
+    resident_unsupported: usize,
+    resident_partial: usize,
+    generation: u64,
+    class: ReadClass,
 }
 
 /// The single final Bytes owner returns the allocation, never a CQ callback
@@ -444,6 +496,16 @@ fn resident_test_preadv2(
     *attempted = true;
     match result {
         ResidentTestResult::Unsupported => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+        ResidentTestResult::Complete => {
+            let mut bytes = vec![0; buffer.len()];
+            plan.member
+                .file
+                .read_exact_at(&mut bytes, plan.member.offset)?;
+            for (slot, byte) in buffer.iter_mut().zip(bytes) {
+                slot.write(byte);
+            }
+            Ok(buffer.len())
+        }
         ResidentTestResult::Partial(read) if read > 0 && read < buffer.len() => {
             let mut prefix = vec![0; read];
             plan.member
@@ -473,9 +535,13 @@ fn resident_preadv2(
     ))
 }
 
-const REQUEST_METADATA_BYTES: usize = 4 * (size_of::<PendingRequest>() + 2 * size_of::<u64>());
+const REQUEST_METADATA_BYTES: usize =
+    4 * (size_of::<PendingRequest>() + size_of::<PreparedRead>() + 2 * size_of::<u64>());
 const MEMBER_METADATA_BYTES: usize = 4
-    * (size_of::<Operation>() + size_of::<Option<Bytes>>() + 4 * size_of::<u64>())
+    * (size_of::<Operation>()
+        + size_of::<Option<Bytes>>()
+        + size_of::<(ValueRecordReference, u64, usize, u64)>()
+        + 4 * size_of::<u64>())
     + cache::OWNER_BYTES;
 // Wire clients reserve 4096 + sum(member.len + 4096) when chunking. Keep that
 // conservative contract valid if internal owner layouts change on any target.
@@ -484,6 +550,7 @@ const _: () = assert!(REQUEST_METADATA_BYTES <= 4096 && MEMBER_METADATA_BYTES <=
 #[cfg(all(test, target_os = "linux"))]
 enum ResidentTestResult {
     Unsupported,
+    Complete,
     Partial(usize),
 }
 
@@ -615,42 +682,93 @@ impl ReadExecutor {
                 "read plan exceeds its reply reservation",
             ));
         }
-        let mut cache = self.admission.cache.lock();
-        let generation = cache.generation;
-        let mut records = plans
-            .iter()
-            .map(|(reference, _)| cache.cache.get(reference))
-            .collect::<Vec<_>>();
-        let initial_misses = records.iter().filter(|record| record.is_none()).count();
-        let cache_hits = records.len() - initial_misses;
-
-        let mut wal_bytes = 0u64;
-        let mut served_bytes = 0u64;
-        for (record, (_, plan)) in records.iter().zip(&plans) {
-            if let Some(bytes) = record {
-                served_bytes += bytes.len() as u64;
-            } else {
-                wal_bytes += plan.member.len as u64;
+        let prepared = lease.as_mut().unwrap().prepared.take();
+        let resuming_prepared = prepared.is_some();
+        let mut retained_signature = None;
+        let (
+            generation,
+            mut records,
+            mut resident_buffers,
+            cache_hits,
+            initial_misses,
+            wal_bytes,
+            served_bytes,
+            mut resident_fallbacks,
+            mut resident_unsupported,
+            mut resident_partial,
+        ) = if let Some(prepared) = prepared {
+            if prepared.signature.len() != plans.len()
+                || prepared
+                    .signature
+                    .iter()
+                    .zip(&plans)
+                    .any(|(saved, (reference, plan))| {
+                        *saved != (*reference, plan.member.offset, plan.member.len, plan.device)
+                    })
+                || prepared.class != class
+            {
+                lease.as_mut().unwrap().prepared = Some(prepared);
+                return Err(StorageError::Invalid(
+                    "retried read does not match prepared resident progress",
+                ));
             }
-        }
-        drop(cache);
+            retained_signature = Some(prepared.signature);
+            (
+                prepared.generation,
+                prepared.records,
+                prepared.resident_buffers,
+                prepared.cache_hits,
+                prepared.cache_misses,
+                prepared.wal_bytes,
+                prepared.served_bytes,
+                prepared.resident_fallbacks,
+                prepared.resident_unsupported,
+                prepared.resident_partial,
+            )
+        } else {
+            let mut cache = self.admission.cache.lock();
+            let generation = cache.generation;
+            let records = plans
+                .iter()
+                .map(|(reference, _)| cache.cache.get(reference))
+                .collect::<Vec<_>>();
+            let initial_misses = records.iter().filter(|record| record.is_none()).count();
+            let cache_hits = records.len() - initial_misses;
+            let (mut wal_bytes, mut served_bytes) = (0u64, 0u64);
+            for (record, (_, plan)) in records.iter().zip(&plans) {
+                if let Some(bytes) = record {
+                    served_bytes += bytes.len() as u64;
+                } else {
+                    wal_bytes += plan.member.len as u64;
+                }
+            }
+            drop(cache);
+            (
+                generation,
+                records,
+                if self.config.resident_first {
+                    (0..plans.len()).map(|_| None).collect()
+                } else {
+                    Vec::new()
+                },
+                cache_hits,
+                initial_misses,
+                wal_bytes,
+                served_bytes,
+                0,
+                0,
+                0,
+            )
+        };
 
         // The NOWAIT budget applies only to plans already pinned and authorized
         // by the caller. Buffers stay private until fully initialized.
-        let mut resident_buffers = if self.config.resident_first {
-            (0..plans.len()).map(|_| None).collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
         let mut resident_attempts = 0usize;
         let mut resident_successes = 0usize;
-        let mut resident_fallbacks = 0usize;
-        let mut resident_unsupported = 0usize;
-        let mut resident_partial = 0usize;
         let mut resident_deferred = 0usize;
-        if self.config.resident_first {
+        if self.config.resident_first && !resuming_prepared {
             for (index, (reference, plan)) in plans.iter().enumerate() {
-                if records[index].is_some() {
+                if records[index].is_some() || resident_buffers[index].is_some() {
                     continue;
                 }
                 let len = plan.member.len;
@@ -710,7 +828,10 @@ impl ReadExecutor {
                     Ok(read) => {
                         resident_fallbacks += 1;
                         resident_partial += usize::from(read > 0);
-                        resident_buffers[index] = Some((buffer, read));
+                        resident_buffers[index] = Some(ResidentPrefix {
+                            bytes: buffer,
+                            filled: read,
+                        });
                     }
                     Err(error)
                         if matches!(
@@ -721,7 +842,10 @@ impl ReadExecutor {
                         resident_fallbacks += 1;
                         resident_unsupported +=
                             usize::from(error.raw_os_error() == Some(libc::EOPNOTSUPP));
-                        resident_buffers[index] = Some((buffer, 0));
+                        resident_buffers[index] = Some(ResidentPrefix {
+                            bytes: buffer,
+                            filled: 0,
+                        });
                     }
                     Err(error) => {
                         self.admission.return_buffer(buffer);
@@ -778,12 +902,42 @@ impl ReadExecutor {
                 state.devices.get(id).copied().unwrap_or(0) + count > self.config.max_device_reads
             })
         {
+            drop(state);
+            lease.as_mut().unwrap().prepared = Some(PreparedRead {
+                signature: retained_signature.unwrap_or_else(|| read_plan_signature(&plans)),
+                records,
+                resident_buffers,
+                cache_hits,
+                cache_misses: initial_misses,
+                wal_bytes,
+                served_bytes,
+                resident_fallbacks,
+                resident_unsupported,
+                resident_partial,
+                generation,
+                class,
+            });
             return Ok(SubmitOutcome::Full(plans));
         }
         #[cfg(target_os = "linux")]
         {
             let sq = self.ring.submission();
             if sq.capacity() - sq.len() < misses {
+                drop(state);
+                lease.as_mut().unwrap().prepared = Some(PreparedRead {
+                    signature: retained_signature.unwrap_or_else(|| read_plan_signature(&plans)),
+                    records,
+                    resident_buffers,
+                    cache_hits,
+                    cache_misses: initial_misses,
+                    wal_bytes,
+                    served_bytes,
+                    resident_fallbacks,
+                    resident_unsupported,
+                    resident_partial,
+                    generation,
+                    class,
+                });
                 return Ok(SubmitOutcome::Full(plans));
             }
         }
@@ -823,10 +977,16 @@ impl ReadExecutor {
             }
             let token = self.next_token;
             self.next_token += 1;
-            let (buffer, filled) = resident_buffers
+            let ResidentPrefix {
+                bytes: buffer,
+                filled,
+            } = resident_buffers
                 .get_mut(index)
                 .and_then(Option::take)
-                .unwrap_or_else(|| (self.admission.take_buffer(plan.member.len), 0));
+                .unwrap_or_else(|| ResidentPrefix {
+                    bytes: self.admission.take_buffer(plan.member.len),
+                    filled: 0,
+                });
             let mut op = Operation {
                 request_id,
                 index,
