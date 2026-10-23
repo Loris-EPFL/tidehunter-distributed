@@ -1326,13 +1326,13 @@ impl ReadService {
         flights[flight_slot] = Arc::downgrade(&flight);
         drop(flights);
         let _poison = PoisonOnPanic(self.state.clone());
-        self.state.read_rpcs.fetch_add(1, Ordering::Relaxed);
         let sampled = self.state.diagnostics.select();
         let started = sampled.then(Instant::now);
         let transport_before = sampled.then(|| {
             client.profile_read_transport(true);
             client.transport_progress_stats()
         });
+        let message_requests = client.message_read_requests();
         let result = if sampled || profile.is_some() {
             let result = client.read_records_profiled(epoch, std::slice::from_ref(reference));
             if sampled {
@@ -1350,6 +1350,9 @@ impl ReadService {
         } else {
             client.read_records(epoch, std::slice::from_ref(reference))
         };
+        if client.message_read_requests() != message_requests {
+            self.state.read_rpcs.fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(before) = transport_before {
             self.state
                 .diagnostics

@@ -8,7 +8,7 @@ This is a source/status guide, not a replacement for [D1](ONE_SIDED_WAL_READS_20
 
 ## Current hardware-campaign preparation
 
-Four source-review findings were corrected before hardware admission:
+Five source-review findings were corrected before hardware admission:
 
 | Defect | Correction and source | Required evidence |
 |---|---|---|
@@ -16,6 +16,7 @@ Four source-review findings were corrected before hardware admission:
 | A message-only fallback could still request or promote resident grants | `tcp/reactor.rs` gates client acquisition and server promotion on negotiated `rma_capabilities`, not configured capacity alone | Regression uses a real committed record, current authority, original owner, and actual message-only endpoint; ordinary RPC must preserve the value |
 | Dropping the registry/node could release original WAL authority while an unresolved MR remained quarantined | `SourceRegion::retained_owner` retains the same admitted original-owner `Arc` beside the MR/source bytes; failed MR close retains its byte charge too | After all unrelated original owners are dropped, uncertain teardown must block same-root reopen; exact successful drain/retirement must permit it |
 | Profiled resident-grant RPC replies omitted response-recheck observations, making positive server spans appear unavailable and fail diagnostic qualification | `tcp/reactor.rs::flush_responses` updates both `RecordsProfiled` and `ResidentRecordsProfiled`; actual one-sided hits still report no target-handler timing | Real software-provider durable acquisition regression failed with zero recheck samples versus one request before the fix, then passed; reused `FI_READ` has no read RPC or server spans |
+| Inline one-sided reads incremented the exported logical read-RPC count despite sending no Read message | `remote_db/pending_read.rs::ReadService::read_inline` uses the same actual `message_read_requests` delta check as reactor dispatch, after either profiled or ordinary client completion | Real remote-database acquisition counts one RPC; warmed ordinary/profiled `FI_READ` hits leave it unchanged. The regression observed an incorrect two versus one before the fix and passed after it |
 
 The explicit software-fabric profile selects the new message-only fallback, strict device-read rejection, and original-owner quarantine/drain regressions. Selection is not an execution result; current verification results must be recorded separately from the historical ledger below.
 
@@ -42,6 +43,8 @@ Sui's former `checkpoint_exec_latency` was registered but had no observations an
 The local native and RMA diagnostic commands also completed full-value/reopen audits. `diagnostic-validation.json` in the same engine proof root records 128 native and 128 remote scalar profile rows with nonzero component clocks; 22 remote rows completed with zero Read RPCs and correctly marked server clocks unavailable. These instrumented mixed rows are not substituted for the clean bounded populations or for cloud timing.
 
 The post-review profiled-grant correction was rebuilt and exercised separately in `rma-grant-profile-fixed-8192-b32/`: executable SHA256 `55538fe60ab3791c4a89e4cca3247170f46d48283e1a30c33a770ee6115dbeff`, full-value/reopen audit complete. `grant-profile-regression.json` records strict `checkpoint_kv.validate_diagnostic_evidence` acceptance for all five owners: 128 scalar profiles, 105 actual RPC rows with available server timing and 23 one-sided rows without a Read RPC or target-handler spans. The earlier saved diagnostic correctly fails that strict consumer with positive spans marked unavailable. `transport_floor.py::flatten_counters` also validates the exact root/client `server_handler_available` and `server_handler_not_applicable` boolean metadata paths without treating them as numeric counters; raw flags remain unchanged, including mixed aggregates where both are true. Unknown boolean counters and malformed known flags still fail. This is actual software-provider integration proof, not hardware timing.
+
+The inline-counter correction also passed a new actual release CLI and the same strict consumer: `inline-rpc-regression.json`, executable SHA256 `c83ed7abc3c9fb8346559315590894e5af8666b3318feb5515722960e64ef4f9`, full-value/reopen audit complete, 128 profiles with 106 actual RPC/server-timing rows and 22 no-Read-RPC rows. These retained invocation counts depend on the observed mixed service path; they are not latency or hit-rate claims. Both profiled and ordinary inline public reads are covered by the real-provider counter regression.
 
 Pinned-provider source proof is separate from runtime proof: [`efa_ep_getopt`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/efa_ep.c#L63-L72) returns false for the direct endpoint's emulated-read/write options. The application still checks the actual selected endpoint and its negotiated RMA capabilities; a source-code constant or instance-type name alone does not qualify a campaign host.
 

@@ -128,7 +128,9 @@ fn software_provider_read_io_monitor_reports_wal_and_real_rma_lane_activity() {
             }],
         )
         .unwrap();
+        let read_rpcs_before = db.read_rpc_count();
         assert_eq!(db.get(KeySpace(0), key).unwrap().unwrap().as_ref(), value);
+        assert_eq!(db.read_rpc_count(), read_rpcs_before + 1);
         let monitor = db.read_io_monitor();
         let storage_reads = monitor.sample().unwrap();
         assert_eq!(storage_reads.len(), 1);
@@ -148,6 +150,15 @@ fn software_provider_read_io_monitor_reports_wal_and_real_rma_lane_activity() {
                 && resident_after[0].2.rma_hits > resident_before[0].2.rma_hits,
             "monitor must observe initiator READ activity on the read lane"
         );
+        assert_eq!(
+            resident_after[0].2.message_read_requests,
+            resident_before[0].2.message_read_requests
+        );
+        assert_eq!(db.read_rpc_count(), read_rpcs_before + 1);
+        let (actual, profile) = db.get_profiled(KeySpace(0), key).unwrap();
+        assert_eq!(actual.unwrap().as_ref(), value);
+        assert_eq!(profile.tcp.requests, 0);
+        assert_eq!(db.read_rpc_count(), read_rpcs_before + 1);
         let group_keys = (0..6)
             .map(|index| format!("g{index:03}").into_bytes())
             .collect::<Vec<_>>();
