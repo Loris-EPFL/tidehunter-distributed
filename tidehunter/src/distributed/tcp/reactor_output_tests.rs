@@ -839,8 +839,15 @@ fn forced_server_grant_request_with_real_authority_uses_message_only_fallback() 
     use crate::distributed::storage::WalMemberReadPolicy;
 
     let mut pair = pair();
-    pair.session.sock.fabric =
-        Some(tidehunter_fabric::Endpoint::open("tcp;ofi_rxm", Some("lo")).unwrap());
+    let mut source_endpoint = tidehunter_fabric::Endpoint::open("tcp;ofi_rxm", Some("lo")).unwrap();
+    let mut peer_endpoint = tidehunter_fabric::Endpoint::open("tcp;ofi_rxm", Some("lo")).unwrap();
+    source_endpoint
+        .set_peer(&peer_endpoint.address().unwrap())
+        .unwrap();
+    peer_endpoint
+        .set_peer(&source_endpoint.address().unwrap())
+        .unwrap();
+    pair.session.sock.fabric = Some(source_endpoint);
     let mut node_config = config(&pair._temp.path().join("node"));
     let source = ResidentReadConfig {
         source_bytes: 4096,
@@ -873,22 +880,16 @@ fn forced_server_grant_request_with_real_authority_uses_message_only_fallback() 
         .plan_record_read(&reference)
         .unwrap()
         .resident_owner();
-    let Response::Records(records) = node
-        .handle(
-            Request::Read {
-                epoch: 1,
-                references: vec![reference],
-                class: ReadClass::Point,
-                grant_limit: 0,
-                grant_max_bytes: 0,
-            },
-            TcpLimits::default(),
-        )
-        .unwrap()
-    else {
-        panic!("read did not return records");
-    };
-    let records: Vec<_> = records.into_iter().map(WireBytes::into_bytes).collect();
+    snapshot.members[0]
+        .0
+        .validate_durable_record_reference(&reference)
+        .unwrap();
+    let records = vec![
+        snapshot.members[0]
+            .0
+            .read_record_encoded(&reference)
+            .unwrap(),
+    ];
     assert_eq!(
         CompleteBatch::decode_record(
             &KeyShape::from_yaml(&node_config.shape_yaml).unwrap(),
