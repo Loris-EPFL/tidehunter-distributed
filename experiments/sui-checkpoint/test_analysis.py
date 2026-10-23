@@ -340,6 +340,76 @@ class CheckpointSequenceCacheEvidence(unittest.TestCase):
             analyze.checkpoint_sequence_cache_stats(duplicate)
 
 
+class CheckpointCompletionHistogram(unittest.TestCase):
+    def values(self, count=200):
+        return analyze.parse_metrics(
+            f'checkpoint_completion_latency_bucket{{le="0.01"}} {count // 2}\n'
+            f'checkpoint_completion_latency_bucket{{le="0.1"}} {count}\n'
+            f'checkpoint_completion_latency_bucket{{le="+Inf"}} {count}\n'
+            f'checkpoint_completion_latency_sum {count / 50}\n'
+            f'checkpoint_completion_latency_count {count}\n')
+
+    def test_completion_timer_has_its_own_actual_count_and_noninterpolated_bounds(self):
+        result = analyze.checkpoint_completion_observation(self.values(), required=True)
+        self.assertEqual(result['metric'], 'checkpoint_completion_latency')
+        self.assertEqual(result['count'], 200)
+        self.assertEqual(result['total_seconds'], 4)
+        self.assertAlmostEqual(result['mean_us'], 20000)
+        self.assertEqual(result['quantiles']['p50']['upper_us'], 10000)
+        self.assertEqual(result['quantiles']['p99']['lower_us'], 10000)
+        self.assertEqual(result['quantiles']['p99']['upper_us'], 100000)
+        self.assertEqual(analyze.wrapper_latencies(self.values()), [])
+        self.assertIn('pipeline wait', result['scope'])
+        self.assertIn('not certification arrival', result['scope'])
+
+    def test_historical_exec_timer_is_not_a_completion_latency_substitute(self):
+        old = {key.replace('checkpoint_completion_latency', 'checkpoint_exec_latency'): value
+               for key, value in self.values().items()}
+        result = analyze.checkpoint_completion_observation(old)
+        self.assertFalse(result['available'])
+        self.assertIsNone(result['count'])
+        with self.assertRaises(ValueError):
+            analyze.checkpoint_completion_observation(old, required=True)
+        self.assertFalse(analyze.checkpoint_completion_observation(self.values(0))['available'])
+
+    def test_small_actual_population_does_not_become_a_checkpoint_count_or_p99_assumption(self):
+        result = analyze.checkpoint_completion_observation(self.values(2), required=True)
+        self.assertEqual(result['count'], 2)
+        self.assertFalse(result['quantiles']['p99']['available'])
+        self.assertIsNone(result['quantiles']['p99']['upper_us'])
+        self.assertIn('not assumed equal', result['count_contract'])
+
+    def test_nonfinite_values_and_incomplete_buckets_fail_strict_admission(self):
+        for kind in ('nan', 'infinite', 'missing_inf', 'wrong_inf', 'decreasing'):
+            with self.subTest(kind=kind):
+                values = self.values()
+                if kind == 'nan':
+                    values['checkpoint_completion_latency_sum'] = float('nan')
+                elif kind == 'infinite':
+                    values['checkpoint_completion_latency_count'] = float('inf')
+                elif kind == 'missing_inf':
+                    del values['checkpoint_completion_latency_bucket{le="+Inf"}']
+                elif kind == 'wrong_inf':
+                    values['checkpoint_completion_latency_bucket{le="+Inf"}'] = 199
+                else:
+                    values['checkpoint_completion_latency_bucket{le="0.1"}'] = 1
+                with self.assertRaises(ValueError):
+                    analyze.checkpoint_completion_observation(values, required=True)
+
+    def test_different_histogram_series_are_not_pooled_or_selected_for_completion_proof(self):
+        values = {}
+        for label in ('a', 'b'):
+            for key, value in self.values(60).items():
+                name = (key.replace('{', '{node="' + label + '",', 1)
+                        if '{' in key else key + '{node="' + label + '"}')
+                values[name] = value
+        result = analyze.checkpoint_completion_observation(values)
+        self.assertFalse(result['available'])
+        self.assertIsNone(result['count'])
+        with self.assertRaises(ValueError):
+            analyze.checkpoint_completion_observation(values, required=True)
+
+
 class CampaignComparison(unittest.TestCase):
     def cells(self):
         cells = []

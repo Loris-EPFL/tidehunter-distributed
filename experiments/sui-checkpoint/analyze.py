@@ -7,8 +7,9 @@ controller-config.json, cleanup-verified.json, retrieved/{receipt.json,
 controller.tar.gz,cells/.../storage/.../final/evidence.tar.gz}, and
 paired-results/<cell>/{receipt.json,evidence.tar.gz}. No AWS APIs, workload
 processes or additional serving instrumentation are used. Campaign output is
-analysis-details.json, cell-summary.csv, all-wrapper-latencies.csv and
-adapter-means.csv. Missing diagnostics are null with a reason, never zero.
+analysis-details.json, cell-summary.csv, all-wrapper-latencies.csv,
+adapter-means.csv and checkpoint-completion-latencies.csv. Missing diagnostics
+are null with a reason, never zero.
 """
 import argparse
 from contextlib import contextmanager
@@ -351,6 +352,7 @@ def summarize_verified(verified):
             process_io_final=replay['process_io_final'],
             host_swap_delta_pages={key:replay['host_after']['swap_pages'][key]-replay['host_before']['swap_pages'][key]
                 for key in ('pswpin','pswpout')},foreground_metrics=foreground)
+        summary['modes'][mode]['checkpoint_completion'] = checkpoint_completion_observation(foreground)
         summary['modes'][mode]['adapter_by_namespace'] = adapter_stats(foreground)
         summary['modes'][mode]['shard_read_by_owner'] = shard_read_stats(foreground)
         summary['modes'][mode]['checkpoint_sequence_cache_counts'] = checkpoint_sequence_cache_stats(foreground)
@@ -531,7 +533,37 @@ def adapter_means(stats):
 
 
 def wrapper_latencies(values):
-    """All typed-store latency histograms, including empty populations.
+    """All typed-store latency histograms, including empty populations."""
+    return _histogram_rows(values, r'rocksdb_\w+_latency_seconds')
+
+
+def checkpoint_completion_observation(values, *, required=False):
+    """Actual admitted-checkpoint completion observations; never start spacing."""
+    rows = _histogram_rows(values, 'checkpoint_completion_latency', include_buckets=True)
+    if len(rows) != 1:
+        observation = dict(metric='checkpoint_completion_latency', labels={}, count=None,
+            total_seconds=None, mean_us=None, quantiles={}, buckets=[], available=False,
+            reason='missing or ambiguous checkpoint_completion_latency histogram',
+            quantile_method='cumulative histogram bucket bounds, not raw quantiles')
+    else:
+        observation = rows[0]
+        if (not observation['available'] or observation['total_seconds'] <= 0
+                or not observation['complete_buckets']):
+            observation.update(available=False,
+                reason='checkpoint completion histogram requires positive count/sum and complete valid buckets')
+    if observation['available']:
+        observation['count'] = int(observation['count'])
+    observation.update(
+        scope='synced checkpoint admission before pipeline wait through queueing/execution/storage commit/publication after highest-executed watermark update; not certification arrival, execution-start spacing or raw device latency',
+        observation_boundary='foreground tip-watermark scrape; final checkpoint may update watermark immediately before its histogram observation',
+        count_contract='actual positive observed count; not assumed equal to fixture checkpoint count')
+    if required and not observation['available']:
+        raise ValueError('checkpoint completion histogram unavailable: ' + observation['reason'])
+    return observation
+
+
+def _histogram_rows(values, metric_pattern, *, include_buckets=False):
+    """Decode a named histogram family without pooling labels or populations.
 
     Quantiles are cumulative-histogram bucket bounds in microseconds, NOT raw
     sample quantiles. The unbounded +Inf upper endpoint is represented by null.
@@ -541,12 +573,14 @@ def wrapper_latencies(values):
     """
     groups = {}
     for metric, value in values.items():
-        match = re.fullmatch(r'(rocksdb_\w+_latency_seconds)_(sum|count|bucket)(?:\{(.*)\})?', metric)
+        match = re.fullmatch(r'(' + metric_pattern + r')_(sum|count|bucket)(?:\{(.*)\})?', metric)
         if not match:
             continue
         name, kind, encoded = match.groups()
-        labels = {k: json.loads('"' + v + '"') for k, v in
-                  re.findall(r'(\w+)="((?:\\.|[^"\\])*)"', encoded or '')}
+        pairs = re.findall(r'(\w+)="((?:\\.|[^"\\])*)"', encoded or '')
+        labels = {key: json.loads('"' + value + '"') for key, value in pairs}
+        if len(labels) != len(pairs):
+            raise ValueError('duplicate histogram label')
         bound = labels.pop('le', None)
         key = (name, tuple(sorted(labels.items())))
         group = groups.setdefault(key, {})
@@ -589,6 +623,11 @@ def wrapper_latencies(values):
                     (math.isinf(buckets[-1][0]) and buckets[-1][1] != count)):
                 raise ValueError('histogram bucket/count mismatch')
         complete = bool(buckets and math.isinf(buckets[-1][0]) and count is not None)
+        if include_buckets:
+            row['complete_buckets'] = complete
+            row['buckets'] = [dict(upper_seconds=bound if math.isfinite(bound) else None,
+                                   upper_unbounded=math.isinf(bound), cumulative_count=int(n))
+                              for bound, n in buckets]
         for percentile in (50, 95, 99):
             quantile = dict(available=False, lower_us=None, upper_us=None,
                             upper_unbounded=False, reason='empty or incomplete histogram population')
@@ -952,7 +991,7 @@ def write_campaign_report(root, report):
     binding = {k: report[k] for k in ('run_id', 'source_archive_sha256', 'source_manifest_sha256',
                                      'build_manifest_sha256', 'checkpoint_digest',
                                      'controller_archive_sha256', 'closure_sha256', 'analyzer_sha256')}
-    cells, wrappers, adapters = [], [], []
+    cells, wrappers, adapters, completions = [], [], [], []
     for cell in report['cells']:
         identity = binding | {k: cell[k] for k in ('cell_id', 'transport', 'repetition', 'ordinal',
                               'population', 'read_profile_limit', 'write_profile_limit', 'native_write_profile_limit', 'replay_evidence_sha256')}
@@ -961,6 +1000,16 @@ def write_campaign_report(root, report):
         identity['resident_reads'] = json.dumps(cell.get('resident_reads'), sort_keys=True)
         cells.append(identity | {k: cell[k] for k in ('native_seconds', 'remote_seconds', 'remote_over_native')})
         for mode, measured in cell['modes'].items():
+            completion = measured.get('checkpoint_completion')
+            if completion is not None:
+                row = identity | dict(mode=mode) | {key: completion.get(key) for key in
+                    ('metric', 'count', 'total_seconds', 'mean_us', 'available', 'reason',
+                     'quantile_method', 'scope', 'observation_boundary', 'count_contract')}
+                row['labels'] = json.dumps(completion['labels'], sort_keys=True)
+                row['buckets'] = json.dumps(completion['buckets'], sort_keys=True)
+                for percentile, quantile in completion['quantiles'].items():
+                    row.update({percentile + '_' + key: value for key, value in quantile.items()})
+                completions.append(row)
             for histogram in measured['wrapper_latencies']:
                 row = identity | dict(mode=mode) | {k: histogram[k] for k in
                     ('metric', 'count', 'total_seconds', 'mean_us', 'available', 'reason', 'quantile_method')}
@@ -971,7 +1020,8 @@ def write_campaign_report(root, report):
             for namespace, means in measured['adapter_means'].items():
                 for stage, mean in means.items():
                     adapters.append(identity | dict(mode=mode, namespace=namespace, stage=stage) | mean)
-    for name, rows in (('cell-summary.csv', cells), ('all-wrapper-latencies.csv', wrappers), ('adapter-means.csv', adapters)):
+    for name, rows in (('cell-summary.csv', cells), ('all-wrapper-latencies.csv', wrappers),
+                       ('adapter-means.csv', adapters), ('checkpoint-completion-latencies.csv', completions)):
         fields = list(dict.fromkeys(key for row in rows for key in row))
         with (root / name).open('w', newline='') as stream:
             writer = csv.DictWriter(stream, fieldnames=fields)

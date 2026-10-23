@@ -1,3 +1,26 @@
+## 23 October actual checkpoint-completion admission
+
+The same-build local replay must now retain a positive, finite
+`checkpoint_completion_latency` histogram for **both native and remote** before
+preparation can emit `READY.json` or enable the paid campaign. Validation reads
+the exact foreground Prometheus scrapes inside the receipt-hashed replay archive;
+loose files, execution-start spacing and the old unobserved
+`checkpoint_exec_latency` metric cannot substitute for this evidence.
+
+The timer spans synced-checkpoint admission before the pipeline wait through
+queueing/execution, storage commit and publication after the highest-executed
+watermark update. It is not certification-arrival latency or raw device service.
+The actual observed count is retained independently for each backend: the final
+watermark scrape can race the final histogram observation, so no exact1775-count
+requirement or fabricated missing observation is introduced.
+
+Derived observations, source-scrape hashes and cumulative-bucket quantile bounds
+are saved in the copied verification receipt and `READY.json`. The original
+replay receipt and evidence archive remain unchanged. Closed-campaign analysis
+also emits `checkpoint-completion-latencies.csv`; bounds are not interpolated raw
+quantiles, and fewer than100 observations do not establish p99. Missing, zero,
+nonfinite or incomplete histograms fail the local readiness gate.
+
 ## 23 October focused hardware populations (current campaign policy)
 
 The current `ci-config.json` selects `kv_suite.scope=hardware-populations`,
