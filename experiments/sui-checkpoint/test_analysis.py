@@ -416,6 +416,30 @@ class CampaignComparison(unittest.TestCase):
         self.assertEqual(len(unavailable), 3)
         self.assertTrue(all(pair['candidate_transport'] == 'efa-native' for pair in unavailable))
 
+    def test_registered_arm_is_distinct_from_same_provider_rpc_baseline(self):
+        cells = self.cells()[:2]
+        native = cells[0] | dict(cell_id='r01-efa-native', transport='efa-native', ordinal=2)
+        profile = dict(source_bytes=4194304, source_regions=512, destination_bytes=20971520,
+                       destination_slots=640, max_read_bytes=32768, max_handles=4096,
+                       require_device_read=True)
+        registered = native | dict(cell_id='r01-efa-native-rma', ordinal=3, resident_reads=profile)
+        rows = cells + [native, registered]
+        pairs = analyze.transport_comparison(rows)['pairs']
+        arm, = [pair for pair in pairs if pair['candidate_transport'] == 'efa-native-rma']
+        self.assertTrue(arm['available'])
+        self.assertEqual(arm['reference_cell'], 'r01-efa-native')
+        self.assertEqual(arm['registration_profiles']['candidate'], profile)
+        ordinary = [pair for pair in pairs if pair['candidate_transport'] == 'efa-native']
+        self.assertEqual(len(ordinary), 2)
+        with self.assertRaisesRegex(ValueError, 'registered-read profiles'):
+            analyze.population_comparison(rows)
+        for field, value in (('source_archive_sha256', 'foreign'),
+                             ('cache', dict(coordinator_bytes=8388608, shard_bytes=0)),
+                             ('read_profile_limit', 1)):
+            changed = cells + [native, registered | {field: value}]
+            with self.assertRaises(ValueError):
+                analyze.transport_comparison(changed)
+
     def test_duplicate_and_cross_source_or_population_comparisons_fail(self):
         cells = self.cells()
         with self.assertRaises(ValueError):

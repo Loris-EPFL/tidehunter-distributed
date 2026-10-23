@@ -75,7 +75,7 @@ def validate_config(config_path):
     owner = OWNED_BASE / cfg['run_id']
     transport = cfg.get('transport')
     if (transport not in ('tcp', 'efa', 'efa-direct', 'efa-native') or not isinstance(cfg.get('cell_id'), str)
-            or not re.fullmatch(r'r0[1-4]-' + transport, cfg['cell_id'])):
+            or not re.fullmatch(r'r0[1-4]-' + transport + (r'(?:-rma)?' if transport == 'efa-native' else ''), cfg['cell_id'])):
         raise ValueError('invalid matrix cell/transport identity')
     root = owner / 'checkpoint-cells' / cfg['cell_id'] / 'storage'
     if cfg.get('root') != str(root):

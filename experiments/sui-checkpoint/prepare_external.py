@@ -22,6 +22,8 @@ def main():
     parser.add_argument('--transport',choices=('tcp', *deployment.HARDWARE_TRANSPORTS),default='tcp')
     parser.add_argument('--coordinator-cache-mib',type=int,default=8)
     parser.add_argument('--shard-cache-mib',type=int,default=0)
+    parser.add_argument('--resident-reads',type=Path,
+                        help='bounded per-database registered-read JSON policy; trusted-native fabric only')
     parser.add_argument('--write-profile-limit',type=int,default=0,
                         help='maximum profiled append RPCs per owning connection, 0 disables diagnostics')
     args=parser.parse_args()
@@ -32,6 +34,8 @@ def main():
         raise ValueError('port/cache outside bounded limits')
     if not 0<=args.write_profile_limit<=65536:
         raise ValueError('write profile limit must be 0..65536')
+    resident = (deployment.resident_read_config(json.loads(args.resident_reads.read_text()))
+                if args.resident_reads else None)
     manifest=json.loads((args.build/'build-manifest.json').read_text())
     binary=args.build/'binaries/storage-node'
     if build.digest(binary)!=manifest['binaries']['storage-node'] or manifest['protocol']!=9:
@@ -44,7 +48,7 @@ def main():
         shape_yamls={name:(args.schema/name/'shape.yaml').read_text() for name in schema},hosts=hosts,port=args.port,
         transport=args.transport,coordinator_cache=args.coordinator_cache_mib*deployment.MIB,
         shard_cache=args.shard_cache_mib*deployment.MIB,guest_root=args.guest_root,
-        write_profile_limit=args.write_profile_limit)
+        write_profile_limit=args.write_profile_limit,resident_reads=resident)
     host_records=[]
     for partition,host in enumerate(hosts):
         selected=[node for node in nodes if node['partition']==partition]
@@ -66,6 +70,7 @@ def main():
         config_sha256=build.digest(output/'config.json'),build_manifest_sha256=build.digest(args.build/'build-manifest.json'),
         source_archive_sha256=manifest['source_archive_sha256'],storage_binary_sha256=manifest['binaries']['storage-node'],
         shard_cache_bytes=args.shard_cache_mib*deployment.MIB,write_profile_limit=args.write_profile_limit,hosts=host_records,
+        resident_reads=deployment.resident_read_config(resident),
         ownership='controller creates each fresh guest root, starts only listed process groups, bounds deadlines, collects /proc IO/RSS/swap and stops only owned groups',
         security=('trusted isolated cluster; no application TLS or certificate files'
                   if args.transport in deployment.TRUSTED_TRANSPORTS else
