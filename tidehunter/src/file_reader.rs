@@ -1,10 +1,10 @@
-use bytes::BytesMut;
-use minibytes::Bytes;
-use std::alloc::Layout;
+use minibytes::{Bytes, BytesOwner};
+use std::alloc::{self, Layout};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::ops::Range;
 use std::os::unix::fs::FileExt;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 pub struct FileReader {
@@ -17,60 +17,146 @@ impl FileReader {
         Self { file, direct_io }
     }
 
-    /// Returns new un-initialized buffer of a given size
-    #[allow(clippy::uninit_vec)] // todo look more into it?
-    pub fn io_buffer(size: usize, direct_io: bool) -> Vec<u8> {
-        if direct_io {
-            unsafe {
-                const PAGE_SIZE: usize = 4 * 1024;
-                let layout = Layout::from_size_align(size, PAGE_SIZE).unwrap();
-                let mem = std::alloc::alloc(layout);
-                Vec::from_raw_parts(mem, size, size)
-            }
-        } else {
-            let mut v = Vec::with_capacity(size);
-            unsafe { v.set_len(size) };
-            v
-        }
-    }
-
-    pub fn io_buffer_bytes(size: usize, direct_io: bool) -> BytesMut {
-        let buffer = Self::io_buffer(size, direct_io);
-        BytesMut::from(bytes::Bytes::from(buffer))
-    }
-
     pub fn read_exact_at(&self, pos: u64, len: usize) -> io::Result<Bytes> {
+        let len_u64 = u64::try_from(len).map_err(|_| invalid_range())?;
+        let end = pos.checked_add(len_u64).ok_or_else(invalid_range)?;
+        if len == 0 {
+            return Ok(Bytes::new());
+        }
+
         if self.direct_io {
-            let range = pos..(pos + len as u64);
-            let (read_range, map_range) = align_range(range);
-            let mut buffer =
-                Self::io_buffer((read_range.end - read_range.start) as usize, self.direct_io);
-            self.file.read_exact_at(&mut buffer, read_range.start)?;
-            let buffer = Bytes::from(buffer);
-            let buffer = buffer.slice(map_range);
-            Ok(buffer)
+            let (read_range, map_range) = align_range(pos..end)?;
+            let read_len =
+                usize::try_from(read_range.end - read_range.start).map_err(|_| invalid_range())?;
+            let mut buffer = AlignedBuffer::new(read_len)?;
+            let mut bytes_read =
+                read_direct_at(self.file.as_ref(), buffer.as_mut_slice(), read_range.start)?;
+            if bytes_read < map_range.end && bytes_read != 0 {
+                // A short read may stop before the requested bytes even when
+                // the file has more data. Resume from an aligned overlapping
+                // sector into aligned storage, merging only newly covered bytes.
+                let mut scratch = AlignedBuffer::new(read_len)?;
+                while bytes_read < map_range.end {
+                    let overlap_start = align_down(bytes_read as u64, DIRECT_IO_ALIGNMENT) as usize;
+                    let overlap = bytes_read - overlap_start;
+                    let offset = read_range
+                        .start
+                        .checked_add(overlap_start as u64)
+                        .ok_or_else(invalid_range)?;
+                    let remaining = read_len - overlap_start;
+                    let next = read_direct_at(
+                        self.file.as_ref(),
+                        &mut scratch.as_mut_slice()[..remaining],
+                        offset,
+                    )?;
+                    if next <= overlap {
+                        return Err(unexpected_eof());
+                    }
+                    let next_end = overlap_start + next;
+                    buffer.as_mut_slice()[bytes_read..next_end]
+                        .copy_from_slice(&scratch.as_ref()[overlap..next]);
+                    bytes_read = next_end;
+                }
+            }
+            if bytes_read < map_range.end {
+                return Err(unexpected_eof());
+            }
+            Ok(Bytes::from_owner(buffer).slice(map_range))
         } else {
-            let mut buffer = Self::io_buffer(len, self.direct_io);
+            let mut buffer = vec![0; len];
             self.file.read_exact_at(&mut buffer, pos)?;
             Ok(Bytes::from(buffer))
         }
     }
 }
 
-/// Aligns given range with specified alignment (const 512 bytes right now).
-/// This adjusts given arbitrary range to a range that can be used with direct io.
+const DIRECT_BUFFER_ALIGNMENT: usize = 4 * 1024;
+
+/// Owns a zero-initialized direct-I/O allocation with the exact layout needed
+/// to release it. Once returned as immutable bytes, no mutable access remains.
+struct AlignedBuffer {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
+
+impl AlignedBuffer {
+    fn new(len: usize) -> io::Result<Self> {
+        let layout =
+            Layout::from_size_align(len, DIRECT_BUFFER_ALIGNMENT).map_err(|_| invalid_range())?;
+        // SAFETY: this private constructor receives a nonzero read length and
+        // the checked layout is valid. Initialize the allocation before exposing
+        // it through FileExt's initialized byte-slice API.
+        let ptr = unsafe { alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            alloc::handle_alloc_error(layout);
+        }
+        // SAFETY: null was handled above and `layout` is nonzero because this
+        // buffer is only allocated for a non-empty aligned read.
+        let ptr = unsafe { NonNull::new_unchecked(ptr) };
+        Ok(Self { ptr, layout })
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: allocation is live, initialized, uniquely borrowed here, and
+        // `layout.size()` is the exact initialized byte length.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.layout.size()) }
+    }
+}
+
+// The allocation is uniquely mutable before publication and immutable after
+// it becomes a Bytes owner; sharing the owner therefore cannot race mutation.
+unsafe impl Send for AlignedBuffer {}
+unsafe impl Sync for AlignedBuffer {}
+
+impl AsRef<[u8]> for AlignedBuffer {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: the allocation remains live and fully initialized for its
+        // lifetime, and consumers only receive immutable access.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.layout.size()) }
+    }
+}
+
+impl BytesOwner for AlignedBuffer {}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        // SAFETY: this pointer was allocated with this exact non-zero layout
+        // and has not been deallocated or transferred elsewhere.
+        unsafe { alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
+
+fn invalid_range() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, "file read range is too large")
+}
+
+fn read_direct_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    loop {
+        match file.read_at(buffer, offset) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
+fn unexpected_eof() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "failed to read requested file range",
+    )
+}
+
+/// Aligns an arbitrary range for direct I/O.
 ///
-/// Returns two ranges:
-///  - **Read range** - potentially bigger range aligned for direct IO.
-///  - **Map range** - Range that maps region that has been read into the originally requested region.
-fn align_range(range: Range<u64>) -> (Range<u64>, Range<usize>) {
-    let range_len = range.end - range.start;
-    let read_range =
-        align_down(range.start, DIRECT_IO_ALIGNMENT)..align_up(range.end, DIRECT_IO_ALIGNMENT);
-    let map_start = (range.start - read_range.start) as usize;
-    let map_end = map_start + range_len as usize;
-    let map_range = map_start..map_end;
-    (read_range, map_range)
+/// Returns the aligned read range and the range that selects the requested
+/// bytes from that read.
+fn align_range(range: Range<u64>) -> io::Result<(Range<u64>, Range<usize>)> {
+    let read_start = align_down(range.start, DIRECT_IO_ALIGNMENT);
+    let read_end = checked_align_up(range.end, DIRECT_IO_ALIGNMENT).ok_or_else(invalid_range)?;
+    let map_start = usize::try_from(range.start - read_start).map_err(|_| invalid_range())?;
+    let range_len = usize::try_from(range.end - range.start).map_err(|_| invalid_range())?;
+    let map_end = map_start.checked_add(range_len).ok_or_else(invalid_range)?;
+    Ok((read_start..read_end, map_start..map_end))
 }
 
 const DEFAULT_ALIGNMENT: u64 = 8;
@@ -90,6 +176,13 @@ const fn align_down(v: u64, align: u64) -> u64 {
 
 const fn align_up(v: u64, align: u64) -> u64 {
     align_down(v + align - 1, align)
+}
+
+const fn checked_align_up(v: u64, align: u64) -> Option<u64> {
+    match v.checked_add(align - 1) {
+        Some(v) => Some(align_down(v, align)),
+        None => None,
+    }
 }
 
 #[doc(hidden)]
@@ -122,7 +215,7 @@ fn set_o_direct(_options: &mut OpenOptions) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::BufMut;
+    use bytes::{BufMut, BytesMut};
     use std::fs::OpenOptions;
     use std::path::Path;
 
@@ -130,7 +223,7 @@ mod tests {
     fn test_align_range() {
         #[track_caller]
         fn assert_align(range: Range<u64>, expected_read: Range<u64>, expected_map: Range<usize>) {
-            let (actual_read, actual_map) = align_range(range);
+            let (actual_read, actual_map) = align_range(range).unwrap();
             assert_eq!(actual_read, expected_read, "Read range mismatch");
             assert_eq!(actual_map, expected_map, "Map range mismatch");
         }
@@ -144,6 +237,19 @@ mod tests {
         assert_align(1024..(1024 + 512), 1024..(1024 + 512), 0..512);
         assert_align(1034..(1024 + 512), 1024..(1024 + 512), 10..512);
         assert_align(1034..1044, 1024..(1024 + 512), 10..20);
+
+        assert!(align_range(u64::MAX - 10..u64::MAX).is_err());
+    }
+
+    #[test]
+    fn aligned_bytes_owner_is_initialized_aligned_and_drops_with_its_layout() {
+        let bytes = Bytes::from_owner(AlignedBuffer::new(512).unwrap());
+        let owner = bytes.downcast_ref::<AlignedBuffer>().unwrap();
+
+        assert_eq!(owner.as_ref(), &[0; 512]);
+        assert_eq!(owner.ptr.as_ptr() as usize % DIRECT_BUFFER_ALIGNMENT, 0);
+        assert_eq!(owner.layout.size(), 512);
+        assert_eq!(owner.layout.align(), DIRECT_BUFFER_ALIGNMENT);
     }
 
     #[test]
@@ -184,6 +290,31 @@ mod tests {
         test_file_reader_impl(&path, true);
     }
 
+    #[test]
+    fn read_at_non_aligned_eof_accepts_only_fully_present_ranges() {
+        let dir = tempdir::TempDir::new("test_file_reader_partial_eof").unwrap();
+        let path = dir.path().join("file");
+        let expected: Vec<u8> = (0..513).map(|i| i as u8).collect();
+        std::fs::write(&path, &expected).unwrap();
+
+        for direct_io in [false, true] {
+            let mut options = OpenOptions::new();
+            options.read(true);
+            set_direct_options(&mut options, direct_io);
+            let file = options.open(&path).unwrap();
+            let reader = FileReader::new(Arc::new(file), direct_io);
+
+            assert_eq!(
+                reader.read_exact_at(512, 1).unwrap().as_ref(),
+                &[expected[512]]
+            );
+            assert_eq!(
+                reader.read_exact_at(512, 2).unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        }
+    }
+
     fn test_file_reader_impl(path: &Path, direct_io: bool) {
         println!("test_file_reader_impl direct_io: {direct_io}");
         let mut options = OpenOptions::new();
@@ -200,6 +331,23 @@ mod tests {
             assert_eq!(u32::from_be_bytes(sbuf), v);
         }
 
+        let expected = std::fs::read(path).unwrap();
+        for (pos, len) in [(0, 0), (511, 2), (4095, 3), (512, 512), (12 * 1024, 0)] {
+            let actual = reader.read_exact_at(pos, len).unwrap();
+            assert_eq!(actual.as_ref(), &expected[pos as usize..pos as usize + len]);
+        }
+
+        assert!(reader.read_exact_at(12 * 1024 - 1, 2).is_err());
+        assert_eq!(
+            reader.read_exact_at(u64::MAX, 1).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            reader.read_exact_at(12 * 1024 - 4, 4).unwrap().as_ref(),
+            &expected[12 * 1024 - 4..]
+        );
+
+        let retained = reader.read_exact_at(4095, 3).unwrap();
         test_read(&reader, 0);
         test_read(&reader, 1);
         test_read(&reader, 15);
@@ -209,5 +357,7 @@ mod tests {
         test_read(&reader, 2047);
         test_read(&reader, 2049);
         test_read(&reader, 3 * 1024 - 1);
+        drop(reader);
+        assert_eq!(retained.as_ref(), &expected[4095..4098]);
     }
 }

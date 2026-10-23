@@ -180,6 +180,23 @@ where
         Some(owner.as_any_mut())
     }
 }
+impl AbstractBytes<[u8]> {
+    /// Creates `Bytes` by sharing an existing `BytesOwner` allocation.
+    ///
+    /// Unlike [`Self::from_owner`], this does not allocate a new `Arc`; the
+    /// supplied owner must already be in a stable `Arc` allocation.
+    pub fn from_shared_owner<T: BytesOwner>(owner: Arc<T>) -> Self {
+        let bytes = owner.as_ref().as_ref();
+        let ptr = bytes.as_ptr();
+        let len = bytes.len();
+        let owner: Arc<dyn AbstractOwner<[u8]>> = owner;
+        Self {
+            ptr,
+            len,
+            owner: Some(owner),
+        }
+    }
+}
 
 impl Bytes {
     #[inline]
