@@ -1052,6 +1052,7 @@ fn controller(output: &Path) -> Result<()> {
             128 * MIB,
             PollingPolicy::Adaptive,
             true,
+            tidehunter::distributed::tcp::ResidentReadConfig::default(),
         )?;
         let mut remote = owned.config.clone();
         cluster = Some(owned);

@@ -5,6 +5,10 @@
 #[path = "support/tcp_cluster.rs"]
 mod tcp_cluster;
 
+#[cfg(feature = "experimental-fabric")]
+#[path = "support/rma_probe.rs"]
+mod rma_probe;
+
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -58,6 +62,9 @@ impl Args {
                 );
                 println!(
                     "Local nodes are owned and stopped by this process. External nodes are operator-owned; their configured polling policy must match. efa-native/fabric-tcp-native omit application TLS and require a trusted isolated deployment. Timed API includes full deterministic payload validation. Idle injection and result writing are outside each sample timer. Profiling adds clocks; compare unprofiled runs separately."
+                );
+                println!(
+                    "Use --rma-probe --help for the isolated raw provider FI_READ floor (requires experimental-fabric)."
                 );
                 std::process::exit(0);
             }
@@ -276,6 +283,14 @@ fn run(args: &Args, clients: &mut [Client]) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    let mut arguments = std::env::args();
+    let _program = arguments.next();
+    if arguments.next().as_deref() == Some("--rma-probe") {
+        #[cfg(feature = "experimental-fabric")]
+        return rma_probe::run(arguments);
+        #[cfg(not(feature = "experimental-fabric"))]
+        return Err(invalid("--rma-probe requires experimental-fabric").into());
+    }
     if tcp_cluster::maybe_run_storage_node()? {
         return Ok(());
     }
@@ -315,6 +330,7 @@ fn main() -> Result<()> {
             128 * MIB,
             args.polling,
             false,
+            tidehunter::distributed::tcp::ResidentReadConfig::default(),
         )?;
         let config = owned.config.clone();
         cluster = Some(owned);
