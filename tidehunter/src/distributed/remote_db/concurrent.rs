@@ -501,6 +501,7 @@ impl ConcurrentRemoteDatabase {
     pub fn read_io_monitor(&self) -> ReadIoMonitor {
         ReadIoMonitor {
             clients: self.io_clients.clone(),
+            reads: self.reads.clone(),
         }
     }
     pub fn read_admission_generation(&self) -> u64 {

@@ -29,6 +29,43 @@ fn reopen_result(fixture: &Fixture) -> Result<RemoteDatabase, LocalDbError> {
     )
 }
 
+#[cfg(all(target_os = "linux", feature = "test-utils"))]
+#[test]
+fn benchmark_owner_lookup_uses_authoritative_reference_and_reports_absence() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    let key = 11u32.to_be_bytes();
+    db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(11, 1)])
+        .unwrap();
+    db.drain().unwrap();
+    let partition = db
+        .partition_for_key_for_benchmark(KeySpace(0), &key)
+        .unwrap()
+        .unwrap();
+    assert!(fixture.config.storage.partitions.contains(&partition));
+    assert_eq!(
+        db.partition_for_key_for_benchmark(KeySpace(0), &12u32.to_be_bytes())
+            .unwrap(),
+        None
+    );
+
+    db.write_batch(
+        fixture.operation(1, 2),
+        vec![Mutation::Delete {
+            keyspace: KeySpace(0),
+            key: key.to_vec().into(),
+        }],
+    )
+    .unwrap();
+    db.drain().unwrap();
+    assert_eq!(
+        db.partition_for_key_for_benchmark(KeySpace(0), &key)
+            .unwrap(),
+        None
+    );
+    db.shutdown().unwrap();
+}
+
 #[test]
 fn checkpoint_restores_overwrite_delete_tail_and_original_retry_receipts() {
     let fixture = Fixture::new();

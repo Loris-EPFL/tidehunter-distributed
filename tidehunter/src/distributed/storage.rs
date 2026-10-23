@@ -84,6 +84,7 @@ impl StaticInventory {
     }
 }
 
+pub use super::reference_directory::AuthorityCacheStats;
 pub use crate::wal::WalMemberReadPolicy;
 
 /// Explicit limits for this experimental log, separate from native Db limits.
@@ -559,6 +560,33 @@ pub(crate) struct RecordReadPlan {
     _authority: Arc<RegisteredBatch>,
     // Holds both immutable segment ownership and the directory authority lock.
     pub(crate) _log: Arc<PartitionLog>,
+}
+/// Exact native ownership retained by a remote resident grant. The authority
+/// Arc keeps registered-descriptor metadata credit charged; the file and log
+/// keep the original native source and its directory authority alive.
+pub(crate) struct ResidentReadOwner {
+    _authority: Arc<RegisteredBatch>,
+    _file: Arc<File>,
+    _log: Arc<PartitionLog>,
+}
+impl Clone for ResidentReadOwner {
+    fn clone(&self) -> Self {
+        Self {
+            _authority: Arc::clone(&self._authority),
+            _file: Arc::clone(&self._file),
+            _log: Arc::clone(&self._log),
+        }
+    }
+}
+
+impl RecordReadPlan {
+    pub(crate) fn resident_owner(&self) -> ResidentReadOwner {
+        ResidentReadOwner {
+            _authority: Arc::clone(&self._authority),
+            _file: Arc::clone(&self.member.file),
+            _log: Arc::clone(&self._log),
+        }
+    }
 }
 
 impl RecordReadPlan {
@@ -1615,6 +1643,11 @@ impl PartitionLog {
         stats.registered_records = references.retained_descriptors;
         stats.reference_metadata_bytes = references.charged_metadata_bytes;
         stats
+    }
+
+    /// Metadata residency counters, not value-cache hits or physical read IOPS.
+    pub fn authority_cache_stats(&self) -> AuthorityCacheStats {
+        self.references.read_stats()
     }
 
     pub(crate) fn claim_worker(&self) -> Result<(), StorageError> {

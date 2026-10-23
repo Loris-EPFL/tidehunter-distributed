@@ -71,6 +71,7 @@ pub use transports::RemoteTransportPool;
 /// held over these network waits. Counters are cumulative, not a quiescent cut.
 pub struct ReadIoMonitor {
     clients: Vec<(u32, Arc<Mutex<Client>>)>,
+    reads: Arc<ReadService>,
 }
 impl ReadIoMonitor {
     pub fn sample(&self) -> Result<Vec<(u32, super::tcp::ReadExecutorStats)>, LocalDbError> {
@@ -84,6 +85,28 @@ impl ReadIoMonitor {
                     .map_err(LocalDbError::component)
             })
             .collect()
+    }
+    /// Per-partition client-side RMA counters; unlike shard I/O, these measure
+    /// actual initiator posts/completions and require no network probe.
+    pub fn sample_resident_reads(
+        &self,
+    ) -> Result<Vec<(u32, super::tcp::ResidentReadStats)>, LocalDbError> {
+        let mut samples = self.reads.resident_read_stats();
+        for (node, _) in &mut samples {
+            *node = self.clients[*node as usize].0;
+        }
+        Ok(samples)
+    }
+    /// Per configured read lane, for proving warmed coverage before timing.
+    /// Sampling locks each exclusive lane briefly but does not make an RPC.
+    pub fn sample_resident_read_lanes(
+        &self,
+    ) -> Result<Vec<(u32, usize, super::tcp::ResidentReadStats)>, LocalDbError> {
+        let mut samples = self.reads.resident_read_lane_stats();
+        for (node, _, _) in &mut samples {
+            *node = self.clients[*node as usize].0;
+        }
+        Ok(samples)
     }
 }
 
@@ -983,6 +1006,28 @@ impl RemoteDatabase {
             .pin_cut(cut)
             .map_err(LocalDbError::component)
     }
+    /// Resolve the authoritative owner of a key for benchmark evidence.
+    ///
+    /// The caller must have drained the database and prevent concurrent writes
+    /// until this observation is complete. The returned owner comes from the
+    /// exact pinned index reference; absence or a tombstone returns `None`.
+    /// No transport or cache lock is held.
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    pub fn partition_for_key_for_benchmark(
+        &self,
+        keyspace: KeySpace,
+        full_key: &[u8],
+    ) -> Result<Option<u32>, LocalDbError> {
+        let (cut, pin) = self.protected_published_cut()?;
+        let reference = self
+            .index
+            .read()
+            .get(keyspace, full_key, cut)
+            .map_err(LocalDbError::component)?;
+        let partition = reference.map(|reference| reference.batch_address.partition);
+        drop(pin);
+        Ok(partition)
+    }
 
     pub fn open(
         path: &Path,
@@ -1122,7 +1167,8 @@ impl RemoteDatabase {
             tls_config.clone(),
             retained_reads,
         )?;
-        let connected = transports::connect(&config, &shape, tls_config, 1, retained_controls)?;
+        let connected =
+            transports::connect(&config, &shape, tls_config, 1, false, retained_controls)?;
         recovery_stats.connection_setup_ns = connected.elapsed_ns;
         recovery_stats.created_connections = (connected.clients.len() - connected.reused) as u64;
         recovery_stats.reused_connections = connected.reused as u64;
@@ -1406,6 +1452,7 @@ impl RemoteDatabase {
                 .zip(&self.clients)
                 .map(|(endpoint, worker)| (endpoint.partition, worker.client.clone()))
                 .collect(),
+            reads: self.reads.clone(),
         }
     }
 
@@ -2807,6 +2854,15 @@ impl RemoteDatabase {
             result = self.commit_checkpoint();
         }
         self.shutdown_stats.checkpoint_ns = elapsed(started);
+        let _resident_pause = match self.reads.pause_and_release_resident_grants() {
+            Ok(pause) => Some(pause),
+            Err(error) => {
+                if result.is_ok() {
+                    result = Err(error);
+                }
+                None
+            }
+        };
         let started = Instant::now();
         let read_clients = if result.is_ok() && self.transport_pool.is_some() {
             self.reads.stop_with_clients()
@@ -2820,17 +2876,18 @@ impl RemoteDatabase {
                 "asynchronous read failed before shutdown",
             ));
         }
-        let started = Instant::now();
-        // Issue all seals before waiting for any; drain every submitted reply.
-        let seals: Vec<_> = self
-            .clients
-            .iter()
-            .map(|client| client.seal(self.epoch))
-            .collect();
-        for seal in seals {
-            let sealed = seal.and_then(receive);
-            if result.is_ok() {
-                result = sealed;
+        if result.is_ok() {
+            // Issue all seals before waiting for any; drain every submitted reply.
+            let seals: Vec<_> = self
+                .clients
+                .iter()
+                .map(|client| client.seal(self.epoch))
+                .collect();
+            for seal in seals {
+                let sealed = seal.and_then(receive);
+                if result.is_ok() {
+                    result = sealed;
+                }
             }
         }
         self.shutdown_stats.seal_ns = elapsed(started);

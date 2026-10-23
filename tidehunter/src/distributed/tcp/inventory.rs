@@ -150,6 +150,7 @@ impl NodeInventory {
         Ok(evidence)
     }
     pub fn open(mut config: NodeConfig, metrics: Arc<Metrics>) -> Result<Self, TcpError> {
+        config.resident_reads.validate()?;
         config.partition.validate().map_err(TcpError::component)?;
         if config.partition.inventory.epoch != 1
             || config.partition.inventory.segment_generation != 1

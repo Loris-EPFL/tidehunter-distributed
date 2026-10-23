@@ -16,10 +16,15 @@ use std::mem::size_of;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 const MAX_RESIDENT_BATCHES: usize = 1024;
 const AUTHORITY_CACHE_ENTRIES: usize = 64;
+const MAX_AUTHORITY_CACHE_ENTRIES: usize = 1024;
+// The base allowance covers the 64-entry hash table and LRU sentinels. Charge
+// extra capacity conservatively for hashbrown's bucket/control-byte rounding.
+const CACHE_TABLE_BYTES_PER_EXTRA_ENTRY: usize = 64;
+const CACHE_TABLE_HEADROOM_DIVISOR: usize = 16;
 // lru 0.12's fixed KeyRef/pointer table and sentinels remain allocated on eviction.
 const CACHE_TABLE_BYTES: usize = 4096;
 const CACHE_ENTRY_BYTES: usize = 128;
@@ -147,6 +152,41 @@ fn root_charge() -> usize {
         // both conservatively even while empty, so retained capacity is bounded.
         + 2 * MAX_RESIDENT_BATCHES * size_of::<Arc<RegisteredBatch>>()
 }
+
+fn authority_cache_capacity(metadata_limit: usize) -> usize {
+    let table_headroom =
+        metadata_limit.saturating_sub(root_charge()) / CACHE_TABLE_HEADROOM_DIVISOR;
+    AUTHORITY_CACHE_ENTRIES
+        + (table_headroom / CACHE_TABLE_BYTES_PER_EXTRA_ENTRY)
+            .min(MAX_AUTHORITY_CACHE_ENTRIES - AUTHORITY_CACHE_ENTRIES)
+}
+
+fn extra_cache_table_bytes(metadata_limit: usize) -> usize {
+    (authority_cache_capacity(metadata_limit) - AUTHORITY_CACHE_ENTRIES)
+        * CACHE_TABLE_BYTES_PER_EXTRA_ENTRY
+}
+
+/// Authority planning is separate from value residency and physical device I/O.
+/// Event counters include attempted lookups; live snapshots are not atomic
+/// across all counters. History loads can themselves hit the OS page cache.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AuthorityCacheStats {
+    pub resident_hits: u64,
+    pub resident_misses: u64,
+    pub contention: u64,
+    pub history_loads: u64,
+    pub entries: usize,
+    pub capacity: usize,
+    pub table_bytes: usize,
+}
+
+#[derive(Default)]
+struct AuthorityReadCounters {
+    resident_hits: AtomicU64,
+    resident_misses: AtomicU64,
+    contention: AtomicU64,
+    history_loads: AtomicU64,
+}
 #[derive(Debug)]
 struct MetadataBudget {
     limit: usize,
@@ -221,6 +261,7 @@ pub(crate) struct ReferenceDirectory {
     authority: RwLock<Authority>,
     cache: Mutex<AuthorityCache>,
     budget: Arc<MetadataBudget>,
+    reads: AuthorityReadCounters,
 }
 pub(crate) struct ReferenceDirectoryWriter {
     directory: Arc<ReferenceDirectory>,
@@ -255,7 +296,9 @@ impl ReferenceDirectory {
             return Err(DirectoryError::InvalidLimits);
         }
         if batches > max_batches.min(MAX_RESIDENT_BATCHES)
-            || Self::metadata_bytes(batches, descriptors)? > max_metadata_bytes
+            || Self::metadata_bytes(batches, descriptors)?
+                .checked_add(extra_cache_table_bytes(max_metadata_bytes))
+                .is_none_or(|bytes| bytes > max_metadata_bytes)
         {
             return Err(DirectoryError::Capacity);
         }
@@ -305,14 +348,19 @@ impl ReferenceDirectory {
             }),
             cache: Mutex::new(AuthorityCache {
                 entries: LruCache::new(
-                    NonZeroUsize::new(AUTHORITY_CACHE_ENTRIES)
-                        .ok_or(DirectoryError::InvalidLimits)?,
+                    NonZeroUsize::new(authority_cache_capacity(
+                        config.max_reference_metadata_bytes,
+                    ))
+                    .ok_or(DirectoryError::InvalidLimits)?,
                 ),
                 bytes: 0,
             }),
+            reads: AuthorityReadCounters::default(),
             budget: Arc::new(MetadataBudget {
                 limit: config.max_reference_metadata_bytes - root_charge(),
-                used: AtomicUsize::new(0),
+                used: AtomicUsize::new(extra_cache_table_bytes(
+                    config.max_reference_metadata_bytes,
+                )),
                 descriptors: AtomicUsize::new(0),
             }),
         });
@@ -335,17 +383,44 @@ impl ReferenceDirectory {
         if address.partition != self.partition || address.segment_generation != self.generation {
             return None;
         }
-        if let Some(mut cache) = self.cache.try_lock()
-            && let Some(batch) = cache.entries.get(&address)
-        {
-            return Some(batch.clone());
+        if let Some(mut cache) = self.cache.try_lock() {
+            if let Some(batch) = cache.entries.get(&address) {
+                self.reads.resident_hits.fetch_add(1, Ordering::Relaxed);
+                return Some(batch.clone());
+            }
+        } else {
+            self.reads.contention.fetch_add(1, Ordering::Relaxed);
         }
-        let authority = self.authority.try_read()?;
-        authority
+        let Some(authority) = self.authority.try_read() else {
+            self.reads.contention.fetch_add(1, Ordering::Relaxed);
+            self.reads.resident_misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        let batch = authority
             .pending
             .iter()
             .find(|batch| batch.address == address)
-            .cloned()
+            .cloned();
+        if batch.is_some() {
+            self.reads.resident_hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.reads.resident_misses.fetch_add(1, Ordering::Relaxed);
+        }
+        batch
+    }
+    pub(crate) fn read_stats(&self) -> AuthorityCacheStats {
+        let cache = self.cache.lock();
+        AuthorityCacheStats {
+            resident_hits: self.reads.resident_hits.load(Ordering::Relaxed),
+            resident_misses: self.reads.resident_misses.load(Ordering::Relaxed),
+            contention: self.reads.contention.load(Ordering::Relaxed),
+            history_loads: self.reads.history_loads.load(Ordering::Relaxed),
+            entries: cache.entries.len(),
+            capacity: cache.entries.cap().get(),
+            table_bytes: CACHE_TABLE_BYTES
+                + (cache.entries.cap().get() - AUTHORITY_CACHE_ENTRIES)
+                    * CACHE_TABLE_BYTES_PER_EXTRA_ENTRY,
+        }
     }
     fn reserve_with_cache(
         &self,
@@ -384,6 +459,7 @@ impl ReferenceDirectory {
             }
             authority.history.clone()
         };
+        self.reads.history_loads.fetch_add(1, Ordering::Relaxed);
         let Some(page) = reader.lookup_address_page(address)? else {
             return Ok(None);
         };
@@ -671,10 +747,12 @@ impl ReferenceDirectoryWriter {
             authority.pending.len() + batches.len(),
             descriptors,
         )?;
-        self.directory
-            .cache
-            .lock()
-            .trim(self.directory.max_metadata_bytes.saturating_sub(bytes));
+        self.directory.cache.lock().trim(
+            self.directory
+                .max_metadata_bytes
+                .saturating_sub(bytes)
+                .saturating_sub(extra_cache_table_bytes(self.directory.max_metadata_bytes)),
+        );
         authority.last_end = group_end;
         authority.pending.extend(batches.into_iter().map(Arc::new));
         Ok(())
