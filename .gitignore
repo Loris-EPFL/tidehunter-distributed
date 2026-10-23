@@ -15,3 +15,6 @@ target/
 # Python build and test caches are not source artifacts.
 __pycache__/
 *.py[cod]
+
+# Retained benchmark evidence and generated source-bound build trees.
+/checkpoint-work/
