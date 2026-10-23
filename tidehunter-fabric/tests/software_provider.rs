@@ -6,7 +6,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tidehunter_fabric::Endpoint;
+use tidehunter_fabric::{Endpoint, PeerDrainToken, RemoteReadRegion, RmaConfig};
 
 fn pair() -> io::Result<(Endpoint, Endpoint)> {
     let mut a = Endpoint::open("tcp;ofi_rxm", Some("lo"))?;
@@ -16,6 +16,281 @@ fn pair() -> io::Result<(Endpoint, Endpoint)> {
     a.set_peer(&b_addr)?;
     b.set_peer(&a_addr)?;
     Ok((a, b))
+}
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm and local network permission"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Exercise one registered grant through CQ mixing, retained ownership, cancellation and reuse."
+)]
+fn software_provider_rma_reads_with_mixed_cq_and_retained_buffer_ownership() -> io::Result<()> {
+    let config = RmaConfig {
+        source_bytes: 8192,
+        source_region_slots: 1,
+        destination_bytes: 8192,
+        destination_slots: 1,
+        max_read_bytes: 8192,
+        require_device_read: false,
+    };
+    let mut a = Endpoint::open_rma("tcp;ofi_rxm", Some("lo"), config)?;
+    let mut b = Endpoint::open_rma("tcp;ofi_rxm", Some("lo"), config)?;
+    let mut wrong_endpoint = Endpoint::open_rma("tcp;ofi_rxm", Some("lo"), config)?;
+    let a_address = a.address()?;
+    let b_address = b.address()?;
+    a.set_peer(&b_address)?;
+    b.set_peer(&a_address)?;
+    wrong_endpoint.set_peer(&b_address)?;
+
+    let payload: Vec<u8> = (0..4096)
+        .map(|index| u8::try_from(index % 239).unwrap())
+        .collect();
+    let grant = b.reserve_read_region(44, 3)?;
+    let mut expected = Vec::with_capacity(payload.len() + 16);
+    expected.extend_from_slice(&grant.region_id().to_le_bytes());
+    expected.extend_from_slice(&grant.generation().to_le_bytes());
+    expected.extend_from_slice(&payload);
+    let remote = b.register_read_region(&grant, expected.clone())?;
+    assert!(matches!(
+        b.reserve_read_region(44, 3),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    assert!(matches!(
+        a.register_read_region(&grant, expected.clone()),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput
+    ));
+    assert_eq!(a.available_read_slots()?, 1);
+    assert_eq!(wrong_endpoint.available_read_slots()?, 1);
+    assert_eq!(usize::try_from(remote.len).ok(), Some(expected.len()));
+    assert!(matches!(
+        a.try_post_read(&remote, expected.len() - 1, 2),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput
+    ));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut accepted = None;
+    for _ in 0..1_000_000 {
+        assert!(Instant::now() < deadline, "RMA connection setup stalled");
+        match a.try_post_read(&remote, 0, expected.len()) {
+            Ok(operation) => {
+                accepted = Some(operation);
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                assert_eq!(a.available_read_slots()?, 1);
+                progress_nonblocking(&mut a)?;
+                progress_nonblocking(&mut b)?;
+                thread::yield_now();
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let mut operation = accepted
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "RMA post did not become ready"))?;
+    assert_eq!(a.available_read_slots()?, 0);
+    assert!(matches!(
+        wrong_endpoint.try_read_completion(&mut operation),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput
+    ));
+    assert!(matches!(
+        a.try_post_read(&remote, 0, expected.len()),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    assert_eq!(a.try_send(b"mixed")?, 5);
+    let mut received = [0; 5];
+    let mut received_len = 0;
+    let mut read_result = None;
+    while received_len != received.len() || read_result.is_none() || a.sends_pending() {
+        assert!(Instant::now() < deadline, "software-provider RMA stalled");
+        progress_nonblocking(&mut a)?;
+        progress_nonblocking(&mut b)?;
+        if received_len < received.len() {
+            match b.try_receive(&mut received[received_len..]) {
+                Ok(len) => received_len += len,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if read_result.is_none()
+            && let Some(result) = a.try_read_completion(&mut operation)?
+        {
+            read_result = Some(result?.into_minibytes_bytes());
+        }
+    }
+    assert_eq!(&received, b"mixed");
+    assert_eq!(read_result.as_deref(), Some(expected.as_slice()));
+    assert_eq!(a.available_read_slots()?, 0);
+
+    assert!(matches!(
+        a.try_post_read(&remote, 0, expected.len()),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    drop(read_result);
+    assert_eq!(a.available_read_slots()?, 1);
+
+    let window = RemoteReadRegion {
+        remote_address: remote.remote_address.checked_add(128).unwrap(),
+        len: remote.len - 128,
+        ..remote
+    };
+    let cancelled = a.try_post_read(&window, 0, 256)?;
+    drop(cancelled);
+    let mut recovered = loop {
+        assert!(Instant::now() < deadline, "cancelled RMA did not retire");
+        progress_nonblocking(&mut a)?;
+        progress_nonblocking(&mut b)?;
+        match a.try_post_read(&window, 0, 256) {
+            Ok(operation) => break operation,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+    };
+    let buffer = loop {
+        assert!(Instant::now() < deadline, "recovered RMA did not complete");
+        progress_nonblocking(&mut b)?;
+        if let Some(result) = a.try_read_completion(&mut recovered)? {
+            break result?;
+        }
+    };
+    assert_eq!(buffer.as_ref(), &expected[128..384]);
+    drop(buffer);
+
+    // SAFETY: The test has completed all accepted reads and will not post more.
+    b.retire_read_region(grant, unsafe { PeerDrainToken::after_ack(44, 3) })?;
+    Ok(())
+}
+
+fn post_group_read(
+    local: &mut Endpoint,
+    peer: &mut Endpoint,
+    remote: &RemoteReadRegion,
+    offset: usize,
+    deadline: Instant,
+) -> io::Result<tidehunter_fabric::ReadOperation> {
+    for _ in 0..1_000_000 {
+        if Instant::now() >= deadline {
+            break;
+        }
+        match local.try_post_read(remote, offset, 256) {
+            Ok(operation) => return Ok(operation),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                progress_nonblocking(local)?;
+                progress_nonblocking(peer)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "group RMA post stalled",
+    ))
+}
+
+fn collect_group_reads(
+    local: &mut Endpoint,
+    peer: &mut Endpoint,
+    operations: &mut [tidehunter_fabric::ReadOperation],
+    deadline: Instant,
+) -> io::Result<Vec<Option<minibytes::Bytes>>> {
+    let mut records = vec![None; operations.len()];
+    for _ in 0..1_000_000 {
+        if Instant::now() >= deadline {
+            break;
+        }
+        progress_nonblocking(peer)?;
+        progress_nonblocking(local)?;
+        // Harvest in reverse caller order, independently of provider CQ order.
+        for index in (0..operations.len()).rev() {
+            if records[index].is_none()
+                && let Some(result) = local.take_read_completion(&mut operations[index])?
+            {
+                records[index] = Some(result?.into_minibytes_bytes());
+            }
+        }
+        if records.iter().all(Option::is_some) {
+            return Ok(records);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "group RMA completion stalled",
+    ))
+}
+
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm and local network permission"]
+fn software_provider_rma_group_preserves_order_with_retained_consumers() -> io::Result<()> {
+    let config = RmaConfig {
+        source_bytes: 8192,
+        source_region_slots: 1,
+        destination_bytes: 8192,
+        destination_slots: 32,
+        max_read_bytes: 256,
+        require_device_read: false,
+    };
+    let mut local = Endpoint::open_rma("tcp;ofi_rxm", Some("lo"), config)?;
+    let mut peer = Endpoint::open_rma("tcp;ofi_rxm", Some("lo"), config)?;
+    local.set_peer(&peer.address()?)?;
+    peer.set_peer(&local.address()?)?;
+    let region = peer.reserve_read_region(91, 5)?;
+    let payload: Vec<_> = (0..8192)
+        .map(|index| u8::try_from(index / 256).unwrap())
+        .collect();
+    let remote = peer.register_read_region(&region, payload)?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut operations = Vec::with_capacity(32);
+    for index in 0..32 {
+        operations.push(post_group_read(
+            &mut local,
+            &mut peer,
+            &remote,
+            index * 256,
+            deadline,
+        )?);
+    }
+    let mut first = collect_group_reads(&mut local, &mut peer, &mut operations, deadline)?;
+    assert_eq!(local.available_read_slots()?, 0);
+    assert!(matches!(local.try_post_read(&remote, 0, 256),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+    for (index, record) in first.iter().enumerate() {
+        assert_eq!(
+            record.as_ref().unwrap().as_ref(),
+            &[u8::try_from(index).unwrap(); 256]
+        );
+    }
+    for index in (0..32).step_by(2) {
+        drop(first[index].take());
+    }
+    assert_eq!(local.available_read_slots()?, 16);
+    operations.clear();
+    for index in 0..16 {
+        operations.push(post_group_read(
+            &mut local,
+            &mut peer,
+            &remote,
+            (31 - index) * 256,
+            deadline,
+        )?);
+    }
+    let second = collect_group_reads(&mut local, &mut peer, &mut operations, deadline)?;
+    for (index, record) in second.iter().enumerate() {
+        assert_eq!(
+            record.as_ref().unwrap().as_ref(),
+            &[u8::try_from(31 - index).unwrap(); 256]
+        );
+    }
+    for index in (1..32).step_by(2) {
+        assert_eq!(
+            first[index].as_ref().unwrap().as_ref(),
+            &[u8::try_from(index).unwrap(); 256]
+        );
+    }
+    drop(first);
+    drop(second);
+    assert_eq!(local.available_read_slots()?, 32);
+    // SAFETY: Both groups reached terminal CQ and all returned buffers were
+    // released. This exact peer will post no more reads for session 91/grant 5.
+    peer.retire_read_region(region, unsafe { PeerDrainToken::after_ack(91, 5) })?;
+    Ok(())
 }
 
 #[test]

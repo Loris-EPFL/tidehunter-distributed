@@ -6,9 +6,13 @@ use efa_direct::{ControlWindow, SendWindow, StreamReceiver};
 use ofi_libfabric_sys::bindgen as ffi;
 use resources::{ADDRESS, Resources, error, invalid};
 use std::{
+    any::Any,
     io::{self, IoSlice, Write},
     mem,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -16,6 +20,7 @@ const CHUNK: usize = 65_536;
 const SLOTS: usize = 4;
 const PROGRESS_LIMIT: usize = 10_000_000;
 pub(crate) const ENDPOINTS: usize = 1024;
+pub(super) const RMA_CANCELLED: u64 = 1 << 63;
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 
 /// Bounded lifetime CQ counters. Poll-gap timing is opt-in and measures the
@@ -90,6 +95,169 @@ pub struct OpenProfile {
     pub mtu: usize,
     pub provider_version: u32,
 }
+/// Fixed per-endpoint bounds for registered one-sided reads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RmaConfig {
+    pub source_bytes: usize,
+    pub source_region_slots: usize,
+    pub destination_bytes: usize,
+    pub destination_slots: usize,
+    pub max_read_bytes: usize,
+    pub require_device_read: bool,
+}
+
+/// The provider's selected memory addressing and read implementation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RmaCapabilities {
+    pub address_mode: RmaAddressMode,
+    pub read_mode: RmaReadMode,
+    pub max_read_bytes: usize,
+    pub max_iov: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RmaAddressMode {
+    Virtual,
+    Offset,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RmaReadMode {
+    Native,
+    Emulated,
+}
+
+/// Wire-safe remote address; contains no process-local MR descriptor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteReadRegion {
+    pub region_id: u64,
+    pub generation: u64,
+    /// Peer-defined window base: a virtual address or an MR-relative offset.
+    pub remote_address: u64,
+    pub key: u64,
+    pub len: u64,
+}
+
+/// Opaque attestation that a peer/session grant has been drained.
+/// Its constructor is unsafe because remote-DMA quiescence cannot be inferred
+/// from local CQ, timeout, endpoint close, or MR close state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerDrainToken {
+    session_id: u64,
+    grant_generation: u64,
+}
+
+impl PeerDrainToken {
+    /// Creates an attestation after the exact peer's grant has been drained.
+    ///
+    /// # Safety
+    /// The caller must have closed admission for this session and grant, and
+    /// validated an acknowledgement on that exact peer session proving every accepted
+    /// `FI_READ` for this grant reached terminal completion. A timeout,
+    /// local endpoint/MR close, failed operation, unknown CQ context, or assumed
+    /// idle interval is not sufficient.
+    #[must_use]
+    pub const unsafe fn after_ack(session_id: u64, grant_generation: u64) -> Self {
+        Self {
+            session_id,
+            grant_generation,
+        }
+    }
+}
+
+/// Endpoint-local handle for a reserved or registered immutable source region.
+#[derive(Debug, Eq, PartialEq)]
+pub struct RegisteredReadRegion {
+    owner_id: u64,
+    region_id: u64,
+    generation: u64,
+    session_id: u64,
+    grant_generation: u64,
+}
+
+impl RegisteredReadRegion {
+    /// Stable identity to include in the immutable member envelope.
+    #[must_use]
+    pub const fn region_id(&self) -> u64 {
+        self.region_id
+    }
+
+    /// Generation paired with `region_id` in the immutable member envelope.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// Identifier for one accepted `FI_READ`. Dropping it never cancels provider
+/// work or releases its registered destination.
+pub struct ReadOperation {
+    slot: usize,
+    generation: u64,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    finished: bool,
+}
+
+impl Drop for ReadOperation {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.cancelled.fetch_or(RMA_CANCELLED, Ordering::Release);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ReadBufferStorage {
+    bytes: Box<[std::cell::UnsafeCell<u8>]>,
+    len: AtomicUsize,
+    charged_bytes: usize,
+    charged_slots: usize,
+}
+
+// SAFETY: Resources returns a ReadBuffer only for a terminal successful CQE.
+// It does not reuse the backing slot while any ReadBuffer Arc remains alive.
+unsafe impl Sync for ReadBufferStorage {}
+
+impl Drop for ReadBufferStorage {
+    fn drop(&mut self) {
+        resources::release_destination_charge(self.charged_bytes, self.charged_slots);
+    }
+}
+
+/// Stable owned bytes whose backing DMA slot remains unavailable until drop.
+#[derive(Clone, Debug)]
+pub struct ReadBuffer {
+    storage: std::sync::Arc<ReadBufferStorage>,
+}
+
+impl AsRef<[u8]> for ReadBufferStorage {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: Only a completed DMA slot is exposed as an owner, and Arc
+        // ownership prevents endpoint reuse while this immutable borrow exists.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.bytes.as_ptr().cast::<u8>(),
+                self.len.load(Ordering::Acquire),
+            )
+        }
+    }
+}
+
+impl minibytes::BytesOwner for ReadBufferStorage {}
+
+impl AsRef<[u8]> for ReadBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.storage.as_ref().as_ref()
+    }
+}
+
+impl ReadBuffer {
+    /// Transfers the preallocated destination-slot lease into a zero-copy owner.
+    #[must_use]
+    pub fn into_minibytes_bytes(self) -> minibytes::Bytes {
+        minibytes::Bytes::from_shared_owner(self.storage)
+    }
+}
 
 /// One exclusively operated `FI_EP_RDM` endpoint with four 64 KiB slots each
 /// for sends and receives (512 KiB total).
@@ -130,7 +298,19 @@ impl Endpoint {
     /// # Errors
     /// Reports invalid names, absent providers/devices or exhausted admission.
     pub fn open(provider: &str, domain: Option<&str>) -> io::Result<Self> {
-        Self::open_inner(provider, domain, false)
+        Self::open_inner(provider, domain, false, None)
+    }
+
+    /// Opens a message endpoint with negotiated one-sided read support and
+    /// bounded pre-registered destination resources.
+    ///
+    /// Inspect `rma_capabilities` before use: optional unsupported RMA can leave
+    /// a message-only endpoint. This never changes the requested provider.
+    /// # Errors
+    /// Reports invalid bounds, exhausted admission, provider errors or missing
+    /// hardware reads when `require_device_read` is set.
+    pub fn open_rma(provider: &str, domain: Option<&str>, config: RmaConfig) -> io::Result<Self> {
+        Self::open_inner(provider, domain, false, Some(config))
     }
 
     /// Opens only the `efa-direct` fabric of the EFA provider. No regular-EFA
@@ -138,7 +318,16 @@ impl Endpoint {
     /// # Errors
     /// Returns a hardware-unavailable error when the direct fabric is absent.
     pub fn open_efa_direct(domain: Option<&str>) -> io::Result<Self> {
-        Self::open_inner("efa", domain, true)
+        Self::open_inner("efa", domain, true, None)
+    }
+
+    /// Opens the explicit `efa-direct` packet/message endpoint with `FI_READ`
+    /// capability negotiation and the configured bounded RMA pools.
+    /// # Errors
+    /// Reports invalid bounds, exhausted admission or unavailable direct/RMA
+    /// capabilities. No regular-EFA or software fallback is attempted.
+    pub fn open_efa_direct_rma(domain: Option<&str>, config: RmaConfig) -> io::Result<Self> {
+        Self::open_inner("efa", domain, true, Some(config))
     }
 
     /// Test-only packet-protocol exercise over libfabric's software provider.
@@ -146,12 +335,18 @@ impl Endpoint {
     /// fallback for `open_efa_direct`.
     #[cfg(test)]
     fn open_software_packet_test(domain: Option<&str>) -> io::Result<Self> {
-        let mut endpoint = Self::open_inner("tcp;ofi_rxm", domain, false)?;
+        let mut endpoint = Self::open_inner("tcp;ofi_rxm", domain, false, None)?;
         endpoint.inner().enable_test_packet_adapter();
         endpoint.direct = Some(Box::new(DirectState::new(4096)?));
         Ok(endpoint)
     }
-    fn open_inner(provider: &str, domain: Option<&str>, direct: bool) -> io::Result<Self> {
+
+    fn open_inner(
+        provider: &str,
+        domain: Option<&str>,
+        direct: bool,
+        rma: Option<RmaConfig>,
+    ) -> io::Result<Self> {
         LIVE.fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
             (live < ENDPOINTS).then_some(live + 1)
         })
@@ -162,13 +357,10 @@ impl Endpoint {
             direct: None,
             failed: false,
         };
+        let use_direct = direct || (provider == "efa" && rma.is_some());
         endpoint.inner().open_profile.allocation_ns = resources::elapsed_ns(allocation);
-        if direct {
-            endpoint.inner().open_mode(provider, domain, true)?;
-        } else {
-            endpoint.inner().open(provider, domain)?;
-        }
-        if direct {
+        endpoint.inner().open_mode(provider, domain, direct, rma)?;
+        if use_direct {
             endpoint.direct = Some(Box::new(DirectState::new(endpoint.open_profile().mtu)?));
         }
         Ok(endpoint)
@@ -190,6 +382,194 @@ impl Endpoint {
     /// Reports invalid provider address data.
     pub fn address(&mut self) -> io::Result<Vec<u8>> {
         Ok(self.inner().address().to_vec())
+    }
+
+    /// Returns negotiated RMA capabilities, or `None` for message-only opens.
+    #[must_use]
+    pub fn rma_capabilities(&self) -> Option<RmaCapabilities> {
+        self.resources
+            .as_deref()
+            .and_then(Resources::rma_capabilities)
+    }
+    /// Counts currently reusable destination slots; this is advisory only.
+    /// The subsequent post is authoritative and can still return `WouldBlock`.
+    /// # Errors
+    /// Reports a failed endpoint or unavailable RMA state.
+    pub fn available_read_slots(&mut self) -> io::Result<usize> {
+        self.ready()?;
+        self.inner().available_read_slots()
+    }
+
+    /// Reserves an immutable source-region identity before encoding its envelope.
+    ///
+    /// The reservation consumes one bounded source-region slot but does not
+    /// allocate or register bytes. Finalize the envelope using its identity,
+    /// then call `register_read_region`.
+    /// # Errors
+    /// Rejects invalid identities, failed endpoints and exhausted source slots.
+    pub fn reserve_read_region(
+        &mut self,
+        session_id: u64,
+        grant_generation: u64,
+    ) -> io::Result<RegisteredReadRegion> {
+        self.ready()?;
+        self.inner()
+            .reserve_read_region(session_id, grant_generation)
+    }
+
+    /// Registers the finalized immutable envelope for its prior reservation.
+    /// # Errors
+    /// Rejects foreign or inactive reservations and exhausted byte budgets.
+    /// Provider registration errors retain any uncertain native ownership.
+    pub fn register_read_region(
+        &mut self,
+        region: &RegisteredReadRegion,
+        bytes: Vec<u8>,
+    ) -> io::Result<RemoteReadRegion> {
+        self.ready()?;
+        let result = self.inner().register_read_region(region, bytes);
+        if result.as_ref().is_err_and(|error| {
+            !matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::WouldBlock
+            )
+        }) {
+            self.failed = true;
+        }
+        result
+    }
+
+    /// Registers a finalized immutable envelope and retains its original source
+    /// owner for exactly as long as the provider-owned region is retained.
+    ///
+    /// Use this for buffers whose native authority or backing storage must stay
+    /// pinned while remote DMA may still address the registration. The owner is
+    /// retained on uncertain registration teardown and endpoint quarantine, and
+    /// released after exact peer drain and successful MR retirement.
+    /// # Errors
+    /// Rejects foreign or inactive reservations and exhausted source budgets.
+    /// Provider registration errors retain the owner whenever native ownership
+    /// is uncertain.
+    pub fn register_read_region_with_owner(
+        &mut self,
+        region: &RegisteredReadRegion,
+        bytes: Vec<u8>,
+        owner: Arc<dyn Any + Send + Sync>,
+    ) -> io::Result<RemoteReadRegion> {
+        self.ready()?;
+        let result = self
+            .inner()
+            .register_read_region_with_owner(region, bytes, Some(owner));
+        if result.as_ref().is_err_and(|error| {
+            !matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::WouldBlock
+            )
+        }) {
+            self.failed = true;
+        }
+        result
+    }
+
+    /// Retires a source region only after the matching peer drain acknowledgement.
+    /// # Errors
+    /// Rejects foreign regions, inactive identities and mismatched drain tokens.
+    /// Native close failures quarantine the registered source.
+    pub fn retire_read_region(
+        &mut self,
+        region: RegisteredReadRegion,
+        token: PeerDrainToken,
+    ) -> io::Result<()> {
+        self.ready()?;
+        let result = self.inner().retire_read_region(region, token);
+        if result
+            .as_ref()
+            .is_err_and(|error| error.kind() != io::ErrorKind::InvalidInput)
+        {
+            self.failed = true;
+        }
+        result
+    }
+    /// Reclaims a source registered for a grant that was never published.
+    ///
+    /// # Errors
+    /// Reports invalid region identity, failed endpoints or native close failure.
+    /// Uncertain ownership remains quarantined.
+    ///
+    /// # Safety
+    /// The caller must prove that neither this region's descriptor nor any
+    /// equivalent address/key/length was ever exposed to the remote peer.
+    pub unsafe fn retire_unpublished_read_region(
+        &mut self,
+        region: RegisteredReadRegion,
+    ) -> io::Result<()> {
+        self.ready()?;
+        // SAFETY: The caller upholds the documented unpublished-region proof.
+        let result = unsafe { self.inner().retire_unpublished_read_region(region) };
+        if result
+            .as_ref()
+            .is_err_and(|error| error.kind() != io::ErrorKind::InvalidInput)
+        {
+            self.failed = true;
+        }
+        result
+    }
+
+    /// Posts one actual `FI_READ` from a previously registered peer region.
+    /// `WouldBlock` means no operation was accepted and ownership was not taken.
+    /// # Errors
+    /// Rejects invalid ranges and failed endpoints. Exhausted destinations or
+    /// provider backpressure return `WouldBlock` without accepting a read.
+    pub fn try_post_read(
+        &mut self,
+        remote: &RemoteReadRegion,
+        offset: usize,
+        len: usize,
+    ) -> io::Result<ReadOperation> {
+        self.ready()?;
+        let result = self.inner().try_post_read(remote, offset, len);
+        match result {
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => Err(error),
+            result => self.finish_try(result),
+        }
+    }
+
+    /// Polls the shared CQ once and returns the exact operation's terminal bytes.
+    /// The destination remains unavailable until every returned `ReadBuffer`
+    /// clone is dropped. Dropping the operation before completion never cancels DMA.
+    /// # Errors
+    /// The outer result reports foreign operations or endpoint/progress errors.
+    /// The inner result reports the accepted operation's terminal provider error.
+    pub fn try_read_completion(
+        &mut self,
+        operation: &mut ReadOperation,
+    ) -> io::Result<Option<io::Result<ReadBuffer>>> {
+        self.ready()?;
+        self.inner().validate_read_operation(operation)?;
+        let result = self
+            .inner()
+            .poll()
+            .and_then(|_| self.inner().take_read_completion(operation));
+        self.finish_try(result)
+    }
+
+    /// Takes a previously progressed operation without polling the shared CQ.
+    ///
+    /// Batch owners can call `try_progress` once and then harvest each operation.
+    /// Destination ownership and generation checks match `try_read_completion`.
+    /// # Errors
+    /// The outer result reports foreign operations or a failed endpoint.
+    /// The inner result reports the accepted operation's terminal provider error.
+    pub fn take_read_completion(
+        &mut self,
+        operation: &mut ReadOperation,
+    ) -> io::Result<Option<io::Result<ReadBuffer>>> {
+        self.ready()?;
+        let result = self.inner().take_read_completion(operation);
+        match result {
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => Err(error),
+            result => self.finish_try(result),
+        }
     }
 
     /// Installs one authenticated peer and posts the initial receive buffer.
@@ -834,6 +1214,17 @@ impl Endpoint {
 impl Drop for Endpoint {
     fn drop(&mut self) {
         if let Some(mut resources) = self.resources.take() {
+            if resources.has_live_read_regions() {
+                // A successful local endpoint close does not prove that remote
+                // initiators have stopped reading a published registered region.
+                // Retain the entire domain, MR, bytes and admission permit.
+                mem::forget(resources);
+                let _ = writeln!(
+                    io::stderr(),
+                    "fabric source region not peer-drained; bounded resources quarantined"
+                );
+                return;
+            }
             if let Err(error) = resources.close() {
                 // A provider may still access registered memory after failed
                 // close. Retain its buffers, contexts and admission permit.
