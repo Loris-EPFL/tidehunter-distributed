@@ -304,14 +304,15 @@ class MatrixEvidenceTests(unittest.TestCase):
             self.assertEqual(len(rows), 12)
             self.assertEqual(sum(spec['transport_floor'] for spec in rows), 1)
 
-    def diagnostic_fixture(self, root, transport='efa-native', mode='tcp', cold=True):
+    def diagnostic_fixture(self, root, transport='efa-native', mode='tcp', cold=True,
+                           shape=(256, 1, 1), reads=256):
         directory = Path(root)
-        spec = dict(shape=[256, 1, 1], repetition=3, transport=transport,
+        spec = dict(shape=list(shape), repetition=3, transport=transport,
                     cold=cold, diagnostics=True, cached=False, authority_resident_batches=None,
-                    workload_reads=256)
+                    workload_reads=reads)
         native = mode == 'native-sync'
         identity = dict(backend='native_value_wal_barrier' if native else matrix.TRANSPORT_BACKENDS[transport],
-                        value_bytes=256, batch_size=1, window=1, repetition=0)
+                        value_bytes=shape[0], batch_size=shape[1], window=shape[2], repetition=0)
         def table(filename, fields, applicable):
             states = ['warm'] + (['cache-evicted'] if cold else []) + [
                 'reopened-warm' if native else 'reopened-cache-cleared']
@@ -381,6 +382,37 @@ class MatrixEvidenceTests(unittest.TestCase):
                     with self.subTest(transport=transport, mode=mode, cold=cold), tempfile.TemporaryDirectory() as root:
                         spec, _ = self.diagnostic_fixture(root, transport, mode, cold)
                         checkpoint_kv.validate_diagnostic_evidence(root, spec, mode, list(range(5)))
+
+    def test_current_native_diagnostic_availability_metadata_keeps_strict_clock_and_numeric_admission(self):
+        for mutation in (None, 'metadata_type', 'unknown_boolean', 'zero_clock', 'boolean_counter'):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as root:
+                spec, records = self.diagnostic_fixture(root, transport='fabric-tcp-native',
+                    cold=False, shape=(8192, 32, 1), reads=64)
+                for row in records:
+                    for _, node in row['nodes']:
+                        profiled = row['phase'] in ('warm-profiled-read-diagnostics', 'reopened-read-diagnostics')
+                        node['client'].update(server_handler_available=profiled,
+                                              server_handler_not_applicable=row['phase'] != 'load-write-diagnostics')
+                node = records[1]['nodes'][0][1]
+                if mutation == 'metadata_type':
+                    node['client']['server_handler_available'] = 'true'
+                elif mutation == 'unknown_boolean':
+                    node['client']['handler_available_unknown'] = True
+                elif mutation == 'zero_clock':
+                    node['client']['server_record_read_ns'] = 0
+                elif mutation == 'boolean_counter':
+                    node['client']['requests'] = True
+                path = Path(root) / 'node_profiles.yaml'
+                path.write_text(''.join('---\n' + json.dumps(record) + '\n' for record in records))
+                retained = path.read_text()
+                if mutation is None:
+                    checkpoint_kv.validate_diagnostic_evidence(root, spec, 'tcp', list(range(5)))
+                    self.assertEqual(path.read_text(), retained)
+                    self.assertIs(records[1]['nodes'][0][1]['client']['server_handler_available'], True)
+                    self.assertIs(records[1]['nodes'][0][1]['client']['server_handler_not_applicable'], True)
+                else:
+                    with self.assertRaises(ValueError):
+                        checkpoint_kv.validate_diagnostic_evidence(root, spec, 'tcp', list(range(5)))
 
     def test_diagnostic_cold_samples_cannot_stop_at_the_local_index(self):
         with tempfile.TemporaryDirectory() as root:

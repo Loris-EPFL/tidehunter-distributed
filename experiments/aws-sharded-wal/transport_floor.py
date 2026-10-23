@@ -239,12 +239,26 @@ def integer(value):
     return value
 
 
+PROFILE_AVAILABILITY_FIELDS = frozenset(
+    prefix + field for prefix in ('', 'client.')
+    for field in ('server_handler_available', 'server_handler_not_applicable'))
+
+
 def flatten_counters(value, prefix=''):
+    """Project numeric counters; validate metadata without modifying the raw profile.
+
+    Handler availability flags can both be true in mixed RPC/RMA aggregates.
+    They remain booleans in the retained profile, never 0/1 timing counters.
+    """
     if not isinstance(value, dict):
         raise ValueError('expected structured counters')
     result = {}
     for key, item in value.items():
         name = prefix + key
+        if name in PROFILE_AVAILABILITY_FIELDS:
+            if type(item) is not bool:
+                raise ValueError('expected boolean profile availability metadata: ' + name)
+            continue
         if isinstance(item, dict):
             result.update(flatten_counters(item, name + '.'))
         else:

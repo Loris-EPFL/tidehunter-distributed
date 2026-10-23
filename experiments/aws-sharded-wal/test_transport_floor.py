@@ -193,6 +193,94 @@ def floor_files(path, spec):
     table(path / 'summary.csv', summary)
 
 
+class ProfileAvailabilityMetadataTests(unittest.TestCase):
+    def test_known_boolean_metadata_is_validated_without_becoming_numeric_work(self):
+        for prefix in ('', 'client.'):
+            for available, not_applicable in ((False, False), (True, False), (False, True), (True, True)):
+                with self.subTest(prefix=prefix, available=available, not_applicable=not_applicable):
+                    client = dict(requests=2, server_handler_ns=17,
+                        server_handler_available=available, server_handler_not_applicable=not_applicable)
+                    raw = dict(client=client, requests=2) if prefix else client
+                    original = copy.deepcopy(raw)
+                    flattened = profile.flatten_counters(raw)
+                    self.assertEqual(raw, original)
+                    self.assertIs(client['server_handler_available'], available)
+                    self.assertIs(client['server_handler_not_applicable'], not_applicable)
+                    self.assertNotIn(prefix + 'server_handler_available', flattened)
+                    self.assertNotIn(prefix + 'server_handler_not_applicable', flattened)
+                    self.assertEqual(flattened[prefix + 'requests'], 2)
+                    self.assertEqual(flattened[prefix + 'server_handler_ns'], 17)
+                    self.assertTrue(all(type(value) is int for value in flattened.values()))
+
+    def test_known_metadata_requires_actual_bool_not_truthy_numbers_strings_or_structures(self):
+        for prefix in ('', 'client.'):
+            for field in ('server_handler_available', 'server_handler_not_applicable'):
+                for invalid in (0, 1, -1, 0.0, 1.0, 'true', 'false', None, [], {}, {'calls': 1}):
+                    with self.subTest(prefix=prefix, field=field, invalid=invalid):
+                        raw = {field: invalid}
+                        if prefix:
+                            raw = dict(client=raw)
+                        with self.assertRaisesRegex(ValueError, 'boolean profile availability'):
+                            profile.flatten_counters(raw)
+
+    def test_unknown_boolean_fields_and_misplaced_availability_names_remain_invalid_counters(self):
+        for raw in (
+                dict(requests=True),
+                dict(client=dict(requests=False)),
+                dict(server_handler_available_extra=True),
+                dict(client=dict(server_handler_not_applicable_count=False)),
+                dict(transport=dict(server_handler_available=True)),
+                dict(client=dict(socket=dict(server_handler_not_applicable=True)))):
+            with self.subTest(raw=raw), self.assertRaisesRegex(ValueError, 'nonnegative integer'):
+                profile.flatten_counters(raw)
+        for invalid in (-1, 1.5, '1', None, []):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                profile.flatten_counters(dict(requests=invalid, server_handler_available=True))
+
+    def test_explicit_client_prefix_preserves_the_same_metadata_boundary(self):
+        raw = dict(requests=1, server_handler_available=True, server_handler_not_applicable=True)
+        self.assertEqual(profile.flatten_counters(raw, 'client.'), {'client.requests': 1})
+        self.assertIs(raw['server_handler_available'], True)
+        self.assertIs(raw['server_handler_not_applicable'], True)
+
+
+    def test_current_floor_profile_accepts_boolean_metadata_without_weakening_polling_or_tls(self):
+        for mutation in (None, 'metadata_integer', 'unknown_boolean', 'polling_zero', 'tls_work'):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                spec = profile.subsuite_floor_spec('efa-native', True)
+                floor_files(root, spec)
+                paths = sorted(root.glob('evidence-*.yaml'))
+                for path in paths:
+                    evidence = profile.yaml_one(path.read_text())
+                    for node in evidence[2]:
+                        node.update(server_handler_available=False, server_handler_not_applicable=False)
+                        node['client'] = dict(requests=node['requests'], server_handler_available=True,
+                                              server_handler_not_applicable=True)
+                    save(path, evidence)
+                if mutation:
+                    evidence = profile.yaml_one(paths[0].read_text())
+                    node = evidence[2][0]
+                    if mutation == 'metadata_integer':
+                        node['client']['server_handler_available'] = 1
+                    elif mutation == 'unknown_boolean':
+                        node['client']['unknown_available'] = True
+                    elif mutation == 'polling_zero':
+                        node['polling']['progress_sweeps'] = 0
+                    else:
+                        node['client_transport']['tls_read']['calls'] = 1
+                    save(paths[0], evidence)
+                    with self.assertRaises(ValueError):
+                        profile.read_floor_metrics(root, spec)
+                else:
+                    metrics = profile.read_floor_metrics(root, spec)
+                    self.assertTrue(metrics)
+                    self.assertFalse(any('server_handler_available' in key[2] or
+                                         'server_handler_not_applicable' in key[2] for key in metrics))
+                    retained = profile.yaml_one(paths[0].read_text())[2][0]
+                    self.assertIs(retained['client']['server_handler_available'], True)
+                    self.assertIs(retained['client']['server_handler_not_applicable'], True)
+
 class PlanAndComparisonTests(unittest.TestCase):
     def test_bounded_scopes_and_no_synthetic_native_controls(self):
         for scope, specs, apis in [('full', 164, 216), ('core', 148, 200), ('recovery', 20, 20)]:
