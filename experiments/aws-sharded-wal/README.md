@@ -1,3 +1,25 @@
+## 23 October Sui node-supervisor deadline correction
+
+Run `39864855396` rebuilt all six binaries and passed the same-build local Sui
+audit. It obtained six `g6.8xlarge` hosts in Frankfurt with cluster placement,
+but the first Sui cell stopped before replay: all five storage samplers rejected
+their configuration and exited before readiness. No performance comparison was
+produced. The exported supervisor log reports configuration rejection; local
+reproduction identifies the remaining `cloud_node.py` one-hour ceiling against
+the campaign's two-hour absolute deadline.
+
+The Sui node supervisor now accepts at most 7,200 seconds, matching the outer
+launch chain. It still uses the supplied absolute UTC deadline and its original
+monotonic bound; the controller's export reserve, namespace ownership, sample
+limit, failure cleanup and process-group reaping are unchanged. A lifetime
+greater than two hours remains invalid.
+
+Local validation runs the production supervisor CLI with a 110-minute deadline
+and three isolated executable child fixtures: readiness and resource sampling
+must succeed, the deadline must remain unchanged, and controller stop must reap
+all children. The lifecycle regression also exercises the two-hour boundary.
+This is supervisor validation, not RDMA hardware or Tidehunter performance proof.
+
 ## 22 October complete-matrix deadline and timing admission
 
 Run `39830242085` completed all 16 Sui cells, 49 of 172 paired KV

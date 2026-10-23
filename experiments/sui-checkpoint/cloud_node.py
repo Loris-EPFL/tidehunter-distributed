@@ -25,7 +25,7 @@ import yaml
 
 OWNED_BASE = Path('/mnt/tidehunter')
 MAX_NAMESPACES = 16
-MAX_SECONDS = 3600
+MAX_SECONDS = 7200
 MAX_SAMPLES = 2048
 SAMPLE_SECONDS = 2.0
 POLL_SECONDS = 0.1
@@ -91,7 +91,7 @@ def validate_config(config_path):
     monotonic_now = time.monotonic()
     left = deadline.timestamp() - now
     if not CLEANUP_RESERVE < left <= MAX_SECONDS:
-        raise ValueError('deadline expired, lacks cleanup reserve, or exceeds one hour')
+        raise ValueError('deadline expired, lacks cleanup reserve, or exceeds two hours')
     for key in ('storage_binary_sha256', 'build_manifest_sha256', 'config_sha256'):
         if not isinstance(cfg.get(key), str) or not re.fullmatch(r'[0-9a-f]{64}', cfg[key]):
             raise ValueError('source/config hashes must be lowercase SHA256')
