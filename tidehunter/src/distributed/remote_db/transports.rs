@@ -71,6 +71,7 @@ pub(super) fn connect(
     shape: &KeyShape,
     tls_config: super::super::tcp::ClientTlsConfig,
     lanes: usize,
+    resident_read_owner: bool,
     retained: Option<Vec<SharedClient>>,
 ) -> Result<Connections, LocalDbError> {
     let started = Instant::now();
@@ -100,6 +101,14 @@ pub(super) fn connect(
             return Ok(client);
         }
         let mut tls = config.tls.clone();
+        if resident_read_owner {
+            tls.resident_reads = tls
+                .resident_reads
+                .destination_per_connection(count)
+                .map_err(LocalDbError::component)?;
+        } else {
+            tls.resident_reads = super::super::tcp::ResidentReadConfig::default();
+        }
         tls.server_name = endpoint.server_name.clone();
         Client::connect_shared(
             &endpoint.address,
@@ -132,7 +141,16 @@ impl ReadSetup {
     ) -> Result<Self, LocalDbError> {
         let thread = thread::Builder::new()
             .name("wal-read-setup".to_owned())
-            .spawn(move || connect(&config, &shape, tls_config, config.read_lanes, retained))
+            .spawn(move || {
+                connect(
+                    &config,
+                    &shape,
+                    tls_config,
+                    config.read_lanes,
+                    true,
+                    retained,
+                )
+            })
             .map_err(LocalDbError::component)?;
         Ok(Self(Some(thread)))
     }

@@ -269,12 +269,37 @@ impl Transport {
     }
 
     #[cfg(feature = "experimental-fabric")]
-    fn open(self) -> io::Result<tidehunter_fabric::Endpoint> {
+    fn open(
+        self,
+        rma: Option<super::resident::ResidentReadConfig>,
+    ) -> io::Result<tidehunter_fabric::Endpoint> {
+        let Some(config) = rma.filter(|config| config.enabled()) else {
+            return match self {
+                Self::Efa => tidehunter_fabric::Endpoint::open("efa", None),
+                Self::EfaDirect | Self::EfaNative => {
+                    tidehunter_fabric::Endpoint::open_efa_direct(None)
+                }
+                Self::FabricTcp | Self::FabricTcpNative => {
+                    tidehunter_fabric::Endpoint::open("tcp;ofi_rxm", Some("lo"))
+                }
+                Self::Tcp => Err(io::Error::other("TCP needs no fabric endpoint")),
+            };
+        };
+        let config = tidehunter_fabric::RmaConfig {
+            source_bytes: config.source_bytes,
+            source_region_slots: config.source_regions,
+            destination_bytes: config.destination_bytes,
+            destination_slots: config.destination_slots,
+            max_read_bytes: config.max_read_bytes,
+            require_device_read: config.require_device_read,
+        };
         match self {
-            Self::Efa => tidehunter_fabric::Endpoint::open("efa", None),
-            Self::EfaDirect | Self::EfaNative => tidehunter_fabric::Endpoint::open_efa_direct(None),
+            Self::Efa => tidehunter_fabric::Endpoint::open_rma("efa", None, config),
+            Self::EfaDirect | Self::EfaNative => {
+                tidehunter_fabric::Endpoint::open_efa_direct_rma(None, config)
+            }
             Self::FabricTcp | Self::FabricTcpNative => {
-                tidehunter_fabric::Endpoint::open("tcp;ofi_rxm", Some("lo"))
+                tidehunter_fabric::Endpoint::open_rma("tcp;ofi_rxm", Some("lo"), config)
             }
             Self::Tcp => Err(io::Error::other("TCP needs no fabric endpoint")),
         }
@@ -282,14 +307,14 @@ impl Transport {
 }
 
 // Both peers exchange bounded native addresses and a ready marker over the
-// control socket. TLS transports retain their authenticated TLS bootstrap;
-// trusted native transports use this only after exact mode negotiation.
+// control socket. TLS transports retain their authenticated TLS stream.
 #[cfg(feature = "experimental-fabric")]
 pub(super) fn bootstrap(
     stream: &mut (impl Read + Write),
     transport: Transport,
+    resident_reads: super::resident::ResidentReadConfig,
 ) -> Result<tidehunter_fabric::Endpoint, TcpError> {
-    let mut endpoint = transport.open()?;
+    let mut endpoint = transport.open(Some(resident_reads))?;
     let address = endpoint.address()?;
     let len = u16::try_from(address.len()).map_err(TcpError::component)?;
     stream.write_all(&len.to_be_bytes())?;

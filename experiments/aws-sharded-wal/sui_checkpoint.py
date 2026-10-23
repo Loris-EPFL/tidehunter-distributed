@@ -35,8 +35,9 @@ import boto3
 from botocore.config import Config
 from checkpoint_matrix import (matrix_plan, check_cell, validate_provider, efa_snapshot,
                                efa_proof, validate_efa_proof, validate_matrix, validate_placement,
-                               HARDWARE_TRANSPORTS, DIRECT_TRANSPORTS, fabric_name)
+                               HARDWARE_TRANSPORTS, DIRECT_TRANSPORTS, fabric_name, cell_resident_reads)
 from checkpoint_kv import run_suite as run_kv_suite, validate_options as validate_kv_options
+from resident_config import resident_read_config
 
 # SendCommand has no idempotency token. An ambiguous HTTP acknowledgement must
 # never be replayed by botocore; exact-unit cleanup and TTL own that uncertainty.
@@ -135,6 +136,23 @@ def safe_extract(archive, destination, *, symlinks=False, max_bytes=32 << 30):
 
 def read_json(path):
     return json.loads(Path(path).read_text())
+
+
+def validate_prepared_cell(cfg, cell, prepared, external):
+    """Admit actual coordinator and manifest policy, not a transport-only label."""
+    resident = cell_resident_reads(cfg, cell['transport'], cell)
+    if cell.get('resident_reads') != (resident if resident['destination_slots'] else None):
+        raise ValueError('prepared cell resident-read metadata differs from canonical matrix policy')
+    resident_read_config(cell.get('resident_reads'))
+    if not prepared['databases'] or any(
+            database['tls']['transport'] != cell['transport']
+            or database.get('write_profile_limit', 0) != cell['write_profile_limit']
+            or resident_read_config(database['tls'].get('resident_reads')) != resident
+            for database in prepared['databases'].values()):
+        raise ValueError('prepared transport/profiling/resident reads differs from matrix cell; no fallback')
+    if (external.get('transport') != cell['transport']
+            or resident_read_config(external.get('resident_reads')) != resident):
+        raise ValueError('prepared manifest resident-read policy differs from matrix cell; no fallback')
 
 
 def scoped_path(root, path):
@@ -793,22 +811,25 @@ class SuiCampaign(Campaign):
             '--transport', self.cell['transport'], '--port', str(self.cfg.get('port', 24000)),
             '--write-profile-limit', str(self.cell['write_profile_limit']),
             '--coordinator-cache-mib', str(self.cell['coordinator_cache_mib']), '--shard-cache-mib', str(self.cell['shard_cache_mib'])]
+        resident = cell_resident_reads(self.cfg, self.cell['transport'], self.cell)
+        if resident['destination_slots']:
+            policy = self.cell_root / 'resident-reads.json'
+            write_json(policy, resident)
+            command += ['--resident-reads', policy]
         self.run_command('prepare-external', command, 120)
         prepared = read_json(self.deployment / 'config.json')
-        if not prepared['databases'] or any(
-                database['tls']['transport'] != self.cell['transport']
-                or database.get('write_profile_limit', 0) != self.cell['write_profile_limit']
-                for database in prepared['databases'].values()):
-            raise ValueError('prepared transport/profiling differs from matrix cell; no fallback')
+        self.external = read_json(self.deployment / 'external-manifest.json')
+        validate_prepared_cell(self.cfg, self.cell, prepared, self.external)
         self.cell['namespace_ids'] = {name: database['storage']['database']
                                      for name, database in prepared['databases'].items()}
-        self.external = read_json(self.deployment / 'external-manifest.json')
         if (self.external['build_manifest_sha256'] != self.cfg['build_manifest_sha256']
                 or self.external['config_sha256'] != sha(self.deployment / 'config.json')
                 or self.external['storage_binary_sha256'] != self.cfg['binaries']['storage-node']):
             raise ValueError('prepared deployment source binding differs')
         shutil.copy2(self.deployment / 'config.json', self.results / 'external-config.json')
         shutil.copy2(self.deployment / 'external-manifest.json', self.results / 'external-manifest.json')
+        if resident['destination_slots']:
+            shutil.copy2(policy, self.results / 'resident-reads.json')
         for host, node in zip(self.external['hosts'], self.nodes):
             if host['partition'] != node['partition'] or host['host'] != node['private_ip']:
                 raise ValueError('host deployment inventory differs')

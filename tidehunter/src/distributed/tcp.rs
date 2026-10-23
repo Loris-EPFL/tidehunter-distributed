@@ -15,6 +15,11 @@ mod fabric;
 pub use fabric::{Transport, TransportProgressStats};
 mod control;
 mod inventory;
+mod resident;
+#[cfg(feature = "experimental-fabric")]
+use resident::encode_envelope;
+use resident::{RemoteRegion, ResidentGrant};
+pub use resident::{ResidentReadConfig, ResidentReadStats};
 mod payload;
 pub use diagnostics::{ConnectionProfile, PollingProfile, SocketProfile, WorkProfile};
 use payload::WireBytes;
@@ -46,13 +51,16 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 pub use inventory::NodeInventory;
-const PROTOCOL: u32 = 9;
+const PROTOCOL: u32 = 10;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
+static NEXT_RESIDENT_SESSION: AtomicU64 = AtomicU64::new(1);
+#[cfg(feature = "experimental-fabric")]
+static NEXT_RESIDENT_GRANT: AtomicU64 = AtomicU64::new(1);
 const MODE_MAGIC: [u8; 4] = *b"THDP";
 
 fn transport_mode_id(transport: Transport) -> u8 {
@@ -117,6 +125,10 @@ pub struct NodeConfig {
     pub read_max_inflight_bytes: usize,
     #[serde(default = "default_device_reads")]
     pub read_max_device_reads: usize,
+    /// Process-wide source/destination registration budgets for resident RMA.
+    /// Disabled by default; ordinary RPC behavior is unchanged.
+    #[serde(default)]
+    pub resident_reads: ResidentReadConfig,
 }
 impl NodeConfig {
     /// Requested fixed slot-table bytes before allocation; included in cache budget.
@@ -162,6 +174,9 @@ pub struct TlsFiles {
     /// Expected server DNS name; ignored by the listener and trusted native modes.
     #[serde(default)]
     pub server_name: String,
+    /// Explicit opt-in for one-sided reads on this client/session transport.
+    #[serde(default)]
+    pub resident_reads: ResidentReadConfig,
 }
 
 /// Network-owner scheduling only, not a whole-system lock-free guarantee.
@@ -267,6 +282,10 @@ pub struct TcpReadProfile {
     /// Bytes whose full deterministic payload check succeeded.
     pub ram_payload_verified_bytes: u64,
     pub requests: u64,
+    /// True when the response carried server handler clocks.
+    pub server_handler_available: bool,
+    /// True when at least one sample used RMA and had no server handler.
+    pub server_handler_not_applicable: bool,
     /// Read-handler residence through completed records, excluding the final recheck.
     pub server_handler_ns: u64,
     /// No append/control inventory wait; retained as a zero-valued compatibility
@@ -302,6 +321,8 @@ impl TcpReadProfile {
         self.ram_payload_verify_calls += next.ram_payload_verify_calls;
         self.ram_payload_verified_bytes += next.ram_payload_verified_bytes;
         self.requests += next.requests;
+        self.server_handler_available |= next.server_handler_available;
+        self.server_handler_not_applicable |= next.server_handler_not_applicable;
         self.server_handler_ns += next.server_handler_ns;
         self.server_inventory_wait_ns += next.server_inventory_wait_ns;
         self.server_authority_lookup_ns += next.server_authority_lookup_ns;
@@ -381,6 +402,9 @@ enum Request {
         files: Vec<u64>,
     },
     ReadIoStats,
+    RevokeGrants {
+        generations: Vec<u64>,
+    },
     Status {
         protocol: u32,
     },
@@ -395,6 +419,8 @@ enum Request {
         epoch: u64,
         references: Vec<ValueRecordReference>,
         class: ReadClass,
+        grant_limit: usize,
+        grant_max_bytes: usize,
     },
     Recover {
         epoch: u64,
@@ -409,6 +435,8 @@ enum Request {
         epoch: u64,
         references: Vec<ValueRecordReference>,
         class: ReadClass,
+        grant_limit: usize,
+        grant_max_bytes: usize,
     },
     StatsDetailed,
     /// Connection-local diagnostics, explicit and disabled by default.
@@ -477,6 +505,21 @@ enum Response {
     Status(NodeStatus),
     Appended(Vec<Receipt>),
     Records(Vec<WireBytes>),
+    ResidentRecords {
+        grants: Vec<Option<ResidentGrant>>,
+        records: Vec<WireBytes>,
+    },
+    ResidentRecordsProfiled {
+        grants: Vec<Option<ResidentGrant>>,
+        records: Vec<WireBytes>,
+        profile: ServerReadProfile,
+    },
+    GrantsRevoked(Vec<u64>),
+    ResidentPoison {
+        owner_boot: [u8; 16],
+        session_id: u64,
+        generations: Vec<u64>,
+    },
     Recovery {
         batches: Vec<(WireBytes, Receipt)>,
         next: Option<usize>,
@@ -528,6 +571,9 @@ pub struct StorageNode {
     wal_member_read: super::storage::WalMemberReadPolicy,
     read_config: read_executor::ReadExecutorConfig,
     read_admission: Arc<read_executor::ReadAdmission>,
+    resident_grants: Arc<resident::GrantRegistry>,
+    owner_boot: [u8; 16],
+    resident_reads: ResidentReadConfig,
     terminal: Arc<AtomicBool>,
     #[cfg(any(test, feature = "test-utils"))]
     drop_append_response: AtomicBool,
@@ -541,11 +587,13 @@ impl StorageNode {
         if !(1..=8).contains(&config.read_workers) {
             return Err(TcpError::new("read_workers must be in 1..=8"));
         }
-        if (config.read_cache_bytes != 0 || config.read_resident_first)
+        if (config.read_cache_bytes != 0
+            || config.read_resident_first
+            || config.resident_reads.source_enabled())
             && config.wal_member_read != super::storage::WalMemberReadPolicy::Async
         {
             return Err(TcpError::new(
-                "shard read cache and resident-first reads require the async read policy",
+                "resident grants, shard cache and resident-first reads require async reads",
             ));
         }
         let read_pool = rayon::ThreadPoolBuilder::new()
@@ -564,6 +612,7 @@ impl StorageNode {
         };
         let read_admission =
             Arc::new(read_executor::ReadAdmission::new(read_config).map_err(TcpError::component)?);
+        let resident_reads = config.resident_reads;
         let inventory = NodeInventory::open(config, metrics)?;
         let readers = inventory.readers.clone();
         let terminal = inventory.terminal.clone();
@@ -571,6 +620,11 @@ impl StorageNode {
         let append_batch_limits = inventory.config.partition.batch_limits;
         let append_group_limits = inventory.config.partition.group_limits;
         let inventory = Arc::new(Mutex::new(inventory));
+        let resident_grants = Arc::new(resident::GrantRegistry::new(
+            resident_reads.source_bytes,
+            resident_reads.source_regions,
+        ));
+        let owner_boot = rand::random::<[u8; 16]>();
         #[cfg(test)]
         let panic_after_append = Arc::new(AtomicBool::new(false));
         let control_context = Arc::new(control::ControlContext {
@@ -583,6 +637,7 @@ impl StorageNode {
             wal_member_read,
             read_config,
             read_admission: read_admission.clone(),
+            resident_grants: resident_grants.clone(),
             #[cfg(test)]
             panic_after_append: panic_after_append.clone(),
         });
@@ -603,6 +658,9 @@ impl StorageNode {
             panic_after_append,
             #[cfg(test)]
             read_hook: Mutex::new(None),
+            resident_reads,
+            resident_grants,
+            owner_boot,
         }))
     }
     pub fn status(&self) -> Result<NodeStatus, TcpError> {
@@ -613,17 +671,26 @@ impl StorageNode {
         epoch: u64,
         references: &[ValueRecordReference],
     ) -> Result<inventory::ReaderSnapshot, TcpError> {
+        if self.resident_grants.poison_requested() {
+            return Err(TcpError::new("reader authority is poison-pending"));
+        }
         self.readers
             .read()
             .snapshot(epoch, references, &self.terminal)
     }
     pub(super) fn reader_authority_valid(&self, epoch: u64, generation: Option<u64>) -> bool {
+        if self.resident_grants.poison_requested() {
+            return false;
+        }
         let readers = self.readers.read();
         if let Some(generation) = generation {
             readers.snapshot_valid(epoch, generation, &self.terminal)
         } else {
             readers.active_valid(epoch, &self.terminal)
         }
+    }
+    pub(super) fn finish_poison_if_quiescent(&self) {
+        self.control_context.finish_poison_if_quiescent();
     }
     pub(super) fn poison_readers(&self) {
         self.control_context.poison_readers();
@@ -707,6 +774,13 @@ impl StorageNode {
             })
             .map_err(TcpError::component)?;
         tls.transport.validate()?;
+        if self.inventory.lock().config.resident_reads.source_enabled()
+            && !tls.transport.is_native()
+        {
+            return Err(TcpError::new(
+                "resident source grants require the explicitly trusted native transport",
+            ));
+        }
         let transport = tls.transport;
         let server = tls.server_config()?;
         listener.set_nonblocking(true)?;
@@ -816,12 +890,20 @@ impl StorageNode {
         shutdown: &AtomicBool,
         transport: Transport,
     ) -> Result<(), TcpError> {
+        #[cfg(feature = "experimental-fabric")]
+        let source_resident_reads = {
+            self.inventory
+                .lock()
+                .config
+                .resident_reads
+                .source_per_connection(limits.max_connections)
+        };
         let mut io = DeadlineIo::new(socket, limits.io_timeout)?;
         if transport.is_native() {
             read_transport_mode(&mut io, transport)?;
             #[cfg(feature = "experimental-fabric")]
             {
-                let endpoint = fabric::bootstrap(&mut io, transport)?;
+                let endpoint = fabric::bootstrap(&mut io, transport, source_resident_reads)?;
                 io.fabric = Some(endpoint);
                 return reactor::serve_session(
                     self,
@@ -858,7 +940,7 @@ impl StorageNode {
         if selected_fabric {
             #[cfg(feature = "experimental-fabric")]
             {
-                let endpoint = fabric::bootstrap(&mut stream, transport)?;
+                let endpoint = fabric::bootstrap(&mut stream, transport, source_resident_reads)?;
                 stream.sock.fabric = Some(endpoint);
             }
             #[cfg(not(feature = "experimental-fabric"))]
@@ -1042,6 +1124,7 @@ pub struct Client {
     reactor: reactor::ClientState,
     connected_status: Option<NodeStatus>,
     connect_profile: ClientConnectProfile,
+    resident_reads: ResidentReadConfig,
     reuse_verifier: Option<Arc<rustls::client::WebPkiServerVerifier>>,
     server_name: Option<ServerName<'static>>,
     polling: PollingPolicy,
@@ -1108,6 +1191,14 @@ impl Client {
             _ => self.wrong_response(),
         }
     }
+    /// Local cumulative grant/RMA counters for this partition connection.
+    /// Snapshot performs no RPC or provider progress.
+    #[must_use]
+    pub fn resident_read_stats(&self) -> ResidentReadStats {
+        let mut stats = self.reactor.resident_read_stats();
+        stats.destination_slots_live = self.resident_reads.destination_slots as u64;
+        stats
+    }
     pub fn connect(
         endpoint: &str,
         tls: &TlsFiles,
@@ -1134,6 +1225,7 @@ impl Client {
         let address: SocketAddr = endpoint.parse().map_err(|_| {
             TcpError::new("endpoint must be numeric IP:port; set TLS server_name separately")
         })?;
+        let destination_resident_reads = tls.resident_reads.destination_per_connection(1)?;
         let began = Instant::now();
         let socket = TcpStream::connect_timeout(&address, timeout)?;
         let connect_ns = elapsed_ns(began);
@@ -1146,7 +1238,8 @@ impl Client {
         {
             #[cfg(feature = "experimental-fabric")]
             {
-                let endpoint = fabric::bootstrap(&mut io, tls.transport)?;
+                let endpoint =
+                    fabric::bootstrap(&mut io, tls.transport, destination_resident_reads)?;
                 io.fabric = Some(endpoint);
                 let fabric_ns = Some(elapsed_ns(setup_started));
                 (reactor::Session::new_native(io)?, None, None, 0, fabric_ns)
@@ -1184,7 +1277,11 @@ impl Client {
                 None
             } else {
                 let began = Instant::now();
-                stream.sock.fabric = Some(fabric::bootstrap(&mut stream, tls.transport)?);
+                stream.sock.fabric = Some(fabric::bootstrap(
+                    &mut stream,
+                    tls.transport,
+                    destination_resident_reads,
+                )?);
                 Some(elapsed_ns(began))
             };
             #[cfg(not(feature = "experimental-fabric"))]
@@ -1209,6 +1306,7 @@ impl Client {
             max_read_bytes: 256 * 1024 * 1024,
             page_limit: 1024,
             diagnostics: None,
+            resident_reads: destination_resident_reads,
             reactor: reactor::ClientState::default(),
             connected_status: None,
             connect_profile: ClientConnectProfile {
@@ -1390,6 +1488,7 @@ impl Client {
         }
     }
     pub fn fence_to(&mut self, epoch: u64) -> Result<NodeStatus, TcpError> {
+        self.revoke_resident_grants()?;
         match self.request(Request::Fence { epoch })? {
             Response::Status(status) if status.active_epoch == Some(epoch) => {
                 self.check_status(status)
@@ -1574,6 +1673,7 @@ impl Client {
         }
     }
     pub fn seal(&mut self, epoch: u64) -> Result<(), TcpError> {
+        self.revoke_resident_grants()?;
         match self.request(Request::Seal { epoch })? {
             Response::Sealed => Ok(()),
             _ => self.wrong_response(),
@@ -1604,6 +1704,12 @@ impl Client {
 impl TlsFiles {
     fn native_mode(&self) -> Result<bool, TcpError> {
         self.transport.validate()?;
+        self.resident_reads.validate()?;
+        if self.resident_reads.enabled() && !self.transport.is_native() {
+            return Err(TcpError::new(
+                "one-sided reads require the explicitly trusted native transport",
+            ));
+        }
         let native = self.transport.is_native();
         if native
             && [&self.ca, &self.cert, &self.key]

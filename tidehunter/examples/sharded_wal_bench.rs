@@ -34,7 +34,7 @@ use tidehunter::distributed::local_inventory::LocalInventoryConfig;
 use tidehunter::distributed::remote_db::{
     RemoteDatabase, RemoteDatabaseConfig, RemoteTransportPool,
 };
-use tidehunter::distributed::tcp::{PollingPolicy, Transport};
+use tidehunter::distributed::tcp::{PollingPolicy, ResidentReadConfig, Transport};
 use tidehunter::distributed::worker::WorkerConfig;
 use tidehunter::key_shape::{KeyShape, KeySpace, KeySpaceConfig, KeyType};
 use tidehunter::metrics::Metrics;
@@ -133,6 +133,7 @@ struct Args {
     batches: usize,
     mixed: usize,
     reads: usize,
+    bounded_hot_reads: Option<usize>,
     repetitions: usize,
     values: Vec<usize>,
     batch_sizes: Vec<usize>,
@@ -140,6 +141,7 @@ struct Args {
     kinds: Vec<Kind>,
     tcp_read_cache_bytes: Option<usize>,
     tcp_shard_cache_bytes: Option<usize>,
+    rma: ResidentReadConfig,
     native_read_cache_bytes: usize,
     read_memory_allowance_bytes: usize,
     shard_read_memory_allowance_bytes: Option<usize>,
@@ -156,7 +158,10 @@ struct Args {
     read_window: usize,
     tcp_preparation_chunk_batches: usize,
     hot_read_pass: bool,
+    bounded_hot_pass: bool,
     cold_read_pass: bool,
+    cold_single_probes: usize,
+    cold_group_probes: usize,
     cache_probe_keys: usize,
     cache_hit_contention: bool,
     concurrent_mixed: bool,
@@ -179,6 +184,7 @@ impl Args {
             batches: 128,
             mixed: 32,
             reads: 512,
+            bounded_hot_reads: None,
             repetitions: 1,
             values: vec![1024, 8192],
             batch_sizes: vec![1, 32],
@@ -191,6 +197,7 @@ impl Args {
             ],
             tcp_read_cache_bytes: None,
             tcp_shard_cache_bytes: None,
+            rma: ResidentReadConfig::default(),
             native_read_cache_bytes: 0,
             read_memory_allowance_bytes: 512 * MIB,
             shard_read_memory_allowance_bytes: None,
@@ -207,7 +214,10 @@ impl Args {
             read_window: 1,
             tcp_preparation_chunk_batches: 16,
             hot_read_pass: false,
+            bounded_hot_pass: false,
             cold_read_pass: false,
+            cold_single_probes: 0,
+            cold_group_probes: 0,
             cache_probe_keys: 0,
             cache_hit_contention: false,
             concurrent_mixed: false,
@@ -221,7 +231,7 @@ impl Args {
         while let Some(flag) = input.next() {
             if flag == "--help" {
                 println!(
-                    "sharded_wal_bench [--transport tcp|efa|efa-direct|fabric-tcp|efa-native|fabric-tcp-native] [--wal-layout small|sui (default small)] [--output DIR] [--backend all|local-all|native-sync|native-async|sharded|tcp] [--tcp-read-cache-bytes N] [--native-read-cache-bytes N (nominal value bytes, excludes metadata)] [--tcp-pipeline true|false] [--tcp-preparation-workers 1..8] [--tcp-preparation-chunk-batches 1..32] [--tcp-scan-prefetch-pages 1|2] [--hot-read-pass true|false] [--cold-read-pass true|false (Linux test-utils)] [--transport-diagnostics true|false] [--remote-config YAML] [--batches 128] [--mixed 32] [--reads 512] [--repetitions 1] [--values 1024,8192] [--batch-sizes 1,32] [--windows 1,8] [--prepare-external-case DIR --guest-case-root ABSOLUTE_PATH --remote-endpoints IP:PORT,...]"
+                    "sharded_wal_bench [--transport tcp|efa|efa-direct|fabric-tcp|efa-native|fabric-tcp-native] [--wal-layout small|sui (default small)] [--output DIR] [--backend all|local-all|native-sync|native-async|sharded|tcp] [--tcp-read-cache-bytes N] [--native-read-cache-bytes N (nominal value bytes, excludes metadata)] [--tcp-pipeline true|false] [--tcp-preparation-workers 1..8] [--tcp-preparation-chunk-batches 1..32] [--tcp-scan-prefetch-pages 1|2] [--hot-read-pass true|false] [--cold-read-pass true|false (Linux test-utils)] [--cold-single-probes 1..4096 (requires cold read pass)] [--cold-group-probes 1..4096 (requires cold read pass)] [--transport-diagnostics true|false] [--remote-config YAML] [--batches 128] [--mixed 32] [--reads 512] [--bounded-hot-reads 32..131072 (independent scalar samples; grouped calls=ceil(N/32))] [--repetitions 1] [--values 1024,8192] [--batch-sizes 1,32] [--windows 1,8] [--prepare-external-case DIR --guest-case-root ABSOLUTE_PATH --remote-endpoints IP:PORT,...]"
                 );
                 println!(
                     "efa-native/fabric-tcp-native require an isolated trusted deployment and empty TLS paths; they do not authenticate or encrypt application traffic."
@@ -234,6 +244,12 @@ impl Args {
                 );
                 println!(
                     "Read controls: --read-window 1..256 --tcp-read-lanes 1..8 --tcp-max-pending-reads 1..4096 --tcp-max-pending-read-bytes N --tcp-server-read-workers 1..8 --tcp-wal-member-read async|mapped|positional (default async) --tcp-shard-cache-bytes N (default 0; per-node retained bytes, including metadata; server controls apply only to local launch or --prepare-external-case)"
+                );
+                println!(
+                    "Resident RMA (trusted-native, explicit opt-in): --rma-source-bytes N --rma-source-regions N --rma-destination-bytes N --rma-destination-slots N --rma-max-read-bytes N --rma-max-handles N --rma-require-device-read true|false. Software fabric is correctness-only; all-zero defaults disable RMA."
+                );
+                println!(
+                    "Matched hot control: --bounded-hot-pass true|false (default false; RMA implies true) or --bounded-hot-reads 32..131072 (explicit N also enables it; independent of --reads). Same32keys, scalar mix and unique32 groups; fixed2*target-read-lanes+1 warm passes. Explicit bounded reads may precede cold phases, which evict and measure separately. Native/RPC results are not registered-hit claims."
                 );
                 println!(
                     "Memory controls: --read-memory-allowance-bytes N (coordinator/native; default 512 MiB) --shard-read-memory-allowance-bytes N (each storage node; default 512 MiB). Distributed allowances bound cache plus in-flight read bytes, not total RSS. Native cache bytes are nominal values only."
@@ -289,12 +305,20 @@ impl Args {
                 "--batches" => args.batches = value.parse()?,
                 "--mixed" => args.mixed = value.parse()?,
                 "--reads" => args.reads = value.parse()?,
+                "--bounded-hot-reads" => args.bounded_hot_reads = Some(value.parse()?),
                 "--repetitions" => args.repetitions = value.parse()?,
                 "--values" => args.values = number_list(&value)?,
                 "--batch-sizes" => args.batch_sizes = number_list(&value)?,
                 "--windows" => args.windows = number_list(&value)?,
                 "--tcp-read-cache-bytes" => args.tcp_read_cache_bytes = Some(value.parse()?),
                 "--tcp-shard-cache-bytes" => args.tcp_shard_cache_bytes = Some(value.parse()?),
+                "--rma-source-bytes" => args.rma.source_bytes = value.parse()?,
+                "--rma-source-regions" => args.rma.source_regions = value.parse()?,
+                "--rma-destination-bytes" => args.rma.destination_bytes = value.parse()?,
+                "--rma-destination-slots" => args.rma.destination_slots = value.parse()?,
+                "--rma-max-read-bytes" => args.rma.max_read_bytes = value.parse()?,
+                "--rma-require-device-read" => args.rma.require_device_read = value.parse()?,
+                "--rma-max-handles" => args.rma.max_handles = value.parse()?,
                 "--native-read-cache-bytes" => args.native_read_cache_bytes = value.parse()?,
                 "--read-memory-allowance-bytes" => {
                     args.read_memory_allowance_bytes = value.parse()?
@@ -333,7 +357,10 @@ impl Args {
                     args.tcp_preparation_chunk_batches = value.parse()?
                 }
                 "--hot-read-pass" => args.hot_read_pass = value.parse()?,
+                "--bounded-hot-pass" => args.bounded_hot_pass = value.parse()?,
                 "--cold-read-pass" => args.cold_read_pass = value.parse()?,
+                "--cold-single-probes" => args.cold_single_probes = value.parse()?,
+                "--cold-group-probes" => args.cold_group_probes = value.parse()?,
                 "--cache-probe-keys" => args.cache_probe_keys = value.parse()?,
                 "--cache-hit-contention" => args.cache_hit_contention = value.parse()?,
                 "--concurrent-mixed" => args.concurrent_mixed = value.parse()?,
@@ -405,11 +432,36 @@ impl Args {
             && (args.tcp_server_read_workers.is_some()
                 || args.tcp_wal_member_read.is_some()
                 || args.tcp_shard_cache_bytes.is_some()
-                || args.shard_read_memory_allowance_bytes.is_some())
+                || args.shard_read_memory_allowance_bytes.is_some()
+                || args.rma != ResidentReadConfig::default())
         {
             return Err(invalid("server read controls must be set in node YAML before launch, not with --remote-config").into());
         }
         args.transport.validate()?;
+        if args.rma != ResidentReadConfig::default()
+            && (!args.transport.is_native()
+                || args.kinds.iter().any(|kind| *kind != Kind::Tcp)
+                || args.rma.source_bytes == 0
+                || args.rma.source_regions == 0
+                || args.rma.destination_slots == 0
+                || args.rma.max_read_bytes == 0
+                || args.rma.max_read_bytes > args.rma.destination_bytes
+                || args.rma.max_handles == 0
+                || args
+                    .rma
+                    .source_bytes
+                    .checked_add(args.tcp_shard_cache_bytes.unwrap_or(0))
+                    .and_then(|bytes| bytes.checked_add(64 * MIB))
+                    .is_none_or(|bytes| bytes > shard_allowance)
+                || args
+                    .rma
+                    .destination_bytes
+                    .checked_add(coordinator_cache)
+                    .and_then(|bytes| bytes.checked_add(64 * MIB))
+                    .is_none_or(|bytes| bytes > args.read_memory_allowance_bytes))
+        {
+            return Err(invalid("resident RMA requires trusted-native tcp backend, nonzero bounded source/destination limits, and charged memory allowances").into());
+        }
         if !(1..=MAX_BENCH_BATCHES).contains(&args.batches)
             || args.mixed > args.batches
             || !(1..=8192).contains(&args.reads)
@@ -422,6 +474,22 @@ impl Args {
                 .any(|v| *v == 0 || *v > 32 || *v > args.batches)
         {
             return Err(invalid("configuration exceeds the bounded local campaign").into());
+        }
+        if !valid_bounded_hot_reads(args.bounded_hot_reads) {
+            return Err(invalid("--bounded-hot-reads must be within 32..131072").into());
+        }
+        if (args.bounded_hot_pass || args.bounded_hot_reads.is_some())
+            && (args.kinds.contains(&Kind::Sharded)
+                || (args.cold_read_pass && args.bounded_hot_reads.is_none())
+                || args
+                    .batch_sizes
+                    .iter()
+                    .any(|batch| args.batches * batch < 32))
+        {
+            return Err(invalid(
+                "bounded hot control requires non-cold native/TCP cases and at least32loadedkeys",
+            )
+            .into());
         }
         if args.native_read_cache_bytes > args.read_memory_allowance_bytes
             || (args.native_read_cache_bytes != 0
@@ -442,6 +510,18 @@ impl Args {
                 return Err(invalid("resource evidence requires native or TCP backends").into());
             }
         }
+        if !valid_cold_single_probes(args.cold_single_probes, args.cold_read_pass) {
+            return Err(invalid(
+                "--cold-single-probes requires --cold-read-pass and must be within 1..4096",
+            )
+            .into());
+        }
+        if !valid_cold_group_probes(args.cold_group_probes, args.cold_read_pass) {
+            return Err(invalid(
+                "--cold-group-probes requires --cold-read-pass and must be within 1..4096",
+            )
+            .into());
+        }
         if args.cold_read_pass {
             if !cfg!(all(target_os = "linux", feature = "test-utils")) {
                 return Err(
@@ -455,6 +535,7 @@ impl Args {
                 || args.tcp_read_cache_bytes.is_some_and(|n| n != 0)
                 || args.tcp_shard_cache_bytes.is_some_and(|n| n != 0)
                 || args.native_read_cache_bytes != 0
+                || args.rma.destination_slots != 0
             {
                 return Err(invalid(
                     "cold reads require native-sync or tcp and disabled application value caches",
@@ -1167,20 +1248,17 @@ fn profile_native_reads(
     count: usize,
     state: &str,
 ) -> Result<()> {
-    for (sample, (index, generation)) in oracle
-        .iter()
-        .enumerate()
-        .filter_map(|(i, g)| g.map(|g| (i, g)))
-        .take(count.min(256))
-        .enumerate()
-    {
-        let expected = value(index, generation, case.value_bytes);
+    let mut samples = Vec::with_capacity(count);
+    let wall = Instant::now();
+    for sample in 0..count {
+        let index = mix(sample as u64) as usize % oracle.len();
+        let expected = oracle[index].map(|generation| value(index, generation, case.value_bytes));
         let started = Instant::now();
         let (found, p) = db
             .get_profiled_for_benchmark(ks, &key(index))
             .map_err(native_error)?;
         let whole = ns(started);
-        if found.as_ref() != Some(&expected) {
+        if found != expected {
             return Err(invalid("native diagnostic value mismatch").into());
         }
         writeln!(
@@ -1198,8 +1276,16 @@ fn profile_native_reads(
             p.value_cache_hit,
             whole
         )?;
+        samples.push(Sample {
+            elapsed_ns: whole,
+            operations: 1,
+            bytes: expected.map_or(0, |value| value.len()),
+        });
     }
     output.native_read_profiles.flush()?;
+    if state == "warm" {
+        output.phase(case, "point_get", ns(wall), &samples)?;
+    }
     Ok(())
 }
 
@@ -1215,28 +1301,25 @@ fn profile_remote_reads(
     state: &str,
     node_phase: Option<&str>,
 ) -> Result<()> {
-    // Force remote work, but keep shard WAL pages warm.
-    db.clear_read_cache();
+    // A diagnostic twin starts at the same prepared state as the clean scalar
+    // phase. Reopened profiles explicitly describe their post-audit population.
     if node_phase.is_some() {
         db.connection_profiles(true, true)?;
     }
-    for (sample, (index, generation)) in oracle
-        .iter()
-        .enumerate()
-        .filter_map(|(index, generation)| generation.map(|generation| (index, generation)))
-        .take(count.min(256))
-        .enumerate()
-    {
-        let expected = value(index, generation, case.value_bytes);
+    let mut samples = Vec::with_capacity(count);
+    let wall = Instant::now();
+    for sample in 0..count {
+        let index = mix(sample as u64) as usize % oracle.len();
+        let expected = oracle[index].map(|generation| value(index, generation, case.value_bytes));
         let started = Instant::now();
         let (found, profile) = db.get_profiled(ks, &key(index))?;
         let whole = ns(started);
-        if found.as_ref() != Some(&expected) {
+        if found != expected {
             return Err(invalid("profiled remote get verification failed").into());
         }
         writeln!(
             output.remote_read_profiles,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             case.label(),
             case.value_bytes,
             case.batch_size,
@@ -1265,11 +1348,21 @@ fn profile_remote_reads(
             profile.tcp.server_response_recheck_wait_ns,
             profile.tcp.server_response_recheck_ns,
             profile.tcp.server_response_recheck_samples,
-            profile.tcp.server_response_recheck_deferrals
+            profile.tcp.server_response_recheck_deferrals,
+            profile.tcp.requests,
+            profile.tcp.server_response_recheck_samples != 0,
         )?;
         write_exchange_profile(output, case, state, sample, &profile.tcp)?;
+        samples.push(Sample {
+            elapsed_ns: whole,
+            operations: 1,
+            bytes: expected.map_or(0, |value| value.len()),
+        });
     }
     output.remote_read_profiles.flush()?;
+    if state == "warm" {
+        output.phase(case, "point_get", ns(wall), &samples)?;
+    }
     if let Some(phase) = node_phase {
         write_node_profiles(output, case, phase, db.connection_profiles(false, false)?)?;
     }
@@ -1286,11 +1379,17 @@ struct Output {
     exchange_profiles: BufWriter<File>,
     node_profiles: BufWriter<File>,
     read_io: BufWriter<File>,
+    write_io: BufWriter<File>,
+    cold_probes: BufWriter<File>,
+    cold_group_probes: BufWriter<File>,
     read_path_evidence: BufWriter<File>,
     native_read_profiles: BufWriter<File>,
     read_resources: Option<BufWriter<File>>,
     cache_contention: BufWriter<File>,
     checkpoint_diagnostics: BufWriter<File>,
+    resident_reads: BufWriter<File>,
+    registered_controls: BufWriter<File>,
+    bounded_controls: BufWriter<File>,
 }
 impl Output {
     fn new(path: &Path, resource_evidence: bool) -> Result<Self> {
@@ -1313,10 +1412,16 @@ impl Output {
             exchange_profiles: create("exchange_profiles.csv")?,
             node_profiles: create("node_profiles.yaml")?,
             read_io: create("read_io.csv")?,
+            write_io: create("write_io.csv")?,
+            cold_probes: create("cold_probes.jsonl")?,
+            cold_group_probes: create("cold_group_probes.jsonl")?,
             read_path_evidence: create("read_path_evidence.csv")?,
             native_read_profiles: create("native_read_profiles.csv")?,
             cache_contention: create("cache_contention.jsonl")?,
             checkpoint_diagnostics: create("checkpoint_diagnostics.jsonl")?,
+            resident_reads: create("resident_reads.jsonl")?,
+            registered_controls: create("registered_controls.jsonl")?,
+            bounded_controls: create("bounded_hot_controls.jsonl")?,
             read_resources: if resource_evidence {
                 Some(create("read_resources.csv")?)
             } else {
@@ -1345,7 +1450,7 @@ impl Output {
         )?;
         writeln!(
             output.remote_read_profiles,
-            "backend,value_bytes,batch_size,window,repetition,state,sample,index_ns,dispatch_ns,wait_ns,actor_queue_ns,actor_service_ns,actor_return_ns,request_encode_ns,exchange_ns,response_decode_ns,record_verify_ns,server_handler_ns,server_inventory_wait_ns,server_authority_lookup_ns,server_record_read_ns,cache_hits,cache_misses,whole_call_ns,inline_read_ns,server_response_recheck_wait_ns,server_response_recheck_ns,server_response_recheck_samples,server_response_recheck_deferrals"
+            "backend,value_bytes,batch_size,window,repetition,state,sample,index_ns,dispatch_ns,wait_ns,actor_queue_ns,actor_service_ns,actor_return_ns,request_encode_ns,exchange_ns,response_decode_ns,record_verify_ns,server_handler_ns,server_inventory_wait_ns,server_authority_lookup_ns,server_record_read_ns,cache_hits,cache_misses,whole_call_ns,inline_read_ns,server_response_recheck_wait_ns,server_response_recheck_ns,server_response_recheck_samples,server_response_recheck_deferrals,wire_read_requests,server_timing_available"
         )?;
         writeln!(
             output.exchange_profiles,
@@ -1356,8 +1461,12 @@ impl Output {
             "backend,value_bytes,batch_size,window,repetition,phase,partition,pid,physical_read_bytes,minor_faults,major_faults,file_bytes,resident_bytes_before,resident_bytes_after"
         )?;
         writeln!(
+            output.write_io,
+            "backend,value_bytes,batch_size,window,repetition,phase,role,partition,pid,process_start_ticks,accounted_process_read_bytes_before,accounted_process_read_bytes_after,accounted_process_read_bytes_delta,accounted_process_write_bytes_before,accounted_process_write_bytes_after,accounted_process_write_bytes_delta"
+        )?;
+        writeln!(
             output.read_path_evidence,
-            "backend,value_bytes,batch_size,window,repetition,phase,boundary,role,partition,cache_budget_bytes,cache_retained_bytes,cache_metadata_bytes,cache_entries,cache_hits,cache_misses,cache_evictions,wal_reads,wal_read_bytes,inflight_requests,inflight_bytes,inflight_reads,peak_inflight_requests,peak_inflight_bytes,peak_inflight_reads,peak_device_reads,cache_bypass_disabled,cache_bypass_eviction_limit,cache_bypass_scan,cache_bypass_generation,cache_admitted_charge_bytes,cache_served_accounted_bytes,idle_buffer_bytes,idle_buffers,buffer_reuses,buffer_allocations,resident_read_attempts,resident_read_successes,resident_read_fallbacks,resident_read_unsupported,async_read_submissions,resident_read_partial,resident_read_deferred"
+            "backend,value_bytes,batch_size,window,repetition,phase,boundary,role,partition,cache_budget_bytes,cache_retained_bytes,cache_metadata_bytes,cache_entries,cache_hits,cache_misses,cache_evictions,wal_reads,wal_read_bytes,inflight_requests,inflight_bytes,inflight_reads,peak_inflight_requests,peak_inflight_bytes,peak_inflight_reads,peak_device_reads,cache_bypass_disabled,cache_bypass_eviction_limit,cache_bypass_scan,cache_bypass_generation,cache_admitted_charge_bytes,cache_served_accounted_bytes,idle_buffer_bytes,idle_buffers,buffer_reuses,buffer_allocations,resident_read_attempts,resident_read_successes,resident_read_fallbacks,resident_read_unsupported,async_read_submissions,resident_read_partial,resident_read_deferred,authority_available,authority_resident_hits,authority_resident_misses,authority_contention,authority_history_loads,authority_entries,authority_capacity,authority_table_bytes"
         )?;
         writeln!(
             output.native_read_profiles,
@@ -1579,7 +1688,7 @@ impl Output {
         )?;
         writeln!(
             self.read_path_evidence,
-            ",{},{},0,0,{},{},0,0,0,0,0,0,0,0,0,0,0",
+            ",{},{},0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,false,,,,,,,",
             cache.bypass_disabled,
             cache.bypass_eviction_limit,
             cache.admitted_bytes,
@@ -1614,7 +1723,7 @@ impl Output {
                 stats.peak_inflight_reads,
                 stats.peak_device_reads,
             )?;
-            writeln!(
+            write!(
                 self.read_path_evidence,
                 ",{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 stats.cache_bypass_disabled,
@@ -1635,7 +1744,40 @@ impl Output {
                 stats.resident_read_partial,
                 stats.resident_read_deferred,
             )?;
+            if let Some(authority) = &stats.authority {
+                writeln!(
+                    self.read_path_evidence,
+                    ",true,{},{},{},{},{},{},{}",
+                    authority.resident_hits,
+                    authority.resident_misses,
+                    authority.contention,
+                    authority.history_loads,
+                    authority.entries,
+                    authority.capacity,
+                    authority.table_bytes,
+                )?;
+            } else {
+                writeln!(self.read_path_evidence, ",false,,,,,,,")?;
+            }
         }
+        let snapshot = db.read_io_monitor().sample_resident_reads()?;
+        serde_json::to_writer(
+            &mut self.resident_reads,
+            &serde_json::json!({
+                "backend": case.label(),
+                "value_bytes": case.value_bytes,
+                "batch_size": case.batch_size,
+                "window": case.window,
+                "repetition": case.repetition,
+                "phase": phase,
+                "boundary": boundary,
+                "scope": "coordinator_local_per_owner_connection_counters",
+                "source_occupancy_available": false,
+                "owners": snapshot,
+            }),
+        )?;
+        writeln!(self.resident_reads)?;
+        self.resident_reads.flush()?;
         self.read_path_evidence.flush()?;
         Ok(())
     }
@@ -1690,6 +1832,16 @@ impl Output {
         Ok(())
     }
 }
+fn valid_bounded_hot_reads(reads: Option<usize>) -> bool {
+    reads.is_none_or(|reads| (32..=131_072).contains(&reads))
+}
+fn valid_cold_single_probes(probes: usize, cold_read_pass: bool) -> bool {
+    probes == 0 || (cold_read_pass && (1..=4096).contains(&probes))
+}
+fn valid_cold_group_probes(probes: usize, cold_read_pass: bool) -> bool {
+    probes == 0 || (cold_read_pass && (1..=4096).contains(&probes))
+}
+
 struct Case {
     transport: Transport,
     kind: Kind,
@@ -1727,6 +1879,8 @@ fn writes(
     oracle: &mut [Option<u64>],
     operation: &mut u64,
 ) -> Result<()> {
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    let write_before = read_campaign::write_evidence(backend)?;
     let counters = backend.counters()?;
     let mut samples = Vec::with_capacity(batches.len().div_ceil(case.window));
     let mut timings = Vec::with_capacity(if matches!(backend, Backend::Tcp(_)) {
@@ -1774,6 +1928,10 @@ fn writes(
             }
         }
     }
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    let write_after = read_campaign::write_evidence(backend)?;
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    read_campaign::record_write_evidence(output, case, phase, &write_before, &write_after)?;
     output.phase(case, phase, ns(wall), &samples)?;
     for (index, (before, after, diagnostic)) in timings.into_iter().enumerate() {
         output.write_window(case, phase, index, samples[index].elapsed_ns, before, after)?;
@@ -2101,6 +2259,7 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
                 args.shard_read_memory_allowance_bytes.unwrap_or(512 * MIB),
                 args.tcp_polling,
                 args.tcp_resident_first,
+                args.rma,
             )?;
             parameters.remote = Some(owned.config.clone());
             cluster = Some(owned);
@@ -2108,6 +2267,12 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
         }
     }
     if let Some(remote) = &mut parameters.remote {
+        if args.cold_read_pass && remote.tls.resident_reads.destination_slots != 0 {
+            return Err(invalid(
+                "cold controls require resident RMA disabled in the external configuration",
+            )
+            .into());
+        }
         remote.read_memory_allowance_bytes = args.read_memory_allowance_bytes;
         remote.write_profile_limit = if args.transport_diagnostics { 128 } else { 0 };
         if remote.tls.transport != args.transport {
@@ -2225,6 +2390,35 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
         )?;
     }
     drop(load);
+    let registered = parameters.remote.as_ref().is_some_and(|remote| {
+        remote.tls.resident_reads.destination_slots != 0 && remote.read_cache_bytes == 0
+    });
+    if args.bounded_hot_pass
+        || args.bounded_hot_reads.is_some()
+        || parameters
+            .remote
+            .as_ref()
+            .is_some_and(|remote| remote.tls.resident_reads.destination_slots != 0)
+    {
+        let read_lanes = parameters
+            .remote
+            .as_ref()
+            .map_or(args.tcp_read_lanes.unwrap_or(2), |remote| remote.read_lanes);
+        cache_workloads::bounded_hot(
+            &mut backend,
+            case,
+            output,
+            ks,
+            &oracle,
+            cache_workloads::registered_hot_policy(
+                args.reads,
+                args.bounded_hot_reads,
+                read_lanes,
+                true,
+            ),
+            registered,
+        )?;
+    }
     if args.cache_probe_keys != 0 {
         cache_workloads::hot_scan(
             &mut backend,
@@ -2245,30 +2439,27 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
     }
     #[cfg(all(target_os = "linux", feature = "test-utils"))]
     read_campaign::resources(&mut backend, output, "warm-scalar-before")?;
-    reads(
-        &mut backend,
-        case,
-        output,
-        "point_get",
-        ks,
-        &oracle,
-        args.reads,
-        false,
-        false,
-    )?;
-    if args.transport_diagnostics
-        && let Backend::Tcp(db) = &mut backend
+    if !args.transport_diagnostics
+        || case.kind == Kind::Sharded
+        || (!cfg!(all(target_os = "linux", feature = "test-utils")) && case.kind != Kind::Tcp)
     {
-        write_node_profiles(
-            output,
+        reads(
+            &mut backend,
             case,
-            "warm-scalar-read-diagnostics",
-            db.connection_profiles(false, false)?,
+            output,
+            "point_get",
+            ks,
+            &oracle,
+            args.reads,
+            false,
+            false,
         )?;
     }
-    #[cfg(all(target_os = "linux", feature = "test-utils"))]
-    read_campaign::resources(&mut backend, output, "warm-scalar-after")?;
-    // Independent bounded samples; their clocks never enter the ordinary latency rows.
+    // A fresh diagnostic process replaces (not prewarms) its scalar phase with
+    // the identical oracle/order/cardinality plus explicitly enabled clocks.
+    if args.transport_diagnostics {
+        output.read_path_evidence(case, &backend, "point_get", "before")?;
+    }
     #[cfg(all(target_os = "linux", feature = "test-utils"))]
     if args.transport_diagnostics
         && let Backend::Native { db, .. } = &backend
@@ -2289,6 +2480,11 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
             Some("warm-profiled-read-diagnostics"),
         )?;
     }
+    if args.transport_diagnostics {
+        output.read_path_evidence(case, &backend, "point_get", "after")?;
+    }
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    read_campaign::resources(&mut backend, output, "warm-scalar-after")?;
     if args.hot_read_pass {
         reads(
             &mut backend,
@@ -2340,6 +2536,16 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
     }
     #[cfg(all(target_os = "linux", feature = "test-utils"))]
     read_campaign::resources(&mut backend, output, "warm-batched-before")?;
+    grouped_reads(
+        &mut backend,
+        case,
+        output,
+        ks,
+        &oracle,
+        args.reads,
+        "point_get_many_small",
+        4,
+    )?;
     batched_reads(
         &mut backend,
         case,
@@ -2381,6 +2587,8 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
             ks,
             &oracle,
             args.reads,
+            args.cold_single_probes,
+            args.cold_group_probes,
             args.read_window,
             &mut native_workers,
             args.transport_diagnostics,
@@ -2434,6 +2642,8 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
             )
         })
         .collect();
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    let mixed_write_before = read_campaign::write_evidence(&mut backend)?;
     if args.concurrent_mixed {
         cache_workloads::concurrent_mixed(
             &mut backend,
@@ -2533,6 +2743,20 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
         output.checkpoint_diagnostics.flush()?;
         output.stages(case, "mixed", counters, backend.counters()?)?;
     }
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    let mixed_write_after = read_campaign::write_evidence(&mut backend)?;
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    read_campaign::record_write_evidence(
+        output,
+        case,
+        if args.concurrent_mixed {
+            "concurrent_mixed_write_window"
+        } else {
+            "mixed_write_window"
+        },
+        &mixed_write_before,
+        &mixed_write_after,
+    )?;
     drop(mixed);
 
     let start = Instant::now();
@@ -2607,9 +2831,22 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
     drop(scanned);
     drop(expected);
 
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    let flush_write_before = read_campaign::write_evidence(&mut backend)?;
     let start = Instant::now();
     backend.flush_index()?;
-    single(output, case, "maintenance_flush_index", ns(start), 1, 0)?;
+    let flush_elapsed = ns(start);
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    let flush_write_after = read_campaign::write_evidence(&mut backend)?;
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    read_campaign::record_write_evidence(
+        output,
+        case,
+        "maintenance_flush_index",
+        &flush_write_before,
+        &flush_write_after,
+    )?;
+    single(output, case, "maintenance_flush_index", flush_elapsed, 1, 0)?;
     // LocalDatabase::flush_index already writes the image and unloads its cells.
     // Calling unload_index again would create another snapshot of the same data.
     reads(
@@ -2655,10 +2892,14 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
     // This diagnostic pass is outside every main timed phase. Extra substage
     // clocks must not be confused with the normal warm scalar-get measurement.
     #[cfg(all(target_os = "linux", feature = "test-utils"))]
-    if let Backend::Native { db, .. } = &backend {
+    if args.transport_diagnostics
+        && let Backend::Native { db, .. } = &backend
+    {
         profile_native_reads(db, case, output, ks, &oracle, args.reads, "reopened-warm")?;
     }
-    if let Backend::Sharded(db) = &mut backend {
+    if args.transport_diagnostics
+        && let Backend::Sharded(db) = &mut backend
+    {
         for (sample, (index, generation)) in oracle
             .iter()
             .enumerate()
@@ -2691,7 +2932,19 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
         }
         output.read_profiles.flush()?;
     }
-    if let Backend::Tcp(db) = &mut backend {
+    if args.transport_diagnostics
+        && let Backend::Tcp(db) = &mut backend
+    {
+        // clear_read_cache resets its counters: establish that state before
+        // taking the interval's initial evidence snapshot.
+        db.clear_read_cache();
+    }
+    if args.transport_diagnostics {
+        output.read_path_evidence(case, &backend, "reopened_read_diagnostics", "before")?;
+    }
+    if args.transport_diagnostics
+        && let Backend::Tcp(db) = &mut backend
+    {
         profile_remote_reads(
             db,
             case,
@@ -2703,6 +2956,9 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
             args.transport_diagnostics
                 .then_some("reopened-read-diagnostics"),
         )?;
+    }
+    if args.transport_diagnostics {
+        output.read_path_evidence(case, &backend, "reopened_read_diagnostics", "after")?;
     }
     let _ = backend.close()?;
     if case.kind == Kind::Tcp {
@@ -2767,6 +3023,7 @@ fn main() -> Result<()> {
             args.shard_read_memory_allowance_bytes.unwrap_or(512 * MIB),
             args.tcp_polling,
             args.tcp_resident_first,
+            args.rma,
         )?;
         // Freeze the requested experimental controls into the generated remote
         // config as well as applying them when an existing config is executed.
@@ -2823,18 +3080,88 @@ fn main() -> Result<()> {
         geometry.group_max_batches,
         geometry.group_encoded_bytes,
     )?;
+    let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let allowed = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .map_or("unavailable", str::trim)
+    };
     writeln!(
         metadata,
-        "cold_read_pass={}\ntransport_diagnostics={}\ncold_mode=per-case-WAL-advisory-eviction-with-physical-read-evidence\ncold_mode_is_not_capacity_scaling=true\ndiagnostic_node_receive_time_includes_idle=true",
-        args.cold_read_pass, args.transport_diagnostics
+        "target_os={}\ntarget_arch={}\nread_cpu_affinity={}\nread_numa_affinity={}\nread_placement_policy=kernel-scheduled-inherited-affinity\nbuild_features=experimental-fabric:{},test-utils:{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        allowed("Cpus_allowed_list:"),
+        allowed("Mems_allowed_list:"),
+        cfg!(feature = "experimental-fabric"),
+        cfg!(feature = "test-utils"),
     )?;
     writeln!(
         metadata,
-        "diagnostic_timing_schema=6\nstage_times_are_nested_not_additive=true\ntransport_io_time_includes_provider_work=true\nstorage_persist_time_includes_file_lookup_and_sync=true\nresource_deltas_include_control_requests=true\nwarm_diagnostic_coordinator_cache_cleared=true"
+        "process_write_io_scope=accounted_process_write_bytes_from_proc_io;interval_process_accounting_not_device_completed_writes_or_per_key_IO;unavailable_is_blank"
     )?;
     writeln!(
         metadata,
-        "transport={}\nrdma_hardware_requested={}\none_sided_wal_reads=false\nnative_async_is_not_durability_equivalent=true\nlatency_unit=api_call_or_complete_window\nthroughput_includes_driver_and_verification_overhead=true\nvalues={:?}\nbatch_sizes={:?}\nwindows={:?}\nload_batches={}\nmixed_batches={}\npoint_reads={}\nrepetitions={}\nmax_value_history_per_case_bytes={}\nsource_and_binary_hashes=must_be_captured_by_orchestrator",
+        "cold_read_pass={}\ncold_single_probes={}\ncold_group_probes={}\ntransport_diagnostics={}\ncold_mode=per-case-WAL-advisory-eviction-with-physical-read-evidence\ncold_mode_is_not_capacity_scaling=true\nphysical_cold_get_interval_io_is_per_probe_expected_owner_process_accounting=true\nphysical_cold_get_many_interval_io_is_per_probe_expected_owner_process_accounting=true\ndiagnostic_node_receive_time_includes_idle=true",
+        args.cold_read_pass,
+        args.cold_single_probes,
+        args.cold_group_probes,
+        args.transport_diagnostics
+    )?;
+    let (effective_rma, default_read_lanes, default_read_cache_bytes) =
+        if let Some(path) = &args.remote_config {
+            let remote: RemoteDatabaseConfig = serde_yaml::from_slice(&fs::read(path)?)?;
+            (
+                remote.tls.resident_reads,
+                remote.read_lanes,
+                remote.read_cache_bytes,
+            )
+        } else {
+            (args.rma, 2, 8 * MIB)
+        };
+    let registered_policy = cache_workloads::registered_hot_policy(
+        args.reads,
+        args.bounded_hot_reads,
+        args.tcp_read_lanes.unwrap_or(default_read_lanes),
+        effective_rma.destination_slots != 0
+            && args
+                .tcp_read_cache_bytes
+                .unwrap_or(default_read_cache_bytes)
+                == 0,
+    );
+    let bounded_enabled = args.bounded_hot_pass
+        || args.bounded_hot_reads.is_some()
+        || (args.kinds.contains(&Kind::Tcp) && effective_rma.destination_slots != 0);
+    let mut bounded_policy = registered_policy;
+    bounded_policy.enabled = bounded_enabled;
+    writeln!(
+        metadata,
+        "diagnostic_timing_schema=7\nstage_times_are_nested_not_additive=true\ntransport_io_time_includes_provider_work=true\nstorage_persist_time_includes_file_lookup_and_sync=true\nresource_deltas_include_control_requests=true\nwarm_diagnostic_coordinator_cache_cleared=false\nread_query_algorithm=mix64-v1\nread_query_seed=0\nread_query_order=mix(sample)%loaded_keys\nread_prepared_state={}\nprofiled_scalar_population=full_clean_twin_order_and_cardinality\nrma_config={}\none_sided_wal_reads={}\nregistered_hot_policy={}",
+        match (bounded_enabled, args.cache_probe_keys != 0) {
+            (true, true) => "post-load-after-bounded-hot32-controls-and-explicit-hotset-scan-probe",
+            (true, false) => "post-load-after-bounded-hot32-controls",
+            (false, true) => "post-load-after-explicit-hotset-and-scan-probe",
+            (false, false) => "post-load-before-any-read",
+        },
+        serde_json::to_string(&effective_rma)?,
+        effective_rma.destination_slots != 0,
+        serde_json::to_string(&registered_policy)?,
+    )?;
+    writeln!(
+        metadata,
+        "bounded_hot_policy={}",
+        serde_json::to_string(&bounded_policy.bounded())?
+    )?;
+    writeln!(
+        metadata,
+        "bounded_hot_reads={}",
+        args.bounded_hot_reads
+            .map_or_else(|| "legacy".to_string(), |reads| reads.to_string())
+    )?;
+    writeln!(
+        metadata,
+        "transport={}\nrdma_hardware_requested={}\nnative_async_is_not_durability_equivalent=true\nlatency_unit=api_call_or_complete_window\nthroughput_includes_driver_and_verification_overhead=true\nvalues={:?}\nbatch_sizes={:?}\nwindows={:?}\nload_batches={}\nmixed_batches={}\npoint_reads={}\nrepetitions={}\nmax_value_history_per_case_bytes={}\nsource_and_binary_hashes=must_be_captured_by_orchestrator",
         args.transport.label(),
         matches!(
             args.transport,
@@ -2962,4 +3289,33 @@ fn main() -> Result<()> {
         "Verify the topology metadata: spawned nodes share one SSD; this is not Sui or RDMA evidence. External node cleanup remains operator-owned."
     );
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::{valid_bounded_hot_reads, valid_cold_group_probes, valid_cold_single_probes};
+
+    #[test]
+    fn bounded_hot_read_bounds_are_strict_and_legacy_is_unbounded() {
+        assert!(valid_bounded_hot_reads(None));
+        assert!(!valid_bounded_hot_reads(Some(31)));
+        assert!(valid_bounded_hot_reads(Some(32)));
+        assert!(valid_bounded_hot_reads(Some(131_072)));
+        assert!(!valid_bounded_hot_reads(Some(131_073)));
+    }
+    #[test]
+    fn cold_single_probe_count_requires_cold_mode_and_respects_bounds() {
+        assert!(valid_cold_single_probes(0, false));
+        assert!(!valid_cold_single_probes(1, false));
+        assert!(valid_cold_single_probes(1, true));
+        assert!(valid_cold_single_probes(4096, true));
+        assert!(!valid_cold_single_probes(4097, true));
+    }
+    #[test]
+    fn cold_group_probe_count_requires_cold_mode_and_respects_bounds() {
+        assert!(valid_cold_group_probes(0, false));
+        assert!(!valid_cold_group_probes(1, false));
+        assert!(valid_cold_group_probes(1, true));
+        assert!(valid_cold_group_probes(4096, true));
+        assert!(!valid_cold_group_probes(4097, true));
+    }
 }

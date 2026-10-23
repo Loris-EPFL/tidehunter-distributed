@@ -313,6 +313,55 @@ fn cold_old_authority_becomes_hot_without_lifetime_descriptor_residency() {
 }
 
 #[test]
+fn metadata_cache_growth_and_pinned_reads_share_the_write_admission_budget() {
+    let temp = tempdir::TempDir::new("storage-cache-table-budget").unwrap();
+    let mut config = config(vec![3], 3);
+    config.max_batches = 1;
+    config.max_reference_metadata_bytes = 64 * 1024;
+    let log = Arc::new(
+        PartitionLog::create(
+            &temp.path().join("stream"),
+            config.clone(),
+            &shape(),
+            metrics(),
+        )
+        .unwrap(),
+    );
+    let mut pins = Vec::new();
+    let mut refused = None;
+    for n in 0..512 {
+        let candidate = batch(&config, n);
+        let groups_before = log.stats().appended_groups;
+        let receipt = match log.append_complete_batch(authority(&config), &candidate) {
+            Ok(receipt) => receipt,
+            Err(StorageError::Capacity) => {
+                assert_eq!(log.stats().appended_groups, groups_before);
+                assert_eq!(log.lookup(candidate.id()).unwrap(), None);
+                refused = Some(candidate);
+                break;
+            }
+            Err(error) => panic!("unexpected append failure: {error}"),
+        };
+        log.persist_through(receipt).unwrap();
+        let reference = log.record_reference(receipt, 0).unwrap();
+        pins.push(log.plan_record_read(&reference).unwrap());
+        assert!(log.stats().reference_metadata_bytes <= config.max_reference_metadata_bytes);
+    }
+    let candidate = refused.expect("bounded metadata must backpressure retained read pins");
+    drop(pins);
+    let receipt = log
+        .append_complete_batch(authority(&config), &candidate)
+        .unwrap();
+    log.persist_through(receipt).unwrap();
+    let reference = log.record_reference(receipt, 0).unwrap();
+    assert_eq!(
+        log.read_record(&reference).unwrap(),
+        candidate.mutations()[0]
+    );
+    assert!(log.stats().reference_metadata_bytes <= config.max_reference_metadata_bytes);
+}
+
+#[test]
 fn final_read_token_holds_metadata_credit_and_backpressures_before_new_wal_bytes() {
     let temp = tempdir::TempDir::new("storage-authority-credit-lifetime").unwrap();
     let mut config = config(vec![3], 3);

@@ -61,6 +61,16 @@ fn pair() -> Pair {
     }
     panic!("TLS handshake did not finish");
 }
+#[test]
+fn client_does_not_request_grants_without_negotiated_rma() {
+    assert_eq!(client_grant_limit(ReadClass::Point, false, false, 8, 0), 0);
+    assert_eq!(client_grant_limit(ReadClass::Point, false, true, 8, 2), 6);
+    assert_eq!(client_grant_limit(ReadClass::Point, true, true, 8, 2), 0);
+    assert_eq!(
+        client_grant_limit(ReadClass::ScanNoFill, false, true, 8, 2),
+        0
+    );
+}
 
 #[cfg(feature = "experimental-fabric")]
 #[test]
@@ -71,7 +81,7 @@ fn owned_record_segments_preserve_protocol_wire_bytes() {
         WireBytes::from(minibytes::Bytes::from(vec![4, 5, 6, 7])),
     ];
     pair.session
-        .queue_native_records(19, members, None, 4096)
+        .queue_native_records(19, members, None, None, 4096)
         .unwrap();
     let output = pair.session.output.back().unwrap();
     assert!(output.bytes.is_empty());
@@ -103,7 +113,13 @@ fn owned_record_segments_preserve_protocol_wire_bytes() {
 
     let profile = ServerReadProfile::default();
     pair.session
-        .queue_native_records(20, vec![WireBytes::from(vec![8; 64])], Some(profile), 4096)
+        .queue_native_records(
+            20,
+            vec![WireBytes::from(vec![8; 64])],
+            None,
+            Some(profile),
+            4096,
+        )
         .unwrap();
     let frame = pair.session.output.back().unwrap().flatten();
     let response: Envelope<Response> = pair.session.decode(&frame[4..], 4096).unwrap();
@@ -397,6 +413,10 @@ fn stalled_fences_bound_output_and_keep_actual_reply_leases() {
                 charge,
                 epoch: Some(1),
                 read_generation: None,
+                read_references: Vec::new(),
+                authority_owners: Vec::new(),
+                grant_limit: 0,
+                grant_max_bytes: 0,
                 profile: None,
                 record_started: None,
                 read_profile: ServerReadProfile::default(),
@@ -791,6 +811,10 @@ fn completed_read(measured: bool, profiled: bool) -> HashMap<u64, ServerPending>
             charge: 4096,
             epoch: Some(1),
             read_generation: None,
+            read_references: Vec::new(),
+            authority_owners: Vec::new(),
+            grant_limit: 0,
+            grant_max_bytes: 0,
             profile: profiled.then(Instant::now),
             record_started: profiled.then(Instant::now),
             read_profile: ServerReadProfile::default(),
@@ -807,7 +831,120 @@ fn completed_read(measured: bool, profiled: bool) -> HashMap<u64, ServerPending>
         },
     )])
 }
+#[cfg(feature = "experimental-fabric")]
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm software provider"]
+fn forced_server_grant_request_with_real_authority_uses_message_only_fallback() {
+    use super::super::tests::{batch, config, metrics};
+    use crate::distributed::storage::WalMemberReadPolicy;
 
+    let mut pair = pair();
+    let mut source_endpoint = tidehunter_fabric::Endpoint::open("tcp;ofi_rxm", Some("lo")).unwrap();
+    let mut peer_endpoint = tidehunter_fabric::Endpoint::open("tcp;ofi_rxm", Some("lo")).unwrap();
+    source_endpoint
+        .set_peer(&peer_endpoint.address().unwrap())
+        .unwrap();
+    peer_endpoint
+        .set_peer(&source_endpoint.address().unwrap())
+        .unwrap();
+    pair.session.sock.fabric = Some(source_endpoint);
+    let mut node_config = config(&pair._temp.path().join("node"));
+    let source = ResidentReadConfig {
+        source_bytes: 4096,
+        source_regions: 2,
+        max_read_bytes: 1024,
+        ..ResidentReadConfig::default()
+    };
+    node_config.wal_member_read = WalMemberReadPolicy::Async;
+    node_config.resident_reads = source;
+    let node = StorageNode::open(node_config.clone(), metrics()).unwrap();
+    node.inventory.lock().fence_to(1).unwrap();
+
+    let batch = batch(&node_config, 1, 0);
+    let Response::Appended(receipts) = node
+        .handle(
+            Request::Append {
+                epoch: 1,
+                batches: vec![batch.encoded().clone().into()],
+            },
+            TcpLimits::default(),
+        )
+        .unwrap()
+    else {
+        panic!("append did not return receipts");
+    };
+    let reference = batch.record_reference(receipts[0].address, 0).unwrap();
+    let snapshot = node.reader_snapshot(1, &[reference]).unwrap();
+    let owner = snapshot.members[0]
+        .0
+        .plan_record_read(&reference)
+        .unwrap()
+        .resident_owner();
+    snapshot.members[0]
+        .0
+        .validate_durable_record_reference(&reference)
+        .unwrap();
+    let records = vec![
+        snapshot.members[0]
+            .0
+            .read_record_encoded(&reference)
+            .unwrap(),
+    ];
+    assert_eq!(
+        CompleteBatch::decode_record(
+            &KeyShape::from_yaml(&node_config.shape_yaml).unwrap(),
+            &reference,
+            records[0].clone(),
+        )
+        .unwrap(),
+        batch.mutations()[0]
+    );
+
+    let request = ServerPending {
+        deadline: Instant::now() + Duration::from_secs(2),
+        charge: read_charge(&[reference]).unwrap(),
+        epoch: Some(1),
+        read_generation: Some(snapshot.generation),
+        read_references: vec![reference],
+        authority_owners: vec![owner],
+        grant_limit: 1,
+        grant_max_bytes: 1024,
+        profile: None,
+        record_started: None,
+        read_profile: ServerReadProfile::default(),
+        response_queued: false,
+        ready_response: None,
+        response_ready_at: None,
+        measured: false,
+        output_started: None,
+        _lease: None,
+        async_started: None,
+        async_handler_ns: 0,
+        control_queued: None,
+        is_append: false,
+    };
+    assert!(
+        resident_grants_for_read(
+            &node,
+            &mut pair.session,
+            1,
+            source,
+            &mut Vec::new(),
+            &request,
+            &records,
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(node.resident_grants.live_stats(), (0, 0, 0));
+}
+fn finish_test_read(
+    node: &StorageNode,
+    pending: &mut HashMap<u64, ServerPending>,
+    result: Result<Vec<minibytes::Bytes>, TcpError>,
+) -> Result<(), TcpError> {
+    finish_read(node, pending, 1, result)
+}
 #[test]
 fn completed_response_rejects_fenced_or_poisoned_authority() {
     use super::super::tests::{config, metrics};
@@ -818,7 +955,12 @@ fn completed_response_rejects_fenced_or_poisoned_authority() {
         let generation = node.reader_snapshot(1, &[]).unwrap().generation;
         let mut pending = completed_read(true, true);
         pending.get_mut(&1).unwrap().read_generation = Some(generation);
-        finish_read(&mut pending, 1, Ok(vec![b"completed record"[..].into()])).unwrap();
+        finish_test_read(
+            &node,
+            &mut pending,
+            Ok(vec![b"completed record"[..].into()]),
+        )
+        .unwrap();
         pending.get_mut(&1).unwrap().response_ready_at =
             Some(Instant::now() - Duration::from_millis(1));
         let mut profile = ConnectionProfile::default();
@@ -864,7 +1006,7 @@ fn recheck_profiles_success_and_preserves_member_errors() {
         } else {
             Ok(vec![b"completed record"[..].into()])
         };
-        finish_read(&mut pending, 1, result).unwrap();
+        finish_test_read(&node, &mut pending, result).unwrap();
         assert!(
             flush_responses(
                 &node,
@@ -897,8 +1039,14 @@ fn recheck_profiles_success_and_preserves_member_errors() {
 
 #[test]
 fn ordinary_completed_reads_do_not_start_recheck_clocks() {
+    use super::super::tests::{config, metrics};
+    let pair = pair();
+    let node = StorageNode::open(config(&pair._temp.path().join("node")), metrics()).unwrap();
+    node.inventory.lock().fence_to(1).unwrap();
+    let generation = node.reader_snapshot(1, &[]).unwrap().generation;
     let mut pending = completed_read(false, false);
-    finish_read(&mut pending, 1, Ok(vec![b"record"[..].into()])).unwrap();
+    pending.get_mut(&1).unwrap().read_generation = Some(generation);
+    finish_test_read(&node, &mut pending, Ok(vec![b"record"[..].into()])).unwrap();
     assert!(pending[&1].response_ready_at.is_none());
     assert_eq!(pending[&1].read_profile.response_recheck_deferrals, 0);
     assert!(matches!(
@@ -956,8 +1104,38 @@ fn submitted_ready_cqes_share_rechecks_deadlines_and_reply_retirement() {
         // Deterministically leave a real ready CQE for the exact helper called
         // after the server's submission turn. Do not synthesize record bytes.
         executor.wait_for_ready_completion().unwrap();
-        assert!(harvest_reads(&mut executor, &mut pending).unwrap());
-        assert!(!harvest_reads(&mut executor, &mut pending).unwrap());
+        #[cfg(feature = "experimental-fabric")]
+        let mut resident_grants = Vec::new();
+        #[cfg(feature = "experimental-fabric")]
+        let source = ResidentReadConfig::default();
+        #[cfg(feature = "experimental-fabric")]
+        let progressed = harvest_reads(
+            &node,
+            &mut pair.session,
+            1,
+            source,
+            &mut resident_grants,
+            &mut executor,
+            &mut pending,
+        )
+        .unwrap();
+        #[cfg(not(feature = "experimental-fabric"))]
+        let progressed = harvest_reads(&node, &mut executor, &mut pending).unwrap();
+        assert!(progressed);
+        #[cfg(feature = "experimental-fabric")]
+        let progressed = harvest_reads(
+            &node,
+            &mut pair.session,
+            1,
+            source,
+            &mut resident_grants,
+            &mut executor,
+            &mut pending,
+        )
+        .unwrap();
+        #[cfg(not(feature = "experimental-fabric"))]
+        let progressed = harvest_reads(&node, &mut executor, &mut pending).unwrap();
+        assert!(!progressed);
         assert!(pending[&1].ready_response.is_some());
         assert!(pending[&1]._lease.is_some());
         assert_eq!(node.read_admission.stats().inflight_reads, 0);
@@ -1017,4 +1195,106 @@ fn submitted_ready_cqes_share_rechecks_deadlines_and_reply_retirement() {
         assert_eq!(retained, 0);
         assert_eq!(node.read_admission.stats().inflight_requests, 0);
     }
+}
+
+#[cfg(feature = "experimental-fabric")]
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm software provider"]
+fn expired_posted_rma_read_fail_stops_with_grant_memory_quarantined() {
+    use super::super::tests::{batch, config, metrics};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    let temp = tempdir::TempDir::new("resident-rma-deadline").unwrap();
+    let mut node_config = config(&temp.path().join("node"));
+    let source = ResidentReadConfig {
+        source_bytes: 64 * 1024,
+        source_regions: 4,
+        max_read_bytes: 4096,
+        ..ResidentReadConfig::default()
+    };
+    let destination = ResidentReadConfig {
+        destination_bytes: 16 * 1024,
+        destination_slots: 4,
+        max_handles: 4,
+        max_read_bytes: 4096,
+        ..ResidentReadConfig::default()
+    };
+    node_config.resident_reads = source;
+    node_config.wal_member_read = crate::wal::WalMemberReadPolicy::Async;
+    let node = StorageNode::open(node_config.clone(), metrics()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = listener.local_addr().unwrap().to_string();
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_stop = Arc::clone(&stop);
+    let server = node.clone();
+    let server_tls = TlsFiles {
+        transport: Transport::FabricTcpNative,
+        ca: PathBuf::new(),
+        cert: PathBuf::new(),
+        key: PathBuf::new(),
+        server_name: "trusted-software-provider-test".to_owned(),
+        resident_reads: source,
+    };
+    let worker = thread::spawn(move || {
+        server
+            .serve(listener, server_tls, TcpLimits::default(), server_stop)
+            .unwrap();
+    });
+    let client_tls = TlsFiles {
+        transport: Transport::FabricTcpNative,
+        ca: PathBuf::new(),
+        cert: PathBuf::new(),
+        key: PathBuf::new(),
+        server_name: "trusted-software-provider-test".to_owned(),
+        resident_reads: destination,
+    };
+    let mut client = Client::connect(
+        &endpoint,
+        &client_tls,
+        Duration::from_secs(3),
+        node_config.partition.clone(),
+        &serde_yaml::from_str(&node_config.shape_yaml).unwrap(),
+    )
+    .unwrap();
+    client.fence_to(1).unwrap();
+    let batch = batch(&node_config, 1, 0);
+    let receipt = client.append_many(1, std::slice::from_ref(&batch)).unwrap();
+    let reference = batch
+        .record_reference(receipt[0].appended().address(), 0)
+        .unwrap();
+    client
+        .read_records_correlated(1, &[reference], ReadClass::Point, None)
+        .unwrap();
+
+    let read_id = client
+        .submit_read(
+            1,
+            vec![reference],
+            Instant::now() + Duration::from_secs(3),
+            ReadClass::Point,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(client.progress_reads().unwrap().is_empty());
+    assert_eq!(client.resident_read_stats().rma_posts, 1);
+    client.reactor.reads.get_mut(&read_id).unwrap().deadline = Instant::now();
+    assert!(client.progress_reads().is_err());
+    assert!(client.broken);
+
+    drop(client);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if node.resident_grants.live_stats().2 != 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "lost DMA owner was not retained in grant quarantine"
+        );
+        thread::yield_now();
+    }
+    stop.store(true, Ordering::Release);
+    worker.join().unwrap();
 }

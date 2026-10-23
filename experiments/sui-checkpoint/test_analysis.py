@@ -340,6 +340,76 @@ class CheckpointSequenceCacheEvidence(unittest.TestCase):
             analyze.checkpoint_sequence_cache_stats(duplicate)
 
 
+class CheckpointCompletionHistogram(unittest.TestCase):
+    def values(self, count=200):
+        return analyze.parse_metrics(
+            f'checkpoint_completion_latency_bucket{{le="0.01"}} {count // 2}\n'
+            f'checkpoint_completion_latency_bucket{{le="0.1"}} {count}\n'
+            f'checkpoint_completion_latency_bucket{{le="+Inf"}} {count}\n'
+            f'checkpoint_completion_latency_sum {count / 50}\n'
+            f'checkpoint_completion_latency_count {count}\n')
+
+    def test_completion_timer_has_its_own_actual_count_and_noninterpolated_bounds(self):
+        result = analyze.checkpoint_completion_observation(self.values(), required=True)
+        self.assertEqual(result['metric'], 'checkpoint_completion_latency')
+        self.assertEqual(result['count'], 200)
+        self.assertEqual(result['total_seconds'], 4)
+        self.assertAlmostEqual(result['mean_us'], 20000)
+        self.assertEqual(result['quantiles']['p50']['upper_us'], 10000)
+        self.assertEqual(result['quantiles']['p99']['lower_us'], 10000)
+        self.assertEqual(result['quantiles']['p99']['upper_us'], 100000)
+        self.assertEqual(analyze.wrapper_latencies(self.values()), [])
+        self.assertIn('pipeline wait', result['scope'])
+        self.assertIn('not certification arrival', result['scope'])
+
+    def test_historical_exec_timer_is_not_a_completion_latency_substitute(self):
+        old = {key.replace('checkpoint_completion_latency', 'checkpoint_exec_latency'): value
+               for key, value in self.values().items()}
+        result = analyze.checkpoint_completion_observation(old)
+        self.assertFalse(result['available'])
+        self.assertIsNone(result['count'])
+        with self.assertRaises(ValueError):
+            analyze.checkpoint_completion_observation(old, required=True)
+        self.assertFalse(analyze.checkpoint_completion_observation(self.values(0))['available'])
+
+    def test_small_actual_population_does_not_become_a_checkpoint_count_or_p99_assumption(self):
+        result = analyze.checkpoint_completion_observation(self.values(2), required=True)
+        self.assertEqual(result['count'], 2)
+        self.assertFalse(result['quantiles']['p99']['available'])
+        self.assertIsNone(result['quantiles']['p99']['upper_us'])
+        self.assertIn('not assumed equal', result['count_contract'])
+
+    def test_nonfinite_values_and_incomplete_buckets_fail_strict_admission(self):
+        for kind in ('nan', 'infinite', 'missing_inf', 'wrong_inf', 'decreasing'):
+            with self.subTest(kind=kind):
+                values = self.values()
+                if kind == 'nan':
+                    values['checkpoint_completion_latency_sum'] = float('nan')
+                elif kind == 'infinite':
+                    values['checkpoint_completion_latency_count'] = float('inf')
+                elif kind == 'missing_inf':
+                    del values['checkpoint_completion_latency_bucket{le="+Inf"}']
+                elif kind == 'wrong_inf':
+                    values['checkpoint_completion_latency_bucket{le="+Inf"}'] = 199
+                else:
+                    values['checkpoint_completion_latency_bucket{le="0.1"}'] = 1
+                with self.assertRaises(ValueError):
+                    analyze.checkpoint_completion_observation(values, required=True)
+
+    def test_different_histogram_series_are_not_pooled_or_selected_for_completion_proof(self):
+        values = {}
+        for label in ('a', 'b'):
+            for key, value in self.values(60).items():
+                name = (key.replace('{', '{node="' + label + '",', 1)
+                        if '{' in key else key + '{node="' + label + '"}')
+                values[name] = value
+        result = analyze.checkpoint_completion_observation(values)
+        self.assertFalse(result['available'])
+        self.assertIsNone(result['count'])
+        with self.assertRaises(ValueError):
+            analyze.checkpoint_completion_observation(values, required=True)
+
+
 class CampaignComparison(unittest.TestCase):
     def cells(self):
         cells = []
@@ -415,6 +485,30 @@ class CampaignComparison(unittest.TestCase):
         unavailable = [pair for pair in analyze.transport_comparison(missing)['pairs'] if not pair['available']]
         self.assertEqual(len(unavailable), 3)
         self.assertTrue(all(pair['candidate_transport'] == 'efa-native' for pair in unavailable))
+
+    def test_registered_arm_is_distinct_from_same_provider_rpc_baseline(self):
+        cells = self.cells()[:2]
+        native = cells[0] | dict(cell_id='r01-efa-native', transport='efa-native', ordinal=2)
+        profile = dict(source_bytes=4194304, source_regions=512, destination_bytes=20971520,
+                       destination_slots=640, max_read_bytes=32768, max_handles=4096,
+                       require_device_read=True)
+        registered = native | dict(cell_id='r01-efa-native-rma', ordinal=3, resident_reads=profile)
+        rows = cells + [native, registered]
+        pairs = analyze.transport_comparison(rows)['pairs']
+        arm, = [pair for pair in pairs if pair['candidate_transport'] == 'efa-native-rma']
+        self.assertTrue(arm['available'])
+        self.assertEqual(arm['reference_cell'], 'r01-efa-native')
+        self.assertEqual(arm['registration_profiles']['candidate'], profile)
+        ordinary = [pair for pair in pairs if pair['candidate_transport'] == 'efa-native']
+        self.assertEqual(len(ordinary), 2)
+        with self.assertRaisesRegex(ValueError, 'registered-read profiles'):
+            analyze.population_comparison(rows)
+        for field, value in (('source_archive_sha256', 'foreign'),
+                             ('cache', dict(coordinator_bytes=8388608, shard_bytes=0)),
+                             ('read_profile_limit', 1)):
+            changed = cells + [native, registered | {field: value}]
+            with self.assertRaises(ValueError):
+                analyze.transport_comparison(changed)
 
     def test_duplicate_and_cross_source_or_population_comparisons_fail(self):
         cells = self.cells()

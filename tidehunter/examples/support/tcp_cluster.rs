@@ -17,7 +17,7 @@ use tidehunter::distributed::local_inventory::LocalInventoryConfig;
 use tidehunter::distributed::remote_db::{RemoteDatabaseConfig, RemoteEndpoint};
 use tidehunter::distributed::storage::{PartitionConfig, StaticInventory};
 use tidehunter::distributed::tcp::{
-    NodeConfig, PollingPolicy, StorageNode, TcpLimits, TlsFiles, Transport,
+    NodeConfig, PollingPolicy, ResidentReadConfig, StorageNode, TcpLimits, TlsFiles, Transport,
 };
 use tidehunter::key_shape::KeyShape;
 use tidehunter::metrics::Metrics;
@@ -44,6 +44,7 @@ pub fn prepare_external_case(
     read_memory_allowance_bytes: usize,
     polling: PollingPolicy,
     read_resident_first: bool,
+    resident_reads: ResidentReadConfig,
 ) -> Result<()> {
     if !guest_root.is_absolute() || addresses.len() != storage.partitions.len() {
         return Err(io::Error::other("invalid external case root/endpoints").into());
@@ -113,6 +114,7 @@ pub fn prepare_external_case(
                 read_max_inflight_requests: 32,
                 read_max_inflight_bytes: 64 * 1024 * 1024,
                 read_max_device_reads: 128,
+                resident_reads,
             },
             tls: TlsFiles {
                 transport,
@@ -120,6 +122,7 @@ pub fn prepare_external_case(
                 cert: cert.clone(),
                 key: key.clone(),
                 server_name: server_name.clone(),
+                resident_reads,
             },
             limits: TcpLimits {
                 io_timeout: Duration::from_secs(60),
@@ -148,6 +151,7 @@ pub fn prepare_external_case(
             cert: rebase(&certs.authority.certificate),
             key: rebase(&certs.authority.private_key),
             server_name: "unused-client-template".into(),
+            resident_reads,
         }
     } else {
         TlsFiles {
@@ -156,6 +160,7 @@ pub fn prepare_external_case(
             cert: PathBuf::new(),
             key: PathBuf::new(),
             server_name: "unused-client-template".into(),
+            resident_reads,
         }
     };
     let config = RemoteDatabaseConfig {
@@ -419,6 +424,7 @@ impl LoopbackCluster {
             512 * 1024 * 1024,
             PollingPolicy::Adaptive,
             false,
+            ResidentReadConfig::default(),
         )
     }
 
@@ -438,6 +444,7 @@ impl LoopbackCluster {
         read_memory_allowance_bytes: usize,
         polling: PollingPolicy,
         read_resident_first: bool,
+        resident_reads: ResidentReadConfig,
     ) -> Result<Self> {
         transport.validate()?;
         fs::create_dir_all(data)?;
@@ -507,6 +514,7 @@ impl LoopbackCluster {
                     read_max_inflight_requests: 32,
                     read_max_inflight_bytes: 64 * 1024 * 1024,
                     read_max_device_reads: 128,
+                    resident_reads,
                 },
                 tls: TlsFiles {
                     transport,
@@ -514,6 +522,7 @@ impl LoopbackCluster {
                     cert: cert.clone(),
                     key: key.clone(),
                     server_name: server_name.clone(),
+                    resident_reads,
                 },
                 limits,
                 listen: "127.0.0.1:0".parse()?,
@@ -543,6 +552,7 @@ impl LoopbackCluster {
                 cert: certs.authority.certificate,
                 key: certs.authority.private_key,
                 server_name: "unused-client-template".to_owned(),
+                resident_reads,
             }
         } else {
             TlsFiles {
@@ -551,6 +561,7 @@ impl LoopbackCluster {
                 cert: PathBuf::new(),
                 key: PathBuf::new(),
                 server_name: "unused-client-template".to_owned(),
+                resident_reads,
             }
         };
         let config = RemoteDatabaseConfig {
@@ -638,6 +649,7 @@ impl LoopbackCluster {
             cert: foreign.authority.certificate,
             key: foreign.authority.private_key,
             server_name: String::new(),
+            resident_reads: ResidentReadConfig::default(),
         })
     }
     pub fn restart_partition(&mut self, partition: u32) -> Result<()> {

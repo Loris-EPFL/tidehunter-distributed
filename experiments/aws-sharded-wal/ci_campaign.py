@@ -195,9 +195,9 @@ def load_config(path, env=None):
             or len(set(cfg['instance_types'])) != len(cfg['instance_types'])
             or set(cfg.get('transports', [])) != set(TRANSPORTS)
             or len(cfg['transports']) != len(TRANSPORTS)
-            or cfg.get('kv_suite', {}).get('scope') != 'full'
+            or cfg.get('kv_suite', {}).get('scope') not in ('full', 'hardware-populations')
             or cfg.get('kv_suite', {}).get('diagnostics') is not True):
-        raise ValueError('CI config must retain exact branch, approved hardware, fixed TTL and full TCP/EFA/Direct/Native/Sui/KV suite')
+        raise ValueError('CI config must retain exact branch, approved hardware, fixed TTL and complete TCP/EFA/Direct/Native/Sui/KV populations')
     from checkpoint_matrix import matrix_plan
     from checkpoint_kv import validate_options
     matrix_plan(cfg)
@@ -284,7 +284,8 @@ def admit_inputs(build, fixture, verification, output):
     # The currently executing operator and every bootstrap/runtime helper must
     # be part of this build's source identity, not a downloaded frozen importer.
     source_records = identities['tidehunter-sharded-wal']['files']
-    helpers = sorted(path for path in HERE.glob('*.py') if not path.name.startswith('test_'))
+    helpers = sorted([*(path for path in HERE.glob('*.py') if not path.name.startswith('test_')),
+                      HERE.parent / 'resident_config.py'])
     for path in [*helpers, *(HERE.parent / 'sui-checkpoint').glob('*.py')]:
         rel = str(path.relative_to(HERE.parent.parent))
         if path.is_symlink() or sha(path) != source_records.get(rel, {}).get('sha256'):
@@ -1199,6 +1200,8 @@ class Campaign:
                          ('build_bundle', 'fixture_bundle', 'verification_bundle')})
         bindings.update({name: self.cfg[name] for name in ('transports', 'repetitions', 'read_profile_limits',
                          'write_profile_limits', 'native_write_profile_limits', 'kv_suite')})
+        bindings.update({name: self.cfg[name] for name in
+            ('coordinator_cache_mib_by_repetition', 'shard_cache_mib_by_repetition') if name in self.cfg})
         runner = admission['inputs']['runner_bundle']
         plan = dict(run_id=self.run_id, account=self.cfg['account'], region=candidate['region'],
             bucket=self.cfg['bucket'], prefix=self.run_id, ttl_seconds=self.cfg['ttl_seconds'], export_reserve_seconds=600,
@@ -1406,6 +1409,8 @@ class Campaign:
         cfg = {key: self.cfg[key] for key in ('transports', 'repetitions', 'read_profile_limits',
             'write_profile_limits', 'native_write_profile_limits', 'kv_suite', 'coordinator_cache_mib',
             'shard_cache_mib', 'replay_deadline_seconds')}
+        cfg.update({name: self.cfg[name] for name in
+            ('coordinator_cache_mib_by_repetition', 'shard_cache_mib_by_repetition') if name in self.cfg})
         cfg.update(plan['atomic_bindings'])
         cfg.update(campaign='sui-checkpoint', run_id=self.run_id, account=self.cfg['account'], region=candidate['region'],
             availability_zone=candidate['az'], placement_group=self.run_id, bucket=self.cfg['bucket'], s3_prefix=self.run_id,

@@ -3,6 +3,10 @@ from pathlib import Path
 import json
 import re
 import time
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from resident_config import resident_read_config
 
 
 FABRIC_LOCAL_PREFIX = b'TIDEHUNTER_FABRIC_LOCAL_DIAGNOSTICS'
@@ -102,6 +106,14 @@ def fabric_local_archive_log(archive, name, *, required=False, forbidden=False):
     return validate_fabric_local_population(result, name, required, forbidden)
 
 
+def cell_resident_reads(cfg, transport, cell=None):
+    """Hardware campaigns retain an OFF baseline and a separately named ON arm."""
+    profile = resident_read_config((cfg.get('kv_suite') or {}).get('resident_reads'))
+    if (cfg.get('kv_suite') or {}).get('scope') == 'hardware-populations':
+        return profile if transport == 'efa-native' and cell and cell.get('resident_reads') == profile else resident_read_config()
+    return profile if transport == 'efa-native' else resident_read_config()
+
+
 def matrix_plan(cfg):
     transports = cfg.get('transports')
     repetitions = cfg.get('repetitions')
@@ -133,18 +145,41 @@ def matrix_plan(cfg):
                 or any(type(value) is not int or not 0 <= value <= 128 for value in budgets)):
             raise ValueError('cache schedules require one integer 0..128 MiB per repetition')
         cache_budgets[name] = budgets
-    return [dict(cell_id=f'r{repeat + 1:02d}-{transport}', repetition=repeat + 1,
-                 transport=transport, ordinal=ordinal, read_profile_limit=limits[repeat],
-                 write_profile_limit=write_limits[repeat], native_write_profile_limit=native_limits[repeat],
-                 **{name: budgets[repeat] for name, budgets in cache_budgets.items()})
-            for ordinal, (repeat, transport) in enumerate(
-                ( (repeat, transport) for repeat in range(repetitions)
-                  for transport in (transports if repeat % 2 == 0 else transports[::-1]) ))]
+    resident = resident_read_config((cfg.get('kv_suite') or {}).get('resident_reads'))
+    cells = [dict(cell_id=f'r{repeat + 1:02d}-{transport}', repetition=repeat + 1,
+                  transport=transport, ordinal=ordinal, read_profile_limit=limits[repeat],
+                  write_profile_limit=write_limits[repeat], native_write_profile_limit=native_limits[repeat],
+                  **{name: budgets[repeat] for name, budgets in cache_budgets.items()})
+             for ordinal, (repeat, transport) in enumerate(
+                 ( (repeat, transport) for repeat in range(repetitions)
+                   for transport in (transports if repeat % 2 == 0 else transports[::-1]) ))]
+    if (cfg.get('kv_suite') or {}).get('scope') == 'hardware-populations':
+        if (repetitions != 3 or limits[:2] != [0, 0] or limits[2] == 0
+                or write_limits != limits or native_limits != limits
+                or cache_budgets['coordinator_cache_mib'] != [0, 8, 0]
+                or cache_budgets['shard_cache_mib'] != [8, 8, 8]
+                or not resident['destination_slots'] or not resident['require_device_read']):
+            raise ValueError('hardware Sui requires two clean coor0/8MiB controls, owner8MiB and separate clocks')
+        focused = []
+        for cell in cells:
+            if cell['repetition'] == 3 and cell['transport'] != 'efa-native':
+                continue
+            focused.append(cell)
+            if cell['transport'] == 'efa-native':
+                focused.append(cell | dict(cell_id=cell['cell_id'] + '-rma', resident_reads=dict(resident)))
+        for ordinal, cell in enumerate(focused):
+            cell['ordinal'] = ordinal
+        return focused
+    if resident['destination_slots']:
+        for cell in cells:
+            if cell['transport'] == 'efa-native':
+                cell['resident_reads'] = dict(resident)
+    return cells
 
 
 def check_cell(cell_id, transport):
     if (transport not in TRANSPORTS or not isinstance(cell_id, str)
-            or not re.fullmatch(r'r0[1-4]-' + transport, cell_id)):
+            or not re.fullmatch(r'r0[1-4]-' + transport + (r'(?:-rma)?' if transport == 'efa-native' else ''), cell_id)):
         raise ValueError('invalid checkpoint cell identity')
 
 
@@ -242,6 +277,9 @@ def validate_matrix(cfg, cells):
         if any(cell.get(key, 0 if key in ('write_profile_limit', 'native_write_profile_limit') else None) != value
                for key, value in planned.items()) or cell.get('complete') is not True:
             raise ValueError('matrix cell missing, reordered, mismatched or incomplete')
+        if cell.get('resident_reads') != planned.get('resident_reads'):
+            raise ValueError('matrix cell registered-read policy differs from the canonical profile')
+        resident_read_config(cell.get('resident_reads'))
         if cell.get('build_manifest_sha256') != cfg['build_manifest_sha256'] or cell.get('binaries') != cfg['binaries']:
             raise ValueError('matrix cell source differs')
         for key in ('fixture_bundle', 'verification_bundle', 'source_archive_sha256', 'source_manifest_sha256'):

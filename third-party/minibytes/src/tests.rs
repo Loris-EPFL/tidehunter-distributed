@@ -7,6 +7,8 @@
 
 use quickcheck::quickcheck;
 
+use std::sync::Arc;
+
 use crate::Bytes;
 use crate::Text;
 
@@ -98,6 +100,23 @@ fn test_into_vec() {
     let c = b.slice(1..3);
     drop(b);
     assert_eq!(c.into_vec(), b"bc");
+}
+
+#[test]
+fn test_shared_owner_retains_allocation_without_copying() {
+    let owner = Arc::new(b"shared bytes".to_vec());
+    let weak = Arc::downgrade(&owner);
+    let original_ptr = owner.as_slice().as_ptr();
+
+    let bytes = Bytes::from_shared_owner(owner.clone());
+    assert_eq!(Arc::strong_count(&owner), 2);
+    assert_eq!(bytes.as_ptr(), original_ptr);
+    assert_eq!(bytes.as_ref(), b"shared bytes");
+
+    drop(owner);
+    assert!(weak.upgrade().is_some());
+    drop(bytes);
+    assert!(weak.upgrade().is_none());
 }
 
 #[test]

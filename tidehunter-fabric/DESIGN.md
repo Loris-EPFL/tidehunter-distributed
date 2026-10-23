@@ -4,10 +4,12 @@
 `Endpoint` and `Resources` implementation preserved at
 `project:archive/middleware-legacy/crates/rdma-fabric-sys` in the parent project.
 That path records provenance; the active crate does not build or import archived
-code. It deliberately omits the original shared progress scheduler. Each TLS or
-explicit trusted-native session owns one FI_EP_RDM endpoint and drives its completion queue. The coordinator's
-single read owner services its connections; bounded reusable shard workers own
-server sessions. There is no new Rust runtime or remote WAL registration.
+code. Each TLS or explicit trusted-native session owns one FI_EP_RDM endpoint
+and drives its completion queue. The coordinator's single read owner services
+its connections; bounded reusable shard workers own server sessions. The
+native-feature endpoint can additionally expose immutable resident member
+regions for read-only FI_READ; this is a derived cache, never authoritative WAL,
+and ordinary message-only opens remain unchanged.
 
 ## Dependencies and provenance
 
@@ -587,3 +589,76 @@ claim follows from local tests. Physical NVMe misses and remote-resident reads
 are distinct target populations; an MR key or transport label cannot make cold
 disk data resident.
 
+## Bounded resident FI_READ extension (23 October)
+
+`Endpoint::open_rma(provider, domain, config)` negotiates FI_RMA/FI_READ on the
+same FI_EP_RDM endpoint and provider used by the existing message path.
+`open_efa_direct_rma(domain, config)` selects only EFA's `efa-direct` fabric;
+unsupported or non-native capability is never reported as native. The
+message-only `open` and `open_efa_direct` entry points retain their old behavior.
+`RmaCapabilities` reports virtual-vs-offset MR addressing, selected RMA size and
+IOV limit, and native-vs-emulated read mode. EFA native mode is reported only
+after querying `FI_OPT_EFA_EMULATED_READ` and receiving `false`.
+
+`reserve_read_region` allocates a bounded stable identity before envelope
+encoding, so region ID and generation can be embedded in the immutable bytes.
+`register_read_region` then owns those finalized bytes and registers source
+memory with `FI_REMOTE_READ` only. It returns a plain `RemoteReadRegion`
+(identity, address, key and length); it never exposes a local MR descriptor.
+Requested MR keys are process-unique from 3 upward, avoiding the existing
+endpoint message keys 1 and 2 in a shared domain. A destination is one stable
+registered slot with an `fi_context2`; `try_post_read` posts an actual
+`fi_read`, and the shared CQ dispatches its completion by exact context
+alongside SEND/RECV completions.
+`try_read_completion` transfers a stable `ReadBuffer` owner only after terminal
+completion. `ReadBuffer::into_minibytes_bytes` transfers that slot lease to
+zero-copy decoded consumers. A slot stays unavailable while either a request
+can still DMA or any result owner remains alive.
+
+The fabric enforces process-wide RMA budgets (256 MiB source, 256 MiB
+destinations, 65,536 source-region slots and 8,192 destination slots) as well
+as each endpoint's configured budgets. Destination pool setup rolls back
+successfully closed MRs and all unconsumed admission credits on registration
+failure. Any uncertain MR close retains its backing allocation and credits;
+the MR FID is never retried. Dropping an endpoint with a live source or pending
+read quarantines its endpoint, domain, MRs, contexts and bytes under the
+existing 1,024-endpoint process cap. Quarantine is bounded, not a time-based
+reclamation rule.
+
+Source retirement requires `PeerDrainToken::after_ack` for the exact session
+and grant generation after an authenticated grant-drain acknowledgement has
+drained every admitted read for that grant. Timeout, endpoint close, unknown
+context or failed operation is not such an acknowledgement. EFA's pinned
+provider implementation does not justify reusing a source after uncertain
+remote DMA: `efa_ep_close` returns success even if base endpoint teardown
+failed, and `efa_mr_close` frees its wrapper even on deregistration error.
+Therefore unproven source memory stays quarantined; a quota limit must fail
+closed rather than reclaiming it.
+
+Primary provider basis:
+
+- [Pinned EFA direct capability matrix](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/docs/efa_fabric_comparison.md):
+  `efa-direct` supports RMA reads, requires local/allocated/provider-key/virtual
+  address MR modes, and has no `fi_cancel`, `FI_FENCE` or read event.
+- [`efa_rma_post_read`, pinned `efa_rma.c`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/efa_rma.c)
+  and [generic `fi_rma(3)`](https://ofiwg.github.io/libfabric/v2.6.0/man/fi_rma.3.html):
+  read posting consumes the remote address/key and local destination descriptor;
+  the destination cannot be read before completion.
+- [`efa_ep_close`, pinned `efa_ep.c`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/efa_ep.c),
+  [`efa_base_ep_destruct_qp_unsafe`, `efa_base_ep.c`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/efa_base_ep.c),
+  and [`efa_mr_close` / `efa_mr_dereg_impl`, `efa_mr.c`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/efa_mr.c):
+  local CQ/QP teardown and MR wrapper release do not establish that an
+  already-issued remote read has ceased accessing its source.
+- [`fi_efa(7)`](https://ofiwg.github.io/libfabric/v2.6.0/man/fi_efa.7.html),
+  [`fi_mr(3)`](https://ofiwg.github.io/libfabric/v2.6.0/man/fi_mr.3.html) and
+  [`fi_cq(3)`](https://ofiwg.github.io/libfabric/v2.6.0/man/fi_cq.3.html):
+  query EFA emulation, follow negotiated MR address mode, and retain the local
+  destination/context through terminal CQ handling.
+
+The ignored software-provider regression
+`software_provider_rma_reads_with_mixed_cq_and_retained_buffer_ownership`
+performs a real loopback FI_READ byte comparison, mixes it with SEND/RECV
+progress, exercises range rejection, pool pressure, retained result ownership,
+operation-drop cancellation and grant retirement. It is a local correctness
+test only; no EFA device latency, DMA-failure recovery or native-read
+performance has been demonstrated by it.

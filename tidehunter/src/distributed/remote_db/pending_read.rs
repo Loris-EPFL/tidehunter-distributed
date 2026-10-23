@@ -407,8 +407,11 @@ struct State {
     failed: AtomicBool,
     stopped: AtomicBool,
     retained: Mutex<(usize, usize)>,
+    admission_paused: AtomicBool,
     admission_generation: AtomicU64,
     admission_changed: parking_lot::Condvar,
+    active_wait: Mutex<()>,
+    active_changed: parking_lot::Condvar,
     // Fixed flight signals and weak slots are reserved from pending bytes.
     flight_ready: Box<[FlightSignal]>,
     read_rpcs: AtomicU64,
@@ -454,6 +457,18 @@ impl Drop for Credit {
         self.state.admission_changed.notify_all();
     }
 }
+pub(super) struct AdmissionPause(Arc<State>);
+impl Drop for AdmissionPause {
+    fn drop(&mut self) {
+        let _retained = self.0.retained.lock();
+        if !self.0.failed.load(Ordering::Acquire) && !self.0.stopped.load(Ordering::Acquire) {
+            self.0.admission_paused.store(false, Ordering::Release);
+            self.0.admission_generation.fetch_add(1, Ordering::Release);
+            self.0.admission_changed.notify_all();
+        }
+    }
+}
+
 struct LaneScheduling {
     inline_reserved: bool,
 }
@@ -464,10 +479,15 @@ impl Drop for InlineLaneReservation {
     }
 }
 
-struct LaneCredit(Arc<AtomicUsize>);
+struct LaneCredit {
+    outstanding: Arc<AtomicUsize>,
+    state: Arc<State>,
+}
 impl Drop for LaneCredit {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Release);
+        self.outstanding.fetch_sub(1, Ordering::Release);
+        let _wait = self.state.active_wait.lock();
+        self.state.active_changed.notify_all();
     }
 }
 struct Request {
@@ -565,6 +585,7 @@ struct ReactorLane {
     profiling: bool,
 }
 
+#[allow(clippy::too_many_arguments)] // The actor takes explicit ownership, admission and polling inputs once.
 fn drive_reads(
     state: Arc<State>,
     receiver: mpsc::Receiver<Request>,
@@ -573,6 +594,7 @@ fn drive_reads(
     max_requests: usize,
     fabric: bool,
     busy: bool,
+    resident_enabled: bool,
 ) {
     let _poison = PoisonOnPanic(state.clone());
     let mut disconnected = false;
@@ -613,7 +635,11 @@ fn drive_reads(
                     progressed = true;
                 }
             }
-            if lane.queued.is_empty() && lane.active.is_empty() && !lane.profiling {
+            if lane.queued.is_empty()
+                && lane.active.is_empty()
+                && !lane.profiling
+                && !resident_enabled
+            {
                 continue;
             }
             // Diagnostics and the deterministic test hook may own a mutex.
@@ -633,6 +659,13 @@ fn drive_reads(
                 lane.profiling = profiling;
             }
             if lane.queued.is_empty() && lane.active.is_empty() {
+                match client.progress_resident_control() {
+                    Ok(made_progress) => progressed |= made_progress,
+                    Err(_) => {
+                        state.poison();
+                        progressed = true;
+                    }
+                }
                 continue;
             }
             let transport_before = profiling.then(|| client.transport_progress_stats());
@@ -655,6 +688,7 @@ fn drive_reads(
                 let mut request = lane.queued.pop_front().unwrap();
                 let started = request.submitted.map(|_| Instant::now());
                 let references = std::mem::take(&mut request.references);
+                let message_requests = client.message_read_requests();
                 match client.submit_read(
                     epoch,
                     references,
@@ -663,7 +697,9 @@ fn drive_reads(
                     request.submitted.is_some(),
                 ) {
                     Ok(Some(id)) => {
-                        state.read_rpcs.fetch_add(1, Ordering::Relaxed);
+                        if client.message_read_requests() != message_requests {
+                            state.read_rpcs.fetch_add(1, Ordering::Relaxed);
+                        }
                         lane.active.insert(id, InflightRead { request, started });
                         #[cfg(test)]
                         state
@@ -671,8 +707,6 @@ fn drive_reads(
                             .fetch_max(lane.active.len(), Ordering::Relaxed);
                     }
                     Ok(None) => {
-                        // Preflight and admission share this exclusive guard;
-                        // capacity cannot change between them.
                         request.complete(Err(LocalDbError::new(
                             "read admission changed under exclusive ownership",
                         )));
@@ -796,6 +830,9 @@ fn drive_reads(
                     empty_polls = 0;
                     thread::yield_now();
                 }
+            } else if resident_enabled {
+                empty_polls = 0;
+                thread::yield_now();
             } else {
                 empty_polls = 0;
                 // No accepted I/O needs polling. Wake on admission rather than
@@ -821,6 +858,7 @@ pub(super) struct ReadService {
     max_requests: usize,
     max_bytes: usize,
     timeout: Duration,
+    resident_enabled: bool,
 }
 pub(super) struct ReadRequest {
     parts: SmallVec<[(Arc<ReadFlight>, usize); 1]>,
@@ -917,8 +955,11 @@ impl ReadService {
             failed: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             retained: Mutex::new((0, 0)),
+            admission_paused: AtomicBool::new(false),
             admission_generation: AtomicU64::new(0),
             admission_changed: parking_lot::Condvar::new(),
+            active_wait: Mutex::new(()),
+            active_changed: parking_lot::Condvar::new(),
             flight_ready: (0..flight_slots)
                 .map(|_| FlightSignal::new())
                 .collect::<Vec<_>>()
@@ -944,6 +985,7 @@ impl ReadService {
                 .max_pending_read_bytes
                 .saturating_sub(flight_metadata_bytes),
             timeout: config.timeout,
+            resident_enabled: config.tls.resident_reads.enabled(),
         };
         let mut reactor_lanes = Vec::new();
         let mut clients = clients.into_iter();
@@ -976,6 +1018,7 @@ impl ReadService {
         let (sender, receiver) = mpsc::sync_channel(flight_slots);
         let state = service.state.clone();
         let fabric = config.tls.transport != super::super::tcp::Transport::Tcp;
+        let resident_enabled = service.resident_enabled;
         *service.thread.get_mut() = Some(
             thread::Builder::new()
                 .name("wal-read-reactor".to_owned())
@@ -988,6 +1031,7 @@ impl ReadService {
                         flight_slots,
                         fabric,
                         busy,
+                        resident_enabled,
                     )
                 })
                 .map_err(LocalDbError::component)?,
@@ -1003,12 +1047,100 @@ impl ReadService {
         }
         Ok(())
     }
+    pub(super) fn pause_and_release_resident_grants(
+        &self,
+    ) -> Result<Option<AdmissionPause>, LocalDbError> {
+        if !self.resident_enabled {
+            return Ok(None);
+        }
+        let deadline = Instant::now() + self.timeout;
+        let retained = self.state.retained.lock();
+        if self.state.admission_paused.swap(true, Ordering::AcqRel) {
+            return Err(LocalDbError::new(
+                "resident maintenance is already in progress",
+            ));
+        }
+        let pause = AdmissionPause(self.state.clone());
+        self.state
+            .admission_generation
+            .fetch_add(1, Ordering::Release);
+        self.state.admission_changed.notify_all();
+        drop(retained);
+        let mut active_wait = self.state.active_wait.lock();
+        while self
+            .lanes
+            .read()
+            .iter()
+            .flatten()
+            .any(|lane| lane.outstanding.load(Ordering::Acquire) != 0)
+        {
+            if self.failed() || self.state.stopped.load(Ordering::Acquire) {
+                drop(active_wait);
+                return Err(LocalDbError::new("read authority is poisoned or closed"));
+            }
+            if Instant::now() >= deadline {
+                drop(active_wait);
+                return Err(LocalDbError::new("resident read drain deadline expired"));
+            }
+            self.state
+                .active_changed
+                .wait_until(&mut active_wait, deadline);
+        }
+        drop(active_wait);
+        let clients = self
+            .lanes
+            .read()
+            .iter()
+            .flat_map(|lanes| lanes.iter().map(|lane| lane.client.clone()))
+            .collect::<Vec<_>>();
+        for client in clients {
+            if let Err(error) = client.lock().revoke_resident_grants() {
+                self.state.poison();
+                return Err(LocalDbError::component(error));
+            }
+        }
+        Ok(Some(pause))
+    }
     pub(super) fn failed(&self) -> bool {
         self.state.failed.load(Ordering::Acquire)
     }
     #[cfg(test)]
     pub(super) fn lane_client(&self, node: usize, lane: usize) -> Arc<Mutex<Client>> {
         self.lanes.read()[node][lane].client.clone()
+    }
+    pub(super) fn resident_read_stats(&self) -> Vec<(u32, super::super::tcp::ResidentReadStats)> {
+        self.lanes
+            .read()
+            .iter()
+            .enumerate()
+            .map(|(node, lanes)| {
+                let mut stats = super::super::tcp::ResidentReadStats::default();
+                for lane in lanes {
+                    stats.add(lane.client.lock().resident_read_stats());
+                }
+                (node as u32, stats)
+            })
+            .collect()
+    }
+    pub(super) fn resident_read_lane_stats(
+        &self,
+    ) -> Vec<(u32, usize, super::super::tcp::ResidentReadStats)> {
+        let clients = self
+            .lanes
+            .read()
+            .iter()
+            .enumerate()
+            .flat_map(|(node, lanes)| {
+                lanes
+                    .iter()
+                    .enumerate()
+                    .map(move |(lane, client)| (node as u32, lane, client.client.clone()))
+            })
+            .collect::<Vec<_>>();
+        clients
+            .into_iter()
+            .map(|(node, lane, client)| (node, lane, client.lock().resident_read_stats()))
+            .collect()
     }
     pub(super) fn profiles(
         &self,
@@ -1134,8 +1266,14 @@ impl ReadService {
             .ok_or_else(|| LocalDbError::new(BACKPRESSURE))?;
         let (lane, reservation) = {
             let mut retained = self.state.retained.lock();
-            if self.failed() || self.state.stopped.load(Ordering::Acquire) {
-                return Err(LocalDbError::new("read authority is poisoned or closed"));
+            if self.failed() {
+                return Err(LocalDbError::new("read authority is poisoned"));
+            }
+            if self.state.stopped.load(Ordering::Acquire) {
+                return Err(LocalDbError::new("read authority is closed"));
+            }
+            if self.state.admission_paused.load(Ordering::Acquire) {
+                return Err(LocalDbError::new(BACKPRESSURE));
             }
             if retained.0 == self.max_requests || bytes > self.max_bytes - retained.1 {
                 return Ok(None);
@@ -1151,6 +1289,7 @@ impl ReadService {
                 let mut scheduling = lane.scheduling.lock();
                 if !scheduling.inline_reserved && lane.outstanding.load(Ordering::Acquire) == 0 {
                     scheduling.inline_reserved = true;
+                    lane.outstanding.fetch_add(1, Ordering::AcqRel);
                     selected = Some((lane.clone(), InlineLaneReservation(lane.scheduling.clone())));
                     break;
                 }
@@ -1168,6 +1307,10 @@ impl ReadService {
             requests: 1,
         });
         let _reservation = reservation;
+        let _lane_credit = LaneCredit {
+            outstanding: lane.outstanding.clone(),
+            state: self.state.clone(),
+        };
         let Some(mut client) = lane.client.try_lock() else {
             return Ok(None);
         };
@@ -1183,13 +1326,13 @@ impl ReadService {
         flights[flight_slot] = Arc::downgrade(&flight);
         drop(flights);
         let _poison = PoisonOnPanic(self.state.clone());
-        self.state.read_rpcs.fetch_add(1, Ordering::Relaxed);
         let sampled = self.state.diagnostics.select();
         let started = sampled.then(Instant::now);
         let transport_before = sampled.then(|| {
             client.profile_read_transport(true);
             client.transport_progress_stats()
         });
+        let message_requests = client.message_read_requests();
         let result = if sampled || profile.is_some() {
             let result = client.read_records_profiled(epoch, std::slice::from_ref(reference));
             if sampled {
@@ -1207,6 +1350,9 @@ impl ReadService {
         } else {
             client.read_records(epoch, std::slice::from_ref(reference))
         };
+        if client.message_read_requests() != message_requests {
+            self.state.read_rpcs.fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(before) = transport_before {
             self.state
                 .diagnostics
@@ -1318,6 +1464,15 @@ impl ReadService {
         };
         let (credit, lane) = {
             let mut retained = self.state.retained.lock();
+            if self.failed() {
+                return Err(LocalDbError::new("read authority is poisoned"));
+            }
+            if self.state.stopped.load(Ordering::Acquire) {
+                return Err(LocalDbError::new("read authority is closed"));
+            }
+            if self.state.admission_paused.load(Ordering::Acquire) {
+                return Err(LocalDbError::new(BACKPRESSURE));
+            }
             if (new_request != 0 && retained.0 == self.max_requests)
                 || bytes > self.max_bytes - retained.1
             {
@@ -1384,7 +1539,10 @@ impl ReadService {
                 sampled,
                 flight: flight.clone(),
                 _credit: credit.clone(),
-                _lane_credit: LaneCredit(lane.outstanding.clone()),
+                _lane_credit: LaneCredit {
+                    outstanding: lane.outstanding.clone(),
+                    state: self.state.clone(),
+                },
             };
             let sender_guard = self.sender.lock();
             let Some(sender) = sender_guard.as_ref() else {

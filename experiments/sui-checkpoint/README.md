@@ -8,6 +8,205 @@ RocksDB. Every selected Tidehunter DB must export the same namespace/key shape
 and use the remote backend in the distributed run; a missing mapping or a native
 fallback fails the run.
 
+## 23 October local resident-read and comparison controls
+
+The active KV planner now preserves **both** 8-KiB/batch32 working sets:
+`load320` (10,240 keys, 80 MiB payload) and `load3200` (102,400 keys,
+800 MiB payload). They are distinct case namespaces, never a matched
+source-regression denominator. The targeted scope adds the smaller historical
+control and a 256-byte/batch32 control; the full paid matrix is not enlarged.
+Historical evidence and generated reports remain unchanged.
+
+`aws-sharded-wal/checkpoint_kv.py` exposes offline-only commands:
+
+```sh
+python3 experiments/aws-sharded-wal/checkpoint_kv.py plan --config CONTROLLER_CONFIG.json
+python3 experiments/aws-sharded-wal/checkpoint_kv.py identity RESULTS/CASE-tcp --config CONTROLLER_CONFIG.json --spec CASE_SPEC.json --mode tcp > CASE.identity.json
+python3 experiments/aws-sharded-wal/checkpoint_kv.py compare OLD.identity.json NEW.identity.json --compared implementation
+python3 experiments/aws-sharded-wal/checkpoint_kv.py compare TCP.identity.json FABRIC.identity.json --compared implementation transport
+python3 experiments/aws-sharded-wal/checkpoint_kv.py evidence RESULTS/CASE-tcp --mode tcp
+```
+
+`plan` prints the same prepare/native/remote argv used by the existing
+source-bound guest pipeline, but marks them planned, not observed. `identity`
+requires successful exact command/binary receipts, source-archive provenance,
+the observed load/read summary, query algorithm/order/seed, layout, preparation,
+budgets and polling policy, compilation features, OS/architecture, admitted
+region/AZ/instance/cluster profile, and observed coordinator CPU/NUMA allowed
+masks. Allowed masks are not proof of per-thread pinned cores. Existing closed
+campaign placement/provider verification remains necessary; the offline command
+does not make a fresh hardware query. Missing older metadata remains unqualified.
+`compare` exits 2 and forbids ratios for unqualified or mismatched controls.
+Implementation/source digests are retained as provenance, not required equal
+when implementation is the named A/B axis. Transport changes must also be
+named explicitly; they do not silently relax workload/cache/policy matching.
+
+Clean runs never enable detailed scalar/reopen/cold diagnostic clocks.
+Clean advisory-eviction evidence uses the original counter/residency/physical-I/O
+brackets; the obsolete separately profiled cold-certificate helper and its
+tests are removed. Historical raw evidence and generated reports are preserved.
+A fresh diagnostic twin replaces its scalar phase with profiled calls using the
+same complete random oracle, key order, cardinality and initial prepared state;
+it no longer samples a warmed sequential 256-key prefix. Diagnostic rows remain
+separate from clean latency. Grouped reads expose widths 4 and 32 independently.
+The targeted shard-cache-on cases explicitly fill a 256-key hot set with
+coordinator caching disabled. `cache_hot_before_scan` is hit-only only when its
+actual owner/frontend counter deltas prove it; enlarged uniform reads are not
+assumed resident or cache hits.
+
+Local software-fabric controls can opt in to bounded registered reads with
+`--backend tcp --transport fabric-tcp-native --tcp-read-cache-bytes 0`
+and explicit `--rma-source-bytes`, `--rma-source-regions`,
+`--rma-destination-bytes`, `--rma-destination-slots`, `--rma-max-read-bytes`,
+`--rma-max-handles`, `--rma-require-device-read false`. All-zero defaults
+disable RMA. These limits are charged beside the explicit application caches
+and in-flight allowances. Configure both owners and client before launch;
+existing external configurations reject CLI server-control overrides.
+`resident_reads.jsonl` retains actual grant acquisition, posts, successful CQ
+completions, verified hits, errors/fallback reasons and occupancy snapshots
+at each read boundary, with coordinator-local/per-owner-connection scope.
+It does not claim to sample remote source occupancy.
+
+For an explicit trusted-native resident experiment, `kv_suite.resident_reads`
+accepts the complete limits object, without adding cases to either matrix:
+
+```json
+{
+  "source_bytes": 4194304,
+  "source_regions": 512,
+  "destination_bytes": 20971520,
+  "destination_slots": 640,
+  "max_read_bytes": 32768,
+  "max_handles": 4096,
+  "require_device_read": false
+}
+```
+
+This opt-in applies only to explicitly trusted-native cases. In the usual
+TCP/EFA/EFA-direct/EFA-native matrix, TCP and TLS cases remain RPC controls;
+only EFA-native warm cases receive the distinct RMA-bound identity.
+Prepared owner and client YAML carry the exact limits,
+the case name binds their digest, and cold
+cases deliberately omit them. Hardware qualification must request
+`require_device_read: true` and retain the existing provider/hardware evidence;
+software-provider success is not hardware proof.
+
+After the integrated source-bound build, run these paired loopback controls
+with the **new bundle's** executable, not an older `target/release` binary.
+Both use the same 32-key control before the legacy full-oracle workloads:
+
+```sh
+BUILD_ROOT=/path/to/new/source-bound/build
+"$BUILD_ROOT/binaries/storage-node" --output logs/resident-native --backend native-sync --transport fabric-tcp-native --values 8192 --batch-sizes 32 --windows 1 --batches 320 --mixed 64 --reads 512 --read-window 32 --tcp-read-lanes 4 --native-read-cache-bytes 0 --tcp-read-cache-bytes 0 --tcp-shard-cache-bytes 0 --hot-read-pass true --read-resource-evidence true --bounded-hot-pass true
+"$BUILD_ROOT/binaries/storage-node" --output logs/resident-local --backend tcp --transport fabric-tcp-native --values 8192 --batch-sizes 32 --windows 1 --batches 320 --mixed 64 --reads 512 --read-window 32 --tcp-read-lanes 4 --native-read-cache-bytes 0 --tcp-read-cache-bytes 0 --tcp-shard-cache-bytes 0 --hot-read-pass true --read-resource-evidence true --bounded-hot-pass true --rma-source-bytes 4194304 --rma-source-regions 512 --rma-destination-bytes 20971520 --rma-destination-slots 640 --rma-max-read-bytes 32768 --rma-max-handles 4096 --rma-require-device-read false
+python3 experiments/aws-sharded-wal/checkpoint_kv.py evidence logs/resident-native --mode native-sync
+python3 experiments/aws-sharded-wal/checkpoint_kv.py evidence logs/resident-local --mode tcp
+```
+
+`--bounded-hot-pass` is off by default and automatic when RMA is enabled.
+Native receives no RMA arguments and invents no RMA counters. Inspect
+`bounded_hot.service_qualified` on both sides and
+`resident_reads.registered_controls.qualified` on the remote side. Native
+qualification requires actual zero accounted reads/major faults with observed
+WAL residency and its value cache disabled. Software fabric proves correctness,
+not EFA latency. Replace `--batches 320` with `3200` on **both** sides for the
+larger working set; never combine the two denominators.
+
+Source-bound pipeline identities support an explicit bounded-only comparison:
+`compare NATIVE.identity.json REMOTE.identity.json --population bounded-hot
+--compared implementation transport`. The ordinary matcher remains strict.
+Standalone CLI population evidence does not invent missing campaign provenance.
+
+The destination budget is a coordinator-wide total partitioned across read
+lanes, not multiplied per connection. At 32-KiB maximum reads, 640 slots and
+20 MiB permit a width-32 result group on each of up to 20 lanes. Smaller totals
+remain legitimate pressure controls but can force grouped-read RPC fallback;
+they must not be presented as a supported resident grouped-hit population.
+The 4,096-handle total also leaves room for session-scoped references across
+read lanes; a fitting value set alone does not prove that the handle cache fits.
+The control uses exactly the first 32 loaded keys, independent of the
+320/3200-batch oracle, immediately after load and before other read populations.
+The deterministic scalar sequence is `mix64(sample) % 32`, with
+`min(512, max(32, reads))` calls; each grouped call uses all 32 distinct keys,
+with `ceil(scalar_calls / 32)` calls. Native, RPC and RMA run the same
+`2 * read_lanes + 1` complete scalar-then-group warm passes. RMA additionally
+requires `read_lanes` consecutive fully registered-hit passes after every lane
+of each active hot-set owner has verified hits; it does not stop preparation
+early. `bounded_hot_setup` is the common CSV setup phase.
+`bounded_hot_controls.jsonl` retains the shared policy and verified populations;
+`registered_hot_setup` remains the RMA-specific preparation record inside
+`registered_controls.jsonl`. Acquisition and setup time are not hit latency.
+
+`registered_controls.jsonl` retains raw before/after lane snapshots, every
+preparation pass, the key/order/cardinality policy and both measured populations.
+For a registered experiment, only fully verified, prepared populations with
+zero Read/ReadProfiled messages, new grant acquisitions, fallbacks or errors
+may retain `cache_hot_get` / `cache_hot_get_many` rather than `*_mixed` labels.
+Accepted FI_READ posts and successful completions must equal **every** intended returned element;
+eligible reads and verified hits count complete owner groups, not elements.
+A 32-member group can therefore have one group hit and 32 posts/completions.
+Group hits must equal grouped calls times the actual hot-set owner count;
+scalar hits must equal scalar calls. Positive partial populations cannot pass.
+The consumer recomputes lane coverage and deltas, checks per-owner aggregates,
+and binds the CSV sample/operation counts. Mixed or invalid populations use
+`*_mixed` timing labels and cannot qualify the registered probe, even if some
+RMA hits occurred. Successful RPC fallback with all-zero RMA counters is not
+qualification. Inspect `resident_reads.registered_controls.qualified` in the
+`evidence` output; ordinary process success is insufficient.
+
+The original full-oracle `point_get` / `point_get_hot` and grouped populations
+retain their original counts/order. They are **not** relabeled registered-hit-only
+because the small control qualified. No server-handler clocks apply to a
+registered hit, and neither software-provider results nor these API timings
+establish hardware-only or physical-NVMe latency. Active RMA identities require
+the observed preparation policy and qualified raw controls. Older binaries
+without that policy remain unqualified unless their observed, source-bound
+all-zero resident configuration proves this preparation did not run; that
+inactive state is matched without inventing unused historical hot-set metadata.
+
+Use fresh output roots for each native/TCP/software-fabric/cache-off/cache-on
+control. Keep the same value shape, cardinality, read count/order and
+preparation controls for intentional comparisons; label the transport/RMA axis.
+The example requires Linux `test-utils` and `experimental-fabric`; use the same
+libfabric ABI as the build. Detailed clocks remain off unless explicitly enabled.
+
+`read_path_evidence.csv` additionally records nullable authority-cache counters:
+resident hits/misses, contention, history loads, entries/capacity and charged
+table bytes. Each owner retains its before/after observations; absent older
+fields or unavailable samples remain null. Authority-history loads can be
+served by page cache and never establish physical NVMe I/O.
+
+The same rebuilt real-Sui fixture/replay pipeline remains the qualification
+gate: use its existing `--local-transport fabric-tcp-native` mode and complete
+namespace/value audit before any cloud allocation. No AWS operation is needed
+to inspect these commands or qualify source binding. Loopback correctness is
+not EFA hardware latency.
+
+Sui summaries additionally retain `shard_read_by_owner`, parsed from
+`tidehunter_shard_read{namespace,partition,stat}`. Missing families on older
+binaries or failed `shard_sample_available` observations are unavailable,
+never zero. A foreground-only snapshot is cumulative, not an invented delta;
+the strict before/after consumer preserves each owner and rejects resets or
+population drift. Application-cache hits, resident/page-cache service, async
+submissions and positive process physical-I/O brackets remain distinct.
+Advisory eviction and async submission alone never prove physical NVMe reads,
+and process-I/O brackets never establish one device read per key.
+
+Parent integration checks (not run by the implementation worker):
+
+```sh
+(cd experiments/aws-sharded-wal && python3 -m unittest test_matched_reads test_cloud_profile_populations test_checkpoint_matrix test_local_safety)
+(cd experiments/sui-checkpoint && python3 -m unittest test_shard_read_evidence test_analysis)
+```
+
+Run the existing Rust example builds/checks and bounded native/TCP/software-
+fabric controls after integration. Require actual nonempty owner populations,
+separate registered acquisition/hit/fallback populations, successful value and
+reopen audits, and counter-qualified cache/physical-I/O classifications.
+The existing deadline, export reserve, process ownership and unconditional
+cleanup/termination semantics are unchanged.
+
+
 ## 16 October targeted metadata and residency experiment
 
 The integrated build now includes six source-bound executables: native and

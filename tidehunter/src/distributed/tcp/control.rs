@@ -33,6 +33,7 @@ pub(super) struct ControlContext {
     pub(super) wal_member_read: super::super::storage::WalMemberReadPolicy,
     pub(super) read_config: read_executor::ReadExecutorConfig,
     pub(super) read_admission: Arc<read_executor::ReadAdmission>,
+    pub(super) resident_grants: Arc<resident::GrantRegistry>,
     #[cfg(test)]
     pub(super) panic_after_append: Arc<AtomicBool>,
 }
@@ -523,8 +524,19 @@ impl ControlContext {
         }
     }
     pub(super) fn poison_readers(&self) {
-        self.terminal.store(true, Ordering::Release);
-        self.readers.write().invalidate();
+        self.resident_grants.request_poison();
+        self.finish_poison_if_quiescent();
+    }
+    pub(super) fn finish_poison_if_quiescent(&self) {
+        if self.resident_grants.poison_quiescent() && !self.terminal.swap(true, Ordering::AcqRel) {
+            // The terminal authority boundary is after every session's exact
+            // drain acknowledgment. Readers remain valid while notifications
+            // are in flight; no successful cached result can cross this point.
+            // A lost or unknown session stays represented as a live/quarantined
+            // owner: poison cannot publish terminal authority until remote DMA
+            // is proven impossible (operationally, restart the affected process).
+            self.readers.write().invalidate();
+        }
     }
     fn append_profiled(
         &self,
@@ -533,7 +545,7 @@ impl ControlContext {
         mut profile: Option<&mut ConnectionProfile>,
         drain: Option<&mut dyn FnMut() -> Result<(), TcpError>>,
     ) -> Result<(Arc<super::super::storage::PartitionLog>, Vec<AppendedBatch>), TcpError> {
-        if self.terminal.load(Ordering::Acquire) {
+        if self.terminal.load(Ordering::Acquire) || self.resident_grants.poison_requested() {
             return Err(TcpError::new(
                 "log control authority is poisoned; reopen required",
             ));
@@ -644,7 +656,7 @@ impl ControlContext {
     ) -> Result<Response, TcpError> {
         // Admission can precede an earlier command's panic or uncertain I/O.
         // Queued work must recheck terminal health before decoding or mutation.
-        if self.terminal.load(Ordering::Acquire) {
+        if self.terminal.load(Ordering::Acquire) || self.resident_grants.poison_requested() {
             return Err(TcpError::new(
                 "log control authority is poisoned; reopen required",
             ));
@@ -675,12 +687,30 @@ impl ControlContext {
                 prefix,
                 files,
             } => {
-                self.inventory
-                    .lock()
-                    .retire_files(authority_epoch, epoch, prefix, &files)?;
-                Ok(Response::Retired)
+                if !self.resident_grants.close_admission() {
+                    return Err(TcpError::new(
+                        "resident grants are live or being issued; release them before retirement",
+                    ));
+                }
+                let result =
+                    self.inventory
+                        .lock()
+                        .retire_files(authority_epoch, epoch, prefix, &files);
+                if result.is_ok() {
+                    self.resident_grants.reopen_admission();
+                }
+                result.map(|()| Response::Retired)
             }
-            Request::ReadIoStats => Ok(Response::ReadIoStats(self.read_admission.stats())),
+            Request::ReadIoStats => {
+                let log = {
+                    let inventory = self.inventory.lock();
+                    let active = inventory.status()?.active_epoch;
+                    active.map(|epoch| inventory.active(epoch)).transpose()?
+                };
+                let mut stats = self.read_admission.stats();
+                stats.authority = log.map(|log| log.authority_cache_stats());
+                Ok(Response::ReadIoStats(stats))
+            }
             Request::Status { protocol } => {
                 if protocol != PROTOCOL {
                     return Err(TcpError::new("unsupported wire protocol"));
@@ -694,12 +724,18 @@ impl ControlContext {
                 Ok(Response::Status(status))
             }
             Request::Fence { epoch } => {
+                if !self.resident_grants.close_admission() {
+                    return Err(TcpError::new(
+                        "resident grants are live or being issued; release them before fencing",
+                    ));
+                }
                 let mut status = self.inventory.lock().fence_to(epoch)?;
                 status.max_frame_bytes = limits.max_frame_bytes;
                 status.max_reads = self.effective_max_reads(limits);
                 status.max_read_bytes = self.read_config.max_bytes;
                 status.recovery_page_batches = limits.recovery_page_batches;
                 status.polling = limits.polling;
+                self.resident_grants.reopen_admission();
                 Ok(Response::Status(status))
             }
             Request::Append { epoch, batches } => {
@@ -725,6 +761,9 @@ impl ControlContext {
             Request::Read { .. } | Request::ReadProfiled { .. } => {
                 Err(TcpError::new("read sent to the log control owner"))
             }
+            Request::RevokeGrants { .. } => Err(TcpError::new(
+                "resident grant revocation requires the session owner",
+            )),
             Request::Recover {
                 epoch,
                 cursor,
@@ -734,6 +773,11 @@ impl ControlContext {
                 .lock()
                 .recovery_page(epoch, cursor, limit, limits),
             Request::Seal { epoch } => {
+                if !self.resident_grants.close_admission() {
+                    return Err(TcpError::new(
+                        "resident grants are live or being issued; release them before sealing",
+                    ));
+                }
                 self.inventory.lock().seal(epoch)?;
                 Ok(Response::Sealed)
             }

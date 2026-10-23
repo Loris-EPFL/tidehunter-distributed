@@ -716,54 +716,65 @@ fn registered_value_reads_do_not_acquire_the_partition_metadata_mutex() {
 #[test]
 fn reference_metadata_budget_rejects_before_any_authority_bytes() {
     let temp = tempdir::TempDir::new("native-reference-budget").unwrap();
-    let original = config(vec![3], 3);
-    let probe = PartitionLog::create(
-        &temp.path().join("probe"),
-        original.clone(),
-        &shape(),
-        metrics(),
-    )
-    .unwrap();
-    let first = probe
-        .append_complete_batch(authority(&original), &batch(&original, 0))
-        .unwrap();
-    let one_batch_budget = probe.stats().reference_metadata_bytes;
-    probe.persist_through(first).unwrap();
-    drop(probe);
-    let mut config = original;
-    config.max_reference_metadata_bytes = one_batch_budget;
-    let log = PartitionLog::create(
-        &temp.path().join("bounded"),
-        config.clone(),
-        &shape(),
-        metrics(),
-    )
-    .unwrap();
+    let mut config = config(vec![3], 3);
+    config.max_reference_metadata_bytes = 64 * 1024;
+    config.max_batches = 4096;
+    let log = Arc::new(
+        PartitionLog::create(
+            &temp.path().join("bounded"),
+            config.clone(),
+            &shape(),
+            metrics(),
+        )
+        .unwrap(),
+    );
     let first = log
         .append_complete_batch(authority(&config), &batch(&config, 0))
         .unwrap();
     log.persist_through(first).unwrap();
-    assert_eq!(log.stats().registered_records, 2);
-    let later = batch(&config, 1);
-    let oversized = CompleteGroup::new(
-        &shape(),
-        vec![later.clone(), batch(&config, 2)],
-        config.batch_limits,
-        config.group_limits,
-    )
-    .unwrap();
-    assert!(matches!(
-        log.append_group(authority(&config), &oversized),
-        Err(StorageError::Capacity)
-    ));
-    assert_eq!(log.lookup(later.id()).unwrap(), None);
-    assert_eq!(log.stats().appended_groups, 1);
-    assert_eq!(log.stats().reference_metadata_bytes, one_batch_budget);
-    assert_eq!(
-        log.append_complete_batch(authority(&config), &batch(&config, 0))
-            .unwrap(),
-        first
-    );
+    // The cache table adapts to the budget. Exercise actual exhaustion rather
+    // than assuming that a large-budget probe has the same fixed table charge.
+    // Owned read plans retain real descriptor credits across cache eviction.
+    // 512 batches remain below the configured batch-count limit.
+    let mut retained = Vec::new();
+    for number in 1..=256 {
+        let later = batch(&config, number * 2 - 1);
+        let last = batch(&config, number * 2);
+        let group = CompleteGroup::new(
+            &shape(),
+            vec![later.clone(), last.clone()],
+            config.batch_limits,
+            config.group_limits,
+        )
+        .unwrap();
+        let before = log.stats();
+        assert!(before.reference_metadata_bytes <= config.max_reference_metadata_bytes);
+        match log.append_group(authority(&config), &group) {
+            Ok(receipts) => {
+                log.persist_through(receipts[0]).unwrap();
+                for receipt in receipts {
+                    let reference = log.record_reference(receipt, 0).unwrap();
+                    retained.push(log.plan_record_read(&reference).unwrap());
+                }
+            }
+            Err(StorageError::Capacity) => {
+                assert_eq!(log.lookup(later.id()).unwrap(), None);
+                assert_eq!(log.lookup(last.id()).unwrap(), None);
+                assert_eq!(log.stats().appended_groups, before.appended_groups);
+                assert!(
+                    log.stats().reference_metadata_bytes <= config.max_reference_metadata_bytes
+                );
+                assert_eq!(
+                    log.append_complete_batch(authority(&config), &batch(&config, 0))
+                        .unwrap(),
+                    first
+                );
+                return;
+            }
+            Err(error) => panic!("unexpected append error: {error:?}"),
+        }
+    }
+    panic!("bounded authority metadata did not reject a group");
 }
 fn authority(config: &PartitionConfig) -> RequestAuthority {
     RequestAuthority {

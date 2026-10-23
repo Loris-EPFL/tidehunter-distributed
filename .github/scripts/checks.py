@@ -21,6 +21,8 @@ SOFTWARE_STREAM_TESTS = (
     "software_provider_nonblocking_backpressure_resumes_without_replaying_unposted_bytes",
     "software_provider_nonblocking_close_keeps_pending_dma_slots_owned",
     "software_provider_explicit_sweeps_transfer_without_repolling",
+    "software_provider_rma_reads_with_mixed_cq_and_retained_buffer_ownership",
+    "software_provider_rma_group_preserves_order_with_retained_consumers",
 )
 SOFTWARE_ENGINE_TESTS = (
     "fabric_mtls_authentication_lost_response_and_recovery",
@@ -35,6 +37,25 @@ SOFTWARE_ENGINE_TESTS = (
     "fabric_tcp_native_rejects_corrupt_member_reply_without_tls",
     "fabric_tcp_native_large_partial_frames_bypass_tls",
     "fabric_tcp_native_disconnect_retains_owned_reply_credits_until_retirement",
+    "software_provider_read_io_monitor_reports_wal_and_real_rma_lane_activity",
+    "software_provider_concurrent_cold_acquisition_with_one_handle_returns_both_values",
+    "software_provider_durable_grant_reads_real_member_without_read_rpc",
+    "software_provider_two_clients_submit_rma_before_either_completion_wait",
+    "software_provider_idle_holder_cannot_acknowledge_fence_before_release",
+    "software_provider_source_and_destination_limits_preserve_rpc_values",
+    "software_provider_group_above_destination_slots_falls_back_without_reordering",
+    "software_provider_corrupt_envelope_and_member_are_rejected",
+    "software_provider_wrong_epoch_and_reference_never_return_stale_value",
+    "software_provider_dropped_holder_quarantines_grant_and_blocks_fence",
+    "software_provider_shutdown_releases_grants_before_clean_reopen",
+    "software_provider_shutdown_drains_completed_read_while_result_handle_is_held",
+    "software_provider_rma_off_history_retirement_drains_accepted_read",
+    "software_provider_spontaneous_poison_waits_for_client_release_notification",
+    "software_provider_release_immediately_after_rpc_reply_is_accepted",
+    "software_provider_quarantine_keeps_original_wal_owner_after_node_drop",
+    "software_provider_exact_drain_releases_original_wal_owner",
+    "forced_server_grant_request_with_real_authority_uses_message_only_fallback",
+    "expired_posted_rma_read_fail_stops_with_grant_memory_quarantined",
 )
 
 
@@ -133,6 +154,8 @@ def check(profile, env):
         selected_ignored(fabric, stream, "software_provider_", SOFTWARE_STREAM_TESTS)
         direct = "software_provider_runs_direct_packet_adapter_on_large_partial_streams"
         selected_ignored(fabric, ("-p", "tidehunter-fabric", "--features", "native", "--lib"), direct, (direct,))
+        strict_read = "strict_device_read_rejects_software_provider"
+        selected_ignored(fabric, ("-p", "tidehunter-fabric", "--features", "native", "--lib"), strict_read, (strict_read,))
         engine = ("-p", "tidehunter", "--features", "experimental-fabric,test-utils", "--lib")
         for name in SOFTWARE_ENGINE_TESTS:
             selected_ignored(fabric, engine, name, (name,))

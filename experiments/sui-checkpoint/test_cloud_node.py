@@ -115,6 +115,24 @@ class CloudNodeContract(unittest.TestCase):
             with self.subTest(fallback=fallback), self.assertRaisesRegex(ValueError, 'transport differs'):
                 self.validate()
 
+    def test_registered_native_cell_has_distinct_owned_identity(self):
+        old_root = self.root
+        self.root = old_root.parent.parent / 'r04-efa-native-rma/storage'
+        self.root.parent.mkdir()
+        old_root.rename(self.root)
+        self.config_path = self.root / 'node-config.json'
+        self.binary = self.root / 'storage-node'
+        self.cfg = json.loads(json.dumps(self.cfg).replace(str(old_root), str(self.root))
+                              .replace('"r04-tcp"', '"r04-efa-native-rma"').replace('"tcp"', '"efa-native"'))
+        launch = Path(self.cfg['commands'][0][2])
+        value = json.loads(launch.read_text().replace(str(old_root), str(self.root)))
+        value['tls'] = dict(transport='efa-native', ca='', cert='', key='')
+        launch.write_text(json.dumps(value))
+        self.assertEqual(self.validate()['cell_id'], 'r04-efa-native-rma')
+        self.cfg.update(cell_id='r04-tcp-rma', transport='tcp')
+        with self.assertRaisesRegex(ValueError, 'matrix cell/transport'):
+            self.validate()
+
     def test_native_without_credential_files_runs_and_reaps_owned_namespace(self):
         old_root = self.root
         self.root = old_root.parent.parent / 'r04-efa-native/storage'

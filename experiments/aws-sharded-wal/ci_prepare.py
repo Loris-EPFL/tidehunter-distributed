@@ -2,6 +2,7 @@
 """Prepare current committed sources and local proof before any paid allocation."""
 import argparse
 from datetime import datetime, timezone
+from functools import cache
 import hashlib
 import importlib.util
 import json
@@ -109,6 +110,41 @@ def unpack_fixture(archive, output, expected=FIXTURE_SHA256):
     return fixture
 
 
+@cache
+def checkpoint_analyzer():
+    scripts = ROOT / 'experiments/sui-checkpoint'
+    spec = importlib.util.spec_from_file_location('ci_checkpoint_completion_analysis', scripts / 'analyze.py')
+    module = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(scripts))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        del sys.path[0]
+    return module
+
+
+def checkpoint_completion_observations(evidence):
+    """Read the hash-bound foreground scrapes, not logs, spacing or legacy timers."""
+    analyzer = checkpoint_analyzer()
+    observations = {}
+    with tarfile.open(evidence, 'r:gz') as archive:
+        members = archive.getmembers()
+        for mode in ('native', 'remote'):
+            name = f'experiment/{mode}-foreground.prom'
+            matching = [member for member in members if member.name == name]
+            if (len(matching) != 1 or not matching[0].isfile()
+                    or not 0 < matching[0].size <= 32 << 20):
+                raise ValueError('checkpoint completion histogram requires one bounded foreground scrape: ' + mode)
+            with archive.extractfile(matching[0]) as stream:
+                metrics = stream.read()
+            observed = analyzer.checkpoint_completion_observation(
+                analyzer.parse_metrics(metrics.decode()), required=True)
+            observations[mode] = observed | dict(source=name, metrics_sha256=hashlib.sha256(metrics).hexdigest())
+    return dict(schema=1, metric='checkpoint_completion_latency', modes=observations,
+        evidence_sha256=sha(evidence),
+        origin='ci_prepare analysis of source-bound local replay foreground metric archive; not a producer receipt field')
+
+
 def verification_bundle(source, destination):
     source, destination = Path(source), Path(destination)
     receipt = json.loads((source / 'receipt.json').read_text())
@@ -124,10 +160,11 @@ def verification_bundle(source, destination):
     schema = source / 'experiment/native-schema'
     if not schema.is_dir() or not any(p.is_file() for p in schema.rglob('*')):
         raise ValueError('local replay did not retain native namespace schemas')
+    completion = checkpoint_completion_observations(source / 'evidence.tar.gz')
     destination.mkdir(mode=0o700, parents=True, exist_ok=False)
     (destination / 'experiment').mkdir()
-    for name in ('receipt.json', 'evidence.tar.gz'):
-        shutil.copy2(source / name, destination / name)
+    shutil.copy2(source / 'evidence.tar.gz', destination / 'evidence.tar.gz')
+    save(destination / 'receipt.json', receipt | dict(checkpoint_completion_observations=completion))
     for name in ('results.json', 'audit.json'):
         shutil.copy2(source / 'experiment' / name, destination / 'experiment' / name)
     shutil.copytree(schema, destination / 'experiment/native-schema')
@@ -176,6 +213,8 @@ def prepare(args):
         'source_archive_sha256': manifest['source_archive_sha256'],
         'source_manifest_sha256': manifest['source_manifest_sha256'],
         'binaries': manifest['binaries'],
+        'checkpoint_completion_observations': json.loads((verification / 'receipt.json').read_text())[
+            'checkpoint_completion_observations'],
         'topology': 'same-build five-process local trusted software-fabric correctness proof; not hardware performance evidence',
     })
     print(output / 'READY.json')

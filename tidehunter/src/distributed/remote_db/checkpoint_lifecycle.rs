@@ -473,21 +473,19 @@ impl RemoteDatabase {
             (IndexReadCut::At(_), IndexReadCut::BeforeAll) => true,
             _ => false,
         };
-        if advances {
-            self.start_checkpoint_with_floor(Some(floor))
-                .inspect_err(|_| {
-                    self.healthy = false;
-                    self.concurrent_failure
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    self.reads.poison();
-                })?;
-            self.progress_checkpoint(true)?;
-        } else {
-            // A newly observed Stop may be an old retained anchor. Expired cuts
-            // cannot be resurrected, and the durable floor must never regress.
-            self.commit_checkpoint()?;
-        }
-        let result = self.retire_unreachable_sealed_files();
+        let _resident_pause = self.reads.pause_and_release_resident_grants()?;
+        let result = (|| {
+            if advances {
+                self.start_checkpoint_with_floor(Some(floor))?;
+                self.progress_checkpoint(true)?;
+                // A newly observed Stop may be an old retained anchor. Expired cuts
+                // cannot be resurrected, and the durable floor must never regress.
+                self.commit_checkpoint()?;
+            } else {
+                self.commit_checkpoint()?;
+            }
+            self.retire_unreachable_sealed_files()
+        })();
         if result.is_err() {
             self.healthy = false;
             self.concurrent_failure

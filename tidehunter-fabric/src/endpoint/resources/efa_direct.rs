@@ -14,6 +14,7 @@ pub(super) fn validate(
     protocol: u32,
     protocol_version: u32,
     max_message: usize,
+    rma: bool,
     tx_size: usize,
     rx_size: usize,
     mode: u64,
@@ -21,15 +22,18 @@ pub(super) fn validate(
     mr_mode: i32,
     mtu: usize,
 ) -> io::Result<bool> {
+    let allowed_mode =
+        ffi::FI_CONTEXT2 | ffi::FI_CONTEXT | if rma { ffi::FI_RX_CQ_DATA } else { 0 };
     if provider_version != PROVIDER_VERSION
         || protocol != ffi::FI_PROTO_EFA
         || protocol_version != 1
         || !(MIN_MTU..=CHUNK).contains(&mtu)
-        || max_message != mtu
+        || max_message < mtu
+        || (!rma && max_message != mtu)
         || tx_size < SLOTS
         || rx_size < SLOTS
         || mode & ffi::FI_CONTEXT2 == 0
-        || mode & !(ffi::FI_CONTEXT2 | ffi::FI_CONTEXT) != 0
+        || mode & !allowed_mode != 0
         || data_progress != ffi::fi_progress_FI_PROGRESS_AUTO
         || mr_mode & i32::try_from(ffi::FI_MR_LOCAL).unwrap() == 0
     {
@@ -54,6 +58,7 @@ mod tests {
                 ffi::FI_PROTO_EFA,
                 protocol_version,
                 4096,
+                false,
                 SLOTS,
                 SLOTS,
                 mode,
@@ -63,6 +68,22 @@ mod tests {
             )
         };
         assert!(check(1, context, automatic).is_ok());
+        assert!(
+            validate(
+                PROVIDER_VERSION,
+                ffi::FI_PROTO_EFA,
+                1,
+                65_536,
+                true,
+                SLOTS,
+                SLOTS,
+                context | ffi::FI_RX_CQ_DATA,
+                automatic,
+                i32::try_from(ffi::FI_MR_LOCAL).unwrap(),
+                4096,
+            )
+            .is_ok()
+        );
         assert!(check(4, context, automatic).is_err());
         assert!(check(1, 0, automatic).is_err());
         assert!(check(1, context | ffi::FI_MSG_PREFIX, automatic).is_err());

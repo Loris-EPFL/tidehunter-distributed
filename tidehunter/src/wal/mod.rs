@@ -20,6 +20,7 @@ use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::ops::Range;
+#[cfg(feature = "experimental-distributed")]
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -393,18 +394,8 @@ impl Wal {
                 ))
             }
             Some(FrameSource::File(file)) => {
-                let buffer_size = if self.layout.direct_io {
-                    self.layout.align(pos.frame_len() as u64) as usize
-                } else {
-                    pos.frame_len()
-                };
-                let mut buf = FileReader::io_buffer_bytes(buffer_size, self.layout.direct_io);
-                file.read_exact_at(&mut buf, self.layout.offset_in_wal_file(pos.offset))?;
-                let mut bytes = Bytes::from(bytes::Bytes::from(buf));
-                if self.layout.direct_io && bytes.len() > pos.frame_len() {
-                    // Direct IO buffer can be larger then needed
-                    bytes = bytes.slice(..pos.frame_len());
-                }
+                let bytes = FileReader::new(file, self.layout.direct_io)
+                    .read_exact_at(self.layout.offset_in_wal_file(pos.offset), pos.frame_len())?;
                 Ok((
                     ReadType::Syscall,
                     Some(CrcFrame::read_from_bytes(&bytes, 0)?),

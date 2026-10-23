@@ -20,6 +20,25 @@ fixture is at `project:checkpoint-fixtures/sui-genesis-1775/fixture/`.
 Software libfabric uses its owned cache rather than an archived `target/`.
 Earlier dated sections retain their historical paths and measurements.
 
+**One-sided resident read implementation, 23 October 2026:**
+[Exact implementation, source mappings, safety rules and local evidence](ONE_SIDED_WAL_IMPLEMENTATION_2026-10-23.md).
+Eligible registered-memory hits now use actual `FI_READ`; first reads and
+capacity misses retain ordinary RPC. The registered pool is bounded and immutable,
+not an adaptive replacement for all owner-cache or physical WAL reads.
+Local native/RPC/RMA controls and certified Sui equality audits passed.
+EFA hardware, independent-NVMe scaling and native-speed parity remain unproven;
+the software-provider batch32 result did not improve every measured metric.
+
+**Remote-read decision and plan, 23 October 2026:**
+[Exact RAM/WAL read paths, EFA/ConnectX/UDP comparison and selective NVMe-oF gates](REMOTE_READ_PATH_PLAN_2026-10-23.md).
+The archive audit found that the historical 8 KiB/batch32 comparison used a
+ten-times-smaller dataset; it does not isolate a source regression. The new plan
+maps all five owners, separates page-cache service from device I/O, and retains
+the current architecture while qualifying thinner messages and bounded one-sided
+reads. File-backed read-only NVMe-oF is a conditional cold-path experiment, not
+an implemented feature or a replacement for every coordinator-cache miss.
+No runtime code or AWS resource changes accompany this plan.
+
 **Native-style distributed fast path, 22 October 2026:**
 [`perf/native-wal-fastpath`: exact mechanisms, source references and local evidence](../../tidehunter-fabric/DESIGN.md#native-style-distributed-wal-path-22-october).
 The distributed member format now uses a versioned CRC32/IEEE over identity,

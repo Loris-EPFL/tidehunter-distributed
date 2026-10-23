@@ -148,6 +148,7 @@ jobs:
         run: |
           python3 engine/.github/scripts/checks.py native
           python3 engine/.github/scripts/checks.py distributed
+          python3 engine/.github/scripts/checks.py software-fabric
           python3 engine/.github/scripts/checks.py harness
       - name: Rebuild six binaries and audit the same build locally
         if: steps.settings.outputs.enabled == 'true'

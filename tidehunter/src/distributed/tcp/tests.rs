@@ -8,6 +8,8 @@ use std::process::Command;
 
 #[path = "reactor_tests.rs"]
 pub(in crate::distributed::tcp) mod multiplexed;
+#[path = "resident_tests.rs"]
+pub(in crate::distributed::tcp) mod resident_reads;
 fn shape() -> KeyShape {
     KeyShape::new_single(4, 1, KeyType::uniform(1))
 }
@@ -48,6 +50,7 @@ pub(super) fn config(root: &Path) -> NodeConfig {
         read_max_inflight_requests: default_read_requests(),
         read_max_inflight_bytes: default_read_bytes(),
         read_max_device_reads: default_device_reads(),
+        resident_reads: ResidentReadConfig::default(),
     }
 }
 pub(super) fn batch(config: &NodeConfig, epoch: u64, sequence: u64) -> CompleteBatch {
@@ -323,7 +326,9 @@ fn node_restart_seals_replays_and_never_reactivates_old_epoch() {
             Request::Read {
                 class: ReadClass::Point,
                 epoch: 7,
-                references: vec![reference]
+                references: vec![reference],
+                grant_limit: 0,
+                grant_max_bytes: 0,
             },
             TcpLimits::default()
         )
@@ -335,6 +340,8 @@ fn node_restart_seals_replays_and_never_reactivates_old_epoch() {
                 class: ReadClass::Point,
                 epoch: 9,
                 references: vec![reference],
+                grant_limit: 0,
+                grant_max_bytes: 0,
             },
             TcpLimits::default(),
         )
@@ -394,6 +401,8 @@ fn profiled_reads_preserve_authority_membership_and_frame_bounds() {
         epoch,
         references,
         class: ReadClass::Point,
+        grant_limit: 0,
+        grant_max_bytes: 0,
     };
     let limits = TcpLimits::default();
     let response = node.handle(request(1, vec![reference]), limits).unwrap();
@@ -445,7 +454,9 @@ fn profiled_reads_preserve_authority_membership_and_frame_bounds() {
             Request::Read {
                 class: ReadClass::Point,
                 epoch: 1,
-                references: vec![reference]
+                references: vec![reference],
+                grant_limit: 0,
+                grant_max_bytes: 0,
             },
             small
         )
@@ -643,6 +654,7 @@ pub(super) fn certificates(root: &Path) -> TlsFiles {
         cert: root.join("leaf.der"),
         key: root.join("key.der"),
         server_name: "localhost".into(),
+        resident_reads: ResidentReadConfig::default(),
     }
 }
 
@@ -929,6 +941,8 @@ fn read_admission_class_is_required_and_roundtrips() {
                 epoch: 7,
                 references: Vec::new(),
                 class,
+                grant_limit: 0,
+                grant_max_bytes: 0,
             },
         };
         let bytes = wire_codec(HARD_FRAME_LIMIT).serialize(&request).unwrap();

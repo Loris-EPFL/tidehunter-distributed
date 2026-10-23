@@ -187,6 +187,51 @@ class DeploymentContract(unittest.TestCase):
                         coordinator_cache=0, shard_cache=0, write_profile_limit=limit)
                 self.assertFalse(root.exists())
 
+    def test_registered_reads_cannot_bypass_encrypted_transport_policy(self):
+        resident = dict(source_bytes=8192, source_regions=4, destination_bytes=8192,
+                        destination_slots=2, max_read_bytes=4096, max_handles=4,
+                        require_device_read=False)
+        for transport in ('tcp', 'fabric-tcp', 'efa', 'efa-direct'):
+            with self.subTest(transport=transport), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / 'deployment'
+                hardware = transport in deployment.HARDWARE_TRANSPORTS
+                with self.assertRaises(ValueError):
+                    deployment.prepare(root, {'db': {}}, Path(tmp) / 'remote',
+                        shape_yamls={'db': 'key_spaces: []\n'},
+                        hosts=['10.0.0.' + str(i) for i in range(1, 6)] if hardware else ['127.0.0.1'] * 5,
+                        port=24000, transport=transport, coordinator_cache=0, shard_cache=0,
+                        guest_root=Path('/owned') if hardware else None, resident_reads=resident)
+                self.assertFalse(root.exists())
+
+    def test_registered_destination_budgets_include_every_namespace(self):
+        for destination_bytes, destination_slots in ((128 * deployment.MIB, 64),
+                                                     (64 * deployment.MIB, 4096)):
+            with self.subTest(bytes=destination_bytes, slots=destination_slots), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / 'deployment'
+                schema = {f'db-{i}': {} for i in range(3)}
+                resident = dict(source_bytes=8192, source_regions=4,
+                    destination_bytes=destination_bytes, destination_slots=destination_slots,
+                    max_read_bytes=4096, max_handles=4, require_device_read=False)
+                with self.assertRaises(ValueError):
+                    deployment.prepare(root, schema, Path(tmp) / 'remote',
+                        shape_yamls={name: 'key_spaces: []\n' for name in schema},
+                        hosts=['127.0.0.1'] * 5, port=24000, transport='fabric-tcp-native',
+                        coordinator_cache=0, shard_cache=0, resident_reads=resident)
+                self.assertFalse(root.exists())
+
+    def test_registered_read_limit_must_fit_each_destination_not_just_total_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'deployment'
+            resident = dict(source_bytes=8192, source_regions=4, destination_bytes=8192,
+                            destination_slots=2, max_read_bytes=4097, max_handles=4,
+                            require_device_read=False)
+            with self.assertRaises(ValueError):
+                deployment.prepare(root, {'db': {}}, Path(tmp) / 'remote',
+                    shape_yamls={'db': 'key_spaces: []\n'}, hosts=['127.0.0.1'] * 5,
+                    port=24000, transport='fabric-tcp-native', coordinator_cache=0,
+                    shard_cache=0, resident_reads=resident)
+            self.assertFalse(root.exists())
+
     def test_cache_only_reads_do_not_require_invented_rpc_samples(self):
         databases = {'db': dict(tls={'transport': 'tcp'}, endpoints=[{}])}
         stats = dict(read_rpcs=0, read_profile_selected=0, read_profile_completed=0,
@@ -251,6 +296,8 @@ class CheckpointSourceBoundaries(unittest.TestCase):
                 (scripts / 'audit').mkdir()
                 for path in Path(run.__file__).resolve().parent.glob('*.py'):
                     shutil.copy2(path, scripts / path.name)
+                shutil.copy2(Path(deployment.__file__).resolve().parent.parent / 'resident_config.py',
+                             base / 'experiments/resident_config.py')
             else:
                 (base / 'Cargo.toml').write_text('[workspace]\n')
             identities[owner] = dict(revision='frozen', files={

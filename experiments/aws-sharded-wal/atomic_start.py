@@ -23,6 +23,7 @@ BINDINGS = ('build_bundle', 'fixture_bundle', 'verification_bundle',
             'binaries', 'transports', 'repetitions', 'read_profile_limits', 'write_profile_limits',
             'native_write_profile_limits', 'kv_suite',
             'checkpoint_digest', 'checkpoint_limit')
+CACHE_BINDINGS = ('coordinator_cache_mib_by_repetition', 'shard_cache_mib_by_repetition')
 ROLES = {'controller', *(f'storage-{i}' for i in range(5))}
 
 
@@ -62,6 +63,10 @@ def launch_contract(plan):
              'protected_instances', 'bundle_sha256', 'bundle_bytes', 'atomic_bindings')
     result = {name: plan[name] for name in names}
     result['atomic_client_token'] = plan.get('atomic_client_token', plan['run_id'] + '-atomic')
+    bindings = result['atomic_bindings']
+    expected = set(BINDINGS) | (set(bindings) & set(CACHE_BINDINGS))
+    if (bindings.get('kv_suite') or {}).get('scope') == 'hardware-populations':
+        expected.update(CACHE_BINDINGS)
     if (not re.fullmatch(r'th-[a-f0-9]{16}', result['run_id'])
             or not re.fullmatch(r'[0-9]{12}', result['account'])
             or result['prefix'] != result['run_id'] or result['placement_group'] != result['run_id']
@@ -70,7 +75,7 @@ def launch_contract(plan):
             or not 300 <= result['export_reserve_seconds'] <= 900
             or not re.fullmatch(r'[a-f0-9]{64}', result['bundle_sha256'])
             or not 0 < result['bundle_bytes'] <= 512 * 1024 * 1024
-            or set(result['atomic_bindings']) != set(BINDINGS)):
+            or set(result['atomic_bindings']) != expected):
         raise ValueError('invalid immutable atomic startup contract')
     if 'instance_profiles' in plan:
         instance_profile(plan, 'controller')

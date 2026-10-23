@@ -87,6 +87,7 @@ impl Running {
                 cert: PathBuf::new(),
                 key: PathBuf::new(),
                 server_name: "trusted-test-cluster".to_owned(),
+                resident_reads: ResidentReadConfig::default(),
             }
         } else {
             let mut tls = certificates(temp.path());
@@ -406,6 +407,7 @@ fn fabric_tcp_native_mode_mismatch_with_tls_fails_closed() {
         cert: PathBuf::new(),
         key: PathBuf::new(),
         server_name: "trusted-test-cluster".into(),
+        resident_reads: ResidentReadConfig::default(),
     };
     assert!(
         Client::connect(
@@ -604,6 +606,7 @@ fn faulty_peer(fault: Fault, transport: Transport) {
             cert: PathBuf::new(),
             key: PathBuf::new(),
             server_name: "trusted-test-cluster".to_owned(),
+            resident_reads: ResidentReadConfig::default(),
         }
     } else {
         certificates(temp.path())
@@ -623,6 +626,8 @@ fn faulty_peer(fault: Fault, transport: Transport) {
                 epoch: 1,
                 references: vec![reference],
                 class: ReadClass::Point,
+                grant_limit: 0,
+                grant_max_bytes: 0,
             },
             TcpLimits::default(),
         )
@@ -647,7 +652,8 @@ fn faulty_peer(fault: Fault, transport: Transport) {
             #[cfg(feature = "experimental-fabric")]
             {
                 read_transport_mode(&mut io, transport).unwrap();
-                let endpoint = fabric::bootstrap(&mut io, transport).unwrap();
+                let endpoint =
+                    fabric::bootstrap(&mut io, transport, ResidentReadConfig::default()).unwrap();
                 Box::new(NativeFaultPeer {
                     endpoint,
                     _control: io,

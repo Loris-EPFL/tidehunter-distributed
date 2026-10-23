@@ -354,6 +354,7 @@ fn main() -> Result<()> {
         512 * MIB,
         tidehunter::distributed::tcp::PollingPolicy::Adaptive,
         false,
+        tidehunter::distributed::tcp::ResidentReadConfig::default(),
     )?;
     let path = temporary.path().join("authority");
     let config = CoordinatorLaunch {
@@ -459,6 +460,7 @@ fn main() -> Result<()> {
         512 * MIB,
         tidehunter::distributed::tcp::PollingPolicy::Adaptive,
         false,
+        tidehunter::distributed::tcp::ResidentReadConfig::default(),
     )?;
     let mut client = lost.client(0, &shape)?;
     client.fence_to(1)?;

@@ -198,6 +198,7 @@ fn run_case(output: &Path, backend: &str, value_bytes: usize, profile: bool) -> 
             128 * MIB,
             PollingPolicy::Adaptive,
             true,
+            tidehunter::distributed::tcp::ResidentReadConfig::default(),
         )?);
         let mut config = cluster
             .as_ref()

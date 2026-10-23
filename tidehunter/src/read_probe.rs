@@ -9,6 +9,7 @@ use std::{fs, io};
 pub struct ReadEvidence {
     pub pid: u32,
     pub start_ticks: u64,
+    pub process_boot_id: Option<[u8; 16]>,
     pub read_bytes: u64,
     pub minor_faults: u64,
     pub major_faults: u64,
@@ -20,10 +21,15 @@ pub struct ReadEvidence {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct ProcessResources {
     pub pid: u32,
+    pub process_start_ticks: Option<u64>,
     pub rss_bytes: u64,
     pub peak_rss_bytes: u64,
     pub user_cpu_ns: u64,
     pub system_cpu_ns: u64,
+    /// Linux process-accounted bytes; `None` means the observation was unavailable.
+    pub accounted_process_read_bytes: Option<u64>,
+    /// Linux process-accounted bytes, not completed device writes.
+    pub accounted_process_write_bytes: Option<u64>,
 }
 
 impl ProcessResources {
@@ -55,12 +61,68 @@ impl ProcessResources {
         };
         Ok(Self {
             pid: std::process::id(),
+            process_start_ticks: process_start_ticks().ok(),
             rss_bytes: status_bytes(&status, "VmRSS:")?,
             peak_rss_bytes: status_bytes(&status, "VmHWM:")?,
             user_cpu_ns: cpu_ns(usage.ru_utime)?,
             system_cpu_ns: cpu_ns(usage.ru_stime)?,
+            accounted_process_read_bytes: process_io_counter("read_bytes:"),
+            accounted_process_write_bytes: process_io_counter("write_bytes:"),
         })
     }
+}
+fn process_start_ticks() -> io::Result<u64> {
+    let stat = fs::read_to_string("/proc/self/stat")?;
+    let (_, tail) = stat
+        .rsplit_once(") ")
+        .ok_or_else(|| io::Error::other("invalid process stat"))?;
+    tail.split_whitespace()
+        .nth(19)
+        .ok_or_else(|| io::Error::other("missing process start time"))?
+        .parse()
+        .map_err(io::Error::other)
+}
+
+fn process_io_counter(name: &str) -> Option<u64> {
+    let io = fs::read_to_string("/proc/self/io").ok()?;
+    parse_process_io_counter(&io, name)
+}
+
+fn parse_process_io_counter(io: &str, name: &str) -> Option<u64> {
+    io.lines()
+        .find_map(|line| line.strip_prefix(name))?
+        .trim()
+        .parse()
+        .ok()
+}
+fn process_boot_id() -> Option<[u8; 16]> {
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    parse_process_boot_id(&boot_id)
+}
+
+fn parse_process_boot_id(value: &str) -> Option<[u8; 16]> {
+    let mut bytes = [0; 16];
+    let mut nibble = None;
+    let mut index = 0;
+    for byte in value
+        .bytes()
+        .filter(|byte| *byte != b'-' && !byte.is_ascii_whitespace())
+    {
+        let value = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => return None,
+        };
+        if let Some(high) = nibble.take() {
+            let slot = bytes.get_mut(index)?;
+            *slot = high << 4 | value;
+            index += 1;
+        } else {
+            nibble = Some(value);
+        }
+    }
+    (index == bytes.len() && nibble.is_none()).then_some(bytes)
 }
 
 fn status_bytes(status: &str, name: &str) -> io::Result<u64> {
@@ -117,6 +179,7 @@ impl ReadEvidence {
         Ok(Self {
             pid: std::process::id(),
             start_ticks: field(19)?,
+            process_boot_id: process_boot_id(),
             read_bytes: bytes,
             minor_faults: field(7)?,
             major_faults: field(9)?,
@@ -127,8 +190,15 @@ impl ReadEvidence {
     /// # Errors
     /// Rejects a changed process identity or a decreasing cumulative counter.
     pub fn delta(self, earlier: Self) -> io::Result<Self> {
-        if (self.pid, self.start_ticks) != (earlier.pid, earlier.start_ticks) {
-            return Err(io::Error::other("read evidence process changed"));
+        if (self.pid, self.start_ticks) != (earlier.pid, earlier.start_ticks)
+            || matches!(
+                (self.process_boot_id, earlier.process_boot_id),
+                (Some(current), Some(previous)) if current != previous
+            )
+        {
+            return Err(io::Error::other(
+                "read evidence process or boot identity changed",
+            ));
         }
         let sub = |a: u64, b: u64| {
             a.checked_sub(b)
@@ -211,8 +281,58 @@ mod tests {
         assert_eq!(resources.pid, std::process::id());
         assert!(resources.rss_bytes > 0);
         assert!(resources.peak_rss_bytes >= resources.rss_bytes);
+        assert_eq!(
+            resources.accounted_process_write_bytes,
+            process_io_counter("write_bytes:")
+        );
     }
 
+    #[test]
+    fn process_io_counter_preserves_missing_or_malformed_as_unavailable() {
+        assert_eq!(
+            parse_process_io_counter("read_bytes: 12\nwrite_bytes: 34\n", "write_bytes:"),
+            Some(34)
+        );
+        assert_eq!(
+            parse_process_io_counter("read_bytes: 12\n", "write_bytes:"),
+            None
+        );
+        assert_eq!(
+            parse_process_io_counter("write_bytes: unknown\n", "write_bytes:"),
+            None
+        );
+    }
+
+    #[test]
+    fn process_boot_id_parser_preserves_valid_identity_and_rejects_invalid_values() {
+        assert_eq!(
+            parse_process_boot_id("00112233-4455-6677-8899-aabbccddeeff\n"),
+            Some([
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff
+            ])
+        );
+        assert_eq!(parse_process_boot_id("invalid"), None);
+    }
+
+    #[test]
+    fn evidence_rejects_changed_boot_identity() {
+        let first = ReadEvidence {
+            pid: 1,
+            start_ticks: 2,
+            process_boot_id: Some([1; 16]),
+            read_bytes: 4096,
+            ..ReadEvidence::default()
+        };
+        assert!(
+            ReadEvidence {
+                process_boot_id: Some([2; 16]),
+                ..first
+            }
+            .delta(first)
+            .is_err()
+        );
+    }
     #[test]
     fn evidence_rejects_changed_process_or_decreased_counters() {
         let first = ReadEvidence {

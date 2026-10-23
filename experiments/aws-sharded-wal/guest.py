@@ -21,6 +21,10 @@ import socket
 import subprocess
 import tarfile
 import time
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from resident_config import resident_read_config
 
 import efa_progress
 import checkpoint_async
@@ -45,10 +49,13 @@ TRANSFER = TransferConfig(max_concurrency=2, multipart_threshold=8 * 1024 * 1024
 CACHE_BYTES = 8 * 1024 * 1024
 
 
+
+
 def benchmark_case_identity(label, shape, repetition, *, storage=False, capacity=False,
                             chunk_control=False, cold=False, diagnostics=False, transport='tcp',
                             cached=False, authority_resident_batches=None, shard_cache_bytes=0,
-                            preparation_chunk_batches=16, wal_layout=None):
+                            preparation_chunk_batches=16, wal_layout=None, workload_batches=None,
+                            resident_reads=None, bounded_hot_reads=None, cold_single_probes=None, cold_group_probes=None):
     """Canonical outer identity, shared by execution and closed evidence admission."""
     value, batch, window = shape
     prefix = 'chunk32' if chunk_control else ('capacity4m' if capacity else ('storage' if storage else 'warm'))
@@ -66,6 +73,24 @@ def benchmark_case_identity(label, shape, repetition, *, storage=False, capacity
         prefix = 'wal-sui-' + prefix
     if authority_resident_batches is not None:
         prefix = f'authority{authority_resident_batches}-' + prefix
+    if workload_batches is not None:
+        prefix = f'load{workload_batches}-' + prefix
+    resident = resident_read_config(resident_reads)
+    if resident != resident_read_config():
+        digest = hashlib.sha256(json.dumps(resident, sort_keys=True).encode()).hexdigest()[:8]
+        prefix = f'rma{digest}-' + prefix
+    if bounded_hot_reads is not None:
+        if type(bounded_hot_reads) is not int or not 32 <= bounded_hot_reads <= 131072:
+            raise ValueError('bounded_hot_reads requires an integer 32..131072')
+        prefix = f'hotreads{bounded_hot_reads}-' + prefix
+    if cold_single_probes is not None:
+        if type(cold_single_probes) is not int or not 1 <= cold_single_probes <= 4096 or not cold:
+            raise ValueError('cold_single_probes requires a cold case and integer 1..4096')
+        prefix = f'coldprobes{cold_single_probes}-' + prefix
+    if cold_group_probes is not None:
+        if type(cold_group_probes) is not int or not 1 <= cold_group_probes <= 4096 or not cold:
+            raise ValueError('cold_group_probes requires a cold case and integer 1..4096')
+        prefix = f'coldgroups{cold_group_probes}-' + prefix
     return f'{prefix}-{label}-v{value}-b{batch}-w{window}-r{repetition}', prefix
 
 
@@ -83,7 +108,9 @@ def kv_case_commands(cfg, spec):
         authority_resident_batches=spec['authority_resident_batches'],
         shard_cache_bytes=spec.get('shard_cache_bytes', 0),
         preparation_chunk_batches=spec.get('preparation_chunk_batches', 16),
-        wal_layout=spec.get('wal_layout'))
+        wal_layout=spec.get('wal_layout'), workload_batches=spec.get('workload_batches'),
+        resident_reads=spec.get('resident_reads'), bounded_hot_reads=spec.get('bounded_hot_reads'),
+        cold_single_probes=spec.get('cold_single_probes'), cold_group_probes=spec.get('cold_group_probes'))
     case_root = root / 'cases' / case_id
     binary = str(root / 'cloud-bin/current/sharded_wal_bench')
     value, batch, window = spec['shape']
@@ -106,15 +133,36 @@ def kv_case_commands(cfg, spec):
                '--tcp-wal-member-read', 'async', '--tcp-resident-first', 'true',
                '--tcp-polling', 'adaptive', '--tcp-shard-cache-bytes', str(spec.get('shard_cache_bytes', 0))]
     prepare += shape_args
+    resident = resident_read_config(spec.get('resident_reads'))
+    if resident != resident_read_config():
+        if spec['cold'] or spec['transport'] not in ('efa-native', 'fabric-tcp-native'):
+            raise ValueError('resident KV reads require trusted-native fabric and are disabled for cold controls')
+        prepare += ['--backend', 'tcp']
+        for field, value in resident.items():
+            prepare += ['--rma-' + field.replace('_', '-'),
+                        str(value).lower() if isinstance(value, bool) else str(value)]
     commands = {}
     for mode in ('native-sync', 'tcp'):
         output = root / 'checkpoint-results/kv' / (case_id + '-' + mode)
         command = [binary, '--output', str(output), '--backend', mode] + shape_args
         command += ['--read-resource-evidence', 'true']
+        if not spec['cold'] and (resident['destination_slots'] or spec.get('bounded_hot_reads') is not None):
+            # The Native reference shares preparation/samples, never RMA flags.
+            command += ['--bounded-hot-pass', 'true']
+        if spec.get('bounded_hot_reads') is not None:
+            command += ['--bounded-hot-reads', str(spec['bounded_hot_reads']),
+                        '--tcp-read-lanes', '2']
+        if spec.get('shard_cache_bytes', 0) and not spec['cached']:
+            # Coordinator caching stays off: this population reaches the owner.
+            command += ['--cache-probe-keys', '256']
         if spec.get('cache_hit_contention', False):
             command += ['--cache-hit-contention', 'true']
         if spec['cold']:
             command += ['--cold-read-pass', 'true']
+            if spec.get('cold_single_probes') is not None:
+                command += ['--cold-single-probes', str(spec['cold_single_probes'])]
+            if spec.get('cold_group_probes') is not None:
+                command += ['--cold-group-probes', str(spec['cold_group_probes'])]
         if spec['diagnostics']:
             command += ['--transport-diagnostics', 'true']
         command += ['--read-window', '32']
@@ -155,12 +203,15 @@ def kv_case_policy(cfg, spec):
     batch_limits = dict(max_operations=32, max_encoded_bytes=320 * 1024)
     common_partition = geometry | dict(batch_limits=batch_limits, max_reference_metadata_bytes=16 * 1024**2)
     case_root = Path(arguments['--guest-case-root'])
+    resident_reads = resident_read_config(spec.get('resident_reads'))
     def tls(identity, server_name):
-        if arguments['--transport'] == 'efa-native':
-            return dict(transport='efa-native', ca='', cert='', key='', server_name=server_name)
+        if arguments['--transport'] in ('efa-native', 'fabric-tcp-native'):
+            return dict(transport=arguments['--transport'], ca='', cert='', key='',
+                        server_name=server_name, resident_reads=resident_reads)
         return dict(transport=arguments['--transport'], ca=str(case_root / 'tls/ca.der'),
                     cert=str(case_root / 'tls' / (identity + '.der')),
-                    key=str(case_root / 'tls' / (identity + '.pk8')), server_name=server_name)
+                    key=str(case_root / 'tls' / (identity + '.pk8')), server_name=server_name,
+                    resident_reads=resident_reads)
     remote = dict(
         storage=common_partition | dict(database=[42] * 16, partitions=partitions,
             max_batches_per_partition=resident, max_epochs=4),
@@ -191,7 +242,8 @@ def kv_case_policy(cfg, spec):
                 read_resident_first=arguments['--tcp-resident-first'] == 'true',
                 read_cache_bytes=int(arguments['--tcp-shard-cache-bytes']),
                 read_memory_allowance_bytes=512 * 1024**2, read_max_inflight_requests=32,
-                read_max_inflight_bytes=64 * 1024**2, read_max_device_reads=128),
+                read_max_inflight_bytes=64 * 1024**2, read_max_device_reads=128,
+                resident_reads=resident_reads),
             tls=tls(f'tidehunter-node-{partition}', f'tidehunter-node-{partition}'),
             limits=dict(max_frame_bytes=16 * 1024**2, max_connections=16, max_reads=256,
                         recovery_page_batches=128, io_timeout=dict(secs=60, nanos=0),
@@ -1082,10 +1134,12 @@ class Campaign:
                  resource_evidence=False, authority_resident_batches=None,
                  shard_cache_bytes=0, transport_floor_probe=False,
                  preparation_chunk_batches=16, workload_batches=None, workload_reads=None,
-                 wal_layout=None, cache_hit_contention=False):
+                 wal_layout=None, cache_hit_contention=False, resident_reads=None, bounded_hot_reads=None,
+                 cold_single_probes=None, cold_group_probes=None):
         if ((shard_cache_bytes or transport_floor_probe or preparation_chunk_batches != 16
                 or workload_batches is not None or workload_reads is not None or wal_layout is not None
-                or cache_hit_contention) and not self.cfg.get('kv_subsuite')
+                or cache_hit_contention or resident_reads is not None or bounded_hot_reads is not None
+                or cold_single_probes is not None or cold_group_probes is not None) and not self.cfg.get('kv_subsuite')
                 or type(shard_cache_bytes) is not int or not 0 <= shard_cache_bytes <= 128 * 1024**2
                 or type(transport_floor_probe) is not bool
                 or type(cache_hit_contention) is not bool
@@ -1095,6 +1149,9 @@ class Campaign:
                        for value, bound in ((workload_batches, 4096), (workload_reads, 8192)))
                 or wal_layout not in (None, 'small', 'sui')):
             raise ValueError('bounded cache, RAM-floor and workload controls require a KV subsuite')
+        resident_read_config(resident_reads)
+        if bounded_hot_reads is not None and (type(bounded_hot_reads) is not int or not 32 <= bounded_hot_reads <= 131072):
+            raise ValueError('bounded_hot_reads requires an integer 32..131072')
         checkpoint = self.cfg.get('campaign') in ('checkpoint-async', 'cluster-ram', 'scalar-transport', 'transport-floor', 'stage-timing')
         ram = self.cfg.get('campaign') in ('cluster-ram', 'scalar-transport', 'transport-floor', 'stage-timing')
         profile = (stage_timing if self.cfg.get('campaign') == 'stage-timing' else transport_floor if self.cfg.get('campaign') == 'transport-floor' else scalar_transport if self.cfg.get('campaign') == 'scalar-transport' else
@@ -1129,7 +1186,9 @@ class Campaign:
             storage=storage, capacity=capacity, chunk_control=chunk_control, cold=cold,
             diagnostics=diagnostics, transport=transport, cached=cached,
             authority_resident_batches=authority_resident_batches, shard_cache_bytes=shard_cache_bytes,
-            preparation_chunk_batches=preparation_chunk_batches, wal_layout=wal_layout)
+            preparation_chunk_batches=preparation_chunk_batches, wal_layout=wal_layout,
+            workload_batches=workload_batches, resident_reads=resident_reads, bounded_hot_reads=bounded_hot_reads,
+            cold_single_probes=cold_single_probes, cold_group_probes=cold_group_probes)
         if progress:
             case_id, prefix = spec['case_id'], spec['family']
         self.progress('preparing-' + case_id)
@@ -1146,7 +1205,8 @@ class Campaign:
                 transport=transport, cached=cached, authority_resident_batches=authority_resident_batches,
                 shard_cache_bytes=shard_cache_bytes, preparation_chunk_batches=preparation_chunk_batches,
                 workload_batches=workload_batches, workload_reads=workload_reads, wal_layout=wal_layout,
-                cache_hit_contention=cache_hit_contention)
+                cache_hit_contention=cache_hit_contention, resident_reads=resident_reads, bounded_hot_reads=bounded_hot_reads,
+                cold_single_probes=cold_single_probes, cold_group_probes=cold_group_probes)
             prepare, kv_commands = kv_case_commands(self.cfg, kv_spec)
         else:
             batches, mixed = (320, 64) if storage else (128, 32)

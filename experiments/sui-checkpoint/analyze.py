@@ -7,8 +7,9 @@ controller-config.json, cleanup-verified.json, retrieved/{receipt.json,
 controller.tar.gz,cells/.../storage/.../final/evidence.tar.gz}, and
 paired-results/<cell>/{receipt.json,evidence.tar.gz}. No AWS APIs, workload
 processes or additional serving instrumentation are used. Campaign output is
-analysis-details.json, cell-summary.csv, all-wrapper-latencies.csv and
-adapter-means.csv. Missing diagnostics are null with a reason, never zero.
+analysis-details.json, cell-summary.csv, all-wrapper-latencies.csv,
+adapter-means.csv and checkpoint-completion-latencies.csv. Missing diagnostics
+are null with a reason, never zero.
 """
 import argparse
 from contextlib import contextmanager
@@ -127,6 +128,108 @@ def adapter_stats(values):
             if name.startswith('native_profile_') and name.endswith('_ns') and stats.get('native_profile_available') != 1:
                 stats[name] = None
     return result
+
+
+def shard_read_stats(values):
+    """Per-owner observations, retaining unavailable samples instead of zeroes."""
+    availability = adapter_stats(values)
+    owners = {}
+    for metric, value in values.items():
+        if not metric.startswith('tidehunter_shard_read{'):
+            continue
+        labels = {name: json.loads('"' + encoded + '"') for name, encoded in
+                  re.findall(r'(\w+)="((?:\\.|[^"\\])*)"', metric)}
+        # Sui's database registry adds a constant db label, not another owner.
+        if (set(labels) - {'db'} != {'namespace', 'partition', 'stat'} or
+                not labels['partition'].isascii() or not labels['partition'].isdigit() or
+                value < 0 or value != int(value)):
+            raise ValueError('invalid per-owner read counter identity/value')
+        namespace, partition, stat = (labels[key] for key in ('namespace', 'partition', 'stat'))
+        owner = owners.setdefault(namespace, {}).setdefault(partition, {})
+        if stat in owner:
+            raise ValueError('duplicate per-owner read counter')
+        owner[stat] = int(value) if availability.get(namespace, {}).get('shard_sample_available') == 1 else None
+    for partitions in owners.values():
+        for stats in partitions.values():
+            for prefix in ('authority_', 'initiator_'):
+                available = prefix + 'available'
+                if stats.get(available) != 1:
+                    for stat in stats:
+                        if stat.startswith(prefix) and stat != available:
+                            stats[stat] = None
+    return dict(available=bool(owners), by_namespace=owners,
+                sample_available_by_namespace={ns: stats.get('shard_sample_available') == 1 and ns in owners
+                    for ns, stats in availability.items()},
+                unavailable_reason=None if owners else 'per-owner metric family absent (older source or failed sample)',
+                scope='cumulative owned-process counters at foreground boundary; not per-value physical IO',
+                deltas_available=False, delta_unavailable_reason='no initial per-owner counter snapshot')
+
+
+def shard_read_deltas(before, after):
+    """Require both complete owner/stat populations; resets fail closed."""
+    initial, final = shard_read_stats(before), shard_read_stats(after)
+    if not initial['available'] or not final['available']:
+        return dict(available=False, reason='missing per-owner counter snapshot', by_namespace={})
+    left, right = initial['by_namespace'], final['by_namespace']
+    if (set(left) != set(right) or any(set(left[ns]) != set(right[ns]) for ns in left)
+            or any(set(left[ns][owner]) != set(right[ns][owner])
+                   for ns in left for owner in left[ns])):
+        return dict(available=False, reason='owner/stat population differs', by_namespace={})
+    result = {}
+    for ns, owners in right.items():
+        result[ns] = {}
+        for owner, stats in owners.items():
+            result[ns][owner] = {}
+            for stat, value in stats.items():
+                previous = left[ns][owner][stat]
+                if value is None or previous is None:
+                    delta = None
+                elif (stat.startswith(('inflight_', 'peak_'))
+                      or stat.endswith(('_live', '_available')) or stat in {
+                        'cache_bytes', 'cache_budget', 'cache_budget_bytes',
+                        'cache_metadata_bytes', 'cache_retained_bytes', 'cache_entries',
+                        'authority_entries', 'authority_capacity', 'authority_table_bytes'}):
+                    # Gauges are endpoint observations, not monotonically increasing work.
+                    delta = dict(before=previous, after=value)
+                elif value < previous:
+                    raise ValueError('per-owner read counter reset')
+                else:
+                    delta = value - previous
+                result[ns][owner][stat] = delta
+    return dict(available=True, by_namespace=result,
+                scope='observed before/after per-owner counters; unavailable samples remain null')
+
+def resident_replay_population(owners, *, configured, native=False):
+    """Natural replay snapshots are not a prepared, per-lane hit-only interval."""
+    if native:
+        return dict(applicable=False, configured=False, population='native_reference_not_RMA',
+                    pure_registered_hit_population=False)
+    fields = ('initiator_message_read_requests', 'initiator_rma_posts', 'initiator_rma_completions',
+              'initiator_rma_hits', 'initiator_rma_errors', 'initiator_grant_acquisitions',
+              'initiator_fallback_missing', 'initiator_fallback_oversize',
+              'initiator_fallback_capacity', 'initiator_fallback_unsupported', 'initiator_fallback_stale')
+    available = bool(owners) and all(owner.get('initiator_available') == 1
+        and all(type(owner.get(field)) in (int, float) and owner[field] >= 0
+                and owner[field] == int(owner[field]) for field in fields) for owner in owners.values())
+    totals = {field: sum(owner[field] for owner in owners.values()) for field in fields} if available else None
+    population = 'unavailable_actual_initiator_counters'
+    if totals is not None:
+        posts, completed, hits = (totals[field] for field in
+            ('initiator_rma_posts', 'initiator_rma_completions', 'initiator_rma_hits'))
+        if not hits <= completed <= posts:
+            raise ValueError('Sui registered hit/completion/post populations differ')
+        if posts and not configured:
+            raise ValueError('RMA-disabled Sui control contains actual FI_READ posts')
+        wire = totals['initiator_message_read_requests']
+        population = ('mixed_RPC_and_registered_FI_READ_observed' if posts and wire else
+                      'registered_FI_READ_observed_no_wire_Read_in_snapshot' if posts else
+                      'RPC_only_observed' if wire else 'no_remote_read_work_observed')
+    return dict(applicable=True, configured=configured, counters_available=available,
+        actual_owner_snapshots=owners, totals=totals, population=population,
+        pure_registered_hit_population=False, per_lane_prepared_population_available=False,
+        server_profile_scope='bounded_Read_RPC_calls_only;not_FI_READ_handler_or_wire_latency',
+        scope='foreground endpoint lifetime snapshots may include setup/acquisition/scans; not clean per-phase deltas or an all-Sui-cache tier claim')
+
 
 @cache
 def checkpoint_matrix_helpers():
@@ -249,7 +352,9 @@ def summarize_verified(verified):
             process_io_final=replay['process_io_final'],
             host_swap_delta_pages={key:replay['host_after']['swap_pages'][key]-replay['host_before']['swap_pages'][key]
                 for key in ('pswpin','pswpout')},foreground_metrics=foreground)
+        summary['modes'][mode]['checkpoint_completion'] = checkpoint_completion_observation(foreground)
         summary['modes'][mode]['adapter_by_namespace'] = adapter_stats(foreground)
+        summary['modes'][mode]['shard_read_by_owner'] = shard_read_stats(foreground)
         summary['modes'][mode]['checkpoint_sequence_cache_counts'] = checkpoint_sequence_cache_stats(foreground)
         summary['modes'][mode]['execution_cache_api_calls'] = {k:v for k,v in foreground.items() if k.startswith('execution_cache_db_read_calls')}
         summary['modes'][mode]['execution_cache_keys'] = {k:v for k,v in foreground.items() if k.startswith('execution_cache_requests')}
@@ -428,7 +533,37 @@ def adapter_means(stats):
 
 
 def wrapper_latencies(values):
-    """All typed-store latency histograms, including empty populations.
+    """All typed-store latency histograms, including empty populations."""
+    return _histogram_rows(values, r'rocksdb_\w+_latency_seconds')
+
+
+def checkpoint_completion_observation(values, *, required=False):
+    """Actual admitted-checkpoint completion observations; never start spacing."""
+    rows = _histogram_rows(values, 'checkpoint_completion_latency', include_buckets=True)
+    if len(rows) != 1:
+        observation = dict(metric='checkpoint_completion_latency', labels={}, count=None,
+            total_seconds=None, mean_us=None, quantiles={}, buckets=[], available=False,
+            reason='missing or ambiguous checkpoint_completion_latency histogram',
+            quantile_method='cumulative histogram bucket bounds, not raw quantiles')
+    else:
+        observation = rows[0]
+        if (not observation['available'] or observation['total_seconds'] <= 0
+                or not observation['complete_buckets']):
+            observation.update(available=False,
+                reason='checkpoint completion histogram requires positive count/sum and complete valid buckets')
+    if observation['available']:
+        observation['count'] = int(observation['count'])
+    observation.update(
+        scope='synced checkpoint admission before pipeline wait through queueing/execution/storage commit/publication after highest-executed watermark update; not certification arrival, execution-start spacing or raw device latency',
+        observation_boundary='foreground tip-watermark scrape; final checkpoint may update watermark immediately before its histogram observation',
+        count_contract='actual positive observed count; not assumed equal to fixture checkpoint count')
+    if required and not observation['available']:
+        raise ValueError('checkpoint completion histogram unavailable: ' + observation['reason'])
+    return observation
+
+
+def _histogram_rows(values, metric_pattern, *, include_buckets=False):
+    """Decode a named histogram family without pooling labels or populations.
 
     Quantiles are cumulative-histogram bucket bounds in microseconds, NOT raw
     sample quantiles. The unbounded +Inf upper endpoint is represented by null.
@@ -438,12 +573,14 @@ def wrapper_latencies(values):
     """
     groups = {}
     for metric, value in values.items():
-        match = re.fullmatch(r'(rocksdb_\w+_latency_seconds)_(sum|count|bucket)(?:\{(.*)\})?', metric)
+        match = re.fullmatch(r'(' + metric_pattern + r')_(sum|count|bucket)(?:\{(.*)\})?', metric)
         if not match:
             continue
         name, kind, encoded = match.groups()
-        labels = {k: json.loads('"' + v + '"') for k, v in
-                  re.findall(r'(\w+)="((?:\\.|[^"\\])*)"', encoded or '')}
+        pairs = re.findall(r'(\w+)="((?:\\.|[^"\\])*)"', encoded or '')
+        labels = {key: json.loads('"' + value + '"') for key, value in pairs}
+        if len(labels) != len(pairs):
+            raise ValueError('duplicate histogram label')
         bound = labels.pop('le', None)
         key = (name, tuple(sorted(labels.items())))
         group = groups.setdefault(key, {})
@@ -486,6 +623,11 @@ def wrapper_latencies(values):
                     (math.isinf(buckets[-1][0]) and buckets[-1][1] != count)):
                 raise ValueError('histogram bucket/count mismatch')
         complete = bool(buckets and math.isinf(buckets[-1][0]) and count is not None)
+        if include_buckets:
+            row['complete_buckets'] = complete
+            row['buckets'] = [dict(upper_seconds=bound if math.isfinite(bound) else None,
+                                   upper_unbounded=math.isinf(bound), cumulative_count=int(n))
+                              for bound, n in buckets]
         for percentile in (50, 95, 99):
             quantile = dict(available=False, lower_us=None, upper_us=None,
                             upper_unbounded=False, reason='empty or incomplete histogram population')
@@ -589,6 +731,14 @@ def verified_campaign(root):
                     or result.get('external_manifest', {}).get('transport') != cell['transport']
                     or result.get('external_manifest', {}).get('config_sha256') != cell['config_sha256']):
                 raise ValueError('paired replay cell/source/population binding differs')
+            expected_resident = matrix.resident_read_config(cell.get('resident_reads'))
+            if (cfg.get('kv_suite') or {}).get('scope') == 'hardware-populations':
+                observed = result.get('resident_reads_by_namespace')
+                if (not observed or set(observed) != set(result.get('deployment', {}).get('databases', {}))
+                        or any(matrix.resident_read_config(value) != expected_resident
+                                        for value in observed.values())
+                        or matrix.resident_read_config(result.get('external_manifest', {}).get('resident_reads')) != expected_resident):
+                    raise ValueError('paired replay resident population differs from admitted cell')
             resources = archived_bytes(archive, prefix + 'resources.json')
             if (hashlib.sha256(resources).hexdigest() != cell['resources_sha256']
                     or json.loads(resources) != result.get('external_resources')):
@@ -637,6 +787,8 @@ def population_comparison(cells):
     """Observed sample distributions, not a causal or zero-overhead claim."""
     if len({json.dumps(cell.get('cache'), sort_keys=True) for cell in cells}) > 1:
         raise ValueError('cannot pool different cache budgets')
+    if len({json.dumps(cell.get('resident_reads'), sort_keys=True) for cell in cells}) > 1:
+        raise ValueError('cannot pool different registered-read profiles')
     for field in ('source_range', 'source_archive_sha256', 'source_manifest_sha256',
                   'build_manifest_sha256', 'checkpoint_digest', 'durability', 'table_counts'):
         if len({json.dumps(cell.get(field), sort_keys=True) for cell in cells}) > 1:
@@ -684,15 +836,20 @@ def population_comparison(cells):
 
 def transport_comparison(cells):
     pairs = []
-    transports = {cell['transport'] for cell in cells}
-    if transports - {'tcp', 'efa', 'efa-direct', 'efa-native'}:
+    def arm(cell):
+        profile = cell.get('resident_reads') or {}
+        return cell['transport'] + ('-rma' if profile.get('destination_slots', 0) else '')
+    transports = {arm(cell) for cell in cells}
+    if transports - {'tcp', 'efa', 'efa-direct', 'efa-native', 'efa-native-rma'}:
         raise ValueError('unknown transport comparison label')
     order = ['tcp', 'efa'] + [name for name in ('efa-direct', 'efa-native') if name in transports]
     comparisons = [(reference, candidate) for reference, candidate in combinations(order, 2)
                    if reference in transports or candidate in transports]
+    if 'efa-native-rma' in transports:
+        comparisons.append(('efa-native', 'efa-native-rma'))
     for repetition in sorted({cell['repetition'] for cell in cells}):
         selected = [cell for cell in cells if cell['repetition'] == repetition]
-        by_transport = {cell['transport']: cell for cell in selected}
+        by_transport = {arm(cell): cell for cell in selected}
         if len(by_transport) != len(selected):
             raise ValueError('duplicate transport/repetition cell')
         for reference_transport, candidate_transport in comparisons:
@@ -714,6 +871,7 @@ def transport_comparison(cells):
                     raise ValueError('transport pair source/workload populations differ: ' + field)
             pairs.append(pair | dict(available=True, population=reference['population'],
                 cache=reference.get('cache'), source_range=reference.get('source_range'),
+                registration_profiles=dict(reference=reference.get('resident_reads'), candidate=candidate.get('resident_reads')),
                 reference_cell=reference['cell_id'], candidate_cell=candidate['cell_id'],
                 reference_native_seconds=reference['native_seconds'],
                 candidate_native_seconds=candidate['native_seconds'],
@@ -750,6 +908,7 @@ def compare_campaign(root):
         row = {k: identity[k] for k in ('cell_id', 'transport', 'ordinal', 'repetition', 'read_profile_limit')}
         row['write_profile_limit'] = identity.get('write_profile_limit', 0)
         row['native_write_profile_limit'] = identity.get('native_write_profile_limit', 0)
+        row['resident_reads'] = helpers.resident_read_config(identity.get('resident_reads'))
         row.update({key: cfg[key] for key in ('source_archive_sha256', 'source_manifest_sha256',
                                              'build_manifest_sha256', 'checkpoint_digest')})
         row.update(population='profiled' if any(row[key] for key in
@@ -768,6 +927,12 @@ def compare_campaign(root):
                 raise ValueError('empty elapsed population')
         for mode, measured in summary['modes'].items():
             stats = measured['adapter_by_namespace']
+            measured['registered_read_population'] = {
+                namespace: resident_replay_population(
+                    measured['shard_read_by_owner']['by_namespace'].get(namespace, {}),
+                    configured=mode == 'remote' and bool(row['resident_reads']['destination_slots']),
+                    native=mode == 'native')
+                for namespace in sorted(set(summary['table_counts']) | set(stats))}
             measured['wrapper_latencies'] = wrapper_latencies(measured['foreground_metrics'])
             measured['wrapper_latency_availability'] = (
                 'observed histograms; empty/missing bucket populations reported individually'
@@ -795,6 +960,9 @@ def compare_campaign(root):
     for cell in cells:
         cache = cell['cache']
         name = f"coordinator-{cache['coordinator_bytes']}-shard-{cache['shard_bytes']}"
+        if cell['resident_reads']['destination_slots']:
+            digest = hashlib.sha256(json.dumps(cell['resident_reads'], sort_keys=True).encode()).hexdigest()[:12]
+            name += '-rma-' + digest
         cache_groups.setdefault(name, []).append(cell)
     return dict(schema=3, run_id=cfg['run_id'], source_archive_sha256=cfg['source_archive_sha256'],
                 source_manifest_sha256=cfg['source_manifest_sha256'],
@@ -823,14 +991,25 @@ def write_campaign_report(root, report):
     binding = {k: report[k] for k in ('run_id', 'source_archive_sha256', 'source_manifest_sha256',
                                      'build_manifest_sha256', 'checkpoint_digest',
                                      'controller_archive_sha256', 'closure_sha256', 'analyzer_sha256')}
-    cells, wrappers, adapters = [], [], []
+    cells, wrappers, adapters, completions = [], [], [], []
     for cell in report['cells']:
         identity = binding | {k: cell[k] for k in ('cell_id', 'transport', 'repetition', 'ordinal',
                               'population', 'read_profile_limit', 'write_profile_limit', 'native_write_profile_limit', 'replay_evidence_sha256')}
         identity.update(coordinator_cache_bytes=cell['cache']['coordinator_bytes'],
                         shard_cache_bytes=cell['cache']['shard_bytes'])
+        identity['resident_reads'] = json.dumps(cell.get('resident_reads'), sort_keys=True)
         cells.append(identity | {k: cell[k] for k in ('native_seconds', 'remote_seconds', 'remote_over_native')})
         for mode, measured in cell['modes'].items():
+            completion = measured.get('checkpoint_completion')
+            if completion is not None:
+                row = identity | dict(mode=mode) | {key: completion.get(key) for key in
+                    ('metric', 'count', 'total_seconds', 'mean_us', 'available', 'reason',
+                     'quantile_method', 'scope', 'observation_boundary', 'count_contract')}
+                row['labels'] = json.dumps(completion['labels'], sort_keys=True)
+                row['buckets'] = json.dumps(completion['buckets'], sort_keys=True)
+                for percentile, quantile in completion['quantiles'].items():
+                    row.update({percentile + '_' + key: value for key, value in quantile.items()})
+                completions.append(row)
             for histogram in measured['wrapper_latencies']:
                 row = identity | dict(mode=mode) | {k: histogram[k] for k in
                     ('metric', 'count', 'total_seconds', 'mean_us', 'available', 'reason', 'quantile_method')}
@@ -841,7 +1020,8 @@ def write_campaign_report(root, report):
             for namespace, means in measured['adapter_means'].items():
                 for stage, mean in means.items():
                     adapters.append(identity | dict(mode=mode, namespace=namespace, stage=stage) | mean)
-    for name, rows in (('cell-summary.csv', cells), ('all-wrapper-latencies.csv', wrappers), ('adapter-means.csv', adapters)):
+    for name, rows in (('cell-summary.csv', cells), ('all-wrapper-latencies.csv', wrappers),
+                       ('adapter-means.csv', adapters), ('checkpoint-completion-latencies.csv', completions)):
         fields = list(dict.fromkeys(key for row in rows for key in row))
         with (root / name).open('w', newline='') as stream:
             writer = csv.DictWriter(stream, fieldnames=fields)

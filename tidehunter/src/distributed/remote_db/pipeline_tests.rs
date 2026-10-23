@@ -61,6 +61,7 @@ impl Fixture {
                 cert: certs.authority.certificate.clone(),
                 key: certs.authority.private_key.clone(),
                 server_name: String::new(),
+                resident_reads: super::super::tcp::ResidentReadConfig::default(),
             },
             timeout: Duration::from_secs(5),
             max_admitted_batches: max_batches,
@@ -95,6 +96,7 @@ impl Fixture {
                     read_max_inflight_requests: 32,
                     read_max_inflight_bytes: 64 * 1024 * 1024,
                     read_max_device_reads: 128,
+                    resident_reads: super::super::tcp::ResidentReadConfig::default(),
                 },
                 metrics(),
             )
@@ -111,6 +113,7 @@ impl Fixture {
                 cert: identity.certificate,
                 key: identity.private_key,
                 server_name: identity.server_name,
+                resident_reads: super::super::tcp::ResidentReadConfig::default(),
             };
             let serving = Arc::clone(&node);
             let stop = Arc::clone(&shutdown);

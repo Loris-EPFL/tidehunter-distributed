@@ -92,6 +92,137 @@ class PreparationAdmissionTests(unittest.TestCase):
                 self.assertFalse((root / 'verification').exists())
 
 
+class CheckpointCompletionAdmissionTests(unittest.TestCase):
+    """Real archived metric consumer fixtures, not benchmark measurements."""
+    def metrics(self, count=1774):
+        return (
+            f'checkpoint_completion_latency_bucket{{le="0.01"}} {count * 9 // 10}\n'
+            f'checkpoint_completion_latency_bucket{{le="0.1"}} {count}\n'
+            f'checkpoint_completion_latency_bucket{{le="+Inf"}} {count}\n'
+            f'checkpoint_completion_latency_sum {count / 100}\n'
+            f'checkpoint_completion_latency_count {count}\n')
+
+    def source(self, root, *, native=None, remote=None, duplicate=False):
+        source = Path(root) / 'source'
+        experiment = source / 'experiment'
+        (experiment / 'native-schema').mkdir(parents=True)
+        (experiment / 'native-schema/schema.json').write_text('{"namespace":"real-schema-fixture"}')
+        audit = dict(all_equal=True, databases={'db': {'equal': True}}, rocksdb={'db': {'equal': True}})
+        ci_prepare.save(experiment / 'audit.json', audit)
+        ci_prepare.save(experiment / 'results.json', dict(complete=True, audit=audit,
+            topology='five-process loopback', local_transport='fabric-tcp-native',
+            checkpoint_limit=ci_prepare.TIP, checkpoint_digest=ci_prepare.CHECKPOINT))
+        for mode, text in (('native', native if native is not None else self.metrics()),
+                           ('remote', remote if remote is not None else self.metrics(1773))):
+            (experiment / (mode + '-foreground.prom')).write_text(text)
+        with tarfile.open(source / 'evidence.tar.gz', 'w:gz') as archive:
+            archive.add(experiment, arcname='experiment')
+            if duplicate:
+                archive.add(experiment / 'native-foreground.prom', arcname='experiment/native-foreground.prom')
+        ci_prepare.save(source / 'receipt.json', dict(complete=True,
+            evidence_sha256=ci_prepare.sha(source / 'evidence.tar.gz')))
+        return source, Path(root) / 'verification'
+
+    def test_actual_positive_native_and_remote_observations_and_bucket_bounds_are_retained(self):
+        with tempfile.TemporaryDirectory() as root:
+            source, output = self.source(root)
+            original = json.loads((source / 'receipt.json').read_text())
+            ci_prepare.verification_bundle(source, output)
+            copied = json.loads((output / 'receipt.json').read_text())
+            report = copied['checkpoint_completion_observations']
+            self.assertEqual(report['evidence_sha256'], original['evidence_sha256'])
+            self.assertEqual(report['modes']['native']['count'], 1774)
+            self.assertEqual(report['modes']['remote']['count'], 1773)
+            for mode, observation in report['modes'].items():
+                self.assertTrue(observation['available'])
+                self.assertAlmostEqual(observation['mean_us'], 10000)
+                self.assertEqual(observation['quantiles']['p50']['lower_us'], 0)
+                self.assertEqual(observation['quantiles']['p50']['upper_us'], 10000)
+                self.assertEqual(observation['quantiles']['p99']['lower_us'], 10000)
+                self.assertEqual(observation['quantiles']['p99']['upper_us'], 100000)
+                self.assertIn('not raw quantiles', observation['quantile_method'])
+                self.assertIn('not assumed equal', observation['count_contract'])
+                self.assertEqual(observation['metrics_sha256'],
+                    ci_prepare.sha(source / 'experiment' / (mode + '-foreground.prom')))
+            self.assertEqual(json.loads((source / 'receipt.json').read_text()), original)
+            self.assertEqual(ci_prepare.sha(output / 'evidence.tar.gz'), original['evidence_sha256'])
+
+    def test_missing_zero_or_semantically_old_timer_fails_each_backend_before_packaging(self):
+        invalid = (
+            '# metric missing\n',
+            self.metrics(0),
+            self.metrics().replace('checkpoint_completion_latency', 'checkpoint_exec_latency'),
+            'checkpoint_exec_interval_count 1774\ncheckpoint_execution_started 1775\n',
+        )
+        for mode in ('native', 'remote'):
+            for text in invalid:
+                with self.subTest(mode=mode, text=text), tempfile.TemporaryDirectory() as root:
+                    source, output = self.source(root, **{mode: text})
+                    with self.assertRaises(ValueError):
+                        ci_prepare.verification_bundle(source, output)
+                    self.assertFalse(output.exists())
+
+    def test_nonfinite_missing_and_malformed_histogram_measurements_cannot_satisfy_readiness(self):
+        text = self.metrics()
+        invalid = [
+            text.replace('_sum 17.74', '_sum 0'),
+            text.replace('_sum 17.74', '_sum NaN'),
+            text.replace('_sum 17.74', '_sum +Inf'),
+            text.replace('_count 1774', '_count NaN'),
+            text.replace('_count 1774', '_count +Inf'),
+            text.replace('_count 1774', '_count 1.5'),
+            text.replace('le="0.1"} 1774', 'le="0.1"} 1'),
+            text.replace('le="+Inf"} 1774', 'le="+Inf"} 1773'),
+            text.replace('le="0.01"', 'le="-0.01"'),
+            text.replace('le="0.01"', 'le="0.01",le="0.1"'),
+            text.replace('le="0.01"} 1596', 'le="0.01"} NaN'),
+            text + text.splitlines()[0] + '\n',
+            '\n'.join(line for line in text.splitlines() if '_sum ' not in line),
+            '\n'.join(line for line in text.splitlines() if '_count ' not in line),
+            '\n'.join(line for line in text.splitlines() if 'le="+Inf"' not in line),
+            '\n'.join(line for line in text.splitlines() if '_bucket{' not in line),
+        ]
+        for measurement in invalid:
+            with self.subTest(measurement=measurement), tempfile.TemporaryDirectory() as root:
+                source, output = self.source(root, remote=measurement)
+                with self.assertRaises(ValueError):
+                    ci_prepare.verification_bundle(source, output)
+                self.assertFalse(output.exists())
+
+    def test_scrape_is_bound_to_archive_not_replaceable_loose_metrics(self):
+        with tempfile.TemporaryDirectory() as root:
+            source, output = self.source(root, native=self.metrics(0))
+            (source / 'experiment/native-foreground.prom').write_text(self.metrics())
+            with self.assertRaises(ValueError):
+                ci_prepare.verification_bundle(source, output)
+            self.assertFalse(output.exists())
+
+    def test_duplicate_archive_scrapes_and_missing_remote_scrape_are_not_selected_silently(self):
+        with tempfile.TemporaryDirectory() as root:
+            source, output = self.source(root, duplicate=True)
+            with self.assertRaisesRegex(ValueError, 'one bounded foreground'):
+                ci_prepare.verification_bundle(source, output)
+            self.assertFalse(output.exists())
+        with tempfile.TemporaryDirectory() as root:
+            source, output = self.source(root)
+            with tarfile.open(source / 'evidence.tar.gz', 'w:gz') as archive:
+                archive.add(source / 'experiment/native-foreground.prom', arcname='experiment/native-foreground.prom')
+            ci_prepare.save(source / 'receipt.json', dict(complete=True,
+                evidence_sha256=ci_prepare.sha(source / 'evidence.tar.gz')))
+            with self.assertRaisesRegex(ValueError, 'one bounded foreground'):
+                ci_prepare.verification_bundle(source, output)
+            self.assertFalse(output.exists())
+
+    def test_positive_small_actual_count_does_not_become_an_invented_p99(self):
+        with tempfile.TemporaryDirectory() as root:
+            source, output = self.source(root, native=self.metrics(1), remote=self.metrics(2))
+            ci_prepare.verification_bundle(source, output)
+            observations = json.loads((output / 'receipt.json').read_text())['checkpoint_completion_observations']['modes']
+            self.assertEqual(observations['native']['count'], 1)
+            self.assertFalse(observations['native']['quantiles']['p99']['available'])
+            self.assertIsNone(observations['native']['quantiles']['p99']['upper_us'])
+
+
 class FrozenSourceRestoreTests(unittest.TestCase):
     def inputs(self, root):
         inputs = root / 'prepared'
@@ -110,6 +241,8 @@ class FrozenSourceRestoreTests(unittest.TestCase):
             for path in (ci_prepare.ROOT / 'experiments' / directory).glob('*.py'):
                 if directory == 'sui-checkpoint' or not path.name.startswith('test_'):
                     shutil.copy2(path, target / path.name)
+        shutil.copy2(ci_prepare.ROOT / 'experiments/resident_config.py',
+                     engine / 'experiments/resident_config.py')
         identities = {}
         for owner in ('sui', 'tidehunter-sharded-wal'):
             base = sources / owner
