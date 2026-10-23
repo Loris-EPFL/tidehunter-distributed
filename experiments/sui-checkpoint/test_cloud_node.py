@@ -229,7 +229,7 @@ class CloudNodeContract(unittest.TestCase):
     def test_rejects_expired_unzoned_and_unbounded_deadlines(self):
         now = time.time()
         values = [datetime.fromtimestamp(now + delta, timezone.utc).isoformat()
-                  for delta in (-1, 2, 3700)]
+                  for delta in (-1, 2, 7300)]
         values.append(datetime.fromtimestamp(now + 60).isoformat())
         for value in values:
             with self.subTest(deadline=value):
@@ -282,6 +282,20 @@ class CloudNodeContract(unittest.TestCase):
 
     def test_live_samples_and_normal_controller_shutdown(self):
         self.check_live_samples_and_normal_controller_shutdown()
+
+    def test_two_hour_deadline_runs_and_reaps_all_three_namespaces(self):
+        deadline = datetime.fromtimestamp(time.time() + 7200, timezone.utc).isoformat()
+        self.cfg['deadline_utc'] = deadline
+        self.add_namespace()
+        self.add_namespace()
+        self.check_live_samples_and_normal_controller_shutdown()
+        result = json.loads(Path(self.cfg['resource_path']).read_text())
+        self.assertEqual(result['deadline_utc'], deadline)
+        final_processes = result['samples'][-1]['processes']
+        self.assertEqual(len(final_processes), 3)
+        self.assertTrue(all(process['exited'] and
+                            process['unavailable']['process'] == 'exited_and_reaped'
+                            for process in final_processes))
 
     def check_live_samples_and_normal_controller_shutdown(self):
         owner = self.owner()
