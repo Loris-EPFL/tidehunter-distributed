@@ -131,19 +131,24 @@ fn software_provider_read_io_monitor_reports_wal_and_real_rma_lane_activity() {
         let read_rpcs_before = db.read_rpc_count();
         assert_eq!(db.get(KeySpace(0), key).unwrap().unwrap().as_ref(), value);
         assert_eq!(db.read_rpc_count(), read_rpcs_before + 1);
-        let monitor = db.read_io_monitor();
-        let storage_reads = monitor.sample().unwrap();
+        let storage_reads = db.read_io_stats().unwrap();
         assert_eq!(storage_reads.len(), 1);
         assert!(
             storage_reads[0].1.wal_reads > 0,
             "the remote read lane must account the WAL member"
         );
-        let resident_before = monitor.sample_resident_read_lanes().unwrap();
+        let resident_before = db
+            .read_evidence_monitor()
+            .sample_resident_read_lanes()
+            .unwrap();
         assert_eq!(resident_before.len(), 1);
         assert_eq!((resident_before[0].0, resident_before[0].1), (2, 0));
         assert_eq!(resident_before[0].2.rma_hits, 0);
         assert_eq!(db.get(KeySpace(0), key).unwrap().unwrap().as_ref(), value);
-        let resident_after = monitor.sample_resident_read_lanes().unwrap();
+        let resident_after = db
+            .read_evidence_monitor()
+            .sample_resident_read_lanes()
+            .unwrap();
         assert!(
             resident_after[0].2.rma_posts > resident_before[0].2.rma_posts
                 && resident_after[0].2.rma_completions > resident_before[0].2.rma_completions
@@ -192,7 +197,7 @@ fn software_provider_read_io_monitor_reports_wal_and_real_rma_lane_activity() {
                 Some(vec![5; 8].into()),
             ]
         );
-        let storage_after_group = monitor.sample().unwrap();
+        let storage_after_group = db.read_io_stats().unwrap();
         assert!(storage_after_group[0].1.wal_reads > storage_reads[0].1.wal_reads);
         db.shutdown().unwrap();
     }
@@ -517,7 +522,7 @@ fn software_provider_concurrent_cold_acquisition_with_one_handle_returns_both_va
     );
     database.validate_cached_read().unwrap();
     let lane_stats = database
-        .read_io_monitor()
+        .read_evidence_monitor()
         .sample_resident_read_lanes()
         .unwrap();
     assert_eq!(lane_stats.len(), 1);
@@ -1314,9 +1319,95 @@ fn software_provider_exact_drain_releases_original_wal_owner() {
 #[cfg(feature = "experimental-fabric")]
 #[test]
 #[ignore = "requires libfabric tcp;ofi_rxm software provider"]
+fn software_provider_delayed_diagnostic_does_not_break_real_append() {
+    let fixture = RemoteFixture::new(
+        ResidentReadConfig::default(),
+        ResidentReadConfig::default(),
+        0,
+        1,
+    );
+    let mut database = fixture.open();
+    let monitor = database.operational_read_io_monitor();
+    let inventory = fixture.node.inventory.lock();
+    let mut generation = 0;
+    monitor.visit(|snapshot, _| generation = snapshot.generation);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let sampled = loop {
+        let mut sample = None;
+        let mut last_status = None;
+        monitor.visit(|snapshot, stopped| {
+            last_status = Some((
+                snapshot.generation,
+                snapshot.available,
+                snapshot.resident_available,
+                snapshot.failed_samples,
+                stopped,
+            ));
+            if snapshot.generation >= generation + 2 {
+                sample = Some((snapshot.generation, stopped));
+            }
+        });
+        if let Some(sample) = sample {
+            break sample;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "operational diagnostics did not progress while inventory was held; generation/owner/resident/errors/stopped={last_status:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(inventory);
+    assert!(sampled.0 > generation);
+    assert!(!sampled.1);
+
+    database
+        .write_batch(
+            [53; 16],
+            vec![Mutation::Put {
+                keyspace: KeySpace(0),
+                key: b"diag"[..].into(),
+                value: b"append-survives"[..].into(),
+            }],
+        )
+        .unwrap();
+    assert_eq!(
+        database
+            .get(KeySpace(0), b"diag")
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"append-survives"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut healthy = false;
+        monitor.visit(|snapshot, stopped| {
+            healthy = !stopped
+                && snapshot.generation >= sampled.0 + 2
+                && snapshot.available
+                && snapshot.resident_available
+                && snapshot.owners.len() == 1
+                && snapshot.owners[0].0 == 2
+                && snapshot.owners[0].1.completed_reads == 1;
+        });
+        if healthy {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "operational sampling did not recover and account the actual WAL read"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+#[cfg(feature = "experimental-fabric")]
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm software provider"]
 fn software_provider_shutdown_releases_grants_before_clean_reopen() {
     let fixture = RemoteFixture::new(enabled_source(), enabled_destination(), 0, 1);
     let mut database = fixture.open();
+    let operational = database.operational_read_io_monitor();
     let key = b"r001";
     let value = b"reopen-value";
     database
@@ -1338,12 +1429,19 @@ fn software_provider_shutdown_releases_grants_before_clean_reopen() {
         value
     );
     let resident = database
-        .read_io_monitor()
+        .read_evidence_monitor()
         .sample_resident_read_lanes()
         .unwrap();
     assert!(resident[0].2.rma_hits > 0);
 
     database.shutdown().unwrap();
+    operational.visit(|snapshot, stopped| {
+        assert!(stopped);
+        assert!(!snapshot.available);
+        assert!(!snapshot.resident_available);
+        assert!(snapshot.owners.is_empty());
+        assert!(snapshot.residents.is_empty());
+    });
     assert_eq!(fixture.node.resident_grants.live_stats(), (0, 0, 0));
     drop(database);
 
@@ -1389,7 +1487,7 @@ fn software_provider_shutdown_drains_completed_read_while_result_handle_is_held(
     let retained = database.submit_get(KeySpace(0), key).unwrap().wait();
     assert!(
         database
-            .read_io_monitor()
+            .read_evidence_monitor()
             .sample_resident_read_lanes()
             .unwrap()[0]
             .2
@@ -1491,7 +1589,7 @@ fn software_provider_rma_off_history_retirement_drains_accepted_read() {
     );
     assert!(
         database
-            .read_io_monitor()
+            .read_evidence_monitor()
             .sample_resident_read_lanes()
             .unwrap()
             .iter()

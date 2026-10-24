@@ -1,10 +1,27 @@
-"""Canonical resident-read limits for source-bound local and cloud experiments."""
+"""Canonical resource policies for source-bound local and cloud experiments."""
 
 MIB = 1024 * 1024
 MAX_REGISTERED_BYTES = 256 * MIB
 MAX_SOURCE_REGIONS = 65_536
 MAX_DESTINATION_SLOTS = 8_192
 MAX_HANDLES = 65_536
+
+
+def software_fabric_environment(environment, *, software):
+    """Bound software RxM preposts before exec, without mutating the caller.
+
+    libfabric 2.6 rxm_init.c registers msg_rx_size (250–258) and uses it
+    for the shared receive queue (664–666). Reject conflicting inherited
+    settings rather than silently replacing an explicit experiment control.
+    Hardware and plain TCP environments are copied without modification.
+    """
+    result = dict(environment)
+    if software:
+        name = 'FI_OFI_RXM_MSG_RX_SIZE'
+        if name in result and result[name] != '128':
+            raise ValueError(f'{name} must be 128 for bounded software fabric')
+        result[name] = '128'
+    return result
 
 
 def resident_read_config(value=None):

@@ -78,6 +78,152 @@ def checkpoint_sequence_cache_stats(values):
     return result
 
 
+OWNER_SAMPLE_STATS = frozenset(('shard_sample_generation', 'shard_sample_errors',
+    'shard_sample_age_ms', 'shard_sample_available', 'resident_sample_available',
+    'shard_sampler_stopped'))
+LOCAL_SAMPLE_STATS = frozenset(('local_sample_generation', 'local_sample_available',
+    'local_sample_age_ms', 'local_sampler_stopped'))
+
+# Current Sui update_operational_metrics owner export. Historical owner decoding
+# remains permissive; live/final qualification requires this complete population.
+OWNER_BASE_STATS = frozenset(('cache_hits', 'cache_misses', 'cache_inserts',
+    'cache_evictions', 'cache_bytes', 'cache_budget', 'wal_reads', 'wal_read_bytes',
+    'resident_read_attempts', 'resident_read_successes', 'resident_read_fallbacks',
+    'resident_read_unsupported', 'resident_read_partial', 'resident_read_deferred',
+    'async_read_submissions', 'completed_reads', 'errors', 'cancellations',
+    'inflight_requests', 'inflight_bytes', 'inflight_reads',
+    'authority_available', 'initiator_available'))
+RESIDENT_REPLAY_FIELDS = ('initiator_message_read_requests', 'initiator_rma_posts',
+    'initiator_rma_completions', 'initiator_rma_hits', 'initiator_rma_errors',
+    'initiator_grant_acquisitions', 'initiator_fallback_missing',
+    'initiator_fallback_oversize', 'initiator_fallback_capacity',
+    'initiator_fallback_unsupported', 'initiator_fallback_stale')
+OWNER_OPTIONAL_STATS = {
+    'authority_available': frozenset(('authority_resident_hits', 'authority_resident_misses',
+        'authority_contention', 'authority_history_loads', 'authority_entries',
+        'authority_capacity', 'authority_table_bytes')),
+    'initiator_available': frozenset(RESIDENT_REPLAY_FIELDS) | {
+        'initiator_eligible_reads', 'initiator_handles_live', 'initiator_destination_slots_live'},
+}
+OWNER_KNOWN_STATS = OWNER_BASE_STATS.union(*OWNER_OPTIONAL_STATS.values())
+
+class MetricStreamsUnavailable(Exception):
+    """Explicitly unavailable current streams whose metadata is not yet published."""
+    def __init__(self, streams, missing):
+        super().__init__('current metric streams explicitly unavailable with sparse metadata')
+        self.streams = streams
+        self.missing = missing
+
+
+
+def operational_read_io_stats(values):
+    """Decode only current owner status; historical adapter status is not current."""
+    result = {}
+    for metric, value in values.items():
+        if not metric.startswith('tidehunter_operational_read_io{'):
+            continue
+        labels = {name: json.loads('"' + encoded + '"') for name, encoded in
+                  re.findall(r'(\w+)="((?:\\.|[^"\\])*)"', metric)}
+        if (set(labels) - {'db'} != {'namespace', 'stat'} or
+                labels['stat'] not in OWNER_SAMPLE_STATS or value < 0 or value != int(value)):
+            raise ValueError('invalid operational read-I/O status identity/value')
+        stats = result.setdefault(labels['namespace'], {})
+        if labels['stat'] in stats:
+            raise ValueError('duplicate operational read-I/O status')
+        stats[labels['stat']] = int(value)
+    return result
+
+
+def owner_sample_usable(stats):
+    return (OWNER_SAMPLE_STATS.issubset(stats) and stats.get('shard_sample_available') == 1 and
+        stats.get('resident_sample_available') == 1 and
+        stats.get('shard_sampler_stopped') == 0 and
+        0 <= stats.get('shard_sample_age_ms', float('inf')) <= 3000)
+
+
+def current_metric_streams(values, namespaces, *, remote, allow_sparse_unavailable=False):
+    """Decode current streams; only the live wait may tolerate explicit sparse unavailability."""
+    adapters = adapter_stats(values)
+    owners = operational_read_io_stats(values)
+    result, sparse = {}, []
+    for namespace in namespaces:
+        local = adapters.get(namespace, {})
+        unknown = {key for key in local if key.startswith('local_sample')} - LOCAL_SAMPLE_STATS
+        if unknown:
+            raise ValueError(f'{namespace}: unknown local publication metadata')
+        present = LOCAL_SAMPLE_STATS.intersection(local)
+        if any(local[key] < 0 or local[key] != int(local[key]) for key in present):
+            raise ValueError(f'{namespace}: invalid local publication metadata')
+        if any(local[key] not in (0, 1) for key in
+               present.intersection(('local_sample_available', 'local_sampler_stopped'))):
+            raise ValueError(f'{namespace}: invalid local publication flags')
+        if present != LOCAL_SAMPLE_STATS:
+            if not allow_sparse_unavailable or local.get('local_sample_available') != 0:
+                raise ValueError(f'{namespace}: missing local publication metadata')
+            sparse.append(dict(namespace=namespace, stream='local',
+                missing=sorted(LOCAL_SAMPLE_STATS - present)))
+        result[namespace] = dict(local={key: local[key] for key in present})
+        if remote:
+            owner = owners.get(namespace, {})
+            if any(owner[key] not in (0, 1) for key in
+                   set(owner).intersection(('shard_sample_available', 'resident_sample_available', 'shard_sampler_stopped'))):
+                raise ValueError(f'{namespace}: invalid owner publication flags')
+            if set(owner) != OWNER_SAMPLE_STATS:
+                if not allow_sparse_unavailable or not (
+                        owner.get('shard_sample_available') == 0 or owner.get('resident_sample_available') == 0):
+                    raise ValueError(f'{namespace}: missing current owner publication metadata')
+                sparse.append(dict(namespace=namespace, stream='owner',
+                    missing=sorted(OWNER_SAMPLE_STATS - set(owner))))
+            result[namespace]['owner'] = owner
+    # Validate the entire required population before allowing a transient signal:
+    # one unavailable namespace must not hide malformed or missing peers.
+    if sparse:
+        raise MetricStreamsUnavailable(result, sparse)
+    return result
+
+
+def metric_stream_usable(stream, name):
+    if name == 'owner':
+        return owner_sample_usable(stream)
+    return (stream['local_sample_available'] == 1 and stream['local_sampler_stopped'] == 0
+        and stream['local_sample_age_ms'] <= 3000)
+
+
+def validate_final_metric_cut(values, namespaces, cut, *, remote):
+    streams = current_metric_streams(values, namespaces, remote=remote)
+    if (cut.get('status') != 'post-certified-two-generation-cut' or
+            cut.get('required_namespaces') != sorted(namespaces) or cut.get('final') != streams or
+            set(cut.get('baseline', {})) != set(namespaces)):
+        raise ValueError('final metric cut population/status differs')
+    for namespace, row in streams.items():
+        if set(cut['baseline'][namespace]) != set(row):
+            raise ValueError('final metric cut baseline stream population differs')
+        for name, stream in row.items():
+            generation = 'shard_sample_generation' if name == 'owner' else 'local_sample_generation'
+            initial = cut['baseline'][namespace][name].get(generation)
+            if (not isinstance(initial, (int, float)) or initial < 0 or initial != int(initial) or
+                    not metric_stream_usable(stream, name) or stream[generation] < initial + 2):
+                raise ValueError('final metric cut is not causally fresh and available')
+    if remote:
+        owners = shard_read_stats(values)['by_namespace']
+        for namespace in namespaces:
+            partitions = owners.get(namespace, {})
+            if set(partitions) != {str(i) for i in range(5)} or any(not stats for stats in partitions.values()):
+                raise ValueError('final metrics lack all five live owners')
+            for stats in partitions.values():
+                if set(stats) - OWNER_KNOWN_STATS:
+                    raise ValueError('final metrics contain unknown owner counters')
+                if not OWNER_BASE_STATS.issubset(stats):
+                    raise ValueError('final metrics have partial mandatory owner counter populations')
+                for available, fields in OWNER_OPTIONAL_STATS.items():
+                    if stats[available] not in (0, 1):
+                        raise ValueError('final metrics contain invalid owner availability flags')
+                    if stats[available] == 1 and (
+                            not fields.issubset(stats) or any(stats[field] is None for field in fields)):
+                        raise ValueError('final metrics have partial available owner counter populations')
+    return streams
+
+
 def adapter_stats(values):
     result = {}
     for metric, value in values.items():
@@ -91,10 +237,17 @@ def adapter_stats(values):
         if labels['stat'] in stats:
             raise ValueError('duplicate adapter namespace/stat')
         stats[labels['stat']] = value
-    for stats in result.values():
-        if stats.get('shard_sample_available') != 1:
+    owners = operational_read_io_stats(values)
+    for namespace, owner in owners.items():
+        stats = result.setdefault(namespace, {})
+        if OWNER_SAMPLE_STATS.intersection(stats):
+            raise ValueError('mixed legacy adapter and current owner status families')
+        stats.update(owner)
+    for namespace, stats in result.items():
+        usable = owner_sample_usable(stats) if namespace in owners else stats.get('shard_sample_available') == 1
+        if not usable:
             for name in list(stats):
-                if name.startswith('shard_') and name != 'shard_sample_available':
+                if name.startswith('shard_') and name not in OWNER_SAMPLE_STATS:
                     stats[name] = None
         for name in ('scalar_read_ns', 'read_index_ns'):
             if name in stats and stats.get(name + '_available') != 1:
@@ -133,6 +286,9 @@ def adapter_stats(values):
 def shard_read_stats(values):
     """Per-owner observations, retaining unavailable samples instead of zeroes."""
     availability = adapter_stats(values)
+    current = operational_read_io_stats(values)
+    usable = {ns: owner_sample_usable(stats) if ns in current else stats.get('shard_sample_available') == 1
+              for ns, stats in availability.items()}
     owners = {}
     for metric, value in values.items():
         if not metric.startswith('tidehunter_shard_read{'):
@@ -148,7 +304,7 @@ def shard_read_stats(values):
         owner = owners.setdefault(namespace, {}).setdefault(partition, {})
         if stat in owner:
             raise ValueError('duplicate per-owner read counter')
-        owner[stat] = int(value) if availability.get(namespace, {}).get('shard_sample_available') == 1 else None
+        owner[stat] = int(value) if usable.get(namespace, False) else None
     for partitions in owners.values():
         for stats in partitions.values():
             for prefix in ('authority_', 'initiator_'):
@@ -158,10 +314,10 @@ def shard_read_stats(values):
                         if stat.startswith(prefix) and stat != available:
                             stats[stat] = None
     return dict(available=bool(owners), by_namespace=owners,
-                sample_available_by_namespace={ns: stats.get('shard_sample_available') == 1 and ns in owners
+                sample_available_by_namespace={ns: usable[ns] and ns in owners
                     for ns, stats in availability.items()},
                 unavailable_reason=None if owners else 'per-owner metric family absent (older source or failed sample)',
-                scope='cumulative owned-process counters at foreground boundary; not per-value physical IO',
+                scope='cumulative owned-process counters at scrape boundary; not per-value physical IO',
                 deltas_available=False, delta_unavailable_reason='no initial per-owner counter snapshot')
 
 
@@ -204,10 +360,7 @@ def resident_replay_population(owners, *, configured, native=False):
     if native:
         return dict(applicable=False, configured=False, population='native_reference_not_RMA',
                     pure_registered_hit_population=False)
-    fields = ('initiator_message_read_requests', 'initiator_rma_posts', 'initiator_rma_completions',
-              'initiator_rma_hits', 'initiator_rma_errors', 'initiator_grant_acquisitions',
-              'initiator_fallback_missing', 'initiator_fallback_oversize',
-              'initiator_fallback_capacity', 'initiator_fallback_unsupported', 'initiator_fallback_stale')
+    fields = RESIDENT_REPLAY_FIELDS
     available = bool(owners) and all(owner.get('initiator_available') == 1
         and all(type(owner.get(field)) in (int, float) and owner[field] >= 0
                 and owner[field] == int(owner[field]) for field in fields) for owner in owners.values())
@@ -296,6 +449,21 @@ def verified_replay(root):
         audit = archived_json(archive, 'experiment/audit.json')
         foreground_by_mode = {mode:parse_metrics(archived_bytes(archive, f'experiment/{mode}-foreground.prom').decode())
                               for mode in ('native', 'remote')}
+        current = (result.get('metrics_schema') == 2 or any(
+            operational_read_io_stats(values) or any(
+                LOCAL_SAMPLE_STATS.intersection(stats) for stats in adapter_stats(values).values())
+            for values in foreground_by_mode.values()))
+        final_by_mode = {mode: parse_metrics(archived_bytes(
+            archive, f'experiment/{mode}-final.prom').decode()) for mode in ('native', 'remote')} if current else {}
+        if current:
+            for mode, values in final_by_mode.items():
+                cut = result[mode].get('final_metrics_freshness', {})
+                namespaces = cut.get('required_namespaces', [])
+                from run import live_metric_namespaces
+                expected = live_metric_namespaces(audit['databases'], result[mode].get('completed_checkpoint_epoch'))
+                if set(namespaces) != expected:
+                    raise ValueError('final metric cut lacks audited live namespaces')
+                validate_final_metric_cut(values, namespaces, cut, remote=mode == 'remote')
         build_bytes = archived_bytes(archive, 'provenance/build-manifest.json')
         manifest = json.loads(build_bytes)
         if (hashlib.sha256(build_bytes).hexdigest() != receipt['build_manifest_sha256']
@@ -320,10 +488,10 @@ def verified_replay(root):
             raise ValueError('completed replay digest differs')
     if any(comparison.get('equal') is not True for comparison in audit['databases'].values()):
         raise ValueError('selected Tidehunter database differs')
-    observed = adapter_stats(foreground_by_mode['remote'])
+    observed = adapter_stats(final_by_mode.get('remote', foreground_by_mode['remote']))
     if set(observed) != set(audit['databases']) or any(stats.get('shard_sample_available') != 1 for stats in observed.values()):
         raise ValueError('remote physical shard observations are unavailable')
-    return receipt, result, audit, foreground_by_mode
+    return receipt, result, audit, foreground_by_mode, final_by_mode
 
 
 def summarize(root):
@@ -335,7 +503,7 @@ def summarize(root):
 
 
 def summarize_verified(verified):
-    _, result, audit, foreground_by_mode = verified
+    _, result, audit, foreground_by_mode, final_by_mode = verified
     summary=dict(schema=1,checkpoint_limit=result['checkpoint_limit'],checkpoint_digest=result['checkpoint_digest'],
         source_range=result['source_range'],source_archive_sha256=result['source_archive_sha256'],
         build_manifest_sha256=result['build_manifest_sha256'],topology=result['topology'],
@@ -352,6 +520,12 @@ def summarize_verified(verified):
             process_io_final=replay['process_io_final'],
             host_swap_delta_pages={key:replay['host_after']['swap_pages'][key]-replay['host_before']['swap_pages'][key]
                 for key in ('pswpin','pswpout')},foreground_metrics=foreground)
+        if mode in final_by_mode:
+            final = final_by_mode[mode]
+            summary['modes'][mode].update(final_metrics_freshness=replay['final_metrics_freshness'],
+                final_metrics=final, final_adapter_by_namespace=adapter_stats(final),
+                final_shard_read_by_owner=shard_read_stats(final),
+                final_metrics_scope='post-certified causal cut; excluded from foreground metrics/timing; not quiescent physical IO')
         summary['modes'][mode]['checkpoint_completion'] = checkpoint_completion_observation(foreground)
         summary['modes'][mode]['adapter_by_namespace'] = adapter_stats(foreground)
         summary['modes'][mode]['shard_read_by_owner'] = shard_read_stats(foreground)
@@ -716,7 +890,7 @@ def verified_campaign(root):
             if archived_json(archive, prefix + 'cell-receipt.json') != cell:
                 raise ValueError('controller cell receipt differs')
             replay = verified_replay(root / 'paired-results' / cell_id)
-            replay_receipt, result, _, _ = replay
+            replay_receipt, result, _, _, _ = replay
             if (replay_receipt != archived_json(archive, prefix + 'replay-receipt.json')
                     or replay_receipt['evidence_sha256'] != cell['replay_evidence_sha256']
                     or result['source_archive_sha256'] != cfg['source_archive_sha256']
@@ -1049,7 +1223,7 @@ def main():
             print(json.dumps(dict(complete=True, run_id=report['run_id'],
                                   cells=len(report['cells']), comparison_by_cache=report['comparison_by_cache']), indent=2))
     elif args.verify_only:
-        _, result, _, _ = verified_replay(root)
+        _, result, _, _, _ = verified_replay(root)
         print(json.dumps(dict(verified=True, checkpoint_digest=result['checkpoint_digest'],
                               performance_analysis='deferred'), indent=2))
     else:

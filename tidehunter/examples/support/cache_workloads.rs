@@ -473,7 +473,7 @@ pub(super) fn bounded_hot(
         );
     }
     let monitor = match backend {
-        Backend::Tcp(db) if registered => Some(db.read_io_monitor()),
+        Backend::Tcp(db) if registered => Some(db.read_evidence_monitor()),
         Backend::Tcp(_) | Backend::Native { .. } => None,
         Backend::Sharded(_) => {
             return Err(invalid("bounded hot control requires native or TCP").into());

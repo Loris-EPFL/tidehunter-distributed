@@ -167,7 +167,7 @@ fn collect(
     completed
 }
 
-fn observe_idle_tcp_wait(client: &mut Client) {
+fn observe_idle_readiness_wait(client: &mut Client) {
     client.connection_profile(true, true).unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -180,27 +180,107 @@ fn observe_idle_tcp_wait(client: &mut Client) {
         }
         assert!(
             Instant::now() < deadline,
-            "idle TCP did not park on readiness"
+            "idle owner did not park on readiness"
         );
     }
 }
 
-#[test]
-fn adaptive_idle_tcp_wakes_for_scalar_read_and_shutdown() {
-    let server = Running::new(Transport::Tcp, WalMemberReadPolicy::Positional);
+fn adaptive_idle_reads_and_shutdown(transport: Transport) {
+    let server = Running::with_limits(
+        transport,
+        WalMemberReadPolicy::Positional,
+        default_read_bytes(),
+        default_device_reads(),
+        0,
+        TcpLimits {
+            polling: PollingPolicy::Adaptive,
+            ..TcpLimits::default()
+        },
+    );
     let mut client = server.client();
     let (batches, references) = server.data(&mut client);
-    assert_eq!(client.polling_policy(), PollingPolicy::Adaptive);
     for _ in 0..3 {
-        observe_idle_tcp_wait(&mut client);
+        observe_idle_readiness_wait(&mut client);
         assert_eq!(
             client.read_record(1, &references[0]).unwrap(),
             batches[0].mutations()[0],
         );
     }
-    observe_idle_tcp_wait(&mut client);
+    observe_idle_readiness_wait(&mut client);
     drop(server);
     assert!(client.read_record(1, &references[0]).is_err());
+}
+
+#[test]
+fn adaptive_idle_tcp_wakes_for_scalar_read_and_shutdown() {
+    adaptive_idle_reads_and_shutdown(Transport::Tcp);
+}
+
+#[cfg(feature = "experimental-fabric")]
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm and local network permission"]
+fn software_provider_adaptive_idle_wakes_for_scalar_read_and_shutdown() {
+    for transport in [Transport::FabricTcp, Transport::FabricTcpNative] {
+        adaptive_idle_reads_and_shutdown(transport);
+    }
+}
+
+fn operational_session_for_transport(transport: Transport) {
+    let server = Running::new(transport, WalMemberReadPolicy::Positional);
+    let mut serving = server.client();
+    let (batches, references) = server.data(&mut serving);
+    assert_eq!(
+        serving.read_record(1, &references[0]).unwrap(),
+        batches[0].mutations()[0],
+    );
+    let tls = server.tls.client_config_with_identity().unwrap();
+    let diagnostic = |expected| {
+        Client::connect_operational_shared(
+            &server.endpoint,
+            &server.tls,
+            tls.clone(),
+            Duration::from_secs(2),
+            expected,
+            &shape(),
+        )
+        .unwrap()
+    };
+    let mut wrong_owner = server.config.partition.clone();
+    wrong_owner.inventory.database[0] ^= 1;
+    assert!(diagnostic(wrong_owner).operational_read_io_stats().is_err());
+    let next = batch(&server.config, 1, 2);
+    for try_status_upgrade in [false, true] {
+        let mut client = diagnostic(server.config.partition.clone());
+        let stats = client.operational_read_io_stats().unwrap().unwrap();
+        assert_eq!(stats.completed_reads, 1);
+        if try_status_upgrade {
+            assert!(client.status().is_err());
+        } else {
+            assert!(client.append_many(1, std::slice::from_ref(&next)).is_err());
+        }
+    }
+    let receipts = serving.append_many(1, std::slice::from_ref(&next)).unwrap();
+    let reference = next
+        .record_reference(receipts[0].appended().address(), 0)
+        .unwrap();
+    assert_eq!(
+        serving.read_record(1, &reference).unwrap(),
+        next.mutations()[0],
+    );
+}
+
+#[test]
+fn operational_session_binds_owner_identity_and_cannot_admit_data() {
+    operational_session_for_transport(Transport::Tcp);
+}
+
+#[cfg(feature = "experimental-fabric")]
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm and local network permission"]
+fn software_provider_operational_session_binds_identity_and_cannot_admit_data() {
+    for transport in [Transport::FabricTcp, Transport::FabricTcpNative] {
+        operational_session_for_transport(transport);
+    }
 }
 
 fn established_connection_survives_idle_timeout(transport: Transport) {
@@ -469,7 +549,7 @@ fn async_tcp_multiple_misses_are_bounded_and_report_real_wal_submissions() {
     let mut client = server.client();
     let (batches, references) = server.data(&mut client);
     let before = client.read_io_stats().unwrap();
-    observe_idle_tcp_wait(&mut client);
+    observe_idle_readiness_wait(&mut client);
     let mut ids = Vec::new();
     for index in 0..32 {
         ids.push(
@@ -1075,7 +1155,6 @@ fn ram_probe_round_trip(transport: Transport, polling: PollingPolicy) {
         assert!(stats.output_retire_samples > 0);
     }
     if transport != Transport::Tcp {
-        assert_eq!(profile.polling.idle_wait_calls, 0);
         for transport in [profile.transport, profile.client_transport] {
             assert!(transport.send_copy_calls > 0);
             assert!(transport.receive_copy_calls > 0);

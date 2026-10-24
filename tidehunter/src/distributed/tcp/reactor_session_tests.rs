@@ -40,7 +40,7 @@ fn one_session_pipelines_appends_but_keeps_fence_and_seal_as_barriers() {
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        client.stream.progress().unwrap();
+        client.stream.progress(None).unwrap();
         if persist_entered.try_recv().is_ok() {
             break;
         }
@@ -81,7 +81,7 @@ fn one_session_pipelines_appends_but_keeps_fence_and_seal_as_barriers() {
 
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        client.stream.progress().unwrap();
+        client.stream.progress(None).unwrap();
         assert!(
             take_wire_responses(&mut client).is_empty(),
             "an append reply escaped before its persistence barrier"
@@ -104,7 +104,7 @@ fn one_session_pipelines_appends_but_keeps_fence_and_seal_as_barriers() {
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut responses = Vec::new();
     while responses.len() != 5 {
-        client.stream.progress().unwrap();
+        client.stream.progress(None).unwrap();
         responses.extend(take_wire_responses(&mut client));
         assert!(
             Instant::now() < deadline,

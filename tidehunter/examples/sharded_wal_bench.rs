@@ -1760,7 +1760,7 @@ impl Output {
                 writeln!(self.read_path_evidence, ",false,,,,,,,")?;
             }
         }
-        let snapshot = db.read_io_monitor().sample_resident_reads()?;
+        let snapshot = db.read_evidence_monitor().sample_resident_reads()?;
         serde_json::to_writer(
             &mut self.resident_reads,
             &serde_json::json!({

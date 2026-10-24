@@ -6,7 +6,11 @@ import analyze
 
 class ShardReadEvidence(unittest.TestCase):
     def metrics(self, available=1, offset=0):
-        text = f'tidehunter_adapter{{namespace="perpetual",stat="shard_sample_available"}} {available}\n'
+        status = dict(shard_sample_available=available, resident_sample_available=available,
+            shard_sample_generation=offset + 1, shard_sample_errors=0,
+            shard_sample_age_ms=0, shard_sampler_stopped=0)
+        text = ''.join(f'tidehunter_operational_read_io{{namespace="perpetual",stat="{key}"}} {value}\n'
+                       for key, value in status.items())
         for owner in (0, 1):
             for stat, value in {'cache_hits': 7 + owner + offset,
                                 'wal_reads': 3 + owner + offset,
@@ -107,6 +111,28 @@ class ShardReadEvidence(unittest.TestCase):
         after['tidehunter_shard_read{namespace="perpetual",partition="0",stat="authority_available"}'] = 0
         owner = analyze.shard_read_deltas(before, after)['by_namespace']['perpetual']['0']
         self.assertEqual(owner['authority_available'], dict(before=1, after=0))
+
+    def test_historical_adapter_status_normalizes_without_current_qualification(self):
+        current = self.metrics()
+        historical = {key: value for key, value in current.items()
+                      if not key.startswith('tidehunter_operational_read_io{')}
+        historical['tidehunter_adapter{namespace="perpetual",stat="shard_sample_available"}'] = 1
+        self.assertEqual(analyze.shard_read_stats(current)['by_namespace'],
+                         analyze.shard_read_stats(historical)['by_namespace'])
+        self.assertEqual(analyze.adapter_stats(current)['perpetual']['shard_sample_available'],
+                         analyze.adapter_stats(historical)['perpetual']['shard_sample_available'])
+        with self.assertRaises(ValueError):
+            analyze.current_metric_streams(historical, {'perpetual'}, remote=True)
+
+    def test_new_owner_status_requires_resident_freshness_and_not_stopped(self):
+        for key, value in (('resident_sample_available', 0), ('shard_sample_age_ms', 3001),
+                           ('shard_sampler_stopped', 1), ('shard_sample_available', 0)):
+            values = self.metrics()
+            values[f'tidehunter_operational_read_io{{namespace="perpetual",stat="{key}"}}'] = value
+            with self.subTest(key=key):
+                evidence = analyze.shard_read_stats(values)
+                self.assertFalse(evidence['sample_available_by_namespace']['perpetual'])
+                self.assertIsNone(evidence['by_namespace']['perpetual']['0']['wal_reads'])
 
 
 class ResidentReplayPopulation(unittest.TestCase):

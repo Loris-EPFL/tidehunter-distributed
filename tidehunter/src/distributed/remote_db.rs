@@ -66,28 +66,293 @@ use read_cache::{ReadCache, ReadCachePolicy};
 pub(crate) use read_pipeline::PendingScanPage;
 pub use transports::RemoteTransportPool;
 
-/// Diagnostic handles do not borrow the coordinator/index owner. Each control
-/// connection retains its own authenticated stream lock; no global Db lock is
-/// held over these network waits. Counters are cumulative, not a quiescent cut.
-pub struct ReadIoMonitor {
+const OPERATIONAL_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const OPERATIONAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+pub struct OperationalReadIoSnapshot {
+    pub generation: u64,
+    pub last_attempt: Option<Instant>,
+    pub available: bool,
+    pub failed_samples: u64,
+    pub owners: Vec<(u32, super::tcp::ReadExecutorStats)>,
+    pub resident_available: bool,
+    pub residents: Vec<(u32, super::tcp::ResidentReadStats)>,
+}
+struct OperationalReadIoState {
+    snapshot: RwLock<OperationalReadIoSnapshot>,
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+/// Passive operational owner counters. This handle retains only an inert snapshot.
+#[derive(Clone)]
+pub struct OperationalReadIoMonitor {
+    state: Arc<OperationalReadIoState>,
+}
+impl OperationalReadIoMonitor {
+    pub fn visit(&self, visit: impl FnOnce(&OperationalReadIoSnapshot, bool)) {
+        let snapshot = self.state.snapshot.read();
+        visit(
+            &snapshot,
+            self.state
+                .stopped
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
+    }
+    pub fn try_visit(&self, visit: impl FnOnce(&OperationalReadIoSnapshot, bool)) -> Option<()> {
+        let snapshot = self.state.snapshot.try_read()?;
+        visit(
+            &snapshot,
+            self.state
+                .stopped
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
+        Some(())
+    }
+}
+
+struct PendingOperationalReadIoSampling {
+    config: RemoteDatabaseConfig,
+    shape: KeyShape,
+    tls_config: super::tcp::ClientTlsConfig,
+}
+
+pub(super) struct OperationalReadIoLifecycle {
+    state: Arc<OperationalReadIoState>,
+    pending: Option<PendingOperationalReadIoSampling>,
+    stop: Option<mpsc::SyncSender<()>>,
+    worker: Option<JoinHandle<()>>,
+    stopped: bool,
+}
+
+struct OperationalReadIoSampler {
+    state: Arc<OperationalReadIoState>,
+    lifecycle: Arc<Mutex<OperationalReadIoLifecycle>>,
+}
+impl OperationalReadIoSampler {
+    fn dormant(
+        config: RemoteDatabaseConfig,
+        shape: KeyShape,
+        tls_config: super::tcp::ClientTlsConfig,
+    ) -> Self {
+        let state = Arc::new(OperationalReadIoState {
+            snapshot: RwLock::new(OperationalReadIoSnapshot::default()),
+            stopped: std::sync::atomic::AtomicBool::new(false),
+        });
+        Self {
+            state: state.clone(),
+            lifecycle: Arc::new(Mutex::new(OperationalReadIoLifecycle {
+                state,
+                pending: Some(PendingOperationalReadIoSampling {
+                    config,
+                    shape,
+                    tls_config,
+                }),
+                stop: None,
+                worker: None,
+                stopped: false,
+            })),
+        }
+    }
+
+    fn monitor(&self) -> OperationalReadIoMonitor {
+        OperationalReadIoMonitor {
+            state: self.state.clone(),
+        }
+    }
+
+    fn downgrade_lifecycle(&self) -> std::sync::Weak<Mutex<OperationalReadIoLifecycle>> {
+        Arc::downgrade(&self.lifecycle)
+    }
+
+    fn activate(&self, reads: &Arc<ReadService>) {
+        Self::activate_lifecycle(&self.lifecycle, reads);
+    }
+
+    pub(super) fn activate_lifecycle(
+        lifecycle: &Arc<Mutex<OperationalReadIoLifecycle>>,
+        reads: &Arc<ReadService>,
+    ) {
+        let mut lifecycle = lifecycle.lock();
+        if lifecycle.stopped || lifecycle.worker.is_some() {
+            return;
+        }
+        let Some(pending) = lifecycle.pending.take() else {
+            return;
+        };
+        let state = lifecycle.state.clone();
+        let thread_state = state.clone();
+        let reads = reads.clone();
+        let (stop, stopped) = mpsc::sync_channel(1);
+        let spawn_result = thread::Builder::new()
+            .name("wal-operational-metrics".to_owned())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    operational_sample_loop(
+                        pending.config,
+                        pending.shape,
+                        pending.tls_config,
+                        reads,
+                        thread_state.clone(),
+                        stopped,
+                    )
+                }));
+                if result.is_err() {
+                    mark_operational_sample_failed(&thread_state);
+                    eprintln!("operational read-I/O sampler panicked");
+                }
+            });
+        match spawn_result {
+            Ok(worker) => {
+                lifecycle.stop = Some(stop);
+                lifecycle.worker = Some(worker);
+            }
+            Err(error) => {
+                lifecycle.stopped = true;
+                mark_operational_sample_failed(&state);
+                eprintln!("failed to start operational read-I/O sampler: {error}");
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        let (state, stop, worker) = {
+            let mut lifecycle = self.lifecycle.lock();
+            lifecycle.stopped = true;
+            lifecycle.pending = None;
+            lifecycle
+                .state
+                .stopped
+                .store(true, std::sync::atomic::Ordering::Release);
+            (
+                lifecycle.state.clone(),
+                lifecycle.stop.take(),
+                lifecycle.worker.take(),
+            )
+        };
+        if let Some(stop) = stop {
+            let _ = stop.try_send(());
+        }
+        if let Some(worker) = worker
+            && worker.join().is_err()
+        {
+            mark_operational_sample_failed(&state);
+            eprintln!("operational read-I/O sampler panicked during shutdown");
+        }
+        if let Some(mut snapshot) = state.snapshot.try_write() {
+            snapshot.available = false;
+            snapshot.resident_available = false;
+            snapshot.owners.clear();
+            snapshot.residents.clear();
+        }
+    }
+}
+
+fn mark_operational_sample_failed(state: &OperationalReadIoState) {
+    state
+        .stopped
+        .store(true, std::sync::atomic::Ordering::Release);
+    if let Some(mut snapshot) = state.snapshot.try_write() {
+        snapshot.generation = snapshot.generation.saturating_add(1);
+        snapshot.last_attempt = Some(Instant::now());
+        snapshot.failed_samples = snapshot.failed_samples.saturating_add(1);
+        snapshot.available = false;
+        snapshot.owners.clear();
+        snapshot.resident_available = false;
+        snapshot.residents.clear();
+    }
+}
+
+impl Drop for OperationalReadIoSampler {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn operational_sample_loop(
+    config: RemoteDatabaseConfig,
+    shape: KeyShape,
+    tls_config: super::tcp::ClientTlsConfig,
+    reads: Arc<ReadService>,
+    state: Arc<OperationalReadIoState>,
+    stop: mpsc::Receiver<()>,
+) {
+    let mut clients: Vec<Option<Client>> = (0..config.endpoints.len()).map(|_| None).collect();
+    loop {
+        if stop.try_recv().is_ok() {
+            break;
+        }
+        let attempt_started = Instant::now();
+        let mut owners = Vec::with_capacity(config.endpoints.len());
+        let mut available = true;
+        for (index, endpoint) in config.endpoints.iter().enumerate() {
+            if stop.try_recv().is_ok() {
+                available = false;
+                break;
+            }
+            if clients[index].is_none() {
+                let mut tls = config.tls.clone();
+                tls.server_name = endpoint.server_name.clone();
+                tls.resident_reads = super::tcp::ResidentReadConfig::default();
+                clients[index] = Client::connect_operational_shared(
+                    &endpoint.address,
+                    &tls,
+                    tls_config.clone(),
+                    OPERATIONAL_REQUEST_TIMEOUT,
+                    config.partition_config(1, endpoint.partition),
+                    &shape,
+                )
+                .ok();
+            }
+            match clients[index]
+                .as_mut()
+                .map(Client::operational_read_io_stats)
+            {
+                Some(Ok(Some(stats))) => owners.push((endpoint.partition, stats)),
+                Some(Ok(None)) | None => available = false,
+                Some(Err(_)) => {
+                    clients[index] = None;
+                    available = false;
+                }
+            }
+        }
+        let residents = reads.try_resident_read_stats().and_then(|samples| {
+            let mut rows = Vec::with_capacity(samples.len());
+            for (node, stats) in samples {
+                rows.push((config.endpoints.get(node as usize)?.partition, stats));
+            }
+            (rows.len() == config.endpoints.len()).then_some(rows)
+        });
+        if !state.stopped.load(std::sync::atomic::Ordering::Acquire)
+            && let Some(mut snapshot) = state.snapshot.try_write()
+        {
+            snapshot.generation = snapshot.generation.saturating_add(1);
+            snapshot.last_attempt = Some(attempt_started);
+            snapshot.available = available && owners.len() == config.endpoints.len();
+            snapshot.failed_samples = snapshot
+                .failed_samples
+                .saturating_add(u64::from(!snapshot.available));
+            snapshot.owners = if snapshot.available {
+                owners
+            } else {
+                Vec::new()
+            };
+            snapshot.resident_available = residents.is_some();
+            snapshot.residents = residents.unwrap_or_default();
+        }
+        match stop.recv_timeout(OPERATIONAL_SAMPLE_INTERVAL) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+/// Explicit benchmark evidence handle; resident-lane reads may wait on a lane.
+pub struct ReadEvidenceMonitor {
     clients: Vec<(u32, Arc<Mutex<Client>>)>,
     reads: Arc<ReadService>,
 }
-impl ReadIoMonitor {
-    pub fn sample(&self) -> Result<Vec<(u32, super::tcp::ReadExecutorStats)>, LocalDbError> {
-        self.clients
-            .iter()
-            .map(|(partition, client)| {
-                client
-                    .lock()
-                    .read_io_stats()
-                    .map(|stats| (*partition, stats))
-                    .map_err(LocalDbError::component)
-            })
-            .collect()
-    }
-    /// Per-partition client-side RMA counters; unlike shard I/O, these measure
-    /// actual initiator posts/completions and require no network probe.
+impl ReadEvidenceMonitor {
+    /// Per-partition client-side RMA counters; this does not make an RPC.
     pub fn sample_resident_reads(
         &self,
     ) -> Result<Vec<(u32, super::tcp::ResidentReadStats)>, LocalDbError> {
@@ -98,7 +363,6 @@ impl ReadIoMonitor {
         Ok(samples)
     }
     /// Per configured read lane, for proving warmed coverage before timing.
-    /// Sampling locks each exclusive lane briefly but does not make an RPC.
     pub fn sample_resident_read_lanes(
         &self,
     ) -> Result<Vec<(u32, usize, super::tcp::ResidentReadStats)>, LocalDbError> {
@@ -891,6 +1155,7 @@ pub struct RemoteDatabase {
     transport_pool: Option<Arc<RemoteTransportPool>>,
     transport_key: Option<[u8; 32]>,
     config: RemoteDatabaseConfig,
+    operational_sampler: OperationalReadIoSampler,
     shape: KeyShape,
     path: PathBuf,
     epoch: u64,
@@ -1167,8 +1432,14 @@ impl RemoteDatabase {
             tls_config.clone(),
             retained_reads,
         )?;
-        let connected =
-            transports::connect(&config, &shape, tls_config, 1, false, retained_controls)?;
+        let connected = transports::connect(
+            &config,
+            &shape,
+            tls_config.clone(),
+            1,
+            false,
+            retained_controls,
+        )?;
         recovery_stats.connection_setup_ns = connected.elapsed_ns;
         recovery_stats.created_connections = (connected.clients.len() - connected.reused) as u64;
         recovery_stats.reused_connections = connected.reused as u64;
@@ -1331,9 +1602,12 @@ impl RemoteDatabase {
             .collect();
         let checkpoint_diagnostics =
             (config.write_profile_limit != 0).then(|| VecDeque::with_capacity(128));
+        let reads = Arc::new(reads);
+        let operational_sampler =
+            OperationalReadIoSampler::dormant(config.clone(), shape.clone(), tls_config.clone());
         let mut database = Self {
             clients: workers,
-            reads: Arc::new(reads),
+            reads,
             preparation_pool,
             read_cache: Arc::new(Mutex::new(ReadCache::new(config.read_cache_bytes))),
             cache_policy: ReadCachePolicy::default(),
@@ -1342,6 +1616,7 @@ impl RemoteDatabase {
             transport_key,
             inventory: config.inventory(epoch),
             config,
+            operational_sampler,
             shape,
             path,
             epoch,
@@ -1443,8 +1718,8 @@ impl RemoteDatabase {
         self.epoch
     }
 
-    pub fn read_io_monitor(&self) -> ReadIoMonitor {
-        ReadIoMonitor {
+    pub fn read_evidence_monitor(&self) -> ReadEvidenceMonitor {
+        ReadEvidenceMonitor {
             clients: self
                 .config
                 .endpoints
@@ -1454,6 +1729,10 @@ impl RemoteDatabase {
                 .collect(),
             reads: self.reads.clone(),
         }
+    }
+    pub fn operational_read_io_monitor(&self) -> OperationalReadIoMonitor {
+        self.operational_sampler.activate(&self.reads);
+        self.operational_sampler.monitor()
     }
 
     pub fn validate_cached_read(&self) -> Result<(), LocalDbError> {
@@ -2846,6 +3125,7 @@ impl RemoteDatabase {
         if self.stopped {
             return Ok(());
         }
+        self.operational_sampler.stop();
         let started = Instant::now();
         let mut result = self.drain();
         self.shutdown_stats.drain_ns = elapsed(started);
@@ -2876,6 +3156,7 @@ impl RemoteDatabase {
                 "asynchronous read failed before shutdown",
             ));
         }
+        let started = Instant::now();
         if result.is_ok() {
             // Issue all seals before waiting for any; drain every submitted reply.
             let seals: Vec<_> = self

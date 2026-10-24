@@ -444,6 +444,8 @@ enum Request {
         enabled: bool,
         reset: bool,
     },
+    /// Nonblocking operational snapshot; not a durability barrier or evidence cut.
+    OperationalReadIoStats,
     #[cfg(all(target_os = "linux", feature = "test-utils"))]
     ReadEvidence {
         epoch: u64,
@@ -466,6 +468,7 @@ impl Request {
             Self::Stats
             | Self::StatsDetailed
             | Self::ReadIoStats
+            | Self::OperationalReadIoStats
             | Self::ConnectionProfile { .. } => true,
             #[cfg(all(target_os = "linux", feature = "test-utils"))]
             Self::ReadEvidence { .. } => true,
@@ -547,6 +550,7 @@ enum Response {
     },
     // Diagnostics must not enlarge every ordinary read/write response value.
     ConnectionProfile(Box<ConnectionProfile>),
+    OperationalReadIoStats(Box<(PartitionConfig, Option<ReadExecutorStats>)>),
     #[cfg(all(target_os = "linux", feature = "test-utils"))]
     ReadEvidence(crate::read_probe::ReadEvidence),
     #[cfg(all(target_os = "linux", feature = "test-utils"))]
@@ -619,6 +623,7 @@ impl StorageNode {
         let append_shape = inventory.shape.clone();
         let append_batch_limits = inventory.config.partition.batch_limits;
         let append_group_limits = inventory.config.partition.group_limits;
+        let partition = inventory.config.partition.clone();
         let inventory = Arc::new(Mutex::new(inventory));
         let resident_grants = Arc::new(resident::GrantRegistry::new(
             resident_reads.source_bytes,
@@ -628,6 +633,7 @@ impl StorageNode {
         #[cfg(test)]
         let panic_after_append = Arc::new(AtomicBool::new(false));
         let control_context = Arc::new(control::ControlContext {
+            partition,
             inventory: inventory.clone(),
             readers: readers.clone(),
             terminal: terminal.clone(),
@@ -1191,6 +1197,19 @@ impl Client {
             _ => self.wrong_response(),
         }
     }
+    /// Nonblocking read-only owner counters for operational metrics.
+    pub fn operational_read_io_stats(&mut self) -> Result<Option<ReadExecutorStats>, TcpError> {
+        match self.request(Request::OperationalReadIoStats)? {
+            Response::OperationalReadIoStats(snapshot) => {
+                let (partition, stats) = *snapshot;
+                if partition != self.expected {
+                    return self.wrong_response();
+                }
+                Ok(stats)
+            }
+            _ => self.wrong_response(),
+        }
+    }
     /// Local cumulative grant/RMA counters for this partition connection.
     /// Snapshot performs no RPC or provider progress.
     #[must_use]
@@ -1216,6 +1235,43 @@ impl Client {
         timeout: Duration,
         expected: PartitionConfig,
         shape: &KeyShape,
+    ) -> Result<Self, TcpError> {
+        Self::connect_shared_with_status(
+            endpoint,
+            tls,
+            client_config,
+            timeout,
+            expected,
+            shape,
+            true,
+        )
+    }
+    pub(crate) fn connect_operational_shared(
+        endpoint: &str,
+        tls: &TlsFiles,
+        client_config: ClientTlsConfig,
+        timeout: Duration,
+        expected: PartitionConfig,
+        shape: &KeyShape,
+    ) -> Result<Self, TcpError> {
+        Self::connect_shared_with_status(
+            endpoint,
+            tls,
+            client_config,
+            timeout,
+            expected,
+            shape,
+            false,
+        )
+    }
+    fn connect_shared_with_status(
+        endpoint: &str,
+        tls: &TlsFiles,
+        client_config: ClientTlsConfig,
+        timeout: Duration,
+        expected: PartitionConfig,
+        shape: &KeyShape,
+        query_status: bool,
     ) -> Result<Self, TcpError> {
         expected.validate().map_err(TcpError::component)?;
         tls.transport.validate()?;
@@ -1323,9 +1379,11 @@ impl Client {
             #[cfg(feature = "test-utils")]
             ram_probe_bytes: None,
         };
-        let began = Instant::now();
-        client.connected_status = Some(client.status()?);
-        client.connect_profile.status_ns = elapsed_ns(began);
+        if query_status {
+            let began = Instant::now();
+            client.connected_status = Some(client.status()?);
+            client.connect_profile.status_ns = elapsed_ns(began);
+        }
         #[cfg(feature = "experimental-fabric")]
         {
             // Normal EFA can defer RX pool creation/registration until its

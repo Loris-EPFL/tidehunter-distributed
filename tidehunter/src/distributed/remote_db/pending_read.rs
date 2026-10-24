@@ -1122,6 +1122,20 @@ impl ReadService {
             })
             .collect()
     }
+    pub(super) fn try_resident_read_stats(
+        &self,
+    ) -> Option<Vec<(u32, super::super::tcp::ResidentReadStats)>> {
+        let lanes = self.lanes.try_read()?;
+        let mut samples = Vec::with_capacity(lanes.len());
+        for (node, node_lanes) in lanes.iter().enumerate() {
+            let mut stats = super::super::tcp::ResidentReadStats::default();
+            for lane in node_lanes {
+                stats.add(lane.client.try_lock()?.resident_read_stats());
+            }
+            samples.push((node as u32, stats));
+        }
+        Some(samples)
+    }
     pub(super) fn resident_read_lane_stats(
         &self,
     ) -> Vec<(u32, usize, super::super::tcp::ResidentReadStats)> {

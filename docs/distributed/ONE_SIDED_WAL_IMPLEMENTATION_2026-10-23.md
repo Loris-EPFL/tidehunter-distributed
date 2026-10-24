@@ -283,7 +283,7 @@ For **registered RMA rows**, `registered_controls.jsonl` retains raw lane snapsh
 
 Counter semantics are separate: legacy `read_rpcs` / `RemoteDatabase::read_rpc_count` counts admitted RPC groups and excludes resident RMA groups; it is not a member/packet count. The initiator's actual wire Read/ReadProfiled count comes from `Client::message_read_requests`, incremented in `queue_read_chunk`, including additional chunks when one logical group needs more than one message. Use that exact initiator counter for zero-RPC hit qualification rather than inferring zero messages from the legacy group count. RMA `eligible_reads`/`rma_hits` count complete groups, while `rma_posts`/`rma_completions` count elements.
 
-`ReadIoMonitor::{sample_resident_reads,sample_resident_read_lanes}` in `distributed/remote_db.rs` maps internal client-vector indices through `self.clients` to actual physical partition IDs before exporting counters. This matters for noncontiguous inventories (including a partition-2 regression); vector index zero must not silently become owner/partition zero. Both aggregate and per-lane observations use the same mapping. This source fix prevents foreign owner labels from qualifying an otherwise valid hit population.
+`ReadEvidenceMonitor::{sample_resident_reads,sample_resident_read_lanes}` in `distributed/remote_db.rs` maps internal client-vector indices through `self.clients` to actual physical partition IDs before exporting counters. This explicit benchmark API was named `ReadIoMonitor` in the earlier source-navigation snapshot. Operational collection now uses the separate inert `OperationalReadIoMonitor` described in §11. Vector index zero must not become partition zero when the actual owner is partition 2.
 
 ## 8. Reproduction entry points and policy
 
@@ -573,3 +573,127 @@ The verified research handoff was `history://WalReadReferences:134-175`; primary
 | Pinned libfabric `3cc1095272b07ebeb5cc8f44851af6aa3eb75e41`: [`efa_fabric_comparison.md`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/docs/efa_fabric_comparison.md), [`efa_rma.c`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/efa_rma.c), [`efa_mr.c`](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/prov/efa/src/efa_mr.c) | Evidence for direct-provider caps/modes, target AV insertion, native read posting, local descriptors, and the MR-close wrapper caveat. | A local close result, timeout or generation increment is not proven revocation of all already-posted remote DMA. This source pin is a research identity; runtime library/build identity still has to be recorded independently. |
 
 The [AWS supported-instance table](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa.html#efa-instance-types) supplies instance-type capability context only. It is not an AWS operation or proof of an attached device selected by a particular experiment.
+
+## 11. Local CI readiness repairs
+
+The earlier cloud preparation failed before a complete campaign. Run
+`40078567891` was cancelled before its benchmark job allocated EC2. Its closure
+receipt is under
+`project:checkpoint-work/aws-ci-runs/40078567891-1/failure/aws-mcp-cancelled-closure.json`.
+There is no new cloud performance comparison from that cancelled run.
+
+The local repair branch is `fix/software-fabric-local-liveness-2026-10-24`.
+These changes fix readiness and observation, not the physical EFA latency floor.
+
+| Failure or risk | Mechanism and code |
+|---|---|
+| A delayed diagnostic poisons a connection needed for a real append. | `remote_db.rs` separates explicit `ReadEvidenceMonitor` from inert `OperationalReadIoMonitor`. Its DB-owned sampler remains dormant until a monitor is requested: no thread, diagnostic connection, or extra strong/weak `ReadService` reference exists before activation. The lifecycle mutex serializes activation and stop; `ConcurrentRemoteDatabase` holds only a weak lifecycle reference. Active sampling uses independent, RMA-disabled clients. `tcp.rs` and `tcp/reactor.rs` accept a version-checked operational first request without the serving `Status` barrier. That session cannot issue data requests or upgrade through `Status`; every reply binds the configured partition identity. |
+| Software-provider receive pools exceed the small CI host's practical memory budget. | `experiments/resident_config.py::software_fabric_environment` fixes `FI_OFI_RXM_MSG_RX_SIZE=128` for explicit software runs and rejects conflicting inherited values. Deployment, the raw software CLI and the software CI profile use this policy. The pinned RxM implementation registers this setting in `rxm_init.c:250–258` and uses it for the shared receive queue at `664–666`. Hardware configuration is not changed. |
+| Idle manual-progress sessions compete with Sui cleanup on two CPUs. | Software `tcp;ofi_rxm` message-only endpoints qualify `FI_WAIT_UNSPEC`; `Endpoint::try_progress_for_sweep` can replace its single CQ acquisition with provider-managed `fi_cq_sread`. A wait requires drained message state, all receives posted, no TX, RMA or direct state, and at least one millisecond remaining. The requested wait is at most one millisecond. The reactor arms it only for an established, drained adaptive server session. Active clients and hardware EFA/direct keep their existing progress policy. |
+| A collector retains a DB or waits on its serving connections. | `distributed/sui.rs` supplies try-only local metric reads. Sui `typed-store/src/tidehunter_util.rs` reads owner snapshots directly from inert state and uses a separate Weak-DB publisher for local adapter gauges. `Database` owns and stops that publisher before storage teardown or exclusive DB recovery. The collector takes no serving client mutex and performs no RPC. |
+| Concurrent local publication and collection produce partial or misleading metric families. | Sui serializes publication and collection with one metrics-only mutex. DB reads remain try-only. `tidehunter_operational_read_io` contains exactly six owner-status fields; seven aggregate owner counters stay in `tidehunter_adapter` and follow owner availability. Each successful owner vector must contain all 23 base counters and every availability-gated authority/initiator counter. Sampling age starts before the first owner RPC, not when the last reply is published. Failed, stale or stopped samples cannot qualify. These locks are outside the read/write fast path. |
+| A new opcode differs between the storage executable and Sui's feature set. | Production operational variants precede the `cfg(test-utils)` tails in both request and response enums. The transport wire version is `10`; experiment packaging protocol remains `9`. These are separate version domains. |
+| A final scrape contains counters sampled before checkpoint completion. | `run.py::wait_for_final_metrics` takes a baseline after index catchup and certified checkpoint verification. Each required live namespace must advance its local stream and, for remote mode, its owner stream by at least two generations with valid availability and age. This wait is outside foreground timing and inside the original remaining replay deadline. `analyze.py` validates that cut and keeps historical evidence separate. |
+
+The diagnostic request reports temporary lock contention as unavailable. It does
+not imply a broken transport. The sampler retains that diagnostic connection on
+`Ok(None)` and replaces it only after an actual request failure. It must not
+recreate an EFA endpoint for every contended snapshot.
+
+No original Tidehunter data-path lock was removed. WAL allocation, durable
+receipts, contiguous publication, read authority, registered-buffer ownership
+and quarantine rules are unchanged. A CQ completion still does not prove
+durability or arbitrary remote-DMA quiescence. A bounded provider timeout is not
+a hard scheduler-latency guarantee.
+
+### Observed local evidence
+
+- The original delayed-diagnostic regression failed at a real append with
+  “connection requires replacement; request outcome may be unknown.”
+  `diagnostic-interference-red.json` records the test executable identity under
+  `project:checkpoint-work/software-startup-repro-2026-10-24/`.
+- The repaired regression requires sampling attempts while inventory is held,
+  a successful real append/read after release, then a complete later owner
+  sample accounting for that WAL read. It passed after the protocol repair.
+  Separate role tests passed on TCP, TLS software fabric and native software
+  fabric; they reject wrong owner identity, data admission and a `Status`
+  upgrade on a diagnostic session.
+- In the old-binary constrained replay, the original ten-second shutdown grace
+  failed. The captured stopped instruction was in Sui's upstream Moka hash-map
+  destructor. Moving only the owned storage threads off Sui's two CPUs then
+  allowed natural exit `0` after `0.951978` seconds; all selected Tidehunter and
+  unchanged RocksDB row audits matched. This is a diagnostic CPU-contention
+  experiment, **not** a passed original-deadline admission run. Records are in
+  `replay-two-cpu-storage-release/experiment/`.
+- The real software-provider transfer tests exercise idle arming, byte delivery,
+  bidirectional progress, pending-send and buffered-receive exclusions, and
+  registered-read exclusion. The software path is not hardware RDMA evidence.
+
+The functional bundle with source SHA-256
+`753ba725f05eff6ac9466e70645f352ddfec05ab1a9c3f6573d325f7e99c1f66`
+is retained as `rebuilt-current/build-functional-validated/`. Its three completed
+replays use the same frozen, certified private Sui chain: checkpoints `0..1775`,
+1,776 verified summaries, digest
+`EhUPyfwLGDEKH5Ssg3nFbVAHwi4XA87xNKvnFEo3ZJb6`. This is not mainnet data.
+Both native and distributed nodes exited `0`. All three Tidehunter namespace
+audits and the unchanged `epochs`, `indexes` and `rpc_store` RocksDB audits
+matched. Each sealed archive passed `analyze.py --verify-only`, including
+post-certified two-generation local/owner cuts.
+
+| Completed local exercise | Evidence directory under `software-startup-repro-2026-10-24/` | Scope |
+|---|---|---|
+| Ordinary CPU affinity | `replay-rebuilt-normal/` | Native and TLS software-fabric replay on the available 20 CPUs. |
+| Original constrained topology | `replay-rebuilt-two-cpu/` | All children on CPUs `0,1`; original 900-second replay and ten-second shutdown grace, no tracing, no CPU release and no longer deadline. All 177 complete remote resource samples report zero owned-process swap; peak summed RSS is 7,965,220,864 bytes, not unique physical memory. |
+| Registered-read integration | `replay-rebuilt-registered-software/` | Coordinator cache off, owner cache 8 MiB, explicit software provider. Final cumulative counters show 710 actual FI_READ posts/completions/hits and 8,985 message reads across 15 owners. This is a mixed natural replay, not a pure RMA-hit benchmark. |
+| Raw registered-read API | `rebuilt-current/raw-fi-read-software/` | Both 256-byte and 8,192-byte cases complete 64 warmup and 1,000 clean reads with exact drain and process cleanup. Provider is explicitly `tcp;ofi_rxm`, read mode `emulated`; no hardware claim. |
+
+Strict engine profiles completed with 385 native tests, 805 distributed tests,
+806 fabric-enabled engine tests, 49 native-fabric unit tests and all 49 explicitly
+selected software-provider cases passing. Existing ignored cases remain visible
+in `rebuilt-current/local-gates/7268`. The corrected inherited-offline harness
+passes 608 AWS tests (four existing skips) and 164 Sui harness tests, recorded in
+`local-gates/7283`. Native Sui storage passes 35 library tests (`local-gates/7285`).
+Fresh local `file://` Git fixtures alone permit their initial Cargo checkout;
+production Cargo checks remain locked and offline.
+
+The final lint-clean source archive is
+`0c1411cafa2cc04174e11342f18af035e5136f38b1abe963b43437ad5f068de1`.
+All six executables were rebuilt from that snapshot after the Sui control-flow
+simplifications; native Sui's 35 library tests and strict library Clippy passed.
+`replay-final-two-cpu/` then passed the unchanged constrained replay, and
+`replay-final-registered-software-resume/` passed the normal-affinity registered
+replay. Both use the final source hash, native/distributed exit `0`, complete
+Tidehunter/RocksDB equality and valid post-certified freshness cuts. Both sealed
+archives pass strict verification. These are the final runtime gates; do not
+substitute the earlier functional source hash for them.
+
+One intervening registered replay was cancelled for a mistyped extra environment
+variable and is explicitly marked inadmissible. Its immediate replacement hit a
+local `Address already in use` startup error. No architecture change or timeout
+increase was made for that port collision; after listeners cleared, the final
+unchanged binaries passed. Failure logs remain separate from successful evidence.
+
+GitHub OIDC was exercised separately by cost-report-only run
+[`40092596198`](https://github.com/Loris-EPFL/tidehunter-distributed/actions/runs/40092596198).
+Its prepare and benchmark jobs were skipped; it could not allocate EC2.
+The downloaded accounting artifacts agree on ledger revision 56, no active
+reservations, estimated usage `$76.571582257221` and estimated available budget
+`$23.428417742779` under the unchanged `$100` weekly limit. Cost Explorer remains
+unavailable, not zero. Before the subsequent user-requested reload, MCP execution
+returned `Unknown tool: aws___run_script` and the named local login had expired.
+OIDC success alone is not an EC2 inventory or a hardware benchmark result.
+
+
+### Remaining publication gates
+
+The final local runtime gates above are complete. Before a paid campaign,
+publish the compatible engine and Sui repair commits, update the immutable Sui
+pin, and pass the protected review/checks before merging to `bench/aws-efa`.
+Do not run the older benchmark branch as a substitute for testing these repairs.
+The final local bundle lives at `rebuilt-current/build/`; its six successful
+Cargo invocations and executable hashes are in `build-manifest.json`.
+
+The earlier one-NVMe and software-provider timings remain local observations.
+Neither these repairs nor passing local tests demonstrate independent-NVMe
+scaling, hardware EFA/direct latency, or a new microsecond remote-read result.
+

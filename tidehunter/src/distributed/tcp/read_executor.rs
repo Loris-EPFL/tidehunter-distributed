@@ -213,6 +213,24 @@ impl ReadAdmission {
         stats.cache_admitted_bytes = cache.cache_admitted_bytes;
         stats
     }
+    /// Nonblocking operational snapshot. Contention makes the whole sample unavailable.
+    pub(crate) fn try_stats(&self) -> Option<ReadExecutorStats> {
+        let cache = self.cache.try_lock()?;
+        let mut stats = self.state.try_lock()?.stats;
+        stats.cache_inserts = cache.stats.cache_inserts;
+        stats.cache_evictions = cache.stats.cache_evictions;
+        stats.cache_oversized = cache.stats.cache_oversized;
+        stats.cache_entries = cache.stats.cache_entries;
+        stats.cache_bytes = cache.stats.cache_bytes;
+        stats.cache_metadata_bytes = cache.stats.cache_metadata_bytes;
+        stats.cache_budget = cache.stats.cache_budget;
+        stats.cache_bypass_disabled = cache.stats.cache_bypass_disabled;
+        stats.cache_bypass_eviction_limit = cache.stats.cache_bypass_eviction_limit;
+        stats.cache_bypass_scan = cache.stats.cache_bypass_scan;
+        stats.cache_bypass_generation = cache.stats.cache_bypass_generation;
+        stats.cache_admitted_bytes = cache.stats.cache_admitted_bytes;
+        Some(stats)
+    }
     /// Diagnostic read admission, retained through response send retirement.
     /// Caller includes all retained work in `bytes`; this is not device credit.
     pub(crate) fn reserve_reply(

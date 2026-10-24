@@ -38,7 +38,15 @@ fn clean_reuse_recovers_retry_identity_and_rejects_old_read_handles() {
         Some(vec![9; 32].into())
     );
     let old = db.submit_get(KeySpace(0), &7u32.to_be_bytes()).unwrap();
+    let operational = db.operational_read_io_monitor();
     db.shutdown().unwrap();
+    operational.visit(|snapshot, stopped| {
+        assert!(stopped);
+        assert!(!snapshot.available);
+        assert!(!snapshot.resident_available);
+        assert!(snapshot.owners.is_empty());
+        assert!(snapshot.residents.is_empty());
+    });
     drop(db);
 
     let mut db = open(&fixture, &pool).unwrap();

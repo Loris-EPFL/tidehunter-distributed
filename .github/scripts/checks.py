@@ -11,6 +11,8 @@ import sys
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "experiments"))
+from resident_config import software_fabric_environment
 TOOLCHAIN = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
 PROFILES = ("format", "lint", "native", "distributed", "fabric", "software-fabric", "harness", "all")
 SOFTWARE_STREAM_TESTS = (
@@ -23,10 +25,14 @@ SOFTWARE_STREAM_TESTS = (
     "software_provider_explicit_sweeps_transfer_without_repolling",
     "software_provider_rma_reads_with_mixed_cq_and_retained_buffer_ownership",
     "software_provider_rma_group_preserves_order_with_retained_consumers",
+    "software_provider_idle_wait_wakes_once_and_transfers_both_ways",
+    "software_provider_pending_send_disables_idle_cq_wait",
+    "software_provider_buffered_receive_disables_idle_cq_wait",
 )
 SOFTWARE_ENGINE_TESTS = (
     "fabric_mtls_authentication_lost_response_and_recovery",
     "established_software_fabric_connection_survives_idle_timeout",
+    "software_provider_adaptive_idle_wakes_for_scalar_read_and_shutdown",
     "one_software_fabric_connection_completes_out_of_order",
     "fabric_control_violation_closes_a_live_session_without_waiting_for_rpc_deadline",
     "fabric_authenticated_ram_probe_boundaries_and_busy_shutdown",
@@ -38,6 +44,8 @@ SOFTWARE_ENGINE_TESTS = (
     "fabric_tcp_native_large_partial_frames_bypass_tls",
     "fabric_tcp_native_disconnect_retains_owned_reply_credits_until_retirement",
     "software_provider_read_io_monitor_reports_wal_and_real_rma_lane_activity",
+    "software_provider_delayed_diagnostic_does_not_break_real_append",
+    "software_provider_operational_session_binds_identity_and_cannot_admit_data",
     "software_provider_concurrent_cold_acquisition_with_one_handle_returns_both_values",
     "software_provider_durable_grant_reads_real_member_without_read_rpc",
     "software_provider_two_clients_submit_rma_before_either_completion_wait",
@@ -149,7 +157,7 @@ def check(profile, env):
         cargo(fabric, "test", "-p", "tidehunter-fabric", "--features", "native",
               "--test", "software_provider")
     elif profile == "software-fabric":
-        fabric = fabric_environment(env)
+        fabric = software_fabric_environment(fabric_environment(env), software=True)
         stream = ("-p", "tidehunter-fabric", "--features", "native", "--test", "software_provider")
         selected_ignored(fabric, stream, "software_provider_", SOFTWARE_STREAM_TESTS)
         direct = "software_provider_runs_direct_packet_adapter_on_large_partial_streams"

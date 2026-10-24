@@ -23,6 +23,10 @@ import tarfile
 import time
 import uuid
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from resident_config import software_fabric_environment
+
 PAYLOADS = (256, 8192)
 SAMPLES = 1000
 WARMUP = 64
@@ -659,6 +663,7 @@ def reap(child):
 def local_software(binary, output, *, samples=SAMPLES, warmup=WARMUP, deadline_ms=PROBE_MS):
     """Run the REAL existing software FI_READ executable; no AWS/systemd/mock."""
     binary, output = Path(binary).resolve(), Path(output).resolve()
+    environment = software_fabric_environment(os.environ, software=True)
     output.mkdir(parents=True, exist_ok=False)
     binary_hash = digest(binary)
     results = []
@@ -677,7 +682,7 @@ def local_software(binary, output, *, samples=SAMPLES, warmup=WARMUP, deadline_m
         end = time.monotonic() + deadline_ms / 1000
         try:
             with (case / 'server.stdout.log').open('wb') as stdout, (case / 'server.stderr.log').open('wb') as stderr:
-                server = subprocess.Popen(server_args, stdout=stdout, stderr=stderr, start_new_session=True)
+                server = subprocess.Popen(server_args, stdout=stdout, stderr=stderr, start_new_session=True, env=environment)
                 processes.append(server)
                 while not listener_owned(server.pid, address):
                     if server.poll() is not None:
@@ -688,7 +693,7 @@ def local_software(binary, output, *, samples=SAMPLES, warmup=WARMUP, deadline_m
                 if digest(Path(f'/proc/{server.pid}/exe')) != binary_hash:
                     raise ValueError('local raw RMA target executable identity differs')
                 with (case / 'client.stdout.log').open('wb') as client_stdout, (case / 'client.stderr.log').open('wb') as client_stderr:
-                    client = subprocess.Popen(client_args, stdout=client_stdout, stderr=client_stderr, start_new_session=True)
+                    client = subprocess.Popen(client_args, stdout=client_stdout, stderr=client_stderr, start_new_session=True, env=environment)
                     processes.append(client)
                     if client.wait(timeout=max(.001, end - time.monotonic())) != 0:
                         raise RuntimeError('real software FI_READ client failed; inspect stderr')
@@ -699,12 +704,14 @@ def local_software(binary, output, *, samples=SAMPLES, warmup=WARMUP, deadline_m
                 reap(child)
             document(case / 'processes.json', dict(binary_sha256=binary_hash,
                 server_command=server_args, client_command=client_args,
+                environment={key: value for key, value in environment.items() if key.startswith('FI_')},
                 exits=[child.returncode for child in processes], cleanup_complete=all(
                     child.poll() is not None for child in processes)))
         expected = dict(payload=payload, samples=samples, warmup=warmup, deadline_ms=deadline_ms,
                         client_domain='lo', server_domain='lo')
         results.append(validate_reports(document(case / 'client.json'), document(case / 'server.json'), expected, software=True))
-    document(output / 'receipt.json', dict(complete=True, hardware=False, binary_sha256=binary_hash, cases=results))
+    document(output / 'receipt.json', dict(complete=True, hardware=False, binary_sha256=binary_hash,
+        environment={key: value for key, value in environment.items() if key.startswith('FI_')}, cases=results))
 
 
 def main():

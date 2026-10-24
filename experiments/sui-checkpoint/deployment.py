@@ -8,13 +8,19 @@ import yaml
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from resident_config import resident_read_config, validate_destination_total
+from resident_config import resident_read_config, validate_destination_total, software_fabric_environment
 
 MIB = 1024 * 1024
 HARDWARE_TRANSPORTS = ('efa', 'efa-direct', 'efa-native')
 SOFTWARE_TRANSPORTS = ('fabric-tcp', 'fabric-tcp-native')
 TRUSTED_TRANSPORTS = ('efa-native', 'fabric-tcp-native')
 TRANSPORTS = ('tcp', *HARDWARE_TRANSPORTS, *SOFTWARE_TRANSPORTS)
+
+
+def process_environment(environment, *, transport):
+    if transport not in TRANSPORTS:
+        raise ValueError('unsupported transport')
+    return software_fabric_environment(environment, software=transport in SOFTWARE_TRANSPORTS)
 
 
 def dump(path, value):

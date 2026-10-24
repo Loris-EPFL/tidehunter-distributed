@@ -116,6 +116,8 @@ pub struct ConcurrentRemoteDatabase {
     pub(super) read_resolve_ns: AtomicU64,
     pub(super) value_read_ns: AtomicU64,
     io_clients: Vec<(u32, Arc<Mutex<Client>>)>,
+    operational_monitor: OperationalReadIoMonitor,
+    operational_lifecycle: std::sync::Weak<Mutex<OperationalReadIoLifecycle>>,
     #[cfg(test)]
     progress: Arc<Mutex<Option<mpsc::SyncSender<PipelineStats>>>>,
 }
@@ -163,7 +165,9 @@ impl ConcurrentRemoteDatabase {
             partition_indexes: db.partition_indexes.clone(),
             read_resolve_ns: AtomicU64::new(0),
             value_read_ns: AtomicU64::new(0),
-            io_clients: db.read_io_monitor().clients,
+            io_clients: db.read_evidence_monitor().clients,
+            operational_monitor: db.operational_sampler.monitor(),
+            operational_lifecycle: db.operational_sampler.downgrade_lifecycle(),
             #[cfg(test)]
             progress: db.concurrent_progress.clone(),
         };
@@ -498,11 +502,71 @@ impl ConcurrentRemoteDatabase {
             checkpoint_diagnostics: snapshot.checkpoint_diagnostics,
         });
     }
-    pub fn read_io_monitor(&self) -> ReadIoMonitor {
-        ReadIoMonitor {
+    /// Bounded metrics snapshot; lock contention makes the whole snapshot unavailable.
+    pub fn try_visit_write_metrics(&self, visit: impl FnOnce(WriteMetricsSnapshot)) -> Option<()> {
+        let snapshot = {
+            let stored = self.snapshot.try_lock()?;
+            let budget = self.admission.budget.try_lock()?;
+            let cache = self.cache.try_lock()?;
+            let write_profile = self.write_profile.try_lock()?;
+            let mut pipeline = stored.pipeline;
+            pipeline.concurrent_queued_peak = budget.peak_requests;
+            pipeline.concurrent_queue_bytes_peak = budget.peak_bytes;
+            WriteMetricsSnapshot {
+                authority: stored.authority,
+                pipeline,
+                read_cache: cache.stats(),
+                write_profile: *write_profile,
+                checkpoint_diagnostics: stored.checkpoint_diagnostics,
+            }
+        };
+        visit(snapshot);
+        Some(())
+    }
+    pub fn try_index_metrics(
+        &self,
+    ) -> Option<(
+        super::super::native_index::NativeIndexStats,
+        usize,
+        IndexReadCut,
+    )> {
+        let index = self.index.try_read()?;
+        Some((
+            index.stats(),
+            index.retained_metadata_bytes(),
+            index.retention_floor(),
+        ))
+    }
+    pub fn try_metadata_history_bytes(&self) -> Option<usize> {
+        Some(self.snapshot.try_lock()?.metadata_history_bytes)
+    }
+    pub fn try_read_cache_stats(&self) -> Option<ReadCacheStats> {
+        Some(self.cache.try_lock()?.stats())
+    }
+    pub fn try_stats(&self) -> Option<LocalDbStats> {
+        let mut stats = self.snapshot.try_lock()?.stats;
+        stats.read_resolve_ns += self.read_resolve_ns.load(Ordering::Relaxed);
+        stats.read_resolve_ns_available = self.read_profile_enabled();
+        stats.value_read_ns += self.value_read_ns.load(Ordering::Relaxed);
+        Some(stats)
+    }
+    pub fn try_per_keyspace_read_cache_stats(
+        &self,
+    ) -> Option<[PerKeyspaceReadCacheStats; KEYSPACE_COUNTER_COUNT]> {
+        Some(self.cache.try_lock()?.per_keyspace_stats())
+    }
+    pub fn read_evidence_monitor(&self) -> ReadEvidenceMonitor {
+        ReadEvidenceMonitor {
             clients: self.io_clients.clone(),
             reads: self.reads.clone(),
         }
+    }
+    /// Passive snapshots do not keep the write owner or its connections alive.
+    pub fn operational_read_io_monitor(&self) -> OperationalReadIoMonitor {
+        if let Some(lifecycle) = self.operational_lifecycle.upgrade() {
+            OperationalReadIoSampler::activate_lifecycle(&lifecycle, &self.reads);
+        }
+        self.operational_monitor.clone()
     }
     pub fn read_admission_generation(&self) -> u64 {
         self.reads.admission_generation()
