@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "seed": 1775,
+  "repeats": 5,
+  "layout": "distributed",
+  "backends": ["tidehunter_tcp", "tikv", "cassandra", "foundationdb"],
+  "profiles": [
+    {"name": "fresh-small-working-set", "keys": 4096, "aging_operations": 0},
+    {"name": "aged-small-working-set", "keys": 4096, "aging_operations": 8192},
+    {"name": "fresh-larger-working-set", "keys": 65536, "aging_operations": 0}
+  ],
+  "rates": [100, 1000, 5000],
+  "base_config": "../../benchmarks/kv-research/example.json",
+  "client_cpus": 2,
+  "client_memory_mib": 2048,
+  "max_runs": 180
+}

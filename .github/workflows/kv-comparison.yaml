@@ -1,0 +1,126 @@
+name: Local KV adapter qualification
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'benchmarks/kv-research/**'
+      - 'experiments/kv-comparison/**'
+      - '.github/workflows/kv-comparison.yaml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tidehunter/**'
+      - 'tidehunter-fabric/**'
+  workflow_dispatch:
+    inputs:
+      backend:
+        description: Actual adapter to rerun (all runs sequentially)
+        type: choice
+        options: [all, native, tidehunter_tcp, tikv, cassandra, foundationdb]
+        default: all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: local-kv-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: '2'
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+
+jobs:
+  qualification:
+    runs-on: ubuntu-24.04
+    # Cover bounded setup/build/qualification plus cleanup and artifact upload.
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7
+        with:
+          toolchain: '1.90'
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-${{ runner.arch }}-kv-rust-1.90-${{ hashFiles('Cargo.lock') }}
+      - name: Prepare explicit native build prerequisites
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/kv-results"
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get \
+            -o Acquire::Retries=2 -o Acquire::http::Timeout=30 install -y --no-install-recommends \
+            build-essential pkg-config clang libclang-dev cmake protobuf-compiler \
+            libssl-dev libfontconfig1-dev ca-certificates openssl bzip2
+          protoc --version | tee "$RUNNER_TEMP/kv-results/protoc-version.txt"
+          clang --version | tee "$RUNNER_TEMP/kv-results/clang-version.txt"
+          dpkg-query -W build-essential pkg-config clang libclang-dev cmake protobuf-compiler \
+            libssl-dev libfontconfig1-dev > "$RUNNER_TEMP/kv-results/native-packages.txt"
+      - name: Prepare matching FoundationDB client in owned prefix
+        timeout-minutes: 5
+        run: |
+          mkdir -p "$RUNNER_TEMP/kv-results"
+          python3 experiments/kv-comparison/local.py prepare-fdb --prefix "$RUNNER_TEMP/kv-results/fdb-client"
+          echo "FDB_CLIENT_LIB_DIR=$RUNNER_TEMP/kv-results/fdb-client/lib" >> "$GITHUB_ENV"
+          echo "FDB_CLIENT_LIB_PATH=$RUNNER_TEMP/kv-results/fdb-client/lib" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/kv-results/fdb-client/lib" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$RUNNER_TEMP/kv-results/fdb-client/lib" >> "$GITHUB_ENV"
+      - name: Admission and accounting behavior tests
+        run: python3 -m unittest discover -s experiments/kv-comparison -p 'test_*.py'
+      - name: Build actual external adapters
+        timeout-minutes: 25
+        run: cargo build --locked -p kv-research --features tikv,cassandra,foundationdb
+      - name: Test the comparison crate with actual adapter features
+        timeout-minutes: 10
+        run: cargo test --locked -p kv-research --features tikv,cassandra,foundationdb
+      - name: Check monitoring freshness and metric semantics
+        run: python3 -m unittest discover -s experiments/kv-comparison/observability -p 'test_*.py'
+      - name: Exercise actual servers and monitoring sequentially (not latency or HA evidence)
+        timeout-minutes: 15
+        env:
+          SELECTED_BACKEND: ${{ inputs.backend || 'all' }}
+        run: |
+          set -euo pipefail
+          if [ "$SELECTED_BACKEND" = all ]; then
+            backends='native tidehunter_tcp tikv cassandra foundationdb'
+          else
+            backends="$SELECTED_BACKEND"
+          fi
+          for backend in $backends; do
+            python3 experiments/kv-comparison/campaign.py \
+              --manifest experiments/kv-comparison/ci.json \
+              --binary target/debug/kv-research --qualification --observe \
+              --backend "$backend" --output "$RUNNER_TEMP/kv-results/$backend"
+            python3 experiments/kv-comparison/observability/stack.py verify \
+              --output "$RUNNER_TEMP/kv-results/${backend}-monitoring.json"
+          done
+      - name: Export failures and clean exact-owned databases and observer even if either fails
+        if: always()
+        timeout-minutes: 5
+        run: |
+          set +e
+          database_status=0
+          observer_status=0
+          python3 experiments/kv-comparison/cleanup.py --root "$RUNNER_TEMP/kv-results" || database_status=$?
+          python3 experiments/kv-comparison/observability/stack.py stop || observer_status=$?
+          if [ "$database_status" -ne 0 ] || [ "$observer_status" -ne 0 ]; then
+            echo "Exact-owned cleanup failed: databases=$database_status observer=$observer_status" >&2
+            exit 1
+          fi
+      - name: Retain raw qualification and failure evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: local-kv-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/kv-results/
+            !${{ runner.temp }}/kv-results/fdb-client/lib/**
+          if-no-files-found: error
+          retention-days: 7

@@ -2,6 +2,14 @@
 
 Started 6 October 2026 in a separate checkout named `tidehunter-sharded-wal`.
 
+**Distributed-KV research comparison:**
+[Experimental protocol, guarantee tiers and source mapping](KV_COMPARISON_PROTOCOL.md).
+The local framework under `benchmarks/kv-research` and
+`experiments/kv-comparison` separates embedded references, distributed client
+APIs, workload outcomes and observational telemetry. Prometheus/Grafana are
+local tools; credential-free comparison CI does not activate the protected AWS
+campaign. One shared laptop SSD is not independent-NVMe or EFA evidence.
+
 **Cloud/local correctness automation:**
 [Shared test commands, Codex Cloud setup and EFA hardware limits](CLOUD_AND_CI_TESTING.md).
 The same checks serve local and GitHub runners. Software-provider/direct-packet

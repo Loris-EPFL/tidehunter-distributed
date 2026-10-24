@@ -1,0 +1,115 @@
+name: kv-comparison-observability
+x-security: &security
+  network_mode: host
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  pids_limit: 128
+  restart: "no"
+  logging:
+    driver: json-file
+    options: {max-size: "5m", max-file: "2"}
+
+services:
+  prometheus:
+    <<: *security
+    image: prom/prometheus:v3.13.5@sha256:aafa9d694e6a883c02db516d9f6e5b84e14195f49a2a6456a4cca815edda72b9
+    mem_limit: 768m
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.listen-address=127.0.0.1:9090
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --storage.tsdb.retention.size=2GB
+    volumes:
+      - ./prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+      - ./.state/targets:/etc/prometheus/targets:ro
+      - prometheus-data:/prometheus
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:9090/-/ready]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  grafana:
+    <<: *security
+    image: grafana/grafana:13.2.4@sha256:dbbc38ea21103cefb50396340cd88afec779c7e070b0a7bf5a75b4ce46651d3f
+    # Grafana and its datasource plugin share the container's PID budget.
+    # On high-core hosts the default Go thread fanout exhausted 128 PIDs.
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 256
+    environment:
+      GOMAXPROCS: "2"
+      GF_SERVER_HTTP_ADDR: 127.0.0.1
+      GF_SERVER_HTTP_PORT: "3000"
+      GF_SERVER_ROOT_URL: http://127.0.0.1:3000
+      GF_SECURITY_ADMIN_USER: researcher
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/comparison.json
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./provisioning:/etc/grafana/provisioning:ro
+      - ./dashboards:/var/lib/grafana/dashboards:ro
+      - ./.state/grafana_admin_password:/run/secrets/grafana_admin_password:ro
+    tmpfs: ["/tmp:size=64m,mode=1777"]
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:3000/api/health]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+
+  exporter:
+    <<: *security
+    image: python:3.13.17-slim-bookworm@sha256:e32be0e55814a08977501ca863271d9bd02443710db8f2afaf8372e2c4508530
+    mem_limit: 128m
+    command: [python3, -B, /app/exporter.py, --config, /config/exporter.json]
+    volumes:
+      - ./exporter.py:/app/exporter.py:ro
+      - ./.state/exporter.json:/config/exporter.json:ro
+      - ./.state/no-run:/results:ro
+    healthcheck:
+      test: [CMD, python3, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9899/healthz', timeout=2).read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  node:
+    <<: *security
+    image: prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0
+    mem_limit: 128m
+    command:
+      - --web.listen-address=127.0.0.1:9100
+      - --web.max-requests=2
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --collector.disable-defaults
+      - --collector.cpu
+      - --collector.meminfo
+      - --collector.diskstats
+      - --collector.netdev
+      - --collector.stat
+      - --collector.loadavg
+      - --collector.uname
+      - --collector.vmstat
+      - --collector.pressure
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:9100/metrics]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  prometheus-data: {}
+  grafana-data: {}
