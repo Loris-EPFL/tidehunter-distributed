@@ -726,6 +726,12 @@ metric cuts pass the generation/freshness checks. The 60 Sui and 465 KV storage
 output archives match their individual receipt hashes; deployment input packages
 are a different namespace and are not counted as result archives.
 
+The complete GitHub evidence and cost artifacts were also downloaded. A final
+local pass verifies **all 2,017 current-run S3 objects**, 689,699,470 bytes,
+against `retrieval-manifest.json`, with zero size/hash mismatches. This is the
+current-run inventory, not the older 747-object campaign. Proof:
+`full-artifact-retrieval-verified.json`.
+
 The complete numerical exports are under `analysis/`, bound by
 `analysis-file-manifest.json`:
 
