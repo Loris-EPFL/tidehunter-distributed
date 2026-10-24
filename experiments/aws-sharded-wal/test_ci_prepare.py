@@ -348,6 +348,17 @@ class FrozenSourceRestoreTests(unittest.TestCase):
             self.assertEqual(admission['bindings']['build_manifest_sha256'],
                              result['build_manifest_sha256'])
             self.assertTrue((root / 'admission/input-admission.json').is_file())
+            import sui_checkpoint as supervisor
+            runner = Path(admission['inputs']['runner_bundle']['path'])
+            self.assertEqual(ci_prepare.sha(runner), admission['inputs']['runner_bundle']['sha256'])
+            installed = root / 'installed-runner'
+            supervisor.safe_extract(runner, installed)
+            records = json.loads((restored / 'build/source-manifest.json').read_text())[
+                'tidehunter-sharded-wal']['files']
+            self.assertNotIn('experiments/aws-sharded-wal/resident_config.py', records)
+            self.assertEqual(ci_prepare.sha(installed / 'runner/resident_config.py'),
+                             records['experiments/resident_config.py']['sha256'])
+            supervisor.validate_runner_helpers(installed / 'runner', records)
             with self.assertRaises(FileExistsError):
                 ci_prepare.restore_inputs(package, digest, restored)
 

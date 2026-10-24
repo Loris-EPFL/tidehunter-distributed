@@ -2,9 +2,20 @@
 
 23 October 2026. Branch: `perf/one-sided-wal-reads-2026-10-23`. Base commit: `405f3e3bc7304e089713f1e8b04e07aee8e92451`.
 
-**Status: preparing a new source-bound hardware campaign.** The earlier six-binary release build, bounded native/RMA controls and certified private-fixture Sui replay/equality audits passed at their recorded source snapshots. They are historical evidence, not validation of the later prelaunch corrections below. The replay mixed RPC/RMA and the single-host remote run swapped; neither proves EFA-device behavior, native-speed parity or independent-NVMe scaling. The immutable v2 bundle is not the current upload candidate. The campaign must rebuild all six binaries, audit the same build locally, and bind the engine/Sui revisions before EC2 admission. No native mutex was removed.
+**Status: current-source local preparation passed; the first hardware campaign stopped before workload execution.** Run `40035176278` rebuilt all six executables from engine `f330f9144ec7968de2958cd89e4988aa50a1b3c0` and Sui `bc2fcffd8c5f94af843f6000136b1287f8d6fd5c`, passed the full-state audit, and retained 1,776 positive checkpoint-completion observations in each local replay mode. A runner source-path validation error then blocked every hardware workload cell. The canonical-origin repair below passed actual retained-runner admission and changed-helper rejection. There are no new hardware latency results, EFA-parity claims or independent-NVMe scaling conclusions from that failed attempt. No native mutex was removed.
 
 This is a source/status guide, not a replacement for [D1](ONE_SIDED_WAL_READS_2026-10-21.md), the [23 October remote-read plan](REMOTE_READ_PATH_PLAN_2026-10-23.md), or preserved historical results. Paths and symbols below identify the working tree. There are deliberately no fabricated GitHub permalinks to unpushed changes. After the parent's production/benchmark freeze signal, selected inspected line ranges were added below; these are local snapshot coordinates, not immutable committed permalinks. `project:` denotes the parent of this engine checkout.
+
+## 24 October: failed hardware admission and repair
+
+The first campaign allocated exactly six `g6.8xlarge` hosts in `us-east-1a`, one controller plus five owners, under cluster placement group `th-60ac6254cafaf05a`. It exported failure diagnostics and requested unconditional teardown before any workload cell. Independent AWS MCP checks at `2026-10-24T00:02:32Z` confirmed all six instances terminated and their EBS volumes, EFA interfaces, security group and placement group absent. This was an orchestration/source-admission defect, not a Tidehunter speed result.
+
+The actual runner correctly contained `runner/resident_config.py`, SHA256 `9b80d3b460f7d64ce1f2a990148085974358ec37fe07bb8f62c76fffabd84c08`, identical to frozen `experiments/resident_config.py`. The old controller incorrectly looked for `experiments/aws-sharded-wal/resident_config.py`. `sui_checkpoint.py::validate_runner_helpers` now shares the explicit canonical source association, exact Python-helper inventory, ordinary-file and SHA checks with controller admission and `ci_campaign.py::admit_inputs`. The latter extracts and validates the **actual assembled runner archive before writing `input-admission.json` or allocating EC2**; binding checks remain enabled.
+
+Retained evidence is `project:checkpoint-work/aws-ci-runs/40035176278-1/`: verified preparation metadata, original failed runner, failure exports, and accounting artifacts. `failure/helper-admission-proof.json` records admission of that real runner against its frozen manifest and rejection after changing the shared helper. Full repaired gates ran 601 AWS harness cases with four optional/environment skips and passed 137 Sui analysis cases. These are correctness checks, not hardware performance.
+
+The retry prefers `us-east-1`, then `us-east-2`, `us-west-2`, `eu-central-1`, and `eu-west-1`: the first fleet succeeded in Virginia after four Oregon capacity rejections, and the results bucket is in Virginia. All regional fallbacks remain. Cluster placement, machine candidates, full matrix, 7,200-second deadline, 600-second export reserve and weekly budget are unchanged. The repair changes Python orchestration only; the Sui source and engine library pin remain unchanged.
+
 
 ## Current hardware-campaign preparation
 
