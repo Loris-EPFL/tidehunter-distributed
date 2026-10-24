@@ -284,11 +284,11 @@ def admit_inputs(build, fixture, verification, output):
     # The currently executing operator and every bootstrap/runtime helper must
     # be part of this build's source identity, not a downloaded frozen importer.
     source_records = identities['tidehunter-sharded-wal']['files']
-    helpers = sorted([*(path for path in HERE.glob('*.py') if not path.name.startswith('test_')),
-                      HERE.parent / 'resident_config.py'])
-    for path in [*helpers, *(HERE.parent / 'sui-checkpoint').glob('*.py')]:
+    for path in [*(HERE.parent.parent / relative for relative in
+                   supervisor.runner_helper_origins(source_records).values()),
+                 *(HERE.parent / 'sui-checkpoint').glob('*.py')]:
         rel = str(path.relative_to(HERE.parent.parent))
-        if path.is_symlink() or sha(path) != source_records.get(rel, {}).get('sha256'):
+        if path.is_symlink() or not path.is_file() or sha(path) != source_records.get(rel, {}).get('sha256'):
             raise ValueError('current source differs from build: ' + rel)
     commands = manifest.get('commands', [])
     if len(commands) != 6 or {item['label'] for item in commands} != BINARIES:
@@ -336,7 +336,9 @@ def admit_inputs(build, fixture, verification, output):
         fresh_archive(verification_bundle, [(staged / name, 'verification/' + name)
                       for name in ('receipt.json', 'evidence.tar.gz', 'experiment')])
     runner = output / 'bundle.tar.gz'
-    fresh_archive(runner, [(path, 'runner/' + path.name) for path in helpers])
+    with tempfile.TemporaryDirectory(prefix='ci-runner-assembly-') as temporary:
+        staged = supervisor.assemble_runner(HERE.parent.parent, Path(temporary) / 'runner', source_records)
+        fresh_archive(runner, [(staged, 'runner')])
     if runner.stat().st_size > 512 << 20:
         raise ValueError('bootstrap bundle exceeds guest bound')
     # Exercise the controller's installed-layout binding on the actual archive
@@ -344,12 +346,13 @@ def admit_inputs(build, fixture, verification, output):
     with tempfile.TemporaryDirectory(prefix='ci-runner-admission-') as temporary:
         installed = Path(temporary) / 'installed'
         supervisor.safe_extract(runner, installed, max_bytes=512 << 20)
-        supervisor.validate_runner_helpers(installed / 'runner', source_records)
+        runner_entrypoint = supervisor.validate_runner_entrypoint(installed / 'runner', source_records)
     paths = dict(build_bundle=build / 'build-bundle.tar.gz', fixture_bundle=fixture,
                  verification_bundle=verification_bundle, runner_bundle=runner)
     result = dict(bindings=bindings, inputs={name: dict(path=str(path), bytes=path.stat().st_size, sha256=sha(path))
                                            for name, path in paths.items()},
-                  bootstrap_sha256=sha(HERE / 'bootstrap.py'), atomic_start_sha256=sha(HERE / 'atomic_start.py'))
+                  bootstrap_sha256=sha(HERE / 'bootstrap.py'), atomic_start_sha256=sha(HERE / 'atomic_start.py'),
+                  runner_entrypoint=runner_entrypoint)
     dump(output / 'input-admission.json', result)
     return result
 

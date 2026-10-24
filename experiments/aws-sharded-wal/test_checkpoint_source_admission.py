@@ -8,7 +8,6 @@ import unittest
 from unittest.mock import patch
 
 import sui_checkpoint as supervisor
-from ci_campaign import fresh_archive
 
 
 class CheckpointSourceAdmission(unittest.TestCase):
@@ -27,10 +26,6 @@ class CheckpointSourceAdmission(unittest.TestCase):
             shutil.copy2(path, helpers / path.name)
         shared = engine / 'experiments/resident_config.py'
         shutil.copy2(installed.parent / 'resident_config.py', shared)
-        runner = root / 'runner.tar.gz'
-        fresh_archive(runner, [(path, 'runner/' + path.name) for path in
-            [*(path for path in helpers.glob('*.py') if not path.name.startswith('test_')), shared]])
-        supervisor.safe_extract(runner, root / 'installed')
         support = engine / self.support_relative
         support.parent.mkdir(parents=True)
         support.write_text('"""Frozen standalone checkpoint helper."""\n')
@@ -56,6 +51,8 @@ class CheckpointSourceAdmission(unittest.TestCase):
             files[self.support_relative] = {'link': 'other.py'}
             files[str(support.with_name('other.py').relative_to(engine))] = {
                 'sha256': supervisor.sha(support), 'mode': 0o644}
+        supervisor.assemble_runner(engine, root / 'installed/runner',
+                                   identities['tidehunter-sharded-wal']['files'])
         supervisor.write_json(bundle / 'source-manifest.json', identities)
         with tarfile.open(bundle / 'sources.tar.gz', 'w:gz') as archive:
             archive.add(sources, arcname='sources')

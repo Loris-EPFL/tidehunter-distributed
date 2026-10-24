@@ -27,6 +27,7 @@ import signal
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 
 from guest import (Campaign, SDK_CONFIG, download, evidence, remaining, sha,
@@ -137,11 +138,8 @@ def safe_extract(archive, destination, *, symlinks=False, max_bytes=32 << 30):
 RUNNER_SHARED_SOURCES = {'resident_config.py': 'experiments/resident_config.py'}
 
 
-def validate_runner_helpers(directory, source_records):
-    """Bind the flattened runner to exact canonical frozen source origins."""
-    directory = Path(directory)
-    if directory.is_symlink() or not directory.is_dir():
-        raise ValueError('installed runner helper directory must be ordinary')
+def runner_helper_origins(source_records):
+    """Canonical non-test runtime inventory for both installed runner factories."""
     origins = {}
     for relative in source_records:
         source = PurePosixPath(relative)
@@ -152,17 +150,69 @@ def validate_runner_helpers(directory, source_records):
         if name in origins:
             raise ValueError('ambiguous canonical runner helper source: ' + name)
         origins[name] = relative
+    return origins
+
+
+def _validate_runner_source(path, relative, source_records):
+    entry = source_records.get(relative)
+    if (not isinstance(entry, dict) or 'link' in entry
+            or not isinstance(entry.get('sha256'), str) or not re.fullmatch(HEX, entry['sha256'])
+            or path.is_symlink() or not path.is_file() or sha(path) != entry['sha256']):
+        raise ValueError('runner helper differs from frozen build: ' + str(path) + ' <- ' + relative)
+
+
+def validate_runner_helpers(directory, source_records):
+    """Bind the flattened runner to exact canonical frozen source origins."""
+    directory = Path(directory)
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError('installed runner helper directory must be ordinary')
+    origins = runner_helper_origins(source_records)
     installed = {path.name: path for path in directory.glob('*.py')}
     if installed.keys() != origins.keys():
         missing = sorted(origins.keys() - installed.keys())
         unknown = sorted(installed.keys() - origins.keys())
         raise ValueError(f'installed runner helper inventory differs: missing={missing}, unknown={unknown}')
     for name, relative in origins.items():
-        path, entry = installed[name], source_records.get(relative)
-        if (not isinstance(entry, dict) or 'link' in entry
-                or not isinstance(entry.get('sha256'), str) or not re.fullmatch(HEX, entry['sha256'])
-                or path.is_symlink() or not path.is_file() or sha(path) != entry['sha256']):
-            raise ValueError('installed supervisor/helper differs from frozen build: ' + name + ' <- ' + relative)
+        _validate_runner_source(installed[name], relative, source_records)
+
+
+def assemble_runner(source_root, destination, source_records):
+    """Assemble one complete source-bound worker/controller Python environment."""
+    source_root, destination = Path(source_root), Path(destination)
+    origins = runner_helper_origins(source_records)
+    helpers = source_root / 'experiments/aws-sharded-wal'
+    if helpers.is_symlink() or not helpers.is_dir():
+        raise ValueError('runner source directory must be ordinary')
+    actual = {path.name for path in helpers.glob('*.py') if not path.name.startswith('test_')}
+    if actual != origins.keys() - RUNNER_SHARED_SOURCES.keys():
+        raise ValueError('runner source helper inventory differs from frozen build')
+    for relative in origins.values():
+        _validate_runner_source(source_root / relative, relative, source_records)
+    destination.mkdir(parents=True, exist_ok=False)
+    for name, relative in sorted(origins.items()):
+        shutil.copy2(source_root / relative, destination / name)
+    validate_runner_helpers(destination, source_records)
+    return destination
+
+
+def validate_runner_entrypoint(directory, source_records):
+    """Import the assembled storage-worker CLI without repository path fallbacks."""
+    validate_runner_helpers(directory, source_records)
+    directory = Path(directory).resolve(strict=True)
+    environment = dict(os.environ)
+    environment.pop('PYTHONPATH', None)
+    environment['AWS_EC2_METADATA_DISABLED'] = 'true'
+    environment.pop('PYTHONHOME', None)
+    with tempfile.TemporaryDirectory(prefix='runner-entrypoint-') as working:
+        result = subprocess.run(
+            [sys.executable, '-E', str(directory / 'sui_checkpoint.py'), 'node', '--help'],
+            cwd=working, env=environment, capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise ValueError('assembled runner worker entrypoint failed: ' + result.stderr[-4096:])
+    return dict(entrypoint='sui_checkpoint.py node --help', isolated_python_environment=True,
+                exit_code=result.returncode,
+                stdout_sha256=hashlib.sha256(result.stdout.encode()).hexdigest(),
+                stderr_sha256=hashlib.sha256(result.stderr.encode()).hexdigest())
 
 
 def read_json(path):
@@ -857,6 +907,12 @@ class SuiCampaign(Campaign):
         shutil.copy2(self.deployment / 'external-manifest.json', self.results / 'external-manifest.json')
         if resident['destination_slots']:
             shutil.copy2(policy, self.results / 'resident-reads.json')
+        source_manifest = self.build / 'source-manifest.json'
+        if sha(source_manifest) != self.cfg['source_manifest_sha256']:
+            raise ValueError('per-cell runner source manifest differs from admitted build')
+        source_records = read_json(source_manifest)['tidehunter-sharded-wal']['files']
+        _validate_runner_source(self.scripts / 'cloud_node.py',
+                                'experiments/sui-checkpoint/cloud_node.py', source_records)
         for host, node in zip(self.external['hosts'], self.nodes):
             if host['partition'] != node['partition'] or host['host'] != node['private_ip']:
                 raise ValueError('host deployment inventory differs')
@@ -866,10 +922,7 @@ class SuiCampaign(Campaign):
             payload = self.cell_root / f"payload-{node['partition']}"
             safe_extract(original, payload)
             shutil.copy2(self.scripts / 'cloud_node.py', payload / 'cloud_node.py')
-            support = payload / 'runner'
-            support.mkdir()
-            for path in self.support.glob('*.py'):
-                shutil.copy2(path, support / path.name)
+            assemble_runner(self.support.parents[1], payload / 'runner', source_records)
             cloud = {key: host[key] for key in ('commands', 'ready_files', 'stop_files')}
             cloud.update(run_id=self.cfg['run_id'], cell_id=self.cell['cell_id'], transport=self.cell['transport'], deadline_utc=self.deadline,
                 storage_binary_sha256=self.cfg['binaries']['storage-node'], build_manifest_sha256=self.cfg['build_manifest_sha256'],

@@ -21,6 +21,19 @@ from ci_campaign import fresh_archive
 def encoded(value):
     return (json.dumps(value, indent=2) + '\n').encode()
 
+def frozen_runner_sources(root):
+    source_root = Path(supervisor.__file__).resolve().parents[2]
+    records = {str(path.relative_to(source_root)): dict(sha256=supervisor.sha(path))
+               for path in (source_root / 'experiments').rglob('*.py')
+               if path.is_file() and not path.is_symlink()}
+    frozen = root / 'frozen-source'
+    for relative in supervisor.runner_helper_origins(records).values():
+        target = frozen / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_root / relative, target)
+    return frozen, records
+
+
 
 def example_config():
     cfg = supervisor.schema()['config']
@@ -217,6 +230,79 @@ class RunnerHelperAdmissionTests(unittest.TestCase):
             helper.symlink_to(target)
             with self.assertRaises(ValueError):
                 supervisor.validate_runner_helpers(installed, records)
+
+
+    def test_canonical_assembler_validates_sources_and_excludes_tests_before_copying(self):
+        for change in (None, 'missing', 'changed', 'symlink', 'extra'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                records, _ = self.sources(root)
+                source = root / 'source'
+                dependency = source / 'experiments/resident_config.py'
+                if change == 'missing':
+                    dependency.unlink()
+                elif change == 'changed':
+                    dependency.write_text('changed dependency\n')
+                elif change == 'symlink':
+                    target = root / 'original.py'
+                    dependency.rename(target)
+                    dependency.symlink_to(target)
+                elif change == 'extra':
+                    (source / 'experiments/aws-sharded-wal/unbound.py').write_text('unbound\n')
+                destination = root / 'runner'
+                if change is None:
+                    supervisor.assemble_runner(source, destination, records)
+                    supervisor.validate_runner_helpers(destination, records)
+                    self.assertEqual({path.name for path in destination.iterdir()},
+                                     {'sui_checkpoint.py', 'guest.py', 'resident_config.py'})
+                else:
+                    with self.assertRaises(ValueError):
+                        supervisor.assemble_runner(source, destination, records)
+                    self.assertFalse(destination.exists())
+
+    def test_actual_assembled_worker_entrypoint_runs_without_repository_python_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            frozen, records = frozen_runner_sources(root)
+            runner = supervisor.assemble_runner(frozen, root / 'runner', records)
+            poison = root / 'not-a-python-home'
+            poison.mkdir()
+            with patch.dict(supervisor.os.environ, PYTHONPATH=str(poison), PYTHONHOME=str(poison)):
+                receipt = supervisor.validate_runner_entrypoint(runner, records)
+            self.assertEqual(receipt['exit_code'], 0)
+            self.assertTrue(receipt['isolated_python_environment'])
+            self.assertEqual(len(receipt['stdout_sha256']), 64)
+
+    def test_preallocation_import_probe_rejects_dependency_only_available_from_repository_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            frozen, records = frozen_runner_sources(root)
+            relative = 'experiments/aws-sharded-wal/guest.py'
+            guest = frozen / relative
+            guest.write_bytes(guest.read_bytes() + b'\nimport worker_dependency_only_on_repository_path\n')
+            records[relative]['sha256'] = supervisor.sha(guest)
+            runner = supervisor.assemble_runner(frozen, root / 'runner', records)
+            poison = root / 'repository-path'
+            poison.mkdir()
+            (poison / 'worker_dependency_only_on_repository_path.py').write_text('present_only_outside_bundle = True\n')
+            with patch.dict(supervisor.os.environ, PYTHONPATH=str(poison)):
+                with self.assertRaisesRegex(ValueError, 'worker_dependency_only_on_repository_path'):
+                    supervisor.validate_runner_entrypoint(runner, records)
+
+    def test_missing_or_changed_installed_dependency_cannot_be_masked_by_repository_imports(self):
+        for change in ('missing', 'changed'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                frozen, records = frozen_runner_sources(root)
+                runner = supervisor.assemble_runner(frozen, root / 'runner', records)
+                dependency = runner / 'resident_config.py'
+                if change == 'missing':
+                    dependency.unlink()
+                else:
+                    dependency.write_text('changed installed dependency\n')
+                with patch.dict(supervisor.os.environ, PYTHONPATH=str(frozen / 'experiments')):
+                    with self.assertRaises(ValueError):
+                        supervisor.validate_runner_entrypoint(runner, records)
 
 
 class EvidenceTests(unittest.TestCase):
@@ -447,7 +533,7 @@ class EvidenceTests(unittest.TestCase):
 
 
 class PreparedResidentPolicyTests(unittest.TestCase):
-    def prepare_campaign(self, root, profile, transport='efa-native'):
+    def prepare_campaign(self, root, profile, transport='efa-native', source_change=None, captured_uploads=None):
         """Execute the real preparation CLI; only the AWS upload is replaced."""
         campaign = object.__new__(supervisor.SuiCampaign)
         campaign.cfg = example_config()
@@ -469,8 +555,18 @@ class PreparedResidentPolicyTests(unittest.TestCase):
         binary = campaign.build / 'binaries/storage-node'
         binary.write_bytes(b'fixture executable bytes; preparation hashes and archives, never executes this file')
         campaign.cfg['binaries']['storage-node'] = supervisor.sha(binary)
+        frozen, records = frozen_runner_sources(root)
+        supervisor.write_json(campaign.build / 'source-manifest.json',
+                              {'tidehunter-sharded-wal': {'files': records}})
+        campaign.cfg['source_manifest_sha256'] = supervisor.sha(campaign.build / 'source-manifest.json')
+        campaign.support = frozen / 'experiments/aws-sharded-wal'
+        if source_change == 'missing_shared':
+            (frozen / 'experiments/resident_config.py').unlink()
+        elif source_change == 'changed_shared':
+            (frozen / 'experiments/resident_config.py').write_text('changed dependency\n')
         manifest = dict(protocol=9, fabric=True, binaries=campaign.cfg['binaries'],
-                        source_archive_sha256=campaign.cfg['source_archive_sha256'])
+                        source_archive_sha256=campaign.cfg['source_archive_sha256'],
+                        source_manifest_sha256=campaign.cfg['source_manifest_sha256'])
         supervisor.write_json(campaign.build / 'build-manifest.json', manifest)
         campaign.cfg['build_manifest_sha256'] = supervisor.sha(campaign.build / 'build-manifest.json')
         campaign.verification = root / 'verification'
@@ -480,11 +576,9 @@ class PreparedResidentPolicyTests(unittest.TestCase):
         supervisor.write_json(schema / 'shape.json', {})
         (schema / 'shape.yaml').write_text('{}\n')
         campaign.scripts = Path(__file__).resolve().parents[1] / 'sui-checkpoint'
-        campaign.support = root / 'support'
-        campaign.support.mkdir()
         campaign.nodes = copy.deepcopy(campaign.cfg['nodes'])
         campaign.state, campaign.s3 = dict(uploads=[]), object()
-        commands, uploads = [], []
+        commands, uploads = [], captured_uploads if captured_uploads is not None else []
         def execute(name, command, timeout):
             commands.append([str(part) for part in command])
             subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout)
@@ -521,6 +615,35 @@ class PreparedResidentPolicyTests(unittest.TestCase):
                     self.assertEqual(launch['node']['resident_reads'], profile)
                     self.assertEqual(launch['tls']['transport'], 'efa-native')
                     self.assertEqual(launch['tls']['cert'], '')
+
+    def test_tcp_storage_artifacts_contain_the_same_complete_source_bound_worker_runner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            campaign, _, archives = self.prepare_campaign(root, None, 'tcp')
+            records = supervisor.read_json(campaign.build / 'source-manifest.json')[
+                'tidehunter-sharded-wal']['files']
+            self.assertEqual(len(archives), 5)
+            for index, archive in enumerate(archives):
+                installed = root / f'installed-worker-{index}'
+                supervisor.safe_extract(archive, installed)
+                runner = installed / 'runner'
+                supervisor.validate_runner_helpers(runner, records)
+                self.assertEqual(supervisor.sha(runner / 'resident_config.py'),
+                                 records['experiments/resident_config.py']['sha256'])
+                self.assertFalse(any(path.name.startswith('test_') for path in runner.iterdir()))
+                self.assertEqual(supervisor.sha(installed / 'cloud_node.py'),
+                                 records['experiments/sui-checkpoint/cloud_node.py']['sha256'])
+                if index == 0:
+                    self.assertEqual(supervisor.validate_runner_entrypoint(runner, records)['exit_code'], 0)
+
+    def test_storage_dependency_source_failures_are_rejected_before_any_payload_upload(self):
+        for change in ('missing_shared', 'changed_shared'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
+                uploads = []
+                with self.assertRaises(ValueError):
+                    self.prepare_campaign(Path(temporary), None, 'tcp',
+                                          source_change=change, captured_uploads=uploads)
+                self.assertEqual(uploads, [])
 
     def test_actual_coordinator_and_manifest_policy_cannot_be_silently_omitted_or_changed(self):
         with tempfile.TemporaryDirectory() as temporary:

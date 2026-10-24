@@ -348,6 +348,8 @@ class FrozenSourceRestoreTests(unittest.TestCase):
             self.assertEqual(admission['bindings']['build_manifest_sha256'],
                              result['build_manifest_sha256'])
             self.assertTrue((root / 'admission/input-admission.json').is_file())
+            self.assertEqual(admission['runner_entrypoint']['exit_code'], 0)
+            self.assertTrue(admission['runner_entrypoint']['isolated_python_environment'])
             import sui_checkpoint as supervisor
             runner = Path(admission['inputs']['runner_bundle']['path'])
             self.assertEqual(ci_prepare.sha(runner), admission['inputs']['runner_bundle']['sha256'])
