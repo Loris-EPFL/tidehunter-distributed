@@ -562,6 +562,107 @@ class CheckpointSourceBoundaries(unittest.TestCase):
             self.assertFalse((root / 'binaries').exists())
 
 
+class ReplaySamplingLifecycle(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.owner = run.Owned(self.root, os.environ.copy())
+        command = [sys.executable, '-c',
+                   "import sys;sys.stdin.buffer.read(1);"
+                   "print('actual child failure: operation deadline expired',flush=True);sys.exit(7)"]
+        with (self.root/'remote.log').open('xb') as log:
+            self.child = build.OwnedProcess(command, stdin=subprocess.PIPE,
+                                            stdout=log, stderr=subprocess.STDOUT)
+        self.owner.children.append(self.child)
+        self.addCleanup(self.owner.close)
+        self.addCleanup(self.child._process.stdin.close)
+
+    def finish_child(self):
+        self.child._process.stdin.write(b'x')
+        self.child._process.stdin.flush()
+        self.assertEqual(self.child.wait(timeout=5), 7)
+        self.assertFalse(self.child.reaped)
+        self.assertIsNone(self.child._process.returncode)
+
+    def test_live_procfs_failures_are_not_exits_or_zero_io(self):
+        read_text = Path.read_text
+        for error in (PermissionError, FileNotFoundError, ProcessLookupError):
+            failure = error('live procfs access failed')
+            def read_proc(path, *args, **kwargs):
+                if str(path) == f'/proc/{self.child.pid}/io':
+                    raise failure
+                return read_text(path, *args, **kwargs)
+            with self.subTest(error=error.__name__), patch.object(Path, 'read_text', read_proc):
+                with self.assertRaises(error) as raised:
+                    run.sample(self.child)
+                self.assertIs(raised.exception, failure)
+                self.assertIsNone(self.child.poll())
+
+    def test_permission_transition_after_exit_keeps_owned_exit_status(self):
+        read_text = Path.read_text
+        def read_proc(path, *args, **kwargs):
+            if str(path) == f'/proc/{self.child.pid}/io':
+                self.finish_child()
+                raise PermissionError('counter access revoked during exit')
+            return read_text(path, *args, **kwargs)
+        with patch.object(Path, 'read_text', read_proc):
+            row = run.sample(self.child)
+        self.assertTrue(row['exited'])
+        self.assertEqual(row['exit_code'], 7)
+        self.assertEqual(row['unavailable'], {'io': 'PermissionError'})
+        self.assertNotIn('io', row)
+        self.assertNotIn('VmRSS', row)
+
+    def test_permission_transition_checks_fresh_core_dump_state(self):
+        status_reads = 0
+        def read_proc(path, *args, **kwargs):
+            nonlocal status_reads
+            if str(path) == f'/proc/{self.child.pid}/status':
+                status_reads += 1
+                return f'CoreDumping:\t{int(status_reads > 1)}\nVmRSS:\t4 kB\n'
+            if str(path) == f'/proc/{self.child.pid}/io':
+                raise PermissionError('counter access revoked during core dump')
+            self.fail(f'unexpected procfs path: {path}')
+        with patch.object(Path, 'read_text', read_proc):
+            row = run.sample(self.child)
+        self.assertEqual(status_reads, 2)
+        self.assertFalse(row['exited'])
+        self.assertTrue(row['core_dumping'])
+        self.assertEqual(row['unavailable'], {'io': 'PermissionError'})
+        self.assertNotIn('io', row)
+        self.assertNotIn('VmRSS', row)
+
+    def test_replay_keeps_child_failure_samples_and_last_real_metrics(self):
+        read_text = Path.read_text
+        io_reads = 0
+        def read_proc(path, *args, **kwargs):
+            nonlocal io_reads
+            if str(path) == f'/proc/{self.child.pid}/io':
+                io_reads += 1
+                if io_reads == 2:
+                    self.finish_child()
+                    raise PermissionError('counter access revoked during exit')
+            return read_text(path, *args, **kwargs)
+        metrics = 'last_executed_checkpoint 0\n'
+        with patch.object(self.owner, 'start', return_value=self.child), \
+                patch.object(run.checkpoint, 'configuration', return_value={'metrics-address': 'unused'}), \
+                patch.object(run.urllib.request, 'urlopen', return_value=io.BytesIO(metrics.encode())), \
+                patch.object(run, 'host_sample', return_value={}), \
+                patch.object(Path, 'read_text', read_proc):
+            with self.assertRaisesRegex(RuntimeError, f'owned process {self.child.pid} exited with code 7'):
+                run.replay(self.owner, 'unused', self.root, 'remote', 1, 'digest', {}, [], 30)
+        rows = [json.loads(line) for line in (self.root/'remote-samples.jsonl').read_text().splitlines()]
+        self.assertEqual(len(rows), 2)
+        self.assertIn('io', rows[0]['node'])
+        self.assertEqual(rows[1]['node']['exit_code'], 7)
+        self.assertEqual(rows[1]['node']['unavailable'], {'io': 'PermissionError'})
+        self.assertNotIn('io', rows[1]['node'])
+        self.assertEqual((self.root/'remote-foreground.prom').read_text(), metrics)
+        self.assertIn('actual child failure: operation deadline expired', (self.root/'remote.log').read_text())
+        self.assertFalse(self.child.reaped)
+
+
 class EvidenceBoundaries(unittest.TestCase):
     def assert_process_gone(self, pid, message):
         for _ in range(100):

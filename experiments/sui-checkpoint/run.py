@@ -24,15 +24,41 @@ def read_json(path):
     return json.loads(path.read_text())
 
 
-def sample(pid):
+def sample(child):
+    """Sample a reserved owned PID; unavailable counters never stand in for IO."""
+    if not isinstance(child, build.OwnedProcess):
+        raise TypeError('sampling requires an owned process')
+    pid = child.pid
+    code = child.poll()
+    if code is not None:
+        return dict(pid=pid, exited=True, exit_code=code,
+                    unavailable={'process': 'exited_and_reaped' if child.reaped else 'exited'})
+    source = 'status'
     try:
         status = Path(f'/proc/{pid}/status').read_text().splitlines()
+        source = 'io'
         io = Path(f'/proc/{pid}/io').read_text().splitlines()
         return dict(pid=pid, **{line.split(':')[0]: int(line.split()[1])*1024 for line in status
             if line.startswith(('VmRSS:', 'VmHWM:', 'VmSwap:'))},
             io={line.split(':')[0]: int(line.split()[1]) for line in io})
-    except (FileNotFoundError, ProcessLookupError):
-        return dict(pid=pid, exited=True)
+    except (FileNotFoundError, ProcessLookupError, PermissionError) as error:
+        code = child.poll()
+        if code is None and isinstance(error, PermissionError):
+            # Core dumping revokes ptrace-gated /proc/io access before waitid
+            # reports exit. Re-read status only on this failure path: an earlier
+            # status read may predate the fatal signal.
+            try:
+                status = Path(f'/proc/{pid}/status').read_text().splitlines()
+            except (FileNotFoundError, ProcessLookupError):
+                status = []
+            code = child.poll()
+            if code is None and any(line.split() == ['CoreDumping:', '1'] for line in status):
+                return dict(pid=pid, exited=False, core_dumping=True,
+                            unavailable={source: type(error).__name__})
+        if code is None:
+            raise
+        return dict(pid=pid, exited=True, exit_code=code,
+                    unavailable={source: type(error).__name__})
 
 
 def host_sample():
@@ -79,29 +105,40 @@ def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline):
     progress, samples, final_count = [], [], 0
     metrics = ''
     with (owned.root / f'{mode}-samples.jsonl').open('x') as stream:
-        while time.monotonic()-start < deadline:
-            if child.poll() is not None or any(p.poll() is not None for p in shards):
-                raise RuntimeError(f'{mode}: owned process exited during replay')
-            row = dict(seconds=time.monotonic()-start, node=sample(child.pid), shards=[sample(p.pid) for p in shards], host=host_sample())
-            samples.append(row)
-            stream.write(json.dumps(row)+'\n')
-            stream.flush()
-            try:
-                with urllib.request.urlopen(f"http://{config['metrics-address']}/metrics", timeout=1) as response:
-                    metrics = response.read(32 << 20).decode()
-                completed = checkpoint.completed_checkpoint(metrics)
-            except (OSError, ValueError):
+        try:
+            while time.monotonic()-start < deadline:
+                row = dict(seconds=time.monotonic()-start, node=sample(child), shards=[sample(p) for p in shards], host=host_sample())
+                samples.append(row)
+                stream.write(json.dumps(row)+'\n')
+                stream.flush()
+                failed = next((p for p in [row['node'], *row['shards']]
+                               if p.get('exited') or p.get('core_dumping')), None)
+                if failed is not None:
+                    state = f"exited with code {failed['exit_code']}" if failed.get('exited') else 'is core-dumping'
+                    raise RuntimeError(f"{mode}: owned process {failed['pid']} {state} during replay; see {owned.root}/*.log")
+                try:
+                    with urllib.request.urlopen(f"http://{config['metrics-address']}/metrics", timeout=1) as response:
+                        metrics = response.read(32 << 20).decode()
+                    completed = checkpoint.completed_checkpoint(metrics)
+                except (OSError, ValueError):
+                    time.sleep(.25)
+                    continue
+                progress.append(dict(seconds=time.monotonic()-start, completed_checkpoint=completed))
+                if completed > tip:
+                    raise RuntimeError('replay passed frozen tip')
+                final_count = final_count+1 if completed == tip else 0
+                if final_count == 2:
+                    break
                 time.sleep(.25)
-                continue
-            progress.append(dict(seconds=time.monotonic()-start, completed_checkpoint=completed))
-            if completed > tip:
-                raise RuntimeError('replay passed frozen tip')
-            final_count = final_count+1 if completed == tip else 0
-            if final_count == 2:
-                break
-            time.sleep(.25)
-        else:
-            raise TimeoutError(f'{mode}: foreground deadline exceeded')
+            else:
+                raise TimeoutError(f'{mode}: foreground deadline exceeded')
+        except BaseException as error:
+            if metrics:
+                try:
+                    (owned.root / f'{mode}-foreground.prom').write_text(metrics)
+                except OSError as retention_error:
+                    error.add_note(f'foreground metrics retention failed: {retention_error}')
+            raise
     elapsed = time.monotonic()-start
     (owned.root / f'{mode}-foreground.prom').write_text(metrics)
     metrics, catchup = checkpoint.wait_for_rpc_indexes(child, config['metrics-address'], tip, metrics)
