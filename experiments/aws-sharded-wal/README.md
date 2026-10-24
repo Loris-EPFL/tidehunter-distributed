@@ -1,3 +1,41 @@
+## 24 October bounded SSM metadata and complete-matrix retry
+
+Run `40063575350` passed all 12 real Sui pairs, both native hardware `FI_READ`
+payload probes and eight normal KV pairs. Its first cold case did not launch:
+the verbose case identity exceeded SSM `SendCommand.Comment`'s 100-character
+limit. Only that display label now uses a fixed-size case digest; the full case,
+payload, command, namespace and artifact identities remain unchanged. An offline
+probe exercised the actual production builder and SDK serialization for all
+186 start/stop requests: 60 old labels exceeded the API bound; repaired labels
+are at most 42 characters, with no AWS request sent.
+
+The active full-matrix lifetime is **5,700 seconds (95 minutes)**: 85 minutes of
+work and the unchanged 600-second export reserve. The validator accepts integer
+lifetimes from 3,600 through the existing 7,200-second ceiling. No continuation,
+deadline extension, budget override or case/sample reduction is permitted.
+All **93 KV pairs / 186 processes, 12 Sui pairs / 24 replays**, two raw read sizes,
+32,768 hot reads and 1,024 independently evidenced scalar plus complete32 cold
+probes remain. Region/type fallback, cluster placement and the $100 weekly
+`budget.json` authority are unchanged.
+
+Duration admission uses actual retained clocks, not summed API time: the earlier
+172-pair campaign took 64m45s; the latest eight pairs took 275.307s including
+their enclosing suite work. The previously unmeasured cold-probe workload was
+then run locally at its full requested count on the admitted current binary:
+native 3.97s; five local TCP owners 40.68s, including 25.618s local shutdown.
+The two physical-cold phases took 3.096s native and 6.626s TCP; every one of the
+1,024 scalar and 1,024 complete32 probes qualified in each mode. This is a
+shared-SSD duration/coverage calibration, not an AWS performance prediction.
+The 95-minute admission is a forecast with leeway, not a completion guarantee.
+
+The latest failed fleet is closed, all 747 raw objects are locally SHA/size
+verified, and its reservation was released. Estimated branch usage is
+$76.571582257221, leaving $23.428417742779 under the unchanged current cap.
+Retained US pricing projects a roughly $22.81 maximum 95-minute reservation;
+the next run must still reprice and pass the live affordability filter before
+allocating. Final billing remains unavailable. No Rust/Sui code or pin changes
+are part of this orchestration repair.
+
 ## 23 October actual checkpoint-completion admission
 
 The same-build local replay must now retain a positive, finite
@@ -25,7 +63,7 @@ nonfinite or incomplete histograms fail the local readiness gate.
 
 The current `ci-config.json` selects `kv_suite.scope=hardware-populations`,
 not the historical full Cartesian matrix described below. One existing
-`bench/aws-efa` fleet and its absolute 7,200-second lifetime are retained.
+`bench/aws-efa` fleet is used, with the active absolute lifetime stated above.
 No continuation, deadline reset, additional fleet or budget override is implied.
 `budget.json` remains the sole $100/week authority.
 

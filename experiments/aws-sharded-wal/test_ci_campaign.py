@@ -716,6 +716,18 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(reserved, Decimal('39.909285714286'))
         self.assertEqual(ci.parsed(self.campaign.journal.data['expires_at']).timestamp(), started + 7200)
 
+    def test_partial_hour_reservation_keeps_cleanup_charge_and_launch_deadline(self):
+        self.cfg['ttl_seconds'] = 5700
+        for candidate in self.candidates:
+            candidate['maximum_estimate_usd'] = str(
+                Decimal(candidate['host_hourly_usd']) * 6 * 5700 / 3600)
+        started = self.clock.time()
+        self.allocate()
+        _, reserved, provenance = Ledger.reservations[0]
+        self.assertEqual(provenance['reconciliation_usd'], '3.000000000000')
+        self.assertEqual(reserved, Decimal('32.409285714286'))
+        self.assertEqual(ci.parsed(self.campaign.journal.data['expires_at']).timestamp(), started + 5700)
+
     def test_two_hour_cost_cannot_be_admitted_with_only_one_hour_headroom(self):
         self.cfg['ttl_seconds'] = 7200
         for candidate in self.candidates:
