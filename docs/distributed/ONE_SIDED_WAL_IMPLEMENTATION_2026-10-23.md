@@ -2,7 +2,7 @@
 
 23 October 2026. Branch: `perf/one-sided-wal-reads-2026-10-23`. Base commit: `405f3e3bc7304e089713f1e8b04e07aee8e92451`.
 
-**Status: hardware run `40063575350` remains partial; preparation retry `40073005718` failed before EC2 allocation.** The hardware run completed all 12 Sui pairs, both native hardware `FI_READ` payloads and eight KV pairs before an SSM metadata limit. All 747 raw objects are locally SHA/size-verified and its fleet is closed. The bounded-label repair and fixed 95-minute full-matrix reservation are published. The latest preparation exposed another intermittent software-fabric startup deadline; the locally verified observer correction below preserves process-failure evidence instead of masking it with a procfs permission error. The complete cloud KV matrix and native parity remain unproven. No native mutex was removed.
+**Status: run `40098179412` completed all 12 certified Sui pairs, all 93 KV pairs and both hardware `FI_READ` probes; its fleet is fully closed.** GitHub remains red because final offline admission compared a frozen config with runtime node records polluted by deployment receipts. The original evidence is retained. Replaying the sealed deployment journal reconstructs both original probe configurations exactly, and the unchanged strict validator accepts the complete dataset. The emitter defect is fixed locally without weakening identity checks or launching another fleet. Coordinator cache hits are sub-microsecond; remote scalar reads and Sui commit/tail parity remain unmet. See §12. Earlier partial runs below remain historical evidence. No native mutex was removed.
 
 This is a source/status guide, not a replacement for [D1](ONE_SIDED_WAL_READS_2026-10-21.md), the [23 October remote-read plan](REMOTE_READ_PATH_PLAN_2026-10-23.md), or preserved historical results. Paths and symbols below identify the working tree. There are deliberately no fabricated GitHub permalinks to unpushed changes. After the parent's production/benchmark freeze signal, selected inspected line ranges were added below; these are local snapshot coordinates, not immutable committed permalinks. `project:` denotes the parent of this engine checkout.
 
@@ -684,16 +684,280 @@ returned `Unknown tool: aws___run_script` and the named local login had expired.
 OIDC success alone is not an EC2 inventory or a hardware benchmark result.
 
 
-### Remaining publication gates
+### Completed publication and cloud gate
 
-The final local runtime gates above are complete. Before a paid campaign,
-publish the compatible engine and Sui repair commits, update the immutable Sui
-pin, and pass the protected review/checks before merging to `bench/aws-efa`.
-Do not run the older benchmark branch as a substitute for testing these repairs.
+Engine repairs `c1f49b2` and `aabf177`, followed by documentation commit `9076518`,
+were published in PR 22. Sui repairs `770e0f1` and dependency pin `2fc8fa1` were
+published in the Sui fork. All eight protected engine checks passed. Normal merge
+`66a6a8a` triggered the single campaign below; GitHub rebuilt all six executables
+and passed preparation before allocating the fleet. The optional Sui Codex review
+had not returned findings at the last observation; it is not reported as cleared.
 The final local bundle lives at `rebuilt-current/build/`; its six successful
 Cargo invocations and executable hashes are in `build-manifest.json`.
 
 The earlier one-NVMe and software-provider timings remain local observations.
 Neither these repairs nor passing local tests demonstrate independent-NVMe
 scaling, hardware EFA/direct latency, or a new microsecond remote-read result.
+
+## 12. Complete hardware campaign, 24 October 2026
+
+### Sources, fleet and retained evidence
+
+[`40098179412`](https://github.com/Loris-EPFL/tidehunter-distributed/actions/runs/40098179412)
+ran one controller and five owners on six `g6.8xlarge` instances in `us-east-1a`,
+all in cluster placement group `th-b629cfece9769789`. Each owner used its own
+instance-store NVMe. No second fleet or continuation was launched.
+
+| Binding | Exact value |
+|---|---|
+| Engine merge | `66a6a8a7f32f9efcd3c1584ff89e1cf9c21f36e7` |
+| Sui fork | `2fc8fa1eb529cdeaa8cf3906c46d0de5e0b32a19` |
+| Sui's engine dependency | `9076518cb9e166e41b382d41bcc644db94aa332b` |
+| Source archive SHA-256 | `9164db7fb1e06681de6e309023e729fa65d63c2d8fa41a3756b2628d94348329` |
+| Build manifest SHA-256 | `5151c4654d1f8dbe73727b454b1c6b25285ba9092713ed2d9639e601e04b7bdd` |
+| Controller archive SHA-256 | `5950cd0c0192e57df1fefc963507fe971f9e9086ec3c1f516c9185f74bacadc8` |
+| Controller archive | 217,068,225 bytes; 10,011 members; 2,339,923,803 extracted bytes |
+| Certified chain | Checkpoints 0–1775; tip `EhUPyfwLGDEKH5Ssg3nFbVAHwi4XA87xNKvnFEo3ZJb6` |
+
+The local root is `project:checkpoint-work/aws-ci-runs/40098179412-1/`.
+`unpacked-controller/results/` preserves the original data. All 12 sealed Sui
+archives and their source/build/audit bindings pass verification. All 24 final
+metric cuts pass the generation/freshness checks. The 60 Sui and 465 KV storage
+output archives match their individual receipt hashes; deployment input packages
+are a different namespace and are not counted as result archives.
+
+The complete GitHub evidence and cost artifacts were also downloaded. A final
+local pass verifies **all 2,017 current-run S3 objects**, 689,699,470 bytes,
+against `retrieval-manifest.json`, with zero size/hash mismatches. This is the
+current-run inventory, not the older 747-object campaign. Proof:
+`full-artifact-retrieval-verified.json`.
+
+The complete numerical exports are under `analysis/`, bound by
+`analysis-file-manifest.json`:
+
+| File | Rows | Scope |
+|---|---:|---|
+| `kv-all-phases.csv` | 5,246 | Every backend phase, including reads, writes, deletion, scans, checkpoints and reopen |
+| `kv-matched-phase-comparisons.csv` | 2,530 | Same-case shared phases; units and population equality retained |
+| `sui-cell-summary.csv` | 24 | Both backends for every Sui cell |
+| `sui-wrapper-latencies.csv` | 1,224 | Every labeled wrapper histogram, without pooling labels |
+| `sui-adapter-components.csv` | 14,064 | Named component means and denominators, foreground/final cuts separate |
+
+`derived-{sui,kv-csv}-analysis.json`, `offline-full-qualification.json` and the
+original raw CSV/JSONL files retain the larger evidence. The strict consumer
+accepts 186 comparison/API identities, nine registered hit-only controls and all
+32 physical-I/O backend outputs. It classifies 170 bounded service populations.
+The other 16 are native configured-cache references without native hit counters,
+not failed cold probes; do not call them counter-proved native-cache-hit-only.
+Every actual `samples.csv` phase count matches its summary.
+
+### Workflow failure and local correction
+
+The workload receipt reports `complete=true`, 12 Sui pairs, 186 KV backend
+results and no workload failures. GitHub step 8 nevertheless failed with
+`raw RMA original campaign identity differs`. Cleanup and artifact retention
+succeeded; the historical GitHub conclusion remains **failure**.
+
+Only `nodes` differed. Its five stable `(instance_id, partition, private_ip)`
+identities matched. `SuiCampaign.__init__` had sorted the admitted node dictionaries
+without copying them; `prepare` then added each cell's `payload` receipt to those
+same dictionaries. Both original raw intents therefore included the last cell's
+deployment receipts, while the earlier frozen campaign config did not. Every
+other immutable field matched, including source, binaries, fleet and deadline.
+
+The offline recovery replays all 60 **sealed, recorded** deployment-receipt
+assignments into a copy of the base config. The resulting entire object equals
+both original probe configs, across all keys. The unchanged
+`checkpoint_kv.validate_auxiliary` then accepts all 186 outputs, both raw probes
+and 651 fabric diagnostic populations. This does not rewrite the base archive,
+ignore node identity, suppress the guard, or turn the old GitHub run green.
+
+Local repair `b0ce3c0` gives `SuiCampaign.nodes` its own five dictionaries, so
+deployment receipts cannot change admitted identity. It also updates the offline
+`compare_campaign` unpack to the current five-element verified replay tuple.
+The actual frozen/current constructors reproduce contamination before and
+preserve identity after; worker receipts remain usable in both. SDK construction
+and the validated root path were isolated in that local probe; no AWS API or
+benchmark ran. All 608 AWS harness tests pass with four existing skips, and all
+164 Sui harness tests pass. No Rust binary changed in this post-run repair.
+
+### Certified Sui: faster transport does not remove the commit gap
+
+The following are clean startup-inclusive seconds, not individual checkpoint
+latency. Coordinator cache is 0 MiB in `r01`, 8 MiB in `r02`; owner cache is
+8 MiB in both. These two rows per mode are different cache populations, not
+identical statistical repeats.
+
+| Mode | Native, cache-off pair | Distributed, cache off | R/N | Native, cache-on pair | Distributed, cache on | R/N |
+|---|---:|---:|---:|---:|---:|---:|
+| TCP | 6.246279 | 10.434714 | 1.6705 | 6.269660 | 10.166831 | 1.6216 |
+| EFA | 6.252578 | 9.368294 | 1.4983 | 6.245050 | 9.374528 | 1.5011 |
+| EFA-direct | 6.240563 | 9.369546 | 1.5014 | 6.258209 | 9.119758 | 1.4572 |
+| EFA-native message | 6.249840 | 9.105402 | 1.4569 | 6.269471 | 9.104789 | 1.4522 |
+| EFA-native + registered reads | 6.252633 | 9.608931 | 1.5368 | 6.285754 | 9.357156 | 1.4886 |
+
+All 24 completion histograms contain 1,776 observations. Native means are about
+10.3 ms; distributed means are 15.5–18.0 ms. Every native completion p99 lies in
+`(10,25] ms`, versus `(150,175] ms` remotely. These are bucket bounds, not exact
+quantiles. The sampled completed-window denominator is 1,775 increments and is
+not the histogram count.
+
+With coordinator caching, shared-version wrapper multiget means fall to
+5.08–7.17 µs, versus native 2.86–3.46 µs. Certified-get means reach
+20.77–24.08 µs, versus native 18.45–20.78 µs. Yet remote perpetual wrapper commits
+remain 0.91–1.16 ms, versus native 0.59–0.61 ms. This is why a faster read hit alone
+does not restore replay parity.
+
+The fixture is not a cold-object workload: all enclosing coordinator/storage
+physical `read_bytes` are zero, and diagnostic exact-version object DB keys are
+zero. Empty object multigets are not remote object fetches. RMA hits concentrate
+in epoch/shared-version reads. Cache-enabled `r02-efa-native-rma` has **zero**
+RMA posts; its speed is not evidence of an RMA win.
+
+### Bounded 8-KiB reads: one consistent clean repetition
+
+All rows below use `r1`, batch size/window 1, load 320 and EFA-native. Ordinary
+bounded populations have 32,768 scalar calls and 1,024 complete 32-member calls.
+Physical rows have 1,024 of each. Values are p50 µs; complete32 is one whole API
+call, never a per-value median obtained by division.
+
+| Population | Native scalar | Distributed scalar | Native complete32 | Distributed complete32 |
+|---|---:|---:|---:|---:|
+| Coordinator cache / native configured-cache reference | 0.140 | 0.429 | 7.800 | 10.570 |
+| Owner encoded RAM cache | 1.120 | 48.741 | 38.931 | 344.858 |
+| Buffered/page-cache control | 1.120 | 50.661 | 38.451 | 303.327 |
+| Registered hit-only | 1.120 | 54.481 | 39.561 | 190.725 |
+| Positive physical-I/O probes | 326.168 | 183.785 | 741.428 | 860.361 |
+
+Coordinator hits reach native's order of performance, but remote scalar reads
+do not. Registered reads reduce whole32 time in this shape while making scalar
+reads 7.54% slower than the same-repetition message control. Remote registered
+scalar p95/p99 are 64.251/77.492 µs; whole32 p95/p99 are 209.465/225.845 µs.
+
+The physical ratios compare complete API operations, **not equal-byte device
+service**: native scalar probes charge 131,072 bytes each; remote 8-KiB probes
+charge 12,288 or 16,384 bytes. Every requested probe qualifies, with positive
+charged I/O on each expected owner. All 32 cold outputs together retain 32,768
+scalar and 32,768 complete32 intervals; this does not prove each member of a
+group incurred a separate physical read.
+
+The 8-KiB write-batch32 shape is separate. At load3200 in clean `r1`, registered
+reads change scalar p50 from 50.981 to 55.451 µs, but whole32 from 688.907 to
+207.306 µs. Load320 and load3200 are never pooled. For batch1, a 32-key group
+spans five owners/ten lanes; batch32 keeps the group on one owner/two lanes.
+Both hit-only measurement intervals have 32,768 `FI_READ` elements and zero
+Read messages, grant acquisitions, fallbacks or errors.
+
+### Hardware floor and measured read components
+
+These actual native, non-emulated device reads use provider `efa`, fabric
+`efa-direct`, with 64 warmups and 1,000 measured calls per size:
+
+| Payload / actual transfer | Completion p50/p95/p99 µs | API + validation p50/p95/p99 µs |
+|---|---|---|
+| 256 / 280 bytes | 42.992 / 47.241 / 49.691 | 44.111 / 48.351 / 50.822 |
+| 8192 / 8216 bytes | 47.032 / 52.662 / 55.422 | 65.741 / 73.022 / 76.362 |
+
+Completion is accepted post through **observed** completion, not pure wire RTT.
+The mean same-request API-minus-completion interval is 1.153 µs at 256 bytes and
+16.961 µs at 8 KiB; it includes posting/wrapper/deterministic validation work,
+not validation alone. This configuration does not establish few-microsecond
+remote reads.
+
+Fresh diagnostic 8-KiB warm message calls give these means:
+
+| Mode | Whole API µs | Enclosing exchange µs | Server handler µs | Server record read µs |
+|---|---:|---:|---:|---:|
+| TCP | 159.538 | 157.562 | 11.527 | 9.491 |
+| EFA | 57.410 | 55.812 | 3.679 | 2.996 |
+| EFA-direct | 59.225 | 56.959 | 4.131 | 3.408 |
+| EFA-native message | 52.912 | 50.723 | 3.908 | 3.209 |
+
+Each row has 4,096 wire/timed observations. Index means are only 0.388–0.450 µs.
+Enclosing exchange dominates these message populations, but it is not a
+network-only clock. RMA diagnostic full-dataset calls are mixed: 1,977 hits plus
+2,119 messages and 256 grant acquisitions. Their mean 79.269 µs and p99
+430.511 µs must not replace the bounded registered-hit-only distribution.
+Legacy exchange subphase zeroes are unavailable compatibility clocks.
+
+### Writes, checkpoint maintenance and historical comparison
+
+At 8 KiB, batch/window32, clean `r0` load3200:
+
+| Mode | Load throughput, operations/s | Complete-window p50 ms | p99 ms |
+|---|---:|---:|---:|
+| Native TCP-case reference | 51,323 | 19.896 | 20.764 |
+| TCP | 42,081 | 17.168 | 86.568 |
+| EFA | 42,066 | 17.173 | 82.677 |
+| EFA-direct | 41,118 | 17.939 | 95.425 |
+| EFA-native message | 42,485 | 17.159 | 87.153 |
+| Registered reads enabled | 42,676 | 17.581 | 81.852 |
+
+The native row is its identified paired control, not a pooled native population.
+Lower remote median windows do not imply better throughput: long tails reverse
+that comparison. The shorter load320 has only ten windows and a different
+outcome; do not use it as a substitute for the 100-window load3200.
+The explicit suite durability is RF1 Value-WAL file-and-directory barriers,
+not replication/quorum or full index/database durability.
+
+In Sui diagnostics, remote storage append means are 16–35 µs, but persistence
+means are 399–496 µs and client exchanges 515–683 µs. Native sampled barriers
+are 171–331 µs, over a different file population. Perpetual index-persist means
+are approximately 100–101 ms over ten engine checkpoints; receipt history adds
+its separately measured approximately 20-ms phase. Publication-blocked batches
+also remain. These overlapping populations cannot be summed into elapsed time,
+and no per-checkpoint causal join proves which maintenance event caused each
+Sui completion tail.
+
+Compared with old hardware run `40063575350`, matched clean Sui remote elapsed
+times change only −1.81% to +1.85%; the large gap has not materially closed.
+The old native `r02-efa-direct` wall-time anomaly must not be called an engine
+improvement. Only eight old native/TCP KV pairs exist. Their matched page-cache
+8-KiB batch32/load320 TCP whole32 p50 regresses 15.23%; load3200 improves 3.11%.
+No absent historical cold/EFA/RMA cells are inferred.
+
+Next work should therefore separate three measured problems: raw-provider
+post/completion latency; mixed grant acquisition/fallback cost; and durable
+commit/maintenance tails. Optimizing the sub-microsecond coordinator index is
+not an explanation for a roughly 43-µs raw device-read interval or a 100-ms
+index-persist phase. Blanket RMA enablement is not supported by the natural Sui
+results; the existing bounded registered bulk path is useful evidence, not
+native parity.
+
+### Closure and cost
+
+Independent AWS MCP at `2026-10-24T15:40:34Z` confirms all six exact instances
+terminated and every exact EBS root, EFA interface, security/placement group,
+IAM role and instance profile absent. A fresh 23-enabled-region sweep at
+`15:47:44Z` finds no current-run instances. Five unrelated users' instances were
+left untouched. No manual rescue was needed.
+
+| Cost measure | USD, estimated |
+|---|---:|
+| This run | 12.637135452670 |
+| Current UTC day | 26.083316778316 |
+| Current Monday week | 89.208717709891 |
+| October / since-ledger total | 89.208717709891 |
+| Weekly policy | 100.000000000000 |
+| Remaining weekly headroom | 10.791282290109 |
+| Active reservation | 0.000000000000 |
+
+Ledger revision 59 released the $22.805459470735 reservation. These are partial
+usage estimates, not invoices: Cost Explorer billing remains unavailable due
+`ListCostAllocationTags` access denial. Retained S3 results still incur storage
+charges; termination is not a claim of zero charges for retained evidence.
+Proofs are `ops/aws-mcp-closure.json`, `ops/aws-mcp-inventory.json`,
+`ops/aws-s3-output-archives.json`, `controller-retrieval-verified.json` and
+`kv-node-archives-verified.json` under the local run root.
+
+### Separate inherited Sui CI defects
+
+The Sui fork's PR 2 also triggered broader upstream frontend, validator and
+dependency-audit workflows. Missing generated OpenRPC/site inputs, a pnpm version
+mismatch and missing Slack credentials are separate failures. The audit reports
+critical/high JavaScript advisories involving `proxy-addr`, `zod` and
+`body-parser`, plus Rust advisories for `rustls-webpki 0.103.13` and
+`tokio 1.52.1`. These inherited dependencies were not changed or suppressed in
+this experiment. Passing the source-bound storage/replay gates is not a claim
+that the whole Sui repository passes CI or is ready for production deployment.
 

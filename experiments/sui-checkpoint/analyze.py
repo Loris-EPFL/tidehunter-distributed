@@ -1078,7 +1078,7 @@ def compare_campaign(root):
                 logs = [helpers.fabric_local_archive_log(archive, name, forbidden=not diagnostic)
                         for name in names]
             fabric['storage'].append(dict(partition=node['partition'], archive=str(path), logs=logs))
-        _, raw, _, _ = replay
+        _, raw, _, _, _ = replay
         row = {k: identity[k] for k in ('cell_id', 'transport', 'ordinal', 'repetition', 'read_profile_limit')}
         row['write_profile_limit'] = identity.get('write_profile_limit', 0)
         row['native_write_profile_limit'] = identity.get('native_write_profile_limit', 0)

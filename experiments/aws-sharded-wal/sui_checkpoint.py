@@ -641,7 +641,8 @@ class SuiCampaign(Campaign):
         self.ec2 = self.session.client('ec2', config=SDK_CONFIG)
         self.deadline = datetime.fromtimestamp(datetime.fromisoformat(cfg['deadline_utc'].replace('Z', '+00:00')).timestamp() - cfg.get('export_reserve_seconds', 600), timezone.utc).isoformat()
         self.state = {'run_id': cfg['run_id'], 'campaign': 'sui-checkpoint', 'complete': False, 'failures': [], 'uploads': [], 'cells': []}
-        self.nodes = sorted(cfg['nodes'], key=lambda n: n['partition'])
+        # Deployment receipts are worker state, not part of the admitted config.
+        self.nodes = sorted((node.copy() for node in cfg['nodes']), key=lambda n: n['partition'])
         self.attempted_nodes = set()
         self.collected_final = set()
         self.child = None
