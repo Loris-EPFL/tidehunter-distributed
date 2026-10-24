@@ -186,6 +186,8 @@ jobs:
             ${{ runner.temp }}/benchmark-inputs/build/*.log
             ${{ runner.temp }}/benchmark-inputs/local-replay/receipt.json
             ${{ runner.temp }}/benchmark-inputs/local-replay/experiment/*.log
+            ${{ runner.temp }}/benchmark-inputs/local-replay/experiment/*.jsonl
+            ${{ runner.temp }}/benchmark-inputs/local-replay/experiment/*.prom
             ${{ runner.temp }}/benchmark-inputs/local-replay/experiment/results.json
           retention-days: 7
           if-no-files-found: warn
