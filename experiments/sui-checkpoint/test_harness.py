@@ -21,6 +21,16 @@ import build
 import run
 
 
+class SoftwareFabricGeometry(unittest.TestCase):
+    def test_excessive_or_invalid_software_receive_geometry_is_rejected(self):
+        for value in ('', '4096', '0'):
+            for transport in deployment.SOFTWARE_TRANSPORTS:
+                with self.subTest(value=value, transport=transport):
+                    with self.assertRaises(ValueError):
+                        deployment.process_environment(
+                            {'FI_OFI_RXM_MSG_RX_SIZE': value}, transport=transport)
+
+
 class NativeProfileContract(unittest.TestCase):
     def test_capability_remains_available_with_zero_sampling_budget(self):
         clean = dict(native_profile_limit=0, native_profile_available=1,
@@ -323,6 +333,7 @@ class CheckpointSourceBoundaries(unittest.TestCase):
             build.verify_staged(root, identities)
 
     def cargo_sources(self, root, *, selected_version='0.1.0'):
+        """Only local path/file Git dependencies; a fresh checkout needs Cargo offline disabled."""
         self.source_tree(root / 'inputs')
         sources = root / 'inputs/sources'
         engine = sources / 'tidehunter-sharded-wal'
@@ -381,6 +392,7 @@ class CheckpointSourceBoundaries(unittest.TestCase):
         commit(engine)
         return sources
 
+    @patch.dict(os.environ, {'CARGO_NET_OFFLINE': 'false'})
     def test_prepare_selects_staged_engine_over_portable_git_pin_and_hash_binds_inputs(self):
         for fabric in (False, True):
             with self.subTest(fabric=fabric), tempfile.TemporaryDirectory() as tmp:
@@ -435,6 +447,7 @@ class CheckpointSourceBoundaries(unittest.TestCase):
                             archived = archive.extractfile(f'sources/{owner}/{relative}').read()
                             self.assertEqual(hashlib.sha256(archived).hexdigest(), record['sha256'])
 
+    @patch.dict(os.environ, {'CARGO_NET_OFFLINE': 'false'})
     def test_prepare_rejects_git_version_mismatch_resolved_by_real_cargo(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -661,6 +674,331 @@ class ReplaySamplingLifecycle(unittest.TestCase):
         self.assertEqual((self.root/'remote-foreground.prom').read_text(), metrics)
         self.assertIn('actual child failure: operation deadline expired', (self.root/'remote.log').read_text())
         self.assertFalse(self.child.reaped)
+
+
+class PassiveMetricFreshness(unittest.TestCase):
+    def scrape(self, generations, *, unavailable=(), stale=(), stopped=(), remote=True):
+        rows = []
+        for namespace, (local, owner) in generations.items():
+            stats = dict(local_sample_generation=local, local_sample_available=int(namespace not in unavailable),
+                local_sample_age_ms=3001 if namespace in stale else 0,
+                local_sampler_stopped=int(namespace in stopped))
+            rows.extend(f'tidehunter_adapter{{namespace="{namespace}",stat="{key}"}} {value}'
+                        for key, value in stats.items())
+            if remote:
+                stats = dict(shard_sample_generation=owner, shard_sample_errors=0,
+                    shard_sample_available=int(namespace not in unavailable), resident_sample_available=1,
+                    shard_sample_age_ms=3001 if namespace in stale else 0,
+                    shard_sampler_stopped=int(namespace in stopped))
+                rows.extend(f'tidehunter_operational_read_io{{namespace="{namespace}",stat="{key}"}} {value}'
+                            for key, value in stats.items())
+                if namespace not in unavailable:
+                    owner_stats = dict.fromkeys(analyze.OWNER_KNOWN_STATS, 0)
+                    owner_stats.update(wal_reads=1, authority_available=1, initiator_available=1)
+                    rows.extend(f'tidehunter_shard_read{{namespace="{namespace}",partition="{p}",stat="{key}"}} {value}'
+                                for p in range(5) for key, value in owner_stats.items())
+        return '\n'.join(rows) + '\n'
+
+    def wait(self, texts, *, remote=True, namespaces=('a', 'b'), budget=1):
+        clock = [10.]
+        def sleep(seconds):
+            clock[0] += seconds
+        responses = iter(texts)
+        last = texts[-1]
+        def scrape(*args, **kwargs):
+            nonlocal last
+            last = next(responses, last)
+            return io.BytesIO(last.encode())
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(run.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(run.time, 'sleep', side_effect=sleep), \
+                patch.object(run, 'sample', return_value={'pid': 123, 'exited': False}), \
+                patch.object(run.urllib.request, 'urlopen', side_effect=scrape):
+            destination = Path(directory) / 'final.prom'
+            try:
+                return run.wait_for_final_metrics(object(), [], 'unused', set(namespaces),
+                    remote=remote, end=10 + budget, destination=destination)
+            finally:
+                self.last_retained = destination.read_text() if destination.exists() else None
+
+    def sparse(self, text, *, stream='owner', available=0):
+        family = 'tidehunter_operational_read_io' if stream == 'owner' else 'tidehunter_adapter'
+        omitted = ('shard_sample_generation', 'shard_sample_age_ms', 'shard_sample_errors') if stream == 'owner' else (
+            'local_sample_generation', 'local_sample_age_ms')
+        flag = 'shard_sample_available' if stream == 'owner' else 'local_sample_available'
+        rows = []
+        for row in text.splitlines():
+            if 'namespace="a"' in row:
+                if stream == 'owner' and row.startswith('tidehunter_shard_read{'):
+                    continue
+                if row.startswith(family + '{'):
+                    if any(f'stat="{key}"' in row for key in omitted):
+                        continue
+                    if f'stat="{flag}"' in row:
+                        row = row.rsplit(' ', 1)[0] + f' {available}'
+            rows.append(row)
+        return '\n'.join(rows) + '\n'
+
+    def test_explicit_busy_sparse_owner_keeps_baseline_and_records_unavailability(self):
+        baseline = self.scrape({'a': (5, 5), 'b': (9, 9)})
+        busy = self.sparse(self.scrape({'a': (6, 6), 'b': (10, 10)}))
+        final = self.scrape({'a': (7, 7), 'b': (11, 11)})
+        text, cut = self.wait([baseline, busy, final])
+        self.assertEqual(text, final)
+        self.assertEqual(cut['baseline']['a']['owner']['shard_sample_generation'], 5)
+        self.assertEqual(cut['unavailable_observations'], 1)
+        observation = cut['observations'][1]
+        self.assertTrue(observation['unavailable'])
+        self.assertNotIn('shard_sample_generation', observation['streams']['a']['owner'])
+        self.assertIn('shard_sample_generation', observation['missing'][0]['missing'])
+        resident_busy = busy.replace(
+            'namespace="a",stat="shard_sample_available"} 0',
+            'namespace="a",stat="shard_sample_available"} 1').replace(
+            'namespace="a",stat="resident_sample_available"} 1',
+            'namespace="a",stat="resident_sample_available"} 0')
+        _, cut = self.wait([baseline, resident_busy, final])
+        self.assertEqual(cut['unavailable_observations'], 1)
+
+    def test_sparse_local_before_baseline_waits_for_complete_metadata_without_rebaselining(self):
+        baseline = self.scrape({'a': (50, 0), 'b': (90, 0)}, remote=False)
+        busy = self.sparse(baseline, stream='local')
+        first = self.scrape({'a': (51, 0), 'b': (91, 0)}, remote=False)
+        final = self.scrape({'a': (52, 0), 'b': (92, 0)}, remote=False)
+        text, cut = self.wait([busy, baseline, first, final], remote=False)
+        self.assertEqual(text, final)
+        self.assertEqual(cut['baseline']['a']['local']['local_sample_generation'], 50)
+        self.assertEqual(len(cut['observations']), 4)
+        self.assertEqual(cut['unavailable_observations'], 1)
+        self.assertNotIn('local_sample_generation', cut['observations'][0]['streams']['a']['local'])
+
+    def test_missing_metadata_with_available_one_still_fails_immediately(self):
+        baseline = self.scrape({'a': (5, 5), 'b': (9, 9)})
+        for stream in ('local', 'owner'):
+            missing = self.sparse(baseline, stream=stream, available=1)
+            with self.subTest(stream=stream), self.assertRaises(ValueError):
+                self.wait([baseline, missing])
+            self.assertEqual(self.last_retained, missing)
+
+    def test_sparse_unavailability_never_hides_invalid_fields_or_missing_peers(self):
+        baseline = self.scrape({'a': (5, 5), 'b': (9, 9)})
+        busy = self.sparse(baseline)
+        malformed = (
+            busy + 'tidehunter_operational_read_io{namespace="a",stat="shard_sample_generation"} -1\n',
+            busy + 'tidehunter_operational_read_io{namespace="a",stat="unknown"} 0\n',
+            busy.replace('stat="resident_sample_available"} 1', 'stat="resident_sample_available"} 2'),
+            '\n'.join(row for row in busy.splitlines() if 'namespace="b"' not in row) + '\n',
+            self.sparse(baseline, stream='local') + 'tidehunter_adapter{namespace="a",stat="local_sample_unknown"} 0\n')
+        for text in malformed:
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                self.wait([baseline, text])
+            self.assertEqual(self.last_retained, text)
+
+    def test_sparse_live_tolerance_does_not_weaken_strict_final_parser(self):
+        baseline = self.scrape({'a': (5, 5), 'b': (9, 9)})
+        busy = self.sparse(baseline)
+        with self.assertRaises(ValueError):
+            analyze.current_metric_streams(analyze.parse_metrics(busy), {'a', 'b'}, remote=True)
+        with self.assertRaises(TimeoutError):
+            self.wait([baseline, busy])
+        self.assertEqual(self.last_retained, busy)
+
+    def test_sparse_overlap_preserves_last_complete_generation_regression_check(self):
+        baseline = self.scrape({'a': (5, 5), 'b': (9, 9)})
+        advanced = self.scrape({'a': (6, 6), 'b': (10, 10)})
+        busy = self.sparse(advanced)
+        reset = self.scrape({'a': (7, 5), 'b': (11, 11)})
+        with self.assertRaisesRegex(ValueError, 'regressed'):
+            self.wait([baseline, advanced, busy, reset])
+        busy = self.sparse(self.scrape({'a': (8, 6), 'b': (10, 10)}))
+        # A valid local generation observed while the owner stream was sparse
+        # remains monotonic too; a peer's unavailable state cannot erase it.
+        with self.assertRaisesRegex(ValueError, 'regressed'):
+            self.wait([baseline, busy, reset])
+
+    def test_each_namespace_and_both_streams_need_two_post_boundary_generations(self):
+        baseline = self.scrape({'a': (40, 90), 'b': (7, 3)})
+        first = self.scrape({'a': (42, 92), 'b': (8, 4)})
+        second = self.scrape({'a': (42, 92), 'b': (9, 4)})
+        final = self.scrape({'a': (42, 92), 'b': (9, 5)})
+        text, cut = self.wait([baseline, first, second, final])
+        self.assertEqual(text, final)
+        self.assertEqual(len(cut['observations']), 4)
+        self.assertEqual(cut['baseline']['a']['owner']['shard_sample_generation'], 90)
+        with self.assertRaises(TimeoutError):
+            self.wait([baseline, baseline])
+
+    def test_failed_first_attempt_does_not_qualify_until_both_streams_recover(self):
+        baseline = self.scrape({'a': (5, 5), 'b': (10, 10)})
+        failed = self.scrape({'a': (7, 7), 'b': (10, 12)}, unavailable=('b',))
+        recovered = self.scrape({'a': (7, 7), 'b': (12, 13)})
+        _, cut = self.wait([baseline, failed, recovered])
+        self.assertEqual(len(cut['observations']), 3)
+
+    def test_native_requires_only_independent_local_publications(self):
+        _, cut = self.wait([
+            self.scrape({'a': (5, 0), 'b': (8, 0)}, remote=False),
+            self.scrape({'a': (7, 0), 'b': (10, 0)}, remote=False)], remote=False)
+        self.assertEqual(set(cut['final']['a']), {'local'})
+
+    def test_unavailable_stale_and_stopped_cannot_qualify(self):
+        baseline = self.scrape({'a': (1, 1), 'b': (1, 1)})
+        for option in ('unavailable', 'stale', 'stopped'):
+            final = self.scrape({'a': (3, 3), 'b': (3, 3)}, **{option: ('b',)})
+            with self.subTest(option=option), self.assertRaises(TimeoutError):
+                self.wait([baseline, final])
+            self.assertEqual(self.last_retained, final)
+
+    def test_missing_namespace_wrong_family_and_conflicting_status_fail_closed(self):
+        baseline = self.scrape({'a': (1, 1), 'b': (1, 1)})
+        missing = self.scrape({'a': (3, 3)})
+        wrong = baseline.replace('tidehunter_operational_read_io', 'tidehunter_adapter')
+        conflict = baseline + 'tidehunter_adapter{namespace="a",stat="shard_sample_available"} 1\n'
+        duplicate = baseline + 'tidehunter_operational_read_io{stat="shard_sample_generation",namespace="a"} 1\n'
+        for text in (missing, wrong, conflict, duplicate):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                self.wait([baseline, text])
+            self.assertEqual(self.last_retained, text)
+
+    def test_missing_owner_population_is_not_fresh_complete_evidence(self):
+        baseline = self.scrape({'a': (1, 1), 'b': (1, 1)})
+        final = self.scrape({'a': (3, 3), 'b': (3, 3)})
+        final = '\n'.join(line for line in final.splitlines() if 'partition="4"' not in line) + '\n'
+        with self.assertRaisesRegex(ValueError, 'all five'):
+            self.wait([baseline, final])
+
+    def test_same_missing_mandatory_stat_on_every_owner_fails_live_and_archived_cut(self):
+        baseline = self.scrape({'a': (5, 5), 'b': (9, 9)})
+        final = self.scrape({'a': (7, 7), 'b': (11, 11)})
+        _, cut = self.wait([baseline, final])
+        for stat in analyze.OWNER_BASE_STATS:
+            incomplete = '\n'.join(row for row in final.splitlines() if not (
+                row.startswith('tidehunter_shard_read{') and f'stat="{stat}"' in row)) + '\n'
+            with self.subTest(stat=stat, boundary='live'), self.assertRaisesRegex(
+                    ValueError, 'partial mandatory owner'):
+                self.wait([baseline, incomplete])
+            with self.subTest(stat=stat, boundary='archive'), self.assertRaisesRegex(
+                    ValueError, 'partial mandatory owner'):
+                analyze.validate_final_metric_cut(analyze.parse_metrics(incomplete),
+                    {'a', 'b'}, cut, remote=True)
+
+    def test_optional_owner_groups_require_full_population_only_when_available(self):
+        baseline = self.scrape({'a': (5, 5), 'b': (9, 9)})
+        final = self.scrape({'a': (7, 7), 'b': (11, 11)})
+        _, cut = self.wait([baseline, final])
+        for flag, fields in analyze.OWNER_OPTIONAL_STATS.items():
+            for stat in fields:
+                incomplete = '\n'.join(row for row in final.splitlines() if not (
+                    row.startswith('tidehunter_shard_read{') and f'stat="{stat}"' in row)) + '\n'
+                with self.subTest(flag=flag, stat=stat), self.assertRaisesRegex(
+                        ValueError, 'partial available owner'):
+                    self.wait([baseline, incomplete])
+                with self.subTest(flag=flag, stat=stat, boundary='archive'), self.assertRaisesRegex(
+                        ValueError, 'partial available owner'):
+                    analyze.validate_final_metric_cut(analyze.parse_metrics(incomplete),
+                        {'a', 'b'}, cut, remote=True)
+            # Owners may independently lack an optional facility. Missing gated
+            # rows are not mandatory when its explicit availability flag is zero.
+            unavailable = '\n'.join(row for row in final.splitlines() if not (
+                row.startswith('tidehunter_shard_read{') and 'partition="0"' in row
+                and any(f'stat="{stat}"' in row for stat in fields))) + '\n'
+            unavailable = '\n'.join(row.rsplit(' ', 1)[0] + ' 0' if (
+                row.startswith('tidehunter_shard_read{') and 'partition="0"' in row
+                and f'stat="{flag}"' in row) else row for row in unavailable.splitlines()) + '\n'
+            self.wait([baseline, unavailable])
+            analyze.validate_final_metric_cut(analyze.parse_metrics(unavailable),
+                {'a', 'b'}, cut, remote=True)
+
+    def test_current_owner_unknown_fields_and_invalid_availability_fail_closed(self):
+        baseline = self.scrape({'a': (5, 5), 'b': (9, 9)})
+        final = self.scrape({'a': (7, 7), 'b': (11, 11)})
+        for invalid in (
+            final + 'tidehunter_shard_read{namespace="a",partition="0",stat="unknown"} 0\n',
+            final.replace('stat="authority_available"} 1', 'stat="authority_available"} 2')):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self.wait([baseline, invalid])
+
+    def test_expired_original_deadline_does_not_scrape_or_accept_old_fresh_data(self):
+        with self.assertRaises(TimeoutError):
+            self.wait([self.scrape({'a': (100, 100), 'b': (100, 100)})], budget=0)
+        self.assertIsNone(self.last_retained)
+
+    def test_generation_regression_and_partial_owner_rows_fail_closed(self):
+        baseline = self.scrape({'a': (5, 5), 'b': (5, 5)})
+        advanced = self.scrape({'a': (6, 6), 'b': (6, 6)})
+        reset = self.scrape({'a': (5, 7), 'b': (7, 7)})
+        with self.assertRaisesRegex(ValueError, 'regressed'):
+            self.wait([baseline, advanced, reset])
+        final = self.scrape({'a': (7, 7), 'b': (7, 7)})
+        partial = '\n'.join(row for row in final.splitlines() if
+            'namespace="a",partition="0",stat="cache_hits"' not in row) + '\n'
+        with self.assertRaisesRegex(ValueError, 'partial mandatory owner'):
+            self.wait([baseline, partial])
+
+    def test_archived_cut_cannot_shrink_namespaces_or_qualify_one_generation(self):
+        baseline = self.scrape({'a': (5, 5), 'b': (9, 9)})
+        final = self.scrape({'a': (7, 7), 'b': (11, 11)})
+        text, cut = self.wait([baseline, final])
+        values = analyze.parse_metrics(text)
+        analyze.validate_final_metric_cut(values, {'a', 'b'}, cut, remote=True)
+        for mutation in ('namespace', 'local', 'owner'):
+            changed = copy.deepcopy(cut)
+            if mutation == 'namespace':
+                changed['required_namespaces'] = ['a']
+            else:
+                key = 'local_sample_generation' if mutation == 'local' else 'shard_sample_generation'
+                changed['baseline']['b'][mutation][key] += 1
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                analyze.validate_final_metric_cut(values, {'a', 'b'}, changed, remote=True)
+
+    def test_replay_baseline_is_after_certification_and_foreground_is_unchanged(self):
+        events = []
+        foreground = 'last_executed_checkpoint 1\n'
+        baseline = self.scrape({'a': (10, 20), 'b': (30, 40)})
+        final = self.scrape({'a': (12, 22), 'b': (32, 42)})
+        texts = iter((foreground, foreground, baseline, final))
+        def scrape(*args, **kwargs):
+            text = next(texts)
+            if text != foreground:
+                self.assertIn('certified', events)
+            events.append('scrape')
+            return io.BytesIO(text.encode())
+        def certified(*args):
+            events.append('certified')
+            return dict(digest='digest', sequenceNumber='1', epoch='0')
+        clock = [0.]
+        def sleep(seconds):
+            clock[0] += seconds
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'remote.log').write_text('')
+            child = SimpleNamespace(returncode=0)
+            owner = SimpleNamespace(root=root, start=lambda *args: child,
+                                    stop=lambda *args: events.append('stop'))
+            with patch.object(run.time, 'monotonic', side_effect=lambda: clock[0]), \
+                    patch.object(run.time, 'sleep', side_effect=sleep), \
+                    patch.object(run, 'sample', return_value={'pid': 123, 'exited': False}), \
+                    patch.object(run, 'host_sample', return_value={}), \
+                    patch.object(run.urllib.request, 'urlopen', side_effect=scrape), \
+                    patch.object(run.checkpoint, 'configuration', return_value={
+                        'metrics-address': 'unused', 'json-rpc-address': 'unused'}), \
+                    patch.object(run.checkpoint, 'wait_for_rpc_indexes', return_value=(foreground, {})), \
+                    patch.object(run.checkpoint, 'rpc', side_effect=certified), \
+                    patch.object(run.checkpoint, 'replay_phases', return_value={}), \
+                    patch.object(run.deployment, 'schemas', return_value={'a': {}, 'b': {}}):
+                result = run.replay(owner, 'unused', root, 'remote', 1, 'digest',
+                    {'SUI_SHARDED_WAL_SCHEMA_OUTPUT': str(root / 'schema')}, [], 10)
+            self.assertEqual((root / 'remote-foreground.prom').read_text(), foreground)
+            self.assertEqual((root / 'remote-final.prom').read_text(), final)
+            self.assertEqual(result['elapsed_seconds_including_startup'], .25)
+            self.assertEqual(events, ['scrape', 'scrape', 'certified', 'scrape', 'scrape', 'stop'])
+
+    def test_expected_population_excludes_closed_epochs_not_missing_live_namespaces(self):
+        schema = {'live/checkpoints': {}, 'live/store/perpetual': {},
+                  'live/store/epoch_0': {}, 'live/store/epoch_1': {}}
+        self.assertEqual(run.live_metric_namespaces(schema, 1),
+            {'live/checkpoints', 'live/store/perpetual', 'live/store/epoch_1'})
+        with self.assertRaises(ValueError):
+            run.live_metric_namespaces(schema, 2)
 
 
 class EvidenceBoundaries(unittest.TestCase):

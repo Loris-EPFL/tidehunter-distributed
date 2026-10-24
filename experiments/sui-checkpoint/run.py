@@ -97,6 +97,88 @@ class Owned:
             self.stop(child)
 
 
+def live_metric_namespaces(schema, epoch):
+    """Exports fix population independently of scrapes; old epoch stores are closed."""
+    if type(epoch) is not int or epoch < 0:
+        raise ValueError('certified checkpoint lacks a valid epoch')
+    import re
+    epochs = {name for name in schema if re.search(r'/epoch_[0-9]+$', name)}
+    live = {name for name in schema if name not in epochs or name.endswith(f'/epoch_{epoch}')}
+    if not live or (epochs and not live.intersection(epochs)):
+        raise ValueError('selected schema lacks the certified live epoch namespace')
+    return live
+
+
+def wait_for_final_metrics(child, shards, address, namespaces, *, remote, end, destination):
+    """Two publications after a post-certified scrape establish the causal cut."""
+    from analyze import (current_metric_streams, metric_stream_usable, parse_metrics,
+                         validate_final_metric_cut, MetricStreamsUnavailable)
+    baseline = None
+    last_generations = {}
+    unavailable_observations = 0
+    observations = []
+    def observe_generations(streams):
+        for namespace, row in streams.items():
+            for name, stream in row.items():
+                generation = 'shard_sample_generation' if name == 'owner' else 'local_sample_generation'
+                if generation not in stream:
+                    continue
+                identity = (namespace, name)
+                previous = last_generations.get(identity)
+                if previous is not None and stream[generation] < previous:
+                    raise ValueError(f'{namespace}: {name} sample generation regressed')
+                last_generations[identity] = stream[generation]
+
+    start = time.monotonic()
+    while True:
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('final metrics freshness exceeded original replay deadline')
+        for process in (child, *shards):
+            state = sample(process)
+            if state.get('exited') or state.get('core_dumping'):
+                status = f"exited with code {state['exit_code']}" if state.get('exited') else 'is core-dumping'
+                raise RuntimeError(f"owned process {state['pid']} {status} during final metrics freshness; see {destination.parent}/*.log")
+        with urllib.request.urlopen(f'http://{address}/metrics', timeout=min(1, remaining)) as response:
+            text = response.read(32 << 20).decode()
+        # Retain the last real response even on schema/deadline/freshness failure.
+        destination.write_text(text)
+        if time.monotonic() >= end:
+            raise TimeoutError('final metrics scrape exceeded original replay deadline')
+        try:
+            streams = current_metric_streams(parse_metrics(text), namespaces, remote=remote,
+                                             allow_sparse_unavailable=True)
+        except MetricStreamsUnavailable as unavailable:
+            unavailable_observations += 1
+            observations.append(dict(seconds=time.monotonic() - start, unavailable=True,
+                streams=unavailable.streams, missing=unavailable.missing))
+            observe_generations(unavailable.streams)
+            time.sleep(min(.1, max(0, end - time.monotonic())))
+            continue
+        observations.append(dict(seconds=time.monotonic() - start, streams=streams))
+        observe_generations(streams)
+        if baseline is None:
+            baseline = streams
+        else:
+            ready = True
+            for namespace, row in streams.items():
+                for name, stream in row.items():
+                    generation = 'shard_sample_generation' if name == 'owner' else 'local_sample_generation'
+                    initial = baseline[namespace][name][generation]
+                    ready &= metric_stream_usable(stream, name) and stream[generation] >= initial + 2
+            if ready:
+                cut = dict(status='post-certified-two-generation-cut',
+                    required_namespaces=sorted(namespaces), baseline=baseline, final=streams,
+                    observations=observations, seconds=time.monotonic() - start,
+                    unavailable_observations=unavailable_observations,
+                    scope='after certified RPC and index catchup; excluded from foreground elapsed; passive operational snapshots, not quiescent physical IO')
+                validate_final_metric_cut(parse_metrics(text), namespaces, cut, remote=remote)
+                if time.monotonic() >= end:
+                    raise TimeoutError('final metrics qualification exceeded original replay deadline')
+                return text, cut
+        time.sleep(min(.1, max(0, end - time.monotonic())))
+
+
 def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline):
     config = checkpoint.configuration(root, mode)
     start = time.monotonic()
@@ -145,15 +227,20 @@ def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline):
     certified = checkpoint.rpc(config['json-rpc-address'], 'sui_getCheckpoint', [str(tip)])
     if certified['digest'] != digest or int(certified['sequenceNumber']) != tip:
         raise RuntimeError('completed certified checkpoint digest mismatch')
-    (owned.root / f'{mode}-final.prom').write_text(metrics)
+    schema = deployment.schemas(Path(extra['SUI_SHARDED_WAL_SCHEMA_OUTPUT']),
+                                'sharded-wal' if mode == 'remote' else 'native')
+    namespaces = live_metric_namespaces(schema, int(certified['epoch']))
+    metrics, freshness = wait_for_final_metrics(child, shards, config['metrics-address'], namespaces,
+        remote=mode == 'remote', end=start + deadline, destination=owned.root / f'{mode}-final.prom')
     # SIGTERM only after committed indexer frontiers; audit subsequently reopens all stores.
     owned.stop(child)
     if child.returncode not in (0, -signal.SIGTERM):
         raise RuntimeError(f'{mode}: shutdown required forced kill or failed')
     return dict(elapsed_seconds_including_startup=elapsed, completed_checkpoint_digest=digest,
+        completed_checkpoint_epoch=int(certified['epoch']),
         checkpoint_limit=tip, completed_window=checkpoint.completion_window(progress), progress=progress,
         phase_timing=checkpoint.replay_phases((owned.root / f'{mode}.log').read_text(), elapsed),
-        rpc_index_catchup=catchup, exit_code=child.returncode,
+        rpc_index_catchup=catchup, final_metrics_freshness=freshness, exit_code=child.returncode,
         peak_sampled_rss_bytes=max(sum(p.get('VmRSS', 0) for p in [r['node'], *r['shards']]) for r in samples),
         process_io_final=samples[-1], host_before=samples[0]['host'], host_after=samples[-1]['host'])
 
@@ -492,9 +579,10 @@ def main():
                TH_DEFAULT_MUTEX_COUNT='1', TH_DEFAULT_MAX_DIRTY_KEYS='128', TH_DEFAULT_VALUE_CACHE_SIZE='1000',
                SUI_TH_READ_PROFILE_LIMIT=str(args.read_profile_limit),
                SUI_TH_NATIVE_WRITE_PROFILE_LIMIT=str(args.native_write_profile_limit))
+    env = deployment.process_environment(env, transport='tcp' if args.external_config else args.local_transport)
     owned=Owned(output,env)
     producer_env = checkpoint.source_environment(prior)
-    result=dict(schema=1,protocol=9,backend='tidehunter-sharded-wal',durability='synchronous durable whole-batch publication',
+    result=dict(schema=1,metrics_schema=2,protocol=9,backend='tidehunter-sharded-wal',durability='synchronous durable whole-batch publication',
         fixture=str(fixture),fixture_files=fixture_files,checkpoint_limit=tip,checkpoint_digest=expected_digest,
         build_manifest_sha256=build.digest(build_root/'build-manifest.json'),source_archive_sha256=manifest['source_archive_sha256'],
         binaries=manifest['binaries'],configurations=configs,
@@ -576,7 +664,7 @@ def main():
         if deployment.schemas(output/'remote-schema', 'sharded-wal') != schema:
             raise ValueError('remote selected schema differs from native')
         from analyze import adapter_stats, checkpoint_sequence_cache_stats, metrics
-        counters = adapter_stats(metrics(output/'remote-foreground.prom'))
+        counters = adapter_stats(metrics(output/'remote-final.prom'))
         required = {'read_calls','read_keys','read_rpcs','cache_hits','cache_misses','shard_sample_available',
                     'remote_timing_available','write_gate_wait_calls','scalar_read_calls','bulk_read_calls','write_commit_calls',
                     'scalar_read_ns_available','read_index_ns_available',
@@ -603,7 +691,7 @@ def main():
             raise ValueError('scalar/index diagnostic timing availability differs from selected population')
         validate_profiles(counters, config['databases'], args.read_profile_limit, args.write_profile_limit)
         validate_checkpoint_diagnostics(counters, args.write_profile_limit)
-        native_counters = adapter_stats(metrics(output/'native-foreground.prom'))
+        native_counters = adapter_stats(metrics(output/'native-final.prom'))
         if set(native_counters) != set(schema) or any(
                 stats.get('remote_timing_available') != 0 or 'write_gate_wait_calls' not in stats
                 for stats in native_counters.values()):
