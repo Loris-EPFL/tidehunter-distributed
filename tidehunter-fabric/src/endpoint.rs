@@ -851,22 +851,44 @@ impl Endpoint {
         self.finish_try(result)
     }
 
-    /// One CQ acquisition for a reactor sweep; direct credit is deferred until
-    /// DATA output has had an opportunity to carry the cumulative frontier.
+    /// One CQ acquisition for a reactor sweep. An idle deadline permits a
+    /// provider-managed bounded wait only when the message endpoint is fully
+    /// quiescent; it never changes direct or RMA progress.
+    /// Returns `(made_progress, used_bounded_wait)`.
     /// # Errors
     /// Returns nonpoisoning `WouldBlock` for receive repost backpressure; other
     /// provider or packet errors poison the endpoint.
-    pub fn try_progress_for_sweep(&mut self) -> io::Result<bool> {
+    pub fn try_progress_for_sweep(
+        &mut self,
+        idle_deadline: Option<Instant>,
+    ) -> io::Result<(bool, bool)> {
         self.ready()?;
         let result = if self.direct.is_some() {
             self.direct_progress(false)
+                .map(|progress| (progress, false))
         } else {
             let state = self.inner();
             state
-                .poll()
-                .and_then(|completed| state.try_post_receive().map(|posted| completed || posted))
+                .poll_for_sweep(idle_deadline)
+                .and_then(|(completed, waited)| {
+                    state
+                        .try_post_receive()
+                        .map(|posted| (completed || posted, waited))
+                })
         };
         self.finish_try(result)
+    }
+
+    /// Whether setup qualified bounded CQ waiting for this software endpoint.
+    /// This is a capability query only; transient sweep eligibility is stricter.
+    #[must_use]
+    pub fn supports_idle_wait(&self) -> bool {
+        !self.failed
+            && self.direct.is_none()
+            && self
+                .resources
+                .as_deref()
+                .is_some_and(Resources::supports_idle_wait)
     }
 
     /// Sends standalone EFA-direct credit debt without acquiring the CQ.

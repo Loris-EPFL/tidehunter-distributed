@@ -209,7 +209,7 @@ fn output_budget_is_shared_across_the_two_turns_of_one_sweep() {
         pair.session.queue(id, &id, 1024).unwrap();
     }
     let submitted_before = pair.session.stats.frames_submitted;
-    pair.session.progress().unwrap();
+    pair.session.progress(None).unwrap();
     let submitted_after = pair.session.stats.frames_submitted;
     assert_eq!(
         submitted_after - submitted_before,
@@ -488,7 +488,7 @@ fn abort_cancels_delivery_without_pretending_send_fences_completed() {
     pair.session.abort();
     assert!(pair.session.output.is_empty());
     assert_eq!(pair.session.transport_stats().frames_retired, 0);
-    assert!(pair.session.progress().is_err());
+    assert!(pair.session.progress(None).is_err());
     assert!(pair.session.queue(2, &0u8, 1024).is_err());
 }
 

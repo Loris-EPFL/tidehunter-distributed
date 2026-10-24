@@ -25,7 +25,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 pub(super) const ADDRESS: usize = 512;
@@ -105,6 +105,13 @@ impl Drop for Memory {
 }
 
 #[derive(Default)]
+enum CqWaitMode {
+    #[default]
+    Polling,
+    SoftwareBounded,
+}
+
+#[derive(Default)]
 pub(super) struct Resources {
     fabric: *mut ffi::fid_fabric,
     domain: *mut ffi::fid_domain,
@@ -127,6 +134,7 @@ pub(super) struct Resources {
     time_progress: bool,
     last_poll: Option<Instant>,
     last_any_poll: Option<Instant>,
+    cq_wait_mode: CqWaitMode,
     rx_pending: [bool; SLOTS],
     rx_len: [usize; SLOTS],
     rx_offset: usize,
@@ -618,6 +626,7 @@ impl Resources {
         let is_efa = provider == "efa";
         let direct_fabric = direct || (is_efa && rma.is_some());
         self.direct = direct_fabric;
+        let software_wait_candidate = provider == "tcp;ofi_rxm" && !direct_fabric && rma.is_none();
         if let Some(config) = rma {
             RmaState::validate_config(config)?;
         }
@@ -839,6 +848,7 @@ impl Resources {
             self.open_endpoint(
                 info.0,
                 active_rma.map_or(0, |config| config.destination_slots),
+                software_wait_candidate,
             )?;
             let stage = Instant::now();
             if let (Some(config), Some(mut capabilities)) = (active_rma, selected_rma_capabilities)
@@ -939,14 +949,23 @@ impl Resources {
         Ok(())
     }
 
-    fn open_endpoint(&mut self, info: *mut ffi::fi_info, rma_slots: usize) -> io::Result<()> {
+    fn open_endpoint(
+        &mut self,
+        info: *mut ffi::fi_info,
+        rma_slots: usize,
+        allow_wait: bool,
+    ) -> io::Result<()> {
         let cq_size = (2 * SLOTS)
             .checked_add(rma_slots)
             .ok_or_else(|| invalid("RMA completion queue size overflow"))?;
         let mut cq = ffi::fi_cq_attr {
             size: cq_size,
             format: ffi::fi_cq_format_FI_CQ_FORMAT_MSG,
-            wait_obj: ffi::fi_wait_obj_FI_WAIT_NONE,
+            wait_obj: if allow_wait {
+                ffi::fi_wait_obj_FI_WAIT_UNSPEC
+            } else {
+                ffi::fi_wait_obj_FI_WAIT_NONE
+            },
             ..ffi::fi_cq_attr::default()
         };
         let mut av = ffi::fi_av_attr {
@@ -958,10 +977,19 @@ impl Resources {
         // Every acquired handle is saved before the next fallible operation.
         unsafe {
             let stage = Instant::now();
-            check(
-                "open completion queue",
-                ffi::fi_cq_open(self.domain, &raw mut cq, &raw mut self.cq, ptr::null_mut()),
-            )?;
+            let mut code =
+                ffi::fi_cq_open(self.domain, &raw mut cq, &raw mut self.cq, ptr::null_mut());
+            if allow_wait
+                && (code == -i32::try_from(ffi::FI_ENOSYS).unwrap()
+                    || code == -i32::try_from(ffi::FI_EOPNOTSUPP).unwrap())
+            {
+                cq.wait_obj = ffi::fi_wait_obj_FI_WAIT_NONE;
+                self.cq = ptr::null_mut();
+                code = ffi::fi_cq_open(self.domain, &raw mut cq, &raw mut self.cq, ptr::null_mut());
+            } else if code == 0 && allow_wait {
+                self.cq_wait_mode = CqWaitMode::SoftwareBounded;
+            }
+            check("open completion queue", code)?;
             self.open_profile.cq_ns = elapsed_ns(stage);
             let stage = Instant::now();
             check(
@@ -1429,6 +1457,10 @@ impl Resources {
         (self.accepted_send, self.completed_send)
     }
 
+    pub(super) fn supports_idle_wait(&self) -> bool {
+        matches!(self.cq_wait_mode, CqWaitMode::SoftwareBounded)
+    }
+
     pub(super) fn progress_stats(&self) -> ProgressStats {
         self.progress_stats
     }
@@ -1723,11 +1755,37 @@ impl Resources {
         Ok(self.rx_pending[slot])
     }
 
+    pub(super) fn poll(&mut self) -> io::Result<bool> {
+        self.poll_with_timeout::<false>(0)
+    }
+
+    pub(super) fn poll_for_sweep(&mut self, deadline: Option<Instant>) -> io::Result<(bool, bool)> {
+        let Some(deadline) = deadline else {
+            return self.poll().map(|progress| (progress, false));
+        };
+        let can_wait = self.supports_idle_wait()
+            && !self.direct
+            && self.rma.is_none()
+            && self.peer.is_some()
+            && self.tx_pending.iter().all(|pending| !pending)
+            && self.rx_pending.iter().all(|pending| *pending)
+            && self.rx_len.iter().all(|&len| len == 0)
+            && self.rx_offset == 0
+            && self.rx_read == self.rx_post;
+        if !can_wait
+            || deadline.saturating_duration_since(Instant::now()) < Duration::from_millis(1)
+        {
+            return self.poll().map(|progress| (progress, false));
+        }
+        self.poll_with_timeout::<true>(1)
+            .map(|progress| (progress, true))
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "Keep each CQ pass and its message/RMA context retirement in one ordered block."
     )]
-    pub(super) fn poll(&mut self) -> io::Result<bool> {
+    fn poll_with_timeout<const WAIT: bool>(&mut self, timeout_ms: i32) -> io::Result<bool> {
         if self.time_progress {
             let now = Instant::now();
             if let Some(previous) = self.last_any_poll.replace(now) {
@@ -1756,7 +1814,19 @@ impl Resources {
         let began = self.time_progress.then(Instant::now);
         // SAFETY: Our CQ uses MSG format and may initialize at most entries.len()
         // entries; no Rust references to this storage cross the synchronous call.
-        let count = unsafe { ffi::fi_cq_read(self.cq, entries.as_mut_ptr().cast(), entries.len()) };
+        let count = unsafe {
+            if WAIT {
+                ffi::fi_cq_sread(
+                    self.cq,
+                    entries.as_mut_ptr().cast(),
+                    entries.len(),
+                    ptr::null(),
+                    timeout_ms,
+                )
+            } else {
+                ffi::fi_cq_read(self.cq, entries.as_mut_ptr().cast(), entries.len())
+            }
+        };
         if let Some(began) = began {
             self.progress_stats.cq_call_ns = self
                 .progress_stats
@@ -1769,7 +1839,12 @@ impl Resources {
             self.open_profile.first_progress_ns = elapsed_ns(start);
             self.initial_progress_recorded = true;
         }
-        if count == -isize::try_from(ffi::FI_EAGAIN).unwrap() || count == 0 {
+        if count == -isize::try_from(ffi::FI_EAGAIN).unwrap()
+            || count == 0
+            || WAIT
+                && (count == -isize::try_from(ffi::FI_ETIMEDOUT).unwrap()
+                    || count == -isize::try_from(libc::EINTR).unwrap())
+        {
             self.progress_stats.cq_empty_polls =
                 self.progress_stats.cq_empty_polls.saturating_add(1);
             return Ok(false);

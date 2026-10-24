@@ -787,6 +787,16 @@ impl Session {
         #[cfg(not(feature = "experimental-fabric"))]
         false
     }
+    fn supports_fabric_idle_wait(&self) -> bool {
+        #[cfg(feature = "experimental-fabric")]
+        return self
+            .sock
+            .fabric
+            .as_ref()
+            .is_some_and(tidehunter_fabric::Endpoint::supports_idle_wait);
+        #[cfg(not(feature = "experimental-fabric"))]
+        false
+    }
     /// Pending work includes accepted requests, deferred admission, workers and
     /// io_uring reads. None can rely on socket readability for its next event.
     /// Once Status initializes the authenticated session, idle TCP waits remain
@@ -802,6 +812,9 @@ impl Session {
     ) -> Option<Instant> {
         if limits.polling != PollingPolicy::Adaptive
             || self.is_fabric()
+                && (!initialized
+                    || self.input_started.is_some()
+                    || !self.supports_fabric_idle_wait())
             || progressed
             || work_pending
             || !self.output.is_empty()
@@ -812,6 +825,8 @@ impl Session {
             return None;
         }
         let idle_deadline = if initialized {
+            // The software provider caps its own CQ wait at one millisecond.
+            // Keep enough permission for that full, deadline-rounded wait.
             Instant::now() + IDLE_SHUTDOWN_CHECK_INTERVAL
         } else {
             idle_since + limits.io_timeout
@@ -832,16 +847,22 @@ impl Session {
     }
     /// One provider CQ sweep shared by TLS transmit, receive and fence
     /// retirement. Neither no-poll data adapter performs extra CQ reads.
-    fn progress_fabric_data(&mut self) -> Result<bool, TcpError> {
+    fn progress_fabric_data(
+        &mut self,
+        idle_deadline: Option<Instant>,
+    ) -> Result<(bool, Option<u64>), TcpError> {
         #[cfg(feature = "experimental-fabric")]
         if let Some(endpoint) = &mut self.sock.fabric {
-            return match endpoint.try_progress_for_sweep() {
-                Ok(changed) => Ok(changed),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            let began = (idle_deadline.is_some() && self.time_work).then(Instant::now);
+            return match endpoint.try_progress_for_sweep(idle_deadline) {
+                Ok((changed, waited)) => Ok((changed, waited.then(|| began.map_or(0, elapsed_ns)))),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok((false, None)),
                 Err(error) => Err(error.into()),
             };
         }
-        Ok(false)
+        #[cfg(not(feature = "experimental-fabric"))]
+        let _ = idle_deadline;
+        Ok((false, None))
     }
     fn fabric_receive_ready(&mut self) -> Result<bool, TcpError> {
         #[cfg(feature = "experimental-fabric")]
@@ -922,13 +943,16 @@ impl Session {
         }
         Ok(changed)
     }
-    fn progress(&mut self) -> Result<bool, TcpError> {
+    fn progress(
+        &mut self,
+        idle_deadline: Option<Instant>,
+    ) -> Result<(bool, Option<u64>), TcpError> {
         if self.closed {
             return Err(TcpError::new("session is closed"));
         }
         self.output_budget.reset();
         self.check_control_peer(false)?;
-        let mut changed = self.progress_fabric_data()?;
+        let (mut changed, idle_wait_ns) = self.progress_fabric_data(idle_deadline)?;
         changed |= self.progress_output()?;
         if self.conn.as_ref().is_some_and(|conn| conn.wants_read())
             && self.plaintext_pending == 0
@@ -960,7 +984,7 @@ impl Session {
                 Err(e) => return Err(e.into()),
             }
         }
-        Ok(changed)
+        Ok((changed, idle_wait_ns))
     }
     fn finish_fabric_sweep(&mut self) -> Result<bool, TcpError> {
         #[cfg(feature = "experimental-fabric")]
@@ -2107,7 +2131,8 @@ impl Client {
         {
             return Err(TcpError::new("remote operation deadline expired"));
         }
-        self.reactor.progressed = self.stream.progress()?;
+        let (progressed, _) = self.stream.progress(None)?;
+        self.reactor.progressed = progressed;
         // A peer can reply before our request's local CQE. Keep subsequent
         // chunks in their bounded read owner until output retirement frees a
         // frame credit; never overfill output or turn that stall into an error.
@@ -2992,11 +3017,13 @@ pub(super) fn serve_session(
     let mut workers = 0usize;
     let mut retained_bytes = 0usize;
     let mut initialized = false;
+    let mut diagnostic_only = false;
     let mut last_id = 0;
     let mut diagnostics = None::<ConnectionProfile>;
     let mut idle_since = Instant::now();
     let mut polling = ActivePoll::default();
     let mut previous_sweep = None::<Instant>;
+    let mut fabric_idle_deadline = None;
     #[cfg(feature = "test-utils")]
     let mut ram_probe = None::<minibytes::Bytes>;
     let result = (|| {
@@ -3029,7 +3056,15 @@ pub(super) fn serve_session(
             {
                 return Err(TcpError::new("session request deadline expired"));
             }
-            let mut progressed = stream.progress()?;
+            // An idle provider wait replaces this sweep's CQ acquisition. It
+            // never adds a second consumer or parks an active client request.
+            let (mut progressed, idle_wait_ns) = stream.progress(fabric_idle_deadline.take())?;
+            if let Some(wait_ns) = idle_wait_ns
+                && let Some(profile) = diagnostics.as_mut()
+            {
+                profile.polling.idle_wait_calls += 1;
+                profile.polling.idle_wait_ns += wait_ns;
+            }
             retire_responses(
                 &mut stream,
                 &mut pending,
@@ -3183,9 +3218,18 @@ pub(super) fn serve_session(
                         "invalid, duplicate or nonmonotonic request ID",
                     ));
                 }
-                if !initialized && !matches!(&envelope.body, Request::Status { protocol: PROTOCOL })
+                if !initialized {
+                    if matches!(&envelope.body, Request::OperationalReadIoStats) {
+                        diagnostic_only = true;
+                    } else if !matches!(&envelope.body, Request::Status { protocol: PROTOCOL }) {
+                        return Err(TcpError::new("status/protocol handshake required"));
+                    }
+                } else if diagnostic_only
+                    && !matches!(&envelope.body, Request::OperationalReadIoStats)
                 {
-                    return Err(TcpError::new("status/protocol handshake required"));
+                    return Err(TcpError::new(
+                        "diagnostic session cannot serve data requests",
+                    ));
                 }
                 if initialized && matches!(&envelope.body, Request::Status { .. }) {
                     // Reusing a live TLS channel must not let an expired client
@@ -3621,6 +3665,18 @@ pub(super) fn serve_session(
             let mut blocked_control = false;
             for _ in 0..controls.len() {
                 let (id, request) = controls.pop_front().unwrap();
+                if matches!(&request, Request::OperationalReadIoStats) {
+                    queue_response(
+                        &mut pending,
+                        id,
+                        Response::OperationalReadIoStats(Box::new((
+                            node.control_context.partition.clone(),
+                            node.read_admission.try_stats(),
+                        ))),
+                    )?;
+                    progressed = true;
+                    continue;
+                }
                 let is_append = matches!(&request, Request::Append { .. });
                 let is_control = !matches!(
                     &request,
@@ -3749,11 +3805,15 @@ pub(super) fn serve_session(
                 initialized,
                 idle_since,
             ) {
-                let began = diagnostics.as_ref().map(|_| Instant::now());
-                wait_for_readable(&stream.sock.socket, deadline)?;
-                if let Some(profile) = diagnostics.as_mut() {
-                    profile.polling.idle_wait_calls += 1;
-                    profile.polling.idle_wait_ns += began.map_or(0, elapsed_ns);
+                if stream.is_fabric() {
+                    fabric_idle_deadline = Some(deadline);
+                } else {
+                    let began = diagnostics.as_ref().map(|_| Instant::now());
+                    wait_for_readable(&stream.sock.socket, deadline)?;
+                    if let Some(profile) = diagnostics.as_mut() {
+                        profile.polling.idle_wait_calls += 1;
+                        profile.polling.idle_wait_ns += began.map_or(0, elapsed_ns);
+                    }
                 }
             } else {
                 let (yielded, spun) = polling.pause(limits.polling, stream.is_fabric(), progressed);

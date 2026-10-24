@@ -326,7 +326,10 @@ fn sweep_data_send_piggybacks_consumed_credit_without_control_packet() {
         .receive
         .accept_data(1, b"reply")
         .unwrap();
-    assert!(fixture.endpoint().try_progress_for_sweep().unwrap());
+    assert_eq!(
+        fixture.endpoint().try_progress_for_sweep(None).unwrap(),
+        (true, false)
+    );
     assert_eq!(fixture.state().polls, 1);
     assert_eq!(fixture.state().sends, 0);
     let mut received = [0; 5];
@@ -457,7 +460,13 @@ fn sweep_without_data_output_retries_standalone_credit_after_eagain() {
 #[test]
 fn blocking_receive_posts_credit_for_sweep_resident_direct_data() {
     let mut fixture = Fixture::new_direct();
-    assert!(fixture.endpoint().try_progress_for_sweep().unwrap());
+    assert_eq!(
+        fixture
+            .endpoint()
+            .try_progress_for_sweep(Some(Instant::now() + Duration::from_secs(1)))
+            .unwrap(),
+        (true, false)
+    );
     let (receive_buffer, receive_context) = {
         let state = fixture.state();
         (state.received, state.received_context)
@@ -473,7 +482,13 @@ fn blocking_receive_posts_credit_for_sweep_resident_direct_data() {
         len,
         ..ffi::fi_cq_msg_entry::default()
     });
-    assert!(fixture.endpoint().try_progress_for_sweep().unwrap());
+    assert_eq!(
+        fixture
+            .endpoint()
+            .try_progress_for_sweep(Some(Instant::now() + Duration::from_secs(1)))
+            .unwrap(),
+        (true, false)
+    );
     assert_eq!(fixture.state().sends, 0);
 
     let mut output = [0; 5];

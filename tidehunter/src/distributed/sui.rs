@@ -908,6 +908,277 @@ impl Db {
             });
         }
     }
+    pub fn try_visit_timing_metrics(&self, mut set: impl FnMut(&'static str, u64)) -> Option<()> {
+        visit_stages!(set, self, write_gate_wait);
+        let profile = &self.native_write_profile;
+        set(
+            "native_profile_limit",
+            profile.limit.load(Ordering::Relaxed),
+        );
+        set(
+            "native_profile_available",
+            u64::from(matches!(&self.backend, Backend::Native(_))),
+        );
+        set(
+            "native_profile_barrier_calls",
+            profile.barrier.calls.load(Ordering::Relaxed),
+        );
+        set(
+            "native_profile_barrier_errors",
+            profile.barrier.errors.load(Ordering::Relaxed),
+        );
+        set(
+            "native_profile_barrier_ns",
+            profile.barrier.ns.load(Ordering::Relaxed),
+        );
+        set(
+            "native_profile_file_calls",
+            profile.file_calls.load(Ordering::Relaxed),
+        );
+        set(
+            "native_profile_file_successes",
+            profile.file_successes.load(Ordering::Relaxed),
+        );
+        set(
+            "native_profile_file_ns",
+            profile.file_ns.load(Ordering::Relaxed),
+        );
+        set(
+            "native_profile_namespace_calls",
+            profile.namespace_calls.load(Ordering::Relaxed),
+        );
+        set(
+            "native_profile_namespace_successes",
+            profile.namespace_successes.load(Ordering::Relaxed),
+        );
+        set(
+            "native_profile_namespace_ns",
+            profile.namespace_ns.load(Ordering::Relaxed),
+        );
+        set(
+            "remote_timing_available",
+            u64::from(self.native().is_none()),
+        );
+        set("read_profile_enabled", 0);
+        set("read_profile_server_available", 0);
+        set("read_profile_transport_progress_available", 0);
+        set("read_profile_transport_cq_available", 0);
+        set("scalar_read_ns_available", 0);
+        set("read_index_ns_available", 0);
+        set("write_checkpoint_diagnostics_available", 0);
+        if let Backend::Remote(remote) = &self.backend {
+            let read_timing_available = u64::from(remote.db.read_profile_enabled());
+            set("scalar_read_ns_available", read_timing_available);
+            set("read_index_ns_available", read_timing_available);
+            let (index, history_bytes, floor) = remote.db.try_index_metrics()?;
+            set(
+                "index_resident_metadata_bytes",
+                index.charged_metadata_bytes as u64,
+            );
+            set(
+                "index_transient_metadata_bytes",
+                index.transient_metadata_bytes as u64,
+            );
+            set("index_history_bytes", history_bytes as u64);
+            set("index_retained_versions", index.retained_versions as u64);
+            set(
+                "coordinator_outcome_resident_bytes",
+                remote.db.try_metadata_history_bytes()? as u64,
+            );
+            let (at, epoch, sequence, operation_index) = match floor {
+                IndexReadCut::At(version) => (
+                    1,
+                    version.batch.epoch,
+                    version.batch.sequence,
+                    u64::from(version.operation_index),
+                ),
+                _ => (0, 0, 0, 0),
+            };
+            set("retention_floor_at", at);
+            set("retention_floor_epoch", epoch);
+            set("retention_floor_sequence", sequence);
+            set("retention_floor_operation_index", operation_index);
+            visit_stages!(
+                set,
+                remote,
+                scalar_read,
+                bulk_read,
+                write_commit,
+                read_submit,
+                read_admission_wait,
+                read_detached_wait,
+                read_finish
+            );
+            remote.profile.visit(&mut set);
+            remote.db.try_visit_write_metrics(|snapshot| {
+                let checkpoint = snapshot.checkpoint_diagnostics;
+                set(
+                    "write_checkpoint_diagnostics_available",
+                    u64::from(checkpoint.available),
+                );
+                macro_rules! checkpoint_fields {
+                    ($($field:ident),+ $(,)?) => {
+                        $(set(
+                            concat!("write_checkpoint_diagnostic_", stringify!($field)),
+                            checkpoint.$field,
+                        );)+
+                    };
+                }
+                checkpoint_fields!(
+                    records,
+                    dropped_records,
+                    pressure_wait_ns,
+                    pressure_wait_count,
+                    drain_ns,
+                    drain_count,
+                    existing_capture_wait_ns,
+                    existing_capture_wait_count,
+                    new_capture_wait_ns,
+                    new_capture_wait_count,
+                    staging_manifest_ns,
+                    staging_manifest_count,
+                    receipt_history_ns,
+                    receipt_history_count,
+                    receipt_history_sync_ns,
+                    receipt_history_sync_count,
+                    node_prefix_wait_ns,
+                    node_prefix_wait_count,
+                    index_prepare_ns,
+                    index_prepare_count,
+                    index_persist_ns,
+                    index_persist_count,
+                    metadata_install_ns,
+                    metadata_install_count,
+                    owner_adoption_ns,
+                    owner_adoption_count,
+                    obsolete_cleanup_ns,
+                    obsolete_cleanup_count,
+                    history_io_checkpoint_count,
+                    history_stream_opens,
+                    history_previous_slot_reads,
+                    history_receipt_write_ops,
+                    history_receipt_write_bytes,
+                    history_buffer_flushes,
+                    history_node_write_ops,
+                    history_node_write_bytes,
+                    history_sync_operations,
+                    tail_pressure_count,
+                    known_identity_pressure_count,
+                    partition_window_pressure_count,
+                    index_reservation_pressure_count,
+                    already_available_count,
+                    after_drain_relief_count,
+                    after_existing_capture_relief_count,
+                    after_new_capture_relief_count,
+                    capacity_error_count,
+                    progress_error_count,
+                );
+                let authority = snapshot.authority;
+                set("write_storage_wait_ns", authority.storage_wait_ns);
+                set("write_publication_ns", authority.publication_ns);
+                set("write_dispatch_ns", authority.dispatch_ns);
+                set(
+                    "write_preparation_admission_ns",
+                    authority.preparation_admission_ns,
+                );
+                set("write_checkpoint_ns", authority.checkpoint_ns);
+                set("write_checkpoint_count", authority.checkpoint_count);
+                set(
+                    "write_foreground_checkpoint_ns",
+                    authority.foreground_checkpoint_ns,
+                );
+                set(
+                    "write_foreground_checkpoint_count",
+                    authority.foreground_checkpoint_count,
+                );
+                set(
+                    "write_background_checkpoint_suffix_batches",
+                    authority.background_checkpoint_suffix_batches,
+                );
+                set(
+                    "write_background_checkpoint_ns",
+                    authority.background_checkpoint_ns,
+                );
+                set(
+                    "write_durable_receipt_publication_blocked_batches",
+                    authority.durable_receipt_publication_blocked_batches,
+                );
+                set(
+                    "write_durable_receipt_publication_waiting_batches",
+                    authority.durable_receipt_publication_waiting_batches,
+                );
+                set(
+                    "write_durable_receipt_publication_waiting_peak",
+                    authority.durable_receipt_publication_waiting_peak,
+                );
+                set(
+                    "write_durable_receipt_publication_blocked_ns",
+                    authority.durable_receipt_publication_blocked_ns,
+                );
+                let pipeline = snapshot.pipeline;
+                set("write_append_requests", pipeline.append_requests);
+                set("write_direct_appends", pipeline.direct_appends);
+                set(
+                    "write_peak_inflight_nodes",
+                    pipeline.peak_inflight_nodes as u64,
+                );
+                set("write_durable_batches", pipeline.durable_batches);
+                set("write_concurrent_admitted", pipeline.concurrent_admitted);
+                set("write_concurrent_completed", pipeline.concurrent_completed);
+                set(
+                    "write_concurrent_pending_peak",
+                    pipeline.concurrent_pending_peak as u64,
+                );
+                set(
+                    "write_concurrent_queued_peak",
+                    pipeline.concurrent_queued_peak as u64,
+                );
+                set(
+                    "write_concurrent_queue_bytes_peak",
+                    pipeline.concurrent_queue_bytes_peak as u64,
+                );
+                let cache = snapshot.read_cache;
+                set("cache_inserts", cache.inserts);
+                set("cache_bypass_admission", cache.bypass_admission);
+                set("cache_rejected_oversize", cache.rejected_oversize);
+                set("cache_rejected_mismatch", cache.rejected_mismatch);
+                set("cache_bypass_disabled", cache.bypass_disabled);
+                set("cache_bypass_eviction_limit", cache.bypass_eviction_limit);
+                set("cache_admitted_bytes", cache.admitted_bytes);
+                set("cache_entries", cache.entries as u64);
+                let write_profile = snapshot.write_profile;
+                set(
+                    "write_profile_limit",
+                    write_profile.limit_per_connection as u64,
+                );
+                set(
+                    "write_profile_expected_connections",
+                    write_profile.expected_connections as u64,
+                );
+                set(
+                    "write_profile_captured_connections",
+                    write_profile.captured_connections as u64,
+                );
+                set(
+                    "write_profile_sampled_requests",
+                    write_profile.sampled_requests,
+                );
+                set(
+                    "write_profile_available",
+                    u64::from(
+                        write_profile.limit_per_connection != 0
+                            && write_profile.expected_connections != 0
+                            && write_profile.captured_connections
+                                == write_profile.expected_connections,
+                    ),
+                );
+                if write_profile.limit_per_connection != 0 {
+                    visit_write_connection_profile(&mut set, write_profile.profile);
+                }
+            })?;
+        }
+        Some(())
+    }
     pub fn native(&self) -> Option<&Arc<NativeDb>> {
         match &self.backend {
             Backend::Native(db) => Some(db),
@@ -1165,9 +1436,11 @@ impl Db {
             ),
         }
     }
-    pub fn remote_io_monitor(&self) -> Option<super::remote_db::ReadIoMonitor> {
+    pub fn operational_read_io_monitor(
+        &self,
+    ) -> Option<super::remote_db::OperationalReadIoMonitor> {
         match &self.backend {
-            Backend::Remote(remote) => Some(remote.db.read_io_monitor()),
+            Backend::Remote(remote) => Some(remote.db.operational_read_io_monitor()),
             Backend::Native(_) => None,
         }
     }
@@ -1194,6 +1467,36 @@ impl Db {
         match &self.backend {
             Backend::Remote(remote) => Some(remote.db.per_keyspace_read_cache_stats()),
             _ => None,
+        }
+    }
+    pub fn try_remote_counters(
+        &self,
+    ) -> Option<
+        Option<(
+            super::remote_db::ReadCacheStats,
+            super::local_db::LocalDbStats,
+            u64,
+        )>,
+    > {
+        match &self.backend {
+            Backend::Remote(remote) => Some(Some((
+                remote.db.try_read_cache_stats()?,
+                remote.db.try_stats()?,
+                remote.db.read_rpc_count(),
+            ))),
+            Backend::Native(_) => Some(None),
+        }
+    }
+    pub fn try_remote_keyspace_cache_counters(
+        &self,
+    ) -> Option<
+        Option<
+            [super::remote_db::PerKeyspaceReadCacheStats; super::remote_db::KEYSPACE_COUNTER_COUNT],
+        >,
+    > {
+        match &self.backend {
+            Backend::Remote(remote) => Some(Some(remote.db.try_per_keyspace_read_cache_stats()?)),
+            Backend::Native(_) => Some(None),
         }
     }
     pub fn start_relocation(self: &Arc<Self>) -> Result<()> {

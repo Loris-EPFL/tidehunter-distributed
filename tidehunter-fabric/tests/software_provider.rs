@@ -35,6 +35,8 @@ fn software_provider_rma_reads_with_mixed_cq_and_retained_buffer_ownership() -> 
     let mut a = Endpoint::open_rma("tcp;ofi_rxm", Some("lo"), config)?;
     let mut b = Endpoint::open_rma("tcp;ofi_rxm", Some("lo"), config)?;
     let mut wrong_endpoint = Endpoint::open_rma("tcp;ofi_rxm", Some("lo"), config)?;
+    assert!(!a.supports_idle_wait());
+    assert!(!b.supports_idle_wait());
     let a_address = a.address()?;
     let b_address = b.address()?;
     a.set_peer(&b_address)?;
@@ -709,5 +711,122 @@ fn software_provider_explicit_sweeps_transfer_without_repolling() -> io::Result<
     assert_eq!(sent, input.len());
     assert_eq!(output, input);
     assert_eq!(a.accepted_send_fence()?, a.completed_send_fence()?);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm and local network permission"]
+fn software_provider_idle_wait_wakes_once_and_transfers_both_ways() -> io::Result<()> {
+    let (mut a, mut b) = pair()?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let sender_barrier = std::sync::Arc::clone(&barrier);
+    let sender = thread::spawn(move || -> io::Result<Endpoint> {
+        sender_barrier.wait();
+        a.send(b"idle-wake", deadline)?;
+        Ok(a)
+    });
+
+    let wait_supported = b.supports_idle_wait();
+    barrier.wait();
+    let mut waited = false;
+    while !b.receive_ready()? {
+        assert!(
+            Instant::now() < deadline,
+            "idle CQ progress deadline expired"
+        );
+        let (_, used_wait) = b.try_progress_for_sweep(Some(deadline))?;
+        waited |= used_wait;
+    }
+    if wait_supported {
+        assert!(waited);
+    }
+    let mut incoming = [0; 32];
+    assert_eq!(b.try_receive(&mut incoming)?, b"idle-wake".len());
+    assert_eq!(&incoming[..b"idle-wake".len()], b"idle-wake");
+    assert_eq!(
+        b.try_receive(&mut incoming).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+
+    let mut a = sender.join().unwrap()?;
+    b.send(b"reply", deadline)?;
+    let mut reply_waited = false;
+    while !a.receive_ready()? {
+        assert!(
+            Instant::now() < deadline,
+            "reply CQ progress deadline expired"
+        );
+        let (_, used_wait) = a.try_progress_for_sweep(Some(deadline))?;
+        reply_waited |= used_wait;
+    }
+    if a.supports_idle_wait() {
+        assert!(reply_waited);
+    }
+    assert_eq!(a.try_receive(&mut incoming)?, b"reply".len());
+    assert_eq!(&incoming[..b"reply".len()], b"reply");
+    a.flush(deadline)?;
+    b.flush(deadline)?;
+    drop(a);
+    drop(b);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm and local network permission"]
+fn software_provider_pending_send_disables_idle_cq_wait() -> io::Result<()> {
+    let (mut a, mut b) = pair()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    thread::scope(|scope| -> io::Result<()> {
+        let sender = scope.spawn(|| -> io::Result<()> {
+            assert_eq!(a.queue_send(b"pending", deadline)?, b"pending".len());
+            assert!(a.sends_pending());
+            let (_, waited) = a.try_progress_for_sweep(Some(deadline))?;
+            assert!(!waited);
+            a.flush(deadline)?;
+            // Local CQ retirement is not peer delivery. Keep manual progress
+            // running until the peer confirms it consumed the actual payload.
+            let mut acknowledged = [0];
+            assert_eq!(a.receive(&mut acknowledged, deadline)?, 1);
+            assert_eq!(acknowledged, [1]);
+            Ok(())
+        });
+        let mut received = [0; 16];
+        assert_eq!(b.receive(&mut received, deadline)?, b"pending".len());
+        assert_eq!(&received[..b"pending".len()], b"pending");
+        b.send(&[1], deadline)?;
+        sender.join().unwrap()?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm and local network permission"]
+fn software_provider_buffered_receive_disables_idle_cq_wait() -> io::Result<()> {
+    let (mut a, mut b) = pair()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    thread::scope(|scope| -> io::Result<()> {
+        let sender = scope.spawn(|| -> io::Result<()> {
+            assert_eq!(a.send(b"buffered", deadline)?, b"buffered".len());
+            let mut acknowledged = [0];
+            assert_eq!(a.receive(&mut acknowledged, deadline)?, 1);
+            assert_eq!(acknowledged, [1]);
+            Ok(())
+        });
+        let mut first = [0];
+        assert_eq!(b.receive(&mut first, deadline)?, 1);
+        assert_eq!(first, [b'b']);
+        let (_, waited) = b.try_progress_for_sweep(Some(deadline))?;
+        assert!(!waited);
+        let mut rest = [0; 7];
+        assert_eq!(b.receive(&mut rest, deadline)?, rest.len());
+        assert_eq!(&rest, b"uffered");
+        b.send(&[1], deadline)?;
+        sender.join().unwrap()?;
+        Ok(())
+    })?;
+    a.flush(deadline)?;
+    b.flush(deadline)?;
     Ok(())
 }

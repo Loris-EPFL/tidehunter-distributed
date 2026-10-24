@@ -25,6 +25,75 @@ pub(super) fn node_for(db: &RemoteDatabase, key: u32) -> usize {
 pub(super) fn value(byte: u8) -> Option<Bytes> {
     Some(vec![byte; 32].into())
 }
+
+#[test]
+fn operational_sampling_releases_read_ownership_before_activation_and_after_shutdown() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(42, 7)])
+        .unwrap();
+    assert_eq!(db.get(KeySpace(0), &42u32.to_be_bytes()).unwrap(), value(7));
+    assert!(Arc::get_mut(&mut db.reads).is_some());
+
+    let monitor = db.operational_read_io_monitor();
+    let second_monitor = db.operational_read_io_monitor();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let generation = loop {
+        let mut complete = None;
+        monitor.visit(|snapshot, stopped| {
+            assert!(!stopped);
+            if snapshot.available && snapshot.resident_available {
+                assert_eq!(
+                    snapshot
+                        .owners
+                        .iter()
+                        .map(|(_, stats)| stats.completed_reads)
+                        .sum::<u64>(),
+                    1
+                );
+                complete = Some(snapshot.generation);
+            }
+        });
+        if let Some(generation) = complete {
+            break generation;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "operational sampler did not publish a complete sample"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    second_monitor.visit(|snapshot, stopped| {
+        assert!(!stopped);
+        assert!(snapshot.generation >= generation);
+        assert!(snapshot.available && snapshot.resident_available);
+    });
+
+    db.shutdown().unwrap();
+    assert!(Arc::get_mut(&mut db.reads).is_some());
+    let mut generation_at_stop = 0;
+    monitor.visit(|snapshot, stopped| {
+        assert!(stopped);
+        assert!(!snapshot.available && !snapshot.resident_available);
+        generation_at_stop = snapshot.generation;
+    });
+    let after_stop_monitor = db.operational_read_io_monitor();
+    assert!(Arc::get_mut(&mut db.reads).is_some());
+    std::thread::sleep(Duration::from_millis(1100));
+    after_stop_monitor.visit(|snapshot, stopped| {
+        assert!(stopped);
+        assert!(!snapshot.available && !snapshot.resident_available);
+        assert_eq!(snapshot.generation, generation_at_stop);
+    });
+    drop(db);
+    let mut reopened = fixture.open();
+    assert_eq!(
+        reopened.get(KeySpace(0), &42u32.to_be_bytes()).unwrap(),
+        value(7)
+    );
+    reopened.shutdown().unwrap();
+}
 #[test]
 fn bounded_read_profiles_count_rpc_misses_not_hits_absences_or_backpressure() {
     let mut fixture = Fixture::new();

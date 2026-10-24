@@ -24,6 +24,7 @@ const MAX_COMMANDS: usize = 64;
 const MAX_COMMAND_BYTES: usize = 256 * 1024 * 1024;
 
 pub(super) struct ControlContext {
+    pub(super) partition: PartitionConfig,
     pub(super) inventory: Arc<Mutex<NodeInventory>>,
     pub(super) readers: Arc<parking_lot::RwLock<inventory::ReaderAuthority>>,
     pub(super) terminal: Arc<AtomicBool>,
@@ -711,6 +712,10 @@ impl ControlContext {
                 stats.authority = log.map(|log| log.authority_cache_stats());
                 Ok(Response::ReadIoStats(stats))
             }
+            Request::OperationalReadIoStats => Ok(Response::OperationalReadIoStats(Box::new((
+                self.partition.clone(),
+                self.read_admission.try_stats(),
+            )))),
             Request::Status { protocol } => {
                 if protocol != PROTOCOL {
                     return Err(TcpError::new("unsupported wire protocol"));
