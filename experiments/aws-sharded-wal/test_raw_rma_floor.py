@@ -30,7 +30,7 @@ class RawRmaFloorTests(unittest.TestCase):
             s3_prefix='th-0123456789abcdef', transports=['tcp', 'efa-native'],
             kv_suite=dict(resident_reads=dict(source_bytes=8192, destination_slots=1)))
         return dict(config=cfg, case_id='raw-rma-0123456789abcdef-v256',
-            instance_id=cfg['nodes'][0]['instance_id'], port=raw.owned_port(cfg),
+            instance_id=cfg['nodes'][0]['instance_id'], port=raw.owned_port(cfg, 256),
             payload=256, samples=raw.SAMPLES, warmup=raw.WARMUP, deadline_ms=raw.PROBE_MS,
             software=False, binary_sha256='a' * 64, work_deadline=self.stamp(500),
             artifact=dict(key=cfg['s3_prefix'] + '/case-artifacts/raw-rma-0123456789abcdef-binary/node-0.tar.gz',
@@ -67,6 +67,12 @@ class RawRmaFloorTests(unittest.TestCase):
             payload[field] = value
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, message):
                 raw.validate_payload(payload)
+
+    def test_other_payload_cannot_reuse_previous_control_port(self):
+        payload = self.payload()
+        payload.update(payload=8192, case_id='raw-rma-0123456789abcdef-v8192')
+        with self.assertRaisesRegex(ValueError, 'unused owned port'):
+            raw.validate_payload(payload)
 
     def test_missing_floor_fails_registered_admission_not_rpc_default(self):
         cfg = self.payload()['config']
