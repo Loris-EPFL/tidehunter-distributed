@@ -134,6 +134,37 @@ def safe_extract(archive, destination, *, symlinks=False, max_bytes=32 << 30):
             raise ValueError('resolved source symlink escapes archive')
 
 
+RUNNER_SHARED_SOURCES = {'resident_config.py': 'experiments/resident_config.py'}
+
+
+def validate_runner_helpers(directory, source_records):
+    """Bind the flattened runner to exact canonical frozen source origins."""
+    directory = Path(directory)
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError('installed runner helper directory must be ordinary')
+    origins = {}
+    for relative in source_records:
+        source = PurePosixPath(relative)
+        if (source.parent == PurePosixPath('experiments/aws-sharded-wal')
+                and source.suffix == '.py' and not source.name.startswith('test_')):
+            origins[source.name] = relative
+    for name, relative in RUNNER_SHARED_SOURCES.items():
+        if name in origins:
+            raise ValueError('ambiguous canonical runner helper source: ' + name)
+        origins[name] = relative
+    installed = {path.name: path for path in directory.glob('*.py')}
+    if installed.keys() != origins.keys():
+        missing = sorted(origins.keys() - installed.keys())
+        unknown = sorted(installed.keys() - origins.keys())
+        raise ValueError(f'installed runner helper inventory differs: missing={missing}, unknown={unknown}')
+    for name, relative in origins.items():
+        path, entry = installed[name], source_records.get(relative)
+        if (not isinstance(entry, dict) or 'link' in entry
+                or not isinstance(entry.get('sha256'), str) or not re.fullmatch(HEX, entry['sha256'])
+                or path.is_symlink() or not path.is_file() or sha(path) != entry['sha256']):
+            raise ValueError('installed supervisor/helper differs from frozen build: ' + name + ' <- ' + relative)
+
+
 def read_json(path):
     return json.loads(Path(path).read_text())
 
@@ -720,11 +751,7 @@ class SuiCampaign(Campaign):
         self.support = self.build / 'sources/tidehunter-sharded-wal/experiments/aws-sharded-wal'
         # Admission binds even the already executing lifecycle helpers, not only
         # the scripts we are about to spawn from the immutable archive.
-        for path in Path(__file__).resolve().parent.glob('*.py'):
-            relative = 'experiments/aws-sharded-wal/' + path.name
-            entry = sources['tidehunter-sharded-wal']['files'].get(relative)
-            if entry is None or sha(path) != entry['sha256']:
-                raise ValueError('installed supervisor/helper differs from frozen build: ' + path.name)
+        validate_runner_helpers(Path(__file__).resolve().parent, sources['tidehunter-sharded-wal']['files'])
         self.verify_local()
         preflight([self.build / 'binaries' / name for name in sorted(BINARIES)], self.results / 'preflight')
         for transport in self.cfg['transports']:

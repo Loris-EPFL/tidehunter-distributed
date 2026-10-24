@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 
 import sui_checkpoint as supervisor
 import guest as kv_guest
+from ci_campaign import fresh_archive
 
 
 def encoded(value):
@@ -107,6 +108,115 @@ def archive_at(path, files, extra=()):
                 member.size = len(content)
                 archive.addfile(member, io.BytesIO(content))
     return path
+
+
+class RunnerHelperAdmissionTests(unittest.TestCase):
+    def sources(self, root):
+        engine = root / 'source'
+        records, helpers = {}, []
+        current = Path(supervisor.__file__).resolve().parent
+        for relative, content in (
+                ('experiments/aws-sharded-wal/sui_checkpoint.py', (current / 'sui_checkpoint.py').read_bytes()),
+                ('experiments/aws-sharded-wal/guest.py', (current / 'guest.py').read_bytes()),
+                ('experiments/resident_config.py', (current.parent / 'resident_config.py').read_bytes()),
+                ('experiments/aws-sharded-wal/test_not_a_runtime_helper.py', b'not installed\n')):
+            path = engine / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            records[relative] = dict(sha256=supervisor.sha(path))
+            if not path.name.startswith('test_'):
+                helpers.append(path)
+        return records, helpers
+
+    def install(self, root, helpers):
+        archive = root / 'bundle.tar.gz'
+        fresh_archive(archive, [(path, 'runner/' + path.name) for path in helpers])
+        supervisor.safe_extract(archive, root / 'installed', max_bytes=512 << 20)
+        return root / 'installed/runner'
+
+    def test_real_flattened_archive_binds_shared_helper_to_its_canonical_origin(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            records, helpers = self.sources(root)
+            installed = self.install(root, helpers)
+            self.assertNotIn('experiments/aws-sharded-wal/resident_config.py', records)
+            self.assertEqual(supervisor.sha(installed / 'resident_config.py'),
+                             records['experiments/resident_config.py']['sha256'])
+            supervisor.validate_runner_helpers(installed, records)
+            self.assertEqual({path.name for path in installed.iterdir()},
+                             {'sui_checkpoint.py', 'guest.py', 'resident_config.py'})
+
+    def test_actual_archives_reject_missing_unknown_changed_and_symlink_helpers(self):
+        for change in ('missing_shared', 'missing_runtime', 'unknown', 'changed_shared', 'changed_runtime', 'symlink'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                records, helpers = self.sources(root)
+                shared = next(path for path in helpers if path.name == 'resident_config.py')
+                guest = next(path for path in helpers if path.name == 'guest.py')
+                if change == 'missing_shared':
+                    helpers.remove(shared)
+                elif change == 'missing_runtime':
+                    helpers.remove(guest)
+                elif change == 'unknown':
+                    unknown = root / 'unknown.py'
+                    unknown.write_text('unbound helper\n')
+                    helpers.append(unknown)
+                elif change == 'changed_shared':
+                    shared.write_text('changed shared helper\n')
+                elif change == 'changed_runtime':
+                    guest.write_text('changed runtime helper\n')
+                else:
+                    original = root / 'original-guest.py'
+                    guest.rename(original)
+                    guest.symlink_to(original)
+                with self.assertRaises(ValueError):
+                    installed = self.install(root, helpers)
+                    supervisor.validate_runner_helpers(installed, records)
+
+    def test_equal_bytes_under_noncanonical_or_ambiguous_source_names_are_not_a_fallback(self):
+        for destination in ('experiments/aws-sharded-wal/resident_config.py',
+                            'experiments/other/resident_config.py'):
+            with self.subTest(destination=destination), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                records, helpers = self.sources(root)
+                installed = self.install(root, helpers)
+                records[destination] = records.pop('experiments/resident_config.py')
+                with self.assertRaises(ValueError):
+                    supervisor.validate_runner_helpers(installed, records)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            records, helpers = self.sources(root)
+            installed = self.install(root, helpers)
+            records['experiments/aws-sharded-wal/resident_config.py'] = dict(
+                records['experiments/resident_config.py'])
+            with self.assertRaisesRegex(ValueError, 'ambiguous canonical'):
+                supervisor.validate_runner_helpers(installed, records)
+
+    def test_missing_link_or_malformed_canonical_hash_record_remains_fail_closed(self):
+        for entry in (None, {}, {'link': 'somewhere.py'}, {'sha256': None}, {'sha256': 1},
+                      {'sha256': 'f' * 64}, {'sha256': 'not-a-hash'}):
+            with self.subTest(entry=entry), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                records, helpers = self.sources(root)
+                installed = self.install(root, helpers)
+                if entry is None:
+                    del records['experiments/resident_config.py']
+                else:
+                    records['experiments/resident_config.py'] = entry
+                with self.assertRaises(ValueError):
+                    supervisor.validate_runner_helpers(installed, records)
+
+    def test_controller_rejects_installed_symlink_even_when_target_bytes_match(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            records, helpers = self.sources(root)
+            installed = self.install(root, helpers)
+            helper = installed / 'resident_config.py'
+            target = root / 'same-bytes.py'
+            helper.rename(target)
+            helper.symlink_to(target)
+            with self.assertRaises(ValueError):
+                supervisor.validate_runner_helpers(installed, records)
 
 
 class EvidenceTests(unittest.TestCase):

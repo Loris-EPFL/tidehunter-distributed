@@ -339,6 +339,12 @@ def admit_inputs(build, fixture, verification, output):
     fresh_archive(runner, [(path, 'runner/' + path.name) for path in helpers])
     if runner.stat().st_size > 512 << 20:
         raise ValueError('bootstrap bundle exceeds guest bound')
+    # Exercise the controller's installed-layout binding on the actual archive
+    # before exposing an admitted runner to any paid fleet.
+    with tempfile.TemporaryDirectory(prefix='ci-runner-admission-') as temporary:
+        installed = Path(temporary) / 'installed'
+        supervisor.safe_extract(runner, installed, max_bytes=512 << 20)
+        supervisor.validate_runner_helpers(installed / 'runner', source_records)
     paths = dict(build_bundle=build / 'build-bundle.tar.gz', fixture_bundle=fixture,
                  verification_bundle=verification_bundle, runner_bundle=runner)
     result = dict(bindings=bindings, inputs={name: dict(path=str(path), bytes=path.stat().st_size, sha256=sha(path))
