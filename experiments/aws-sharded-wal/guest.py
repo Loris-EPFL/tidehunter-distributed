@@ -836,9 +836,10 @@ class Campaign:
         nodes = [n['instance_id'] for n in self.cfg['nodes']]
         # If this reply is lost, outcome stays unknown. No replacement benchmark is
         # started; cleanup targets the same deterministic node units and hard TTL.
+        # SSM limits this display label to 100 chars; payload and receipts retain the full case.
         reply = self.ssm.send_command(InstanceIds=nodes, DocumentName='AWS-RunShellScript',
                     Parameters={'commands': [command], 'executionTimeout': [str(timeout)]},
-                    TimeoutSeconds=60, Comment=f"{self.cfg['run_id']} {payload['action']} {payload['case_id']}")
+                    TimeoutSeconds=60, Comment=f"{self.cfg['run_id']} {payload['action']} {hashlib.sha256(payload['case_id'].encode()).hexdigest()[:16]}")
         command_id = reply['Command']['CommandId']
         record = self.results / f"ssm-{payload['case_id']}-{payload['action']}.json"
         results = {}

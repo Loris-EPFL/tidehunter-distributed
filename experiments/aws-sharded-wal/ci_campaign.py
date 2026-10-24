@@ -186,7 +186,7 @@ def load_config(path, env=None):
             cfg[name] = env.get('AWS_BENCH_' + name.upper())
     if (cfg.get('schema') != 1 or cfg.get('repository') != REPOSITORY or cfg.get('branch') != BRANCH
             or not re.fullmatch(r'[0-9]{12}', cfg.get('account', ''))
-            or type(cfg.get('ttl_seconds')) is not int or cfg['ttl_seconds'] not in (3600, 7200)
+            or type(cfg.get('ttl_seconds')) is not int or not 3600 <= cfg['ttl_seconds'] <= 7200
             or cfg.get('export_reserve_seconds') != 600
             or not isinstance(cfg.get('regions'), list) or not cfg['regions']
             or len(set(cfg['regions'])) != len(cfg['regions']) or not set(cfg['regions']) <= set(REGIONS)

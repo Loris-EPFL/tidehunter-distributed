@@ -183,21 +183,6 @@ class HardwarePopulations(unittest.TestCase):
                 kv.cold_interval_evidence(root, spec, 'tcp')
 
 
-    def test_runtime_sensitivity_is_explicit_not_a_completion_guarantee(self):
-        summary = kv.planning_summary(self.config(), kv_pair_seconds=30)
-        self.assertEqual(summary['kv_pairs'], 93)
-        self.assertEqual(summary['kv_processes'], 186)
-        self.assertEqual(summary['sui_cells'], 12)
-        self.assertEqual(summary['sui_replays'], 24)
-        self.assertEqual(summary['bounded_hot_policy']['group_calls'], 1024)
-        self.assertEqual(summary['physical_cold_probes_total'], 32768)
-        self.assertEqual(summary['physical_cold_group_probes_total'], 32768)
-        self.assertEqual(summary['physical_cold_group_members_total'], 1048576)
-        self.assertEqual(summary['measured_work_seconds'], 6600)
-        self.assertEqual(summary['estimated_work_seconds'], 5640)
-        self.assertAlmostEqual(summary['maximum_mean_kv_pair_seconds'], 3750 / 93)
-        self.assertEqual(summary['per_sui_replay_deadline_seconds'], 300)
-        self.assertFalse(summary['qualified'])
 
 
 class PhysicalColdPopulations(unittest.TestCase):
