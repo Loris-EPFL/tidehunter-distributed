@@ -88,12 +88,14 @@ def enabled(cfg):
     return bool(resident and any(resident.values()) and 'efa-native' in cfg['transports'])
 
 
-def owned_port(cfg):
+def owned_port(cfg, payload_bytes):
     # Existing internal SG already permits fleet-to-fleet traffic. Do not change
     # ingress or reuse the normal KV 7700 or Sui's reserved namespace port range.
+    # Each payload needs a fresh listener port; the prior case can leave TIME_WAIT.
     base = cfg.get('port', 24000)
-    return next(port for port in (17700, 27700, 37700, 47700, 57700)
-                if not base <= port <= base + 615)
+    ports = [port for port in (17700, 27700, 37700, 47700, 57700)
+             if not base <= port <= base + 615]
+    return ports[PAYLOADS.index(payload_bytes)]
 
 
 def command(binary, role, address, payload, domain, output, *, software=False,
@@ -242,7 +244,7 @@ def validate_payload(payload):
         raise ValueError('raw RMA requires a fresh exact case namespace')
     if payload['payload'] not in PAYLOADS or not payload['case_id'].endswith('-v' + str(payload['payload'])):
         raise ValueError('raw RMA payload/case binding differs')
-    if payload['port'] != owned_port(cfg) or payload['port'] == 7700:
+    if payload['port'] != owned_port(cfg, payload['payload']) or payload['port'] == 7700:
         raise ValueError('raw RMA port is not the explicit unused owned port')
     if (payload['deadline_ms'] != PROBE_MS or payload['samples'] != SAMPLES or
             payload['warmup'] != WARMUP or payload['software'] is not False):
@@ -594,7 +596,7 @@ def run_registered_floor(suite):
                 payload = dict(config=cfg, case_id=case_id, instance_id=node['instance_id'],
                     binary_sha256=state['binary_sha256'], artifact=artifact,
                     payload=payload_bytes, samples=SAMPLES, warmup=WARMUP,
-                    deadline_ms=PROBE_MS, software=False, port=owned_port(cfg), work_deadline=suite.deadline)
+                    deadline_ms=PROBE_MS, software=False, port=owned_port(cfg, payload_bytes), work_deadline=suite.deadline)
                 document(case / 'intent.json', payload)
                 prefix = result_key(payload)
                 record = dict(case_id=case_id, complete=False)
