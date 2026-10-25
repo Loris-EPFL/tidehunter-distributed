@@ -594,6 +594,10 @@ export, not historical FoundationDB failures. Primary curves require common
 completed repeats across all requested systems; the separately labeled cold
 cohort explicitly lists excluded systems and still requires matched repeats.
 
+Release preparation probes `rustc` and records `cargo` from the extracted source
+directory, just like compilation. This makes its admitted `rust-toolchain.toml`
+select Rust 1.90 instead of a hosted runner's unrelated default toolchain.
+
 Design anchors: Tidehunter paper §§3/6 (`../papers/parsed/Tidehunter-2026-v2.md`
 relative to the containing project) separates Value-WAL/index publication,
 materialized-value reads and fill/measurement phases; native source remains
