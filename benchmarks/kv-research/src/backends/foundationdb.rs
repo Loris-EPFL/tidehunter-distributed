@@ -24,6 +24,7 @@ use tidehunter::minibytes::Bytes;
 use crate::backend::{BackendInfo, BackendResult, BatchAtomicity, KvBackend};
 
 static API_BOOTED: AtomicBool = AtomicBool::new(false);
+const FDB_MAX_KEY_BYTES: usize = 10_000;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -242,6 +243,8 @@ pub struct FoundationDbBackend {
 }
 
 impl FoundationDbBackend {
+    // Keep native-client identity, live cluster admission and key-domain metadata in one constructor.
+    #[allow(clippy::too_many_lines)]
     pub async fn open(options: &JsonValue, _registry: &Registry) -> BackendResult<Self> {
         let options = parse_options(options)?;
         if API_BOOTED
@@ -313,7 +316,33 @@ impl FoundationDbBackend {
             get_many_strategy: "one serializable transaction, sequential native transaction gets, exact caller order".to_owned(),
             batch_atomicity: BatchAtomicity::SerializableTransaction,
             topology: serde_json::json!({"cluster_file": options.cluster_file, "cluster_status": status}),
-            configuration: serde_json::json!({"required_replication_factor": options.required_replication_factor, "observed_replication_factor": observed_rf, "storage_replicas": configuration.get("storage_replicas"), "redundancy_mode": configuration.get("redundancy_mode"), "storage_replication_policy": configuration.get("storage_replication_policy"), "log_replication_policy": configuration.get("log_replication_policy"), "full_replication": true, "disk_ack": "cluster transaction commit acknowledged; physical-device persistence unverified", "transport_security": "effective TLS/authentication not reported by adapter; unverified", "compaction": "storage-engine compaction configuration not exposed by observed status", "value_separation": "not configured by this KV adapter; internal storage representation unverified", "loaded_native_library": {"path": client_library_path, "blake2b512": client_library_blake2b512, "api_max_version": client_api_max_version}}),
+            configuration: serde_json::json!({
+                "required_replication_factor": options.required_replication_factor,
+                "observed_replication_factor": observed_rf,
+                "storage_replicas": configuration.get("storage_replicas"),
+                "redundancy_mode": configuration.get("redundancy_mode"),
+                "storage_replication_policy": configuration.get("storage_replication_policy"),
+                "log_replication_policy": configuration.get("log_replication_policy"),
+                "full_replication": true,
+                "disk_ack": "cluster transaction commit acknowledged; physical-device persistence unverified",
+                "transport_security": "effective TLS/authentication not reported by adapter; unverified",
+                "compaction": "storage-engine compaction configuration not exposed by observed status",
+                "value_separation": "not configured by this KV adapter; internal storage representation unverified",
+                "key_encoding": {
+                    "encoding": "bounded-leading-byte-v1",
+                    "first_byte_mapping": "min(first logical byte, 0xfe), or 0 for the empty key; then append all logical key bytes unchanged",
+                    "overhead_bytes": 1,
+                    "logical_key_max_bytes": FDB_MAX_KEY_BYTES - 1,
+                    "physical_key_max_bytes": FDB_MAX_KEY_BYTES,
+                    "physical_first_byte_max": 254,
+                    "lexicographic_order_preserved": true
+                },
+                "loaded_native_library": {
+                    "path": client_library_path,
+                    "blake2b512": client_library_blake2b512,
+                    "api_max_version": client_api_max_version
+                }
+            }),
         };
         Ok(Self {
             database,
@@ -324,13 +353,16 @@ impl FoundationDbBackend {
     }
 
     fn key(key: &[u8]) -> BackendResult<Vec<u8>> {
-        const MAX_FDB_KEY: usize = 10_000;
-        if key.len() > MAX_FDB_KEY {
+        if key.len() > FDB_MAX_KEY_BYTES - 1 {
             return Err(invalid(format!(
-                "FoundationDB key exceeds {MAX_FDB_KEY} byte limit"
+                "FoundationDB logical key exceeds {} byte limit after ordered user-keyspace encoding",
+                FDB_MAX_KEY_BYTES - 1
             )));
         }
-        Ok(key.to_vec())
+        let mut physical = Vec::with_capacity(key.len() + 1);
+        physical.push(key.first().copied().unwrap_or(0).min(0xfe));
+        physical.extend_from_slice(key);
+        Ok(physical)
     }
 }
 
@@ -341,12 +373,11 @@ impl KvBackend for FoundationDbBackend {
 
     async fn get(&self, key: &[u8]) -> BackendResult<Option<Bytes>> {
         let key = Self::key(key)?;
+        let key = key.as_slice();
         let value = tokio::time::timeout(
             self.timeout,
-            self.database.run(move |transaction, _| {
-                let key = key.clone();
-                async move { Ok(transaction.get(&key, false).await?) }
-            }),
+            self.database
+                .run(|transaction, _| async move { Ok(transaction.get(key, false).await?) }),
         )
         .await
         .map_err(timeout_elapsed)?
@@ -356,16 +387,13 @@ impl KvBackend for FoundationDbBackend {
 
     async fn put(&self, key: Bytes, value: Bytes) -> BackendResult<()> {
         let key = Self::key(key.as_ref())?;
-        let value = value.to_vec();
+        let key = key.as_slice();
+        let value = value.as_ref();
         tokio::time::timeout(
             self.timeout,
-            self.database.run(move |transaction, _| {
-                let key = key.clone();
-                let value = value.clone();
-                async move {
-                    transaction.set(&key, &value);
-                    Ok(())
-                }
+            self.database.run(|transaction, _| async move {
+                transaction.set(key, value);
+                Ok(())
             }),
         )
         .await
@@ -376,14 +404,12 @@ impl KvBackend for FoundationDbBackend {
 
     async fn delete(&self, key: Bytes) -> BackendResult<()> {
         let key = Self::key(key.as_ref())?;
+        let key = key.as_slice();
         tokio::time::timeout(
             self.timeout,
-            self.database.run(move |transaction, _| {
-                let key = key.clone();
-                async move {
-                    transaction.clear(&key);
-                    Ok(())
-                }
+            self.database.run(|transaction, _| async move {
+                transaction.clear(key);
+                Ok(())
             }),
         )
         .await
@@ -397,17 +423,15 @@ impl KvBackend for FoundationDbBackend {
             .iter()
             .map(|key| Self::key(key.as_ref()))
             .collect::<BackendResult<Vec<_>>>()?;
+        let keys = keys.as_slice();
         let values = tokio::time::timeout(
             self.timeout,
-            self.database.run(move |transaction, _| {
-                let keys = keys.clone();
-                async move {
-                    let mut values = Vec::with_capacity(keys.len());
-                    for key in &keys {
-                        values.push(transaction.get(key, false).await?);
-                    }
-                    Ok(values)
+            self.database.run(|transaction, _| async move {
+                let mut values = Vec::with_capacity(keys.len());
+                for key in keys {
+                    values.push(transaction.get(key.as_slice(), false).await?);
                 }
+                Ok(values)
             }),
         )
         .await
@@ -422,18 +446,16 @@ impl KvBackend for FoundationDbBackend {
     async fn put_batch(&self, entries: &[(Bytes, Bytes)]) -> BackendResult<()> {
         let entries = entries
             .iter()
-            .map(|(key, value)| Ok((Self::key(key.as_ref())?, value.to_vec())))
+            .map(|(key, value)| Ok((Self::key(key.as_ref())?, value.as_ref())))
             .collect::<BackendResult<Vec<_>>>()?;
+        let entries = entries.as_slice();
         tokio::time::timeout(
             self.timeout,
-            self.database.run(move |transaction, _| {
-                let entries = entries.clone();
-                async move {
-                    for (key, value) in &entries {
-                        transaction.set(key, value);
-                    }
-                    Ok(())
+            self.database.run(|transaction, _| async move {
+                for (key, value) in entries {
+                    transaction.set(key.as_slice(), value);
                 }
+                Ok(())
             }),
         )
         .await
@@ -459,5 +481,42 @@ mod tests {
             let io_error = error.downcast_ref::<io::Error>().unwrap();
             assert_eq!(io_error.kind(), io::ErrorKind::TimedOut);
         }
+    }
+    #[test]
+    fn logical_key_embedding_preserves_order_and_spreads_leading_buckets() {
+        let logical_keys: [&[u8]; 9] = [
+            &[],
+            &[0x00],
+            &[0x00, 0x00],
+            &[0x01, 0xff],
+            &[0x80, 0x00],
+            &[0xfe],
+            &[0xfe, 0xff],
+            &[0xff],
+            &[0xff, 0x00],
+        ];
+        let physical_keys: Vec<_> = logical_keys
+            .iter()
+            .map(|key| FoundationDbBackend::key(key).unwrap())
+            .collect();
+
+        for pair in logical_keys.windows(2).zip(physical_keys.windows(2)) {
+            let (logical, physical) = pair;
+            assert_eq!(logical[0].cmp(logical[1]), physical[0].cmp(&physical[1]));
+        }
+        for physical in &physical_keys {
+            assert!(physical[0] <= 0xfe);
+        }
+        assert_ne!(physical_keys[3][0], physical_keys[4][0]);
+    }
+
+    #[test]
+    fn logical_key_embedding_enforces_physical_key_limit() {
+        let largest_logical = vec![0xff; FDB_MAX_KEY_BYTES - 1];
+        let physical = FoundationDbBackend::key(&largest_logical).unwrap();
+        assert_eq!(physical.len(), FDB_MAX_KEY_BYTES);
+
+        let oversized_logical = vec![0xff; FDB_MAX_KEY_BYTES];
+        assert!(FoundationDbBackend::key(&oversized_logical).is_err());
     }
 }
