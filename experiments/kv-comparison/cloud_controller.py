@@ -205,6 +205,50 @@ def command(argv, *, timeout=60, env=None):
     return result.stdout
 
 
+def admit_fabrics(config, index, clients, root):
+    # Pinned util/info.c maps -p to prov_name, -f to fabric name, and -c/-m
+    # to caps/mode. efa-direct is a fabric of provider efa, not a provider:
+    # https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/util/info.c
+    # Match resources.rs::Info::hints. Direct TLS/native messages need no RMA;
+    # only registered-RAM adds read caps and RX_CQ_DATA. Rust still checks
+    # endpoint geometry and FI_OPT_EFA_EMULATED_READ after endpoint enable.
+    profiles = (
+        ("efa_message", "efa", "FI_MSG|FI_DIRECTED_RECV", "FI_CONTEXT"),
+        ("efa_direct_message", "efa-direct", "FI_MSG", "FI_CONTEXT2"),
+        ("efa_direct_read", "efa-direct", "FI_MSG|FI_RMA|FI_READ|FI_REMOTE_READ", "FI_CONTEXT2|FI_RX_CQ_DATA"),
+    )
+    host = config["fleet"]["coordinator"] if index == -1 else config["fleet"]["nodes"][index]
+    receipt = {"complete": False, "run_id": config["prefix"], "instance_id": host["instance_id"],
+               "source_sha256": config["source_sha256"], "binary_sha256": config["binary_sha256"],
+               "scope": "fi_getinfo discovery only; not endpoint/native-read or workload qualification", "probes": {}}
+    failure = None
+    for name, fabric, caps, mode in profiles:
+        argv = ["/opt/amazon/efa/bin/fi_info", "-p", "efa", "-f", fabric,
+                "-t", "FI_EP_RDM", "-c", caps, "-m", mode, "-v"]
+        probe = {"argv": argv}
+        receipt["probes"][name] = probe
+        try:
+            probe["stdout"] = command(argv, timeout=30, env=environment(config))
+            probe["status"] = "discovered"
+        except Exception as exc:
+            probe.update(status="failed", error=type(exc).__name__ + ": " + str(exc))
+            failure = exc
+            break
+    receipt["complete"] = failure is None
+    dump(Path(root) / "fabric-admission.json", receipt)
+    key = config["prefix"] + ("/results/fabric-admission.json" if index == -1
+                              else f"/results/cells/startup/storage/{index}/fabric-admission.json")
+    try:
+        s3_json(clients["s3"], config, key, receipt)
+    except Exception as exc:
+        if failure is not None:
+            raise failure from exc
+        raise
+    if failure is not None:
+        raise failure
+    return receipt
+
+
 def make_clients(config, *, guest=False):
     # Delayed: offline plan/admission must not require boto3 or credentials.
     import boto3
@@ -531,11 +575,7 @@ def guest_operation(config, request, clients):
                           else {"complete": False, "gaps": ["bootstrap monitoring image receipt missing"]})
         return {"identity": identity, "package": package, "bootstrap": receipt, "ready": ready, "monitor_images": monitor_images,
                 "expiry_timer": command(["systemctl", "show", timer], timeout=10), "images": images,
-                "fi_info": command(["/opt/amazon/efa/bin/fi_info", "-p", "efa"], timeout=30, env=environment(config)),
-                "fi_info_rma": command(["/opt/amazon/efa/bin/fi_info", "-p", "efa", "-t", "FI_EP_RDM", "-c", "FI_RMA"],
-                                       timeout=30, env=environment(config)),
-                "fi_info_direct_rma": command(["/opt/amazon/efa/bin/fi_info", "-p", "efa-direct", "-t", "FI_EP_RDM", "-c", "FI_RMA"],
-                                              timeout=30, env=environment(config)),
+                "fabric_admission": admit_fabrics(config, index, clients, root),
                 "ldd": command(["ldd", config["binary"]], timeout=30, env=environment(config)),
                 "snapshot": snapshot(config)}
     if action in ("monitor_start", "monitor_stop"):
