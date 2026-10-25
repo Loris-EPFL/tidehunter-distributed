@@ -101,6 +101,50 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn("--scope", argv)  # The service manager, not SSM, is the long-lived parent.
 
 
+class FabricAdmissionTests(unittest.TestCase):
+    def test_failed_read_discovery_retains_prior_observations_without_admitting_host(self):
+        config = config_fixture()
+        clients = clients_fixture(config)
+        stored = {}
+        clients["s3"].put_object.side_effect = lambda **value: stored.update(value)
+        clients["s3"].head_object.side_effect = lambda **_: {
+            "ContentLength": len(stored["Body"]), "Metadata": stored["Metadata"]}
+        failure = controller.InfrastructureError("fi_getinfo: -61 (No data available)")
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+                controller, "command", side_effect=["ordinary observed info", "direct observed info", failure]):
+            with self.assertRaises(controller.InfrastructureError) as caught:
+                controller.admit_fabrics(config, 2, clients, Path(tmp))
+            receipt = json.loads((Path(tmp) / "fabric-admission.json").read_text())
+        self.assertIs(caught.exception, failure)
+        self.assertFalse(receipt["complete"])
+        self.assertEqual(receipt["instance_id"], config["fleet"]["nodes"][2]["instance_id"])
+        self.assertEqual(receipt["source_sha256"], config["source_sha256"])
+        self.assertEqual(receipt["binary_sha256"], config["binary_sha256"])
+        probes = receipt["probes"]
+        self.assertEqual(probes["efa_message"]["stdout"], "ordinary observed info")
+        self.assertEqual(probes["efa_direct_message"]["stdout"], "direct observed info")
+        self.assertEqual(probes["efa_direct_read"]["status"], "failed")
+        self.assertIn("No data available", probes["efa_direct_read"]["error"])
+        self.assertNotIn("stdout", probes["efa_direct_read"])
+        self.assertEqual(json.loads(stored["Body"]), receipt)
+
+    def test_receipt_export_failure_cannot_replace_original_discovery_failure(self):
+        config = config_fixture()
+        clients = clients_fixture(config)
+        clients["s3"].put_object.side_effect = OSError("receipt upload unavailable")
+        failure = controller.InfrastructureError("EFA discovery unavailable")
+        with tempfile.TemporaryDirectory() as tmp, patch.object(controller, "command", side_effect=failure):
+            with self.assertRaises(controller.InfrastructureError) as caught:
+                controller.admit_fabrics(config, -1, clients, Path(tmp))
+            receipt = json.loads((Path(tmp) / "fabric-admission.json").read_text())
+        self.assertIs(caught.exception, failure)
+        self.assertIsInstance(caught.exception.__cause__, OSError)
+        self.assertFalse(receipt["complete"])
+        self.assertEqual(receipt["instance_id"], config["fleet"]["coordinator"]["instance_id"])
+        self.assertEqual(set(receipt["probes"]), {"efa_message"})
+        self.assertEqual(receipt["probes"]["efa_message"]["status"], "failed")
+
+
 class OwnershipTests(unittest.TestCase):
     def test_exact_six_current_hosts_required(self):
         config = config_fixture()

@@ -37,7 +37,7 @@ EFA = {"installer_version": "1.50.0", "installer_sha256": "fa6dff8593d866866c13c
        "libfabric_version": "2.6.0amzn1.0", "provider_version": "206.0", "rdm_protocol_version": 4, "direct_protocol_version": 1,
        "upstream_commit": "3cc1095272b07ebeb5cc8f44851af6aa3eb75e41",
        "runtime_library_dir": "/opt/amazon/efa/lib", "required_environment": {"FI_EFA_USE_DEVICE_RDMA": "1"},
-       "hardware_admission": "fi_info must admit efa and efa-direct with RMA read caps; code enforces geometry; no TCP fallback"}
+       "hardware_admission": "provider efa, RDM fabrics efa (MSG|DIRECTED_RECV) and efa-direct (MSG); registered-RAM additionally requires efa-direct RMA|READ|REMOTE_READ; Rust enforces geometry and native device reads; no TCP fallback"}
 NEW_ROOTS = ("benchmarks/kv-research/", "experiments/kv-comparison/")
 SUFFIXES = {".rs", ".toml", ".lock", ".py", ".json", ".yaml", ".yml", ".sh", ".md", ".c", ".h", ".cpp", ".proto", ".html", ".css", ".js", ".txt"}
 EXCLUDED = {".git", "target", "checkpoint-work", "logs", "results", "artifacts", "data", "secrets", "credentials", ".state", "__pycache__", ".aws", ".ssh", "node_modules", ".venv"}

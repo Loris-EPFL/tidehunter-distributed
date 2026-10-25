@@ -296,7 +296,7 @@ class ResultAdmissionTests(unittest.TestCase):
 
     def export(self, **changes):
         base = self.output / 's3' / RUN / 'results'
-        base.mkdir(parents=True)
+        base.mkdir(parents=True, exist_ok=True)
         archive = base / 'controller.tar.gz'
         records = ci.cloud_controller.archive_results(self.raw, archive)
         receipt = dict(status='incomplete', files=records, bytes=archive.stat().st_size,
@@ -304,6 +304,117 @@ class ResultAdmissionTests(unittest.TestCase):
         receipt.update(changes)
         ci.core.dump(base / 'receipt.json', receipt)
         return archive
+
+    def startup_failure_export(self, **changes):
+        # Reduced deterministic copy of the eight-file retained export from
+        # th-7d1c2c124e8ae87a: startup, controller outcome, five failed storage
+        # command receipts and observer receipt; no matrix, cases or TSDB.
+        self.raw.joinpath('matrix.json').unlink()
+        self.startup_error = (
+            'InfrastructureError: command failed (61): /opt/amazon/efa/bin/fi_info '
+            '-p efa-direct -t FI_EP_RDM -c FI_RMA\n\nfi_getinfo: -61 (No data available)\n')
+        ci.core.dump(self.raw / 'startup.json', dict(status='starting',
+            config=dict(source_revision='f211f4ebea727724d8b2713b8a8d2933952f7c46',
+                binary_sha256='528741cb1904e0b0617be737fe9ef9c485a67dbd33215988287cbb771191872d'),
+            observed_utc='2026-10-25T17:53:28.222790+00:00'))
+        ci.core.dump(self.raw / 'controller-outcome.json', dict(error=self.startup_error,
+            observed_utc='2026-10-25T17:58:29.950582+00:00'))
+        for index in range(5):
+            ci.core.dump(self.raw / f'commands/{index + 1:06}.json', dict(
+                status='known_not_accepted', request=dict(action='bootstrap', index=index),
+                error="InvalidInstanceId('Instances not in a valid state for account')"))
+        ci.core.dump(self.raw / 'observability/receipt.json', dict(
+            schema_version=1, attempted=False, complete=False, events=[]))
+        return self.export(error=self.startup_error, **changes)
+
+    def cleanup_action(self, closed=True):
+        # Model already observed resource closure and retrieval, but exercise
+        # the actual cleanup entry point and its archive/benchmark validation.
+        self.campaign.journal = Mock(data={'controller_config': {'spec': self.cfg['spec']}})
+        self.campaign.cleanup = Mock(return_value={'cleanup_complete': closed})
+        self.campaign.retrieve = Mock()
+        self.campaign.settle = Mock()
+        aws = Mock()
+        aws.client.return_value.get_caller_identity.return_value = {'Account': ACCOUNT}
+        with patch.object(ci, 'load_config', return_value=self.cfg), \
+                patch.object(ci.core, 'trusted_run', return_value=RUN), \
+                patch.object(ci.core, 'AWS', return_value=aws), \
+                patch.object(ci, 'Campaign', return_value=self.campaign), \
+                patch('sys.stderr', io.StringIO()):
+            return ci.main(['cleanup', '--config', str(ci.HERE / 'ci-config.json'),
+                            '--output', str(self.output)])
+
+    def test_retained_startup_failure_is_structured_and_run_still_fails(self):
+        self.startup_failure_export()
+        with self.assertRaisesRegex(RuntimeError, 'incomplete campaign'):
+            self.campaign.validate_results({'spec': self.cfg['spec']})
+        result = ci.core.read_json(self.output / 'campaign-validation.json')
+        self.assertEqual(result['controller_status'], 'incomplete')
+        self.assertEqual(result['controller_error'], self.startup_error)
+        self.assertEqual(result['controller_outcome']['error'], self.startup_error)
+        self.assertEqual(result['missing_files'], ['matrix.json'])
+        self.assertEqual(result['planned_cases'], 684)
+        self.assertIsNone(result['completed_cases'])
+        self.assertFalse(result['benchmark_complete'])
+        self.assertFalse(result['monitoring_complete'])
+        self.assertFalse(result['complete'])
+        self.assertFalse((self.output / 'validated-results/comparison.json').exists())
+        self.assertFalse((self.output / 'validated-results/cases').exists())
+
+    def test_verified_cleanup_succeeds_independently_of_incomplete_benchmarks(self):
+        self.startup_failure_export()
+        self.assertEqual(self.cleanup_action(), 0)
+        summary = ci.core.read_json(self.output / 'cleanup-validation.json')
+        self.assertTrue(summary['resource_cleanup_complete'])
+        self.assertFalse(summary['campaign_complete'])
+        self.assertEqual(summary['campaign_validation']['controller_error'], self.startup_error)
+        self.assertEqual(summary['campaign_validation']['missing_files'], ['matrix.json'])
+        self.assertFalse((self.output / 'operator-failure.json').exists())
+
+    def test_startup_failure_never_hides_unverified_cleanup(self):
+        self.startup_failure_export()
+        self.assertEqual(self.cleanup_action(closed=False), 1)
+        summary = ci.core.read_json(self.output / 'cleanup-validation.json')
+        self.assertFalse(summary['resource_cleanup_complete'])
+        self.assertFalse(summary['campaign_complete'])
+
+    def test_completed_claim_and_stale_local_matrix_cannot_hide_missing_export_matrix(self):
+        self.startup_failure_export(status='completed', monitoring_complete=True)
+        ci.core.dump(self.output / 'validated-results/matrix.json',
+            dict(schema_version=1, spec=self.cfg['spec'], jobs=self.jobs))
+        outcome = self.campaign.validate_results({'spec': self.cfg['spec']}, require_complete=False)
+        self.assertEqual(outcome['missing_files'], ['matrix.json'])
+        self.assertFalse(outcome['complete'])
+        self.assertFalse(outcome['benchmark_complete'])
+        self.assertIsNone(outcome['completed_cases'])
+
+    def test_cleanup_rejects_inner_inventory_tampering_without_reversing_resource_proof(self):
+        self.startup_failure_export()
+        receipt_path = self.output / 's3' / RUN / 'results/receipt.json'
+        receipt = ci.core.read_json(receipt_path)
+        receipt['files']['startup.json']['sha256'] = '0' * 64
+        ci.core.dump(receipt_path, receipt)
+        self.assertEqual(self.cleanup_action(), 1)
+        summary = ci.core.read_json(self.output / 'cleanup-validation.json')
+        self.assertTrue(summary['resource_cleanup_complete'])
+        self.assertFalse(summary['campaign_complete'])
+        self.assertIn('raw result file differs', summary['validation_error'])
+
+    def test_startup_failure_does_not_bypass_archive_path_safety(self):
+        archive = self.startup_failure_export()
+        payload = b'not an admitted result'
+        with ci.tarfile.open(archive, 'w:gz') as stream:
+            member = ci.tarfile.TarInfo('../outside.json')
+            member.size = len(payload)
+            stream.addfile(member, io.BytesIO(payload))
+        receipt_path = archive.parent / 'receipt.json'
+        receipt = ci.core.read_json(receipt_path)
+        receipt.update(bytes=archive.stat().st_size, sha256=ci.core.sha(archive),
+            files={'../outside.json': dict(bytes=len(payload), sha256=ci.hashlib.sha256(payload).hexdigest())})
+        ci.core.dump(receipt_path, receipt)
+        with self.assertRaisesRegex(ValueError, 'unsafe'):
+            self.campaign.validate_results({'spec': self.cfg['spec']}, require_complete=False)
+        self.assertFalse((self.output / 'outside.json').exists())
 
     def test_all_684_unrun_cases_remain_incomplete_with_monitor_failure_separate(self):
         self.export()

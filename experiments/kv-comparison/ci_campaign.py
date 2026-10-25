@@ -326,7 +326,8 @@ class Campaign(core.Campaign):
             self.clock.sleep(10)
         raise TimeoutError('absolute campaign/export deadline reached')
 
-    def validate_results(self, cfg):
+    def validate_results(self, cfg, *, require_complete=True):
+        """Validate raw evidence; only cleanup may retain an incomplete outcome."""
         base = self.output / 's3' / self.run_id / 'results'
         receipt = core.read_json(base / 'receipt.json')
         archive = base / 'controller.tar.gz'
@@ -358,13 +359,24 @@ class Campaign(core.Campaign):
                     raise ValueError('raw result file differs from export inventory: ' + member.name)
         if seen != set(inventory):
             raise ValueError('raw archive omits receipted files')
-        planned = core.read_json(root / 'matrix.json')
         expected_jobs = cloud_campaign.make_matrix(cfg['spec'])
-        if planned != {'schema_version': 1, 'spec': cfg['spec'], 'jobs': expected_jobs}:
-            raise ValueError('exported matrix differs from all 684 admitted cases')
-        report = cloud_campaign.report(root)
+        missing_files = []
+        controller_outcome = (core.read_json(root / 'controller-outcome.json')
+                              if 'controller-outcome.json' in seen else None)
+        if 'matrix.json' not in seen:
+            # Startup can fail before the matrix is written. Do not fabricate a
+            # report (or reuse a matrix left by an earlier local validation).
+            missing_files.append('matrix.json')
+            report = dict(complete=False, completed_cases=None)
+        else:
+            planned = core.read_json(root / 'matrix.json')
+            if planned != {'schema_version': 1, 'spec': cfg['spec'], 'jobs': expected_jobs}:
+                raise ValueError('exported matrix differs from all 684 admitted cases')
+            report = cloud_campaign.report(root)
         monitor_error = None
         try:
+            if not {'observability/receipt.json', 'observability/monitoring.tar.gz'} <= seen:
+                raise ValueError('controller export lacks monitoring receipt or archive')
             monitoring = core.read_json(root / 'observability/receipt.json')
             monitor_complete = monitoring.get('complete') is True and receipt.get('monitoring_complete') is True
             monitor_spec = importlib.util.spec_from_file_location('kv_ci_monitor', HERE / 'observability/campaign_monitor.py')
@@ -387,10 +399,13 @@ class Campaign(core.Campaign):
         outcome = dict(schema_version=1, suite='kv-comparison', planned_cases=684,
             completed_cases=report['completed_cases'], benchmark_complete=report['complete'],
             monitoring_complete=monitor_complete, controller_status=receipt.get('status'),
+            controller_error=receipt.get('error') or (controller_outcome or {}).get('error'),
+            controller_outcome=controller_outcome, missing_files=missing_files,
             monitoring_error=monitor_error,
-            complete=report['complete'] and monitor_complete and receipt.get('status') == 'completed')
+            complete=report['complete'] and monitor_complete and receipt.get('status') == 'completed'
+                and not receipt.get('error') and not (controller_outcome or {}).get('error'))
         core.dump(self.output / 'campaign-validation.json', outcome)
-        if not outcome['complete']:
+        if require_complete and not outcome['complete']:
             raise RuntimeError('incomplete campaign: ' + json.dumps(outcome, sort_keys=True))
         return outcome
 
@@ -403,6 +418,34 @@ def cleanup_campaign(campaign):
     finally:
         campaign.settle(cleanup)
     return cleanup['cleanup_complete']
+
+
+def validate_cleanup_results(campaign, cleanup_complete):
+    """Keep verified resource closure independent of benchmark completion.
+
+    Invalid/unsafe evidence still raises, but an honestly incomplete export is
+    persisted without making a successfully closed fleet look like a leak.
+    """
+    summary = dict(schema_version=1, resource_cleanup_complete=cleanup_complete,
+                   campaign_complete=None)
+    try:
+        controller = (campaign.journal.data or {}).get('controller_config')
+        if controller:
+            archive = campaign.output / 's3' / campaign.run_id / 'results/controller.tar.gz'
+            if archive.is_file():
+                outcome = campaign.validate_results(controller, require_complete=False)
+            else:
+                outcome = dict(complete=False, benchmark_complete=None, monitoring_complete=None,
+                    raw_export_available=False, lifecycle_error='activated campaign has no retained controller export')
+                core.dump(campaign.output / 'campaign-validation.json', outcome)
+            summary['campaign_complete'] = outcome['complete']
+            summary['campaign_validation'] = outcome
+    except Exception as error:
+        summary.update(campaign_complete=False, validation_error=repr(error))
+        raise
+    finally:
+        core.dump(campaign.output / 'cleanup-validation.json', summary)
+    return cleanup_complete
 
 
 def main(argv=None):
@@ -431,16 +474,7 @@ def main(argv=None):
         campaign = Campaign(aws, cfg, run_id, args.output, cleanup_only=args.action == 'cleanup')
         if args.action == 'cleanup':
             complete = cleanup_campaign(campaign)
-            controller = (campaign.journal.data or {}).get('controller_config')
-            if controller:
-                archive = args.output / 's3' / run_id / 'results/controller.tar.gz'
-                if not archive.is_file():
-                    core.dump(args.output / 'campaign-validation.json', dict(complete=False,
-                        benchmark_complete=None, monitoring_complete=None, raw_export_available=False,
-                        lifecycle_error='activated campaign has no retained controller export'))
-                    return 1
-                campaign.validate_results(controller)
-            return 0 if complete else 1
+            return 0 if validate_cleanup_results(campaign, complete) else 1
         preflight = live_preflight(aws, cfg)
         core.dump(args.output / 'live-preflight.json', preflight)
         def interrupted(number, frame):
