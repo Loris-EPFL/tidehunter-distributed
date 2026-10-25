@@ -627,6 +627,17 @@ invented metrics. `cleanup-validation.json` reports verified resource closure
 independently. A successful cleanup is not a successful benchmark; unsafe or
 tampered export evidence is still rejected.
 
+Atomic allocation attaches the six distinct instance profiles after launch.
+The KV installer now mirrors the retained
+[Sui atomic bootstrap's post-profile agent restart](../aws-sharded-wal/atomic_start.py#L285):
+after its private bundle download and runtime admission prove profile access,
+it restarts the already-running SSM Agent before publishing readiness.
+[AWS documents role discovery or agent restart after role attachment](https://repost.aws/knowledge-center/assign-iam-role-ec2-instance).
+`ssm-agent-profile-refresh.json` records this process activation, **not** successful
+managed-node registration. The controller must still obtain real command
+acceptance within its existing bound; neither timeouts nor IAM policies are
+relaxed. The real registration path cannot be validated on a non-EC2 laptop.
+
 Design anchors: Tidehunter paper §§3/6 (`../papers/parsed/Tidehunter-2026-v2.md`
 relative to the containing project) separates Value-WAL/index publication,
 materialized-value reads and fill/measurement phases; native source remains
