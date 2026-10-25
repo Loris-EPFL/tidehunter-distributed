@@ -615,6 +615,7 @@ struct WorkerRequest {
 
 struct WorkerCompletion {
     id: u64,
+    worker_index: usize,
     sample: Sample,
 }
 
@@ -630,6 +631,8 @@ struct PendingOperation {
 struct WorkerPool {
     senders: Vec<std_mpsc::SyncSender<WorkerRequest>>,
     next_worker: usize,
+    idle_workers: Vec<usize>,
+    closed_loop: bool,
     completions: mpsc::Receiver<WorkerCompletion>,
     workers: Vec<JoinHandle<()>>,
     pending: std::collections::HashMap<u64, PendingOperation>,
@@ -647,6 +650,12 @@ impl WorkerPool {
         require_present_reads: bool,
     ) -> BackendResult<Self> {
         let (completion_tx, completions) = mpsc::channel(config.execution.queue_capacity.max(1));
+        let closed_loop = config.execution.mode == ExecutionMode::ClosedLoop;
+        let mut idle_workers = Vec::new();
+        if closed_loop {
+            idle_workers.reserve(config.execution.concurrency);
+            idle_workers.extend((0..config.execution.concurrency).rev());
+        }
         let mut senders = Vec::with_capacity(config.execution.concurrency);
         let mut workers = Vec::with_capacity(config.execution.concurrency);
         let per_worker_capacity = config
@@ -689,7 +698,14 @@ impl WorkerPool {
                                 require_present_reads,
                                 dispatch_timestamp,
                             ));
-                            if tx.blocking_send(WorkerCompletion { id, sample }).is_err() {
+                            if tx
+                                .blocking_send(WorkerCompletion {
+                                    id,
+                                    worker_index,
+                                    sample,
+                                })
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -701,6 +717,8 @@ impl WorkerPool {
         Ok(Self {
             senders,
             next_worker: 0,
+            idle_workers,
+            closed_loop,
             completions,
             workers,
             pending: std::collections::HashMap::default(),
@@ -736,29 +754,49 @@ impl WorkerPool {
             global_deadline: deadline,
             dispatch_timestamp: Arc::clone(&dispatch_timestamp),
         };
-        for offset in 0..self.senders.len() {
-            let index = (self.next_worker + offset) % self.senders.len();
-            match self.senders[index].try_send(request) {
-                Ok(()) => {
-                    self.next_worker = (index + 1) % self.senders.len();
-                    self.pending.insert(
-                        id,
-                        PendingOperation {
-                            operation,
-                            logical_keys,
-                            bytes,
-                            phase,
-                            scheduled_ns,
-                            dispatch_timestamp,
-                        },
-                    );
-                    return Ok(());
+        'dispatch: {
+            if self.closed_loop {
+                let Some(index) = self.idle_workers.pop() else {
+                    return Err(request.work);
+                };
+                match self.senders[index].try_send(request) {
+                    Ok(()) => break 'dispatch,
+                    Err(std_mpsc::TrySendError::Full(returned)) => {
+                        self.idle_workers.push(index);
+                        return Err(returned.work);
+                    }
+                    Err(std_mpsc::TrySendError::Disconnected(returned)) => {
+                        return Err(returned.work);
+                    }
                 }
-                Err(std_mpsc::TrySendError::Full(returned)) => request = returned,
-                Err(std_mpsc::TrySendError::Disconnected(returned)) => return Err(returned.work),
             }
+            for offset in 0..self.senders.len() {
+                let index = (self.next_worker + offset) % self.senders.len();
+                match self.senders[index].try_send(request) {
+                    Ok(()) => {
+                        self.next_worker = (index + 1) % self.senders.len();
+                        break 'dispatch;
+                    }
+                    Err(std_mpsc::TrySendError::Full(returned)) => request = returned,
+                    Err(std_mpsc::TrySendError::Disconnected(returned)) => {
+                        return Err(returned.work);
+                    }
+                }
+            }
+            return Err(request.work);
         }
-        Err(request.work)
+        self.pending.insert(
+            id,
+            PendingOperation {
+                operation,
+                logical_keys,
+                bytes,
+                phase,
+                scheduled_ns,
+                dispatch_timestamp,
+            },
+        );
+        Ok(())
     }
 
     fn record_completion(
@@ -771,6 +809,9 @@ impl WorkerPool {
             let _ = self.record_unknown_pending(reporter);
             self.shutdown(false);
             return Err(error);
+        }
+        if self.closed_loop {
+            self.idle_workers.push(completion.worker_index);
         }
         Ok(())
     }
@@ -1639,6 +1680,44 @@ mod tests {
             Ok(())
         }
     }
+    struct GatedBackend {
+        calls: AtomicUsize,
+        slow_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        slow_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    impl KvBackend for GatedBackend {
+        fn info(&self) -> BackendInfo {
+            MemoryBackend::new(false, false).info()
+        }
+
+        async fn get(&self, _key: &[u8]) -> BackendResult<Option<Bytes>> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                if let Some(started) = self.slow_started.lock().unwrap().take() {
+                    let _ = started.send(());
+                }
+                let release = { self.slow_release.lock().unwrap().take().unwrap() };
+                let _ = release.await;
+            }
+            Ok(Some(Bytes::from_static(b"value")))
+        }
+
+        async fn put(&self, _key: Bytes, _value: Bytes) -> BackendResult<()> {
+            Ok(())
+        }
+
+        async fn delete(&self, _key: Bytes) -> BackendResult<()> {
+            Ok(())
+        }
+
+        async fn get_many(&self, keys: &[Bytes]) -> BackendResult<Vec<Option<Bytes>>> {
+            Ok(vec![None; keys.len()])
+        }
+
+        async fn put_batch(&self, _entries: &[(Bytes, Bytes)]) -> BackendResult<()> {
+            Ok(())
+        }
+    }
 
     fn read_test_config() -> RunConfig {
         let mut config: RunConfig = serde_json::from_str(include_str!("../example.json")).unwrap();
@@ -1674,6 +1753,85 @@ mod tests {
         ));
         std::fs::create_dir(&path).unwrap();
         path
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_worker_starts_replacement_while_first_request_is_gated() {
+        let directory = result_directory("idle-worker-progress");
+        let output = directory.join("result");
+        let mut config: RunConfig = serde_json::from_str(include_str!("../example.json")).unwrap();
+        config.execution.concurrency = 2;
+        config.execution.queue_capacity = 2;
+        config.execution.request_timeout_ms = 30_000;
+        let (slow_started_tx, slow_started_rx) = tokio::sync::oneshot::channel();
+        let (slow_release_tx, slow_release_rx) = tokio::sync::oneshot::channel();
+        let backend = Arc::new(GatedBackend {
+            calls: AtomicUsize::new(0),
+            slow_started: Mutex::new(Some(slow_started_tx)),
+            slow_release: Mutex::new(Some(slow_release_rx)),
+        });
+        let mut reporter = Reporter::create(
+            &output,
+            prometheus::Registry::new(),
+            "gated-test".to_owned(),
+        )
+        .unwrap();
+        let origin = Instant::now();
+        let deadline = origin + Duration::from_secs(30);
+        let mut pool = WorkerPool::new(&backend, &config, &[0; 16], origin, false).unwrap();
+        let read = |id| WorkItem {
+            operation: OperationKind::Read,
+            keys: vec![id],
+        };
+
+        pool.try_dispatch(read(0), "measurement", 0, deadline)
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), slow_started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        pool.try_dispatch(read(1), "measurement", 0, deadline)
+            .unwrap();
+        let fast = tokio::time::timeout(Duration::from_secs(5), pool.receive())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fast.id, 1);
+        pool.record_completion(fast, &mut reporter).unwrap();
+
+        pool.try_dispatch(read(2), "measurement", 0, deadline)
+            .unwrap();
+        let replacement = tokio::time::timeout(Duration::from_secs(5), pool.receive()).await;
+        let (replacement, completed_while_slow_pending) = match replacement {
+            Ok(Ok(completion)) => {
+                let completion_id = completion.id;
+                (
+                    Some(completion),
+                    completion_id == 2 && pool.pending.contains_key(&0),
+                )
+            }
+            Ok(Err(_)) | Err(_) => (None, false),
+        };
+        let _ = slow_release_tx.send(());
+        let slow = pool.receive().await.unwrap();
+        let slow_id = slow.id;
+        pool.record_completion(slow, &mut reporter).unwrap();
+        let replacement_id = if let Some(completion) = replacement {
+            let id = completion.id;
+            pool.record_completion(completion, &mut reporter).unwrap();
+            id
+        } else {
+            let completion = pool.receive().await.unwrap();
+            let id = completion.id;
+            pool.record_completion(completion, &mut reporter).unwrap();
+            id
+        };
+        pool.shutdown(true);
+        drop(pool);
+        drop(reporter);
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(completed_while_slow_pending);
+        assert_eq!(slow_id, 0);
+        assert_eq!(replacement_id, 2);
     }
 
     #[tokio::test]

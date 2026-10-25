@@ -4,6 +4,9 @@ These adapters are standalone application-level KV comparators; they do not repl
 
 For a normal run with a complete preload and no configured workload deletes, ordinary `get` and every `get_many` element must be present and match its deterministic full value; an absent result is a `wrong_value` outcome. Without preload, or when the workload can delete keys, absence remains valid. Explicit `missing_read` always expects absence. Ordered `get_many` checks preserve both result count and the value for each corresponding input key.
 
+Closed-loop dispatch now sends work only to an idle worker and returns a worker to the available set when its completion is consumed. Earlier runner artifacts used round-robin private queues, which could place a request behind a busy worker while another worker was idle; closed-loop throughput and latency from that runner can therefore be confounded by head-of-line scheduling, especially for asymmetric request times. Open-loop arrival timing and its bounded per-worker queues are unchanged.
+
+
 
 
 Security is a workload dimension, not an equivalence claim: the existing native TCP adapter uses mTLS, TiKV RawKV currently uses plaintext, CQL reports either plaintext or CA-verified TLS, and FoundationDB reports negotiated transport/trust as unverified from its live status. Runs with different trust modes must remain explicitly labeled and are not security-matched comparisons. The three `validate_options` entrypoints are pure JSON parsing/semantic validation, share their deny-unknown-fields parser with `open`, and do not inspect live endpoints or generated files. In particular, FDB preflight validates only that `cluster_file` is a nonempty UTF-8 path; its presence is checked only when opening the backend after lifecycle preparation.

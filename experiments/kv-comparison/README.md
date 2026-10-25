@@ -573,6 +573,12 @@ or missing members of read-many groups then fail instead of inflating successful
 goodput. Delete-capable and unpreloaded workloads retain valid absence semantics.
 Historical exports made before this oracle fix remain unchanged; their success
 counts alone do not certify that every expected value was present.
+Current closed-loop dispatch also replenishes an idle worker rather than placing
+a replacement behind a busy worker's private queue. Older concurrent closed-loop
+throughput and response times can include that scheduling bias. This does not
+explain single-outstanding-request latency or separate Sui checkpoint results.
+The open-loop arrival schedule, admission bound and rejection semantics remain
+unchanged.
 
 Design anchors: Tidehunter paper §§3/6 (`../papers/parsed/Tidehunter-2026-v2.md`
 relative to the containing project) separates Value-WAL/index publication,
