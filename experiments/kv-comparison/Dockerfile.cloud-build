@@ -1,0 +1,34 @@
+# amd64 Ubuntu24.04 manifest resolved from Docker Hub, not a floating tag.
+# Rust1.90 is mounted read-only from the existing toolchain; Cargo uses only
+# mounted registry/git caches and --frozen during the network-disabled build.
+FROM ubuntu@sha256:a2d43bffc46670d7108bb3c0468c67c5557c4c92e83e1e34cbff1322ad1b94dc
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+# Signed immutable apt snapshot. Priority1001 permits coherent dependency
+# downgrades if the pinned base contains a newer Ubuntu security update.
+# The minimal base has no CA bundle. Bootstrap only ca-certificates using apt's
+# existing Ubuntu archive signing keys (NEVER allow unauthenticated packages),
+# then restore normal HTTPS verification for every remaining download.
+RUN rm -f /etc/apt/sources.list.d/ubuntu.sources && \
+    printf 'deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/20251001T000000Z/ noble main universe\ndeb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/20251001T000000Z/ noble-updates main universe\ndeb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/20251001T000000Z/ noble-security main universe\n' > /etc/apt/sources.list && \
+    printf 'Package: *\nPin: origin snapshot.ubuntu.com\nPin-Priority: 1001\n' > /etc/apt/preferences.d/frozen && \
+    timeout 180 apt-get -o Acquire::Retries=2 -o Acquire::https::Timeout=30 -o Acquire::https::Verify-Peer=false update && \
+    timeout 180 apt-get -o Acquire::https::Verify-Peer=false --allow-downgrades install -y --no-install-recommends ca-certificates && \
+    timeout 600 apt-get --allow-downgrades install -y --no-install-recommends \
+      ca-certificates curl build-essential pkg-config libclang-dev clang cmake \
+      python3 libssl-dev liblzma-dev zlib1g-dev rdma-core libibverbs-dev libnuma-dev \
+      autoconf automake libtool debhelper libnl-3-dev libnl-route-3-dev && \
+    rm -rf /var/lib/apt/lists/*
+# Same installer as the EC2 bootstrap. Do not substitute upstream/system
+# libfabric: direct-EFA requires provider206.0/protocol1; ordinary EFA uses protocol4.
+RUN timeout 330 curl --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 300 --max-filesize 650132335 --retry 2 \
+      -fsS https://efa-installer.amazonaws.com/aws-efa-installer-1.50.0.tar.gz -o /tmp/efa.tar.gz && \
+    echo 'fa6dff8593d866866c13cb4640d9059835cd4efa427971f100ab40c97bef2841  /tmp/efa.tar.gz' | sha256sum -c - && \
+    tar -xzf /tmp/efa.tar.gz -C /tmp && \
+    cd /tmp/aws-efa-installer && timeout 600 ./efa_installer.sh -y --skip-kmod --skip-mpi && \
+    rm -rf /tmp/aws-efa-installer /tmp/efa.tar.gz && \
+    dpkg-query -W > /opt/cloud-build-packages.txt
+ENV PATH=/rust/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    CARGO_HOME=/cargo RUSTC=/rust/bin/rustc PYTHONDONTWRITEBYTECODE=1
+WORKDIR /work
+ENTRYPOINT ["python3", "/package/experiments/kv-comparison/cloud_package.py", "build"]
