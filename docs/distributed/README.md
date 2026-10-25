@@ -6,9 +6,19 @@ Started 6 October 2026 in a separate checkout named `tidehunter-sharded-wal`.
 [Experimental protocol, guarantee tiers and source mapping](KV_COMPARISON_PROTOCOL.md).
 The local framework under `benchmarks/kv-research` and
 `experiments/kv-comparison` separates embedded references, distributed client
-APIs, workload outcomes and observational telemetry. Prometheus/Grafana are
-local tools; credential-free comparison CI does not activate the protected AWS
-campaign. One shared laptop SSD is not independent-NVMe or EFA evidence.
+APIs, workload outcomes and observational telemetry.
+[Campaign and local Prometheus/Grafana monitoring](../../experiments/kv-comparison/observability/README.md)
+now supports explicit fleet targets, private live access and real offline TSDB
+replay. The campaign observer is cohosted, not an independent measured host.
+Credential-free comparison CI does not activate the protected AWS campaign.
+One shared laptop SSD is not independent-NVMe or EFA evidence.
+
+**AWS comparison report, 25 October 2026:**
+[All-eight-system graphs, complete numeric results and evidence-qualified explanations](reports/2026-10-25-kv-comparison/REPORT.md).
+Native, TCP, EFA, EFA-direct, EFA-native, TiKV, Cassandra and FoundationDB have
+two matched primary repetitions. The bounded campaign is incomplete; failed
+FoundationDB cold preloads and missing repetitions remain explicit. PNG/PDF
+figures and their source-point CSV are generated offline; the fleet is closed.
 
 **Cloud/local correctness automation:**
 [Shared test commands, Codex Cloud setup and EFA hardware limits](CLOUD_AND_CI_TESTING.md).
