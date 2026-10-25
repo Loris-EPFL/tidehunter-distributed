@@ -36,7 +36,7 @@ GOODPUT = ("success_calls_per_second", "success_logical_keys_per_second",
            "success_value_mib_per_second")
 BASE_CAPTION = (
     "Points: median of matched per-repeat values; whiskers: observed run min/max, NOT confidence intervals. "
-    "No pooled quantiles; N=2 supports no confidence claim. Successful latency is conditional on operation/outcome. "
+    "No pooled quantiles; few repetitions support no confidence claim. Successful latency is conditional on operation/outcome. "
     "RF1 does not equalize consistency, durability, security, or transaction semantics. "
     "Primary RF1 only: native uses value_wal_barrier and TH explicit caches are off; other cohorts use their stated settings. "
     "Warm OS is not guaranteed cache residency. Tail quantiles are descriptive, including small populations."
