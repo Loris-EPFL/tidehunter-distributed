@@ -144,8 +144,9 @@ class Dataset:
             if case["status"] not in ("completed", "failed", "not_run"):
                 raise ValueError("unknown case status")
             if case["status"] != "completed":
-                if case.get("metrics") is not None:
-                    raise ValueError("failed/missing case must not carry performance metrics")
+                # Failed measurements remain diagnostics, never performance points.
+                if case["status"] == "not_run" and case.get("metrics") is not None:
+                    raise ValueError("not-run case must not carry performance metrics")
                 continue
             if case.get("backend", {}).get("name") != OBSERVED_NAMES.get(backend, backend):
                 raise ValueError("job and observed backend differ")
@@ -267,7 +268,7 @@ def figure_specs():
          for operation in ("read", "put")], 3,
         "Success and rejected populations are NEVER mixed. API is dispatch-to-completion; response is scheduled-arrival-to-completion; "
         "scheduling is arrival-to-dispatch. Rejected arrivals have response only (API/scheduling undefined). "
-        "Rejected-response points require a timed rejection in BOTH matched repeats; missing populations are gaps, not zeros. "
+        "Rejected-response points require a timed rejection in every matched repeat; missing populations are gaps, not zeros. "
         "Read with offered-load-accounting; fast conditional tails alone do not imply accepting offered load. ", "offered")
     zipf = []
     for backend in BACKENDS:
@@ -299,12 +300,12 @@ def figure_specs():
         "Cumulative path counters include preload/warmup/qualification and are not timing fractions. ")
     cold = [{"label": STYLES[backend][0], "backend": backend,
              "cells": [(backend, "cold_os_cache", "cold-os-large", 65536)], "x": [i]}
-            for i, backend in enumerate(BACKENDS) if backend != "foundationdb"]
-    add("cold-os-cache", "Cold-OS-cache protocol — 64 KiB reads, c16; 7 available systems", cold,
+            for i, backend in enumerate(BACKENDS)]
+    add("cold-os-cache", "Cold-OS-cache protocol — 64 KiB reads, c16", cold,
         [panel("API p50", "api_ns", "read", "p50"), panel("API p99", "api_ns", "read")] + goodput_panels(), 3,
         "8 GiB value preload, no warmup, cache-drop gate. Cold OS does NOT mean isolated NVMe/device latency: engine and controller caches, "
-        "network, scheduling and metadata may contribute. FoundationDB unavailable: all three preloads failed before measurement; "
-        "no latency/goodput zero is invented. Seven-system matched r0/r1 cohort is explicitly separate from primary. ",
+        "network, scheduling and metadata may contribute. Systems need at least two completed cold repeats to enter this separate cohort; "
+        "all plotted systems share matched repeats and exclusions remain explicit. Missing results are never plotted as zero. ",
         "backend", [STYLES[name][0] for name in BACKENDS])
     native = []
     for cohort, suffix in (("primary_rf1", " / WAL barrier"), ("native_pagecache", " / pagecache")):
@@ -327,6 +328,18 @@ def figure_specs():
 def build_figures(dataset):
     figures, omitted = [], []
     for spec in figure_specs():
+        unavailable = []
+        if spec["name"] == "cold-os-cache":
+            available = []
+            for series in spec["series"]:
+                cell = series["cells"][0]
+                if len(dataset.completed_repeats(cell)) >= 2:
+                    available.append(series)
+                else:
+                    unavailable.append({
+                        "backend": series["backend"], "reason": "Fewer than two completed cold-OS repeats",
+                        "case_ids": [case["case_id"] for key, case in dataset.index.items() if key[:-1] == cell]})
+            spec = dict(spec, series=available)
         cells = list(dict.fromkeys(cell for series in spec["series"] for cell in series["cells"]))
         try:
             repeats = dataset.matched_repeats(cells)
@@ -360,8 +373,7 @@ def build_figures(dataset):
         result["case_ids"] = sorted(used)
         result["caption"] += BASE_CAPTION
         if spec["name"] == "cold-os-cache":
-            result["unavailable_systems"] = [{"backend": "foundationdb", "reason": "No completed cold-OS cases; all 3 failed before measurement",
-                "case_ids": [case["case_id"] for case in dataset.cases if case["job"]["backend"] == "foundationdb" and case["job"]["cohort"] == "cold_os_cache"]}]
+            result["unavailable_systems"] = unavailable
         figures.append(result)
     return figures, omitted
 
@@ -527,10 +539,10 @@ def main():
                 "coverage_figure": {"files": ["coverage.png", "coverage.pdf"], "title": "Campaign coverage",
                                     "caption": "All planned statuses, all repeats; not performance points; counts in coverage and plot-data.csv"},
                 "completed_cases_not_in_figures": [case["case_id"] for case in dataset.cases if case["status"] == "completed" and case["case_id"] not in used],
-                "limitations": ["Extra FoundationDB r2 primary executions are left to the raw numeric appendix, never combined with r0/r1 main curves.",
+                "limitations": ["Unmatched repetitions remain in the raw appendix and are not pooled into matched curves.",
                                 "No raw-sample verification or independence proof beyond exported case/repeat identity; source receipts remain authoritative.",
                                 "No rejection API/scheduling latency: undispatched arrivals have no such clocks.",
-                                "No Sui checkpoint replay, isolated disk/RDMA microbenchmark, confidence inference, or new AWS run."]}
+                                "No Sui checkpoint replay, isolated disk/RDMA microbenchmark, or confidence inference; rendering is offline."]}
     (args.output / "plots.json").write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n")
     print(f"Wrote {len(figures) + 1} figure pairs, plot-data.csv and plots.json to {args.output}")
 

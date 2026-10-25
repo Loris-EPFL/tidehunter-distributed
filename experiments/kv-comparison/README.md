@@ -588,6 +588,12 @@ downloads within an 85-minute job limit. A slow package mirror previously exhaus
 the five-minute setup step before compilation. This does not extend the paid
 fleet's three-hour lifetime or enable AWS access during qualification.
 
+Plots retain validated partial failures as diagnostics and coverage, never as
+successful performance points. Cold-read availability is derived from the current
+export, not historical FoundationDB failures. Primary curves require common
+completed repeats across all requested systems; the separately labeled cold
+cohort explicitly lists excluded systems and still requires matched repeats.
+
 Design anchors: Tidehunter paper §§3/6 (`../papers/parsed/Tidehunter-2026-v2.md`
 relative to the containing project) separates Value-WAL/index publication,
 materialized-value reads and fill/measurement phases; native source remains

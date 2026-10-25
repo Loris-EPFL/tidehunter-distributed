@@ -78,6 +78,41 @@ class MatchedRepeatIntegrity(unittest.TestCase):
         self.assertEqual([item["value"] for item in point["observations"]], [100, 900])
 
 
+class ColdAvailabilityIntegrity(unittest.TestCase):
+    def cold_cases(self):
+        cases = []
+        for backend in plots.BACKENDS:
+            for repeat in (0, 1):
+                item = case(backend, repeat)
+                item["case_id"] = f"{backend}-cold-r{repeat}"
+                item["job"].update(case_id=item["case_id"], cohort="cold_os_cache",
+                                   profile="cold-os-large", value_size=65536)
+                item["metrics"]["success_value_mib_per_second"] = 10 * 65536 / 1024**2
+                cases.append(item)
+        return cases
+
+    def test_completed_foundationdb_cold_reads_are_not_historically_excluded(self):
+        figures, _ = plots.build_figures(dataset(self.cold_cases()))
+        cold = next(row for row in figures if row["name"] == "cold-os-cache")
+        self.assertEqual(cold["unavailable_systems"], [])
+        series = cold["panels"][0]["series"]
+        self.assertEqual({row["backend"] for row in series}, set(plots.BACKENDS))
+        fdb = next(row for row in series if row["backend"] == "foundationdb")
+        self.assertEqual(fdb["points"][0]["median"], 100)
+
+    def test_failed_cold_backend_has_explicit_coverage_not_a_latency_zero(self):
+        cases = self.cold_cases()
+        for item in cases:
+            if item["job"]["backend"] == "foundationdb":
+                item["status"] = "failed"
+        figures, _ = plots.build_figures(dataset(cases))
+        cold = next(row for row in figures if row["name"] == "cold-os-cache")
+        self.assertEqual([row["backend"] for row in cold["unavailable_systems"]], ["foundationdb"])
+        self.assertEqual(len(cold["unavailable_systems"][0]["case_ids"]), 2)
+        self.assertNotIn("foundationdb", {row["backend"] for row in cold["panels"][0]["series"]})
+        self.assertEqual(cold["repeats"], [0, 1])
+
+
 class MissingAndOutcomeIntegrity(unittest.TestCase):
     def test_failed_or_missing_case_is_unavailable_not_zero(self):
         data = dataset([case(repeat=0), case(repeat=1, status="failed")])
@@ -114,10 +149,27 @@ class MissingAndOutcomeIntegrity(unittest.TestCase):
         self.assertIsNone(point)
         self.assertIn("absent", reason)
 
-    def test_failed_case_cannot_carry_success_metrics(self):
+    def test_partial_failed_measurements_do_not_hide_completed_repeats(self):
+        complete = [case(repeat=repeat, populations=[population(count=20)]) for repeat in (0, 1)]
+        partial = case(repeat=2, populations=[population(p50=99999, p99=99999)])
+        partial["status"] = "failed"
+        partial["job"]["measurement_operations"] = 20
+        partial["metrics"]["planned_measurement_calls"] = 20
+        partial["metrics"]["measurement_rows_complete"] = False
+        data = dataset(complete + [partial])
+        cell = ("native", "primary_rf1", "read-concurrent", 64)
+        self.assertEqual(plots.coverage(data)["total"], {"completed": 2, "failed": 1})
+        repeats = data.matched_repeats([cell])
+        self.assertEqual(repeats, [0, 1])
+        point, reason = plots.aggregate_point(data, cell, repeats, "api_ns", "read", percentile="p50")
+        self.assertIsNone(reason)
+        self.assertEqual(point["median"], 100)
+        self.assertEqual([row["repeat"] for row in point["observations"]], [0, 1])
+
+    def test_not_run_case_cannot_carry_measurement_metrics(self):
         item = case()
-        item["status"] = "failed"
-        with self.assertRaisesRegex(ValueError, "failed/missing"):
+        item["status"] = "not_run"
+        with self.assertRaises(ValueError):
             dataset([item])
 
     def test_rejected_arrival_cannot_invent_api_latency(self):
