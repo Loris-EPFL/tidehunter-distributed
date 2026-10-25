@@ -559,6 +559,21 @@ A failed requested dependency, server, readiness or adapter exits nonzero. A tin
 single-process test proves only the functions actually exercised, not distributed
 latency, replication resilience or physical ownership scaling.
 
+The local job installs pinned boto3/PyYAML in its own virtual environment for the
+offline lifecycle tests; having the SDK installed does not grant AWS credentials.
+Local and cloud TiKV launches explicitly allow 1,048,576 open descriptors instead
+of inheriting Docker's host-dependent limit. The first PR runner inherited only
+65,536 and TiKV rejected startup before workload execution. This follows
+[TiKV's deployment prerequisite](https://docs.pingcap.com/tidb-in-kubernetes/dev/deploy-failures/#ulimit-is-not-large-enough);
+the harness does not reduce RocksDB's file budget to conceal a startup failure.
+
+Current normal-run validation also requires present values when preload covers
+the dataset and no configured operation can delete a key. Missing ordinary reads
+or missing members of read-many groups then fail instead of inflating successful
+goodput. Delete-capable and unpreloaded workloads retain valid absence semantics.
+Historical exports made before this oracle fix remain unchanged; their success
+counts alone do not certify that every expected value was present.
+
 Design anchors: Tidehunter paper §§3/6 (`../papers/parsed/Tidehunter-2026-v2.md`
 relative to the containing project) separates Value-WAL/index publication,
 materialized-value reads and fill/measurement phases; native source remains

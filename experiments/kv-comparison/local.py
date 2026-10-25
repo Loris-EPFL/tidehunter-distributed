@@ -24,6 +24,8 @@ IMAGES = {
     "cassandra": "library/cassandra:5.0.9@sha256:3ea9333712c5692f3fe91d6c4dcc262df9e36338c4fdd1bc00a5e53f1137a1a0",
     "foundationdb": "foundationdb/foundationdb:7.3.77@sha256:559b178a137bbe09272ad6e3752531aa04e2ddacab8ccfa4ffa86467db033bea",
 }
+# TiKV 8.5.4 rejects the hosted runner's inherited 65,536-descriptor limit.
+TIKV_NOFILE = 1_048_576
 
 
 def dump(path, value):
@@ -88,7 +90,8 @@ def topology(backend, layout, directory, owner):
             add(f"tikv{i}", "tikv", 2.0, "1536m", ["--addr", f"127.0.0.1:{20160+i}",
                 "--advertise-addr", f"127.0.0.1:{20160+i}", "--status-addr", f"127.0.0.1:{20180+i}",
                 "--pd", "127.0.0.1:2379", "--data-dir", "/data", "--config", "/config/tikv.toml",
-                "--labels", f"zone=local-process-{i}"])
+                "--labels", f"zone=local-process-{i}"],
+                ulimits={"nofile": {"soft": TIKV_NOFILE, "hard": TIKV_NOFILE}})
             services[f"tikv{i}"]["volumes"].append(str(directory / "tikv.toml") + ":/config/tikv.toml:ro")
     elif backend == "cassandra":
         for i in range(count):

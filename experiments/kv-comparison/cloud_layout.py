@@ -111,6 +111,8 @@ def node_config(fleet, backend, index):
         argv = ["docker", "run", "--detach", "--name", name, "--network", "host", "--restart", "no",
                 "--cpus", str(cpus), "--memory", f"{memory}m", "--memory-swap", f"{memory}m", "--pids-limit", "1024",
                 "--log-opt", "max-size=8m", "--log-opt", "max-file=2"]
+        if image == "tikv":
+            argv += ["--ulimit", f"nofile={local.TIKV_NOFILE}:{local.TIKV_NOFILE}"]
         for key, value in labels.items():
             argv += ["--label", key + "=" + value]
         # Bind rather than -v: Docker must never silently create an absent host path.
