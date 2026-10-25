@@ -84,6 +84,8 @@ pub async fn run<B: KvBackend>(
         config.workload.batch_size,
         config.workload.distribution.clone(),
     );
+    let require_present_reads =
+        !config.qualification_only && config.phases.preload && config.workload.mix.delete == 0;
     if fatal_reason.is_none() && !config.qualification_only && config.phases.preload {
         reporter.set_phase("preload");
         match preload(
@@ -120,6 +122,7 @@ pub async fn run<B: KvBackend>(
             count,
             started,
             deadline,
+            require_present_reads,
             &mut reporter,
         )
         .await
@@ -151,6 +154,7 @@ pub async fn run<B: KvBackend>(
                 config.phases.measurement_operations,
                 started,
                 deadline,
+                require_present_reads,
                 &mut reporter,
             )
             .await
@@ -264,7 +268,7 @@ async fn preload<B: KvBackend>(
     deadline: Instant,
     reporter: &mut Reporter,
 ) -> BackendResult<()> {
-    let mut pool = WorkerPool::new(&backend, config, namespace, origin)?;
+    let mut pool = WorkerPool::new(&backend, config, namespace, origin, false)?;
     let drain_deadline = deadline + Duration::from_secs(config.limits.shutdown_grace_seconds);
     let mut next_snapshot = Instant::now() + Duration::from_secs(1);
     let mut expired = false;
@@ -640,6 +644,7 @@ impl WorkerPool {
         config: &RunConfig,
         namespace: &[u8; 16],
         origin: Instant,
+        require_present_reads: bool,
     ) -> BackendResult<Self> {
         let (completion_tx, completions) = mpsc::channel(config.execution.queue_capacity.max(1));
         let mut senders = Vec::with_capacity(config.execution.concurrency);
@@ -681,6 +686,7 @@ impl WorkerPool {
                                 scheduled_ns,
                                 origin,
                                 global_deadline,
+                                require_present_reads,
                                 dispatch_timestamp,
                             ));
                             if tx.blocking_send(WorkerCompletion { id, sample }).is_err() {
@@ -912,9 +918,10 @@ async fn run_phase<B: KvBackend>(
     count: u64,
     origin: Instant,
     deadline: Instant,
+    require_present_reads: bool,
     reporter: &mut Reporter,
 ) -> BackendResult<()> {
-    let mut pool = WorkerPool::new(&backend, config, namespace, origin)?;
+    let mut pool = WorkerPool::new(&backend, config, namespace, origin, require_present_reads)?;
     let phase_start = Instant::now();
     let mut scheduled_index = 0_u64;
     let mut phase_expired = false;
@@ -1110,6 +1117,7 @@ async fn execute_item<B: KvBackend>(
     scheduled: u64,
     origin: Instant,
     deadline: Instant,
+    require_present_reads: bool,
     dispatch_timestamp: Arc<AtomicU64>,
 ) -> Sample {
     let operation = work.operation;
@@ -1215,9 +1223,10 @@ async fn execute_item<B: KvBackend>(
                 BackendResponse::Read(value) => {
                     let absent = value.is_none();
                     let valid = operation == OperationKind::MissingRead
-                        || value
-                            .as_ref()
-                            .is_none_or(|actual| actual.as_ref() == entries[0].1.as_ref());
+                        || match value.as_ref() {
+                            Some(actual) => actual.as_ref() == entries[0].1.as_ref(),
+                            None => !require_present_reads,
+                        };
                     let returned_bytes = value.as_ref().map_or(0, |v| v.len() as u64);
                     let outcome = if operation == OperationKind::MissingRead {
                         if absent {
@@ -1234,6 +1243,8 @@ async fn execute_item<B: KvBackend>(
                         String::new()
                     } else if operation == OperationKind::MissingRead {
                         "missing-key read returned a value".to_owned()
+                    } else if value.is_none() && require_present_reads {
+                        "read returned no value for a preloaded key".to_owned()
                     } else {
                         "read bytes differ from deterministic payload".to_owned()
                     };
@@ -1242,9 +1253,10 @@ async fn execute_item<B: KvBackend>(
                 BackendResponse::Many(values) => {
                     let valid_count = values.len() == work.keys.len();
                     let valid_values = values.iter().zip(&entries).all(|(actual, expected)| {
-                        actual
-                            .as_ref()
-                            .is_none_or(|value| value.as_ref() == expected.1.as_ref())
+                        match actual.as_ref() {
+                            Some(value) => value.as_ref() == expected.1.as_ref(),
+                            None => !require_present_reads,
+                        }
                     });
                     let valid = valid_count && valid_values;
                     (
@@ -1257,7 +1269,8 @@ async fn execute_item<B: KvBackend>(
                         if valid {
                             String::new()
                         } else {
-                            "get_many result count or ordered value bytes differ".to_owned()
+                            "get_many result count, presence, or ordered value bytes differ"
+                                .to_owned()
                         },
                     )
                 }
@@ -1507,11 +1520,14 @@ mod tests {
     use crate::backend::BackendInfo;
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
 
     struct MemoryBackend {
         data: Mutex<HashMap<Vec<u8>, Bytes>>,
         corrupt_reads: bool,
         reverse_groups: bool,
+        omit_put_number: Option<usize>,
+        put_count: AtomicUsize,
     }
 
     impl MemoryBackend {
@@ -1520,7 +1536,21 @@ mod tests {
                 data: Mutex::new(HashMap::new()),
                 corrupt_reads,
                 reverse_groups,
+                omit_put_number: None,
+                put_count: AtomicUsize::new(0),
             }
+        }
+
+        fn omitting_put(number: usize) -> Self {
+            Self {
+                omit_put_number: Some(number),
+                ..Self::new(false, false)
+            }
+        }
+
+        fn should_omit_put(&self) -> bool {
+            self.put_count.fetch_add(1, Ordering::Relaxed)
+                == self.omit_put_number.unwrap_or(usize::MAX)
         }
 
         fn actual_value(&self, value: Bytes) -> Bytes {
@@ -1560,10 +1590,12 @@ mod tests {
         }
 
         async fn put(&self, key: Bytes, value: Bytes) -> BackendResult<()> {
-            self.data
-                .lock()
-                .map_err(|_| invalid("poisoned test store"))?
-                .insert(key.as_ref().to_vec(), value);
+            if !self.should_omit_put() {
+                self.data
+                    .lock()
+                    .map_err(|_| invalid("poisoned test store"))?
+                    .insert(key.as_ref().to_vec(), value);
+            }
             Ok(())
         }
 
@@ -1600,10 +1632,160 @@ mod tests {
                 .lock()
                 .map_err(|_| invalid("poisoned test store"))?;
             for (key, value) in entries {
-                data.insert(key.as_ref().to_vec(), value.clone());
+                if !self.should_omit_put() {
+                    data.insert(key.as_ref().to_vec(), value.clone());
+                }
             }
             Ok(())
         }
+    }
+
+    fn read_test_config() -> RunConfig {
+        let mut config: RunConfig = serde_json::from_str(include_str!("../example.json")).unwrap();
+        config.dataset.keys = 1;
+        config.dataset.value_size = 256;
+        config.workload.batch_size = 2;
+        config.workload.mix = crate::config::OperationMix {
+            read: 1,
+            ..crate::config::OperationMix::default()
+        };
+        config.phases.warmup_operations = 0;
+        config.phases.aging_operations = 0;
+        config.phases.measurement_operations = 1;
+        config.execution.request_timeout_ms = 1000;
+        config.limits.deadline_seconds = 30;
+        config
+    }
+
+    fn measurement_outcomes(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path.join("samples.csv"))
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("measurement,"))
+            .map(|line| line.split(',').nth(2).unwrap().to_owned())
+            .collect()
+    }
+
+    fn result_directory(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "kv-research-{name}-{}-{}",
+            std::process::id(),
+            hex(&fresh_namespace().unwrap())
+        ));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn full_preload_missing_scalar_read_is_wrong_value() {
+        let directory = result_directory("full-preload-missing-read");
+        let mut config = read_test_config();
+        config.phases.preload = true;
+        let output = directory.join("result");
+        let result = run(
+            MemoryBackend::omitting_put(5),
+            config,
+            &output,
+            prometheus::Registry::new(),
+        )
+        .await;
+        let outcomes = measurement_outcomes(&output);
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(result.is_err());
+        assert_eq!(outcomes, ["wrong_value"]);
+    }
+
+    #[tokio::test]
+    async fn full_preload_missing_get_many_value_is_wrong_value() {
+        let directory = result_directory("full-preload-missing-many");
+        let mut config = read_test_config();
+        config.dataset.keys = 2;
+        config.workload.mix = crate::config::OperationMix {
+            get_many: 1,
+            ..crate::config::OperationMix::default()
+        };
+        config.seed = (0..10_000)
+            .find(|seed| {
+                let mut generator = WorkloadGenerator::new(
+                    *seed ^ 0x6b76_7265_7365_6172,
+                    config.dataset.keys,
+                    config.workload.mix.clone(),
+                    config.workload.batch_size,
+                    config.workload.distribution.clone(),
+                );
+                let keys = generator.next_item().unwrap().keys;
+                keys.contains(&0) && keys.contains(&1)
+            })
+            .expect("small deterministic seed search finds both dataset keys");
+        let output = directory.join("result");
+        let result = run(
+            MemoryBackend::omitting_put(5),
+            config,
+            &output,
+            prometheus::Registry::new(),
+        )
+        .await;
+        let outcomes = measurement_outcomes(&output);
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(result.is_err());
+        assert_eq!(outcomes, ["wrong_value"]);
+    }
+
+    #[tokio::test]
+    async fn partial_preload_missing_scalar_read_remains_success() {
+        let directory = result_directory("partial-preload-missing-read");
+        let mut config = read_test_config();
+        config.phases.preload = false;
+        let output = directory.join("result");
+        let result = run(
+            MemoryBackend::new(false, false),
+            config,
+            &output,
+            prometheus::Registry::new(),
+        )
+        .await;
+        let outcomes = measurement_outcomes(&output);
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(result.is_ok());
+        assert_eq!(outcomes, ["success"]);
+    }
+
+    #[tokio::test]
+    async fn aging_delete_keeps_later_missing_read_valid() {
+        let directory = result_directory("aging-delete-missing-read");
+        let mut config = read_test_config();
+        config.workload.mix = crate::config::OperationMix {
+            read: 1,
+            delete: 1,
+            ..crate::config::OperationMix::default()
+        };
+        config.phases.aging_operations = 1;
+        config.phases.measurement_operations = 1;
+        config.seed = (0..10_000)
+            .find(|seed| {
+                let mut generator = WorkloadGenerator::new(
+                    *seed ^ 0x6b76_7265_7365_6172,
+                    config.dataset.keys,
+                    config.workload.mix.clone(),
+                    config.workload.batch_size,
+                    config.workload.distribution.clone(),
+                );
+                generator.next_item().unwrap().operation == OperationKind::Delete
+                    && generator.next_item().unwrap().operation == OperationKind::Read
+            })
+            .expect("small deterministic seed search finds delete then read");
+        let output = directory.join("result");
+        let result = run(
+            MemoryBackend::new(false, false),
+            config,
+            &output,
+            prometheus::Registry::new(),
+        )
+        .await;
+        let outcomes = measurement_outcomes(&output);
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(result.is_ok());
+        assert_eq!(outcomes, ["success"]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
