@@ -35,7 +35,7 @@ jobs:
   qualification:
     runs-on: ubuntu-24.04
     # Cover bounded setup/build/qualification plus cleanup and artifact upload.
-    timeout-minutes: 75
+    timeout-minutes: 85
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -50,7 +50,7 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-${{ runner.arch }}-kv-rust-1.90-${{ hashFiles('Cargo.lock') }}
       - name: Prepare explicit native build prerequisites
-        timeout-minutes: 5
+        timeout-minutes: 15
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/kv-results"

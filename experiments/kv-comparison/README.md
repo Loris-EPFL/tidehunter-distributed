@@ -583,6 +583,11 @@ TiKV repetition matching uses the adapter's `tikv_raw` identity. It retains
 configured placement/version while excluding volatile store IDs and heartbeat
 observations; the original deployment evidence remains unchanged.
 
+Credential-free CI qualification allows 15 minutes for native prerequisite
+downloads within an 85-minute job limit. A slow package mirror previously exhausted
+the five-minute setup step before compilation. This does not extend the paid
+fleet's three-hour lifetime or enable AWS access during qualification.
+
 Design anchors: Tidehunter paper §§3/6 (`../papers/parsed/Tidehunter-2026-v2.md`
 relative to the containing project) separates Value-WAL/index publication,
 materialized-value reads and fill/measurement phases; native source remains
