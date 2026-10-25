@@ -1,0 +1,40 @@
+[package]
+name = "kv-research"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+tidehunter = { path = "../../tidehunter", features = ["experimental-distributed"] }
+serde = { version = "1.0.208", features = ["derive"] }
+serde_json = "1.0.140"
+serde_yaml = "0.9.21"
+rand = { workspace = true }
+tokio = { version = "1.45.1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+prometheus = { workspace = true }
+blake2 = "0.10.6"
+libc = { workspace = true }
+
+tikv-client = { version = "=0.4.0", default-features = false, optional = true }
+tonic = { version = "0.10", default-features = false, optional = true }
+scylla = { version = "=1.9.0", features = ["rustls-023"], optional = true }
+foundationdb = { version = "=0.11.0", default-features = false, features = ["fdb-7_3", "embedded-fdb-include"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+rocksdb = { version = "0.21", optional = true }
+# Match the engine's explicit ring provider; do not enable a second default provider.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+
+[features]
+default = []
+tikv = ["dep:tikv-client", "dep:reqwest", "dep:tonic"]
+cassandra = ["dep:scylla", "dep:rustls", "dep:rustls-pemfile"]
+foundationdb = ["dep:foundationdb"]
+rocksdb = ["dep:rocksdb"]
+# Explicitly opt in to real libfabric/EFA transports; disabled builds still
+# reject EFA configuration rather than selecting the TCP path.
+efa = ["tidehunter/experimental-fabric"]
+test-utils = ["tidehunter/test-utils"]
+
+[lints.clippy]
+all = "warn"

@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "backend": {
+    "kind": "native",
+    "options": {
+      "path": "./kv-research-data/native"
+    }
+  },
+  "seed": 20261024,
+  "namespace": "local-example",
+  "dataset": {
+    "keys": 65536,
+    "value_size": 1024,
+    "entropy": 1.0
+  },
+  "workload": {
+    "distribution": "uniform",
+    "mix": {
+      "read": 70,
+      "put": 20,
+      "delete": 5,
+      "missing_read": 2,
+      "get_many": 3,
+      "put_batch": 0
+    },
+    "batch_size": 32
+  },
+  "execution": {
+    "mode": "closed_loop",
+    "concurrency": 16,
+    "queue_capacity": 64,
+    "request_timeout_ms": 30000
+  },
+  "phases": {
+    "preload": true,
+    "warmup_operations": 10000,
+    "aging_operations": 0,
+    "measurement_operations": 100000
+  },
+  "qualification_only": false,
+  "source_revision": null,
+  "limits": {
+    "max_keys": 1000000,
+    "max_bytes": 1073741824,
+    "max_operations": 1000000,
+    "deadline_seconds": 3600,
+    "shutdown_grace_seconds": 30
+  }
+}

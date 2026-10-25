@@ -1,0 +1,13 @@
+apiVersion: 1
+prune: true
+datasources:
+  - name: Local comparison Prometheus
+    uid: kv-comparison-prometheus
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 5s
+      httpMethod: POST

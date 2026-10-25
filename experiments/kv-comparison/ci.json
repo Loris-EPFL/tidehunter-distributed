@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "seed": 1775,
+  "repeats": 1,
+  "layout": "qualification",
+  "backends": ["native", "tidehunter_tcp", "tikv", "cassandra", "foundationdb"],
+  "profiles": [{"name": "api-qualification-only", "keys": 64, "aging_operations": 0}],
+  "rates": [100],
+  "base_config": "../../benchmarks/kv-research/example.json",
+  "client_cpus": 2,
+  "client_memory_mib": 2048,
+  "max_runs": 5
+}

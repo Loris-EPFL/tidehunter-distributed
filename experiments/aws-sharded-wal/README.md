@@ -1,3 +1,40 @@
+## Protected AWS suite selection
+
+The single paid workflow is `.github/workflows/aws-efa-benchmarks.yaml`.
+On a protected `bench/aws-efa` push, `suite.json` selects exactly one suite:
+`kv-comparison` (the committed default) or `sui-transport` (the preserved Sui
+preparation and campaign). Manual dispatch accepts `suite=configured` or one
+explicit suite. Unknown selections and non-manual overrides fail closed.
+There is no second paid push workflow and no combined/double-fleet selection.
+
+Selection and both build paths require the exact trusted repository/branch.
+`AWS_BENCH_ENABLED=true` and account-side protected-environment approvals remain
+required; committing a selector does not activate AWS. KV preparation has only
+`contents: read`, no OIDC issuance, no Sui checkout token, and no fixture access.
+Its source-bound all-adapter/EFA release and real software API qualification
+finish before artifact restoration and fleet-role credentials on another VM.
+The Sui preparation path retains its separate input-only identity.
+
+```sh
+gh workflow run aws-efa-benchmarks.yaml \
+  --repo Loris-EPFL/tidehunter-distributed --ref bench/aws-efa \
+  -f operation=benchmark -f suite=configured
+# To explicitly run the original Sui suite instead:
+# -f operation=benchmark -f suite=sui-transport
+```
+
+Both suites share non-cancelling workflow concurrency, `rdma-bench` approvals,
+`budget.json`, the S3 CAS accounting ledger, the independent expiry watchdog,
+artifact export and exact-owned cleanup. `operation=cost-report` skips all
+preparation and allocation and preserves the existing billing/reconciliation
+interface. KV uses `experiments/kv-comparison/ci-config.json` with a 10,800-second
+absolute fleet lifetime and its export reserve; the Sui config remains separate.
+The orchestration step/job allow 240/300 minutes for fleet work, retrieval and
+cleanup; fleet-role maximum session duration must admit the requested four-hour
+session. An unconditional invoked-campaign cleanup path obtains a fresh one-hour
+OIDC session before reconciliation, rather than relying on the original session.
+These are orchestration bounds, not permission to reset guest expiry.
+
 ## 24 October bounded SSM metadata and complete-matrix retry
 
 Run `40063575350` passed all 12 real Sui pairs, both native hardware `FI_READ`

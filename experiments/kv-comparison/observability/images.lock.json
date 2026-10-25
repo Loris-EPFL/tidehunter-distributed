@@ -1,0 +1,22 @@
+{
+  "resolved_on": "2026-10-24",
+  "registry": "https://registry-1.docker.io/v2/",
+  "images": {
+    "prom/prometheus": {
+      "image": "prom/prometheus:v3.13.5@sha256:aafa9d694e6a883c02db516d9f6e5b84e14195f49a2a6456a4cca815edda72b9",
+      "source": "https://hub.docker.com/r/prom/prometheus/tags?name=v3.13.5"
+    },
+    "grafana/grafana": {
+      "image": "grafana/grafana:13.2.4@sha256:dbbc38ea21103cefb50396340cd88afec779c7e070b0a7bf5a75b4ce46651d3f",
+      "source": "https://hub.docker.com/r/grafana/grafana/tags?name=13.2.4"
+    },
+    "prom/node-exporter": {
+      "image": "prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0",
+      "source": "https://hub.docker.com/r/prom/node-exporter/tags?name=v1.12.1"
+    },
+    "library/python": {
+      "image": "library/python:3.13.17-slim-bookworm@sha256:e32be0e55814a08977501ca863271d9bd02443710db8f2afaf8372e2c4508530",
+      "source": "https://hub.docker.com/r/library/python/tags?name=3.13.17-slim-bookworm"
+    }
+  }
+}

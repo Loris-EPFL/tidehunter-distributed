@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "run_id": "th-7dea3c080cb44d48",
+  "scope": "offline report/plot generation only; no new benchmark or AWS operation",
+  "source_json_sha256": "4d71203e8c760ff40446644a274acb12145a9451cb4c0d26a92ddabcaa2405b2",
+  "original_csv_sha256": "dfe591140fd9a0897b11ac0c609bf0d5627e0eb8bda28753a66592c732a91bf1",
+  "raw_numeric_rows": 1084,
+  "figure_pairs": 13,
+  "verified_plot_points": 1727,
+  "verified_original_observations": 3454,
+  "graphed_completed_r0_r1_cases": 454,
+  "extra_FDB_r2_cases_separate_numeric_only": 24,
+  "missing_or_failed_performance_zero_filled": false,
+  "local_links_checked": 68,
+  "python": "3.12.3",
+  "matplotlib": "3.11.2",
+  "regression_tests": {
+    "passed": 143,
+    "command": "python -B -m unittest discover -s experiments/kv-comparison -p test_*.py"
+  },
+  "image_dimensions": {
+    "primary-read-concurrent": [
+      2971,
+      2137
+    ],
+    "primary-write-concurrent": [
+      2973,
+      2137
+    ],
+    "primary-read-many32": [
+      2971,
+      2137
+    ],
+    "primary-point-mixed-latency": [
+      2973,
+      2862
+    ],
+    "primary-point-mixed-goodput": [
+      2973,
+      1412
+    ],
+    "offered-load-accounting": [
+      1978,
+      2137
+    ],
+    "offered-load-tails": [
+      2978,
+      2862
+    ],
+    "zipf-versus-uniform": [
+      2973,
+      1412
+    ],
+    "cache-cohorts": [
+      2976,
+      2862
+    ],
+    "cold-os-cache": [
+      2978,
+      2137
+    ],
+    "native-pagecache-latency": [
+      2973,
+      3587
+    ],
+    "native-pagecache-goodput": [
+      2971,
+      1412
+    ],
+    "coverage": [
+      3179,
+      1482
+    ]
+  },
+  "markdown_heading_anchors_checked": 3,
+  "embedded_graphs": 13,
+  "visual_review": {
+    "all_13_chart_layouts": "inspected in actual rendered contact sheet",
+    "full_resolution_examples": [
+      "primary-write-concurrent",
+      "offered-load-accounting",
+      "cache-cohorts",
+      "native-pagecache-latency",
+      "primary-point-mixed-latency",
+      "cold-os-cache"
+    ],
+    "temporary_contact_sheet": "removed after review; not a report figure"
+  },
+  "plot_script_sha256": "28baade72b85b395e4ca560ff0cdaf6300b3b4659a8d43e6f3be024ce7952846",
+  "new_test_script_sha256": "587b50efc02ca9c45f0aa460abbfb7249a3675b736403a7a3919639d4b2f8638"
+}

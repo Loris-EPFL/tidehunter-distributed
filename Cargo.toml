@@ -4,6 +4,7 @@ members = [
     "tidehunter-fabric",
     "benchmarks/random_access_speed_test",
     "benchmarks/benchmark",
+    "benchmarks/kv-research",
     "benchmarks/read_window_test",
     "benchmarks/index_benchmark",
     "benchmarks/wal_benchmark",

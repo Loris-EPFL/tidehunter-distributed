@@ -1,0 +1,1991 @@
+{
+  "uid": "kv-comparison-campaign",
+  "title": "KV campaign \u2014 one case and retained timeline",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "timezone": "utc",
+  "refresh": "5s",
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "tags": [
+    "kv-research",
+    "campaign",
+    "historical-replay"
+  ],
+  "description": "Run-owned cohost observations. One case/size/cohort at a time. Exact terminal CSV-derived gauges and approximate live rates are separate; offline replay uses original timestamps. No equal-HA, steady-state, device-durability or microsecond-hardware-latency claim.",
+  "templating": {
+    "list": [
+      {
+        "name": "run_id",
+        "label": "Run \u2014 single only",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "kv-campaign-prometheus"
+        },
+        "query": "label_values(kv_observer_case_terminal{job=\"campaign-benchmark\"}, run_id)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": false,
+        "options": []
+      },
+      {
+        "name": "case_id",
+        "label": "Case \u2014 single only",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "kv-campaign-prometheus"
+        },
+        "query": "label_values(kv_observer_case_terminal{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id!=\"idle\"}, case_id)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": false,
+        "options": []
+      },
+      {
+        "name": "phase",
+        "label": "Phase",
+        "type": "constant",
+        "query": "measurement",
+        "current": {
+          "text": "measurement",
+          "value": "measurement"
+        },
+        "hide": 0
+      },
+      {
+        "name": "operation",
+        "label": "Operation \u2014 separate series",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "kv-campaign-prometheus"
+        },
+        "query": "label_values(kv_comparison_offered_total{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",phase=\"$phase\"}, operation)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "options": [],
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "outcome",
+        "label": "Conditional latency outcome",
+        "type": "custom",
+        "query": "success,rejected,error,timeout,unknown_mutation,wrong_value,unexpected_present",
+        "multi": false,
+        "includeAll": false,
+        "current": {
+          "text": "success",
+          "value": "success"
+        },
+        "options": [
+          {
+            "text": "success",
+            "value": "success",
+            "selected": true
+          },
+          {
+            "text": "rejected",
+            "value": "rejected",
+            "selected": false
+          },
+          {
+            "text": "error",
+            "value": "error",
+            "selected": false
+          },
+          {
+            "text": "timeout",
+            "value": "timeout",
+            "selected": false
+          },
+          {
+            "text": "unknown_mutation",
+            "value": "unknown_mutation",
+            "selected": false
+          },
+          {
+            "text": "wrong_value",
+            "value": "wrong_value",
+            "selected": false
+          },
+          {
+            "text": "unexpected_present",
+            "value": "unexpected_present",
+            "selected": false
+          }
+        ]
+      },
+      {
+        "name": "host_index",
+        "label": "Host index \u2014 role in legend",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "kv-campaign-prometheus"
+        },
+        "query": "label_values(up{job=\"campaign-host\",run_id=\"$run_id\"}, host_index)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "options": [],
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "device",
+        "label": "Disk device \u2014 WAL mapping must be known",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "kv-campaign-prometheus"
+        },
+        "query": "label_values(node_disk_read_bytes_total{job=\"campaign-host\",run_id=\"$run_id\",host_index=~\"$host_index\"}, device)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "options": [],
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Scope, clocks and historical replay",
+      "type": "text",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "Read before comparing cases.",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "### One case, one contract \u2014 not a pooled leaderboard\nSelect exactly one run and case. Case context below preserves requested backend, workload profile, cohort/contract, value bytes and repeat; payload backend identity may differ. Never compare five sizes or different durability/HA contracts as one population.\n\n**Cohost observer:** capped collector shares the controller and root volume. Caps do not prove zero perturbation. This dashboard is neither equal-HA nor steady-state evidence. Raw latency CSV and admitted source/config/deployment receipts are authoritative; a batch latency is for the complete API group, not divided by its keys.\n\n**Historical restore:** use the archive's original absolute time range; no live targets are contacted. No data / one-scrape short intervals are not zero. Terminal cards use the last real sample in this range, not a replayed current timestamp. Host rates use rolling windows and are not exact per-case device attribution.\n\nAPI, response and scheduling are separate clocks, **not additive engine stages**. Successful latency is conditional on outcome=success. Grafana cannot invent microsecond hardware latency, pure wire RTT, device durability, or unavailable stage profiling."
+      }
+    },
+    {
+      "id": 2,
+      "title": "Case context and actual data availability",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "State is exporter state, not successful outcome. Final=1 requires an actual final metrics snapshot; terminal status can be failed without numeric summaries. Context labels are retained even for a single scrape.",
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "last_over_time(kv_observer_case_status{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range])",
+          "legendFormat": "{{requested_backend}} | {{profile}} | {{cohort}} | {{value_bytes}} B | r{{repeat}} | {{status}}",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        },
+        {
+          "expr": "last_over_time(kv_observer_snapshot_final{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range])",
+          "legendFormat": "actual final snapshot",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "B"
+        },
+        {
+          "expr": "kv_observer_data_available{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}",
+          "legendFormat": "current actual payload",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "C"
+        },
+        {
+          "expr": "kv_observer_state{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"} == 1",
+          "legendFormat": "current state={{state}}",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "D"
+        },
+        {
+          "expr": "last_over_time(kv_case_measurement_seconds{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range])",
+          "legendFormat": "measurement duration",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "E"
+        },
+        {
+          "expr": "kv_observer_snapshot_age_seconds{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}",
+          "legendFormat": "producer age (not scrape age)",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "F"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "E"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "F"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "orientation": "auto"
+      }
+    },
+    {
+      "id": 3,
+      "title": "Exact terminal goodput, offered and rejected rates",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "Complete measurement rows only. Offered, success and rejected share the identical elapsed measurement duration; no rate() required. Failed/absent summary is No data, never zero. Keys/s and value MiB/s are separate units, not API call counts.",
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "last_over_time(kv_case_success_calls_per_second{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range])",
+          "legendFormat": "successful API calls/s",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        },
+        {
+          "expr": "last_over_time(kv_case_offered_calls{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range]) / (last_over_time(kv_case_measurement_seconds{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range]) > 0)",
+          "legendFormat": "offered API calls/s",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "B"
+        },
+        {
+          "expr": "last_over_time(kv_case_rejected_calls{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range]) / (last_over_time(kv_case_measurement_seconds{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range]) > 0)",
+          "legendFormat": "rejected API calls/s",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "C"
+        },
+        {
+          "expr": "last_over_time(kv_case_success_logical_keys_per_second{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range])",
+          "legendFormat": "successful logical keys/s",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "D"
+        },
+        {
+          "expr": "last_over_time(kv_case_success_value_mib_per_second{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range])",
+          "legendFormat": "successful value MiB/s",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "E"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "D"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "suffix:keys/s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "E"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "suffix:MiB/s"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "orientation": "auto"
+      }
+    },
+    {
+      "id": 4,
+      "title": "Exact terminal offered, success, rejected and outcome counts",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "All scheduled arrivals are offered calls. Success is only outcome=success; rejection/error/timeout/unknown are not success. Outcomes partition offered calls. Counts and timed samples may differ; missing clock samples are absent, not zero.",
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "last_over_time(kv_case_offered_calls{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range])",
+          "legendFormat": "offered calls",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        },
+        {
+          "expr": "last_over_time(kv_case_success_calls{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range])",
+          "legendFormat": "successful calls",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "B"
+        },
+        {
+          "expr": "last_over_time(kv_case_rejected_calls{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range])",
+          "legendFormat": "rejected calls",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "C"
+        },
+        {
+          "expr": "last_over_time(kv_case_outcome_calls{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range])",
+          "legendFormat": "{{operation}} {{outcome}} calls",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "D"
+        },
+        {
+          "expr": "last_over_time(kv_case_timed_samples{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",outcome=\"$outcome\",operation=~\"$operation\"}[$__range])",
+          "legendFormat": "{{operation}} {{outcome}} {{clock}} timed samples",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "E"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "orientation": "auto"
+      }
+    },
+    {
+      "id": 5,
+      "title": "Exact terminal api quantiles \u2014 outcome=$outcome",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "Backend API dispatch through materialized response. Not pure network/device latency. Exact raw-sample per-operation quantiles from admitted measurement rows, not histogram interpolation. Conditional on selected outcome (default success); p99/p999 remain descriptive for small populations. quantile=1 is maximum. Never average quantile gauges.",
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "last_over_time(kv_case_api_quantile_seconds{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",operation=~\"$operation\",outcome=\"$outcome\"}[$__range])",
+          "legendFormat": "{{operation}} {{outcome}} q={{quantile}}",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "orientation": "auto"
+      }
+    },
+    {
+      "id": 6,
+      "title": "Exact terminal response quantiles \u2014 outcome=$outcome",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "Scheduled arrival through completed response, including scheduling and API time. Not the sum of independent quantiles. Exact raw-sample per-operation quantiles from admitted measurement rows, not histogram interpolation. Conditional on selected outcome (default success); p99/p999 remain descriptive for small populations. quantile=1 is maximum. Never average quantile gauges.",
+      "gridPos": {
+        "x": 12,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "last_over_time(kv_case_response_quantile_seconds{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",operation=~\"$operation\",outcome=\"$outcome\"}[$__range])",
+          "legendFormat": "{{operation}} {{outcome}} q={{quantile}}",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "orientation": "auto"
+      }
+    },
+    {
+      "id": 7,
+      "title": "Exact terminal scheduling quantiles \u2014 outcome=$outcome",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "Scheduled arrival through backend dispatch. Rejected or untimed populations can lack this clock. Exact raw-sample per-operation quantiles from admitted measurement rows, not histogram interpolation. Conditional on selected outcome (default success); p99/p999 remain descriptive for small populations. quantile=1 is maximum. Never average quantile gauges.",
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "last_over_time(kv_case_scheduling_quantile_seconds{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",operation=~\"$operation\",outcome=\"$outcome\"}[$__range])",
+          "legendFormat": "{{operation}} {{outcome}} q={{quantile}}",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "orientation": "auto"
+      }
+    },
+    {
+      "id": 8,
+      "title": "Live rolling offered, success and rejected calls/s",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "Rolling monotonic-counter rates, not exact terminal goodput. Requires at least two scrapes and changing producer snapshots; frozen final snapshots are not live traffic. No zero-fill. Operations stay distinct; measurement phase only.",
+      "gridPos": {
+        "x": 12,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "rate(kv_comparison_offered_total{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",phase=\"$phase\",operation=~\"$operation\"}[$__rate_interval]) and on(run_id,case_id) (changes(kv_comparison_snapshot_timestamp_seconds{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__rate_interval]) > 0)",
+          "legendFormat": "{{operation}} offered",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(kv_comparison_completed_total{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",phase=\"$phase\",operation=~\"$operation\",outcome=\"success\"}[$__rate_interval]) and on(run_id,case_id) (changes(kv_comparison_snapshot_timestamp_seconds{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__rate_interval]) > 0)",
+          "legendFormat": "{{operation}} success",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(kv_comparison_rejected_total{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",phase=\"$phase\",operation=~\"$operation\"}[$__rate_interval]) and on(run_id,case_id) (changes(kv_comparison_snapshot_timestamp_seconds{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__rate_interval]) > 0)",
+          "legendFormat": "{{operation}} rejected",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "title": "Live p95 bucket estimates \u2014 outcome=$outcome",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "Approximate histogram_quantile(0.95, rate(bucket)), per selected case, operation and outcome only. Not exact CSV quantiles or hardware-stage latency. Missing/short/frozen intervals remain No data. No aggregation across cases, phases, operations, sizes or contracts.",
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(kv_comparison_api_latency_seconds_bucket{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",phase=\"$phase\",operation=~\"$operation\",outcome=\"$outcome\"}[$__rate_interval])) and on(run_id,case_id) (changes(kv_comparison_snapshot_timestamp_seconds{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__rate_interval]) > 0)",
+          "legendFormat": "api p95 {{operation}} {{outcome}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(kv_comparison_response_latency_seconds_bucket{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",phase=\"$phase\",operation=~\"$operation\",outcome=\"$outcome\"}[$__rate_interval])) and on(run_id,case_id) (changes(kv_comparison_snapshot_timestamp_seconds{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__rate_interval]) > 0)",
+          "legendFormat": "response p95 {{operation}} {{outcome}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(kv_comparison_scheduling_delay_seconds_bucket{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",phase=\"$phase\",operation=~\"$operation\",outcome=\"$outcome\"}[$__rate_interval])) and on(run_id,case_id) (changes(kv_comparison_snapshot_timestamp_seconds{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__rate_interval]) > 0)",
+          "legendFormat": "scheduling p95 {{operation}} {{outcome}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "Scrape / kernel collector availability",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "Historical target health, not benchmark success. Missing target/unsupported collector is No data, not up=0. Node health is shown over the selected case visibility interval. Host labels identify role and index.",
+      "gridPos": {
+        "x": 12,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "up{job=~\"campaign-host|campaign-cgroup|campaign-benchmark\",run_id=\"$run_id\",host_index=~\"$host_index\"} and on(run_id) kv_observer_case_terminal{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}",
+          "legendFormat": "{{job}} {{host_role}} #{{host_index}} {{instance}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        },
+        {
+          "expr": "node_scrape_collector_success{job=\"campaign-host\",run_id=\"$run_id\",host_index=~\"$host_index\",collector=~\"cpu|meminfo|pressure|diskstats|netdev\"} and on(run_id) kv_observer_case_terminal{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}",
+          "legendFormat": "{{collector}} {{host_role}} #{{host_index}} {{instance}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "title": "Host busy CPU fraction",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "Per host non-idle CPU fraction averaged across its logical CPUs. Includes benchmark, OS and cohost observer. Rolling-window boundary overlap is possible; not cgroup CPU or isolated workload attribution.",
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "(1 - avg by (run_id,host_index,host_role,instance) (rate(node_cpu_seconds_total{job=\"campaign-host\",run_id=\"$run_id\",host_index=~\"$host_index\",mode=\"idle\"}[$__rate_interval]))) and on(run_id) kv_observer_case_terminal{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}",
+          "legendFormat": "{{host_role}} #{{host_index}} {{instance}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "title": "Host memory: available and total",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "Kernel MemAvailable and MemTotal gauges; available is not free memory and includes reclaim estimates. Includes all workloads and observer.",
+      "gridPos": {
+        "x": 12,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "node_memory_MemAvailable_bytes{job=\"campaign-host\",run_id=\"$run_id\",host_index=~\"$host_index\"} and on(run_id) kv_observer_case_terminal{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}",
+          "legendFormat": "available {{host_role}} #{{host_index}} {{instance}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        },
+        {
+          "expr": "node_memory_MemTotal_bytes{job=\"campaign-host\",run_id=\"$run_id\",host_index=~\"$host_index\"} and on(run_id) kv_observer_case_terminal{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}",
+          "legendFormat": "total {{host_role}} #{{host_index}} {{instance}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "title": "Host PSI stall fractions",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "Kernel pressure seconds/s: waiting=some tasks stalled; stalled=all non-idle tasks stalled (full). Unsupported pressure files remain No data. Not sums of CPU/memory/IO service time.",
+      "gridPos": {
+        "x": 0,
+        "y": 48,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "rate(node_pressure_cpu_waiting_seconds_total{job=\"campaign-host\",run_id=\"$run_id\",host_index=~\"$host_index\"}[$__rate_interval]) and on(run_id) kv_observer_case_terminal{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}",
+          "legendFormat": "CPU some {{host_role}} #{{host_index}} {{instance}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(node_pressure_memory_waiting_seconds_total{job=\"campaign-host\",run_id=\"$run_id\",host_index=~\"$host_index\"}[$__rate_interval]) and on(run_id) kv_observer_case_terminal{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}",
+          "legendFormat": "memory some {{host_role}} #{{host_index}} {{instance}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(node_pressure_memory_stalled_seconds_total{job=\"campaign-host\",run_id=\"$run_id\",host_index=~\"$host_index\"}[$__rate_interval]) and on(run_id) kv_observer_case_terminal{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}",
+          "legendFormat": "memory full {{host_role}} #{{host_index}} {{instance}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "C"
+        },
+        {
+          "expr": "rate(node_pressure_io_waiting_seconds_total{job=\"campaign-host\",run_id=\"$run_id\",host_index=~\"$host_index\"}[$__rate_interval]) and on(run_id) kv_observer_case_terminal{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}",
+          "legendFormat": "IO some {{host_role}} #{{host_index}} {{instance}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "D"
+        },
+        {
+          "expr": "rate(node_pressure_io_stalled_seconds_total{job=\"campaign-host\",run_id=\"$run_id\",host_index=~\"$host_index\"}[$__rate_interval]) and on(run_id) kv_observer_case_terminal{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}",
+          "legendFormat": "IO full {{host_role}} #{{host_index}} {{instance}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "E"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "title": "Host device disk read / write bytes/s",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "Actual Linux device diskstats counters, not logical WAL bytes/RMA/cache reads. Default includes all observed devices; select a WAL device only with retained mapping evidence, never infer one by name. Partitions/stacked devices may double-count if summed; no host/device summation here.",
+      "gridPos": {
+        "x": 12,
+        "y": 48,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "rate(node_disk_read_bytes_total{job=\"campaign-host\",run_id=\"$run_id\",host_index=~\"$host_index\",device=~\"$device\"}[$__rate_interval]) and on(run_id) kv_observer_case_terminal{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}",
+          "legendFormat": "read {{device}} {{host_role}} #{{host_index}} {{instance}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(node_disk_written_bytes_total{job=\"campaign-host\",run_id=\"$run_id\",host_index=~\"$host_index\",device=~\"$device\"}[$__rate_interval]) and on(run_id) kv_observer_case_terminal{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}",
+          "legendFormat": "write {{device}} {{host_role}} #{{host_index}} {{instance}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 15,
+      "title": "Host diskstats mean request time and average queue depth",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "Mean read/write request time = diskstats time counter rate / completed request counter rate, only when completed rate > 0. Includes software queue effects, NOT microsecond hardware latency or a percentile. Weighted IO seconds/s is average outstanding requests, not latency; no zero denominator fallback.",
+      "gridPos": {
+        "x": 0,
+        "y": 56,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "(rate(node_disk_read_time_seconds_total{job=\"campaign-host\",run_id=\"$run_id\",host_index=~\"$host_index\",device=~\"$device\"}[$__rate_interval]) / (rate(node_disk_reads_completed_total{job=\"campaign-host\",run_id=\"$run_id\",host_index=~\"$host_index\",device=~\"$device\"}[$__rate_interval]) > 0)) and on(run_id) kv_observer_case_terminal{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}",
+          "legendFormat": "read mean {{device}} {{host_role}} #{{host_index}} {{instance}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        },
+        {
+          "expr": "(rate(node_disk_write_time_seconds_total{job=\"campaign-host\",run_id=\"$run_id\",host_index=~\"$host_index\",device=~\"$device\"}[$__rate_interval]) / (rate(node_disk_writes_completed_total{job=\"campaign-host\",run_id=\"$run_id\",host_index=~\"$host_index\",device=~\"$device\"}[$__rate_interval]) > 0)) and on(run_id) kv_observer_case_terminal{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}",
+          "legendFormat": "write mean {{device}} {{host_role}} #{{host_index}} {{instance}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(node_disk_io_time_weighted_seconds_total{job=\"campaign-host\",run_id=\"$run_id\",host_index=~\"$host_index\",device=~\"$device\"}[$__rate_interval]) and on(run_id) kv_observer_case_terminal{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}",
+          "legendFormat": "queue depth {{device}} {{host_role}} #{{host_index}} {{instance}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 16,
+      "title": "Host network receive / transmit",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "Per observed non-loopback interface. Linux NIC counters are not logical RMA payload bytes, pure wire RTT or guaranteed fabric-hardware counters. Device disk selector deliberately does not filter NIC names.",
+      "gridPos": {
+        "x": 12,
+        "y": 56,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "rate(node_network_receive_bytes_total{job=\"campaign-host\",run_id=\"$run_id\",host_index=~\"$host_index\",device!=\"lo\"}[$__rate_interval]) and on(run_id) kv_observer_case_terminal{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}",
+          "legendFormat": "receive {{device}} {{host_role}} #{{host_index}} {{instance}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(node_network_transmit_bytes_total{job=\"campaign-host\",run_id=\"$run_id\",host_index=~\"$host_index\",device!=\"lo\"}[$__rate_interval]) and on(run_id) kv_observer_case_terminal{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}",
+          "legendFormat": "transmit {{device}} {{host_role}} #{{host_index}} {{instance}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 17,
+      "title": "Explicit cgroup availability",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "1=readable explicitly selected cgroupv2, 0=unavailable; absent=no cgroup selection or no scrape. No arbitrary process scans. Unsupported individual kernel fields remain absent even if availability=1.",
+      "gridPos": {
+        "x": 0,
+        "y": 64,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "kv_observer_cgroup_available{job=\"campaign-cgroup\",run_id=\"$run_id\",case_id=\"$case_id\",host_index=~\"$host_index\"}",
+          "legendFormat": "{{host_role}} #{{host_index}} {{instance}} {{process_role}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 18,
+      "title": "Cgroup CPU consumption",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "CPU usage seconds/s, where 1 is one fully busy logical CPU. Not divided by a guessed core count or cgroup cap. Separate process roles; no cross-host sum.",
+      "gridPos": {
+        "x": 12,
+        "y": 64,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "rate(kv_observer_cgroup_cpu_seconds_total{job=\"campaign-cgroup\",run_id=\"$run_id\",case_id=\"$case_id\",host_index=~\"$host_index\"}[$__rate_interval])",
+          "legendFormat": "{{host_role}} #{{host_index}} {{instance}} {{process_role}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix:cores",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 19,
+      "title": "Cgroup throttled time and period fraction",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "Throttled seconds/s and throttled periods / periods are different signals. Throttled seconds can exceed wall seconds with parallel scheduling. A zero/absent period-rate denominator gives No data, never an invented zero.",
+      "gridPos": {
+        "x": 0,
+        "y": 72,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "rate(kv_observer_cgroup_cpu_throttled_seconds_total{job=\"campaign-cgroup\",run_id=\"$run_id\",case_id=\"$case_id\",host_index=~\"$host_index\"}[$__rate_interval])",
+          "legendFormat": "throttled seconds/s {{host_role}} #{{host_index}} {{instance}} {{process_role}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(kv_observer_cgroup_cpu_throttled_periods_total{job=\"campaign-cgroup\",run_id=\"$run_id\",case_id=\"$case_id\",host_index=~\"$host_index\"}[$__rate_interval]) / (rate(kv_observer_cgroup_cpu_periods_total{job=\"campaign-cgroup\",run_id=\"$run_id\",case_id=\"$case_id\",host_index=~\"$host_index\"}[$__rate_interval]) > 0)",
+          "legendFormat": "throttled period fraction {{host_role}} #{{host_index}} {{instance}} {{process_role}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "suffix:s/s"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 20,
+      "title": "Cgroup current and lifetime peak memory",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "Actual cgroup memory.current and memory.peak. Lifetime peak is not a per-case peak unless the selected cgroup was created for this case. Parent/child cgroups can overlap; never sum without ownership evidence.",
+      "gridPos": {
+        "x": 12,
+        "y": 72,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "kv_observer_cgroup_memory_current_bytes{job=\"campaign-cgroup\",run_id=\"$run_id\",case_id=\"$case_id\",host_index=~\"$host_index\"}",
+          "legendFormat": "current {{host_role}} #{{host_index}} {{instance}} {{process_role}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        },
+        {
+          "expr": "kv_observer_cgroup_memory_peak_bytes{job=\"campaign-cgroup\",run_id=\"$run_id\",case_id=\"$case_id\",host_index=~\"$host_index\"}",
+          "legendFormat": "lifetime peak {{host_role}} #{{host_index}} {{instance}} {{process_role}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 21,
+      "title": "Cgroup device IO: bytes/s and operations/s",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "io.stat counters for explicit cgroups and major:minor device identities. No WAL-device mapping is inferred; host disk-name selector cannot be applied to major:minor. IO attribution is not proof of physical media service or durability.",
+      "gridPos": {
+        "x": 0,
+        "y": 80,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "rate(kv_observer_cgroup_io_read_bytes_total{job=\"campaign-cgroup\",run_id=\"$run_id\",case_id=\"$case_id\",host_index=~\"$host_index\"}[$__rate_interval])",
+          "legendFormat": "read bytes {{device}} {{host_role}} #{{host_index}} {{instance}} {{process_role}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(kv_observer_cgroup_io_write_bytes_total{job=\"campaign-cgroup\",run_id=\"$run_id\",case_id=\"$case_id\",host_index=~\"$host_index\"}[$__rate_interval])",
+          "legendFormat": "write bytes {{device}} {{host_role}} #{{host_index}} {{instance}} {{process_role}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(kv_observer_cgroup_io_reads_total{job=\"campaign-cgroup\",run_id=\"$run_id\",case_id=\"$case_id\",host_index=~\"$host_index\"}[$__rate_interval])",
+          "legendFormat": "read ops {{device}} {{host_role}} #{{host_index}} {{instance}} {{process_role}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "C"
+        },
+        {
+          "expr": "rate(kv_observer_cgroup_io_writes_total{job=\"campaign-cgroup\",run_id=\"$run_id\",case_id=\"$case_id\",host_index=~\"$host_index\"}[$__rate_interval])",
+          "legendFormat": "write ops {{device}} {{host_role}} #{{host_index}} {{instance}} {{process_role}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "iops"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "D"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "iops"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 22,
+      "title": "Cgroup OOM kills \u2014 rolling counter increase",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "Counter increase over the rolling rate interval; Prometheus extrapolation may yield fractional estimates. No samples/short intervals are No data. Zero is valid only for an observed unchanged counter with sufficient scrape history.",
+      "gridPos": {
+        "x": 12,
+        "y": 80,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "increase(kv_observer_cgroup_oom_kills_total{job=\"campaign-cgroup\",run_id=\"$run_id\",case_id=\"$case_id\",host_index=~\"$host_index\"}[$__rate_interval])",
+          "legendFormat": "{{host_role}} #{{host_index}} {{instance}} {{process_role}}",
+          "instant": false,
+          "range": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 23,
+      "title": "Logical native WAL bytes \u2014 not device IO",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "Native wal_written_bytes is a GAUGE (never rate it). wal_written_bytes_type is a cumulative COUNTER; this last observed total is not a measurement-only delta. Includes adapter lifetime/preload/warmup. Logical owner WAL reads and RMA completions in the instrumentation panel are not device IOPS, physical reads or hardware latency.",
+      "gridPos": {
+        "x": 0,
+        "y": 88,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "last_over_time(wal_written_bytes{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range])",
+          "legendFormat": "logical written gauge",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        },
+        {
+          "expr": "last_over_time(wal_written_bytes_type{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range])",
+          "legendFormat": "logical lifetime {{ks}} {{type}} counter",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "orientation": "auto"
+      }
+    },
+    {
+      "id": 24,
+      "title": "Observed instrumentation and ADAPTER-LIFETIME read paths",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "kv-campaign-prometheus"
+      },
+      "description": "Read-path GAUGES come only from admitted read-evidence.json. ADAPTER LIFETIME includes preload, warmup and post-workload qualification; NOT measurement-only counts, live rates, hit fractions, device IOPS or hardware latency. Components/partitions remain separate. Availability is observed; absent evidence stays No data. Write-profile flag is only observed effective_configuration.client.write_profile_limit > 0: 0=disabled, 1=enabled, absent=unknown. Enabled still supplies NO measured stage breakdown here; no fabricated serialization/WAL/NIC/replication timings.",
+      "gridPos": {
+        "x": 12,
+        "y": 88,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "last_over_time(kv_observer_write_profile_enabled{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range])",
+          "legendFormat": "observed enabled (unknown = No data)",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "A"
+        },
+        {
+          "expr": "last_over_time(kv_case_read_evidence_available{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range])",
+          "legendFormat": "read evidence availability {{component}}",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "B"
+        },
+        {
+          "expr": "last_over_time(kv_case_read_path_calls{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",scope=\"adapter_lifetime\"}[$__range])",
+          "legendFormat": "LIFETIME {{component}} {{path}} partition={{partition}}",
+          "instant": true,
+          "range": false,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "kv-campaign-prometheus"
+          },
+          "editorMode": "code",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "orientation": "auto"
+      }
+    }
+  ],
+  "annotations": {
+    "list": []
+  }
+}

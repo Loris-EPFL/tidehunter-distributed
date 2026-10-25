@@ -817,6 +817,8 @@ class Journal:
 
 
 class Campaign:
+    guest_policy = staticmethod(guest_policy)
+
     def __init__(self, aws, cfg, run_id, output, *, clock=time, cleanup_only=False):
         self.aws, self.cfg, self.run_id, self.output, self.clock = aws, cfg, run_id, Path(output), clock
         self.output.mkdir(parents=True, exist_ok=True)
@@ -1015,7 +1017,7 @@ class Campaign:
 
     def install_guest_policy(self, role, identity, *, region, instances=None):
         iam = self.aws.client('iam', self.cfg['bucket_region'])
-        policy = guest_policy(self.cfg, self.run_id, role, region=region,
+        policy = self.guest_policy(self.cfg, self.run_id, role, region=region,
             expires_at=self.journal.data['expires_at'], instances=instances)
         name = identity['role_name']
         read = lambda: self.iam_read(lambda: iam.get_role_policy(RoleName=name, PolicyName='run-scope'))
@@ -1372,20 +1374,10 @@ class Campaign:
             return instances, candidate, plan
         raise RuntimeError('all live-priced candidates definitively rejected capacity or quota')
 
-    def configure(self, instances, candidate, plan):
-        from checkpoint_matrix import validate_placement
-        import sui_checkpoint as supervisor
+    def bind_profiles(self, current, candidate, profiles, end):
+        """Bind six exact per-run profiles before any controller activation."""
         ec2 = self.aws.client('ec2', candidate['region'])
-        end = min(self.clock.time() + 240, parsed(self.journal.data['expires_at']).timestamp() - 1200)
-        while self.clock.time() < end:
-            current = self.validate_fleet(self.active(), candidate)
-            if all(item['State']['Name'] == 'running' and item.get('PrivateIpAddress') for item in current):
-                break
-            self.clock.sleep(5)
-        else:
-            raise TimeoutError('six-host running readiness exceeded original startup reserve')
         index = {item['AmiLaunchIndex']: item for item in current}
-        profiles = plan['instance_profiles']
         if profiles != planned_profiles(self.cfg, self.run_id):
             raise ValueError('final profile map is not the exact per-run six-role namespace')
         self.finalize_guest_policies(current, candidate, profiles)
@@ -1409,10 +1401,24 @@ class Campaign:
             current = self.validate_fleet(self.active(), candidate)
             if all(item.get('IamInstanceProfile', {}).get('Arn') == profiles[
                     'controller' if item['AmiLaunchIndex'] == 5 else f"storage-{item['AmiLaunchIndex']}"]['arn'] for item in current):
+                return current
+            self.clock.sleep(5)
+        raise TimeoutError('final exact per-run profiles did not converge')
+
+    def configure(self, instances, candidate, plan):
+        from checkpoint_matrix import validate_placement
+        import sui_checkpoint as supervisor
+        ec2 = self.aws.client('ec2', candidate['region'])
+        end = min(self.clock.time() + 240, parsed(self.journal.data['expires_at']).timestamp() - 1200)
+        while self.clock.time() < end:
+            current = self.validate_fleet(self.active(), candidate)
+            if all(item['State']['Name'] == 'running' and item.get('PrivateIpAddress') for item in current):
                 break
             self.clock.sleep(5)
         else:
-            raise TimeoutError('final exact per-run profiles did not converge')
+            raise TimeoutError('six-host running readiness exceeded original startup reserve')
+        current = self.bind_profiles(current, candidate, plan['instance_profiles'], end)
+        index = {item['AmiLaunchIndex']: item for item in current}
         deadline = min(parsed(self.journal.data['expires_at']),
                        *(parsed(item['LaunchTime']) + timedelta(seconds=self.cfg['ttl_seconds']) for item in current))
         cfg = {key: self.cfg[key] for key in ('transports', 'repetitions', 'read_profile_limits',
