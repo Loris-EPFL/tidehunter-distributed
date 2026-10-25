@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "seed": 1775,
+  "repeats": 3,
+  "value_sizes": [64, 256, 1024, 8192, 65536],
+  "backends": ["native", "tidehunter_tcp", "tidehunter_efa", "tidehunter_efa_direct", "tidehunter_efa_native", "tikv", "cassandra", "foundationdb"],
+  "keys": 4096,
+  "max_cases": 700,
+  "offered_rates": [1000, 10000, 50000],
+  "offered_seconds": 8,
+  "case_deadline_seconds": 180,
+  "hard_deadline_seconds": 10800,
+  "export_reserve_seconds": 600
+}
