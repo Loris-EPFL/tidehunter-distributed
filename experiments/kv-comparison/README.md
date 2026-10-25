@@ -598,6 +598,35 @@ Release preparation probes `rustc` and records `cargo` from the extracted source
 directory, just like compilation. This makes its admitted `rust-toolchain.toml`
 select Rust 1.90 instead of a hosted runner's unrelated default toolchain.
 
+EFA startup admission follows the Rust endpoint hints, not the transport label:
+
+| Path | Provider | Fabric | Requested capabilities | Requested mode |
+| --- | --- | --- | --- | --- |
+| Ordinary EFA messages | `efa` | `efa` | `FI_MSG\|FI_DIRECTED_RECV` | `FI_CONTEXT` |
+| Direct messages, including EFA-native without resident reads | `efa` | `efa-direct` | `FI_MSG` | `FI_CONTEXT2` |
+| Registered-RAM reads | `efa` | `efa-direct` | `FI_MSG\|FI_RMA\|FI_READ\|FI_REMOTE_READ` | `FI_CONTEXT2\|FI_RX_CQ_DATA` |
+
+`fi_info -p` selects a **provider**; `-f` selects a **fabric**. Passing
+`efa-direct` to `-p` rejected the first fleet before any measurement.
+The [pinned CLI implementation](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/util/info.c),
+[provider rules](https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/man/fi_efa.7.md)
+and [Rust hints](../../tidehunter-fabric/src/endpoint/resources.rs#L540)
+define these selectors and masks. The pinned direct-RMA provider requires
+hardware read **and write** support to advertise RMA.
+[AWS lists both capabilities for all four permitted machine types](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa.html#efa-instance-types);
+this establishes type eligibility, not actual device or endpoint admission.
+Native-read, registration and geometry checks remain mandatory. No TCP fallback
+is introduced. Each host retains a source/binary/host-bound
+`fabric-admission.json`, including passed observations before a later failure;
+discovery alone does not certify endpoint operation or performance.
+
+`campaign-validation.json` reports benchmark validity separately from resource
+closure. A startup export without `matrix.json` remains incomplete, with its
+original controller error and unknown completed-case count; it does not acquire
+invented metrics. `cleanup-validation.json` reports verified resource closure
+independently. A successful cleanup is not a successful benchmark; unsafe or
+tampered export evidence is still rejected.
+
 Design anchors: Tidehunter paper §§3/6 (`../papers/parsed/Tidehunter-2026-v2.md`
 relative to the containing project) separates Value-WAL/index publication,
 materialized-value reads and fill/measurement phases; native source remains
