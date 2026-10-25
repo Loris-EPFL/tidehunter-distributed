@@ -42,12 +42,17 @@ def blank_instance_disk(devices, expected_count=1):
 def bootstrap(args):
     if os.geteuid() != 0 or not re.fullmatch(r'th-[a-f0-9]{16}', args.run_id):
         raise ValueError('root and an exact fresh run ID required')
-    if type(args.ttl_seconds) is not int or not 600 <= args.ttl_seconds <= 7200:
-        raise ValueError('guest lifetime must be an integer in 600..7200 seconds')
+    if type(args.ttl_seconds) is not int or not 600 <= args.ttl_seconds <= 10800:
+        raise ValueError('guest lifetime must be an integer in 600..10800 seconds')
     info = identity()
     if info['accountId'] != args.account or info['instanceType'] != args.instance_type:
         raise ValueError('unexpected account or instance hardware')
     deadline = datetime.fromisoformat(info['pendingTime'].replace('Z', '+00:00')) + timedelta(seconds=args.ttl_seconds)
+    if getattr(args, 'deadline_utc', None) is not None:
+        absolute = datetime.fromisoformat(args.deadline_utc.replace('Z', '+00:00'))
+        if absolute.tzinfo is None or absolute.utcoffset() != timedelta(0) or absolute > deadline:
+            raise ValueError('absolute deadline must be UTC and cannot extend the launch lifetime')
+        deadline = absolute
     if deadline <= datetime.now(timezone.utc):
         subprocess.run(['/usr/sbin/poweroff'], check=True)
         raise ValueError('launch deadline already passed')
@@ -87,6 +92,7 @@ def main():
     parser.add_argument('--account', required=True)
     parser.add_argument('--run-id', required=True)
     parser.add_argument('--ttl-seconds', type=int, required=True)
+    parser.add_argument('--deadline-utc', help='Optional earlier immutable UTC termination deadline')
     bootstrap(parser.parse_args())
 
 

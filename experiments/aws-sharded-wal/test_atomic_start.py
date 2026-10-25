@@ -1,7 +1,7 @@
 """Offline six-guest startup exercise; no real AWS, IMDS, poweroff or benchmark."""
 import configparser
 import copy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import io
 import json
@@ -323,8 +323,19 @@ class BootstrapDeadlineTests(unittest.TestCase):
         self.assertEqual(timer.read_bytes(), original_timer)
         self.assertEqual((self.mount / self.args.run_id / 'bootstrap.json').read_bytes(), record)
 
+    def test_three_hour_boot_keeps_the_earlier_absolute_campaign_deadline(self):
+        deadline = self.launched + timedelta(seconds=10500)
+        args = SimpleNamespace(**(vars(self.args) | {
+            'ttl_seconds': 10800, 'deadline_utc': deadline.isoformat()}))
+        boot.bootstrap(args)
+        record = json.loads((self.mount / args.run_id / 'bootstrap.json').read_text())
+        self.assertEqual(datetime.fromisoformat(record['deadline_utc']), deadline)
+        timer = configparser.ConfigParser()
+        timer.read(self.units / ('sharded-wal-expire-' + args.run_id + '.timer'))
+        self.assertEqual(timer['Timer']['OnCalendar'], deadline.strftime('%Y-%m-%d %H:%M:%S UTC'))
+
     def test_malformed_or_excess_lifetimes_fail_before_metadata_or_timer_creation(self):
-        for value in (599, 7201, 7200.001, 7200.0, True, None, '7200'):
+        for value in (599, 10801, 10800.001, 10800.0, True, None, '10800'):
             with self.subTest(lifetime=value), self.assertRaises(ValueError):
                 boot.bootstrap(SimpleNamespace(**(vars(self.args) | {'ttl_seconds': value})))
         self.metadata.assert_not_called()
