@@ -1,9 +1,180 @@
-# Local KV comparison observability
+# KV comparison observability
+
+Two modes share the pinned Prometheus, Grafana, node_exporter and Python images:
+
+- **Campaign mode:** `campaign_monitor.py` collects explicitly admitted fleet
+  targets, preserves a real Prometheus snapshot, and restores it offline.
+- **Single-run local mode:** `stack.py` observes one explicit result directory.
+  Its commands and limitations are below. It does not contact AWS.
+
+Neither mode changes Tidehunter, Sui, database durability or workload semantics.
+These tools observe the generic KV comparison harness; adding this integration
+does not automatically add monitoring to the separate Sui checkpoint runner.
+
+## Live cloud campaigns
+
+`cloud_controller.py` starts campaign monitoring on the admitted fleet. Bootstrap
+caches the digest-pinned images before measured work; package preparation includes
+the monitor, exporters, dashboard and pins in the source-bound closure.
+
+The collector is deliberately **cohosted on the measured controller**, not on a
+seventh paid instance. TSDB state resides on the root filesystem under
+`/var/lib/tidehunter-observation/<run_id>`, not the benchmark data mount.
+Per-container CPU, memory, process and log limits bound resource use. They do
+**not** prove zero measurement interference. Independent observation or matched
+observer-off/on calibration is needed before attributing small differences.
+
+The six admitted hosts receive explicit private-IP targets; arbitrary service
+discovery, public ingress and host-network scans are not used. Host exporters bind
+only the admitted private address. Grafana and Prometheus bind controller loopback.
+Default campaign ports:
+
+| Endpoint | Port | Access | CPU cap | RAM cap |
+|---|---:|---|---:|---:|
+| Grafana | 13000 | controller loopback, authenticated | 0.5 | 768 MiB |
+| Prometheus, including admin API | 19090 | controller loopback | 1 | 1 GiB |
+| Case exporter | 19899 | controller loopback | 0.25 | 256 MiB |
+| node_exporter, per host | 19100 | admitted private address | 0.1 | 128 MiB |
+| Cgroup exporter, per host | 19898 | admitted private address | 0.1 | 128 MiB |
+
+Use `results/observability/access.json` from the running campaign. It records the
+actual coordinator instance ID, region, private SSM port-forwarding commands and
+required permissions. Forward the loopback ports; do not expose the admin API or
+Grafana on a public security-group rule. SSM access requires working agent,
+network and operator/instance permissions; recording a command does not grant IAM
+permissions. The login is `researcher`; the generated password stays in the
+session's private state. It is not included in result archives.
+
+Before a case, the controller atomically selects its identity and explicit owned
+process cgroups. After raw-result validation and **outside API measurement**, it
+publishes the terminal summary and waits for a fresh scrape of that same case.
+This bounded observation barrier preserves cases shorter than the scrape interval.
+It does not repeat the workload. A failed case publishes failure, not invented
+successful requests or zero latency.
+
+Before fleet teardown, the controller exports:
+
+- `results/observability/monitoring.tar.gz` and its SHA-256 receipt;
+- startup, case-observation, completeness/gap, query and cleanup receipts;
+- exact target and image identities, dashboard/configuration, capture time range
+  and a real TSDB snapshot **including its current head**.
+
+These files join the existing raw-result archive and S3 retrieval path. Monitoring
+failure remains explicit but cannot prevent raw-result export or the fleet's
+unconditional termination path. Startup checks exact listen ports, container
+ownership/running/image identity and Prometheus session identity; partial startup
+rolls back only newly attempted owned containers.
+
+This adds no managed-monitoring subscription or extra EC2 host. Collector CPU,
+root-volume writes, larger result archives and S3 retention/transfer still cost
+resources. Local qualification is not a cloud cost or overhead measurement.
+
+## What the campaign dashboard measures
+
+Dashboard UID: `kv-comparison-campaign`. It contains 24 panels and 58 source
+queries. Select **one run and one case**; do not pool different value sizes,
+durability contracts, cache cohorts, repeats or backends.
+
+- Exact terminal API/response/scheduling quantiles, sample counts, offered,
+  successful and rejected calls, calls/s, logical keys/s and value MiB/s come from
+  validated raw results. Batch latency remains the complete group latency.
+  The clocks are distinct scopes, not additive engine stages.
+- Live rates and histogram quantiles are coarse rolling observations. Histogram
+  quantiles are bucket estimates, not the exact raw-sample terminal quantiles.
+  A short population can have one scrape and no valid rate; no data is not zero.
+- All six hosts expose CPU, memory, PSI, diskstats and network context. Explicit
+  owned cgroups expose available CPU/throttling, current/peak memory, OOM and
+  device-I/O counters. Shared-host statistics and rolling windows can include
+  preload or teardown; they are not exact per-case physical-I/O attribution.
+  The access receipt preserves observed data-device mappings; unknown mappings
+  remain unknown.
+- Logical native WAL bytes are not physical device bytes. Page-cache/WAL
+  submissions do not establish an NVMe fetch.
+- Available coordinator/owner/resident read-path counters are labeled
+  **adapter-lifetime**. They are not measurement-only hit ratios or RDMA timings.
+  Missing owner evidence, disabled profiling and unsupported cgroup fields stay
+  absent or explicitly unavailable.
+
+No new hot-path tracing is enabled. This dashboard cannot supply an unmeasured
+TLS/fsync/coordination breakdown, pure network RTT, hardware-RDMA latency,
+per-request NVMe latency, or vendor-specific compaction/GC internals. Use the raw
+CSV, deployment receipts and guarantee metadata for the research comparison.
+
+## Retain and replay offline
+
+Do not copy an active TSDB directory or replace old sample timestamps with
+current time. `export` uses the
+[Prometheus snapshot API](https://prometheus.io/docs/prometheus/latest/querying/api/#snapshot)
+with `skip_head=false`, and records the original capture bounds. This follows
+the [storage backup guidance](https://prometheus.io/docs/prometheus/latest/storage/#backups).
+The bounded archive includes a SHA-256 manifest, not Grafana's SQLite database,
+admin password or cloud credentials.
+
+Replay requires the archived digest-pinned images already cached locally.
+Campaign `start` and `replay` never pull implicitly. Online preparation can use
+`campaign_monitor.py --spec SESSION.json pull`; the campaign bootstrap does this
+before measurement. Retain the images as well as the result bundle if the
+analysis machine will be fully disconnected.
+
+Run from the checkout root. This retained local qualification archive is usable
+without AWS or a running database:
+
+```bash
+OBS=experiments/kv-comparison/observability
+ARCHIVE=checkpoint-work/kv-comparison/monitoring-online-offline-2026-10-25/th-monitor-20261025142334/monitoring.tar.gz
+REPLAY_STATE="$(mktemp -d /tmp/tidehunter-monitor-replay.XXXXXX)/state"
+python3 "$OBS/campaign_monitor.py" replay \
+  --archive "$ARCHIVE" --state-dir "$REPLAY_STATE"
+python3 "$OBS/campaign_monitor.py" --spec "$REPLAY_STATE/spec.json" access
+cat "$REPLAY_STATE/grafana_admin_password"
+python3 "$OBS/campaign_monitor.py" --spec "$REPLAY_STATE/spec.json" verify
+# When analysis is finished:
+python3 "$OBS/campaign_monitor.py" --spec "$REPLAY_STATE/spec.json" stop
+```
+
+For a retrieved cloud run, set `ARCHIVE` to that run's
+`results/observability/monitoring.tar.gz`. Always use a fresh state leaf. Default
+replay endpoints are Grafana `127.0.0.1:23000` and Prometheus `127.0.0.1:29090`;
+`access` returns the URL with the archive's original absolute time range.
+The restored Prometheus has **no live scrape jobs**. Replay checks original
+query hashes, authenticates Grafana and executes all source queries through its
+real datasource API. It never pretends old telemetry was collected now.
+
+Live retention is 7 days / 2 GB of blocks; block-size retention is
+[not a hard disk quota](https://prometheus.io/docs/prometheus/latest/storage/#operational-aspects).
+The WAL/head can require more space. Startup requires 6 GiB free on the root
+filesystem; export/extraction is bounded to 4 GiB and 100,000 files. Replay
+adjusts time retention for the archive's age. Local analysis containers run until
+explicitly stopped; an operation deadline is not a daemon shutdown scheduler.
+Cloud fleet deadlines and termination remain the campaign orchestrator's job.
+
+## Local qualification, 25 October 2026
+
+Evidence: `checkpoint-work/kv-comparison/monitoring-online-offline-2026-10-25/`.
+Two actual native populations were admitted and validated: an open-loop mixed
+case with 3,000 offered calls, and a 32-call, 8-KiB read-many case whose measurement
+lasted 4.46 ms. Both terminal observations reached Prometheus. All six logical
+host targets were healthy, and an explicitly labeled qualification worker
+produced observed cgroup CPU/throttle counters.
+
+After snapshot/export and full live shutdown, a fresh replay preserved all nine
+checked exact counts/quantiles, with zero live scrape targets. Live and offline
+Grafana pages were opened and captured. Failed-case/no-fabricated-count behavior,
+occupied-port rejection, real partial-start rollback and unrelated-session
+preservation were exercised. The single-run stack also started from cached images,
+passed its real datasource queries, stopped and restored its prior selection.
+
+The host targets share one laptop kernel and SSD; the cgroup worker was not
+claimed as benchmark-client CPU accounting. These are functional qualification
+results, **not** new comparative performance results or EC2/EFA/independent-NVMe
+validation. No AWS resources were launched for this implementation.
+
+## Single-run local mode
 
 This Linux-only stack observes one **explicit current result directory**. It does
-not start a database, discover runs, change native/Sui code, or contact AWS.
-Prometheus and Grafana run in local Docker; the exporter uses only Python's
-standard library. Provisioned dashboard UID: `kv-comparison-local`.
+not start a database or discover runs. Prometheus and Grafana run in local Docker;
+the exporter uses only Python's standard library. Its dashboard UID remains
+`kv-comparison-local`.
 
 ## Start with a real run
 
@@ -45,13 +216,14 @@ Endpoints (all bind **127.0.0.1 only**):
 - Comparison exporter: <http://127.0.0.1:9899/metrics>
 - node_exporter: <http://127.0.0.1:9100/metrics>
 
-`start` pulls only pinned images, records actual local image IDs/repository
-manifest digests in `.state/resolved-images.json`, recreates these four services,
-and waits at most 150 seconds for container health. This recreation is intentional:
+`start` pulls only pinned images. Use `start --offline` to require the cached
+pins without registry access; a missing image fails before service startup.
+Both modes record actual local image IDs/repository digests in
+`.state/resolved-images.json`, recreate these four services with `--pull never`,
+and wait at most 150 seconds for container health. Recreation is intentional:
 atomic replacement of a bind-mounted config file requires remount/restart. Start
 only outside a timed measurement; restarting observers during a run changes load.
-If startup fails, the command fails rather than reporting readiness. Diagnose with
-`status` and exact-project logs, then stop the project:
+If startup fails, diagnose with `status` and exact-project logs, then stop:
 
 ```bash
 python3 "$OBS/stack.py" status
@@ -246,11 +418,11 @@ Grafana access or signup is enabled. Local users who can reach loopback can stil
 read unauthenticated Prometheus/exporter metrics: this is not a multi-user secure
 metrics deployment.
 
-**This measured controller must not host a future research collector.** For a
-future cluster experiment, deploy Prometheus/Grafana/exporter on a dedicated,
-non-measured observer and explicitly allow only intended scrape targets. This
-local host-network deployment is not an off-host collector configuration and must
-not be carried to a controller as if it were one.
+This single-run local deployment is **not an off-host research collector**.
+Campaign mode above deliberately cohosts a capped collector on the controller;
+its receipts and dashboard disclose that placement. A dedicated non-measured
+observer remains preferable for final precision. Neither mode establishes
+overhead neutrality without calibration.
 
 Before interpreting performance, run matched **observer-off / observer-on**
 calibration using the same source/config/seed, physical cache policy and workload,
@@ -303,7 +475,7 @@ python3 -m unittest discover -s experiments/kv-comparison/observability -p test_
 
 These checks cover stale/final/failure precedence, absent future result leaves,
 exact byte preservation, symlink/FIFO/size boundaries, and explicit safe targets.
-They do not pretend to prove container wiring. Integration must also launch the
-real stack, inspect target health and listeners, run an actual fresh harness
-population, open the provisioned Grafana dashboard, and exercise stale/no-run
-states. No services or checks were run during implementation.
+They do not pretend to prove container wiring. The current live/export/restore
+qualification and its limits are recorded above. Requalify target health,
+authenticated dashboard queries, failure states and cleanup when changing the
+collector or image pins.

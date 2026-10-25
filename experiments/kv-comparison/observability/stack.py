@@ -137,7 +137,8 @@ def main():
     configure.add_argument('--stale-seconds', type=int, default=15)
     configure.add_argument('--native-target', action='append', default=[], metavar='HTTP_URL')
     configure.add_argument('--sui-target', action='append', default=[], metavar='HTTP_URL')
-    commands.add_parser('start', help='Pull pinned images and wait for health (Linux Docker Engine + Compose required)')
+    start = commands.add_parser('start', help='Start pinned services; --offline requires cached images')
+    start.add_argument('--offline', action='store_true', help='Do not contact image registries; fail if a pinned image is absent')
     commands.add_parser('stop', help='Stop exact project containers; retain data volumes and secret')
     commands.add_parser('status', help='Show exact project container health and selected run')
     commands.add_parser('pull', help='Pull pinned images without starting services')
@@ -170,10 +171,11 @@ def main():
             print(json.dumps(current, indent=2))
             print('If running, use start to recreate the exporter mount. Target discovery reloads within 5 seconds.')
         elif args.command in ('pull', 'start'):
-            compose('pull', timeout=900)
+            if args.command == 'pull' or not args.offline:
+                compose('pull', timeout=900)
             record_images()
             if args.command == 'start':
-                compose('up', '-d', '--wait', '--force-recreate', '--wait-timeout', '150', timeout=180)
+                compose('up', '-d', '--pull', 'never', '--wait', '--force-recreate', '--wait-timeout', '150', timeout=180)
                 print('Grafana http://127.0.0.1:3000/d/kv-comparison-local ; user researcher')
                 print('Read generated password with: python3 ' + str(ROOT / 'stack.py') + ' password')
         elif args.command == 'stop':
