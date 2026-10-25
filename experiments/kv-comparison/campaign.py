@@ -56,11 +56,12 @@ def admitted_fdb_environment(identity):
     return environment
 
 
-def verify_run_identity(result_dir, receipt, normalized_config, fdb_identity=None):
+def verify_run_identity(result_dir, receipt, normalized_config, fdb_identity=None, *, allow_failed=False):
     manifest = json.loads((result_dir / "manifest.json").read_text())
     run = manifest["run"]
-    if manifest.get("status") != "completed" or run["config"] != normalized_config:
-        raise RuntimeError("Rust manifest did not complete with the exact normalized admitted configuration")
+    statuses = {"completed", "failed"} if allow_failed else {"completed"}
+    if manifest.get("status") not in statuses or run["config"] != normalized_config:
+        raise RuntimeError("Rust manifest status/config differs from the admitted execution boundary")
     if run["binary"].get("blake2b512") != receipt["binary_blake2b512"]:
         raise RuntimeError("Rust manifest binary Blake2b-512 differs from admitted executable")
     if fdb_identity:
@@ -71,7 +72,7 @@ def verify_run_identity(result_dir, receipt, normalized_config, fdb_identity=Non
         receipt["loaded_native_library"] = loaded
 
 
-def verify_timing_result(result_dir, config):
+def verify_timing_result(result_dir, config, *, allow_partial=False):
     counts = dict.fromkeys(("preload", "warmup", "aging", "measurement"), 0)
     for row in analyze.read_samples(result_dir / "samples.csv", measurement_only=False):
         if row["phase"] not in counts:
@@ -85,8 +86,8 @@ def verify_timing_result(result_dir, config):
     }
     if config["qualification_only"]:
         expected = dict.fromkeys(expected, 0)
-    if counts != expected:
-        raise ValueError(f"raw timing rows do not cover every admitted phase: expected={expected}, observed={counts}")
+    if any(counts[name] > expected[name] for name in counts) or (not allow_partial and counts != expected):
+        raise ValueError(f"raw timing rows differ from admitted phase bounds: expected={expected}, observed={counts}")
     return counts
 
 
