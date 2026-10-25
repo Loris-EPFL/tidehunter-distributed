@@ -69,9 +69,9 @@ class EvidenceAdmission(unittest.TestCase):
         changed = copy.deepcopy(base)
         changed['store_metadata']['stores'][0]['store']['id'] = 44
         changed['store_metadata']['stores'][0]['status']['last_heartbeat_ts'] = 'later'
-        self.assertEqual(analyze.stable_topology('tikv', base), analyze.stable_topology('tikv', changed))
+        self.assertEqual(analyze.stable_topology('tikv_raw', base), analyze.stable_topology('tikv_raw', changed))
         changed['store_metadata']['stores'][0]['store']['version'] = 'different-release'
-        self.assertNotEqual(analyze.stable_topology('tikv', base), analyze.stable_topology('tikv', changed))
+        self.assertNotEqual(analyze.stable_topology('tikv_raw', base), analyze.stable_topology('tikv_raw', changed))
 
     def test_host_memory_and_swap_capacity_are_part_of_the_contract(self):
         small = analyze.host_capacity('MemTotal: 1024 kB\nMemFree: 12 kB\nSwapTotal: 0 kB\n')

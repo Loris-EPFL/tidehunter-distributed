@@ -579,6 +579,9 @@ throughput and response times can include that scheduling bias. This does not
 explain single-outstanding-request latency or separate Sui checkpoint results.
 The open-loop arrival schedule, admission bound and rejection semantics remain
 unchanged.
+TiKV repetition matching uses the adapter's `tikv_raw` identity. It retains
+configured placement/version while excluding volatile store IDs and heartbeat
+observations; the original deployment evidence remains unchanged.
 
 Design anchors: Tidehunter paper §§3/6 (`../papers/parsed/Tidehunter-2026-v2.md`
 relative to the containing project) separates Value-WAL/index publication,

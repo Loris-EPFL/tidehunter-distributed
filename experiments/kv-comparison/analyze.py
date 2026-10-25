@@ -137,7 +137,7 @@ def stable_topology(name, original):
         topology["endpoints"] = sorted(
             ({"partition": item["partition"]} for item in topology["endpoints"]),
             key=lambda item: item["partition"])
-    if name == "tikv" and "store_metadata" in topology:
+    if name == "tikv_raw" and "store_metadata" in topology:
         # IDs, capacity/current load, start/heartbeat times are observations,
         # not independent-run configuration. Preserve the raw original artifact.
         topology["store_metadata"] = sorted((
