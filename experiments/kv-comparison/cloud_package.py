@@ -356,7 +356,7 @@ def build(snapshot_dir, output, fdb_prefix, fabric_prefix, timeout=5400):
     argv = ["cargo", "--config", "build.rustflags=" + json.dumps(flags),
             "--config", f"target.{TARGET}.rustflags=" + json.dumps(flags), "build", "--release", "--frozen",
             "--target", TARGET, "-p", "kv-research", "--no-default-features", "--features", ",".join(FEATURES)]
-    rustc = command(["rustc", "-vV"], env=environment)
+    rustc = command(["rustc", "-vV"], cwd=source, env=environment)
     if not rustc.startswith("rustc 1.90.0 "):
         raise ValueError("the source-pinned Rust1.90.0 toolchain is required")
     if identity(Path(__file__).resolve())["sha256"] != metadata["sha256"]["experiments/kv-comparison/cloud_package.py"]:
@@ -376,7 +376,7 @@ def build(snapshot_dir, output, fdb_prefix, fabric_prefix, timeout=5400):
         raise ValueError("executable did not link the admitted FDB and libfabric libraries")
     receipt = {"schema_version": 1, "source_sha256": metadata["snapshot_sha256"], "source_tree_sha256": metadata["tree_sha256"],
                "features": FEATURES, "target": TARGET, "cpu": "x86-64", "build_command": argv, "rustc": rustc,
-               "cargo": command(["cargo", "--version"], env=environment), "glibc": command(["getconf", "GNU_LIBC_VERSION"]),
+               "cargo": command(["cargo", "--version"], cwd=source, env=environment), "glibc": command(["getconf", "GNU_LIBC_VERSION"]),
                "binary": binary, "fdb": fdb, "fabric_build": fabric, "linkage": linkage,
                "build_log": identity(output / "build.log"), "runtime_efa": EFA,
                "builder_image": os.environ.get("CLOUD_PACKAGE_BUILDER_IMAGE"),
