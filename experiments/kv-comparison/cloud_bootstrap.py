@@ -240,6 +240,21 @@ def cache_monitor_images(source, index, deadline):
     return evidence
 
 
+def restart_ssm_after_profile():
+    """Reload the profile attached after atomic allocation before command readiness."""
+    # Match the Sui atomic bootstrap: enable --now leaves the AMI-started
+    # agent running. AWS requires role discovery or a restart after attachment:
+    # https://repost.aws/knowledge-center/assign-iam-role-ec2-instance
+    for unit in ("amazon-ssm-agent.service", "snap.amazon-ssm-agent.amazon-ssm-agent.service"):
+        installed = subprocess.run(["systemctl", "cat", unit], capture_output=True, text=True, timeout=10)
+        if installed.returncode:
+            continue
+        subprocess.run(["systemctl", "restart", unit], check=True, timeout=30)
+        subprocess.run(["systemctl", "is-active", "--quiet", unit], check=True, timeout=10)
+        return unit
+    raise RuntimeError("bootstrap installed no discoverable SSM Agent service")
+
+
 def install(plan):
     validate_plan(plan)
     if os.geteuid() != 0:
@@ -274,6 +289,12 @@ def install(plan):
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     os.environ["FI_EFA_USE_DEVICE_RDMA"] = "1"
     cloud_package.verify_directory(stage, runtime=True)
+    # The successful private bundle download proves the attached profile is usable.
+    # Give the boot-started agent a fresh credential-discovery cycle.
+    ssm_refresh = {"unit": restart_ssm_after_profile(), "process_active": True,
+        "observed_utc": datetime.now(timezone.utc).isoformat(),
+        "scope": "post-profile agent restart only; managed-node command acceptance remains mandatory"}
+    (root / "ssm-agent-profile-refresh.json").write_text(json.dumps(ssm_refresh, indent=2) + "\n")
     alias = Path("/mnt/tidehunter-kv-comparison")
     alias.mkdir(mode=0o700, exist_ok=False)
     subprocess.run(["mount", "--bind", "/mnt/tidehunter", str(alias)], check=True, timeout=30)
@@ -295,6 +316,9 @@ def install(plan):
     temporary.write_text(json.dumps(ready, indent=2) + "\n")
     temporary.replace(marker)
     ready_key = plan["run_id"] + ("/results/controller-bootstrap.json" if index == 5 else f"/results/cells/startup/storage/{index}/bootstrap.json")
+    refresh_key = ready_key.rsplit("/", 1)[0] + "/ssm-agent-profile-refresh.json"
+    client.put_object(Bucket=plan["bucket"], Key=refresh_key, Body=json.dumps(ssm_refresh).encode(),
+        ExpectedBucketOwner=plan["account"], ServerSideEncryption="AES256")
     client.put_object(Bucket=plan["bucket"], Key=ready_key, Body=json.dumps(ready).encode(),
         ExpectedBucketOwner=plan["account"], ServerSideEncryption="AES256")
     if index != 5:
