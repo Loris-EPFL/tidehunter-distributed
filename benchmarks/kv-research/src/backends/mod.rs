@@ -19,6 +19,9 @@ pub fn validate_options(
     match kind {
         "native" => native::validate_options(options),
         "tidehunter_tcp" => tidehunter::validate_options(options),
+        "tidehunter_efa" => tidehunter::validate_efa_options(options),
+        "tidehunter_efa_native" => tidehunter::validate_efa_native_options(options),
+        "tidehunter_efa_direct" => tidehunter::validate_efa_direct_options(options),
         #[cfg(feature = "rocksdb")]
         "rocksdb" | "blobdb" => rocks::validate_options(options, kind == "blobdb"),
         #[cfg(feature = "tikv")]

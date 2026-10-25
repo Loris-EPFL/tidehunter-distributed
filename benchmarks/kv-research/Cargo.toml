@@ -31,7 +31,9 @@ tikv = ["dep:tikv-client", "dep:reqwest", "dep:tonic"]
 cassandra = ["dep:scylla", "dep:rustls", "dep:rustls-pemfile"]
 foundationdb = ["dep:foundationdb"]
 rocksdb = ["dep:rocksdb"]
-# Forward the existing TCP harness instrumentation only when requested.
+# Explicitly opt in to real libfabric/EFA transports; disabled builds still
+# reject EFA configuration rather than selecting the TCP path.
+efa = ["tidehunter/experimental-fabric"]
 test-utils = ["tidehunter/test-utils"]
 
 [lints.clippy]

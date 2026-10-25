@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::backend::BackendResult;
 
@@ -134,6 +134,13 @@ fn default_deadline() -> u64 {
 fn default_shutdown_grace() -> u64 {
     30
 }
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeasurementGateConfig {
+    pub ready_file: PathBuf,
+    pub release_file: PathBuf,
+    pub timeout_seconds: u64,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -141,9 +148,12 @@ pub struct RunConfig {
     pub schema_version: u32,
     pub backend: BackendSpec,
     pub seed: u64,
-    /// Non-secret human label; physical keys always use an independently generated run id.
+    /// Non-secret human label; does not select the physical key namespace.
     #[serde(default)]
     pub namespace: Option<String>,
+    /// Explicit owned-cloud dataset identity; requires a complete preload before reuse.
+    #[serde(default)]
+    pub key_namespace_hex: Option<String>,
     pub dataset: DatasetConfig,
     pub workload: WorkloadConfig,
     pub execution: ExecutionConfig,
@@ -152,6 +162,8 @@ pub struct RunConfig {
     pub qualification_only: bool,
     #[serde(default)]
     pub source_revision: Option<String>,
+    #[serde(default)]
+    pub measurement_gate: Option<MeasurementGateConfig>,
     pub limits: LimitsConfig,
 }
 
@@ -169,6 +181,27 @@ impl RunConfig {
         let invalid = |message: &str| -> BackendResult<()> {
             Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, message.to_owned()).into())
         };
+        if let Some(namespace) = &self.key_namespace_hex
+            && (namespace.len() != 32
+                || !namespace
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                || !self.phases.preload)
+        {
+            return invalid(
+                "key_namespace_hex requires 32 lowercase hex digits and complete preload",
+            );
+        }
+        if let Some(gate) = &self.measurement_gate
+            && (!gate.ready_file.is_absolute()
+                || !gate.release_file.is_absolute()
+                || gate.ready_file == gate.release_file
+                || !(1..=120).contains(&gate.timeout_seconds))
+        {
+            return invalid(
+                "measurement_gate requires distinct absolute marker paths and timeout_seconds between 1 and 120",
+            );
+        }
         if self.schema_version != 1 {
             return invalid("schema_version must be 1");
         }
@@ -178,8 +211,59 @@ impl RunConfig {
         if self.dataset.keys == 0 || self.dataset.keys > self.limits.max_keys {
             return invalid("dataset.keys must be positive and within limits.max_keys");
         }
-        if !matches!(self.dataset.value_size, 256 | 1024 | 8192) {
-            return invalid("dataset.value_size must be 256, 1024, or 8192 bytes");
+        if !matches!(self.dataset.value_size, 64 | 256 | 1024 | 8192 | 65_536) {
+            return invalid("dataset.value_size must be 64, 256, 1024, 8192, or 65536 bytes");
+        }
+        if matches!(
+            self.backend.kind.as_str(),
+            "tidehunter_tcp" | "tidehunter_efa" | "tidehunter_efa_direct" | "tidehunter_efa_native"
+        ) {
+            // Qualification always checks a two-entry batch; workload batches
+            // use the configured size only when put_batch is actually offered.
+            let batch_operations = if self.workload.mix.put_batch > 0 {
+                self.workload.batch_size.max(2)
+            } else {
+                2
+            };
+            // CompleteBatch's fixed header and per-member key/record framing
+            // are included in this conservative owner admission bound.
+            let encoded_batch_bytes = self
+                .dataset
+                .value_size
+                .checked_add(crate::workload::KEY_BYTES)
+                .and_then(|bytes| bytes.checked_add(32))
+                .and_then(|bytes| bytes.checked_mul(batch_operations))
+                .and_then(|bytes| bytes.checked_add(96));
+            let owner_batch_operations = self
+                .backend
+                .options
+                .get("external_remote_config")
+                .and_then(|config| config.get("storage"))
+                .and_then(|storage| storage.get("batch_limits"))
+                .and_then(|limits| limits.get("max_operations"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|count| usize::try_from(count).ok())
+                .unwrap_or(32);
+            if batch_operations > owner_batch_operations {
+                return invalid(
+                    "Tidehunter batch qualification/workload exceeds the configured owner operation limit",
+                );
+            }
+            let owner_batch_limit = self
+                .backend
+                .options
+                .get("external_remote_config")
+                .and_then(|config| config.get("storage"))
+                .and_then(|storage| storage.get("batch_limits"))
+                .and_then(|limits| limits.get("max_encoded_bytes"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|bytes| usize::try_from(bytes).ok())
+                .unwrap_or(320 * 1024);
+            if encoded_batch_bytes.is_none_or(|bytes| bytes > owner_batch_limit) {
+                return invalid(
+                    "Tidehunter batch qualification/workload exceeds the configured owner batch byte limit",
+                );
+            }
         }
         if !self.dataset.entropy.is_finite() || !(0.0..=1.0).contains(&self.dataset.entropy) {
             return invalid("dataset.entropy must be finite and between 0 and 1");
@@ -288,6 +372,7 @@ mod tests {
             },
             seed: 1,
             namespace: Some("test".to_owned()),
+            key_namespace_hex: None,
             dataset: DatasetConfig {
                 keys: 100,
                 value_size: 256,
@@ -316,6 +401,7 @@ mod tests {
             },
             qualification_only: false,
             source_revision: None,
+            measurement_gate: None,
             limits: LimitsConfig {
                 max_keys: 100,
                 max_bytes: 25_600,
@@ -332,6 +418,24 @@ mod tests {
         let mut too_few = config();
         too_few.limits.max_operations = 102;
         assert!(too_few.validate().is_err());
+    }
+
+    #[test]
+    fn reused_key_namespace_requires_full_preload_and_exact_hex_identity() {
+        let mut reused = config();
+        reused.key_namespace_hex = Some("00112233445566778899aabbccddeeff".to_owned());
+        assert!(reused.validate().is_ok());
+        reused.phases.preload = false;
+        assert!(reused.validate().is_err());
+        reused.phases.preload = true;
+        for malformed in [
+            "0",
+            "00112233445566778899aabbccddeeff00",
+            "00112233445566778899AABBCCDDEEFF",
+        ] {
+            reused.key_namespace_hex = Some(malformed.to_owned());
+            assert!(reused.validate().is_err());
+        }
     }
 
     #[test]
@@ -362,5 +466,65 @@ mod tests {
         let decoded =
             serde_json::from_str::<BackendSpec>(r#"{"kind":"native","options":{},"secret":"x"}"#);
         assert!(decoded.is_err());
+    }
+    #[test]
+    fn admits_only_value_sizes_and_tidehunter_batch_limits_that_fit() {
+        let mut config = config();
+        for size in [64, 65_536] {
+            config.dataset.value_size = size;
+            config.limits.max_bytes = config.dataset.keys * size as u64;
+            assert!(config.validate().is_ok(), "value size {size}");
+        }
+
+        config.backend.kind = "tidehunter_tcp".to_owned();
+        config.backend.options = serde_json::json!({});
+        config.dataset.value_size = 8192;
+        config.limits.max_bytes = config.dataset.keys * 8192;
+        config.workload.mix.put_batch = 1;
+        config.workload.batch_size = 32;
+        assert!(config.validate().is_ok());
+
+        config.dataset.value_size = 65_536;
+        config.limits.max_bytes = config.dataset.keys * 65_536;
+        config.workload.mix.put_batch = 0;
+        assert!(config.validate().is_ok());
+        config.workload.mix.put_batch = 1;
+        config.workload.batch_size = 32;
+        assert!(config.validate().is_err());
+        config.workload.batch_size = 4;
+        assert!(config.validate().is_ok());
+        config.backend.options = serde_json::json!({
+            "external_remote_config": {
+                "storage": {
+                    "batch_limits": {
+                        "max_operations": 3,
+                        "max_encoded_bytes": 320 * 1024
+                    }
+                }
+            }
+        });
+        assert!(config.validate().is_err());
+        config.workload.batch_size = 1;
+        config.backend.options["external_remote_config"]["storage"]["batch_limits"]["max_operations"] =
+            serde_json::json!(1);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validates_optional_measurement_gate_paths_and_timeout() {
+        let mut config = config();
+        config.measurement_gate = Some(MeasurementGateConfig {
+            ready_file: PathBuf::from("/tmp/kv-ready"),
+            release_file: PathBuf::from("/tmp/kv-release"),
+            timeout_seconds: 60,
+        });
+        assert!(config.validate().is_ok());
+        config.measurement_gate.as_mut().unwrap().release_file = PathBuf::from("relative-release");
+        assert!(config.validate().is_err());
+        config.measurement_gate.as_mut().unwrap().release_file = PathBuf::from("/tmp/kv-ready");
+        assert!(config.validate().is_err());
+        config.measurement_gate.as_mut().unwrap().release_file = PathBuf::from("/tmp/kv-release");
+        config.measurement_gate.as_mut().unwrap().timeout_seconds = 121;
+        assert!(config.validate().is_err());
     }
 }

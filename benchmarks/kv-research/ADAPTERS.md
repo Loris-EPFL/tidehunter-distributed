@@ -1,6 +1,6 @@
 # External KV adapters: research, semantics, and local preparation
 
-These adapters are standalone application-level KV comparators; they do not replace Tidehunter's native engine or alter its WAL/recovery model. The benchmark provides blind full-value `put`, `get`, `delete`, ordered `get_many`, and optional `put_batch`. Run-level namespacing is supplied by the common workload generator, so adapters preserve the opaque binary keys without rewriting them. The Tidehunter paper's §3.1 separates its append/WAL durability path from later work, §3.2 describes its index-assisted read path, and §6.2 compares engine-specific operations and storage behavior. These external APIs expose different server-side paths and acknowledgement meanings; results must retain their `BackendInfo` semantic and trust metadata rather than claim equivalent durability or transport. See [Tidehunter paper §§3, 6](../../../papers/parsed/Tidehunter-2026-v2.md) and the current [one-sided WAL implementation/evidence guide](../../docs/distributed/ONE_SIDED_WAL_IMPLEMENTATION_2026-10-23.md).
+These adapters are standalone application-level KV comparators; they do not replace Tidehunter's native engine or alter its WAL/recovery model. The benchmark provides blind full-value `put`, `get`, `delete`, ordered `get_many`, and optional `put_batch`. The common generator supplies opaque logical binary keys; FoundationDB adds the documented user-domain encoding below, while the other adapters retain the raw bytes. The Tidehunter paper's §3.1 separates append/WAL durability from later work, §3.2 describes index-assisted reads, and §6.2 compares engine-specific operations and storage behavior. External APIs have different server-side paths and acknowledgement meanings; retain `BackendInfo` semantic/trust metadata rather than claim equivalent durability or transport. See [Tidehunter paper §§3, 6](../../../papers/parsed/Tidehunter-2026-v2.md) and the [one-sided WAL evidence guide](../../docs/distributed/ONE_SIDED_WAL_IMPLEMENTATION_2026-10-23.md).
 
 
 Security is a workload dimension, not an equivalence claim: the existing native TCP adapter uses mTLS, TiKV RawKV currently uses plaintext, CQL reports either plaintext or CA-verified TLS, and FoundationDB reports negotiated transport/trust as unverified from its live status. Runs with different trust modes must remain explicitly labeled and are not security-matched comparisons. The three `validate_options` entrypoints are pure JSON parsing/semantic validation, share their deny-unknown-fields parser with `open`, and do not inspect live endpoints or generated files. In particular, FDB preflight validates only that `cluster_file` is a nonempty UTF-8 path; its presence is checked only when opening the backend after lifecycle preparation.
@@ -37,6 +37,7 @@ Manifest support dependencies are purpose-specific: `reqwest` for PD metadata ov
 ### FoundationDB
 
 - Options require an explicit `cluster_file` and `required_replication_factor`; `transaction_timeout_ms` defaults to 5000. There is no fallback to a default cluster file. The adapter sets a database transaction timeout to bound the C client retry behavior and also applies an API-side timeout; an interrupted mutation may have an unknown outcome, not rollback semantics.
+- FoundationDB reserves keys starting with `0xff` for [internal system use](https://apple.github.io/foundationdb/developer-guide.html) and limits [physical keys to 10,000 bytes](https://apple.github.io/foundationdb/known-limitations.html#large-keys-and-values). Uniform random benchmark keys can hit that reserved domain. User operations prepend `min(first_byte_or_zero, 0xfe)` to the original key. This injective, order-preserving embedding keeps physical first bytes across `0x00..0xfe`, rather than concentrating the workload under one fixed prefix. The 32-byte logical keys become 33-byte physical keys; the maximum logical length is 9,999 bytes. All five user operations share the encoding; the explicit system-status query remains a system query. Metadata records the encoding and overhead. Keys/values are retained outside retry closures rather than copied on each transaction attempt.
 - The adapter reads FoundationDB's machine-readable `\xff\xff/status/json` system key using `ReadSystemKeys`, requires `full_replication=true`, and verifies the requested RF from observed custom `storage_replicas` or the standard `redundancy_mode` (`single`/`double`/`triple`). It retains the status and configured storage/log replication policies; reported `storage_replicas` and standard mode are distinct evidence, not assumed from the launch option. Process versions and locality come from that same live status when present. The status schema is explicitly not a stable public API; unknown or missing required RF/full-replication fields fail closed.
 - `get_many` performs sequential native key gets inside one serializable transaction and preserves exact order. `put_batch` sets all entries in a single retryable serializable transaction. `Database::run` may retry a transaction and warns that a result can be maybe-committed; the adapter performs no external side effect in its transaction closure. Typed FoundationDB `timed_out` (1004), `transaction_timed_out` (1031), and the adapter API's elapsed deadline are surfaced as `io::ErrorKind::TimedOut` with their original causes retained. Physical device persistence, negotiated transport security/authentication, storage-engine compaction, and internal value-separation implementation are not inferred from a successful commit or merely echoed cluster-file data; they remain unverified unless observed status proves them.
 - Runtime client identity is read from the unique executable, non-deleted `libfdb_c.so*` mapping in `/proc/self/maps`, canonicalized and hashed as Blake2b-512; the loaded C API maximum version is queried from the FoundationDB API. These are emitted under `configuration.loaded_native_library` and are evidence from the running process, not the caller-supplied path or build-time link search.
@@ -57,4 +58,64 @@ The pinned release/reference sources are [foundationdb-rs 0.11.0 prerequisites a
 
 ## Evidence boundary
 
-These constructors query live metadata, but this implementation has not been run against a local TiKV, Cassandra/Scylla, or FoundationDB cluster yet. The CI/lifecycle owner supplies pinned actual-server deployments and later live validation. Compilation under selected features, native ABI linking, and actual server correctness/performance still require the parent's consolidated feature builds and local service campaign. No mock server, echoed configuration, synthetic result, or remote benchmark is used as evidence here.
+The constructors query live metadata. Actual-server qualification must retain the deployment receipt, executable/configuration identities and full-payload/ordered-group checks; compilation and mocked configuration tests are not live-server evidence. The separate five-host `cloud_layout.py` contract also verifies physical placement and effective acknowledgement controls. Local loopback qualification does not establish independent-NVMe or EFA performance. Cloud measurements require the source-bound release package and real hardware admission described in `experiments/kv-comparison/README.md`.
+
+## Tidehunter transport adapters and external owner preparation
+
+The distributed adapter kinds share the unchanged `tidehunter/examples/support/tcp_cluster.rs` engine harness and the same keyshape, owner protocol, WAL acknowledgement and RF1 semantics:
+
+| Backend kind | Engine `Transport` value | Security/data path |
+|---|---|---|
+| `tidehunter_tcp` | `tcp` | Existing TCP with mutual TLS; default local path remains available without libfabric. |
+| `tidehunter_efa` | `efa` | EFA provider with mutual TLS. |
+| `tidehunter_efa_direct` | `efa-direct` | EFA-direct with mutual TLS. |
+| `tidehunter_efa_native` | `efa-native` | Trusted-network EFA-direct without TLS; this is a separate unencrypted security cohort. |
+
+Build one comparator binary with `--features "efa,rocksdb,tikv,cassandra,foundationdb"` as needed. The `efa` feature explicitly forwards `tidehunter/experimental-fabric`; without it, EFA configuration fails during config admission. `Transport::validate` rejects absent fabric support, and the real transport open rejects a missing EFA device/provider. These paths never relabel or fall back to TCP. The engine's reviewed hardware runtime is AWS libfabric `2.6.0amzn1.0` (provider ABI 206.0, EFA protocol 4); the feature does not install a provider. `efa-native` deliberately disables application TLS and must not be compared as security-equivalent to the three TLS transports.
+
+Every distributed adapter accepts the existing `external_remote_config` object plus an `external_owner_read_config` array. The latter is required for external owners and must have exactly one entry for every configured partition:
+
+```json
+{
+  "partition": 0,
+  "read_workers": 2,
+  "wal_member_read": "async",
+  "read_resident_first": false,
+  "read_cache_bytes": 8388608,
+  "read_memory_allowance_bytes": 536870912,
+  "read_max_inflight_requests": 32,
+  "read_max_inflight_bytes": 67108864,
+  "read_max_device_reads": 128,
+  "resident_reads": {
+    "source_bytes": 0,
+    "source_regions": 0,
+    "destination_bytes": 0,
+    "destination_slots": 0,
+    "max_read_bytes": 0,
+    "max_handles": 0,
+    "require_device_read": false
+  }
+}
+```
+
+This is copied from the actual serialized owner `NodeConfig`, not inferred from the coordinator's request. `external_remote_config.tls.transport` must exactly match the selected backend kind; TCP under an EFA label is rejected. The coordinator cache budget is configured by `coordinator_read_cache_bytes`; when absent, an external adapter preserves the budget in `external_remote_config.read_cache_bytes` (the engine default is 8 MiB). Effective JSON configuration retains the exact transport name, trust mode, coordinator cache settings, owner storage limits, owner read configuration and placement evidence. External topology is not asserted to use independent NVMe unless its deployment evidence establishes that fact.
+
+Use the built binary's pure prep mode to generate engine-native external configs instead of reconstructing their YAML in deployment code:
+
+```sh
+kv-research --prepare-external-case input.json --output FRESH_DIR
+```
+
+`input.json` has exactly these required fields: absolute `guest_root`; five unique `addresses` as `IPv4:port`/`[IPv6]:port` strings; `transport` (`tcp`, `efa`, `efa-direct`, or `efa-native`); positive `max_batches_per_partition`, `max_admitted_batches` and `max_index_bytes`; nonnegative `coordinator_cache_bytes`; positive `owner_read_workers` and `owner_read_memory_allowance_bytes`; nonnegative `owner_read_cache_bytes`; `owner_wal_member_read` (`async`, `mapped`, or `positional`); `owner_read_resident_first`; `resident_reads` with the fields shown above; and `polling` (`adaptive` or `busy`). The helper fixes the comparison keyshape at 16 mutexes × 64 cells and writes `node-{0..4}/launch.yaml`, `remote.yaml`, `remote.json`, `shape.yaml`, generated `tls/` material when TLS is selected, plus `external_owner_read_config.json` extracted from each actual launch file. Owner limits are 32 operations/320 KiB encoded batch, 32 batches/1 MiB group, 1 MiB fragments, 1 GiB WAL files, 64 MiB reference metadata and four epochs. Owner read admission includes a 64 MiB in-flight allowance, 32 requests and 128 device reads. A pre-existing output directory is rejected. The signing key stays in the generated coordinator-side TLS tree; stage each node's launch config and required CA certificate/server leaf certificate+key, never the CA signing key, to that owner. The coordinator uses `remote.json` credentials.
+
+At shutdown, `read-evidence.json` records coordinator cache hits/misses/bytes and read RPC count separately from the most recent available owner read-executor and resident/RDMA counters. Owner `wal_reads` are logical member reads, not device IOPS; async submissions are not proof of physical NVMe activity. Evidence includes sample generation/age/availability and the effective cache/read configuration. It adds no per-operation sampling calls; a passive bounded owner monitor samples outside the measured API calls.
+
+## Measurement gate for external cold-state capture
+
+An optional `RunConfig.measurement_gate` pauses after preload, warm-up and aging have drained, immediately before the `measurement` phase begins. Its shape is:
+
+```json
+{"ready_file":"/absolute/existing-dir/ready","release_file":"/absolute/existing-dir/release","timeout_seconds":60}
+```
+
+Both marker paths must be distinct, absolute and absent when the run starts; their parent directories must already exist. The runner atomically creates the ready marker with create-new semantics, then waits at most `timeout_seconds` (maximum 120) and never beyond the run's global deadline. A controller may collect device counters and perform explicitly authorized cold-state preparation on owned hosts while the workload is paused, then create the release marker. Existing application-cache configuration and actual cache/RDMA evidence remain recorded separately; the gate does not claim that page-cache dropping removes all memory-resident data.

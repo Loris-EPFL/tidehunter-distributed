@@ -50,9 +50,7 @@ pub fn key_bytes(namespace: &[u8; 16], seed: u64, id: u64) -> Bytes {
     Bytes::copy_from_slice(&digest[..KEY_BYTES])
 }
 
-/// Generate deterministic opaque values with a 16-byte per-key identity header.
-/// Entropy controls the randomized fraction of the remaining value; the rest is zero-filled.
-// Admitted values are at most 8192 bytes and entropy is finite in [0, 1].
+// Admitted values are at most 65,536 bytes and entropy is finite in [0, 1].
 #[allow(clippy::cast_precision_loss)]
 // Deliberate nearest-byte rounding of the nonnegative, bounded entropy fraction.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

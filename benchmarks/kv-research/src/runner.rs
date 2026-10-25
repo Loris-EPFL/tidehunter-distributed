@@ -8,7 +8,7 @@ use crate::workload::{
 use blake2::{Blake2b512, Digest};
 use std::borrow::Cow;
 use std::future::Future;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc as std_mpsc};
@@ -36,8 +36,17 @@ pub async fn run<B: KvBackend>(
             "put_batch requested but backend does not provide supported batch semantics",
         ));
     }
-    let namespace = fresh_namespace()?;
-    let validation_namespace = derive_namespace(&namespace, b"qualification");
+    let namespace = if let Some(encoded) = &config.key_namespace_hex {
+        let mut namespace = [0; 16];
+        for (byte, pair) in namespace.iter_mut().zip(encoded.as_bytes().chunks_exact(2)) {
+            *byte = u8::from_str_radix(std::str::from_utf8(pair)?, 16)?;
+        }
+        namespace
+    } else {
+        fresh_namespace()?
+    };
+    // Qualification remains isolated even when an owned cloud dataset is reused.
+    let validation_namespace = derive_namespace(&fresh_namespace()?, b"qualification");
     let config_bytes = serde_json::to_vec(&config)?;
     let config_hash = hex_digest(&config_bytes);
     let started_wall = unix_seconds();
@@ -124,24 +133,33 @@ pub async fn run<B: KvBackend>(
         && fatal_reason.is_none()
         && config.phases.measurement_operations > 0
     {
-        reporter.set_phase("measurement");
-        if let Err(error) = run_phase(
-            Arc::clone(&backend),
-            &config,
-            &namespace,
-            &mut generator,
-            "measurement",
-            config.phases.measurement_operations,
-            started,
-            deadline,
-            &mut reporter,
-        )
-        .await
+        if let Some(gate) = &config.measurement_gate
+            && let Err(error) = wait_for_measurement_gate(gate, deadline).await
         {
             failed = true;
-            fatal_reason = Some(format!("measurement phase stopped: {error}"));
+            fatal_reason = Some(format!("measurement gate failed: {error}"));
+            reporter.snapshot()?;
         }
-        reporter.snapshot()?;
+        if fatal_reason.is_none() {
+            reporter.set_phase("measurement");
+            if let Err(error) = run_phase(
+                Arc::clone(&backend),
+                &config,
+                &namespace,
+                &mut generator,
+                "measurement",
+                config.phases.measurement_operations,
+                started,
+                deadline,
+                &mut reporter,
+            )
+            .await
+            {
+                failed = true;
+                fatal_reason = Some(format!("measurement phase stopped: {error}"));
+            }
+            reporter.snapshot()?;
+        }
     }
 
     reporter.set_phase("qualification");
@@ -205,7 +223,7 @@ pub async fn run<B: KvBackend>(
         distributions: reporter.distribution_summaries(),
         limitations: vec![
             "Finite local workload phases are not evidence of sustainable steady-state capacity.".to_owned(),
-            "All local owners share the host storage and do not establish independent-NVMe scaling.".to_owned(),
+            "Owner physical-device independence is not inferred from configured topology; see backend topology evidence.".to_owned(),
             "Measured API latency ends when response bytes are materialized; byte verification is outside the API timer.".to_owned(),
             "Batch latency is one complete backend API call; logical key counts are reported separately and no per-key latency is inferred.".to_owned(),
             "Concurrent workload traces do not assert a completion-order final-state oracle or linearizability.".to_owned(),
@@ -815,6 +833,65 @@ impl WorkerPool {
         } else {
             self.workers.clear();
         }
+    }
+}
+
+async fn wait_for_measurement_gate(
+    gate: &crate::config::MeasurementGateConfig,
+    global_deadline: Instant,
+) -> BackendResult<()> {
+    let invalid =
+        |message: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, message.to_owned());
+    let normalize_marker = |marker: &Path| -> BackendResult<std::path::PathBuf> {
+        let parent = marker
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let file_name = marker
+            .file_name()
+            .ok_or_else(|| invalid("measurement gate marker path must name a file"))?;
+        if !parent.is_dir() {
+            return Err(
+                invalid("measurement gate marker parent directory must already exist").into(),
+            );
+        }
+        Ok(std::fs::canonicalize(parent)?.join(file_name))
+    };
+    let ready_identity = normalize_marker(&gate.ready_file)?;
+    let release_identity = normalize_marker(&gate.release_file)?;
+    if ready_identity == release_identity {
+        return Err(invalid("measurement gate marker paths must resolve to distinct files").into());
+    }
+    for marker in [&gate.ready_file, &gate.release_file] {
+        if marker.try_exists()? {
+            return Err(invalid("measurement gate markers must not already exist").into());
+        }
+    }
+    if Instant::now() >= global_deadline {
+        return Err(invalid("global deadline expired before measurement gate").into());
+    }
+    let mut ready = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&gate.ready_file)?;
+    ready.write_all(b"ready\n")?;
+    ready.sync_all()?;
+
+    let gate_deadline =
+        (Instant::now() + Duration::from_secs(gate.timeout_seconds)).min(global_deadline);
+    loop {
+        if Instant::now() >= gate_deadline {
+            let message = if gate_deadline == global_deadline {
+                "global deadline expired while waiting at measurement gate"
+            } else {
+                "measurement gate timed out waiting for release marker"
+            };
+            return Err(invalid(message).into());
+        }
+        if gate.release_file.try_exists()? {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

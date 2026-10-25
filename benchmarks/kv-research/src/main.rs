@@ -10,9 +10,26 @@ fn main() {
     }
 }
 
+// Keep feature-gated backend admission and dispatch together so they cannot diverge.
+#[allow(clippy::too_many_lines)]
 fn entry() -> BackendResult<()> {
     if backends::tidehunter::maybe_run_storage_node()? {
         return Ok(());
+    }
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--prepare-external-case")
+    {
+        if arguments.len() != 4 || arguments[2] != "--output" {
+            return Err(
+                "usage: kv-research --prepare-external-case INPUT.json --output FRESH_DIR".into(),
+            );
+        }
+        return backends::tidehunter::prepare_external_case_file(
+            PathBuf::from(&arguments[1]).as_path(),
+            PathBuf::from(&arguments[3]).as_path(),
+        );
     }
     let mut args = std::env::args().skip(1);
     let mut config_path = None;
@@ -36,9 +53,9 @@ fn entry() -> BackendResult<()> {
             "--help" | "-h" => {
                 println!(
                     "Usage: kv-research --config FILE --output FRESH_DIR [--validate-config]\n\
-                    Local qualification only: no AWS or EFA hardware is started.\n\
-                    Backends: native, tidehunter_tcp; optional features: rocksdb (rocksdb/blobdb), tikv, cassandra, foundationdb.\n\
-                    Requested unavailable features fail; embedded reference results are not network-service results."
+                    External owner prep: kv-research --prepare-external-case INPUT.json --output FRESH_DIR\n\
+                    Backends: native, tidehunter_tcp (TLS), tidehunter_efa (TLS), tidehunter_efa_direct (TLS), tidehunter_efa_native (trusted plaintext); optional features: efa, rocksdb, tikv, cassandra, foundationdb.\n\
+                    EFA modes require the real provider/device and never fall back to TCP."
                 );
                 return Ok(());
             }
@@ -74,6 +91,23 @@ fn entry() -> BackendResult<()> {
             "tidehunter_tcp" => {
                 let backend =
                     backends::tidehunter::open(&config.backend.options, &registry).await?;
+                runner::run(backend, config, &output, registry).await
+            }
+            "tidehunter_efa" => {
+                let backend =
+                    backends::tidehunter::open_efa(&config.backend.options, &registry).await?;
+                runner::run(backend, config, &output, registry).await
+            }
+            "tidehunter_efa_direct" => {
+                let backend =
+                    backends::tidehunter::open_efa_direct(&config.backend.options, &registry)
+                        .await?;
+                runner::run(backend, config, &output, registry).await
+            }
+            "tidehunter_efa_native" => {
+                let backend =
+                    backends::tidehunter::open_efa_native(&config.backend.options, &registry)
+                        .await?;
                 runner::run(backend, config, &output, registry).await
             }
             #[cfg(feature = "rocksdb")]
