@@ -1,6 +1,10 @@
-"""Focused data-integrity tests; no Matplotlib or benchmark execution required."""
+"""Behavioral data-integrity and offline rendering tests; no benchmark execution."""
 import copy
+import csv
+from pathlib import Path
+import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 
 import plot_cloud_comparison as plots
 
@@ -42,8 +46,173 @@ def dataset(cases):
                           "completed_cases": sum(item["status"] == "completed" for item in cases), "cases": cases})
 
 
+def full_matrix_cases(repeats=(0,)):
+    """Independent fixture of the full per-repeat campaign cells."""
+    cells = [(backend, "primary_rf1", profile, size)
+             for backend in plots.BACKENDS
+             for profile in ("read-concurrent", "write-concurrent", "read-many32", "point-mixed")
+             for size in plots.SIZES]
+    cells += [(backend, "primary_rf1", profile, 1024)
+              for backend in plots.BACKENDS
+              for profile in ("offered-1000", "offered-10000", "offered-50000", "zipf-read")]
+    cells += [(backend, cohort, profile, size)
+              for backend in plots.TH for size in (256, 8192)
+              for cohort, profile in (("coordinator_cache_configured", "coordinator-cache"),
+                                      ("owner_cache_configured", "owner-cache"))]
+    cells += [("tidehunter_efa_native", "registered_ram_configured", "registered-ram", size)
+              for size in (256, 8192)]
+    cells += [(backend, "cold_os_cache", "cold-os-large", 65536) for backend in plots.BACKENDS]
+    cells += [("native", "native_pagecache", profile, size)
+              for profile in ("point-mixed", "read-many32") for size in plots.SIZES]
+    result = []
+    for backend, cohort, profile, size in cells:
+        for repeat in repeats:
+            groups = [population(operation, p50=100 + repeat * 100, p99=900 + repeat * 100)
+                      for operation in ("read", "put", "delete", "missing_read", "get_many")]
+            item = case(backend, repeat, populations=groups)
+            identity = f"{backend}-{cohort}-{profile}-{size}-r{repeat}"
+            item["case_id"] = identity
+            item["job"].update(case_id=identity, cohort=cohort, profile=profile, value_size=size)
+            item["metrics"]["success_value_mib_per_second"] = 50 * size / 1024**2
+            result.append(item)
+    return result
+
+
+class SingleRepeatPolicy(unittest.TestCase):
+    def test_historical_eight_system_report_keeps_coverage_and_single_repeat_policy(self):
+        original = [row for row in full_matrix_cases() if row["job"]["backend"] != "valkey_tcp"]
+        frozen = copy.deepcopy(original)
+        data = dataset(original)
+        figures, omitted = plots.build_figures(data)
+        self.assertEqual(omitted, [])
+        self.assertEqual(original, frozen)
+        coverage = plots.coverage(data)
+        self.assertEqual(coverage["total"], {"completed": 228})
+        self.assertFalse(coverage["current_backend_coverage"])
+        self.assertNotIn("valkey_tcp", coverage["planned_backends"])
+        primary = next(row for row in figures if row["name"] == "primary-read-concurrent")
+        self.assertEqual(len(primary["panels"][0]["series"]), 8)
+        self.assertFalse(primary["run_to_run_errorbars"])
+        self.assertEqual(primary["repeats"], [0])
+
+    def test_valkey_has_real_series_without_value_wal_read_claim(self):
+        data = dataset(full_matrix_cases())
+        figures, _ = plots.build_figures(data)
+        self.assertTrue(plots.coverage(data)["current_backend_coverage"])
+        primary = next(row for row in figures if row["name"] == "primary-read-concurrent")
+        valkey = next(row for row in primary["panels"][0]["series"] if row["backend"] == "valkey_tcp")
+        self.assertEqual(valkey["label"], "Valkey TCP")
+        self.assertEqual(valkey["points"][0]["median"], 100)
+        cold = next(row for row in figures if row["name"] == "cold-os-cache")
+        self.assertIn("RAM-resident", cold["caption"])
+        self.assertIn("AOF is not a read backing store", cold["caption"])
+
+    def test_one_planned_identity_accepts_one_shared_complete_repeat(self):
+        data = dataset([case(backend, 7) for backend in plots.BACKENDS])
+        cells = [(backend, "primary_rf1", "read-concurrent", 64) for backend in plots.BACKENDS]
+        self.assertEqual(data.planned_repeats, [7])
+        self.assertEqual(data.matched_repeats(cells), [7])
+        point, reason = plots.aggregate_point(data, cells[0], [7], "api_ns", "read")
+        self.assertIsNone(reason)
+        self.assertEqual(point["median"], 900)
+        self.assertEqual(point["observations"][0]["timed_sample_count_or_denominator"], 10)
+        self.assertEqual(point["independent_repetitions"], 1)
+        self.assertFalse(point["run_to_run_errorbars"])
+        self.assertIn("no run-to-run variability estimate", data.repetition_metadata()["variation"])
+
+    def test_failed_and_not_run_plans_prevent_one_repeat_reclassification(self):
+        cell = ("native", "primary_rf1", "read-concurrent", 64)
+        for status in ("failed", "not_run"):
+            with self.subTest(status=status):
+                data = dataset([case(), case("foundationdb", 1, status)])
+                self.assertEqual(data.planned_repeats, [0, 1])
+                with self.assertRaisesRegex(ValueError, "fewer than two common"):
+                    data.matched_repeats([cell])
+                point, reason = plots.aggregate_point(data, cell, [0], "api_ns", "read")
+                self.assertIsNone(point)
+                self.assertIn("fewer than 2", reason)
+
+    def test_missing_cell_prevents_single_repeat_comparison(self):
+        cells = [(backend, "primary_rf1", "read-concurrent", 64) for backend in plots.BACKENDS]
+        for status in ("failed", "not_run", "absent"):
+            with self.subTest(status=status):
+                cases = [case(backend) for backend in plots.BACKENDS if backend != "foundationdb"]
+                if status != "absent":
+                    cases.append(case("foundationdb", status=status))
+                data = dataset(cases)
+                with self.assertRaises(ValueError):
+                    data.matched_repeats(cells)
+
+    def test_full_single_repeat_has_all_twelve_performance_figures_plus_coverage(self):
+        cases = full_matrix_cases()
+        original = copy.deepcopy(cases)
+        figures, omitted = plots.build_figures(dataset(cases))
+        self.assertEqual(omitted, [])
+        self.assertEqual(len(figures) + 1, 13)
+        self.assertEqual(cases, original)  # Source summaries/populations are never rewritten.
+        for figure in figures:
+            self.assertEqual(figure["repeats"], [0])
+            self.assertEqual(figure["repetition_mode"], "single")
+            self.assertFalse(figure["run_to_run_errorbars"])
+            self.assertIn("One independent repetition", figure["title"])
+            self.assertIn("No run-to-run variability estimate", figure["caption"])
+
+    def test_historical_three_planned_two_complete_preserves_matched_ranges(self):
+        cases = full_matrix_cases((0, 1, 2))
+        for item in cases:
+            if item["job"]["repeat"] == 2 and item["job"]["backend"] != "foundationdb":
+                item.update(status="not_run", metrics=None)
+        figures, omitted = plots.build_figures(dataset(cases))
+        self.assertEqual(omitted, [])
+        self.assertEqual(len(figures), 12)
+        for figure in figures:
+            self.assertEqual(figure["planned_repeats"], [0, 1, 2])
+            self.assertEqual(figure["repeats"], [0, 1])
+            self.assertTrue(figure["run_to_run_errorbars"])
+            self.assertIn("Matched repeats r0, r1", figure["title"])
+            for request in figure["panels"]:
+                for series in request["series"]:
+                    for point in series["points"]:
+                        self.assertEqual(point["independent_repetitions"], 2)
+                        self.assertEqual([row["repeat"] for row in point["observations"]], [0, 1])
+                        if point["metric"] in plots.TIMINGS:
+                            self.assertEqual(point["observed_max"] - point["observed_min"], 100)
+
+    def test_single_repeat_csv_retains_units_source_values_and_explicit_mode(self):
+        data = dataset(full_matrix_cases())
+        figures, _ = plots.build_figures(data)
+        with tempfile.TemporaryDirectory() as directory:
+            plots.export_data(figures, plots.coverage(data), Path(directory))
+            with (Path(directory) / "plot-data.csv").open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+        latency = [row for row in rows if row["metric"] == "api_ns"]
+        self.assertTrue(latency)
+        for row in latency:
+            self.assertEqual(row["unit"], "ns")
+            self.assertEqual(row["value"], row["median"])
+            self.assertEqual(row["planned_repeats"], "[0]")
+            self.assertEqual(row["repetition_mode"], "single")
+            self.assertEqual(row["independent_repetitions"], "1")
+            self.assertEqual(row["run_to_run_errorbars"], "False")
+            self.assertIn("no run-to-run variability estimate", row["variation"])
+
+    def test_renderer_emits_whiskers_only_for_multiple_repetitions(self):
+        # Inspect real SVG drawing primitives, not mocked Matplotlib calls.
+        for repeats in ((0,), (0, 1)):
+            with self.subTest(repeats=repeats), tempfile.TemporaryDirectory() as directory:
+                data = dataset(full_matrix_cases(repeats))
+                figures, _ = plots.build_figures(data)
+                figure = copy.deepcopy(next(row for row in figures if row["name"] == "cold-os-cache"))
+                figure.update(panels=figure["panels"][:1], columns=1, files=["observations.svg"])
+                plots.render([figure], plots.coverage(data), Path(directory))
+                root = ET.parse(Path(directory) / "observations.svg").getroot()
+                whiskers = [element for element in root.iter()
+                            if element.get("id", "").startswith("LineCollection_")]
+                self.assertEqual(bool(whiskers), len(repeats) > 1)
+
+
 class MatchedRepeatIntegrity(unittest.TestCase):
-    def test_extra_fdb_repeat_cannot_contaminate_eight_system_median(self):
+    def test_extra_fdb_repeat_cannot_contaminate_all_system_median(self):
         cases = [case(backend, repeat) for backend in plots.BACKENDS for repeat in (0, 1)]
         extra = case("foundationdb", 2, populations=[population(p50=999999, p99=999999)])
         cases.append(extra)
@@ -51,15 +220,18 @@ class MatchedRepeatIntegrity(unittest.TestCase):
         cells = [(backend, "primary_rf1", "read-concurrent", 64) for backend in plots.BACKENDS]
         repeats = data.matched_repeats(cells)
         self.assertEqual(repeats, [0, 1])
-        point, reason = plots.aggregate_point(data, cells[-1], repeats, "api_ns", "read", percentile="p50")
+        fdb_cell = next(cell for cell in cells if cell[0] == "foundationdb")
+        point, reason = plots.aggregate_point(data, fdb_cell, repeats, "api_ns", "read", percentile="p50")
         self.assertIsNone(reason)
         self.assertEqual(point["median"], 100)
         self.assertEqual([row["repeat"] for row in point["observations"]], [0, 1])
         self.assertNotIn(extra["case_id"], [row["case_id"] for row in point["observations"]])
 
-    def test_no_silent_one_repeat_subset_on_eight_system_chart(self):
+    def test_no_silent_one_repeat_subset_on_all_system_chart(self):
         cases = [case(backend, repeat) for backend in plots.BACKENDS for repeat in (0, 1)]
-        cases[-1] = case("foundationdb", 1, "not_run")
+        index = next(i for i, row in enumerate(cases)
+                     if row["job"]["backend"] == "foundationdb" and row["job"]["repeat"] == 1)
+        cases[index] = case("foundationdb", 1, "not_run")
         data = dataset(cases)
         cells = [(backend, "primary_rf1", "read-concurrent", 64) for backend in plots.BACKENDS]
         with self.assertRaisesRegex(ValueError, "fewer than two common"):
@@ -111,6 +283,46 @@ class ColdAvailabilityIntegrity(unittest.TestCase):
         self.assertEqual(len(cold["unavailable_systems"][0]["case_ids"]), 2)
         self.assertNotIn("foundationdb", {row["backend"] for row in cold["panels"][0]["series"]})
         self.assertEqual(cold["repeats"], [0, 1])
+
+    def test_single_repeat_cold_missing_systems_are_explicit_not_zero_filled(self):
+        for status in ("failed", "not_run", "absent"):
+            with self.subTest(status=status):
+                cases = [row for row in self.cold_cases() if row["job"]["repeat"] == 0]
+                fdb = next(row for row in cases if row["job"]["backend"] == "foundationdb")
+                if status == "absent":
+                    cases.remove(fdb)
+                else:
+                    fdb.update(status=status, metrics=None)
+                figures, _ = plots.build_figures(dataset(cases))
+                cold = next(row for row in figures if row["name"] == "cold-os-cache")
+                self.assertEqual(cold["repeats"], [0])
+                self.assertFalse(cold["run_to_run_errorbars"])
+                excluded = cold["unavailable_systems"]
+                self.assertEqual([row["backend"] for row in excluded], ["foundationdb"])
+                self.assertEqual(excluded[0]["case_ids"], [] if status == "absent" else [fdb["case_id"]])
+                self.assertNotIn("foundationdb", {row["backend"] for row in cold["panels"][0]["series"]})
+                self.assertIn("Missing results are never plotted as zero", cold["caption"])
+
+    def test_cold_multi_plan_does_not_fall_back_to_one_common_repeat(self):
+        cases = [row for row in full_matrix_cases((0, 1, 2)) if row["job"]["cohort"] == "cold_os_cache"]
+        for row in cases:
+            excluded_repeat = 2 if row["job"]["backend"] == "native" else 0
+            if row["job"]["repeat"] == excluded_repeat:
+                row.update(status="not_run", metrics=None)
+        figures, omitted = plots.build_figures(dataset(cases))
+        self.assertNotIn("cold-os-cache", {row["name"] for row in figures})
+        cold = next(row for row in omitted if row["figure"] == "cold-os-cache")
+        self.assertIn("fewer than two common", cold["reason"])
+        self.assertEqual(cold["unavailable_systems"], [])
+
+    def test_cold_single_plan_with_no_complete_system_is_omitted_with_exclusions(self):
+        cases = [row for row in self.cold_cases() if row["job"]["repeat"] == 0]
+        for row in cases:
+            row.update(status="not_run", metrics=None)
+        figures, omitted = plots.build_figures(dataset(cases))
+        self.assertEqual(figures, [])
+        cold = next(row for row in omitted if row["figure"] == "cold-os-cache")
+        self.assertEqual({row["backend"] for row in cold["unavailable_systems"]}, set(plots.BACKENDS))
 
 
 class MissingAndOutcomeIntegrity(unittest.TestCase):
@@ -205,6 +417,12 @@ class DuplicateIdentityIntegrity(unittest.TestCase):
     def test_shared_profile_name_cannot_hide_different_workload_contract(self):
         changed = case("foundationdb")
         changed["job"]["concurrency"] = 1
+        with self.assertRaisesRegex(ValueError, "workload contract changed"):
+            dataset([case("native"), changed])
+
+    def test_single_planned_repeat_still_rejects_incompatible_value_contracts(self):
+        changed = case("foundationdb")
+        changed["job"]["measurement_operations"] = 20
         with self.assertRaisesRegex(ValueError, "workload contract changed"):
             dataset([case("native"), changed])
 

@@ -38,6 +38,19 @@ MAX_BYTES = 4 * 1024**3
 MAX_MEMBERS = 100000
 MAX_JSON = 16 * 1024**2
 SCRAPE_SECONDS = 1
+QUERY_PAGE_SECONDS = 300
+QUERY_METRICS = ('kv_observer_snapshot_final', 'kv_observer_case_terminal', 'kv_observer_data_available', 'up',
+                 'kv_case_success_calls_per_second', 'kv_case_api_quantile_seconds', 'kv_case_read_path_calls',
+                 'kv_case_resource_interval_available', 'kv_case_resource_interval_elapsed_seconds',
+                 'kv_case_resource_interval_cpu_seconds', 'kv_case_resource_interval_cpu_throttled_seconds',
+                 'kv_case_resource_interval_cpu_periods', 'kv_case_resource_interval_cpu_throttled_periods',
+                 'kv_case_resource_interval_io_read_bytes', 'kv_case_resource_interval_io_write_bytes',
+                 'kv_case_resource_interval_memory_current_bytes', 'kv_case_resource_interval_memory_peak_bytes',
+                 'kv_observer_cgroup_cpu_seconds_total', 'kv_observer_cgroup_cpu_throttled_seconds_total',
+                 'kv_observer_cgroup_cpu_periods_total', 'kv_observer_cgroup_cpu_throttled_periods_total',
+                 'kv_observer_cgroup_io_read_bytes_total', 'kv_observer_cgroup_io_write_bytes_total',
+                 'kv_case_write_diagnostic_available', 'kv_case_write_diagnostic_operations',
+                 'kv_case_write_diagnostic_stage_seconds', 'kv_case_write_diagnostic_stage_count')
 CAPS = {'prometheus': ('1', '1g'), 'grafana': ('0.5', '768m'),
         'benchmark': ('0.25', '256m'), 'host': ('0.1', '128m'), 'node': ('0.1', '128m')}
 TOKEN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$')
@@ -169,9 +182,10 @@ def digest(path):
     return result.hexdigest()
 
 
-def atomic_json(path, value, mode=0o600):
+def atomic_json(path, value, mode=0o600, compact=False):
     path = Path(path)
-    data = (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + '\n').encode()
+    data = (json.dumps(value, sort_keys=True, indent=None if compact else 2,
+                       separators=(',', ':') if compact else None, allow_nan=False) + '\n').encode()
     if len(data) > MAX_JSON:
         raise ValueError('JSON evidence exceeds size bound')
     fd, temporary = tempfile.mkstemp(prefix='.' + path.name, dir=path.parent)
@@ -360,6 +374,10 @@ def run_container(spec, state, owner, service, image, arguments, mounts=(), envi
     return answer
 
 
+class ResponseTooLarge(ValueError):
+    pass
+
+
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *_args, **_kwargs):
         raise ValueError('unexpected redirect from fixed observer endpoint')
@@ -379,8 +397,10 @@ def http(spec, service, path, payload=None, method=None, authenticated=False, ma
     request = Request(url, data=data, headers=headers, method=method)
     with build_opener(ProxyHandler({}), NoRedirect()).open(request, timeout=budget(spec, maximum)) as response:
         raw = response.read(MAX_JSON + 1)
-        if not 200 <= response.status < 300 or len(raw) > MAX_JSON:
-            raise ValueError('observer endpoint returned invalid status or oversized response')
+        if len(raw) > MAX_JSON:
+            raise ResponseTooLarge('observer endpoint returned oversized response')
+        if not 200 <= response.status < 300:
+            raise ValueError('observer endpoint returned invalid status')
     result = json.loads(raw) if raw else {}
     if not isinstance(result, dict):
         raise ValueError('observer endpoint did not return a JSON object')
@@ -400,7 +420,7 @@ def wait_http(spec, service, path, authenticated=False):
 
 
 def query(spec, expression, timestamp=None, start=None, end=None):
-    parameters = {'query': expression, 'timeout': '2s', 'limit': 10000}
+    parameters = {'query': expression, 'timeout': '2s'}
     path = '/api/v1/query'
     if start is not None:
         path += '_range'
@@ -408,8 +428,8 @@ def query(spec, expression, timestamp=None, start=None, end=None):
     elif timestamp is not None:
         parameters['time'] = timestamp
     answer = http(spec, 'prometheus', path + '?' + urlencode(parameters), maximum=3)
-    if answer.get('status') != 'success' or answer.get('error'):
-        raise ValueError('Prometheus query failed')
+    if answer.get('status') != 'success' or answer.get('error') or answer.get('warnings'):
+        raise ValueError('Prometheus query failed or returned incomplete/warned evidence')
     return answer['data']
 
 
@@ -677,7 +697,8 @@ def select_host(spec, index, job, processes):
 
 
 @bounded(2.5)
-def finish_case(spec, job, result_dir, *, metrics=None, status='completed', write_profile_enabled=None, read_evidence=None):
+def finish_case(spec, job, result_dir, *, metrics=None, status='completed', write_profile_enabled=None,
+                read_evidence=None, resource_evidence=None, write_diagnostics=None):
     started = time.monotonic()
     spec = validate_spec(spec)
     state, _ = state_for(spec)
@@ -697,6 +718,12 @@ def finish_case(spec, job, result_dir, *, metrics=None, status='completed', writ
         terminal['write_profile_enabled'] = write_profile_enabled
     if read_evidence is not None:
         terminal['read_evidence'] = read_evidence
+    if resource_evidence is not None:
+        terminal['resource_evidence'] = resource_evidence
+    if write_diagnostics is not None:
+        terminal['write_diagnostics'] = write_diagnostics
+    import campaign_exporter
+    campaign_exporter.terminal_metrics(terminal, {})
     selected['terminal'] = terminal
     published_at = time.time()
     atomic_json(state / 'benchmark/selection.json', selected, 0o444)
@@ -733,7 +760,7 @@ def finish_case(spec, job, result_dir, *, metrics=None, status='completed', writ
 def access(spec):
     state, _ = state_for(spec)
     replay_info = load_json(state / 'replay.json') if (state / 'replay.json').exists() else None
-    suffix = ''
+    suffix = '?' + urlencode({'var-run_id': spec['run_id']})
     if replay_info:
         recorded = replay_info['time_range']
         suffix = '?' + urlencode({'from': int(recorded['start'] * 1000), 'to': int(recorded['end'] * 1000), 'var-run_id': spec['run_id']})
@@ -756,12 +783,10 @@ def interpolate(expression, spec, case_id, duration):
             raise ValueError('unsupported dashboard variable: ' + name)
         return variables[name]
     rendered = re.sub(r'\$\{([A-Za-z_][A-Za-z_0-9]*)(?::[^}]+)?\}|\$([A-Za-z_][A-Za-z_0-9]*)', replace, expression)
-    if '$' in rendered:
-        raise ValueError('unresolved dashboard variable')
     return rendered
 
 
-@bounded(60)
+@bounded(180)
 def verify(spec):
     started = time.monotonic()
     spec = validate_spec(spec)
@@ -797,26 +822,28 @@ def verify(spec):
                 labels = target.get('labels', {})
                 if target.get('health') != 'up' or any(labels.get(name) != value for name, value in admitted.get(key, {}).items()):
                     gaps.append('explicit target unhealthy or host labels differ: ' + str(key))
-        anchors = {}
-        for metric in ('kv_observer_snapshot_final', 'kv_observer_case_terminal', 'kv_observer_data_available', 'up',
-                       'kv_case_success_calls_per_second', 'kv_case_api_quantile_seconds', 'kv_case_read_path_calls'):
-            expression = metric + '{run_id=' + json.dumps(spec['run_id']) + '}'
-            # Raw range vectors preserve even one-scrape short cases; adaptive
-            # range-query steps could silently skip their terminal sample.
-            anchors[metric] = query(spec, expression + '[' + str(max(1, math.ceil(end - start))) + 's]', timestamp=end)
-        evidence['queries'] = anchors
-        actual_seen = {row['metric'].get('case_id') for row in anchors['kv_observer_case_terminal'].get('result', [])
-                       if any(float(value) == 1 for _, value in row.get('values', []))}
+        captured_pages = session.get('query_evidence') if offline else None
+        if offline and not captured_pages:
+            # Legacy archives retain their original query scope and hashes, including
+            # missing hashes/gaps. Never manufacture a replacement baseline.
+            anchors = {}
+            for metric in QUERY_METRICS[:7]:
+                expression = metric + '{run_id=' + json.dumps(spec['run_id']) + '}'
+                anchors[metric] = query(spec, expression + '[' + str(max(1, math.ceil(end - start))) + 's]', timestamp=end)
+            actual_seen = terminal_cases(anchors['kv_observer_case_terminal'])
+            hashes = {name: query_digest(value) for name, value in anchors.items()}
+            evidence['historical_query_sha256'] = hashes
+            if not session.get('query_sha256') or hashes != session['query_sha256']:
+                gaps.append('historical samples differ from retained capture query evidence')
+        else:
+            pages, actual_seen = collect_query_evidence(spec, state, time_range, captured_pages)
+            evidence['query_evidence'] = pages
+            if offline and pages != captured_pages:
+                gaps.append('historical samples differ from retained capture query evidence')
         missing = set(session.get('expected_case_ids', [])) - actual_seen
         if missing:
             gaps.append('expected terminal cases missing from TSDB: ' + ','.join(sorted(missing)))
         evidence['actual_seen_case_ids'] = sorted(case for case in actual_seen if case)
-        if offline:
-            captured = session.get('query_sha256', {})
-            hashes = {name: query_digest(value) for name, value in anchors.items()}
-            evidence['historical_query_sha256'] = hashes
-            if not captured or hashes != captured:
-                gaps.append('historical samples differ from retained capture query evidence')
         source = http(spec, 'grafana', '/api/datasources/uid/' + DATASOURCE, authenticated=True)
         if source.get('type') != 'prometheus' or source.get('url') != f'http://127.0.0.1:{spec["ports"]["prometheus"]}':
             raise ValueError('Grafana datasource identity/URL mismatch')
@@ -844,7 +871,7 @@ def verify(spec):
                     raise ValueError('dashboard target references unexpected datasource')
                 requests.append({'refId': target['refId'], 'expr': interpolate(target['expr'], spec, case_id, end - start),
                     'datasource': {'type': 'prometheus', 'uid': DATASOURCE}, 'intervalMs': 1000,
-                    'maxDataPoints': 600, 'format': 'time_series', 'instant': bool(target.get('instant')),
+                    'maxDataPoints': 600, 'format': target.get('format', 'time_series'), 'instant': bool(target.get('instant')),
                     'range': not bool(target.get('instant'))})
             if not requests:
                 continue
@@ -901,6 +928,94 @@ def query_digest(value):
     return hashlib.sha256(json.dumps(normalized, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
+def terminal_cases(value):
+    return {row['metric'].get('case_id') for row in value.get('result', [])
+            if any(float(sample) == 1 for _, sample in row.get('values', []))}
+
+
+def collect_query_evidence(spec, state, time_range, captured=None):
+    """Retain exact raw range vectors in bounded, hash-addressed (start,end] pages."""
+    start, end = time_range['start'], time_range['end']
+    lower = end - max(1, math.ceil(end - start))
+    directory = state / 'query-evidence'
+    directory.mkdir(mode=0o700, exist_ok=True)
+    seen, pages = set(), []
+    if captured is not None:
+        validate_query_evidence(captured, time_range)
+        plan = [(page['metric'], page['start'], page['end']) for page in captured['pages']]
+    else:
+        plan = []
+        for metric in QUERY_METRICS:
+            cursor = lower
+            while cursor < end:
+                boundary = min(end, cursor + QUERY_PAGE_SECONDS)
+                plan.append((metric, cursor, boundary))
+                cursor = boundary
+
+    def retain(metric, left, right):
+        check_deadline()
+        expression = metric + '{run_id=' + json.dumps(spec['run_id']) + '}'
+        try:
+            # Whole-second page boundaries also work with older PromQL duration
+            # parsers. Preserve the original fractional evaluation timestamp.
+            duration = round(right - left)
+            value = query(spec, expression + '[' + str(duration) + 's]', timestamp=right)
+            if value.get('resultType') != 'matrix' or not isinstance(value.get('result'), list):
+                raise ValueError('raw query evidence must be a range vector')
+            value = dict(value, result=sorted(value['result'], key=lambda row: json.dumps(row.get('metric', {}), sort_keys=True)))
+            if len((json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False) + '\n').encode()) > MAX_JSON:
+                raise ResponseTooLarge('normalized query page exceeds size bound')
+            content_hash = query_digest(value)
+            filename = content_hash + '.json'
+            atomic_json(directory / filename, value, compact=True)
+        except ResponseTooLarge:
+            if captured is not None or right - left <= 1:
+                raise
+            middle = left + max(1, round(right - left) // 2)
+            retain(metric, left, middle)
+            retain(metric, middle, right)
+            return
+        if len(pages) >= MAX_MEMBERS - 1000:
+            raise ValueError('query evidence page count exceeds archive reserve')
+        pages.append({'metric': metric, 'start': left, 'end': right, 'query_sha256': content_hash,
+                      'file': filename, 'sha256': digest(directory / filename),
+                      'bytes': (directory / filename).stat().st_size})
+        if metric == 'kv_observer_case_terminal':
+            seen.update(terminal_cases(value))
+
+    for metric, left, right in plan:
+        retain(metric, left, right)
+    result = {'schema_version': 2, 'page_interval': '(start,end]', 'pages': pages}
+    validate_query_evidence(result, time_range)
+    return result, seen
+
+
+def validate_query_evidence(evidence, time_range):
+    if (not isinstance(evidence, dict) or evidence.get('schema_version') != 2
+            or evidence.get('page_interval') != '(start,end]' or not isinstance(evidence.get('pages'), list)
+            or not 0 < len(evidence['pages']) < MAX_MEMBERS):
+        raise ValueError('invalid bounded query evidence index')
+    end = time_range['end']
+    lower = end - max(1, math.ceil(end - time_range['start']))
+    cursors = {metric: lower for metric in QUERY_METRICS}
+    for page in evidence['pages']:
+        if not isinstance(page, dict):
+            raise ValueError('query page index row must be an object')
+        metric = page.get('metric')
+        if (metric not in cursors or page.get('start') != cursors[metric]
+                or not isinstance(page.get('end'), (int, float)) or not math.isfinite(page['end'])
+                or not page['start'] < page['end'] <= end
+                or page['end'] - page['start'] > QUERY_PAGE_SECONDS
+                or not re.fullmatch(r'[a-f0-9]{64}', str(page.get('query_sha256', '')))
+                or page.get('file') != page['query_sha256'] + '.json'
+                or not re.fullmatch(r'[a-f0-9]{64}', str(page.get('sha256', '')))
+                or type(page.get('bytes')) is not int or not 0 < page['bytes'] <= MAX_JSON):
+            raise ValueError('invalid query page identity, size or coverage')
+        cursors[metric] = page['end']
+    if any(cursor != end for cursor in cursors.values()):
+        raise ValueError('query evidence has missing metric/time coverage')
+
+
 def regular_files(root):
     root = Path(root)
     if root.is_symlink() or not root.is_dir():
@@ -922,7 +1037,7 @@ def regular_files(root):
     return sorted(files)
 
 
-@bounded(90)
+@bounded(300)
 def export_session(spec, destination):
     started = time.monotonic()
     spec = validate_spec(spec)
@@ -938,7 +1053,7 @@ def export_session(spec, destination):
     staging = Path(tempfile.mkdtemp(prefix='capture-', dir=state))
     try:
         try:
-            verification = verify(spec, timeout_seconds=min(20, budget(spec, 20)))
+            verification = verify(spec, timeout_seconds=min(180, budget(spec, 180)))
             time_range = verification['time_range']
             if not verification['complete']:
                 gaps.extend(verification['gaps'])
@@ -974,11 +1089,24 @@ def export_session(spec, destination):
             'containers': [load_json(path) for path in sorted(state.glob('container-*.json'))[:16]],
             'source_sha256': session.get('source_sha256', {}), 'images': session.get('images', {}),
             'targets': session.get('targets', {}), 'terminal_observations': session.get('terminal_observations', []),
-            'query_sha256': {name: query_digest(value) for name, value in verification.get('evidence', {}).get('queries', {}).items()},
+            'query_sha256': verification.get('evidence', {}).get('historical_query_sha256', {}),
+            'query_evidence': verification.get('evidence', {}).get('query_evidence'),
             'complete': complete and not gaps, 'gaps': gaps, 'bounds': {'uncompressed_bytes': MAX_BYTES, 'members': MAX_MEMBERS},
             'raw_latency_csv': 'authoritative; not synthesized from TSDB', 'observer_overhead_calibrated': False}
         atomic_json(evidence / 'capture.json', capture)
         atomic_json(evidence / 'verification.json', verification)
+        if capture['query_evidence']:
+            # Only referenced pages enter the archive; prior verification runs may
+            # have other end timestamps and must not accumulate in the receipt.
+            page_directory = evidence / 'query-evidence'
+            page_directory.mkdir()
+            for page in capture['query_evidence']['pages']:
+                source = state / 'query-evidence' / page['file']
+                if digest(source) != page['sha256'] or source.stat().st_size != page['bytes']:
+                    raise ValueError('query artifact changed before capture')
+                target = page_directory / page['file']
+                if not target.exists():
+                    os.link(source, target)
         if (state / 'ui-readiness.json').exists():
             atomic_json(evidence / 'ui-readiness.json', load_json(state / 'ui-readiness.json'))
         if (state / 'config').exists():
@@ -1098,7 +1226,15 @@ def unpack_archive(archive_path, target):
         path = target / name
         if path.stat().st_size != entry['bytes'] or digest(path) != entry['sha256']:
             raise ValueError('archive member hash/size mismatch')
-    return load_json(target / 'evidence/capture.json')
+    capture = load_json(target / 'evidence/capture.json')
+    if capture.get('query_evidence') is not None:
+        validate_query_evidence(capture['query_evidence'], capture['time_range'])
+        for page in capture['query_evidence']['pages']:
+            path = target / 'evidence/query-evidence' / page['file']
+            if (digest(path) != page['sha256'] or path.stat().st_size != page['bytes']
+                    or query_digest(load_json(path)) != page['query_sha256']):
+                raise ValueError('query page does not match captured evidence index')
+    return capture
 
 
 @startup_guard
@@ -1137,6 +1273,7 @@ def replay(archive, state_dir, ports=None, deadline_utc=None):
         offline = {'time_range': time_range, 'seen_case_ids': capture['seen_case_ids'],
                    'expected_case_ids': capture['expected_case_ids'], 'archive_sha256': digest(archive),
                    'query_sha256': capture.get('query_sha256', {}),
+                   'query_evidence': capture.get('query_evidence'),
                    'original_timestamps': True, 'live_scrape_targets': [], 'source_capture': capture}
         atomic_json(state / 'replay.json', offline)
         # Retention is relative to wall clock, not replay end; include historical age + 30d.
@@ -1215,6 +1352,8 @@ def main():
             command.add_argument('--status', choices=('completed', 'failed'), default='completed')
             command.add_argument('--write-profile-enabled', choices=('true', 'false'))
             command.add_argument('--read-evidence', type=Path)
+            command.add_argument('--resource-evidence', type=Path)
+            command.add_argument('--write-diagnostics', type=Path)
     command = commands.add_parser('export')
     command.add_argument('--destination', type=Path, required=True)
     command = commands.add_parser('replay')
@@ -1253,7 +1392,9 @@ def main():
                 answer = finish_case(spec, load_json(args.job), args.result_dir,
                     metrics=load_json(args.metrics) if args.metrics else None, status=args.status,
                     write_profile_enabled=None if args.write_profile_enabled is None else args.write_profile_enabled == 'true',
-                    read_evidence=load_json(args.read_evidence) if args.read_evidence else None)
+                    read_evidence=load_json(args.read_evidence) if args.read_evidence else None,
+                    resource_evidence=load_json(args.resource_evidence) if args.resource_evidence else None,
+                    write_diagnostics=load_json(args.write_diagnostics) if args.write_diagnostics else None)
             elif args.command == 'export':
                 answer = export_session(spec, args.destination)
             elif args.command == 'verify':

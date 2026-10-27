@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Offline, matched-run figures from the closed cloud comparison export.
+"""Offline, plan-aware matched-run figures from a cloud comparison export.
 
-No raw samples are pooled. Latency points are medians of per-run conditional
-quantiles, and vertical whiskers are observed run minima/maxima, NOT CIs.
+No raw samples are pooled. Single-planned-repeat observations have no run-to-run
+variability estimate or whiskers. Multi-repeat points are medians of per-run
+conditional quantiles, with observed run min/max whiskers, NOT CIs.
 Matplotlib is imported only when rendering; data validation needs stdlib only.
 """
 import argparse
@@ -26,6 +27,7 @@ STYLES = {
     "tikv": ("TiKV", "#CC79A7", "P", "--"),
     "cassandra": ("Cassandra", "#8C6500", "X", ":"),
     "foundationdb": ("FoundationDB", "#7854A3", "h", "-."),
+    "valkey_tcp": ("Valkey TCP", "#C23B83", "*", "--"),
 }
 BACKENDS = tuple(STYLES)
 OBSERVED_NAMES = {"tikv": "tikv_raw", "cassandra": "cassandra_cql_vendor_unverified"}
@@ -35,10 +37,10 @@ TIMINGS = ("api_ns", "response_ns", "scheduling_ns")
 GOODPUT = ("success_calls_per_second", "success_logical_keys_per_second",
            "success_value_mib_per_second")
 BASE_CAPTION = (
-    "Points: median of matched per-repeat values; whiskers: observed run min/max, NOT confidence intervals. "
-    "No pooled quantiles; few repetitions support no confidence claim. Successful latency is conditional on operation/outcome. "
+    "No pooled quantiles or confidence/significance claims. Successful latency is conditional on operation/outcome. "
     "RF1 does not equalize consistency, durability, security, or transaction semantics. "
     "Primary RF1 only: native uses value_wal_barrier and TH explicit caches are off; other cohorts use their stated settings. "
+    "Valkey GET remains RAM-resident, including cold OS; appendfsync always acknowledges AOF writes, not value-WAL reads. "
     "Warm OS is not guaranteed cache residency. Tail quantiles are descriptive, including small populations."
 )
 
@@ -125,6 +127,7 @@ class Dataset:
         if document.get("planned_cases") != len(self.cases):
             raise ValueError("planned_cases does not match case coverage")
         self.index = {}
+        planned_repeats = set()
         ids, contracts = set(), {}
         for case in self.cases:
             job = case["job"]
@@ -133,6 +136,7 @@ class Dataset:
             if backend not in STYLES:
                 raise ValueError(f"unknown backend {backend}; add an explicit style")
             integer(job["repeat"], "repeat")
+            planned_repeats.add(job["repeat"])
             integer(job["value_size"], "value_size", 1)
             if case_id in ids or job.get("case_id") != case_id:
                 raise ValueError("duplicate or inconsistent case identity")
@@ -160,6 +164,29 @@ class Dataset:
         completed = sum(case["status"] == "completed" for case in self.cases)
         if document.get("completed_cases") != completed:
             raise ValueError("completed_cases does not match coverage")
+        self.planned_repeats = sorted(planned_repeats)
+        self.single_repetition = len(self.planned_repeats) == 1
+        self.minimum_common_repeats = 1 if self.single_repetition else 2
+        self.planned_backends = sorted({case["job"]["backend"] for case in self.cases})
+
+    def repetition_metadata(self):
+        return {
+            "repetition_mode": "single" if self.single_repetition else "multiple",
+            "planned_backends": self.planned_backends,
+            "current_backend_coverage": set(BACKENDS) <= set(self.planned_backends),
+            "planned_repeats": self.planned_repeats,
+            "minimum_common_repeats": self.minimum_common_repeats,
+            "run_to_run_errorbars": not self.single_repetition,
+            "aggregation": ("one independent repetition; source scalar metrics/conditional quantiles, never pooled samples"
+                            if self.single_repetition else
+                            "median of per-repeat scalar metrics/conditional quantiles, never pooled samples"),
+            "variation": ("no run-to-run variability estimate; no between-run errorbars; no confidence/significance claim"
+                          if self.single_repetition else
+                          "observed min/max across matched repeats, NOT CI; no confidence/significance claim"),
+            "repeat_policy": ("intersection of completed repeat identities across EVERY cell in each figure; "
+                              "minimum one only when ALL planned cases have one repeat identity; "
+                              "otherwise minimum two; no one-repeat fallback"),
+        }
 
     def completed_repeats(self, cell):
         return {key[-1] for key, case in self.index.items()
@@ -169,8 +196,9 @@ class Dataset:
         """No per-backend downselection: every point in a figure shares repeats."""
         sets = [self.completed_repeats(cell) for cell in cells]
         common = sorted(set.intersection(*sets)) if sets else []
-        if len(common) < 2:
-            raise ValueError("fewer than two common completed repeats across every requested cell; figure omitted")
+        if len(common) < self.minimum_common_repeats:
+            minimum = "one" if self.single_repetition else "two"
+            raise ValueError(f"fewer than {minimum} common completed repeats across every requested cell; figure omitted")
         return common
 
 
@@ -202,13 +230,15 @@ def aggregate_point(dataset, cell, repeats, metric, operation=None, outcome="suc
         observations.append({"repeat": repeat, "case_id": case["case_id"], "value": value,
                              "timed_sample_count_or_denominator": samples})
     values = [item["value"] for item in observations]
-    if len(values) < 2:
-        return None, "fewer than two matched observations; not a comparative point"
+    if len(values) < dataset.minimum_common_repeats:
+        return None, f"fewer than {dataset.minimum_common_repeats} matched observations; not a comparative point"
     return {"backend": cell[0], "cohort": cell[1], "profile": cell[2], "value_bytes": cell[3],
             "operation": operation, "outcome": outcome if operation else "whole_workload",
             "metric": metric, "percentile": percentile if metric in TIMINGS else None,
             "repeats": repeats, "observations": observations, "median": statistics.median(values),
-            "observed_min": min(values), "observed_max": max(values)}, None
+            "observed_min": min(values), "observed_max": max(values),
+            "repetition_mode": "single" if dataset.single_repetition else "multiple",
+            "independent_repetitions": len(repeats), "run_to_run_errorbars": not dataset.single_repetition}, None
 
 
 def panel(title, metric, operation=None, percentile="p99", outcome="success", **kwargs):
@@ -228,7 +258,7 @@ def goodput_panels():
             panel("Successful value payload", GOODPUT[2])]
 
 
-def figure_specs():
+def figure_specs(backends=BACKENDS):
     specs = []
 
     def add(name, title, series, panels, columns, caption, xkind="size", xticks=None):
@@ -239,13 +269,14 @@ def figure_specs():
                                       ("write-concurrent", "put", "Pure writes"),
                                       ("read-many32", "get_many", "Read-many32")):
         add("primary-" + profile, title + " — primary RF1, c16",
-            size_series(BACKENDS, "primary_rf1", profile),
+            size_series(backends, "primary_rf1", profile),
             [panel("API p50", "api_ns", operation, "p50"), panel("API p99", "api_ns", operation),
              panel("Response p99", "response_ns", operation)] + goodput_panels(), 3,
             "Closed-loop c16; all five value sizes. " +
             ("Get-many latency is PER CALL of 32 keys, not per key. FoundationDB performs 32 sequential transaction gets. "
-             if operation == "get_many" else "One key per API call. "))
-    mixed = size_series(BACKENDS, "primary_rf1", "point-mixed")
+             if operation == "get_many" else "One key per API call. ") +
+            "Valkey get-many uses ordered bounded per-key GET routing, not cross-slot MGET; no atomic PUT-batch support. ")
+    mixed = size_series(backends, "primary_rf1", "point-mixed")
     add("primary-point-mixed-latency", "Point-mixed — primary RF1, c1", mixed,
         [panel(f"{operation} API {quantile}", "api_ns", operation, quantile)
          for quantile in ("p50", "p99") for operation in ("read", "put", "delete", "missing_read")], 4,
@@ -256,7 +287,7 @@ def figure_specs():
         "Value MiB/s uses successful value payload accounting, not wire traffic or delete/missing bytes. ")
     offered = [{"label": STYLES[backend][0], "backend": backend,
                 "cells": [(backend, "primary_rf1", f"offered-{rate}", 1024) for rate in (1000, 10000, 50000)],
-                "x": [1000, 10000, 50000]} for backend in BACKENDS]
+                "x": [1000, 10000, 50000]} for backend in backends]
     add("offered-load-accounting", "Offered load — 1 KiB, c32", offered,
         goodput_panels() + [panel("Rejected arrivals / offered arrivals", "rejection_fraction")], 2,
         "Open-loop 70% read / 30% put; c32 dispatch bound; configured arrival rates, not achieved throughput, on x. "
@@ -271,7 +302,7 @@ def figure_specs():
         "Rejected-response points require a timed rejection in every matched repeat; missing populations are gaps, not zeros. "
         "Read with offered-load-accounting; fast conditional tails alone do not imply accepting offered load. ", "offered")
     zipf = []
-    for backend in BACKENDS:
+    for backend in backends:
         zipf.append({"label": STYLES[backend][0], "backend": backend,
                      "cells": [(backend, "primary_rf1", profile, 1024) for profile in ("read-concurrent", "zipf-read")],
                      "x": [0, 1]})
@@ -282,11 +313,11 @@ def figure_specs():
         "category", ["Uniform", "Zipf 0.99"])
     cache_series, cache_panels = [], []
     # Separate panels, not a pooled cache-mode curve or an unmatched c16 baseline.
-    for cohort, profile, backends, label in (
+    for cohort, profile, cache_backends, label in (
             ("coordinator_cache_configured", "coordinator-cache", TH, "Coordinator cache"),
             ("owner_cache_configured", "owner-cache", TH, "Owner cache"),
             ("registered_ram_configured", "registered-ram", ("tidehunter_efa_native",), "Registered RAM")):
-        rows = size_series(backends, cohort, profile, (256, 8192))
+        rows = size_series(cache_backends, cohort, profile, (256, 8192))
         cache_series.extend(rows)
         for metric, quantile, heading in (("api_ns", "p50", "API p50"), ("api_ns", "p99", "API p99"),
                                           (GOODPUT[0], "p99", "successful calls")):
@@ -300,13 +331,14 @@ def figure_specs():
         "Cumulative path counters include preload/warmup/qualification and are not timing fractions. ")
     cold = [{"label": STYLES[backend][0], "backend": backend,
              "cells": [(backend, "cold_os_cache", "cold-os-large", 65536)], "x": [i]}
-            for i, backend in enumerate(BACKENDS)]
+            for i, backend in enumerate(backends)]
     add("cold-os-cache", "Cold-OS-cache protocol — 64 KiB reads, c16", cold,
         [panel("API p50", "api_ns", "read", "p50"), panel("API p99", "api_ns", "read")] + goodput_panels(), 3,
-        "8 GiB value preload, no warmup, cache-drop gate. Cold OS does NOT mean isolated NVMe/device latency: engine and controller caches, "
-        "network, scheduling and metadata may contribute. Systems need at least two completed cold repeats to enter this separate cohort; "
+        "8 GiB value preload, no warmup, cache-drop gate. Valkey GET remains RAM-resident: AOF is not a read backing store. "
+        "Cold OS does NOT mean isolated NVMe/device latency: engine and controller caches, network, scheduling and metadata may contribute. "
+        "Systems must meet the planned-mode completion minimum to enter this separate cohort; "
         "all plotted systems share matched repeats and exclusions remain explicit. Missing results are never plotted as zero. ",
-        "backend", [STYLES[name][0] for name in BACKENDS])
+        "backend", [STYLES[name][0] for name in backends])
     native = []
     for cohort, suffix in (("primary_rf1", " / WAL barrier"), ("native_pagecache", " / pagecache")):
         for profile, short in (("point-mixed", "mixed c1"), ("read-many32", "many32 c16")):
@@ -327,27 +359,43 @@ def figure_specs():
 
 def build_figures(dataset):
     figures, omitted = [], []
-    for spec in figure_specs():
+    # Frozen pre-Valkey reports keep their original eight-system comparison.
+    # This affects presentation only; current runtime admission remains strict.
+    backends = BACKENDS[:-1] if set(dataset.planned_backends) == set(BACKENDS[:-1]) else BACKENDS
+    for spec in figure_specs(backends):
         unavailable = []
         if spec["name"] == "cold-os-cache":
             available = []
             for series in spec["series"]:
                 cell = series["cells"][0]
-                if len(dataset.completed_repeats(cell)) >= 2:
+                if len(dataset.completed_repeats(cell)) >= dataset.minimum_common_repeats:
                     available.append(series)
                 else:
                     unavailable.append({
-                        "backend": series["backend"], "reason": "Fewer than two completed cold-OS repeats",
+                        "backend": series["backend"],
+                        "reason": f"Fewer than {dataset.minimum_common_repeats} completed cold-OS repeats required by planned mode",
                         "case_ids": [case["case_id"] for key, case in dataset.index.items() if key[:-1] == cell]})
             spec = dict(spec, series=available)
         cells = list(dict.fromkeys(cell for series in spec["series"] for cell in series["cells"]))
         try:
             repeats = dataset.matched_repeats(cells)
         except ValueError as error:
-            omitted.append({"figure": spec["name"], "reason": str(error)})
+            omitted.append({"figure": spec["name"], "reason": str(error),
+                            **({"unavailable_systems": unavailable} if spec["name"] == "cold-os-cache" else {})})
             continue
         result = {key: value for key, value in spec.items() if key not in ("series", "panels")}
         result.update(repeats=repeats, panels=[], files=[spec["name"] + extension for extension in (".png", ".pdf")])
+        result.update(dataset.repetition_metadata())
+        result.update(independent_repetitions=len(repeats), run_to_run_errorbars=not dataset.single_repetition)
+        repeat_names = ", ".join("r" + str(value) for value in repeats)
+        if dataset.single_repetition:
+            result["title"] += f"\nOne independent repetition ({repeat_names}); no run-to-run variability estimate"
+            result["caption"] += ("One independent repetition; points are source per-case values/conditional quantiles. "
+                                  "No run-to-run variability estimate or between-run errorbars. ")
+        else:
+            result["title"] += "\nMatched repeats " + repeat_names
+            result["caption"] += ("Points: median of matched per-repeat values; whiskers: observed run min/max, NOT confidence intervals. "
+                                  "Few repetitions support no confidence claim. ")
         used = set()
         for number, request in enumerate(spec["panels"]):
             plotted = dict(request, id=f"{spec['name']}:{number}", series=[], unavailable=[])
@@ -374,12 +422,21 @@ def build_figures(dataset):
         result["caption"] += BASE_CAPTION
         if spec["name"] == "cold-os-cache":
             result["unavailable_systems"] = unavailable
+            result["caption"] += f" Cold-cohort inclusion requires at least {dataset.minimum_common_repeats} completed repetition(s) per system."
         figures.append(result)
     return figures, omitted
 
 
 def coverage(dataset):
-    result = {"total": dict(Counter(case["status"] for case in dataset.cases)), "by_backend": {}, "by_cohort": {}}
+    result = {"total": dict(Counter(case["status"] for case in dataset.cases)), "by_backend": {}, "by_cohort": {},
+              **dataset.repetition_metadata(),
+              "title": ("Campaign coverage — one planned independent repetition\nNo run-to-run variability estimate" if dataset.single_repetition else
+                        "Campaign coverage — all planned repeats, not the matched performance subset"),
+              "caption": ("Coverage counts are not performance zeros. Performance figures use only their stated common complete repetition identities. "
+                          "Completed/failed/not_run are original campaign states, not reconstructed successes; no new runs or Sui replay. "
+                          + ("One independent repetition; no run-to-run variability estimate or between-run errorbars."
+                             if dataset.single_repetition else
+                             "Coverage includes all planned repetitions, not just the matched performance subset."))}
     for field, destination in (("backend", "by_backend"), ("cohort", "by_cohort")):
         for name in sorted({case["job"][field] for case in dataset.cases}):
             result[destination][name] = dict(Counter(case["status"] for case in dataset.cases if case["job"][field] == name))
@@ -417,8 +474,9 @@ def render(figures, coverage_data, output):
                 scale = 1 / 1000 if item["metric"] in TIMINGS else 1
                 x = [point["x"] for point in points]
                 y = [point["median"] * scale for point in points]
-                error = [[(point["median"] - point["observed_min"]) * scale for point in points],
-                         [(point["observed_max"] - point["median"]) * scale for point in points]]
+                error = ([[(point["median"] - point["observed_min"]) * scale for point in points],
+                          [(point["observed_max"] - point["median"]) * scale for point in points]]
+                         if figure["run_to_run_errorbars"] else None)
                 positive |= any(value > 0 for value in y)
                 zero |= any(point["observed_min"] == 0 for point in points)
                 # Do not connect across an unavailable x: missing values are explicit NaN gaps.
@@ -430,8 +488,12 @@ def render(figures, coverage_data, output):
                     line_for_error = "none"
                 else:
                     line_for_error = line if figure["xkind"] != "backend" else "none"
-                axis.errorbar(x, y, yerr=error, color=color, marker=marker, linestyle=line_for_error,
-                              capsize=3, markersize=5, linewidth=1.3)
+                if figure["run_to_run_errorbars"]:
+                    axis.errorbar(x, y, yerr=error, color=color, marker=marker, linestyle=line_for_error,
+                                  capsize=3, markersize=5, linewidth=1.3)
+                else:
+                    axis.plot(x, y, color=color, marker=marker, linestyle=line_for_error,
+                              markersize=5, linewidth=1.3)
                 labels[series["label"]] = Line2D([], [], color=color, marker=marker, linestyle=line)
             if item["metric"] == "rejection_fraction":
                 axis.set_ylim(-.02, 1.02)
@@ -453,11 +515,14 @@ def render(figures, coverage_data, output):
                                 rotation=45 if figure["xkind"] == "backend" else 0,
                                 ha="right" if figure["xkind"] == "backend" else "center")
                 if figure["xkind"] == "backend":
-                    axis.text(.98, .97, "FDB unavailable", transform=axis.transAxes, ha="right", va="top", fontsize=9)
+                    excluded = [STYLES[entry["backend"]][0] for entry in figure.get("unavailable_systems", [])]
+                    if excluded:
+                        axis.text(.98, .97, "Unavailable: " + ", ".join(excluded), transform=axis.transAxes,
+                                  ha="right", va="top", fontsize=9)
             axis.grid(True, which="major", alpha=.25)
         for axis in list(axes.flat)[len(figure["panels"]):]:
             axis.set_visible(False)
-        fig.suptitle(figure["title"] + "\nMatched repeats " + ", ".join("r" + str(value) for value in figure["repeats"]), fontsize=15, y=.995)
+        fig.suptitle(figure["title"], fontsize=15, y=.995)
         fig.legend(list(labels.values()), list(labels), loc="upper center", bbox_to_anchor=(.5, .947), ncol=min(4, len(labels)))
         caption = "\n".join(textwrap.wrap(figure["caption"], width=columns * 49))
         fig.text(.025, .015, caption, va="bottom", fontsize=8)
@@ -478,9 +543,8 @@ def render(figures, coverage_data, output):
         axis.set_ylabel("Planned cases (count)")
         axis.set_title(title)
         axis.legend()
-    fig.suptitle("Campaign coverage — all planned repeats, not the matched performance subset")
-    fig.text(.03, .025, "Coverage counts are not performance zeros. FDB r2 primary extras are retained here but excluded from matched main curves.\n"
-             "Completed/failed/not_run are original campaign states, not reconstructed successes; no new runs or Sui replay.", fontsize=10)
+    fig.suptitle(coverage_data["title"])
+    fig.text(.03, .025, "\n".join(textwrap.wrap(coverage_data["caption"], width=145)), fontsize=10)
     fig.tight_layout(rect=(0, .11, 1, .94))
     for extension in ("png", "pdf"):
         fig.savefig(output / ("coverage." + extension), bbox_inches="tight")
@@ -490,7 +554,8 @@ def render(figures, coverage_data, output):
 def export_data(figures, coverage_data, output):
     fields = ["figure", "panel", "series", "backend", "cohort", "profile", "value_bytes", "x", "operation", "outcome",
               "metric", "percentile", "unit", "median", "observed_min", "observed_max", "repeat", "case_id", "value",
-              "timed_sample_count_or_denominator"]
+              "timed_sample_count_or_denominator", "repetition_mode", "independent_repetitions",
+              "run_to_run_errorbars", "planned_repeats", "aggregation", "variation"]
     with (output / "plot-data.csv").open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
@@ -500,6 +565,8 @@ def export_data(figures, coverage_data, output):
                     for point in series["points"]:
                         base = {key: point.get(key) for key in fields if key in point}
                         base.update(figure=figure["name"], panel=item["id"], series=series["label"],
+                                    planned_repeats=canonical(figure["planned_repeats"]),
+                                    aggregation=figure["aggregation"], variation=figure["variation"],
                                     unit="ns" if point["metric"] in TIMINGS else
                                     {GOODPUT[0]: "calls/s", GOODPUT[1]: "keys/s", GOODPUT[2]: "value MiB/s", "rejection_fraction": "fraction"}[point["metric"]])
                         for observation in point["observations"]:
@@ -531,13 +598,11 @@ def main():
     export_data(figures, coverage_data, args.output)
     used = set().union(*(set(figure["case_ids"]) for figure in figures))
     manifest = {"schema_version": 1, "input": str(args.input), "input_sha256": hashlib.sha256(raw).hexdigest(),
-                "aggregation": "median of per-repeat scalar metrics/conditional quantiles, never pooled samples",
-                "variation": "observed min/max across matched repeats, NOT CI; no confidence claim",
-                "repeat_policy": "intersection of completed repeat identities across EVERY cell in each figure; minimum two; no one-repeat fallback",
+                **dataset.repetition_metadata(),
                 "units": "plot-data.csv retains exact source ns; latency figures convert ns / 1000 to µs; MiB = 2^20 bytes",
                 "figures": figures, "omitted_figures": omitted, "coverage": coverage_data,
-                "coverage_figure": {"files": ["coverage.png", "coverage.pdf"], "title": "Campaign coverage",
-                                    "caption": "All planned statuses, all repeats; not performance points; counts in coverage and plot-data.csv"},
+                "coverage_figure": {"files": ["coverage.png", "coverage.pdf"], "title": coverage_data["title"],
+                                    "caption": coverage_data["caption"]},
                 "completed_cases_not_in_figures": [case["case_id"] for case in dataset.cases if case["status"] == "completed" and case["case_id"] not in used],
                 "limitations": ["Unmatched repetitions remain in the raw appendix and are not pooled into matched curves.",
                                 "No raw-sample verification or independence proof beyond exported case/repeat identity; source receipts remain authoritative.",

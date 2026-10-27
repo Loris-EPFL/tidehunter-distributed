@@ -137,6 +137,10 @@ def stable_topology(name, original):
         topology["endpoints"] = sorted(
             ({"partition": item["partition"]} for item in topology["endpoints"]),
             key=lambda item: item["partition"])
+    if name == "valkey_tcp" and isinstance(topology.get("primaries"), list):
+        topology["primaries"] = sorted(
+            ({key: value for key, value in item.items() if key != "node_id"}
+             for item in topology["primaries"]), key=canonical)
     if name == "tikv_raw" and "store_metadata" in topology:
         # IDs, capacity/current load, start/heartbeat times are observations,
         # not independent-run configuration. Preserve the raw original artifact.
@@ -162,11 +166,17 @@ def stable_topology(name, original):
     return topology
 
 
-def stable_configuration(original):
+def stable_configuration(original, name=None):
     config = {key: value for key, value in original.items() if key not in ("coordinator_path", "cluster_file")}
     if isinstance(config.get("loaded_native_library"), dict):
         config["loaded_native_library"] = {
             key: value for key, value in config["loaded_native_library"].items() if key != "path"}
+    if name == "valkey_tcp" and isinstance(config.get("persistence"), list):
+        # Retain health/guarantee evidence, not changing AOF sizes, timestamps,
+        # rewrite progress or counters. Original artifacts retain every field.
+        fields = ("aof_enabled", "loading", "async_loading", "aof_last_write_status", "aof_last_bgrewrite_status")
+        config["persistence"] = [{key: item[key] for key in fields if key in item}
+                                 for item in config["persistence"]]
     return config
 
 
@@ -209,11 +219,12 @@ def boundary(run):
         raise ValueError(f"{run}: manifest lacks observed effective BackendInfo")
     deployment_path = run / "deployment/deployment.json"
     deployment = json.loads(deployment_path.read_text()) if deployment_path.exists() else None
-    if config["backend"]["kind"] in ("tikv", "cassandra", "foundationdb"):
+    if config["backend"]["kind"] in ("tikv", "cassandra", "foundationdb", "valkey_tcp"):
         if not deployment:
             raise ValueError(f"{run}: missing actual external deployment/replication proof")
         observed, nodes = deployment["observed"], deployment["topology"]["nodes"]
-        expected_rf = (1 if nodes == 1 else 2) if config["backend"]["kind"] == "foundationdb" else nodes
+        expected_rf = (1 if config["backend"]["kind"] == "valkey_tcp" else
+                       (1 if nodes == 1 else 2) if config["backend"]["kind"] == "foundationdb" else nodes)
         if backend["replication_factor"] != expected_rf:
             raise ValueError(f"{run}: observed backend RF does not match admitted deployment")
         if config["backend"]["kind"] == "tikv":
@@ -223,6 +234,15 @@ def boundary(run):
         elif config["backend"]["kind"] == "foundationdb":
             if not observed["cluster"].get("full_replication") or not observed["cluster"].get("database_available"):
                 raise ValueError(f"{run}: missing available/full-replication FoundationDB observation")
+        elif config["backend"]["kind"] == "valkey_tcp":
+            expected_primaries = 1 if deployment["topology"]["layout"] == "qualification" else 5
+            coverage = observed.get("coverage", {})
+            if (nodes != expected_primaries or coverage.get("required_primary_nodes") != nodes
+                    or coverage.get("replication_factor") != 1 or coverage.get("replica_count") != 0
+                    or len(observed.get("nodes", [])) != nodes
+                    or len(set(coverage.get("primary_endpoints", []))) != nodes
+                    or coverage.get("slot_count") != (0 if nodes == 1 else 16384)):
+                raise ValueError(f"{run}: incomplete Valkey RF1 primary/slot ownership proof")
         elif len(observed["nodes"]) != nodes:
             raise ValueError(f"{run}: incomplete Cassandra member observations")
     # Dynamic per-run namespaces/storage roots are not compared. Retain raw originals and
@@ -232,7 +252,7 @@ def boundary(run):
         guarantee["native_client_runtime"] = {
             key: value for key, value in json.loads((run.parent / "fdb-client.json").read_text()).items()
             if key != "path"}
-    guarantee["effective_configuration"] = stable_configuration(backend["configuration"])
+    guarantee["effective_configuration"] = stable_configuration(backend["configuration"], backend["name"])
     guarantee["observed_topology"] = stable_topology(backend["name"], backend["topology"])
     hardware = receipt["hardware"]
     capacity = host_capacity(hardware["memory"])
@@ -271,7 +291,10 @@ def boundary(run):
     return {"backend": guarantee, "workload": {key: config[key] for key in ("dataset", "workload", "execution", "phases", "limits", "seed")},
             "hardware": hardware, "deployment": deployment_budget, "client_budget": receipt["client_budget"],
             "binary_sha256": receipt["binary_sha256"], "claim_boundary": receipt["claim_boundary"],
-            "observation": receipt["observation"], "storage_population": receipt["storage_population"]}
+            "observation": receipt["observation"],
+            "diagnostics": config.get("diagnostics", {"write_profile_limit": 0}),
+            "completion_accounting_gate": config.get("measurement_completion_gate") is not None,
+            "storage_population": receipt["storage_population"]}
 
 
 def independent_run_identity(run):
