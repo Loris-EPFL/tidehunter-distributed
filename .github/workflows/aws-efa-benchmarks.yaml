@@ -15,6 +15,10 @@ on:
         type: choice
         options: [configured, sui-transport, kv-comparison]
         default: configured
+      backends:
+        description: "KV only: comma-separated subset of cloud-campaign.json IDs; blank uses tracked list"
+        type: string
+        default: ""
       reconcile_run_id:
         description: "Optional closed campaign to remeasure during cost-report"
         type: string
@@ -319,7 +323,7 @@ jobs:
     if: always() && github.repository == 'Loris-EPFL/tidehunter-distributed' && github.ref == 'refs/heads/bench/aws-efa' && needs.selection.outputs.enabled == 'true' && ((needs.selection.outputs.suite == 'sui-transport' && needs.prepare.result == 'success') || (needs.selection.outputs.suite == 'kv-comparison' && needs.prepare-kv.result == 'success'))
     runs-on: ubuntu-24.04
     environment: rdma-bench
-    timeout-minutes: 300
+    timeout-minutes: 360
     permissions:
       contents: read
       id-token: write
@@ -361,6 +365,21 @@ jobs:
               --archive "$RUNNER_TEMP/incoming/campaign-inputs.tar.gz" --sha256 "$PACKAGE_SHA256" \
               --output "$RUNNER_TEMP/benchmark-inputs"
           fi
+      - name: Validate selected KV backends before obtaining AWS credentials
+        if: needs.selection.outputs.suite == 'kv-comparison' || inputs.backends != ''
+        env:
+          SELECTED_BACKENDS: ${{ inputs.backends || '' }}
+          SELECTED_SUITE: ${{ needs.selection.outputs.suite }}
+        run: |
+          if [ "$SELECTED_SUITE" != kv-comparison ]; then
+            echo "backends selection is valid only for kv-comparison" >&2
+            exit 1
+          fi
+          args=(validate --config engine/experiments/kv-comparison/ci-config.json)
+          if [ -n "$SELECTED_BACKENDS" ]; then
+            args+=(--backends "$SELECTED_BACKENDS")
+          fi
+          python3 engine/experiments/kv-comparison/ci_campaign.py "${args[@]}"
       # No Cargo/build script executes on this VM or receives these credentials.
       - name: Obtain short-lived fleet credentials
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
@@ -382,11 +401,15 @@ jobs:
         timeout-minutes: 240
         env:
           SELECTED_SUITE: ${{ needs.selection.outputs.suite }}
+          SELECTED_BACKENDS: ${{ inputs.backends || '' }}
         run: |
           echo 'invoked=true' >> "$GITHUB_OUTPUT"
           if [ "$SELECTED_SUITE" = kv-comparison ]; then
-            python3 engine/experiments/kv-comparison/ci_campaign.py run \
-              --config engine/experiments/kv-comparison/ci-config.json \
+            args=(run --config engine/experiments/kv-comparison/ci-config.json)
+            if [ -n "$SELECTED_BACKENDS" ]; then
+              args+=(--backends "$SELECTED_BACKENDS")
+            fi
+            python3 engine/experiments/kv-comparison/ci_campaign.py "${args[@]}" \
               --inputs "$RUNNER_TEMP/benchmark-inputs" --output "$RUNNER_TEMP/aws-campaign" \
               --budget-file engine/experiments/aws-sharded-wal/budget.json
           else
@@ -409,7 +432,7 @@ jobs:
           unset-current-credentials: true
       - name: Reconcile exact-owned cleanup after success or failure
         if: always() && steps.campaign.outputs.invoked == 'true'
-        timeout-minutes: 15
+        timeout-minutes: 45
         env:
           SELECTED_SUITE: ${{ needs.selection.outputs.suite }}
         run: |
