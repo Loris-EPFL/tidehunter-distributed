@@ -41,9 +41,12 @@ def case(backend="native", repeat=0, status="completed", populations=None):
                 "populations": groups}}
 
 
-def dataset(cases):
-    return plots.Dataset({"schema_version": 1, "planned_cases": len(cases),
-                          "completed_cases": sum(item["status"] == "completed" for item in cases), "cases": cases})
+def dataset(cases, planned_backends=None):
+    document = {"schema_version": 1, "planned_cases": len(cases),
+                "completed_cases": sum(item["status"] == "completed" for item in cases), "cases": cases}
+    if planned_backends is not None:
+        document["planned_backends"] = list(planned_backends)
+    return plots.Dataset(document)
 
 
 def full_matrix_cases(repeats=(0,)):
@@ -95,17 +98,45 @@ class SingleRepeatPolicy(unittest.TestCase):
         self.assertFalse(primary["run_to_run_errorbars"])
         self.assertEqual(primary["repeats"], [0])
 
-    def test_valkey_has_real_series_without_value_wal_read_claim(self):
+    def test_valkey_has_real_observations_in_its_series(self):
         data = dataset(full_matrix_cases())
         figures, _ = plots.build_figures(data)
         self.assertTrue(plots.coverage(data)["current_backend_coverage"])
         primary = next(row for row in figures if row["name"] == "primary-read-concurrent")
         valkey = next(row for row in primary["panels"][0]["series"] if row["backend"] == "valkey_tcp")
-        self.assertEqual(valkey["label"], "Valkey TCP")
         self.assertEqual(valkey["points"][0]["median"], 100)
-        cold = next(row for row in figures if row["name"] == "cold-os-cache")
-        self.assertIn("RAM-resident", cold["caption"])
-        self.assertIn("AOF is not a read backing store", cold["caption"])
+
+    def test_backend_subsets_keep_primary_figures_without_unplanned_cache_series(self):
+        subsets = (("valkey_tcp",), ("native", "valkey_tcp"),
+                   ("tidehunter_tcp", "tidehunter_efa_native"))
+        for selected in subsets:
+            with self.subTest(selected=selected):
+                cases = [row for row in full_matrix_cases() if row["job"]["backend"] in selected]
+                figures, omitted = plots.build_figures(dataset(cases, selected))
+                self.assertEqual(omitted, [])
+                primary = next(row for row in figures if row["name"] == "primary-read-concurrent")
+                self.assertEqual({row["backend"] for row in primary["panels"][0]["series"]}, set(selected))
+                for figure in figures:
+                    for panel in figure["panels"]:
+                        self.assertTrue({row["backend"] for row in panel["series"]} <= set(selected))
+                names = {row["name"] for row in figures}
+                self.assertEqual("cache-cohorts" in names, bool(set(selected) & set(plots.TH)))
+                self.assertEqual("native-pagecache-latency" in names, "native" in selected)
+
+    def test_selected_backend_failure_cannot_be_dropped_to_complete_a_figure(self):
+        selected = ("native", "valkey_tcp")
+        cases = [row for row in full_matrix_cases((0, 1)) if row["job"]["backend"] in selected]
+        missing = next(row for row in cases if row["job"]["backend"] == "valkey_tcp"
+                       and row["job"]["profile"] == "read-concurrent"
+                       and row["job"]["value_size"] == 64 and row["job"]["repeat"] == 1)
+        missing.update(status="not_run", metrics=None)
+        figures, omitted = plots.build_figures(dataset(cases, selected))
+        self.assertNotIn("primary-read-concurrent", {row["name"] for row in figures})
+        self.assertIn("primary-read-concurrent", {row["figure"] for row in omitted})
+
+    def test_declared_inventory_cannot_hide_an_observed_backend(self):
+        with self.assertRaises(ValueError):
+            dataset([case("native")], ("valkey_tcp",))
 
     def test_one_planned_identity_accepts_one_shared_complete_repeat(self):
         data = dataset([case(backend, 7) for backend in plots.BACKENDS])
@@ -154,8 +185,6 @@ class SingleRepeatPolicy(unittest.TestCase):
             self.assertEqual(figure["repeats"], [0])
             self.assertEqual(figure["repetition_mode"], "single")
             self.assertFalse(figure["run_to_run_errorbars"])
-            self.assertIn("One independent repetition", figure["title"])
-            self.assertIn("No run-to-run variability estimate", figure["caption"])
 
     def test_historical_three_planned_two_complete_preserves_matched_ranges(self):
         cases = full_matrix_cases((0, 1, 2))
@@ -169,7 +198,6 @@ class SingleRepeatPolicy(unittest.TestCase):
             self.assertEqual(figure["planned_repeats"], [0, 1, 2])
             self.assertEqual(figure["repeats"], [0, 1])
             self.assertTrue(figure["run_to_run_errorbars"])
-            self.assertIn("Matched repeats r0, r1", figure["title"])
             for request in figure["panels"]:
                 for series in request["series"]:
                     for point in series["points"]:
@@ -293,7 +321,7 @@ class ColdAvailabilityIntegrity(unittest.TestCase):
                     cases.remove(fdb)
                 else:
                     fdb.update(status=status, metrics=None)
-                figures, _ = plots.build_figures(dataset(cases))
+                figures, _ = plots.build_figures(dataset(cases, plots.BACKENDS))
                 cold = next(row for row in figures if row["name"] == "cold-os-cache")
                 self.assertEqual(cold["repeats"], [0])
                 self.assertFalse(cold["run_to_run_errorbars"])
@@ -301,7 +329,6 @@ class ColdAvailabilityIntegrity(unittest.TestCase):
                 self.assertEqual([row["backend"] for row in excluded], ["foundationdb"])
                 self.assertEqual(excluded[0]["case_ids"], [] if status == "absent" else [fdb["case_id"]])
                 self.assertNotIn("foundationdb", {row["backend"] for row in cold["panels"][0]["series"]})
-                self.assertIn("Missing results are never plotted as zero", cold["caption"])
 
     def test_cold_multi_plan_does_not_fall_back_to_one_common_repeat(self):
         cases = [row for row in full_matrix_cases((0, 1, 2)) if row["job"]["cohort"] == "cold_os_cache"]

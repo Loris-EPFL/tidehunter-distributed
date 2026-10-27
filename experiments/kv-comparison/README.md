@@ -1435,4 +1435,19 @@ Both guest deliveries returned the same real result. Evidence is
 `checkpoint-work/portable-cloud-launch-20261027/control-recovery-proof.json`;
 external AWS/identity services were simulated, not the local execution gate.
 
+### Planned backend subsets in figures
+
+Plot selection now reads `planned_backends` from the frozen comparison report,
+not from successful cases. Older reports without that field use all their
+planned case rows. Only selected systems enter primary comparisons; cache and
+native-only figures require the corresponding selected backends. A selected
+system's missing or failed case still prevents an unmatched primary comparison;
+it is not silently removed or assigned zero.
+
+A Valkey-only 25-case rendering fixture produced ten PNG/PDF figure pairs,
+including primary reads/writes, and retained its input unchanged. The figures
+use synthetic fixture values, not measured Valkey performance. Single-repetition
+labels and the absence of between-run error bars remain unchanged. Evidence is
+under `checkpoint-work/portable-cloud-launch-20261027/plot-subset-check-193245Z/`.
+
 

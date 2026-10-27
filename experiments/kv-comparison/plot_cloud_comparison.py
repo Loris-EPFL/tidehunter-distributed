@@ -167,7 +167,14 @@ class Dataset:
         self.planned_repeats = sorted(planned_repeats)
         self.single_repetition = len(self.planned_repeats) == 1
         self.minimum_common_repeats = 1 if self.single_repetition else 2
-        self.planned_backends = sorted({case["job"]["backend"] for case in self.cases})
+        observed_backends = {case["job"]["backend"] for case in self.cases}
+        selected = document.get("planned_backends", sorted(observed_backends))
+        if (not isinstance(selected, list) or not selected
+                or any(not isinstance(name, str) or name not in STYLES for name in selected)
+                or len(selected) != len(set(selected))
+                or not observed_backends <= set(selected)):
+            raise ValueError("planned backend inventory is invalid or excludes observed cases")
+        self.planned_backends = sorted(selected)
 
     def repetition_metadata(self):
         return {
@@ -262,6 +269,8 @@ def figure_specs(backends=BACKENDS):
     specs = []
 
     def add(name, title, series, panels, columns, caption, xkind="size", xticks=None):
+        if not series:
+            return
         specs.append(dict(name=name, title=title, series=series, panels=panels, columns=columns,
                           caption=caption, xkind=xkind, xticks=xticks))
 
@@ -317,6 +326,9 @@ def figure_specs(backends=BACKENDS):
             ("coordinator_cache_configured", "coordinator-cache", TH, "Coordinator cache"),
             ("owner_cache_configured", "owner-cache", TH, "Owner cache"),
             ("registered_ram_configured", "registered-ram", ("tidehunter_efa_native",), "Registered RAM")):
+        cache_backends = tuple(name for name in cache_backends if name in backends)
+        if not cache_backends:
+            continue
         rows = size_series(cache_backends, cohort, profile, (256, 8192))
         cache_series.extend(rows)
         for metric, quantile, heading in (("api_ns", "p50", "API p50"), ("api_ns", "p99", "API p99"),
@@ -339,6 +351,8 @@ def figure_specs(backends=BACKENDS):
         "Systems must meet the planned-mode completion minimum to enter this separate cohort; "
         "all plotted systems share matched repeats and exclusions remain explicit. Missing results are never plotted as zero. ",
         "backend", [STYLES[name][0] for name in backends])
+    if "native" not in backends:
+        return specs
     native = []
     for cohort, suffix in (("primary_rf1", " / WAL barrier"), ("native_pagecache", " / pagecache")):
         for profile, short in (("point-mixed", "mixed c1"), ("read-many32", "many32 c16")):
@@ -359,9 +373,9 @@ def figure_specs(backends=BACKENDS):
 
 def build_figures(dataset):
     figures, omitted = [], []
-    # Frozen pre-Valkey reports keep their original eight-system comparison.
-    # This affects presentation only; current runtime admission remains strict.
-    backends = BACKENDS[:-1] if set(dataset.planned_backends) == set(BACKENDS[:-1]) else BACKENDS
+    # Select from the frozen plan, never infer selection from successful cases.
+    # Historical reports without explicit inventory retain their planned case rows.
+    backends = tuple(name for name in BACKENDS if name in dataset.planned_backends)
     for spec in figure_specs(backends):
         unavailable = []
         if spec["name"] == "cold-os-cache":
