@@ -42,8 +42,8 @@ class RawRmaFloorTests(unittest.TestCase):
         provider = 'tcp;ofi_rxm' if software else 'efa'
         common = dict(benchmark='raw_provider_fi_read_floor', claim=raw.CLAIM,
             topology='two_process_control_tcp_and_provider_fabric',
-            control_security=raw.SECURITY, provider=provider,
-            fabric='tcp;ofi_rxm_explicit_software' if software else 'efa-direct',
+            control_security=raw.SECURITY,
+            fabric='software-tcp' if software else 'efa-direct',
             payload_bytes=payload, accepted_fi_reads=samples + warmup,
             samples_requested=samples, warmup_requested=warmup,
             warmup_completed=warmup, clean_samples_completed=samples,
@@ -60,13 +60,13 @@ class RawRmaFloorTests(unittest.TestCase):
             provider_info = dict(backend=config['backend'], provider=provider,
                 fabric='actual-fabric', domain='lo', source_address=None,
                 device=None, driver=None, bus_address=None,
-                rma_capabilities=dict(read_mode=read_mode, max_read_bytes=payload + 24),
+                rma_capabilities=dict(read_mode=read_mode, address_mode='virtual', max_read_bytes=payload + 24),
                 capability_evidence='provider capability discovery')
-            caps = dict(provider=provider, domain='lo', read_mode=read_mode,
-                efa_direct_requested=not software, software_provider_explicit=software,
+            caps = dict(read_mode=read_mode, provider_info=provider_info,
+                fabric_config=config, require_device_read=require_device_read,
                 address_mode='virtual', max_read_bytes=payload + 24)
-            report = dict(common, role=role, domain='lo', fabric_config=config,
-                require_device_read=require_device_read, provider_info=provider_info,
+            report = dict(common, role=role, fabric_config=config,
+                provider_info=provider_info,
                 capabilities=caps, cpu_affinity='0', detailed_steps_ns=[
                     ['provider_source_setup_ns' if role == 'server' else 'provider_endpoint_setup_ns', 1],
                     ['drain_ack_retirement_ns' if role == 'server' else 'control_bootstrap_descriptor_ns', 1],
@@ -119,6 +119,14 @@ class RawRmaFloorTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 raw.validate_reports(changed, reports[1], expected, software=True)
 
+
+    def test_command_reconstruction_does_not_create_remote_directories(self):
+        with tempfile.TemporaryDirectory() as folder:
+            remote = Path(folder) / 'absent-storage-host/run/server.json'
+            command = raw.command('probe', 'server', '10.0.0.11:17700', 256, remote)
+            self.assertEqual(command[command.index('--fabric-config') + 1],
+                             str(remote.with_suffix('.fabric.json')))
+            self.assertFalse(remote.parent.exists())
 
     def test_deadline_cannot_consume_export_reserve(self):
         payload = self.payload()

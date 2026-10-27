@@ -25,7 +25,7 @@ import uuid
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from portable_transport import transport_for_case
+from portable_transport import transport_for_case, validate_transport
 from resident_config import software_fabric_environment
 
 PAYLOADS = (256, 8192)
@@ -103,15 +103,19 @@ def owned_port(cfg, payload_bytes):
     return ports[PAYLOADS.index(payload_bytes)]
 
 def fabric_config_for_case(label, domain):
-    return transport_for_case(label)['fabric'] | {'domain': domain, 'source_address': None}
+    transport = transport_for_case(label)
+    transport['fabric']['domain'] = domain
+    return validate_transport(transport)['fabric']
 
 
-def command(binary, role, address, payload, domain, output, *, software=False,
-            samples=SAMPLES, warmup=WARMUP, deadline_ms=PROBE_MS):
+def write_fabric_config(output, domain, *, software=False):
     label = 'fabric-tcp' if software else 'efa-direct'
-    fabric_config = fabric_config_for_case(label, domain)
+    document(Path(output).with_suffix('.fabric.json'), fabric_config_for_case(label, domain))
+
+
+def command(binary, role, address, payload, output, *, software=False,
+            samples=SAMPLES, warmup=WARMUP, deadline_ms=PROBE_MS):
     config_path = Path(output).with_suffix('.fabric.json')
-    config_path.write_text(json.dumps(fabric_config, indent=2) + '\n')
     require_device_read = not software
     return [str(binary), '--rma-probe', '--role', role,
             '--listen' if role == 'server' else '--connect', address,
@@ -133,11 +137,11 @@ def validate_reports(client, server, expected, *, software=False):
         if not isinstance(report, dict) or report.get('benchmark') != 'raw_provider_fi_read_floor':
             raise ValueError('raw RMA benchmark identity differs')
     payload, count, warmup = (expected[key] for key in ('payload', 'samples', 'warmup'))
-    fabric = 'tcp;ofi_rxm_explicit_software' if software else 'efa-direct'
+    fabric = 'software-tcp' if software else 'efa-direct'
     provider = 'tcp;ofi_rxm' if software else 'efa'
     common = dict(benchmark='raw_provider_fi_read_floor', claim=CLAIM,
         topology='two_process_control_tcp_and_provider_fabric', control_security=SECURITY,
-        provider=provider, fabric=fabric, payload_bytes=payload,
+        fabric=fabric, payload_bytes=payload,
         accepted_fi_reads=count + warmup, samples_requested=count, warmup_requested=warmup,
         warmup_completed=warmup, clean_samples_completed=count,
         registered_region_bytes=payload + 24, deadline_ms=expected['deadline_ms'], polling='busy_spin')
@@ -145,8 +149,11 @@ def validate_reports(client, server, expected, *, software=False):
         actual_config = expected.get(role + '_fabric_config')
         if not isinstance(actual_config, dict):
             raise ValueError(f'raw RMA {role} request metadata is incomplete')
+        caps = report.get('capabilities')
+        if not isinstance(caps, dict):
+            raise ValueError(f'raw RMA {role} capability metadata missing')
         if (report.get('fabric_config') != actual_config
-                or report.get('require_device_read') is not expected['require_device_read']):
+                or caps.get('require_device_read') is not expected['require_device_read']):
             raise ValueError(f'raw RMA {role} request metadata differs')
         provider_info = report.get('provider_info')
         if not isinstance(provider_info, dict) or not provider_info:
@@ -157,12 +164,12 @@ def validate_reports(client, server, expected, *, software=False):
             raise ValueError(f'raw RMA {role} provider metadata is incomplete')
         fabric_config = actual_config
         if (provider_info['backend'] != fabric_config['backend']
-                or provider_info['domain'] != fabric_config.get('domain')
+                or (fabric_config.get('domain') is not None
+                    and provider_info['domain'] != fabric_config['domain'])
                 or (fabric_config.get('source_address') is not None
                     and provider_info['source_address'] != fabric_config['source_address'])):
             raise ValueError(f'raw RMA {role} actual provider selection differs')
-        expected_provider = 'tcp;ofi_rxm' if software else 'efa'
-        if (provider_info['provider'] != expected_provider
+        if (provider_info['provider'] != provider
                 or not isinstance(provider_info['provider'], str) or not provider_info['provider']
                 or not isinstance(provider_info['fabric'], str) or not provider_info['fabric']
                 or not isinstance(provider_info['capability_evidence'], str)
@@ -175,15 +182,13 @@ def validate_reports(client, server, expected, *, software=False):
                 or (software and read_mode == 'native')
                 or nonnegative(rma.get('max_read_bytes'), 'provider_info.max_read_bytes') < payload + 24):
             raise ValueError(f'raw RMA {role} provider metadata does not attest the requested read policy')
-        for key, value in dict(common, role=role, domain=expected[role + '_domain']).items():
+        for key, value in dict(common, role=role).items():
             if report.get(key) != value or type(report.get(key)) is not type(value):
                 raise ValueError(f'raw RMA {role} mismatched {key}')
         if not isinstance(report.get('cpu_affinity'), str) or not re.fullmatch(r'[0-9,-]+', report['cpu_affinity']):
             raise ValueError('missing actual raw RMA CPU affinity')
-        caps = report.get('capabilities', {})
-        required = dict(provider=provider, domain=expected[role + '_domain'],
-            read_mode=read_mode,
-            efa_direct_requested=not software, software_provider_explicit=software)
+        required = dict(read_mode=read_mode, fabric_config=actual_config,
+                        provider_info=provider_info)
         for key, value in required.items():
             if caps.get(key) != value or type(caps.get(key)) is not type(value):
                 raise ValueError('raw RMA did not select the explicit provider capability: ' + key)
@@ -191,7 +196,8 @@ def validate_reports(client, server, expected, *, software=False):
                 nonnegative(caps.get('max_read_bytes'), 'max_read_bytes') < payload + 24):
             raise ValueError('raw RMA registration/read capability differs')
         if (caps.get('read_mode') != read_mode
-                or caps.get('max_read_bytes') != rma.get('max_read_bytes')):
+                or caps.get('max_read_bytes') != rma.get('max_read_bytes')
+                or caps.get('address_mode') != rma.get('address_mode')):
             raise ValueError('raw RMA capability summary disagrees with selected provider metadata')
         details = report.get('detailed_steps_ns')
         if not isinstance(details, list) or not details:
@@ -384,7 +390,8 @@ def guest_action(payload):
             address = node['private_ip'] + ':' + str(payload['port'])
             with socket.socket() as reservation:
                 reservation.bind((node['private_ip'], payload['port']))
-            args = command(binary, 'server', address, payload['payload'], domain, output)
+            write_fabric_config(output, domain)
+            args = command(binary, 'server', address, payload['payload'], output)
             document(case / 'command.json', dict(command=args, binary_sha256=digest(binary)))
             subprocess.run(['systemd-run', '--quiet', '--collect', '--unit=' + unit,
                 '--property=Type=exec', '--property=RemainAfterExit=yes',
@@ -523,13 +530,13 @@ def validate_case(case, payload, client_domain):
         raise ValueError('raw RMA target retrieved S3 archive provenance differs')
     remote_case = Path('/mnt/tidehunter') / cfg['run_id'] / 'raw-rma-control' / case_id
     server_args = command(remote_case / 'transport-floor', 'server', ready['address'],
-        payload['payload'], ready['domain'], remote_case / 'server.json')
+        payload['payload'], remote_case / 'server.json')
     if captured['command.json'] != dict(command=server_args, binary_sha256=payload['binary_sha256']):
         raise ValueError('raw RMA target executable/command provenance differs')
     root = Path(cfg['run_root'])
     client_case = root / 'checkpoint-results/kv/raw-rma' / case_id
     client_args = command(root / 'checkpoint-inputs/build_bundle/binaries/transport-floor',
-        'client', ready['address'], payload['payload'], client_domain, client_case / 'client.json')
+        'client', ready['address'], payload['payload'], client_case / 'client.json')
     client_receipt = document(case / 'client-receipt.json')
     if (client_receipt.get('key') != f"{cfg['s3_prefix']}/case-artifacts/{case_id}/client-results.tar.gz" or
             client_receipt.get('sha256') != digest(case / 'client-retrieved.tar.gz')):
@@ -662,8 +669,9 @@ def run_registered_floor(suite):
                     ready = s3_json(suite.s3, cfg, prefix + '.ready.json')
                     validate_ready(ready, payload)
                     document(case / 'ready.json', ready)
+                    write_fabric_config(case / 'client.json', client_domain)
                     args = command(binary, 'client', ready['address'], payload_bytes,
-                                   client_domain, case / 'client.json')
+                                   case / 'client.json')
                     run_recorded(args, case / 'client-process', client_deadline(suite.deadline),
                         env=os.environ | dict(FI_EFA_USE_DEVICE_RDMA='1', FI_EFA_ENABLE_SHM_TRANSFER='0'),
                         expected_binary_sha256=state['binary_sha256'])
@@ -720,13 +728,15 @@ def local_software(binary, output, *, samples=SAMPLES, warmup=WARMUP, deadline_m
     for payload in PAYLOADS:
         case = output / str(payload)
         case.mkdir()
+        for name in ('server.json', 'client.json'):
+            write_fabric_config(case / name, 'lo', software=True)
         with socket.socket() as reservation:
             reservation.bind(('127.0.0.1', 0))
             port = reservation.getsockname()[1]
         address = '127.0.0.1:' + str(port)
-        server_args = command(binary, 'server', address, payload, 'lo', case / 'server.json',
+        server_args = command(binary, 'server', address, payload, case / 'server.json',
             software=True, samples=samples, warmup=warmup, deadline_ms=deadline_ms)
-        client_args = command(binary, 'client', address, payload, 'lo', case / 'client.json',
+        client_args = command(binary, 'client', address, payload, case / 'client.json',
             software=True, samples=samples, warmup=warmup, deadline_ms=deadline_ms)
         processes = []
         end = time.monotonic() + deadline_ms / 1000

@@ -29,11 +29,35 @@ artifact export and exact-owned cleanup. `operation=cost-report` skips all
 preparation and allocation and preserves the existing billing/reconciliation
 interface. KV uses `experiments/kv-comparison/ci-config.json` with a 10,800-second
 absolute fleet lifetime and its export reserve; the Sui config remains separate.
-The orchestration step/job allow 240/300 minutes for fleet work, retrieval and
+The orchestration step/job allow 240/360 minutes for fleet work, retrieval and
 cleanup; fleet-role maximum session duration must admit the requested four-hour
-session. An unconditional invoked-campaign cleanup path obtains a fresh one-hour
-OIDC session before reconciliation, rather than relying on the original session.
+session. The unconditional invoked-campaign cleanup path has a 45-minute bound
+and obtains a fresh one-hour OIDC session before reconciliation, rather than
+relying on the original session.
 These are orchestration bounds, not permission to reset guest expiry.
+
+## Raw provider admission and current campaign authority
+
+The software-fabric CI profile builds the real raw-read executable, runs both
+256-byte and 8-KiB two-process software `FI_READ` populations, and passes the
+actual producer reports through campaign admission and failure-only evidence
+checks. Software success is not evidence of hardware RDMA or cloud performance.
+The consumer reads requested device-read policy from `capabilities`, binds its
+provider/configuration summaries to the actual root metadata, and keeps native,
+emulated and unknown read modes distinct. No legacy root provider/domain fields
+or invented hardware capability flags are accepted as substitutes.
+
+Command reconstruction is filesystem-free: offline consumers can validate the
+original remote absolute arguments without creating paths on the local machine.
+Only the owning launch path writes its canonical fabric configuration before
+starting the process. Both peers must complete the exact drain protocol.
+
+For the selected KV comparison, current configuration files are authoritative:
+`experiments/kv-comparison/ci-config.json` sets the three-hour fleet lifetime,
+and `budget.json` sets the approved $220 rolling weekly cap. Dated campaign notes
+below retain historical deadlines, budgets and results; they do not override
+these tracked policies.
+
 
 ## 24 October bounded SSM metadata and complete-matrix retry
 

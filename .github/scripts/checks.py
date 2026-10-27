@@ -8,6 +8,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -167,6 +168,15 @@ def check(profile, env):
         engine = ("-p", "tidehunter", "--features", "experimental-fabric,test-utils", "--lib")
         for name in SOFTWARE_ENGINE_TESTS:
             selected_ignored(fabric, engine, name, (name,))
+        cargo(fabric, "build", "-p", "tidehunter", "--features", "experimental-fabric,test-utils",
+              "--example", "sharded_wal_transport_bench")
+        binary = ROOT / fabric.get("CARGO_TARGET_DIR", "target") / "debug/examples/sharded_wal_transport_bench"
+        with tempfile.TemporaryDirectory(prefix="tidehunter-raw-read-") as temporary:
+            evidence = str(Path(temporary) / "evidence")
+            run([sys.executable, "experiments/aws-sharded-wal/raw_rma_floor.py", "local-software",
+                 "--binary", str(binary), "--output", evidence], fabric)
+            run([sys.executable, "-m", "unittest", "discover", "-s", "experiments/aws-sharded-wal",
+                 "-p", "test_raw_rma_floor.py", "-v"], fabric | {"RAW_RMA_SOFTWARE_EVIDENCE": evidence})
     elif profile == "harness":
         if env.get("TH_TEST_SYSTEMD") == "1":
             raise RuntimeError("harness is offline: unset TH_TEST_SYSTEMD; run real-systemd checks separately")
