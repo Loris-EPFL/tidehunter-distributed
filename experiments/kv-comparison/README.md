@@ -1406,3 +1406,33 @@ were closed. Evidence is under
 not substitutes for the unchanged cloud matrix or proof of Valkey RDMA,
 Sui integration, cold-storage GET or cross-slot atomic writes.
 
+### Exact-operation SSM recovery
+
+`control_execution.py` guards each guest operation with a run-local durable
+started/completed record and a per-operation process lock. Its key, canonical
+request and UTC deadline cannot change on replay. A duplicate delivery returns
+the completed result without re-running a cache drop, reset or service launch.
+A crash or callback error after the started marker remains indeterminate and
+fails closed; this is at-most-once execution, not exactly-once liveness.
+
+`Controller.request` first reconciles the exact S3 result after a lost send
+acknowledgement. Only a missing object permits at most two replays of the same
+guarded command; the shell, response key and original deadline remain identical.
+Failed, malformed or foreign receipts cannot become success. SDK blind retries
+remain disabled, known invocation failures remain failures, and neither the
+work cutoff nor the three-hour fleet expiry is extended.
+
+Control records live under `/var/lib/tidehunter-kv-control/<run>`, outside the
+owner NVMe data roots and timed KV APIs. Directory/file sync precedes reuse;
+backend data resets do not erase operation identity. The serialized S3 receipt
+bound stays 32 MiB; the separate local record bound includes both the bounded
+request and result plus their envelope.
+
+Local verification passed all 260 comparison tests. A real threaded guest-entry
+fault injection lost the first acknowledgement, delivered the identical command
+twice, and observed one filesystem side effect and one completed durable record.
+Both guest deliveries returned the same real result. Evidence is
+`checkpoint-work/portable-cloud-launch-20261027/control-recovery-proof.json`;
+external AWS/identity services were simulated, not the local execution gate.
+
+

@@ -55,6 +55,9 @@ def physical_fixture():
              "host_identity": {"boot_id": f"boot-{i}"},
              "block_devices": {"blockdevices": [{"model": "Amazon EC2 NVMe Instance Storage", "serial": f"serial-{i}"}]}}
             for i in range(6)]
+class MissingS3ObjectError(Exception):
+    response = {"Error": {"Code": "NoSuchKey"}}
+
 
 
 class ConfigTests(unittest.TestCase):
@@ -364,19 +367,104 @@ class BackendCleanupTests(unittest.TestCase):
 
 
 class CommandSafetyTests(unittest.TestCase):
-    def test_unknown_send_outcome_is_never_retried(self):
+    def test_lost_send_ack_accepts_exact_completed_receipt_without_resend(self):
         config = config_fixture()
         clients = clients_fixture(config)
         clients["ssm"].send_command.side_effect = TimeoutError("response lost after acceptance")
         runtime = controller.Controller(config, clients)
         with tempfile.TemporaryDirectory() as tmp:
             runtime.root = Path(tmp)
-            with self.assertRaisesRegex(controller.InfrastructureError, "never blindly retry"):
-                runtime.request(0, {"action": "snapshot"})
-            self.assertEqual(clients["ssm"].send_command.call_count, 1)
-            clients["ssm"].get_command_invocation.assert_not_called()
-            intent = json.loads(next((Path(tmp) / "commands").glob("*.json")).read_text())
-            self.assertEqual(intent["status"], "unknown_send_response")
+            with patch.object(controller, "read_s3_json") as read_receipt:
+                read_receipt.side_effect = lambda _client, _config, _key: {
+                    "request": {"action": "snapshot", "index": 0},
+                    "instance_id": runtime.ids[1], "status": "completed",
+                    "result": {"snapshot": "exact-result"}}
+                self.assertEqual(runtime.request(0, {"action": "snapshot"}), {"snapshot": "exact-result"})
+                self.assertEqual(read_receipt.call_count, 1)
+        clients["ssm"].send_command.assert_called_once()
+        clients["ssm"].get_command_invocation.assert_not_called()
+
+    def test_absent_receipt_replays_only_identical_invocation_with_bounded_attempts(self):
+        config = config_fixture()
+        clients = clients_fixture(config)
+        clients["ssm"].send_command.side_effect = [TimeoutError("lost ack")] * 3
+        now = [100.0]
+        runtime = controller.Controller(config, clients, clock=lambda: now[0])
+        def advance(seconds):
+            now[0] += seconds
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime.root = Path(tmp)
+            with patch.object(controller, "read_s3_json", side_effect=MissingS3ObjectError()), \
+                 patch.object(controller.time, "sleep", side_effect=advance):
+                with self.assertRaises(controller.InfrastructureError):
+                    runtime.request(0, {"action": "snapshot"}, timeout=3)
+        self.assertEqual(clients["ssm"].send_command.call_count, 3)
+        calls = clients["ssm"].send_command.call_args_list
+        self.assertEqual(calls[0], calls[1])
+        self.assertEqual(calls[1], calls[2])
+
+    def test_untrusted_or_incomplete_receipts_never_succeed(self):
+        config = config_fixture()
+        cases = (
+            ("null object", lambda runtime: None),
+            ("array object", lambda runtime: []),
+            ("foreign host", lambda runtime: {
+                "request": {"action": "snapshot", "index": 0}, "instance_id": "i-foreign",
+                "status": "completed", "result": {"forged": True}}),
+            ("foreign request", lambda runtime: {
+                "request": {"action": "other", "index": 0}, "instance_id": runtime.ids[1],
+                "status": "completed", "result": {"forged": True}}),
+            ("failed", lambda runtime: {
+                "request": {"action": "snapshot", "index": 0}, "instance_id": runtime.ids[1],
+                "status": "failed", "error": "operation failed"}),
+            ("missing status", lambda runtime: {
+                "request": {"action": "snapshot", "index": 0}, "instance_id": runtime.ids[1],
+                "result": {"forged": True}}),
+            ("missing result", lambda runtime: {
+                "request": {"action": "snapshot", "index": 0}, "instance_id": runtime.ids[1],
+                "status": "completed"}),
+        )
+        for name, make_receipt in cases:
+            with self.subTest(name=name):
+                clients = clients_fixture(config)
+                clients["ssm"].send_command.side_effect = TimeoutError("lost ack")
+                runtime = controller.Controller(config, clients)
+                with tempfile.TemporaryDirectory() as tmp:
+                    runtime.root = Path(tmp)
+                    with patch.object(controller, "read_s3_json", side_effect=lambda *_: make_receipt(runtime)):
+                        with self.assertRaises((controller.InfrastructureError, controller.SafetyError)):
+                            runtime.request(0, {"action": "snapshot"}, timeout=3)
+                clients["ssm"].send_command.assert_called_once()
+
+    def test_expired_ambiguous_request_is_not_replayed_or_reported_successful(self):
+        config = config_fixture()
+        clients = clients_fixture(config)
+        now = [100.0]
+        def lost_ack_after_deadline(**_kwargs):
+            now[0] += 2
+            raise TimeoutError("lost ack after operation deadline")
+        clients["ssm"].send_command.side_effect = lost_ack_after_deadline
+        runtime = controller.Controller(config, clients, clock=lambda: now[0])
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime.root = Path(tmp)
+            with patch.object(controller, "read_s3_json", side_effect=MissingS3ObjectError()):
+                with self.assertRaises(controller.InfrastructureError):
+                    runtime.request(0, {"action": "snapshot"}, timeout=1)
+        clients["ssm"].send_command.assert_called_once()
+
+
+    def test_failed_invocation_status_is_not_hidden_by_receipt(self):
+        config = config_fixture()
+        clients = clients_fixture(config)
+        clients["ssm"].send_command.return_value = {"Command": {"CommandId": "00000000-0000-0000-0000-000000000000"}}
+        clients["ssm"].get_command_invocation.return_value = {"Status": "Failed", "ResponseCode": 1}
+        runtime = controller.Controller(config, clients)
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime.root = Path(tmp)
+            with patch.object(controller, "read_s3_json") as read_receipt:
+                with self.assertRaisesRegex(controller.InfrastructureError, "failed/unknown terminal status"):
+                    runtime.request(0, {"action": "snapshot"})
+                read_receipt.assert_not_called()
 
     def test_bootstrap_retries_only_explicit_nonacceptance_not_unknown_outcomes(self):
         config = config_fixture()

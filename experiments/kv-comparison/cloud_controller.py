@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -42,6 +43,7 @@ import cloud_layout
 import local
 import resource_accounting
 from portable_transport import is_trusted, protocol_key, validate_transport
+from control_execution import execute_at_most_once
 
 ACCOUNT = "354775971805"
 TAGS = {"Project": "TideHunter", "ManagedBy": "sharded-wal-benchmark",
@@ -49,6 +51,7 @@ TAGS = {"Project": "TideHunter", "ManagedBy": "sharded-wal-benchmark",
         "BenchmarkBranch": "bench/aws-efa", "SourceBranch": "feat/cloud-kv-comparison"}
 RAW_FILES = ("manifest.json", "summary.json", "samples.csv", "metrics.prom")
 MAX_JSON_BYTES = 32 * 1024 * 1024
+MAX_AMBIGUOUS_REPLAYS = 2
 DISABLED_RESIDENT_READS = {"source_bytes": 0, "source_regions": 0, "destination_bytes": 0,
     "destination_slots": 0, "max_read_bytes": 0, "max_handles": 0, "require_device_read": False}
 
@@ -266,8 +269,8 @@ def make_clients(config, *, guest=False):
         **common, retries={"total_max_attempts": 2, "mode": "standard"}))}
     if not guest:
         for service in ("ec2", "ssm", "sts"):
-            # SendCommand is deliberately never retried: an unknown response can
-            # already have started the command. Poll only a known command ID.
+            # SDK retries remain disabled for SendCommand. Only Controller.request
+            # can replay an identical operation through the durable guest gate.
             clients[service] = session.client(service, config=Config(**common, retries={
                 "total_max_attempts": 1 if service == "ssm" else 2, "mode": "standard"}))
     return clients
@@ -741,20 +744,27 @@ class Controller:
         return s3_json(self.clients["s3"], self.config, self.config["prefix"] + "/results/" + name, value)
 
     def request(self, index, request, *, case="startup", timeout=180, export=False):
-        timeout = max(1, min(int(timeout), int(self.remaining(export=export))))
+        available = self.remaining(export=export)
+        if available < 1:
+            raise DeadlineError("insufficient whole-second control-operation budget")
+        timeout = max(1, min(int(timeout), int(available)))
         request = {**request, "index": index}
         if request.get("action") == "layout":
             request["operation_timeout"] = timeout
         if request.get("action") == "layout" and request.get("operation") == "probe":
             request["timeout"] = min(request["timeout"], timeout)
-        self.guard()
         if index == -1:
+            self.guard()
             return guest_operation(self.config, request, self.clients)
         with self.sequence_lock:
             self.sequence += 1
             number = self.sequence
         key = f"{self.config['prefix']}/results/cells/{case}/storage/{index}/{number:06d}-{request['action']}.json"
-        payload = {"request": request, "key": key}
+        deadline = min(self.end if export else self.work_end, self.clock() + timeout)
+        deadline_epoch = min(timestamp(self.config["deadline_utc"]).timestamp(),
+                             utc().timestamp() + max(0, deadline - self.clock()))
+        payload = {"execution_schema_version": 1, "deadline_epoch": deadline_epoch,
+                   "request": request, "key": key}
         encode = lambda v: base64.b64encode(json.dumps(v).encode()).decode()
         script = Path(self.config["repository_root"]) / "experiments/kv-comparison/cloud_controller.py"
         argv = ["python3", str(script), "guest", "--config-base64", encode(self.config), "--request-base64", encode(payload)]
@@ -765,10 +775,51 @@ class Controller:
             shell = shlex.join(["timeout", str(max(1, timeout - 60)), "sh", "-c", waiting]) + " && " + shell
         intent = {"instance_id": self.ids[index + 1], "request": request, "key": key, "sent_utc": utc().isoformat()}
         journal = self.root / "commands" / f"{number:06d}.json"
-        dump(journal, {**intent, "status": "intent"})
-        deadline = self.clock() + timeout
-        while self.clock() < deadline:
+        attempts = []
+        command_id = None
+
+        def record(status, **evidence):
+            dump(journal, {**intent, "status": status, "attempts": attempts, **evidence})
+
+        def receipt_if_present():
+            try:
+                result = read_s3_json(self.clients["s3"], self.config, key)
+                if not isinstance(result, dict):
+                    raise SafetyError("guest response is not a control-operation receipt")
+                return result
+            except Exception as exc:
+                response = getattr(exc, "response", {})
+                code = response.get("Error", {}).get("Code") if isinstance(response, dict) else None
+                if code in ("NoSuchKey", "404", "NotFound"):
+                    return None
+                raise
+
+        def admit(result, *, reconciled):
+            if (not isinstance(result, dict) or result.get("request") != request
+                    or result.get("instance_id") != self.ids[index + 1]):
+                raise SafetyError("guest response not bound to exact request/host")
+            dump(self.root / "guest" / case / f"storage-{index}-{number:06d}.json", result)
+            if result.get("status") != "completed":
+                raise InfrastructureError("guest operation failed: " + str(result.get("error")))
+            if "result" not in result:
+                raise SafetyError("completed guest response has no operation result")
+            record("completed", command_id=command_id, reconciled=reconciled)
+            return result["result"]
+
+        record("intent")
+        ambiguous = 0
+        # Explicit bootstrap nonacceptance can wait for agent registration.
+        # Ambiguous replay is separately bounded and always uses the identical
+        # payload, S3 key and deadline guarded by the guest's durable execution gate.
+        for _ in range(timeout + 1):
+            if self.clock() >= deadline:
+                break
             self.remaining(export=export)
+            self.guard()
+            if self.clock() >= deadline:
+                break
+            attempts.append({"number": len(attempts) + 1, "status": "intent"})
+            record("sending")
             try:
                 response = self.clients["ssm"].send_command(InstanceIds=[self.ids[index + 1]], DocumentName="AWS-RunShellScript",
                     Parameters={"commands": [shell], "executionTimeout": [str(timeout)]},
@@ -776,43 +827,53 @@ class Controller:
                 command_id = response["Command"]["CommandId"]
                 if not isinstance(command_id, str) or not re.fullmatch(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}", command_id):
                     raise ValueError("missing/invalid command identity")
+                attempts[-1].update(status="sent", command_id=command_id)
+                record("sent", command_id=command_id)
                 break
             except self.clients["ssm"].exceptions.InvalidInstanceId as exc:
-                # This typed rejection guarantees nonacceptance. It is distinct
-                # from a lost response, which must never trigger another send.
-                dump(journal, {**intent, "status": "known_not_accepted", "error": repr(exc)})
+                attempts[-1].update(status="known_not_accepted", error=repr(exc))
+                record("known_not_accepted")
                 if request["action"] != "bootstrap":
                     raise InfrastructureError("SSM rejected exact guest; no command was accepted") from exc
                 time.sleep(min(2, max(0, deadline - self.clock())))
-                self.guard()
             except Exception as exc:
-                dump(journal, {**intent, "status": "unknown_send_response", "error": repr(exc)})
-                raise InfrastructureError("SSM SendCommand outcome unknown; never blindly retry") from exc
-        else:
-            raise InfrastructureError("exact guest never accepted bounded bootstrap command")
-        dump(journal, {**intent, "status": "sent", "command_id": command_id})
-        while self.clock() < deadline:
+                command_id = None
+                attempts[-1].update(status="unknown_send_response", error=repr(exc))
+                record("unknown_send_response")
+                self.remaining(export=export)
+                if self.clock() >= deadline:
+                    break
+                result = receipt_if_present()
+                if result is not None:
+                    return admit(result, reconciled=True)
+                if ambiguous == MAX_AMBIGUOUS_REPLAYS:
+                    break
+                ambiguous += 1
+                time.sleep(min(0.5, max(0, deadline - self.clock())))
+        for _ in range(2 * timeout + 1):
+            if self.clock() >= deadline:
+                break
             self.remaining(export=export)
-            try:
-                invocation = self.clients["ssm"].get_command_invocation(CommandId=command_id, InstanceId=self.ids[index + 1])
-            except self.clients["ssm"].exceptions.InvocationDoesNotExist:
-                time.sleep(0.5)
-                continue
-            status = invocation.get("Status")
-            if status in ("Pending", "InProgress", "Delayed"):
-                time.sleep(0.5)
-                continue
-            dump(journal, {**intent, "command_id": command_id, "invocation": invocation})
-            if status != "Success" or invocation.get("ResponseCode") != 0:
-                raise InfrastructureError("SSM command failed/unknown terminal status: " + str(status))
-            result = read_s3_json(self.clients["s3"], self.config, key)
-            if result.get("request") != request or result.get("instance_id") != self.ids[index + 1]:
-                raise SafetyError("guest response not bound to exact request/host")
-            dump(self.root / "guest" / case / f"storage-{index}-{number:06d}.json", result)
-            if result.get("status") != "completed":
-                raise InfrastructureError("guest operation failed: " + str(result.get("error")))
-            return result["result"]
-        raise InfrastructureError("SSM known command deadline exceeded; state may still be live")
+            if command_id is None:
+                result = receipt_if_present()
+                if result is not None:
+                    return admit(result, reconciled=True)
+            else:
+                try:
+                    invocation = self.clients["ssm"].get_command_invocation(
+                        CommandId=command_id, InstanceId=self.ids[index + 1])
+                except self.clients["ssm"].exceptions.InvocationDoesNotExist:
+                    time.sleep(min(0.5, max(0, deadline - self.clock())))
+                    continue
+                status = invocation.get("Status")
+                if status not in ("Pending", "InProgress", "Delayed"):
+                    record("invocation_terminal", command_id=command_id, invocation=invocation)
+                    if status != "Success" or invocation.get("ResponseCode") != 0:
+                        raise InfrastructureError("SSM command failed/unknown terminal status: " + str(status))
+                    return admit(read_s3_json(self.clients["s3"], self.config, key), reconciled=False)
+            time.sleep(min(0.5, max(0, deadline - self.clock())))
+        record("deadline_exceeded", command_id=command_id)
+        raise InfrastructureError("SSM exact operation deadline exceeded; state may still be live")
 
     def all_hosts(self, request, *, case="startup", timeout=180, export=False):
         # Calls are bounded and each mutating SSM request rechecks all six tags.
@@ -1552,6 +1613,15 @@ def archive_results(root, destination, *, deadline_check=None):
 
 def guest_main(config, payload):
     validate_config(config)
+    if (not isinstance(payload, dict)
+            or set(payload) != {"execution_schema_version", "deadline_epoch", "request", "key"}
+            or type(payload["execution_schema_version"]) is not int
+            or payload["execution_schema_version"] != 1):
+        raise SafetyError("guest requires the guarded control-execution schema")
+    deadline_epoch = payload["deadline_epoch"]
+    if (type(deadline_epoch) not in (int, float) or not math.isfinite(deadline_epoch)
+            or deadline_epoch > timestamp(config["deadline_utc"]).timestamp()):
+        raise SafetyError("guest operation deadline differs from bounded fleet expiry")
     request, key = payload["request"], payload["key"]
     index = request["index"]
     if type(index) is not int or index not in range(5):
@@ -1559,10 +1629,23 @@ def guest_main(config, payload):
     expected = f"{config['prefix']}/results/cells/"
     if not key.startswith(expected) or f"/storage/{index}/" not in key or ".." in key.split("/"):
         raise SafetyError("guest result key is outside exact node prefix")
+    verify_local_identity(config, index)
+    guarded(config["fleet"]["data_root"], Path("/mnt/tidehunter-kv-comparison"), must_exist=True)
+    # Keep durable control receipts off the measured owner NVMe data roots.
+    root = guarded(Path("/var/lib/tidehunter-kv-control") / config["prefix"],
+                   Path("/var/lib/tidehunter-kv-control"))
+    for directory in (root.parent, root):
+        directory.mkdir(mode=0o700, exist_ok=True)
+        descriptor = os.open(directory.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
     clients = make_clients(config, guest=True)
     result = {"request": request, "instance_id": config["fleet"]["nodes"][index]["instance_id"]}
     try:
-        result["result"] = guest_operation(config, request, clients)
+        result["result"] = execute_at_most_once(root, key, request,
+            lambda: guest_operation(config, request, clients), deadline_epoch=deadline_epoch)
         result["status"] = "completed"
     except Exception as exc:
         result.update(status="failed", error=type(exc).__name__ + ": " + str(exc))
