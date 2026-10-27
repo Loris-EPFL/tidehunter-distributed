@@ -30,6 +30,22 @@ def metrics():
                  "scheduling_ns": timing(0, None)}]}
 
 
+def write_diagnostics():
+    return {"schema_version": 1, "backend": "native", "phase": "measurement", "phase_attempted": True,
+            "runtime_enabled": True, "runtime_observation_mode": "sampled_prefix",
+            "selection": {"requested_limit": 8, "observed_samples": 3,
+                          "selection_policy": "first N accepted scalar measurement writes",
+                          "phase_exclusions": ["preload", "warmup", "qualification"]},
+            "clock_scope": "independent nested clocks", "overlap_semantics": "not additive",
+            "unsupported_stages": ["pure network time"], "error": None,
+            "profile": {"selected_operations": 3,
+                        "stages": {"wal_append_ns": 2000000000, "wal_append_errors": 0,
+                                   "index_apply_ns": 300000000, "index_apply_errors": 1},
+                        "value_wal_persistence": {"status": "sampled", "profiled_barriers": 3,
+                                                  "file_calls": 3, "file_successes": 2,
+                                                  "file_ns": 1000000000}}}
+
+
 class CaseIdentityTests(unittest.TestCase):
     def test_scopes_quoted_labels_without_splitting_their_commas_or_braces(self):
         source = b'# TYPE observed counter\nobserved{op="read,brace}quote\\\""} 7\n'
@@ -113,6 +129,158 @@ class CaseIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "trailing"):
             campaign.scoped(b'observed{op="read",} 7\n', {"case_id": "owned"})
 
+
+    def test_terminal_resource_gauges_preserve_observed_zero_and_missing_counters(self):
+        evidence = {"schema_version": 1, "scope": "measurement_boundary_interval", "processes": [
+            {"host_index": -1, "process_role": "client", "available": True, "elapsed_seconds": 1.2,
+             "cpu_seconds": 0.75, "cpu_throttled_seconds": 0, "cpu_periods": 10,
+             "cpu_throttled_periods": 0, "io_read_bytes": 8192},
+            {"host_index": 0, "process_role": "storage", "available": False, "reason": "cgroup replaced"}]}
+        text = campaign.terminal_metrics({"status": "completed", "metrics": None, "resource_evidence": evidence}, {})
+        self.assertIn('kv_case_resource_interval_cpu_throttled_seconds{scope="measurement_boundary_interval",resource_host_index="-1",process_role="client"} 0', text)
+        self.assertIn('kv_case_resource_interval_available{scope="measurement_boundary_interval",resource_host_index="0",process_role="storage"} 0', text)
+        self.assertNotIn("io_write_bytes", text)
+        self.assertNotIn("memory_peak_bytes", text)
+        self.assertNotIn("cgroup replaced", text)
+        self.assertNotIn("_total", text)
+
+    def test_resource_absence_is_not_an_available_zero_interval(self):
+        terminal = {"status": "failed", "metrics": None}
+        self.assertNotIn("resource_interval", campaign.terminal_metrics(terminal, {}))
+        terminal["resource_evidence"] = {"schema_version": 1, "scope": "measurement_boundary_interval", "processes": [
+            {"host_index": -1, "process_role": "client", "available": False, "reason": "cpu counter reset"}]}
+        text = campaign.terminal_metrics(terminal, {})
+        self.assertIn('resource_interval_available{', text)
+        self.assertNotIn('resource_interval_elapsed_seconds', text)
+        self.assertNotIn('resource_interval_cpu_seconds', text)
+
+    def test_resource_rejects_reset_impossible_or_unavailable_counter_claims(self):
+        valid = {"host_index": -1, "process_role": "client", "available": True, "elapsed_seconds": 1,
+                 "cpu_periods": 5, "cpu_throttled_periods": 2}
+        for change in ({"cpu_seconds": -1}, {"elapsed_seconds": 0}, {"elapsed_seconds": float("nan")},
+                       {"cpu_throttled_periods": 6}, {"io_read_bytes": 1.5}, {"host_index": True},
+                       {"available": False, "reason": "reset"}, {"available": True, "reason": "not allowed"}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                campaign.resource_interval_metrics({"schema_version": 1, "scope": "measurement_boundary_interval",
+                                                     "processes": [valid | change]}, {})
+        for rows in ([valid, valid], [valid] * 17):
+            with self.assertRaises(ValueError):
+                campaign.resource_interval_metrics({"schema_version": 1, "scope": "measurement_boundary_interval",
+                                                     "processes": rows}, {})
+
+    def test_write_diagnostics_export_actual_totals_counts_and_nested_clock_scopes(self):
+        text = campaign.terminal_metrics({"status": "completed", "metrics": None,
+                                          "write_diagnostics": write_diagnostics()}, {})
+        self.assertIn('phase="measurement",scope="sampled_prefix"', text)
+        self.assertIn('component="stages",stage="wal_append_ns"} 2.0', text)
+        self.assertIn('component="stages",counter="wal_append_errors"} 0', text)
+        self.assertIn('component="value_wal_persistence",stage="file_ns"} 1.0', text)
+        self.assertIn('component="value_wal_persistence",counter="file_successes"} 2', text)
+        self.assertIn('population="observed_samples"} 3', text)
+        self.assertNotIn("quantile", text)
+        self.assertNotIn("percent", text)
+        remote = write_diagnostics()
+        remote["profile"] = {"stages": {"write_profile_client_exchange_ns": 700000000,
+                                          "write_profile_storage_append_calls": 3,
+                                          "write_profile_storage_append_errors": 1}}
+        text = campaign.write_diagnostic_metrics(remote, {})
+        self.assertIn('stage="write_profile_client_exchange_ns"} 0.7', text)
+        self.assertIn('counter="write_profile_storage_append_calls"} 3', text)
+
+    def test_write_diagnostics_absence_and_unavailable_stages_are_not_zeros(self):
+        self.assertEqual(campaign.write_diagnostic_metrics(None, {}), "")
+        value = write_diagnostics()
+        value["profile"]["value_wal_persistence"] = {"status": "not_applicable", "reason": "page cache"}
+        text = campaign.write_diagnostic_metrics(value, {})
+        self.assertNotIn("file_ns", text)
+        for changes in ({"runtime_enabled": False}, {"profile": None}, {"error": "profile unavailable"}):
+            text = campaign.write_diagnostic_metrics(value | changes, {})
+            self.assertIn('diagnostic_backend="native"} 0', text)
+            self.assertNotIn("diagnostic_stage_seconds", text)
+            self.assertNotIn("diagnostic_stage_count", text)
+        value["selection"]["observed_samples"] = 0
+        self.assertNotIn("diagnostic_stage_seconds", campaign.write_diagnostic_metrics(value, {}))
+
+    def test_write_diagnostics_reject_wrong_phase_bad_counts_and_oversize(self):
+        for changes in ({"phase": "warmup"}, {"schema_version": True}, {"clock_scope": ""},
+                        {"runtime_enabled": 1}, {"overlap_semantics": "x" * 65537}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                campaign.write_diagnostic_metrics(write_diagnostics() | changes, {})
+        for bad in (-1, 1.5, float("nan"), float("inf"), True):
+            value = write_diagnostics()
+            value["profile"]["stages"]["wal_append_ns"] = bad
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                campaign.write_diagnostic_metrics(value, {})
+        value = write_diagnostics()
+        value["profile"]["value_wal_persistence"] = {"status": "not_applicable", "file_ns": 0}
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            campaign.write_diagnostic_metrics(value, {})
+
+    def test_full_remote_profile_and_coordinator_window_fit_without_clipping(self):
+        value = write_diagnostics()
+        value["backend"] = "tidehunter_tcp"
+        value["profile"]["stages"] = {
+            "transport_" + str(index) + "_ns": index * 1000000000
+            for index in range(268)}
+        value["profile"]["coordinator_interval"] = {
+            "scope": "measurement_boundary_cumulative_delta",
+            "clock_scope": "separate full measurement interval",
+            "stages": {"write_concurrent_completed": 4096, "write_publication_ns": 9000000000}}
+        text = campaign.write_diagnostic_metrics(value, {})
+        self.assertIn('component="stages",stage="transport_267_ns"} 267.0', text)
+        self.assertIn('component="coordinator_interval",stage="write_publication_ns"} 9.0', text)
+
+    def test_numeric_budget_is_global_across_profile_components(self):
+        value = write_diagnostics()
+        for component in ("stages", "value_wal_persistence"):
+            value["profile"][component] = {
+                "stage_" + str(index) + "_calls": 1 for index in range(256)}
+        with self.assertRaises(ValueError):
+            campaign.write_diagnostic_metrics(value, {})
+
+    def test_coordinator_interval_is_full_window_even_without_prefix_samples(self):
+        value = write_diagnostics()
+        value["runtime_enabled"] = False
+        value["selection"]["observed_samples"] = 0
+        value["profile"]["coordinator_interval"] = {
+            "scope": "measurement_boundary_cumulative_delta",
+            "clock_scope": "coordinator counters before release through completion gate",
+            "stages": {"write_storage_wait_ns": 2000000000, "write_publication_ns": 300000000,
+                       "write_checkpoint_count": 4, "write_concurrent_completed": 100}}
+        text = campaign.write_diagnostic_metrics(value, {})
+        boundary = ('phase="measurement",scope="measurement_boundary_cumulative_delta",'
+                    'diagnostic_backend="native",component="coordinator_interval"')
+        self.assertIn('stage_seconds{' + boundary + ',stage="write_storage_wait_ns"} 2.0', text)
+        self.assertIn('stage_count{' + boundary + ',counter="write_checkpoint_count"} 4', text)
+        self.assertIn('stage_count{' + boundary + ',counter="write_concurrent_completed"} 100', text)
+        self.assertNotIn('component="stages"', text)
+        self.assertIn('scope="sampled_prefix",diagnostic_backend="native"} 0', text)
+        self.assertIn('scope="measurement_boundary_cumulative_delta",diagnostic_backend="native"} 1', text)
+
+    def test_coordinator_interval_absence_or_counter_reset_does_not_invent_zero(self):
+        value = write_diagnostics()
+        self.assertNotIn("measurement_boundary_cumulative_delta", campaign.write_diagnostic_metrics(value, {}))
+        value["profile"]["coordinator_interval_error"] = "write_storage_wait_ns reset"
+        text = campaign.write_diagnostic_metrics(value, {})
+        self.assertIn('scope="measurement_boundary_cumulative_delta",diagnostic_backend="native"} 0', text)
+        self.assertNotIn('component="coordinator_interval"', text)
+
+    def test_coordinator_interval_rejects_wrong_scope_gauges_resets_and_conflicts(self):
+        interval = {"scope": "measurement_boundary_cumulative_delta", "clock_scope": "coordinator interval",
+                    "stages": {"write_storage_wait_ns": 1}}
+        for changes in ({"scope": "sampled_prefix"}, {"clock_scope": ""},
+                        {"stages": {"write_inflight_peak": 100}}, {"stages": {"write_storage_wait_ns": -1}},
+                        {"stages": {"write_storage_wait_ns": float("nan")}},
+                        {"stages": {"write_storage_wait_ns": True}}, {"stages": {}}):
+            value = write_diagnostics()
+            value["profile"]["coordinator_interval"] = interval | changes
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                campaign.write_diagnostic_metrics(value, {})
+        value = write_diagnostics()
+        value["profile"]["coordinator_interval"] = interval
+        value["profile"]["coordinator_interval_error"] = "counter reset"
+        with self.assertRaises(ValueError):
+            campaign.write_diagnostic_metrics(value, {})
 
 class ExplicitCgroupTests(unittest.TestCase):
     def setUp(self):

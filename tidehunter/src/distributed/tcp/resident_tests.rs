@@ -64,7 +64,7 @@ fn software_provider_read_io_monitor_reports_wal_and_real_rma_lane_activity() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = listener.local_addr().unwrap().to_string();
     let server_tls = TlsFiles {
-        transport: Transport::FabricTcpNative,
+        transport: software_transport(FabricSecurity::Trusted),
         ca: PathBuf::new(),
         cert: PathBuf::new(),
         key: PathBuf::new(),
@@ -92,7 +92,7 @@ fn software_provider_read_io_monitor_reports_wal_and_real_rma_lane_activity() {
                 server_name: "trusted-software-provider-test".to_owned(),
             }],
             tls: TlsFiles {
-                transport: Transport::FabricTcpNative,
+                transport: software_transport(FabricSecurity::Trusted),
                 ca: PathBuf::new(),
                 cert: PathBuf::new(),
                 key: PathBuf::new(),
@@ -253,7 +253,7 @@ impl ResidentFixture {
         let server_stop = stop.clone();
         let server = node.clone();
         let tls = TlsFiles {
-            transport: Transport::FabricTcpNative,
+            transport: software_transport(FabricSecurity::Trusted),
             ca: PathBuf::new(),
             cert: PathBuf::new(),
             key: PathBuf::new(),
@@ -402,7 +402,7 @@ impl RemoteFixture {
         let thread_stop = stop.clone();
         let serving = node.clone();
         let server_tls = TlsFiles {
-            transport: Transport::FabricTcpNative,
+            transport: software_transport(FabricSecurity::Trusted),
             ca: PathBuf::new(),
             cert: PathBuf::new(),
             key: PathBuf::new(),
@@ -426,7 +426,7 @@ impl RemoteFixture {
                 server_name: "trusted-software-provider-test".to_owned(),
             }],
             tls: TlsFiles {
-                transport: Transport::FabricTcpNative,
+                transport: software_transport(FabricSecurity::Trusted),
                 ca: PathBuf::new(),
                 cert: PathBuf::new(),
                 key: PathBuf::new(),
@@ -1177,7 +1177,7 @@ fn software_provider_quarantine_keeps_original_wal_owner_after_node_drop() {
     let server_stop = Arc::clone(&stop);
     let server_node = Arc::clone(&node);
     let server_tls = TlsFiles {
-        transport: Transport::FabricTcpNative,
+        transport: software_transport(FabricSecurity::Trusted),
         ca: PathBuf::new(),
         cert: PathBuf::new(),
         key: PathBuf::new(),
@@ -1192,7 +1192,7 @@ fn software_provider_quarantine_keeps_original_wal_owner_after_node_drop() {
     let mut client = Client::connect(
         &endpoint,
         &TlsFiles {
-            transport: Transport::FabricTcpNative,
+            transport: software_transport(FabricSecurity::Trusted),
             ca: PathBuf::new(),
             cert: PathBuf::new(),
             key: PathBuf::new(),
@@ -1261,7 +1261,7 @@ fn software_provider_exact_drain_releases_original_wal_owner() {
     let server_stop = Arc::clone(&stop);
     let server_node = Arc::clone(&node);
     let server_tls = TlsFiles {
-        transport: Transport::FabricTcpNative,
+        transport: software_transport(FabricSecurity::Trusted),
         ca: PathBuf::new(),
         cert: PathBuf::new(),
         key: PathBuf::new(),
@@ -1276,7 +1276,7 @@ fn software_provider_exact_drain_releases_original_wal_owner() {
     let mut client = Client::connect(
         &endpoint,
         &TlsFiles {
-            transport: Transport::FabricTcpNative,
+            transport: software_transport(FabricSecurity::Trusted),
             ca: PathBuf::new(),
             cert: PathBuf::new(),
             key: PathBuf::new(),

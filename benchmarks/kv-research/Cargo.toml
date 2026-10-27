@@ -24,16 +24,18 @@ rocksdb = { version = "0.21", optional = true }
 # Match the engine's explicit ring provider; do not enable a second default provider.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 rustls-pemfile = { version = "2", optional = true }
+redis = { version = "=1.8.0", default-features = false, features = ["cluster-async", "tokio-comp"], optional = true }
 
 [features]
 default = []
 tikv = ["dep:tikv-client", "dep:reqwest", "dep:tonic"]
 cassandra = ["dep:scylla", "dep:rustls", "dep:rustls-pemfile"]
 foundationdb = ["dep:foundationdb"]
+valkey-tcp = ["dep:redis"]
 rocksdb = ["dep:rocksdb"]
-# Explicitly opt in to real libfabric/EFA transports; disabled builds still
-# reject EFA configuration rather than selecting the TCP path.
-efa = ["tidehunter/experimental-fabric"]
+# Opt in to native OFI transports without tying selection to one provider.
+# Disabled builds reject OFI configuration rather than selecting TCP.
+fabric = ["tidehunter/experimental-fabric"]
 test-utils = ["tidehunter/test-utils"]
 
 [lints.clippy]

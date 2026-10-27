@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "declared_utc": "2026-10-25T22:56:54.930809+00:00",
+  "purpose": "development triage only; not statistical equivalence or publication confidence",
+  "latency": {
+    "relative_fraction": 0.1,
+    "absolute_floor_us": 1.0
+  },
+  "throughput": {
+    "relative_fraction": 0.1
+  },
+  "rejection": {
+    "absolute_fraction": 0.01
+  },
+  "rerun_rule": "Only preregistered report-relevant uncertain or regressed configurations; freeze sources/settings and include every backend in that comparison. No automatic runs and no missing-third completion campaign.",
+  "publication_rule": "Use multiple independent repetitions under an explicit publication/reproducibility protocol; two or three runs do not justify a statistical-insignificance claim."
+}

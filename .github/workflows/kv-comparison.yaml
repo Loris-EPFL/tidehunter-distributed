@@ -13,11 +13,10 @@ on:
       - 'tidehunter-fabric/**'
   workflow_dispatch:
     inputs:
-      backend:
-        description: Actual adapter to rerun (all runs sequentially)
-        type: choice
-        options: [all, native, tidehunter_tcp, tikv, cassandra, foundationdb]
-        default: all
+      backends:
+        description: "Comma-separated nonempty subset of tracked backend IDs; blank uses ci.json"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -68,7 +67,7 @@ jobs:
         run: |
           python3 -m venv --system-site-packages "$RUNNER_TEMP/kv-python"
           "$RUNNER_TEMP/kv-python/bin/pip" install --disable-pip-version-check --retries 2 --timeout 30 \
-            boto3==1.35.99 PyYAML==6.0.2
+            boto3==1.35.99 PyYAML==6.0.2 matplotlib==3.11.2
           echo "$RUNNER_TEMP/kv-python/bin" >> "$GITHUB_PATH"
       - name: Prepare matching FoundationDB client in owned prefix
         timeout-minutes: 5
@@ -83,31 +82,36 @@ jobs:
         run: python3 -m unittest discover -s experiments/kv-comparison -p 'test_*.py'
       - name: Build actual external adapters
         timeout-minutes: 25
-        run: cargo build --locked -p kv-research --features tikv,cassandra,foundationdb
+        run: cargo build --locked -p kv-research --features tikv,cassandra,foundationdb,valkey-tcp
       - name: Test the comparison crate with actual adapter features
         timeout-minutes: 10
-        run: cargo test --locked -p kv-research --features tikv,cassandra,foundationdb
+        run: cargo test --locked -p kv-research --features tikv,cassandra,foundationdb,valkey-tcp
       - name: Check monitoring freshness and metric semantics
         run: python3 -m unittest discover -s experiments/kv-comparison/observability -p 'test_*.py'
+      - name: Validate sparse-series Prometheus query semantics
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          image="$(python3 -c 'import json; print(json.load(open("experiments/kv-comparison/observability/images.lock.json"))["images"]["prom/prometheus"]["image"])')"
+          docker run --rm --pull=missing --network none \
+            --volume "$PWD/experiments/kv-comparison/observability:/rules:ro" \
+            --entrypoint /bin/promtool "$image" test rules /rules/rate-regressions.yaml
       - name: Exercise actual servers and monitoring sequentially (not latency or HA evidence)
         timeout-minutes: 15
         env:
-          SELECTED_BACKEND: ${{ inputs.backend || 'all' }}
+          SELECTED_BACKENDS: ${{ inputs.backends || '' }}
         run: |
           set -euo pipefail
-          if [ "$SELECTED_BACKEND" = all ]; then
-            backends='native tidehunter_tcp tikv cassandra foundationdb'
-          else
-            backends="$SELECTED_BACKEND"
+          backend_args=()
+          if [ -n "$SELECTED_BACKENDS" ]; then
+            backend_args+=(--backends "$SELECTED_BACKENDS")
           fi
-          for backend in $backends; do
-            python3 experiments/kv-comparison/campaign.py \
-              --manifest experiments/kv-comparison/ci.json \
-              --binary target/debug/kv-research --qualification --observe \
-              --backend "$backend" --output "$RUNNER_TEMP/kv-results/$backend"
-            python3 experiments/kv-comparison/observability/stack.py verify \
-              --output "$RUNNER_TEMP/kv-results/${backend}-monitoring.json"
-          done
+          python3 experiments/kv-comparison/campaign.py \
+            --manifest experiments/kv-comparison/ci.json \
+            --binary target/debug/kv-research --qualification --observe \
+            "${backend_args[@]}" --output "$RUNNER_TEMP/kv-results/selected"
+          python3 experiments/kv-comparison/observability/stack.py verify \
+            --output "$RUNNER_TEMP/kv-results/selected-monitoring.json"
       - name: Export failures and clean exact-owned databases and observer even if either fails
         if: always()
         timeout-minutes: 5

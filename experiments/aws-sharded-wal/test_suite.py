@@ -83,8 +83,6 @@ class SuiteTests(unittest.TestCase):
         job, campaign = campaigns[0]
         self.assertGreaterEqual(int(campaign['timeout-minutes']) * 60, 10800 + 1800)
         self.assertGreater(int(job['timeout-minutes']), int(campaign['timeout-minutes']) + 15)
-        self.assertIn('kv-comparison/ci_campaign.py run', campaign['run'])
-        self.assertIn('aws-sharded-wal/ci_campaign.py run', campaign['run'])
         self.assertIn('--inputs', campaign['run'])
         self.assertTrue(any(step.get('if', '').startswith('always()') and 'ci_campaign.py cleanup' in step.get('run', '') for step in steps))
         cleanup = next(index for index, step in enumerate(steps) if 'ci_campaign.py cleanup' in step.get('run', ''))

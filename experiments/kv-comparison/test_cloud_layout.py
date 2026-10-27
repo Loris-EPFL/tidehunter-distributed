@@ -88,6 +88,33 @@ class Plans(unittest.TestCase):
         self.assertEqual(tokens[0], -(2**63))
         self.assertTrue(all(b - a == 2**64 // 5 for a, b in zip(tokens, tokens[1:])))
 
+    def test_valkey_five_primaries_and_client_only_coordinator(self):
+        for qualification in (False, True):
+            value = fleet(qualification)
+            plan = layout.build_plan(value, "valkey_tcp")
+            coordinator = plan["nodes"][0]
+            self.assertEqual(coordinator["containers"], [])
+            self.assertEqual(coordinator["budget"], {"cpus": 0, "memory_mib": 0})
+            self.assertEqual(coordinator["client_budget"], {"cpus": 4, "memory_mib": 8192})
+            self.assertEqual(plan["backend_options"], {
+                "nodes": [node["address"] + ":6379" for node in value["nodes"]], "cluster": True,
+                "required_replication_factor": 1, "required_primary_nodes": 5, "request_timeout_ms": 5000})
+            for node in plan["nodes"][1:]:
+                self.assertEqual(len(node["containers"]), 1)
+                container = node["containers"][0]
+                argv = container["run_argv"]
+                for key, expected in (("--bind", node["address"]), ("--port", "6379"), ("--cluster-port", "16379"),
+                                      ("--appendonly", "yes"), ("--appendfsync", "always"),
+                                      ("--no-appendfsync-on-rewrite", "no"), ("--maxmemory-policy", "noeviction"),
+                                      ("--cluster-announce-ip", node["address"]), ("--cluster-enabled", "yes")):
+                    self.assertEqual(argv[argv.index(key) + 1], expected)
+                self.assertNotIn("--save", argv)
+                self.assertNotIn("--auto-aof-rewrite-percentage", argv)
+                self.assertNotIn("--rdma-port", argv)
+                self.assertIn(":9.0.7@sha256:", container["image"])
+                self.assertIn("--initialize", coordinator["actions"]["probe"])
+                self.assertIn("--cluster", node["actions"]["probe"])
+
     def test_fdb_machine_ids_and_actual_cluster_file_options(self):
         value = fleet()
         plan = layout.build_plan(value, "foundationdb")

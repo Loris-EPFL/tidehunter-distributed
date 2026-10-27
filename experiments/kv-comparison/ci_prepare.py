@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 MAX_ARCHIVE = 768 << 20
 MAX_EXPANDED = 1 << 30
 MAX_FILES = 22000
-BACKENDS = {'native', 'tidehunter_tcp', 'tikv', 'cassandra', 'foundationdb'}
+BACKENDS = {'native', 'tidehunter_tcp', 'tikv', 'cassandra', 'foundationdb', 'valkey_tcp'}
 
 
 def sha(path):
@@ -81,7 +81,7 @@ def admit_qualification(directory, ready):
         if set(receipt.get('artifacts_sha256', {})) != {'manifest.json', 'summary.json', 'samples.csv', 'metrics.prom'}:
             raise ValueError('qualification raw artifacts incomplete')
     if found != BACKENDS:
-        raise ValueError('qualification must cover all five software-admissible adapters; EFA hardware remains separate')
+        raise ValueError('qualification must cover all six software-admissible adapters; EFA hardware remains separate')
 
 
 def admit_inputs(inputs, engine=None, expected_commit=None):

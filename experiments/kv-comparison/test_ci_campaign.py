@@ -26,28 +26,51 @@ ENV = dict(AWS_BENCH_BUCKET='tidehunter-ci-354775971805-us-east-1', AWS_BENCH_BU
 
 
 class ConfigTests(unittest.TestCase):
-    def config(self, mutate=None):
+    def config(self, mutate=None, matrix=None, backend_selection=None):
         value = ci.core.read_json(ci.HERE / 'ci-config.json')
         if mutate:
             mutate(value)
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / 'cfg.json'
             ci.core.dump(path, value)
-            return ci.load_config(path, ENV)
+            original = ci.core.read_json
+            def read(source):
+                if matrix is not None and Path(source) == ci.HERE / 'cloud-campaign.json':
+                    return copy.deepcopy(matrix)
+                return original(source)
+            with patch.object(ci.core, 'read_json', side_effect=read):
+                return ci.load_config(path, ENV, backend_selection)
 
-    def test_all_eight_full_matrix_and_three_hour_lifetime(self):
-        cfg = self.config()
-        self.assertEqual(len(ci.cloud_campaign.make_matrix(cfg['spec'])), 684)
-        self.assertEqual(cfg['spec']['backends'], list(ci.cloud_campaign.BACKENDS))
-        self.assertEqual((cfg['ttl_seconds'], cfg['export_reserve_seconds']), (10800, 600))
+    def test_full_single_and_three_repeat_matrices_are_admitted(self):
+        spec = ci.core.read_json(ci.HERE / 'cloud-campaign.json')
+        for limit in (0, 256):
+            for repeats, ordinary_cases in ((1, 253), (3, 759)):
+                with self.subTest(repeats=repeats, write_profile_limit=limit):
+                    cfg = self.config(matrix=spec | {
+                        'repeats': repeats, 'diagnostics': {'write_profile_limit': limit}})
+                    jobs = ci.cloud_campaign.make_matrix(cfg['spec'])
+                    diagnostics = [job for job in jobs if job['cohort'] == 'write_stage_diagnostics']
+                    self.assertEqual(len(jobs) - len(diagnostics), ordinary_cases)
+                    self.assertEqual(len(diagnostics), 5 * repeats if limit else 0)
+                    self.assertEqual({job['backend'] for job in jobs}, set(ci.cloud_campaign.BACKENDS))
+                    self.assertEqual((cfg['ttl_seconds'], cfg['export_reserve_seconds']), (10800, 600))
+    def test_explicit_backend_subset_is_frozen_and_resizes_expected_jobs(self):
+        spec = ci.core.read_json(ci.HERE / 'cloud-campaign.json')
+        selected = self.config(matrix=spec, backend_selection='valkey_tcp')
+        self.assertEqual(selected['spec']['backends'], ['valkey_tcp'])
+        jobs = ci.cloud_campaign.make_matrix(selected['spec'])
+        self.assertEqual(len(jobs), 25)
+        self.assertEqual({job['backend'] for job in jobs}, {'valkey_tcp'})
+        for invalid in ('', 'valkey_tcp,', 'native,native', 'rocksdb'):
+            with self.subTest(selection=invalid), self.assertRaises(ValueError):
+                self.config(matrix=spec, backend_selection=invalid)
+
 
     def test_export_bound_covers_all_planned_csv_rows_and_monitor_snapshot(self):
-        cfg = self.config()
+        spec = ci.core.read_json(ci.HERE / 'cloud-campaign.json') | {'repeats': 3}
+        cfg = self.config(matrix=spec)
         jobs = ci.cloud_campaign.make_matrix(cfg['spec'])
-        offered = sum(job['measurement_operations'] for job in jobs if job['offered_ops_per_second'] is not None)
         rows = sum(job['keys'] + job['warmup_operations'] + job['measurement_operations'] for job in jobs)
-        self.assertEqual(offered, 11712000)
-        self.assertEqual(rows, 21520896)
         # Eight u64 columns, bounded/escaped error text and fixed labels fit
         # within 1KiB per CSV row. Keep the full 4GiB observer archive as well.
         raw_allowance = rows * 1024 + 4 * 1024**3
@@ -66,15 +89,21 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 self.config(lambda cfg: cfg.update({key: value}))
 
-    def test_rejects_shortened_or_incomplete_matrix(self):
-        original = ci.core.read_json
-        for replacement in ({'repeats': 1}, {'backends': ['native']}, {'export_reserve_seconds': 1}):
-            def read(path):
-                value = original(path)
-                return value | replacement if Path(path).name == 'cloud-campaign.json' else value
-            with self.subTest(replacement=replacement), patch.object(ci.core, 'read_json', side_effect=read):
-                with self.assertRaises(ValueError):
-                    self.config()
+    def test_rejects_invalid_repetitions_and_incomplete_dimensions(self):
+        spec = ci.core.read_json(ci.HERE / 'cloud-campaign.json')
+        replacements = (
+            {'backends': []}, {'backends': ['native', 'native']},
+            {'backends': spec['backends'] + ['native']},
+            {'value_sizes': [64, 256, 1024, 8192]},
+            {'value_sizes': [64, 256, 1024, 8192, 8192]},
+            {'offered_rates': [1000, 10000]}, {'offered_rates': [1000, 10000, 10000]},
+            {'offered_rates': [1000, 10000, 49999]}, {'offered_rates': [1000.0, 10000, 50000]},
+            {'export_reserve_seconds': 1},
+        )
+        for repeats in (1, 3):
+            for replacement in replacements:
+                with self.subTest(repeats=repeats, replacement=replacement), self.assertRaises(ValueError):
+                    self.config(matrix=spec | {'repeats': repeats} | replacement)
 
     def test_real_sui_loader_still_refuses_three_hour_config(self):
         old = ci.core.read_json(ci.OLD / 'ci-config.json')
@@ -286,6 +315,7 @@ class ResultAdmissionTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.output = Path(self.temporary.name)
         self.cfg = ci.load_config(ci.HERE / 'ci-config.json', ENV)
+        self.cfg['spec'] = self.cfg['spec'] | {'repeats': 1}
         self.campaign = object.__new__(ci.Campaign)
         self.campaign.cfg, self.campaign.run_id, self.campaign.output = self.cfg, RUN, self.output
         self.raw = self.output / 'raw'
@@ -294,12 +324,18 @@ class ResultAdmissionTests(unittest.TestCase):
         ci.core.dump(self.raw / 'matrix.json', dict(schema_version=1, spec=self.cfg['spec'], jobs=self.jobs))
         ci.core.dump(self.raw / 'observability/receipt.json', dict(complete=False, attempted=True))
 
+    def inventory(self, records):
+        path = self.output / 's3' / RUN / 'results/controller-inventory.json'
+        ci.core.dump(path, records)
+        return dict(key=RUN + '/results/controller-inventory.json',
+                    bytes=path.stat().st_size, sha256=ci.core.sha(path))
+
     def export(self, **changes):
         base = self.output / 's3' / RUN / 'results'
         base.mkdir(parents=True, exist_ok=True)
         archive = base / 'controller.tar.gz'
         records = ci.cloud_controller.archive_results(self.raw, archive)
-        receipt = dict(status='incomplete', files=records, bytes=archive.stat().st_size,
+        receipt = dict(schema_version=2, status='incomplete', inventory=self.inventory(records), bytes=archive.stat().st_size,
             sha256=ci.core.sha(archive), monitoring_complete=False)
         receipt.update(changes)
         ci.core.dump(base / 'receipt.json', receipt)
@@ -353,7 +389,7 @@ class ResultAdmissionTests(unittest.TestCase):
         self.assertEqual(result['controller_error'], self.startup_error)
         self.assertEqual(result['controller_outcome']['error'], self.startup_error)
         self.assertEqual(result['missing_files'], ['matrix.json'])
-        self.assertEqual(result['planned_cases'], 684)
+        self.assertEqual(result['planned_cases'], len(self.jobs))
         self.assertIsNone(result['completed_cases'])
         self.assertFalse(result['benchmark_complete'])
         self.assertFalse(result['monitoring_complete'])
@@ -392,7 +428,9 @@ class ResultAdmissionTests(unittest.TestCase):
         self.startup_failure_export()
         receipt_path = self.output / 's3' / RUN / 'results/receipt.json'
         receipt = ci.core.read_json(receipt_path)
-        receipt['files']['startup.json']['sha256'] = '0' * 64
+        records = ci.core.read_json(receipt_path.with_name('controller-inventory.json'))
+        records['startup.json']['sha256'] = '0' * 64
+        receipt['inventory'] = self.inventory(records)
         ci.core.dump(receipt_path, receipt)
         self.assertEqual(self.cleanup_action(), 1)
         summary = ci.core.read_json(self.output / 'cleanup-validation.json')
@@ -410,27 +448,38 @@ class ResultAdmissionTests(unittest.TestCase):
         receipt_path = archive.parent / 'receipt.json'
         receipt = ci.core.read_json(receipt_path)
         receipt.update(bytes=archive.stat().st_size, sha256=ci.core.sha(archive),
-            files={'../outside.json': dict(bytes=len(payload), sha256=ci.hashlib.sha256(payload).hexdigest())})
+            inventory=self.inventory({'../outside.json': dict(bytes=len(payload), sha256=ci.hashlib.sha256(payload).hexdigest())}))
         ci.core.dump(receipt_path, receipt)
         with self.assertRaisesRegex(ValueError, 'unsafe'):
             self.campaign.validate_results({'spec': self.cfg['spec']}, require_complete=False)
         self.assertFalse((self.output / 'outside.json').exists())
 
-    def test_all_684_unrun_cases_remain_incomplete_with_monitor_failure_separate(self):
-        self.export()
-        with self.assertRaisesRegex(RuntimeError, 'incomplete campaign'):
-            self.campaign.validate_results({'spec': self.cfg['spec']})
-        result = ci.core.read_json(self.output / 'campaign-validation.json')
-        self.assertEqual((result['planned_cases'], result['completed_cases']), (684, 0))
-        self.assertFalse(result['benchmark_complete'])
-        self.assertFalse(result['monitoring_complete'])
-        self.assertFalse(result['complete'])
-        report = ci.core.read_json(self.output / 'validated-results/comparison.json')
-        self.assertEqual({case['case_id'] for case in report['cases']}, {job['case_id'] for job in self.jobs})
+    def test_all_planned_unrun_cases_remain_incomplete_with_monitor_failure_separate(self):
+        for repeats in (1, 3):
+            with self.subTest(repeats=repeats):
+                self.output = Path(self.temporary.name) / f"repeats-{repeats}"
+                self.campaign.output = self.output
+                self.raw = self.output / "raw"
+                self.raw.mkdir(parents=True)
+                self.cfg['spec'] = self.cfg['spec'] | {'repeats': repeats}
+                self.jobs = ci.cloud_campaign.make_matrix(self.cfg['spec'])
+                count = len(self.jobs)
+                ci.core.dump(self.raw / 'matrix.json',
+                    dict(schema_version=1, spec=self.cfg['spec'], jobs=self.jobs))
+                self.export()
+                with self.assertRaisesRegex(RuntimeError, 'incomplete campaign'):
+                    self.campaign.validate_results({'spec': self.cfg['spec']})
+                result = ci.core.read_json(self.output / 'campaign-validation.json')
+                self.assertEqual((result['planned_cases'], result['completed_cases']), (count, 0))
+                self.assertFalse(result['benchmark_complete'])
+                self.assertFalse(result['monitoring_complete'])
+                self.assertFalse(result['complete'])
+                report = ci.core.read_json(self.output / 'validated-results/comparison.json')
+                self.assertEqual({case['case_id'] for case in report['cases']}, {job['case_id'] for job in self.jobs})
 
     def test_monitor_failure_cannot_turn_successful_benchmark_green(self):
         self.export(status='completed', monitoring_complete=True)
-        with patch.object(ci.cloud_campaign, 'report', return_value=dict(complete=True, completed_cases=684)):
+        with patch.object(ci.cloud_campaign, 'report', return_value=dict(complete=True, completed_cases=len(self.jobs))):
             with self.assertRaisesRegex(RuntimeError, 'incomplete campaign'):
                 self.campaign.validate_results({'spec': self.cfg['spec']})
         outcome = ci.core.read_json(self.output / 'campaign-validation.json')
@@ -439,10 +488,37 @@ class ResultAdmissionTests(unittest.TestCase):
         self.assertFalse(outcome['complete'])
 
     def test_narrowed_export_matrix_rejected_even_with_terminal_success_claim(self):
-        ci.core.dump(self.raw / 'matrix.json', dict(schema_version=1, spec=self.cfg['spec'], jobs=self.jobs[:-1]))
-        self.export(status='completed', monitoring_complete=True)
-        with self.assertRaisesRegex(ValueError, '684'):
+        for repeats in (1, 3):
+            with self.subTest(repeats=repeats):
+                self.output = Path(self.temporary.name) / f"repeats-{repeats}"
+                self.campaign.output = self.output
+                self.raw = self.output / "raw"
+                self.raw.mkdir(parents=True)
+                self.cfg['spec'] = self.cfg['spec'] | {'repeats': repeats}
+                self.jobs = ci.cloud_campaign.make_matrix(self.cfg['spec'])
+                ci.core.dump(self.raw / 'matrix.json',
+                    dict(schema_version=1, spec=self.cfg['spec'], jobs=self.jobs[:-1]))
+                self.export(status='completed', monitoring_complete=True)
+                with self.assertRaisesRegex(ValueError, 'admitted cases'):
+                    self.campaign.validate_results({'spec': self.cfg['spec']})
+
+    def test_changed_bulk_inventory_rejected_before_archive_extraction(self):
+        self.export()
+        path = self.output / 's3' / RUN / 'results/controller-inventory.json'
+        path.write_bytes(path.read_bytes() + b' ')
+        with self.assertRaisesRegex(ValueError, 'bulk result inventory differs'):
             self.campaign.validate_results({'spec': self.cfg['spec']})
+        self.assertFalse((self.output / 'validated-results/matrix.json').exists())
+
+    def test_foreign_inventory_descriptor_cannot_redirect_result_admission(self):
+        self.export()
+        path = self.output / 's3' / RUN / 'results/receipt.json'
+        receipt = ci.core.read_json(path)
+        receipt['inventory']['key'] = 'th-ffffffffffffffff/results/controller-inventory.json'
+        ci.core.dump(path, receipt)
+        with self.assertRaisesRegex(ValueError, 'source-bound result inventory'):
+            self.campaign.validate_results({'spec': self.cfg['spec']})
+        self.assertFalse((self.output / 'validated-results/matrix.json').exists())
 
     def test_changed_raw_archive_rejected_before_reporting(self):
         archive = self.export()

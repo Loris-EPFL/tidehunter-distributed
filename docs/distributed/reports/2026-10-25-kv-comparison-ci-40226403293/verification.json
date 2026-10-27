@@ -1,0 +1,50 @@
+{
+  "run_id": "th-e4a783f03101a780",
+  "github_run_id": 40226403293,
+  "source_revision": "c61c9e295708e5b4354dae43538e900f3515df4d",
+  "archive_sha256": "bc4472c99850f774bf4420b86b3ddc32d0033354b68ff9f79c93750cdb7bbc83",
+  "files_verified": 29827,
+  "campaign_validation": {
+    "schema_version": 1,
+    "suite": "kv-comparison",
+    "planned_cases": 684,
+    "completed_cases": 509,
+    "benchmark_complete": false,
+    "monitoring_complete": false,
+    "controller_status": "incomplete",
+    "controller_error": "InfrastructureError: SSM SendCommand outcome unknown; never blindly retry",
+    "controller_outcome": {
+      "error": "InfrastructureError: SSM SendCommand outcome unknown; never blindly retry",
+      "observed_utc": "2026-10-25T21:47:37.291286+00:00"
+    },
+    "missing_files": [],
+    "monitoring_error": null,
+    "complete": false
+  },
+  "original_csv_sha256": "4895479e00ace34e3d15fb1870c05951eb407dd89b5859cd373f99a9a1612bc2",
+  "matched_case_count": 456,
+  "matched_primary_case_count": 384,
+  "matched_repeats": [
+    0,
+    1
+  ],
+  "figures": 13,
+  "offline_replay_failure": {
+    "exception": "ValueError",
+    "message": "JSON evidence exceeds size bound",
+    "seconds": 8.842,
+    "state_dir": "/home/hybr1d/.cache/tidehunter/observability/offline-th-e4a783f03101a780"
+  },
+  "monitor_snapshot_complete": true,
+  "monitoring_certified_complete": false,
+  "new_cluster_launched": false,
+  "budget_settlement_pending": false,
+  "ledger_revision": 84,
+  "run_usage_estimated_usd": "27.604082335488",
+  "active_reservations_usd": "0",
+  "unresolved_runs": 0,
+  "github_workflow_conclusion": "failure",
+  "github_reconciliation_step_timed_out": true,
+  "github_raw_artifact_retention_succeeded": true,
+  "billing_status": "unavailable"
+}

@@ -1017,7 +1017,7 @@ impl ReadService {
         // Each queued request owns a distinct, byte-bounded flight slot.
         let (sender, receiver) = mpsc::sync_channel(flight_slots);
         let state = service.state.clone();
-        let fabric = config.tls.transport != super::super::tcp::Transport::Tcp;
+        let fabric = config.tls.transport.is_fabric();
         let resident_enabled = service.resident_enabled;
         *service.thread.get_mut() = Some(
             thread::Builder::new()
@@ -1755,7 +1755,7 @@ impl RemoteDatabase {
     pub fn read_profile_monitor(&self) -> ReadProfileMonitor {
         ReadProfileMonitor {
             state: self.reads.state.clone(),
-            fabric: self.config.tls.transport != super::super::tcp::Transport::Tcp,
+            fabric: self.config.tls.transport.is_fabric(),
         }
     }
     pub fn read_rpc_count(&self) -> u64 {

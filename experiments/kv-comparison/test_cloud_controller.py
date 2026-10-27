@@ -55,6 +55,9 @@ def physical_fixture():
              "host_identity": {"boot_id": f"boot-{i}"},
              "block_devices": {"blockdevices": [{"model": "Amazon EC2 NVMe Instance Storage", "serial": f"serial-{i}"}]}}
             for i in range(6)]
+class MissingS3ObjectError(Exception):
+    response = {"Error": {"Code": "NoSuchKey"}}
+
 
 
 class ConfigTests(unittest.TestCase):
@@ -68,6 +71,30 @@ class ConfigTests(unittest.TestCase):
             value = json.loads((Path(tmp) / "plan.json").read_text())
             self.assertEqual(set(j["backend"] for j in value["jobs"]), set(controller.cloud_campaign.BACKENDS))
             self.assertIn("no cloud health", value["scope"])
+
+    def test_valkey_external_role_inventory_has_five_primaries_and_no_control_server(self):
+        config = config_fixture()
+        job = next(job for job in controller.cloud_campaign.make_matrix(config["spec"])
+                   if job["backend"] == "valkey_tcp")
+        coordinator = controller.owned_monitor_processes(config, -1, job)
+        self.assertEqual([item["role"] for item in coordinator["processes"]], ["client"])
+        options = controller.cloud_layout.backend_options(config["fleet"], "valkey_tcp", "/tmp/client")
+        self.assertEqual(options["nodes"], [f"10.0.0.{i+2}:6379" for i in range(5)])
+        self.assertEqual((options["required_primary_nodes"], options["required_replication_factor"]), (5, 1))
+        roles = []
+        for index in range(5):
+            deployment = controller.cloud_layout.node_config(config["fleet"], "valkey_tcp", index)
+            self.assertEqual(len(deployment["containers"]), 1)
+            role = deployment["containers"][0]["service"]
+            with patch.object(controller.cloud_layout, "inspect_container", return_value={}), \
+                    patch.object(controller, "docker_monitor_identity", return_value={
+                        "container_id": str(index) * 64, "pid": 100 + index,
+                        "cgroup": f"/owned/valkey-{index}"}):
+                observed = controller.owned_monitor_processes(config, index, job)
+            self.assertEqual(observed["missing"], [])
+            self.assertEqual(observed["processes"], [{"role": role, "cgroup": f"/owned/valkey-{index}"}])
+            roles.append(role)
+        self.assertEqual(len(set(roles)), 5)
 
 
     def test_account_duplicate_nonphysical_and_extra_fields_rejected(self):
@@ -340,19 +367,104 @@ class BackendCleanupTests(unittest.TestCase):
 
 
 class CommandSafetyTests(unittest.TestCase):
-    def test_unknown_send_outcome_is_never_retried(self):
+    def test_lost_send_ack_accepts_exact_completed_receipt_without_resend(self):
         config = config_fixture()
         clients = clients_fixture(config)
         clients["ssm"].send_command.side_effect = TimeoutError("response lost after acceptance")
         runtime = controller.Controller(config, clients)
         with tempfile.TemporaryDirectory() as tmp:
             runtime.root = Path(tmp)
-            with self.assertRaisesRegex(controller.InfrastructureError, "never blindly retry"):
-                runtime.request(0, {"action": "snapshot"})
-            self.assertEqual(clients["ssm"].send_command.call_count, 1)
-            clients["ssm"].get_command_invocation.assert_not_called()
-            intent = json.loads(next((Path(tmp) / "commands").glob("*.json")).read_text())
-            self.assertEqual(intent["status"], "unknown_send_response")
+            with patch.object(controller, "read_s3_json") as read_receipt:
+                read_receipt.side_effect = lambda _client, _config, _key: {
+                    "request": {"action": "snapshot", "index": 0},
+                    "instance_id": runtime.ids[1], "status": "completed",
+                    "result": {"snapshot": "exact-result"}}
+                self.assertEqual(runtime.request(0, {"action": "snapshot"}), {"snapshot": "exact-result"})
+                self.assertEqual(read_receipt.call_count, 1)
+        clients["ssm"].send_command.assert_called_once()
+        clients["ssm"].get_command_invocation.assert_not_called()
+
+    def test_absent_receipt_replays_only_identical_invocation_with_bounded_attempts(self):
+        config = config_fixture()
+        clients = clients_fixture(config)
+        clients["ssm"].send_command.side_effect = [TimeoutError("lost ack")] * 3
+        now = [100.0]
+        runtime = controller.Controller(config, clients, clock=lambda: now[0])
+        def advance(seconds):
+            now[0] += seconds
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime.root = Path(tmp)
+            with patch.object(controller, "read_s3_json", side_effect=MissingS3ObjectError()), \
+                 patch.object(controller.time, "sleep", side_effect=advance):
+                with self.assertRaises(controller.InfrastructureError):
+                    runtime.request(0, {"action": "snapshot"}, timeout=3)
+        self.assertEqual(clients["ssm"].send_command.call_count, 3)
+        calls = clients["ssm"].send_command.call_args_list
+        self.assertEqual(calls[0], calls[1])
+        self.assertEqual(calls[1], calls[2])
+
+    def test_untrusted_or_incomplete_receipts_never_succeed(self):
+        config = config_fixture()
+        cases = (
+            ("null object", lambda runtime: None),
+            ("array object", lambda runtime: []),
+            ("foreign host", lambda runtime: {
+                "request": {"action": "snapshot", "index": 0}, "instance_id": "i-foreign",
+                "status": "completed", "result": {"forged": True}}),
+            ("foreign request", lambda runtime: {
+                "request": {"action": "other", "index": 0}, "instance_id": runtime.ids[1],
+                "status": "completed", "result": {"forged": True}}),
+            ("failed", lambda runtime: {
+                "request": {"action": "snapshot", "index": 0}, "instance_id": runtime.ids[1],
+                "status": "failed", "error": "operation failed"}),
+            ("missing status", lambda runtime: {
+                "request": {"action": "snapshot", "index": 0}, "instance_id": runtime.ids[1],
+                "result": {"forged": True}}),
+            ("missing result", lambda runtime: {
+                "request": {"action": "snapshot", "index": 0}, "instance_id": runtime.ids[1],
+                "status": "completed"}),
+        )
+        for name, make_receipt in cases:
+            with self.subTest(name=name):
+                clients = clients_fixture(config)
+                clients["ssm"].send_command.side_effect = TimeoutError("lost ack")
+                runtime = controller.Controller(config, clients)
+                with tempfile.TemporaryDirectory() as tmp:
+                    runtime.root = Path(tmp)
+                    with patch.object(controller, "read_s3_json", side_effect=lambda *_: make_receipt(runtime)):
+                        with self.assertRaises((controller.InfrastructureError, controller.SafetyError)):
+                            runtime.request(0, {"action": "snapshot"}, timeout=3)
+                clients["ssm"].send_command.assert_called_once()
+
+    def test_expired_ambiguous_request_is_not_replayed_or_reported_successful(self):
+        config = config_fixture()
+        clients = clients_fixture(config)
+        now = [100.0]
+        def lost_ack_after_deadline(**_kwargs):
+            now[0] += 2
+            raise TimeoutError("lost ack after operation deadline")
+        clients["ssm"].send_command.side_effect = lost_ack_after_deadline
+        runtime = controller.Controller(config, clients, clock=lambda: now[0])
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime.root = Path(tmp)
+            with patch.object(controller, "read_s3_json", side_effect=MissingS3ObjectError()):
+                with self.assertRaises(controller.InfrastructureError):
+                    runtime.request(0, {"action": "snapshot"}, timeout=1)
+        clients["ssm"].send_command.assert_called_once()
+
+
+    def test_failed_invocation_status_is_not_hidden_by_receipt(self):
+        config = config_fixture()
+        clients = clients_fixture(config)
+        clients["ssm"].send_command.return_value = {"Command": {"CommandId": "00000000-0000-0000-0000-000000000000"}}
+        clients["ssm"].get_command_invocation.return_value = {"Status": "Failed", "ResponseCode": 1}
+        runtime = controller.Controller(config, clients)
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime.root = Path(tmp)
+            with patch.object(controller, "read_s3_json") as read_receipt:
+                with self.assertRaisesRegex(controller.InfrastructureError, "failed/unknown terminal status"):
+                    runtime.request(0, {"action": "snapshot"})
+                read_receipt.assert_not_called()
 
     def test_bootstrap_retries_only_explicit_nonacceptance_not_unknown_outcomes(self):
         config = config_fixture()
@@ -544,7 +656,7 @@ class CapsuleAndExportTests(unittest.TestCase):
         root = Path(config["fleet"]["data_root"]) / "cells" / case
         launch = {"ready_file": str(root / "node-0/ready"), "stop_file": str(root / "node-0/stop"),
             "node": {"root": str(root / "node-0/storage")}, "listen": "10.0.0.2:9400",
-            "tls": {"transport": "tcp", "ca": str(root / "tls/ca.der"),
+            "tls": {"transport": {"kind": "tcp"}, "ca": str(root / "tls/ca.der"),
                     "cert": str(root / "tls/tidehunter-node-0.der"), "key": str(root / "tls/tidehunter-node-0.pk8")}}
         controller.validate_launch(config, launch, case, 0)
         for mutation in (lambda x: x["tls"].update(key=str(root / "tls/ca.key")),
@@ -552,6 +664,17 @@ class CapsuleAndExportTests(unittest.TestCase):
             broken = copy.deepcopy(launch)
             mutation(broken)
             with self.assertRaises(controller.SafetyError):
+                controller.validate_launch(config, broken, case, 0)
+        trusted = copy.deepcopy(launch)
+        trusted["tls"].update(
+            transport={"kind": "ofi", "fabric": {"backend": "efa-direct", "domain": "efa0"},
+                       "security": "trusted"},
+            ca="", cert="", key="")
+        controller.validate_launch(config, trusted, case, 0)
+        for field in ("ca", "cert", "key"):
+            broken = copy.deepcopy(trusted)
+            broken["tls"][field] = str(root / "tls/ca.der")
+            with self.subTest(field=field), self.assertRaises(controller.SafetyError):
                 controller.validate_launch(config, broken, case, 0)
 
 
@@ -647,6 +770,9 @@ class MonitoringBoundaryTests(unittest.TestCase):
         uploads = {}
         def upload(path, bucket, key, **kwargs):
             uploads[key] = Path(path).read_bytes()
+        def put(**kwargs):
+            uploads[kwargs["Key"]] = kwargs["Body"]
+        clients["s3"].put_object.side_effect = put
         def head(**kwargs):
             content = uploads[kwargs["Key"]]
             return {"ContentLength": len(content), "Metadata": {
@@ -680,6 +806,44 @@ class MonitoringBoundaryTests(unittest.TestCase):
             self.assertEqual([event["operation"] for event in observation["events"]],
                              ["session_export", "session_stop"])
             self.assertEqual(json.loads((runtime.root / "receipt.json").read_text())["status"], "incomplete")
+        clients["ec2"].terminate_instances.assert_called_once_with(InstanceIds=runtime.ids)
+
+    def test_inventory_publication_failure_preserves_raw_archive_and_termination(self):
+        config = config_fixture()
+        clients = clients_fixture(config)
+        runtime = controller.Controller(config, clients)
+        uploads = {}
+        def upload(path, bucket, key, **kwargs):
+            uploads[key] = Path(path).read_bytes()
+        def head(**kwargs):
+            raw = uploads[kwargs["Key"]]
+            return {"ContentLength": len(raw),
+                    "Metadata": {"sha256": controller.hashlib.sha256(raw).hexdigest()}}
+        clients["s3"].upload_file.side_effect = upload
+        clients["s3"].head_object.side_effect = head
+        clients["s3"].put_object.side_effect = OSError("inventory publication unavailable")
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime.root = Path(tmp) / "results"
+            def bootstrap():
+                runtime.root.mkdir()
+                runtime.root_owned = True
+                path = runtime.root / "cases/failed/result/samples.csv"
+                path.parent.mkdir(parents=True)
+                path.write_bytes(b"retain this complete raw payload\n")
+                raise controller.InfrastructureError("workload failed")
+            runtime.bootstrap = bootstrap
+            runtime.export_monitoring = Mock()
+            runtime.stop_monitoring = Mock()
+            runtime.persist = lambda name, value: controller.dump(runtime.root / name, value)
+            with patch.dict(controller.sys.modules, {"boto3.s3.transfer": Mock()}), \
+                    self.assertRaises(controller.InfrastructureError):
+                runtime.run()
+            with tarfile.open(fileobj=io.BytesIO(uploads[config["prefix"] + "/results/controller.tar.gz"])) as archive:
+                self.assertEqual(archive.extractfile("cases/failed/result/samples.csv").read(),
+                                 b"retain this complete raw payload\n")
+            receipt = json.loads((runtime.root / "receipt.json").read_text())
+            self.assertEqual(receipt["status"], "export_failed")
+            self.assertIn("inventory publication unavailable", receipt["export_error"])
         clients["ec2"].terminate_instances.assert_called_once_with(InstanceIds=runtime.ids)
 
     def test_only_exact_monitoring_archive_is_retained_with_raw_evidence(self):

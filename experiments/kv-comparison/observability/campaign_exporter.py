@@ -16,6 +16,13 @@ TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
 METRIC = re.compile(r"[A-Za-z_:][A-Za-z0-9_:]*")
 LABEL = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*("(?:[^"\\]|\\.)*")')
 QUANTILES = {"p50": "0.5", "p95": "0.95", "p99": "0.99", "p999": "0.999", "max": "1"}
+COORDINATOR_INTERVAL_COUNTERS = {
+    "write_storage_wait_ns", "write_publication_ns", "write_dispatch_ns", "write_preparation_admission_ns",
+    "write_checkpoint_ns", "write_checkpoint_count", "write_foreground_checkpoint_ns",
+    "write_foreground_checkpoint_count", "write_background_checkpoint_ns",
+    "write_background_checkpoint_suffix_batches", "write_durable_receipt_publication_blocked_ns",
+    "write_durable_receipt_publication_blocked_batches", "write_append_requests", "write_direct_appends",
+    "write_durable_batches", "write_concurrent_admitted", "write_concurrent_completed"}
 
 
 def absolute(value):
@@ -174,6 +181,195 @@ def read_path_metrics(evidence, labels):
     return result
 
 
+def resource_interval_metrics(evidence, labels):
+    """Terminal boundary deltas/gauges, never reconstructed live scrape rates."""
+    if evidence is None:
+        return ""
+    if (not isinstance(evidence, dict) or set(evidence) != {"schema_version", "scope", "processes"}
+            or type(evidence["schema_version"]) is not int or evidence["schema_version"] != 1
+            or evidence["scope"] != "measurement_boundary_interval"
+            or not isinstance(evidence["processes"], list) or len(evidence["processes"]) > 16):
+        raise ValueError("invalid bounded resource interval schema")
+    seconds = {"cpu_seconds", "cpu_throttled_seconds"}
+    integers = {"cpu_periods", "cpu_throttled_periods", "io_read_bytes", "io_write_bytes",
+                "memory_current_bytes", "memory_peak_bytes"}
+    identities, result = set(), ""
+    for row in evidence["processes"]:
+        if not isinstance(row, dict):
+            raise ValueError("resource process must be an object")
+        host = row.get("host_index")
+        if type(host) is not int or not -1 <= host <= 4:
+            raise ValueError("invalid resource host index")
+        role = token(row.get("process_role"))
+        identity = (host, role)
+        if identity in identities or type(row.get("available")) is not bool:
+            raise ValueError("duplicate resource process or invalid availability")
+        identities.add(identity)
+        local = labels | {"scope": evidence["scope"], "resource_host_index": str(host), "process_role": role}
+        result += sample("kv_case_resource_interval_available", int(row["available"]), local)
+        required = {"host_index", "process_role", "available"}
+        if not row["available"]:
+            reason = row.get("reason")
+            if (set(row) != required | {"reason"} or not isinstance(reason, str)
+                    or not reason.strip() or len(reason) > 512):
+                raise ValueError("unavailable resource evidence requires only a bounded reason")
+            continue
+        if (not required | {"elapsed_seconds"} <= set(row)
+                or set(row) - required - seconds - integers - {"elapsed_seconds"}):
+            raise ValueError("invalid available resource fields")
+        elapsed = number(row["elapsed_seconds"])
+        if elapsed <= 0:
+            raise ValueError("resource interval elapsed time must be positive")
+        if ("cpu_periods" in row and "cpu_throttled_periods" in row
+                and count(row["cpu_throttled_periods"]) > count(row["cpu_periods"])):
+            raise ValueError("throttled periods exceed observed periods")
+        result += sample("kv_case_resource_interval_elapsed_seconds", elapsed, local)
+        for field in sorted(seconds | integers):
+            if field in row:
+                value = count(row[field]) if field in integers else number(row[field])
+                result += sample("kv_case_resource_interval_" + field, value, local)
+    return result
+
+
+def write_diagnostic_metrics(evidence, labels):
+    """Bounded accumulated clocks/counts with independent explicit population scopes."""
+    if evidence is None:
+        return ""
+    required = {"schema_version", "backend", "phase", "phase_attempted", "runtime_enabled",
+                "runtime_observation_mode", "selection", "clock_scope", "overlap_semantics",
+                "unsupported_stages", "profile", "error"}
+    if not isinstance(evidence, dict) or set(evidence) != required:
+        raise ValueError("invalid write diagnostic artifact fields")
+    if len(json.dumps(evidence, allow_nan=False, separators=(",", ":")).encode()) > 64 * 1024:
+        raise ValueError("write diagnostic artifact exceeds 64KiB")
+    numeric_fields = 0
+
+    def bounded_tree(value, depth=0):
+        nonlocal numeric_fields
+        if depth > 6:
+            raise ValueError("write diagnostic nesting exceeds bound")
+        if isinstance(value, dict):
+            if len(value) > 512 or any(not isinstance(key, str) or not key or len(key) > 160 for key in value):
+                raise ValueError("invalid bounded write diagnostic object")
+            for child in value.values():
+                bounded_tree(child, depth + 1)
+        elif isinstance(value, list):
+            if len(value) > 32:
+                raise ValueError("write diagnostic list exceeds bound")
+            for child in value:
+                bounded_tree(child, depth + 1)
+        elif isinstance(value, str):
+            if len(value) > 2048:
+                raise ValueError("write diagnostic string exceeds bound")
+        elif value is not None and not isinstance(value, bool):
+            count(value)
+            numeric_fields += 1
+            if numeric_fields > 512:
+                raise ValueError("write diagnostic numeric field count exceeds bound")
+
+    bounded_tree(evidence)
+    if (type(evidence["schema_version"]) is not int or evidence["schema_version"] != 1
+            or evidence["phase"] != "measurement" or type(evidence["phase_attempted"]) is not bool
+            or type(evidence["runtime_enabled"]) is not bool
+            or not isinstance(evidence["runtime_observation_mode"], str)
+            or not evidence["runtime_observation_mode"]
+            or any(not isinstance(evidence[field], str) or not evidence[field].strip()
+                   for field in ("clock_scope", "overlap_semantics"))
+            or not isinstance(evidence["unsupported_stages"], list)
+            or any(not isinstance(stage, str) for stage in evidence["unsupported_stages"])
+            or evidence["error"] is not None and not isinstance(evidence["error"], str)):
+        raise ValueError("invalid write diagnostic phase, mode or status")
+    backend = token(evidence["backend"])
+    selection = evidence["selection"]
+    if (not isinstance(selection, dict) or set(selection) != {
+            "requested_limit", "observed_samples", "selection_policy", "phase_exclusions"}
+            or not isinstance(selection["selection_policy"], str) or not selection["selection_policy"]
+            or not isinstance(selection["phase_exclusions"], list)
+            or any(not isinstance(phase, str) for phase in selection["phase_exclusions"])
+            or not 0 < count(selection["requested_limit"]) <= 65536):
+        raise ValueError("invalid write diagnostic selection")
+    observed = count(selection["observed_samples"])
+    profile = evidence["profile"]
+    if profile is not None and not isinstance(profile, dict):
+        raise ValueError("write diagnostic profile must be an object or null")
+    available = (evidence["phase_attempted"] and evidence["runtime_enabled"] and observed > 0
+                 and profile is not None and isinstance(profile.get("stages"), dict)
+                 and bool(profile["stages"]) and evidence["error"] is None)
+    local = labels | {"phase": "measurement", "scope": "sampled_prefix", "diagnostic_backend": backend}
+    result = sample("kv_case_write_diagnostic_available", int(available), local)
+    result += sample("kv_case_write_diagnostic_operations", selection["requested_limit"], local | {"population": "requested_limit"})
+    result += sample("kv_case_write_diagnostic_operations", observed, local | {"population": "observed_samples"})
+    if profile is None:
+        return result
+    stages = profile.get("stages")
+    persistence = profile.get("value_wal_persistence")
+    if ((stages is not None and not isinstance(stages, dict))
+            or (persistence is not None and not isinstance(persistence, dict))):
+        raise ValueError("write diagnostic stages must be bounded objects")
+    counters = []
+
+    def stage_tree(tree, component, depth=0):
+        if depth > 4:
+            raise ValueError("write diagnostic stage nesting exceeds bound")
+        if tree.get("status") == "not_applicable":
+            if set(tree) - {"status", "reason"}:
+                raise ValueError("unsupported write diagnostic stage cannot claim counters")
+            return
+        for field, value in tree.items():
+            token(field)
+            if isinstance(value, dict):
+                stage_tree(value, component + "." + field, depth + 1)
+            elif isinstance(value, str) and field in ("status", "reason"):
+                continue
+            else:
+                value = count(value)
+                if field.endswith("_ns"):
+                    counters.append(("kv_case_write_diagnostic_stage_seconds", value / 1e9,
+                                     {"component": component, "stage": field}))
+                elif field.endswith(("_calls", "_errors", "_samples", "_requests", "_retries", "_groups",
+                                     "_receipts", "_publications", "_successes", "_operations", "_barriers",
+                                     "_connections", "_count", "_batches", "_appends", "_admitted", "_completed")):
+                    counters.append(("kv_case_write_diagnostic_stage_count", value,
+                                     {"component": component, "counter": field}))
+
+    if stages is not None:
+        stage_tree(stages, "stages")
+    if persistence is not None:
+        stage_tree(persistence, "value_wal_persistence")
+    if available:
+        for metric, value, dimensions in counters:
+            result += sample(metric, value, local | dimensions)
+    coordinator = profile.get("coordinator_interval")
+    coordinator_error = profile.get("coordinator_interval_error")
+    if coordinator_error is not None:
+        if not isinstance(coordinator_error, str) or not coordinator_error.strip() or coordinator is not None:
+            raise ValueError("invalid coordinator interval error or conflicting evidence")
+    if coordinator is not None:
+        if (not isinstance(coordinator, dict) or set(coordinator) != {"scope", "clock_scope", "stages"}
+                or coordinator["scope"] != "measurement_boundary_cumulative_delta"
+                or not isinstance(coordinator["clock_scope"], str) or not coordinator["clock_scope"].strip()
+                or not isinstance(coordinator["stages"], dict) or not coordinator["stages"]
+                or set(coordinator["stages"]) - COORDINATOR_INTERVAL_COUNTERS):
+            raise ValueError("invalid coordinator cumulative interval schema or counter whitelist")
+        for value in coordinator["stages"].values():
+            count(value)
+        boundary_labels = local | {"scope": coordinator["scope"]}
+        boundary_available = evidence["phase_attempted"]
+        result += sample("kv_case_write_diagnostic_available", int(boundary_available), boundary_labels)
+        if boundary_available:
+            for field, value in sorted(coordinator["stages"].items()):
+                if field.endswith("_ns"):
+                    result += sample("kv_case_write_diagnostic_stage_seconds", value / 1e9,
+                                     boundary_labels | {"component": "coordinator_interval", "stage": field})
+                else:
+                    result += sample("kv_case_write_diagnostic_stage_count", value,
+                                     boundary_labels | {"component": "coordinator_interval", "counter": field})
+    elif coordinator_error is not None:
+        result += sample("kv_case_write_diagnostic_available", 0,
+                         local | {"scope": "measurement_boundary_cumulative_delta"})
+    return result
+
+
 def terminal_metrics(terminal, labels):
     if terminal is None:
         return sample("kv_observer_case_terminal", 0, labels)
@@ -187,6 +383,8 @@ def terminal_metrics(terminal, labels):
             raise ValueError("write profile state must be observed boolean or absent")
         result += sample("kv_observer_write_profile_enabled", int(enabled), labels)
     result += read_path_metrics(terminal.get("read_evidence"), labels)
+    result += resource_interval_metrics(terminal.get("resource_evidence"), labels)
+    result += write_diagnostic_metrics(terminal.get("write_diagnostics"), labels)
     metrics = terminal.get("metrics")
     if metrics is None:
         return result

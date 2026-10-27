@@ -172,6 +172,9 @@ def rows(report):
                    "boundary": backend["measurement_boundary"], "acknowledgement": backend["acknowledgement"],
                    "consistency": backend["consistency"], "replication_factor": backend["replication_factor"],
                    "batch_atomicity": backend["batch_atomicity"], "get_many_strategy": backend["get_many_strategy"],
+                   "server_roles": analyze.canonical((boundary.get("deployment") or {}).get("roles", {})),
+                   "observed_topology": analyze.canonical(backend.get("observed_topology")),
+                   "effective_configuration": analyze.canonical(backend.get("effective_configuration")),
                    "value_bytes": workload["dataset"]["value_size"], "dataset_keys": workload["dataset"]["keys"],
                    "distribution": analyze.canonical(workload["workload"]["distribution"]),
                    "operation_mix": analyze.canonical(workload["workload"]["mix"]),
@@ -215,6 +218,7 @@ def markdown(report, csv_rows):
                 lines.append(f"- Case `{row['case']}`, cohort `{row['cohort'][:12]}`, {row['backend']}: {row['value_bytes']} B values, {row['dataset_keys']} keys, {rate} offered calls/s, {row['aging_operations']} aging calls, CPU ceiling {row['allocated_cpu_ceiling']}. Ack `{row['acknowledgement']}`; consistency `{row['consistency']}`; atomic batch `{row['batch_atomicity']}`; GET-many `{row['get_many_strategy']}`. Boundary: {row['boundary']}.")
     lines.extend(["", "## Interpretation", "",
                   "Raw pooled quantiles are not averages of run p99 values. JSON retains per-run throughput and conditional tail variability. Confidence intervals require at least five independent runs; high tails also require a declared sample-count threshold. Missing intervals are not zero uncertainty.", "",
+                  "Valkey TCP uses RF1 AOF appendfsync always for write acknowledgment, not a value-WAL-backed read path. GET remains RAM-resident even in an OS-cache-drop cohort; no cross-shard atomic PUT-batch guarantee is implied.", "",
                   "A batch's elapsed time is not individual-key latency. Failure/rejection populations remain visible. Qualification-only runs deliberately contribute no performance samples. Sampled aggregate RSS can double-count shared pages and is not total physical memory/cache usage.", ""])
     return "\n".join(lines)
 

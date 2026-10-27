@@ -18,6 +18,7 @@ import raw_rma_floor
 
 from checkpoint_matrix import efa_snapshot, efa_proof, validate_efa_proof, validate_provider
 from checkpoint_matrix import fabric_local_log, fabric_local_archive_log
+from portable_transport import transport_for_case, metadata_transport_label
 from checkpoint_matrix import HARDWARE_TRANSPORTS, DIRECT_TRANSPORTS, TRANSPORT_BACKENDS
 from guest import (Campaign, upload, write_json, sha, benchmark_case_identity,
                    kv_case_commands, kv_case_policy, resident_read_config)
@@ -200,7 +201,7 @@ def comparison_identity(directory, spec, mode, cfg):
                     (directory / 'campaign.txt').read_text().splitlines() if '=' in line)
     process = json.loads((directory.parent / (directory.name + '-process.command.json')).read_text())
     prepare, commands = kv_case_commands(cfg, spec)
-    remote, owners = kv_case_policy(cfg, spec)
+    remote, owners, owner_transports = kv_case_policy(cfg, spec)
     required = ('load_batches', 'mixed_batches', 'point_reads', 'read_query_algorithm',
                 'read_query_seed', 'read_query_order', 'read_prepared_state',
                 'wal_fragment_bytes', 'wal_file_bytes', 'wal_group_max_batches',
@@ -239,6 +240,13 @@ def comparison_identity(directory, spec, mode, cfg):
     case_id = directory.name.removesuffix('-' + mode)
     preparation_path = directory.parent / (case_id + '-prepare.command.json')
     deployment_path = directory.parent / (case_id + '-remote.yaml')
+    observed_client_transport = None
+    observed_owner_transports = []
+    owner_transport_sha256 = None
+    requested_transport_sha256 = None
+    requested_owner_transports_sha256 = None
+    owner_transport_path = directory.parent / (case_id + '-owner-transports.json')
+    observed_launch_sha256 = {}
     if not preparation_path.is_file() or not deployment_path.is_file():
         missing.append('observed_preparation_and_deployment_binding')
     else:
@@ -249,13 +257,70 @@ def comparison_identity(directory, spec, mode, cfg):
         deployment = transport_floor.yaml_documents(deployment_path.read_text())
         if len(deployment) != 1:
             raise ValueError('ambiguous comparison deployment')
-        require_kv_policy(deployment[0], remote)
+        observed_remote = deployment[0]
+        require_kv_policy(observed_remote, remote)
+        observed_client_transport = observed_remote.get('tls', {}).get('transport')
+        if mode == 'tcp':
+            requested_transport_path = directory.parent / (case_id + '-transport-config.json')
+            requested_owners_path = directory.parent / (case_id + '-owner-transports-requested.json')
+            if not requested_transport_path.is_file() or not requested_owners_path.is_file():
+                missing.append('requested_transport_configs_missing')
+            else:
+                requested_transport_sha256 = sha(requested_transport_path)
+                requested_owner_transports_sha256 = sha(requested_owners_path)
+                requested_transport = json.loads(requested_transport_path.read_text())
+                requested_owners = json.loads(requested_owners_path.read_text())
+                if (requested_transport != transport_for_case(spec['transport'])
+                        or requested_transport != observed_client_transport):
+                    missing.append('requested_client_transport_differs_from_deployment')
+                if requested_owners != owner_transports:
+                    missing.append('requested_owner_transport_vector_differs_from_policy')
+        if mode == 'tcp':
+            for node in sorted(cfg['nodes'], key=lambda item: item['partition']):
+                launch_path = directory.parent / (case_id + f"-node-{node['partition']}-launch.yaml")
+                if not launch_path.is_file():
+                    missing.append(f"prepared_owner_transport_{node['partition']}_missing")
+                    continue
+                observed_launch_sha256[str(node['partition'])] = sha(launch_path)
+                launch = transport_floor.yaml_documents(launch_path.read_text())
+                if len(launch) != 1:
+                    raise ValueError('ambiguous prepared owner launch')
+                actual = launch[0].get('tls', {}).get('transport')
+                observed_owner_transports.append(actual)
+            if not owner_transport_path.is_file():
+                missing.append('prepared_owner_transport_vector_missing')
+            else:
+                owner_transport_sha256 = sha(owner_transport_path)
+                prepared_vector = json.loads(owner_transport_path.read_text())
+                if prepared_vector != observed_owner_transports:
+                    missing.append('prepared_owner_transport_vector_differs_from_launches')
+            if (requested_transport_sha256 is not None and requested_owner_transports_sha256 is not None
+                    and owner_transport_sha256 is not None
+                    and len(observed_launch_sha256) == len(cfg['nodes'])):
+                transport_receipt_path = directory.parent / (case_id + '-prepared-transports.json')
+                if not transport_receipt_path.is_file():
+                    missing.append('prepared_transport_hash_receipt_missing')
+                else:
+                    expected_receipt = dict(schema=1,
+                        requested_transport_sha256=requested_transport_sha256,
+                        requested_owner_transports_sha256=requested_owner_transports_sha256,
+                        owner_transports_sha256=owner_transport_sha256,
+                        launch_sha256=observed_launch_sha256)
+                    if json.loads(transport_receipt_path.read_text()) != expected_receipt:
+                        missing.append('prepared_transport_hash_receipt_differs_from_artifacts')
+            if observed_owner_transports != owner_transports:
+                missing.append('structured_owner_transport_binding')
     identity = dict(schema=1, qualified=not missing, missing=missing,
         implementation=dict(binary_sha256=binary, source_archive_sha256=source),
+        preparation=dict(owner_transports_sha256=owner_transport_sha256,
+            requested_transport_sha256=requested_transport_sha256,
+            requested_owner_transports_sha256=requested_owner_transports_sha256),
         transport=dict(name=spec['transport'] if mode == 'tcp' else 'native',
             security='unauthenticated-native' if spec['transport'] in
             ('efa-native', 'fabric-tcp-native') and mode == 'tcp' else
             'tls' if mode == 'tcp' else 'local',
+            client=observed_client_transport,
+            owner_transports=observed_owner_transports if mode == 'tcp' else [],
             one_sided=metadata.get('one_sided_wal_reads'), build_features=metadata.get('build_features')),
         clocks=dict(detailed=spec['diagnostics']))
     if missing:
@@ -304,7 +369,7 @@ def comparison_identity(directory, spec, mode, cfg):
         elif common.get('policy') != common_policy:
             raise ValueError('bounded control differs from the source-bound preparation policy')
         expected_case = ['native_value_wal_barrier' if mode == 'native-sync' else TRANSPORT_BACKENDS[spec['transport']],
-                         'tcp' if mode == 'native-sync' else spec['transport'], *spec['shape'], 0]
+                         'tcp' if mode == 'native-sync' else metadata_transport_label(spec['transport']), *spec['shape'], 0]
         if common.get('available') and common.get('identity') != expected_case:
             raise ValueError('bounded control case differs from its source-bound identity')
         if mode == 'native-sync' and metadata['native_read_cache_bytes'] != str(remote['read_cache_bytes']):
@@ -352,6 +417,7 @@ def comparison_identity(directory, spec, mode, cfg):
         registration_profile=observed_rma)
     identity['preparation'] = dict(chunk_batches=spec.get('preparation_chunk_batches', 16),
         workers=remote['preparation_workers'], scan_prefetch_pages=remote['scan_prefetch_pages'],
+        owner_transports_sha256=owner_transport_sha256,
         layout={key: int(metadata[key]) for key in required[7:11]},
         registered_hot_policy=warm_policy,
         registered_hot_state=('qualified_all_lane_hit_only' if controls.get('qualified') else 'mixed_or_invalid')
@@ -625,7 +691,9 @@ def bounded_control_evidence(directory, mode, owner_partitions=range(5)):
         raise ValueError('bounded control case/phase population differs')
     identity = next(iter(identities))
     native = mode == 'native-sync'
-    expected_backend = 'native_value_wal_barrier' if native else TRANSPORT_BACKENDS.get(identity[1])
+    expected_backend = 'native_value_wal_barrier' if native else next(
+        (backend for case, backend in TRANSPORT_BACKENDS.items()
+         if metadata_transport_label(case) == identity[1]), None)
     if identity[0] != expected_backend:
         raise ValueError('bounded control backend differs')
     policy = phases['bounded_hot_setup']['policy']
@@ -1001,7 +1069,7 @@ def require_registered_probe(spec, mode, evidence):
         raise ValueError('bounded registered probe is mixed/invalid or lacks actual all-lane hit-only evidence')
     expected_policy = registered_hot_policy(spec.get('workload_reads') or 4096, 2, True, spec.get('bounded_hot_reads'))
     require_kv_policy(control['policy'], expected_policy)
-    expected_identity = [TRANSPORT_BACKENDS[spec['transport']], spec['transport'], *spec['shape'], 0]
+    expected_identity = [TRANSPORT_BACKENDS[spec['transport']], metadata_transport_label(spec['transport']), *spec['shape'], 0]
     if control.get('identity') != expected_identity:
         raise ValueError('registered control case identity differs')
     for phase in ('cache_hot_get', 'cache_hot_get_many'):
@@ -1037,7 +1105,7 @@ def validate_contention(path, spec, mode):
                        ('value_bytes', 'batch_size', 'window', 'repetition'))
                 or [row.get(k) for k in ('value_bytes', 'batch_size', 'window')] != spec['shape']
                 or row.get('repetition') != 0
-                or (mode == 'tcp' and row.get('transport') != spec['transport'])):
+                or (mode == 'tcp' and row.get('transport') != metadata_transport_label(spec['transport']))):
             raise ValueError('cache contention API/shape/transport identity differs')
         observed = row['observation']
         samples = observed['get_api_intervals_ns_by_caller']
@@ -1101,7 +1169,7 @@ def validate_checkpoint_records(directory, spec, mode):
     for row, window in zip(rows, windows):
         if (row.get('diagnostic_available') is not True or row.get('phase') != window['phase']
                 or row.get('sample') != int(window['sample'])
-                or row.get('backend') != window['backend'] or row.get('transport') != spec['transport']
+                or row.get('backend') != window['backend'] or row.get('transport') != metadata_transport_label(spec['transport'])
                 or any(row.get(key) != int(window[key]) for key in
                        ('value_bytes', 'batch_size', 'window', 'repetition'))):
             raise ValueError('checkpoint diagnostics lost their exact timed-window identity')
@@ -1477,7 +1545,7 @@ def physical_cold_probe_evidence(directory, spec, mode, owner_partitions=range(5
     native = mode == 'native-sync'
     expected = {0} if native else set(owner_partitions)
     case = dict(backend='native_value_wal_barrier' if native else TRANSPORT_BACKENDS[spec['transport']],
-                transport='tcp' if native else spec['transport'], value_bytes=spec['shape'][0],
+                transport='tcp' if native else metadata_transport_label(spec['transport']), value_bytes=spec['shape'][0],
                 batch_size=spec['shape'][1], window=spec['shape'][2], repetition=0,
                 phase='physical_cold_get', requested_probes=count)
     identities, reasons = {}, []
@@ -1593,7 +1661,7 @@ def physical_cold_group_probe_evidence(directory, spec, mode, owner_partitions=r
     native = mode == 'native-sync'
     expected = {0} if native else set(owner_partitions)
     case = dict(backend='native_value_wal_barrier' if native else TRANSPORT_BACKENDS[spec['transport']],
-        transport='tcp' if native else spec['transport'], value_bytes=spec['shape'][0],
+        transport='tcp' if native else metadata_transport_label(spec['transport']), value_bytes=spec['shape'][0],
         batch_size=spec['shape'][1], window=spec['shape'][2], repetition=0,
         phase='physical_cold_get_many', requested_probes=count)
     identities, reasons = {}, []
@@ -1912,7 +1980,7 @@ def validate_auxiliary(root, state, cfg):
         command = [str(base / 'cloud-bin/current/sharded_wal_transport_bench'),
                    '--output', str(base / 'checkpoint-results/kv' / output),
                    '--remote-config', str(base / 'cases' / case_id / 'remote.yaml')]
-        command += transport_floor.floor_flags(spec)
+        command += transport_floor.floor_flags(spec, base / 'cases' / 'requested-configs' / case_id / 'transport.json')
         if (process.get('exit_code') != 0 or process.get('binary_sha256') != cfg['binaries']['transport-floor']
                 or not math.isfinite(process.get('elapsed_seconds', float('nan')))
                 or process['elapsed_seconds'] <= 0 or process.get('command') != command):
@@ -2127,7 +2195,7 @@ def main(argv=None):
         result = []
         for spec in plan(cfg['kv_suite'], cfg['transports']):
             prepare, commands = kv_case_commands(cfg, spec)
-            remote, owners = kv_case_policy(cfg, spec)
+            remote, owners, owner_transports = kv_case_policy(cfg, spec)
             value, batch, _ = spec['shape']
             batches = int(prepare[prepare.index('--batches') + 1])
             workload = dict(loaded_batches=batches, loaded_keys=batches * batch,
@@ -2137,6 +2205,7 @@ def main(argv=None):
             result.append(dict(specification=spec, prepare=prepare, commands=commands,
                                qualified=False, qualification='planned_not_observed',
                                expected_workload=workload, expected_remote_policy=remote,
+                               expected_owner_transports=owner_transports,
                                expected_owner_policies=owners,
                                source_archive_sha256=cfg.get('source_archive_sha256'),
                                binary_sha256=cfg.get('binaries', {}).get('storage-node')))

@@ -2,8 +2,12 @@
 import csv
 import math
 import statistics
+import sys
 from collections import defaultdict
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from portable_transport import metadata_transport_label
 
 import checkpoint_async
 import efa_progress
@@ -96,11 +100,15 @@ def expected_cases(scope='full'):
             for spec in plan(scope) for mode in spec['modes']}
 
 
-def flags(spec, mode, external=False, prepare=False):
+def flags(spec, mode, external=False, prepare=False, transport_config=None):
+    if transport_config is None:
+        transport_args = ['--transport', spec['transport']]
+    else:
+        transport_args = ['--transport-config', str(transport_config)]
     result = ['--values', str(spec['value']), '--batch-sizes', str(spec['batch']),
               '--windows', str(spec['window']), '--batches', str(spec['batches']),
               '--mixed', str(spec['mixed']), '--reads', str(spec['reads']), '--repetitions', '1',
-              '--transport', spec['transport'], '--tcp-read-cache-bytes', str(spec['cache']),
+              *transport_args, '--tcp-read-cache-bytes', str(spec['cache']),
               '--native-read-cache-bytes', str(spec['cache'] if mode == 'native-sync' else 0),
               '--native-read-workers', str(spec['native_workers']), '--read-window', str(spec['read_window']),
               '--read-resource-evidence', 'true', '--cold-read-pass', str(spec['cold']).lower(),
@@ -200,7 +208,7 @@ def read_metrics(path, spec, mode):
         if not math.isclose(float(row['instrumented_phase_ops_per_sec']), rate, rel_tol=1e-8):
             raise ValueError('throughput differs from operation count/wall')
         if spec['build'] == 'current':
-            if row['transport'] != spec['transport']:
+            if row['transport'] != metadata_transport_label(spec['transport']):
                 raise ValueError('paired transport identity differs')
             mixed = phase.startswith(('mixed_', 'concurrent_mixed_'))
             if row['rate_scope'] != ('shared_read_write_wall' if mixed else 'phase_wall'):
@@ -252,7 +260,7 @@ def read_metrics(path, spec, mode):
             for row in read_csv(path / 'write_windows.csv'):
                 dimensions(row)
                 phase = row['phase']
-                if int(row['sample']) != len(windows[phase]) or row['transport'] != spec['transport']:
+                if int(row['sample']) != len(windows[phase]) or row['transport'] != metadata_transport_label(spec['transport']):
                     raise ValueError('write-window identity differs')
                 windows[phase].append(row)
                 parents = sum(number(row[k]) for k in ('preparation_admission_ns', 'storage_wait_ns', 'publication_ns', 'dispatch_ns', 'checkpoint_ns'))
@@ -360,8 +368,11 @@ def read_cloud_case(root, name, spec, mode):
     if audit.read_json(root / (spec['case_id'] + '-plan.json')) != spec:
         raise ValueError('archived RAM case differs from immutable plan')
     process = audit.read_json(root / (name + '-process.command.json'))
-    expected = [binary, '--output', str(base / 'results' / name), '--backend', mode]
-    expected += flags(spec, mode, external=mode == 'tcp')
+    command_backend = 'tcp' if mode == 'tcp' else mode
+    expected = [binary, '--output', str(base / 'results' / name), '--backend', command_backend]
+    transport_config = (case_root.parent / 'requested-configs' / spec['case_id'] / 'transport.json'
+                        if spec['build'] == 'current' else None)
+    expected += flags(spec, mode, external=mode == 'tcp', transport_config=transport_config)
     if mode == 'tcp':
         expected += ['--remote-config', str(case_root / 'remote.yaml')]
     if (process.get('exit_code') != 0 or process['command'][0] != binary or
@@ -369,11 +380,18 @@ def read_cloud_case(root, name, spec, mode):
         raise ValueError('executed RAM command differs from exact workload/source')
     preparation = audit.read_json(root / (spec['case_id'] + '-prepare.command.json'))
     endpoints = ','.join(n['private_ip'] + ':7700' for n in sorted(cfg['nodes'], key=lambda n: n['partition']))
+    transport_config = (case_root.parent / 'requested-configs' / spec['case_id'] / 'transport.json'
+                        if spec['build'] == 'current' else None)
     expected = [binary, '--prepare-external-case', str(case_root), '--guest-case-root', str(case_root),
-                '--remote-endpoints', endpoints] + flags(spec, 'tcp', prepare=True)
+                '--remote-endpoints', endpoints] + flags(spec, 'tcp', prepare=True,
+                                                         transport_config=transport_config)
+    if spec['build'] == 'current':
+        expected += ['--owner-transports', str(case_root.parent / 'requested-configs' / spec['case_id'] / 'owner-transports.json')]
     if (preparation.get('exit_code') != 0 or preparation['command'][0] != binary or
             efa_progress.command_options(preparation['command']) != efa_progress.command_options(expected)):
         raise ValueError('prepared RAM node/coordinator controls differ')
+    if spec['build'] == 'current':
+        audit.validate_prepared_transport(root, spec['case_id'], spec['transport'], cfg['nodes'])
     remote = (root / (spec['case_id'] + '-remote.yaml')).read_text()
     settings = [('read_lanes', spec['lanes']), ('read_cache_bytes', spec['cache'])]
     if spec['build'] == 'current':

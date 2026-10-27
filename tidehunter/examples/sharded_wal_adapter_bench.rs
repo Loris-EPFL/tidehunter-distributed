@@ -7,6 +7,8 @@
 mod cache_contention;
 #[path = "support/tcp_cluster.rs"]
 mod tcp_cluster;
+#[path = "support/transport_config.rs"]
+mod transport_config;
 
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -129,7 +131,13 @@ fn key(id: usize) -> Bytes {
     )
 }
 
-fn run_case(output: &Path, backend: &str, value_bytes: usize, profile: bool) -> Result<()> {
+fn run_case(
+    output: &Path,
+    backend: &str,
+    value_bytes: usize,
+    profile: bool,
+    transport: &Transport,
+) -> Result<()> {
     fs::create_dir(output)?;
     let temporary = tempdir::TempDir::new_in(output, "owned-data")?;
     let database = temporary.path().join("database");
@@ -191,7 +199,7 @@ fn run_case(output: &Path, backend: &str, value_bytes: usize, profile: bool) -> 
             4096,
             128 * MIB,
             None,
-            Transport::Tcp,
+            transport.clone(),
             2,
             WalMemberReadPolicy::Async,
             0,
@@ -378,17 +386,25 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let mut args = std::env::args_os().skip(1);
-    let output = args
-        .next()
-        .ok_or("usage: sharded_wal_adapter_bench NEW_OUTPUT_DIRECTORY [--profile]")?;
-    let profile = match args.next() {
-        None => false,
-        Some(flag) if flag == "--profile" => true,
-        Some(_) => return Err("expected --profile after the new output directory".into()),
-    };
-    if args.next().is_some() {
-        return Err("too many arguments".into());
+    let output = args.next().ok_or(
+        "usage: sharded_wal_adapter_bench NEW_OUTPUT_DIRECTORY [--profile] [--transport-config JSON_FILE]",
+    )?;
+    let mut profile = false;
+    let mut transport = Transport::Tcp;
+    while let Some(flag) = args.next() {
+        if flag == "--profile" {
+            if profile {
+                return Err("duplicate --profile".into());
+            }
+            profile = true;
+        } else if flag == "--transport-config" {
+            let path = args.next().ok_or("missing --transport-config JSON_FILE")?;
+            transport = transport_config::load(Path::new(&path))?;
+        } else {
+            return Err("unknown adapter benchmark argument".into());
+        }
     }
+    transport.validate()?;
     let output = Path::new(&output);
     fs::create_dir(output)?;
     for value_bytes in [256, 8192] {
@@ -402,6 +418,7 @@ fn main() -> Result<()> {
                 backend,
                 value_bytes,
                 profile,
+                &transport,
             )?;
         }
     }

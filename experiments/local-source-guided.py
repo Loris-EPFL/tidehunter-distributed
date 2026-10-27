@@ -8,7 +8,14 @@ import json
 from pathlib import Path
 
 
+import sys
+
+
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import portable_transport
+
+
 spec = importlib.util.spec_from_file_location(
     "local_compare", HERE / "aws-sharded-wal/local_compare.py"
 )
@@ -38,6 +45,11 @@ def main():
     }
     hashes = {name: sha256(path) for name, path in binaries.items()}
     args.output.mkdir()
+    transport_config = args.output / "requested-configs" / "transport.json"
+    transport_config.parent.mkdir()
+    portable_transport.write_transport_config(
+        transport_config, portable_transport.transport_for_case("tcp")
+    )
     # Every TCP comparison uses zero application value cache. This avoids
     # attributing previous cache-hit advantages to preparation/read-ahead work.
     tcp = ["--backend", "tcp", "--tcp-pipeline", "true", "--tcp-read-cache-bytes", "0"]
@@ -71,6 +83,7 @@ def main():
     plan = {
         "binary_sha256": hashes,
         "binaries": {name: str(path) for name, path in binaries.items()},
+        "transport_config": str(transport_config),
         "configs": configs,
         "common": common,
         "repetitions": args.repetitions,
@@ -91,8 +104,12 @@ def main():
             if sha256(binaries[name]) != hashes[name]:
                 raise ValueError("benchmark executable changed during campaign")
             output = args.output / f"{label}-r{repetition}"
+            runtime_transport = (
+                ["--transport-config", str(transport_config)] if name == "candidate" else []
+            )
             local.run(
-                [str(binaries[name]), "--output", str(output), *common, *flags],
+                [str(binaries[name]), "--output", str(output), *common,
+                 *runtime_transport, *flags],
                 output,
             )
             if not (output / "COMPLETE").exists():

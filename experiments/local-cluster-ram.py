@@ -14,6 +14,9 @@ sys.path.insert(0, str(HERE / 'aws-sharded-wal'))
 import cluster_ram
 import local_compare
 
+import portable_transport
+
+
 
 def digest(path):
     with Path(path).open('rb') as stream:
@@ -102,7 +105,19 @@ def main():
     for spec in cases:
         spec['reads'] = args.reads
     args.output.mkdir()
+    requested_configs = args.output / 'requested-configs'
+    requested_configs.mkdir()
+    transport_configs = {}
+    for spec in cases:
+        if spec['build'] == 'current':
+            path = requested_configs / spec['case_id'] / 'transport.json'
+            path.parent.mkdir()
+            portable_transport.write_transport_config(
+                path, portable_transport.transport_for_case(args.transport)
+            )
+            transport_configs[spec['case_id']] = path
     plan = dict(schema=1, campaign='cluster-ram-local', transport=args.transport,
+                transport_configs={case_id: str(path) for case_id, path in transport_configs.items()},
                 source_manifests=manifests, cases=cases,
                 topology='five loopback storage processes; one shared SSD and RAM pool; no hardware RDMA',
                 case_deadline_seconds=600,
@@ -118,7 +133,11 @@ def main():
         for mode in modes:
             output = args.output / (spec['case_id'] + '-' + mode)
             command = [timeout, '--signal=TERM', '--kill-after=5s', '600s', str(binary),
-                       '--output', str(output), '--backend', mode] + cluster_ram.flags(spec, mode)
+                       '--output', str(output), '--backend', mode]
+            command += cluster_ram.flags(
+                spec, mode,
+                transport_config=transport_configs.get(spec['case_id'])
+            )
             local_compare.run(command, output)
             record = json.loads(output.with_suffix('.resources.json').read_text())
             if record['remaining_sampled_pids']:

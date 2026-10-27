@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tidehunter-fabric = { path = "../tidehunter-fabric", optional = true, features = ["native"] }
+tidehunter-fabric = { path = "../tidehunter-fabric" }
 arc-swap = "1.6.0"
 memmap2 = "0.7.0"
 minibytes = { path = "../third-party/minibytes", default-features = false, features = ["frommmap", "frombytes"] }
@@ -46,7 +46,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 serde_json = "1.0.140"
 
 [features]
-experimental-fabric = ["experimental-distributed", "dep:tidehunter-fabric", "dep:serde_json"]
+experimental-fabric = ["experimental-distributed", "tidehunter-fabric/native", "dep:serde_json"]
 experimental-distributed = ["dep:blake2b_simd", "dep:rustls", "dep:io-uring"]
 tokio = ["dep:tokio"]
 test_methods = []

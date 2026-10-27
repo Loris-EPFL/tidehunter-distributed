@@ -11,6 +11,128 @@ native-feature endpoint can additionally expose immutable resident member
 regions for read-only FI_READ; this is a derived cache, never authoritative WAL,
 and ordinary message-only opens remain unchanged.
 
+## Portable transport boundary (27 October 2026)
+
+The distributed storage/WAL/index protocol is shared. Transport selection
+changes only the bounded message endpoint and, when explicitly configured,
+the registered-read endpoint; it does not create a provider-specific WAL,
+index, lock, durability, or recovery implementation.
+
+```text
+                 shared Tidehunter WAL + index + read-grant protocol
+                                      |
+                            common engine Transport
+                              /               \
+                            TCP               OFI
+                      existing TLS       common libfabric Endpoint
+                                        /           |            \
+                                      EFA       EFA-direct   generic verbs
+                                                            IB / RoCE / Falcon
+```
+
+`FabricBackend` explicitly selects `efa`, `efa-direct`, `verbs`, or
+`software-tcp`; provider mapping is centralized: `efa`, `efa-direct` fabric,
+`verbs;ofi_rxm`, and `tcp;ofi_rxm`, respectively. EFA's SRD transport is not
+interoperable with verbs RDMA. InfiniBand, RoCE and Falcon use the common
+verbs/RxM implementation when the selected host's libfabric exposes a
+compatible device, but are not interchangeable wire technologies or a claim
+that devices on different networks can communicate.
+
+Canonical engine configuration is structured:
+
+```json
+{"kind":"ofi","fabric":{"backend":"verbs","domain":"mlx5_0","source_address":"10.1.0.2"},"security":"trusted"}
+```
+
+`Transport` is `tcp` or `ofi`; OFI security is `mutual-tls` (default) or
+`trusted`. `domain` and `source_address` are optional host-local selectors:
+use the appropriate local domain/device and source IP on each host, while
+selecting the same provider family and security mode on both peers. Source-IP
+selectors are provider-constrained: EFA and EFA-direct reject them because
+`FI_ADDR_EFA` is opaque and no source-IP association is attested; verbs accepts
+IPv4 only because the pinned RxM layer lists only `FI_SOCKADDR`/
+`FI_SOCKADDR_IN` (regardless of core verbs IPv6 support); software-tcp accepts
+IPv4 or IPv6 when `fi_getinfo` returns a matching sockaddr. Without a selector,
+all providers use their default selection. Metadata records the selected source
+address only when an IPv4/IPv6 sockaddr can be parsed. For an explicit source,
+the `fi_getinfo` hint is exact-compared with the returned selection;
+unsupported formats remain unobserved rather than being echoed from configuration.
+Peers with different backend/security fail protocol matching. Fabric selection
+never retries or silently downgrades to TCP. Default transport remains TCP;
+configuration types do not require native libfabric linkage, which is opt-in.
+
+One-sided reads remain opt-in and bounded by `RmaConfig`. `Endpoint::provider_info`
+reports `ProviderInfo` fields: selected backend/provider/fabric/domain/source,
+observed device/driver/PCI bus address when available, RMA capabilities, and
+capability evidence. Unknown or unobserved facts remain absent or explicitly
+unverified. `require_device_read` is strict: it rejects `Unknown` or `Emulated`
+read modes. EFA native mode requires `FI_OPT_EFA_EMULATED_READ == false`;
+verbs requires native FI_READ plus provider PCI NIC/device metadata matched to
+that NIC's canonical sysfs PCI BDF, and excludes software `rxe`, `rdma_rxe`,
+and `siw` drivers. This establishes a PCI-backed generic verbs endpoint, not
+that the device is Falcon. Software-provider FI_READ byte-comparison tests
+qualify software correctness only; they do not qualify EFA, IB, RoCE, or Falcon
+hardware or performance.
+
+The transport does not alter WAL append receipts, synchronization semantics,
+index updates, grant/drain ownership, or the storage's existing locks. Local
+send/CQ completion is not remote application receipt or persistence. The
+durable storage receipt remains the write acknowledgement.
+
+Implementation map:
+
+- `tidehunter-fabric/src/config.rs`: `FabricBackend`, `FabricConfig`, selector validation.
+- `tidehunter-fabric/src/endpoint.rs` and `endpoint/resources.rs`: endpoint setup, provider discovery, bounded message and RMA ownership/capabilities.
+- `tidehunter/src/distributed/tcp/fabric.rs`: engine `Transport`, `FabricSecurity`, protocol matching and endpoint bootstrap.
+- `tidehunter/src/distributed/tcp/resident.rs`: resident-read budgets and device-read requirement.
+- `tidehunter/examples/support/tcp_cluster.rs` and `benchmarks/kv-research/src/backends/tidehunter.rs`: shared engine adapter and benchmark integration.
+
+Primary references: [OFI verbs provider](https://ofiwg.github.io/libfabric/main/man/fi_verbs.7.html),
+[OFI RxM provider](https://ofiwg.github.io/libfabric/main/man/fi_rxm.7.html),
+[EFA provider](https://ofiwg.github.io/libfabric/main/man/fi_efa.7.html),
+[RDMA over Falcon specification, §§6.2–6.4](https://www.opencompute.org/documents/rdma-over-falcon-spec-v1-1-pdf),
+and the local [Tidehunter 2026 paper, §3](../../papers/parsed/Tidehunter-2026-v2.md)
+for WAL/index/concurrency semantics. The papers and provider documentation
+inform design; they are not hardware-validation evidence.
+
+### Local qualification, 27 October 2026
+
+The final local release builds and strict all-target Clippy checks passed.
+The fabric library passed 49 tests (2 hardware/opt-in tests ignored); the
+fabric-enabled engine passed 807 (41 ignored), and the comparison crate
+passed 40. Fourteen low-level software-provider tests and 21 application-level
+software-provider tests also ran explicitly. Five-owner TCP, software OFI with
+mutual TLS, and trusted software OFI completed the standalone crash/reopen,
+retry, fencing and owner-restart checks.
+
+The raw software FI_READ probe validated 64 warm-up and 1,000 clean reads with
+different control/data interfaces and actual selected source addresses. It
+reported **emulated**, not native, reads. Verbs and EFA-direct hardware
+admission failed explicitly on this laptop, with no fallback or result claim.
+No new EFA, InfiniBand, RoCE, Falcon or independent-NVMe performance is proved.
+Sui preparation and artifact admission were checked locally; this refactor
+does not claim a fresh full Sui checkpoint replay.
+
+Native and five-owner software-OFI adapters passed real API qualification.
+Separate tiny functional workload cases each recorded 384 raw timing rows,
+with no failed/rejected operations or unknown mutations. These are functional
+checks, not a fair performance comparison or a change to tracked case sizes.
+Evidence is retained under
+`checkpoint-work/portable-transports-20261027T145226Z/`.
+
+Software OFI has a material provider-memory cost: pinned libfabric 2.6.0's
+[RxM RX/TX pools](https://github.com/ofiwg/libfabric/blob/v2.6.0/prov/rxm/src/rxm_ep.c#L117-L149)
+allocate 1,024-buffer chunks, with a
+[16-KiB configured buffer size](https://github.com/ofiwg/libfabric/blob/v2.6.0/prov/rxm/src/rxm_init.c#L51-L55).
+Application queue-size hints are not a hard cap on these pools. The local
+six-process software qualification exceeded the default 2,048-MiB aggregate
+allowance; a task-owned cohost profile explicitly allowed 4,096 MiB and sampled
+a 2,281,836,544-byte aggregate peak, with zero swap-in/out counter increments.
+The default CI/TCP budget and every cloud per-host budget remain unchanged.
+The existing software MSG receive setting is recorded, not presented as a
+hard provider-memory bound.
+
+
 ## Dependencies and provenance
 
 `ofi-libfabric-sys = 0.2.0` is the OpenFabrics libfabric project's generated Rust
@@ -201,7 +323,8 @@ CQ poll per sweep. No EFA hardware performance is inferred from these changes.
 
 ## Separate EFA-direct packet transport (17 October)
 
-`Endpoint::open_efa_direct(domain)` selects **provider `efa`, fabric `efa-direct`**.
+Selecting `FabricBackend::EfaDirect` through `Endpoint::open` selects
+**provider `efa`, fabric `efa-direct`**.
 It does not call the ordinary EFA message path, and absence or incompatible
 capabilities produces an error, not a TCP, software-provider or regular-EFA retry.
 TCP remains the default distributed transport. TLS authentication, encryption,
@@ -591,14 +714,15 @@ disk data resident.
 
 ## Bounded resident FI_READ extension (23 October)
 
-`Endpoint::open_rma(provider, domain, config)` negotiates FI_RMA/FI_READ on the
-same FI_EP_RDM endpoint and provider used by the existing message path.
-`open_efa_direct_rma(domain, config)` selects only EFA's `efa-direct` fabric;
-unsupported or non-native capability is never reported as native. The
-message-only `open` and `open_efa_direct` entry points retain their old behavior.
-`RmaCapabilities` reports virtual-vs-offset MR addressing, selected RMA size and
-IOV limit, and native-vs-emulated read mode. EFA native mode is reported only
-after querying `FI_OPT_EFA_EMULATED_READ` and receiving `false`.
+`Endpoint::open(&FabricConfig, Option<RmaConfig>)` negotiates message transport
+and, when requested, FI_RMA/FI_READ on the same FI_EP_RDM endpoint and
+provider. The backend selects EFA, EFA-direct, generic verbs, or software TCP;
+there are no provider-specific endpoint constructors.
+`Endpoint::provider_info()` exposes actual provider/fabric/domain/source/device
+setup and capability evidence. `RmaCapabilities` reports virtual-vs-offset MR
+addressing, selected RMA size and IOV limit, and native/emulated/unknown read
+mode. `require_device_read` rejects unknown/emulated modes and applies the
+backend-specific evidence checks described in the portable transport section.
 
 `reserve_read_region` allocates a bounded stable identity before envelope
 encoding, so region ID and generation can be embedded in the immutable bytes.

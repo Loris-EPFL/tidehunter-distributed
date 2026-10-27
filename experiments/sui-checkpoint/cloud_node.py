@@ -18,9 +18,13 @@ from pathlib import Path
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'runner'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from portable_transport import validate_transport, protocol_key, transport_for_case
 import yaml
 
 OWNED_BASE = Path('/mnt/tidehunter')
@@ -74,9 +78,16 @@ def validate_config(config_path):
         raise ValueError('invalid owned run ID')
     owner = OWNED_BASE / cfg['run_id']
     transport = cfg.get('transport')
-    if (transport not in ('tcp', 'efa', 'efa-direct', 'efa-native') or not isinstance(cfg.get('cell_id'), str)
-            or not re.fullmatch(r'r0[1-4]-' + transport + (r'(?:-rma)?' if transport == 'efa-native' else ''), cfg['cell_id'])):
+    if (transport not in ('tcp', 'efa', 'efa-direct', 'efa-native')
+            or not isinstance(cfg.get('cell_id'), str)
+            or not re.fullmatch(r'r0[1-4]-' + re.escape(transport) + (r'(?:-rma)?' if transport == 'efa-native' else ''), cfg['cell_id'])):
         raise ValueError('invalid matrix cell/transport identity')
+    client_transport = validate_transport(cfg.get('client_transport'))
+    owner_transport = validate_transport(cfg.get('owner_transport'))
+    if protocol_key(client_transport) != protocol_key(transport_for_case(transport)):
+        raise ValueError('client Transport protocol differs from matrix cell')
+    if protocol_key(client_transport) != protocol_key(owner_transport):
+        raise ValueError('storage owner transport protocol differs from client')
     root = owner / 'checkpoint-cells' / cfg['cell_id'] / 'storage'
     if cfg.get('root') != str(root):
         raise ValueError('root must be the exact owned matrix cell storage directory')
@@ -139,11 +150,13 @@ def validate_config(config_path):
                 or document.get('stop_file') != str(stop)):
             raise ValueError('namespace storage/readiness/stop paths differ from launch')
         tls = document.get('tls')
-        if not isinstance(tls, dict) or tls.get('transport') != transport:
-            raise ValueError('storage TLS transport differs from matrix cell')
-        if transport == 'efa-native':
+        if not isinstance(tls, dict) or validate_transport(tls.get('transport')) != owner_transport:
+            raise ValueError('storage TLS transport differs from host data-NIC selection')
+        if protocol_key(owner_transport) != protocol_key(client_transport):
+            raise ValueError('storage owner transport protocol differs from client')
+        if owner_transport.get('security') == 'trusted':
             if any(tls.get(key) != '' for key in ('ca', 'cert', 'key')):
-                raise ValueError('native transport requires explicit empty credentials')
+                raise ValueError('trusted transport requires explicit empty credentials')
         else:
             for key in ('ca', 'cert', 'key'):
                 inputs.add(owned_path(tls.get(key), root, 'file'))

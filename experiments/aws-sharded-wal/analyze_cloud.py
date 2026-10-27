@@ -26,6 +26,7 @@ import cluster_ram
 import scalar_transport
 import transport_floor
 import stage_timing
+from portable_transport import transport_for_case, select_transports
 
 
 BACKENDS = {"tcp": "experimental_tcp_authority", "native-sync": "native_value_wal_barrier"}
@@ -186,7 +187,7 @@ def validate_build_pair(root, receipts):
             or any(pair.get(flag) is not True for flag in
                    ("distinct_sources", "distinct_binaries", "capability_checks"))):
         errors["cloud-build-pair-verified"] = "pair receipt must confirm both exact binary hashes, distinct sources/binaries and capabilities"
-    config_names = {"remote.yaml"} | {f"node-{node}/launch.yaml" for node in range(5)}
+    config_names = {"remote.yaml", "owner_transports.json"} | {f"node-{node}/launch.yaml" for node in range(5)}
     if (root / 'campaign-config.json').is_file() and read_json(root / 'campaign-config.json').get('campaign') in ('transport-floor', 'stage-timing'):
         config_names.add('shape.yaml')
     hashes = pair.get("prepared_configuration_sha256")
@@ -199,7 +200,8 @@ def validate_build_pair(root, receipts):
             if recorded.get("exit_code") != 0 or recorded.get("command") != [binary, "--help"]:
                 raise ValueError("missing successful --help for the recorded build")
             help_text = (root / f"capability-{label}.stdout.log").read_text()
-            if "--remote-config" not in help_text or (label == "current" and "--prepare-external-case" not in help_text):
+            if "--remote-config" not in help_text or (label == "current" and any(
+                    flag not in help_text for flag in ("--prepare-external-case", "--transport-config", "--owner-transports"))):
                 raise ValueError("required cloud benchmark capabilities absent from help output")
         except (OSError, ValueError, KeyError, TypeError) as error:
             errors[f"cloud-build-capability-{label}"] = str(error)
@@ -214,18 +216,31 @@ def validate_build_pair(root, receipts):
         options = dict(zip(command[1::2], command[2::2]))
         if len(options) != len(command) // 2:
             raise ValueError("duplicate preparation options")
+        request_root = str(PurePosixPath(case_root).parent / 'requested-configs' / PurePosixPath(case_root).name)
         expected = {"--prepare-external-case": case_root, "--guest-case-root": case_root,
+                    "--transport-config": request_root + "/transport.json",
+                    "--owner-transports": request_root + "/owner-transports.json",
                     "--values": "1024", "--batch-sizes": "1", "--windows": "1", "--batches": "128",
                     "--mixed": "32", "--reads": "512", "--repetitions": "1"}
         endpoints = options.get("--remote-endpoints", "").split(",")
         if (any(options.get(k) != v for k, v in expected.items()) or
                 set(options) != set(expected) | {"--remote-endpoints"} or
-                len(endpoints) != 5 or len(set(endpoints)) != 5 or
                 any(not endpoint.endswith(":7700") or len(endpoint) <= 5 for endpoint in endpoints)):
             raise ValueError("preparation did not use the expected six-config/five-endpoint smoke")
         recorded = read_json(root / ("cloud-build-preparation-check.command.json" if current_preflight else "cloud-build-preparation-smoke.command.json"))
         if recorded.get("exit_code") != 0 or recorded.get("command") != command:
             raise ValueError("successful preparation command does not match pair receipt")
+        cfg = read_json(root / 'campaign-config.json') if (root / 'campaign-config.json').is_file() else {}
+        requested_transport = root / 'cloud-build-requested-transport.json'
+        requested_owners = root / 'cloud-build-requested-owner-transports.json'
+        transport_label = (cfg.get('transports') or ['tcp'])[0]
+        expected_client = transport_for_case(transport_label)
+        expected_owners = select_transports(expected_client, None, len(cfg.get('nodes', [])))
+        if (json.loads(requested_transport.read_text()) != expected_client
+                or json.loads(requested_owners.read_text()) != expected_owners
+                or pair.get('requested_transport_sha256') != hashlib.sha256(requested_transport.read_bytes()).hexdigest()
+                or pair.get('requested_owner_transports_sha256') != hashlib.sha256(requested_owners.read_bytes()).hexdigest()):
+            raise ValueError('requested transport configs differ from hash-bound canonical selectors')
     except (OSError, ValueError, KeyError, TypeError) as error:
         errors["cloud-build-preparation-smoke"] = str(error)
     return errors
@@ -397,8 +412,16 @@ def read_case(root, name, info, campaign_profile="original"):
     options = dict(zip(command[1::2], command[2::2]))
     cache_bytes = str(8 * 1024 * 1024) if family == 'cache' else '0'
     if campaign_profile in ("overlap", "read-path", "efa", "efa-cache") and mode == "tcp":
-        if campaign_profile in ['efa', 'efa-cache'] and options.get('--transport', 'tcp') != ('efa' if uses_efa else 'tcp'):
-            raise ValueError('benchmark transport differs from expected case')
+        if campaign_profile in ['efa', 'efa-cache']:
+            if build == 'current':
+                remote_config = PurePosixPath(options.get('--remote-config', ''))
+                expected_config = str(remote_config.parent.parent / 'requested-configs'
+                                      / remote_config.parent.name / 'transport.json')
+                if (not options.get('--remote-config')
+                        or options.get('--transport-config') != expected_config):
+                    raise ValueError('benchmark canonical transport config path differs from case')
+            elif options.get('--transport', 'tcp') != ('efa' if uses_efa else 'tcp'):
+                raise ValueError('frozen benchmark transport differs from expected case')
         if options.get("--tcp-read-cache-bytes") != cache_bytes:
             raise ValueError("frontend cache budget differs from selected case")
         if build == "current" and options.get("--tcp-preparation-chunk-batches") != ("32" if family == "chunk32" else "16"):
@@ -470,6 +493,43 @@ def read_case(root, name, info, campaign_profile="original"):
     return metrics
 
 
+def validate_prepared_transport(root, case, transport, nodes):
+    """Bind requested selectors to the captured coordinator and every owner."""
+    expected_client = transport_for_case(transport)
+    expected_owners = select_transports(expected_client, None, len(nodes))
+    requested_client_path = root / (case + '-transport-config.json')
+    requested_owners_path = root / (case + '-owner-transports-requested.json')
+    actual_owners_path = root / (case + '-owner-transports.json')
+    receipt_path = root / (case + '-prepared-transports.json')
+    if not all(path.is_file() for path in
+               (requested_client_path, requested_owners_path, actual_owners_path, receipt_path)):
+        raise ValueError('current preparation is missing requested/actual transport configuration artifacts')
+    remote_docs = transport_floor.yaml_documents((root / (case + '-remote.yaml')).read_text())
+    if (read_json(requested_client_path) != expected_client
+            or json.loads(requested_owners_path.read_text()) != expected_owners
+            or json.loads(actual_owners_path.read_text()) != expected_owners
+            or len(remote_docs) != 1
+            or remote_docs[0].get('tls', {}).get('transport') != expected_client):
+        raise ValueError('requested transport configs differ from actual coordinator/owner policy')
+    launch_hashes = {}
+    for node, expected_owner in zip(sorted(nodes, key=lambda item: item['partition']), expected_owners):
+        path = root / (case + f"-node-{node['partition']}-launch.yaml")
+        if not path.is_file():
+            raise ValueError('prepared owner launch is missing')
+        docs = transport_floor.yaml_documents(path.read_text())
+        if len(docs) != 1 or docs[0].get('tls', {}).get('transport') != expected_owner:
+            raise ValueError('prepared per-owner transports differ from admitted vector')
+        launch_hashes[str(node['partition'])] = hashlib.sha256(path.read_bytes()).hexdigest()
+    expected_receipt = dict(schema=1,
+        requested_transport_sha256=hashlib.sha256(requested_client_path.read_bytes()).hexdigest(),
+        requested_owner_transports_sha256=hashlib.sha256(requested_owners_path.read_bytes()).hexdigest(),
+        owner_transports_sha256=hashlib.sha256(actual_owners_path.read_bytes()).hexdigest(),
+        launch_sha256=launch_hashes)
+    if read_json(receipt_path) != expected_receipt:
+        raise ValueError('prepared transport sidecar/owner hashes differ from captured artifacts')
+    return remote_docs[0]
+
+
 def validate_progress_case(root, name, spec, mode, process, summaries, metrics):
     checkpoint = 'shard_cache' in spec
     options = efa_progress.command_options(process['command'])
@@ -484,16 +544,22 @@ def validate_progress_case(root, name, spec, mode, process, summaries, metrics):
         raise ValueError('benchmark binary differs from source-bound cloud build')
     expected = {'--values': spec['value'], '--batch-sizes': spec['batch'], '--windows': spec['window'],
                 '--batches': spec['batches'], '--mixed': spec['mixed'], '--reads': spec['reads'],
-                '--repetitions': 1, '--backend': mode,
+                '--repetitions': 1,
+                '--backend': 'tcp' if mode == 'tcp' else mode,
                 '--output': str(PurePosixPath(cfg['run_root']) / 'results' / name)}
     if spec['cold']:
         expected['--cold-read-pass'] = 'true'
     if spec['diagnostics']:
         expected['--transport-diagnostics'] = 'true'
     if mode == 'tcp':
-        expected.update({'--transport': spec['transport'], '--tcp-read-cache-bytes': spec['cache'],
+        case_root = PurePosixPath(cfg['run_root']) / 'cases' / case
+        if spec['build'] == 'current':
+            expected['--transport-config'] = str(case_root.parent / 'requested-configs' / case / 'transport.json')
+        else:
+            expected['--transport'] = spec['transport']
+        expected.update({'--tcp-read-cache-bytes': spec['cache'],
                          '--tcp-preparation-chunk-batches': 16,
-                         '--remote-config': str(PurePosixPath(cfg['run_root']) / 'cases' / case / 'remote.yaml')})
+                         '--remote-config': str(case_root / 'remote.yaml')})
     if spec['build'] == 'current' or checkpoint:
         expected.update({'--read-window': spec['read_window'], '--read-resource-evidence': 'true'})
         if mode == 'native-sync':
@@ -530,11 +596,17 @@ def validate_progress_case(root, name, spec, mode, process, summaries, metrics):
     prep_expected = {flag: str(spec[key]) for flag, key in [
         ('--values', 'value'), ('--batch-sizes', 'batch'), ('--windows', 'window'),
         ('--batches', 'batches'), ('--mixed', 'mixed'), ('--reads', 'reads'),
-        ('--transport', 'transport'), ('--tcp-read-cache-bytes', 'cache')]}
+        ('--tcp-read-cache-bytes', 'cache')]}
     case_root = str(PurePosixPath(cfg['run_root']) / 'cases' / case)
+    if spec['build'] == 'current':
+        prep_expected['--transport-config'] = str(PurePosixPath(cfg['run_root']) / 'cases' / 'requested-configs' / case / 'transport.json')
+    else:
+        prep_expected['--transport'] = str(spec['transport'])
     prep_expected.update({'--repetitions': '1', '--prepare-external-case': case_root,
                           '--guest-case-root': case_root, '--remote-endpoints': ','.join(
                               n['private_ip'] + ':7700' for n in sorted(cfg['nodes'], key=lambda n: n['partition']))})
+    if spec['build'] == 'current':
+        prep_expected['--owner-transports'] = str(PurePosixPath(cfg['run_root']) / 'cases' / 'requested-configs' / case / 'owner-transports.json')
     if spec['build'] == 'current' or checkpoint:
         prep_expected.update({flag: str(spec[key]) for flag, key in [
             ('--tcp-read-lanes', 'lanes'), ('--tcp-server-read-workers', 'workers'),
@@ -543,6 +615,8 @@ def validate_progress_case(root, name, spec, mode, process, summaries, metrics):
         prep_expected['--tcp-shard-cache-bytes'] = str(spec['shard_cache'])
     if prep != prep_expected:
         raise ValueError('prepared workload/endpoint/server policy differs from exact case')
+    if spec['build'] == 'current':
+        validate_prepared_transport(root, case, spec['transport'], cfg['nodes'])
     if spec['build'] == 'current' or checkpoint:
         remote = (root / (case + '-remote.yaml')).read_text()
         for key, value in [('read_lanes', spec['lanes']), ('read_cache_bytes', spec['cache'])]:
@@ -673,7 +747,9 @@ def read_recovery_case(root, name, spec, profile=checkpoint_async):
     expected_prep = {'--prepare-external-case': str(base / 'cases' / case),
                      '--guest-case-root': str(base / 'cases' / case),
                      '--remote-endpoints': ','.join(n['private_ip'] + ':7700' for n in sorted(cfg['nodes'], key=lambda n: n['partition'])),
-                     '--tcp-read-cache-bytes': '0', '--transport': spec['transport'],
+                     '--tcp-read-cache-bytes': '0',
+                     **({'--transport-config': str(base / 'cases' / 'requested-configs' / case / 'transport.json')}
+                        if spec['build'] == 'current' else {'--transport': spec['transport']}),
                      '--tcp-read-lanes': str(spec['lanes']), '--tcp-server-read-workers': str(spec['workers']),
                      '--tcp-wal-member-read': spec['member'], '--values': '8192', '--batch-sizes': '32',
                      '--windows': '32', '--batches': str(spec['batches']), '--mixed': str(spec['mixed']),
@@ -681,10 +757,13 @@ def read_recovery_case(root, name, spec, profile=checkpoint_async):
     if spec['build'] == 'current':
         expected_prep['--tcp-shard-cache-bytes'] = '0'
     if profile in (cluster_ram, scalar_transport, transport_floor, stage_timing):
+        transport_config = base / 'cases' / 'requested-configs' / case / 'transport.json' if spec['build'] == 'current' else None
         expected_prep = efa_progress.command_options(['binary', '--prepare-external-case', str(base / 'cases' / case),
             '--guest-case-root', str(base / 'cases' / case), '--remote-endpoints',
             ','.join(n['private_ip'] + ':7700' for n in sorted(cfg['nodes'], key=lambda n: n['partition']))]
-            + profile.flags(spec, 'tcp', prepare=True))
+            + profile.flags(spec, 'tcp', prepare=True, transport_config=transport_config))
+    if spec['build'] == 'current':
+        expected_prep['--owner-transports'] = str(base / 'cases' / 'requested-configs' / case / 'owner-transports.json')
     if (preparation.get('exit_code') != 0 or preparation['command'][0] != str(base / 'cloud-bin' / spec['build'] / 'sharded_wal_bench')
             or efa_progress.command_options(preparation['command']) != expected_prep):
         raise ValueError('recovery preparation differs from source-bound server policy')
@@ -773,7 +852,8 @@ def validate_checkpoint_campaign(root, receipts, recorded, qualification, profil
         overlay = hashlib.sha256(source.read_bytes()).hexdigest()
         recovery_stats = label == 'current' or profile in (cluster_ram, scalar_transport, transport_floor, stage_timing)
         receipt = receipts['cloud-build-' + label]
-        if (receipt['features'] != 'experimental-fabric,test-utils' or receipt['recovery_overlay_sha256'] != overlay
+        expected_features = 'experimental-fabric,test-utils'
+        if (receipt['features'] != expected_features or receipt['recovery_overlay_sha256'] != overlay
                 or receipt['recovery_cfg'] != ('checkpoint_recovery_stats' if recovery_stats else None)
                 or not is_sha256(receipt.get('lock_sha256')) or receipt.get('engine_source_unchanged') is not True
                 or not is_sha256(receipt['source_archive_sha256']) or not is_sha256(receipt['recovery_binary_sha256'])):
@@ -1214,7 +1294,9 @@ def main():
     if args.profile in ['read-path', 'efa', 'efa-cache']:
         receipt = receipts.get('cloud-build-current', {})
         command = receipt.get('command', [])
-        if (receipt.get('features') != ('experimental-fabric,test-utils' if args.profile in ['efa', 'efa-cache'] else 'experimental-distributed,test-utils')
+        expected_features = ('experimental-fabric,test-utils' if args.profile in ['efa', 'efa-cache']
+                              else 'experimental-distributed,test-utils')
+        if (receipt.get('features') != expected_features
                 or command.count('--features') != 1
                 or ('--features', receipt.get('features')) not in zip(command, command[1:])):
             build_errors['read-path-features'] = 'cold campaign does not verify the required frozen build features'
@@ -1237,7 +1319,8 @@ def main():
             evidence_errors['qualification'] = str(error)
         for label in ('baseline', 'current'):
             receipt = receipts.get('cloud-build-' + label, {})
-            if receipt.get('features') != 'experimental-fabric,test-utils':
+            expected_features = 'experimental-fabric,test-utils'
+            if receipt.get('features') != expected_features:
                 build_errors[label + '-efa-features'] = 'progress requires two frozen EFA builds'
         if receipts.get('cloud-build-baseline', {}).get('source_tree_sha256') != efa_progress.BASELINE_SOURCE_SHA256:
             build_errors['preserved-baseline'] = 'progress requires the preserved completed October 7 EFA source'

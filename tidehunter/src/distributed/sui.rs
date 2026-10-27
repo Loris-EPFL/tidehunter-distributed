@@ -48,6 +48,11 @@ struct StageTimer<'a> {
     failed: bool,
 }
 impl Stage {
+    fn reset(&self) {
+        self.ns.store(0, Ordering::Relaxed);
+        self.calls.store(0, Ordering::Relaxed);
+        self.errors.store(0, Ordering::Relaxed);
+    }
     fn record(&self, ns: Option<u64>, failed: bool) {
         if let Some(ns) = ns {
             self.ns.fetch_add(ns, Ordering::Relaxed);
@@ -617,6 +622,36 @@ impl Db {
             .remaining
             .store(limit, Ordering::Relaxed);
     }
+    /// Arm a new bounded write sample after warm-up. Remote owners activate
+    /// their append-connection profilers only after the barrier is acknowledged.
+    pub fn arm_write_profile(&self, limit: usize) -> Result<()> {
+        if limit > 65_536 {
+            return Err(error("write profile limit exceeds 65536"));
+        }
+        let _gate = self.write_gate();
+        match &self.backend {
+            Backend::Native(_) => {
+                let profile = &self.native_write_profile;
+                profile.limit.store(limit as u64, Ordering::Relaxed);
+                profile.remaining.store(limit as u64, Ordering::Relaxed);
+                profile.barrier.reset();
+                for counter in [
+                    &profile.file_calls,
+                    &profile.file_successes,
+                    &profile.file_ns,
+                    &profile.namespace_calls,
+                    &profile.namespace_successes,
+                    &profile.namespace_ns,
+                ] {
+                    counter.store(0, Ordering::Relaxed);
+                }
+            }
+            Backend::Remote(remote) => {
+                remote.db.arm_write_profile(limit).map_err(error)?;
+            }
+        }
+        Ok(())
+    }
     /// Set before serving; zero disables extra actor/protocol diagnostic clocks.
     pub fn set_read_profile_limit(&self, limit: u64) {
         if let Backend::Remote(remote) = &self.backend {
@@ -890,6 +925,14 @@ impl Db {
                     write_profile.captured_connections as u64,
                 );
                 set(
+                    "write_profile_activation_errors",
+                    write_profile.profile_activation_errors,
+                );
+                set(
+                    "write_profile_capture_errors",
+                    write_profile.profile_capture_errors,
+                );
+                set(
                     "write_profile_sampled_requests",
                     write_profile.sampled_requests,
                 );
@@ -899,7 +942,9 @@ impl Db {
                         write_profile.limit_per_connection != 0
                             && write_profile.expected_connections != 0
                             && write_profile.captured_connections
-                                == write_profile.expected_connections,
+                                == write_profile.expected_connections
+                            && write_profile.profile_activation_errors == 0
+                            && write_profile.profile_capture_errors == 0,
                     ),
                 );
                 if write_profile.limit_per_connection != 0 {
@@ -1160,6 +1205,14 @@ impl Db {
                     write_profile.captured_connections as u64,
                 );
                 set(
+                    "write_profile_activation_errors",
+                    write_profile.profile_activation_errors,
+                );
+                set(
+                    "write_profile_capture_errors",
+                    write_profile.profile_capture_errors,
+                );
+                set(
                     "write_profile_sampled_requests",
                     write_profile.sampled_requests,
                 );
@@ -1169,7 +1222,9 @@ impl Db {
                         write_profile.limit_per_connection != 0
                             && write_profile.expected_connections != 0
                             && write_profile.captured_connections
-                                == write_profile.expected_connections,
+                                == write_profile.expected_connections
+                            && write_profile.profile_activation_errors == 0
+                            && write_profile.profile_capture_errors == 0,
                     ),
                 );
                 if write_profile.limit_per_connection != 0 {

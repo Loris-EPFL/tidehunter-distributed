@@ -69,7 +69,7 @@ def main():
                 'rustc': subprocess.check_output(['rustc', '--version'], cwd=repo, text=True).strip(),
                 'topology': 'Five local child processes share one NVMe; same source prepared for five separate RF1 TCP nodes'}
     manifest.update(auxiliary)
-    if 'experimental-fabric' in args.features:
+    if 'fabric' in args.features:
         library = Path(subprocess.check_output(['pkg-config', '--variable=libdir', 'libfabric'], text=True).strip()) / 'libfabric.so.1'
         manifest['libfabric'] = {'version': subprocess.check_output(['pkg-config', '--modversion', 'libfabric'], text=True).strip(),
                                 'path': str(library.resolve()), 'sha256': sha(library.resolve())}

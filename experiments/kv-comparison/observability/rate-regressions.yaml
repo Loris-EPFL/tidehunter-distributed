@@ -1,0 +1,49 @@
+# Evaluate with the pinned Prometheus promtool, not a hand-written rate emulator.
+# Live counters and terminal interval gauges deliberately have different semantics.
+rule_files: []
+evaluation_interval: 5s
+tests:
+  - interval: 5s
+    input_series:
+      - series: 'kv_observer_cgroup_cpu_throttled_seconds_total{case_id="one-point"}'
+        values: '7 stale'
+      - series: 'kv_observer_cgroup_cpu_throttled_seconds_total{case_id="observed-zero"}'
+        values: '7 7 7 7 7'
+      - series: 'kv_observer_cgroup_cpu_throttled_seconds_total{case_id="reset"}'
+        values: '10 12 1 4 7'
+      - series: 'kv_observer_cgroup_cpu_periods_total{case_id="observed-zero"}'
+        values: '0 0 0 0 0'
+      - series: 'kv_observer_cgroup_cpu_throttled_periods_total{case_id="observed-zero"}'
+        values: '0 0 0 0 0'
+      - series: 'kv_case_resource_interval_cpu_throttled_seconds{case_id="terminal",scope="measurement_boundary_interval"}'
+        values: '0 stale'
+    promql_expr_test:
+      - expr: 'rate(kv_observer_cgroup_cpu_throttled_seconds_total{case_id="one-point"}[20s])'
+        eval_time: 5s
+        exp_samples: []
+      - expr: 'rate(kv_observer_cgroup_cpu_throttled_seconds_total{case_id="absent"}[20s])'
+        eval_time: 20s
+        exp_samples: []
+      - expr: 'rate(kv_observer_cgroup_cpu_throttled_seconds_total{case_id="observed-zero"}[20s])'
+        eval_time: 20s
+        exp_samples:
+          - labels: '{case_id="observed-zero"}'
+            value: 0
+      - expr: 'resets(kv_observer_cgroup_cpu_throttled_seconds_total{case_id="reset"}[20s])'
+        eval_time: 20s
+        exp_samples:
+          - labels: '{case_id="reset"}'
+            value: 1
+      - expr: 'rate(kv_observer_cgroup_cpu_throttled_seconds_total{case_id="reset"}[20s]) > bool 0'
+        eval_time: 20s
+        exp_samples:
+          - labels: '{case_id="reset"}'
+            value: 1
+      - expr: 'rate(kv_observer_cgroup_cpu_throttled_periods_total{case_id="observed-zero"}[20s]) / (rate(kv_observer_cgroup_cpu_periods_total{case_id="observed-zero"}[20s]) > 0)'
+        eval_time: 20s
+        exp_samples: []
+      - expr: 'last_over_time(kv_case_resource_interval_cpu_throttled_seconds{case_id="terminal",scope="measurement_boundary_interval"}[20s])'
+        eval_time: 5s
+        exp_samples:
+          - labels: 'kv_case_resource_interval_cpu_throttled_seconds{case_id="terminal",scope="measurement_boundary_interval"}'
+            value: 0

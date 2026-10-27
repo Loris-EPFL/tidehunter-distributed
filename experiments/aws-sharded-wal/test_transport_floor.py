@@ -12,6 +12,7 @@ import cluster_ram
 import scalar_transport
 import transport_floor as profile
 from test_scalar_transport import Evidence as ScalarEvidence, recovery_stats, save, table
+from portable_transport import transport_for_case
 
 SHAPE = '''key_spaces:
 - inner:
@@ -40,11 +41,13 @@ class Evidence(ScalarEvidence):
             self.pins.append(pin)
             build = self.builds[label]
             build.update(source_tree_sha256=source, source_archive_sha256='4' * 64,
-                         local_binary_sha256=profile.BASELINE_BINARY_SHA256 if label == 'baseline' else profile.CURRENT_BINARY_SHA256)
+                         local_binary_sha256=profile.BASELINE_BINARY_SHA256 if label == 'baseline' else profile.CURRENT_BINARY_SHA256,
+                         features='experimental-fabric,test-utils')
             build['command'] = ['cargo', '+1.90.0', 'build', '--release', '--locked', '--manifest-path',
                                 self.base + f'/build-source/{label}/Cargo.toml', '-p', 'tidehunter',
-                                '--features', 'experimental-fabric,test-utils', '--example', 'sharded_wal_bench']
-            manifest = dict(source_sha256=files, source_tree_sha256=source, binary_sha256=build['local_binary_sha256'])
+                                '--features', build['features'], '--example', 'sharded_wal_bench']
+            manifest = dict(source_sha256=files, source_tree_sha256=source, binary_sha256=build['local_binary_sha256'],
+                            features=build['features'])
             if label == 'current':
                 manifest.update(floor_binary_sha256=profile.CURRENT_FLOOR_BINARY_SHA256,
                                 recovery_binary_sha256=profile.CURRENT_RECOVERY_BINARY_SHA256)
@@ -75,7 +78,8 @@ class Evidence(ScalarEvidence):
         launch = dict(node=dict(partition={'partition': partition}, shape_yaml=SHAPE,
                                read_workers=spec['workers'], wal_member_read=spec['member'],
                                read_cache_bytes=spec['shard_cache'], read_memory_allowance_bytes=spec['shard_allowance']),
-                      tls={'transport': spec['transport']}, limits={})
+                      tls={'transport': (transport_for_case(spec['transport']) if spec['build'] == 'current'
+                                         else spec['transport'])}, limits={})
         if spec['build'] == 'current':
             launch['node']['read_resident_first'] = spec['resident_first']
             launch['limits']['polling'] = spec['polling']
@@ -88,12 +92,17 @@ class Evidence(ScalarEvidence):
         case = spec['case_id']
         path = self.root / (case + '-prepare.command.json')
         receipt = audit.read_json(path)
-        receipt['command'] = [self.binary(spec['build']), '--prepare-external-case', self.base + '/cases/' + case,
-                              '--guest-case-root', self.base + '/cases/' + case, '--remote-endpoints', self.endpoints]
-        receipt['command'] += profile.flags(spec, 'tcp', prepare=True)
+        case_root = self.base + '/cases/' + case
+        receipt['command'] = [self.binary(spec['build']), '--prepare-external-case', case_root,
+                              '--guest-case-root', case_root, '--remote-endpoints', self.endpoints]
+        transport_config = self.base + '/cases/requested-configs/' + case + '/transport.json' if spec['build'] == 'current' else None
+        receipt['command'] += profile.flags(spec, 'tcp', prepare=True, transport_config=transport_config)
+        if spec['build'] == 'current':
+            receipt['command'] += ['--owner-transports', self.base + '/cases/requested-configs/' + case + '/owner-transports.json']
         save(path, receipt)
         remote = dict(read_lanes=spec['lanes'], read_cache_bytes=spec['cache'], read_memory_allowance_bytes=spec['read_allowance'],
-                      tls={'transport': spec['transport']}, storage={'partitions': list(range(5))},
+                      tls={'transport': (transport_for_case(spec['transport']) if spec['build'] == 'current'
+                                         else spec['transport'])}, storage={'partitions': list(range(5))},
                       endpoints=[dict(partition=n['partition'], address=n['private_ip'] + ':7700') for n in self.cfg['nodes']])
         (self.root / (case + '-remote.yaml')).write_text(json.dumps(remote))
         if spec['build'] == 'current':
@@ -107,7 +116,8 @@ class Evidence(ScalarEvidence):
         floor_files(path, spec)
         command = [self.base + '/cloud-bin/current/sharded_wal_transport_bench', '--output',
                    self.base + '/results/' + name, '--remote-config', self.base + '/cases/' + spec['case_id'] + '/remote.yaml']
-        command += profile.floor_flags(spec)
+        command += profile.floor_flags(
+            spec, self.base + '/cases/requested-configs/' + spec['case_id'] + '/transport.json')
         self.process(name, spec, command)
         process = audit.read_json(self.root / (name + '-process.command.json'))
         save(self.root / (name + '-process.command.json'), process | {'binary_sha256': self.builds['current']['floor_binary_sha256']})
@@ -163,7 +173,8 @@ class Evidence(ScalarEvidence):
 
 def floor_files(path, spec):
     (path / 'COMPLETE').write_text('verified\n')
-    metadata = dict(transport=spec['transport'], polling=spec['polling'].title(), instrumented=str(spec['profile']).lower(),
+    label = profile.metadata_transport_label(spec['transport']) if spec.get('build', 'current') == 'current' else spec['transport']
+    metadata = dict(transport=label, polling=spec['polling'].title(), instrumented=str(spec['profile']).lower(),
                     topology='external_nodes', shards=5, timed_scope='authenticated_exchange_decode_and_full_payload_validation',
                     wall_scope='measured_requests_and_offered_idle_including_scheduler_delay',
                     wal_io='checked_zero_member_reads', physical_network_latency='not_isolated', external_cleanup='operator_owned', argv='[]')
@@ -176,7 +187,7 @@ def floor_files(path, spec):
             n = spec['samples']
             samples.extend(dict(value_bytes=value, repetition=rep, sample=i, partition_index=i % 5, api_ns=100 + i) for i in range(n))
             wall = sum(100 + i for i in range(n)) + n * spec['idle_us'] * 1000 + 1000
-            summary.append(dict(transport=spec['transport'], polling=spec['polling'].title(), instrumented=str(spec['profile']).lower(),
+            summary.append(dict(transport=label, polling=spec['polling'].title(), instrumented=str(spec['profile']).lower(),
                                 shards=5, value_bytes=value, repetition=rep, idle_us=spec['idle_us'], samples=n, wall_ns=wall,
                                 p50_ns=100 + (n * 50 + 99) // 100 - 1, p95_ns=100 + (n * 95 + 99) // 100 - 1,
                                 p99_ns=100 + (n * 99 + 99) // 100 - 1, max_ns=99 + n, phase_ops_per_sec=n * 1e9 / wall))
@@ -194,6 +205,14 @@ def floor_files(path, spec):
 
 
 class ProfileAvailabilityMetadataTests(unittest.TestCase):
+    def test_unavailable_authority_cache_stays_missing_not_zero(self):
+        raw = dict(authority=None, wal_reads=3)
+        self.assertEqual(profile.flatten_counters(raw), dict(wal_reads=3))
+        self.assertIsNone(raw['authority'])
+        for invalid in (0, True, [], 'unavailable'):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                profile.flatten_counters(dict(authority=invalid, wal_reads=3))
+
     def test_known_boolean_metadata_is_validated_without_becoming_numeric_work(self):
         for prefix in ('', 'client.'):
             for available, not_applicable in ((False, False), (True, False), (False, True), (True, True)):
@@ -442,6 +461,9 @@ class CloudEvidenceTests(unittest.TestCase):
             original = metadata.read_text()
             metadata.write_text(original.replace(
                 'trusted_native_exchange_decode', 'authenticated_exchange_decode'))
+            with self.assertRaises(ValueError):
+                profile.read_floor_metrics(directory, spec)
+            metadata.write_text(original.replace('transport=ofi-efa-direct-trusted', 'transport=ofi-efa-direct-mutual-tls'))
             with self.assertRaises(ValueError):
                 profile.read_floor_metrics(directory, spec)
             metadata.write_text(original)

@@ -29,6 +29,7 @@ import sys
 import tarfile
 import tempfile
 import time
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from guest import (Campaign, SDK_CONFIG, download, evidence, remaining, sha,
                    upload, upload_final, write_json)
@@ -39,6 +40,7 @@ from checkpoint_matrix import (matrix_plan, check_cell, validate_provider, efa_s
                                HARDWARE_TRANSPORTS, DIRECT_TRANSPORTS, fabric_name, cell_resident_reads)
 from checkpoint_kv import run_suite as run_kv_suite, validate_options as validate_kv_options
 from resident_config import resident_read_config
+from portable_transport import transport_for_case, validate_transport, protocol_key, select_transports, write_transport_config
 
 # SendCommand has no idempotency token. An ambiguous HTTP acknowledgement must
 # never be replayed by botocore; exact-unit cleanup and TTL own that uncertainty.
@@ -135,7 +137,10 @@ def safe_extract(archive, destination, *, symlinks=False, max_bytes=32 << 30):
             raise ValueError('resolved source symlink escapes archive')
 
 
-RUNNER_SHARED_SOURCES = {'resident_config.py': 'experiments/resident_config.py'}
+RUNNER_SHARED_SOURCES = {
+    'resident_config.py': 'experiments/resident_config.py',
+    'portable_transport.py': 'experiments/portable_transport.py',
+}
 
 
 def runner_helper_origins(source_records):
@@ -168,6 +173,11 @@ def validate_runner_helpers(directory, source_records):
         raise ValueError('installed runner helper directory must be ordinary')
     origins = runner_helper_origins(source_records)
     installed = {path.name: path for path in directory.glob('*.py')}
+    for name in RUNNER_SHARED_SOURCES:
+        if name not in installed:
+            source = directory.parent / name
+            if source.is_file() and not source.is_symlink():
+                installed[name] = source
     if installed.keys() != origins.keys():
         missing = sorted(origins.keys() - installed.keys())
         unknown = sorted(installed.keys() - origins.keys())
@@ -225,15 +235,32 @@ def validate_prepared_cell(cfg, cell, prepared, external):
     if cell.get('resident_reads') != (resident if resident['destination_slots'] else None):
         raise ValueError('prepared cell resident-read metadata differs from canonical matrix policy')
     resident_read_config(cell.get('resident_reads'))
+    if external.get('schema') != 2:
+        raise ValueError('prepared external manifest schema differs from structured transports')
+    expected = transport_for_case(cell['transport'])
+    client = validate_transport(external.get('transport'))
+    owners = select_transports(client, external.get('owner_transports'), 5)
+    if protocol_key(client) != protocol_key(expected):
+        raise ValueError('prepared client transport differs from matrix case protocol')
+    host_records = external.get('hosts')
+    if (not isinstance(host_records, list) or len(host_records) != 5
+            or any(not isinstance(row, dict) for row in host_records)
+            or any(type(row.get('partition')) is not int for row in host_records)
+            or {row['partition'] for row in host_records} != set(range(5))
+            or any(not isinstance(row.get('host'), str) for row in host_records)
+            or len({row['host'] for row in host_records}) != 5
+            or any(validate_transport(row.get('transport')) != owners[row['partition']]
+                   for row in host_records)):
+        raise ValueError('prepared host data-NIC transports differ from explicit owner vector')
     if not prepared['databases'] or any(
-            database['tls']['transport'] != cell['transport']
+            validate_transport(database['tls']['transport']) != client
             or database.get('write_profile_limit', 0) != cell['write_profile_limit']
             or resident_read_config(database['tls'].get('resident_reads')) != resident
             for database in prepared['databases'].values()):
         raise ValueError('prepared transport/profiling/resident reads differs from matrix cell; no fallback')
-    if (external.get('transport') != cell['transport']
+    if (external.get('transport') != client or external.get('owner_transports') != owners
             or resident_read_config(external.get('resident_reads')) != resident):
-        raise ValueError('prepared manifest resident-read policy differs from matrix cell; no fallback')
+        raise ValueError('prepared manifest transport/resident-read policy differs from matrix cell; no fallback')
 
 
 def scoped_path(root, path):
@@ -749,12 +776,13 @@ class SuiCampaign(Campaign):
         self.fixture = inputs / 'fixture_bundle/fixture'
         self.verification = inputs / 'verification_bundle/verification'
         manifest = read_json(self.build / 'build-manifest.json')
+        plan = read_json(self.build / 'plan.json')
         if sha(self.build / 'build-manifest.json') != self.cfg['build_manifest_sha256']:
             raise ValueError('build manifest differs from MCP immutable plan')
         for name, key in [('sources.tar.gz', 'source_archive_sha256'), ('source-manifest.json', 'source_manifest_sha256')]:
             if sha(self.build / name) != self.cfg[key] or manifest[key] != self.cfg[key]:
                 raise ValueError('source archive/manifest binding differs')
-        if manifest['protocol'] != 9 or manifest['binaries'] != self.cfg['binaries']:
+        if manifest['protocol'] != plan['protocol'] or manifest['binaries'] != self.cfg['binaries']:
             raise ValueError('wrong wire protocol or executable inventory')
         if any(transport in HARDWARE_TRANSPORTS for transport in self.cfg['transports']) and not manifest.get('fabric'):
             raise ValueError('transport requires fabric-enabled frozen binaries')
@@ -844,7 +872,8 @@ class SuiCampaign(Campaign):
             raise ValueError('local successful replay used another executable or chain')
         if 'loopback' not in result['topology'] or result.get('external_manifest'):
             raise ValueError('a cloud replay cannot satisfy the prerequisite local replay')
-        if 'efa-native' in self.cfg['transports'] and result.get('local_transport') != 'fabric-tcp-native':
+        if ('efa-native' in self.cfg['transports']
+                and validate_transport(result.get('local_transport')) != transport_for_case('fabric-tcp-native')):
             raise ValueError('trusted EFA requires same-build native software-fabric local proof')
         if audit != result['audit'] or audit.get('all_equal') is not True or not audit.get('databases') or not audit.get('rocksdb'):
             raise ValueError('local full-state audit is incomplete')
@@ -883,10 +912,16 @@ class SuiCampaign(Campaign):
         suffix = Path(config['db-path']).relative_to('distributed')
         db_root = self.replay_root / 'remote' / suffix
         self.deployment = self.cell_root / 'deployment'
+        client_transport = transport_for_case(self.cell['transport'])
+        owner_transports = select_transports(client_transport, None, len(self.nodes))
+        transport_path = self.cell_root / 'transport-config.json'
+        owner_path = self.cell_root / 'owner-transports.json'
+        write_transport_config(transport_path, client_transport)
+        write_json(owner_path, owner_transports)
         command = [sys.executable, self.scripts / 'prepare_external.py', '--schema', self.verification / 'experiment/native-schema',
             '--build', self.build, '--output', self.deployment, '--db-root', db_root,
             '--guest-root', self.cell_root / 'storage', '--hosts', ','.join(n['private_ip'] for n in self.nodes),
-            '--transport', self.cell['transport'], '--port', str(self.cfg.get('port', 24000)),
+            '--transport-config', transport_path, '--owner-transports', owner_path, '--port', str(self.cfg.get('port', 24000)),
             '--write-profile-limit', str(self.cell['write_profile_limit']),
             '--coordinator-cache-mib', str(self.cell['coordinator_cache_mib']), '--shard-cache-mib', str(self.cell['shard_cache_mib'])]
         resident = cell_resident_reads(self.cfg, self.cell['transport'], self.cell)
@@ -915,8 +950,9 @@ class SuiCampaign(Campaign):
         _validate_runner_source(self.scripts / 'cloud_node.py',
                                 'experiments/sui-checkpoint/cloud_node.py', source_records)
         for host, node in zip(self.external['hosts'], self.nodes):
-            if host['partition'] != node['partition'] or host['host'] != node['private_ip']:
-                raise ValueError('host deployment inventory differs')
+            if (host['partition'] != node['partition'] or host['host'] != node['private_ip']
+                    or validate_transport(host.get('transport')) != self.external['owner_transports'][node['partition']]):
+                raise ValueError('control host/data transport deployment inventory differs')
             original = Path(host['archive'])
             if sha(original) != host['archive_sha256']:
                 raise ValueError('host payload digest differs')
@@ -925,7 +961,9 @@ class SuiCampaign(Campaign):
             shutil.copy2(self.scripts / 'cloud_node.py', payload / 'cloud_node.py')
             assemble_runner(self.support.parents[1], payload / 'runner', source_records)
             cloud = {key: host[key] for key in ('commands', 'ready_files', 'stop_files')}
-            cloud.update(run_id=self.cfg['run_id'], cell_id=self.cell['cell_id'], transport=self.cell['transport'], deadline_utc=self.deadline,
+            cloud.update(run_id=self.cfg['run_id'], cell_id=self.cell['cell_id'], transport=self.cell['transport'],
+                client_transport=self.external['transport'], owner_transport=self.external['owner_transports'][node['partition']],
+                deadline_utc=self.deadline,
                 storage_binary_sha256=self.cfg['binaries']['storage-node'], build_manifest_sha256=self.cfg['build_manifest_sha256'],
                 config_sha256=self.external['config_sha256'], checkpoint_digest=CHECKPOINT,
                 root=str(self.cell_root / 'storage'), resource_path=str(self.cell_root / 'storage/resources.json'),

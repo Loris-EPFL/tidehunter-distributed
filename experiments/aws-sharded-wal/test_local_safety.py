@@ -224,10 +224,11 @@ class SafetyTests(unittest.TestCase):
                     if '--prepare-external-case' in command:
                         self.assertEqual(Path(command[0]).name, 'sharded_wal_bench')
                         self.assertEqual(expected_binary_sha256, 'main-hash')
-                        self.assertEqual(command[command.index('--transport') + 1], 'efa')
+                        config = Path(command[command.index('--transport-config') + 1])
+                        self.assertEqual(json.loads(config.read_text())['fabric']['backend'], 'efa')
                         self.assertEqual(command[command.index('--tcp-polling') + 1], 'busy')
                         root = Path(command[command.index('--prepare-external-case') + 1])
-                        names = ['remote.yaml', 'tls/ca.der']
+                        names = ['remote.yaml', 'owner_transports.json', 'tls/ca.der']
                         if defect != 'missing-shape':
                             names.append('shape.yaml')
                         for p in range(5):
@@ -236,11 +237,16 @@ class SafetyTests(unittest.TestCase):
                         for name in names:
                             path = root / name
                             path.parent.mkdir(parents=True, exist_ok=True)
-                            path.write_text('prepared fixture\n')
+                            if name == 'owner_transports.json':
+                                requested = Path(command[command.index('--owner-transports') + 1])
+                                path.write_text(requested.read_text())
+                            else:
+                                path.write_text('prepared fixture\n')
                     else:
                         self.assertEqual(Path(command[0]).name, 'sharded_wal_transport_bench')
                         self.assertEqual(expected_binary_sha256, 'floor-hash')
-                        self.assertEqual(command[command.index('--transport') + 1], 'efa')
+                        config = Path(command[command.index('--transport-config') + 1])
+                        self.assertEqual(json.loads(config.read_text())['fabric']['backend'], 'efa')
                         self.assertEqual(command[command.index('--polling') + 1], 'busy')
                         self.assertNotIn('--backend', command)
                         remote = Path(command[command.index('--remote-config') + 1])
@@ -532,14 +538,18 @@ class SafetyTests(unittest.TestCase):
             elif '--help' in command:
                 text = '--remote-config'
                 if 'current' in Path(command[0]).parts and not missing_capability:
-                    text += ' --prepare-external-case --tcp-preparation-chunk-batches --cold-read-pass --transport-diagnostics'
+                    text += ' --prepare-external-case --tcp-preparation-chunk-batches --cold-read-pass --transport-diagnostics --transport-config --owner-transports'
                 output.with_suffix('.stdout.log').write_text(text)
             elif '--prepare-external-case' in command:
                 root = Path(command[command.index('--prepare-external-case') + 1])
-                for name in ['remote.yaml'] + [f'node-{p}/launch.yaml' for p in range(5)]:
+                for name in ['remote.yaml', 'owner_transports.json'] + [f'node-{p}/launch.yaml' for p in range(5)]:
                     file = root / name
                     file.parent.mkdir(parents=True, exist_ok=True)
-                    file.write_text('prepared: true\n')
+                    if name == 'owner_transports.json':
+                        requested = Path(command[command.index('--owner-transports') + 1])
+                        file.write_text(requested.read_text())
+                    else:
+                        file.write_text('prepared: true\n')
             else:
                 self.fail('unexpected build-gate subprocess')
         return run
@@ -556,7 +566,7 @@ class SafetyTests(unittest.TestCase):
             self.assertEqual(upload.call_count, 2)
             self.assertEqual(campaign.install_cloud_binary.call_count, 2)
             proof = json.loads((campaign.results / 'cloud-build-pair-verified.json').read_text())
-            self.assertEqual(len(proof['prepared_configuration_sha256']), 6)
+            self.assertEqual(len(proof['prepared_configuration_sha256']), 7)
             self.assertTrue(proof['distinct_binaries'])
 
     def test_scalar_recovery_uses_each_manifest_bound_example_not_overlay(self):
@@ -612,7 +622,8 @@ class SafetyTests(unittest.TestCase):
                 target = Path(env['CARGO_TARGET_DIR'])
                 example = command[command.index('--example') + 1]
                 self.assertEqual(target, campaign.root / 'build-target' / Path(cwd).name)
-                self.assertEqual(command[command.index('--features') + 1], 'experimental-fabric,test-utils')
+                self.assertEqual(command[command.index('--features') + 1],
+                                 'experimental-fabric,test-utils')
                 if example != 'sharded_wal_bench':
                     source = Path(cwd) / 'tidehunter/examples' / (example + '.rs')
                     self.assertEqual(source.read_text(), Path(cwd).name + (
@@ -735,11 +746,12 @@ class SafetyTests(unittest.TestCase):
                     self.assertEqual(guest.sha(command[0]), expected_binary_sha256)
                     if '--help' in command:
                         if Path(command[0]).name == 'sharded_wal_transport_bench':
-                            flags = ('--output --remote-config --transport --polling --values '
+                            flags = ('--output --remote-config --transport --transport-config --polling --values '
                                      '--samples --repetitions --idle-us --profile').split()
                         else:
                             flags = ('--remote-config --prepare-external-case --tcp-preparation-chunk-batches '
-                                     '--transport --native-read-workers --read-resource-evidence --read-window '
+                                     '--transport --transport-config --owner-transports '
+                                     '--native-read-workers --read-resource-evidence --read-window '
                                      '--native-read-cache-bytes --tcp-read-lanes --tcp-server-read-workers '
                                      '--tcp-wal-member-read --cold-read-pass --hot-read-pass --tcp-shard-cache-bytes '
                                      '--read-memory-allowance-bytes --shard-read-memory-allowance-bytes '
@@ -749,11 +761,15 @@ class SafetyTests(unittest.TestCase):
                         Path(output).with_suffix('.stdout.log').write_text(' '.join(f for f in flags if f != missing))
                     else:
                         root = Path(command[command.index('--prepare-external-case') + 1])
-                        for name in ['remote.yaml', 'shape.yaml'] + [f'node-{p}/launch.yaml' for p in range(5)]:
+                        for name in ['remote.yaml', 'owner_transports.json', 'shape.yaml'] + [f'node-{p}/launch.yaml' for p in range(5)]:
                             if name != missing:
                                 path = root / name
                                 path.parent.mkdir(parents=True, exist_ok=True)
-                                path.write_text('prepared\n')
+                                if name == 'owner_transports.json':
+                                    requested = Path(command[command.index('--owner-transports') + 1])
+                                    path.write_text(requested.read_text())
+                                else:
+                                    path.write_text('prepared\n')
 
                 with patch.object(guest, 'run_recorded', side_effect=run):
                     if missing:
@@ -1085,12 +1101,31 @@ class ProgressCampaignTests(unittest.TestCase):
                      '--batches': 64, '--mixed': 16, '--reads': 256, '--repetitions': 1}
             prepare = shape | {'--prepare-external-case': case_root, '--guest-case-root': case_root,
                 '--remote-endpoints': ','.join(n['private_ip'] + ':7700' for n in cfg['nodes']),
-                '--tcp-read-cache-bytes': 0, '--transport': 'efa', '--tcp-read-lanes': spec['lanes'],
-                '--tcp-server-read-workers': 1, '--tcp-wal-member-read': 'mapped'}
+                '--tcp-read-cache-bytes': 0, '--transport-config': case_root.replace('/cases/', '/cases/requested-configs/') + '/transport.json',
+                '--owner-transports': case_root.replace('/cases/', '/cases/requested-configs/') + '/owner-transports.json',
+                '--tcp-read-lanes': spec['lanes'], '--tcp-server-read-workers': 1,
+                '--tcp-wal-member-read': 'mapped'}
             def command(opts):
                 return [binary] + [str(item) for pair in opts.items() for item in pair]
             save(root / (case + '-prepare.command.json'), {'exit_code': 0, 'command': command(prepare)})
-            (root / (case + '-remote.yaml')).write_text(f'read_lanes: {spec["lanes"]}\nread_cache_bytes: 0\n')
+            transport = guest.transport_for_case(spec['transport'])
+            owners = guest.select_transports(transport, None, len(cfg['nodes']))
+            save(root / (case + '-transport-config.json'), transport)
+            save(root / (case + '-owner-transports-requested.json'), owners)
+            save(root / (case + '-owner-transports.json'), owners)
+            (root / (case + '-remote.yaml')).write_text(
+                f'read_lanes: {spec["lanes"]}\nread_cache_bytes: 0\n'
+                + 'tls:\n  transport: ' + json.dumps(transport) + '\n')
+            launch_hashes = {}
+            for node, owner in zip(cfg['nodes'], owners):
+                path = root / (case + f"-node-{node['partition']}-launch.yaml")
+                path.write_text('tls:\n  transport: ' + json.dumps(owner) + '\n')
+                launch_hashes[str(node['partition'])] = guest.sha(path)
+            save(root / (case + '-prepared-transports.json'), dict(schema=1,
+                requested_transport_sha256=guest.sha(root / (case + '-transport-config.json')),
+                requested_owner_transports_sha256=guest.sha(root / (case + '-owner-transports-requested.json')),
+                owner_transports_sha256=guest.sha(root / (case + '-owner-transports.json')),
+                launch_sha256=launch_hashes))
             node_root = root / 'nodes' / case
             node_root.mkdir(parents=True)
             for node in cfg['nodes']:
@@ -1115,13 +1150,15 @@ class ProgressCampaignTests(unittest.TestCase):
                 path = root / name
                 path.mkdir()
                 (path / 'COMPLETE').write_text('verified\n')
-                opts = shape | {'--backend': mode, '--output': cfg['run_root'] + '/results/' + name,
+                opts = shape | {'--backend': 'tcp' if mode == 'tcp' else mode,
+                    '--output': cfg['run_root'] + '/results/' + name,
                     '--cold-read-pass': 'true', '--read-window': 32, '--read-resource-evidence': 'true'}
                 if mode == 'native-sync':
                     opts.update({'--native-read-cache-bytes': 0, '--native-read-workers': 32})
                 else:
                     opts.update({'--remote-config': case_root + '/remote.yaml', '--tcp-read-cache-bytes': 0,
-                                 '--transport': 'efa', '--tcp-preparation-chunk-batches': 16})
+                                 '--transport-config': case_root.replace('/cases/', '/cases/requested-configs/') + '/transport.json',
+                                 '--tcp-preparation-chunk-batches': 16})
                 save(root / (name + '-process.command.json'), {'exit_code': 0, 'command': command(opts),
                                                               'pid': 42, 'peak_sampled_main_process_rss_kib': 100})
                 for stage in ('before', 'after'):

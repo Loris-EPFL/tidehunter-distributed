@@ -8,6 +8,48 @@ RocksDB. Every selected Tidehunter DB must export the same namespace/key shape
 and use the remote backend in the distributed run; a missing mapping or a native
 fallback fails the run.
 
+## Portable transport selection
+
+The Sui replay's shared WAL/index and read-grant protocol is transport
+independent. TCP remains the default; opt-in OFI uses the same bounded engine
+transport and does not change storage locks, WAL acknowledgement, or
+durability. Configure a structured transport on each applicable endpoint:
+
+```json
+{"kind":"ofi","fabric":{"backend":"verbs","domain":"mlx5_0","source_address":"10.1.0.2"},"security":"trusted"}
+```
+
+The available provider profiles are `efa`, `efa-direct`, `verbs`, and
+`software-tcp`. Domain/source selectors are host-local and may differ between
+peers, which must agree on backend and security. Source-IP support depends on
+the provider: EFA/EFA-direct reject source IPs, verbs accepts IPv4 only because
+pinned RxM lists `FI_SOCKADDR`/`FI_SOCKADDR_IN` (despite core verbs IPv6
+support), and software-tcp accepts IPv4/IPv6 when `fi_getinfo` selects a match.
+No source selector means provider-default selection. Metadata reports a
+selected IPv4/IPv6 source only when parseable; explicit selection is checked
+against the returned address. Generic verbs supports provider-selected
+IB/RoCE/Falcon devices; these are not wire-interchangeable, and EFA SRD is
+separate. Explicit selection fails closed and does not downgrade to TCP.
+
+Resident FI_READ is a separate explicit choice. Setting
+`require_device_read: true` requires native reads plus provider-specific
+device evidence. For verbs this includes PCI metadata matched to canonical
+sysfs PCI BDF and rejects `rxe`, `rdma_rxe`, and `siw`; it does not establish
+Falcon identity. Successful setup alone is not proof. Software-provider FI_READ
+tests demonstrate software-path correctness only, not EFA/IB/RoCE/Falcon
+hardware operation or performance.
+Hardware qualification remains pending until actual device evidence and
+parent-reviewed measurements are available. See the [fabric design](../../tidehunter-fabric/DESIGN.md#portable-transport-boundary-27-october-2026)
+for implementation symbols and primary OFI, Falcon, and native-paper sources.
+
+This structured-transport cutover uses wire protocol 11. The build plan records
+it; external deployment and replay results copy the frozen build manifest's
+protocol rather than inventing a new value. Rebuild all participants and
+regenerate configurations together. Old string-transport deployments cannot
+mix with these endpoints. Local transport checks and their hardware limits are
+recorded in the [27 October qualification](../../tidehunter-fabric/DESIGN.md#local-qualification-27-october-2026);
+no fresh full Sui replay is claimed by that check.
+
 ## 23 October local resident-read and comparison controls
 
 The active KV planner now preserves **both** 8-KiB/batch32 working sets:
@@ -54,18 +96,32 @@ coordinator caching disabled. `cache_hot_before_scan` is hit-only only when its
 actual owner/frontend counter deltas prove it; enlarged uniform reads are not
 assumed resident or cache hits.
 
-Local software-fabric controls can opt in to bounded registered reads with
-`--backend tcp --transport fabric-tcp-native --tcp-read-cache-bytes 0`
-and explicit `--rma-source-bytes`, `--rma-source-regions`,
-`--rma-destination-bytes`, `--rma-destination-slots`, `--rma-max-read-bytes`,
-`--rma-max-handles`, `--rma-require-device-read false`. All-zero defaults
-disable RMA. These limits are charged beside the explicit application caches
-and in-flight allowances. Configure both owners and client before launch;
+Local software-provider controls use canonical transport selection, for
+example `{"kind":"ofi","fabric":{"backend":"software-tcp"},"security":"trusted"}`.
+Registered reads remain explicitly bounded by `resident_reads` and disabled
+with all-zero limits. Configure both owners and client before launch;
 existing external configurations reject CLI server-control overrides.
 `resident_reads.jsonl` retains actual grant acquisition, posts, successful CQ
 completions, verified hits, errors/fallback reasons and occupancy snapshots
 at each read boundary, with coordinator-local/per-owner-connection scope.
 It does not claim to sample remote source occupancy.
+
+For raw FI_READ measurement, provide a `FabricConfig` JSON and explicit device
+read policy:
+
+```sh
+sharded_wal_transport_bench --rma-probe --role server --listen 127.0.0.1:PORT --fabric-config fabric.json --require-device-read false
+sharded_wal_transport_bench --rma-probe --role client --connect 127.0.0.1:PORT --fabric-config fabric.json --require-device-read false
+```
+
+The probe requires both `--fabric-config` and `--require-device-read`; set the
+latter to `true` to require proven native device reads, not merely request
+them. Output includes observed provider setup metadata and capability evidence.
+A successful software-provider FI_READ comparison qualifies software
+correctness only. Configure the same provider/security on both peers, with
+host-specific `domain` and `source_address` selectors as needed. Hardware
+qualification remains pending until parent-reviewed results from actual
+devices.
 
 For an explicit trusted-native resident experiment, `kv_suite.resident_reads`
 accepts the complete limits object, without adding cases to either matrix:
@@ -82,13 +138,11 @@ accepts the complete limits object, without adding cases to either matrix:
 }
 ```
 
-This opt-in applies only to explicitly trusted-native cases. In the usual
-TCP/EFA/EFA-direct/EFA-native matrix, TCP and TLS cases remain RPC controls;
-only EFA-native warm cases receive the distinct RMA-bound identity.
-Prepared owner and client YAML carry the exact limits,
-the case name binds their digest, and cold
-cases deliberately omit them. Hardware qualification must request
-`require_device_read: true` and retain the existing provider/hardware evidence;
+This opt-in applies only to explicitly trusted-native cases. Existing
+historical TCP/EFA/EFA-direct/EFA-native matrix identities remain unchanged.
+Prepared owner and client YAML carry the exact limits, the case name binds
+their digest, and cold cases deliberately omit them. Hardware qualification
+must set `require_device_read: true` and retain actual provider/device evidence;
 software-provider success is not hardware proof.
 
 After the integrated source-bound build, run these paired loopback controls
@@ -176,11 +230,22 @@ table bytes. Each owner retains its before/after observations; absent older
 fields or unavailable samples remain null. Authority-history loads can be
 served by page cache and never establish physical NVMe I/O.
 
-The same rebuilt real-Sui fixture/replay pipeline remains the qualification
-gate: use its existing `--local-transport fabric-tcp-native` mode and complete
-namespace/value audit before any cloud allocation. No AWS operation is needed
-to inspect these commands or qualify source binding. Loopback correctness is
-not EFA hardware latency.
+For a local replay select the canonical engine transport with `--transport-config JSON_FILE`.
+TCP is the default. Local hardware OFI is rejected; local runs permit TCP or
+the software provider for correctness testing only. The transport configuration
+must be present in a fabric-enabled build. Use external deployment configuration
+for hardware providers; software-fabric results are not EFA or verbs hardware
+latency.
+
+Standalone `sharded_wal_bench` uses the same structured `Transport` file:
+
+```sh
+sharded_wal_bench --backend tcp --transport-config transport.json
+```
+
+Example benchmarks and `kv-research` have different selection surfaces:
+`kv-research` uses backend kind `tidehunter` and the
+`backend.options.transport` object in its run JSON.
 
 Sui summaries additionally retain `shard_read_by_owner`, parsed from
 `tidehunter_shard_read{namespace,partition,stat}`. Missing families on older

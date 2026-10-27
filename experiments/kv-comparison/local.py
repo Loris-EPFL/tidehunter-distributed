@@ -23,6 +23,7 @@ IMAGES = {
     "tikv": "pingcap/tikv:v8.5.4@sha256:12f547570dd2bfe56f20fd349c6b80335520a2ff7b0fd82c98071a507a9d202c",
     "cassandra": "library/cassandra:5.0.9@sha256:3ea9333712c5692f3fe91d6c4dcc262df9e36338c4fdd1bc00a5e53f1137a1a0",
     "foundationdb": "foundationdb/foundationdb:7.3.77@sha256:559b178a137bbe09272ad6e3752531aa04e2ddacab8ccfa4ffa86467db033bea",
+    "valkey_tcp": "valkey/valkey:9.0.7@sha256:7e1deda01b64ece3167d370ab5be3452d29734feec22cbcbc69b3a64f6859d6d",
 }
 # TiKV 8.5.4 rejects the hosted runner's inherited 65,536-descriptor limit.
 TIKV_NOFILE = 1_048_576
@@ -39,6 +40,8 @@ def dump(path, value):
 def command(args, timeout=30, check=True):
     result = subprocess.run([str(x) for x in args], capture_output=True, text=True,
                             timeout=timeout, cwd=ROOT)
+    if len(result.stdout) + len(result.stderr) > 32 * 1024 * 1024:
+        raise RuntimeError("command output exceeded evidence bound")
     if check and result.returncode:
         raise RuntimeError(f"command failed ({result.returncode}): {args}\n{result.stderr[-8000:]}\n{result.stdout[-8000:]}")
     return result.stdout if check else result.stdout + result.stderr
@@ -56,14 +59,176 @@ def load(directory):
         raise ValueError("state owner/path mismatch; refusing lifecycle action")
     if state["project"] != "kv-" + state["owner"][:16] or state["compose_file"] != str(directory / "compose.json"):
         raise ValueError("state project/compose identity mismatch; refusing action")
-    if state["backend"] not in ("tikv", "cassandra", "foundationdb") or state["layout"] not in ("distributed", "qualification"):
+    if state["backend"] not in ("tikv", "cassandra", "foundationdb", "valkey_tcp") or state["layout"] not in ("distributed", "qualification"):
         raise ValueError("unsupported saved deployment contract")
     return state
 
 
+def valkey_server_args(address, port, bus_port, cluster, maxmemory_mib):
+    # Keep Valkey's snapshot/rewrite maintenance defaults; never substitute a cache.
+    args = ["valkey-server", "--bind", address, "--port", str(port), "--protected-mode", "no",
+            "--dir", "/data", "--appendonly", "yes", "--appendfsync", "always",
+            "--no-appendfsync-on-rewrite", "no", "--maxmemory-policy", "noeviction",
+            "--maxmemory", str(maxmemory_mib * 1024**2)]
+    if cluster:
+        args += ["--cluster-enabled", "yes", "--cluster-config-file", "/data/nodes.conf",
+                 "--cluster-node-timeout", "5000", "--cluster-announce-ip", address,
+                 "--cluster-announce-port", str(port), "--cluster-port", str(bus_port),
+                 "--cluster-announce-bus-port", str(bus_port)]
+    return args
+
+
+def valkey_info(text):
+    result = {}
+    for line in text.splitlines():
+        if line and not line.startswith("#") and ":" in line:
+            name, value = line.split(":", 1)
+            if name in result:
+                raise RuntimeError("duplicate Valkey INFO field")
+            result[name] = value
+    return result
+
+
+def valkey_cli(run, endpoint, *args, json_output=False):
+    host, port = endpoint.rsplit(":", 1)
+    text = run(endpoint, "valkey-cli", "--json" if json_output else "--raw",
+               "-h", host, "-p", port, *args)
+    return json.loads(text) if json_output else text
+
+
+def valkey_evidence(run, endpoints, cluster):
+    nodes = []
+    for endpoint in endpoints:
+        settings = valkey_cli(run, endpoint, "CONFIG", "GET", "*", json_output=True)
+        if isinstance(settings, list) and len(settings) % 2 == 0:
+            settings = dict(zip(settings[::2], settings[1::2]))
+        if not isinstance(settings, dict):
+            raise RuntimeError("Valkey CONFIG GET did not return effective settings")
+        node = {"endpoint": endpoint, "effective_config": settings}
+        for section in ("server", "persistence", "replication", "cluster"):
+            text = valkey_cli(run, endpoint, "INFO", section)
+            node["info_" + section] = valkey_info(text)
+        if cluster:
+            node["cluster_info"] = valkey_info(valkey_cli(run, endpoint, "CLUSTER", "INFO"))
+            node["cluster_nodes"] = valkey_cli(run, endpoint, "CLUSTER", "NODES")
+            node["cluster_links"] = valkey_cli(run, endpoint, "CLUSTER", "LINKS", json_output=True)
+        nodes.append(node)
+    return {"nodes": nodes, "transport": "TCP", "authentication": "unauthenticated private network only",
+            "read_path": "in-memory; not an NVMe cold-read or value-WAL equivalent",
+            "image": IMAGES["valkey_tcp"]}
+
+
+def admit_valkey(nodes, endpoints, cluster, complete=True):
+    expected = set(endpoints)
+    if len(nodes) != len(expected) or len(expected) != (5 if cluster and complete else 1) or {x["endpoint"] for x in nodes} != expected:
+        raise RuntimeError("Valkey requested primary endpoint inventory mismatch")
+    views, identities = [], {}
+    for node in nodes:
+        config, server = node["effective_config"], node["info_server"]
+        persistence, replication = node["info_persistence"], node["info_replication"]
+        required = {"appendonly": "yes", "appendfsync": "always", "no-appendfsync-on-rewrite": "no",
+                    "maxmemory-policy": "noeviction", "dir": "/data", "cluster-enabled": "yes" if cluster else "no"}
+        if any(config.get(k) != v for k, v in required.items()):
+            raise RuntimeError("Valkey effective durable/no-eviction/cluster configuration mismatch")
+        for field in ("appenddirname", "appendfilename"):
+            value = config.get(field, "")
+            if not value or value in (".", "..") or "/" in value:
+                raise RuntimeError("Valkey AOF path escapes owned data bind")
+        mode = server.get("server_mode", server.get("redis_mode"))
+        if server.get("valkey_version") != "9.0.7" or mode != ("cluster" if cluster else "standalone"):
+            raise RuntimeError("Valkey observed version/mode mismatch")
+        if (persistence.get("loading") != "0" or persistence.get("aof_enabled") != "1" or
+                persistence.get("aof_last_write_status") != "ok" or persistence.get("aof_last_bgrewrite_status") != "ok"):
+            raise RuntimeError("Valkey AOF is disabled, loading or unhealthy")
+        if replication.get("role") != "master" or replication.get("connected_slaves") != "0":
+            raise RuntimeError("Valkey RF1 requires primaries with zero replicas")
+        if node["info_cluster"].get("cluster_enabled") != ("1" if cluster else "0"):
+            raise RuntimeError("Valkey INFO cluster mode mismatch")
+        if not cluster or not complete:
+            continue
+        info = node["cluster_info"]
+        required_info = {"cluster_state": "ok", "cluster_slots_assigned": "16384", "cluster_slots_ok": "16384",
+                         "cluster_slots_pfail": "0", "cluster_slots_fail": "0",
+                         "cluster_known_nodes": "5", "cluster_size": "5"}
+        if any(info.get(k) != v for k, v in required_info.items()):
+            raise RuntimeError("Valkey incomplete/unhealthy cluster slot or primary inventory")
+        owners, members, self_ids = {}, {}, []
+        for line in node["cluster_nodes"].splitlines():
+            fields = line.split()
+            if len(fields) < 8:
+                raise RuntimeError("Valkey malformed CLUSTER NODES evidence")
+            identity, advertised, flags, master, _, _, _, link, *slots = fields
+            flags = set(flags.split(","))
+            endpoint, _, bus = advertised.split(",")[0].partition("@")
+            if (not re.fullmatch(r"[a-f0-9]{40}", identity) or identity in members or endpoint not in expected or
+                    not bus.isdigit() or int(bus) != int(endpoint.rsplit(":", 1)[1]) + 10000 or
+                    flags - {"myself", "master"} or "master" not in flags or master != "-" or link != "connected"):
+                raise RuntimeError("Valkey requires exact healthy primary membership and connected cluster links")
+            members[identity] = endpoint
+            if "myself" in flags:
+                if endpoint != node["endpoint"]:
+                    raise RuntimeError("Valkey self identity advertises wrong endpoint")
+                self_ids.append(identity)
+            if not slots:
+                raise RuntimeError("Valkey requested primary owns no slots")
+            for token in slots:
+                if not re.fullmatch(r"\d+(?:-\d+)?", token):
+                    raise RuntimeError("Valkey slot migration/import or malformed ownership is not admitted")
+                bounds = token.split("-")
+                start, end = int(bounds[0]), int(bounds[-1])
+                if not 0 <= start <= end < 16384:
+                    raise RuntimeError("Valkey slot outside legal range")
+                for slot in range(start, end + 1):
+                    if slot in owners:
+                        raise RuntimeError("Valkey duplicate slot ownership")
+                    owners[slot] = identity
+        if len(members) != 5 or set(members.values()) != expected or len(self_ids) != 1 or len(owners) != 16384:
+            raise RuntimeError("Valkey incomplete unique 16384-slot primary ownership")
+        links = node["cluster_links"]
+        if not isinstance(links, list):
+            raise RuntimeError("Valkey cluster link evidence missing")
+        links = [dict(zip(link[::2], link[1::2])) if isinstance(link, list) and len(link) % 2 == 0 else link for link in links]
+        others = set(members) - set(self_ids)
+        if len(links) != 8 or any(not isinstance(link, dict) or "r" not in link.get("events", "") for link in links) or any(
+                {link.get("node") for link in links if link.get("direction") == direction} != others
+                for direction in ("to", "from")):
+            raise RuntimeError("Valkey not all requested primary cluster links are active")
+        identities[node["endpoint"]] = self_ids[0]
+        views.append((members, owners))
+    if cluster and complete and (len(set(identities.values())) != 5 or any(view != views[0] for view in views[1:])):
+        raise RuntimeError("Valkey primary views disagree about identities or slot ownership")
+    return {"required_primary_nodes": 5 if cluster else 1, "replication_factor": 1, "replica_count": 0,
+            "primary_endpoints": sorted(expected), "slot_count": (16384 if cluster else 0) if complete else None,
+            "primary_ids": identities, "durability": "AOF appendfsync always; no-appendfsync-on-rewrite no"}
+
+
+def initialize_valkey(run, endpoints, directory, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if any(valkey_cli(run, endpoint, "PING").strip() != "PONG" for endpoint in endpoints):
+                raise RuntimeError("Valkey primary PING failed")
+            infos = [valkey_info(valkey_cli(run, endpoint, "CLUSTER", "INFO")) for endpoint in endpoints]
+            break
+        except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired):
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Valkey primary startup deadline exceeded")
+            time.sleep(min(1, max(0, deadline - time.monotonic())))
+    evidence = {"observed_at_unix": time.time(), "initial_cluster_info": infos}
+    # Only create a pristine cluster. Never replay a partially completed mutation:
+    # final admission, not the create command's exit status, proves readiness.
+    if all(info.get("cluster_known_nodes") == "1" and info.get("cluster_slots_assigned") == "0" for info in infos):
+        evidence["create"] = valkey_cli(run, endpoints[0], "--cluster", "create", *endpoints,
+                                       "--cluster-replicas", "0", "--cluster-yes", "--cluster-timeout", "5000")
+    else:
+        evidence["create"] = "existing cluster membership retained; actual topology admission required"
+    dump(Path(directory) / "initialization.json", evidence)
+    return evidence
+
+
 def topology(backend, layout, directory, owner):
     """Compose limits are hard cgroup budgets, not reserved physical resources."""
-    count = 1 if layout == "qualification" else 3
+    count = 1 if layout == "qualification" else (5 if backend == "valkey_tcp" else 3)
     services, volumes = {}, {}
 
     def add(name, image, cpus, memory, args=None, **extra):
@@ -119,6 +284,10 @@ def topology(backend, layout, directory, owner):
                 "--locality-zoneid", f"local-process-{i}", "--locality-machineid", f"local-process-{i}",
                 "--locality-dcid", "local-dc", "--class", "unset"], entrypoint=["/usr/bin/fdbserver"])
             services[f"fdb{i}"]["volumes"].append(str(directory / "fdb.cluster") + ":/config/fdb.cluster")
+    elif backend == "valkey_tcp":
+        for i in range(count):
+            add(f"valkey{i}", "valkey_tcp", 2.0, "1536m",
+                valkey_server_args(f"127.0.0.{21+i}", 6379+i, 16379+i, count > 1, 1024))
     else:
         raise ValueError("unknown backend")
     return {"services": services, "volumes": volumes}, count
@@ -189,6 +358,21 @@ def probe(state):
             records.append({"status": status, "local": rows[0],
                             "effective_yaml": execute(state, f"cassandra{i}", "cat", "/etc/cassandra/cassandra.yaml")})
         return {"nodes": records, "keyspace_replication": "validated by adapter after isolated keyspace creation"}
+    if backend == "valkey_tcp":
+        endpoints = state["backend_options"]["nodes"]
+        proof = valkey_evidence(
+            lambda endpoint, *args: execute(state, f"valkey{endpoints.index(endpoint)}", *args),
+            endpoints, count > 1)
+        for item in items:
+            if (item["Config"]["Image"] != IMAGES["valkey_tcp"] or
+                    item["HostConfig"]["Memory"] != 1536 * 1024**2 or item["HostConfig"]["NanoCpus"] != 2_000_000_000):
+                raise RuntimeError("Valkey running image or CPU/memory caps differ from owned deployment")
+        proof["runtime"] = [{"id": item["Id"], "image_id": item["Image"], "state": item["State"],
+                             "memory_bytes": item["HostConfig"]["Memory"], "nano_cpus": item["HostConfig"]["NanoCpus"],
+                             "runtime_configuration_sha256": runtime_configuration_hash(item)} for item in items]
+        dump(Path(state["directory"]) / "probe-attempt.json", proof)
+        proof["coverage"] = admit_valkey(proof["nodes"], endpoints, count > 1)
+        return proof
     text = execute(state, "fdb0", "/usr/bin/fdbcli", "-C", "/config/fdb.cluster", "--timeout", "8", "--exec", "status json")
     status = json.loads(text)
     cluster = status.get("cluster", {})
@@ -240,7 +424,7 @@ def export(state, output):
     for item in items:
         name = item["Config"]["Labels"]["com.docker.compose.service"]
         (output / (name + ".log")).write_text(command(["docker", "logs", "--tail", "300", item["Id"]], check=False))
-    for name in ("owner.json", "compose.json", "deployment.json", "images.json", "pd.toml", "tikv.toml", "fdb.cluster"):
+    for name in ("owner.json", "compose.json", "deployment.json", "probe-attempt.json", "initialization.json", "images.json", "pd.toml", "tikv.toml", "fdb.cluster"):
         source = Path(state["directory"]) / name
         if source.exists() and source.resolve() != (output / name).resolve():
             shutil.copyfile(source, output / name)
@@ -279,6 +463,8 @@ def start(args):
     elif args.backend == "cassandra":
         addresses = [(f"127.0.0.{11+i}", p) for i in range(count) for p in (7000, 7001, 9042)]
         addresses += [("127.0.0.1", 7199+i) for i in range(count)]
+    elif args.backend == "valkey_tcp":
+        addresses = [(f"127.0.0.{21+i}", p) for i in range(count) for p in (6379+i, 16379+i)]
     else:
         addresses = [("127.0.0.1", 4500+i) for i in range(count)]
     for address in addresses:
@@ -293,6 +479,10 @@ def start(args):
              "compose_file": str(directory / "compose.json"), "physical_hosts": 1, "independent_disks": False,
              "placement": "all local processes share host SSD; logical zones are not failure domains",
              "created_at_unix": time.time()}
+    if args.backend == "valkey_tcp":
+        state["backend_options"] = {"nodes": [f"127.0.0.{21+i}:{6379+i}" for i in range(count)],
+                                    "cluster": count > 1, "required_replication_factor": 1,
+                                    "required_primary_nodes": count, "request_timeout_ms": 5000}
     dump(directory / "owner.json", state)
     dump(directory / "compose.json", spec)
     (directory / "pd.toml").write_text(f'[replication]\nmax-replicas = {count}\nlocation-labels = ["zone"]\n')
@@ -331,6 +521,10 @@ def start(args):
             # This command blocks on the real coordinator handshake, not an arbitrary startup sleep.
             execute(state, "fdb0", "/usr/bin/fdbcli", "-C", "/config/fdb.cluster", "--timeout", "10", "--exec",
                     "configure new " + ("single" if count == 1 else "double") + " ssd")
+        if args.backend == "valkey_tcp" and count > 1:
+            initialize_valkey(
+                lambda endpoint, *argv: execute(state, f"valkey{state['backend_options']['nodes'].index(endpoint)}", *argv),
+                state["backend_options"]["nodes"], directory, args.timeout)
         ready(state, args.timeout)
     except BaseException:
         export(state, directory / "failure")
@@ -377,7 +571,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
     launch = sub.add_parser("start")
-    launch.add_argument("--backend", required=True, choices=["tikv", "cassandra", "foundationdb"])
+    launch.add_argument("--backend", required=True, choices=["tikv", "cassandra", "foundationdb", "valkey_tcp"])
     launch.add_argument("--layout", choices=["distributed", "qualification"], default="distributed")
     launch.add_argument("--state", type=Path, required=True)
     launch.add_argument("--timeout", type=int, default=180)

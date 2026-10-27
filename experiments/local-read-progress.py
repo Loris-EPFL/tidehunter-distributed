@@ -10,6 +10,13 @@ from pathlib import Path
 import shutil
 
 
+import sys
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import portable_transport
+
+
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location(
     "local_compare", HERE / "aws-sharded-wal/local_compare.py"
@@ -208,9 +215,15 @@ def main():
         if case.get("pressure") and args.reads < 1024:
             raise ValueError("cache pressure needs at least 1024 reads across the larger working set")
     args.output.mkdir()
+    transport_config = args.output / "requested-configs" / "transport.json"
+    transport_config.parent.mkdir()
+    portable_transport.write_transport_config(
+        transport_config, portable_transport.transport_for_case(args.transport)
+    )
     plan = dict(binary=str(binary), binary_sha256=identity, configurations=cases,
                 values=values, repetitions=args.repetitions, batches=args.batches, reads=args.reads,
-                transport=args.transport, case_count=len(cases) * len(values) * args.repetitions,
+                transport=args.transport, transport_config=str(transport_config),
+                case_count=len(cases) * len(values) * args.repetitions,
                 case_timeout_seconds=600,
                 topology="five loopback storage processes on one shared SSD; no hardware RDMA",
                 limits="bounded cold-start comparison, not NVMe saturation or larger-than-RAM scaling",
@@ -231,7 +244,7 @@ def main():
                 if digest(binary) != identity:
                     raise ValueError("benchmark executable changed during campaign")
                 output = args.output / f'{case["label"]}-v{value}-r{repetition}'
-                flags = ["--backend", case["backend"], "--transport", args.transport,
+                flags = ["--backend", case["backend"], "--transport-config", str(transport_config),
                          "--values", str(value), "--batch-sizes", "32", "--windows", "32",
                          "--batches", str(args.batches), "--mixed", str(min(64, args.batches // 4)),
                          "--reads", str(args.reads), "--repetitions", "1",

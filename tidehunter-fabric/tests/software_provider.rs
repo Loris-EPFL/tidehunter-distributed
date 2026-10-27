@@ -6,17 +6,56 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tidehunter_fabric::{Endpoint, PeerDrainToken, RemoteReadRegion, RmaConfig};
+use tidehunter_fabric::{
+    Endpoint, FabricBackend, FabricConfig, PeerDrainToken, RemoteReadRegion, RmaConfig,
+};
+
+fn software_config(domain: Option<&str>) -> FabricConfig {
+    FabricConfig {
+        backend: FabricBackend::SoftwareTcp,
+        domain: domain.map(str::to_owned),
+        source_address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
+    }
+}
 
 fn pair() -> io::Result<(Endpoint, Endpoint)> {
-    let mut a = Endpoint::open("tcp;ofi_rxm", Some("lo"))?;
-    let mut b = Endpoint::open("tcp;ofi_rxm", Some("lo"))?;
+    let mut a = Endpoint::open(&software_config(Some("lo")), None)?;
+    let mut b = Endpoint::open(&software_config(Some("lo")), None)?;
+    assert_eq!(a.provider_info().provider, "tcp;ofi_rxm");
+    assert_eq!(
+        a.provider_info().source_address,
+        Some(std::net::Ipv4Addr::LOCALHOST.into())
+    );
     let a_addr = a.address()?;
     let b_addr = b.address()?;
     a.set_peer(&b_addr)?;
     b.set_peer(&a_addr)?;
     Ok((a, b))
 }
+#[test]
+fn regular_efa_rma_is_rejected_instead_of_promoted_to_direct() {
+    let config = FabricConfig {
+        backend: FabricBackend::Efa,
+        domain: None,
+        source_address: None,
+    };
+    let rma = RmaConfig {
+        source_bytes: 4096,
+        source_region_slots: 1,
+        destination_bytes: 4096,
+        destination_slots: 1,
+        max_read_bytes: 4096,
+        require_device_read: false,
+    };
+    assert_eq!(
+        Endpoint::open(&config, Some(rma))
+            .err()
+            .expect("regular EFA must reject RMA")
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+}
+
 #[test]
 #[ignore = "requires libfabric tcp;ofi_rxm and local network permission"]
 #[allow(
@@ -32,9 +71,17 @@ fn software_provider_rma_reads_with_mixed_cq_and_retained_buffer_ownership() -> 
         max_read_bytes: 8192,
         require_device_read: false,
     };
-    let mut a = Endpoint::open_rma("tcp;ofi_rxm", Some("lo"), config)?;
-    let mut b = Endpoint::open_rma("tcp;ofi_rxm", Some("lo"), config)?;
-    let mut wrong_endpoint = Endpoint::open_rma("tcp;ofi_rxm", Some("lo"), config)?;
+    let mut a = Endpoint::open(&software_config(Some("lo")), Some(config))?;
+    let mut b = Endpoint::open(&software_config(Some("lo")), Some(config))?;
+    let mut wrong_endpoint = Endpoint::open(&software_config(Some("lo")), Some(config))?;
+    assert_eq!(
+        a.rma_capabilities().unwrap().read_mode,
+        tidehunter_fabric::RmaReadMode::Emulated
+    );
+    assert_eq!(
+        a.provider_info().rma_capabilities.unwrap().read_mode,
+        tidehunter_fabric::RmaReadMode::Emulated
+    );
     assert!(!a.supports_idle_wait());
     assert!(!b.supports_idle_wait());
     let a_address = a.address()?;
@@ -229,8 +276,8 @@ fn software_provider_rma_group_preserves_order_with_retained_consumers() -> io::
         max_read_bytes: 256,
         require_device_read: false,
     };
-    let mut local = Endpoint::open_rma("tcp;ofi_rxm", Some("lo"), config)?;
-    let mut peer = Endpoint::open_rma("tcp;ofi_rxm", Some("lo"), config)?;
+    let mut local = Endpoint::open(&software_config(Some("lo")), Some(config))?;
+    let mut peer = Endpoint::open(&software_config(Some("lo")), Some(config))?;
     local.set_peer(&peer.address()?)?;
     peer.set_peer(&local.address()?)?;
     let region = peer.reserve_read_region(91, 5)?;
@@ -373,19 +420,37 @@ fn software_provider_timeout_poison_and_teardown_preserve_buffer_lifetimes() -> 
 }
 
 #[test]
-fn missing_provider_is_an_error_without_implicit_tcp_fallback() {
-    assert!(Endpoint::open("tidehunter_missing_provider", None).is_err());
+fn invalid_provider_selectors_are_rejected_before_native_discovery() {
+    let mut config = software_config(None);
+    config.domain = Some(String::new());
+    assert_eq!(
+        Endpoint::open(&config, None)
+            .err()
+            .expect("empty selector must fail validation")
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
 }
 
 #[test]
 #[ignore = "requires a real EFA device and libfabric efa-direct support"]
 fn efa_direct_opens_only_the_negotiated_hardware_fabric() -> io::Result<()> {
-    let endpoint = Endpoint::open_efa_direct(None)?;
+    let config = FabricConfig {
+        backend: FabricBackend::EfaDirect,
+        domain: None,
+        source_address: None,
+    };
+    let endpoint = Endpoint::open(&config, None)?;
     let profile = endpoint.open_profile();
     assert_eq!(profile.provider_version, 206 << 16);
     assert!(profile.mtu > 28);
     assert!(profile.selected_tx >= 4);
     assert!(profile.selected_rx >= 4);
+    assert_eq!(endpoint.provider_info().provider, "efa");
+    assert_eq!(
+        endpoint.provider_info().fabric.as_deref(),
+        Some("efa-direct")
+    );
     Ok(())
 }
 

@@ -374,7 +374,7 @@ impl ReadEvidenceMonitor {
     }
 }
 
-pub const BACKEND_ID: &str = "experimental-native-cell-sharded-value-wal-tcp-rf1";
+pub const BACKEND_ID: &str = "tidehunter-tcp-rf1";
 const MANIFEST: &str = "tcp-database-authority-v1";
 /// Admission, not a timer: crashes retain at most this many post-checkpoint
 /// complete batches, including unacknowledged in-flight work.
@@ -1108,8 +1108,10 @@ pub struct WriteMetricsSnapshot {
 pub struct WriteProfileSnapshot {
     pub limit_per_connection: usize,
     pub expected_connections: usize,
-    pub sampled_requests: u64,
     pub captured_connections: usize,
+    pub sampled_requests: u64,
+    pub profile_activation_errors: u64,
+    pub profile_capture_errors: u64,
     pub profile: super::tcp::ConnectionProfile,
 }
 
@@ -1697,21 +1699,34 @@ impl RemoteDatabase {
     }
 
     pub fn backend_id(&self) -> &'static str {
-        match self.config.tls.transport {
+        match &self.config.tls.transport {
             super::tcp::Transport::Tcp => BACKEND_ID,
-            super::tcp::Transport::Efa => "experimental-native-cell-sharded-value-wal-efa-rf1",
-            super::tcp::Transport::FabricTcp => {
-                "experimental-native-cell-sharded-value-wal-software-fabric-rf1"
-            }
-            super::tcp::Transport::EfaDirect => {
-                "experimental-native-cell-sharded-value-wal-efa-direct-rf1"
-            }
-            super::tcp::Transport::EfaNative => {
-                "trusted-native-cell-sharded-value-wal-efa-native-rf1"
-            }
-            super::tcp::Transport::FabricTcpNative => {
-                "native-cell-sharded-value-wal-software-fabric-rf1"
-            }
+            super::tcp::Transport::Ofi { fabric, security } => match (&fabric.backend, security) {
+                (super::tcp::FabricBackend::Efa, super::tcp::FabricSecurity::MutualTls) => {
+                    "tidehunter-ofi-efa-mutual-tls-rf1"
+                }
+                (super::tcp::FabricBackend::Efa, super::tcp::FabricSecurity::Trusted) => {
+                    "tidehunter-ofi-efa-trusted-rf1"
+                }
+                (super::tcp::FabricBackend::EfaDirect, super::tcp::FabricSecurity::MutualTls) => {
+                    "tidehunter-ofi-efa-direct-mutual-tls-rf1"
+                }
+                (super::tcp::FabricBackend::EfaDirect, super::tcp::FabricSecurity::Trusted) => {
+                    "tidehunter-ofi-efa-direct-trusted-rf1"
+                }
+                (super::tcp::FabricBackend::Verbs, super::tcp::FabricSecurity::MutualTls) => {
+                    "tidehunter-ofi-verbs-mutual-tls-rf1"
+                }
+                (super::tcp::FabricBackend::Verbs, super::tcp::FabricSecurity::Trusted) => {
+                    "tidehunter-ofi-verbs-trusted-rf1"
+                }
+                (super::tcp::FabricBackend::SoftwareTcp, super::tcp::FabricSecurity::MutualTls) => {
+                    "tidehunter-ofi-software-tcp-mutual-tls-rf1"
+                }
+                (super::tcp::FabricBackend::SoftwareTcp, super::tcp::FabricSecurity::Trusted) => {
+                    "tidehunter-ofi-software-tcp-trusted-rf1"
+                }
+            },
         }
     }
     pub fn epoch(&self) -> u64 {
@@ -2965,6 +2980,24 @@ impl RemoteDatabase {
                 .collect(),
         }
     }
+    /// Arm a fresh, bounded append profile after the caller has completed
+    /// warm-up. Draining here makes the phase boundary explicit.
+    pub fn arm_write_profile(&mut self, limit: usize) -> Result<(), LocalDbError> {
+        if limit > 65_536 {
+            return Err(LocalDbError::new("write profile limit exceeds 65536"));
+        }
+        self.drain()?;
+        self.config.write_profile_limit = limit;
+        *self.write_profile.lock() = WriteProfileSnapshot {
+            limit_per_connection: limit,
+            expected_connections: self.clients.len(),
+            ..WriteProfileSnapshot::default()
+        };
+        for client in &self.clients {
+            client.arm_profile(limit)?;
+        }
+        Ok(())
+    }
     /// Capture partial opt-in append profiles after all admitted writes have drained.
     /// With a zero limit, this returns without issuing any diagnostic RPC.
     pub fn finish_write_profile(&mut self) -> Result<(), LocalDbError> {
@@ -2972,8 +3005,14 @@ impl RemoteDatabase {
         if self.config.write_profile_limit == 0 {
             return Ok(());
         }
+        let mut first_error = None;
         for client in &self.clients {
-            client.finish_profile()?;
+            if let Err(error) = client.finish_profile() {
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(())
     }
@@ -3743,12 +3782,21 @@ fn capture_write_profile(
     snapshot.profile.add(profile);
     snapshot.captured_connections += 1;
 }
+fn record_write_profile_error(shared: &Mutex<WriteProfileSnapshot>, activation: bool) {
+    let mut snapshot = shared.lock();
+    if activation {
+        snapshot.profile_activation_errors += 1;
+    } else {
+        snapshot.profile_capture_errors += 1;
+    }
+}
 
 type Pending<T> = mpsc::Receiver<Result<T, LocalDbError>>;
 enum Command {
     Append(u64, Vec<CompleteBatch>, Reply<Vec<DurableBatch>>),
     Stats(Reply<PartitionStats>),
     Seal(u64, Reply<()>),
+    ArmProfile(usize, Reply<()>),
     FinishProfile(Reply<()>),
 }
 struct ClientWorker {
@@ -3771,6 +3819,7 @@ impl ClientWorker {
         let thread = thread::Builder::new()
             .name("value-wal-tcp".into())
             .spawn(move || {
+                let mut write_profile_limit = write_profile_limit;
                 let mut profile_attempted = false;
                 let mut profile_enabled = false;
                 let mut profile_requests = 0usize;
@@ -3807,7 +3856,10 @@ impl ClientWorker {
                     {
                         if write_profile_limit > 0 && !profile_attempted && appends.is_empty() {
                             profile_attempted = true;
-                            profile_enabled = client.connection_profile(true, false).is_ok();
+                            match client.connection_profile(true, false) {
+                                Ok(_) => profile_enabled = true,
+                                Err(_) => record_write_profile_error(&write_profile, true),
+                            }
                         }
                         let first = batches[0].version();
                         match client.submit_append_many(*epoch, batches) {
@@ -3878,7 +3930,9 @@ impl ClientWorker {
                                         Command::Stats(reply) => {
                                             let _ = reply.send(Err(LocalDbError::new(&message)));
                                         }
-                                        Command::Seal(_, reply) | Command::FinishProfile(reply) => {
+                                        Command::ArmProfile(_, reply)
+                                        | Command::Seal(_, reply)
+                                        | Command::FinishProfile(reply) => {
                                             let _ = reply.send(Err(LocalDbError::new(&message)));
                                         }
                                     }
@@ -3892,8 +3946,9 @@ impl ClientWorker {
                         && profile_requests >= write_profile_limit
                         && appends.is_empty()
                     {
-                        if let Ok(profile) = client.connection_profile(false, false) {
-                            capture_write_profile(&write_profile, profile);
+                        match client.connection_profile(false, false) {
+                            Ok(profile) => capture_write_profile(&write_profile, profile),
+                            Err(_) => record_write_profile_error(&write_profile, false),
                         }
                         profile_enabled = false;
                         progressed = true;
@@ -3903,6 +3958,7 @@ impl ClientWorker {
                         match queued.front() {
                             Some(Command::Stats(_))
                             | Some(Command::Seal(_, _))
+                            | Some(Command::ArmProfile(_, _))
                             | Some(Command::FinishProfile(_)) => {
                                 match queued.pop_front().expect("front control exists") {
                                     Command::Stats(reply) => {
@@ -3914,15 +3970,38 @@ impl ClientWorker {
                                             client.seal(epoch).map_err(LocalDbError::component),
                                         );
                                     }
+                                    Command::ArmProfile(limit, reply) => {
+                                        write_profile_limit = limit;
+                                        profile_requests = 0;
+                                        profile_attempted = limit != 0;
+                                        let enabled = limit != 0;
+                                        let result = client
+                                            .connection_profile(enabled, true)
+                                            .map(|_| profile_enabled = enabled)
+                                            .map_err(LocalDbError::component);
+                                        if result.is_err() {
+                                            record_write_profile_error(&write_profile, true);
+                                            profile_enabled = false;
+                                        }
+                                        let _ = reply.send(result);
+                                    }
                                     Command::FinishProfile(reply) => {
                                         let result = if profile_enabled {
-                                            client
-                                                .connection_profile(false, false)
-                                                .map(|profile| {
+                                            match client.connection_profile(false, false) {
+                                                Ok(profile) => {
                                                     capture_write_profile(&write_profile, profile);
                                                     profile_enabled = false;
-                                                })
-                                                .map_err(LocalDbError::component)
+                                                    Ok(())
+                                                }
+                                                Err(error) => {
+                                                    record_write_profile_error(
+                                                        &write_profile,
+                                                        false,
+                                                    );
+                                                    profile_enabled = false;
+                                                    Err(LocalDbError::component(error))
+                                                }
+                                            }
                                         } else {
                                             Ok(())
                                         };
@@ -3945,8 +4024,9 @@ impl ClientWorker {
                 }
                 if profile_enabled {
                     let mut client = worker_client.lock();
-                    if let Ok(profile) = client.connection_profile(false, false) {
-                        capture_write_profile(&write_profile, profile);
+                    match client.connection_profile(false, false) {
+                        Ok(profile) => capture_write_profile(&write_profile, profile),
+                        Err(_) => record_write_profile_error(&write_profile, false),
                     }
                 }
             })?;
@@ -3976,6 +4056,11 @@ impl ClientWorker {
         let (tx, rx) = mpsc::sync_channel(1);
         self.send(Command::Stats(tx))?;
         Ok(rx)
+    }
+    fn arm_profile(&self, limit: usize) -> Result<(), LocalDbError> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.send(Command::ArmProfile(limit, tx))?;
+        receive(rx)
     }
     fn finish_profile(&self) -> Result<(), LocalDbError> {
         let (tx, rx) = mpsc::sync_channel(1);

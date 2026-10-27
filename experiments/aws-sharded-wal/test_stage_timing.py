@@ -102,7 +102,8 @@ class StageTimingTests(unittest.TestCase):
             if s.get('floor') and s['build'] == 'baseline':
                 self.assertEqual((s['samples'], s['floor_repetitions'], s['floor_values'], s['idle_us'], s['profile']),
                                  (1000, 3, [1024, 8192], 0, False))
-                self.assertIn('--tcp-polling', profile.flags(s, 'tcp', prepare=True))
+                self.assertIn('--transport', profile.flags(s, 'tcp', prepare=True))
+                self.assertNotIn('--tcp-polling', profile.flags(s, 'tcp', prepare=True))
                 self.assertEqual(profile.floor_flags(s)[-4:], ['--warmup', '64', '--shards', '5'])
         self.assertEqual(len(transport_floor.expected_cases()), 216)
         self.assertEqual(transport_floor.CURRENT_SOURCE_SHA256,

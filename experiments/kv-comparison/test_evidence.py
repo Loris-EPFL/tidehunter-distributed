@@ -73,6 +73,36 @@ class EvidenceAdmission(unittest.TestCase):
         changed['store_metadata']['stores'][0]['store']['version'] = 'different-release'
         self.assertNotEqual(analyze.stable_topology('tikv_raw', base), analyze.stable_topology('tikv_raw', changed))
 
+    def test_valkey_primary_order_is_stable_but_topology_and_settings_remain_distinct(self):
+        first = {"cluster": True, "required_primary_nodes": 5, "observed_primary_nodes": 5,
+                 "primaries": [{"node_id": f"old-{i}", "address": f"10.0.0.{i+2}:6379",
+                                "slots": [[i*1000, i*1000+999]]} for i in range(5)]}
+        original = copy.deepcopy(first)
+        reordered = {**first, "primaries": [{**row, "node_id": "new-" + row["node_id"]}
+                                           for row in reversed(first["primaries"])]}
+        self.assertEqual(analyze.stable_topology("valkey_tcp", first),
+                         analyze.stable_topology("valkey_tcp", reordered))
+        changed = {**first, "observed_primary_nodes": 1}
+        self.assertNotEqual(analyze.stable_topology("valkey_tcp", first),
+                            analyze.stable_topology("valkey_tcp", changed))
+        always = {"node_config": [{"appendfsync": "always", "maxmemory-policy": "noeviction"}]}
+        everysec = {"node_config": [{"appendfsync": "everysec", "maxmemory-policy": "noeviction"}]}
+        self.assertNotEqual(analyze.stable_configuration(always), analyze.stable_configuration(everysec))
+        self.assertEqual(first, original)
+
+    def test_valkey_dynamic_aof_counters_remain_raw_not_repetition_configuration(self):
+        first = {"node_config": [{"appendfsync": "always"}], "persistence": [{
+            "aof_enabled": "1", "aof_last_write_status": "ok", "aof_current_size": "100",
+            "aof_rewrite_in_progress": "0"}]}
+        later = copy.deepcopy(first)
+        later["persistence"][0].update(aof_current_size="999", aof_rewrite_in_progress="1")
+        self.assertEqual(analyze.stable_configuration(first, "valkey_tcp"),
+                         analyze.stable_configuration(later, "valkey_tcp"))
+        self.assertEqual(first["persistence"][0]["aof_current_size"], "100")
+        later["persistence"][0]["aof_last_write_status"] = "err"
+        self.assertNotEqual(analyze.stable_configuration(first, "valkey_tcp"),
+                            analyze.stable_configuration(later, "valkey_tcp"))
+
     def test_host_memory_and_swap_capacity_are_part_of_the_contract(self):
         small = analyze.host_capacity('MemTotal: 1024 kB\nMemFree: 12 kB\nSwapTotal: 0 kB\n')
         equally_sized = analyze.host_capacity('MemTotal: 1024 kB\nMemFree: 900 kB\nSwapTotal: 0 kB\n')

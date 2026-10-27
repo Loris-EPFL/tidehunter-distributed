@@ -71,8 +71,8 @@ resources. Local qualification is not a cloud cost or overhead measurement.
 
 ## What the campaign dashboard measures
 
-Dashboard UID: `kv-comparison-campaign`. It contains 24 panels and 58 source
-queries. Select **one run and one case**; do not pool different value sizes,
+Dashboard UID: `kv-comparison-campaign`. It contains 28 panels. Select
+**one run and one case**; do not pool different value sizes,
 durability contracts, cache cohorts, repeats or backends.
 
 - Exact terminal API/response/scheduling quantiles, sample counts, offered,
@@ -82,6 +82,15 @@ durability contracts, cache cohorts, repeats or backends.
 - Live rates and histogram quantiles are coarse rolling observations. Histogram
   quantiles are bucket estimates, not the exact raw-sample terminal quantiles.
   A short population can have one scrape and no valid rate; no data is not zero.
+  The **actual** generated campaign configuration scrapes host/cgroup targets at
+  5 seconds and terminal benchmark gauges at 1 second. A one-point cgroup series
+  cannot establish a rate or no throttling; neither max-minus-min nor zero-fill
+  is used. Workloads are not prolonged to obtain more scrapes. These sampling
+  choices and cohost observer overhead remain uncalibrated.
+  [Prometheus `rate`](https://prometheus.io/docs/prometheus/latest/querying/functions/#rate)
+  handles counter resets and extrapolates; terminal counter deltas are not that
+  estimator. `rate-regressions.yaml` exercises the real PromQL engine for sparse,
+  absent, observed-zero and reset cases rather than emulating rate in Python.
 - All six hosts expose CPU, memory, PSI, diskstats and network context. Explicit
   owned cgroups expose available CPU/throttling, current/peak memory, OOM and
   device-I/O counters. Shared-host statistics and rolling windows can include
@@ -94,11 +103,125 @@ durability contracts, cache cohorts, repeats or backends.
   **adapter-lifetime**. They are not measurement-only hit ratios or RDMA timings.
   Missing owner evidence, disabled profiling and unsupported cgroup fields stay
   absent or explicitly unavailable.
+- Optional terminal `resource_evidence` is a separate, validated before/end
+  accounting source, not a Prometheus live-rate substitute. Its host-local
+  monotonic interval includes driver/oracle, gate/control-plane overlap and
+  background work; it is **not** pure per-operation CPU or measurement-only stage
+  time. The controller checks same boot/cgroup inode and nonnegative deltas.
+  IO byte totals cover all owned-cgroup devices (raw frames retain devices).
+  Memory current is an end-boundary gauge; memory peak is cgroup-lifetime, not a
+  measurement-only maximum. Missing fields remain missing. Unavailable/replaced/
+  reset rows export availability=0 but no numerical resource fields.
 
-No new hot-path tracing is enabled. This dashboard cannot supply an unmeasured
-TLS/fsync/coordination breakdown, pure network RTT, hardware-RDMA latency,
-per-request NVMe latency, or vendor-specific compaction/GC internals. Use the raw
-CSV, deployment receipts and guarantee metadata for the research comparison.
+The bounded terminal object is schema version 1 with
+`scope="measurement_boundary_interval"` and a `processes` list (at most 16 unique
+`host_index,process_role` identities). Host index is an integer -1 through 4;
+roles use the existing bounded metric token syntax. Each row requires boolean
+`available`. Unavailable rows contain only identity, availability and a nonblank
+`reason` of at most 512 characters. Available rows require finite positive
+`elapsed_seconds`; optional `cpu_seconds,cpu_throttled_seconds` are finite
+nonnegative seconds and `cpu_periods,cpu_throttled_periods,io_read_bytes,
+io_write_bytes,memory_current_bytes,memory_peak_bytes` are nonnegative integers.
+Throttled periods cannot exceed observed periods when both exist. Unknown
+fields are rejected. The exported `kv_case_resource_interval_*` metrics are
+**gauges**, labeled by `scope,resource_host_index,process_role`; `resource_host_index`
+avoids colliding with the benchmark exporter's own scrape-target `host_index`.
+Absent resource evidence emits no resource gauges, not available=0 or zero usage.
+
+Optional `finish-case --write-diagnostics FILE` (or `finish_case(...,
+write_diagnostics=...)`) publishes a real schema-1 `write-diagnostics.json`.
+Accepted top-level fields are `schema_version,backend,phase,phase_attempted,
+runtime_enabled,runtime_observation_mode,selection,clock_scope,overlap_semantics,
+unsupported_stages,profile,error`. `phase` must be `measurement`; selection has
+`requested_limit,observed_samples,selection_policy,phase_exclusions`. Limits are
+64 KiB of compact JSON, 512 numeric fields, at most 512 keys per object,
+six object/list nesting levels,
+32 list items and 2,048 characters per metadata string. Requested limit must be
+1 through 65,536. All numerical artifact fields must be nonnegative integers.
+Stage trees are bounded to four nested levels; unknown scalar metadata inside
+stages is rejected except `status/reason`. Unsupported stages may not claim
+zero counters.
+
+For `scope=sampled_prefix`, `kv_case_write_diagnostic_available` requires actual
+runtime-enabled evidence, positive observed samples, an attempted measurement
+and an error-free nonempty stage profile. `kv_case_write_diagnostic_operations`
+preserves requested-limit and observed-sample populations without equating
+their scopes.
+`kv_case_write_diagnostic_stage_seconds` converts actual accumulated `_ns`
+counters to seconds; `kv_case_write_diagnostic_stage_count` preserves observed
+call/sample/request/error/success/connection and related operation counts.
+Native `profile.value_wal_persistence` retains its separate component scope.
+These are terminal **gauges** with `phase=measurement,scope=sampled_prefix`,
+not live rates, per-operation percentiles or proven-representative sampling.
+Nested/independent stage clocks overlap and are **not additive latency
+fractions**, pure network time or zero-overhead instrumentation. Exact policy,
+clock descriptions, unsupported stages and errors remain in the admitted
+artifact. Absence remains No data; unavailable prefix profiles expose no
+sampled-prefix stage gauges.
+The page/hash capture includes every new diagnostic metric family.
+
+The full current TCP profile has 268 stage fields plus the separate coordinator
+window; the former 256-field limit rejected a valid real artifact. The 512-field
+budget admits that profile without clipping and does not relax the 64-KiB artifact,
+16-MiB query-page or total archive limits. Terminal publication validates the
+complete metrics/resource/profile payload before replacing the active selection.
+An invalid caller payload cannot poison a working scrape target.
+
+Diagnostic panels are labelled tables, not dense grids of anonymous values.
+The `metric` column gives count/availability/seconds semantics; `detail` retains
+the original stage, counter or sample population. A `_ns` stage name is converted
+to seconds only when `metric=stage_seconds`. CPU period counts remain explicit;
+a throttled-period fraction is undefined for zero observed periods. Query validation
+uses each panel's actual table/time-series format and preserves PromQL `$1`
+capture replacements and regex end anchors during Grafana-variable expansion.
+
+
+An independent optional `profile.coordinator_interval` carries
+`{scope:"measurement_boundary_cumulative_delta",clock_scope:<nonblank string>,
+stages:{<whitelisted counter>:<nonnegative integer delta>}}`.
+It is a **full measurement-boundary cumulative-counter window**, not the bounded
+owner/transport/native prefix. The Rust adapter validates monotonic before/end
+counters; a missing/reset counter yields `profile.coordinator_interval_error`
+and no interval object, not a substituted zero. Interval error and successful
+interval evidence are mutually exclusive. The exporter rejects unknown gauge/
+peak keys, wrong scope, malformed clocks and invalid counters. Accepted counter
+keys are:
+
+```
+write_storage_wait_ns
+write_publication_ns
+write_dispatch_ns
+write_preparation_admission_ns
+write_checkpoint_ns
+write_checkpoint_count
+write_foreground_checkpoint_ns
+write_foreground_checkpoint_count
+write_background_checkpoint_ns
+write_background_checkpoint_suffix_batches
+write_durable_receipt_publication_blocked_ns
+write_durable_receipt_publication_blocked_batches
+write_append_requests
+write_direct_appends
+write_durable_batches
+write_concurrent_admitted
+write_concurrent_completed
+```
+
+These values use the same stage-seconds/count families but
+`scope=measurement_boundary_cumulative_delta,component=coordinator_interval`.
+Availability requires an attempted measurement and a valid interval;
+**owner-prefix runtime/sample availability does not gate it**. A recorded
+interval error exports availability=0 without coordinator stage values; absent
+optional interval evidence exports no coordinator values. The dashboard labels
+both populations explicitly. Do not add their overlapping stage totals,
+normalize full-window coordinator counters by prefix sample counts, infer
+per-operation percentiles, or turn the populations into latency fractions.
+
+Normal runs remain unprofiled; diagnostic runs are a separate observation mode.
+The dashboard still cannot supply unmeasured TLS/fsync/coordination breakdowns,
+pure network RTT, hardware-RDMA latency, per-request NVMe latency, or
+vendor-specific compaction/GC internals. Use raw CSV, diagnostic artifacts,
+deployment receipts and guarantee metadata for the research comparison.
 
 ## Retain and replay offline
 
@@ -109,6 +232,24 @@ with `skip_head=false`, and records the original capture bounds. This follows
 the [storage backup guidance](https://prometheus.io/docs/prometheus/latest/storage/#backups).
 The bounded archive includes a SHA-256 manifest, not Grafana's SQLite database,
 admin password or cloud credentials.
+Raw query evidence is retained in schema-2 bounded `(start,end]` pages (at most
+300 seconds each, recursively split on oversized responses down to one second).
+These are instant queries of **raw range vectors**, not stepped range queries:
+every observed timestamp/value is retained, including a sole sample. Canonical
+series ordering makes query hashes independent of response row order. Receipts
+contain bounded page identities/hashes, never the combined raw payloads.
+`evidence/query-evidence/<query_sha256>.json` files are individually limited to
+16 MiB and separately bound by the archive manifest; archive/member limits are
+unchanged. Query warnings fail evidence collection rather than accepting
+truncated results. A still-oversized one-second response is an honest gap.
+Replay re-executes exactly the captured page boundaries and compares hashes,
+checks complete nonoverlapping metric/time coverage, and retains capture gaps.
+Legacy archives use their original full-range query hashes; missing historical
+hashes remain missing and prevent parity claims. No old archive is rewritten or
+silently assigned new baseline hashes.
+The paging interval follows Prometheus'
+[left-open/right-closed range selectors](https://prometheus.io/docs/prometheus/latest/querying/basics/#range-vector-selectors);
+adjacent pages do not duplicate boundary samples.
 
 Replay requires the archived digest-pinned images already cached locally.
 Campaign `start` and `replay` never pull implicitly. Online preparation can use
@@ -470,7 +611,8 @@ Primary references:
 The integration owner should run the focused file/target semantic regressions:
 
 ```bash
-python3 -m unittest discover -s experiments/kv-comparison/observability -p test_semantics.py
+python3 -m unittest discover -s experiments/kv-comparison/observability -p 'test_*.py'
+promtool test rules experiments/kv-comparison/observability/rate-regressions.yaml
 ```
 
 These checks cover stale/final/failure precedence, absent future result leaves,

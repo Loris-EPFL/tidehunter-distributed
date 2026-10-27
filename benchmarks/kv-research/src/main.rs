@@ -54,8 +54,8 @@ fn entry() -> BackendResult<()> {
                 println!(
                     "Usage: kv-research --config FILE --output FRESH_DIR [--validate-config]\n\
                     External owner prep: kv-research --prepare-external-case INPUT.json --output FRESH_DIR\n\
-                    Backends: native, tidehunter_tcp (TLS), tidehunter_efa (TLS), tidehunter_efa_direct (TLS), tidehunter_efa_native (trusted plaintext); optional features: efa, rocksdb, tikv, cassandra, foundationdb.\n\
-                    EFA modes require the real provider/device and never fall back to TCP."
+                    Backends: native, tidehunter (structured TCP/OFI transport), valkey_tcp (plain TCP, feature valkey-tcp), rocksdb, tikv, cassandra, foundationdb.\n\
+                    OFI requires the fabric feature and never falls back to TCP."
                 );
                 return Ok(());
             }
@@ -88,26 +88,18 @@ fn entry() -> BackendResult<()> {
                 let backend = backends::native::open(&config.backend.options, &registry).await?;
                 runner::run(backend, config, &output, registry).await
             }
-            "tidehunter_tcp" => {
+            #[cfg(feature = "valkey-tcp")]
+            "valkey_tcp" => {
+                let backend = backends::valkey_tcp::ValkeyTcpBackend::open(
+                    &config.backend.options,
+                    &registry,
+                )
+                .await?;
+                runner::run(backend, config, &output, registry).await
+            }
+            "tidehunter" => {
                 let backend =
                     backends::tidehunter::open(&config.backend.options, &registry).await?;
-                runner::run(backend, config, &output, registry).await
-            }
-            "tidehunter_efa" => {
-                let backend =
-                    backends::tidehunter::open_efa(&config.backend.options, &registry).await?;
-                runner::run(backend, config, &output, registry).await
-            }
-            "tidehunter_efa_direct" => {
-                let backend =
-                    backends::tidehunter::open_efa_direct(&config.backend.options, &registry)
-                        .await?;
-                runner::run(backend, config, &output, registry).await
-            }
-            "tidehunter_efa_native" => {
-                let backend =
-                    backends::tidehunter::open_efa_native(&config.backend.options, &registry)
-                        .await?;
                 runner::run(backend, config, &output, registry).await
             }
             #[cfg(feature = "rocksdb")]

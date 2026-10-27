@@ -1476,7 +1476,7 @@
         "type": "prometheus",
         "uid": "kv-campaign-prometheus"
       },
-      "description": "CPU usage seconds/s, where 1 is one fully busy logical CPU. Not divided by a guessed core count or cgroup cap. Separate process roles; no cross-host sum.",
+      "description": "LIVE CPU usage seconds/s, where 1 is one fully busy logical CPU. Requires at least two scrape samples; one point is No data, never zero. Actual host/cgroup scrape interval is 5s. Not divided by a guessed core count or cap. Observer overhead remains uncalibrated. Terminal boundary deltas are shown separately below.",
       "gridPos": {
         "x": 12,
         "y": 64,
@@ -1530,7 +1530,7 @@
         "type": "prometheus",
         "uid": "kv-campaign-prometheus"
       },
-      "description": "Throttled seconds/s and throttled periods / periods are different signals. Throttled seconds can exceed wall seconds with parallel scheduling. A zero/absent period-rate denominator gives No data, never an invented zero.",
+      "description": "LIVE throttled seconds/s and throttled periods / periods are different signals. Actual scrape interval is 5s; one-point series are No data, not proof of no throttling. No max-minus-min shortcut or zero-fill. Throttled seconds may exceed wall seconds with parallel scheduling. A zero/absent period-rate denominator gives No data. Validated terminal interval gauges are separate below.",
       "gridPos": {
         "x": 0,
         "y": 72,
@@ -1675,7 +1675,7 @@
         "type": "prometheus",
         "uid": "kv-campaign-prometheus"
       },
-      "description": "io.stat counters for explicit cgroups and major:minor device identities. No WAL-device mapping is inferred; host disk-name selector cannot be applied to major:minor. IO attribution is not proof of physical media service or durability.",
+      "description": "LIVE io.stat rates require at least two samples at the actual 5s scrape interval; one-point series are No data, not zero IO. Explicit cgroups and major:minor device identities only. No WAL-device mapping is inferred. IO attribution is not physical media service or durability. Separate terminal interval gauges below need no rate inference.",
       "gridPos": {
         "x": 0,
         "y": 80,
@@ -1912,7 +1912,7 @@
         "type": "prometheus",
         "uid": "kv-campaign-prometheus"
       },
-      "description": "Read-path GAUGES come only from admitted read-evidence.json. ADAPTER LIFETIME includes preload, warmup and post-workload qualification; NOT measurement-only counts, live rates, hit fractions, device IOPS or hardware latency. Components/partitions remain separate. Availability is observed; absent evidence stays No data. Write-profile flag is only observed effective_configuration.client.write_profile_limit > 0: 0=disabled, 1=enabled, absent=unknown. Enabled still supplies NO measured stage breakdown here; no fabricated serialization/WAL/NIC/replication timings.",
+      "description": "Read-path GAUGES come only from admitted read-evidence.json. ADAPTER LIFETIME includes preload, warmup and post-workload qualification; NOT measurement-only counts, live rates, hit fractions, device IOPS or hardware latency. Components/partitions remain separate. Availability is observed; absent evidence stays No data. The legacy write-profile flag is configuration evidence only, not proof of collected stages. The TERMINAL sampled-prefix panel below requires real runtime-enabled write-diagnostics.json and observed samples; no fabricated serialization/WAL/NIC/replication timings.",
       "gridPos": {
         "x": 12,
         "y": 88,
@@ -1983,6 +1983,62 @@
         "graphMode": "none",
         "orientation": "auto"
       }
+    },
+    {
+      "id": 25,
+      "title": "TERMINAL boundary accounting availability and elapsed seconds",
+      "type": "table",
+      "datasource": {"type": "prometheus", "uid": "kv-campaign-prometheus"},
+      "description": "Controller-validated same-boot, same-cgroup-inode before/end accounting. The host-local monotonic interval includes driver/oracle, background work and gate/control-plane overlap; NOT pure operation CPU or measurement-only stage time. Availability 0 means rejected/unavailable; absent means no evidence. Elapsed seconds are observed boundary separation, NOT benchmark API exposure or a live rate interval. resource_host_index identifies the measured host, not exporter placement. Sampling and observer overhead remain uncalibrated.",
+      "gridPos": {"x": 0, "y": 96, "w": 12, "h": 8},
+      "targets": [
+        {"refId": "A", "expr": "label_replace(last_over_time({__name__=~\"kv_case_resource_interval_(available|elapsed_seconds)\",job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",scope=\"measurement_boundary_interval\",resource_host_index=~\"$host_index\"}[$__range]), \"metric\", \"$1\", \"__name__\", \"kv_case_resource_interval_(.*)\")", "format": "table", "instant": true, "range": false}
+      ],
+      "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "__name__": true, "job": true, "instance": true, "host_index": true, "host_role": true, "run_id": true, "case_id": true}}}],
+      "fieldConfig": {"defaults": {"unit": "none", "noValue": "No data"}, "overrides": []},
+      "options": {"showHeader": true, "cellHeight": "sm"}
+    },
+    {
+      "id": 26,
+      "title": "TERMINAL interval CPU seconds and throttling",
+      "type": "table",
+      "datasource": {"type": "prometheus", "uid": "kv-campaign-prometheus"},
+      "description": "Validated boundary CPU/throttling seconds and observed period counts, NOT Prometheus rates. A throttled-period fraction can be computed only for a positive observed period delta; it is undefined at zero. Missing counters stay No data; validated zero deltas remain real zeros. Includes driver/oracle, background work and gate/control-plane overlap; not pure operation CPU, measurement-only stages or the benchmark API clock.",
+      "gridPos": {"x": 12, "y": 96, "w": 12, "h": 8},
+      "targets": [
+        {"refId": "A", "expr": "label_replace(last_over_time({__name__=~\"kv_case_resource_interval_cpu_(seconds|throttled_seconds|periods|throttled_periods)\",job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",scope=\"measurement_boundary_interval\",resource_host_index=~\"$host_index\"}[$__range]), \"metric\", \"$1\", \"__name__\", \"kv_case_resource_interval_(.*)\")", "format": "table", "instant": true, "range": false}
+      ],
+      "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "__name__": true, "job": true, "instance": true, "host_index": true, "host_role": true, "run_id": true, "case_id": true}}}],
+      "fieldConfig": {"defaults": {"unit": "none", "decimals": 6, "noValue": "No data"}, "overrides": []},
+      "options": {"showHeader": true, "cellHeight": "sm"}
+    },
+    {
+      "id": 27,
+      "title": "TERMINAL interval IO bytes and boundary memory",
+      "type": "table",
+      "datasource": {"type": "prometheus", "uid": "kv-campaign-prometheus"},
+      "description": "Observed IO byte deltas summed across all owned-cgroup devices (raw accounting frames retain device identities), plus end-boundary memory.current / cgroup-lifetime memory.peak gauges. Missing counters stay absent, not zero. Accounting includes driver/oracle/background/gate overlap; not physical media latency, durability or pure measured-operation IO. Memory peak is not a per-measurement maximum. Do not sum overlapping parent/child groups or turn these gauges into live rates.",
+      "gridPos": {"x": 0, "y": 104, "w": 24, "h": 8},
+      "targets": [
+        {"refId": "A", "expr": "label_replace(last_over_time({__name__=~\"kv_case_resource_interval_(io_(read|write)_bytes|memory_(current|peak)_bytes)\",job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",scope=\"measurement_boundary_interval\",resource_host_index=~\"$host_index\"}[$__range]), \"metric\", \"$1\", \"__name__\", \"kv_case_resource_interval_(.*)\")", "format": "table", "instant": true, "range": false}
+      ],
+      "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "__name__": true, "job": true, "instance": true, "host_index": true, "host_role": true, "run_id": true, "case_id": true}}}],
+      "fieldConfig": {"defaults": {"unit": "bytes", "noValue": "No data"}, "overrides": []},
+      "options": {"showHeader": true, "cellHeight": "sm"}
+    },
+    {
+      "id": 28,
+      "title": "TERMINAL write stage totals — distinct scoped populations",
+      "type": "table",
+      "datasource": {"type": "prometheus", "uid": "kv-campaign-prometheus"},
+      "description": "Real schema-1 write-diagnostics.json only. TWO INDEPENDENT POPULATIONS: scope=sampled_prefix is bounded owner/transport/native write samples; scope=measurement_boundary_cumulative_delta is the coordinator's FULL measurement-boundary counter window, including coordinator preparation/admission, storage wait, publication, checkpoints and prefix-blocked time. The coordinator window is not restricted to the sampled prefix, and its availability does not require owner samples. Never combine their counts or normalize one population by the other's samples. Accumulated ns clocks become seconds, NOT per-operation percentiles, pure network time or additive latency fractions. Nested/overlapping stages MUST NOT be added or drawn as a percentage pie. Prefix selection is not proven representative; clock/collection overhead is NOT zero. Absent/reset/unavailable intervals remain No data, with explicit availability=0 only when a recorded interval error exists. Inspect each population's clock_scope and the artifact's overlap_semantics.",
+      "gridPos": {"x": 0, "y": 112, "w": 24, "h": 12},
+      "targets": [
+        {"refId": "A", "expr": "label_replace(label_replace(label_replace(label_replace(last_over_time({__name__=~\"kv_case_write_diagnostic_(available|operations|stage_seconds|stage_count)\",job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",phase=\"measurement\",scope=~\"sampled_prefix|measurement_boundary_cumulative_delta\"}[$__range]), \"metric\", \"$1\", \"__name__\", \"kv_case_write_diagnostic_(.*)\"), \"detail\", \"$1\", \"stage\", \"(.+)\"), \"detail\", \"$1\", \"counter\", \"(.+)\"), \"detail\", \"$1\", \"population\", \"(.+)\")", "format": "table", "instant": true, "range": false}
+      ],
+      "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "__name__": true, "job": true, "instance": true, "host_index": true, "host_role": true, "run_id": true, "case_id": true, "phase": true, "diagnostic_backend": true, "stage": true, "counter": true, "population": true}, "indexByName": {"scope": 0, "component": 1, "detail": 2, "metric": 3, "Value": 4}}}],
+      "fieldConfig": {"defaults": {"unit": "none", "decimals": 9, "noValue": "No data"}, "overrides": [{"matcher": {"id": "byName", "options": "detail"}, "properties": [{"id": "custom.width", "value": 460}]}]},
+      "options": {"showHeader": true, "cellHeight": "sm"}
     }
   ],
   "annotations": {

@@ -130,12 +130,15 @@ class CampaignMonitorBoundaries(unittest.TestCase):
         state, _, result = self.initialize_selection()
         monitor.select_case(self.spec, self.job, result)
         expressions = []
+        resource = {'schema_version': 1, 'scope': 'measurement_boundary_interval', 'processes': [
+            {'host_index': -1, 'process_role': 'client', 'available': False, 'reason': 'counter reset'}]}
         def observed(spec, expression, **kwargs):
             expressions.append(expression)
             return {'resultType': 'vector', 'result': [{'metric': {}, 'value': [time.time(), '1']}]}
         with patch.object(monitor, 'query', side_effect=observed):
             answer = monitor.finish_case(self.spec, self.job, result, status='failed',
-                                         write_profile_enabled=False, read_evidence={'owner_io': {'available': False}})
+                                         write_profile_enabled=False, read_evidence={'owner_io': {'available': False}},
+                                         resource_evidence=resource)
         self.assertTrue(answer['complete'])
         self.assertIn('kv_observer_case_terminal', expressions[0])
         self.assertIn('status="failed"', expressions[0])
@@ -143,8 +146,44 @@ class CampaignMonitorBoundaries(unittest.TestCase):
         terminal = monitor.load_json(state / 'benchmark/selection.json')['terminal']
         self.assertEqual(terminal['write_profile_enabled'], False)
         self.assertEqual(terminal['read_evidence'], {'owner_io': {'available': False}})
+        self.assertEqual(terminal['resource_evidence'], resource)
         self.assertIsNone(terminal['metrics'])
         self.assertIn(self.job['case_id'], monitor.load_json(state / 'session.json')['seen_case_ids'])
+
+    def test_malformed_terminal_metrics_cannot_poison_active_selection(self):
+        state, _, result = self.initialize_selection()
+        monitor.select_case(self.spec, self.job, result)
+        selection = (state / 'benchmark/selection.json').read_bytes()
+        session = (state / 'session.json').read_bytes()
+        for metrics in ({'measurement_rows_complete': False},
+                        {'measurement_rows_complete': True, 'offered_calls': 4,
+                         'success_calls': 5, 'populations': []}):
+            with self.subTest(metrics=metrics), self.assertRaises(ValueError):
+                monitor.finish_case(self.spec, self.job, result, metrics=metrics)
+            self.assertEqual((state / 'benchmark/selection.json').read_bytes(), selection)
+            self.assertEqual((state / 'session.json').read_bytes(), session)
+
+    def test_terminal_write_diagnostics_are_validated_before_atomic_publication(self):
+        state, _, result = self.initialize_selection()
+        monitor.select_case(self.spec, self.job, result)
+        evidence = {'schema_version': 1, 'backend': 'native', 'phase': 'measurement',
+                    'phase_attempted': True, 'runtime_enabled': True, 'runtime_observation_mode': 'sampled_prefix',
+                    'selection': {'requested_limit': 2, 'observed_samples': 2,
+                                  'selection_policy': 'first N accepted scalar measurement writes',
+                                  'phase_exclusions': ['warmup', 'preload']},
+                    'clock_scope': 'local accumulated clocks', 'overlap_semantics': 'overlapping totals',
+                    'unsupported_stages': [], 'error': None,
+                    'profile': {'stages': {'wal_append_ns': 500, 'wal_append_errors': 0}}}
+        before = (state / 'benchmark/selection.json').read_bytes()
+        with self.assertRaises(ValueError):
+            monitor.finish_case(self.spec, self.job, result, write_diagnostics=evidence | {'phase': 'preload'})
+        self.assertEqual((state / 'benchmark/selection.json').read_bytes(), before)
+        observed = {'resultType': 'vector', 'result': [{'metric': {}, 'value': [time.time(), '1']}]}
+        with patch.object(monitor, 'query', return_value=observed):
+            answer = monitor.finish_case(self.spec, self.job, result, write_diagnostics=evidence)
+        self.assertTrue(answer['complete'])
+        terminal = monitor.load_json(state / 'benchmark/selection.json')['terminal']
+        self.assertEqual(terminal['write_diagnostics'], evidence)
 
     def test_unavailable_terminal_does_not_claim_observed_or_release_next_case(self):
         state, _, result = self.initialize_selection()
@@ -177,6 +216,161 @@ class CampaignMonitorBoundaries(unittest.TestCase):
         second['result'][0]['values'][0][0] += 1
         self.assertNotEqual(monitor.query_digest(first), monitor.query_digest(second))
 
+    def test_full_matrix_pages_retain_samples_without_monolithic_json(self):
+        state, _ = monitor.state_for(self.spec, create=True)
+        window = {'start': 1600000000, 'end': 1600000300}
+        calls = []
+        def observed(spec, expression, timestamp=None):
+            calls.append((expression, timestamp))
+            return {'resultType': 'matrix', 'result': [
+                {'metric': {'case_id': 'case-' + str(index), 'identity': 'x' * 600,
+                            'source_metric': expression.split('{', 1)[0]},
+                 'values': [[1600000001 + offset, '1'] for offset in range(60)]}
+                for index in range(684)]}
+        with patch.object(monitor, 'query', side_effect=observed):
+            captured, seen = monitor.collect_query_evidence(self.spec, state, window)
+            replayed, replay_seen = monitor.collect_query_evidence(self.spec, state, window, captured)
+        self.assertEqual(captured, replayed)
+        self.assertEqual(seen, replay_seen)
+        self.assertEqual(len(seen), 684)
+        self.assertGreater(sum(page['bytes'] for page in captured['pages']), monitor.MAX_JSON)
+        self.assertTrue(all(page['bytes'] <= monitor.MAX_JSON for page in captured['pages']))
+        self.assertTrue(all('[' in expression and timestamp == window['end'] for expression, timestamp in calls))
+        monitor.atomic_json(state / 'bounded-receipt.json', {'query_evidence': captured})
+        for page in captured['pages']:
+            payload = monitor.load_json(state / 'query-evidence' / page['file'])
+            self.assertEqual(payload['result'][0]['values'], [[1600000001 + offset, '1'] for offset in range(60)])
+            self.assertEqual(monitor.query_digest(payload), page['query_sha256'])
+
+    def test_query_pages_split_oversized_response_and_replay_exact_boundaries(self):
+        state, _ = monitor.state_for(self.spec, create=True)
+        window = {'start': 1600000000, 'end': 1600000301}
+        calls = []
+        def observed(spec, expression, timestamp=None):
+            duration = float(expression.rsplit('[', 1)[1][:-2])
+            calls.append((duration, timestamp))
+            if duration > 150:
+                raise monitor.ResponseTooLarge('test response bound')
+            return {'resultType': 'matrix', 'result': [
+                {'metric': {'case_id': 'last'}, 'values': [[timestamp, '1']]}]}
+        with patch.object(monitor, 'query', side_effect=observed):
+            captured, seen = monitor.collect_query_evidence(self.spec, state, window)
+            calls.clear()
+            replayed, _ = monitor.collect_query_evidence(self.spec, state, window, captured)
+        self.assertEqual(captured, replayed)
+        self.assertEqual(seen, {'last'})
+        self.assertTrue(all(duration <= 150 for duration, _ in calls))
+        for change in ('missing-page', 'overlap', 'wrong-hash', 'oversized-file'):
+            broken = copy.deepcopy(captured)
+            if change == 'missing-page':
+                broken['pages'].pop()
+            elif change == 'overlap':
+                broken['pages'][1]['start'] -= 1
+            elif change == 'wrong-hash':
+                broken['pages'][0]['sha256'] = 'not-a-hash'
+            else:
+                broken['pages'][0]['bytes'] = monitor.MAX_JSON + 1
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                monitor.validate_query_evidence(broken, window)
+
+    def test_query_page_preserves_one_sample_and_detects_changed_historical_value(self):
+        state, _ = monitor.state_for(self.spec, create=True)
+        window = {'start': 1600000000, 'end': 1600000001}
+        one = {'resultType': 'matrix', 'result': [
+            {'metric': {'case_id': 'short'}, 'values': [[1600000001, '1']]}]}
+        with patch.object(monitor, 'query', return_value=one):
+            captured, seen = monitor.collect_query_evidence(self.spec, state, window)
+        changed = copy.deepcopy(one)
+        changed['result'][0]['values'][0][1] = '0'
+        with patch.object(monitor, 'query', return_value=changed):
+            replayed, replay_seen = monitor.collect_query_evidence(self.spec, state, window, captured)
+        self.assertNotEqual(captured, replayed)
+        self.assertEqual(seen, {'short'})
+        self.assertEqual(replay_seen, set())
+        with patch.object(monitor, 'query', side_effect=monitor.ResponseTooLarge('single-second too large')):
+            with self.assertRaises(monitor.ResponseTooLarge):
+                monitor.collect_query_evidence(self.spec, state, window)
+
+    def test_warned_query_cannot_silently_accept_truncated_evidence(self):
+        with patch.object(monitor, 'http', return_value={'status': 'success', 'warnings': ['truncated'],
+                                                        'data': {'resultType': 'matrix', 'result': []}}):
+            with self.assertRaisesRegex(ValueError, 'warned'):
+                monitor.query(self.spec, 'metric[1s]', timestamp=1600000001)
+
+    def test_capture_pages_are_manifest_bound(self):
+        state, _, _ = self.initialize_selection()
+        window = {'start': 1600000000, 'end': 1600000300}
+        with patch.object(monitor, 'query', return_value={'resultType': 'matrix', 'result': []}):
+            pages, _ = monitor.collect_query_evidence(self.spec, state, window)
+        snapshot = state / 'prometheus/snapshots/unit-snapshot/block'
+        snapshot.mkdir(parents=True)
+        monitor.atomic_json(snapshot / 'meta.json', {'minTime': 1600000000000, 'maxTime': 1600000300001})
+        verification = {'complete': True, 'gaps': [], 'time_range': window, 'evidence': {'query_evidence': pages}}
+        destination = self.root / 'paged.tar.gz'
+        with patch.object(monitor, 'verify', return_value=verification), \
+                patch.object(monitor, 'http', return_value={'status': 'success', 'data': {'name': 'unit-snapshot'}}):
+            exported = monitor.export_session(self.spec, destination)
+        self.assertTrue(exported['complete'])
+        restored = self.root / 'restored'
+        restored.mkdir()
+        capture = monitor.unpack_archive(destination, restored)
+        self.assertEqual(capture['query_evidence'], pages)
+        manifest = monitor.load_json(restored / 'manifest.json')
+        for page in pages['pages']:
+            entry = manifest['files']['evidence/query-evidence/' + page['file']]
+            self.assertEqual(entry['sha256'], page['sha256'])
+            self.assertEqual(entry['bytes'], page['bytes'])
+        # A self-consistent container manifest cannot override the semantic query
+        # index: keep the capture's historical hashes and substitute one raw page.
+        page_name = 'evidence/query-evidence/' + pages['pages'][0]['file']
+        monitor.atomic_json(restored / page_name, {'resultType': 'matrix', 'result': [
+            {'metric': {'case_id': 'substituted'}, 'values': [[1600000001, '1']]}]}, compact=True)
+        manifest['files'][page_name] = {'sha256': monitor.digest(restored / page_name),
+                                       'bytes': (restored / page_name).stat().st_size}
+        monitor.atomic_json(restored / 'manifest.json', manifest)
+        forged = self.root / 'substituted.tar.gz'
+        with tarfile.open(forged, 'w:gz') as archive:
+            for path in monitor.regular_files(restored):
+                archive.add(path, arcname=str(path.relative_to(restored)))
+        monitor.atomic_json(str(forged) + '.receipt.json', {
+            'sha256': monitor.digest(forged), 'manifest_sha256': monitor.digest(restored / 'manifest.json')})
+        fresh = self.root / 'reject-substitution'
+        fresh.mkdir()
+        with self.assertRaisesRegex(ValueError, 'query page does not match'):
+            monitor.unpack_archive(forged, fresh)
+
+    def test_verify_preserves_legacy_missing_hash_gap_and_checks_authenticated_grafana(self):
+        state, _, _ = self.initialize_selection()
+        historical = {'time_range': {'start': 1600000000, 'end': 1600000300},
+                      'seen_case_ids': [], 'expected_case_ids': ['missing-case'], 'query_sha256': {},
+                      'source_capture': {'gaps': ['historic missing receipt']}}
+        monitor.atomic_json(state / 'replay.json', historical)
+        requests = []
+        def endpoint(spec, service, path, payload=None, authenticated=False, **kwargs):
+            requests.append((service, path, authenticated))
+            if path == '/api/v1/targets':
+                return {'data': {'activeTargets': []}}
+            if path.endswith('/health'):
+                return {'status': 'OK'}
+            if path.startswith('/api/datasources/uid/'):
+                return {'type': 'prometheus', 'url': f'http://127.0.0.1:{self.spec["ports"]["prometheus"]}'}
+            if path.startswith('/api/dashboards/uid/'):
+                return {'dashboard': {'uid': monitor.DASHBOARD, 'panels': [
+                    {'id': 1, 'datasource': {'type': 'prometheus', 'uid': monitor.DATASOURCE},
+                     'targets': [{'refId': 'A', 'expr': 'up'}]}]}}
+            if path == '/api/ds/query':
+                return {'results': {'A': {'status': 200, 'frames': []}}}
+            self.fail('unexpected endpoint')
+        with patch.object(monitor, 'http', side_effect=endpoint), \
+                patch.object(monitor, 'query', return_value={'resultType': 'matrix', 'result': []}):
+            result = monitor.verify(self.spec)
+        self.assertFalse(result['complete'])
+        self.assertTrue(any('historic missing receipt' in gap for gap in result['gaps']))
+        self.assertTrue(any('historical samples differ' in gap for gap in result['gaps']))
+        self.assertTrue(any('missing-case' in gap for gap in result['gaps']))
+        self.assertTrue(all(authenticated for service, _, authenticated in requests if service == 'grafana'))
+        self.assertEqual(monitor.load_json(state / 'replay.json'), historical)
+
     def test_interpolation_keeps_one_case_and_original_window(self):
         text = monitor.interpolate('last_over_time(x{run_id="$run_id",case_id="$case_id",outcome="$outcome"}[$__range])',
                                    self.spec, 'case-01', 31.2)
@@ -185,6 +379,17 @@ class CampaignMonitorBoundaries(unittest.TestCase):
         self.assertIn('[32s]', text)
         with self.assertRaises(ValueError):
             monitor.interpolate('$unexpected', self.spec, 'case-01', 30)
+
+    def test_promql_capture_replacements_and_anchors_survive_interpolation(self):
+        for replacement in ('$1', '${1}'):
+            expression = ('label_replace(x{run_id="$run_id",name=~"value$"}, '
+                          '"metric", "' + replacement + '", "__name__", "(.*)")')
+            rendered = monitor.interpolate(expression, self.spec, 'case-01', 30)
+            self.assertIn('run_id="' + self.spec['run_id'] + '"', rendered)
+            self.assertIn('"metric", "' + replacement + '"', rendered)
+            self.assertIn('name=~"value$"', rendered)
+        with self.assertRaises(ValueError):
+            monitor.interpolate('${unexpected}', self.spec, 'case-01', 30)
 
     def make_archive(self, members):
         archive = self.root / 'capture.tar.gz'

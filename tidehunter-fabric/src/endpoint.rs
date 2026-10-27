@@ -2,9 +2,12 @@
 
 mod efa_direct;
 mod resources;
+use crate::{FabricBackend, FabricConfig};
 use efa_direct::{ControlWindow, SendWindow, StreamReceiver};
 use ofi_libfabric_sys::bindgen as ffi;
 use resources::{ADDRESS, Resources, error, invalid};
+use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use std::{
     any::Any,
     io::{self, IoSlice, Write},
@@ -107,7 +110,7 @@ pub struct RmaConfig {
 }
 
 /// The provider's selected memory addressing and read implementation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RmaCapabilities {
     pub address_mode: RmaAddressMode,
     pub read_mode: RmaReadMode,
@@ -115,16 +118,35 @@ pub struct RmaCapabilities {
     pub max_iov: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum RmaAddressMode {
     Virtual,
     Offset,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum RmaReadMode {
     Native,
     Emulated,
+    Unknown,
+}
+
+/// Observed provider setup and the provenance of its advertised capabilities.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderInfo {
+    pub backend: FabricBackend,
+    pub provider: String,
+    pub fabric: Option<String>,
+    pub domain: Option<String>,
+    pub source_address: Option<IpAddr>,
+    pub device: Option<String>,
+    pub driver: Option<String>,
+    pub bus_address: Option<String>,
+    pub rma_capabilities: Option<RmaCapabilities>,
+    pub capability_evidence: String,
 }
 
 /// Wire-safe remote address; contains no process-local MR descriptor.
@@ -294,59 +316,36 @@ impl DirectState {
 unsafe impl Send for Endpoint {}
 
 impl Endpoint {
-    /// Opens exactly the selected libfabric provider, without software fallback.
-    /// # Errors
-    /// Reports invalid names, absent providers/devices or exhausted admission.
-    pub fn open(provider: &str, domain: Option<&str>) -> io::Result<Self> {
-        Self::open_inner(provider, domain, false, None)
-    }
-
-    /// Opens a message endpoint with negotiated one-sided read support and
-    /// bounded pre-registered destination resources.
+    /// Opens exactly the configured libfabric provider, without software fallback.
     ///
-    /// Inspect `rma_capabilities` before use: optional unsupported RMA can leave
-    /// a message-only endpoint. This never changes the requested provider.
     /// # Errors
-    /// Reports invalid bounds, exhausted admission, provider errors or missing
-    /// hardware reads when `require_device_read` is set.
-    pub fn open_rma(provider: &str, domain: Option<&str>, config: RmaConfig) -> io::Result<Self> {
-        Self::open_inner(provider, domain, false, Some(config))
+    /// Reports invalid configuration, unavailable providers, unsupported
+    /// capabilities, exhausted admission or native resource-setup failures.
+    pub fn open(config: &FabricConfig, rma: Option<RmaConfig>) -> io::Result<Self> {
+        config.validate()?;
+        if config.backend == FabricBackend::Efa && rma.is_some() {
+            return Err(invalid(
+                "regular EFA RMA is unsupported; select the explicit efa-direct backend",
+            ));
+        }
+        Self::open_inner(config, rma)
     }
 
-    /// Opens only the `efa-direct` fabric of the EFA provider. No regular-EFA
-    /// or software fallback is attempted.
-    /// # Errors
-    /// Returns a hardware-unavailable error when the direct fabric is absent.
-    pub fn open_efa_direct(domain: Option<&str>) -> io::Result<Self> {
-        Self::open_inner("efa", domain, true, None)
-    }
-
-    /// Opens the explicit `efa-direct` packet/message endpoint with `FI_READ`
-    /// capability negotiation and the configured bounded RMA pools.
-    /// # Errors
-    /// Reports invalid bounds, exhausted admission or unavailable direct/RMA
-    /// capabilities. No regular-EFA or software fallback is attempted.
-    pub fn open_efa_direct_rma(domain: Option<&str>, config: RmaConfig) -> io::Result<Self> {
-        Self::open_inner("efa", domain, true, Some(config))
-    }
-
-    /// Test-only packet-protocol exercise over libfabric's software provider.
-    /// The ordinary provider remains honestly reported and is never a runtime
-    /// fallback for `open_efa_direct`.
+    /// Test-only packet-protocol exercise over the explicitly selected software provider.
     #[cfg(test)]
     fn open_software_packet_test(domain: Option<&str>) -> io::Result<Self> {
-        let mut endpoint = Self::open_inner("tcp;ofi_rxm", domain, false, None)?;
+        let config = FabricConfig {
+            backend: FabricBackend::SoftwareTcp,
+            domain: domain.map(str::to_owned),
+            source_address: None,
+        };
+        let mut endpoint = Self::open(&config, None)?;
         endpoint.inner().enable_test_packet_adapter();
         endpoint.direct = Some(Box::new(DirectState::new(4096)?));
         Ok(endpoint)
     }
 
-    fn open_inner(
-        provider: &str,
-        domain: Option<&str>,
-        direct: bool,
-        rma: Option<RmaConfig>,
-    ) -> io::Result<Self> {
+    fn open_inner(config: &FabricConfig, rma: Option<RmaConfig>) -> io::Result<Self> {
         LIVE.fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
             (live < ENDPOINTS).then_some(live + 1)
         })
@@ -357,10 +356,9 @@ impl Endpoint {
             direct: None,
             failed: false,
         };
-        let use_direct = direct || (provider == "efa" && rma.is_some());
         endpoint.inner().open_profile.allocation_ns = resources::elapsed_ns(allocation);
-        endpoint.inner().open_mode(provider, domain, direct, rma)?;
-        if use_direct {
+        endpoint.inner().open_mode(config, rma)?;
+        if config.backend.is_direct() {
             endpoint.direct = Some(Box::new(DirectState::new(endpoint.open_profile().mtu)?));
         }
         Ok(endpoint)
@@ -375,6 +373,17 @@ impl Endpoint {
             .as_deref()
             .expect("resources exist until Endpoint::drop")
             .open_profile
+    }
+    /// Returns actual provider/domain/device setup evidence without discovery calls.
+    /// # Panics
+    /// Panics if the internal ownership invariant is broken: successful open
+    /// retains the provider metadata until this endpoint is dropped.
+    #[must_use]
+    pub fn provider_info(&self) -> &ProviderInfo {
+        self.resources
+            .as_deref()
+            .and_then(Resources::provider_info)
+            .expect("provider info exists after successful endpoint open")
     }
 
     /// Returns the bounded address for the authenticated TLS bootstrap.
@@ -1347,7 +1356,15 @@ mod tests {
     }
 
     #[test]
-    fn provider_name_cannot_contain_nul() {
-        assert!(Endpoint::open("efa\0tcp", None).is_err());
+    fn domain_selector_cannot_contain_nul() {
+        let config = FabricConfig {
+            backend: FabricBackend::Verbs,
+            domain: Some("verbs\0device".to_owned()),
+            source_address: None,
+        };
+        assert_eq!(
+            config.validate().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 }

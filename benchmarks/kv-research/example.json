@@ -37,6 +37,10 @@
     "aging_operations": 0,
     "measurement_operations": 100000
   },
+  "measurement_completion_gate": null,
+  "diagnostics": {
+    "write_profile_limit": 0
+  },
   "qualification_only": false,
   "source_revision": null,
   "limits": {

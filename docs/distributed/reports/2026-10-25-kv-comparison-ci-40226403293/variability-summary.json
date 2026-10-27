@@ -1,0 +1,45 @@
+{
+  "policy_sha256": "14b68bfe6be6ada22395cf0fa703af77fce3495953f3eb9efcb5b9e5d73221eb",
+  "inputs": [
+    {
+      "run_id": "th-e4a783f03101a780",
+      "numeric_csv_sha256": "4895479e00ace34e3d15fb1870c05951eb407dd89b5859cd373f99a9a1612bc2",
+      "source_revision": "c61c9e295708e5b4354dae43538e900f3515df4d",
+      "owner_cpu_ceiling": 8,
+      "owner_memory_gib_ceiling": 16
+    },
+    {
+      "run_id": "th-7dea3c080cb44d48",
+      "numeric_csv_sha256": "dfe591140fd9a0897b11ac0c609bf0d5627e0eb8bda28753a66592c732a91bf1",
+      "owner_cpu_ceiling": 4,
+      "owner_memory_gib_ceiling": 8,
+      "limit": "Older normal-read presence cannot be retrospectively certified; no cross-history causal regression claim."
+    }
+  ],
+  "independent_repetitions_used": [
+    0,
+    1
+  ],
+  "histories_analyzed_separately": true,
+  "comparison_count": 7780,
+  "within_history_metric_spreads": 2456,
+  "counts": {
+    "current_th-e4a783f03101a780": {
+      "unchanged_descriptive_conclusion_across_observed_spread": 3624,
+      "uncertain_at_material_threshold": 280
+    },
+    "previous_th-7dea3c080cb44d48": {
+      "unchanged_descriptive_conclusion_across_observed_spread": 3502,
+      "uncertain_at_material_threshold": 374
+    }
+  },
+  "limitations": [
+    "Observed ranges from two runs are not confidence intervals and do not prove equivalence.",
+    "Each comparison stays within its original history and cohort; old/new hardware and harness contracts differ and are not pooled.",
+    "Conditional offered-load latency cannot establish superiority without acceptance/goodput/rejection context.",
+    "Tail sample-count warnings remain; this assessment does not increase within-case samples or claim significance."
+  ],
+  "new_measurements": 0,
+  "new_clusters": 0,
+  "automatically_scheduled_reruns": 0
+}

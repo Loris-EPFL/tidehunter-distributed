@@ -10,6 +10,7 @@ import unittest
 
 import analyze_cloud as audit
 import scalar_transport as profile
+from portable_transport import metadata_transport_label, select_transports, transport_for_case, write_transport_config
 
 
 def save(path, value):
@@ -78,7 +79,7 @@ class Evidence:
     """
     def __init__(self, root, scope='full'):
         self.root = root
-        self.cfg = dict(campaign='scalar-transport', checkpoint_scope=scope, efa=True,
+        self.cfg = dict(campaign='scalar-transport', checkpoint_scope=scope, efa=True, transports=['tcp'],
             run_id='th-0123456789abcdef', run_root='/mnt/tidehunter/th-0123456789abcdef',
             instance_type='g6.16xlarge', region='us-east-1', repetitions=3,
             export_reserve_seconds=600, deadline_utc='2026-10-11T03:00:00+00:00',
@@ -86,6 +87,14 @@ class Evidence:
             nodes=[dict(partition=p, instance_id=f'i-{p+2:017x}', private_ip=f'172.31.32.{p+10}')
                    for p in range(5)])
         save(root / 'campaign-config.json', self.cfg)
+        requested_client = transport_for_case('tcp')
+        requested_path = root / 'cloud-build-requested-transport.json'
+        write_transport_config(requested_path, requested_client)
+        requested_owners_path = root / 'cloud-build-requested-owner-transports.json'
+        requested_owners_path.write_text(json.dumps(
+            select_transports(requested_client, None, len(self.cfg['nodes']))) + '\n')
+        requested_client_hash = hashlib.sha256(requested_path.read_bytes()).hexdigest()
+        requested_owners_hash = hashlib.sha256(requested_owners_path.read_bytes()).hexdigest()
         tags = dict(Project='TideHunter', ManagedBy='sharded-wal-benchmark', RunId=self.cfg['run_id'])
         save(root / 'owned-instances.json', [dict(InstanceId=n['instance_id'],
             InstanceType='g6.16xlarge', Placement={'AvailabilityZone': 'us-east-1a'},
@@ -95,10 +104,11 @@ class Evidence:
         self.builds = {}
         for label, digest, source in [('baseline', 'a' * 64, profile.BASELINE_SOURCE_SHA256),
                                       ('current', 'b' * 64, profile.CURRENT_SOURCE_SHA256)]:
+            features = 'experimental-fabric,test-utils'
             command = ['cargo', '+1.90.0', 'build', '--manifest-path',
-                       self.base + f'/build-source/{label}/Cargo.toml']
+                       self.base + f'/build-source/{label}/Cargo.toml', '--features', features]
             receipt = dict(label=label, binary_sha256=digest, source_tree_sha256=source,
-                source_manifest_sha256='c' * 64, features='experimental-fabric,test-utils',
+                source_manifest_sha256='c' * 64, features=features,
                 local_binary_sha256=profile.BASELINE_BINARY_SHA256 if label == 'baseline' else 'd' * 64,
                 libfabric_version=profile.FABRIC_VERSION, libfabric_sha256='e' * 64,
                 recovery_binary_sha256=('f' if label == 'current' else '0') * 64,
@@ -107,17 +117,24 @@ class Evidence:
             save(root / f'cloud-build-{label}.json', receipt)
             save(root / f'build-{label}.command.json', dict(exit_code=0, command=command))
             save(root / f'capability-{label}.command.json', dict(exit_code=0, command=[self.binary(label), '--help']))
-            (root / f'capability-{label}.stdout.log').write_text('--remote-config --prepare-external-case\n')
+            (root / f'capability-{label}.stdout.log').write_text(
+                '--remote-config --prepare-external-case --transport-config --owner-transports\n')
         smoke_root = self.base + '/build-smoke/external-case'
-        smoke = [self.binary('current'), '--prepare-external-case', smoke_root, '--guest-case-root', smoke_root,
-                 '--remote-endpoints', self.endpoints, '--values', '1024', '--batch-sizes', '1',
+        request_root = self.base + '/build-smoke/requested-configs/external-case'
+        smoke = [self.binary('current'), '--prepare-external-case', smoke_root,
+                 '--guest-case-root', smoke_root, '--remote-endpoints', self.endpoints,
+                 '--transport-config', request_root + '/transport.json',
+                 '--owner-transports', request_root + '/owner-transports.json',
+                 '--values', '1024', '--batch-sizes', '1',
                  '--windows', '1', '--batches', '128', '--mixed', '32', '--reads', '512', '--repetitions', '1']
         save(root / 'cloud-build-preparation-smoke.command.json', dict(exit_code=0, command=smoke))
         save(root / 'cloud-build-pair-verified.json', dict(
             binary_sha256={label: r['binary_sha256'] for label, r in self.builds.items()},
             distinct_sources=True, distinct_binaries=True, capability_checks=True, prepare_command=smoke,
             prepared_configuration_sha256={name: '1' * 64 for name in
-                ['remote.yaml'] + [f'node-{p}/launch.yaml' for p in range(5)]}))
+                ['remote.yaml', 'owner_transports.json'] + [f'node-{p}/launch.yaml' for p in range(5)]},
+            requested_transport_sha256=requested_client_hash,
+            requested_owner_transports_sha256=requested_owners_hash))
 
     @property
     def base(self):
@@ -166,13 +183,41 @@ class Evidence:
     def prepare(self, spec):
         case = spec['case_id']
         save(self.root / (case + '-plan.json'), spec)
-        command = [self.binary(spec['build']), '--prepare-external-case', self.base + '/cases/' + case,
-                   '--guest-case-root', self.base + '/cases/' + case, '--remote-endpoints', self.endpoints]
-        command += profile.flags(spec, 'tcp', prepare=True)
+        case_root = self.base + '/cases/' + case
+        command = [self.binary(spec['build']), '--prepare-external-case', case_root,
+                   '--guest-case-root', case_root, '--remote-endpoints', self.endpoints]
+        transport_config = self.base + '/cases/requested-configs/' + case + '/transport.json' if spec['build'] == 'current' else None
+        command += profile.flags(spec, 'tcp', prepare=True, transport_config=transport_config)
+        if spec['build'] == 'current':
+            command += ['--owner-transports', self.base + '/cases/requested-configs/' + case + '/owner-transports.json']
         save(self.root / (case + '-prepare.command.json'), dict(exit_code=0, command=command,
              binary_sha256=self.builds[spec['build']]['binary_sha256']))
-        (self.root / (case + '-remote.yaml')).write_text(
-            'read_lanes: 1\nread_cache_bytes: 0\nread_memory_allowance_bytes: 536870912\n')
+        if spec['build'] == 'current':
+            transport = transport_for_case(spec['transport'])
+            owner_transports = select_transports(transport, None, len(self.cfg['nodes']))
+            write_transport_config(self.root / (case + '-transport-config.json'), transport)
+            save(self.root / (case + '-owner-transports-requested.json'), owner_transports)
+            save(self.root / (case + '-owner-transports.json'), owner_transports)
+            remote = ('read_lanes: 1\nread_cache_bytes: 0\nread_memory_allowance_bytes: 536870912\n'
+                      + 'tls:\n  transport: ' + json.dumps(transport) + '\n')
+        else:
+            remote = 'read_lanes: 1\nread_cache_bytes: 0\nread_memory_allowance_bytes: 536870912\n'
+        (self.root / (case + '-remote.yaml')).write_text(remote)
+        if spec['build'] == 'current':
+            for node, owner_transport in zip(self.cfg['nodes'], owner_transports):
+                (self.root / (case + f"-node-{node['partition']}-launch.yaml")).write_text(
+                    'tls:\n  transport: ' + json.dumps(owner_transport) + '\n')
+            launch_hashes = {str(node['partition']): hashlib.sha256(
+                (self.root / (case + f"-node-{node['partition']}-launch.yaml")).read_bytes()).hexdigest()
+                for node in self.cfg['nodes']}
+            save(self.root / (case + '-prepared-transports.json'), dict(schema=1,
+                requested_transport_sha256=hashlib.sha256(
+                    (self.root / (case + '-transport-config.json')).read_bytes()).hexdigest(),
+                requested_owner_transports_sha256=hashlib.sha256(
+                    (self.root / (case + '-owner-transports-requested.json')).read_bytes()).hexdigest(),
+                owner_transports_sha256=hashlib.sha256(
+                    (self.root / (case + '-owner-transports.json')).read_bytes()).hexdigest(),
+                launch_sha256=launch_hashes))
         for partition in range(5):
             self.archive(spec, partition, self.node_members(spec, partition))
 
@@ -194,7 +239,9 @@ class Evidence:
         path.mkdir()
         (path / 'COMPLETE').write_text('verified\n')
         command = [self.binary(spec['build']), '--output', self.base + '/results/' + name, '--backend', mode]
-        command += profile.flags(spec, mode, external=mode == 'tcp')
+        transport_config = (self.base + '/cases/requested-configs/' + spec['case_id'] + '/transport.json'
+                            if spec['build'] == 'current' else None)
+        command += profile.flags(spec, mode, external=mode == 'tcp', transport_config=transport_config)
         if mode == 'tcp':
             command += ['--remote-config', self.base + '/cases/' + spec['case_id'] + '/remote.yaml']
         self.process(name, spec, command)
@@ -211,11 +258,13 @@ class Evidence:
             counts.update(reopen_reused_transport=1, reopen_reused_get_audit=spec['batches'] * spec['batch'])
         if spec['cold']:
             counts.update(dict.fromkeys(('cache_evicted_get', 'cache_evicted_get_many', 'cache_evicted_get_window'), 1))
+        runtime_label = (metadata_transport_label(spec['transport'])
+                         if spec['build'] == 'current' else spec['transport'])
         table(path / 'samples.csv', [dimensions | dict(phase=p, sample=0, latency_ns=100, logical_operations=n)
                                     for p, n in counts.items()])
         table(path / 'summary.csv', [dimensions | dict(phase=p, samples=1, logical_operations=n,
             measured_api_ns=100, phase_wall_ns=1000, p50_ns=100, p95_ns='', p99_ns='',
-            instrumented_phase_ops_per_sec=n * 1e6, transport=spec['transport'],
+            instrumented_phase_ops_per_sec=n * 1e6, transport=runtime_label,
             durability='value_wal_file_and_directory_barrier', sample_unit='whole_phase',
             rate_scope='shared_read_write_wall' if p.startswith('mixed_') else 'phase_wall')
             for p, n in counts.items()])
@@ -245,7 +294,7 @@ class Evidence:
             table(path / 'read_path_evidence.csv', [dimensions | counters | dict(phase=phase, boundary=boundary,
                 role=role, partition=p) for phase in ('point_get', 'point_get_window')
                 for boundary in ('before', 'after') for role, p, _ in roles])
-            table(path / 'write_windows.csv', [dimensions | dict(phase=phase, sample=0, transport=spec['transport'],
+            table(path / 'write_windows.csv', [dimensions | dict(phase=phase, sample=0, transport=runtime_label,
                 preparation_admission_ns=1, storage_wait_ns=1, publication_ns=1, dispatch_ns=1,
                 checkpoint_ns=1, foreground_checkpoint_ns=1, api_ns=100, checkpoint_count=1,
                 foreground_checkpoint_count=1) for phase in
@@ -442,7 +491,7 @@ class ScalarEvidenceTests(unittest.TestCase):
         save(path, original)
         path = self.root / (spec['case_id'] + '-prepare.command.json')
         row = audit.read_json(path)
-        row['command'][row['command'].index('--transport') + 1] = 'tcp'
+        row['command'][row['command'].index('--transport-config') + 1] = '/wrong/transport.json'
         save(path, row)
         with self.assertRaises(ValueError):
             self.read(name)

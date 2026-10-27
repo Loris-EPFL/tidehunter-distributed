@@ -63,7 +63,9 @@ impl Fixture {
                 server_name: String::new(),
                 resident_reads: super::super::tcp::ResidentReadConfig::default(),
             },
-            timeout: Duration::from_secs(5),
+            // Five-node startup/replay shares disk and CPU with the full suite.
+            // This is a bounded liveness guard, not a latency assertion.
+            timeout: Duration::from_secs(30),
             max_admitted_batches: max_batches,
             max_index_bytes: 1024 * 1024,
             max_pending_batches: 64,
@@ -122,7 +124,7 @@ impl Fixture {
                     listener,
                     tls,
                     TcpLimits {
-                        io_timeout: Duration::from_secs(5),
+                        io_timeout: Duration::from_secs(30),
                         ..TcpLimits::default()
                     },
                     stop,

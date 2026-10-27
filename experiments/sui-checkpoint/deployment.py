@@ -9,6 +9,8 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from resident_config import resident_read_config, validate_destination_total, software_fabric_environment
+from portable_transport import (validate_transport, select_transports,
+                                is_trusted, is_software, is_fabric)
 
 MIB = 1024 * 1024
 HARDWARE_TRANSPORTS = ('efa', 'efa-direct', 'efa-native')
@@ -17,10 +19,14 @@ TRUSTED_TRANSPORTS = ('efa-native', 'fabric-tcp-native')
 TRANSPORTS = ('tcp', *HARDWARE_TRANSPORTS, *SOFTWARE_TRANSPORTS)
 
 
+def select_owner_transports(client, owners, count):
+    """Select host-local owner transports through the shared protocol validator."""
+    return select_transports(validate_transport(client), owners, count)
+
+
 def process_environment(environment, *, transport):
-    if transport not in TRANSPORTS:
-        raise ValueError('unsupported transport')
-    return software_fabric_environment(environment, software=transport in SOFTWARE_TRANSPORTS)
+    transport = validate_transport(transport)
+    return software_fabric_environment(environment, software=is_software(transport))
 
 
 def dump(path, value):
@@ -67,32 +73,34 @@ def schemas(directory, expected_backend=None):
     return result
 
 
-def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, coordinator_cache, shard_cache, guest_root=None, write_profile_limit=0, resident_reads=None):
+def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, coordinator_cache, shard_cache, guest_root=None, write_profile_limit=0, resident_reads=None, owner_transports=None):
     if type(write_profile_limit) is not int or not 0 <= write_profile_limit <= 65536:
         raise ValueError('write profile limit must be an integer 0..65536')
-    if transport not in TRANSPORTS or len(hosts) != 5:
-        raise ValueError('a supported transport and exactly five hosts are required')
-    if transport in SOFTWARE_TRANSPORTS and (guest_root is not None or any(host != '127.0.0.1' for host in hosts)):
-        raise ValueError('software fabric is loopback-only in the native engine; use tcp or EFA for external hosts')
-    if transport in HARDWARE_TRANSPORTS and guest_root is None:
-        raise ValueError('hardware EFA needs explicit external mode')
+    transport = validate_transport(transport)
+    owners = select_owner_transports(transport, owner_transports, 5)
+    if len(hosts) != 5:
+        raise ValueError('exactly five hosts are required')
+    if is_software(transport) and (guest_root is not None or any(host != '127.0.0.1' for host in hosts)):
+        raise ValueError('software fabric is loopback-only in the native engine')
+    if is_fabric(transport) and not is_software(transport) and guest_root is None:
+        raise ValueError('hardware fabric needs explicit external mode')
     if set(shape_yamls) != set(schema):
         raise ValueError('canonical engine YAML must cover every selected namespace')
     resident = resident_read_config(resident_reads)
-    if resident['destination_slots'] and transport not in TRUSTED_TRANSPORTS:
+    if resident['destination_slots'] and not is_trusted(transport):
         raise ValueError('resident_reads requires an explicit trusted-native transport')
-    if resident['require_device_read'] and transport in SOFTWARE_TRANSPORTS:
+    if resident['require_device_read'] and is_software(transport):
         raise ValueError('software fabric cannot qualify hardware device reads')
     validate_destination_total(resident, len(schema))
     directory.mkdir(mode=0o700)
-    if transport not in TRUSTED_TRANSPORTS:
+    if not is_trusted(transport):
         certificates(directory / 'tls')
     runtime = guest_root or directory
     tls_root = runtime / 'tls'
-    def tls(name, base):
-        if transport in TRUSTED_TRANSPORTS:
-            return dict(transport=transport, ca='', cert='', key='', server_name=name)
-        return dict(transport=transport, ca=str(base / 'ca.der'), cert=str(base / f'{name}.der'),
+    def tls(name, base, selected):
+        if is_trusted(selected):
+            return dict(transport=selected, ca='', cert='', key='', server_name=name)
+        return dict(transport=selected, ca=str(base / 'ca.der'), cert=str(base / f'{name}.der'),
                     key=str(base / f'{name}.pk8'), server_name=name)
     databases, nodes = {}, []
     for number, (namespace, shape) in enumerate(schema.items()):
@@ -123,7 +131,7 @@ def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, 
                 node['resident_reads'] = resident
             # Adaptive parks drained TCP on readiness and keeps fabric CQ
             # progress live; neither transport uses periodic idle sleeps.
-            launch = dict(node=node, tls=tls(f'node-{partition}', tls_root),
+            launch = dict(node=node, tls=tls(f'node-{partition}', tls_root, owners[partition]),
                 limits=dict(max_frame_bytes=16*MIB, max_connections=16, max_reads=256,
                     recovery_page_batches=128, io_timeout=dict(secs=60, nanos=0), polling='adaptive'),
                 listen=address, ready_file=str(runtime_node / 'ready'), stop_file=str(runtime_node / 'stop'),
@@ -133,7 +141,7 @@ def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, 
                 launch=str(node_dir / 'launch.yaml'), ready=str(runtime_node / 'ready'), stop=str(runtime_node / 'stop')))
             endpoints.append(dict(partition=partition, address=address, server_name=f'node-{partition}'))
         # Coordinator-local credentials are unnecessary in explicit trusted mode.
-        client_tls = tls('authority', directory / 'tls')
+        client_tls = tls('authority', directory / 'tls', transport)
         # Retained epoch history is not the in-flight window: acknowledged
         # identities remain necessary for exact retries and crash recovery.
         databases[namespace] = dict(storage=storage, endpoints=endpoints, tls=client_tls,

@@ -142,6 +142,14 @@ pub struct MeasurementGateConfig {
     pub timeout_seconds: u64,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnosticsConfig {
+    /// Maximum write operations to sample in the measured phase. Zero disables profiling.
+    #[serde(default)]
+    pub write_profile_limit: usize,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunConfig {
@@ -164,6 +172,10 @@ pub struct RunConfig {
     pub source_revision: Option<String>,
     #[serde(default)]
     pub measurement_gate: Option<MeasurementGateConfig>,
+    #[serde(default)]
+    pub measurement_completion_gate: Option<MeasurementGateConfig>,
+    #[serde(default)]
+    pub diagnostics: DiagnosticsConfig,
     pub limits: LimitsConfig,
 }
 
@@ -192,15 +204,35 @@ impl RunConfig {
                 "key_namespace_hex requires 32 lowercase hex digits and complete preload",
             );
         }
-        if let Some(gate) = &self.measurement_gate
-            && (!gate.ready_file.is_absolute()
-                || !gate.release_file.is_absolute()
-                || gate.ready_file == gate.release_file
-                || !(1..=120).contains(&gate.timeout_seconds))
+        for (gate, name) in [
+            (&self.measurement_gate, "measurement_gate"),
+            (
+                &self.measurement_completion_gate,
+                "measurement_completion_gate",
+            ),
+        ] {
+            if let Some(gate) = gate
+                && (!gate.ready_file.is_absolute()
+                    || !gate.release_file.is_absolute()
+                    || gate.ready_file == gate.release_file
+                    || !(1..=120).contains(&gate.timeout_seconds))
+            {
+                return invalid(&format!(
+                    "{name} requires distinct absolute marker paths and timeout_seconds between 1 and 120"
+                ));
+            }
+        }
+        if let (Some(begin), Some(end)) =
+            (&self.measurement_gate, &self.measurement_completion_gate)
+            && (begin.ready_file == end.ready_file
+                || begin.ready_file == end.release_file
+                || begin.release_file == end.ready_file
+                || begin.release_file == end.release_file)
         {
-            return invalid(
-                "measurement_gate requires distinct absolute marker paths and timeout_seconds between 1 and 120",
-            );
+            return invalid("measurement and completion gates require four distinct marker paths");
+        }
+        if self.diagnostics.write_profile_limit > 65_536 {
+            return invalid("diagnostics.write_profile_limit must not exceed 65536");
         }
         if self.schema_version != 1 {
             return invalid("schema_version must be 1");
@@ -208,16 +240,16 @@ impl RunConfig {
         if self.backend.kind.trim().is_empty() {
             return invalid("backend.kind must not be empty");
         }
+        if self.backend.kind == "valkey_tcp" && self.workload.mix.put_batch > 0 {
+            return invalid("valkey_tcp does not support atomic put_batch");
+        }
         if self.dataset.keys == 0 || self.dataset.keys > self.limits.max_keys {
             return invalid("dataset.keys must be positive and within limits.max_keys");
         }
         if !matches!(self.dataset.value_size, 64 | 256 | 1024 | 8192 | 65_536) {
             return invalid("dataset.value_size must be 64, 256, 1024, 8192, or 65536 bytes");
         }
-        if matches!(
-            self.backend.kind.as_str(),
-            "tidehunter_tcp" | "tidehunter_efa" | "tidehunter_efa_direct" | "tidehunter_efa_native"
-        ) {
+        if self.backend.kind == "tidehunter" {
             // Qualification always checks a two-entry batch; workload batches
             // use the configured size only when put_batch is actually offered.
             let batch_operations = if self.workload.mix.put_batch > 0 {
@@ -402,6 +434,8 @@ mod tests {
             qualification_only: false,
             source_revision: None,
             measurement_gate: None,
+            measurement_completion_gate: None,
+            diagnostics: DiagnosticsConfig::default(),
             limits: LimitsConfig {
                 max_keys: 100,
                 max_bytes: 25_600,
@@ -476,7 +510,7 @@ mod tests {
             assert!(config.validate().is_ok(), "value size {size}");
         }
 
-        config.backend.kind = "tidehunter_tcp".to_owned();
+        config.backend.kind = "tidehunter".to_owned();
         config.backend.options = serde_json::json!({});
         config.dataset.value_size = 8192;
         config.limits.max_bytes = config.dataset.keys * 8192;
@@ -519,12 +553,34 @@ mod tests {
             timeout_seconds: 60,
         });
         assert!(config.validate().is_ok());
-        config.measurement_gate.as_mut().unwrap().release_file = PathBuf::from("relative-release");
+        config.measurement_completion_gate = config.measurement_gate.clone();
         assert!(config.validate().is_err());
-        config.measurement_gate.as_mut().unwrap().release_file = PathBuf::from("/tmp/kv-ready");
-        assert!(config.validate().is_err());
-        config.measurement_gate.as_mut().unwrap().release_file = PathBuf::from("/tmp/kv-release");
+        config
+            .measurement_completion_gate
+            .as_mut()
+            .unwrap()
+            .ready_file = PathBuf::from("/tmp/kv-completion-ready");
+        config
+            .measurement_completion_gate
+            .as_mut()
+            .unwrap()
+            .release_file = PathBuf::from("/tmp/kv-completion-release");
+        assert!(config.validate().is_ok());
         config.measurement_gate.as_mut().unwrap().timeout_seconds = 121;
+        assert!(config.validate().is_err());
+        config.measurement_gate.as_mut().unwrap().timeout_seconds = 60;
+        config
+            .measurement_completion_gate
+            .as_mut()
+            .unwrap()
+            .release_file = PathBuf::from("relative");
+        assert!(config.validate().is_err());
+        config
+            .measurement_completion_gate
+            .as_mut()
+            .unwrap()
+            .release_file = PathBuf::from("/tmp/kv-completion-release");
+        config.diagnostics.write_profile_limit = 65_537;
         assert!(config.validate().is_err());
     }
 }

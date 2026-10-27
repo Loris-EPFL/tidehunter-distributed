@@ -132,6 +132,8 @@ pub async fn run<B: KvBackend>(
         }
         reporter.snapshot()?;
     }
+    let mut measurement_attempted = false;
+    let mut profile_arm_error = None;
     if !config.qualification_only
         && fatal_reason.is_none()
         && config.phases.measurement_operations > 0
@@ -143,7 +145,18 @@ pub async fn run<B: KvBackend>(
             fatal_reason = Some(format!("measurement gate failed: {error}"));
             reporter.snapshot()?;
         }
+        if fatal_reason.is_none()
+            && config.diagnostics.write_profile_limit > 0
+            && let Err(error) = backend.arm_write_profile(config.diagnostics.write_profile_limit)
+        {
+            failed = true;
+            let reason = format!("measurement write profile arm failed: {error}");
+            profile_arm_error = Some(reason.clone());
+            fatal_reason = Some(reason);
+            reporter.snapshot()?;
+        }
         if fatal_reason.is_none() {
+            measurement_attempted = true;
             reporter.set_phase("measurement");
             if let Err(error) = run_phase(
                 Arc::clone(&backend),
@@ -166,6 +179,48 @@ pub async fn run<B: KvBackend>(
         }
     }
 
+    if measurement_attempted
+        && let Some(gate) = &config.measurement_completion_gate
+        && let Err(error) = wait_for_measurement_gate(gate, deadline).await
+    {
+        failed = true;
+        fatal_reason = Some(fatal_reason.map_or_else(
+            || format!("measurement completion gate failed: {error}"),
+            |previous| format!("{previous}; measurement completion gate failed: {error}"),
+        ));
+        reporter.snapshot()?;
+    }
+    if config.diagnostics.write_profile_limit > 0 {
+        let profile_deadline = deadline + Duration::from_secs(config.limits.shutdown_grace_seconds);
+        let export = export_write_diagnostics(
+            backend.as_ref(),
+            &config,
+            output,
+            measurement_attempted,
+            profile_arm_error.as_deref(),
+            profile_deadline,
+        )
+        .await;
+        match export {
+            Ok(Some(error)) => {
+                failed = true;
+                fatal_reason = Some(fatal_reason.map_or_else(
+                    || format!("write diagnostics finalization failed: {error}"),
+                    |previous| {
+                        format!("{previous}; write diagnostics finalization failed: {error}")
+                    },
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                failed = true;
+                fatal_reason = Some(fatal_reason.map_or_else(
+                    || format!("write diagnostics export failed: {error}"),
+                    |previous| format!("{previous}; write diagnostics export failed: {error}"),
+                ));
+            }
+        }
+    }
     reporter.set_phase("qualification");
     if fatal_reason.is_none() && Instant::now() < deadline {
         if let Err(error) = qualify_on_worker(
@@ -295,7 +350,7 @@ async fn preload<B: KvBackend>(
         };
         let scheduled = duration_ns(origin.elapsed());
         reporter.offered("preload", "put", 1);
-        if let Err(work) = pool.try_dispatch(work, "preload", scheduled, deadline) {
+        if let Err(work) = pool.try_dispatch(work, "preload", scheduled, deadline, false) {
             reporter.rejected(rejected_sample(
                 "preload",
                 &work,
@@ -607,6 +662,7 @@ struct WorkerRequest {
     id: u64,
     work: WorkItem,
     phase: &'static str,
+    profiled_write: bool,
     scheduled_ns: u64,
     origin: Instant,
     global_deadline: Instant,
@@ -681,6 +737,7 @@ impl WorkerPool {
                                 id,
                                 work,
                                 phase,
+                                profiled_write,
                                 scheduled_ns,
                                 origin,
                                 global_deadline,
@@ -691,6 +748,7 @@ impl WorkerPool {
                                 &config,
                                 &namespace,
                                 work,
+                                profiled_write,
                                 phase,
                                 scheduled_ns,
                                 origin,
@@ -734,6 +792,7 @@ impl WorkerPool {
         phase: &'static str,
         scheduled_ns: u64,
         deadline: Instant,
+        profiled_write: bool,
     ) -> Result<(), WorkItem> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
@@ -749,6 +808,7 @@ impl WorkerPool {
             id,
             work,
             phase,
+            profiled_write,
             scheduled_ns,
             origin: self.origin,
             global_deadline: deadline,
@@ -942,6 +1002,104 @@ async fn wait_for_measurement_gate(
     }
 }
 
+async fn export_write_diagnostics<B: KvBackend>(
+    backend: &B,
+    config: &RunConfig,
+    output: &Path,
+    measurement_attempted: bool,
+    arm_error: Option<&str>,
+    finish_deadline: Instant,
+) -> BackendResult<Option<String>> {
+    let mut finish_error = arm_error.map(str::to_owned);
+    let profile = if finish_error.is_none() && measurement_attempted {
+        match timeout_at(
+            TokioInstant::from_std(finish_deadline),
+            backend.finish_write_profile(),
+        )
+        .await
+        {
+            Ok(Ok(profile)) => Some(profile),
+            Ok(Err(error)) => {
+                finish_error = Some(error.to_string());
+                None
+            }
+            Err(_) => {
+                finish_error =
+                    Some("write profile finalization exceeded shutdown grace".to_owned());
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if finish_error.is_none() {
+        finish_error = profile
+            .as_ref()
+            .and_then(|profile| profile.get("finalization_error"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+    }
+    let observed_samples = profile
+        .as_ref()
+        .and_then(|profile| {
+            profile
+                .get("sampled_requests")
+                .or_else(|| profile.get("selected_operations"))
+        })
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let runtime_mode = profile
+        .as_ref()
+        .and_then(|profile| profile.get("runtime_observation_mode"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("not_armed");
+    let evidence = serde_json::json!({
+        "schema_version": 1,
+        "backend": backend.info().name,
+        "phase": "measurement",
+        "phase_attempted": measurement_attempted,
+        "runtime_enabled": observed_samples > 0,
+        "runtime_observation_mode": runtime_mode,
+        "selection": {
+            "requested_limit": config.diagnostics.write_profile_limit,
+            "observed_samples": observed_samples,
+            "selection_policy": profile.as_ref()
+                .and_then(|value| value.get("selection_policy"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("first N accepted scalar put/delete requests in measurement; batch writes are not selected"),
+            "phase_exclusions": ["qualification", "preload", "warmup", "aging", "post-measurement qualification"]
+        },
+        "clock_scope": profile.as_ref()
+            .and_then(|value| value.get("clock_scope"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("no engine stages captured")),
+        "overlap_semantics": profile.as_ref()
+            .and_then(|value| value.get("overlap_semantics"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("stage sums are independent clocks and are not additive latency fractions")),
+        "unsupported_stages": profile.as_ref()
+            .and_then(|value| value.get("unsupported_stages"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(["measurement_write_stage_profile"])),
+        "profile": profile,
+        "error": finish_error.clone()
+    });
+    std::fs::write(
+        output.join("write-diagnostics.json"),
+        serde_json::to_vec_pretty(&evidence)?,
+    )?;
+    Ok(finish_error)
+}
+fn is_profile_candidate(
+    phase: &str,
+    operation: OperationKind,
+    selected: usize,
+    limit: usize,
+) -> bool {
+    phase == "measurement"
+        && matches!(operation, OperationKind::Put | OperationKind::Delete)
+        && selected < limit
+}
 // Keep phase state, independent clocks and reporter borrowing explicit at this private boundary.
 #[allow(clippy::too_many_arguments)]
 // Keep open/closed-loop admission beside their common completion/drain accounting.
@@ -967,6 +1125,7 @@ async fn run_phase<B: KvBackend>(
     let mut scheduled_index = 0_u64;
     let mut phase_expired = false;
     let mut next_snapshot = Instant::now() + Duration::from_secs(1);
+    let mut profiled_selected = 0usize;
     match config.execution.mode {
         ExecutionMode::ClosedLoop => {
             while scheduled_index < count {
@@ -1006,14 +1165,25 @@ async fn run_phase<B: KvBackend>(
                     reporter.snapshot()?;
                     next_snapshot = Instant::now() + Duration::from_secs(1);
                 }
-                if let Err(work) = pool.try_dispatch(work, phase, scheduled, deadline) {
-                    reporter.rejected(rejected_sample(
+                let profiled_write = is_profile_candidate(
+                    phase,
+                    work.operation,
+                    profiled_selected,
+                    config.diagnostics.write_profile_limit,
+                );
+                match pool.try_dispatch(work, phase, scheduled, deadline, profiled_write) {
+                    Ok(()) => {
+                        if profiled_write {
+                            profiled_selected += 1;
+                        }
+                    }
+                    Err(work) => reporter.rejected(rejected_sample(
                         phase,
                         &work,
                         scheduled,
                         origin,
                         "worker_queue_full",
-                    ))?;
+                    ))?,
                 }
                 scheduled_index += 1;
             }
@@ -1062,19 +1232,30 @@ async fn run_phase<B: KvBackend>(
                 let work = generator.next_item()?;
                 let scheduled = duration_ns(due.saturating_duration_since(origin));
                 reporter.offered(phase, work.operation.as_str(), work.keys.len() as u64);
+                let profiled_write = is_profile_candidate(
+                    phase,
+                    work.operation,
+                    profiled_selected,
+                    config.diagnostics.write_profile_limit,
+                );
                 let dispatched = if pool.pending.len() >= config.execution.queue_capacity {
                     Err(work)
                 } else {
-                    pool.try_dispatch(work, phase, scheduled, deadline)
+                    pool.try_dispatch(work, phase, scheduled, deadline, profiled_write)
                 };
-                if let Err(work) = dispatched {
-                    reporter.rejected(rejected_sample(
+                match dispatched {
+                    Ok(()) => {
+                        if profiled_write {
+                            profiled_selected += 1;
+                        }
+                    }
+                    Err(work) => reporter.rejected(rejected_sample(
                         phase,
                         &work,
                         scheduled,
                         origin,
                         "admission_capacity",
-                    ))?;
+                    ))?,
                 }
                 if Instant::now() >= next_snapshot {
                     reporter.snapshot()?;
@@ -1154,6 +1335,7 @@ async fn execute_item<B: KvBackend>(
     config: &RunConfig,
     namespace: &[u8; 16],
     work: WorkItem,
+    profiled_write: bool,
     phase: &'static str,
     scheduled: u64,
     origin: Instant,
@@ -1232,10 +1414,18 @@ async fn execute_item<B: KvBackend>(
                 .get(key_bytes_vec[0].as_ref())
                 .await
                 .map(BackendResponse::Read),
+            OperationKind::Put if profiled_write => backend
+                .profiled_put(key_bytes_vec[0].clone(), entries[0].1.clone())
+                .await
+                .map(|()| BackendResponse::Mutation(bytes)),
             OperationKind::Put => backend
                 .put(key_bytes_vec[0].clone(), entries[0].1.clone())
                 .await
                 .map(|()| BackendResponse::Mutation(bytes)),
+            OperationKind::Delete if profiled_write => backend
+                .profiled_delete(key_bytes_vec[0].clone())
+                .await
+                .map(|()| BackendResponse::Mutation(0)),
             OperationKind::Delete => backend
                 .delete(key_bytes_vec[0].clone())
                 .await
@@ -1340,13 +1530,22 @@ async fn execute_item<B: KvBackend>(
         }
         Ok(Err(error)) => {
             let timed_out = is_timed_out(error.as_ref());
-            let outcome = if timed_out {
-                timeout_outcome(operation)
+            let transport_failure = crate::backend::is_backend_transport_error(error.as_ref());
+            let is_mutation = matches!(
+                operation,
+                OperationKind::Put | OperationKind::Delete | OperationKind::PutBatch
+            );
+            let outcome = if is_mutation && (timed_out || transport_failure) {
+                "unknown_mutation"
+            } else if timed_out {
+                "timeout"
             } else {
                 "error"
             };
             let note = if timed_out {
                 format!("backend_io_timeout: {error}")
+            } else if is_mutation && transport_failure {
+                format!("backend_transport_failure; mutation outcome unknown: {error}")
             } else if api_ns > timeout_ns {
                 format!("{error}; completed_after_request_timeout")
             } else {
@@ -1783,13 +1982,13 @@ mod tests {
             keys: vec![id],
         };
 
-        pool.try_dispatch(read(0), "measurement", 0, deadline)
+        pool.try_dispatch(read(0), "measurement", 0, deadline, false)
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), slow_started_rx)
             .await
             .unwrap()
             .unwrap();
-        pool.try_dispatch(read(1), "measurement", 0, deadline)
+        pool.try_dispatch(read(1), "measurement", 0, deadline, false)
             .unwrap();
         let fast = tokio::time::timeout(Duration::from_secs(5), pool.receive())
             .await
@@ -1798,7 +1997,7 @@ mod tests {
         assert_eq!(fast.id, 1);
         pool.record_completion(fast, &mut reporter).unwrap();
 
-        pool.try_dispatch(read(2), "measurement", 0, deadline)
+        pool.try_dispatch(read(2), "measurement", 0, deadline, false)
             .unwrap();
         let replacement = tokio::time::timeout(Duration::from_secs(5), pool.receive()).await;
         let (replacement, completed_while_slow_pending) = match replacement {
@@ -2076,5 +2275,83 @@ mod tests {
         assert!(sample.response_ns >= 99);
         assert_eq!(sample.logical_keys, 3);
         assert_eq!(sample.outcome, "rejected");
+    }
+    #[tokio::test]
+    async fn measurement_completion_gate_waits_for_release_with_process_live() {
+        let directory = result_directory("measurement-completion-gate");
+        let ready_file = directory.join("measurement.complete");
+        let release_file = directory.join("measurement.observed");
+        let gate = crate::config::MeasurementGateConfig {
+            ready_file: ready_file.clone(),
+            release_file: release_file.clone(),
+            timeout_seconds: 2,
+        };
+        let controller = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !ready_file.exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                std::fs::write(release_file, b"observed\n").unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        wait_for_measurement_gate(&gate, Instant::now() + Duration::from_secs(3))
+            .await
+            .unwrap();
+        controller.await.unwrap();
+        assert!(gate.ready_file.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn measurement_completion_gate_timeout_preserves_ready_marker() {
+        let directory = result_directory("measurement-completion-timeout");
+        let gate = crate::config::MeasurementGateConfig {
+            ready_file: directory.join("measurement.complete"),
+            release_file: directory.join("measurement.observed"),
+            timeout_seconds: 1,
+        };
+        assert!(
+            wait_for_measurement_gate(&gate, Instant::now() + Duration::from_secs(2))
+                .await
+                .is_err()
+        );
+        assert!(gate.ready_file.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn diagnostic_selection_is_measurement_only_and_bounded_to_scalar_mutations() {
+        assert!(!is_profile_candidate("warmup", OperationKind::Put, 0, 4));
+        assert!(!is_profile_candidate(
+            "measurement",
+            OperationKind::Read,
+            0,
+            4
+        ));
+        assert!(!is_profile_candidate(
+            "measurement",
+            OperationKind::PutBatch,
+            0,
+            4
+        ));
+        assert!(is_profile_candidate(
+            "measurement",
+            OperationKind::Put,
+            0,
+            4
+        ));
+        assert!(is_profile_candidate(
+            "measurement",
+            OperationKind::Delete,
+            3,
+            4
+        ));
+        assert!(!is_profile_candidate(
+            "measurement",
+            OperationKind::Put,
+            4,
+            4
+        ));
     }
 }
