@@ -2,8 +2,12 @@
 import csv
 import math
 import statistics
+import sys
 from collections import defaultdict
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from portable_transport import metadata_transport_label
 
 import checkpoint_async
 import efa_progress
@@ -204,7 +208,7 @@ def read_metrics(path, spec, mode):
         if not math.isclose(float(row['instrumented_phase_ops_per_sec']), rate, rel_tol=1e-8):
             raise ValueError('throughput differs from operation count/wall')
         if spec['build'] == 'current':
-            if row['transport'] != spec['transport']:
+            if row['transport'] != metadata_transport_label(spec['transport']):
                 raise ValueError('paired transport identity differs')
             mixed = phase.startswith(('mixed_', 'concurrent_mixed_'))
             if row['rate_scope'] != ('shared_read_write_wall' if mixed else 'phase_wall'):
@@ -256,7 +260,7 @@ def read_metrics(path, spec, mode):
             for row in read_csv(path / 'write_windows.csv'):
                 dimensions(row)
                 phase = row['phase']
-                if int(row['sample']) != len(windows[phase]) or row['transport'] != spec['transport']:
+                if int(row['sample']) != len(windows[phase]) or row['transport'] != metadata_transport_label(spec['transport']):
                     raise ValueError('write-window identity differs')
                 windows[phase].append(row)
                 parents = sum(number(row[k]) for k in ('preparation_admission_ns', 'storage_wait_ns', 'publication_ns', 'dispatch_ns', 'checkpoint_ns'))

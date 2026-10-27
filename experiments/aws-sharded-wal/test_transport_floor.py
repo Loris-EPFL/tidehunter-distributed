@@ -173,7 +173,8 @@ class Evidence(ScalarEvidence):
 
 def floor_files(path, spec):
     (path / 'COMPLETE').write_text('verified\n')
-    metadata = dict(transport=spec['transport'], polling=spec['polling'].title(), instrumented=str(spec['profile']).lower(),
+    label = profile.metadata_transport_label(spec['transport']) if spec.get('build', 'current') == 'current' else spec['transport']
+    metadata = dict(transport=label, polling=spec['polling'].title(), instrumented=str(spec['profile']).lower(),
                     topology='external_nodes', shards=5, timed_scope='authenticated_exchange_decode_and_full_payload_validation',
                     wall_scope='measured_requests_and_offered_idle_including_scheduler_delay',
                     wal_io='checked_zero_member_reads', physical_network_latency='not_isolated', external_cleanup='operator_owned', argv='[]')
@@ -186,7 +187,7 @@ def floor_files(path, spec):
             n = spec['samples']
             samples.extend(dict(value_bytes=value, repetition=rep, sample=i, partition_index=i % 5, api_ns=100 + i) for i in range(n))
             wall = sum(100 + i for i in range(n)) + n * spec['idle_us'] * 1000 + 1000
-            summary.append(dict(transport=spec['transport'], polling=spec['polling'].title(), instrumented=str(spec['profile']).lower(),
+            summary.append(dict(transport=label, polling=spec['polling'].title(), instrumented=str(spec['profile']).lower(),
                                 shards=5, value_bytes=value, repetition=rep, idle_us=spec['idle_us'], samples=n, wall_ns=wall,
                                 p50_ns=100 + (n * 50 + 99) // 100 - 1, p95_ns=100 + (n * 95 + 99) // 100 - 1,
                                 p99_ns=100 + (n * 99 + 99) // 100 - 1, max_ns=99 + n, phase_ops_per_sec=n * 1e9 / wall))
@@ -204,6 +205,14 @@ def floor_files(path, spec):
 
 
 class ProfileAvailabilityMetadataTests(unittest.TestCase):
+    def test_unavailable_authority_cache_stays_missing_not_zero(self):
+        raw = dict(authority=None, wal_reads=3)
+        self.assertEqual(profile.flatten_counters(raw), dict(wal_reads=3))
+        self.assertIsNone(raw['authority'])
+        for invalid in (0, True, [], 'unavailable'):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                profile.flatten_counters(dict(authority=invalid, wal_reads=3))
+
     def test_known_boolean_metadata_is_validated_without_becoming_numeric_work(self):
         for prefix in ('', 'client.'):
             for available, not_applicable in ((False, False), (True, False), (False, True), (True, True)):
@@ -452,6 +461,9 @@ class CloudEvidenceTests(unittest.TestCase):
             original = metadata.read_text()
             metadata.write_text(original.replace(
                 'trusted_native_exchange_decode', 'authenticated_exchange_decode'))
+            with self.assertRaises(ValueError):
+                profile.read_floor_metrics(directory, spec)
+            metadata.write_text(original.replace('transport=ofi-efa-direct-trusted', 'transport=ofi-efa-direct-mutual-tls'))
             with self.assertRaises(ValueError):
                 profile.read_floor_metrics(directory, spec)
             metadata.write_text(original)

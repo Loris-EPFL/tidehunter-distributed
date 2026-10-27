@@ -119,6 +119,14 @@ def protocol_key(value):
         'ofi', transport['fabric']['backend'], transport['security'])
 
 
+def metadata_transport_label(value):
+    """Match Rust Transport.label(), not the independent research case ID."""
+    transport = transport_for_case(value)
+    if transport['kind'] == 'tcp':
+        return 'tcp'
+    return f"ofi-{transport['fabric']['backend']}-{transport['security']}"
+
+
 def is_trusted(value):
     return validate_transport(value).get('security') == 'trusted'
 

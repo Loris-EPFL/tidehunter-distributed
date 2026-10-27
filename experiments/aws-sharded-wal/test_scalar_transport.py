@@ -10,7 +10,7 @@ import unittest
 
 import analyze_cloud as audit
 import scalar_transport as profile
-from portable_transport import select_transports, transport_for_case, write_transport_config
+from portable_transport import metadata_transport_label, select_transports, transport_for_case, write_transport_config
 
 
 def save(path, value):
@@ -258,11 +258,13 @@ class Evidence:
             counts.update(reopen_reused_transport=1, reopen_reused_get_audit=spec['batches'] * spec['batch'])
         if spec['cold']:
             counts.update(dict.fromkeys(('cache_evicted_get', 'cache_evicted_get_many', 'cache_evicted_get_window'), 1))
+        runtime_label = (metadata_transport_label(spec['transport'])
+                         if spec['build'] == 'current' else spec['transport'])
         table(path / 'samples.csv', [dimensions | dict(phase=p, sample=0, latency_ns=100, logical_operations=n)
                                     for p, n in counts.items()])
         table(path / 'summary.csv', [dimensions | dict(phase=p, samples=1, logical_operations=n,
             measured_api_ns=100, phase_wall_ns=1000, p50_ns=100, p95_ns='', p99_ns='',
-            instrumented_phase_ops_per_sec=n * 1e6, transport=spec['transport'],
+            instrumented_phase_ops_per_sec=n * 1e6, transport=runtime_label,
             durability='value_wal_file_and_directory_barrier', sample_unit='whole_phase',
             rate_scope='shared_read_write_wall' if p.startswith('mixed_') else 'phase_wall')
             for p, n in counts.items()])
@@ -292,7 +294,7 @@ class Evidence:
             table(path / 'read_path_evidence.csv', [dimensions | counters | dict(phase=phase, boundary=boundary,
                 role=role, partition=p) for phase in ('point_get', 'point_get_window')
                 for boundary in ('before', 'after') for role, p, _ in roles])
-            table(path / 'write_windows.csv', [dimensions | dict(phase=phase, sample=0, transport=spec['transport'],
+            table(path / 'write_windows.csv', [dimensions | dict(phase=phase, sample=0, transport=runtime_label,
                 preparation_admission_ns=1, storage_wait_ns=1, publication_ns=1, dispatch_ns=1,
                 checkpoint_ns=1, foreground_checkpoint_ns=1, api_ns=100, checkpoint_count=1,
                 foreground_checkpoint_count=1) for phase in

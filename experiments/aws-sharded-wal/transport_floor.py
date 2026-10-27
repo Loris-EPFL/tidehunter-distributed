@@ -15,7 +15,7 @@ import cluster_ram
 import efa_progress
 import scalar_transport
 from checkpoint_matrix import TRANSPORTS
-from portable_transport import transport_for_case
+from portable_transport import metadata_transport_label, transport_for_case
 
 BASELINE_SOURCE_SHA256 = '2e694cb0be9fe0738c217b75afb9fe0ba5d2eef170573bd95f092fa40e93dc57'
 BASELINE_BINARY_SHA256 = '7f692391ec6b6acbc5c12c31cb64878764c0ef96d98d82e1b0dfb6a67594db2c'
@@ -112,7 +112,7 @@ def subsuite_floor_spec(transport, instrumented):
     """Bounded independent RAM populations inside the existing full KV suite."""
     if transport not in TRANSPORTS or type(instrumented) is not bool:
         raise ValueError('invalid subsuite RAM control population')
-    return dict(transport=transport, polling='adaptive', floor_values=[256, 8192],
+    return dict(build='current', transport=transport, polling='adaptive', floor_values=[256, 8192],
                 samples=256 if instrumented else 512,
                 floor_repetitions=1 if instrumented else 3,
                 idle_us=0, profile=instrumented)
@@ -263,6 +263,11 @@ def flatten_counters(value, prefix=''):
             if type(item) is not bool:
                 raise ValueError('expected boolean profile availability metadata: ' + name)
             continue
+        if name == 'authority':
+            if item is None:
+                continue
+            if not isinstance(item, dict):
+                raise ValueError('expected optional authority-cache counter section')
         if isinstance(item, dict):
             result.update(flatten_counters(item, name + '.'))
         else:
@@ -302,7 +307,8 @@ def read_floor_metrics(path, spec):
     scope = ('trusted_native_exchange_decode_and_full_payload_validation'
              if spec['transport'] in ('efa-native', 'fabric-tcp-native') else
              'authenticated_exchange_decode_and_full_payload_validation')
-    required = dict(transport=spec['transport'], polling=spec['polling'].title(), instrumented=str(spec['profile']).lower(),
+    runtime_label = metadata_transport_label(spec['transport']) if spec['build'] == 'current' else spec['transport']
+    required = dict(transport=runtime_label, polling=spec['polling'].title(), instrumented=str(spec['profile']).lower(),
                     topology='external_nodes', shards='5', timed_scope=scope,
                     wall_scope='measured_requests_and_offered_idle_including_scheduler_delay',
                     wal_io='checked_zero_member_reads', physical_network_latency='not_isolated', external_cleanup='operator_owned')
@@ -324,7 +330,7 @@ def read_floor_metrics(path, spec):
         seen.add(identity)
         values = sorted(samples[identity])
         if (len(values) != spec['samples'] or int(row['samples']) != len(values)
-                or row['transport'] != spec['transport'] or row['polling'] != spec['polling'].title()
+                or row['transport'] != runtime_label or row['polling'] != spec['polling'].title()
                 or row['instrumented'] != str(spec['profile']).lower() or int(row['shards']) != 5
                 or int(row['idle_us']) != spec['idle_us']):
             raise ValueError('floor sample count/policy differs')
@@ -384,7 +390,8 @@ def read_wal_metrics(path, spec, mode, expected_profiles=None):
     if any(int(summaries[p]['logical_operations']) != spec['reads'] for p in read_phases):
         raise ValueError('read phase omitted planned full workload')
     for row in summaries.values():
-        if row['durability'] != 'value_wal_file_and_directory_barrier' or row['transport'] != spec['transport']:
+        expected_label = metadata_transport_label(spec['transport']) if spec['build'] == 'current' else spec['transport']
+        if row['durability'] != 'value_wal_file_and_directory_barrier' or row['transport'] != expected_label:
             raise ValueError('WAL durability/transport differs')
         if spec['build'] == 'current':
             phase = row['phase']

@@ -1,5 +1,9 @@
 """Source-bound scalar/transport campaign; reuse the RAM workload/evidence parsers."""
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from portable_transport import metadata_transport_label
 
 import checkpoint_async
 import cluster_ram
@@ -159,9 +163,11 @@ def read_cloud_case(root, name, spec, mode):
     if process.get('binary_sha256') != receipt['binary_sha256']:
         raise ValueError('benchmark process executable differs from source-bound build')
     metrics = cluster_ram.read_cloud_case(root, name, spec, mode)
+    expected_transport = (metadata_transport_label(spec['transport'])
+                          if spec['build'] == 'current' else spec['transport'])
     for row in cluster_ram.read_csv(root / name / 'summary.csv'):
         transport = row.get('transport', spec['transport'] if spec['build'] == 'baseline' else None)
-        if row['durability'] != 'value_wal_file_and_directory_barrier' or transport != spec['transport']:
+        if row['durability'] != 'value_wal_file_and_directory_barrier' or transport != expected_transport:
             raise ValueError('scalar transport durability/transport identity differs')
     validate_lifecycle(metrics, spec, mode)
     return metrics

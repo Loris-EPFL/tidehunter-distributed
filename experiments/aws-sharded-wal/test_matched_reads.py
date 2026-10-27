@@ -308,7 +308,8 @@ class MatchedReads(unittest.TestCase):
         def counts(groups, elements):
             return dict.fromkeys(kv.REGISTERED_COUNTERS, 0) | dict(
                 eligible_reads=groups, rma_hits=groups, rma_posts=elements, rma_completions=elements)
-        identity = dict(backend='trusted_experimental_efa_native_authority', transport='efa-native',
+        identity = dict(backend='trusted_experimental_efa_native_authority',
+            transport=kv.metadata_transport_label('efa-native'),
             value_bytes=8192, batch_size=32, window=32, repetition=0)
         def record(phase, observation):
             return identity | dict(phase=phase,
@@ -358,7 +359,8 @@ class MatchedReads(unittest.TestCase):
         directory = Path(root)
         policy = self.bounded_policy(spec['workload_reads'])
         identity = dict(backend='native_value_wal_barrier' if native else 'trusted_experimental_efa_native_authority',
-            transport='tcp' if native else 'efa-native', value_bytes=8192, batch_size=32, window=32, repetition=0)
+            transport='tcp' if native else kv.metadata_transport_label('efa-native'),
+            value_bytes=8192, batch_size=32, window=32, repetition=0)
         def record(phase, observation):
             return identity | dict(phase=phase, policy=policy,
                 scope='verified_API_values;RMA_counters_only_in_registered_controls', observation=observation)

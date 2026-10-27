@@ -18,7 +18,7 @@ import raw_rma_floor
 
 from checkpoint_matrix import efa_snapshot, efa_proof, validate_efa_proof, validate_provider
 from checkpoint_matrix import fabric_local_log, fabric_local_archive_log
-from portable_transport import transport_for_case
+from portable_transport import transport_for_case, metadata_transport_label
 from checkpoint_matrix import HARDWARE_TRANSPORTS, DIRECT_TRANSPORTS, TRANSPORT_BACKENDS
 from guest import (Campaign, upload, write_json, sha, benchmark_case_identity,
                    kv_case_commands, kv_case_policy, resident_read_config)
@@ -369,7 +369,7 @@ def comparison_identity(directory, spec, mode, cfg):
         elif common.get('policy') != common_policy:
             raise ValueError('bounded control differs from the source-bound preparation policy')
         expected_case = ['native_value_wal_barrier' if mode == 'native-sync' else TRANSPORT_BACKENDS[spec['transport']],
-                         'tcp' if mode == 'native-sync' else spec['transport'], *spec['shape'], 0]
+                         'tcp' if mode == 'native-sync' else metadata_transport_label(spec['transport']), *spec['shape'], 0]
         if common.get('available') and common.get('identity') != expected_case:
             raise ValueError('bounded control case differs from its source-bound identity')
         if mode == 'native-sync' and metadata['native_read_cache_bytes'] != str(remote['read_cache_bytes']):
@@ -691,7 +691,9 @@ def bounded_control_evidence(directory, mode, owner_partitions=range(5)):
         raise ValueError('bounded control case/phase population differs')
     identity = next(iter(identities))
     native = mode == 'native-sync'
-    expected_backend = 'native_value_wal_barrier' if native else TRANSPORT_BACKENDS.get(identity[1])
+    expected_backend = 'native_value_wal_barrier' if native else next(
+        (backend for case, backend in TRANSPORT_BACKENDS.items()
+         if metadata_transport_label(case) == identity[1]), None)
     if identity[0] != expected_backend:
         raise ValueError('bounded control backend differs')
     policy = phases['bounded_hot_setup']['policy']
@@ -1067,7 +1069,7 @@ def require_registered_probe(spec, mode, evidence):
         raise ValueError('bounded registered probe is mixed/invalid or lacks actual all-lane hit-only evidence')
     expected_policy = registered_hot_policy(spec.get('workload_reads') or 4096, 2, True, spec.get('bounded_hot_reads'))
     require_kv_policy(control['policy'], expected_policy)
-    expected_identity = [TRANSPORT_BACKENDS[spec['transport']], spec['transport'], *spec['shape'], 0]
+    expected_identity = [TRANSPORT_BACKENDS[spec['transport']], metadata_transport_label(spec['transport']), *spec['shape'], 0]
     if control.get('identity') != expected_identity:
         raise ValueError('registered control case identity differs')
     for phase in ('cache_hot_get', 'cache_hot_get_many'):
@@ -1103,7 +1105,7 @@ def validate_contention(path, spec, mode):
                        ('value_bytes', 'batch_size', 'window', 'repetition'))
                 or [row.get(k) for k in ('value_bytes', 'batch_size', 'window')] != spec['shape']
                 or row.get('repetition') != 0
-                or (mode == 'tcp' and row.get('transport') != spec['transport'])):
+                or (mode == 'tcp' and row.get('transport') != metadata_transport_label(spec['transport']))):
             raise ValueError('cache contention API/shape/transport identity differs')
         observed = row['observation']
         samples = observed['get_api_intervals_ns_by_caller']
@@ -1167,7 +1169,7 @@ def validate_checkpoint_records(directory, spec, mode):
     for row, window in zip(rows, windows):
         if (row.get('diagnostic_available') is not True or row.get('phase') != window['phase']
                 or row.get('sample') != int(window['sample'])
-                or row.get('backend') != window['backend'] or row.get('transport') != spec['transport']
+                or row.get('backend') != window['backend'] or row.get('transport') != metadata_transport_label(spec['transport'])
                 or any(row.get(key) != int(window[key]) for key in
                        ('value_bytes', 'batch_size', 'window', 'repetition'))):
             raise ValueError('checkpoint diagnostics lost their exact timed-window identity')
@@ -1543,7 +1545,7 @@ def physical_cold_probe_evidence(directory, spec, mode, owner_partitions=range(5
     native = mode == 'native-sync'
     expected = {0} if native else set(owner_partitions)
     case = dict(backend='native_value_wal_barrier' if native else TRANSPORT_BACKENDS[spec['transport']],
-                transport='tcp' if native else spec['transport'], value_bytes=spec['shape'][0],
+                transport='tcp' if native else metadata_transport_label(spec['transport']), value_bytes=spec['shape'][0],
                 batch_size=spec['shape'][1], window=spec['shape'][2], repetition=0,
                 phase='physical_cold_get', requested_probes=count)
     identities, reasons = {}, []
@@ -1659,7 +1661,7 @@ def physical_cold_group_probe_evidence(directory, spec, mode, owner_partitions=r
     native = mode == 'native-sync'
     expected = {0} if native else set(owner_partitions)
     case = dict(backend='native_value_wal_barrier' if native else TRANSPORT_BACKENDS[spec['transport']],
-        transport='tcp' if native else spec['transport'], value_bytes=spec['shape'][0],
+        transport='tcp' if native else metadata_transport_label(spec['transport']), value_bytes=spec['shape'][0],
         batch_size=spec['shape'][1], window=spec['shape'][2], repetition=0,
         phase='physical_cold_get_many', requested_probes=count)
     identities, reasons = {}, []

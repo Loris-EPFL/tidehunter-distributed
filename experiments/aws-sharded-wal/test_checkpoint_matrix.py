@@ -679,7 +679,8 @@ class MatrixEvidenceTests(unittest.TestCase):
             writes = [[round * 1000, round * 1000 + 500] for round in range(32)]
             rows.append(dict(api='distributed::sui::Db::get', value_bytes=8192,
                 backend='experimental_efa_direct_authority',
-                batch_size=1, window=1, repetition=0, transport='efa-direct',
+                batch_size=1, window=1, repetition=0,
+                transport=checkpoint_kv.metadata_transport_label('efa-direct'),
                 observation=dict(callers=callers, reads_per_caller=1024,
                     concurrent_durable_writes=32, phase_wall_ns=32000,
                     get_api_intervals_ns_by_caller=[copy.deepcopy(intervals) for _ in range(callers)],
@@ -692,6 +693,12 @@ class MatrixEvidenceTests(unittest.TestCase):
                 path.write_text(''.join(json.dumps(row) + '\n' for row in values))
             save(rows)
             checkpoint_kv.validate_contention(path, spec, 'tcp')
+            for label in ('efa-direct', 'ofi-efa-direct-trusted'):
+                changed = copy.deepcopy(rows)
+                changed[0]['transport'] = label
+                save(changed)
+                with self.subTest(label=label), self.assertRaises(ValueError):
+                    checkpoint_kv.validate_contention(path, spec, 'tcp')
             for field, value in (('remote_misses', 1), ('remote_read_rpcs', 1),
                                  ('remote_hits', 1023), ('remote_cache_counter_available', False)):
                 changed = copy.deepcopy(rows)
@@ -817,8 +824,9 @@ class MatrixEvidenceTests(unittest.TestCase):
             self.assertFalse(evidence['async_submissions_prove_device_io'])
 
     def test_checkpoint_records_join_completion_and_pressure_without_invented_spans(self):
-        spec = dict(diagnostics=True, transport='tcp')
-        identity = dict(backend='experimental_tcp_authority', transport='tcp',
+        spec = dict(diagnostics=True, transport='fabric-tcp')
+        identity = dict(backend='experimental_fabric_tcp_authority',
+                        transport=checkpoint_kv.metadata_transport_label('fabric-tcp'),
                         phase='load_write_window', sample=0, value_bytes=8192,
                         batch_size=32, window=32, repetition=0)
         cut = dict(batch=dict(epoch=3, sequence=17), operation_index=31)
@@ -840,6 +848,11 @@ class MatrixEvidenceTests(unittest.TestCase):
             path = directory / 'checkpoint_diagnostics.jsonl'
             path.write_text(json.dumps(row) + '\n')
             checkpoint_kv.validate_checkpoint_records(directory, spec, 'tcp')
+            changed = row | dict(transport='fabric-tcp')
+            path.write_text(json.dumps(changed) + '\n')
+            with self.assertRaisesRegex(ValueError, 'exact timed-window identity'):
+                checkpoint_kv.validate_checkpoint_records(directory, spec, 'tcp')
+            path.write_text(json.dumps(row) + '\n')
             for records in ([], [complete], [complete, complete]):
                 changed = copy.deepcopy(row)
                 changed['record_count'] = len(records)

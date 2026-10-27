@@ -187,8 +187,8 @@ class HardwarePopulations(unittest.TestCase):
 
 
 class PhysicalColdPopulations(unittest.TestCase):
-    def fixture(self, root, mode='tcp'):
-        spec = dict(shape=[256, 1, 1], transport='tcp', cold=True,
+    def fixture(self, root, mode='tcp', transport='tcp'):
+        spec = dict(shape=[256, 1, 1], transport=transport, cold=True,
                     workload_batches=320, cold_single_probes=2)
         rows = []
         for index in range(2):
@@ -197,8 +197,9 @@ class PhysicalColdPopulations(unittest.TestCase):
             selected = (mixed ^ (mixed >> 31)) % 320
             owners = [0] if mode == 'native-sync' else list(range(5))
             owner = 0 if mode == 'native-sync' else index
-            rows.append(dict(backend='native_value_wal_barrier' if mode == 'native-sync' else 'experimental_tcp_authority',
-                transport='tcp', value_bytes=256, batch_size=1, window=1, repetition=0,
+            rows.append(dict(backend='native_value_wal_barrier' if mode == 'native-sync' else kv.TRANSPORT_BACKENDS[transport],
+                transport='tcp' if mode == 'native-sync' else kv.metadata_transport_label(transport),
+                value_bytes=256, batch_size=1, window=1, repetition=0,
                 phase='physical_cold_get', requested_probes=2, probe_index=index,
                 key_index=selected, expected_owner=owner, api_elapsed_ns=1000 + index,
                 preparation_wall_ns=10000, value_verified=True,
@@ -295,10 +296,21 @@ class PhysicalColdPopulations(unittest.TestCase):
             with self.assertRaises(ValueError):
                 kv.physical_cold_probe_evidence(root, spec, 'tcp')
 
+    def test_current_software_transport_probe_uses_runtime_metadata_label(self):
+        with tempfile.TemporaryDirectory() as root:
+            spec, rows = self.fixture(root, transport='fabric-tcp')
+            self.save(root, rows)
+            self.assertTrue(kv.physical_cold_probe_evidence(root, spec, 'tcp')['qualified'])
+            rows[0]['transport'] = 'fabric-tcp'
+            self.save(root, rows)
+            with self.assertRaises(ValueError):
+                kv.physical_cold_probe_evidence(root, spec, 'tcp')
+
+
 
 class GroupedPhysicalColdPopulations(unittest.TestCase):
-    def fixture(self, root, native=False):
-        spec = dict(shape=[256, 1, 1], transport='tcp', cold=True, workload_batches=32, cold_group_probes=2)
+    def fixture(self, root, native=False, transport='tcp'):
+        spec = dict(shape=[256, 1, 1], transport=transport, cold=True, workload_batches=32, cold_group_probes=2)
         owners = [0] if native else list(range(5))
         rows = []
         for index in range(2):
@@ -307,8 +319,9 @@ class GroupedPhysicalColdPopulations(unittest.TestCase):
             start = (mixed ^ (mixed >> 31)) % 32
             indices = [(start + member) % 32 for member in range(32)]
             members = [owners[key % len(owners)] for key in indices]
-            rows.append(dict(backend='native_value_wal_barrier' if native else 'experimental_tcp_authority',
-                transport='tcp', value_bytes=256, batch_size=1, window=1, repetition=0,
+            rows.append(dict(backend='native_value_wal_barrier' if native else kv.TRANSPORT_BACKENDS[transport],
+                transport='tcp' if native else kv.metadata_transport_label(transport),
+                value_bytes=256, batch_size=1, window=1, repetition=0,
                 phase='physical_cold_get_many', requested_probes=2, probe_index=index,
                 start_key_index=start, key_indices=indices, member_owners=members,
                 expected_owners=sorted(set(members)), member_count=32, returned_member_count=32,
@@ -341,6 +354,16 @@ class GroupedPhysicalColdPopulations(unittest.TestCase):
             writer = csv.DictWriter(stream, fieldnames=summary.keys())
             writer.writeheader()
             writer.writerow(summary)
+
+    def test_current_software_transport_group_probe_uses_runtime_metadata_label(self):
+        with tempfile.TemporaryDirectory() as root:
+            spec, rows, summary = self.fixture(root, transport='fabric-tcp')
+            self.save(root, rows, summary)
+            self.assertTrue(kv.physical_cold_group_probe_evidence(root, spec, 'tcp')['qualified'])
+            rows[0]['transport'] = 'fabric-tcp'
+            self.save(root, rows, summary)
+            with self.assertRaises(ValueError):
+                kv.physical_cold_group_probe_evidence(root, spec, 'tcp')
 
     def test_native_and_remote_complete_calls_keep_wrap_order_and_sample_units(self):
         for native in (False, True):

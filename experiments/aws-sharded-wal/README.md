@@ -52,6 +52,27 @@ original remote absolute arguments without creating paths on the local machine.
 Only the owning launch path writes its canonical fabric configuration before
 starting the process. Both peers must complete the exact drain protocol.
 
+Current benchmark artifacts use Rust `Transport::label()` names such as
+`ofi-efa-direct-trusted`, not their independent research selection `efa-native`.
+`experiments/portable_transport.py::metadata_transport_label` maps the expected
+current identities in `transport_floor.py`, `cluster_ram.py`,
+`scalar_transport.py` and `checkpoint_kv.py`. Research case IDs and grouping
+labels remain unchanged. Explicit frozen `build=baseline` WAL artifacts retain
+their old labels; current-only inline floor specs now state `build=current`.
+
+Read-I/O snapshots can contain `authority: null`, as documented by
+`ReadExecutorStats::authority`. This means unavailable authority-cache counters,
+not zero. Counter projection retains the raw null, omits unavailable numeric
+observations, and rejects malformed non-object authority sections.
+
+A local five-process software-provider exercise admitted the actual external
+floor metadata and both 100-sample payloads, rejected a mismatched security
+identity, and admitted real WAL bounded controls, checkpoint windows and
+one/eight-caller cache-hit contention. All five owned processes exited normally.
+Evidence is under
+`checkpoint-work/portable-cloud-launch-20261027/runtime-label-admission-191419Z/`.
+This validates producer/consumer compatibility, not physical RDMA or cloud speed.
+
 For the selected KV comparison, current configuration files are authoritative:
 `experiments/kv-comparison/ci-config.json` sets the three-hour fleet lifetime,
 and `budget.json` sets the approved $220 rolling weekly cap. Dated campaign notes
