@@ -1,9 +1,9 @@
-//! Static RF1 storage transport with authenticated TLS and explicit trusted fabric modes.
+//! Static RF1 storage transport with authenticated TCP/OFI and explicit trusted OFI modes.
 //!
 //! The Tidehunter paper's complete-batch replay and values-in-WAL rules remain
 //! the authority boundary. Transport is not a global log or consensus service.
 //! TLS modes require a dedicated CA and validate both peers with rustls.
-//! Trusted native modes omit application authentication and encryption; deployment
+//! Trusted OFI modes omit application authentication and encryption; deployment
 //! isolation is required. WAL integrity, fencing and durability checks remain.
 
 pub mod checkpoint;
@@ -12,7 +12,9 @@ mod read_executor;
 pub use read_executor::ReadExecutorStats;
 mod diagnostics;
 mod fabric;
-pub use fabric::{Transport, TransportProgressStats};
+pub use fabric::{FabricBackend, FabricConfig, FabricSecurity, Transport, TransportProgressStats};
+#[cfg(feature = "experimental-fabric")]
+pub use tidehunter_fabric::ProviderInfo;
 mod control;
 mod inventory;
 mod resident;
@@ -28,6 +30,10 @@ mod probe;
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(test, feature = "experimental-fabric"))]
+pub(super) fn software_transport(security: FabricSecurity) -> Transport {
+    Transport::ofi(FabricBackend::SoftwareTcp, security)
+}
 use super::codec::{BatchLimits, CompleteBatch, Mutation};
 use super::group::{CompleteGroup, GROUP_HEADER_LEN, GroupLimits};
 use super::storage::{AppendedBatch, DurableBatch, PartitionConfig, PartitionStats, StorageError};
@@ -56,25 +62,30 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub use inventory::NodeInventory;
-const PROTOCOL: u32 = 10;
+const PROTOCOL: u32 = 11;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
 static NEXT_RESIDENT_SESSION: AtomicU64 = AtomicU64::new(1);
 #[cfg(feature = "experimental-fabric")]
 static NEXT_RESIDENT_GRANT: AtomicU64 = AtomicU64::new(1);
 const MODE_MAGIC: [u8; 4] = *b"THDP";
 
-fn transport_mode_id(transport: Transport) -> u8 {
+fn transport_mode_id(transport: &Transport) -> u8 {
     match transport {
         Transport::Tcp => 1,
-        Transport::Efa => 2,
-        Transport::EfaDirect => 3,
-        Transport::FabricTcp => 4,
-        Transport::EfaNative => 5,
-        Transport::FabricTcpNative => 6,
+        Transport::Ofi { fabric, security } => match (&fabric.backend, security) {
+            (FabricBackend::Efa, FabricSecurity::MutualTls) => 2,
+            (FabricBackend::Efa, FabricSecurity::Trusted) => 3,
+            (FabricBackend::EfaDirect, FabricSecurity::MutualTls) => 4,
+            (FabricBackend::EfaDirect, FabricSecurity::Trusted) => 5,
+            (FabricBackend::Verbs, FabricSecurity::MutualTls) => 6,
+            (FabricBackend::Verbs, FabricSecurity::Trusted) => 7,
+            (FabricBackend::SoftwareTcp, FabricSecurity::MutualTls) => 8,
+            (FabricBackend::SoftwareTcp, FabricSecurity::Trusted) => 9,
+        },
     }
 }
 
-fn write_transport_mode(stream: &mut (impl Read + Write), transport: Transport) -> io::Result<()> {
+fn write_transport_mode(stream: &mut (impl Read + Write), transport: &Transport) -> io::Result<()> {
     let mut preface = [0; 8];
     preface[..4].copy_from_slice(&MODE_MAGIC);
     preface[4..6].copy_from_slice(&(PROTOCOL as u16).to_be_bytes());
@@ -83,7 +94,7 @@ fn write_transport_mode(stream: &mut (impl Read + Write), transport: Transport) 
     stream.flush()
 }
 
-fn read_transport_mode(stream: &mut impl Read, expected: Transport) -> Result<(), TcpError> {
+fn read_transport_mode(stream: &mut impl Read, expected: &Transport) -> Result<(), TcpError> {
     let mut preface = [0; 8];
     stream.read_exact(&mut preface)?;
     if preface[..4] != MODE_MAGIC
@@ -159,8 +170,8 @@ fn default_device_reads() -> usize {
 pub(crate) fn default_read_memory_allowance_bytes() -> usize {
     512 * 1024 * 1024
 }
-/// TLS credentials and transport selection. Trusted native modes require empty
-/// credential paths and do not authenticate peers; TLS modes require a dedicated CA.
+/// TLS credentials and transport selection. Trusted OFI requires empty
+/// credential paths; mutual-TLS modes require a dedicated CA.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TlsFiles {
     #[serde(default)]
@@ -171,7 +182,7 @@ pub struct TlsFiles {
     pub cert: PathBuf,
     #[serde(default)]
     pub key: PathBuf,
-    /// Expected server DNS name; ignored by the listener and trusted native modes.
+    /// Expected server DNS name; ignored by the listener and trusted OFI modes.
     #[serde(default)]
     pub server_name: String,
     /// Explicit opt-in for one-sided reads on this client/session transport.
@@ -784,10 +795,10 @@ impl StorageNode {
             && !tls.transport.is_native()
         {
             return Err(TcpError::new(
-                "resident source grants require the explicitly trusted native transport",
+                "resident source grants require explicitly trusted OFI security",
             ));
         }
-        let transport = tls.transport;
+        let transport = tls.transport.clone();
         let server = tls.server_config()?;
         listener.set_nonblocking(true)?;
         struct ConnectionPermit(Arc<AtomicUsize>);
@@ -823,6 +834,7 @@ impl StorageNode {
                         let server = server.clone();
                         let shutdown = shutdown.clone();
                         let sockets = sockets.clone();
+                        let transport = transport.clone();
                         match thread::Builder::new()
                             .name("wal-mtls-session".into())
                             .spawn(move || {
@@ -842,7 +854,7 @@ impl StorageNode {
                                         server.clone(),
                                         limits,
                                         &shutdown,
-                                        transport,
+                                        &transport,
                                     );
                                 }
                             }) {
@@ -894,7 +906,7 @@ impl StorageNode {
         config: ServerTlsConfig,
         limits: TcpLimits,
         shutdown: &AtomicBool,
-        transport: Transport,
+        transport: &Transport,
     ) -> Result<(), TcpError> {
         #[cfg(feature = "experimental-fabric")]
         let source_resident_reads = {
@@ -920,7 +932,7 @@ impl StorageNode {
                 );
             }
             #[cfg(not(feature = "experimental-fabric"))]
-            return Err(TcpError::new("native transport was not compiled"));
+            return Err(TcpError::new("trusted OFI transport was not compiled"));
         }
         let server_config = config
             .config
@@ -933,24 +945,20 @@ impl StorageNode {
         while conn.is_handshaking() {
             conn.complete_io(&mut io)?;
         }
-        if conn.alpn_protocol() != Some(transport.alpn().as_slice())
-            && conn.alpn_protocol() != Some(Transport::Tcp.alpn().as_slice())
-        {
+        if conn.alpn_protocol() != Some(transport.alpn().as_slice()) {
             return Err(TcpError::new("unsupported authenticated protocol"));
         }
-        let selected_fabric = transport != Transport::Tcp
-            && conn.alpn_protocol() == Some(transport.alpn().as_slice());
         let stream = StreamOwned::new(conn, io);
         #[cfg(feature = "experimental-fabric")]
         let mut stream = stream;
-        if selected_fabric {
+        if transport.is_fabric() {
             #[cfg(feature = "experimental-fabric")]
             {
                 let endpoint = fabric::bootstrap(&mut stream, transport, source_resident_reads)?;
                 stream.sock.fabric = Some(endpoint);
             }
             #[cfg(not(feature = "experimental-fabric"))]
-            return Err(TcpError::new("fabric transport was not compiled"));
+            return Err(TcpError::new("OFI transport was not compiled"));
         }
         reactor::serve_session(
             self,
@@ -1288,21 +1296,21 @@ impl Client {
         let mut io = DeadlineIo::new(socket, timeout)?;
         let setup_started = Instant::now();
         if tls.transport.is_native() {
-            write_transport_mode(&mut io, tls.transport)?;
+            write_transport_mode(&mut io, &tls.transport)?;
         }
         let (session, reuse_verifier, server_name, tls_ns, fabric_ns) = if tls.transport.is_native()
         {
             #[cfg(feature = "experimental-fabric")]
             {
                 let endpoint =
-                    fabric::bootstrap(&mut io, tls.transport, destination_resident_reads)?;
+                    fabric::bootstrap(&mut io, &tls.transport, destination_resident_reads)?;
                 io.fabric = Some(endpoint);
                 let fabric_ns = Some(elapsed_ns(setup_started));
                 (reactor::Session::new_native(io)?, None, None, 0, fabric_ns)
             }
             #[cfg(not(feature = "experimental-fabric"))]
             {
-                return Err(TcpError::new("native transport was not compiled"));
+                return Err(TcpError::new("trusted OFI transport was not compiled"));
             }
         } else {
             let name =
@@ -1329,16 +1337,16 @@ impl Client {
             #[cfg(feature = "experimental-fabric")]
             let mut stream = stream;
             #[cfg(feature = "experimental-fabric")]
-            let fabric_ns = if tls.transport == Transport::Tcp {
-                None
-            } else {
+            let fabric_ns = if tls.transport.is_fabric() {
                 let began = Instant::now();
                 stream.sock.fabric = Some(fabric::bootstrap(
                     &mut stream,
-                    tls.transport,
+                    &tls.transport,
                     destination_resident_reads,
                 )?);
                 Some(elapsed_ns(began))
+            } else {
+                None
             };
             #[cfg(not(feature = "experimental-fabric"))]
             let fabric_ns = None;
@@ -1386,8 +1394,8 @@ impl Client {
         }
         #[cfg(feature = "experimental-fabric")]
         {
-            // Normal EFA can defer RX pool creation/registration until its
-            // first CQ progress, inside status rather than fi_endpoint.
+            // Provider setup may defer bounded resources until its first CQ
+            // progress, inside status rather than endpoint creation.
             client.connect_profile.fabric_open = client
                 .stream
                 .sock
@@ -1405,6 +1413,16 @@ impl Client {
     }
     pub(crate) fn connect_profile(&self) -> ClientConnectProfile {
         self.connect_profile
+    }
+    /// Returns setup-time provider evidence for the selected OFI endpoint.
+    /// TCP sessions have no provider metadata; no provider query occurs per request.
+    #[cfg(feature = "experimental-fabric")]
+    pub fn provider_info(&self) -> Option<&tidehunter_fabric::ProviderInfo> {
+        self.stream
+            .sock
+            .fabric
+            .as_ref()
+            .map(tidehunter_fabric::Endpoint::provider_info)
     }
     fn request(&mut self, request: Request) -> Result<Response, TcpError> {
         self.request_inner(request, None)
@@ -1760,25 +1778,25 @@ impl Client {
 }
 
 impl TlsFiles {
-    fn native_mode(&self) -> Result<bool, TcpError> {
+    fn trusted_mode(&self) -> Result<bool, TcpError> {
         self.transport.validate()?;
         self.resident_reads.validate()?;
         if self.resident_reads.enabled() && !self.transport.is_native() {
             return Err(TcpError::new(
-                "one-sided reads require the explicitly trusted native transport",
+                "one-sided reads require explicitly trusted OFI security",
             ));
         }
-        let native = self.transport.is_native();
-        if native
+        let trusted = self.transport.is_native();
+        if trusted
             && [&self.ca, &self.cert, &self.key]
                 .iter()
                 .any(|path| !path.as_os_str().is_empty())
         {
             return Err(TcpError::new(
-                "trusted native transport requires empty TLS credential paths",
+                "trusted OFI transport requires empty TLS credential paths",
             ));
         }
-        Ok(native)
+        Ok(trusted)
     }
     fn material(
         &self,
@@ -1824,7 +1842,7 @@ impl TlsFiles {
         ))
     }
     fn server_config(&self) -> Result<ServerTlsConfig, TcpError> {
-        if self.native_mode()? {
+        if self.trusted_mode()? {
             return Ok(ServerTlsConfig {
                 config: None,
                 verifier: None,
@@ -1854,10 +1872,10 @@ impl TlsFiles {
     pub(crate) fn client_config(&self) -> Result<Arc<ClientConfig>, TcpError> {
         self.client_config_with_identity()?
             .config
-            .ok_or_else(|| TcpError::new("native transport has no TLS client config"))
+            .ok_or_else(|| TcpError::new("trusted OFI transport has no TLS client config"))
     }
     pub(crate) fn client_config_with_identity(&self) -> Result<ClientTlsConfig, TcpError> {
-        if self.native_mode()? {
+        if self.trusted_mode()? {
             return Ok(ClientTlsConfig {
                 config: None,
                 verifier: None,

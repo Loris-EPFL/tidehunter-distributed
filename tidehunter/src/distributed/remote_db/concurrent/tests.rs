@@ -670,18 +670,49 @@ fn acknowledged_writes_prime_bounded_cache_for_immutable_cuts() {
 #[test]
 fn write_profile_is_sampled_only_on_owning_append_connections() {
     let mut fixture = Fixture::new();
-    fixture.config.write_profile_limit = 5;
+    fixture.config.write_profile_limit = 0;
     let db = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
+    db.write_batch(fixture.operation(1, 92), vec![put(8, 3)])
+        .unwrap();
+    db.arm_write_profile(1).unwrap();
     db.write_batch(fixture.operation(1, 93), vec![put(9, 4)])
         .unwrap();
+    db.finish_write_profile().unwrap();
+    db.arm_write_profile(1).unwrap();
+    let mut before = None;
+    db.visit_write_metrics(|metrics| before = Some(metrics));
+    let before = before.unwrap();
+    db.write_batch(fixture.operation(1, 94), vec![put(10, 5)])
+        .unwrap();
+    let mut after = None;
+    db.visit_write_metrics(|metrics| after = Some(metrics));
+    let after = after.unwrap();
+    assert_eq!(
+        after.pipeline.append_requests - before.pipeline.append_requests,
+        1
+    );
+    assert_eq!(
+        after.pipeline.concurrent_admitted - before.pipeline.concurrent_admitted,
+        1
+    );
+    assert_eq!(
+        after.pipeline.concurrent_completed - before.pipeline.concurrent_completed,
+        1
+    );
+    assert_eq!(
+        after.pipeline.durable_batches - before.pipeline.durable_batches,
+        1
+    );
     db.finish_write_profile().unwrap();
     let mut snapshot = None;
     db.visit_write_metrics(|metrics| snapshot = Some(metrics));
     let profile = snapshot.unwrap().write_profile;
-    assert_eq!(profile.limit_per_connection, 5);
+    assert_eq!(profile.limit_per_connection, 1);
     assert_eq!(profile.expected_connections, 5);
     assert_eq!(profile.sampled_requests, 1);
-    assert_eq!(profile.captured_connections, 1);
-    assert!(profile.profile.storage_write.append_calls > 0);
+    assert_eq!(profile.captured_connections, profile.expected_connections);
+    assert_eq!(profile.profile_activation_errors, 0);
+    assert_eq!(profile.profile_capture_errors, 0);
+    assert_eq!(profile.profile.storage_write.append_calls, 1);
     db.shutdown().unwrap();
 }

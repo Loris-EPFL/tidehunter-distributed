@@ -4,6 +4,8 @@
 
 #[path = "support/tcp_cluster.rs"]
 mod tcp_cluster;
+#[path = "support/transport_config.rs"]
+mod transport_config;
 
 #[cfg(feature = "experimental-fabric")]
 #[path = "support/rma_probe.rs"]
@@ -58,10 +60,10 @@ impl Args {
         while let Some(flag) = input.next() {
             if flag == "--help" {
                 println!(
-                    "sharded_wal_transport_bench --output NEW_DIR [--remote-config YAML] [--transport tcp|fabric-tcp|efa|efa-direct|fabric-tcp-native|efa-native] [--polling adaptive|busy] [--samples 100..100000] [--warmup 1..10000] [--repetitions 1..10] [--shards 1..5] [--values 1024,8192] [--idle-us 0..10000] [--profile true|false]"
+                    "sharded_wal_transport_bench --output NEW_DIR [--remote-config YAML] [--transport-config JSON_FILE (canonical Transport JSON; default TCP)] [--polling adaptive|busy] [--samples 100..100000] [--warmup 1..10000] [--repetitions 1..10] [--shards 1..5] [--values 1024,8192] [--idle-us 0..10000] [--profile true|false]"
                 );
                 println!(
-                    "Local nodes are owned and stopped by this process. External nodes are operator-owned; their configured polling policy must match. efa-native/fabric-tcp-native omit application TLS and require a trusted isolated deployment. Timed API includes full deterministic payload validation. Idle injection and result writing are outside each sample timer. Profiling adds clocks; compare unprofiled runs separately."
+                    "Local nodes are owned and stopped by this process. External nodes are operator-owned; their configured polling policy must match. Trusted transport omits application TLS and requires an isolated deployment. Timed API includes full deterministic payload validation. Idle injection and result writing are outside each sample timer. Profiling adds clocks; compare unprofiled runs separately."
                 );
                 println!(
                     "Use --rma-probe --help for the isolated raw provider FI_READ floor (requires experimental-fabric)."
@@ -72,16 +74,8 @@ impl Args {
             match flag.as_str() {
                 "--output" => args.output = value.into(),
                 "--remote-config" => args.remote = Some(value.into()),
-                "--transport" => {
-                    args.transport = match value.as_str() {
-                        "tcp" => Transport::Tcp,
-                        "fabric-tcp" => Transport::FabricTcp,
-                        "efa" => Transport::Efa,
-                        "efa-direct" => Transport::EfaDirect,
-                        "fabric-tcp-native" => Transport::FabricTcpNative,
-                        "efa-native" => Transport::EfaNative,
-                        _ => return Err(invalid("unknown transport").into()),
-                    };
+                "--transport-config" => {
+                    args.transport = transport_config::load(PathBuf::from(value).as_path())?;
                 }
                 "--polling" => {
                     args.polling = match value.as_str() {
@@ -304,7 +298,9 @@ fn main() -> Result<()> {
     let shape;
     let config = if let Some(path) = &args.remote {
         let config: RemoteDatabaseConfig = serde_yaml::from_slice(&fs::read(path)?)?;
-        if config.tls.transport != args.transport || config.endpoints.len() != args.shards {
+        if !config.tls.transport.same_protocol(&args.transport)
+            || config.endpoints.len() != args.shards
+        {
             return Err(invalid(
                 "remote configuration differs from explicit transport/shard count",
             )
@@ -323,7 +319,7 @@ fn main() -> Result<()> {
             256,
             64 * MIB,
             None,
-            args.transport,
+            args.transport.clone(),
             2,
             WalMemberReadPolicy::Async,
             0,

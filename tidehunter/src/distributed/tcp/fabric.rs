@@ -1,4 +1,4 @@
-//! Optional EFA message transport beneath the existing authenticated TLS stream.
+//! Optional OFI message transport beneath the existing storage protocol.
 //! No physical WAL address or registration key is exported. Fabric completion
 //! releases a send buffer; only the existing storage receipt proves durability.
 
@@ -6,6 +6,15 @@ use super::TcpError;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "experimental-fabric")]
 use std::io::{self, Read, Write};
+pub use tidehunter_fabric::{FabricBackend, FabricConfig};
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FabricSecurity {
+    #[default]
+    MutualTls,
+    Trusted,
+}
 
 /// Connection-local bounded progress evidence, including control traffic.
 /// Counters saturate; occupancy gauges describe owned encoded output or reserved
@@ -48,8 +57,7 @@ pub struct TransportProgressStats {
     /// Includes TLS work, backpressure and progress-loop residence, not peer receipt.
     pub output_submit_ns: u64,
     pub output_submit_samples: u64,
-    /// Ciphertext acceptance to observing its contiguous local completion frontier.
-    /// TCP retires at acceptance (zero); EFA includes scheduling/CQ polling.
+    /// TCP retires at acceptance (zero); OFI includes scheduling/CQ polling.
     pub output_retire_ns: u64,
     pub output_retire_samples: u64,
     /// Opt-in frame encoding (size pass/allocation included); bytes include header.
@@ -208,110 +216,138 @@ impl TransportProgressStats {
         );
     }
 }
-/// Explicit selection prevents a missing EFA device from producing a TCP result
-/// labelled RDMA. TCP remains the default and works without native libraries.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+/// Transport selection is explicit: a selected fabric is never replaced with TCP.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Transport {
-    #[default]
     Tcp,
-    Efa,
-    /// Software libfabric provider for correctness tests, never RDMA evidence.
-    FabricTcp,
-    /// Hardware direct fabric with explicit bounded stream ordering and credits.
-    EfaDirect,
-    /// Trusted isolated-cluster native data plane over EFA-direct, without TLS.
-    EfaNative,
-    /// Certificate-free software-provider counterpart for the native data plane.
-    FabricTcpNative,
+    Ofi {
+        fabric: FabricConfig,
+        #[serde(default)]
+        security: FabricSecurity,
+    },
+}
+
+impl Default for Transport {
+    fn default() -> Self {
+        Self::Tcp
+    }
 }
 
 impl Transport {
-    /// # Errors
-    /// Rejects a fabric selection when the native feature is absent.
-    pub fn validate(self) -> Result<(), TcpError> {
-        if self != Self::Tcp && !cfg!(feature = "experimental-fabric") {
-            return Err(TcpError::new(
-                "fabric transport requires experimental-fabric",
-            ));
+    /// Selects an OFI provider without a local domain or source-address constraint.
+    #[must_use]
+    pub fn ofi(backend: FabricBackend, security: FabricSecurity) -> Self {
+        Self::Ofi {
+            fabric: FabricConfig {
+                backend,
+                domain: None,
+                source_address: None,
+            },
+            security,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), TcpError> {
+        if let Self::Ofi { fabric, .. } = self {
+            fabric.validate().map_err(TcpError::component)?;
+            if !cfg!(feature = "experimental-fabric") {
+                return Err(TcpError::new("OFI transport requires experimental-fabric"));
+            }
         }
         Ok(())
     }
 
     #[must_use]
-    pub fn label(self) -> &'static str {
+    pub fn is_fabric(&self) -> bool {
+        matches!(self, Self::Ofi { .. })
+    }
+
+    #[must_use]
+    pub fn is_native(&self) -> bool {
+        matches!(
+            self,
+            Self::Ofi {
+                security: FabricSecurity::Trusted,
+                ..
+            }
+        )
+    }
+
+    pub fn label(&self) -> &'static str {
         match self {
             Self::Tcp => "tcp",
-            Self::Efa => "efa",
-            Self::EfaDirect => "efa-direct",
-            Self::FabricTcp => "fabric-tcp",
-            Self::EfaNative => "efa-native",
-            Self::FabricTcpNative => "fabric-tcp-native",
+            Self::Ofi { fabric, security } => match (&fabric.backend, security) {
+                (FabricBackend::Efa, FabricSecurity::MutualTls) => "ofi-efa-mutual-tls",
+                (FabricBackend::Efa, FabricSecurity::Trusted) => "ofi-efa-trusted",
+                (FabricBackend::EfaDirect, FabricSecurity::MutualTls) => {
+                    "ofi-efa-direct-mutual-tls"
+                }
+                (FabricBackend::EfaDirect, FabricSecurity::Trusted) => "ofi-efa-direct-trusted",
+                (FabricBackend::Verbs, FabricSecurity::MutualTls) => "ofi-verbs-mutual-tls",
+                (FabricBackend::Verbs, FabricSecurity::Trusted) => "ofi-verbs-trusted",
+                (FabricBackend::SoftwareTcp, FabricSecurity::MutualTls) => {
+                    "ofi-software-tcp-mutual-tls"
+                }
+                (FabricBackend::SoftwareTcp, FabricSecurity::Trusted) => "ofi-software-tcp-trusted",
+            },
         }
     }
 
-    pub(super) fn alpn(self) -> Vec<u8> {
+    #[must_use]
+    pub fn same_protocol(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Tcp, Self::Tcp) => true,
+            (
+                Self::Ofi {
+                    fabric: left,
+                    security: left_security,
+                },
+                Self::Ofi {
+                    fabric: right,
+                    security: right_security,
+                },
+            ) => left.backend == right.backend && left_security == right_security,
+            _ => false,
+        }
+    }
+
+    pub(super) fn alpn(&self) -> Vec<u8> {
         format!("tidehunter-{}-v{}", self.label(), super::PROTOCOL).into_bytes()
     }
 
-    pub(super) fn server_alpn(self) -> Vec<Vec<u8>> {
-        if self == Self::Tcp {
-            vec![self.alpn()]
-        } else {
-            vec![self.alpn(), Self::Tcp.alpn()]
-        }
-    }
-
-    /// Whether application TLS is disabled for an explicitly trusted fabric mode.
-    #[must_use]
-    pub fn is_native(self) -> bool {
-        matches!(self, Self::EfaNative | Self::FabricTcpNative)
+    pub(super) fn server_alpn(&self) -> Vec<Vec<u8>> {
+        vec![self.alpn()]
     }
 
     #[cfg(feature = "experimental-fabric")]
     fn open(
-        self,
+        &self,
         rma: Option<super::resident::ResidentReadConfig>,
     ) -> io::Result<tidehunter_fabric::Endpoint> {
-        let Some(config) = rma.filter(|config| config.enabled()) else {
-            return match self {
-                Self::Efa => tidehunter_fabric::Endpoint::open("efa", None),
-                Self::EfaDirect | Self::EfaNative => {
-                    tidehunter_fabric::Endpoint::open_efa_direct(None)
-                }
-                Self::FabricTcp | Self::FabricTcpNative => {
-                    tidehunter_fabric::Endpoint::open("tcp;ofi_rxm", Some("lo"))
-                }
-                Self::Tcp => Err(io::Error::other("TCP needs no fabric endpoint")),
-            };
+        let Self::Ofi { fabric, .. } = self else {
+            return Err(io::Error::other("TCP needs no fabric endpoint"));
         };
-        let config = tidehunter_fabric::RmaConfig {
-            source_bytes: config.source_bytes,
-            source_region_slots: config.source_regions,
-            destination_bytes: config.destination_bytes,
-            destination_slots: config.destination_slots,
-            max_read_bytes: config.max_read_bytes,
-            require_device_read: config.require_device_read,
-        };
-        match self {
-            Self::Efa => tidehunter_fabric::Endpoint::open_rma("efa", None, config),
-            Self::EfaDirect | Self::EfaNative => {
-                tidehunter_fabric::Endpoint::open_efa_direct_rma(None, config)
-            }
-            Self::FabricTcp | Self::FabricTcpNative => {
-                tidehunter_fabric::Endpoint::open_rma("tcp;ofi_rxm", Some("lo"), config)
-            }
-            Self::Tcp => Err(io::Error::other("TCP needs no fabric endpoint")),
-        }
+        let rma =
+            rma.filter(|config| config.enabled())
+                .map(|config| tidehunter_fabric::RmaConfig {
+                    source_bytes: config.source_bytes,
+                    source_region_slots: config.source_regions,
+                    destination_bytes: config.destination_bytes,
+                    destination_slots: config.destination_slots,
+                    max_read_bytes: config.max_read_bytes,
+                    require_device_read: config.require_device_read,
+                });
+        tidehunter_fabric::Endpoint::open(fabric, rma)
     }
 }
 
-// Both peers exchange bounded native addresses and a ready marker over the
-// control socket. TLS transports retain their authenticated TLS stream.
+// Exchange bounded endpoint addresses over the selected control stream; only
+// endpoint setup is provider-specific.
 #[cfg(feature = "experimental-fabric")]
 pub(super) fn bootstrap(
     stream: &mut (impl Read + Write),
-    transport: Transport,
+    transport: &Transport,
     resident_reads: super::resident::ResidentReadConfig,
 ) -> Result<tidehunter_fabric::Endpoint, TcpError> {
     let mut endpoint = transport.open(Some(resident_reads))?;

@@ -1,8 +1,10 @@
-//! Real-process mTLS/TCP correctness checks. No AWS and no throughput claim.
+//! Real-process selectable transport correctness checks. No AWS and no throughput claim.
 //! Run with experimental-distributed,test-utils for deterministic response loss.
 
 #[path = "support/tcp_cluster.rs"]
 mod tcp_cluster;
+#[path = "support/transport_config.rs"]
+mod transport_config;
 
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -290,14 +292,12 @@ fn main() -> Result<()> {
     }
     let mut args = std::env::args().skip(1);
     let mut first = args.next();
-    let transport = if first.as_deref() == Some("--transport") {
-        let selected = match args.next().as_deref() {
-            Some("tcp") => Transport::Tcp,
-            Some("fabric-tcp") => Transport::FabricTcp,
-            _ => return Err(error("local check transport must be tcp or fabric-tcp").into()),
-        };
+    let transport = if first.as_deref() == Some("--transport-config") {
+        let config_path = args
+            .next()
+            .ok_or_else(|| error("missing --transport-config JSON_FILE"))?;
         first = args.next();
-        selected
+        transport_config::load(Path::new(&config_path))?
     } else {
         Transport::Tcp
     };
@@ -311,13 +311,13 @@ fn main() -> Result<()> {
     }
     if first.as_deref() == Some("--help") {
         println!(
-            "sharded_wal_cluster_check --output NEW_DIRECTORY (requires experimental-distributed,test-utils)"
+            "sharded_wal_cluster_check [--transport-config JSON_FILE (canonical Transport JSON; default TCP)] [--output NEW_DIRECTORY] (requires experimental-distributed,test-utils)"
         );
         return Ok(());
     }
     let output = match first.as_deref() {
         None => PathBuf::from(format!(
-            "logs/local-tcp-check-{}",
+            "logs/local-transport-check-{}",
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
         )),
         Some("--output") => PathBuf::from(args.next().ok_or_else(|| error("missing output path"))?),
@@ -347,7 +347,7 @@ fn main() -> Result<()> {
         256,
         64 * MIB,
         None,
-        transport,
+        transport.clone(),
         2,
         tidehunter::distributed::storage::WalMemberReadPolicy::Async,
         0,
@@ -415,34 +415,38 @@ fn main() -> Result<()> {
         "partial_fence_resume=verified missing_node_blocks_open=verified node_process_restart=verified"
     );
 
-    let endpoint = &cluster.config.endpoints[0];
-    let mut wrong_name = cluster.config.tls.clone();
-    wrong_name.server_name = "unrelated.invalid".to_owned();
-    if Client::connect(
-        &endpoint.address,
-        &wrong_name,
-        Duration::from_secs(2),
-        cluster.template(0)?,
-        &shape,
-    )
-    .is_ok()
-    {
-        return Err(error("wrong server identity accepted").into());
+    if !transport.is_native() {
+        let endpoint = &cluster.config.endpoints[0];
+        let mut wrong_name = cluster.config.tls.clone();
+        wrong_name.server_name = "unrelated.invalid".to_owned();
+        if Client::connect(
+            &endpoint.address,
+            &wrong_name,
+            Duration::from_secs(2),
+            cluster.template(0)?,
+            &shape,
+        )
+        .is_ok()
+        {
+            return Err(error("wrong server identity accepted").into());
+        }
+        let mut untrusted = cluster.untrusted_client_tls(&temporary.path().join("foreign-tls"))?;
+        untrusted.server_name = endpoint.server_name.clone();
+        if Client::connect(
+            &endpoint.address,
+            &untrusted,
+            Duration::from_secs(2),
+            cluster.template(0)?,
+            &shape,
+        )
+        .is_ok()
+        {
+            return Err(error("untrusted client identity accepted").into());
+        }
+        println!("wrong_server_name=verified untrusted_client_ca=verified");
+    } else {
+        println!("tls_identity_checks=not_applicable_trusted_transport");
     }
-    let mut untrusted = cluster.untrusted_client_tls(&temporary.path().join("foreign-tls"))?;
-    untrusted.server_name = endpoint.server_name.clone();
-    if Client::connect(
-        &endpoint.address,
-        &untrusted,
-        Duration::from_secs(2),
-        cluster.template(0)?,
-        &shape,
-    )
-    .is_ok()
-    {
-        return Err(error("untrusted client identity accepted").into());
-    }
-    println!("wrong_server_name=verified untrusted_client_ca=verified");
     cluster.shutdown()?;
 
     let mut lost = tcp_cluster::LoopbackCluster::start_with_transport(
@@ -453,7 +457,7 @@ fn main() -> Result<()> {
         256,
         64 * MIB,
         Some(0),
-        transport,
+        transport.clone(),
         2,
         tidehunter::distributed::storage::WalMemberReadPolicy::Async,
         0,

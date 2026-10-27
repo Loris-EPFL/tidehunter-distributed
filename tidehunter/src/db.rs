@@ -40,6 +40,25 @@ use std::sync::{Arc, OnceLock, Weak, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Bounded benchmark-only timing for the native scalar mutation path.
+/// `wal_append_ns` covers the native value-WAL append; `index_apply_ns` covers
+/// the subsequent in-memory index/cache update. The stages are sequential here.
+#[cfg(feature = "experimental-distributed")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NativeWriteStages {
+    pub selected_operations: u64,
+    pub wal_append_ns: u64,
+    pub wal_append_errors: u64,
+    pub index_apply_ns: u64,
+    pub index_apply_errors: u64,
+}
+
+#[cfg(feature = "experimental-distributed")]
+impl NativeWriteStages {
+    fn elapsed(start: Instant) -> u64 {
+        start.elapsed().as_nanos().min(u64::MAX as u128) as u64
+    }
+}
 pub struct Db {
     /// Canonicalized database directory; used to rewrite the keyspace
     /// registry when a keyspace is destroyed.
@@ -421,6 +440,87 @@ impl Db {
         Ok((control_region_store, control_region))
     }
 
+    /// Execute the same scalar insert path as [`Db::insert`], collecting
+    /// bounded benchmark-only append/index stage clocks into the caller's
+    /// profile. Ordinary inserts never instantiate a profile or read a clock.
+    #[cfg(feature = "experimental-distributed")]
+    pub fn insert_profiled_for_benchmark(
+        &self,
+        ks: KeySpace,
+        k: impl Into<Bytes>,
+        v: impl Into<Bytes>,
+        profile: &mut NativeWriteStages,
+    ) -> DbResult<()> {
+        let context = self.ks_context(ks);
+        let _timer = context.db_op_timer(DbOpKind::Insert);
+        let k = k.into();
+        let v = v.into();
+        context.ks_config.check_key(&k);
+        let write =
+            PreparedWalWrite::new(&WalEntry::Record(context.id(), k.clone(), v.clone(), false));
+        context.inc_wal_written(WalEntryKind::Record, write.len() as u64);
+        profile.selected_operations += 1;
+        let append_started = Instant::now();
+        let guard = self.wal_writer.write(&write);
+        profile.wal_append_ns += NativeWriteStages::elapsed(append_started);
+        let guard = match guard {
+            Ok(guard) => guard,
+            Err(error) => {
+                profile.wal_append_errors += 1;
+                return Err(error.into());
+            }
+        };
+        self.metrics
+            .wal_written_bytes
+            .set(guard.wal_position().offset() as i64);
+        let full_key = k.clone();
+        let reduced_key = context.ks_config.reduced_key_bytes(k);
+        let index_started = Instant::now();
+        let result = self
+            .large_table
+            .insert(context, reduced_key, full_key, guard, &v, self);
+        profile.index_apply_ns += NativeWriteStages::elapsed(index_started);
+        if result.is_err() {
+            profile.index_apply_errors += 1;
+        }
+        result
+    }
+
+    /// Benchmark-profiled counterpart to [`Db::remove`], with clocks only for
+    /// explicitly selected diagnostic operations.
+    #[cfg(feature = "experimental-distributed")]
+    pub fn remove_profiled_for_benchmark(
+        &self,
+        ks: KeySpace,
+        k: impl Into<Bytes>,
+        profile: &mut NativeWriteStages,
+    ) -> DbResult<()> {
+        let context = self.ks_context(ks);
+        let _timer = context.db_op_timer(DbOpKind::Remove);
+        let k = k.into();
+        context.ks_config.check_key(&k);
+        let write = PreparedWalWrite::new(&WalEntry::Remove(context.id(), k.clone()));
+        context.inc_wal_written(WalEntryKind::Tombstone, write.len() as u64);
+        profile.selected_operations += 1;
+        let append_started = Instant::now();
+        let guard = self.wal_writer.write(&write);
+        profile.wal_append_ns += NativeWriteStages::elapsed(append_started);
+        let guard = match guard {
+            Ok(guard) => guard,
+            Err(error) => {
+                profile.wal_append_errors += 1;
+                return Err(error.into());
+            }
+        };
+        let reduced_key = context.ks_config.reduced_key_bytes(k);
+        let index_started = Instant::now();
+        let result = self.large_table.remove(context, reduced_key, guard, self);
+        profile.index_apply_ns += NativeWriteStages::elapsed(index_started);
+        if result.is_err() {
+            profile.index_apply_errors += 1;
+        }
+        result
+    }
     pub fn insert(&self, ks: KeySpace, k: impl Into<Bytes>, v: impl Into<Bytes>) -> DbResult<()> {
         let context = self.ks_context(ks);
         let _timer = context.db_op_timer(DbOpKind::Insert);

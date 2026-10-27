@@ -1,4 +1,4 @@
-//! Bounded comparison of native Db, local and separately running TCP partitions.
+//! Bounded comparison of native Db, local and separately running distributed partitions.
 //! The spawned topology shares one SSD; no claimed independent-NVMe or Sui result.
 //! See docs/distributed/LOCAL_BACKEND_BENCHMARK_2026-10-06.md.
 
@@ -16,6 +16,8 @@ mod native_reads;
 mod read_campaign;
 #[path = "support/tcp_cluster.rs"]
 mod tcp_cluster;
+#[path = "support/transport_config.rs"]
+mod transport_config;
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -47,6 +49,46 @@ const CELLS_PER_MUTEX: usize = 64;
 
 const MAX_BENCH_BATCHES: usize = 4096;
 const MAX_VALUE_HISTORY_BYTES: usize = 1024 * MIB;
+
+fn select_owner_transports(
+    coordinator: &Transport,
+    owner_transports: Option<Vec<Transport>>,
+    owner_count: usize,
+) -> Result<Vec<Transport>> {
+    let transports = match owner_transports {
+        Some(transports) if transports.len() == owner_count => transports,
+        Some(_) => {
+            return Err(std::io::Error::other(
+                "owner_transports must contain one transport per owner",
+            )
+            .into());
+        }
+        None => {
+            if matches!(
+                coordinator,
+                Transport::Ofi { fabric, .. } if fabric.source_address.is_some()
+            ) {
+                return Err(std::io::Error::other(
+                    "owner_transports is required when coordinator transport binds a source address",
+                )
+                .into());
+            }
+            vec![coordinator.clone(); owner_count]
+        }
+    };
+    for (owner, transport) in transports.iter().enumerate() {
+        transport
+            .validate()
+            .map_err(|error| format!("owner transport {owner} unavailable: {error}"))?;
+        if !coordinator.same_protocol(transport) {
+            return Err(std::io::Error::other(format!(
+                "owner transport {owner} must match coordinator provider/security"
+            ))
+            .into());
+        }
+    }
+    Ok(transports)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WalLayoutPreset {
@@ -126,6 +168,7 @@ impl Kind {
 
 struct Args {
     transport: Transport,
+    owner_transports: Option<Vec<Transport>>,
     tcp_polling: PollingPolicy,
     tcp_resident_first: bool,
     output: PathBuf,
@@ -177,6 +220,7 @@ impl Args {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let mut args = Self {
             transport: Transport::Tcp,
+            owner_transports: None,
             tcp_polling: PollingPolicy::Adaptive,
             tcp_resident_first: false,
             output: PathBuf::from(format!("logs/sharded-local-bench-{stamp}")),
@@ -231,10 +275,10 @@ impl Args {
         while let Some(flag) = input.next() {
             if flag == "--help" {
                 println!(
-                    "sharded_wal_bench [--transport tcp|efa|efa-direct|fabric-tcp|efa-native|fabric-tcp-native] [--wal-layout small|sui (default small)] [--output DIR] [--backend all|local-all|native-sync|native-async|sharded|tcp] [--tcp-read-cache-bytes N] [--native-read-cache-bytes N (nominal value bytes, excludes metadata)] [--tcp-pipeline true|false] [--tcp-preparation-workers 1..8] [--tcp-preparation-chunk-batches 1..32] [--tcp-scan-prefetch-pages 1|2] [--hot-read-pass true|false] [--cold-read-pass true|false (Linux test-utils)] [--cold-single-probes 1..4096 (requires cold read pass)] [--cold-group-probes 1..4096 (requires cold read pass)] [--transport-diagnostics true|false] [--remote-config YAML] [--batches 128] [--mixed 32] [--reads 512] [--bounded-hot-reads 32..131072 (independent scalar samples; grouped calls=ceil(N/32))] [--repetitions 1] [--values 1024,8192] [--batch-sizes 1,32] [--windows 1,8] [--prepare-external-case DIR --guest-case-root ABSOLUTE_PATH --remote-endpoints IP:PORT,...]"
+                    "sharded_wal_bench [--transport-config JSON_FILE (canonical Transport JSON; default TCP)] [--wal-layout small|sui (default small)] [--output DIR] [--backend all|local-all|native-sync|native-async|sharded|tcp] [--tcp-read-cache-bytes N] [--native-read-cache-bytes N (nominal value bytes, excludes metadata)] [--tcp-pipeline true|false] [--tcp-preparation-workers 1..8] [--tcp-preparation-chunk-batches 1..32] [--tcp-scan-prefetch-pages 1|2] [--hot-read-pass true|false] [--cold-read-pass true|false (Linux test-utils)] [--cold-single-probes 1..4096 (requires cold read pass)] [--cold-group-probes 1..4096 (requires cold read pass)] [--transport-diagnostics true|false] [--remote-config YAML] [--batches 128] [--mixed 32] [--reads 512] [--bounded-hot-reads N] [--repetitions 1] [--values 1024,8192] [--batch-sizes 1,32] [--windows 1,8] [--prepare-external-case DIR --guest-case-root ABSOLUTE_PATH --remote-endpoints IP:PORT,... --owner-transports JSON_FILE (per-owner Transport array)]"
                 );
                 println!(
-                    "efa-native/fabric-tcp-native require an isolated trusted deployment and empty TLS paths; they do not authenticate or encrypt application traffic."
+                    "Trusted transport modes omit application authentication/encryption and require an isolated deployment."
                 );
                 println!(
                     "Campaign bounds: --batches 1..4096, --reads 1..8192; each case is limited to 1 GiB of checked value history."
@@ -277,21 +321,11 @@ impl Args {
                         _ => return Err(invalid("WAL layout must be small or sui").into()),
                     })
                 }
-                "--transport" => {
-                    args.transport = match value.as_str() {
-                        "tcp" => Transport::Tcp,
-                        "efa" => Transport::Efa,
-                        "efa-direct" => Transport::EfaDirect,
-                        "fabric-tcp" => Transport::FabricTcp,
-                        "efa-native" => Transport::EfaNative,
-                        "fabric-tcp-native" => Transport::FabricTcpNative,
-                        _ => {
-                            return Err(invalid(
-                                "transport must be tcp, efa, efa-direct, fabric-tcp, efa-native or fabric-tcp-native",
-                            )
-                            .into());
-                        }
-                    }
+                "--transport-config" => {
+                    args.transport = transport_config::load(Path::new(&value))?;
+                }
+                "--owner-transports" => {
+                    args.owner_transports = Some(serde_json::from_slice(&fs::read(value)?)?);
                 }
                 "--tcp-polling" => {
                     args.tcp_polling = match value.as_str() {
@@ -392,6 +426,11 @@ impl Args {
                 }
                 _ => return Err(invalid("unknown flag").into()),
             }
+        }
+        if args.owner_transports.is_some() && args.prepare_external_case.is_none() {
+            return Err(
+                invalid("--owner-transports is only valid with --prepare-external-case").into(),
+            );
         }
         if !(1..=256).contains(&args.read_window)
             || !(1..=32).contains(&args.native_read_workers)
@@ -616,8 +655,14 @@ impl Args {
             {
                 return Err(invalid("external preparation needs five distinct nonzero numeric endpoints and an absolute guest root, without --remote-config").into());
             }
-        } else if args.guest_case_root.is_some() || !args.remote_endpoints.is_empty() {
-            return Err(invalid("guest root/endpoints require --prepare-external-case").into());
+        } else if args.guest_case_root.is_some()
+            || !args.remote_endpoints.is_empty()
+            || args.owner_transports.is_some()
+        {
+            return Err(invalid(
+                "guest root/endpoints/owner transports require --prepare-external-case",
+            )
+            .into());
         }
         Ok(args)
     }
@@ -1855,17 +1900,45 @@ struct Case {
 
 impl Case {
     fn label(&self) -> &'static str {
-        if self.kind == Kind::Tcp {
-            match self.transport {
-                Transport::Tcp => "experimental_tcp_authority",
-                Transport::Efa => "experimental_efa_authority",
-                Transport::EfaDirect => "experimental_efa_direct_authority",
-                Transport::FabricTcp => "experimental_fabric_tcp_authority",
-                Transport::EfaNative => "trusted_experimental_efa_native_authority",
-                Transport::FabricTcpNative => "experimental_fabric_tcp_native_authority",
-            }
-        } else {
-            self.kind.label()
+        if self.kind != Kind::Tcp {
+            return self.kind.label();
+        }
+        match &self.transport {
+            Transport::Tcp => "experimental_tcp_authority",
+            Transport::Ofi { fabric, security } => match (&fabric.backend, security) {
+                (
+                    tidehunter::distributed::tcp::FabricBackend::Efa,
+                    tidehunter::distributed::tcp::FabricSecurity::MutualTls,
+                ) => "experimental_efa_authority",
+                (
+                    tidehunter::distributed::tcp::FabricBackend::EfaDirect,
+                    tidehunter::distributed::tcp::FabricSecurity::MutualTls,
+                ) => "experimental_efa_direct_authority",
+                (
+                    tidehunter::distributed::tcp::FabricBackend::EfaDirect,
+                    tidehunter::distributed::tcp::FabricSecurity::Trusted,
+                ) => "trusted_experimental_efa_native_authority",
+                (
+                    tidehunter::distributed::tcp::FabricBackend::SoftwareTcp,
+                    tidehunter::distributed::tcp::FabricSecurity::MutualTls,
+                ) => "experimental_fabric_tcp_authority",
+                (
+                    tidehunter::distributed::tcp::FabricBackend::SoftwareTcp,
+                    tidehunter::distributed::tcp::FabricSecurity::Trusted,
+                ) => "experimental_fabric_tcp_native_authority",
+                (
+                    tidehunter::distributed::tcp::FabricBackend::Verbs,
+                    tidehunter::distributed::tcp::FabricSecurity::MutualTls,
+                ) => "experimental_verbs_authority",
+                (
+                    tidehunter::distributed::tcp::FabricBackend::Verbs,
+                    tidehunter::distributed::tcp::FabricSecurity::Trusted,
+                ) => "trusted_experimental_verbs_authority",
+                (
+                    tidehunter::distributed::tcp::FabricBackend::Efa,
+                    tidehunter::distributed::tcp::FabricSecurity::Trusted,
+                ) => "trusted_experimental_efa_authority",
+            },
         }
     }
 }
@@ -2251,7 +2324,7 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
                 parameters.local.max_admitted_batches,
                 parameters.local.max_index_bytes,
                 None,
-                args.transport,
+                args.transport.clone(),
                 args.tcp_server_read_workers.unwrap_or(2),
                 args.tcp_wal_member_read
                     .unwrap_or(tidehunter::distributed::storage::WalMemberReadPolicy::Async),
@@ -3007,6 +3080,11 @@ fn main() -> Result<()> {
     if let Some(directory) = &args.prepare_external_case {
         let parameters =
             BackendParameters::new(Kind::Tcp, directory.join("database"), &args, args.values[0]);
+        let owner_transports = select_owner_transports(
+            &args.transport,
+            args.owner_transports.clone(),
+            args.remote_endpoints.len(),
+        )?;
         tcp_cluster::prepare_external_case(
             directory,
             args.guest_case_root.as_ref().unwrap(),
@@ -3015,7 +3093,8 @@ fn main() -> Result<()> {
             parameters.local.storage,
             parameters.local.max_admitted_batches,
             parameters.local.max_index_bytes,
-            args.transport,
+            args.transport.clone(),
+            &owner_transports,
             args.tcp_server_read_workers.unwrap_or(2),
             args.tcp_wal_member_read
                 .unwrap_or(tidehunter::distributed::storage::WalMemberReadPolicy::Async),
@@ -3053,8 +3132,9 @@ fn main() -> Result<()> {
         }
         fs::write(config_path, serde_yaml::to_string(&config)?)?;
         println!(
-            "prepared_external_case={} no_network_requests=true",
-            directory.display()
+            "prepared_external_case={} owner_transports={} no_network_requests=true",
+            directory.display(),
+            directory.join("owner_transports.json").display()
         );
         return Ok(());
     }
@@ -3161,12 +3241,9 @@ fn main() -> Result<()> {
     )?;
     writeln!(
         metadata,
-        "transport={}\nrdma_hardware_requested={}\nnative_async_is_not_durability_equivalent=true\nlatency_unit=api_call_or_complete_window\nthroughput_includes_driver_and_verification_overhead=true\nvalues={:?}\nbatch_sizes={:?}\nwindows={:?}\nload_batches={}\nmixed_batches={}\npoint_reads={}\nrepetitions={}\nmax_value_history_per_case_bytes={}\nsource_and_binary_hashes=must_be_captured_by_orchestrator",
+        "transport={}\nofi_transport_selected={}\nnative_async_is_not_durability_equivalent=true\nlatency_unit=api_call_or_complete_window\nthroughput_includes_driver_and_verification_overhead=true\nvalues={:?}\nbatch_sizes={:?}\nwindows={:?}\nload_batches={}\nmixed_batches={}\npoint_reads={}\nrepetitions={}\nmax_value_history_per_case_bytes={}\nsource_and_binary_hashes=must_be_captured_by_orchestrator",
         args.transport.label(),
-        matches!(
-            args.transport,
-            Transport::Efa | Transport::EfaDirect | Transport::EfaNative
-        ),
+        args.transport.is_fabric(),
         args.values,
         args.batch_sizes,
         args.windows,
@@ -3264,7 +3341,7 @@ fn main() -> Result<()> {
                         run_case(
                             &args,
                             &Case {
-                                transport: args.transport,
+                                transport: args.transport.clone(),
                                 preparation_chunk_batches: args.tcp_preparation_chunk_batches,
                                 diagnostic: args.transport_diagnostics,
                                 kind,

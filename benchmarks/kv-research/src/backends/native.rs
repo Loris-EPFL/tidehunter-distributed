@@ -2,13 +2,12 @@ use crate::backend::{BackendInfo, BackendResult, BatchAtomicity, KvBackend, nati
 use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tidehunter::config::Config;
-use tidehunter::db::Db;
+use tidehunter::db::{Db, NativeWriteStages, ValueWalPersistenceProfile};
 use tidehunter::key_shape::{KeyShape, KeySpace, KeyType};
 use tidehunter::metrics::Metrics;
 use tidehunter::minibytes::Bytes;
-
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Durability {
@@ -36,12 +35,22 @@ impl Default for Durability {
     }
 }
 
+#[derive(Default)]
+struct NativeWriteDiagnostics {
+    limit: usize,
+    stages: NativeWriteStages,
+    persistence: ValueWalPersistenceProfile,
+    profiled_barriers: u64,
+    barrier_errors: u64,
+}
+
 pub struct NativeBackend {
     db: Arc<Db>,
     keyspace: KeySpace,
     durability: Durability,
     path: PathBuf,
     key_count: u64,
+    diagnostics: Mutex<NativeWriteDiagnostics>,
 }
 
 fn parse_options(value: &serde_json::Value) -> BackendResult<Options> {
@@ -84,6 +93,7 @@ pub async fn open(
         durability: options.durability,
         path: options.path,
         key_count: options.key_count,
+        diagnostics: Mutex::default(),
     })
 }
 
@@ -97,6 +107,45 @@ impl NativeBackend {
         Ok(())
     }
 
+    fn profile_barrier(&self, profile: &mut ValueWalPersistenceProfile) -> BackendResult<()> {
+        if matches!(self.durability, Durability::ValueWalBarrier) {
+            self.db
+                .persist_value_wal_profiled_for_benchmark(profile)
+                .map_err(native_error)?;
+        }
+        Ok(())
+    }
+
+    fn add_profile(
+        &self,
+        stages: NativeWriteStages,
+        persistence: ValueWalPersistenceProfile,
+        barrier_attempted: bool,
+        barrier_error: bool,
+    ) -> BackendResult<()> {
+        let mut diagnostics = self
+            .diagnostics
+            .lock()
+            .map_err(|_| "native write diagnostic lock poisoned")?;
+        diagnostics.stages.selected_operations += stages.selected_operations;
+        diagnostics.stages.wal_append_ns += stages.wal_append_ns;
+        diagnostics.stages.wal_append_errors += stages.wal_append_errors;
+        diagnostics.stages.index_apply_ns += stages.index_apply_ns;
+        diagnostics.stages.index_apply_errors += stages.index_apply_errors;
+        diagnostics.persistence.file_calls += persistence.file_calls;
+        diagnostics.persistence.file_successes += persistence.file_successes;
+        diagnostics.persistence.file_ns += persistence.file_ns;
+        diagnostics.persistence.namespace_calls += persistence.namespace_calls;
+        diagnostics.persistence.namespace_successes += persistence.namespace_successes;
+        diagnostics.persistence.namespace_ns += persistence.namespace_ns;
+        if barrier_attempted {
+            diagnostics.profiled_barriers += 1;
+            if barrier_error {
+                diagnostics.barrier_errors += 1;
+            }
+        }
+        Ok(())
+    }
     fn info(&self) -> BackendInfo {
         BackendInfo {
             name: "native".to_owned(),
@@ -168,5 +217,134 @@ impl KvBackend for NativeBackend {
         }
         batch.commit().map_err(native_error)?;
         self.foreground_barrier()
+    }
+    fn arm_write_profile(&self, limit: usize) -> BackendResult<()> {
+        if limit > 65_536 {
+            return Err("native write profile limit exceeds 65536".into());
+        }
+        let mut diagnostics = self
+            .diagnostics
+            .lock()
+            .map_err(|_| "native write diagnostic lock poisoned")?;
+        *diagnostics = NativeWriteDiagnostics {
+            limit,
+            ..NativeWriteDiagnostics::default()
+        };
+        Ok(())
+    }
+
+    async fn finish_write_profile(&self) -> BackendResult<serde_json::Value> {
+        let diagnostics = self
+            .diagnostics
+            .lock()
+            .map_err(|_| "native write diagnostic lock poisoned")?;
+        Ok(serde_json::json!({
+            "supported": true,
+            "runtime_observation_mode": "runtime_selected_native_scalar_write_stages",
+            "selection_policy": "first N accepted scalar put/delete requests in measurement; native put_batch is excluded",
+            "sample_limit": diagnostics.limit,
+            "selected_operations": diagnostics.stages.selected_operations,
+            "stages": {
+                "selected_operations": diagnostics.stages.selected_operations,
+                "wal_append_ns": diagnostics.stages.wal_append_ns,
+                "wal_append_errors": diagnostics.stages.wal_append_errors,
+                "index_apply_ns": diagnostics.stages.index_apply_ns,
+                "index_apply_errors": diagnostics.stages.index_apply_errors
+            },
+            "value_wal_persistence": match self.durability {
+                Durability::PageCache => serde_json::json!({
+                    "status": "not_applicable",
+                    "reason": "native page_cache durability has no foreground Value-WAL persistence barrier"
+                }),
+                Durability::ValueWalBarrier => serde_json::json!({
+                    "status": "sampled",
+                    "profiled_barriers": diagnostics.profiled_barriers,
+                    "barrier_errors": diagnostics.barrier_errors,
+                    "file_calls": diagnostics.persistence.file_calls,
+                    "file_successes": diagnostics.persistence.file_successes,
+                    "file_errors": diagnostics.persistence.file_calls.saturating_sub(diagnostics.persistence.file_successes),
+                    "file_ns": diagnostics.persistence.file_ns,
+                    "namespace_calls": diagnostics.persistence.namespace_calls,
+                    "namespace_successes": diagnostics.persistence.namespace_successes,
+                    "namespace_errors": diagnostics.persistence.namespace_calls.saturating_sub(diagnostics.persistence.namespace_successes),
+                    "namespace_ns": diagnostics.persistence.namespace_ns
+                })
+            },
+            "clock_scope": "per-selected scalar operation; wal_append_ns measures WalWriter::write; index_apply_ns measures LargeTable insert/remove; independent Value-WAL persistence clocks are nested inside the profiled foreground barrier and must not be added to the outer stages",
+            "overlap_semantics": "native scalar append and index application stages execute sequentially; Value-WAL persistence is a separate post-operation barrier and file/namespace times are components of that barrier",
+            "unsupported_stages": ["native_put_batch_append_index", "per-operation_write_percentiles", "physical_device_io"]
+        }))
+    }
+
+    async fn profiled_put(&self, key: Bytes, value: Bytes) -> BackendResult<()> {
+        let mut stages = NativeWriteStages::default();
+        let mut persistence = ValueWalPersistenceProfile::default();
+        let (result, barrier_attempted) =
+            match self
+                .db
+                .insert_profiled_for_benchmark(self.keyspace, key, value, &mut stages)
+            {
+                Ok(()) => (self.profile_barrier(&mut persistence), true),
+                Err(error) => (Err(native_error(error)), false),
+            };
+        let barrier_error = barrier_attempted && result.is_err();
+        self.add_profile(stages, persistence, barrier_attempted, barrier_error)?;
+        result
+    }
+
+    async fn profiled_delete(&self, key: Bytes) -> BackendResult<()> {
+        let mut stages = NativeWriteStages::default();
+        let mut persistence = ValueWalPersistenceProfile::default();
+        let (result, barrier_attempted) =
+            match self
+                .db
+                .remove_profiled_for_benchmark(self.keyspace, key, &mut stages)
+            {
+                Ok(()) => (self.profile_barrier(&mut persistence), true),
+                Err(error) => (Err(native_error(error)), false),
+            };
+        let barrier_error = barrier_attempted && result.is_err();
+        self.add_profile(stages, persistence, barrier_attempted, barrier_error)?;
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sampled_native_scalar_write_reports_real_append_and_index_stages() {
+        let root = std::env::temp_dir().join(format!(
+            "kv-research-native-write-profile-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let backend = open(
+            &serde_json::json!({"path": root.clone(), "durability": "page_cache"}),
+            &prometheus::Registry::new(),
+        )
+        .await
+        .unwrap();
+        backend.arm_write_profile(1).unwrap();
+        const KEY: [u8; 32] = [7; 32];
+        backend
+            .profiled_put(Bytes::from_static(&KEY), Bytes::from_static(b"value"))
+            .await
+            .unwrap();
+        assert_eq!(backend.get(&KEY).await.unwrap().unwrap().as_ref(), b"value");
+        let evidence = backend.finish_write_profile().await.unwrap();
+        assert_eq!(evidence["selected_operations"], 1);
+        assert!(evidence["stages"]["wal_append_ns"].as_u64().unwrap() > 0);
+        assert!(evidence["stages"]["index_apply_ns"].as_u64().unwrap() > 0);
+        assert_eq!(
+            evidence["value_wal_persistence"]["status"],
+            "not_applicable"
+        );
+        backend.shutdown().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

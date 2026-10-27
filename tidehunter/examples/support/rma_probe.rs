@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 use tidehunter_fabric::{
-    Endpoint, PeerDrainToken, RemoteReadRegion, RmaAddressMode, RmaConfig, RmaReadMode,
+    Endpoint, FabricBackend, FabricConfig, PeerDrainToken, RemoteReadRegion, RmaAddressMode,
+    RmaConfig, RmaReadMode,
 };
 
 type Result<T, E = Box<dyn Error>> = std::result::Result<T, E>;
@@ -22,11 +23,6 @@ enum Role {
     Client,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Fabric {
-    EfaDirect,
-    SoftwareTcp,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Polling {
     Busy,
     Adaptive,
@@ -36,9 +32,8 @@ struct Args {
     role: Role,
     listen: Option<String>,
     connect: Option<String>,
-    provider: String,
-    domain: Option<String>,
-    fabric: Fabric,
+    fabric: FabricConfig,
+    require_device_read: bool,
     payload_bytes: usize,
     samples: usize,
     warmup: usize,
@@ -57,9 +52,12 @@ impl Args {
             role: Role::Client,
             listen: None,
             connect: None,
-            provider: String::new(),
-            domain: None,
-            fabric: Fabric::EfaDirect,
+            fabric: FabricConfig {
+                backend: FabricBackend::SoftwareTcp,
+                domain: None,
+                source_address: None,
+            },
+            require_device_read: false,
             payload_bytes: 256,
             samples: 1000,
             warmup: 64,
@@ -69,28 +67,15 @@ impl Args {
             detailed_steps: false,
         };
         let mut role_explicit = false;
-        let mut provider_explicit = false;
-        let mut domain_explicit = false;
-        let mut fabric_explicit = false;
+        let mut fabric_config_explicit = false;
+        let mut require_device_read_explicit = false;
         let mut tokens = tokens.into_iter();
         while let Some(flag) = tokens.next() {
             if flag == "--help" {
-                return Err(invalid("help requested; use --role server|client --listen ADDR|--connect ADDR --provider efa --domain DOMAIN --efa-direct or --provider tcp;ofi_rxm --domain lo --software-tcp [--bytes N --samples N --warmup N --deadline-ms N --polling busy|adaptive --output FILE --detailed-steps]").into());
+                return Err(invalid("help requested; use --role server|client --listen ADDR|--connect ADDR --fabric-config JSON_FILE --require-device-read true|false [--bytes N --samples N --warmup N --deadline-ms N --polling busy|adaptive --output FILE --detailed-steps]").into());
             }
             if flag == "--detailed-steps" {
                 args.detailed_steps = true;
-                continue;
-            }
-            if flag == "--efa-direct" || flag == "--software-tcp" {
-                if fabric_explicit {
-                    return Err(invalid("select only one explicit fabric mode").into());
-                }
-                args.fabric = if flag == "--efa-direct" {
-                    Fabric::EfaDirect
-                } else {
-                    Fabric::SoftwareTcp
-                };
-                fabric_explicit = true;
                 continue;
             }
             let value = tokens.next().ok_or_else(|| invalid("missing flag value"))?;
@@ -105,16 +90,13 @@ impl Args {
                 }
                 "--listen" => args.listen = Some(value),
                 "--connect" => args.connect = Some(value),
-                "--provider" => {
-                    args.provider = value;
-                    provider_explicit = true;
+                "--fabric-config" => {
+                    args.fabric = serde_json::from_slice(&std::fs::read(value)?)?;
+                    fabric_config_explicit = true;
                 }
-                "--domain" => {
-                    if value.is_empty() {
-                        return Err(invalid("domain must be a nonempty exact name").into());
-                    }
-                    args.domain = Some(value);
-                    domain_explicit = true;
+                "--require-device-read" => {
+                    args.require_device_read = value.parse()?;
+                    require_device_read_explicit = true;
                 }
                 "--bytes" => args.payload_bytes = value.parse()?,
                 "--samples" => args.samples = value.parse()?,
@@ -131,11 +113,13 @@ impl Args {
                 _ => return Err(invalid("unknown RMA probe option").into()),
             }
         }
-        if !role_explicit || !provider_explicit || !domain_explicit || !fabric_explicit {
-            return Err(
-                invalid("select an explicit role, exact provider/domain, and fabric mode").into(),
-            );
+        if !role_explicit || !fabric_config_explicit || !require_device_read_explicit {
+            return Err(invalid(
+                "select an explicit role, --fabric-config and --require-device-read",
+            )
+            .into());
         }
+        args.fabric.validate()?;
         if !(1..=1_048_576).contains(&args.payload_bytes)
             || !(1..=1_000_000).contains(&args.samples)
             || args.warmup > 100_000
@@ -163,15 +147,6 @@ impl Args {
         if !role_address_ok || !address_valid {
             return Err(invalid("server requires a numeric --listen socket address; client requires a numeric --connect socket address").into());
         }
-        match args.fabric {
-            Fabric::EfaDirect if args.provider != "efa" => {
-                return Err(invalid("--efa-direct requires exact provider efa").into());
-            }
-            Fabric::SoftwareTcp if args.provider != "tcp;ofi_rxm" => {
-                return Err(invalid("software mode requires exact provider tcp;ofi_rxm").into());
-            }
-            _ => {}
-        }
         Ok(args)
     }
 }
@@ -196,10 +171,9 @@ fn read_u64(bytes: &[u8], offset: usize) -> io::Result<u64> {
 struct Capabilities {
     address_mode: &'static str,
     read_mode: &'static str,
-    provider: String,
-    domain: Option<String>,
-    efa_direct_requested: bool,
-    software_provider_explicit: bool,
+    provider_info: serde_json::Value,
+    fabric_config: FabricConfig,
+    require_device_read: bool,
     max_read_bytes: usize,
 }
 #[derive(Serialize)]
@@ -221,9 +195,9 @@ struct Report {
     role: &'static str,
     topology: &'static str,
     control_security: &'static str,
-    provider: String,
-    domain: Option<String>,
-    fabric: &'static str,
+    provider_info: serde_json::Value,
+    fabric_config: FabricConfig,
+    fabric: String,
     capabilities: Capabilities,
     payload_bytes: usize,
     accepted_fi_reads: usize,
@@ -259,12 +233,9 @@ fn open_endpoint(args: &Args) -> io::Result<Endpoint> {
         destination_bytes: args.payload_bytes + HEADER_BYTES,
         destination_slots: 1,
         max_read_bytes: args.payload_bytes + HEADER_BYTES,
-        require_device_read: args.fabric == Fabric::EfaDirect,
+        require_device_read: args.require_device_read,
     };
-    match args.fabric {
-        Fabric::EfaDirect => Endpoint::open_efa_direct_rma(args.domain.as_deref(), config),
-        Fabric::SoftwareTcp => Endpoint::open_rma(&args.provider, args.domain.as_deref(), config),
-    }
+    Endpoint::open(&args.fabric, Some(config))
 }
 
 fn write_all_deadline(
@@ -330,13 +301,6 @@ fn capabilities(endpoint: &Endpoint, args: &Args) -> io::Result<Capabilities> {
     let caps = endpoint
         .rma_capabilities()
         .ok_or_else(|| io::Error::other("provider did not negotiate FI_READ"))?;
-    if (args.fabric == Fabric::EfaDirect && caps.read_mode != RmaReadMode::Native)
-        || (args.fabric == Fabric::SoftwareTcp && caps.read_mode != RmaReadMode::Emulated)
-    {
-        return Err(io::Error::other(
-            "provider read capability does not match explicit requested mode",
-        ));
-    }
     if args.payload_bytes + HEADER_BYTES > caps.max_read_bytes {
         return Err(io::Error::other(
             "requested read exceeds provider FI_READ cap",
@@ -350,14 +314,23 @@ fn capabilities(endpoint: &Endpoint, args: &Args) -> io::Result<Capabilities> {
         read_mode: match caps.read_mode {
             RmaReadMode::Native => "native",
             RmaReadMode::Emulated => "emulated",
+            RmaReadMode::Unknown => "unknown",
         },
-        provider: args.provider.clone(),
-        domain: args.domain.clone(),
-        efa_direct_requested: args.fabric == Fabric::EfaDirect,
-        software_provider_explicit: args.fabric == Fabric::SoftwareTcp,
+        provider_info: serde_json::to_value(endpoint.provider_info()).map_err(io::Error::other)?,
+        fabric_config: args.fabric.clone(),
+        require_device_read: args.require_device_read,
         max_read_bytes: caps.max_read_bytes,
     })
 }
+fn fabric_label(config: &FabricConfig) -> &'static str {
+    match &config.backend {
+        FabricBackend::Efa => "efa",
+        FabricBackend::EfaDirect => "efa-direct",
+        FabricBackend::Verbs => "verbs",
+        FabricBackend::SoftwareTcp => "software-tcp",
+    }
+}
+
 fn source_bytes(payload_bytes: usize, region_id: u64, generation: u64) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(HEADER_BYTES + payload_bytes);
     bytes.extend_from_slice(b"RMAP");
@@ -423,6 +396,7 @@ fn server(args: &Args, deadline: Instant) -> Result<()> {
     let caps = capabilities(&endpoint, args)?;
     let own_addr = endpoint.address()?;
     finish_detail(&mut detailed_steps_ns, "provider_source_setup_ns", step);
+    println!("rma_probe_ready listen={listen}");
 
     step = start_detail(args.detailed_steps);
     let mut stream = loop {
@@ -458,7 +432,12 @@ fn server(args: &Args, deadline: Instant) -> Result<()> {
     descriptor.extend_from_slice(&(args.samples as u64).to_le_bytes());
     descriptor.extend_from_slice(&(args.warmup as u64).to_le_bytes());
     descriptor.extend_from_slice(&(caps.max_read_bytes as u64).to_le_bytes());
-    descriptor.push(if caps.read_mode == "native" { 1 } else { 0 });
+    descriptor.push(match caps.read_mode {
+        "emulated" => 0,
+        "native" => 1,
+        "unknown" => 2,
+        _ => return Err(invalid("invalid read mode").into()),
+    });
     descriptor.push(if caps.address_mode == "virtual" { 1 } else { 0 });
     descriptor.extend_from_slice(&[0; 6]);
     write_frame(&mut stream, &descriptor, deadline)?;
@@ -509,13 +488,9 @@ fn server(args: &Args, deadline: Instant) -> Result<()> {
         role: "server",
         topology: "two_process_control_tcp_and_provider_fabric",
         control_security: "bounded_trusted_test_tcp_no_authentication",
-        provider: args.provider.clone(),
-        domain: args.domain.clone(),
-        fabric: if args.fabric == Fabric::EfaDirect {
-            "efa-direct"
-        } else {
-            "tcp;ofi_rxm_explicit_software"
-        },
+        provider_info: caps.provider_info.clone(),
+        fabric_config: args.fabric.clone(),
+        fabric: fabric_label(&args.fabric).to_owned(),
         capabilities: caps,
         payload_bytes: args.payload_bytes,
         accepted_fi_reads: args.warmup + args.samples,
@@ -567,10 +542,15 @@ fn client(args: &Args, deadline: Instant) -> Result<()> {
         key: field(24)?,
         len: field(32)?,
     };
-    let expected_native = args.fabric == Fabric::EfaDirect;
-    if descriptor[64] > 1
+    let expected_read_mode = match caps.read_mode {
+        "emulated" => 0,
+        "native" => 1,
+        "unknown" => 2,
+        _ => return Err(invalid("invalid local read mode").into()),
+    };
+    if descriptor[64] > 2
         || descriptor[65] > 1
-        || (descriptor[64] == 1) != expected_native
+        || descriptor[64] != expected_read_mode
         || (descriptor[65] == 1) != (caps.address_mode == "virtual")
         || field(40)? != args.samples as u64
         || field(48)? != args.warmup as u64
@@ -671,13 +651,9 @@ fn client(args: &Args, deadline: Instant) -> Result<()> {
         role: "client",
         topology: "two_process_control_tcp_and_provider_fabric",
         control_security: "bounded_trusted_test_tcp_no_authentication",
-        provider: args.provider.clone(),
-        domain: args.domain.clone(),
-        fabric: if args.fabric == Fabric::EfaDirect {
-            "efa-direct"
-        } else {
-            "tcp;ofi_rxm_explicit_software"
-        },
+        provider_info: caps.provider_info.clone(),
+        fabric_config: args.fabric.clone(),
+        fabric: fabric_label(&args.fabric).to_owned(),
         capabilities: caps,
         payload_bytes: args.payload_bytes,
         accepted_fi_reads: args.warmup + args.samples,
@@ -720,13 +696,13 @@ where
             "--rma-probe --role server --listen ADDR | --rma-probe --role client --connect ADDR"
         );
         println!(
-            "Required: --provider efa --domain DOMAIN --efa-direct or --provider tcp;ofi_rxm --domain lo --software-tcp."
+            "Required: --fabric-config JSON_FILE --require-device-read true|false. FabricConfig selects efa, efa-direct, verbs or software-tcp explicitly."
         );
         println!(
             "Optional: --bytes 1..1048576 --samples 1..1000000 --warmup 0..100000 --deadline-ms 1..3600000 --polling busy|adaptive --output FILE --detailed-steps."
         );
         println!(
-            "Trusted-test TCP carries bootstrap and drain acknowledgement; no TLS or peer authentication. Hardware mode requires native FI_READ. Software mode is explicitly emulated."
+            "Trusted-test TCP carries bootstrap and drain acknowledgement; no TLS or peer authentication. Device-read policy rejects unverified hardware; software reads are explicitly emulated."
         );
         return Ok(());
     }
@@ -743,83 +719,65 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, Fabric, Role};
+    use super::{Args, FabricBackend, Role};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_CONFIG: AtomicU64 = AtomicU64::new(0);
 
     fn parse(tokens: &[&str]) -> super::Result<Args> {
         Args::parse(tokens.iter().map(|token| (*token).to_owned()))
     }
 
-    #[test]
-    fn parser_requires_role_address_and_explicit_provider_mode_pair() {
-        assert!(parse(&["--role", "client", "--connect", "127.0.0.1:9"]).is_err());
-        assert!(parse(&["--role", "client", "--provider", "efa", "--efa-direct"]).is_err());
-        assert!(
-            parse(&[
+    fn with_config(backend: &str, require_device_read: &str) -> super::Result<Args> {
+        let path = std::env::temp_dir().join(format!(
+            "tidehunter-rma-probe-{}-{}.json",
+            std::process::id(),
+            NEXT_CONFIG.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(
+            &path,
+            format!(r#"{{"backend":"{backend}","domain":"lo","source_address":null}}"#),
+        )?;
+        let path_string = path.to_string_lossy().into_owned();
+        let result = Args::parse(
+            [
                 "--role",
-                "server",
-                "--listen",
-                "127.0.0.1:0",
-                "--provider",
-                "efa",
-                "--domain",
-                "efa",
-                "--efa-direct",
-                "--bytes",
-                "256",
-                "--samples",
-                "10",
-                "--warmup",
-                "2",
-            ])
-            .is_ok_and(|args| args.role == Role::Server && args.fabric == Fabric::EfaDirect)
+                "client",
+                "--connect",
+                "127.0.0.1:9",
+                "--fabric-config",
+                path_string.as_str(),
+                "--require-device-read",
+                require_device_read,
+            ]
+            .into_iter()
+            .map(str::to_owned),
         );
+        std::fs::remove_file(path)?;
+        result
     }
 
     #[test]
-    fn parser_rejects_provider_fallback_and_unbounded_values() {
+    fn parser_requires_explicit_config_policy_and_role_address() {
+        assert!(parse(&["--role", "client", "--connect", "127.0.0.1:9"]).is_err());
+        assert!(with_config("efa-direct", "false").is_ok_and(|args| {
+            args.role == Role::Client && args.fabric.backend == FabricBackend::EfaDirect
+        }));
+        assert!(with_config("verbs", "false").is_ok_and(|args| {
+            args.fabric.backend == FabricBackend::Verbs && !args.require_device_read
+        }));
         assert!(
-            parse(&[
-                "--role",
-                "client",
-                "--connect",
-                "127.0.0.1:9",
-                "--provider",
-                "efa",
-                "--domain",
-                "efa",
-                "--software-tcp",
-            ])
-            .is_err()
+            with_config("software-tcp", "false")
+                .is_ok_and(|args| { args.fabric.backend == FabricBackend::SoftwareTcp })
         );
-        assert!(
-            parse(&[
-                "--role",
-                "client",
-                "--connect",
-                "127.0.0.1:9",
-                "--provider",
-                "tcp;ofi_rxm",
-                "--domain",
-                "lo",
-                "--software-tcp",
-                "--bytes",
-                "0",
-            ])
-            .is_err()
-        );
-        assert!(
-            parse(&[
-                "--role",
-                "client",
-                "--connect",
-                "127.0.0.1:9",
-                "--provider",
-                "tcp;ofi_rxm",
-                "--domain",
-                "lo",
-                "--software-tcp",
-            ])
-            .is_ok_and(|args| args.role == Role::Client && args.fabric == Fabric::SoftwareTcp)
-        );
+        assert!(with_config("efa", "true").is_ok_and(|args| {
+            args.fabric.backend == FabricBackend::Efa && args.require_device_read
+        }));
+    }
+
+    #[test]
+    fn parser_rejects_legacy_provider_selectors() {
+        assert!(parse(&["--role", "client", "--provider", "efa", "--efa-direct"]).is_err());
+        assert!(with_config("tcp", "false").is_err());
     }
 }

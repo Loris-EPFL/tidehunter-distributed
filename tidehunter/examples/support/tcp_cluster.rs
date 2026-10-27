@@ -38,6 +38,7 @@ pub fn prepare_external_case(
     max_admitted_batches: usize,
     max_index_bytes: usize,
     transport: Transport,
+    owner_transports: &[Transport],
     read_workers: usize,
     wal_member_read: tidehunter::distributed::storage::WalMemberReadPolicy,
     read_cache_bytes: usize,
@@ -46,16 +47,34 @@ pub fn prepare_external_case(
     read_resident_first: bool,
     resident_reads: ResidentReadConfig,
 ) -> Result<()> {
-    if !guest_root.is_absolute() || addresses.len() != storage.partitions.len() {
-        return Err(io::Error::other("invalid external case root/endpoints").into());
+    if !guest_root.is_absolute()
+        || addresses.len() != storage.partitions.len()
+        || owner_transports.len() != addresses.len()
+    {
+        return Err(
+            io::Error::other("invalid external case root/endpoints/owner transports").into(),
+        );
     }
     transport.validate()?;
+    for owner_transport in owner_transports {
+        owner_transport.validate()?;
+        if !transport.same_protocol(owner_transport) {
+            return Err(io::Error::other(
+                "owner transport provider/security differs from coordinator transport",
+            )
+            .into());
+        }
+    }
     fs::create_dir(directory)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
     }
+    fs::write(
+        directory.join("owner_transports.json"),
+        serde_json::to_vec_pretty(owner_transports)?,
+    )?;
     let certs = if transport.is_native() {
         None
     } else {
@@ -66,7 +85,13 @@ pub fn prepare_external_case(
     };
     let rebase = |path: &Path| guest_root.join("tls").join(path.file_name().unwrap());
     let mut endpoints = Vec::new();
-    for (i, (&partition, &address)) in storage.partitions.iter().zip(addresses).enumerate() {
+    for (i, ((&partition, &address), owner_transport)) in storage
+        .partitions
+        .iter()
+        .zip(addresses)
+        .zip(owner_transports)
+        .enumerate()
+    {
         let local_node = directory.join(format!("node-{partition}"));
         fs::create_dir(&local_node)?;
         let node_root = guest_root.join(format!("node-{partition}"));
@@ -117,7 +142,7 @@ pub fn prepare_external_case(
                 resident_reads,
             },
             tls: TlsFiles {
-                transport,
+                transport: owner_transport.clone(),
                 ca: ca.clone(),
                 cert: cert.clone(),
                 key: key.clone(),
@@ -146,7 +171,7 @@ pub fn prepare_external_case(
     }
     let client_tls = if let Some(certs) = certs.as_ref() {
         TlsFiles {
-            transport,
+            transport: transport.clone(),
             ca: rebase(&certs.ca),
             cert: rebase(&certs.authority.certificate),
             key: rebase(&certs.authority.private_key),
@@ -155,7 +180,7 @@ pub fn prepare_external_case(
         }
     } else {
         TlsFiles {
-            transport,
+            transport: transport.clone(),
             ca: PathBuf::new(),
             cert: PathBuf::new(),
             key: PathBuf::new(),
@@ -517,7 +542,7 @@ impl LoopbackCluster {
                     resident_reads,
                 },
                 tls: TlsFiles {
-                    transport,
+                    transport: transport.clone(),
                     ca: ca.clone(),
                     cert: cert.clone(),
                     key: key.clone(),
@@ -547,7 +572,7 @@ impl LoopbackCluster {
         }
         let client_tls = if let Some(certs) = certs {
             TlsFiles {
-                transport,
+                transport: transport.clone(),
                 ca: certs.ca,
                 cert: certs.authority.certificate,
                 key: certs.authority.private_key,
@@ -556,7 +581,7 @@ impl LoopbackCluster {
             }
         } else {
             TlsFiles {
-                transport,
+                transport: transport.clone(),
                 ca: PathBuf::new(),
                 cert: PathBuf::new(),
                 key: PathBuf::new(),
@@ -644,7 +669,7 @@ impl LoopbackCluster {
     pub fn untrusted_client_tls(&self, directory: &Path) -> Result<TlsFiles> {
         let foreign = tls_material::TestCertificates::generate(directory, 1)?;
         Ok(TlsFiles {
-            transport: self.config.tls.transport,
+            transport: self.config.tls.transport.clone(),
             ca: self.config.tls.ca.clone(),
             cert: foreign.authority.certificate,
             key: foreign.authority.private_key,

@@ -31,6 +31,33 @@ pub(crate) fn native_error(
     Box::new(NativeError(error))
 }
 
+/// Preserves a backend transport failure's type and cause for outcome classification.
+#[derive(Debug)]
+pub(crate) struct BackendTransportError(Box<dyn std::error::Error + Send + Sync>);
+
+#[cfg(feature = "valkey-tcp")]
+impl BackendTransportError {
+    pub(crate) fn new(error: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        Self(error)
+    }
+}
+
+impl std::fmt::Display for BackendTransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "backend transport failure: {}", self.0)
+    }
+}
+
+impl std::error::Error for BackendTransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+pub(crate) fn is_backend_transport_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    error.downcast_ref::<BackendTransportError>().is_some()
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BatchAtomicity {
@@ -71,6 +98,36 @@ pub trait KvBackend: Send + Sync + 'static {
         entries: &[(Bytes, Bytes)],
     ) -> impl Future<Output = BackendResult<()>> + Send;
 
+    /// Arm bounded write diagnostics at the measurement boundary.
+    fn arm_write_profile(&self, limit: usize) -> BackendResult<()> {
+        if limit == 0 {
+            Ok(())
+        } else {
+            Err(unsupported("measurement-phase write profiling"))
+        }
+    }
+
+    /// Finalize a selected write profile and return its engine-owned evidence.
+    fn finish_write_profile(
+        &self,
+    ) -> impl Future<Output = BackendResult<serde_json::Value>> + Send {
+        async { Ok(serde_json::json!({"supported": false})) }
+    }
+
+    /// Same mutation semantics as `put`, with stage clocks only for selected diagnostics.
+    fn profiled_put(
+        &self,
+        key: Bytes,
+        value: Bytes,
+    ) -> impl Future<Output = BackendResult<()>> + Send {
+        self.put(key, value)
+    }
+
+    /// Same mutation semantics as `delete`, with stage clocks only for selected diagnostics.
+    fn profiled_delete(&self, key: Bytes) -> impl Future<Output = BackendResult<()>> + Send {
+        self.delete(key)
+    }
+
     /// Release the owned client/embedded engine before final success publication.
     /// Backends with observable fallible teardown must override this method.
     fn shutdown(self) -> impl Future<Output = BackendResult<()>> + Send
@@ -83,7 +140,6 @@ pub trait KvBackend: Send + Sync + 'static {
         }
     }
 }
-
 #[must_use]
 pub fn unsupported(operation: &str) -> Box<dyn std::error::Error + Send + Sync> {
     std::io::Error::new(

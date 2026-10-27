@@ -34,7 +34,7 @@ impl ConcurrentRemoteDatabase {
     pub fn read_profile_monitor(&self) -> ReadProfileMonitor {
         ReadProfileMonitor {
             state: self.reads.state.clone(),
-            fabric: self.config.tls.transport != super::super::super::tcp::Transport::Tcp,
+            fabric: self.config.tls.transport.is_fabric(),
         }
     }
     pub fn read_rpc_count(&self) -> u64 {

@@ -79,6 +79,10 @@ enum OwnerCommand {
         reply: WriteReply,
     },
     Flush(Reply<()>),
+    ArmProfile {
+        limit: usize,
+        reply: Reply<()>,
+    },
     FinishProfile(Reply<()>),
     Retire {
         floor: IndexReadCut,
@@ -587,12 +591,36 @@ impl ConcurrentRemoteDatabase {
     pub fn shutdown(mut self) -> Result<(), LocalDbError> {
         self.stop()
     }
+    /// Arm a fresh bounded profile after warm-up has drained.
+    pub fn arm_write_profile(&self, limit: usize) -> Result<(), LocalDbError> {
+        self.ensure_healthy()?;
+        if limit > 65_536 {
+            return Err(LocalDbError::new("write profile limit exceeds 65536"));
+        }
+        *self.write_profile.lock() = WriteProfileSnapshot {
+            limit_per_connection: limit,
+            expected_connections: self.io_clients.len(),
+            ..WriteProfileSnapshot::default()
+        };
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.sender
+            .as_ref()
+            .ok_or_else(|| LocalDbError::new("write authority closed"))?
+            .send(OwnerCommand::ArmProfile {
+                limit,
+                reply: sender,
+            })
+            .map_err(|_| LocalDbError::new("write authority stopped"))?;
+        let _ = self.wake.try_send(());
+        receive(receiver)?;
+        self.ensure_healthy()
+    }
     /// Drain admitted writes and finalize any partial opt-in storage write profiles.
     /// This is the only call apart from the configured sample boundary that may
     /// perform profile-control RPCs; the metrics visitor remains local-only.
     pub fn finish_write_profile(&self) -> Result<(), LocalDbError> {
         self.ensure_healthy()?;
-        if self.config.write_profile_limit == 0 {
+        if self.write_profile.lock().limit_per_connection == 0 {
             return Ok(());
         }
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -624,6 +652,16 @@ impl Drop for ConcurrentRemoteDatabase {
 }
 
 #[allow(clippy::needless_pass_by_value)] // Receiver ownership resolves queued replies on every exit.
+fn refresh_snapshot(db: &RemoteDatabase, snapshot: &Mutex<Snapshot>) {
+    *snapshot.lock() = Snapshot {
+        stats: db.stats(),
+        pipeline: db.pipeline_stats(),
+        authority: db.authority_write_stats(),
+        metadata_history_bytes: db.metadata_history_bytes(),
+        checkpoint_diagnostics: db.checkpoint_diagnostic_summary(),
+    };
+}
+
 fn drive_owner(
     db: &mut RemoteDatabase,
     receiver: mpsc::Receiver<OwnerCommand>,
@@ -634,7 +672,8 @@ fn drive_owner(
     let mut barrier: Option<Reply<()>> = None;
     let mut disconnected = false;
     let mut finish_profiles = false;
-    let mut retirement = None;
+    let mut retirement: Option<IndexReadCut> = None;
+    let mut arm_profile_limit = None;
     // Declared after pending replies: unwind fences readers before resolving
     // those acknowledgements and releasing their admission credits.
     let _poison = FailureOnPanic(db.concurrent_failure.clone());
@@ -653,6 +692,10 @@ fn drive_owner(
             if version.epoch < db.epoch || version.sequence < prefix {
                 db.ensure_healthy()?;
                 db.pipeline_stats.concurrent_completed += 1;
+                if db.config.write_profile_limit != 0 {
+                    // Diagnostic snapshots must be visible before client completion.
+                    refresh_snapshot(db, snapshot);
+                }
                 reply.finish(Ok(version));
             } else {
                 pending.push_back(reply);
@@ -660,7 +703,10 @@ fn drive_owner(
         }
         if barrier.is_some() && db.submissions.is_empty() {
             let finishing_profiles = finish_profiles;
-            let result = if finishing_profiles {
+            let arming_profile = arm_profile_limit.take();
+            let result = if let Some(limit) = arming_profile {
+                db.arm_write_profile(limit)
+            } else if finishing_profiles {
                 db.finish_write_profile()
             } else if let Some(floor) = retirement.take() {
                 db.retire_history_before(floor)
@@ -669,18 +715,13 @@ fn drive_owner(
             };
             finish_profiles = false;
             let failed = result.is_err();
+            refresh_snapshot(db, snapshot);
             let _ = barrier.take().unwrap().send(result);
             if failed && !finishing_profiles {
                 return Err(LocalDbError::new("checkpoint failed; recovery required"));
             }
         }
-        *snapshot.lock() = Snapshot {
-            stats: db.stats(),
-            pipeline: db.pipeline_stats(),
-            authority: db.authority_write_stats(),
-            metadata_history_bytes: db.metadata_history_bytes(),
-            checkpoint_diagnostics: db.checkpoint_diagnostic_summary(),
-        };
+        refresh_snapshot(db, snapshot);
         #[cfg(test)]
         if let Some(events) = db.concurrent_progress.lock().as_ref() {
             let _ = events.try_send(db.pipeline_stats());
@@ -729,6 +770,12 @@ fn drive_owner(
                     }
                     Ok(OwnerCommand::Flush(reply)) => {
                         barrier = Some(reply);
+                        admitted = true;
+                        break;
+                    }
+                    Ok(OwnerCommand::ArmProfile { limit, reply }) => {
+                        barrier = Some(reply);
+                        arm_profile_limit = Some(limit);
                         admitted = true;
                         break;
                     }

@@ -10,6 +10,41 @@ use std::process::Command;
 pub(in crate::distributed::tcp) mod multiplexed;
 #[path = "resident_tests.rs"]
 pub(in crate::distributed::tcp) mod resident_reads;
+#[test]
+fn structured_transport_identity_ignores_local_selectors_only() {
+    let left = Transport::Ofi {
+        fabric: FabricConfig {
+            backend: FabricBackend::Verbs,
+            domain: Some("mlx5_0".to_owned()),
+            source_address: Some("10.1.0.1".parse().unwrap()),
+        },
+        security: FabricSecurity::MutualTls,
+    };
+    let right_fabric = FabricConfig {
+        backend: FabricBackend::Verbs,
+        domain: Some("mlx5_1".to_owned()),
+        source_address: Some("10.1.0.2".parse().unwrap()),
+    };
+    let right = Transport::Ofi {
+        fabric: right_fabric.clone(),
+        security: FabricSecurity::MutualTls,
+    };
+    assert!(left.same_protocol(&right));
+    assert!(!left.same_protocol(&Transport::ofi(
+        FabricBackend::Efa,
+        FabricSecurity::MutualTls,
+    )));
+    assert!(!left.same_protocol(&Transport::Ofi {
+        fabric: right_fabric.clone(),
+        security: FabricSecurity::Trusted,
+    }));
+    assert_eq!(Transport::default(), Transport::Tcp);
+    assert_eq!(
+        serde_json::to_value(Transport::Tcp).unwrap(),
+        serde_json::json!({"kind": "tcp"}),
+    );
+    assert!(serde_json::from_value::<Transport>(serde_json::json!({"kind": "efa"})).is_err());
+}
 fn shape() -> KeyShape {
     KeyShape::new_single(4, 1, KeyType::uniform(1))
 }
@@ -667,13 +702,16 @@ fn mtls_roundtrip_authentication_lost_response_and_recovery() {
 #[test]
 #[ignore = "requires libfabric tcp;ofi_rxm software provider"]
 fn fabric_mtls_authentication_lost_response_and_recovery() {
-    authenticated_roundtrip(Transport::FabricTcp);
+    authenticated_roundtrip(Transport::ofi(
+        FabricBackend::SoftwareTcp,
+        FabricSecurity::MutualTls,
+    ));
 }
 
 fn authenticated_roundtrip(transport: Transport) {
     let temp = tempdir::TempDir::new("tcp-mtls").unwrap();
     let mut tls = certificates(temp.path());
-    tls.transport = transport;
+    tls.transport = transport.clone();
     let config = config(&temp.path().join("node"));
     let node = StorageNode::open(config.clone(), metrics()).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -731,7 +769,7 @@ fn authenticated_roundtrip(transport: Transport) {
     );
     let alien = tempdir::TempDir::new("tcp-alien-ca").unwrap();
     let mut alien_tls = certificates(alien.path());
-    alien_tls.transport = transport;
+    alien_tls.transport = transport.clone();
     alien_tls.ca = tls.ca.clone(); // Trust server, but client certificate is from an untrusted CA.
     assert!(
         Client::connect(
@@ -750,20 +788,19 @@ fn authenticated_roundtrip(transport: Transport) {
         client.stream.sock.fabric.is_some(),
         transport != Transport::Tcp
     );
-    if transport != Transport::Tcp {
+    if transport.is_fabric() {
         let mut fallback = tls.clone();
         fallback.transport = Transport::Tcp;
-        let fallback = Client::connect(
-            &endpoint,
-            &fallback,
-            timeout,
-            config.partition.clone(),
-            &shape(),
-        )
-        .unwrap();
-        #[cfg(feature = "experimental-fabric")]
-        assert!(fallback.stream.sock.fabric.is_none());
-        drop(fallback);
+        assert!(
+            Client::connect(
+                &endpoint,
+                &fallback,
+                timeout,
+                config.partition.clone(),
+                &shape(),
+            )
+            .is_err()
+        );
     }
     client.fence_to(1).unwrap();
     assert_eq!(client.connection_profile(true, true).unwrap().requests, 0);

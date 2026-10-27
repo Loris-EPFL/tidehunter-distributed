@@ -1,5 +1,5 @@
 //! Bounded local lifecycle correctness exercise, not a throughput benchmark.
-//! Uses five real TCP storage children and the synchronous native WAL oracle.
+//! Uses five real storage children and the synchronous native WAL oracle.
 //! Native is a synchronous Put/Delete/reopen oracle. Filter-model removals use
 //! explicit native tombstones, not a claim of native/remote pruner equivalence.
 //! Run: cargo run -p tidehunter --release --features experimental-distributed,test-utils
@@ -13,6 +13,8 @@
 
 #[path = "support/tcp_cluster.rs"]
 mod tcp_cluster;
+#[path = "support/transport_config.rs"]
+mod transport_config;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -1027,7 +1029,7 @@ fn run_worker(launch_file: &Path, output: &Path) -> Result<()> {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
-fn controller(output: &Path) -> Result<()> {
+fn controller(output: &Path, transport: &Transport) -> Result<()> {
     fs::create_dir(output)?;
     let output = fs::canonicalize(output)?;
     let temporary = tempdir::TempDir::new_in(&output, "owned-data")?;
@@ -1045,7 +1047,7 @@ fn controller(output: &Path) -> Result<()> {
             RESIDENT_BATCHES,
             INDEX_BUDGET,
             None,
-            Transport::Tcp,
+            transport.clone(),
             2,
             WalMemberReadPolicy::Async,
             0,
@@ -1109,7 +1111,7 @@ fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let first = args
         .next()
-        .ok_or_else(|| error("usage: sharded_wal_lifecycle_check NEW_OUTPUT_DIRECTORY"))?;
+        .ok_or_else(|| error("usage: sharded_wal_lifecycle_check NEW_OUTPUT_DIRECTORY [--transport-config JSON_FILE]"))?;
     if first == "--lifecycle-worker" {
         let file = args
             .next()
@@ -1128,6 +1130,20 @@ fn main() -> Result<()> {
         save_report(&launch.output, &report)?;
         return result;
     }
-    require(args.next().is_none(), "expected one new output directory")?;
-    controller(Path::new(&first))
+    let output = PathBuf::from(first);
+    let mut transport = Transport::Tcp;
+    while let Some(flag) = args.next() {
+        if flag != "--transport-config" {
+            return Err(error("unknown lifecycle check argument").into());
+        }
+        let path = args
+            .next()
+            .ok_or_else(|| error("missing --transport-config JSON_FILE"))?;
+        transport = transport_config::load(Path::new(&path))?;
+        if args.next().is_some() {
+            return Err(error("unexpected lifecycle check arguments").into());
+        }
+    }
+    transport.validate()?;
+    controller(&output, &transport)
 }

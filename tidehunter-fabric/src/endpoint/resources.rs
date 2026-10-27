@@ -7,10 +7,11 @@ mod efa;
 mod efa_direct;
 
 use super::{
-    CHUNK, OpenProfile, PeerDrainToken, ProgressStats, RMA_CANCELLED, ReadBuffer,
+    CHUNK, OpenProfile, PeerDrainToken, ProgressStats, ProviderInfo, RMA_CANCELLED, ReadBuffer,
     ReadBufferStorage, ReadOperation, RegisteredReadRegion, RemoteReadRegion, RmaAddressMode,
     RmaCapabilities, RmaConfig, RmaReadMode, SLOTS,
 };
+use crate::{FabricBackend, FabricConfig};
 use ofi_libfabric_sys::bindgen as ffi;
 use std::{
     any::Any,
@@ -129,6 +130,7 @@ pub(super) struct Resources {
     accepted_send: u64,
     completed_send: u64,
     progress_stats: ProgressStats,
+    provider_info: Option<ProviderInfo>,
     pub(super) open_profile: OpenProfile,
     initial_progress_recorded: bool,
     time_progress: bool,
@@ -570,7 +572,9 @@ impl Info {
             } else {
                 ffi::fi_progress_FI_PROGRESS_MANUAL
             };
-            let requested_mr_modes = if rma && provider.to_bytes() == b"efa" {
+            let requested_mr_modes = if (rma && provider.to_bytes() == b"efa")
+                || provider.to_bytes() == b"verbs;ofi_rxm"
+            {
                 ffi::FI_MR_LOCAL | ffi::FI_MR_PROV_KEY | ffi::FI_MR_VIRT_ADDR | ffi::FI_MR_ALLOCATED
             } else if direct_fabric {
                 ffi::FI_MR_LOCAL | ffi::FI_MR_ALLOCATED
@@ -610,6 +614,91 @@ impl Info {
     }
 }
 
+fn source_address_matches(info: &ffi::fi_info, requested: std::net::IpAddr) -> bool {
+    selected_source_address(info) == Some(requested)
+}
+
+fn optional_c_string(pointer: *const libc::c_char) -> Option<String> {
+    if pointer.is_null() {
+        None
+    } else {
+        // SAFETY: libfabric owns valid NUL-terminated attribute strings for
+        // the lifetime of the fi_info result.
+        Some(
+            unsafe { CStr::from_ptr(pointer) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+fn selected_source_address(info: &ffi::fi_info) -> Option<std::net::IpAddr> {
+    // SAFETY: `info` is live until this function returns, and each sockaddr
+    // read is guarded by its advertised format, address length and pointer.
+    unsafe {
+        match info.addr_format {
+            ffi::FI_SOCKADDR_IN
+                if info.src_addrlen >= mem::size_of::<libc::sockaddr_in>()
+                    && !info.src_addr.is_null() =>
+            {
+                let address = ptr::read_unaligned(info.src_addr.cast::<libc::sockaddr_in>());
+                Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                    address.sin_addr.s_addr.to_ne_bytes(),
+                )))
+            }
+            ffi::FI_SOCKADDR_IN6
+                if info.src_addrlen >= mem::size_of::<libc::sockaddr_in6>()
+                    && !info.src_addr.is_null() =>
+            {
+                let address = ptr::read_unaligned(info.src_addr.cast::<libc::sockaddr_in6>());
+                Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                    address.sin6_addr.s6_addr,
+                )))
+            }
+            ffi::FI_SOCKADDR
+                if info.src_addrlen >= mem::size_of::<libc::sockaddr>()
+                    && !info.src_addr.is_null() =>
+            {
+                let family = ptr::read_unaligned(info.src_addr.cast::<libc::sockaddr>()).sa_family;
+                if i32::from(family) == libc::AF_INET {
+                    if info.src_addrlen < mem::size_of::<libc::sockaddr_in>() {
+                        return None;
+                    }
+                    let address = ptr::read_unaligned(info.src_addr.cast::<libc::sockaddr_in>());
+                    Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                        address.sin_addr.s_addr.to_ne_bytes(),
+                    )))
+                } else if i32::from(family) == libc::AF_INET6 {
+                    if info.src_addrlen < mem::size_of::<libc::sockaddr_in6>() {
+                        return None;
+                    }
+                    let address = ptr::read_unaligned(info.src_addr.cast::<libc::sockaddr_in6>());
+                    Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                        address.sin6_addr.s6_addr,
+                    )))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+fn is_registered_rdma_pci_device(bus_address: &str) -> bool {
+    let Ok(devices) = std::fs::read_dir("/sys/class/infiniband") else {
+        return false;
+    };
+    devices.filter_map(Result::ok).any(|device| {
+        std::fs::canonicalize(device.path().join("device"))
+            .ok()
+            .and_then(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            })
+            .is_some_and(|name| name == bus_address)
+    })
+}
 impl Resources {
     #[allow(
         clippy::too_many_lines,
@@ -617,20 +706,31 @@ impl Resources {
     )]
     pub(super) fn open_mode(
         &mut self,
-        provider: &str,
-        domain: Option<&str>,
-        direct: bool,
+        config: &FabricConfig,
         rma: Option<RmaConfig>,
     ) -> io::Result<()> {
+        config.validate()?;
         let discovery = Instant::now();
-        let is_efa = provider == "efa";
-        let direct_fabric = direct || (is_efa && rma.is_some());
+        let provider_name = config.backend.provider();
+        let provider = CString::new(provider_name).map_err(invalid)?;
+        let domain = CString::new(config.domain.as_deref().unwrap_or_default()).map_err(invalid)?;
+        let direct_fabric = config.backend.is_direct();
+        let is_efa = matches!(
+            config.backend,
+            FabricBackend::Efa | FabricBackend::EfaDirect
+        );
+        if config.backend == FabricBackend::Efa && rma.is_some() {
+            return Err(invalid(
+                "regular EFA RMA is unsupported; select the explicit efa-direct backend",
+            ));
+        }
         self.direct = direct_fabric;
-        let software_wait_candidate = provider == "tcp;ofi_rxm" && !direct_fabric && rma.is_none();
+        let software_wait_candidate =
+            config.backend == FabricBackend::SoftwareTcp && !direct_fabric && rma.is_none();
         if let Some(config) = rma {
             RmaState::validate_config(config)?;
         }
-        if is_efa && !direct_fabric {
+        if config.backend == FabricBackend::Efa {
             efa::check_environment()?;
             self.open_profile.requested_tx = efa::QUEUE;
             self.open_profile.requested_rx = efa::QUEUE;
@@ -638,10 +738,66 @@ impl Resources {
             self.open_profile.requested_tx = SLOTS;
             self.open_profile.requested_rx = SLOTS;
         }
-        let provider = CString::new(provider).map_err(invalid)?;
-        let domain = CString::new(domain.unwrap_or_default()).map_err(invalid)?;
         let mut active_rma = rma;
         let mut hints = Info::hints(&provider, &domain, direct_fabric, active_rma.is_some())?;
+        let source_v4 = config.source_address.and_then(|address| match address {
+            std::net::IpAddr::V4(address) => Some(libc::sockaddr_in {
+                sin_family: libc::sa_family_t::try_from(libc::AF_INET).unwrap(),
+                sin_port: 0,
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(address.octets()),
+                },
+                sin_zero: [0; 8],
+            }),
+            std::net::IpAddr::V6(_) => None,
+        });
+        let source_v6 = config.source_address.and_then(|address| match address {
+            std::net::IpAddr::V4(_) => None,
+            std::net::IpAddr::V6(address) => Some(libc::sockaddr_in6 {
+                sin6_family: libc::sa_family_t::try_from(libc::AF_INET6).unwrap(),
+                sin6_port: 0,
+                sin6_flowinfo: 0,
+                sin6_addr: libc::in6_addr {
+                    s6_addr: address.octets(),
+                },
+                sin6_scope_id: 0,
+            }),
+        });
+        let apply_source_hint = |hints: &Info| -> io::Result<()> {
+            let (address, address_size, address_format) = if let Some(address) = &source_v4 {
+                (
+                    ptr::from_ref(address).cast::<u8>(),
+                    mem::size_of::<libc::sockaddr_in>(),
+                    ffi::FI_SOCKADDR_IN,
+                )
+            } else if let Some(address) = &source_v6 {
+                (
+                    ptr::from_ref(address).cast::<u8>(),
+                    mem::size_of::<libc::sockaddr_in6>(),
+                    ffi::FI_SOCKADDR_IN6,
+                )
+            } else {
+                return Ok(());
+            };
+            // SAFETY: malloc returns storage for address_size bytes, checked
+            // before use; ownership passes to fi_freeinfo with the live hints.
+            let owned_address = unsafe { libc::malloc(address_size) };
+            if owned_address.is_null() {
+                return Err(error("allocate source address hint", ffi::FI_ENOMEM));
+            }
+            // SAFETY: The source struct is live and exactly address_size bytes.
+            unsafe {
+                ptr::copy_nonoverlapping(address, owned_address.cast(), address_size);
+                if !(*hints.0).src_addr.is_null() {
+                    libc::free((*hints.0).src_addr);
+                }
+                (*hints.0).addr_format = address_format;
+                (*hints.0).src_addr = owned_address;
+                (*hints.0).src_addrlen = address_size;
+            }
+            Ok(())
+        };
+        apply_source_hint(&hints)?;
         let api = (1 << 16)
             | if provider.as_bytes() == b"efa" {
                 18
@@ -657,6 +813,7 @@ impl Resources {
             info = Info(ptr::null_mut());
             active_rma = None;
             hints = Info::hints(&provider, &domain, direct_fabric, false)?;
+            apply_source_hint(&hints)?;
             discovered = unsafe {
                 ffi::fi_getinfo(api, ptr::null(), ptr::null(), 0, hints.0, &raw mut info.0)
             };
@@ -693,10 +850,31 @@ impl Resources {
             {
                 return Err(invalid("incomplete fabric provider capabilities"));
             }
+            if config
+                .source_address
+                .is_some_and(|source| !source_address_matches(selected, source))
+            {
+                return Err(invalid(
+                    "provider did not return the explicitly requested source address",
+                ));
+            }
+            if let Some(expected_domain) = config.domain.as_deref() {
+                let selected_domain = (*selected.domain_attr).name;
+                if selected_domain.is_null()
+                    || CStr::from_ptr(selected_domain).to_bytes() != expected_domain.as_bytes()
+                {
+                    return Err(invalid(
+                        "provider did not return the explicitly requested domain",
+                    ));
+                }
+            }
             let provider_name = (*selected.fabric_attr).prov_name;
             let fabric_name = (*selected.fabric_attr).name;
             let mr_mode = (*selected.domain_attr).mr_mode;
-            let supported_mr_modes = if direct_fabric || is_efa {
+            let supported_mr_modes = if direct_fabric
+                || is_efa
+                || provider.as_bytes() == b"verbs;ofi_rxm"
+            {
                 ffi::FI_MR_LOCAL | ffi::FI_MR_PROV_KEY | ffi::FI_MR_VIRT_ADDR | ffi::FI_MR_ALLOCATED
             } else {
                 ffi::FI_MR_LOCAL | ffi::FI_MR_PROV_KEY | ffi::FI_MR_VIRT_ADDR
@@ -788,26 +966,26 @@ impl Resources {
                     (*selected.ep_attr).protocol_version,
                 )?;
             }
-            if let Some(config) = active_rma {
+            if let Some(rma_config) = active_rma {
                 let provider_limit = if (*selected.ep_attr).max_order_raw_size > 0 {
                     (*selected.ep_attr).max_order_raw_size
                 } else {
                     (*selected.ep_attr).max_msg_size
                 };
-                let requested_read_limit = if config.max_read_bytes == 0 {
+                let requested_read_limit = if rma_config.max_read_bytes == 0 {
                     provider_limit
                 } else {
-                    config.max_read_bytes
+                    rma_config.max_read_bytes
                 };
-                let destination_limit = if config.destination_slots == 0 {
+                let destination_limit = if rma_config.destination_slots == 0 {
                     usize::MAX
                 } else {
-                    config.destination_bytes / config.destination_slots
+                    rma_config.destination_bytes / rma_config.destination_slots
                 };
                 let max_read_bytes = requested_read_limit
                     .min(provider_limit)
                     .min(destination_limit);
-                if max_read_bytes == 0 && config.destination_slots > 0 {
+                if max_read_bytes == 0 && rma_config.destination_slots > 0 {
                     return Err(invalid("provider selected no usable RMA read size"));
                 }
                 selected_rma_capabilities = Some(RmaCapabilities {
@@ -816,15 +994,15 @@ impl Resources {
                     } else {
                         RmaAddressMode::Offset
                     },
-                    read_mode: RmaReadMode::Emulated,
+                    read_mode: match config.backend {
+                        FabricBackend::SoftwareTcp => RmaReadMode::Emulated,
+                        FabricBackend::EfaDirect | FabricBackend::Verbs | FabricBackend::Efa => {
+                            RmaReadMode::Unknown
+                        }
+                    },
                     max_read_bytes,
                     max_iov: (*selected.tx_attr).rma_iov_limit,
                 });
-                if config.require_device_read && !is_efa {
-                    return Err(invalid(
-                        "selected provider cannot prove native device RMA reads",
-                    ));
-                }
             }
             self.addr_format = selected.addr_format;
             if !matches!(
@@ -851,9 +1029,10 @@ impl Resources {
                 software_wait_candidate,
             )?;
             let stage = Instant::now();
-            if let (Some(config), Some(mut capabilities)) = (active_rma, selected_rma_capabilities)
+            if let (Some(rma_config), Some(mut capabilities)) =
+                (active_rma, selected_rma_capabilities)
             {
-                if config.destination_slots > 0 {
+                if rma_config.destination_slots > 0 {
                     let mut provider_max = 0_usize;
                     let mut option_len = mem::size_of::<usize>();
                     // SAFETY: The selected endpoint and query buffers are valid.
@@ -883,18 +1062,58 @@ impl Resources {
                         (&raw mut emulated).cast(),
                         &raw mut option_len,
                     );
-                    if option_status == 0 && option_len == mem::size_of::<bool>() && !emulated {
-                        capabilities.read_mode = RmaReadMode::Native;
+                    if option_status == 0 && option_len == mem::size_of::<bool>() {
+                        capabilities.read_mode = if emulated {
+                            RmaReadMode::Emulated
+                        } else {
+                            RmaReadMode::Native
+                        };
+                    }
+                } else if config.backend == FabricBackend::Verbs {
+                    let nic = selected.nic;
+                    if !nic.is_null() && !(*nic).device_attr.is_null() && !(*nic).bus_attr.is_null()
+                    {
+                        let device = &*(*nic).device_attr;
+                        let bus = &*(*nic).bus_attr;
+                        let driver = if device.driver.is_null() {
+                            String::new()
+                        } else {
+                            CStr::from_ptr(device.driver)
+                                .to_string_lossy()
+                                .to_ascii_lowercase()
+                        };
+                        if bus.bus_type == ffi::fi_bus_type_FI_BUS_PCI
+                            && !device.name.is_null()
+                            && !CStr::from_ptr(device.name).to_bytes().is_empty()
+                            && !device.device_id.is_null()
+                            && !CStr::from_ptr(device.device_id).to_bytes().is_empty()
+                            && !driver.is_empty()
+                            && driver != "rxe"
+                            && driver != "rdma_rxe"
+                            && driver != "siw"
+                        {
+                            let pci = bus.attr.pci;
+                            let bus_address = format!(
+                                "{:04x}:{:02x}:{:02x}.{}",
+                                pci.domain_id, pci.bus_id, pci.device_id, pci.function_id
+                            );
+                            // `verbs;ofi_rxm` reports FI_READ only when its core
+                            // provider supports RMA; require this exact PCI
+                            // function to be registered as an RDMA device too.
+                            if is_registered_rdma_pci_device(&bus_address) {
+                                capabilities.read_mode = RmaReadMode::Native;
+                            }
+                        }
                     }
                 }
-                if config.require_device_read && capabilities.read_mode != RmaReadMode::Native {
+                if rma_config.require_device_read && capabilities.read_mode != RmaReadMode::Native {
                     return Err(invalid(
-                        "EFA did not report native device RMA read capability",
+                        "selected provider/device cannot attest native hardware RMA reads",
                     ));
                 }
-                let mut config = config;
-                config.max_read_bytes = capabilities.max_read_bytes;
-                self.rma = Some(RmaState::new(self.domain, config, capabilities)?);
+                let mut rma_config = rma_config;
+                rma_config.max_read_bytes = capabilities.max_read_bytes;
+                self.rma = Some(RmaState::new(self.domain, rma_config, capabilities)?);
             }
             if mr_mode & i32::try_from(ffi::FI_MR_LOCAL).unwrap() != 0 {
                 check(
@@ -945,6 +1164,64 @@ impl Resources {
             AlignedAddress::new(self.addr_format, len, &address.bytes[..len])?;
             self.address = address.bytes[..len].to_vec();
             self.open_profile.address_ns = elapsed_ns(stage);
+            let (device, driver, bus_address) =
+                if !selected.nic.is_null() && !(*selected.nic).device_attr.is_null() {
+                    let attributes = &*(*selected.nic).device_attr;
+                    let bus_address = if !(*selected.nic).bus_attr.is_null()
+                        && (*(*selected.nic).bus_attr).bus_type == ffi::fi_bus_type_FI_BUS_PCI
+                    {
+                        let pci = (*(*selected.nic).bus_attr).attr.pci;
+                        Some(format!(
+                            "{:04x}:{:02x}:{:02x}.{}",
+                            pci.domain_id, pci.bus_id, pci.device_id, pci.function_id
+                        ))
+                    } else {
+                        None
+                    };
+                    (
+                        optional_c_string(attributes.name),
+                        optional_c_string(attributes.driver),
+                        bus_address,
+                    )
+                } else {
+                    (None, None, None)
+                };
+            let rma_capabilities = self.rma.as_ref().map(|rma| rma.capabilities);
+            let capability_evidence = match (config.backend, rma_capabilities) {
+                (_, None) => "libfabric fi_getinfo provider/domain selection".to_owned(),
+                (FabricBackend::SoftwareTcp, Some(_)) => {
+                    "libfabric FI_READ capability; software provider, no hardware evidence".to_owned()
+                }
+                (FabricBackend::Efa | FabricBackend::EfaDirect, Some(capabilities))
+                    if capabilities.read_mode == RmaReadMode::Native =>
+                {
+                    "EFA FI_OPT_EFA_EMULATED_READ returned false".to_owned()
+                }
+                (FabricBackend::Efa | FabricBackend::EfaDirect, Some(capabilities))
+                    if capabilities.read_mode == RmaReadMode::Emulated =>
+                {
+                    "EFA FI_OPT_EFA_EMULATED_READ returned true".to_owned()
+                }
+                (FabricBackend::Verbs, Some(capabilities))
+                    if capabilities.read_mode == RmaReadMode::Native =>
+                {
+                    "verbs;ofi_rxm FI_READ with selected PCI BDF matched to /sys/class/infiniband; Falcon identity not inferred"
+                        .to_owned()
+                }
+                (_, Some(_)) => "FI_READ capability selected; native hardware read unverified".to_owned(),
+            };
+            self.provider_info = Some(ProviderInfo {
+                backend: config.backend,
+                provider: optional_c_string(provider_name).unwrap_or_default(),
+                fabric: optional_c_string(fabric_name),
+                domain: optional_c_string((*selected.domain_attr).name),
+                source_address: selected_source_address(selected),
+                device,
+                driver,
+                bus_address,
+                rma_capabilities,
+                capability_evidence,
+            });
         }
         Ok(())
     }
@@ -1024,6 +1301,9 @@ impl Resources {
 
     pub(super) fn address(&self) -> &[u8] {
         &self.address
+    }
+    pub(super) fn provider_info(&self) -> Option<&ProviderInfo> {
+        self.provider_info.as_ref()
     }
 
     pub(super) fn has_peer(&self) -> bool {
@@ -2106,25 +2386,6 @@ mod tests {
         assert_eq!(state.free_send_slot(), Some(SLOTS - 1));
     }
     #[test]
-    fn efa_rma_hints_request_provider_key_and_virtual_address_modes() {
-        let basic_map = ffi::FI_MR_PROV_KEY | ffi::FI_MR_VIRT_ADDR;
-        for direct in [false, true] {
-            let hints = Info::hints(c"efa", c"", direct, true).unwrap();
-            // SAFETY: The live Info owns the initialized provider hints.
-            let mr_mode = unsafe { (*(*hints.0).domain_attr).mr_mode };
-            assert_eq!(
-                mr_mode & i32::try_from(basic_map | ffi::FI_MR_LOCAL).unwrap(),
-                i32::try_from(basic_map | ffi::FI_MR_LOCAL).unwrap()
-            );
-            assert_ne!(mr_mode & i32::try_from(ffi::FI_MR_ALLOCATED).unwrap(), 0);
-        }
-
-        let software = Info::hints(c"tcp;ofi_rxm", c"", false, true).unwrap();
-        // SAFETY: The live Info owns the initialized provider hints.
-        let software_mode = unsafe { (*(*software.0).domain_attr).mr_mode };
-        assert_eq!(software_mode, i32::try_from(ffi::FI_MR_LOCAL).unwrap());
-    }
-    #[test]
     #[ignore = "requires libfabric tcp;ofi_rxm software provider"]
     fn strict_device_read_rejects_software_provider() {
         let config = RmaConfig {
@@ -2138,7 +2399,14 @@ mod tests {
         let mut resources = Resources::default();
         assert!(
             resources
-                .open_mode("tcp;ofi_rxm", Some("lo"), false, Some(config))
+                .open_mode(
+                    &FabricConfig {
+                        backend: FabricBackend::SoftwareTcp,
+                        domain: Some("lo".to_owned()),
+                        source_address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
+                    },
+                    Some(config),
+                )
                 .is_err()
         );
     }

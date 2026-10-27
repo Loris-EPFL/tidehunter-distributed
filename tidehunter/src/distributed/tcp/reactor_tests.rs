@@ -220,7 +220,10 @@ fn adaptive_idle_tcp_wakes_for_scalar_read_and_shutdown() {
 #[test]
 #[ignore = "requires libfabric tcp;ofi_rxm and local network permission"]
 fn software_provider_adaptive_idle_wakes_for_scalar_read_and_shutdown() {
-    for transport in [Transport::FabricTcp, Transport::FabricTcpNative] {
+    for transport in [
+        software_transport(FabricSecurity::MutualTls),
+        software_transport(FabricSecurity::Trusted),
+    ] {
         adaptive_idle_reads_and_shutdown(transport);
     }
 }
@@ -278,7 +281,10 @@ fn operational_session_binds_owner_identity_and_cannot_admit_data() {
 #[test]
 #[ignore = "requires libfabric tcp;ofi_rxm and local network permission"]
 fn software_provider_operational_session_binds_identity_and_cannot_admit_data() {
-    for transport in [Transport::FabricTcp, Transport::FabricTcpNative] {
+    for transport in [
+        software_transport(FabricSecurity::MutualTls),
+        software_transport(FabricSecurity::Trusted),
+    ] {
         operational_session_for_transport(transport);
     }
 }
@@ -337,7 +343,7 @@ fn established_tcp_connection_survives_idle_timeout() {
 #[test]
 #[ignore = "requires libfabric tcp;ofi_rxm software provider"]
 fn established_software_fabric_connection_survives_idle_timeout() {
-    established_connection_survives_idle_timeout(Transport::FabricTcp);
+    established_connection_survives_idle_timeout(software_transport(FabricSecurity::MutualTls));
 }
 
 fn delayed_independent(transport: Transport) {
@@ -426,20 +432,23 @@ fn one_tcp_connection_completes_ready_read_before_delayed_read() {
 #[test]
 #[ignore = "requires libfabric tcp;ofi_rxm software provider"]
 fn one_software_fabric_connection_completes_out_of_order() {
-    delayed_independent(Transport::FabricTcp);
+    delayed_independent(software_transport(FabricSecurity::MutualTls));
 }
 #[cfg(feature = "experimental-fabric")]
 #[test]
 #[ignore = "requires libfabric tcp;ofi_rxm software provider"]
 fn native_software_provider_mixed_rpc_reads_complete_out_of_order() {
-    delayed_independent(Transport::FabricTcpNative);
+    delayed_independent(software_transport(FabricSecurity::Trusted));
 }
 
 #[cfg(feature = "experimental-fabric")]
 #[test]
 #[ignore = "requires libfabric tcp;ofi_rxm software provider"]
 fn fabric_tcp_native_rejects_invalid_reference_and_epoch_without_tls() {
-    let server = Running::new(Transport::FabricTcpNative, WalMemberReadPolicy::Positional);
+    let server = Running::new(
+        software_transport(FabricSecurity::Trusted),
+        WalMemberReadPolicy::Positional,
+    );
     let mut client = server.client();
     let (batches, references) = server.data(&mut client);
 
@@ -462,7 +471,10 @@ fn fabric_tcp_native_rejects_invalid_reference_and_epoch_without_tls() {
 #[test]
 #[ignore = "requires libfabric tcp;ofi_rxm software provider"]
 fn fabric_tcp_native_mode_mismatch_with_tls_fails_closed() {
-    let native_server = Running::new(Transport::FabricTcpNative, WalMemberReadPolicy::Positional);
+    let native_server = Running::new(
+        software_transport(FabricSecurity::Trusted),
+        WalMemberReadPolicy::Positional,
+    );
     let tls_dir = native_server._temp.path().join("tls-client");
     fs::create_dir(&tls_dir).unwrap();
     let mut tls_client = certificates(&tls_dir);
@@ -482,7 +494,7 @@ fn fabric_tcp_native_mode_mismatch_with_tls_fails_closed() {
 
     let tls_server = Running::new(Transport::Tcp, WalMemberReadPolicy::Positional);
     let native_client = TlsFiles {
-        transport: Transport::FabricTcpNative,
+        transport: software_transport(FabricSecurity::Trusted),
         ca: PathBuf::new(),
         cert: PathBuf::new(),
         key: PathBuf::new(),
@@ -681,7 +693,7 @@ fn faulty_peer(fault: Fault, transport: Transport) {
     let temp = tempdir::TempDir::new("correlated-reply-fault").unwrap();
     let tls = if transport.is_native() {
         TlsFiles {
-            transport,
+            transport: transport.clone(),
             ca: PathBuf::new(),
             cert: PathBuf::new(),
             key: PathBuf::new(),
@@ -731,9 +743,9 @@ fn faulty_peer(fault: Fault, transport: Transport) {
         let mut stream: Box<dyn FaultPeerIo> = if transport.is_native() {
             #[cfg(feature = "experimental-fabric")]
             {
-                read_transport_mode(&mut io, transport).unwrap();
+                read_transport_mode(&mut io, &transport).unwrap();
                 let endpoint =
-                    fabric::bootstrap(&mut io, transport, ResidentReadConfig::default()).unwrap();
+                    fabric::bootstrap(&mut io, &transport, ResidentReadConfig::default()).unwrap();
                 Box::new(NativeFaultPeer {
                     endpoint,
                     _control: io,
@@ -880,7 +892,10 @@ fn authenticated_scalar_wrong_member_count_fails_connection() {
 #[test]
 #[ignore = "requires libfabric tcp;ofi_rxm software provider"]
 fn fabric_tcp_native_rejects_corrupt_member_reply_without_tls() {
-    faulty_peer(Fault::CorruptMember, Transport::FabricTcpNative);
+    faulty_peer(
+        Fault::CorruptMember,
+        software_transport(FabricSecurity::Trusted),
+    );
 }
 
 #[test]
@@ -1038,7 +1053,10 @@ fn reuse_fails_closed_after_control_peer_shutdown() {
 #[test]
 #[ignore = "requires libfabric tcp;ofi_rxm software provider"]
 fn fabric_control_violation_closes_a_live_session_without_waiting_for_rpc_deadline() {
-    let server = Running::new(Transport::FabricTcp, WalMemberReadPolicy::Positional);
+    let server = Running::new(
+        software_transport(FabricSecurity::MutualTls),
+        WalMemberReadPolicy::Positional,
+    );
     let mut client = server.client();
     let (batches, references) = server.data(&mut client);
     client.refresh_for_reuse().unwrap();
@@ -1071,7 +1089,7 @@ fn fabric_control_violation_closes_a_live_session_without_waiting_for_rpc_deadli
 #[cfg(feature = "test-utils")]
 fn ram_probe_round_trip(transport: Transport, polling: PollingPolicy) {
     let server = Running::with_limits(
-        transport,
+        transport.clone(),
         WalMemberReadPolicy::Positional,
         default_read_bytes(),
         default_device_reads(),
@@ -1193,7 +1211,7 @@ fn authenticated_ram_probe_boundaries_and_busy_shutdown() {
 #[ignore = "requires libfabric tcp;ofi_rxm software provider"]
 fn fabric_authenticated_ram_probe_boundaries_and_busy_shutdown() {
     for polling in [PollingPolicy::Adaptive, PollingPolicy::Busy] {
-        ram_probe_round_trip(Transport::FabricTcp, polling);
+        ram_probe_round_trip(software_transport(FabricSecurity::MutualTls), polling);
     }
 }
 #[cfg(all(feature = "test-utils", feature = "experimental-fabric"))]
@@ -1201,7 +1219,7 @@ fn fabric_authenticated_ram_probe_boundaries_and_busy_shutdown() {
 #[ignore = "requires libfabric tcp;ofi_rxm software provider"]
 fn fabric_tcp_native_large_partial_frames_bypass_tls() {
     for polling in [PollingPolicy::Adaptive, PollingPolicy::Busy] {
-        ram_probe_round_trip(Transport::FabricTcpNative, polling);
+        ram_probe_round_trip(software_transport(FabricSecurity::Trusted), polling);
     }
 }
 
@@ -1398,13 +1416,16 @@ fn tcp_cold_authority_preserves_hot_progress_and_rechecks_fencing() {
 #[ignore = "requires libfabric tcp;ofi_rxm software provider"]
 fn software_fabric_cold_authority_preserves_hot_progress_and_rechecks_fencing() {
     for fenced in [false, true] {
-        cold_authority_does_not_move_hot_reads_to_the_pool(Transport::FabricTcp, fenced);
+        cold_authority_does_not_move_hot_reads_to_the_pool(
+            software_transport(FabricSecurity::MutualTls),
+            fenced,
+        );
     }
 }
 
 fn disconnect_retains_cold_planning_credits_until_the_worker_retires_for(transport: Transport) {
     let server = Running::with_config(
-        transport,
+        transport.clone(),
         WalMemberReadPolicy::Async,
         default_read_bytes(),
         default_device_reads(),
@@ -1495,7 +1516,7 @@ fn disconnect_retains_cold_planning_credits_until_the_worker_retires() {
 #[test]
 #[ignore = "requires libfabric tcp;ofi_rxm software provider"]
 fn fabric_tcp_native_disconnect_retains_owned_reply_credits_until_retirement() {
-    disconnect_retains_cold_planning_credits_until_the_worker_retires_for(
-        Transport::FabricTcpNative,
-    );
+    disconnect_retains_cold_planning_credits_until_the_worker_retires_for(software_transport(
+        FabricSecurity::Trusted,
+    ));
 }

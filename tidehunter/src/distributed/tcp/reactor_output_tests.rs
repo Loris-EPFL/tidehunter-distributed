@@ -839,8 +839,13 @@ fn forced_server_grant_request_with_real_authority_uses_message_only_fallback() 
     use crate::distributed::storage::WalMemberReadPolicy;
 
     let mut pair = pair();
-    let mut source_endpoint = tidehunter_fabric::Endpoint::open("tcp;ofi_rxm", Some("lo")).unwrap();
-    let mut peer_endpoint = tidehunter_fabric::Endpoint::open("tcp;ofi_rxm", Some("lo")).unwrap();
+    let fabric = FabricConfig {
+        backend: FabricBackend::SoftwareTcp,
+        domain: Some("lo".to_owned()),
+        source_address: None,
+    };
+    let mut source_endpoint = tidehunter_fabric::Endpoint::open(&fabric, None).unwrap();
+    let mut peer_endpoint = tidehunter_fabric::Endpoint::open(&fabric, None).unwrap();
     source_endpoint
         .set_peer(&peer_endpoint.address().unwrap())
         .unwrap();
@@ -969,6 +974,9 @@ fn completed_response_rejects_fenced_or_poisoned_authority() {
         } else {
             node.inventory.lock().fence_to(2).unwrap();
         }
+        // Fencing can persist metadata. Start the synthetic request deadline
+        // after that setup; this case tests authority rejection, not expiration.
+        pending.get_mut(&1).unwrap().deadline = Instant::now() + Duration::from_secs(2);
         assert!(
             flush_responses(
                 &node,
@@ -1229,7 +1237,7 @@ fn expired_posted_rma_read_fail_stops_with_grant_memory_quarantined() {
     let server_stop = Arc::clone(&stop);
     let server = node.clone();
     let server_tls = TlsFiles {
-        transport: Transport::FabricTcpNative,
+        transport: software_transport(FabricSecurity::Trusted),
         ca: PathBuf::new(),
         cert: PathBuf::new(),
         key: PathBuf::new(),
@@ -1242,7 +1250,7 @@ fn expired_posted_rma_read_fail_stops_with_grant_memory_quarantined() {
             .unwrap();
     });
     let client_tls = TlsFiles {
-        transport: Transport::FabricTcpNative,
+        transport: software_transport(FabricSecurity::Trusted),
         ca: PathBuf::new(),
         cert: PathBuf::new(),
         key: PathBuf::new(),

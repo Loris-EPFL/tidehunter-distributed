@@ -10,6 +10,8 @@ pub mod rocks;
 pub mod tidehunter;
 #[cfg(feature = "tikv")]
 pub mod tikv;
+#[cfg(feature = "valkey-tcp")]
+pub mod valkey_tcp;
 
 /// Admit configuration before any process, connection or database is created.
 pub fn validate_options(
@@ -18,10 +20,17 @@ pub fn validate_options(
 ) -> crate::backend::BackendResult<()> {
     match kind {
         "native" => native::validate_options(options),
-        "tidehunter_tcp" => tidehunter::validate_options(options),
-        "tidehunter_efa" => tidehunter::validate_efa_options(options),
-        "tidehunter_efa_native" => tidehunter::validate_efa_native_options(options),
-        "tidehunter_efa_direct" => tidehunter::validate_efa_direct_options(options),
+        "valkey_tcp" => {
+            #[cfg(feature = "valkey-tcp")]
+            {
+                valkey_tcp::validate_options(options)
+            }
+            #[cfg(not(feature = "valkey-tcp"))]
+            {
+                Err("backend valkey_tcp is unavailable; enable Cargo feature valkey-tcp".into())
+            }
+        }
+        "tidehunter" => tidehunter::validate_options(options),
         #[cfg(feature = "rocksdb")]
         "rocksdb" | "blobdb" => rocks::validate_options(options, kind == "blobdb"),
         #[cfg(feature = "tikv")]
@@ -30,7 +39,7 @@ pub fn validate_options(
         "cassandra" => cassandra::validate_options(options),
         #[cfg(feature = "foundationdb")]
         "foundationdb" => foundationdb::validate_options(options),
-        kind if matches!(kind, "rocksdb" | "blobdb" | "tikv" | "cassandra" | "foundationdb") => {
+        kind if matches!(kind, "rocksdb" | "blobdb" | "tikv" | "cassandra" | "foundationdb" | "valkey_tcp") => {
             Err(format!("backend {kind} is unavailable; enable its Cargo feature (rocksdb also enables blobdb)").into())
         }
         _ => Err(format!("unknown backend: {kind}").into()),

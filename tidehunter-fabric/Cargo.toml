@@ -16,6 +16,7 @@ libc = { workspace = true, optional = true }
 # Reuse the workspace's CRC32 implementation for per-packet checksums.
 crc32fast = { version = "1.3.2", optional = true }
 minibytes = { path = "../third-party/minibytes", optional = true, default-features = false }
+serde = { version = "1.0.208", features = ["derive"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
