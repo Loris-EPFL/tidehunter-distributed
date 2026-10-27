@@ -6,7 +6,13 @@ import importlib.util
 import json
 from pathlib import Path
 
+import sys
+
+
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import portable_transport
+
 spec = importlib.util.spec_from_file_location('local_compare', HERE / 'aws-sharded-wal/local_compare.py')
 local = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(local)
@@ -22,6 +28,11 @@ def main():
     if not 1 <= args.repetitions <= 5:
         raise ValueError('bounded repetition count required')
     args.output.mkdir()
+    transport_config = args.output / 'requested-configs' / 'transport.json'
+    transport_config.parent.mkdir()
+    portable_transport.write_transport_config(
+        transport_config, portable_transport.transport_for_case('tcp')
+    )
     binaries = {name: getattr(args, name).resolve() for name in ('baseline', 'candidate')}
     hashes = {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in binaries.items()}
     configs = [
@@ -33,7 +44,7 @@ def main():
         ('current-native', 'candidate', ['--backend', 'native-sync']),
     ]
     common = ['--repetitions', '1', '--windows', '1,8,32', '--values', '1024,8192', '--batch-sizes', '1,32', '--batches', '128', '--mixed', '32', '--reads', '512']
-    plan = {'binary_sha256': hashes, 'binaries': {k: str(v) for k, v in binaries.items()}, 'configs': configs, 'common': common, 'repetitions': args.repetitions, 'topology': 'five loopback node processes on one SSD; no RDMA; all reads verify complete values'}
+    plan = {'binary_sha256': hashes, 'binaries': {k: str(v) for k, v in binaries.items()}, 'configs': configs, 'common': common, 'repetitions': args.repetitions, 'transport_config': str(transport_config), 'topology': 'five loopback node processes on one SSD; no RDMA; all reads verify complete values'}
     (args.output / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
     for repetition in range(args.repetitions):
         order = configs[repetition:] + configs[:repetition]
@@ -43,7 +54,11 @@ def main():
             if hashlib.sha256(binaries[binary].read_bytes()).hexdigest() != hashes[binary]:
                 raise ValueError('benchmark executable changed')
             output = args.output / f'{name}-r{repetition}'
-            local.run([str(binaries[binary]), '--output', str(output), *common, *flags], output)
+            runtime_transport = (
+                ['--transport-config', str(transport_config)] if binary == 'candidate' else []
+            )
+            local.run([str(binaries[binary]), '--output', str(output), *common,
+                       *runtime_transport, *flags], output)
             if not (output / 'COMPLETE').exists():
                 raise ValueError('missing correctness completion')
     # A separate identical repeated read trace distinguishes first-fill misses
@@ -54,7 +69,13 @@ def main():
             hot.reverse()
         for name, binary, flags in hot:
             output = args.output / f'hot-{name}-r{repetition}'
-            local.run([str(binaries[binary]), '--output', str(output), '--values', '1024,8192', '--batch-sizes', '32', '--windows', '32', '--repetitions', '1', '--hot-read-pass', 'true', *flags], output)
+            runtime_transport = (
+                ['--transport-config', str(transport_config)] if binary == 'candidate' else []
+            )
+            local.run([str(binaries[binary]), '--output', str(output),
+                       '--values', '1024,8192', '--batch-sizes', '32', '--windows', '32',
+                       '--repetitions', '1', '--hot-read-pass', 'true',
+                       *runtime_transport, *flags], output)
             if not (output / 'COMPLETE').exists():
                 raise ValueError('missing hot-trace correctness completion')
     (args.output / 'COMPLETE').write_text('all matched ablations and separately labelled hot traces verified\n')

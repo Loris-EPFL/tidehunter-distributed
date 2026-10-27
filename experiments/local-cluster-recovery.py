@@ -15,6 +15,9 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / 'aws-sharded-wal'))
 import cluster_ram
 import local_compare
+import portable_transport
+
+
 
 
 def sha(path):
@@ -42,6 +45,8 @@ def main():
     if timeout is None:
         raise RuntimeError('GNU timeout required')
     args.output.mkdir()
+    requested_configs = args.output / 'requested-configs'
+    requested_configs.mkdir()
     identity = dict(benchmark_sha256=sha(bench), recovery_sha256=sha(recovery),
                     source_tree_sha256=manifest['source_tree_sha256'], transport=args.transport,
                     topology='five RF1 local processes share one SSD; process restart, not reboot or OS eviction')
@@ -54,6 +59,11 @@ def main():
             with tempfile.TemporaryDirectory(prefix='owned-recovery-', dir=output) as directory:
                 root = Path(directory).resolve() / 'case'
                 spec = cluster_ram.case('recovery', 'current', 8192, 0, args.transport)
+                transport_config = requested_configs / f'{restart}-tail{tail}' / 'transport.json'
+                transport_config.parent.mkdir()
+                portable_transport.write_transport_config(
+                    transport_config, portable_transport.transport_for_case(args.transport)
+                )
                 spec.update(recovery=True, restart=restart, checkpoint_batches=64,
                             tail_batches=tail, modes=['recovery'], cold=False)
                 # Reserve distinct loopback ports until the exact launch files exist.
@@ -64,7 +74,9 @@ def main():
                     endpoints = ','.join(f'127.0.0.1:{s.getsockname()[1]}' for s in sockets)
                     command = [str(bench), '--prepare-external-case', str(root),
                                '--guest-case-root', str(root), '--remote-endpoints', endpoints]
-                    command += cluster_ram.flags(spec, 'tcp', prepare=True)
+                    command += cluster_ram.flags(
+                        spec, 'tcp', prepare=True, transport_config=transport_config
+                    )
                     local_compare.run([timeout, '60s', *command], output / 'prepare')
                 finally:
                     for listener in sockets:

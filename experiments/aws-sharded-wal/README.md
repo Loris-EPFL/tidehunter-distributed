@@ -73,6 +73,21 @@ Evidence is under
 `checkpoint-work/portable-cloud-launch-20261027/runtime-label-admission-191419Z/`.
 This validates producer/consumer compatibility, not physical RDMA or cloud speed.
 
+Sui CI preparation writes an owned trusted software-provider transport JSON
+and passes `--transport-config` to the current replay runner. Admission requires
+the result's canonical transport to match that request, the native/remote
+database tables and RocksDB semantic audits to agree, and the original hashed
+evidence and completion scrapes. The build protocol must match its frozen build
+plan rather than the obsolete fixed version 9.
+
+Maintained local read-progress, cluster-RAM, cluster-recovery, pipeline-cache
+and source-guided drivers now generate canonical transport files for current
+binaries. Explicit frozen-baseline runs retain their old CLI. A bounded real
+read-progress run completed its four native/TCP warm/cache controls with no
+remaining sampled child processes; evidence is under
+`checkpoint-work/portable-cloud-launch-20261027/local-driver-check-193416Z/`.
+This checks local integration, not cloud performance or a new full Sui replay.
+
 For the selected KV comparison, current configuration files are authoritative:
 `experiments/kv-comparison/ci-config.json` sets the three-hour fleet lifetime,
 and `budget.json` sets the approved $220 rolling weekly cap. Dated campaign notes
