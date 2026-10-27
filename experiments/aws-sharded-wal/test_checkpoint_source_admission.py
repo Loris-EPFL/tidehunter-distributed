@@ -73,8 +73,8 @@ class CheckpointSourceAdmission(unittest.TestCase):
             source_archive_sha256=supervisor.sha(bundle / 'sources.tar.gz'),
             source_manifest_sha256=supervisor.sha(bundle / 'source-manifest.json'))
         supervisor.write_json(bundle / 'build-manifest.json', manifest)
-        for name in ('plan.json', 'portability.json'):
-            supervisor.write_json(bundle / name, {})
+        supervisor.write_json(bundle / 'plan.json', dict(protocol=manifest['protocol']))
+        supervisor.write_json(bundle / 'portability.json', {})
         objects = root / 'objects'
         objects.mkdir()
         with tarfile.open(objects / 'build_bundle.tar.gz', 'w:gz') as archive:

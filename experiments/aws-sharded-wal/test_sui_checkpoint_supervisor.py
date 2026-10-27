@@ -573,6 +573,7 @@ class PreparedResidentPolicyTests(unittest.TestCase):
                         source_archive_sha256=campaign.cfg['source_archive_sha256'],
                         source_manifest_sha256=campaign.cfg['source_manifest_sha256'])
         supervisor.write_json(campaign.build / 'build-manifest.json', manifest)
+        supervisor.write_json(campaign.build / 'plan.json', dict(protocol=manifest['protocol']))
         campaign.cfg['build_manifest_sha256'] = supervisor.sha(campaign.build / 'build-manifest.json')
         campaign.verification = root / 'verification'
         schema = campaign.verification / 'experiment/native-schema/perpetual'

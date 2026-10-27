@@ -78,18 +78,25 @@ class PreparationAdmissionTests(unittest.TestCase):
             (source / 'experiment').mkdir(parents=True)
             (source / 'evidence.tar.gz').write_bytes(b'bound evidence')
             evidence_sha = ci_prepare.sha(source / 'evidence.tar.gz')
-            audit = {'all_equal': True, 'databases': {'db': True}, 'rocksdb': {'db': True}}
+            audit = {'all_equal': True, 'databases': {'db': {'equal': True,
+                'native': {'tables': {}}, 'remote': {'tables': {}}}},
+                'rocksdb': {'db': {'equal': True, 'native_semantic': {}, 'distributed_semantic': {}}}}
             (source / 'receipt.json').write_text(json.dumps({'complete': True, 'evidence_sha256': evidence_sha}))
             (source / 'experiment/audit.json').write_text(json.dumps(audit))
+            requested = ci_prepare.local_replay_transport()
             for change in ({'complete': False}, {'external_manifest': {'transport': 'efa'}},
-                           {'topology': 'six AWS hosts'}, {'local_transport': 'tcp'},
-                           {'local_transport': 'fabric-tcp'}, {'local_transport': None}):
+                           {'topology': 'six AWS hosts'},
+                           {'local_transport': {'kind': 'tcp'}},
+                           {'local_transport': {'kind': 'ofi', 'fabric': {'backend': 'software-tcp'},
+                                                'security': 'mutual-tls'}},
+                           {'local_transport': None}):
                 result = {'complete': True, 'topology': 'five-process loopback',
-                          'local_transport': 'fabric-tcp-native', 'audit': audit} | change
+                          'local_transport': requested, 'audit': audit} | change
                 (source / 'experiment/results.json').write_text(json.dumps(result))
                 with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'loopback replay'):
-                    ci_prepare.verification_bundle(source, root / 'verification')
+                    ci_prepare.verification_bundle(source, root / 'verification', requested)
                 self.assertFalse((root / 'verification').exists())
+
 
 
 class CheckpointCompletionAdmissionTests(unittest.TestCase):
@@ -107,10 +114,14 @@ class CheckpointCompletionAdmissionTests(unittest.TestCase):
         experiment = source / 'experiment'
         (experiment / 'native-schema').mkdir(parents=True)
         (experiment / 'native-schema/schema.json').write_text('{"namespace":"real-schema-fixture"}')
-        audit = dict(all_equal=True, databases={'db': {'equal': True}}, rocksdb={'db': {'equal': True}})
+        audit = dict(all_equal=True, databases={'db': {'equal': True,
+            'native': {'tables': {}}, 'remote': {'tables': {}}}},
+            rocksdb={'db': {'equal': True, 'native_semantic': {}, 'distributed_semantic': {}}})
         ci_prepare.save(experiment / 'audit.json', audit)
-        ci_prepare.save(experiment / 'results.json', dict(complete=True, audit=audit,
-            topology='five-process loopback', local_transport='fabric-tcp-native',
+        ci_prepare.save(experiment / 'results.json', dict(schema=1, metrics_schema=2, protocol=9,
+            backend='tidehunter-sharded-wal', durability='synchronous durable whole-batch publication',
+            complete=True, audit=audit, topology='five physical shards per database; loopback, one SSD/shared host memory',
+            local_transport=ci_prepare.local_replay_transport(),
             checkpoint_limit=ci_prepare.TIP, checkpoint_digest=ci_prepare.CHECKPOINT))
         for mode, text in (('native', native if native is not None else self.metrics()),
                            ('remote', remote if remote is not None else self.metrics(1773))):
@@ -123,11 +134,19 @@ class CheckpointCompletionAdmissionTests(unittest.TestCase):
             evidence_sha256=ci_prepare.sha(source / 'evidence.tar.gz')))
         return source, Path(root) / 'verification'
 
+    def verify(self, source, output):
+        return ci_prepare.verification_bundle(source, output, ci_prepare.local_replay_transport())
+
     def test_actual_positive_native_and_remote_observations_and_bucket_bounds_are_retained(self):
         with tempfile.TemporaryDirectory() as root:
             source, output = self.source(root)
             original = json.loads((source / 'receipt.json').read_text())
-            ci_prepare.verification_bundle(source, output)
+            requested_path = Path(root) / 'local-replay-transport.json'
+            ci_prepare.write_local_replay_transport(requested_path)
+            requested = json.loads(requested_path.read_text())
+            self.assertEqual(json.loads((source / 'experiment/results.json').read_text())['local_transport'],
+                             requested)
+            ci_prepare.verification_bundle(source, output, requested)
             copied = json.loads((output / 'receipt.json').read_text())
             report = copied['checkpoint_completion_observations']
             self.assertEqual(report['evidence_sha256'], original['evidence_sha256'])
@@ -147,6 +166,19 @@ class CheckpointCompletionAdmissionTests(unittest.TestCase):
             self.assertEqual(json.loads((source / 'receipt.json').read_text()), original)
             self.assertEqual(ci_prepare.sha(output / 'evidence.tar.gz'), original['evidence_sha256'])
 
+    def test_native_remote_full_state_audit_disagreement_is_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            source, output = self.source(root)
+            audit = json.loads((source / 'experiment/audit.json').read_text())
+            audit['databases']['db']['remote']['tables'] = {'changed': True}
+            ci_prepare.save(source / 'experiment/audit.json', audit)
+            result = json.loads((source / 'experiment/results.json').read_text())
+            result['audit'] = audit
+            ci_prepare.save(source / 'experiment/results.json', result)
+            with self.assertRaisesRegex(ValueError, 'full-state audit'):
+                self.verify(source, output)
+            self.assertFalse(output.exists())
+
     def test_missing_zero_or_semantically_old_timer_fails_each_backend_before_packaging(self):
         invalid = (
             '# metric missing\n',
@@ -159,7 +191,7 @@ class CheckpointCompletionAdmissionTests(unittest.TestCase):
                 with self.subTest(mode=mode, text=text), tempfile.TemporaryDirectory() as root:
                     source, output = self.source(root, **{mode: text})
                     with self.assertRaises(ValueError):
-                        ci_prepare.verification_bundle(source, output)
+                        self.verify(source, output)
                     self.assertFalse(output.exists())
 
     def test_nonfinite_missing_and_malformed_histogram_measurements_cannot_satisfy_readiness(self):
@@ -186,7 +218,7 @@ class CheckpointCompletionAdmissionTests(unittest.TestCase):
             with self.subTest(measurement=measurement), tempfile.TemporaryDirectory() as root:
                 source, output = self.source(root, remote=measurement)
                 with self.assertRaises(ValueError):
-                    ci_prepare.verification_bundle(source, output)
+                    self.verify(source, output)
                 self.assertFalse(output.exists())
 
     def test_scrape_is_bound_to_archive_not_replaceable_loose_metrics(self):
@@ -194,14 +226,14 @@ class CheckpointCompletionAdmissionTests(unittest.TestCase):
             source, output = self.source(root, native=self.metrics(0))
             (source / 'experiment/native-foreground.prom').write_text(self.metrics())
             with self.assertRaises(ValueError):
-                ci_prepare.verification_bundle(source, output)
+                self.verify(source, output)
             self.assertFalse(output.exists())
 
     def test_duplicate_archive_scrapes_and_missing_remote_scrape_are_not_selected_silently(self):
         with tempfile.TemporaryDirectory() as root:
             source, output = self.source(root, duplicate=True)
             with self.assertRaisesRegex(ValueError, 'one bounded foreground'):
-                ci_prepare.verification_bundle(source, output)
+                self.verify(source, output)
             self.assertFalse(output.exists())
         with tempfile.TemporaryDirectory() as root:
             source, output = self.source(root)
@@ -210,13 +242,13 @@ class CheckpointCompletionAdmissionTests(unittest.TestCase):
             ci_prepare.save(source / 'receipt.json', dict(complete=True,
                 evidence_sha256=ci_prepare.sha(source / 'evidence.tar.gz')))
             with self.assertRaisesRegex(ValueError, 'one bounded foreground'):
-                ci_prepare.verification_bundle(source, output)
+                self.verify(source, output)
             self.assertFalse(output.exists())
 
     def test_positive_small_actual_count_does_not_become_an_invented_p99(self):
         with tempfile.TemporaryDirectory() as root:
             source, output = self.source(root, native=self.metrics(1), remote=self.metrics(2))
-            ci_prepare.verification_bundle(source, output)
+            self.verify(source, output)
             observations = json.loads((output / 'receipt.json').read_text())['checkpoint_completion_observations']['modes']
             self.assertEqual(observations['native']['count'], 1)
             self.assertFalse(observations['native']['quantiles']['p99']['available'])
@@ -277,8 +309,8 @@ class FrozenSourceRestoreTests(unittest.TestCase):
             source_archive_sha256=ci_prepare.sha(build / 'sources.tar.gz'),
             source_manifest_sha256=ci_prepare.sha(build / 'source-manifest.json'))
         ci_prepare.save(build / 'build-manifest.json', manifest)
-        for name in ('plan.json', 'portability.json'):
-            ci_prepare.save(build / name, {})
+        ci_prepare.save(build / 'plan.json', dict(protocol=manifest['protocol']))
+        ci_prepare.save(build / 'portability.json', {})
         with tarfile.open(build / 'build-bundle.tar.gz', 'w:gz') as archive:
             for path in sorted(build.iterdir()):
                 if path.name not in ('sources', 'build-bundle.tar.gz'):

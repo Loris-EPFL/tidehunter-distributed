@@ -145,16 +145,68 @@ def checkpoint_completion_observations(evidence):
         origin='ci_prepare analysis of source-bound local replay foreground metric archive; not a producer receipt field')
 
 
-def verification_bundle(source, destination):
+@cache
+def local_replay_transport():
+    """Return the reviewed canonical local software-provider transport."""
+    scripts = ROOT / 'experiments'
+    sys.path.insert(0, str(scripts))
+    try:
+        from portable_transport import (is_software, is_trusted,
+                                        transport_for_case, validate_transport)
+        transport = validate_transport(transport_for_case('fabric-tcp-native'))
+        if not is_software(transport) or not is_trusted(transport):
+            raise ValueError('local verification requires trusted software-fabric transport')
+        return transport
+    finally:
+        del sys.path[0]
+
+
+def write_local_replay_transport(path):
+    scripts = ROOT / 'experiments'
+    sys.path.insert(0, str(scripts))
+    try:
+        from portable_transport import write_transport_config
+        return write_transport_config(path, local_replay_transport())
+    finally:
+        del sys.path[0]
+
+
+def verification_bundle(source, destination, requested_transport):
     source, destination = Path(source), Path(destination)
+    scripts = ROOT / 'experiments'
+    sys.path.insert(0, str(scripts))
+    try:
+        from portable_transport import is_software, is_trusted, validate_transport
+        requested_transport = validate_transport(requested_transport)
+    finally:
+        del sys.path[0]
+    if not is_software(requested_transport) or not is_trusted(requested_transport):
+        raise ValueError('local verification requires trusted software-fabric transport')
     receipt = json.loads((source / 'receipt.json').read_text())
     result = json.loads((source / 'experiment/results.json').read_text())
     audit = json.loads((source / 'experiment/audit.json').read_text())
+    topology = result.get('topology')
+    databases, rocksdb = audit.get('databases'), audit.get('rocksdb')
+    database_audits_match = (
+        isinstance(databases, dict) and bool(databases)
+        and all(isinstance(row, dict) and row.get('equal') is True
+                and isinstance(row.get('native'), dict) and isinstance(row['native'].get('tables'), dict)
+                and isinstance(row.get('remote'), dict) and isinstance(row['remote'].get('tables'), dict)
+                and row['native']['tables'] == row['remote']['tables']
+                for row in databases.values()))
+    rocksdb_audits_match = (
+        isinstance(rocksdb, dict) and bool(rocksdb)
+        and all(isinstance(row, dict) and row.get('equal') is True
+                and isinstance(row.get('native_semantic'), dict)
+                and isinstance(row.get('distributed_semantic'), dict)
+                and row['native_semantic'] == row['distributed_semantic']
+                for row in rocksdb.values()))
     if (receipt.get('complete') is not True or result.get('complete') is not True
             or result.get('failure') or audit != result.get('audit') or audit.get('all_equal') is not True
-            or not audit.get('databases') or not audit.get('rocksdb')
-            or result.get('local_transport') != 'fabric-tcp-native'
-            or 'loopback' not in result.get('topology', '') or result.get('external_manifest')
+            or not database_audits_match or not rocksdb_audits_match
+            or result.get('local_transport') != requested_transport
+            or not isinstance(topology, str) or 'loopback' not in topology
+            or result.get('external_manifest')
             or sha(source / 'evidence.tar.gz') != receipt.get('evidence_sha256')):
         raise ValueError('complete same-build trusted software-fabric loopback replay and full-state audit required')
     schema = source / 'experiment/native-schema'
@@ -169,6 +221,8 @@ def verification_bundle(source, destination):
         shutil.copy2(source / 'experiment' / name, destination / 'experiment' / name)
     shutil.copytree(schema, destination / 'experiment/native-schema')
     return destination
+
+
 
 
 def prepare(args):
@@ -191,19 +245,23 @@ def prepare(args):
     build = output / 'build'
     target = args.target.resolve()
     replay = output / 'local-replay'
+    transport = local_replay_transport()
+    transport_config = output / 'local-replay-transport.json'
+    write_local_replay_transport(transport_config)
     commands = [
         [sys.executable, str(script), 'prepare', '--sui', str(sui), '--engine', str(engine), '--output', str(build), '--fabric', '--jobs', str(args.jobs)],
         [sys.executable, str(script), 'build', '--output', str(build), '--target', str(target), '--deadline', str(args.deadline)],
-        [sys.executable, str(engine / 'experiments/sui-checkpoint/run.py'), '--build', str(build), '--fixture', str(fixture), '--output', str(replay), '--deadline', '900', '--local-transport', 'fabric-tcp-native'],
+        [sys.executable, str(engine / 'experiments/sui-checkpoint/run.py'), '--build', str(build), '--fixture', str(fixture), '--output', str(replay), '--deadline', '900', '--transport-config', str(transport_config)],
     ]
     for command in commands:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError('absolute CPU build/local-verification deadline exhausted; fleet must not launch')
         module.bounded(command, timeout=remaining)
-    verification = verification_bundle(replay, output / 'verification')
+    verification = verification_bundle(replay, output / 'verification', transport)
     manifest = json.loads((build / 'build-manifest.json').read_text())
-    if manifest.get('fabric') is not True or manifest.get('protocol') != 9:
+    plan = json.loads((build / 'plan.json').read_text())
+    if manifest.get('fabric') is not True or manifest.get('protocol') != plan['protocol']:
         raise ValueError('current fabric-capable protocol build required')
     save(output / 'READY.json', {
         'complete': True, 'created_utc': datetime.now(timezone.utc).isoformat(),

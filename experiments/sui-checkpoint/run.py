@@ -523,7 +523,8 @@ def main():
                 if args.resident_reads else None)
     build_root, fixture, root = args.build.resolve(strict=True), args.fixture.resolve(strict=True), args.output.resolve()
     manifest = read_json(build_root / 'build-manifest.json')
-    if manifest['protocol'] != 9 or build.digest(build_root/'sources.tar.gz') != manifest['source_archive_sha256']:
+    plan = read_json(build_root / 'plan.json')
+    if manifest['protocol'] != plan['protocol'] or build.digest(build_root/'sources.tar.gz') != manifest['source_archive_sha256']:
         raise ValueError('wrong protocol or source archive binding')
     if set(manifest['binaries']) != {'sui-node-native','sui-node-remote','storage-node','state-audit','rocksdb-audit','transport-floor'}:
         raise ValueError('build manifest lacks the exact required executable set')

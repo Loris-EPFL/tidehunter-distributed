@@ -549,6 +549,7 @@ class CheckpointSourceBoundaries(unittest.TestCase):
             binaries={name: 'unused' for name in ('sui-node-native', 'sui-node-remote',
                 'storage-node', 'state-audit', 'rocksdb-audit', 'transport-floor')})
         build.save(root / 'build-manifest.json', manifest)
+        build.save(root / 'plan.json', dict(protocol=manifest['protocol']))
         return identities, manifest
 
     def test_replay_rejects_missing_changed_or_unbound_support_before_spawn(self):

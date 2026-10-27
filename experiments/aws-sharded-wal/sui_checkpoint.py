@@ -776,12 +776,13 @@ class SuiCampaign(Campaign):
         self.fixture = inputs / 'fixture_bundle/fixture'
         self.verification = inputs / 'verification_bundle/verification'
         manifest = read_json(self.build / 'build-manifest.json')
+        plan = read_json(self.build / 'plan.json')
         if sha(self.build / 'build-manifest.json') != self.cfg['build_manifest_sha256']:
             raise ValueError('build manifest differs from MCP immutable plan')
         for name, key in [('sources.tar.gz', 'source_archive_sha256'), ('source-manifest.json', 'source_manifest_sha256')]:
             if sha(self.build / name) != self.cfg[key] or manifest[key] != self.cfg[key]:
                 raise ValueError('source archive/manifest binding differs')
-        if manifest['protocol'] != 9 or manifest['binaries'] != self.cfg['binaries']:
+        if manifest['protocol'] != plan['protocol'] or manifest['binaries'] != self.cfg['binaries']:
             raise ValueError('wrong wire protocol or executable inventory')
         if any(transport in HARDWARE_TRANSPORTS for transport in self.cfg['transports']) and not manifest.get('fabric'):
             raise ValueError('transport requires fabric-enabled frozen binaries')

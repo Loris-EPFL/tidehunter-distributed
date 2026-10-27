@@ -43,8 +43,9 @@ def main():
     resident = (deployment.resident_read_config(json.loads(args.resident_reads.read_text()))
                 if args.resident_reads else None)
     manifest=json.loads((args.build/'build-manifest.json').read_text())
+    plan=json.loads((args.build/'plan.json').read_text())
     binary=args.build/'binaries/storage-node'
-    if build.digest(binary)!=manifest['binaries']['storage-node'] or manifest['protocol']!=9:
+    if build.digest(binary)!=manifest['binaries']['storage-node'] or manifest['protocol']!=plan['protocol']:
         raise ValueError('storage binary/source binding differs')
     if deployment.is_fabric(transport) and not manifest['fabric']:
         raise ValueError('hardware/fabric transport requires a fabric-enabled frozen build')
