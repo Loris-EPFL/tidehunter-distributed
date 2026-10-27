@@ -59,7 +59,9 @@ class CloudNodeContract(unittest.TestCase):
         for name in ('ca.der', 'node.der', 'node.pk8'):
             (tls / name).write_bytes(b'fixture identity; never logged')
         self.config_path = self.root / 'node-config.json'
-        self.cfg = dict(run_id=self.run_id, cell_id='r04-tcp', transport='tcp', root=str(self.root),
+        tcp = {'kind': 'tcp'}
+        self.cfg = dict(run_id=self.run_id, cell_id='r04-tcp', transport='tcp',
+            client_transport=tcp, owner_transport=tcp, root=str(self.root),
             deadline_utc=datetime.fromtimestamp(time.time() + 60, timezone.utc).isoformat(),
             storage_binary_sha256=cloud_node.sha256(self.binary),
             build_manifest_sha256='b' * 64, config_sha256='c' * 64,
@@ -74,7 +76,7 @@ class CloudNodeContract(unittest.TestCase):
         directory.mkdir(parents=True)
         launch = directory / 'launch.yaml'
         value = dict(node=dict(root=str(directory / 'storage')),
-            tls=dict(transport='tcp', ca=str(self.root / 'tls/ca.der'), cert=str(self.root / 'tls/node.der'),
+            tls=dict(transport={'kind': 'tcp'}, ca=str(self.root / 'tls/ca.der'), cert=str(self.root / 'tls/node.der'),
                      key=str(self.root / 'tls/node.pk8')),
             ready_file=str(directory / 'ready'), stop_file=str(directory / 'stop'), test_mode=mode)
         launch.write_text(json.dumps(value))
@@ -102,17 +104,22 @@ class CloudNodeContract(unittest.TestCase):
         old_root.rename(self.root)
         self.config_path = self.root / 'node-config.json'
         self.binary = self.root / 'storage-node'
-        self.cfg = json.loads(json.dumps(self.cfg).replace(str(old_root), str(self.root))
-                              .replace('"r04-tcp"', '"r04-efa-direct"').replace('"tcp"', '"efa-direct"'))
+        self.cfg = json.loads(json.dumps(self.cfg).replace(str(old_root), str(self.root)))
+        self.cfg.update(cell_id='r04-efa-direct', transport='efa-direct',
+                        client_transport={'kind': 'ofi', 'fabric': {'backend': 'efa-direct'}},
+                        owner_transport={'kind': 'ofi', 'fabric': {'backend': 'efa-direct'}})
         launch = Path(self.cfg['commands'][0][2])
         value = json.loads(launch.read_text().replace(str(old_root), str(self.root)))
-        value['tls']['transport'] = 'efa-direct'
+        value['tls']['transport'] = self.cfg['owner_transport']
         launch.write_text(json.dumps(value))
         self.assertEqual(self.validate()['transport'], 'efa-direct')
         for fallback in ('efa', 'tcp', 'fabric-tcp'):
-            value['tls']['transport'] = fallback
+            fallback_backend = 'software-tcp' if fallback == 'fabric-tcp' else fallback
+            value['tls']['transport'] = (cloud_node.validate_transport(
+                {'kind': 'ofi', 'fabric': {'backend': fallback_backend}})
+                if fallback != 'tcp' else {'kind': 'tcp'})
             launch.write_text(json.dumps(value))
-            with self.subTest(fallback=fallback), self.assertRaisesRegex(ValueError, 'transport differs'):
+            with self.subTest(fallback=fallback), self.assertRaisesRegex(ValueError, 'data-NIC selection'):
                 self.validate()
 
     def test_registered_native_cell_has_distinct_owned_identity(self):
@@ -122,11 +129,13 @@ class CloudNodeContract(unittest.TestCase):
         old_root.rename(self.root)
         self.config_path = self.root / 'node-config.json'
         self.binary = self.root / 'storage-node'
-        self.cfg = json.loads(json.dumps(self.cfg).replace(str(old_root), str(self.root))
-                              .replace('"r04-tcp"', '"r04-efa-native-rma"').replace('"tcp"', '"efa-native"'))
+        self.cfg = json.loads(json.dumps(self.cfg).replace(str(old_root), str(self.root)))
+        trusted = {'kind': 'ofi', 'fabric': {'backend': 'efa-direct'}, 'security': 'trusted'}
+        self.cfg.update(cell_id='r04-efa-native-rma', transport='efa-native',
+                        client_transport=trusted, owner_transport=trusted)
         launch = Path(self.cfg['commands'][0][2])
         value = json.loads(launch.read_text().replace(str(old_root), str(self.root)))
-        value['tls'] = dict(transport='efa-native', ca='', cert='', key='')
+        value['tls'] = dict(transport=trusted, ca='', cert='', key='')
         launch.write_text(json.dumps(value))
         self.assertEqual(self.validate()['cell_id'], 'r04-efa-native-rma')
         self.cfg.update(cell_id='r04-tcp-rma', transport='tcp')
@@ -140,12 +149,13 @@ class CloudNodeContract(unittest.TestCase):
         old_root.rename(self.root)
         self.config_path = self.root / 'node-config.json'
         self.binary = self.root / 'storage-node'
-        self.cfg = json.loads(json.dumps(self.cfg).replace(str(old_root), str(self.root))
-                              .replace('"r04-tcp"', '"r04-efa-native"').replace('"tcp"', '"efa-native"'))
+        self.cfg = json.loads(json.dumps(self.cfg).replace(str(old_root), str(self.root)))
+        trusted = {'kind': 'ofi', 'fabric': {'backend': 'efa-direct'}, 'security': 'trusted'}
+        self.cfg.update(cell_id='r04-efa-native', transport='efa-native',
+                        client_transport=trusted, owner_transport=trusted)
         launch = Path(self.cfg['commands'][0][2])
         value = json.loads(launch.read_text().replace(str(old_root), str(self.root)))
-        value['tls'] = dict(transport='efa-native', ca='', cert='', key='',
-                            trusted_domain='isolated-test')
+        value['tls'] = dict(transport=trusted, ca='', cert='', key='')
         for credential in ('ca', 'cert', 'key'):
             value['tls'][credential] = 'unexpected-credential'
             launch.write_text(json.dumps(value))
@@ -188,9 +198,17 @@ class CloudNodeContract(unittest.TestCase):
     def test_rejects_transport_fallback_in_launch(self):
         launch = Path(self.cfg['commands'][0][2])
         value = json.loads(launch.read_text())
-        value['tls']['transport'] = 'fabric-tcp'
+        value['tls']['transport'] = {'kind': 'ofi', 'fabric': {'backend': 'software-tcp'}}
         launch.write_text(json.dumps(value))
-        with self.assertRaisesRegex(ValueError, 'transport differs'):
+        with self.assertRaisesRegex(ValueError, 'data-NIC selection'):
+            self.validate()
+
+
+    def test_readiness_rejects_owner_protocol_mismatch(self):
+        self.cfg.update(cell_id='r04-efa', transport='efa',
+                        client_transport={'kind': 'ofi', 'fabric': {'backend': 'efa'}},
+                        owner_transport={'kind': 'ofi', 'fabric': {'backend': 'verbs'}})
+        with self.assertRaisesRegex(ValueError, 'protocol differs'):
             self.validate()
     def test_rejects_outside_output(self):
         self.cfg['resource_path'] = str(self.base / 'someone-else/resources.json')

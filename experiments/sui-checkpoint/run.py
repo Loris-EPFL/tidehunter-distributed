@@ -404,7 +404,7 @@ def validate_profiles(counters, databases, read_limit, write_limit):
                     or stats.get('read_profile_server_available') != 1
                     or stats.get('read_profile_transport_progress_available') != 1):
                 raise ValueError('bounded read profile lacks successful RPC/server/transport observations')
-            if (databases[name]['tls']['transport'] != 'tcp' and stats['read_rpcs'] > 0
+            if (databases[name]['tls']['transport'].get('kind') != 'tcp' and stats['read_rpcs'] > 0
                     and (stats.get('read_profile_transport_cq_available') != 1
                          or (stats.get('read_profile_transport_cq_timed_calls') or 0) <= 0)):
                 raise ValueError('fabric completion-queue profiling is unavailable')
@@ -425,7 +425,7 @@ def validate_profiles(counters, databases, read_limit, write_limit):
                 or any(stats.get('write_profile_storage_' + field) != 0
                        for field in ('append_errors', 'persist_errors'))):
             raise ValueError(f'bounded write profile lacks complete successful append/persistence coverage: {name}')
-        if (databases[name]['tls']['transport'] != 'tcp'
+        if (databases[name]['tls']['transport'].get('kind') != 'tcp'
                 and any((stats.get(prefix + 'cq_timed_calls') or 0) <= 0
                         for prefix in ('write_profile_client_transport_', 'write_profile_transport_'))):
             raise ValueError('fabric write completion-queue profiling is unavailable')
@@ -485,8 +485,8 @@ def main():
     parser.add_argument('--port', type=int, default=24000)
     parser.add_argument('--coordinator-cache-mib', type=int, default=8)
     parser.add_argument('--shard-cache-mib', type=int, default=0)
-    parser.add_argument('--local-transport', choices=('tcp', *deployment.SOFTWARE_TRANSPORTS), default='tcp',
-                        help='loopback correctness provider; never hardware EFA evidence')
+    parser.add_argument('--transport-config', type=Path,
+                        help='canonical client Transport JSON for local/manual replay; defaults to TCP')
     parser.add_argument('--resident-reads', type=Path,
                         help='bounded per-database registered-read JSON policy; requires trusted-native fabric')
     parser.add_argument('--read-profile-limit', type=int, default=0,
@@ -512,8 +512,13 @@ def main():
         raise ValueError('write profile limit must be 0..65536')
     if not 0 <= args.native_write_profile_limit <= 65536:
         raise ValueError('native write profile limit must be 0..65536')
-    if args.external_config and args.local_transport != 'tcp':
+    if args.external_config and args.transport_config:
         raise ValueError('local transport cannot override an external deployment')
+    local_transport = (deployment.validate_transport(read_json(args.transport_config.resolve(strict=True)))
+                       if args.transport_config else {'kind': 'tcp'})
+    if (not args.external_config and deployment.is_fabric(local_transport)
+            and not deployment.is_software(local_transport)):
+        raise ValueError('local replay accepts only TCP or software OFI; hardware uses external deployment')
     resident = (deployment.resident_read_config(read_json(args.resident_reads.resolve(strict=True)))
                 if args.resident_reads else None)
     build_root, fixture, root = args.build.resolve(strict=True), args.fixture.resolve(strict=True), args.output.resolve()
@@ -522,8 +527,8 @@ def main():
         raise ValueError('wrong protocol or source archive binding')
     if set(manifest['binaries']) != {'sui-node-native','sui-node-remote','storage-node','state-audit','rocksdb-audit','transport-floor'}:
         raise ValueError('build manifest lacks the exact required executable set')
-    if args.local_transport in deployment.SOFTWARE_TRANSPORTS and not manifest['fabric']:
-        raise ValueError('software fabric validation requires a fabric-enabled build')
+    if deployment.is_fabric(local_transport) and not manifest['fabric']:
+        raise ValueError('fabric validation requires a fabric-enabled build')
     sources = read_json(build_root/'source-manifest.json')
     if build.digest(build_root/'source-manifest.json') != manifest['source_manifest_sha256']:
         raise ValueError('source manifest differs')
@@ -533,6 +538,10 @@ def main():
         entry = sources['tidehunter-sharded-wal']['files'].get(relative, {})
         if build.digest(path) != entry.get('sha256'):
             raise ValueError('runner source differs from binary-bound source archive')
+    transport_helper = Path(__file__).resolve().parents[1] / 'portable_transport.py'
+    helper_entry = sources['tidehunter-sharded-wal']['files'].get('experiments/portable_transport.py', {})
+    if build.digest(transport_helper) != helper_entry.get('sha256'):
+        raise ValueError('portable transport helper differs from binary-bound source archive')
     bins = build_root/'binaries'
     for name, expected in manifest['binaries'].items():
         if build.digest(bins/name) != expected:
@@ -579,17 +588,17 @@ def main():
                TH_DEFAULT_MUTEX_COUNT='1', TH_DEFAULT_MAX_DIRTY_KEYS='128', TH_DEFAULT_VALUE_CACHE_SIZE='1000',
                SUI_TH_READ_PROFILE_LIMIT=str(args.read_profile_limit),
                SUI_TH_NATIVE_WRITE_PROFILE_LIMIT=str(args.native_write_profile_limit))
-    env = deployment.process_environment(env, transport='tcp' if args.external_config else args.local_transport)
+    env = deployment.process_environment(env, transport={'kind': 'tcp'} if args.external_config else local_transport)
     owned=Owned(output,env)
     producer_env = checkpoint.source_environment(prior)
-    result=dict(schema=1,metrics_schema=2,protocol=9,backend='tidehunter-sharded-wal',durability='synchronous durable whole-batch publication',
+    result=dict(schema=1,metrics_schema=2,protocol=manifest['protocol'],backend='tidehunter-sharded-wal',durability='synchronous durable whole-batch publication',
         fixture=str(fixture),fixture_files=fixture_files,checkpoint_limit=tip,checkpoint_digest=expected_digest,
         build_manifest_sha256=build.digest(build_root/'build-manifest.json'),source_archive_sha256=manifest['source_archive_sha256'],
         binaries=manifest['binaries'],configurations=configs,
         environment={k:v for k,v in env.items() if k.startswith(('RUST_LOG','TOKIO_','USE_TIDEHUNTER','TH_','SUI_TH_','LD_LIBRARY_PATH','FI_'))},
         cache=dict(coordinator_bytes=args.coordinator_cache_mib*deployment.MIB,shard_bytes=args.shard_cache_mib*deployment.MIB),
         topology='five physical shards per database; '+('external hosts' if args.external_config else 'loopback, one SSD/shared host memory'),
-        local_transport=None if args.external_config else args.local_transport,
+        local_transport=None if args.external_config else local_transport,
         read_profile_limit=args.read_profile_limit,write_profile_limit=args.write_profile_limit,
         native_write_profile_limit=args.native_write_profile_limit,
         started_unix=time.time())
@@ -615,17 +624,36 @@ def main():
             config=read_json(config_path)
             if Path(config['root']) != remote_root or set(config['databases']) != set(schema):
                 raise ValueError('external namespace/root coverage differs')
+            external_manifest=read_json(config_path.parent/'external-manifest.json')
+            if external_manifest.get('schema') != 2:
+                raise ValueError('external deployment manifest schema differs from structured transports')
+            client_transport = deployment.validate_transport(external_manifest['transport'])
+            expected_owners = deployment.select_owner_transports(
+                client_transport, external_manifest.get('owner_transports'), 5)
+            host_records = external_manifest.get('hosts')
+            if (not isinstance(host_records, list) or len(host_records) != 5
+                    or any(not isinstance(row, dict) for row in host_records)
+                    or any(type(row.get('partition')) is not int for row in host_records)
+                    or {row['partition'] for row in host_records} != set(range(5))
+                    or any(not isinstance(row.get('host'), str) for row in host_records)
+                    or len({row['host'] for row in host_records}) != 5
+                    or any(deployment.validate_transport(row.get('transport')) != expected_owners[row['partition']]
+                           for row in host_records)):
+                raise ValueError('external host/data-NIC transport inventory differs')
+            control_hosts = {row['host'] for row in host_records}
             for database in config['databases'].values():
-                if database['tls']['transport'] in deployment.SOFTWARE_TRANSPORTS:
+                if deployment.validate_transport(database['tls']['transport']) != client_transport:
+                    raise ValueError('external client transport differs from prepared manifest')
+                if deployment.is_software(client_transport):
                     raise ValueError('external software fabric is loopback-only in the native engine')
-                if len(database['endpoints']) != 5 or len(set(e['address'].rsplit(':',1)[0] for e in database['endpoints'])) != 5:
-                    raise ValueError('external mode requires five distinct storage hosts per DB')
+                endpoint_hosts = {endpoint['address'].rsplit(':', 1)[0] for endpoint in database['endpoints']}
+                if len(database['endpoints']) != 5 or endpoint_hosts != control_hosts:
+                    raise ValueError('external control endpoints differ from five prepared storage hosts')
                 if database['read_cache_bytes'] != result['cache']['coordinator_bytes']:
                     raise ValueError('external coordinator cache differs')
                 if (resident is not None and
                         deployment.resident_read_config(database['tls'].get('resident_reads')) != resident):
                     raise ValueError('external resident-read policy differs from requested population')
-            external_manifest=read_json(config_path.parent/'external-manifest.json')
             if (external_manifest['config_sha256'] != build.digest(config_path)
                     or external_manifest['build_manifest_sha256'] != result['build_manifest_sha256']
                     or external_manifest['shard_cache_bytes'] != result['cache']['shard_bytes']):
@@ -635,7 +663,7 @@ def main():
             config_path=output/'deployment/config.json'
             config,nodes=deployment.prepare(config_path.parent,schema,remote_root,
                 shape_yamls={name:(output/'native-schema'/name/'shape.yaml').read_text() for name in schema},hosts=['127.0.0.1']*5,
-                port=args.port,transport=args.local_transport,coordinator_cache=result['cache']['coordinator_bytes'],
+                port=args.port,transport=local_transport,coordinator_cache=result['cache']['coordinator_bytes'],
                 shard_cache=result['cache']['shard_bytes'],write_profile_limit=args.write_profile_limit,
                 resident_reads=resident)
             for index,node in enumerate(nodes):

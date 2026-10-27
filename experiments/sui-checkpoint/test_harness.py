@@ -16,7 +16,9 @@ import unittest
 import tomllib
 from unittest.mock import patch
 import deployment
+from portable_transport import transport_for_case
 import analyze
+import yaml
 import build
 import run
 
@@ -24,7 +26,8 @@ import run
 class SoftwareFabricGeometry(unittest.TestCase):
     def test_excessive_or_invalid_software_receive_geometry_is_rejected(self):
         for value in ('', '4096', '0'):
-            for transport in deployment.SOFTWARE_TRANSPORTS:
+            for label in deployment.SOFTWARE_TRANSPORTS:
+                transport = transport_for_case(label)
                 with self.subTest(value=value, transport=transport):
                     with self.assertRaises(ValueError):
                         deployment.process_environment(
@@ -115,7 +118,7 @@ class DeploymentContract(unittest.TestCase):
             root=Path(tmp)
             config,nodes=deployment.prepare(root/'deployment',{'live/perpetual':{'key_spaces':[]},'live/checkpoints':{'key_spaces':[]}},
                 root/'remote',shape_yamls={name:'key_spaces: []\n' for name in ('live/perpetual','live/checkpoints')},
-                hosts=['127.0.0.1']*5,port=24000,transport='tcp',coordinator_cache=0,shard_cache=0)
+                hosts=['127.0.0.1']*5,port=24000,transport={'kind':'tcp'},coordinator_cache=0,shard_cache=0)
             self.assertEqual(len(nodes),10)
             self.assertEqual(len(set(node['launch'] for node in nodes)),10)
             identities=[db['storage']['database'] for db in config['databases'].values()]
@@ -128,10 +131,18 @@ class DeploymentContract(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.object(deployment,'certificates',lambda path:path.mkdir()):
             root=Path(tmp)
             config,nodes=deployment.prepare(root/'deployment',{'live/perpetual':{'key_spaces':[]}},root/'remote',
-                shape_yamls={'live/perpetual':'key_spaces: []\n'},hosts=['10.0.0.'+str(i) for i in range(1,6)],port=24000,transport='efa',
-                coordinator_cache=8388608,shard_cache=8388608,guest_root=Path('/owned/remote'))
+                shape_yamls={'live/perpetual':'key_spaces: []\n'},hosts=['10.0.0.'+str(i) for i in range(1,6)],port=24000,
+                transport=transport_for_case('efa'),coordinator_cache=8388608,shard_cache=8388608,guest_root=Path('/owned/remote'))
             self.assertTrue(config['databases']['live/perpetual']['tls']['key'].startswith(str(root)))
             self.assertTrue(nodes[0]['ready'].startswith('/owned/remote'))
+
+
+
+    def test_owner_protocol_and_security_must_match_client(self):
+        client = transport_for_case('efa')
+        bad_owners = [transport_for_case('efa-native')] * 5
+        with self.assertRaisesRegex(ValueError, 'must match client provider and security'):
+            deployment.select_owner_transports(client, bad_owners, 5)
 
     def test_invalid_schema_namespace_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -175,7 +186,8 @@ class DeploymentContract(unittest.TestCase):
             with self.subTest(transport=transport), tempfile.TemporaryDirectory() as tmp:
                 with self.assertRaises(ValueError):
                     deployment.prepare(Path(tmp)/'x',{},Path(tmp),shape_yamls={},hosts=['127.0.0.1']*5,
-                        port=24000,transport=transport,coordinator_cache=0,shard_cache=0)
+                        port=24000,transport=transport_for_case(transport),
+                        coordinator_cache=0,shard_cache=0)
 
     def test_software_fabric_rejects_nonloopback_hosts(self):
         for transport in ('fabric-tcp', 'fabric-tcp-native'):
@@ -184,7 +196,7 @@ class DeploymentContract(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'loopback-only'):
                     deployment.prepare(root, {}, Path(tmp), shape_yamls={},
                         hosts=['127.0.0.1'] * 4 + ['10.0.0.1'], port=24000,
-                        transport=transport, coordinator_cache=0, shard_cache=0)
+                        transport=transport_for_case(transport), coordinator_cache=0, shard_cache=0)
                 self.assertFalse(root.exists())
 
     def test_invalid_write_profile_budget_fails_before_deployment(self):
@@ -193,7 +205,7 @@ class DeploymentContract(unittest.TestCase):
                 root = Path(tmp) / 'deployment'
                 with self.assertRaisesRegex(ValueError, 'write profile limit'):
                     deployment.prepare(root, {}, Path(tmp), shape_yamls={},
-                        hosts=['127.0.0.1'] * 5, port=24000, transport='tcp',
+                        hosts=['127.0.0.1'] * 5, port=24000, transport={'kind':'tcp'},
                         coordinator_cache=0, shard_cache=0, write_profile_limit=limit)
                 self.assertFalse(root.exists())
 
@@ -209,7 +221,7 @@ class DeploymentContract(unittest.TestCase):
                     deployment.prepare(root, {'db': {}}, Path(tmp) / 'remote',
                         shape_yamls={'db': 'key_spaces: []\n'},
                         hosts=['10.0.0.' + str(i) for i in range(1, 6)] if hardware else ['127.0.0.1'] * 5,
-                        port=24000, transport=transport, coordinator_cache=0, shard_cache=0,
+                        port=24000, transport=transport_for_case(transport), coordinator_cache=0, shard_cache=0,
                         guest_root=Path('/owned') if hardware else None, resident_reads=resident)
                 self.assertFalse(root.exists())
 
@@ -225,7 +237,8 @@ class DeploymentContract(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     deployment.prepare(root, schema, Path(tmp) / 'remote',
                         shape_yamls={name: 'key_spaces: []\n' for name in schema},
-                        hosts=['127.0.0.1'] * 5, port=24000, transport='fabric-tcp-native',
+                        hosts=['127.0.0.1'] * 5, port=24000,
+                        transport=transport_for_case('fabric-tcp-native'),
                         coordinator_cache=0, shard_cache=0, resident_reads=resident)
                 self.assertFalse(root.exists())
 
@@ -238,12 +251,12 @@ class DeploymentContract(unittest.TestCase):
             with self.assertRaises(ValueError):
                 deployment.prepare(root, {'db': {}}, Path(tmp) / 'remote',
                     shape_yamls={'db': 'key_spaces: []\n'}, hosts=['127.0.0.1'] * 5,
-                    port=24000, transport='fabric-tcp-native', coordinator_cache=0,
+                    port=24000, transport=transport_for_case('fabric-tcp-native'), coordinator_cache=0,
                     shard_cache=0, resident_reads=resident)
             self.assertFalse(root.exists())
 
     def test_cache_only_reads_do_not_require_invented_rpc_samples(self):
-        databases = {'db': dict(tls={'transport': 'tcp'}, endpoints=[{}])}
+        databases = {'db': dict(tls={'transport': {'kind':'tcp'}}, endpoints=[{}])}
         stats = dict(read_rpcs=0, read_profile_selected=0, read_profile_completed=0,
                      read_profile_errors=0, read_profile_wire_requests=0,
                      write_profile_expected_connections=1, write_profile_captured_connections=0,
@@ -251,7 +264,7 @@ class DeploymentContract(unittest.TestCase):
         run.validate_profiles({'db': stats}, databases, 4096, 0)
         with self.assertRaisesRegex(ValueError, 'zero read-RPC population'):
             run.validate_profiles({'db': stats | {'read_profile_selected': 1}}, databases, 4096, 0)
-        databases['db']['tls']['transport'] = 'fabric-tcp'
+        databases['db']['tls']['transport'] = transport_for_case('fabric-tcp')
         rpc_stats = stats | dict(read_rpcs=1, read_profile_selected=1, read_profile_completed=1,
                                 read_profile_wire_requests=1, read_profile_server_available=1,
                                 read_profile_transport_progress_available=1)
@@ -259,7 +272,7 @@ class DeploymentContract(unittest.TestCase):
             run.validate_profiles({'db': rpc_stats}, databases, 4096, 0)
 
     def test_write_profiles_reject_partial_errors_and_clean_population_contamination(self):
-        databases = {'db': dict(tls={'transport': 'tcp'}, endpoints=[{}] * 5)}
+        databases = {'db': dict(tls={'transport': {'kind':'tcp'}}, endpoints=[{}] * 5)}
         stats = dict(write_profile_expected_connections=5, write_profile_captured_connections=5,
                      write_profile_sampled_requests=640, write_profile_available=1,
                      write_profile_storage_append_calls=640, write_profile_storage_persist_calls=640,
@@ -308,6 +321,8 @@ class CheckpointSourceBoundaries(unittest.TestCase):
                     shutil.copy2(path, scripts / path.name)
                 shutil.copy2(Path(deployment.__file__).resolve().parent.parent / 'resident_config.py',
                              base / 'experiments/resident_config.py')
+                shutil.copy2(Path(deployment.__file__).resolve().parent.parent / 'portable_transport.py',
+                             base / 'experiments/portable_transport.py')
             else:
                 (base / 'Cargo.toml').write_text('[workspace]\n')
             identities[owner] = dict(revision='frozen', files={
@@ -1045,7 +1060,8 @@ class EvidenceBoundaries(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(ValueError, 'loopback'):
                 deployment.prepare(Path(tmp)/'deployment', {}, Path(tmp), shape_yamls={},
-                    hosts=['10.0.0.'+str(i) for i in range(5)], port=24000, transport='fabric-tcp',
+                    hosts=['10.0.0.'+str(i) for i in range(5)], port=24000,
+                    transport=transport_for_case('fabric-tcp'),
                     coordinator_cache=0, shard_cache=0, guest_root=Path('/owned'))
             self.assertFalse((Path(tmp)/'deployment').exists())
 
