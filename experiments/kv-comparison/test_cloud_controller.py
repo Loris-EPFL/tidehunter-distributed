@@ -720,6 +720,44 @@ class MonitoringBoundaryTests(unittest.TestCase):
             self.assertEqual(json.loads((runtime.root / "receipt.json").read_text())["status"], "incomplete")
         clients["ec2"].terminate_instances.assert_called_once_with(InstanceIds=runtime.ids)
 
+    def test_inventory_publication_failure_preserves_raw_archive_and_termination(self):
+        config = config_fixture()
+        clients = clients_fixture(config)
+        runtime = controller.Controller(config, clients)
+        uploads = {}
+        def upload(path, bucket, key, **kwargs):
+            uploads[key] = Path(path).read_bytes()
+        def head(**kwargs):
+            raw = uploads[kwargs["Key"]]
+            return {"ContentLength": len(raw),
+                    "Metadata": {"sha256": controller.hashlib.sha256(raw).hexdigest()}}
+        clients["s3"].upload_file.side_effect = upload
+        clients["s3"].head_object.side_effect = head
+        clients["s3"].put_object.side_effect = OSError("inventory publication unavailable")
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime.root = Path(tmp) / "results"
+            def bootstrap():
+                runtime.root.mkdir()
+                runtime.root_owned = True
+                path = runtime.root / "cases/failed/result/samples.csv"
+                path.parent.mkdir(parents=True)
+                path.write_bytes(b"retain this complete raw payload\n")
+                raise controller.InfrastructureError("workload failed")
+            runtime.bootstrap = bootstrap
+            runtime.export_monitoring = Mock()
+            runtime.stop_monitoring = Mock()
+            runtime.persist = lambda name, value: controller.dump(runtime.root / name, value)
+            with patch.dict(controller.sys.modules, {"boto3.s3.transfer": Mock()}), \
+                    self.assertRaises(controller.InfrastructureError):
+                runtime.run()
+            with tarfile.open(fileobj=io.BytesIO(uploads[config["prefix"] + "/results/controller.tar.gz"])) as archive:
+                self.assertEqual(archive.extractfile("cases/failed/result/samples.csv").read(),
+                                 b"retain this complete raw payload\n")
+            receipt = json.loads((runtime.root / "receipt.json").read_text())
+            self.assertEqual(receipt["status"], "export_failed")
+            self.assertIn("inventory publication unavailable", receipt["export_error"])
+        clients["ec2"].terminate_instances.assert_called_once_with(InstanceIds=runtime.ids)
+
     def test_only_exact_monitoring_archive_is_retained_with_raw_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "results"

@@ -1372,6 +1372,9 @@ Downloaded inventory bytes are checked before any archive extraction; each
 extracted file still requires its recorded length and hash. The existing
 4-MiB launcher control-JSON bound is unchanged. Bulk JSON uses the existing
 32-MiB guest metadata bound; raw file/count/total export bounds remain separate.
+The raw archive is uploaded and verified before publishing the bulk inventory.
+Inventory publication failure remains a failed export, but cannot prevent the
+raw archive upload or exact-fleet termination.
 
 The retained failed-run inventory contains 29,827 files and serializes to
 5,320,840 bytes. Local execution of the actual publication/control-reader

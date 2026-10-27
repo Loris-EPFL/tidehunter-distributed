@@ -1377,10 +1377,6 @@ class Controller:
         self.remaining(export=True)
         archive = self.root.parent / "controller-export.tar.gz"
         records = archive_results(self.root, archive, deadline_check=lambda: self.remaining(export=True))
-        # File inventories grow with the matrix. Keep bulk metadata out of the
-        # launcher's independently bounded, frequently polled control receipt.
-        inventory = s3_json(self.clients["s3"], self.config,
-                            self.config["prefix"] + "/results/controller-inventory.json", records)
         checksum = digest(archive)
         size = archive.stat().st_size
         from boto3.s3.transfer import TransferConfig
@@ -1392,6 +1388,10 @@ class Controller:
         head = self.clients["s3"].head_object(Bucket=self.config["bucket"], Key=key, ExpectedBucketOwner=self.config["account"])
         if head.get("ContentLength") != size or head.get("Metadata", {}).get("sha256") != checksum:
             raise InfrastructureError("raw archive HEAD differs from exact uploaded bytes")
+        # File inventories grow with the matrix. Keep bulk metadata out of the
+        # launcher's independently bounded, frequently polled control receipt.
+        inventory = s3_json(self.clients["s3"], self.config,
+                            self.config["prefix"] + "/results/controller-inventory.json", records)
         self.persist("receipt.json", {"schema_version": 2,
             "status": "completed" if report["complete"] and not error else "incomplete",
             "error": error, "key": key, "bytes": size, "sha256": checksum, "inventory": inventory,
