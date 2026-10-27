@@ -26,6 +26,7 @@ class CheckpointSourceAdmission(unittest.TestCase):
             shutil.copy2(path, helpers / path.name)
         shared = engine / 'experiments/resident_config.py'
         shutil.copy2(installed.parent / 'resident_config.py', shared)
+        shutil.copy2(installed.parent / 'portable_transport.py', shared.with_name('portable_transport.py'))
         support = engine / self.support_relative
         support.parent.mkdir(parents=True)
         support.write_text('"""Frozen standalone checkpoint helper."""\n')

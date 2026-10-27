@@ -86,9 +86,9 @@ def expected_cases(scope='full'):
             for s in plan(scope) for mode in s['modes']}
 
 
-def flags(spec, mode, external=False, prepare=False):
+def flags(spec, mode, external=False, prepare=False, transport_config=None):
     # Both revisions implement Busy/resident-first and the memory policy flags.
-    return transport_floor.flags(spec | {'build': 'current'}, mode, external, prepare)
+    return transport_floor.flags(spec, mode, external, prepare, transport_config)
 
 
 floor_flags = transport_floor.floor_flags
@@ -99,8 +99,9 @@ def source_identity(directory, label):
     manifest_path = directory / 'source-manifest.json'
     manifest = json.loads(manifest_path.read_text())
     prepare_bundle.validate_source_archive(directory / 'source.tar.gz', manifest)
-    if manifest.get('features') != 'experimental-fabric,test-utils':
-        raise ValueError('stage campaign requires both frozen fabric builds')
+    expected_features = 'experimental-fabric,test-utils'
+    if manifest.get('features') != expected_features:
+        raise ValueError('stage campaign requires source-bound fabric build features')
     with tarfile.open(directory / 'source.tar.gz') as archive:
         protocol = archive.extractfile('tidehunter/src/distributed/tcp.rs').read().decode()
     if re.findall(r'^const PROTOCOL: u32 = (\d+);$', protocol, re.M) != [str(PROTOCOLS[label])]:

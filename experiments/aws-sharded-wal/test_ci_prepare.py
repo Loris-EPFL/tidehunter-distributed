@@ -243,6 +243,8 @@ class FrozenSourceRestoreTests(unittest.TestCase):
                     shutil.copy2(path, target / path.name)
         shutil.copy2(ci_prepare.ROOT / 'experiments/resident_config.py',
                      engine / 'experiments/resident_config.py')
+        shutil.copy2(ci_prepare.ROOT / 'experiments/portable_transport.py',
+                     engine / 'experiments/portable_transport.py')
         identities = {}
         for owner in ('sui', 'tidehunter-sharded-wal'):
             base = sources / owner
@@ -307,7 +309,8 @@ class FrozenSourceRestoreTests(unittest.TestCase):
         result = dict(bindings, complete=True, binaries=manifest['binaries'],
             checkpoint_digest=ci_prepare.CHECKPOINT, checkpoint_limit=ci_prepare.TIP,
             source_range=source_range, fixture_files=fixture_files,
-            topology='five-process loopback', local_transport='fabric-tcp-native', audit=audit,
+            topology='five-process loopback', local_transport={'kind': 'ofi',
+                'fabric': {'backend': 'software-tcp'}, 'security': 'trusted'}, audit=audit,
             native={'completed_checkpoint_digest': ci_prepare.CHECKPOINT},
             remote={'completed_checkpoint_digest': ci_prepare.CHECKPOINT})
         ci_prepare.save(experiment / 'results.json', result)

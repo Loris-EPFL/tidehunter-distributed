@@ -15,6 +15,7 @@ import cluster_ram
 import efa_progress
 import scalar_transport
 from checkpoint_matrix import TRANSPORTS
+from portable_transport import transport_for_case
 
 BASELINE_SOURCE_SHA256 = '2e694cb0be9fe0738c217b75afb9fe0ba5d2eef170573bd95f092fa40e93dc57'
 BASELINE_BINARY_SHA256 = '7f692391ec6b6acbc5c12c31cb64878764c0ef96d98d82e1b0dfb6a67594db2c'
@@ -98,8 +99,8 @@ def expected_cases(scope='full'):
             for spec in plan(scope) for mode in spec['modes']}
 
 
-def flags(spec, mode, external=False, prepare=False):
-    result = cluster_ram.flags(spec | {'build': 'current'}, mode, external, prepare)
+def flags(spec, mode, external=False, prepare=False, transport_config=None):
+    result = cluster_ram.flags(spec, mode, external, prepare, transport_config)
     # External node policy belongs to prepared servers, not an
     # ignored coordinator flag. The old binary predates these two options.
     if spec['build'] == 'current' and (prepare or not external):
@@ -117,8 +118,10 @@ def subsuite_floor_spec(transport, instrumented):
                 idle_us=0, profile=instrumented)
 
 
-def floor_flags(spec):
-    return ['--transport', spec['transport'], '--polling', spec['polling'],
+def floor_flags(spec, transport_config=None):
+    transport_args = (['--transport-config', str(transport_config)] if transport_config is not None
+                      else ['--transport', spec['transport']])
+    return transport_args + ['--polling', spec['polling'],
             '--values', ','.join(map(str, spec['floor_values'])), '--samples', str(spec['samples']),
             '--repetitions', str(spec['floor_repetitions']), '--idle-us', str(spec['idle_us']),
             '--profile', str(spec['profile']).lower(), '--warmup', '64', '--shards', '5']
@@ -210,7 +213,8 @@ def validate_node_policy(root, spec, launch_text, partition):
     launch = yaml_one(launch_text)
     if launch['node']['partition']['partition'] != partition:
         raise ValueError('launch partition differs')
-    if launch['tls']['transport'] != spec['transport']:
+    expected_transport = transport_for_case(spec['transport']) if spec['build'] == 'current' else spec['transport']
+    if launch['tls']['transport'] != expected_transport:
         raise ValueError('launch transport differs')
     if (launch['node']['read_cache_bytes'] != spec['shard_cache']
             or launch['node']['read_memory_allowance_bytes'] != spec['shard_allowance']):
@@ -457,8 +461,13 @@ def read_cloud_case(root, name, spec, mode, profile=None):
     binary = str(base / 'cloud-bin' / spec['build'] / 'sharded_wal_bench')
     prep = audit.read_json(root / (spec['case_id'] + '-prepare.command.json'))
     endpoints = ','.join(n['private_ip'] + ':7700' for n in sorted(cfg['nodes'], key=lambda n: n['partition']))
+    transport_config = (case_root.parent / 'requested-configs' / spec['case_id'] / 'transport.json'
+                        if spec['build'] == 'current' else None)
     expected = [binary, '--prepare-external-case', str(case_root), '--guest-case-root', str(case_root),
-                '--remote-endpoints', endpoints] + profile.flags(spec, 'tcp', prepare=True)
+                '--remote-endpoints', endpoints] + profile.flags(
+                    spec, 'tcp', prepare=True, transport_config=transport_config)
+    if spec['build'] == 'current':
+        expected += ['--owner-transports', str(case_root.parent / 'requested-configs' / spec['case_id'] / 'owner-transports.json')]
     validate_command(prep, expected, receipt['binary_sha256'])
     if mode == 'recovery':
         for action in ('seed', 'reopen'):
@@ -467,20 +476,34 @@ def read_cloud_case(root, name, spec, mode, profile=None):
                 raise ValueError('recovery executable differs from frozen source')
         return audit.read_recovery_case(root, name, spec, audit.transport_floor)
     process = audit.read_json(root / (name + '-process.command.json'))
+    transport_config = (case_root.parent / 'requested-configs' / spec['case_id'] / 'transport.json'
+                        if spec['build'] == 'current' else None)
     if mode == 'floor':
         binary = str(base / 'cloud-bin' / spec['build'] / 'sharded_wal_transport_bench')
-        expected = [binary, '--output', str(base / 'results' / name), '--remote-config', str(case_root / 'remote.yaml')] + profile.floor_flags(spec)
+        transport_config = (case_root.parent / 'requested-configs' / spec['case_id'] / 'transport.json'
+                            if spec['build'] == 'current' else None)
+        expected = [binary, '--output', str(base / 'results' / name), '--remote-config',
+                    str(case_root / 'remote.yaml')] + profile.floor_flags(spec, transport_config)
         digest = receipt['floor_binary_sha256']
     else:
-        expected = [binary, '--output', str(base / 'results' / name), '--backend', mode] + profile.flags(spec, mode, external=mode == 'tcp')
+        command_backend = 'tcp' if mode == 'tcp' else mode
+        expected = [binary, '--output', str(base / 'results' / name), '--backend', command_backend]
+        expected += profile.flags(spec, mode, external=mode == 'tcp', transport_config=transport_config)
         if mode == 'tcp':
             expected += ['--remote-config', str(case_root / 'remote.yaml')]
         digest = receipt['binary_sha256']
     validate_command(process, expected, digest)
-    remote = yaml_one((root / (spec['case_id'] + '-remote.yaml')).read_text())
+    if spec['build'] == 'current':
+        remote = audit.validate_prepared_transport(root, spec['case_id'], spec['transport'], cfg['nodes'])
+    else:
+        documents = yaml_documents((root / (spec['case_id'] + '-remote.yaml')).read_text())
+        if len(documents) != 1:
+            raise ValueError('ambiguous prepared remote configuration')
+        remote = documents[0]
+    expected_transport = transport_for_case(spec['transport']) if spec['build'] == 'current' else spec['transport']
     if (remote['read_lanes'] != spec['lanes'] or remote['read_cache_bytes'] != spec['cache']
             or remote['read_memory_allowance_bytes'] != spec['read_allowance']
-            or remote['tls']['transport'] != spec['transport']
+            or remote['tls']['transport'] != expected_transport
             or remote['storage']['partitions'] != list(range(5))
             or sorted((n['partition'], n['address']) for n in remote['endpoints']) !=
             sorted((n['partition'], n['private_ip'] + ':7700') for n in cfg['nodes'])):

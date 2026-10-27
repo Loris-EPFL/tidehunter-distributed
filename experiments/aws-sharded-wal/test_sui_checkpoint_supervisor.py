@@ -12,7 +12,8 @@ import tempfile
 import unittest
 import sys
 from unittest.mock import Mock, patch
-
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from portable_transport import transport_for_case, select_transports
 import sui_checkpoint as supervisor
 import guest as kv_guest
 from ci_campaign import fresh_archive
@@ -66,7 +67,9 @@ def completed_node(transport='tcp', preflight_identity=False):
     common = {name: cfg[name] for name in ('run_id', 'account', 'region', 'instance_type', 'deadline_utc', 'bucket', 's3_prefix')}
     common.update(transport=transport, cell_id='r01-' + transport)
     root = cfg['run_root'] + '/checkpoint-cells/' + common['cell_id'] + '/storage'
-    cloud = dict(run_id=cfg['run_id'], cell_id=common['cell_id'], transport=transport, deadline_utc=cfg['deadline_utc'], root=root,
+    canonical = transport_for_case(transport)
+    cloud = dict(run_id=cfg['run_id'], cell_id=common['cell_id'], transport=transport,
+        client_transport=canonical, owner_transport=canonical, deadline_utc=cfg['deadline_utc'], root=root,
         storage_binary_sha256=cfg['binaries']['storage-node'], build_manifest_sha256=cfg['build_manifest_sha256'],
         config_sha256='c' * 64, checkpoint_digest=supervisor.CHECKPOINT,
         resource_path=root + '/resources.json', ready_path=root + '/ready', stop_path=root + '/stop',
@@ -81,7 +84,8 @@ def completed_node(transport='tcp', preflight_identity=False):
         reaped=True, exit_code=0, stdout=root + f'/cloud-node-logs/namespace-{i:02d}.stdout.log',
         stderr=root + f'/cloud-node-logs/namespace-{i:02d}.stderr.log') for i, command in enumerate(cloud['commands'])]
     receipt = {key: cloud[key] for key in ('run_id', 'root', 'deadline_utc', 'storage_binary_sha256',
-        'build_manifest_sha256', 'config_sha256', 'checkpoint_digest', 'cell_id', 'transport')}
+        'build_manifest_sha256', 'config_sha256', 'checkpoint_digest', 'cell_id', 'transport',
+        'client_transport', 'owner_transport')}
     receipt.update(node_config_sha256=hashlib.sha256(encoded(cloud)).hexdigest(), schema=1, owner_pid=99,
         started_unix_ns=100, finished_unix_ns=500, started_unix=100 / 1e9, finished_unix=500 / 1e9,
         ready=True, complete=True, failure=None, cleanup_complete=True, stop_reason='controller_stop',
@@ -132,6 +136,7 @@ class RunnerHelperAdmissionTests(unittest.TestCase):
                 ('experiments/aws-sharded-wal/sui_checkpoint.py', (current / 'sui_checkpoint.py').read_bytes()),
                 ('experiments/aws-sharded-wal/guest.py', (current / 'guest.py').read_bytes()),
                 ('experiments/resident_config.py', (current.parent / 'resident_config.py').read_bytes()),
+                ('experiments/portable_transport.py', (current.parent / 'portable_transport.py').read_bytes()),
                 ('experiments/aws-sharded-wal/test_not_a_runtime_helper.py', b'not installed\n')):
             path = engine / relative
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -157,7 +162,7 @@ class RunnerHelperAdmissionTests(unittest.TestCase):
                              records['experiments/resident_config.py']['sha256'])
             supervisor.validate_runner_helpers(installed, records)
             self.assertEqual({path.name for path in installed.iterdir()},
-                             {'sui_checkpoint.py', 'guest.py', 'resident_config.py'})
+                             {'sui_checkpoint.py', 'guest.py', 'resident_config.py', 'portable_transport.py'})
 
     def test_actual_archives_reject_missing_unknown_changed_and_symlink_helpers(self):
         for change in ('missing_shared', 'missing_runtime', 'unknown', 'changed_shared', 'changed_runtime', 'symlink'):
@@ -254,7 +259,7 @@ class RunnerHelperAdmissionTests(unittest.TestCase):
                     supervisor.assemble_runner(source, destination, records)
                     supervisor.validate_runner_helpers(destination, records)
                     self.assertEqual({path.name for path in destination.iterdir()},
-                                     {'sui_checkpoint.py', 'guest.py', 'resident_config.py'})
+                                     {'sui_checkpoint.py', 'guest.py', 'resident_config.py', 'portable_transport.py'})
                 else:
                     with self.assertRaises(ValueError):
                         supervisor.assemble_runner(source, destination, records)
@@ -604,7 +609,9 @@ class PreparedResidentPolicyTests(unittest.TestCase):
             self.assertEqual(campaign.external['resident_reads'], profile)
             prepared = supervisor.read_json(campaign.deployment / 'config.json')
             for database in prepared['databases'].values():
-                self.assertEqual(database['tls']['resident_reads'], profile)
+                self.assertEqual(database['tls']['transport'], transport_for_case(campaign.cell['transport']))
+            self.assertEqual(campaign.external['owner_transports'], select_transports(
+                transport_for_case(campaign.cell['transport']), None, 5))
             self.assertEqual(len(uploads), 5)
             for archive in uploads:
                 with tarfile.open(archive) as stream:
@@ -612,8 +619,8 @@ class PreparedResidentPolicyTests(unittest.TestCase):
                     self.assertEqual(len(launches), 1)
                     with stream.extractfile(launches[0]) as source:
                         launch = yaml.safe_load(source)
-                    self.assertEqual(launch['node']['resident_reads'], profile)
-                    self.assertEqual(launch['tls']['transport'], 'efa-native')
+                    self.assertEqual(launch['tls']['transport'],
+                                     transport_for_case(campaign.cell['transport']))
                     self.assertEqual(launch['tls']['cert'], '')
 
     def test_tcp_storage_artifacts_contain_the_same_complete_source_bound_worker_runner(self):
@@ -630,6 +637,8 @@ class PreparedResidentPolicyTests(unittest.TestCase):
                 supervisor.validate_runner_helpers(runner, records)
                 self.assertEqual(supervisor.sha(runner / 'resident_config.py'),
                                  records['experiments/resident_config.py']['sha256'])
+                self.assertEqual(supervisor.sha(runner / 'portable_transport.py'),
+                                 records['experiments/portable_transport.py']['sha256'])
                 self.assertFalse(any(path.name.startswith('test_') for path in runner.iterdir()))
                 self.assertEqual(supervisor.sha(installed / 'cloud_node.py'),
                                  records['experiments/sui-checkpoint/cloud_node.py']['sha256'])
@@ -686,7 +695,7 @@ class PreparedResidentPolicyTests(unittest.TestCase):
             self.assertNotIn('resident_reads', campaign.cell)
             prepared = supervisor.read_json(campaign.deployment / 'config.json')
             database = next(iter(prepared['databases'].values()))
-            self.assertEqual(database['tls']['transport'], 'tcp')
+            self.assertEqual(database['tls']['transport'], transport_for_case('tcp'))
             self.assertNotIn('resident_reads', database['tls'])
             self.assertTrue(all(database['tls'][name] for name in ('ca', 'cert', 'key')))
             for archive in uploads:
@@ -697,7 +706,7 @@ class PreparedResidentPolicyTests(unittest.TestCase):
                     with stream.extractfile(launch_name) as source:
                         launch = yaml.safe_load(source)
                     self.assertNotIn('resident_reads', launch['node'])
-                    self.assertEqual(launch['tls']['transport'], 'tcp')
+                    self.assertEqual(launch['tls']['transport'], transport_for_case('tcp'))
             self.assertEqual(campaign.external['resident_reads'], supervisor.resident_read_config())
             changed = copy.deepcopy(prepared)
             next(iter(changed['databases'].values()))['tls']['resident_reads'] = resident_profile()

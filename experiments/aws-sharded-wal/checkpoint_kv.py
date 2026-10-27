@@ -18,6 +18,7 @@ import raw_rma_floor
 
 from checkpoint_matrix import efa_snapshot, efa_proof, validate_efa_proof, validate_provider
 from checkpoint_matrix import fabric_local_log, fabric_local_archive_log
+from portable_transport import transport_for_case
 from checkpoint_matrix import HARDWARE_TRANSPORTS, DIRECT_TRANSPORTS, TRANSPORT_BACKENDS
 from guest import (Campaign, upload, write_json, sha, benchmark_case_identity,
                    kv_case_commands, kv_case_policy, resident_read_config)
@@ -200,7 +201,7 @@ def comparison_identity(directory, spec, mode, cfg):
                     (directory / 'campaign.txt').read_text().splitlines() if '=' in line)
     process = json.loads((directory.parent / (directory.name + '-process.command.json')).read_text())
     prepare, commands = kv_case_commands(cfg, spec)
-    remote, owners = kv_case_policy(cfg, spec)
+    remote, owners, owner_transports = kv_case_policy(cfg, spec)
     required = ('load_batches', 'mixed_batches', 'point_reads', 'read_query_algorithm',
                 'read_query_seed', 'read_query_order', 'read_prepared_state',
                 'wal_fragment_bytes', 'wal_file_bytes', 'wal_group_max_batches',
@@ -239,6 +240,13 @@ def comparison_identity(directory, spec, mode, cfg):
     case_id = directory.name.removesuffix('-' + mode)
     preparation_path = directory.parent / (case_id + '-prepare.command.json')
     deployment_path = directory.parent / (case_id + '-remote.yaml')
+    observed_client_transport = None
+    observed_owner_transports = []
+    owner_transport_sha256 = None
+    requested_transport_sha256 = None
+    requested_owner_transports_sha256 = None
+    owner_transport_path = directory.parent / (case_id + '-owner-transports.json')
+    observed_launch_sha256 = {}
     if not preparation_path.is_file() or not deployment_path.is_file():
         missing.append('observed_preparation_and_deployment_binding')
     else:
@@ -249,13 +257,70 @@ def comparison_identity(directory, spec, mode, cfg):
         deployment = transport_floor.yaml_documents(deployment_path.read_text())
         if len(deployment) != 1:
             raise ValueError('ambiguous comparison deployment')
-        require_kv_policy(deployment[0], remote)
+        observed_remote = deployment[0]
+        require_kv_policy(observed_remote, remote)
+        observed_client_transport = observed_remote.get('tls', {}).get('transport')
+        if mode == 'tcp':
+            requested_transport_path = directory.parent / (case_id + '-transport-config.json')
+            requested_owners_path = directory.parent / (case_id + '-owner-transports-requested.json')
+            if not requested_transport_path.is_file() or not requested_owners_path.is_file():
+                missing.append('requested_transport_configs_missing')
+            else:
+                requested_transport_sha256 = sha(requested_transport_path)
+                requested_owner_transports_sha256 = sha(requested_owners_path)
+                requested_transport = json.loads(requested_transport_path.read_text())
+                requested_owners = json.loads(requested_owners_path.read_text())
+                if (requested_transport != transport_for_case(spec['transport'])
+                        or requested_transport != observed_client_transport):
+                    missing.append('requested_client_transport_differs_from_deployment')
+                if requested_owners != owner_transports:
+                    missing.append('requested_owner_transport_vector_differs_from_policy')
+        if mode == 'tcp':
+            for node in sorted(cfg['nodes'], key=lambda item: item['partition']):
+                launch_path = directory.parent / (case_id + f"-node-{node['partition']}-launch.yaml")
+                if not launch_path.is_file():
+                    missing.append(f"prepared_owner_transport_{node['partition']}_missing")
+                    continue
+                observed_launch_sha256[str(node['partition'])] = sha(launch_path)
+                launch = transport_floor.yaml_documents(launch_path.read_text())
+                if len(launch) != 1:
+                    raise ValueError('ambiguous prepared owner launch')
+                actual = launch[0].get('tls', {}).get('transport')
+                observed_owner_transports.append(actual)
+            if not owner_transport_path.is_file():
+                missing.append('prepared_owner_transport_vector_missing')
+            else:
+                owner_transport_sha256 = sha(owner_transport_path)
+                prepared_vector = json.loads(owner_transport_path.read_text())
+                if prepared_vector != observed_owner_transports:
+                    missing.append('prepared_owner_transport_vector_differs_from_launches')
+            if (requested_transport_sha256 is not None and requested_owner_transports_sha256 is not None
+                    and owner_transport_sha256 is not None
+                    and len(observed_launch_sha256) == len(cfg['nodes'])):
+                transport_receipt_path = directory.parent / (case_id + '-prepared-transports.json')
+                if not transport_receipt_path.is_file():
+                    missing.append('prepared_transport_hash_receipt_missing')
+                else:
+                    expected_receipt = dict(schema=1,
+                        requested_transport_sha256=requested_transport_sha256,
+                        requested_owner_transports_sha256=requested_owner_transports_sha256,
+                        owner_transports_sha256=owner_transport_sha256,
+                        launch_sha256=observed_launch_sha256)
+                    if json.loads(transport_receipt_path.read_text()) != expected_receipt:
+                        missing.append('prepared_transport_hash_receipt_differs_from_artifacts')
+            if observed_owner_transports != owner_transports:
+                missing.append('structured_owner_transport_binding')
     identity = dict(schema=1, qualified=not missing, missing=missing,
         implementation=dict(binary_sha256=binary, source_archive_sha256=source),
+        preparation=dict(owner_transports_sha256=owner_transport_sha256,
+            requested_transport_sha256=requested_transport_sha256,
+            requested_owner_transports_sha256=requested_owner_transports_sha256),
         transport=dict(name=spec['transport'] if mode == 'tcp' else 'native',
             security='unauthenticated-native' if spec['transport'] in
             ('efa-native', 'fabric-tcp-native') and mode == 'tcp' else
             'tls' if mode == 'tcp' else 'local',
+            client=observed_client_transport,
+            owner_transports=observed_owner_transports if mode == 'tcp' else [],
             one_sided=metadata.get('one_sided_wal_reads'), build_features=metadata.get('build_features')),
         clocks=dict(detailed=spec['diagnostics']))
     if missing:
@@ -352,6 +417,7 @@ def comparison_identity(directory, spec, mode, cfg):
         registration_profile=observed_rma)
     identity['preparation'] = dict(chunk_batches=spec.get('preparation_chunk_batches', 16),
         workers=remote['preparation_workers'], scan_prefetch_pages=remote['scan_prefetch_pages'],
+        owner_transports_sha256=owner_transport_sha256,
         layout={key: int(metadata[key]) for key in required[7:11]},
         registered_hot_policy=warm_policy,
         registered_hot_state=('qualified_all_lane_hit_only' if controls.get('qualified') else 'mixed_or_invalid')
@@ -1912,7 +1978,7 @@ def validate_auxiliary(root, state, cfg):
         command = [str(base / 'cloud-bin/current/sharded_wal_transport_bench'),
                    '--output', str(base / 'checkpoint-results/kv' / output),
                    '--remote-config', str(base / 'cases' / case_id / 'remote.yaml')]
-        command += transport_floor.floor_flags(spec)
+        command += transport_floor.floor_flags(spec, base / 'cases' / 'requested-configs' / case_id / 'transport.json')
         if (process.get('exit_code') != 0 or process.get('binary_sha256') != cfg['binaries']['transport-floor']
                 or not math.isfinite(process.get('elapsed_seconds', float('nan')))
                 or process['elapsed_seconds'] <= 0 or process.get('command') != command):
@@ -2127,7 +2193,7 @@ def main(argv=None):
         result = []
         for spec in plan(cfg['kv_suite'], cfg['transports']):
             prepare, commands = kv_case_commands(cfg, spec)
-            remote, owners = kv_case_policy(cfg, spec)
+            remote, owners, owner_transports = kv_case_policy(cfg, spec)
             value, batch, _ = spec['shape']
             batches = int(prepare[prepare.index('--batches') + 1])
             workload = dict(loaded_batches=batches, loaded_keys=batches * batch,
@@ -2137,6 +2203,7 @@ def main(argv=None):
             result.append(dict(specification=spec, prepare=prepare, commands=commands,
                                qualified=False, qualification='planned_not_observed',
                                expected_workload=workload, expected_remote_policy=remote,
+                               expected_owner_transports=owner_transports,
                                expected_owner_policies=owners,
                                source_archive_sha256=cfg.get('source_archive_sha256'),
                                binary_sha256=cfg.get('binaries', {}).get('storage-node')))

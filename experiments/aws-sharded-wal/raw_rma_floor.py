@@ -25,6 +25,7 @@ import uuid
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from portable_transport import transport_for_case
 from resident_config import software_fabric_environment
 
 PAYLOADS = (256, 8192)
@@ -101,14 +102,21 @@ def owned_port(cfg, payload_bytes):
              if not base <= port <= base + 615]
     return ports[PAYLOADS.index(payload_bytes)]
 
+def fabric_config_for_case(label, domain):
+    return transport_for_case(label)['fabric'] | {'domain': domain, 'source_address': None}
+
 
 def command(binary, role, address, payload, domain, output, *, software=False,
             samples=SAMPLES, warmup=WARMUP, deadline_ms=PROBE_MS):
+    label = 'fabric-tcp' if software else 'efa-direct'
+    fabric_config = fabric_config_for_case(label, domain)
+    config_path = Path(output).with_suffix('.fabric.json')
+    config_path.write_text(json.dumps(fabric_config, indent=2) + '\n')
+    require_device_read = not software
     return [str(binary), '--rma-probe', '--role', role,
             '--listen' if role == 'server' else '--connect', address,
-            '--provider', 'tcp;ofi_rxm' if software else 'efa', '--domain', domain,
-            '--software-tcp' if software else '--efa-direct', '--bytes', str(payload),
-            '--samples', str(samples), '--warmup', str(warmup),
+            '--fabric-config', str(config_path), '--require-device-read', str(require_device_read).lower(),
+            '--bytes', str(payload), '--samples', str(samples), '--warmup', str(warmup),
             '--deadline-ms', str(deadline_ms), '--polling', 'busy',
             '--detailed-steps', '--output', str(output)]
 
@@ -121,6 +129,9 @@ def nonnegative(value, label):
 
 def validate_reports(client, server, expected, *, software=False):
     """Consume complete producer JSON; never synthesize CQ/RPC/RSS clocks."""
+    for report in (client, server):
+        if not isinstance(report, dict) or report.get('benchmark') != 'raw_provider_fi_read_floor':
+            raise ValueError('raw RMA benchmark identity differs')
     payload, count, warmup = (expected[key] for key in ('payload', 'samples', 'warmup'))
     fabric = 'tcp;ofi_rxm_explicit_software' if software else 'efa-direct'
     provider = 'tcp;ofi_rxm' if software else 'efa'
@@ -131,6 +142,39 @@ def validate_reports(client, server, expected, *, software=False):
         warmup_completed=warmup, clean_samples_completed=count,
         registered_region_bytes=payload + 24, deadline_ms=expected['deadline_ms'], polling='busy_spin')
     for role, report in (('client', client), ('server', server)):
+        actual_config = expected.get(role + '_fabric_config')
+        if not isinstance(actual_config, dict):
+            raise ValueError(f'raw RMA {role} request metadata is incomplete')
+        if (report.get('fabric_config') != actual_config
+                or report.get('require_device_read') is not expected['require_device_read']):
+            raise ValueError(f'raw RMA {role} request metadata differs')
+        provider_info = report.get('provider_info')
+        if not isinstance(provider_info, dict) or not provider_info:
+            raise ValueError(f'raw RMA {role} actual provider metadata missing')
+        required_info = ('backend', 'provider', 'fabric', 'domain', 'source_address', 'device',
+                         'driver', 'bus_address', 'rma_capabilities', 'capability_evidence')
+        if any(key not in provider_info for key in required_info):
+            raise ValueError(f'raw RMA {role} provider metadata is incomplete')
+        fabric_config = actual_config
+        if (provider_info['backend'] != fabric_config['backend']
+                or provider_info['domain'] != fabric_config.get('domain')
+                or (fabric_config.get('source_address') is not None
+                    and provider_info['source_address'] != fabric_config['source_address'])):
+            raise ValueError(f'raw RMA {role} actual provider selection differs')
+        expected_provider = 'tcp;ofi_rxm' if software else 'efa'
+        if (provider_info['provider'] != expected_provider
+                or not isinstance(provider_info['provider'], str) or not provider_info['provider']
+                or not isinstance(provider_info['fabric'], str) or not provider_info['fabric']
+                or not isinstance(provider_info['capability_evidence'], str)
+                or not provider_info['capability_evidence']):
+            raise ValueError(f'raw RMA {role} lacks requested provider/capability evidence')
+        rma = provider_info['rma_capabilities']
+        read_mode = rma.get('read_mode') if isinstance(rma, dict) else None
+        if (read_mode not in ('native', 'emulated', 'unknown')
+                or (expected['require_device_read'] and read_mode != 'native')
+                or (software and read_mode == 'native')
+                or nonnegative(rma.get('max_read_bytes'), 'provider_info.max_read_bytes') < payload + 24):
+            raise ValueError(f'raw RMA {role} provider metadata does not attest the requested read policy')
         for key, value in dict(common, role=role, domain=expected[role + '_domain']).items():
             if report.get(key) != value or type(report.get(key)) is not type(value):
                 raise ValueError(f'raw RMA {role} mismatched {key}')
@@ -138,7 +182,7 @@ def validate_reports(client, server, expected, *, software=False):
             raise ValueError('missing actual raw RMA CPU affinity')
         caps = report.get('capabilities', {})
         required = dict(provider=provider, domain=expected[role + '_domain'],
-            read_mode='emulated' if software else 'native',
+            read_mode=read_mode,
             efa_direct_requested=not software, software_provider_explicit=software)
         for key, value in required.items():
             if caps.get(key) != value or type(caps.get(key)) is not type(value):
@@ -146,6 +190,9 @@ def validate_reports(client, server, expected, *, software=False):
         if (caps.get('address_mode') not in ('virtual', 'offset') or
                 nonnegative(caps.get('max_read_bytes'), 'max_read_bytes') < payload + 24):
             raise ValueError('raw RMA registration/read capability differs')
+        if (caps.get('read_mode') != read_mode
+                or caps.get('max_read_bytes') != rma.get('max_read_bytes')):
+            raise ValueError('raw RMA capability summary disagrees with selected provider metadata')
         details = report.get('detailed_steps_ns')
         if not isinstance(details, list) or not details:
             raise ValueError('raw RMA setup/drain evidence missing')
@@ -496,8 +543,11 @@ def validate_case(case, payload, client_domain):
     if (process.get('exit_code') != 0 or type(process.get('exit_code')) is not int or
             process.get('binary_sha256') != payload['binary_sha256'] or process.get('command') != client_args):
         raise ValueError('raw RMA client command/exit provenance differs')
+    client_fabric = fabric_config_for_case('efa-direct', client_domain)
+    server_fabric = fabric_config_for_case('efa-direct', ready['domain'])
     expected = dict(payload=payload['payload'], samples=payload['samples'], warmup=payload['warmup'],
-        deadline_ms=payload['deadline_ms'], client_domain=client_domain, server_domain=ready['domain'])
+        deadline_ms=payload['deadline_ms'], client_domain=client_domain, server_domain=ready['domain'],
+        client_fabric_config=client_fabric, server_fabric_config=server_fabric, require_device_read=True)
     return expected, validate_reports(client['client.json'], captured['server.json'], expected)
 
 
@@ -707,8 +757,11 @@ def local_software(binary, output, *, samples=SAMPLES, warmup=WARMUP, deadline_m
                 environment={key: value for key, value in environment.items() if key.startswith('FI_')},
                 exits=[child.returncode for child in processes], cleanup_complete=all(
                     child.poll() is not None for child in processes)))
+        client_fabric = fabric_config_for_case('fabric-tcp', 'lo')
+        server_fabric = fabric_config_for_case('fabric-tcp', 'lo')
         expected = dict(payload=payload, samples=samples, warmup=warmup, deadline_ms=deadline_ms,
-                        client_domain='lo', server_domain='lo')
+                        client_domain='lo', server_domain='lo', client_fabric_config=client_fabric,
+                        server_fabric_config=server_fabric, require_device_read=False)
         results.append(validate_reports(document(case / 'client.json'), document(case / 'server.json'), expected, software=True))
     document(output / 'receipt.json', dict(complete=True, hardware=False, binary_sha256=binary_hash,
         environment={key: value for key, value in environment.items() if key.startswith('FI_')}, cases=results))

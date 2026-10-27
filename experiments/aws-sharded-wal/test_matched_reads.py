@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import checkpoint_kv as kv
 from guest import benchmark_case_identity, kv_case_commands
+from portable_transport import transport_for_case, write_transport_config
 
 
 class MatchedReads(unittest.TestCase):
@@ -21,6 +22,23 @@ class MatchedReads(unittest.TestCase):
                     instance_type='fixture-host', placement_group='fixture-cluster',
                     nodes=[dict(partition=p, private_ip=f'10.0.1.{p + 1}') for p in range(5)])
 
+    def test_current_kv_commands_use_canonical_transport_and_example_selector(self):
+        with tempfile.TemporaryDirectory() as root:
+            spec = self.specimen() | dict(transport='efa')
+            prepare, commands = kv_case_commands(self.config() | {'run_root': root}, spec)
+            config_path = Path(commands['tcp'][commands['tcp'].index('--transport-config') + 1])
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            write_transport_config(config_path, transport_for_case(spec['transport']))
+            self.assertEqual(json.loads(config_path.read_text()), {
+                'kind': 'ofi', 'fabric': {'backend': 'efa'}, 'security': 'mutual-tls'})
+            self.assertEqual(commands['tcp'][commands['tcp'].index('--backend') + 1], 'tcp')
+            self.assertEqual(prepare[prepare.index('--transport-config') + 1], str(config_path))
+            self.assertIn('--owner-transports', prepare)
+            remote, owners, owner_transports = kv.kv_case_policy(self.config() | {'run_root': root}, spec)
+            self.assertEqual(owner_transports, [remote['tls']['transport']] * 5)
+            self.assertEqual(remote['tls']['transport'], json.loads(config_path.read_text()))
+            self.assertTrue(all(owner['tls']['transport'] == remote['tls']['transport']
+                                for owner in owners.values()))
     def resident_limits(self):
         return dict(source_bytes=4 * 1024**2, source_regions=512,
             destination_bytes=20 * 1024**2, destination_slots=640, max_read_bytes=32768,
@@ -47,7 +65,7 @@ class MatchedReads(unittest.TestCase):
             'wal_group_max_batches=32\nwal_group_encoded_bytes=1048568\none_sided_wal_reads=false\n'
             'target_os=linux\ntarget_arch=x86_64\nread_cpu_affinity=0-7\nread_numa_affinity=0\n'
             'read_placement_policy=kernel-scheduled-inherited-affinity\n'
-            'build_features=experimental-fabric:true,test-utils:true\ntopology=explicit_external_tcp_nodes\n'
+            'build_features=fabric:true,test-utils:true\ntopology=explicit_external_tcp_nodes\n'
             'native_read_cache_bytes=0\n'
             'registered_hot_policy={"enabled":false,"hot_keys":32,"scalar_reads":512,"group_width":32,"group_calls":16,"read_lanes":2,"max_warm_passes":5,"required_steady_passes":2,"scalar_order":"mix64-v1(sample)%32","group_order":"unique-prefix-keys-0-through-31","preparation":"post-load-before-other-reads;exact-scalar-then-group-sequence"}\n'
             'rma_config={"source_bytes":0,"source_regions":0,"destination_bytes":0,"destination_slots":0,"max_read_bytes":0,"max_handles":0,"require_device_read":false}\n')
@@ -71,8 +89,23 @@ class MatchedReads(unittest.TestCase):
         case_id = directory.name.removesuffix('-' + mode)
         (directory.parent / (case_id + '-prepare.command.json')).write_text(json.dumps(
             dict(exit_code=0, binary_sha256='b' * 64, command=prepare)))
-        remote, _ = kv.kv_case_policy(cfg, spec)
+        remote, owners, owner_transports = kv.kv_case_policy(cfg, spec)
         (directory.parent / (case_id + '-remote.yaml')).write_text(json.dumps(remote))
+        client_path = directory.parent / (case_id + '-transport-config.json')
+        write_transport_config(client_path, transport_for_case(spec['transport']))
+        requested_owners_path = directory.parent / (case_id + '-owner-transports-requested.json')
+        requested_owners_path.write_text(json.dumps(owner_transports))
+        owner_path = directory.parent / (case_id + '-owner-transports.json')
+        owner_path.write_text(json.dumps(owner_transports))
+        launch_hashes = {}
+        for partition, owner in owners.items():
+            launch_path = directory.parent / (case_id + f'-node-{partition}-launch.yaml')
+            launch_path.write_text(json.dumps({'tls': {'transport': owner['tls']['transport']}}))
+            launch_hashes[str(partition)] = kv.sha(launch_path)
+        (directory.parent / (case_id + '-prepared-transports.json')).write_text(json.dumps(dict(
+            schema=1, requested_transport_sha256=kv.sha(client_path),
+            requested_owner_transports_sha256=kv.sha(requested_owners_path),
+            owner_transports_sha256=kv.sha(owner_path), launch_sha256=launch_hashes)))
         with (directory / 'summary.csv').open('w') as stream:
             writer = csv.DictWriter(stream, fieldnames=['phase', 'logical_operations', 'value_bytes', 'batch_size', 'samples'])
             writer.writeheader()
@@ -207,7 +240,8 @@ class MatchedReads(unittest.TestCase):
         self.assertNotIn('--rma-source-bytes', commands['native-sync'])
         # The client consumes the source-bound prepared YAML; no ignored CLI owner override.
         self.assertNotIn('--rma-source-bytes', commands['tcp'])
-        remote, owners = kv.kv_case_policy(self.config(), spec)
+        remote, owners, owner_transports = kv.kv_case_policy(self.config(), spec)
+        self.assertEqual(owner_transports, [remote['tls']['transport']] * 5)
         self.assertEqual(remote['tls']['resident_reads'], config)
         self.assertTrue(all(owner['node']['resident_reads'] == config for owner in owners.values()))
         with self.assertRaises(ValueError):
@@ -555,6 +589,24 @@ class MatchedReads(unittest.TestCase):
                 path.write_text(json.dumps(deployment))
                 with self.assertRaisesRegex(ValueError, 'effective KV policy'):
                     kv.comparison_identity(directory, spec, 'tcp', cfg)
+    def test_prepared_owner_transport_sidecar_and_launches_are_observed_evidence(self):
+        for changed in ('launch', 'sidecar'):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as root:
+                directory, spec, cfg = self.observed(root)
+                case_id = directory.name.removesuffix('-tcp')
+                if changed == 'launch':
+                    path = directory.parent / (case_id + '-node-0-launch.yaml')
+                    path.write_text(json.dumps({'tls': {'transport': {
+                        'kind': 'ofi', 'fabric': {'backend': 'efa'}, 'security': 'mutual-tls'}}}))
+                else:
+                    path = directory.parent / (case_id + '-owner-transports.json')
+                    vector = json.loads(path.read_text())
+                    vector[0] = {'kind': 'ofi', 'fabric': {'backend': 'efa'}, 'security': 'mutual-tls'}
+                    path.write_text(json.dumps(vector))
+                identity = kv.comparison_identity(directory, spec, 'tcp', cfg)
+                self.assertFalse(identity['qualified'])
+                self.assertTrue(any('owner_transport' in missing
+                                    for missing in identity['missing']))
 
     def test_rpc_messages_prevent_registered_hit_only_misclassification(self):
         with tempfile.TemporaryDirectory() as root:

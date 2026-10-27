@@ -22,10 +22,10 @@ import subprocess
 import tarfile
 import time
 import sys
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from portable_transport import (transport_for_case, is_trusted,
+                                select_transports, write_transport_config)
 from resident_config import resident_read_config
-
 import efa_progress
 import checkpoint_async
 import cluster_ram
@@ -112,6 +112,10 @@ def kv_case_commands(cfg, spec):
         resident_reads=spec.get('resident_reads'), bounded_hot_reads=spec.get('bounded_hot_reads'),
         cold_single_probes=spec.get('cold_single_probes'), cold_group_probes=spec.get('cold_group_probes'))
     case_root = root / 'cases' / case_id
+    transport = transport_for_case(spec['transport'])
+    requested_root = case_root.parent / 'requested-configs' / case_id
+    transport_path = str(requested_root / 'transport.json')
+    owner_transports_path = str(requested_root / 'owner-transports.json')
     binary = str(root / 'cloud-bin/current/sharded_wal_bench')
     value, batch, window = spec['shape']
     batches = 512 if spec['authority_resident_batches'] is not None else 320
@@ -129,14 +133,15 @@ def kv_case_commands(cfg, spec):
                          for node in sorted(cfg['nodes'], key=lambda node: node['partition']))
     prepare = [binary, '--prepare-external-case', str(case_root), '--guest-case-root', str(case_root),
                '--remote-endpoints', endpoints, '--tcp-read-cache-bytes', str(cache_bytes),
-               '--transport', spec['transport'], '--tcp-server-read-workers', '2',
-               '--tcp-wal-member-read', 'async', '--tcp-resident-first', 'true',
-               '--tcp-polling', 'adaptive', '--tcp-shard-cache-bytes', str(spec.get('shard_cache_bytes', 0))]
+               '--transport-config', transport_path, '--owner-transports', owner_transports_path,
+               '--tcp-server-read-workers', '2', '--tcp-wal-member-read', 'async',
+               '--tcp-resident-first', 'true', '--tcp-polling', 'adaptive',
+               '--tcp-shard-cache-bytes', str(spec.get('shard_cache_bytes', 0))]
     prepare += shape_args
     resident = resident_read_config(spec.get('resident_reads'))
     if resident != resident_read_config():
-        if spec['cold'] or spec['transport'] not in ('efa-native', 'fabric-tcp-native'):
-            raise ValueError('resident KV reads require trusted-native fabric and are disabled for cold controls')
+        if spec['cold'] or not is_trusted(transport):
+            raise ValueError('resident KV reads require trusted fabric and are disabled for cold controls')
         prepare += ['--backend', 'tcp']
         for field, value in resident.items():
             prepare += ['--rma-' + field.replace('_', '-'),
@@ -144,8 +149,8 @@ def kv_case_commands(cfg, spec):
     commands = {}
     for mode in ('native-sync', 'tcp'):
         output = root / 'checkpoint-results/kv' / (case_id + '-' + mode)
-        command = [binary, '--output', str(output), '--backend', mode] + shape_args
-        command += ['--read-resource-evidence', 'true']
+        command_backend = 'tcp' if mode == 'tcp' else mode
+        command = [binary, '--output', str(output), '--backend', command_backend] + shape_args
         if not spec['cold'] and (resident['destination_slots'] or spec.get('bounded_hot_reads') is not None):
             # The Native reference shares preparation/samples, never RMA flags.
             command += ['--bounded-hot-pass', 'true']
@@ -173,7 +178,7 @@ def kv_case_commands(cfg, spec):
         if mode == 'tcp':
             command += ['--remote-config', str(case_root / 'remote.yaml'),
                         '--tcp-read-cache-bytes', str(cache_bytes),
-                        '--transport', spec['transport'], '--tcp-preparation-chunk-batches',
+                        '--transport-config', transport_path, '--tcp-preparation-chunk-batches',
                         str(spec.get('preparation_chunk_batches', 16))]
         commands[mode] = command
     return prepare, commands
@@ -203,22 +208,24 @@ def kv_case_policy(cfg, spec):
     batch_limits = dict(max_operations=32, max_encoded_bytes=320 * 1024)
     common_partition = geometry | dict(batch_limits=batch_limits, max_reference_metadata_bytes=16 * 1024**2)
     case_root = Path(arguments['--guest-case-root'])
+    transport = transport_for_case(spec['transport'])
+    owner_transports = select_transports(transport, None, len(cfg['nodes']))
     resident_reads = resident_read_config(spec.get('resident_reads'))
-    def tls(identity, server_name):
-        if arguments['--transport'] in ('efa-native', 'fabric-tcp-native'):
-            return dict(transport=arguments['--transport'], ca='', cert='', key='',
-                        server_name=server_name, resident_reads=resident_reads)
-        return dict(transport=arguments['--transport'], ca=str(case_root / 'tls/ca.der'),
+    def tls(identity, server_name, selected):
+        base = dict(transport=selected, server_name=server_name, resident_reads=resident_reads)
+        if is_trusted(selected):
+            return base | dict(ca='', cert='', key='')
+        return base | dict(ca=str(case_root / 'tls/ca.der'),
                     cert=str(case_root / 'tls' / (identity + '.der')),
-                    key=str(case_root / 'tls' / (identity + '.pk8')), server_name=server_name,
-                    resident_reads=resident_reads)
+                    key=str(case_root / 'tls' / (identity + '.pk8')))
     remote = dict(
         storage=common_partition | dict(database=[42] * 16, partitions=partitions,
             max_batches_per_partition=resident, max_epochs=4),
         endpoints=[dict(partition=node['partition'], address=node['private_ip'] + ':7700',
                         server_name=f"tidehunter-node-{node['partition']}")
                    for node in sorted(cfg['nodes'], key=lambda node: node['partition'])],
-        tls=tls('tidehunter-authority', 'unused-client-template'), timeout=dict(secs=10, nanos=0),
+        tls=tls('tidehunter-authority', 'unused-client-template', transport),
+        timeout=dict(secs=10, nanos=0),
         max_admitted_batches=lifetime, max_index_bytes=128 * 1024**2,
         max_pending_batches=128, max_pending_bytes=64 * 1024**2, pipelined_writes=True,
         read_cache_bytes=int(arguments['--tcp-read-cache-bytes']),
@@ -230,7 +237,7 @@ def kv_case_policy(cfg, spec):
         config=dict(disable_unload=False, max_dirty_keys=None, l0_max_entries=None, bloom_filter=None,
                     value_cache_size=0, index_format='Header', unloaded_iterator=True), destroyed=False))])
     owners = {}
-    for node in cfg['nodes']:
+    for owner_index, node in enumerate(sorted(cfg['nodes'], key=lambda node: node['partition'])):
         partition = node['partition']
         node_root = case_root / f'node-{partition}'
         owners[partition] = dict(
@@ -244,13 +251,13 @@ def kv_case_policy(cfg, spec):
                 read_memory_allowance_bytes=512 * 1024**2, read_max_inflight_requests=32,
                 read_max_inflight_bytes=64 * 1024**2, read_max_device_reads=128,
                 resident_reads=resident_reads),
-            tls=tls(f'tidehunter-node-{partition}', f'tidehunter-node-{partition}'),
+            tls=tls(f'tidehunter-node-{partition}', f'tidehunter-node-{partition}', owner_transports[owner_index]),
             limits=dict(max_frame_bytes=16 * 1024**2, max_connections=16, max_reads=256,
                         recovery_page_batches=128, io_timeout=dict(secs=60, nanos=0),
                         polling=arguments['--tcp-polling']),
             listen=node['private_ip'] + ':7700', ready_file=str(node_root / 'ready'),
             stop_file=str(node_root / 'stop'), drop_first_append_response=False)
-    return remote, owners
+    return remote, owners, owner_transports
 
 
 def sha(path):
@@ -925,11 +932,14 @@ class Campaign:
                 if sha(source / name) != expected:
                     raise ValueError(f'{label} source differs: {name}')
             features = original.get('features', 'experimental-distributed')
-            if self.cfg.get('efa') and label == 'current' and features != 'experimental-fabric,test-utils':
-                raise ValueError('EFA campaign requires the frozen native fabric build')
-            if self.cfg.get('campaign') in ('efa-progress', 'checkpoint-async', 'cluster-ram', 'scalar-transport', 'transport-floor', 'stage-timing') and features != 'experimental-fabric,test-utils':
-                raise ValueError('progress requires both preserved and current EFA builds')
-            if features not in ['experimental-distributed', 'experimental-distributed,test-utils', 'experimental-fabric,test-utils']:
+            expected_fabric_features = 'experimental-fabric,test-utils'
+            if self.cfg.get('efa') and label == 'current' and features != expected_fabric_features:
+                raise ValueError('EFA campaign requires the source-bound fabric build')
+            if (self.cfg.get('campaign') in ('efa-progress', 'checkpoint-async', 'cluster-ram', 'scalar-transport', 'transport-floor', 'stage-timing')
+                    and label == 'current' and features != expected_fabric_features):
+                raise ValueError('campaign requires its source-bound fabric build')
+            if features not in ['experimental-distributed', 'experimental-distributed,test-utils',
+                                'experimental-fabric,test-utils']:
                 raise ValueError('unsupported archived build feature set')
             if self.cfg.get('campaign') in ['read-path', 'efa', 'efa-cache'] and label == 'current' and 'test-utils' not in features:
                 raise ValueError('cold-read campaign requires test-utils in the frozen manifest')
@@ -1009,7 +1019,7 @@ class Campaign:
                     if sha(source / name) != expected:
                         raise ValueError('floor build mutated frozen source: ' + name)
             write_json(self.results / ('cloud-build-' + label + '.json'), receipt)
-            if 'experimental-fabric' in features:
+            if 'fabric' in features:
                 run_recorded(['ldd', str(binary)], self.results / ('linked-libraries-' + label), self.deadline)
                 receipt['libfabric_version'] = subprocess.check_output(['pkg-config', '--modversion', 'libfabric'], text=True).strip()
                 receipt['libfabric_sha256'] = sha(Path('/opt/amazon/efa/lib/libfabric.so.1').resolve())
@@ -1038,7 +1048,9 @@ class Campaign:
                          expected_binary_sha256=self.cloud_builds[label]['binary_sha256']
                          if self.cfg.get('campaign') in ('scalar-transport', 'transport-floor', 'stage-timing') else None)
             help_text = output.with_suffix('.stdout.log').read_text()
-            if '--remote-config' not in help_text or (label == 'current' and any(flag not in help_text for flag in ['--prepare-external-case', '--tcp-preparation-chunk-batches'])):
+            if '--remote-config' not in help_text or (label == 'current' and any(
+                    flag not in help_text for flag in ['--prepare-external-case', '--tcp-preparation-chunk-batches',
+                                                       '--transport-config', '--owner-transports'])):
                 raise ValueError(f'{label} cloud binary lacks required benchmark capabilities')
             if self.cfg.get('campaign') in ['read-path', 'efa', 'efa-cache'] and label == 'current' and any(
                     flag not in help_text for flag in ['--cold-read-pass', '--transport-diagnostics']):
@@ -1048,7 +1060,8 @@ class Campaign:
                                                        '--read-window', '--tcp-read-lanes']):
                 raise ValueError('current cloud binary lacks cache/concurrent-read controls')
             if self.cfg.get('campaign') in ('efa-progress', 'checkpoint-async', 'cluster-ram', 'scalar-transport', 'transport-floor', 'stage-timing'):
-                required = ['--transport', '--prepare-external-case', '--remote-config']
+                required = ['--transport-config' if label == 'current' else '--transport',
+                            '--prepare-external-case', '--remote-config']
                 if label == 'current' or self.cfg.get('campaign') in ('checkpoint-async', 'cluster-ram', 'scalar-transport', 'transport-floor', 'stage-timing'):
                     required += ['--native-read-workers', '--read-resource-evidence', '--read-window',
                                  '--native-read-cache-bytes', '--tcp-read-lanes', '--tcp-server-read-workers',
@@ -1069,29 +1082,43 @@ class Campaign:
                          output, self.deadline,
                          expected_binary_sha256=self.cloud_builds[label]['floor_binary_sha256'])
             help_text = output.with_suffix('.stdout.log').read_text()
+            transport_flag = '--transport-config' if label == 'current' else '--transport'
             if any(flag not in help_text for flag in [
-                    '--output', '--remote-config', '--transport', '--polling', '--values',
+                    '--output', '--remote-config', transport_flag, '--polling', '--values',
                     '--samples', '--repetitions', '--idle-us', '--profile']):
                 raise ValueError('floor binary lacks external transport capabilities')
         case_root = self.root / 'build-preflight' / 'external-case'
         case_root.parent.mkdir()
+        transport = (self.cfg.get('transports') or ['tcp'])[0]
+        requested_root = case_root.parent / 'requested-configs' / case_root.name
+        requested_root.mkdir(parents=True, exist_ok=True)
+        transport_path = write_transport_config(requested_root / 'transport.json', transport_for_case(transport))
+        owner_transports_path = requested_root / 'owner-transports.json'
+        write_json(owner_transports_path,
+                   select_transports(transport_for_case(transport), None, len(self.cfg['nodes'])))
         endpoints = ','.join(n['private_ip'] + ':7700' for n in sorted(self.cfg['nodes'], key=lambda n: n['partition']))
         command = [str(self.root / 'cloud-bin/current/sharded_wal_bench'),
                    '--prepare-external-case', str(case_root), '--guest-case-root', str(case_root),
-                   '--remote-endpoints', endpoints, '--values', '1024', '--batch-sizes', '1',
+                   '--remote-endpoints', endpoints, '--transport-config', str(transport_path),
+                   '--owner-transports', str(owner_transports_path),
+                   '--values', '1024', '--batch-sizes', '1',
                    '--windows', '1', '--batches', '128', '--mixed', '32', '--reads', '512',
                    '--repetitions', '1']
         run_recorded(command, self.results / 'cloud-build-preparation-check', self.deadline,
                      expected_binary_sha256=self.cloud_builds['current']['binary_sha256']
                      if self.cfg.get('campaign') in ('scalar-transport', 'transport-floor', 'stage-timing') else None)
-        files = ['remote.yaml'] + [f'node-{p}/launch.yaml' for p in range(5)]
+        files = ['remote.yaml', 'owner_transports.json'] + [f'node-{p}/launch.yaml' for p in range(5)]
         if self.cfg.get('campaign') in ('transport-floor', 'stage-timing'):
             files.append('shape.yaml')
         config_hashes = {name: sha(case_root / name) for name in files}
+        shutil.copy2(transport_path, self.results / 'cloud-build-requested-transport.json')
+        shutil.copy2(owner_transports_path, self.results / 'cloud-build-requested-owner-transports.json')
         write_json(self.results / 'cloud-build-pair-verified.json', {
             'binary_sha256': {label: self.cloud_builds[label]['binary_sha256'] for label in ['baseline', 'current']},
             'distinct_sources': True, 'distinct_binaries': True,
             'capability_checks': True, 'prepared_configuration_sha256': config_hashes,
+            'requested_transport_sha256': sha(transport_path),
+            'requested_owner_transports_sha256': sha(owner_transports_path),
             'prepare_command': command})
 
     def install_cloud_binary(self, label, artifact):
@@ -1194,7 +1221,16 @@ class Campaign:
             case_id, prefix = spec['case_id'], spec['family']
         self.progress('preparing-' + case_id)
         case_root = self.root / 'cases' / case_id
-        case_root.parent.mkdir(exist_ok=True)
+        case_root.parent.mkdir(parents=True, exist_ok=True)
+        requested_root = case_root.parent / 'requested-configs' / case_id
+        transport_path = None
+        owner_transports_path = None
+        if label == 'current':
+            requested_root.mkdir(parents=True, exist_ok=True)
+            transport_path = write_transport_config(requested_root / 'transport.json', transport_for_case(transport))
+            owner_transports_path = str(requested_root / 'owner-transports.json')
+            write_json(owner_transports_path,
+                       select_transports(transport_for_case(transport), None, len(self.cfg['nodes'])))
         kv_commands = None
         if self.cfg.get('kv_subsuite'):
             if (self.cfg.get('campaign') != 'efa-cache' or label != 'current' or not storage
@@ -1206,8 +1242,9 @@ class Campaign:
                 transport=transport, cached=cached, authority_resident_batches=authority_resident_batches,
                 shard_cache_bytes=shard_cache_bytes, preparation_chunk_batches=preparation_chunk_batches,
                 workload_batches=workload_batches, workload_reads=workload_reads, wal_layout=wal_layout,
-                cache_hit_contention=cache_hit_contention, resident_reads=resident_reads, bounded_hot_reads=bounded_hot_reads,
-                cold_single_probes=cold_single_probes, cold_group_probes=cold_group_probes)
+                cache_hit_contention=cache_hit_contention, resident_reads=resident_reads,
+                bounded_hot_reads=bounded_hot_reads, cold_single_probes=cold_single_probes,
+                cold_group_probes=cold_group_probes)
             prepare, kv_commands = kv_case_commands(self.cfg, kv_spec)
         else:
             batches, mixed = (320, 64) if storage else (128, 32)
@@ -1229,7 +1266,9 @@ class Campaign:
             endpoints = ','.join(n['private_ip'] + ':7700' for n in sorted(self.cfg['nodes'], key=lambda n: n['partition']))
             prepare = [str(generator), '--prepare-external-case', str(case_root), '--guest-case-root', str(case_root),
                        '--remote-endpoints', endpoints, '--tcp-read-cache-bytes', str(cache_bytes)]
-            if label == 'current' or progress:
+            if label == 'current':
+                prepare += ['--owner-transports', owner_transports_path, '--transport-config', transport_path]
+            elif progress:
                 prepare += ['--transport', transport]
             if progress and (label == 'current' or checkpoint):
                 prepare += ['--tcp-read-lanes', str(spec['lanes']),
@@ -1240,7 +1279,10 @@ class Campaign:
             if ram:
                 prepare = [str(generator), '--prepare-external-case', str(case_root),
                            '--guest-case-root', str(case_root), '--remote-endpoints', endpoints]
-                prepare += profile.flags(spec, 'tcp', prepare=True)
+                prepare += profile.flags(spec, 'tcp', prepare=True,
+                                         transport_config=transport_path if label == 'current' else None)
+                if label == 'current':
+                    prepare += ['--owner-transports', owner_transports_path]
             else:
                 prepare += shape_args
         run_recorded(prepare, self.results / (case_id + '-prepare'), self.deadline,
@@ -1252,6 +1294,24 @@ class Campaign:
             write_json(self.results / (case_id + '-authority-window.json'),
                        prepare_authority_window(case_root, authority_resident_batches))
         shutil.copy2(case_root / 'remote.yaml', self.results / (case_id + '-remote.yaml'))
+        if label == 'current':
+            shutil.copy2(transport_path, self.results / (case_id + '-transport-config.json'))
+            shutil.copy2(owner_transports_path, self.results / (case_id + '-owner-transports-requested.json'))
+            shutil.copy2(case_root / 'owner_transports.json',
+                         self.results / (case_id + '-owner-transports.json'))
+        for node in self.cfg['nodes']:
+            part = node['partition']
+            shutil.copy2(case_root / f'node-{part}/launch.yaml',
+                         self.results / (case_id + f'-node-{part}-launch.yaml'))
+        if label == 'current':
+            write_json(self.results / (case_id + '-prepared-transports.json'), dict(
+                schema=1,
+                requested_transport_sha256=sha(self.results / (case_id + '-transport-config.json')),
+                requested_owner_transports_sha256=sha(self.results / (case_id + '-owner-transports-requested.json')),
+                owner_transports_sha256=sha(self.results / (case_id + '-owner-transports.json')),
+                launch_sha256={str(node['partition']): sha(
+                    self.results / (case_id + f"-node-{node['partition']}-launch.yaml"))
+                    for node in self.cfg['nodes']}))
         if self.cfg.get('campaign') == 'stage-timing' or (self.cfg.get('campaign') == 'transport-floor' and label == 'current'):
             shutil.copy2(case_root / 'shape.yaml', self.results / (case_id + '-shape.yaml'))
         node_archives = {}
@@ -1289,8 +1349,9 @@ class Campaign:
                 if kv_commands is not None:
                     command = kv_commands[mode]
                 else:
+                    cli_backend = 'tcp' if mode == 'tcp' else mode
                     command = [str(self.root / 'cloud-bin' / label / 'sharded_wal_bench'),
-                               '--output', str(output), '--backend', mode] + shape_args
+                               '--output', str(output), '--backend', cli_backend] + shape_args
                     if resource_evidence:
                         command += ['--read-resource-evidence', 'true']
                     if cache_hit_contention:
@@ -1320,21 +1381,27 @@ class Campaign:
                     if mode == 'tcp':
                         command += ['--remote-config', str(case_root / 'remote.yaml'),
                                     '--tcp-read-cache-bytes', str(cache_bytes)]
-                        if label == 'current' or progress:
-                            command += ['--transport', transport]
-                            command += ['--tcp-preparation-chunk-batches',
+                        if label == 'current':
+                            command += ['--transport-config', transport_path,
+                                        '--tcp-preparation-chunk-batches',
+                                        '32' if chunk_control else '16']
+                        elif progress:
+                            command += ['--transport', transport,
+                                        '--tcp-preparation-chunk-batches',
                                         '32' if chunk_control else '16']
                 if ram and not spec.get('floor'):
+                    cli_backend = 'tcp' if mode == 'tcp' else mode
                     command = [str(self.root / 'cloud-bin' / label / 'sharded_wal_bench'),
-                               '--output', str(output), '--backend', mode]
-                    command += profile.flags(spec, mode, external=mode == 'tcp')
+                               '--output', str(output), '--backend', cli_backend]
+                    command += profile.flags(spec, mode, external=mode == 'tcp',
+                                             transport_config=transport_path if label == 'current' else None)
                     if mode == 'tcp':
                         command += ['--remote-config', str(case_root / 'remote.yaml')]
                 binary_hash = self.cloud_builds[label]['binary_sha256']
                 if progress and spec.get('floor'):
                     command = [str(self.root / 'cloud-bin' / label / 'sharded_wal_transport_bench'),
                                '--output', str(output), '--remote-config', str(case_root / 'remote.yaml')]
-                    command += profile.floor_flags(spec)
+                    command += profile.floor_flags(spec, transport_config=transport_path if label == 'current' else None)
                     binary_hash = self.cloud_builds[label]['floor_binary_sha256']
                 run_recorded(command, self.results / (case_id + '-' + mode + '-process'), self.deadline,
                              expected_binary_sha256=binary_hash
@@ -1354,7 +1421,8 @@ class Campaign:
                     floor_spec = transport_floor.subsuite_floor_spec(transport, instrumented)
                     floor_command = [str(self.root / 'cloud-bin' / label / 'sharded_wal_transport_bench'),
                         '--output', str(floor_output), '--remote-config', str(case_root / 'remote.yaml')]
-                    floor_command += transport_floor.floor_flags(floor_spec)
+                    floor_command += transport_floor.floor_flags(
+                        floor_spec, transport_config=transport_path)
                     run_recorded(floor_command, self.results / (case_id + suffix + '-process'),
                         self.deadline, expected_binary_sha256=self.state['floor_binary_sha256'])
                     if not (floor_output / 'COMPLETE').is_file():

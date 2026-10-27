@@ -48,7 +48,8 @@ class HardwarePopulations(unittest.TestCase):
         paths = set()
         for spec in kv.plan(cfg['kv_suite'], cfg['transports']):
             prepare, commands = kv_case_commands(cfg, spec)
-            remote, owners = kv_case_policy(cfg, spec)
+            remote, owners, owner_transports = kv_case_policy(cfg, spec)
+            self.assertEqual(len(owner_transports), len(cfg['nodes']))
             self.assertEqual(remote['read_cache_bytes'], 8 * 1024**2 if spec['cached'] else 0)
             self.assertEqual({o['node']['read_cache_bytes'] for o in owners.values()}, {spec['shard_cache_bytes']})
             self.assertEqual(remote['tls']['resident_reads']['require_device_read'], 'resident_reads' in spec)

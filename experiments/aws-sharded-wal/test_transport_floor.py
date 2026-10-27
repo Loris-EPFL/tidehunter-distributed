@@ -12,6 +12,7 @@ import cluster_ram
 import scalar_transport
 import transport_floor as profile
 from test_scalar_transport import Evidence as ScalarEvidence, recovery_stats, save, table
+from portable_transport import transport_for_case
 
 SHAPE = '''key_spaces:
 - inner:
@@ -40,11 +41,13 @@ class Evidence(ScalarEvidence):
             self.pins.append(pin)
             build = self.builds[label]
             build.update(source_tree_sha256=source, source_archive_sha256='4' * 64,
-                         local_binary_sha256=profile.BASELINE_BINARY_SHA256 if label == 'baseline' else profile.CURRENT_BINARY_SHA256)
+                         local_binary_sha256=profile.BASELINE_BINARY_SHA256 if label == 'baseline' else profile.CURRENT_BINARY_SHA256,
+                         features='experimental-fabric,test-utils')
             build['command'] = ['cargo', '+1.90.0', 'build', '--release', '--locked', '--manifest-path',
                                 self.base + f'/build-source/{label}/Cargo.toml', '-p', 'tidehunter',
-                                '--features', 'experimental-fabric,test-utils', '--example', 'sharded_wal_bench']
-            manifest = dict(source_sha256=files, source_tree_sha256=source, binary_sha256=build['local_binary_sha256'])
+                                '--features', build['features'], '--example', 'sharded_wal_bench']
+            manifest = dict(source_sha256=files, source_tree_sha256=source, binary_sha256=build['local_binary_sha256'],
+                            features=build['features'])
             if label == 'current':
                 manifest.update(floor_binary_sha256=profile.CURRENT_FLOOR_BINARY_SHA256,
                                 recovery_binary_sha256=profile.CURRENT_RECOVERY_BINARY_SHA256)
@@ -75,7 +78,8 @@ class Evidence(ScalarEvidence):
         launch = dict(node=dict(partition={'partition': partition}, shape_yaml=SHAPE,
                                read_workers=spec['workers'], wal_member_read=spec['member'],
                                read_cache_bytes=spec['shard_cache'], read_memory_allowance_bytes=spec['shard_allowance']),
-                      tls={'transport': spec['transport']}, limits={})
+                      tls={'transport': (transport_for_case(spec['transport']) if spec['build'] == 'current'
+                                         else spec['transport'])}, limits={})
         if spec['build'] == 'current':
             launch['node']['read_resident_first'] = spec['resident_first']
             launch['limits']['polling'] = spec['polling']
@@ -88,12 +92,17 @@ class Evidence(ScalarEvidence):
         case = spec['case_id']
         path = self.root / (case + '-prepare.command.json')
         receipt = audit.read_json(path)
-        receipt['command'] = [self.binary(spec['build']), '--prepare-external-case', self.base + '/cases/' + case,
-                              '--guest-case-root', self.base + '/cases/' + case, '--remote-endpoints', self.endpoints]
-        receipt['command'] += profile.flags(spec, 'tcp', prepare=True)
+        case_root = self.base + '/cases/' + case
+        receipt['command'] = [self.binary(spec['build']), '--prepare-external-case', case_root,
+                              '--guest-case-root', case_root, '--remote-endpoints', self.endpoints]
+        transport_config = self.base + '/cases/requested-configs/' + case + '/transport.json' if spec['build'] == 'current' else None
+        receipt['command'] += profile.flags(spec, 'tcp', prepare=True, transport_config=transport_config)
+        if spec['build'] == 'current':
+            receipt['command'] += ['--owner-transports', self.base + '/cases/requested-configs/' + case + '/owner-transports.json']
         save(path, receipt)
         remote = dict(read_lanes=spec['lanes'], read_cache_bytes=spec['cache'], read_memory_allowance_bytes=spec['read_allowance'],
-                      tls={'transport': spec['transport']}, storage={'partitions': list(range(5))},
+                      tls={'transport': (transport_for_case(spec['transport']) if spec['build'] == 'current'
+                                         else spec['transport'])}, storage={'partitions': list(range(5))},
                       endpoints=[dict(partition=n['partition'], address=n['private_ip'] + ':7700') for n in self.cfg['nodes']])
         (self.root / (case + '-remote.yaml')).write_text(json.dumps(remote))
         if spec['build'] == 'current':
@@ -107,7 +116,8 @@ class Evidence(ScalarEvidence):
         floor_files(path, spec)
         command = [self.base + '/cloud-bin/current/sharded_wal_transport_bench', '--output',
                    self.base + '/results/' + name, '--remote-config', self.base + '/cases/' + spec['case_id'] + '/remote.yaml']
-        command += profile.floor_flags(spec)
+        command += profile.floor_flags(
+            spec, self.base + '/cases/requested-configs/' + spec['case_id'] + '/transport.json')
         self.process(name, spec, command)
         process = audit.read_json(self.root / (name + '-process.command.json'))
         save(self.root / (name + '-process.command.json'), process | {'binary_sha256': self.builds['current']['floor_binary_sha256']})
