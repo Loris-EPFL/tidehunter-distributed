@@ -36,6 +36,20 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             campaign.matrix(spec)
 
+    def test_matrix_selection_is_a_strict_config_subset(self):
+        spec = self.spec()
+        full = campaign.matrix(spec)
+        selected_spec = spec | {"backends": ["tikv"], "max_runs": 8}
+        selected = campaign.matrix(selected_spec)
+        expected = [job for job in full if job["backend"] == "tikv"]
+        self.assertEqual(len(selected), len(expected))
+        self.assertEqual(
+            {(job["repeat"], job["backend"], job["profile"]["name"], job["rate"]) for job in selected},
+            {(job["repeat"], job["backend"], job["profile"]["name"], job["rate"]) for job in expected})
+        for backends in ([], ["tikv", "tikv"], ["not-configured"]):
+            with self.subTest(backends=backends), self.assertRaises(ValueError):
+                campaign.matrix(spec | {"backends": backends})
+
     def test_finite_aging_and_unknown_fields_required(self):
         spec = self.spec()
         spec["profiles"][1]["aging_operations"] = -1
@@ -59,6 +73,51 @@ class AdmissionTests(unittest.TestCase):
         base["phases"]["measurement_operations"] = 1_000_000
         with self.assertRaisesRegex(ValueError, "exceeds supported"):
             campaign.build_config(base, job, None, Path("/tmp/unused"), 17, False)
+    def test_explicit_portable_transport_cannot_masquerade_as_another_case(self):
+        base = {"dataset": {"keys": 1}, "phases": {"preload": False, "warmup_operations": 0,
+                "aging_operations": 0, "measurement_operations": 1}, "execution": {}, "limits": {}}
+        job = {"backend": "tidehunter_verbs", "profile": {"keys": 8, "aging_operations": 0}, "rate": 100}
+        transport = {"kind": "ofi", "fabric": {"backend": "verbs", "domain": "mlx5_0",
+                     "source_address": "192.0.2.10"}, "security": "mutual-tls"}
+        configured = campaign.build_config(base, job, None, Path("/tmp/unused"), 17, False, transport)
+        self.assertEqual(configured["backend"]["kind"], "tidehunter")
+        self.assertEqual(configured["backend"]["options"]["transport"], transport)
+        default_job = job | {"backend": "tidehunter_tcp"}
+        default = campaign.build_config(base, default_job, None, Path("/tmp/unused"), 17, False)
+        self.assertEqual(default["backend"]["kind"], "tidehunter")
+        self.assertEqual(default["backend"]["options"]["transport"], {"kind": "tcp"})
+        with self.assertRaisesRegex(ValueError, "differs from the selected research case"):
+            campaign.build_config(base, default_job, None, Path("/tmp/unused"), 17, False, transport)
+        self.assertEqual(base["dataset"], {"keys": 1})
+
+    def test_local_rust_runtime_maps_all_transport_case_ids(self):
+        base = {"dataset": {"keys": 1}, "phases": {"preload": False, "warmup_operations": 0,
+                "aging_operations": 0, "measurement_operations": 1}, "execution": {}, "limits": {}}
+        for label in ("tidehunter_tcp", "tidehunter_efa", "tidehunter_efa_direct",
+                      "tidehunter_efa_native", "tidehunter_efa_trusted", "tidehunter_verbs",
+                      "tidehunter_verbs_native", "tidehunter_software_tcp",
+                      "tidehunter_software_tcp_native"):
+            with self.subTest(label=label):
+                job = {"backend": label, "profile": {"keys": 8, "aging_operations": 0}, "rate": 100}
+                config = campaign.build_config(base, job, None, Path("/tmp/unused"), 17, False)
+                self.assertEqual(config["backend"]["kind"], "tidehunter")
+                self.assertIn("transport", config["backend"]["options"])
+        spec = self.spec() | {"backends": list(campaign.CASE_TRANSPORTS), "max_runs": 72}
+        jobs = campaign.matrix(spec)
+        self.assertEqual({job["backend"] for job in jobs}, set(campaign.CASE_TRANSPORTS))
+        self.assertEqual(len(jobs), 72)
+
+
+    def test_valkey_local_qualification_and_five_primary_cluster_options(self):
+        spec = self.spec() | {"backends": ["valkey_tcp"], "max_runs": 8}
+        self.assertEqual(len(campaign.matrix(spec)), 8)
+        for count in (1, 5):
+            with self.subTest(primary_nodes=count):
+                options = campaign.backend_options("valkey_tcp", {"nodes": count}, Path("/tmp/unused"))
+                self.assertEqual(options, {
+                    "nodes": [f"127.0.0.{21+i}:{6379+i}" for i in range(count)],
+                    "cluster": count == 5, "required_replication_factor": 1,
+                    "required_primary_nodes": count, "request_timeout_ms": 5000})
 
     def test_owned_state_cannot_be_relocated(self):
         with tempfile.TemporaryDirectory() as directory:

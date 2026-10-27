@@ -33,9 +33,10 @@ _spec = importlib.util.spec_from_file_location('kv_maintained_ci_campaign', OLD 
 core = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = core
 _spec.loader.exec_module(core)
+from portable_transport import select_backends
 
 
-def load_config(path, env=None):
+def load_config(path, env=None, backend_selection=None):
     """Separate KV admission; the original Sui lifetime/matrix stays unchanged."""
     env = os.environ if env is None else env
     cfg = core.read_json(path)
@@ -79,10 +80,11 @@ def load_config(path, env=None):
             raise ValueError('invalid fleet resource cap: ' + name)
     spec = core.read_json(HERE / 'cloud-campaign.json')
     if (spec.get('hard_deadline_seconds') != cfg['ttl_seconds']
-            or spec.get('export_reserve_seconds') != cfg['export_reserve_seconds']
-            or len(cloud_campaign.make_matrix(spec)) != 684
-            or spec.get('backends') != list(cloud_campaign.BACKENDS)):
-        raise ValueError('complete committed 684-case all-eight matrix required')
+            or spec.get('export_reserve_seconds') != cfg['export_reserve_seconds']):
+        raise ValueError('committed campaign lifetime must match approved CI reservations')
+    spec['backends'] = select_backends(backend_selection, spec.get('backends'),
+                                       set(cloud_campaign.BACKENDS))
+    cloud_campaign.make_matrix(spec)
     cfg['spec'] = spec
     return cfg
 
@@ -170,6 +172,19 @@ def live_preflight(aws, cfg):
         raise ValueError('no approved EFA/NVMe candidate fits the physical resource caps')
     result['candidates'] = accepted
     return result
+
+
+def result_inventory(receipt, run_id):
+    descriptor = receipt.get('inventory')
+    if (receipt.get('schema_version') != 2 or not isinstance(descriptor, dict)
+            or set(descriptor) != {'key', 'bytes', 'sha256'}
+            or descriptor['key'] != run_id + '/results/controller-inventory.json'
+            or type(descriptor['bytes']) is not int
+            or not 0 < descriptor['bytes'] <= cloud_controller.MAX_JSON_BYTES
+            or not isinstance(descriptor['sha256'], str)
+            or not re.fullmatch('[a-f0-9]{64}', descriptor['sha256'])):
+        raise ValueError('invalid source-bound result inventory descriptor')
+    return descriptor
 
 
 class Campaign(core.Campaign):
@@ -319,6 +334,12 @@ class Campaign(core.Campaign):
                 head = self.s3.head_object(Bucket=self.cfg['bucket'], Key=receipt['key'], ExpectedBucketOwner=self.cfg['account'])
                 if head['ContentLength'] != receipt['bytes'] or head.get('Metadata', {}).get('sha256') != receipt['sha256']:
                     raise ValueError('controller export not durably bound before termination')
+                inventory = result_inventory(receipt, self.run_id)
+                head = self.s3.head_object(Bucket=self.cfg['bucket'], Key=inventory['key'],
+                                          ExpectedBucketOwner=self.cfg['account'])
+                if (head.get('ContentLength') != inventory['bytes']
+                        or head.get('Metadata', {}).get('sha256') != inventory['sha256']):
+                    raise ValueError('bulk result inventory not durably bound before termination')
                 core.dump(self.output / 'export-receipt.json', receipt)
                 return receipt
             if not self.active():
@@ -335,7 +356,13 @@ class Campaign(core.Campaign):
             raise ValueError('retrieved controller archive differs from durable export receipt')
         root = self.output / 'validated-results'
         root.mkdir(parents=True, exist_ok=True)
-        inventory = receipt.get('files')
+        descriptor = result_inventory(receipt, self.run_id)
+        inventory_path = base / 'controller-inventory.json'
+        cloud_package.regular(inventory_path)
+        if (inventory_path.stat().st_size != descriptor['bytes']
+                or core.sha(inventory_path) != descriptor['sha256']):
+            raise ValueError('retrieved bulk result inventory differs from durable export receipt')
+        inventory = core.read_json(inventory_path)
         if (not isinstance(inventory, dict) or not inventory or len(inventory) > 200000
                 or any(type(entry.get('bytes')) is not int or entry['bytes'] < 0
                        or not re.fullmatch(r'[a-f0-9]{64}', entry.get('sha256', '')) for entry in inventory.values())
@@ -371,7 +398,7 @@ class Campaign(core.Campaign):
         else:
             planned = core.read_json(root / 'matrix.json')
             if planned != {'schema_version': 1, 'spec': cfg['spec'], 'jobs': expected_jobs}:
-                raise ValueError('exported matrix differs from all 684 admitted cases')
+                raise ValueError(f'exported matrix differs from all {len(expected_jobs)} admitted cases')
             report = cloud_campaign.report(root)
         monitor_error = None
         try:
@@ -396,7 +423,7 @@ class Campaign(core.Campaign):
                     and any(path.is_file() and path.parent.name == 'chunks' for path in (restored / 'snapshot').rglob('*')))
         except (OSError, ValueError, KeyError, TypeError, tarfile.TarError) as error:
             monitor_complete, monitor_error = False, repr(error)
-        outcome = dict(schema_version=1, suite='kv-comparison', planned_cases=684,
+        outcome = dict(schema_version=1, suite='kv-comparison', planned_cases=len(expected_jobs),
             completed_cases=report['completed_cases'], benchmark_complete=report['complete'],
             monitoring_complete=monitor_complete, controller_status=receipt.get('status'),
             controller_error=receipt.get('error') or (controller_outcome or {}).get('error'),
@@ -450,16 +477,25 @@ def validate_cleanup_results(campaign, cleanup_complete):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('run', 'cleanup'))
+    parser.add_argument('action', choices=('run', 'cleanup', 'validate'))
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--inputs', type=Path)
-    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--output', type=Path)
+    parser.add_argument('--backends', help='comma-separated nonempty subset of tracked backend IDs')
     parser.add_argument('--budget-file', type=Path, default=core.DEFAULT_BUDGET)
     args = parser.parse_args(argv)
+    if args.action == 'validate':
+        cfg = load_config(args.config, backend_selection=args.backends)
+        jobs = cloud_campaign.make_matrix(cfg['spec'])
+        print(json.dumps({'status': 'valid', 'selected_backends': cfg['spec']['backends'],
+                          'planned_cases': len(jobs)}))
+        return 0
+    if args.output is None:
+        parser.error('--output is required for run/cleanup')
     cfg = run_id = campaign = aws = None
     work_started = False
     try:
-        cfg = load_config(args.config)
+        cfg = load_config(args.config, backend_selection=args.backends)
         cfg['budget_path'] = str(args.budget_file.absolute())
         # Derive before source admission so a restarted/cancelled same-attempt
         # process can reconcile owned hosts even if its local inputs vanished.

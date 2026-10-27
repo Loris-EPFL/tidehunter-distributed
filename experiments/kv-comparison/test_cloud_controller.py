@@ -69,6 +69,30 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(set(j["backend"] for j in value["jobs"]), set(controller.cloud_campaign.BACKENDS))
             self.assertIn("no cloud health", value["scope"])
 
+    def test_valkey_external_role_inventory_has_five_primaries_and_no_control_server(self):
+        config = config_fixture()
+        job = next(job for job in controller.cloud_campaign.make_matrix(config["spec"])
+                   if job["backend"] == "valkey_tcp")
+        coordinator = controller.owned_monitor_processes(config, -1, job)
+        self.assertEqual([item["role"] for item in coordinator["processes"]], ["client"])
+        options = controller.cloud_layout.backend_options(config["fleet"], "valkey_tcp", "/tmp/client")
+        self.assertEqual(options["nodes"], [f"10.0.0.{i+2}:6379" for i in range(5)])
+        self.assertEqual((options["required_primary_nodes"], options["required_replication_factor"]), (5, 1))
+        roles = []
+        for index in range(5):
+            deployment = controller.cloud_layout.node_config(config["fleet"], "valkey_tcp", index)
+            self.assertEqual(len(deployment["containers"]), 1)
+            role = deployment["containers"][0]["service"]
+            with patch.object(controller.cloud_layout, "inspect_container", return_value={}), \
+                    patch.object(controller, "docker_monitor_identity", return_value={
+                        "container_id": str(index) * 64, "pid": 100 + index,
+                        "cgroup": f"/owned/valkey-{index}"}):
+                observed = controller.owned_monitor_processes(config, index, job)
+            self.assertEqual(observed["missing"], [])
+            self.assertEqual(observed["processes"], [{"role": role, "cgroup": f"/owned/valkey-{index}"}])
+            roles.append(role)
+        self.assertEqual(len(set(roles)), 5)
+
 
     def test_account_duplicate_nonphysical_and_extra_fields_rejected(self):
         mutations = [lambda c: c.update(account="000000000000"),
@@ -544,7 +568,7 @@ class CapsuleAndExportTests(unittest.TestCase):
         root = Path(config["fleet"]["data_root"]) / "cells" / case
         launch = {"ready_file": str(root / "node-0/ready"), "stop_file": str(root / "node-0/stop"),
             "node": {"root": str(root / "node-0/storage")}, "listen": "10.0.0.2:9400",
-            "tls": {"transport": "tcp", "ca": str(root / "tls/ca.der"),
+            "tls": {"transport": {"kind": "tcp"}, "ca": str(root / "tls/ca.der"),
                     "cert": str(root / "tls/tidehunter-node-0.der"), "key": str(root / "tls/tidehunter-node-0.pk8")}}
         controller.validate_launch(config, launch, case, 0)
         for mutation in (lambda x: x["tls"].update(key=str(root / "tls/ca.key")),
@@ -552,6 +576,17 @@ class CapsuleAndExportTests(unittest.TestCase):
             broken = copy.deepcopy(launch)
             mutation(broken)
             with self.assertRaises(controller.SafetyError):
+                controller.validate_launch(config, broken, case, 0)
+        trusted = copy.deepcopy(launch)
+        trusted["tls"].update(
+            transport={"kind": "ofi", "fabric": {"backend": "efa-direct", "domain": "efa0"},
+                       "security": "trusted"},
+            ca="", cert="", key="")
+        controller.validate_launch(config, trusted, case, 0)
+        for field in ("ca", "cert", "key"):
+            broken = copy.deepcopy(trusted)
+            broken["tls"][field] = str(root / "tls/ca.der")
+            with self.subTest(field=field), self.assertRaises(controller.SafetyError):
                 controller.validate_launch(config, broken, case, 0)
 
 
@@ -647,6 +682,9 @@ class MonitoringBoundaryTests(unittest.TestCase):
         uploads = {}
         def upload(path, bucket, key, **kwargs):
             uploads[key] = Path(path).read_bytes()
+        def put(**kwargs):
+            uploads[kwargs["Key"]] = kwargs["Body"]
+        clients["s3"].put_object.side_effect = put
         def head(**kwargs):
             content = uploads[kwargs["Key"]]
             return {"ContentLength": len(content), "Metadata": {

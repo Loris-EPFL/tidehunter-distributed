@@ -54,6 +54,16 @@ class PackageTests(unittest.TestCase):
         with zipfile.ZipFile(self.root / "snapshot/source.zip") as archive:
             self.assertEqual(archive.read(dirty), b"// exact dirty bytes\n")
 
+    def test_infiniband_preparation_never_enters_active_source_bundle(self):
+        prep = self.repo / "experiments/valkey-infiniband/qualify.py"
+        prep.parent.mkdir(parents=True)
+        prep.write_text("# operator-only preparation\n")
+        self.git("add", "experiments/valkey-infiniband/qualify.py")
+        snapshot = package.snapshot(self.repo, self.root / "snapshot")
+        self.assertNotIn("experiments/valkey-infiniband/qualify.py", snapshot["sha256"])
+        with zipfile.ZipFile(self.root / "snapshot/source.zip") as archive:
+            self.assertNotIn("experiments/valkey-infiniband/qualify.py", archive.namelist())
+
     def test_source_archive_is_reproducible_and_extracted_inventory_is_exact(self):
         first = package.snapshot(self.repo, self.root / "first")
         second = package.snapshot(self.repo, self.root / "second")

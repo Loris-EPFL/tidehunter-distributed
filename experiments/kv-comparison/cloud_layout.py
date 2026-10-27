@@ -16,7 +16,7 @@ import urllib.request
 
 import local
 
-BACKENDS = ("tikv", "cassandra", "foundationdb")
+BACKENDS = ("tikv", "cassandra", "foundationdb", "valkey_tcp")
 RUN_LABEL = "io.tidehunter.kv-comparison.run"
 NODE_LABEL = "io.tidehunter.kv-comparison.node"
 BACKEND_LABEL = "io.tidehunter.kv-comparison.backend"
@@ -78,6 +78,9 @@ def backend_options(fleet, backend, root):
         return {"nodes": [x["address"] + ":9042" for x in fleet["nodes"]], "keyspace": "kv_comparison",
                 "required_replication_factor": 1, "consistency": "quorum", "request_timeout_ms": 5000,
                 "get_many_concurrency": 16}
+    if backend == "valkey_tcp":
+        return {"nodes": [x["address"] + ":6379" for x in fleet["nodes"]], "cluster": True,
+                "required_replication_factor": 1, "required_primary_nodes": 5, "request_timeout_ms": 5000}
     if backend == "foundationdb":
         if not Path(root).is_absolute():
             raise ValueError("cluster file root must be absolute")
@@ -101,7 +104,8 @@ def node_config(fleet, backend, index):
     labels = {local.OWNER_LABEL: owner, RUN_LABEL: fleet["run_id"], NODE_LABEL: role, BACKEND_LABEL: backend}
     files, containers = {}, []
     # Keep the 8-GiB host total; reserve memory for FDB's transaction/log roles.
-    control_cpu, control_memory = {"tikv": (1, 1024), "cassandra": (0, 0), "foundationdb": (1, 6144)}[backend]
+    control_cpu, control_memory = {"tikv": (1, 1024), "cassandra": (0, 0), "foundationdb": (1, 6144),
+                                  "valkey_tcp": (0, 0)}[backend]
     cpus = control_cpu if coordinator else fleet["server_cpus"]
     memory = control_memory if coordinator else int(fleet["server_memory_mib"])
 
@@ -180,6 +184,9 @@ def node_config(fleet, backend, index):
                                  "-Dcassandra.logdir=/var/lib/cassandra/logs"}
         add(f"cassandra{index}", "cassandra", ["-ec", "cp /config/cassandra.yaml /etc/cassandra/cassandra.yaml; "
             "exec /usr/local/bin/docker-entrypoint.sh cassandra -f"], target="/var/lib/cassandra", entrypoint="/bin/bash", environment=env)
+    elif backend == "valkey_tcp" and not coordinator:
+        add(f"valkey{index}", "valkey_tcp",
+            local.valkey_server_args(address, 6379, 16379, True, memory * 3 // 4))
     elif backend == "foundationdb":
         files["fdb.cluster"] = f"kvcomparison:{owner[:32]}@{pd}:4500\n"
         args = ["--cluster-file", "/config/fdb.cluster",
@@ -219,7 +226,8 @@ def build_plan(fleet, backend):
                           "timeout_seconds": 300, "cleanup": "exact label-checked containers only; reset-data is separate and retains configs/exports"},
             "ack_policy": {"tikv": "RF1 raft-kv/Raft Engine, apply-unpersisted limit=0; v8.5.4 source synchronizes raft writes before persistence notification",
                            "cassandra": "commitlog_sync=batch, durable_writes=true, QUORUM at RF1",
-                           "foundationdb": "single SSD, transaction log durable commit; serializable transaction semantics"}[backend]}
+                           "foundationdb": "single SSD, transaction log durable commit; serializable transaction semantics",
+                           "valkey_tcp": "RF1 AOF appendfsync always, no-appendfsync-on-rewrite no; noeviction; RAM-resident reads"}[backend]}
 
 
 def command(argv, timeout=30, include_stderr=False):
@@ -379,8 +387,8 @@ def start(config):
         # fdbserver opens trace files but does not create --logdir. Reset
         # deliberately empties data/, so recreate it on every fresh start.
         guarded(directory / "data" / "logs").mkdir(exist_ok=True)
-    if config["backend"] == "cassandra" and config["index"] == -1:
-        ensure_image(local.IMAGES["cassandra"])
+    if config["backend"] in ("cassandra", "valkey_tcp") and config["index"] == -1:
+        ensure_image(local.IMAGES[config["backend"]])
     for container in config["containers"]:
         existing = inspect_container(config, container, required=False)
         if existing:
@@ -433,6 +441,23 @@ def cql(fleet, config, query):
         if item:
             command(["docker", "rm", "--force", item["Id"]])
         raise
+
+
+def valkey_command(config, endpoint, *args):
+    if config["containers"]:
+        return execute(config, *args)
+    # Client-only coordinator: exact-owned, bounded CLI tool, never a server.
+    name = "kvcloud-" + config["owner"][:16] + "-valkey-tool"
+    argv = ["docker", "run", "--rm", "--name", name, "--network", "host",
+            "--cpus", "1", "--memory", "512m", "--memory-swap", "512m", "--pids-limit", "128"]
+    for key, value in config["labels"].items():
+        argv += ["--label", key + "=" + value]
+    try:
+        return command([*argv, "--entrypoint", "valkey-cli", local.IMAGES["valkey_tcp"], *args[1:]], timeout=30)
+    finally:
+        item = inspect_container(config, {"name": name}, required=False)
+        if item:
+            command(["docker", "rm", "--force", item["Id"]])
 
 
 def admit_tikv(fleet, stores, regions, replication, configs):
@@ -553,6 +578,10 @@ def initialize(fleet, config):
     elif backend == "cassandra":
         evidence["create_keyspace"] = cql(fleet, config, "CREATE KEYSPACE IF NOT EXISTS kv_comparison WITH replication = "
             "{'class':'SimpleStrategy','replication_factor':1} AND durable_writes = true;")
+    elif backend == "valkey_tcp":
+        evidence["cluster_create"] = local.initialize_valkey(
+            lambda endpoint, *args: valkey_command(config, endpoint, *args),
+            backend_options(fleet, backend, directory)["nodes"], directory, 30)
     else:
         evidence["configure"] = execute(config, "/usr/bin/fdbcli", "-C", "/config/fdb.cluster", "--timeout", "10", "--exec",
             "configure new single ssd logs=1 commit_proxies=1 grv_proxies=1 resolvers=1")
@@ -562,7 +591,7 @@ def initialize(fleet, config):
     return evidence
 
 
-def probe_once(fleet, config):
+def probe_once(fleet, config, cluster=False):
     directory = require_state(config)
     proof = {"observed_at_unix": time.time(), "qualification_only": config["qualification_only"],
              "nvme": nvme_evidence(directory, config["qualification_only"]), "runtime": runtime_evidence(config)}
@@ -629,6 +658,13 @@ def probe_once(fleet, config):
             if len(rows) != 1 or rows[0].get("durable_writes") is not True or rows[0].get("replication", {}).get("replication_factor") != "1" or not rows[0]["replication"].get("class", "").endswith("SimpleStrategy"):
                 raise RuntimeError("Cassandra effective RF1/durable keyspace mismatch")
             proof.update({"peers": peers, "keyspace": rows[0], "storage_node_receipts_required": True})
+    elif backend == "valkey_tcp":
+        complete = config["index"] == -1 or cluster
+        endpoints = backend_options(fleet, backend, directory)["nodes"] if complete else [config["address"] + ":6379"]
+        observed = local.valkey_evidence(lambda endpoint, *args: valkey_command(config, endpoint, *args), endpoints, True)
+        proof.update(observed)
+        save(directory / "probe-attempt.json", proof)
+        proof["coverage"] = local.admit_valkey(observed["nodes"], endpoints, True, complete=complete)
     else:
         status = json.loads(execute(config, "/usr/bin/fdbcli", "-C", "/config/fdb.cluster", "--timeout", "10", "--exec", "status json"))
         proof["status"] = status
@@ -660,7 +696,7 @@ def probe(fleet, config, timeout=120, initialize_cluster=False, cluster=False):
     while time.monotonic() < deadline:
         try:
             initialization = initialize(fleet, config) if initialize_cluster else None
-            proof = probe_once(fleet, config)
+            proof = probe_once(fleet, config, cluster=cluster) if config["backend"] == "valkey_tcp" else probe_once(fleet, config)
             if cluster and config["backend"] == "cassandra" and config["index"] >= 0:
                 if (set(proof["ring_un"]) != {x["address"] for x in fleet["nodes"]} or len(proof["ring_un"]) != 5 or
                         len(proof["ring_members"]) != 5 or any(state != "UN" for state, _ in proof["ring_members"])):
@@ -753,6 +789,8 @@ def stop(config):
     tools = [reset_container(config)]
     if config["backend"] == "cassandra" and config["index"] == -1:
         tools.append({"name": "kvcloud-" + config["owner"][:16] + "-cql-tool"})
+    if config["backend"] == "valkey_tcp" and config["index"] == -1:
+        tools.append({"name": "kvcloud-" + config["owner"][:16] + "-valkey-tool"})
     for tool in tools:
         item = inspect_container(config, tool, required=False)
         if item:

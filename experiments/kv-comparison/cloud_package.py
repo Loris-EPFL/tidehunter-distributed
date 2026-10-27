@@ -21,7 +21,7 @@ import tempfile
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
-FEATURES = ["tikv", "cassandra", "foundationdb", "efa"]
+FEATURES = ["tikv", "cassandra", "foundationdb", "valkey-tcp", "fabric"]
 TARGET = "x86_64-unknown-linux-gnu"
 MAX_GLIBC = (2, 39)  # Ubuntu 24.04, not the build host's version.
 MAX_GLIBCXX = (3, 4, 33)  # Ubuntu 24.04 libstdc++6 (GCC 14).
@@ -38,14 +38,16 @@ EFA = {"installer_version": "1.50.0", "installer_sha256": "fa6dff8593d866866c13c
        "upstream_commit": "3cc1095272b07ebeb5cc8f44851af6aa3eb75e41",
        "runtime_library_dir": "/opt/amazon/efa/lib", "required_environment": {"FI_EFA_USE_DEVICE_RDMA": "1"},
        "hardware_admission": "provider efa, RDM fabrics efa (MSG|DIRECTED_RECV) and efa-direct (MSG); registered-RAM additionally requires efa-direct RMA|READ|REMOTE_READ; Rust enforces geometry and native device reads; no TCP fallback"}
-NEW_ROOTS = ("benchmarks/kv-research/", "experiments/kv-comparison/")
+NEW_ROOTS = ("benchmarks/kv-research/", "experiments/kv-comparison/", "experiments/portable_transport.py")
 SUFFIXES = {".rs", ".toml", ".lock", ".py", ".json", ".yaml", ".yml", ".sh", ".md", ".c", ".h", ".cpp", ".proto", ".html", ".css", ".js", ".txt"}
 EXCLUDED = {".git", "target", "checkpoint-work", "logs", "results", "artifacts", "data", "secrets", "credentials", ".state", "__pycache__", ".aws", ".ssh", "node_modules", ".venv"}
 REQUIRED = {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml", "benchmarks/kv-research/Cargo.toml",
             "benchmarks/kv-research/src/main.rs", "tidehunter/Cargo.toml", "tidehunter-fabric/Cargo.toml",
+            "experiments/portable_transport.py", "experiments/resident_config.py",
             "experiments/kv-comparison/cloud_package.py", "experiments/kv-comparison/cloud_controller.py",
             "experiments/kv-comparison/cloud_campaign.py", "experiments/kv-comparison/cloud_layout.py",
             "experiments/kv-comparison/cloud-campaign.json", "experiments/kv-comparison/local.py",
+            "experiments/kv-comparison/resource_accounting.py",
             "experiments/kv-comparison/observability/campaign_monitor.py",
             "experiments/kv-comparison/observability/campaign_exporter.py",
             "experiments/kv-comparison/observability/exporter.py",
@@ -92,6 +94,8 @@ def safe_name(name):
 def allowed(name):
     path = safe_name(name)
     lowered = {x.lower() for x in path.parts}
+    if path.parts[:2] == ("experiments", "valkey-infiniband"):
+        return False
     if lowered & EXCLUDED or path.name.startswith(".env") or path.suffix.lower() in {".key", ".pem", ".p12", ".pfx"}:
         return False
     if any("credential" in x or "secret" in x for x in lowered):

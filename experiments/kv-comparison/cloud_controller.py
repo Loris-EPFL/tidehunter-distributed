@@ -33,18 +33,22 @@ import time
 import urllib.request
 # A sealed extracted source tree must remain byte-for-byte immutable.
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import analyze
 import campaign
 import cloud_campaign
 import cloud_layout
 import local
+import resource_accounting
+from portable_transport import is_trusted, protocol_key, validate_transport
 
 ACCOUNT = "354775971805"
 TAGS = {"Project": "TideHunter", "ManagedBy": "sharded-wal-benchmark",
         "Repository": "Loris-EPFL/tidehunter-distributed", "Campaign": "kv-comparison",
         "BenchmarkBranch": "bench/aws-efa", "SourceBranch": "feat/cloud-kv-comparison"}
 RAW_FILES = ("manifest.json", "summary.json", "samples.csv", "metrics.prom")
+MAX_JSON_BYTES = 32 * 1024 * 1024
 DISABLED_RESIDENT_READS = {"source_bytes": 0, "source_regions": 0, "destination_bytes": 0,
     "destination_slots": 0, "max_read_bytes": 0, "max_handles": 0, "require_device_read": False}
 
@@ -273,6 +277,8 @@ def s3_json(client, config, key, value):
     if not key.startswith(config["prefix"] + "/") or ".." in key.split("/"):
         raise SafetyError("S3 key escapes exact run prefix")
     raw = (json.dumps(value, sort_keys=True, indent=2, default=str) + "\n").encode()
+    if len(raw) > MAX_JSON_BYTES:
+        raise SafetyError("S3 JSON export exceeds its bounded metadata budget")
     checksum = hashlib.sha256(raw).hexdigest()
     client.put_object(Bucket=config["bucket"], Key=key, Body=raw, ExpectedBucketOwner=config["account"],
                       ServerSideEncryption="AES256", Metadata={"sha256": checksum}, ContentType="application/json")
@@ -282,7 +288,7 @@ def s3_json(client, config, key, value):
     return {"key": key, "bytes": len(raw), "sha256": checksum}
 
 
-def read_s3_json(client, config, key, limit=32 * 1024 * 1024):
+def read_s3_json(client, config, key, limit=MAX_JSON_BYTES):
     if not key.startswith(config["prefix"] + "/"):
         raise SafetyError("foreign S3 result key")
     response = client.get_object(Bucket=config["bucket"], Key=key, ExpectedBucketOwner=config["account"])
@@ -530,10 +536,15 @@ def validate_launch(config, launch, case, index):
     if launch.get("listen") != config["fleet"]["nodes"][index]["address"] + ":9400":
         raise SafetyError("typed listener differs from exact storage endpoint")
     tls = launch.get("tls", {})
-    if tls.get("transport") not in cloud_campaign.TRANSPORTS.values():
-        raise SafetyError("unknown typed transport")
-    if tls["transport"] == "efa-native":
-        if any(tls.get(field) for field in ("ca", "cert", "key")):
+    try:
+        transport = validate_transport(tls.get("transport"))
+    except ValueError as error:
+        raise SafetyError("invalid typed transport") from error
+    if protocol_key(transport) not in {
+            protocol_key(value) for value in cloud_campaign.TRANSPORTS.values()}:
+        raise SafetyError("transport protocol is not admitted by the AWS comparison")
+    if is_trusted(transport):
+        if any(tls.get(field) != "" for field in ("ca", "cert", "key")):
             raise SafetyError("trusted native transport must have empty TLS paths")
     else:
         expected_tls = {"ca": "ca.der", "cert": f"tidehunter-node-{index}.der",
@@ -584,6 +595,16 @@ def guest_operation(config, request, clients):
         return observer.start_host(spec, index) if action == "monitor_start" else observer.stop_host(spec, index)
     if action == "snapshot":
         observed = snapshot(config, request.get("unit"), drop=request.get("drop", False))
+        resource_job = request.get("resource_job")
+        if resource_job is not None:
+            if request.get("monitor_job") is not None and request["monitor_job"] != resource_job:
+                raise SafetyError("resource and monitoring selections disagree")
+            accounting = owned_monitor_processes(config, index, resource_job)
+            observed["resource_accounting"] = resource_accounting.capture(
+                index, observed["nvme"]["host_identity"]["boot_id"], accounting["processes"])
+            for missing in accounting["missing"]:
+                observed["resource_accounting"]["processes"].append({
+                    "process_role": missing["role"], "available": False, "reason": missing["reason"][:300]})
         if request.get("monitor_job") is not None:
             started = time.monotonic()
             try:
@@ -880,6 +901,13 @@ class Controller:
             read_evidence = receipt.get("counter_evidence", {}).get("observed")
             if isinstance(read_evidence, dict):
                 observed["read_evidence"] = read_evidence
+            resources = receipt.get("resource_evidence", {}).get("observed")
+            if isinstance(resources, dict):
+                observed["resource_evidence"] = resources
+            diagnostics = receipt.get("write_diagnostics", {}).get("observed")
+            if isinstance(diagnostics, dict):
+                observed["write_diagnostics"] = diagnostics
+                observed["write_profile_enabled"] = diagnostics["runtime_enabled"]
             return monitor_module(self.config).finish_case(monitoring_spec(self.config, self.root),
                 job, directory / "result", metrics=summary.get("metrics") if summary else None,
                 status=receipt["status"], timeout_seconds=min(2, self.remaining(export=True)), **observed)
@@ -889,7 +917,7 @@ class Controller:
         if not self.monitoring_attempted:
             return
         def capture():
-            timeout = self.observer_cleanup_budget(90, following_seconds=40)
+            timeout = self.observer_cleanup_budget(240, following_seconds=40)
             destination = guarded(self.root / "observability/monitoring.tar.gz", self.root)
             destination.parent.mkdir(parents=True, exist_ok=True)
             return monitor_module(self.config).export_session(monitoring_spec(self.config, self.root),
@@ -1101,6 +1129,7 @@ class Controller:
         client = unit_name(self.config, job["case_id"], "client")
         started = False
         client_quiesced = False
+        completion_observed = False
         failure = None
         self.select_monitoring(job, directory)
         try:
@@ -1152,6 +1181,7 @@ class Controller:
             status = unit_status(client)
             if ready.exists() and status.get("SubState") != "exited" and status.get("ActiveState") not in ("failed", "inactive"):
                 before = self.all_hosts({"action": "snapshot", "drop": job["drop_os_caches"],
+                    "resource_job": job,
                     **({"monitor_job": job} if self.monitoring_attempted else {})}, case=job["case_id"], timeout=60)
                 if self.monitoring_attempted:
                     for index, host in zip(range(-1, 5), before):
@@ -1159,10 +1189,35 @@ class Controller:
                             lambda host=host: host.get("monitoring", {"complete": False, "error": "guest omitted host selector evidence"}))
                 process_before = snapshot(self.config, client)
                 dump(directory / "measurement-before.json", {"hosts": before, "client": process_before})
+                receipt["measurement_evidence"].update({"gate_released": True,
+                    "before": "measurement-before.json", "before_sha256": digest(directory / "measurement-before.json")})
                 (directory / "measurement.release").touch(exist_ok=False)
                 gate_released = True
                 while True:
                     self.remaining()
+                    completed = directory / "measurement.complete"
+                    if completed.exists() and not completion_observed:
+                        ended = self.all_hosts({"action": "snapshot", "drop": False,
+                            "resource_job": job}, case=job["case_id"], timeout=60)
+                        dump(directory / "measurement-end.json", {"hosts": ended,
+                            "client": snapshot(self.config, client)})
+                        resources = resource_accounting.interval(
+                            [host["resource_accounting"] for host in before],
+                            [host["resource_accounting"] for host in ended])
+                        dump(directory / "resource-interval.json", resources)
+                        receipt["resource_evidence"] = {"path": "resource-interval.json",
+                            "sha256": digest(directory / "resource-interval.json"), "observed": resources,
+                            "complete": bool(resources["processes"]) and all(
+                                process["available"] for process in resources["processes"]),
+                            "scope": "host-local premeasurement through completion-gate accounting; includes driver, oracle, gate overlap and background work; IO totals span all cgroup devices"}
+                        self.observe("resource_interval:" + job["case_id"],
+                            lambda: {"complete": receipt["resource_evidence"]["complete"],
+                                "path": "resource-interval.json",
+                                "scope": resource_accounting.SCOPE})
+                        receipt["measurement_evidence"].update({"completion_gate_observed": True,
+                            "end": "measurement-end.json", "end_sha256": digest(directory / "measurement-end.json")})
+                        completion_observed = True
+                        (directory / "measurement.observed").touch(exist_ok=False)
                     status = unit_status(client)
                     if status.get("SubState") == "exited" or status.get("ActiveState") in ("failed", "inactive"):
                         break
@@ -1172,12 +1227,16 @@ class Controller:
             dump(directory / "client-final-unit.json", status)
             after = self.all_hosts({"action": "snapshot", "drop": False}, case=job["case_id"], timeout=60)
             dump(directory / "measurement-after.json", {"hosts": after, "client": snapshot(self.config, client, completed=True)})
-            receipt["measurement_evidence"] = {"gate_released": gate_released,
+            receipt["measurement_evidence"].update({"gate_released": gate_released,
                 "scope": "quiescent gate release through process exit; includes post-workload checks and drain",
                 "before": "measurement-before.json" if gate_released else None, "after": "measurement-after.json",
                 "before_sha256": digest(directory / "measurement-before.json") if gate_released else None,
                 "after_sha256": digest(directory / "measurement-after.json"),
-                "os_caches_dropped": job["drop_os_caches"] if gate_released else False, "engine_caches_evicted": False}
+                "os_caches_dropped": job["drop_os_caches"] if gate_released else False, "engine_caches_evicted": False})
+            receipt["measurement_evidence"].update({
+                "completion_gate_observed": completion_observed,
+                "end": "measurement-end.json" if completion_observed else None,
+                "end_sha256": digest(directory / "measurement-end.json") if completion_observed else None})
             # A failed runner can still have complete, provenance-bound raw
             # samples for its observed phases. Admit those bytes before judging
             # exit/status, but never treat malformed or missing rows as metrics.
@@ -1202,6 +1261,10 @@ class Controller:
                 receipt["artifacts_sha256"] = {name: digest(directory / "result" / name) for name in RAW_FILES}
                 receipt["core_manifest_status"] = manifest["status"]
                 receipt["core_summary_status"] = summary["status"]
+                diagnostics = cloud_campaign.admit_write_diagnostics(
+                    directory, job, completed=manifest["status"] == "completed")
+                if diagnostics is not None:
+                    receipt["write_diagnostics"] = diagnostics
                 receipt["raw_artifacts_validated"] = True
             except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError) as exc:
                 raise SafetyError("terminal source/config/binary/schema/raw-row admission failed: " + str(exc)) from exc
@@ -1222,6 +1285,8 @@ class Controller:
                     counters_missing = True
             if not gate_released:
                 raise RuntimeError("core exited before quiescent measurement release: " + json.dumps(status))
+            if not completion_observed:
+                raise RuntimeError("core exited without the postmeasurement accounting gate")
             if status.get("Result") != "success" or status.get("ExecMainStatus") != "0" or manifest["status"] != "completed":
                 raise RuntimeError("core workload failed: " + json.dumps({"unit": status, "core_status": manifest["status"]}))
             if observed_counts != receipt["planned_timing_rows_by_phase"]:
@@ -1312,6 +1377,10 @@ class Controller:
         self.remaining(export=True)
         archive = self.root.parent / "controller-export.tar.gz"
         records = archive_results(self.root, archive, deadline_check=lambda: self.remaining(export=True))
+        # File inventories grow with the matrix. Keep bulk metadata out of the
+        # launcher's independently bounded, frequently polled control receipt.
+        inventory = s3_json(self.clients["s3"], self.config,
+                            self.config["prefix"] + "/results/controller-inventory.json", records)
         checksum = digest(archive)
         size = archive.stat().st_size
         from boto3.s3.transfer import TransferConfig
@@ -1323,8 +1392,9 @@ class Controller:
         head = self.clients["s3"].head_object(Bucket=self.config["bucket"], Key=key, ExpectedBucketOwner=self.config["account"])
         if head.get("ContentLength") != size or head.get("Metadata", {}).get("sha256") != checksum:
             raise InfrastructureError("raw archive HEAD differs from exact uploaded bytes")
-        self.persist("receipt.json", {"status": "completed" if report["complete"] and not error else "incomplete",
-            "error": error, "key": key, "bytes": size, "sha256": checksum, "files": records,
+        self.persist("receipt.json", {"schema_version": 2,
+            "status": "completed" if report["complete"] and not error else "incomplete",
+            "error": error, "key": key, "bytes": size, "sha256": checksum, "inventory": inventory,
             "source_sha256": self.config["source_sha256"], "binary_blake2b512": self.config["binary_blake2b512"],
             "monitoring_complete": monitoring["complete"]})
         return report

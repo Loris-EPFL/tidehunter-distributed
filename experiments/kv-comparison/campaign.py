@@ -19,6 +19,10 @@ import zipfile
 
 import local
 import analyze
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from portable_transport import (CASE_TRANSPORTS, runtime_backend, transport_for_case,
+                                validate_transport, select_backends, protocol_key, is_software)
+from resident_config import software_fabric_environment
 
 
 def digest(path, algorithm="sha256"):
@@ -148,8 +152,10 @@ def matrix(spec):
     bounded_int(spec.get("client_memory_mib", 2048), 256, 65536, "client_memory_mib")
     if spec.get("layout") not in ("qualification", "distributed"):
         raise ValueError("layout must explicitly name qualification or distributed")
+    supported = {"native", "rocksdb", "blobdb", "tikv", "cassandra", "foundationdb", "valkey_tcp"} | set(CASE_TRANSPORTS)
     backends, profiles, rates = spec.get("backends", []), spec.get("profiles", []), spec.get("rates", [])
-    if not backends or len(backends) != len(set(backends)) or set(backends) - {"native", "tidehunter_tcp", "rocksdb", "blobdb", "tikv", "cassandra", "foundationdb"}:
+    if (not isinstance(backends, list) or not backends or any(not isinstance(x, str) for x in backends)
+            or set(backends) - supported or len(backends) != len(set(backends))):
         raise ValueError("backends must be unique supported backend names")
     if not profiles or any(set(x) != {"name", "keys", "aging_operations"} for x in profiles):
         raise ValueError("profiles require explicit name, keys and aging_operations")
@@ -175,7 +181,9 @@ def matrix(spec):
 
 def source_snapshot(output):
     paths = local.command(["git", "ls-files", "-z"]).split("\0")
-    framework = ["experiments/kv-comparison", "benchmarks/kv-research",
+    framework = ["experiments/kv-comparison", "experiments/portable_transport.py",
+                 "benchmarks/kv-research", "tidehunter/src", "tidehunter/examples",
+                 "tidehunter-fabric/src", "tidehunter-fabric/tests",
                  ".github/workflows/kv-comparison.yaml", ":(glob).github/scripts/kv-comparison*",
                  "docs/distributed/KV_COMPARISON_PROTOCOL.md"]
     paths += local.command(["git", "ls-files", "--others", "--exclude-standard", "-z", "--", *framework]).split("\0")
@@ -186,6 +194,8 @@ def source_snapshot(output):
         excluded_parts = {".state", "__pycache__", "target", "results", "artifacts", "secrets", "credentials"}
         for path in sorted(candidates):
             relative = path.relative_to(local.ROOT)
+            if relative.parts[:2] == ("experiments", "valkey-infiniband"):
+                continue
             if any(part in excluded_parts for part in relative.parts) or path.is_symlink():
                 continue
             if path.is_file() and (path.suffix in {".rs", ".toml", ".lock", ".py", ".json", ".yaml", ".yml", ".sh", ".md"} or path.name in {".gitignore", "Dockerfile"}):
@@ -200,7 +210,7 @@ def source_snapshot(output):
                                         "snapshot_sha256": digest(output / "source.zip")})
 
 
-def backend_options(kind, state, output):
+def backend_options(kind, state, output, transport=None):
     nodes = state["nodes"] if state else 1
     if kind == "tikv":
         return {"pd_endpoints": ["127.0.0.1:2379"], "pd_api_endpoints": ["http://127.0.0.1:2379"],
@@ -210,15 +220,33 @@ def backend_options(kind, state, output):
                 "required_replication_factor": nodes, "consistency": "quorum"}
     if kind == "foundationdb":
         return {"cluster_file": str(Path(state["directory"]) / "fdb.cluster"), "required_replication_factor": 1 if nodes == 1 else 2}
+    if kind == "valkey_tcp":
+        if state and "backend_options" in state:
+            return copy.deepcopy(state["backend_options"])
+        return {"nodes": [f"127.0.0.{21+i}:{6379+i}" for i in range(nodes)],
+                "cluster": nodes > 1, "required_replication_factor": 1,
+                "required_primary_nodes": nodes, "request_timeout_ms": 5000}
     options = {"path": str(output / "database")}
-    if kind == "tidehunter_tcp":
-        options.update({"evidence": str(output / "tcp-evidence"), "owners": 5})
+    if kind in CASE_TRANSPORTS:
+        transport = transport_for_case(kind) if transport is None else validate_transport(transport)
+        label = kind.removeprefix("tidehunter_")
+        options.update({"evidence": str(output / f"{label}-evidence"), "owners": 5,
+                        "transport": transport})
     return options
 
 
-def build_config(base, job, state, output, seed, qualification):
+def build_config(base, job, state, output, seed, qualification, transport=None):
     config = copy.deepcopy(base)
-    config["backend"] = {"kind": job["backend"], "options": backend_options(job["backend"], state, output)}
+    kind = job["backend"]
+    selected_transport = transport_for_case(kind) if kind in CASE_TRANSPORTS else None
+    if transport is not None:
+        if selected_transport is None:
+            raise ValueError("explicit transport requires a Tidehunter research case")
+        selected_transport = validate_transport(transport)
+        if protocol_key(selected_transport) != protocol_key(transport_for_case(kind)):
+            raise ValueError("explicit transport provider/security differs from the selected research case")
+    config["backend"] = {"kind": runtime_backend(kind),
+                         "options": backend_options(kind, state, output, selected_transport)}
     config["seed"] = seed
     config["namespace"] = "local-" + uuid.uuid4().hex
     config["dataset"]["keys"] = job["profile"]["keys"]
@@ -231,11 +259,11 @@ def build_config(base, job, state, output, seed, qualification):
         config["execution"]["request_timeout_ms"] = 5000
         config["limits"]["deadline_seconds"] = 90
         config["limits"]["shutdown_grace_seconds"] = 10
-    if job["backend"] == "tidehunter_tcp":
+    if kind in CASE_TRANSPORTS:
         retained = (config["dataset"]["keys"] if config["phases"]["preload"] else 0)
         retained += sum(config["phases"][name] for name in ("warmup_operations", "aging_operations", "measurement_operations")) + 1024
         if retained > 1_000_000:
-            raise ValueError("finite TCP retained-history requirement exceeds supported 1,000,000 batches per partition; reduce the declared workload explicitly")
+            raise ValueError("finite retained-history requirement exceeds supported 1,000,000 batches per partition; reduce the declared workload explicitly")
         config["backend"]["options"]["max_batches_per_partition"] = retained
     return config
 
@@ -330,7 +358,7 @@ def run_one(args, spec, base, job, index):
     run_dir.mkdir()
     state_dir = args.reuse_state.resolve() if args.reuse_state else run_dir / "server"
     state = None
-    external = job["backend"] in ("tikv", "cassandra", "foundationdb")
+    external = job["backend"] in ("tikv", "cassandra", "foundationdb", "valkey_tcp")
     receipt = {"job": job, "status": "starting", "started_at_unix": time.time(),
                "physical_hosts": 1, "shared_ssd": True, "cloud_billing_estimate": None,
                "claim_boundary": "API qualification only" if args.qualification else "local shared-SSD timing; no HA or independent-NVMe claim",
@@ -343,21 +371,29 @@ def run_one(args, spec, base, job, index):
                             "block_devices": local.command(["lsblk", "-J", "-o", "NAME,TYPE,SIZE,ROTA,MODEL,MOUNTPOINTS"])}}
     local.dump(run_dir / "receipt.json", receipt)
     try:
-        prospective = {"nodes": 1 if spec["layout"] == "qualification" else 3, "directory": str(state_dir)} if external else None
+        prospective = {"nodes": (1 if spec["layout"] == "qualification" else
+                                 5 if job["backend"] == "valkey_tcp" else 3),
+                       "directory": str(state_dir)} if external else None
         if args.reuse_state:
             prospective = local.load(state_dir)
-        config = build_config(base, job, prospective, run_dir, spec["seed"], args.qualification)
+        config = build_config(base, job, prospective, run_dir, spec["seed"], args.qualification,
+                              args.transport_config if job["backend"] in CASE_TRANSPORTS else None)
         config["source_revision"] = local.command(["git", "rev-parse", "HEAD"]).strip()
         local.dump(run_dir / "config.json", config)
         # Reject unsupported binary features/invalid budgets before pulling or starting DBs.
         fdb_identity = args.fdb_client_identity if job["backend"] == "foundationdb" else None
         child_environment = admitted_fdb_environment(fdb_identity) if fdb_identity else None
+        if job["backend"] in CASE_TRANSPORTS and is_software(config["backend"]["options"]["transport"]):
+            child_environment = software_fabric_environment(
+                os.environ if child_environment is None else child_environment, software=True)
+            receipt["software_fabric_environment"] = {
+                "FI_OFI_RXM_MSG_RX_SIZE": child_environment["FI_OFI_RXM_MSG_RX_SIZE"]}
         config = admit_config(args.binary, run_dir / "config.json", run_dir, child_environment)
         receipt["config_sha256"] = digest(run_dir / "config.json")
         receipt["normalized_config_sha256"] = digest(run_dir / "normalized-config.json")
         receipt["binary_sha256"] = digest(args.binary)
         receipt["binary_blake2b512"] = digest(args.binary, "blake2b")
-        if job["backend"] == "tidehunter_tcp":
+        if job["backend"] in CASE_TRANSPORTS:
             receipt["retention_admission"] = {"max_batches_per_partition": config["backend"]["options"]["max_batches_per_partition"],
                                                "derivation": "preload keys + all phase calls + 1024 qualification allowance; worst-case one-owner concentration",
                                                "physical_wal_gc": False}
@@ -418,7 +454,9 @@ def main():
     p.add_argument("--manifest", type=Path, required=True)
     p.add_argument("--binary", type=Path, default=local.ROOT / "target/release/kv-research")
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--backend", help="rerun only this backend, preserving declared matrix and seed")
+    p.add_argument("--backends", help="comma-separated nonempty subset of backend IDs in the tracked manifest")
+    p.add_argument("--transport-config", type=Path,
+                   help="explicit canonical Transport JSON for the local Tidehunter case only; does not alter the declared matrix")
     p.add_argument("--reuse-state", type=Path, help="reuse exact-owned ready deployment; implies explicitly labeled nonfresh storage and leaves it running")
     p.add_argument("--qualification", action="store_true", help="real API qualification, not performance")
     p.add_argument("--observe", action="store_true", help="explicitly configure/start monitoring per cell before timing")
@@ -428,16 +466,24 @@ def main():
     if args.output.exists():
         raise ValueError("output must be fresh; refusing to overwrite provenance")
     spec = json.loads(args.manifest.read_text())
+    supported = {"native", "rocksdb", "blobdb", "tikv", "cassandra", "foundationdb", "valkey_tcp"} | set(CASE_TRANSPORTS)
+    spec["backends"] = select_backends(args.backends, spec.get("backends"), supported)
     jobs = matrix(spec)
-    if args.backend:
-        if args.backend not in spec["backends"]:
-            raise ValueError("requested backend is absent from admitted manifest")
-        jobs = [x for x in jobs if x["backend"] == args.backend]
+    if args.transport_config:
+        args.transport_config = validate_transport(json.loads(args.transport_config.read_text()))
+        tidehunter_cases = [backend for backend in spec["backends"] if backend in CASE_TRANSPORTS]
+        if len(tidehunter_cases) != 1:
+            raise ValueError("--transport-config requires exactly one Tidehunter research case")
+        expected = transport_for_case(tidehunter_cases[0])
+        if protocol_key(args.transport_config) != protocol_key(expected):
+            raise ValueError("transport config provider/security differs from selected research case")
+        if args.reuse_state:
+            raise ValueError("--transport-config cannot reuse a deployment selected under an implicit transport")
     if args.reuse_state:
-        if not args.backend:
-            raise ValueError("--reuse-state requires exactly one explicit --backend")
+        if len(spec["backends"]) != 1:
+            raise ValueError("--reuse-state requires exactly one selected backend")
         reused = local.load(args.reuse_state)
-        if reused["backend"] != args.backend or reused["layout"] != spec["layout"]:
+        if reused["backend"] != spec["backends"][0] or reused["layout"] != spec["layout"]:
             raise ValueError("reused backend/layout differs from campaign declaration")
     if not args.binary.is_file() or not os.access(args.binary, os.X_OK):
         raise RuntimeError("requested kv-research binary missing/not executable; build explicitly first")
