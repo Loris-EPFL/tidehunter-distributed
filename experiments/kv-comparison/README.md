@@ -1389,6 +1389,13 @@ and independent watchdog are unchanged. The editable weekly limit remains
 solely in `experiments/aws-sharded-wal/budget.json`; aggregate accounting stays
 in the conditional-write S3 ledger.
 
+Both the local GitHub KV qualification workflow and the paid workflow's
+credential-free KV preparation job install `matplotlib==3.11.2` before running
+the full comparison harness. Renderer tests exercise real headless figures,
+including the rule that a single repetition has no run-to-run error bars;
+they are not skipped when the library is missing. The exact CI Python pins
+were exercised in a fresh isolated Python 3.12 environment before publication.
+
 An additional real five-primary Valkey 9.0.7 preflight passed all slot-view,
 RF1/AOF/noeviction checks and mixed workloads at 64 B, 256 B, 1 KiB, 8 KiB and
 64 KiB. Each case completed all 376 operations without wrong values, rejected

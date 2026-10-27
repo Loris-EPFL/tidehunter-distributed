@@ -67,7 +67,7 @@ jobs:
         run: |
           python3 -m venv --system-site-packages "$RUNNER_TEMP/kv-python"
           "$RUNNER_TEMP/kv-python/bin/pip" install --disable-pip-version-check --retries 2 --timeout 30 \
-            boto3==1.35.99 PyYAML==6.0.2
+            boto3==1.35.99 PyYAML==6.0.2 matplotlib==3.11.2
           echo "$RUNNER_TEMP/kv-python/bin" >> "$GITHUB_PATH"
       - name: Prepare matching FoundationDB client in owned prefix
         timeout-minutes: 5

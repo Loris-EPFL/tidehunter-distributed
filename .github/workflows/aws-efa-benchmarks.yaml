@@ -259,7 +259,7 @@ jobs:
         run: |
           python3 -m venv --system-site-packages "$RUNNER_TEMP/benchmark-tools"
           "$RUNNER_TEMP/benchmark-tools/bin/pip" install --disable-pip-version-check --retries 2 --timeout 30 \
-            boto3==1.35.99 PyYAML==6.0.2 cmake==3.31.6 ninja==1.11.1.4 protoc-wheel-0==29.3
+            boto3==1.35.99 PyYAML==6.0.2 matplotlib==3.11.2 cmake==3.31.6 ninja==1.11.1.4 protoc-wheel-0==29.3
           echo "$RUNNER_TEMP/benchmark-tools/bin" >> "$GITHUB_PATH"
       - name: Cache locked Cargo sources, never old executables
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
