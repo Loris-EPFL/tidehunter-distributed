@@ -2,6 +2,51 @@
 
 This protocol separates comparative research from engine optimization. Local execution establishes API, lifecycle, accounting and artifact behavior. It does not establish independent-NVMe, EFA, scaling or high-availability performance. No AWS credentials or paid campaign are required by the local comparison workflow.
 
+## Transport configuration and evidence
+
+The distributed transport is not a separate storage protocol: coordinator
+index, owner WAL, read grants, existing locks, and durable append receipts
+remain unchanged. The engine `Transport` defaults to TCP; an explicit OFI
+configuration selects one `FabricBackend` (`efa`, `efa-direct`, `verbs`, or
+`software-tcp`) and `FabricSecurity` (`mutual-tls` or `trusted`). Canonical
+example:
+
+```json
+{"kind":"ofi","fabric":{"backend":"verbs","domain":"mlx5_0","source_address":"10.1.0.2"},"security":"trusted"}
+```
+
+`domain` and `source_address` are optional host-local selectors. Supply each
+host's own selectors as needed; peers must select the same backend and
+security, while selectors need not be identical. Source-IP constraints depend
+on the provider: EFA/EFA-direct reject a source IP because `FI_ADDR_EFA` is
+opaque; verbs accepts IPv4 only because pinned RxM lists `FI_SOCKADDR` and
+`FI_SOCKADDR_IN`, even where core verbs supports IPv6; software-tcp accepts
+IPv4/IPv6 when `fi_getinfo` returns a matching sockaddr. With no selector,
+each provider uses its default. Metadata reports a selected address only when
+it is a parseable IPv4/IPv6 sockaddr. An explicit source is checked against
+the selected OFI address, not echoed from config. Unsupported bindings,
+protocol mismatch, or unmet required device-read capability fail; transport
+never silently downgrades to TCP.
+
+EFA/EFA-direct and generic verbs are separate provider paths. IB, RoCE, and
+Falcon use verbs/RxM when supported by the selected host's provider, but are
+not interchangeable wire fabrics; EFA SRD is not verbs. A provider name or
+requested setting is not hardware proof. Retain actual provider/setup metadata
+and capability provenance. For EFA/EFA-direct, native-read proof requires
+`FI_OPT_EFA_EMULATED_READ == false`. For verbs, it requires provider PCI
+NIC/device metadata matched to canonical sysfs PCI BDF; software `rxe`,
+`rdma_rxe`, and `siw` devices are excluded. Verbs proof does not establish
+Falcon identity. Software OFI FI_READ validation proves only software
+correctness. Do not claim hardware qualification or performance without
+parent-reviewed hardware evidence. Transport does not alter storage locking
+or WAL/durability semantics.
+
+Benchmark backend kind is unified as `tidehunter`; case identities such as
+`tidehunter_tcp`, `tidehunter_efa`, `tidehunter_efa_direct`, and
+`tidehunter_efa_native` remain historical reporting labels, not configuration
+aliases. Preserve provider/security distinctions in any new labels and never
+compare trusted and mutual-TLS cohorts as security-equivalent.
+
 ## Research questions
 
 1. At a fixed offered rate and resource budget, how do completed throughput, response-time distributions and failure rates compare?
@@ -64,11 +109,89 @@ The local controller is a measured application/coordinator. A research collector
 
 For each run retain configuration, seed/generator identity, backend guarantees/capabilities, source and executable identity, topology and effective settings, raw/interval latency data, outcomes, phase bounds, telemetry and failure diagnostics. Retain compact seeds/hashes and generated-input definitions rather than redundant database copies. Do not rewrite historical hash-bound artifacts. Local artifact checks do not imply fresh cloud data.
 
+### Measurement-boundary and sampled write diagnostics
+
+Keep the ordinary unprofiled matrix intact. An explicit
+`diagnostics.write_profile_limit` adds separate native/Tidehunter write-diagnostic
+cohorts; it does not replace primary comparisons or make profiled API latency
+overhead-free. The default has 253 ordinary and five diagnostic cells per
+repetition. Zero disables the additions. Neither mode reduces any within-case
+phase, operation/sample count, backend, transport, size or correctness check.
+
+Capture owned process counters at the pre-measurement gate and again while the
+completion gate holds the still-live client, before profile finalization,
+post-workload qualification, drain and shutdown. Bind the original boundary
+frames and derived `resource-interval.json` by hash. Require identical boot,
+cgroup path/inode, positive host-local monotonic elapsed time and nondecreasing
+counters. Missing/reset/changed identities are unavailable, not zero. Report
+all-cgroup-device IO separately from mounted-data-NVMe host-device counters.
+End memory and cgroup-lifetime peak are gauges, not per-case memory maxima.
+The broader through-exit host window remains separate. None of these intervals
+is pure API time or engine-only CPU.
+
+Arm write profiling after warm-up, not at database open. Native benchmark-only
+scalar mutation entry points time the existing WAL append and index application;
+the existing Value-WAL persistence profiler supplies a separate barrier component.
+Ordinary native algorithms, acknowledgment points and locks are unchanged.
+Distributed owner/connection profiles have a per-connection append-request cap,
+not a global logical-write cap. Their component request counts can differ:
+the local qualification observed 1280 owner samples and 1299 client requests.
+Use each component's own count; do not normalize every clock by owner samples.
+
+The distributed `coordinator_interval` is a separate full measurement-boundary
+delta population: admission/preparation, dispatch, append/group counts, storage
+wait, publication, checkpoint and durable-prefix blocking. It is not restricted
+to the owner prefix. Overlapping/nested clocks, idle-inclusive receive clocks and
+different populations are not additive percentages or measured network-only time.
+Per-stage totals do not provide per-operation stage percentiles.
+
+Preserve raw query evidence as hash-addressed bounded pages, not a single
+monolithic verification response. Replay the exact recorded `(start,end]`
+boundaries, including sparse one-point series; reject changed samples, page
+gaps, overlaps and warnings. Do not invent rate samples or repair legacy missing
+query hashes. The actual host/cgroup scrape period is five seconds and terminal
+benchmark gauges use one second. A one-point series cannot prove no throttling.
+Labelled terminal tables and original raw API/scheduling/response samples remain
+different evidence sources. Observer cohosting and profiling overhead require
+separate calibration before any overhead-neutral research claim.
+
+
 ## Analysis and resource accounting
 
-First show latency versus achieved throughput, plus offered load and failure populations. Report p50/p95/p99 and only supported higher tails with sample counts. Use independent repetitions and randomized/counterbalanced system order. Run-level uncertainty matters: operations in one process are not independent deployment repetitions. Never average worker/run p99s. Merge compatible raw observations only with declared weighting and also show between-run variation.
+First show latency versus achieved throughput, plus offered load and failure populations. Report p50/p95/p99/p99.9, mean, population standard deviation and maximum with sample counts and tail warnings. Preserve every operation's raw API, scheduling and response timings. Operations in one process are not independent deployment repetitions. Keep each case's quantiles separate; label any descriptive median of compatible per-repetition quantiles explicitly rather than presenting it as a pooled percentile. Do not pool incompatible populations or zero-fill missing observations.
 
 Choose warm-up, duration and steady-state criteria before seeing results. Use the local workflow for qualification and an affordable small pilot; expand selected representative cells instead of running every possible parameter product. Larger-than-RAM, storage aging and scaling experiments require suitable independent devices before drawing cluster conclusions.
+
+### Development versus publication
+
+Development defaults to one independent repetition of every case, with all
+backends, transports, sizes, workloads, concurrency/load levels, cohorts, preload,
+warm-up, correctness checks and within-case operation/sample counts unchanged.
+Label the result single-repetition and show no run-to-run error bars, confidence
+interval or significance claim. Publication and explicit reproducibility studies
+keep multiple independent repetitions under a declared protocol; neither two nor
+three runs alone justify describing variation as statistically insignificant.
+
+Use existing matched historical repetitions to assess whether observed spread
+can change the stated performance conclusion. Declare the materially important
+effect threshold before a rerun. The current development-triage policy uses
+10% relative latency with a 1 µs absolute floor, 10% throughput, and one percentage
+point of rejection fraction. These are engineering thresholds, not proof of
+equivalence. Freeze any different thresholds before measurement.
+
+Do not add development repetitions when the observed spread cannot change that
+conclusion, even if it is unfavorable. Repeat only relevant uncertain or regressed
+workload configurations, using frozen sources and identical declared settings
+across every backend involved in that comparison. Do not rerun only a preferred
+backend. Changed resources, acknowledgment, workload or observation modes make
+a regression comparison confounded. Do not modify an active campaign, discard
+existing repetitions, or launch another full campaign just to obtain a missing
+third repetition.
+
+The [comparison README](../../experiments/kv-comparison/README.md#development-repetition-policy)
+records planning/reporting behavior and the preserved historical variability
+assessment. Missing observations remain missing; no follow-up runs are launched
+automatically.
 
 Count every data, coordinator, control-plane, transaction/log and load-generator role. Report allocated CPU/RAM as well as consumed resources and all relevant cache layers. Use a matched TCP deployment for a portable comparison; EFA and registered-memory controls are separate transport ablations, not capabilities attributed to competitors without an implemented path.
 
@@ -76,18 +199,86 @@ Report host-device byte amplification, occupied/live logical space, network traf
 
 Automatic comparison must detect changed workloads, seeds, measurement scopes, hardware/resource budgets, acknowledgment/consistency/replication and observation modes. A deliberately different-contract comparison must display the differences and must not claim same-guarantee superiority.
 
+### Valkey TCP memory-store cohort
+
+`valkey_tcp` adds 25 common cells per repetition without removing any of the
+previous 228 ordinary cells or the five separate native/Tidehunter diagnostics.
+The current default is 258 cases; three repetitions give 774. Historical reports
+must use their retained frozen job list, not be replanned as a nine-backend run.
+Missing historical Valkey observations are absent, never zero.
+
+The distributed layout is five Valkey 9.0.7 primaries, RF1 and zero replicas, using
+the exact-pinned redis-rs 1.8.0 TCP client. Its MGET cluster routing restores
+binary-key input order, missing results and duplicates across slots. Cross-shard
+atomic PUT batches are unsupported. Record plain unauthenticated TCP, the actual
+slot map, primary count, server/client versions, resource limits and live AOF
+policy; do not infer equal guarantees from a shared KV API.
+
+Valkey GET is a **RAM-resident store read**, not a Value-WAL/NVMe cache-miss read.
+AOF `appendfsync=always` and `no-appendfsync-on-rewrite=no` are a separate
+write/recovery contract. Keep `noeviction` and normal AOF rewrite policies,
+retain actual persistence/maintenance state, and report capacity errors rather
+than changing the policy to complete a run. A local five-process cluster still
+has one physical host and shared SSD; it proves neither distributed scaling nor
+InfiniBand performance.
+
+### RDMA-enabled comparator qualification
+
+Add an RDMA comparator only as a separately qualified transport/storage cohort,
+not as an unsupported capability of the current TCP/transaction adapters.
+The implemented Valkey comparator above remains TCP-only.
+[Valkey's experimental RDMA transport](https://github.com/valkey-io/valkey/blob/9.0.7/README.md)
+uses librdmacm/libibverbs and still executes ordinary commands on the server.
+The inspected [RDMA implementation](https://github.com/valkey-io/valkey/blob/9.0.7/src/rdma.c)
+uses connected verbs/registered transfer buffers; it is not a client directly
+reading the database's WAL one-sided. Use the pinned
+[9.0.7 security release](https://github.com/valkey-io/valkey/releases/tag/9.0.7),
+not an unpatched or floating build.
+
+First qualify standalone Valkey TCP versus RDMA on matched compatible hardware.
+Its RDMA-CM/RC path is not established to work unchanged with
+[EFA's Libfabric RDM provider](https://ofiwg.github.io/libfabric/main/man/fi_efa.7.html).
+A ConnectX/RoCE/IB experiment is a different hardware/provider cohort; Tidehunter
+also needs a qualified path on that hardware before transport attribution is fair.
+Do not label standalone RDMA qualification as proven cluster-client, replication
+or cluster-bus RDMA support.
+
+[Valkey AOF policies](https://valkey.io/topics/persistence/) remain separate:
+no AOF, `everysec`, and `appendfsync always` have different acknowledgment and
+recovery contracts. AOF command logging/rewrite is not Tidehunter's owner-local
+Value WAL, even with fsync-before-reply. Charge all client/server/control roles,
+registered RAM, polling CPU, replicas and storage work. The separate
+[`experiments/valkey-infiniband`](../../experiments/valkey-infiniband/README.md)
+tool supplies offline planning/preflight and bounded functional qualification of
+an existing operator-supplied InfiniBand endpoint, with mandatory RDMA commands
+and no TCP fallback. It is not imported into the active suite or CI backend
+matrix. Its existence and unit tests are not hardware validation or RDMA
+performance evidence.
+
+[HERD](https://doi.org/10.1145/2619239.2626299) and
+[FUSEE](https://www.usenix.org/system/files/fast23-shen.pdf) are useful separate
+remote-memory research references, not durable-NVMe-WAL baselines. HERD's reported
+microsecond average is not a portable p99 target or evidence of SSD access.
+
+
 ## Sui application evidence
 
-Keep Sui replay separate from generic KV measurements. Existing certified private-chain replay exercises real Sui execution, not mainnet representativeness. The latest retained fixture measured no physical read bytes; it cannot establish general cold or exact-version-object-miss behavior. Record source range, state size, keyspace/access counts and physical-I/O coverage. Adding a generic TiKV/Cassandra/FDB adapter does not create a corresponding Sui storage integration.
+Keep Sui replay separate from generic KV measurements. Existing certified private-chain replay exercises real Sui execution, not mainnet representativeness. The latest retained fixture measured no physical read bytes; it cannot establish general cold or exact-version-object-miss behavior. Record source range, state size, keyspace/access counts and physical-I/O coverage. Adding a generic TiKV/Cassandra/FDB/Valkey adapter does not create a corresponding Sui storage integration.
 
 ## Source and implementation map
 
 - `benchmarks/kv-research/`: shared application-level backend boundary, bounded workload runner, outcome/timing artifacts and native/distributed/competitor adapters.
 - `experiments/kv-comparison/`: local owned comparator lifecycle, experiment configuration, statistical/comparability analysis and compact artifact handling.
+- `benchmarks/kv-research/src/backends/valkey_tcp.rs`: optional TCP-only cluster client, live policy admission, native MGET splitting and typed transport-failure outcomes.
+- `experiments/valkey-infiniband/`: deliberately separate future hardware qualification, excluded from active benchmark manifests/package sources.
 - `experiments/kv-comparison/observability/`: Prometheus/Grafana/node-exporter provisioning and current-run metrics exposition.
+- `experiments/kv-comparison/resource_accounting.py`: bounded owned-cgroup capture, identity/reset validation and reproducible terminal interval deltas.
+- `experiments/kv-comparison/cloud_campaign.py` and `cloud_controller.py`: separate diagnostic planning, live completion gate, raw/profile admission and integrity bindings.
+- `benchmarks/kv-research/src/runner.rs` and `backends/{native,tidehunter}.rs`: measurement-only profile arming, bounded selection, component scopes and final artifacts.
+- `tidehunter/src/db.rs`: benchmark-only native scalar append/index clocks; `distributed/remote_db.rs` and `remote_db/concurrent.rs`: dynamic profile control and fresh coordinator snapshots.
 - `.github/workflows/kv-comparison.yaml`: credential-free local adapter/instrumentation qualification, not paid cloud performance evidence.
 - `benchmarks/benchmark/src/`: existing native Tidehunter/RocksDB baseline and Prometheus exporter; preserve as the embedded reference.
-- `tidehunter/src/metrics.rs` and Sui typed-store adapter: existing engine/application telemetry. No native engine or Sui behavior change is required for this comparison framework.
+- `tidehunter/src/metrics.rs` and Sui typed-store adapter: existing engine/application telemetry. New benchmark-only profiling hooks do not change ordinary native algorithms, acknowledgment, locks or Sui behavior.
 - `experiments/aws-sharded-wal/` and `experiments/sui-checkpoint/`: preserved source-bound cloud/Sui campaigns. Their protected branch activation, exact-owned cleanup, budget ledger and deadline remain separate. The existing cloud harness's five-owner assumptions are not evidence of arbitrary-N support.
 
 ## Primary references and exact use

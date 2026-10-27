@@ -20,6 +20,33 @@ Each key space has a name and some parameters are configured per key space.
 * Some of the configurations for key spaces currently cannot be changed in an existing database.
 * Note that currently Tidehunter works better with comparatively large values of 512 bytes and more.
 
+## Distributed transport
+
+The sharded-WAL path keeps its WAL, index, read-grant protocol, durability
+receipts, and existing locks independent of transport. A common engine
+`Transport` selects the default TCP path or explicit OFI endpoint; OFI then
+selects EFA, EFA-direct, generic verbs, or software TCP. IB, RoCE, and Falcon
+share the verbs API when supported by the local provider, but are not
+interchangeable network technologies; EFA uses a separate SRD provider.
+
+Configuration is structured, for example:
+
+```json
+{"kind":"ofi","fabric":{"backend":"verbs","domain":"mlx5_0","source_address":"10.1.0.2"},"security":"trusted"}
+```
+
+`domain` and `source_address` are optional local selectors and may vary per
+host; peers must agree on provider and security. Explicit transport selection
+never silently downgrades to TCP. TCP remains the default, and native libfabric
+linkage is opt-in. See
+[`tidehunter-fabric/DESIGN.md`](tidehunter-fabric/DESIGN.md) and the
+[distributed comparison protocol](docs/distributed/KV_COMPARISON_PROTOCOL.md)
+for capability, evidence, and benchmark-label requirements.
+
+The structured transport configuration uses wire protocol 11. Rebuild all
+participants and regenerate deployment configurations together; older binary
+and string-transport configurations are not compatible with this cutover.
+
 # Key distribution
 
 Unlike other key-value stores like RocksDB or sled, Tidehunter generally requires knowledge about the structure of the keys used in the key space.

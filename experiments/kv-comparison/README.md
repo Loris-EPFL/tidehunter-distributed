@@ -4,8 +4,17 @@
 `cloud_layout.py` interface below prepares external servers on admitted physical
 hosts; it does not launch AWS resources or orchestrate a network deployment.
 The application boundary is the `kv-research` Rust binary and its real native/TCP, RocksDB/BlobDB,
-TiKV RawKV, Cassandra CQL and FoundationDB adapters. The common contract and native
+TiKV RawKV, Cassandra CQL, FoundationDB and Valkey Cluster TCP adapters. The common contract and native
 WAL restrictions are in [the comparison protocol](../../docs/distributed/KV_COMPARISON_PROTOCOL.md).
+Transport selection is explicit and provider-neutral. Tidehunter runtime kind
+is `tidehunter`; `Transport` defaults to TCP or accepts structured OFI
+configuration. Historical case names remain report identities, not runtime
+aliases. See [adapter transport mapping](../../benchmarks/kv-research/ADAPTERS.md#tidehunter-transport-adapters-and-external-owner-preparation)
+and the [comparison protocol](../../docs/distributed/KV_COMPARISON_PROTOCOL.md#transport-configuration-and-evidence)
+for canonical JSON, per-host selectors, security matching, and evidence rules.
+Do not interpret a software-provider FI_READ control as hardware proof or claim
+EFA/verbs qualification without actual provider metadata and measured hardware.
+
 Run from the repository root. Python helpers use only the standard library.
 Linux Docker Engine with Compose v2 is required; host networking and distinct
 loopback addresses are deliberate. Docker Desktop is not supported by this layout.
@@ -37,8 +46,10 @@ versions. Startup retains platform-specific local image IDs and RepoDigests in
 [TiKV 8.5.4 LTS release notes](https://docs.pingcap.com/tidb/stable/release-8.5.4/),
 [Apache Cassandra latest GA 5.0.9](https://cassandra.apache.org/_/download), and
 [FoundationDB releases](https://github.com/apple/foundationdb/releases): 7.3.77 is
-non-prerelease; 8.0.0/7.4.x were marked prerelease when selected. Upgrade pins and
-clients together, then rerun qualification; never silently substitute another image.
+non-prerelease; 8.0.0/7.4.x were marked prerelease when selected, and
+[Valkey 9.0.7](https://github.com/valkey-io/valkey/releases/tag/9.0.7) is the pinned
+security release for the TCP integration. Upgrade pins and clients together, then
+rerun qualification; never silently substitute another image.
 
 | Role | Distributed count | Hard per-process/container CPU / RAM cap | Effective policy |
 |---|---:|---|---|
@@ -46,6 +57,7 @@ clients together, then rerun qualification; never silently substitute another im
 | TiKV storage | 3 | 2 CPU / 1536 MiB | RF3, distinct logical `zone` labels; Titan on; 256 MiB shared block cache per store |
 | Cassandra storage+coordinator | 3 | 2 CPU / 1536 MiB | SimpleStrategy RF3, durable_writes=true, dc1, distinct logical racks; 512 MiB JVM heap, 256 MiB direct-memory cap and two GC/application processors |
 | FDB combined roles | 3 | 1 CPU / 768 MiB | double redundancy (RF2), three coordinators/zones; SSD engine; 512 MiB server memory and 128 MiB cache; actual recruited roles retained |
+| Valkey Cluster TCP primaries | 5 | 2 CPU / 1536 MiB | RF1, no replicas; 1024 MiB maxmemory per primary, noeviction; AOF appendfsync=always, no-appendfsync-on-rewrite=no; RAM-resident GET |
 | Rust workload/client (including native/TCP coordinator and owner descendants) | 1 owned process group | 2-CPU inherited affinity / 2048 MiB aggregate sampled RSS budget | independent wall deadline; per-process RSS/CPU sampled every 250 ms, **not** a hard memory cgroup |
 | Monitoring | campaign collector cohosted on controller; separate local mode optional | see [monitoring guide](observability/README.md) for hard caps | explicit observer placement; not off-host or proven overhead-neutral |
 
@@ -57,8 +69,17 @@ RF1 Value-WAL persistence, authenticated TLS and bounded retained history remain
 different contracts from plaintext replicated comparators. Raw metadata retains
 those distinctions; the report must not imply equivalent durability or security.
 
+An explicitly selected local software-OFI profile can need more aggregate RAM:
+RxM allocates provider buffers per endpoint, outside the application slot
+limits. The task-owned six-process transport qualification used 4,096 MiB,
+sampled 2,281,836,544 aggregate RSS bytes and observed no swap-in/out increments.
+This is not a larger default CI budget, a cloud per-host budget change, or a
+software/hardware performance result. See the
+[pinned source and local evidence](../../tidehunter-fabric/DESIGN.md#local-qualification-27-october-2026).
+
 TiKV total hard server caps: 7 CPU / 5 GiB; Cassandra: 6 CPU / 4.5 GiB;
-FDB: 3 CPU / 2.25 GiB. Add client and optional monitoring, the Docker daemon,
+FDB: 3 CPU / 2.25 GiB; Valkey: 10 CPU / 7.5 GiB.
+Add client and optional monitoring, the Docker daemon,
 OS/page cache and image storage; CPU quotas are maxima, not dedicated reservations.
 External qualification uses one data node with the same per-role caps; Tidehunter/TCP
 still starts its five owned processes. Only one backend stack runs at a time.
@@ -82,7 +103,7 @@ export FDB_CLIENT_LIB_DIR="$HOME/.local/kv-fdb-7.3.77/lib"
 export FDB_CLIENT_LIB_PATH="$FDB_CLIENT_LIB_DIR"
 export LD_LIBRARY_PATH="$FDB_CLIENT_LIB_DIR:${LD_LIBRARY_PATH:-}"
 export LIBRARY_PATH="$FDB_CLIENT_LIB_DIR:${LIBRARY_PATH:-}"
-cargo build --locked --release -p kv-research --features tikv,cassandra,foundationdb,rocksdb
+cargo build --locked --release -p kv-research --features tikv,cassandra,foundationdb,rocksdb,valkey-tcp
 python3 -m unittest discover -s experiments/kv-comparison -p 'test_*.py'
 ```
 
@@ -375,21 +396,82 @@ Focused offline regressions remain for the integrating agent to run:
 ## Campaigns, repeat identity and raw exports
 
 ```sh
-# Default: 4 backends × 3 profiles × 3 offered rates × 5 repeats = 180 finite cells.
+# Default: 5 backends × 3 profiles × 3 offered rates × 5 repeats = 225 finite cells.
 python3 experiments/kv-comparison/campaign.py --manifest experiments/kv-comparison/campaign.json \
   --binary target/release/kv-research --output /tmp/kv-campaign-new
 # Exactly one backend, retaining the same declared seed/profile/rate/repeat definitions:
 python3 experiments/kv-comparison/campaign.py --manifest experiments/kv-comparison/campaign.json \
-  --binary target/release/kv-research --backend cassandra --output /tmp/kv-cassandra-rerun-new
-# Cheap actual adapter qualification (same command used by CI, not timing evidence):
+  --binary target/release/kv-research --backends cassandra --output /tmp/kv-cassandra-rerun-new
+# Explicit local subset: comma-separated backend IDs; unsupported, empty, or
+# duplicate selections fail before deployment/resource acquisition.
+python3 experiments/kv-comparison/campaign.py --manifest experiments/kv-comparison/campaign.json \
+  --backends tidehunter_tcp,tikv --binary target/release/kv-research --output /tmp/kv-selected-new
+# API qualification also accepts an explicit backend subset:
 python3 experiments/kv-comparison/campaign.py --manifest experiments/kv-comparison/ci.json \
-  --binary target/debug/kv-research --qualification --backend foundationdb --output /tmp/kv-fdb-api-new
+  --backends native,tidehunter_tcp --binary target/debug/kv-research --qualification --output /tmp/kv-api-selected-new
 # Emergency/repeated exact-owned cleanup from an explicit campaign result root:
 python3 experiments/kv-comparison/cleanup.py --root /tmp/kv-campaign-new
 ```
+An explicit `--backends` subset must be admitted by the selected tracked or
+custom manifest; the option cannot add an ID the manifest does not name. For
+manual non-default Tidehunter transports, put the matching central case ID in
+a custom manifest and select that same ID. For example, a verbs config belongs
+to `tidehunter_verbs`, not `tidehunter_tcp`:
 
-The default primary matrix includes `tidehunter_tcp`, TiKV, Cassandra and
-FoundationDB. Optional embedded controls stay in a **separate** copied manifest
+```sh
+python3 experiments/kv-comparison/campaign.py --manifest /path/to/custom-manifest.json \
+  --backends tidehunter_verbs --transport-config transport-verbs.json \
+  --binary target/release/kv-research --output /tmp/kv-verbs-new
+```
+
+`--transport-config` requires exactly one selected Tidehunter case and must
+match its provider/security; it changes only host-local selectors, not the
+case identity, report label, or transport cohort.
+
+
+### Valkey TCP and the separate future InfiniBand path
+
+`valkey_tcp` is a real five-primary Valkey Cluster comparator in `distributed`
+layouts, not a standalone server relabeled distributed. The maintained
+redis-rs 1.8.0 client caches the cluster slot map and handles MOVED/ASK responses.
+One MGET uses its native cross-slot split/ordered reassembly, including duplicate
+and missing keys. No adapter-wide mutex serializes operations. The Rust feature
+is `valkey-tcp`; `put_batch` is unsupported, not emulated with separate SETs.
+
+The digest-pinned image is
+`valkey/valkey:9.0.7@sha256:7e1deda01b64ece3167d370ab5be3452d29734feec22cbcbc69b3a64f6859d6d`.
+Admission records actual server/configuration/persistence evidence and requires
+RF1, no replicas, five connected primaries and unique coverage of all 16,384
+slots. Lifecycle readiness compares every primary's slot view and cluster links.
+Only private, isolated, unauthenticated TCP endpoints are supported.
+
+```sh
+# Standalone real-API qualification; helper owns startup/export/cleanup:
+python3 experiments/kv-comparison/campaign.py \
+  --manifest experiments/kv-comparison/ci.json --backend valkey_tcp \
+  --binary target/release/kv-research --qualification --output /tmp/kv-valkey-api-new
+# The normal campaign.json distributed layout uses all five primaries:
+python3 experiments/kv-comparison/campaign.py \
+  --manifest experiments/kv-comparison/campaign.json --backend valkey_tcp \
+  --binary target/release/kv-research --output /tmp/kv-valkey-distributed-new
+```
+
+GET reads the in-memory Valkey database; AOF is not a cold-read/NVMe tier.
+Writes use AOF `appendfsync=always`, including during rewrite; normal maintenance
+is not disabled. A memory-capacity failure under `noeviction` is a real failure,
+not a reason to silently evict or change persistence. Do not claim equivalent
+durability/security to other cohorts from common API shapes alone.
+
+[`../valkey-infiniband`](../valkey-infiniband/README.md) contains only independent
+offline planning, preflight and bounded functional qualification against an
+operator-supplied future InfiniBand endpoint. It is excluded from active
+manifests, package source bundles and CI backend choices. There is no Valkey
+RDMA suite backend, EFA substitution or TCP fallback. Hardware qualification and
+a matched TCP/RDMA comparison must precede any future suite integration.
+
+
+The default primary matrix includes `tidehunter_tcp`, TiKV, Cassandra,
+FoundationDB and Valkey Cluster TCP. Optional embedded controls stay in a **separate** copied manifest
 and output directory: set `backends` to `["native","rocksdb","blobdb"]` and
 `max_runs` to 135 for the same three-profile/three-rate/five-repeat design. Their
 one-process API boundaries and acknowledgement policies are an embedded control
@@ -545,19 +627,21 @@ and source/config/deployment artifacts remain the evidence.
 
 `.github/workflows/kv-comparison.yaml` is a cheap credential-free PR/manual job:
 pinned existing action SHAs, Cargo dependency cache, explicit native dependencies,
-`cargo test --locked -p kv-research --features tikv,cassandra,foundationdb`, fixed
-job/step deadlines, sequential real native/Tidehunter-TCP/TiKV/Cassandra/FDB qualification under
+`cargo test --locked -p kv-research --features tikv,cassandra,foundationdb,fabric,valkey-tcp`, fixed
+job/step deadlines, sequential real native/Tidehunter-TCP/TiKV/Cassandra/FDB/Valkey qualification under
 `--observe`, and actual Prometheus/Grafana datasource plus concurrent provisioned
 dashboard query verification after each backend (`stack.py verify --output JSON`).
 Unconditional cleanup independently attempts both exact-owned database cleanup
 and observer stop, preserving failure if either fails; artifacts survive failure.
 Only result/provenance/query receipts are uploaded, never observer `.state` or
-its generated secret. It has no push/benchmark-branch/paid trigger. The separate
-protected AWS workflow can select the source-bound KV suite described below;
-manual dispatch of this local workflow still selects an individual backend.
-A failed requested dependency, server, readiness or adapter exits nonzero. A tiny
-single-process test proves only the functions actually exercised, not distributed
-latency, replication resilience or physical ownership scaling.
+its generated secret. It has no push/benchmark-branch/paid trigger. The
+workflow-dispatch `backends` input accepts a comma-separated supported subset;
+blank uses the ordered backend list in tracked `ci.json`. Pull requests use
+that same tracked list. Invalid, duplicate, or empty list entries fail before
+resource acquisition. A failed requested dependency, server, readiness or
+adapter exits nonzero. A tiny single-process test proves only the functions
+actually exercised, not distributed latency, replication resilience or
+physical ownership scaling.
 
 The local job installs pinned boto3/PyYAML in its own virtual environment for the
 offline lifecycle tests; having the SDK installed does not grant AWS credentials.
@@ -656,8 +740,8 @@ client dependencies or FoundationDB read-merge-write semantics.
 
 `cloud_package.py` performs **local packaging only**; it never calls AWS or
 launches a fleet. The release target is Ubuntu24.04 x86_64, Rust1.90.0, with
-`tikv,cassandra,foundationdb,efa` in one executable. RocksDB is not needed for the
-cloud matrix. `efa` forwards the real engine fabric feature, including direct
+`tikv,cassandra,foundationdb,fabric` in one executable. RocksDB is not needed for the
+cloud matrix. `fabric` enables the real engine fabric feature, including direct
 and device-RMA code; it does not install or qualify EFA hardware.
 
 The protected AWS workflow selects **one** suite through
@@ -666,8 +750,18 @@ override for the original `sui-transport` suite. It does not run both campaigns.
 Its KV compiler job is credential-free, `contents: read` only, and never checks
 out Sui or downloads a checkpoint fixture. The pinned Rust toolchain, locked
 Cargo sources, checksum-pinned libfabric 2.6.0 and digest/hash-pinned FDB client
-feed the maintained `cloud_package` release build. All four features
-`tikv,cassandra,foundationdb,efa` remain mandatory.
+feed the maintained `cloud_package` release build. All five features
+`tikv,cassandra,foundationdb,fabric,valkey-tcp` remain mandatory.
+
+The protected cloud workflow accepts a `backends` comma-separated
+`workflow_dispatch` override. Blank leaves the tracked
+`experiments/kv-comparison/cloud-campaign.json` backend list in effect;
+push/default runs therefore retain all nine backend/transport IDs and the
+existing 258 one-repetition cells. A nonempty value selects an explicit
+supported subset (for example `tidehunter_tcp,tidehunter_efa`); invalid,
+duplicate, or empty elements are rejected before cloud resource allocation.
+The selected IDs and expanded jobs are frozen into campaign artifacts.
+
 
 `ci_prepare.py build --engine PATH --output PATH [--deadline 10800 --jobs 2]`
 requires the clean exact `GITHUB_SHA` checkout on the trusted protected branch.
@@ -729,7 +823,7 @@ python3 -B experiments/kv-comparison/cloud_package.py verify \
 
 The actual Cargo command uses `--release --frozen --target
 x86_64-unknown-linux-gnu -p kv-research --no-default-features --features
-tikv,cassandra,foundationdb,efa`, two build jobs, generic `target-cpu=x86-64`,
+tikv,cassandra,foundationdb,fabric,valkey-tcp`, two build jobs, generic `target-cpu=x86-64`,
 generic C/C++ flags, and source-path remapping. Inherited Rust native-CPU flags
 are discarded. It builds the **extracted frozen bytes**, not the mutable checkout,
 and admits the source again after compilation. `--frozen` will fail rather than
@@ -883,13 +977,91 @@ substitute a mocked version. Child failure/diagnostic containment remains
 covered without the native dependency.
 
 
+## Development repetition policy
+
+Future development campaigns use **one independent repetition**, not fewer
+measurements within each case. Adding Valkey TCP preserves all previous 228
+ordinary cells and adds its 25 common cells: **253 unprofiled cases**. The default
+also adds five separately labelled `write_stage_diagnostics` cases, one 1-KiB
+concurrent-write case for native and each Tidehunter transport, giving **258
+cases**, not extra independent repetitions.
+`diagnostics.write_profile_limit=0` disables these additions and restores 253.
+With `repeats=3`, those plans contain 774 and 759 cases, respectively.
+Publication and explicit reproducibility checks keep multiple independent
+repetitions; two or three runs alone do not justify a confidence or significance claim.
+
+The one-repetition default leaves all nine backends/transports, five sizes,
+workloads, concurrency and offered-load levels, cache/registered-RAM/cold-storage
+cohorts, preload, warm-up, correctness checks and per-case operation/sample counts
+unchanged. The 10,800-second hard deadline and 600-second export reserve also stay
+unchanged. Every operation retains its raw API, scheduling and response clocks.
+Per-case reports retain nearest-rank p50/p95/p99/p99.9, mean, population standard
+deviation, maximum, throughput and rejection counts. Means and standard deviations
+for all three clocks are computed after the measurement; undispatched rejections
+have response timing but no invented API/scheduling timing. Tail sample-count
+warnings remain.
+
+### Single-run figures
+
+The plotter examines **all planned cases**, including failures and `not_run`
+entries. An explicitly one-repetition plan can use its single common completed
+repetition across the compared cells. Its titles, captions, manifest and CSV say
+one independent repetition and no run-to-run variability estimate; it draws no
+run-to-run error bars. Within-case latency standard deviation is not a
+between-run error bar.
+
+A historical or publication plan with multiple repetitions still requires at
+least two shared completed repetitions for a matched multi-run figure. Missing
+repetitions do not silently turn that plan into a single-run result. Incompatible
+populations remain separate; missing/failed observations are never zero-filled.
+Original historical repetitions and their hash-bound artifacts are not changed.
+
+### Selective follow-up decisions
+
+Use existing matched repetitions before buying another run. The
+[retained variability assessment](../../docs/distributed/reports/2026-10-25-kv-comparison-ci-40226403293/variability-summary.json)
+analyzes the two completed histories separately, without pooling their changed
+CPU/memory or harness settings. Its
+[policy](../../docs/distributed/reports/2026-10-25-kv-comparison-ci-40226403293/variability-policy.json)
+declares these development-triage thresholds before any follow-up measurement:
+
+- API latency: a 10% relative effect and at least a 1 µs absolute effect.
+- Achieved throughput: a 10% relative effect.
+- Rejection fraction: a one-percentage-point absolute effect.
+
+These are engineering decision thresholds, not statistical confidence or
+equivalence bounds. A different question can use different thresholds, but record
+the metric, direction and threshold **before** its rerun. Do not change a threshold
+after seeing a favorable result.
+
+For each stated comparison, check whether the observed historical spread can
+change the material conclusion. If every observed baseline/candidate combination
+gives the same conclusion, do not add development repetitions merely to confirm
+it, including an unfavorable conclusion. Observed overlap or a small difference
+is not a claim of statistical insignificance.
+
+Repeat only report-relevant uncertain or regressed **workload configurations**,
+not the full matrix to fill a missing third repetition. A follow-up needs a
+reviewed, frozen comparison plan: source/binary identities, server image versions,
+hardware/resource budgets, workload/seed and all case settings, guarantee/security
+contract, metrics/thresholds, requested repetition count and the **complete set of
+backends involved in that comparison**. Run each involved backend under that
+plan, not just the preferred backend. Reject a changed-setting comparison as
+confounded rather than calling it a reproducible regression. No follow-up is
+automatically scheduled by the variability report.
+
+The 253-case unprofiled development matrix is not narrowed by this policy.
+Diagnostic cases are additions, not replacements or rows pooled with unprofiled
+results. Targeted follow-ups require their own explicit reviewed selection;
+publication and reproducibility checks keep multiple independent repetitions.
+
 ## Manual source-bound cloud comparison
 
 The manual cloud path is separate from the existing local/CI campaign:
 
 | File | Responsibility |
 |---|---|
-| `cloud-campaign.json` | Three repetitions, five value sizes, eight backends, 684 cases, 10,800-second absolute bound and 600-second export reserve. |
+| `cloud-campaign.json` | One development repetition, five value sizes, nine backends: 253 ordinary plus five diagnostic cases by default. Three repetitions give 774 cases, or 759 with diagnostics disabled. The 10,800-second absolute bound and 600-second export reserve are unchanged. |
 | `cloud_campaign.py` | Identical common profile order per repetition, typed configurations and JSON/CSV/Markdown raw-sample reports. |
 | `cloud_package.py` | Dirty-source snapshot, frozen generic-x86 release build, exact hashes and immutable runtime archive. |
 | `cloud_bootstrap.py` | Creation-only termination timer before installation, pinned EFA/runtime admission, ready markers and automatic controller startup. |
@@ -985,15 +1157,19 @@ OS-cache eviction. EFA, EFA-direct with TLS, and trusted EFA-native without TLS
 are separate backends; TCP fallback never counts as EFA. Unsupported cross-store
 atomic batches are excluded from the common comparison.
 
-The measurement gate follows completed preload/warm-up. Host I/O snapshots start
-at gate release and end after process exit: their interval includes final
-qualification, counter sampling and drain, not just measured API calls.
-Optional OS-cache eviction occurs while the gate holds the workload. Engine
-memtables/block caches remain: cold-OS is **not** isolated NVMe latency.
-Tidehunter waits at most three seconds after workload timing for a fresh passive
-owner/RMA sample and records `post_workload_sample`, generation, age and
-availability. Counters include qualification/warm-up and are not exact
-measurement deltas. Registered-RAM configuration alone does not prove a hit.
+The pre-measurement gate follows completed preload/warm-up. The new completion
+gate holds the still-live client after measured calls, before profile finalization,
+post-workload qualification, drain and shutdown. The controller captures
+`measurement-before.json` and `measurement-end.json` and binds a reproducible
+`resource-interval.json` to those original frames. Same-boot/cgroup-inode checks,
+host-local monotonic elapsed time and nondecreasing counters are required.
+The legacy through-process-exit snapshot remains a separate, broader window.
+These windows include driver/oracle/background and gate/control overlap; neither
+is pure engine CPU or an API latency decomposition.
+Optional OS-cache eviction occurs while the pre-measurement gate holds work.
+Engine caches remain: cold-OS is **not** isolated NVMe latency.
+Passive owner/RMA samples still retain generation, age, availability and their
+lifetime-counter scope. Registered-RAM configuration alone does not prove a hit.
 
 Backends use the same explicit generator namespace and 32-byte logical keys per
 campaign/repetition, identical primary order and full per-cell preload. FDB's
@@ -1091,4 +1267,132 @@ FDB r2 results remain separate in the numeric appendix. Missing/failed points
 are never zero-filled and two repetitions do not yield a confidence claim.
 The report explicitly records that distributed write profiling was disabled;
 API/response/scheduling clocks are not a measured engine-stage breakdown.
+
+
+## Local diagnostic qualification, 26 October 2026
+
+No AWS operations, cluster launch, commit or push were performed for this change.
+The release `kv-research` binary was rebuilt with `tikv,cassandra,foundationdb,efa`.
+Native and five-owner TCP each completed one functional run on this shared SSD:
+
+| Backend | Preload rows | Warm-up rows | Measurement rows | Observed stage samples |
+|---|---:|---:|---:|---|
+| Native | 4096 | 512 | 4096 | 256 scalar mutations |
+| Tidehunter TCP | 4096 | 512 | 4096 | 1280 append requests, capped at 256 per owner connection |
+
+Both real completion gates were observed before profile finalization. All measured
+calls succeeded; all five TCP owner profiles were captured. The independent
+coordinator interval recorded 4096 admitted/completed/durable logical batches.
+Append RPCs and logical batches are different counts because groups can coalesce.
+Do not treat the owner cap as a global sample limit or divide every component
+clock by its owner-sample count.
+
+Actual Prometheus capture/export and fresh offline replay both verified the
+original query pages and all 27 executable Grafana panels. Offline replay had
+zero live scrape targets. The authenticated browser also verified the labelled
+write-stage table; dense, unreadable stat grids were replaced by scoped tables.
+All owned local observers and generated database trees were then removed.
+
+Evidence is under
+`checkpoint-work/kv-comparison/diagnostic-coverage-20261026T204922Z/`:
+`cases/*/local-proof.json`, raw `result/` artifacts, boundary frames,
+`monitoring.tar.gz`, online/offline verification and cleanup receipts.
+The real kernel-counter probe used an owned **observer-exporter cgroup**, not an
+isolated benchmark-client cgroup. Raw client process-group samples remain separate.
+This qualifies counter parsing, gate lifetime and rendering, not cloud CPU attribution,
+EFA/RDMA performance, independent-NVMe scaling or observer-neutral latency.
+
+Validation: `kv-research` 38 tests passed; Tidehunter 806 passed and 41 ignored
+with four harness threads; both packages passed formatting and all-target Clippy
+with `-D warnings`. Python suites: 221 comparison tests, 77 observability tests,
+and 613 shared AWS-harness tests run with four skips. Pinned Prometheus `promtool`
+rate/reset/absence fixtures passed. Two test-only deadline assumptions were fixed:
+the five-node fixture has a bounded 30-second liveness guard, and the fenced-reply
+test starts its synthetic deadline after fencing setup. Production deadlines did
+not change.
+
+Real-artifact qualification also fixed rejection of the full 268-field TCP stage
+profile under the former 256-field schema, malformed terminal publication, and
+mistaking PromQL `$1` capture replacements for unresolved Grafana variables.
+The diagnostic schema remains bounded to 64 KiB and 512 numeric fields; the
+16-MiB per-query-page and global archive limits were not raised.
+
+## Local Valkey TCP qualification, 27 October 2026
+
+The digest-pinned Valkey 9.0.7 services and rebuilt redis-rs 1.8.0 adapter were
+exercised locally. The five-primary fixture admitted all 16,384 slots, zero
+replicas and bidirectional cluster links. All five primaries held actual
+benchmark keys after the mixed case. Standalone API qualification also passed,
+including full binary values, replacement writes, deletes and ordered MGET
+with duplicate and missing keys.
+
+| Five-primary functional case | Value bytes | Measured API calls | Successful raw rows, including preload/warm-up/aging |
+|---|---:|---:|---:|
+| Mixed read/write/delete/missing-read/MGET | 1024 | 512 | 864 |
+| Cross-slot MGET, 32 keys | 8192 | 128 | 416 |
+| Cross-slot MGET, 32 keys | 65536 | 128 | 288 |
+
+These are bounded **functional qualification** cases, not a local/cloud
+performance ranking or a replacement for the unchanged research per-case
+counts. Raw rows retain API, scheduling and response clocks. Prometheus and
+authenticated Grafana provisioned-dashboard queries passed for the actual
+Valkey results; this was API/query verification, not visual verification.
+
+The node-local deployment interface was also exercised using six logical
+loopback roles on this laptop: client-only coordinator plus five primaries,
+bootstrap/full-cluster probes, actual Rust API qualification, export, stop and
+data reset. All six roles completed cleanup. This does not establish six
+physical hosts, independent NVMe devices or cloud performance.
+
+Checks passed: 38 `kv-research` tests; 806 Tidehunter tests with 41 ignored;
+comparison/observability/InfiniBand Python suites with 239/77/13 tests; shared
+campaign harness with 613 tests and four skips. Native-only CLI and all active
+adapter builds passed; all-target Clippy used `-D warnings`. The native-only
+binary rejected Valkey without its feature, and the enabled binary rejected
+atomic `put_batch` before connecting. The local workflow YAML and ten shell
+blocks were syntax-checked, not dispatched.
+
+Compact source/config/image/runtime/timing/monitoring and cleanup receipts are
+under `checkpoint-work/kv-comparison/valkey-tcp-20261027T115459Z/`.
+Exact-owner checks found no remaining task containers, observer containers or
+local database volumes; node-local data directories were reset. Cached images
+and pre-existing observer data volumes were not globally pruned.
+
+The separate InfiniBand tool completed offline `plan`; `preflight` correctly
+returned missing requirements. No RDMA endpoint, EFA substitution, provider
+provisioning, AWS launch, Git push or paid workflow was used.
+
+## Cloud launch preflight, 27 October 2026
+
+Terminal export receipt schema 2 separates the bulk file inventory into
+`<run>/results/controller-inventory.json`. The small control receipt contains
+its exact run-owned key, length and SHA-256. Both inventory and raw archive
+must pass S3 `HeadObject` verification before the launcher accepts export.
+Downloaded inventory bytes are checked before any archive extraction; each
+extracted file still requires its recorded length and hash. The existing
+4-MiB launcher control-JSON bound is unchanged. Bulk JSON uses the existing
+32-MiB guest metadata bound; raw file/count/total export bounds remain separate.
+
+The retained failed-run inventory contains 29,827 files and serializes to
+5,320,840 bytes. Local execution of the actual publication/control-reader
+functions preserved every entry while reducing the terminal control object
+to 767 bytes. This is a local serialization/admission check using in-memory
+S3, not a new cloud result or a change to that historical campaign.
+
+The GitHub post-campaign cleanup/retrieval step has a 45-minute timeout rather
+than 15 minutes. This permits full-prefix evidence reconciliation after fleet
+termination; the EC2 TTL stays 10,800 seconds, its 600-second export reserve
+and independent watchdog are unchanged. The editable weekly limit remains
+solely in `experiments/aws-sharded-wal/budget.json`; aggregate accounting stays
+in the conditional-write S3 ledger.
+
+An additional real five-primary Valkey 9.0.7 preflight passed all slot-view,
+RF1/AOF/noeviction checks and mixed workloads at 64 B, 256 B, 1 KiB, 8 KiB and
+64 KiB. Each case completed all 376 operations without wrong values, rejected
+operations, timeouts or unknown mutations. Ordered duplicate/missing
+`get_many` qualification also passed. Both owned clusters and their volumes
+were closed. Evidence is under
+`checkpoint-work/valkey-readiness-20261027/`; these cases are functional checks,
+not substitutes for the unchanged cloud matrix or proof of Valkey RDMA,
+Sui integration, cold-storage GET or cross-slot atomic writes.
 
