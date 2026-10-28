@@ -108,7 +108,7 @@ fn blocked_appends_allow_committed_reads_and_overlap_distinct_nodes() {
     for node in 0..2 {
         let cut = db.published_cut().unwrap();
         let a = db
-            .index_reference(KeySpace(0), &(1 + node * 2u32).to_be_bytes(), cut)
+            .index_reference(KeySpace(0), &(1 + node * 2u32).to_be_bytes(), cut.clone())
             .unwrap()
             .unwrap();
         let b = db
@@ -117,9 +117,13 @@ fn blocked_appends_allow_committed_reads_and_overlap_distinct_nodes() {
             .unwrap();
         assert_eq!(a.mutation_version().batch, b.mutation_version().batch);
         assert!(
-            db.index_reference(KeySpace(0), &(1 + node * 2u32).to_be_bytes(), old_cut)
-                .unwrap()
-                .is_none()
+            db.index_reference(
+                KeySpace(0),
+                &(1 + node * 2u32).to_be_bytes(),
+                old_cut.clone()
+            )
+            .unwrap()
+            .is_none()
         );
         assert_eq!(get(&db, 1 + node * 2), Some(vec![10 + node as u8; 32]));
         assert_eq!(get(&db, 2 + node * 2), Some(vec![10 + node as u8; 32]));
@@ -264,7 +268,7 @@ fn cancelled_late_read_failure_poison_is_shared_with_writer_and_cache() {
 }
 
 #[test]
-fn sui_shared_gate_allows_later_node_durability_without_bypassing_blocked_prefix() {
+fn sui_shared_gate_publishes_disjoint_later_batch_and_freezes_sparse_view() {
     use crate::distributed::sui::Db;
     let fixture = Fixture::new();
     let path = fixture.temp.path().join("authority");
@@ -304,14 +308,15 @@ fn sui_shared_gate_allows_later_node_durability_without_bypassing_blocked_prefix
     let held = connection.lock();
     let (progress, events) = mpsc::sync_channel(64);
     *db.remote_for_test().progress.lock() = Some(progress);
-    let (replies, received) = mpsc::channel();
+    let (first_replies, first_received) = mpsc::channel();
+    let (second_replies, second_received) = mpsc::channel();
     let first_db = db.clone();
-    let first_reply = replies.clone();
     let first = thread::spawn(move || {
         let mut batch = first_db.write_batch();
+        batch.write(ks, 0u32.to_be_bytes().to_vec(), vec![7; 32]);
         batch.write(ks, 1u32.to_be_bytes().to_vec(), vec![1; 32]);
         batch.write(ks, 2u32.to_be_bytes().to_vec(), vec![1; 32]);
-        first_reply.send(batch.commit()).unwrap();
+        first_replies.send(batch.commit()).unwrap();
     });
     let first_admitted = wait_event(&events, |stats| stats.concurrent_admitted == prefix + 1);
     let second_db = db.clone();
@@ -319,21 +324,12 @@ fn sui_shared_gate_allows_later_node_durability_without_bypassing_blocked_prefix
         let mut batch = second_db.write_batch();
         batch.write(ks, 3u32.to_be_bytes().to_vec(), vec![2; 32]);
         batch.write(ks, 4u32.to_be_bytes().to_vec(), vec![2; 32]);
-        replies.send(batch.commit()).unwrap();
+        second_replies.send(batch.commit()).unwrap();
     });
     let later_durable = wait_event(&events, |stats| {
         stats.concurrent_admitted == prefix + 2 && stats.durable_batches > prefix
     });
-    let mut blocked_metrics = None;
-    db.remote_for_test()
-        .visit_write_metrics(|snapshot| blocked_metrics = Some(snapshot));
-    assert!(
-        blocked_metrics
-            .unwrap()
-            .authority
-            .durable_receipt_publication_waiting_batches
-            > 0
-    );
+    let early_ack = second_received.recv_timeout(Duration::from_secs(5));
     let (reads, read_results) = mpsc::sync_channel(1);
     let reader_db = db.clone();
     let reader = thread::spawn(move || {
@@ -347,31 +343,46 @@ fn sui_shared_gate_allows_later_node_durability_without_bypassing_blocked_prefix
         reads.send((cached, absent, view, rows)).unwrap();
     });
     let observed = read_results.recv_timeout(Duration::from_secs(2));
-    let early_ack = received.try_recv();
-    let published_before_release = db.remote_for_test().stats().published_batches;
+    let early_first = first_received.try_recv();
+    let later_values = [3u32, 4].map(|key| db.get(ks, &key.to_be_bytes()));
     drop(held);
-    let first_ack = received.recv_timeout(Duration::from_secs(5));
-    let second_ack = received.recv_timeout(Duration::from_secs(5));
+    let first_ack = first_received.recv_timeout(Duration::from_secs(5));
+    let second_ack = if early_ack.is_err() {
+        Some(second_received.recv_timeout(Duration::from_secs(5)))
+    } else {
+        None
+    };
     first.join().unwrap();
     second.join().unwrap();
     reader.join().unwrap();
     first_admitted.unwrap();
     let overlap = later_durable.unwrap();
     assert!(overlap.peak_inflight_nodes >= 2);
-    assert_eq!(published_before_release, prefix);
-    assert!(matches!(early_ack, Err(mpsc::TryRecvError::Empty)));
+    assert!(matches!(early_first, Err(mpsc::TryRecvError::Empty)));
+    early_ack.unwrap().unwrap();
+    for value in later_values {
+        assert_eq!(value.unwrap().unwrap().as_ref(), &[2; 32]);
+    }
     first_ack.unwrap().unwrap();
-    second_ack.unwrap().unwrap();
+    if let Some(ack) = second_ack {
+        ack.unwrap().unwrap();
+    }
     let (cached, absent, view, rows) = observed.unwrap();
     assert_eq!(cached.unwrap().unwrap().as_ref(), &[9; 32]);
     assert!(absent.unwrap().is_none());
-    assert_eq!(rows.unwrap().len(), 1); // neither batch leaked before the prefix
+    let rows = rows.unwrap();
+    assert_eq!(rows.len(), 3);
+    for (key, expected) in [(0u32, 9u8), (3, 2), (4, 2)] {
+        assert!(
+            rows.iter()
+                .any(|(k, v)| k.as_ref() == key.to_be_bytes() && v.as_ref() == [expected; 32])
+        );
+    }
+    // Exercise retention while the sparse checkpoint still pins its old value.
+    db.flush().unwrap();
     assert_eq!(
-        view.iterator(ks)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-            .len(),
-        1
+        view.iterator(ks).collect::<Result<Vec<_>, _>>().unwrap(),
+        rows
     );
     let rows = db
         .checkpoint()
@@ -379,24 +390,16 @@ fn sui_shared_gate_allows_later_node_durability_without_bypassing_blocked_prefix
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(rows.len(), 5);
+    assert_eq!(
+        db.get(ks, &0u32.to_be_bytes()).unwrap().unwrap().as_ref(),
+        &[7; 32]
+    );
     for key in 1..=4u32 {
         assert_eq!(
             db.get(ks, &key.to_be_bytes()).unwrap().unwrap().as_ref(),
             if key < 3 { &[1; 32] } else { &[2; 32] }
         );
     }
-    // Commit acknowledgements precede the owner's local metrics snapshot.
-    // Wait for its post-snapshot event before inspecting completed wait counters.
-    wait_event(&events, |stats| stats.concurrent_completed == prefix + 2).unwrap();
-    let mut write_metrics = None;
-    db.remote_for_test()
-        .visit_write_metrics(|snapshot| write_metrics = Some(snapshot));
-    let authority = write_metrics.unwrap().authority;
-    assert!(authority.durable_receipt_publication_blocked_batches > 0);
-    assert!(authority.durable_receipt_publication_blocked_ns > 0);
-    assert_eq!(authority.durable_receipt_publication_waiting_batches, 0);
-    assert!(authority.durable_receipt_publication_waiting_peak > 0);
-    db.flush().unwrap();
     db.wait_for_background_threads_to_finish().unwrap();
     let reopened = Db::open_remote(&path, fixture.shape.clone(), fixture.config.clone()).unwrap();
     assert_eq!(
@@ -574,11 +577,11 @@ fn competing_grouped_readers_share_one_credit_without_losing_members() {
     let ready = std::sync::Barrier::new(2);
     thread::scope(|scope| {
         for _ in 0..2 {
-            let (db, keys, ready) = (&db, &keys, &ready);
+            let (db, keys, ready, cut) = (&db, &keys, &ready, cut.clone());
             scope.spawn(move || {
                 ready.wait();
                 for _ in 0..8 {
-                    let values = db.get_many_cut(KeySpace(0), keys, cut).unwrap();
+                    let values = db.get_many_cut(KeySpace(0), keys, cut.clone()).unwrap();
                     for (slot, expected) in [1u8, 4, 2, 3, 1].into_iter().enumerate() {
                         assert_eq!(
                             values[slot].as_ref().unwrap().as_deref(),
@@ -606,12 +609,12 @@ fn acknowledged_writes_prime_bounded_cache_for_immutable_cuts() {
         .unwrap();
     let old_cut = db.published_cut().unwrap();
     let old_reference = db
-        .index_reference(KeySpace(0), &7u32.to_be_bytes(), old_cut)
+        .index_reference(KeySpace(0), &7u32.to_be_bytes(), old_cut.clone())
         .unwrap()
         .unwrap();
     let rpc_count = db.read_rpc_count();
     assert_eq!(
-        db.get_many_cut(KeySpace(0), &[7u32.to_be_bytes().to_vec()], old_cut)
+        db.get_many_cut(KeySpace(0), &[7u32.to_be_bytes().to_vec()], old_cut.clone())
             .unwrap()[0]
             .as_ref()
             .unwrap()
@@ -624,7 +627,7 @@ fn acknowledged_writes_prime_bounded_cache_for_immutable_cuts() {
         .unwrap();
     let updated_cut = db.published_cut().unwrap();
     let updated_reference = db
-        .index_reference(KeySpace(0), &7u32.to_be_bytes(), updated_cut)
+        .index_reference(KeySpace(0), &7u32.to_be_bytes(), updated_cut.clone())
         .unwrap()
         .unwrap();
     assert_ne!(old_reference, updated_reference);

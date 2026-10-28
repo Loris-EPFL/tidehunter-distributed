@@ -11,8 +11,8 @@
 //! the entire scan, and no read prefetch advances publication or refunds writes.
 
 use super::{
-    Bytes, ConcurrentRemoteDatabase, IndexReadCut, KeySpace, LocalDbError, Mutation,
-    RemoteDatabase, ValueRecordReference, elapsed,
+    Bytes, ConcurrentRemoteDatabase, KeySpace, LocalDbError, Mutation, RemoteDatabase,
+    ValueRecordReference, elapsed,
 };
 use crate::distributed::native_index::IndexReadPin;
 use crate::distributed::native_index::NativeIndexScan;
@@ -238,9 +238,7 @@ impl RemoteDatabase {
     /// only additional prefetch storage has the two-page bound.
     pub fn scan(&mut self, ks: KeySpace) -> Result<Vec<(Bytes, Bytes)>, LocalDbError> {
         self.ensure_healthy()?;
-        let cut = self
-            .latest
-            .map_or(IndexReadCut::BeforeAll, IndexReadCut::At);
+        let cut = self.index.read().latest_cut();
         // Reject unsupported/invalid keyspace scans before issuing any RPC or
         // poisoning a serving authority for a caller's invalid request.
         let resolve_started = Instant::now();

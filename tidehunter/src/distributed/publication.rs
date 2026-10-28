@@ -104,6 +104,7 @@ pub struct PublicationTracker {
     next_admission: u64,
     durable_prefix: u64,
     published_prefix: u64,
+    durable_unpublished: usize,
     // Admission is [retained_start, next_admission). Retired complete prefixes
     // remain represented by the monotonic durable/publication counters.
     retained_start: u64,
@@ -127,6 +128,7 @@ impl PublicationTracker {
             next_admission: 0,
             durable_prefix: 0,
             published_prefix: 0,
+            durable_unpublished: 0,
             retained_start: 0,
             entries: std::collections::VecDeque::new(),
             identities: HashMap::new(),
@@ -222,6 +224,7 @@ impl PublicationTracker {
         }
         entry.durable = Some(durable);
         entry.state = PublicationState::Durable;
+        self.durable_unpublished += 1;
         // Prefixes cannot exceed the configured usize capacity: every advance
         // consumes an admitted dense slot. External sequences are never cast.
         while self
@@ -235,40 +238,83 @@ impl PublicationTracker {
         Ok(PublicationState::Durable)
     }
 
-    /// Invoke the actual atomic publication callback for each contiguous durable
-    /// batch. A callback must install all native pending entries and commit their
-    /// shared Transaction before returning success. It must never acknowledge an
-    /// application from inside the callback.
-    ///
-    /// Failure (including unwinding panic) leaves the tracker recovery-required:
-    /// the callback may already have made effects visible. The enclosing DB must
-    /// gate reads, cached reads and writes on `ensure_publication_healthy` and
-    /// rebuild from authoritative storage before serving again. No retry/reset
-    /// method here can guess whether the callback committed before failing.
+    /// Publish the contiguous durable prefix for callers that require it.
+    /// Atomic callbacks must not acknowledge the application themselves.
     pub fn publish_ready<E>(
         &mut self,
         mut publish: impl FnMut(DurableBatch) -> Result<(), E>,
     ) -> Result<PublicationProgress, PublishError<E>> {
         self.ensure_publication_healthy()
             .map_err(PublishError::State)?;
-        let before = self.published_prefix;
-        while let Some(durable) = self
+        let mut callbacks_completed = 0;
+        while let Some(entry) = self
             .entries
             .get((self.published_prefix - self.retained_start) as usize)
-            .and_then(|entry| entry.durable)
+            .copied()
         {
-            // Set before user code: an unwinding callback must also fail closed.
-            self.recovery_required = true;
-            publish(durable).map_err(PublishError::Callback)?;
-            self.entries
-                .get_mut((self.published_prefix - self.retained_start) as usize)
-                .expect("published entry remains admitted")
-                .state = PublicationState::Published;
+            if entry.state != PublicationState::Published {
+                let Some(durable) = entry.durable else {
+                    break;
+                };
+                self.recovery_required = true;
+                publish(durable).map_err(PublishError::Callback)?;
+                self.entries[(self.published_prefix - self.retained_start) as usize].state =
+                    PublicationState::Published;
+                self.durable_unpublished -= 1;
+                callbacks_completed += 1;
+                self.recovery_required = false;
+            }
             self.published_prefix += 1;
-            self.recovery_required = false;
         }
         Ok(PublicationProgress {
-            callbacks_completed: self.published_prefix - before,
+            callbacks_completed,
+            published: self.published_prefix(),
+            blocked_on: (self.published_prefix < self.next_admission).then_some(BatchVersion {
+                epoch: self.epoch,
+                sequence: self.published_prefix,
+            }),
+        })
+    }
+
+    /// Try each durable batch in admission order. Return `false` without making
+    /// effects visible when a required predecessor is unresolved. A successful
+    /// callback must publish the entire batch atomically and return `true`.
+    ///
+    /// A callback error or panic requires recovery: some index changes may have
+    /// become visible. The enclosing authority must fence reads and cache hits
+    /// before releasing its index guard. The stable prefix advances separately;
+    /// nonprefix publication never retires a hole or its bounded admission slot.
+    pub(crate) fn publish_available<E>(
+        &mut self,
+        mut publish: impl FnMut(DurableBatch) -> Result<bool, E>,
+    ) -> Result<PublicationProgress, PublishError<E>> {
+        self.ensure_publication_healthy()
+            .map_err(PublishError::State)?;
+        let mut callbacks_completed = 0;
+        for slot in 0..self.entries.len() {
+            let entry = self.entries[slot];
+            if entry.state != PublicationState::Durable {
+                continue;
+            }
+            self.recovery_required = true;
+            if publish(entry.durable.expect("durable state has a receipt"))
+                .map_err(PublishError::Callback)?
+            {
+                self.entries[slot].state = PublicationState::Published;
+                self.durable_unpublished -= 1;
+                callbacks_completed += 1;
+            }
+            self.recovery_required = false;
+        }
+        while self
+            .entries
+            .get((self.published_prefix - self.retained_start) as usize)
+            .is_some_and(|entry| entry.state == PublicationState::Published)
+        {
+            self.published_prefix += 1;
+        }
+        Ok(PublicationProgress {
+            callbacks_completed,
             published: self.published_prefix(),
             blocked_on: (self.published_prefix < self.next_admission).then_some(BatchVersion {
                 epoch: self.epoch,
@@ -286,6 +332,27 @@ impl PublicationTracker {
             .map(|&slot| self.entries[(slot - self.retained_start) as usize].state)
     }
 
+    pub(crate) fn is_published(&self, version: BatchVersion) -> bool {
+        version.epoch == self.epoch
+            && (version.sequence < self.published_prefix
+                || version
+                    .sequence
+                    .checked_sub(self.retained_start)
+                    .and_then(|slot| usize::try_from(slot).ok())
+                    .and_then(|slot| self.entries.get(slot))
+                    .is_some_and(|entry| entry.state == PublicationState::Published))
+    }
+
+    pub(crate) fn unpublished_versions(&self) -> impl Iterator<Item = BatchVersion> + '_ {
+        self.entries
+            .iter()
+            .filter(|entry| entry.state != PublicationState::Published)
+            .map(|entry| entry.version)
+    }
+
+    pub(crate) fn durable_unpublished(&self) -> usize {
+        self.durable_unpublished
+    }
     pub fn retained_batches(&self) -> usize {
         self.entries.len()
     }
@@ -515,6 +582,55 @@ mod tests {
             tracker.mark_in_flight(batch.id()).unwrap();
         }
         tracker
+    }
+    #[test]
+    fn sparse_publication_keeps_transitive_conflicts_and_prefix_bound() {
+        let batches = [
+            batch(0, 1, 1),
+            batch(1, 2, 2),
+            batch(2, 3, 3),
+            batch(3, 4, 4),
+        ];
+        let receipts = durable_batches(&batches);
+        let mut tracker = admitted(&batches);
+        for receipt in &receipts[1..] {
+            tracker.record_durable(*receipt).unwrap();
+        }
+        // 0={x}, 1={x,y}, 2={y}, 3={z}. Publishing 3 must not bypass
+        // the dependency chain for 1 and 2 or retire the unresolved window.
+        let mut published = Vec::new();
+        let progress = tracker
+            .publish_available::<()>(|receipt| {
+                let sequence = receipt.appended().version().sequence;
+                if matches!(sequence, 1 | 2) && !published.contains(&(sequence - 1)) {
+                    return Ok(false);
+                }
+                published.push(sequence);
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(published, [3]);
+        assert_eq!(progress.published.next_sequence(), 0);
+        assert_eq!(
+            tracker.state(batches[3].id()),
+            Some(PublicationState::Published)
+        );
+        assert!(tracker.is_published(batches[3].version()));
+        tracker.retire_published().unwrap();
+        assert_eq!(tracker.retained_batches(), 4);
+
+        tracker.record_durable(receipts[0]).unwrap();
+        let progress = tracker
+            .publish_ready::<()>(|receipt| {
+                published.push(receipt.appended().version().sequence);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(progress.callbacks_completed, 3);
+        assert_eq!(published, [3, 0, 1, 2]);
+        assert_eq!(tracker.published_prefix().next_sequence(), 4);
+        tracker.retire_published().unwrap();
+        assert_eq!(tracker.retained_batches(), 0);
     }
 
     #[test]

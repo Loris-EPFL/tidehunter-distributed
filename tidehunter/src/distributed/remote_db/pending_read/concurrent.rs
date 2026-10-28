@@ -103,10 +103,16 @@ impl ConcurrentRemoteDatabase {
         let mut groups = vec![Vec::new(); self.partition_indexes.len()];
         let (references, pin) = {
             let index = self.index.read();
-            index.validate_cut(cut).map_err(LocalDbError::component)?;
+            index
+                .validate_cut(cut.clone())
+                .map_err(LocalDbError::component)?;
             let references = keys
                 .iter()
-                .map(|key| index.get(ks, key, cut).map_err(LocalDbError::component))
+                .map(|key| {
+                    index
+                        .get(ks, key, cut.clone())
+                        .map_err(LocalDbError::component)
+                })
                 .collect::<Vec<_>>();
             for (slot, reference) in references.iter().enumerate() {
                 let Ok(Some(reference)) = reference else {
@@ -216,7 +222,10 @@ impl ConcurrentRemoteDatabase {
             // A cache-only result already owns its Bytes before releasing the
             // index guard. Only asynchronous/storage work needs an allocated pin.
             let index = self.index.read();
-            match index.get(ks, key, cut).map_err(LocalDbError::component)? {
+            match index
+                .get(ks, key, cut.clone())
+                .map_err(LocalDbError::component)?
+            {
                 None => GetResolution::Ready(None),
                 Some(reference) => match self.cache.lock().get_point(&reference, ks, key) {
                     Some(value) => GetResolution::Ready(Some(value)),

@@ -702,7 +702,7 @@ fn exercise(launch: &Launch, report: &mut Report) -> Result<()> {
     report.operations.explicit_checkpoints += 1;
     let old_cut = remote.published_cut()?;
     let reference = remote
-        .index_reference(ks, &key((HISTORY_BATCHES - 1) % KEYS), old_cut)?
+        .index_reference(ks, &key((HISTORY_BATCHES - 1) % KEYS), old_cut.clone())?
         .ok_or_else(|| error("pinned payload reference is missing"))?;
     let pinned_file = payload_file(reference);
     report.pinned_payload_file = Some(pinned_file.clone());
@@ -936,7 +936,7 @@ fn exercise(launch: &Launch, report: &mut Report) -> Result<()> {
         "retired_payload_exact_retry",
     )?;
     let expired = remote
-        .index_reference(ks, &key(0), old_cut)
+        .index_reference(ks, &key(0), old_cut.clone())
         .err()
         .ok_or_else(|| error("unprotected old raw cut returned state below persisted floor"))?;
     let expired = expired.to_string();

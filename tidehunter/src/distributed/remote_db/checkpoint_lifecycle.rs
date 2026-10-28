@@ -77,13 +77,14 @@ impl RemoteDatabase {
                 "checkpoint cleanup must complete before another installation",
             ));
         }
-        let pending_batches = self.active_identities.len();
+        // Published suffix slots remain outside the recoverable prefix, even
+        // after their value buffers and active retry entries have been released.
+        let pending_batches = self.submissions.len();
         let pending_bytes = self
             .submissions
             .iter()
-            .filter_map(|entry| entry.batch.as_ref())
-            .try_fold(0usize, |bytes, batch| {
-                bytes.checked_add(batch.encoded().len())
+            .try_fold(0usize, |bytes, entry| {
+                bytes.checked_add(entry.encoded_bytes)
             })
             .ok_or_else(|| LocalDbError::new("checkpoint pending byte count overflow"))?;
         let batches = self
@@ -140,6 +141,9 @@ impl RemoteDatabase {
         }
         let mut by_stream: BTreeMap<(u32, u64), Vec<CheckpointReceipt>> = BTreeMap::new();
         for receipt in self.known.values() {
+            if cut.is_none_or(|cut| receipt.version() > cut.batch) {
+                continue;
+            }
             let node = self
                 .partition_indexes
                 .get(&receipt.address().partition)
@@ -468,7 +472,7 @@ impl RemoteDatabase {
             floor
         };
         let installed = self.index.read().retention_floor();
-        let advances = match (floor, installed) {
+        let advances = match (&floor, &installed) {
             (IndexReadCut::At(requested), IndexReadCut::At(previous)) => requested > previous,
             (IndexReadCut::At(_), IndexReadCut::BeforeAll) => true,
             _ => false,

@@ -1849,12 +1849,7 @@ impl RemoteDatabase {
     /// Admission errors are side-effect-free; use `read_backpressured` to drain a
     /// previous handle and retry. Cache hits allocate/copy no key or value bytes.
     pub fn submit_get(&mut self, ks: KeySpace, key: &[u8]) -> Result<PendingGet, LocalDbError> {
-        self.submit_get_cut(
-            ks,
-            key,
-            self.latest
-                .map_or(IndexReadCut::BeforeAll, IndexReadCut::At),
-        )
+        self.submit_get_cut(ks, key, IndexReadCut::Latest)
     }
     pub fn read_backpressured(error: &LocalDbError) -> bool {
         error.to_string() == BACKPRESSURE
@@ -1879,7 +1874,9 @@ impl RemoteDatabase {
         let index_started = Instant::now();
         let (reference, pin, cached) = {
             let index = self.index.read();
-            let reference = index.get(ks, key, cut).map_err(LocalDbError::component)?;
+            let reference = index
+                .get(ks, key, cut.clone())
+                .map_err(LocalDbError::component)?;
             let cached = reference
                 .and_then(|reference| self.read_cache.lock().get_point(&reference, ks, key));
             let pin = if reference.is_some() && cached.is_none() {

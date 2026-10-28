@@ -211,8 +211,8 @@ fn more_than_4096_tiny_cells_share_one_container_reuse_ranges_and_survive_unlink
             assert_ne!(old.name, new.name);
         } else {
             assert_eq!(
-                (&old.name, old.offset, old.length, old.digest, old.floor),
-                (&new.name, new.offset, new.length, new.digest, new.floor),
+                (&old.name, old.offset, old.length, old.digest, &old.floor),
+                (&new.name, new.offset, new.length, new.digest, &new.floor),
                 "unchanged cells reuse the exact original range"
             );
         }
