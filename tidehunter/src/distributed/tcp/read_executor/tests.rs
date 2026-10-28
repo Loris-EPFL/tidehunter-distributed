@@ -914,6 +914,57 @@ fn all_resident_and_cache_hits_bypass_full_async_device_capacity() {
 }
 
 #[test]
+fn warm_multi_read_preserves_order_and_nowait_budget_and_reply_ownership() {
+    let fixture = Fixture::new(3);
+    let config = ReadExecutorConfig {
+        resident_first: true,
+        cache_bytes: 1024 * 1024,
+        ..ReadExecutorConfig::default()
+    };
+    let (admission, mut executor) = executor(config);
+    for n in 0..2 {
+        executor.begin_sweep();
+        executor
+            .resident_test_results
+            .push_back(ResidentTestResult::Complete);
+        drop(read(&mut executor, &fixture, n, n as u64 + 1));
+    }
+    executor.begin_sweep();
+    let attempts = admission.stats().resident_read_attempts;
+    let members = [1, 0, 1]
+        .into_iter()
+        .map(|n| (fixture.log.clone(), fixture.references[n]))
+        .collect();
+    let SubmitOutcome::Ready { records, lease } =
+        executor.submit(10, members, ReadClass::Point).unwrap()
+    else {
+        panic!("all cached members must complete inline")
+    };
+    assert_eq!(admission.stats().resident_read_attempts, attempts);
+    assert_eq!(executor.resident_calls_remaining, RESIDENT_NOWAIT_MAX_CALLS);
+    admission.clear_cache();
+    for (n, bytes) in [1, 0, 1].into_iter().zip(records) {
+        fixture.assert_value(n, bytes);
+    }
+    assert!(admission.stats().inflight_requests > 0);
+    drop(lease);
+    assert_eq!(admission.stats().inflight_requests, 0);
+
+    executor
+        .resident_test_results
+        .push_back(ResidentTestResult::Complete);
+    let SubmitOutcome::Ready { records, lease } = executor
+        .submit(11, fixture.member(2), ReadClass::Point)
+        .unwrap()
+    else {
+        panic!("warm reads must leave the NOWAIT budget for a subsequent miss")
+    };
+    fixture.assert_value(2, records.into_iter().next().unwrap());
+    drop(lease);
+    assert_eq!(admission.stats().resident_read_attempts, attempts + 1);
+}
+
+#[test]
 fn cache_hit_and_generation_survive_repeated_full_retries_without_refill() {
     let fixture = Fixture::new(3);
     let config = ReadExecutorConfig {

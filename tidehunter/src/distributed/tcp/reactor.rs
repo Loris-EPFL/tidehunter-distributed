@@ -3321,8 +3321,20 @@ pub(super) fn serve_session(
                 if let Some(profile) = diagnostics.as_mut() {
                     profile.requests += u64::from(measured);
                 }
+                // Only grant promotion needs a second copy after the request
+                // moves into deferred planning. Ordinary RPC reads retain their
+                // original references there, including across Full retries.
                 let read_references = match &envelope.body {
-                    Request::Read { references, .. } | Request::ReadProfiled { references, .. } => {
+                    Request::Read {
+                        references,
+                        grant_limit,
+                        ..
+                    }
+                    | Request::ReadProfiled {
+                        references,
+                        grant_limit,
+                        ..
+                    } if *grant_limit != 0 && node.resident_reads.source_enabled() => {
                         references.clone()
                     }
                     _ => Vec::new(),

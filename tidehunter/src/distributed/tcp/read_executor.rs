@@ -764,7 +764,7 @@ impl ReadExecutor {
             (
                 generation,
                 records,
-                if self.config.resident_first {
+                if self.config.resident_first && initial_misses != 0 {
                     (0..plans.len()).map(|_| None).collect()
                 } else {
                     Vec::new()
@@ -784,7 +784,7 @@ impl ReadExecutor {
         let mut resident_attempts = 0usize;
         let mut resident_successes = 0usize;
         let mut resident_deferred = 0usize;
-        if self.config.resident_first && !resuming_prepared {
+        if self.config.resident_first && !resuming_prepared && initial_misses != 0 {
             for (index, (reference, plan)) in plans.iter().enumerate() {
                 if records[index].is_some() || resident_buffers[index].is_some() {
                     continue;
