@@ -15,8 +15,11 @@ use parking_lot::{Mutex, RwLock};
 use std::mem::size_of;
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::thread::JoinHandle;
+
+pub(crate) type HistoryWorkerHandle = Arc<Mutex<Option<JoinHandle<()>>>>;
 
 const MAX_RESIDENT_BATCHES: usize = 1024;
 const AUTHORITY_CACHE_ENTRIES: usize = 64;
@@ -144,8 +147,13 @@ fn batch_charge() -> usize {
 }
 fn root_charge() -> usize {
     size_of::<ReferenceDirectory>()
-        + size_of::<History>()
+        + size_of::<ReferenceDirectoryWriter>()
         + size_of::<MetadataBudget>()
+        + size_of::<Mutex<History>>()
+        + size_of::<Mutex<Option<JoinHandle<()>>>>()
+        + 6 * size_of::<usize>()
+        // One bounded weak-registry notifier and its Arc allocation.
+        + size_of::<[usize; 8]>()
         + 2 * size_of::<usize>()
         + CACHE_TABLE_BYTES
         // Preallocated pending window plus the immutable spill capture. Charge
@@ -186,6 +194,53 @@ struct AuthorityReadCounters {
     resident_misses: AtomicU64,
     contention: AtomicU64,
     history_loads: AtomicU64,
+}
+
+/// Opt-in observations of authority history maintenance for one open handle.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub struct HistoryMaintenanceStats {
+    pub spills: u64,
+    pub batches: u64,
+    pub max_batch_size: u64,
+    pub failures: u64,
+    pub waits: u64,
+    pub wait_ns: u64,
+    pub persist_ns: u64,
+    pub max_wait_ns: u64,
+    pub max_persist_ns: u64,
+    pub adoption_ns: u64,
+}
+
+#[derive(Default)]
+struct HistoryMaintenance {
+    enabled: AtomicBool,
+    spills: AtomicU64,
+    batches: AtomicU64,
+    max_batch_size: AtomicU64,
+    failures: AtomicU64,
+    waits: AtomicU64,
+    wait_ns: AtomicU64,
+    persist_ns: AtomicU64,
+    max_wait_ns: AtomicU64,
+    max_persist_ns: AtomicU64,
+    adoption_ns: AtomicU64,
+}
+
+impl HistoryMaintenance {
+    fn snapshot(&self) -> HistoryMaintenanceStats {
+        HistoryMaintenanceStats {
+            spills: self.spills.load(Ordering::Relaxed),
+            batches: self.batches.load(Ordering::Relaxed),
+            max_batch_size: self.max_batch_size.load(Ordering::Relaxed),
+            failures: self.failures.load(Ordering::Relaxed),
+            waits: self.waits.load(Ordering::Relaxed),
+            wait_ns: self.wait_ns.load(Ordering::Relaxed),
+            persist_ns: self.persist_ns.load(Ordering::Relaxed),
+            max_wait_ns: self.max_wait_ns.load(Ordering::Relaxed),
+            max_persist_ns: self.max_persist_ns.load(Ordering::Relaxed),
+            adoption_ns: self.adoption_ns.load(Ordering::Relaxed),
+        }
+    }
 }
 #[derive(Debug)]
 struct MetadataBudget {
@@ -262,10 +317,25 @@ pub(crate) struct ReferenceDirectory {
     cache: Mutex<AuthorityCache>,
     budget: Arc<MetadataBudget>,
     reads: AuthorityReadCounters,
+    failed: Arc<AtomicBool>,
+    failure_notifier: OnceLock<Arc<dyn Fn() + Send + Sync>>,
+    failure_notified: AtomicBool,
+    maintenance: HistoryMaintenance,
+    #[cfg(test)]
+    pause_history: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    fail_history_after_root: AtomicBool,
 }
 pub(crate) struct ReferenceDirectoryWriter {
     directory: Arc<ReferenceDirectory>,
-    history: History,
+    history: Arc<Mutex<History>>,
+    background: HistoryWorkerHandle,
+    failed: Arc<AtomicBool>,
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DirectoryStats {
@@ -336,6 +406,7 @@ impl ReferenceDirectory {
         };
         let reader = history.reader();
         let last_end = reader.root().end;
+        let failed = Arc::new(AtomicBool::new(false));
         let directory = Arc::new(Self {
             partition: config.partition,
             generation: config.inventory.segment_generation,
@@ -356,6 +427,14 @@ impl ReferenceDirectory {
                 bytes: 0,
             }),
             reads: AuthorityReadCounters::default(),
+            failed: failed.clone(),
+            failure_notifier: OnceLock::new(),
+            failure_notified: AtomicBool::new(false),
+            maintenance: HistoryMaintenance::default(),
+            #[cfg(test)]
+            pause_history: Mutex::new(None),
+            #[cfg(test)]
+            fail_history_after_root: AtomicBool::new(false),
             budget: Arc::new(MetadataBudget {
                 limit: config.max_reference_metadata_bytes - root_charge(),
                 used: AtomicUsize::new(extra_cache_table_bytes(
@@ -366,9 +445,91 @@ impl ReferenceDirectory {
         });
         Ok((
             directory.clone(),
-            ReferenceDirectoryWriter { directory, history },
+            ReferenceDirectoryWriter {
+                directory,
+                history: Arc::new(Mutex::new(history)),
+                background: Arc::new(Mutex::new(None)),
+                failed,
+            },
         ))
     }
+    pub(crate) fn failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+    pub(crate) fn set_history_diagnostics(&self, enabled: bool) {
+        self.maintenance.enabled.store(enabled, Ordering::Release);
+    }
+
+    pub(crate) fn history_stats(&self) -> HistoryMaintenanceStats {
+        self.maintenance.snapshot()
+    }
+
+    pub(crate) fn wait_started(&self) -> Option<std::time::Instant> {
+        self.maintenance
+            .enabled
+            .load(Ordering::Acquire)
+            .then(std::time::Instant::now)
+    }
+
+    pub(crate) fn wait_finished(&self, started: Option<std::time::Instant>) {
+        if let Some(started) = started {
+            self.maintenance.waits.fetch_add(1, Ordering::Relaxed);
+            let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            self.maintenance
+                .wait_ns
+                .fetch_add(elapsed, Ordering::Relaxed);
+            self.maintenance
+                .max_wait_ns
+                .fetch_max(elapsed, Ordering::Relaxed);
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn pause_next_history(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered, started) = std::sync::mpsc::sync_channel(1);
+        let (resume, released) = std::sync::mpsc::sync_channel(1);
+        *self.pause_history.lock() = Some((entered, released));
+        (started, resume)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_history_after_root(&self) {
+        self.fail_history_after_root.store(true, Ordering::Release);
+    }
+    /// Register one non-panicking failure action. It must not acquire the
+    /// partition state or inventory locks; a caller can hold either at failure.
+    pub(crate) fn set_history_failure_notifier(&self, notifier: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.failure_notifier.set(notifier);
+        if self.failed() {
+            self.notify_failure();
+        }
+    }
+
+    fn notify_failure(&self) {
+        if let Some(notifier) = self.failure_notifier.get()
+            && !self.failure_notified.swap(true, Ordering::AcqRel)
+        {
+            notifier();
+        }
+    }
+
+    pub(crate) fn mark_failed(&self) {
+        self.failed.store(true, Ordering::Release);
+        self.notify_failure();
+    }
+
+    fn check_health(&self) -> Result<(), StorageError> {
+        if self.failed() {
+            Err(StorageError::Poisoned)
+        } else {
+            Ok(())
+        }
+    }
+
     pub(crate) fn root(&self) -> HistoryRoot {
         *self.authority.read().history.root()
     }
@@ -442,6 +603,7 @@ impl ReferenceDirectory {
         &self,
         address: PhysicalValueAddress,
     ) -> Result<Option<Arc<RegisteredBatch>>, StorageError> {
+        self.check_health()?;
         if address.partition != self.partition || address.segment_generation != self.generation {
             return Ok(None);
         }
@@ -500,6 +662,7 @@ impl ReferenceDirectory {
         Ok(Some(batch))
     }
     pub(crate) fn lookup_id(&self, id: BatchId) -> Result<Option<AppendedBatch>, StorageError> {
+        self.check_health()?;
         let reader = {
             let authority = self.authority.read();
             if let Some(batch) = authority.pending.iter().find(|batch| batch.id == id) {
@@ -513,6 +676,7 @@ impl ReferenceDirectory {
         &self,
         version: BatchVersion,
     ) -> Result<Option<AppendedBatch>, StorageError> {
+        self.check_health()?;
         let reader = {
             let authority = self.authority.read();
             if let Some(batch) = authority
@@ -533,6 +697,7 @@ impl ReferenceDirectory {
         start: usize,
         limit: usize,
     ) -> Result<Vec<AppendedBatch>, StorageError> {
+        self.check_health()?;
         if limit == 0 || limit > 256 {
             return Err(StorageError::Invalid("receipt page limit must be 1..=256"));
         }
@@ -569,6 +734,7 @@ impl ReferenceDirectory {
         database: [u8; 16],
         epoch: u64,
     ) -> Result<[u8; 32], StorageError> {
+        self.check_health()?;
         use super::tcp::checkpoint::{CheckpointReceipt, PrefixDigest};
         let reader = {
             let authority = self.authority.read();
@@ -605,6 +771,7 @@ impl ReferenceDirectory {
         Ok(PrefixDigest::from_state(prefix, reader.prefix_state(prefix - 1)?).finish())
     }
     pub(crate) fn is_retired(&self, offset: u64) -> Result<bool, StorageError> {
+        self.check_health()?;
         let reader = self.authority.read().history.clone();
         reader.is_retired(offset)
     }
@@ -621,6 +788,34 @@ impl ReferenceDirectory {
 }
 
 impl ReferenceDirectoryWriter {
+    pub(crate) fn wait_background(&self) -> Result<(), StorageError> {
+        let mut started = None;
+        let mut background = match self.background.try_lock() {
+            Some(slot) => slot,
+            None => {
+                started = self.directory.wait_started();
+                self.background.lock()
+            }
+        };
+        if started.is_none() && background.is_some() {
+            started = self.directory.wait_started();
+        }
+        if let Some(handle) = background.take()
+            && handle.join().is_err()
+        {
+            self.directory.mark_failed();
+        }
+        self.directory.wait_finished(started);
+        if self.failed.load(Ordering::Acquire) {
+            return Err(StorageError::Poisoned);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn background_handle(&self) -> (HistoryWorkerHandle, Arc<AtomicBool>) {
+        (self.background.clone(), self.failed.clone())
+    }
+
     pub(crate) fn receipt_group_end(&self, receipt: AppendedBatch) -> Result<u64, StorageError> {
         let reader = {
             let authority = self.directory.authority.read();
@@ -757,45 +952,185 @@ impl ReferenceDirectoryWriter {
         authority.pending.extend(batches.into_iter().map(Arc::new));
         Ok(())
     }
-    pub(crate) fn persist_pending(&mut self, file_count: u64) -> Result<(), StorageError> {
-        self.persist_prefix(u64::MAX, file_count, true).map(|_| ())
-    }
-    pub(crate) fn persist_completed(
+    /// Start one durable-prefix rewrite. The prepaid root charge covers the
+    /// captured Arc vector; the batches themselves remain charged until all
+    /// read owners release them. The pending prefix stays visible until adopt.
+    /// Valkey 9.0.7 `src/aof.c` rotates its incremental log before rewriting
+    /// and publishes the manifest only after the new base succeeds. Here the
+    /// old immutable root and live WAL suffix remain authoritative until our
+    /// separately synced root is installed; WAL fsync policy is unchanged.
+    pub(crate) fn start_background(
         &mut self,
         durable_end: u64,
         file_count: u64,
+        path: &Path,
     ) -> Result<bool, StorageError> {
-        self.persist_prefix(durable_end, file_count, false)
-    }
-    fn persist_prefix(
-        &mut self,
-        durable_end: u64,
-        file_count: u64,
-        allow_empty: bool,
-    ) -> Result<bool, StorageError> {
-        let captured: Vec<_> = {
+        if self.failed.load(Ordering::Acquire) {
+            return Err(StorageError::Poisoned);
+        }
+        let Some(mut slot) = self.background.try_lock() else {
+            return Ok(false);
+        };
+        if slot.as_ref().is_some_and(|handle| !handle.is_finished()) {
+            return Ok(false);
+        }
+        if let Some(handle) = slot.take()
+            && (handle.join().is_err() || self.failed.load(Ordering::Acquire))
+        {
+            self.directory.mark_failed();
+            return Err(StorageError::Poisoned);
+        }
+        let captured = {
             let authority = self.directory.authority.read();
             let completed = authority
                 .pending
                 .partition_point(|batch| batch.group_end <= durable_end);
-            if completed == 0 && !allow_empty {
+            if completed == 0 {
                 return Ok(false);
             }
             authority.pending[..completed].to_vec()
         };
-        // Existing state ownership serializes metadata writers, while readers
-        // retain the previous immutable root throughout file I/O and fsync.
-        self.history.append(&captured, file_count)?;
+        let directory = self.directory.clone();
+        let history = self.history.clone();
+        let path = path.to_path_buf();
+        let worker = std::thread::Builder::new()
+            .name("authority-history".into())
+            .spawn(move || {
+                let measured = directory.maintenance.enabled.load(Ordering::Acquire);
+                let started = measured.then(std::time::Instant::now);
+                if measured {
+                    directory.maintenance.spills.fetch_add(1, Ordering::Relaxed);
+                    directory
+                        .maintenance
+                        .batches
+                        .fetch_add(captured.len() as u64, Ordering::Relaxed);
+                    directory
+                        .maintenance
+                        .max_batch_size
+                        .fetch_max(captured.len() as u64, Ordering::Relaxed);
+                }
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || -> Result<(), StorageError> {
+                        #[cfg(test)]
+                        if let Some((entered, resume)) = directory.pause_history.lock().take() {
+                            let _ = entered.send(());
+                            let _ = resume.recv();
+                        }
+                        let mut history = history.lock();
+                        history.append(&captured, file_count)?;
+                        #[cfg(test)]
+                        if directory
+                            .fail_history_after_root
+                            .swap(false, Ordering::AcqRel)
+                        {
+                            return Err(StorageError::Invalid(
+                                "injected failure after durable history root",
+                            ));
+                        }
+                        if let Some(started) = started {
+                            let elapsed =
+                                started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+                            directory
+                                .maintenance
+                                .persist_ns
+                                .fetch_add(elapsed, Ordering::Relaxed);
+                            directory
+                                .maintenance
+                                .max_persist_ns
+                                .fetch_max(elapsed, Ordering::Relaxed);
+                        }
+                        let adopting = measured.then(std::time::Instant::now);
+                        let root = history.reader();
+                        {
+                            let mut authority = directory.authority.write();
+                            if authority.pending.len() < captured.len()
+                                || !authority
+                                    .pending
+                                    .iter()
+                                    .zip(&captured)
+                                    .all(|(a, b)| Arc::ptr_eq(a, b))
+                            {
+                                return Err(StorageError::Invalid(
+                                    "history prefix changed before adoption",
+                                ));
+                            }
+                            authority.history = root;
+                            drop(authority.pending.drain(..captured.len()));
+                            drop(captured);
+                        }
+                        if let Some(adopting) = adopting {
+                            directory.maintenance.adoption_ns.fetch_add(
+                                adopting.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                                Ordering::Relaxed,
+                            );
+                        }
+                        super::storage::file_inventory::remove_covered(&path, file_count)?;
+                        Ok(())
+                    },
+                ));
+                if !matches!(result, Ok(Ok(()))) {
+                    if measured {
+                        directory
+                            .maintenance
+                            .failures
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    directory.mark_failed();
+                }
+            });
+        match worker {
+            Ok(handle) => *slot = Some(handle),
+            Err(error) => {
+                if self.directory.maintenance.enabled.load(Ordering::Acquire) {
+                    self.directory
+                        .maintenance
+                        .failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                self.directory.mark_failed();
+                return Err(error.into());
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn background_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn background_active(&self) -> bool {
+        self.background.try_lock().is_none_or(|slot| slot.is_some())
+    }
+
+    pub(crate) fn should_start_background(&self, durable_end: u64) -> bool {
+        let authority = self.directory.authority.read();
+        let used = root_charge().saturating_add(self.directory.budget.used.load(Ordering::Acquire));
+        authority.pending.len() >= self.directory.max_batches.div_ceil(2)
+            || used >= self.directory.max_metadata_bytes / 2
+            || durable_end.saturating_sub(authority.history.root().end) >= 32 * 1024 * 1024
+    }
+
+    pub(crate) fn persist_pending(&mut self, file_count: u64) -> Result<(), StorageError> {
+        self.wait_background()?;
+        let captured = self.directory.authority.read().pending.to_vec();
+        let mut history = self.history.lock();
+        history.append(&captured, file_count)?;
         let mut authority = self.directory.authority.write();
-        authority.history = self.history.reader();
-        // Keep the prepaid window allocation across spills; only an actually
-        // unpersisted suffix moves, rather than reallocating each append group.
+        authority.history = history.reader();
         drop(authority.pending.drain(..captured.len()));
-        Ok(!captured.is_empty())
+        Ok(())
     }
     pub(crate) fn retire(&mut self, offsets: &[u64]) -> Result<(), StorageError> {
-        self.history.retire(offsets)?;
-        self.directory.authority.write().history = self.history.reader();
+        self.wait_background()?;
+        let mut history = self.history.lock();
+        history.retire(offsets)?;
+        self.directory.authority.write().history = history.reader();
         Ok(())
+    }
+}
+
+impl Drop for ReferenceDirectoryWriter {
+    fn drop(&mut self) {
+        let _ = self.wait_background();
     }
 }

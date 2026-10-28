@@ -37,7 +37,7 @@ const OLD_REGISTRATION: &str = "partition-registration-v4";
 const SEAL: &str = "partition-seal-v5";
 const MAX_METADATA_BYTES: u64 = 1024 * 1024;
 
-mod file_inventory;
+pub(crate) mod file_inventory;
 pub(crate) mod history;
 
 /// Full static inventory for one database epoch, copied durably to every node.
@@ -84,7 +84,7 @@ impl StaticInventory {
     }
 }
 
-pub use super::reference_directory::AuthorityCacheStats;
+pub use super::reference_directory::{AuthorityCacheStats, HistoryMaintenanceStats};
 pub use crate::wal::WalMemberReadPolicy;
 
 /// Explicit limits for this experimental log, separate from native Db limits.
@@ -886,7 +886,7 @@ impl PartitionLog {
         total_records: usize,
     ) -> Result<(), StorageError> {
         let state = self.state.lock();
-        if state.poisoned {
+        if state.poisoned || state.references.background_failed() {
             return Err(StorageError::Poisoned);
         }
         if state.sealed {
@@ -950,7 +950,7 @@ impl PartitionLog {
         authority: RequestAuthority,
         group: &CompleteGroup,
     ) -> Result<Vec<AppendedBatch>, StorageError> {
-        self.append_group_impl(authority, group, None)
+        self.append_group_impl(authority, group, None, true)
     }
 
     /// Identical append semantics with opt-in, accumulating local stage timings.
@@ -960,7 +960,41 @@ impl PartitionLog {
         group: &CompleteGroup,
         profile: &mut StorageWriteProfile,
     ) -> Result<Vec<AppendedBatch>, StorageError> {
-        self.append_group_impl(authority, group, Some(profile))
+        self.append_group_impl(authority, group, Some(profile), true)
+    }
+
+    pub(crate) fn try_append_group(
+        &self,
+        authority: RequestAuthority,
+        group: &CompleteGroup,
+        profile: Option<&mut StorageWriteProfile>,
+    ) -> Result<Vec<AppendedBatch>, StorageError> {
+        self.append_group_impl(authority, group, profile, false)
+    }
+
+    pub(crate) fn wait_history(&self) -> Result<(), StorageError> {
+        let (background, failed) = self.state.lock().references.background_handle();
+        let mut started = None;
+        let mut slot = match background.try_lock() {
+            Some(slot) => slot,
+            None => {
+                started = self.references.wait_started();
+                background.lock()
+            }
+        };
+        if started.is_none() && slot.is_some() {
+            started = self.references.wait_started();
+        }
+        if let Some(handle) = slot.take()
+            && handle.join().is_err()
+        {
+            self.references.mark_failed();
+        }
+        self.references.wait_finished(started);
+        if failed.load(Ordering::Acquire) {
+            return Err(StorageError::Poisoned);
+        }
+        Ok(())
     }
 
     fn append_group_impl(
@@ -968,6 +1002,7 @@ impl PartitionLog {
         authority: RequestAuthority,
         group: &CompleteGroup,
         profile: Option<&mut StorageWriteProfile>,
+        wait_history: bool,
     ) -> Result<Vec<AppendedBatch>, StorageError> {
         let mut timing = WriteTiming::new(profile, true);
         timing.stage(Some(WriteStage::AppendValidation));
@@ -975,172 +1010,225 @@ impl PartitionLog {
         if authority.epoch != config.inventory.epoch {
             return Err(StorageError::Fenced);
         }
-        timing.stage(Some(WriteStage::AppendLock));
-        let mut state = self.state.lock();
-        timing.stage(Some(WriteStage::AppendValidation));
-        if state.poisoned {
-            return Err(StorageError::Poisoned);
-        }
-        if state.sealed {
-            return Err(StorageError::Sealed);
-        }
-        // The typed group's immutable bytes were verified by its private
-        // constructor/decoder. Recheck schema and admission limits here without
-        // hashing/copying all values again under the partition's admission lock.
-        // Raw network/disk bytes must still use the complete group decoder.
-        group.validate_for(&self.shape, config.batch_limits, config.group_limits)?;
-        let mut previous = Vec::new();
-        for batch in group.batches() {
-            validate_batch(config, batch)?;
-            if let Some(receipt) = self.references.lookup_id(batch.id())? {
-                if receipt.version != batch.version() || receipt.digest != batch.digest() {
-                    return Err(StorageError::IdentityConflict);
-                }
-                previous.push(receipt);
-            } else if self.references.lookup_version(batch.version())?.is_some() {
-                return Err(StorageError::VersionConflict);
-            }
-        }
-        if previous.len() == group.batches().len() {
-            timing.record(|profile| {
-                profile.append_retries = profile.append_retries.saturating_add(1);
-            });
-            timing.success(previous.len());
-            return Ok(previous);
-        }
-        if !previous.is_empty() {
-            return Err(StorageError::MixedRetry);
-        }
-        self.receipt_count()
-            .checked_add(group.batches().len())
-            .ok_or(StorageError::Capacity)?;
-        let descriptor_count = group.batches().iter().try_fold(0usize, |count, batch| {
-            count
-                .checked_add(batch.record_descriptors().len())
-                .ok_or(StorageError::Capacity)
-        })?;
-        ReferenceDirectory::check_fresh_total_capacity(
-            config.max_batches.min(1024),
-            config.max_reference_metadata_bytes,
-            group.batches().len(),
-            descriptor_count,
-        )?;
-        let rooted_end = self.references.root().end;
-        let frame_bytes = group.encoded().len() as u64 + 8;
-        if frame_bytes > 64 * 1024 * 1024 {
-            return Err(StorageError::Capacity);
-        }
-        let next = state
-            .appended_end
-            .checked_add(7)
-            .map(|end| end & !7)
-            .ok_or(StorageError::Capacity)?;
-        let remaining = config.fragment_bytes - next % config.fragment_bytes;
-        let predicted_end = next
-            .saturating_add(if frame_bytes > remaining {
-                remaining
-            } else {
-                0
-            })
-            .saturating_add(frame_bytes);
-        if state
-            .references
-            .check_capacity(group.batches().len(), descriptor_count)
-            .is_err()
-            || predicted_end.saturating_sub(rooted_end) > 64 * 1024 * 1024
-        {
-            // History pages may root only data at or below durable_end. Do not
-            // spill while an appended suffix is awaiting the flusher.
-            if physical_end(&state) > state.durable_end {
-                return Err(StorageError::NeedsPersistence);
-            }
-            // Every buffered completed group already has its exact-file WAL
-            // barrier. Root cold metadata before admitting another group.
-            timing.stage(Some(WriteStage::AppendHistory));
-            let files = state.durable_end.saturating_sub(1) / config.wal_file_bytes + 1;
-            if let Err(error) = state.references.persist_pending(files).and_then(|()| {
-                file_inventory::remove_covered(&self.path, self.references.root().file_count)
-            }) {
-                state.poisoned = true;
-                return Err(error);
-            }
+        // Bound admission retries if other appenders repeatedly consume the
+        // space released by maintenance. No WAL effects precede these retries.
+        for _ in 0..=config.max_batches.min(1024) {
+            timing.stage(Some(WriteStage::AppendLock));
+            let mut state = self.state.lock();
             timing.stage(Some(WriteStage::AppendValidation));
-        }
-        state
-            .references
-            .check_capacity(group.batches().len(), descriptor_count)?;
-        let mut authority_credit = state
-            .references
-            .reserve_group(group.batches().len(), descriptor_count)?;
-        // Allocate descriptors before emitting authority bytes.
-        let descriptors: Vec<Box<[_]>> = group
-            .batches()
-            .iter()
-            .map(|batch| batch.record_descriptors().into())
-            .collect();
-        let prepared = PreparedWalWrite::new(group);
-        // Native allocation can advance before a write panics. parking_lot does
-        // not poison on unwind: retain this explicit poison until all storage
-        // and metadata effects finish. Otherwise a caller catching a panic could
-        // append an acknowledged group behind an unrecoverable allocation hole.
-        // The held state lock keeps this provisional poison private on success.
-        state.poisoned = true;
-        timing.stage(Some(WriteStage::AppendWal));
-        let guard = match state
-            .writer
-            .as_ref()
-            .ok_or(StorageError::Sealed)?
-            .write(&prepared)
-        {
-            Ok(guard) => guard,
-            Err(error) => {
-                state.poisoned = true;
-                return Err(StorageError::Unknown(error));
+            if state.poisoned || state.references.background_failed() {
+                return Err(StorageError::Poisoned);
             }
-        };
-        let position = *guard.wal_position();
-        let group_end = position.offset() + position.frame_len() as u64;
-        drop(guard); // Native storage copy only, never native index publication.
-        timing.stage(Some(WriteStage::AppendPublication));
-        let mut receipts = Vec::with_capacity(group.batches().len());
-        let mut group_metadata = Vec::with_capacity(group.batches().len());
-        for ((batch, offset), descriptors) in group
-            .batches()
-            .iter()
-            .zip(group.batch_offsets())
-            .zip(descriptors)
-        {
-            let receipt = receipt_for(config, batch, member_position(position, *offset, batch));
-            let credit = authority_credit
-                .take_batch(descriptors.len())
-                .map_err(|error| StorageError::Unknown(WalError::Io(io::Error::other(error))))?;
-            group_metadata.push(
-                RegisteredBatch::new(
-                    batch.id(),
-                    batch.version(),
-                    batch.digest(),
-                    receipt.address,
-                    descriptors,
-                    group_end,
-                )
-                .with_credit(credit),
-            );
-            receipts.push(receipt);
-        }
-        // The directory validates all members before publishing one group prefix.
-        // Any unexpected post-append error is UNKNOWN and forces sealed recovery.
-        if let Err(error) = state.references.publish_group(group_metadata) {
+            if state.sealed {
+                return Err(StorageError::Sealed);
+            }
+            // The typed group's immutable bytes were verified by its private
+            // constructor/decoder. Recheck schema and admission limits here without
+            // hashing/copying all values again under the partition's admission lock.
+            // Raw network/disk bytes must still use the complete group decoder.
+            group.validate_for(&self.shape, config.batch_limits, config.group_limits)?;
+            let mut previous = Vec::new();
+            for batch in group.batches() {
+                validate_batch(config, batch)?;
+                if let Some(receipt) = self.references.lookup_id(batch.id())? {
+                    if receipt.version != batch.version() || receipt.digest != batch.digest() {
+                        return Err(StorageError::IdentityConflict);
+                    }
+                    previous.push(receipt);
+                } else if self.references.lookup_version(batch.version())?.is_some() {
+                    return Err(StorageError::VersionConflict);
+                }
+            }
+            if previous.len() == group.batches().len() {
+                timing.record(|profile| {
+                    profile.append_retries = profile.append_retries.saturating_add(1);
+                });
+                timing.success(previous.len());
+                return Ok(previous);
+            }
+            if !previous.is_empty() {
+                return Err(StorageError::MixedRetry);
+            }
+            self.receipt_count()
+                .checked_add(group.batches().len())
+                .ok_or(StorageError::Capacity)?;
+            let descriptor_count = group.batches().iter().try_fold(0usize, |count, batch| {
+                count
+                    .checked_add(batch.record_descriptors().len())
+                    .ok_or(StorageError::Capacity)
+            })?;
+            ReferenceDirectory::check_fresh_total_capacity(
+                config.max_batches.min(1024),
+                config.max_reference_metadata_bytes,
+                group.batches().len(),
+                descriptor_count,
+            )?;
+            let rooted_end = self.references.root().end;
+            let frame_bytes = group.encoded().len() as u64 + 8;
+            if frame_bytes > 64 * 1024 * 1024 {
+                return Err(StorageError::Capacity);
+            }
+            let next = state
+                .appended_end
+                .checked_add(7)
+                .map(|end| end & !7)
+                .ok_or(StorageError::Capacity)?;
+            let remaining = config.fragment_bytes - next % config.fragment_bytes;
+            let predicted_end = next
+                .saturating_add(if frame_bytes > remaining {
+                    remaining
+                } else {
+                    0
+                })
+                .saturating_add(frame_bytes);
+            if state
+                .references
+                .check_capacity(group.batches().len(), descriptor_count)
+                .is_err()
+                || predicted_end.saturating_sub(rooted_end) > 64 * 1024 * 1024
+            {
+                if physical_end(&state) > state.durable_end {
+                    return Err(StorageError::NeedsPersistence);
+                }
+                timing.stage(Some(WriteStage::AppendHistory));
+                let durable_end = state.durable_end;
+                let files = durable_end.saturating_sub(1) / config.wal_file_bytes + 1;
+                let old_root_count = self.references.root().count;
+                if let Err(error) =
+                    state
+                        .references
+                        .start_background(durable_end, files, &self.path)
+                {
+                    state.poisoned = true;
+                    return Err(error);
+                }
+                drop(state);
+                if !wait_history {
+                    return Err(StorageError::NeedsPersistence);
+                }
+                self.wait_history()?;
+                if self.references.root().count == old_root_count
+                    && self.references.root().end == rooted_end
+                {
+                    return Err(StorageError::Capacity);
+                }
+                timing.stage(Some(WriteStage::AppendLock));
+                continue;
+            }
+            state
+                .references
+                .check_capacity(group.batches().len(), descriptor_count)?;
+            let mut authority_credit = match state
+                .references
+                .reserve_group(group.batches().len(), descriptor_count)
+            {
+                Ok(credit) => credit,
+                Err(StorageError::Capacity) => {
+                    let durable_end = state.durable_end;
+                    let files = durable_end.saturating_sub(1) / config.wal_file_bytes + 1;
+                    if let Err(error) =
+                        state
+                            .references
+                            .start_background(durable_end, files, &self.path)
+                    {
+                        state.poisoned = true;
+                        return Err(error);
+                    }
+                    if !state.references.background_active() {
+                        state
+                            .references
+                            .reserve_group(group.batches().len(), descriptor_count)?
+                    } else {
+                        drop(state);
+                        if !wait_history {
+                            return Err(StorageError::NeedsPersistence);
+                        }
+                        timing.stage(Some(WriteStage::AppendHistory));
+                        self.wait_history()?;
+                        timing.stage(Some(WriteStage::AppendLock));
+                        continue;
+                    }
+                }
+                Err(error) => return Err(error),
+            };
+            // Allocate descriptors before emitting authority bytes.
+            let descriptors: Vec<Box<[_]>> = group
+                .batches()
+                .iter()
+                .map(|batch| batch.record_descriptors().into())
+                .collect();
+            let prepared = PreparedWalWrite::new(group);
+            // Native allocation can advance before a write panics. parking_lot does
+            // not poison on unwind: retain this explicit poison until all storage
+            // and metadata effects finish. Otherwise a caller catching a panic could
+            // append an acknowledged group behind an unrecoverable allocation hole.
+            // The held state lock keeps this provisional poison private on success.
             state.poisoned = true;
-            return Err(StorageError::Unknown(WalError::Io(io::Error::other(error))));
+            timing.stage(Some(WriteStage::AppendWal));
+            let guard = match state
+                .writer
+                .as_ref()
+                .ok_or(StorageError::Sealed)?
+                .write(&prepared)
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    state.poisoned = true;
+                    return Err(StorageError::Unknown(error));
+                }
+            };
+            let position = *guard.wal_position();
+            let group_end = position.offset() + position.frame_len() as u64;
+            drop(guard); // Native storage copy only, never native index publication.
+            timing.stage(Some(WriteStage::AppendPublication));
+            let mut receipts = Vec::with_capacity(group.batches().len());
+            let mut group_metadata = Vec::with_capacity(group.batches().len());
+            for ((batch, offset), descriptors) in group
+                .batches()
+                .iter()
+                .zip(group.batch_offsets())
+                .zip(descriptors)
+            {
+                let receipt = receipt_for(config, batch, member_position(position, *offset, batch));
+                let credit = authority_credit
+                    .take_batch(descriptors.len())
+                    .map_err(|error| {
+                        StorageError::Unknown(WalError::Io(io::Error::other(error)))
+                    })?;
+                group_metadata.push(
+                    RegisteredBatch::new(
+                        batch.id(),
+                        batch.version(),
+                        batch.digest(),
+                        receipt.address,
+                        descriptors,
+                        group_end,
+                    )
+                    .with_credit(credit),
+                );
+                receipts.push(receipt);
+            }
+            // The directory validates all members before publishing one group prefix.
+            // Any unexpected post-append error is UNKNOWN and forces sealed recovery.
+            if let Err(error) = state.references.publish_group(group_metadata) {
+                state.poisoned = true;
+                return Err(StorageError::Unknown(WalError::Io(io::Error::other(error))));
+            }
+            state.appended_end = group_end;
+            state.stats.appended_groups += 1;
+            if state.references.background_failed() {
+                return Err(StorageError::Unknown(WalError::Io(io::Error::other(
+                    "authority history failed after WAL append",
+                ))));
+            }
+            state.poisoned = false;
+            timing.record(|profile| {
+                profile.appended_groups = profile.appended_groups.saturating_add(1);
+            });
+            timing.success(receipts.len());
+            return Ok(receipts);
         }
-        state.appended_end = group_end;
-        state.stats.appended_groups += 1;
-        state.poisoned = false;
-        timing.record(|profile| {
-            profile.appended_groups = profile.appended_groups.saturating_add(1);
-        });
-        timing.success(receipts.len());
-        Ok(receipts)
+        Err(StorageError::Capacity)
     }
 
     /// Persist the fully appended prefix captured by the serialized flusher.
@@ -1313,7 +1401,7 @@ impl PartitionLog {
             state.poisoned = true;
             StorageError::Unknown(WalError::Io(error))
         })?;
-        if state.poisoned {
+        if state.poisoned || state.references.background_failed() {
             return Err(StorageError::Poisoned);
         }
         debug_assert!(state.durable_end <= end);
@@ -1325,6 +1413,18 @@ impl PartitionLog {
         if namespace_sync {
             state.namespace_synced_file =
                 Some(crate::wal::position::WalFileId::from_u64(last_file));
+        }
+        if state.references.should_start_background(end)
+            && let Err(error) = state
+                .references
+                .start_background(end, last_file + 1, &self.path)
+        {
+            state.poisoned = true;
+            return Err(error);
+        }
+        if state.references.background_failed() {
+            state.poisoned = true;
+            return Err(StorageError::Poisoned);
         }
         timing.record(|profile| {
             profile.durable_publications = profile.durable_publications.saturating_add(1);
@@ -1394,37 +1494,25 @@ impl PartitionLog {
             Err(StorageError::Capacity) => {}
             result => return result,
         }
-        // The first lookup released every authority/cache/admission guard.
-        // A cold worker may release completed residency once; no reactor caller
-        // reaches this path. Never persist the outstanding unacknowledged group.
-        let persistence = self.persistence.lock();
         let mut state = self.state.lock();
-        if state.poisoned {
+        if state.poisoned || state.references.background_failed() {
             return Err(StorageError::Poisoned);
         }
         let durable_end = state.durable_end;
         let files = durable_end.saturating_sub(1) / self.config().wal_file_bytes + 1;
-        let spill = state
+        if let Err(error) = state
             .references
-            .persist_completed(durable_end, files)
-            .and_then(|changed| {
-                if changed {
-                    file_inventory::remove_covered(&self.path, self.references.root().file_count)?;
-                }
-                Ok(changed)
-            });
-        let changed = spill.map_err(|error| {
+            .start_background(durable_end, files, &self.path)
+        {
             state.poisoned = true;
-            *self.read_admission.write() = false;
-            StorageError::Unknown(WalError::Io(io::Error::other(error)))
-        })?;
-        drop(state);
-        drop(persistence);
-        if changed {
-            self.references.lookup(address)
-        } else {
-            Err(StorageError::Capacity)
+            return Err(error);
         }
+        drop(state);
+        if let Err(error) = self.wait_history() {
+            *self.read_admission.write() = false;
+            return Err(error);
+        }
+        self.references.lookup(address)
     }
 
     fn validate_record_authority(
@@ -1432,6 +1520,9 @@ impl PartitionLog {
         reference: &ValueRecordReference,
         registered: &RegisteredBatch,
     ) -> Result<(), StorageError> {
+        if self.references.failed() {
+            return Err(StorageError::Poisoned);
+        }
         registered.validate_reference(reference)?;
         if registered.group_end() > self.durable_frontier.load(Ordering::Acquire) {
             return Err(StorageError::NeedsPersistence);
@@ -1488,6 +1579,9 @@ impl PartitionLog {
         self: &Arc<Self>,
         reference: &ValueRecordReference,
     ) -> Result<Option<RecordReadPlan>, StorageError> {
+        if self.references.failed() {
+            return Err(StorageError::Poisoned);
+        }
         let Some(admission) = self.read_admission.try_read() else {
             return Ok(None);
         };
@@ -1545,7 +1639,7 @@ impl PartitionLog {
 
     fn read_admission(&self) -> Result<parking_lot::RwLockReadGuard<'_, bool>, StorageError> {
         let admission = self.read_admission.read();
-        if !*admission {
+        if !*admission || self.references.failed() {
             return Err(StorageError::Poisoned);
         }
         Ok(admission)
@@ -1650,8 +1744,38 @@ impl PartitionLog {
         self.references.read_stats()
     }
 
+    /// Enable or disable per-maintenance clocks and counters for this handle.
+    pub fn set_history_maintenance_diagnostics(&self, enabled: bool) {
+        self.references.set_history_diagnostics(enabled);
+    }
+
+    /// Snapshot cumulative local observations; counters are not an atomic set.
+    pub fn history_maintenance_stats(&self) -> HistoryMaintenanceStats {
+        self.references.history_stats()
+    }
+
+    /// The callback must not acquire this log's state or inventory locks.
+    pub(crate) fn set_history_failure_notifier(&self, notifier: Arc<dyn Fn() + Send + Sync>) {
+        self.references.set_history_failure_notifier(notifier);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_history(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.references.pause_next_history()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_history_after_root(&self) {
+        self.references.fail_next_history_after_root();
+    }
+
     pub(crate) fn claim_worker(&self) -> Result<(), StorageError> {
-        if self.state.lock().poisoned {
+        if self.references.failed() || self.state.lock().poisoned {
             return Err(StorageError::Poisoned);
         }
         self.worker_claimed
@@ -1764,7 +1888,11 @@ impl PartitionLog {
     pub fn retire_files(&self, recovery_prefix: usize, files: &[u64]) -> Result<(), StorageError> {
         let _persistence = self.persistence.lock();
         let mut state = self.state.lock();
-        if !state.sealed || state.writer.is_some() || state.poisoned {
+        if !state.sealed
+            || state.writer.is_some()
+            || state.poisoned
+            || state.references.background_failed()
+        {
             return Err(StorageError::Invalid(
                 "retirement requires healthy sealed storage",
             ));
@@ -1814,7 +1942,7 @@ impl PartitionLog {
         }
         let _persistence = self.persistence.lock();
         let mut state = self.state.lock();
-        if state.poisoned {
+        if state.poisoned || state.references.background_failed() {
             return Err(StorageError::Poisoned);
         }
         if state.sealed {
@@ -1932,7 +2060,7 @@ fn receipt_for(config: &PartitionConfig, batch: &CompleteBatch, pos: WalPosition
 
 fn pending_persistence(state: &State, receipt: AppendedBatch) -> Result<Option<u64>, StorageError> {
     let end = state.references.receipt_group_end(receipt)?;
-    if state.poisoned {
+    if state.poisoned || state.references.background_failed() {
         return Err(StorageError::Poisoned);
     }
     Ok((end > state.durable_end).then_some(end))

@@ -1,6 +1,195 @@
 use super::*;
 
 #[test]
+fn background_history_retains_prefix_and_bounds_tail_until_adoption() {
+    let temp = tempdir::TempDir::new("storage-background-history").unwrap();
+    let mut config = config(vec![3], 3);
+    config.max_batches = 4;
+    let path = temp.path().join("stream");
+    let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+    log.set_history_maintenance_diagnostics(true);
+    let old_reader = log.references.freeze_history();
+    let (entered, resume) = log.references.pause_next_history();
+    let mut receipts = Vec::new();
+    for n in 0..2 {
+        let receipt = log
+            .append_complete_batch(authority(&config), &batch(&config, n))
+            .unwrap();
+        log.persist_through(receipt).unwrap();
+        receipts.push(receipt);
+    }
+    entered
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    for n in 2..4 {
+        let receipt = log
+            .append_complete_batch(authority(&config), &batch(&config, n))
+            .unwrap();
+        log.persist_through(receipt).unwrap();
+        receipts.push(receipt);
+    }
+    assert_eq!(log.references.root().count, 0);
+    assert_eq!(log.receipt_page(0, 4).unwrap(), receipts);
+    assert!(log.stats().reference_metadata_bytes <= config.max_reference_metadata_bytes);
+    let group = CompleteGroup::new(
+        &shape(),
+        vec![batch(&config, 4)],
+        config.batch_limits,
+        config.group_limits,
+    )
+    .unwrap();
+    assert!(matches!(
+        log.try_append_group(authority(&config), &group, None),
+        Err(StorageError::NeedsPersistence)
+    ));
+    assert_eq!(log.lookup(group.batches()[0].id()).unwrap(), None);
+    resume.send(()).unwrap();
+    log.wait_history().unwrap();
+    assert_eq!(log.references.root().count, 2);
+    assert_eq!(old_reader.root().count, 0);
+    assert!(old_reader.lookup(receipts[0].id()).unwrap().is_none());
+    assert_eq!(log.receipt_page(0, 4).unwrap(), receipts);
+    let stats = log.history_maintenance_stats();
+    assert_eq!(stats.spills, 1);
+    assert_eq!(stats.batches, 2);
+    assert_eq!(stats.failures, 0);
+    let fifth = log.append_group(authority(&config), &group).unwrap()[0];
+    log.persist_through(fifth).unwrap();
+    log.seal_epoch(authority(&config)).unwrap();
+    drop(log);
+    let recovered = PartitionLog::recover_sealed(&path, &config, metrics()).unwrap();
+    receipts.push(fifth);
+    assert_eq!(recovered.receipt_page(0, 5).unwrap(), receipts);
+}
+
+#[test]
+fn background_root_install_failure_poisons_and_reopens_rooted_suffix() {
+    let temp = tempdir::TempDir::new("storage-background-root-failure").unwrap();
+    let mut config = config(vec![3], 3);
+    config.max_batches = 2;
+    let path = temp.path().join("stream");
+    let log = Arc::new(PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap());
+    let notifications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = notifications.clone();
+    let weak = Arc::downgrade(&log);
+    log.set_history_failure_notifier(Arc::new(move || {
+        if weak.upgrade().is_some_and(|log| log.references.failed()) {
+            observed.fetch_add(1, Ordering::AcqRel);
+        }
+    }));
+    let (entered, resume) = log.references.pause_next_history();
+    log.references.fail_next_history_after_root();
+    let first = log
+        .append_complete_batch(authority(&config), &batch(&config, 0))
+        .unwrap();
+    log.persist_through(first).unwrap();
+    entered
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let second = log
+        .append_complete_batch(authority(&config), &batch(&config, 1))
+        .unwrap();
+    log.persist_through(second).unwrap();
+    let reference = log.record_reference(first, 0).unwrap();
+    resume.send(()).unwrap();
+    assert!(matches!(log.wait_history(), Err(StorageError::Poisoned)));
+    assert_eq!(notifications.load(Ordering::Acquire), 1);
+    log.references.mark_failed();
+    assert_eq!(notifications.load(Ordering::Acquire), 1);
+    assert!(matches!(
+        log.lookup(first.id()),
+        Err(StorageError::Poisoned)
+    ));
+    assert!(matches!(
+        log.try_plan_record_read(&reference),
+        Err(StorageError::Poisoned)
+    ));
+    assert!(matches!(
+        log.append_complete_batch(authority(&config), &batch(&config, 2)),
+        Err(StorageError::Poisoned)
+    ));
+    assert!(matches!(
+        log.persist_through(second),
+        Err(StorageError::Poisoned)
+    ));
+    drop(log);
+    let recovered = PartitionLog::recover_sealed(&path, &config, metrics()).unwrap();
+    assert_eq!(recovered.receipt_page(0, 2).unwrap(), vec![first, second]);
+}
+
+#[test]
+fn late_history_failure_notifier_is_called_once() {
+    let temp = tempdir::TempDir::new("storage-late-history-notifier").unwrap();
+    let config = config(vec![3], 3);
+    let log =
+        PartitionLog::create(&temp.path().join("stream"), config, &shape(), metrics()).unwrap();
+    log.references.mark_failed();
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = count.clone();
+    log.set_history_failure_notifier(Arc::new(move || {
+        observed.fetch_add(1, Ordering::AcqRel);
+    }));
+    log.references.mark_failed();
+    assert_eq!(count.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn history_budget_preflight_rejects_without_filesystem_mutation() {
+    let temp = tempdir::TempDir::new("storage-history-budget-preflight").unwrap();
+    let config = config(vec![3], 3);
+    let path = temp.path().join("stream");
+    let mut too_small = config.clone();
+    too_small.max_reference_metadata_bytes = ReferenceDirectory::metadata_bytes(0, 0).unwrap() - 1;
+    assert!(PartitionLog::create(&path, too_small.clone(), &shape(), metrics()).is_err());
+    assert!(!path.exists());
+    let log = PartitionLog::create(&path, config, &shape(), metrics()).unwrap();
+    drop(log);
+    let root = fs::read(path.join("storage-history-root-v2")).unwrap();
+    let registration = fs::read(path.join(REGISTRATION)).unwrap();
+    assert!(PartitionLog::recover_sealed(&path, &too_small, metrics()).is_err());
+    assert_eq!(
+        fs::read(path.join("storage-history-root-v2")).unwrap(),
+        root
+    );
+    assert_eq!(fs::read(path.join(REGISTRATION)).unwrap(), registration);
+}
+
+#[test]
+fn dropping_stream_joins_inflight_history_before_reopen() {
+    let temp = tempdir::TempDir::new("storage-background-drop").unwrap();
+    let mut config = config(vec![3], 3);
+    config.max_batches = 2;
+    let path = temp.path().join("stream");
+    let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+    let (entered, resume) = log.references.pause_next_history();
+    let receipt = log
+        .append_complete_batch(authority(&config), &batch(&config, 0))
+        .unwrap();
+    log.persist_through(receipt).unwrap();
+    entered
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let (started, starting) = std::sync::mpsc::sync_channel(1);
+    let (done, finished) = std::sync::mpsc::sync_channel(1);
+    let dropper = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        drop(log);
+        done.send(()).unwrap();
+    });
+    starting
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    assert!(finished.try_recv().is_err());
+    resume.send(()).unwrap();
+    finished
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    dropper.join().unwrap();
+    let recovered = PartitionLog::recover_sealed(&path, &config, metrics()).unwrap();
+    assert_eq!(recovered.lookup(receipt.id()).unwrap(), Some(receipt));
+}
+
+#[test]
 fn completed_history_exceeds_resident_limit_with_stable_paged_retries_and_prefixes() {
     let temp = tempdir::TempDir::new("storage-paged-retries").unwrap();
     let mut config = config(vec![3], 3);
@@ -299,10 +488,15 @@ fn cold_old_authority_becomes_hot_without_lifetime_descriptor_residency() {
         .unwrap();
     log.persist_through(first).unwrap();
     let reference = log.record_reference(first, 0).unwrap();
+    log.evict_authority_cache();
     let second = log
         .append_complete_batch(authority(&config), &batch(&config, 1))
         .unwrap();
+    let (entered, resume) = log.references.pause_next_history();
     log.persist_through(second).unwrap();
+    entered
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
     assert!(log.try_plan_record_read(&reference).unwrap().is_none());
     drop(log.plan_record_read(&reference).unwrap());
     assert!(log.try_plan_record_read(&reference).unwrap().is_some());
@@ -310,6 +504,8 @@ fn cold_old_authority_becomes_hot_without_lifetime_descriptor_residency() {
     assert_eq!(log.stats().registered_records, 4);
     log.evict_authority_cache();
     assert_eq!(log.stats().registered_records, 2);
+    resume.send(()).unwrap();
+    log.wait_history().unwrap();
 }
 
 #[test]
@@ -381,7 +577,7 @@ fn final_read_token_holds_metadata_credit_and_backpressures_before_new_wal_bytes
         .unwrap();
     log.persist_through(first).unwrap();
     let reference = log.record_reference(first, 0).unwrap();
-    let pin = log.try_plan_record_read(&reference).unwrap().unwrap();
+    let pin = log.plan_record_read(&reference).unwrap();
     let second_batch = batch(&config, 1);
     assert!(matches!(
         log.append_complete_batch(authority(&config), &second_batch),
@@ -500,7 +696,7 @@ fn missing_highest_acknowledged_suffix_file_is_detected_without_later_wal_names(
 }
 
 #[test]
-fn read_only_cold_authority_pressure_spills_completed_window_once() {
+fn cold_authority_pressure_waits_for_background_window() {
     let temp = tempdir::TempDir::new("storage-cold-read-progress").unwrap();
     let mut config = config(vec![3], 3);
     config.max_batches = 1;
@@ -522,14 +718,21 @@ fn read_only_cold_authority_pressure_spills_completed_window_once() {
     let second = log
         .append_complete_batch(authority(&config), &batch(&config, 1))
         .unwrap();
+    let (entered, resume) = log.references.pause_next_history();
     log.persist_through(second).unwrap();
+    entered
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
     assert_eq!(
         log.stats().reference_metadata_bytes,
         config.max_reference_metadata_bytes
     );
     assert_eq!(log.references.root().count, 1);
     assert!(log.try_plan_record_read(&reference).unwrap().is_none());
-    let plan = log.plan_record_read(&reference).unwrap();
+    let reader = log.clone();
+    let worker = std::thread::spawn(move || reader.plan_record_read(&reference));
+    resume.send(()).unwrap();
+    let plan = worker.join().unwrap().unwrap();
     assert_eq!(
         log.references.root().count,
         2,
@@ -566,7 +769,7 @@ fn cold_pressure_never_reclaims_live_credit_or_repeats_an_empty_root() {
         .unwrap();
     log.persist_through(first).unwrap();
     let reference = log.record_reference(first, 0).unwrap();
-    let held = log.try_plan_record_read(&reference).unwrap().unwrap();
+    let held = log.plan_record_read(&reference).unwrap();
     assert!(matches!(
         log.append_complete_batch(authority(&config), &batch(&config, 1)),
         Err(StorageError::Capacity)
@@ -589,7 +792,7 @@ fn cold_pressure_never_reclaims_live_credit_or_repeats_an_empty_root() {
 }
 
 #[test]
-fn cold_pressure_root_io_error_is_unknown_and_closes_read_admission() {
+fn background_root_io_error_closes_read_admission() {
     let temp = tempdir::TempDir::new("storage-cold-root-failure").unwrap();
     let mut config = config(vec![3], 3);
     config.max_batches = 1;
@@ -604,12 +807,16 @@ fn cold_pressure_root_io_error_is_unknown_and_closes_read_admission() {
     let second = log
         .append_complete_batch(authority(&config), &batch(&config, 1))
         .unwrap();
-    log.persist_through(second).unwrap();
     let temporary = path.join(".storage-history-root-v2.pending");
     fs::create_dir(&temporary).unwrap();
     assert!(matches!(
+        log.persist_through(second),
+        Ok(_) | Err(StorageError::Poisoned)
+    ));
+    assert!(matches!(log.wait_history(), Err(StorageError::Poisoned)));
+    assert!(matches!(
         log.plan_record_read(&reference),
-        Err(StorageError::Unknown(_))
+        Err(StorageError::Poisoned)
     ));
     assert!(matches!(
         log.try_plan_record_read(&reference),
@@ -635,15 +842,23 @@ fn pooled_history_has_constant_file_set_and_frozen_prefix_readers() {
     let path = temp.path().join("stream");
     let log = PartitionLog::create(&path, cfg.clone(), &shape(), metrics()).unwrap();
     let first = batch(&cfg, 0);
-    for sequence in 0..2 {
-        let receipt = log
-            .append_complete_batch(authority(&cfg), &batch(&cfg, sequence))
-            .unwrap();
-        log.persist_through(receipt).unwrap();
-    }
+    let receipt = log
+        .append_complete_batch(authority(&cfg), &batch(&cfg, 0))
+        .unwrap();
+    log.persist_through(receipt).unwrap();
+    let receipt = log
+        .append_complete_batch(authority(&cfg), &batch(&cfg, 1))
+        .unwrap();
+    let (entered, resume) = log.references.pause_next_history();
+    log.persist_through(receipt).unwrap();
+    entered
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
     let frozen = log.references.freeze_history();
     assert_eq!(frozen.root().count, 1);
     let proof = log.checkpoint_prefix(1).unwrap();
+    resume.send(()).unwrap();
+    log.wait_history().unwrap();
     for sequence in 2..24 {
         let receipt = log
             .append_complete_batch(authority(&cfg), &batch(&cfg, sequence))
@@ -731,5 +946,45 @@ fn pooled_node_and_descriptor_corruption_fail_closed_on_cold_access() {
             assert!(log.read_record_encoded(&reference).is_err());
             assert_eq!(log.lookup(first.id()).unwrap(), Some(receipt));
         }
+    }
+}
+
+#[test]
+fn grouped_history_crosses_buffer_boundaries_and_reopens_with_exact_authority() {
+    let temp = tempdir::TempDir::new("storage-buffered-history-reopen").unwrap();
+    let mut config = config(vec![3], 3);
+    config.group_limits.max_encoded_bytes = 4096;
+    config.fragment_bytes = 8192;
+    config.wal_file_bytes = 16384;
+    let path = temp.path().join("stream");
+    let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+    let mut receipts = Vec::new();
+    for group_index in 0..24 {
+        let batches = (0..4)
+            .map(|member| batch(&config, group_index * 4 + member))
+            .collect();
+        let group = CompleteGroup::new(&shape(), batches, config.batch_limits, config.group_limits)
+            .unwrap();
+        let appended = log.append_group(authority(&config), &group).unwrap();
+        log.persist_many(&appended).unwrap();
+        receipts.extend(appended);
+    }
+    let prefix = log.checkpoint_prefix(receipts.len()).unwrap();
+    log.seal_epoch(authority(&config)).unwrap();
+    drop(log);
+
+    let reopened = PartitionLog::recover_sealed(&path, &config, metrics()).unwrap();
+    assert_eq!(reopened.receipt_page(0, receipts.len()).unwrap(), receipts);
+    assert_eq!(reopened.checkpoint_prefix(receipts.len()).unwrap(), prefix);
+    for (n, receipt) in receipts.iter().enumerate() {
+        assert_eq!(reopened.lookup(receipt.id()).unwrap(), Some(*receipt));
+        assert_eq!(
+            reopened.lookup_version(receipt.version()).unwrap(),
+            Some(*receipt)
+        );
+        assert_eq!(
+            reopened.read_batch(*receipt).unwrap().mutations(),
+            batch(&config, n as u64).mutations()
+        );
     }
 }

@@ -43,6 +43,8 @@ pub struct NodeInventory {
     pub(super) terminal: Arc<AtomicBool>,
     pub(super) readers: Arc<RwLock<ReaderAuthority>>,
     metrics: Arc<Metrics>,
+    history_diagnostics: bool,
+    history_failure_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
     // Partition handles each retain this root lock as well.
     lock: Arc<DbLock>,
 }
@@ -272,9 +274,34 @@ impl NodeInventory {
             terminal: Arc::new(AtomicBool::new(false)),
             readers,
             metrics,
+            history_diagnostics: false,
+            history_failure_notifier: None,
             lock,
         })
     }
+    pub(super) fn set_history_maintenance_diagnostics(&mut self, enabled: bool) {
+        self.history_diagnostics = enabled;
+        for log in self.logs.values() {
+            log.set_history_maintenance_diagnostics(enabled);
+        }
+    }
+
+    pub(super) fn history_maintenance_stats(
+        &self,
+    ) -> Vec<(u64, crate::distributed::storage::HistoryMaintenanceStats)> {
+        self.logs
+            .iter()
+            .map(|(&epoch, log)| (epoch, log.history_maintenance_stats()))
+            .collect()
+    }
+
+    pub(super) fn set_history_failure_notifier(&mut self, notifier: Arc<dyn Fn() + Send + Sync>) {
+        for log in self.logs.values() {
+            log.set_history_failure_notifier(notifier.clone());
+        }
+        self.history_failure_notifier = Some(notifier);
+    }
+
     fn ensure_healthy(&self) -> Result<(), TcpError> {
         if self.healthy && !self.terminal.load(Ordering::Acquire) {
             Ok(())
@@ -360,6 +387,10 @@ impl NodeInventory {
         )
         .map_err(TcpError::component)?;
         let log = Arc::new(log.retain_local_authority(self.lock.clone()));
+        log.set_history_maintenance_diagnostics(self.history_diagnostics);
+        if let Some(notifier) = &self.history_failure_notifier {
+            log.set_history_failure_notifier(notifier.clone());
+        }
         self.manifest.epochs.last_mut().unwrap().state = EpochState::Active;
         persist(&self.config.root, &self.manifest)?;
         self.logs.insert(epoch, log);
