@@ -313,11 +313,11 @@ identical. The new admission/publication schedule can still change I/O
 concurrency and checkpoint interference; identical persistence code does not
 prove identical execution cost or exonerate the architecture.
 
-**The large-write regression remains an open performance gate.** All five
-owners and the authority use one physical benchmark volume here. Independent
-NVMe devices can remove cross-owner disk contention, but that is a hypothesis,
-not an observed improvement. Adding global disk serialization to make this
-laptop case faster would reintroduce the cluster coupling being removed.
+**The large-write tail remains an open measurement issue.** All five owners
+and the authority use one physical benchmark volume here. Independent NVMe
+devices can remove cross-owner disk contention, but that is not yet an observed
+improvement. Adding global disk serialization to make this laptop case faster
+would reintroduce the cluster coupling being removed.
 No fsync, checksum, conflict, snapshot, fencing or memory-lifetime guarantee
 was weakened to hide the result.
 
@@ -328,24 +328,78 @@ executor-member counts differ, so these totals must not be mixed into a hit
 ratio. They show predominantly owner-RAM service, not a physical-NVMe read
 latency benchmark. No hardware RMA was used by these TCP cases.
 
+### Matched persistence-tail investigation, 2026-10-28
+
+The reported 246.731694 ms was a p99, not one isolated maximum: that population
+contained 240 calls at or above 100 ms. A fresh matched pair then ran the frozen
+buffered control first and the frozen current executable second. Each again
+completed 4096 successful measurement calls, with unchanged workload and fresh
+owned databases. Neither recorded system swap-out.
+
+| Fresh 8 KiB PUT batch32 case | API p50 ms | API p99 ms | Maximum ms | Calls/s | Calls at least 100 ms |
+|---|---:|---:|---:|---:|---:|
+| Buffered control | 15.191637 | 198.481659 | 246.228908 | 487.26 | 243 |
+| Current | 14.088723 | 66.018367 | 84.081969 | 875.94 | 0 |
+
+This reverses the earlier ordering. It neither proves a current-source speedup
+nor supports calling the earlier tail a deterministic architectural regression.
+No populations are pooled, and no run-to-run significance claim is made.
+
+Separate intrusive `strace` twins followed all owner processes. In the current
+case, a node-0 WAL `fdatasync` lasting 64.266 ms overlapped a proven mapping of
+the same WAL's fragment (`msync`, 55.473 ms), a coordinator index-container
+`fsync` (57.869 ms), and node-3 WAL synchronization (64.287 ms). Their completion
+times clustered within about 0.14 ms. The control showed the same class of
+overlap: node-4 WAL synchronization, that WAL's fragment, owner authority-history
+and coordinator receipt-history barriers completed within about 0.082 ms.
+
+The mapping and shared-address-space provenance were checked, not inferred from
+an unmapped `msync` address. These observations support shared-host persistence
+interference as a hypothesis. They do not distinguish physical-device service,
+filesystem/journal or inode/writeback coordination, CPU descheduling and tracing
+overhead. The coarse wall-clock anchor cannot identify which individual API
+sample contains a particular syscall. Traced timings are not clean API results.
+
+Local-only reproducibility evidence is retained under
+`checkpoint-work/tail-investigation-20261028T202848Z/`: `plan.json`,
+`clean-pair.json`, `trace-pair.json`, `syscall-analysis.json`, the separate raw
+case results and per-thread traces. This directory is intentionally not shipped
+in the Git source archive. Source and executable SHA-256 checks confirmed the
+same frozen implementations; no runtime or durability change was made during
+this investigation.
+
+### Approved cloud validation scope
+
 The implementation is locally correctness-qualified for a **diagnostic**
 independent-NVMe campaign, not performance-approved or production-parity proven.
-Before any paid allocation, freeze this exact candidate and the compatible
-Sui checkout, rebuild the source-bound Sui/native/storage/transport binaries,
-and require successful startup and artifact checks. After explicit user
-approval, compare the native barrier tier, TCP, EFA and direct EFA with
-matched checkpoint fixtures, workload, caches, counts and provider evidence.
-Include both small writes and the regressed batch32 case, coordinator hits,
-owner-cache/registered-RAM hits and qualified physical-I/O misses. Retain
-per-owner persistence, coordinator-prefix/dependency/checkpoint and host-I/O
-evidence; retrieve complete results before the existing deadline/watchdog
-teardown and verify every task-owned instance is terminated.
+Freeze the candidate, rebuild the selected suite's release executable, and
+require source-bound packaging and real-server qualification before allocation.
 
-No AWS resources were launched in this task. No commit, push, Sui dependency
-pin or native mutex removal was made. At least 11.464 GiB of this task's closed
-WAL datasets was reclaimed while retaining raw results, configs, source
-archives and diagnostic evidence. Later owned datasets were also removed
-after validation. No project skill files were present to make stale.
+The user-selected campaign uses the existing `kv-comparison` mode on
+`bench/aws-efa`, not the Sui suite. Its tracked matrix contains 258 cases across
+native Tidehunter, distributed TCP, EFA, direct EFA, native EFA, TiKV, Cassandra,
+FoundationDB and Valkey TCP. Preserve the workload counts and one independent
+repetition. Keep native page-cache and value-WAL-barrier tiers, configured cache
+cohorts, observed read sources and physical-I/O evidence separate. The common
+matrix contains scalar writes and batch reads; it does not reproduce this
+local atomic PUT-batch32 case, which Valkey TCP does not support.
+
+Collect raw API, scheduling and response samples, engine write profiles,
+measurement-boundary cache/WAL evidence, per-process resource counters, host
+I/O and the Prometheus TSDB snapshot with Grafana configuration. Verify durable
+S3 export before normal teardown, retain the unconditional deadline/watchdog
+backstop, download and hash-check the complete evidence, then independently
+verify every task-owned instance and temporary attached volume has been removed.
+Keep the result objects under the configured retention policy; S3 retention
+continues to have a storage cost and is not billed as running EC2 compute.
+
+A separate future Sui campaign must also freeze the compatible Sui checkout
+and fixture and rebuild its Sui/native/storage/transport executables. It must
+not be presented as part of this synthetic comparison.
+
+No Sui dependency pin or native mutex was changed. Only completed task-owned
+WAL datasets were reclaimed; raw results and provenance remain. No project
+skill files were present to make stale.
 
 ## Historical bounded background history, 28 October 2026
 
