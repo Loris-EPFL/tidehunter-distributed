@@ -7,6 +7,17 @@ Two modes share the pinned Prometheus, Grafana, node_exporter and Python images:
 - **Single-run local mode:** `stack.py` observes one explicit result directory.
   Its commands and limitations are below. It does not contact AWS.
 
+`measurement-read-evidence.json` records quiescent start after warmup and the
+measurement gate, and end after measured requests drain but before
+postqualification and the completion gate. Fresh authenticated owner snapshots
+are sequential across owners, not globally atomic. Counter deltas and gauges
+are separate; unavailability and resets are explicit rather than zero-filled.
+Logical WAL reads do not prove physical NVMe I/O. See
+[measurement read evidence](../README.md#measurement-read-evidence).
+The Prometheus `write_out_of_prefix_published_batches` and
+`write_dependency_wait_batches` counts diagnose publication activity; they are
+not latency percentiles.
+
 Neither mode changes Tidehunter, Sui, database durability or workload semantics.
 These tools observe the generic KV comparison harness; adding this integration
 does not automatically add monitoring to the separate Sui checkpoint runner.

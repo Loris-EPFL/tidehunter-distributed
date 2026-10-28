@@ -251,7 +251,7 @@ pub fn maybe_run_storage_node() -> Result<bool> {
             return Err(io::Error::other("controller exited during node startup").into());
         }
     }
-    let config: NodeLaunch = serde_yaml::from_slice(&fs::read(file)?)?;
+    let config: NodeLaunch = serde_yaml::from_slice(&fs::read(&file)?)?;
     println!(
         "shard_read_memory_allowance_bytes={} cache_budget_bytes={} cache_metadata_before_allocation_bytes={}",
         config.node.read_memory_allowance_bytes,
@@ -261,6 +261,13 @@ pub fn maybe_run_storage_node() -> Result<bool> {
     println!("read_resident_first={}", config.node.read_resident_first);
     let metrics = Metrics::new_in_enabled(&prometheus::Registry::new(), false);
     let node = StorageNode::open(config.node, metrics)?;
+    let history_diagnostics =
+        if std::env::var_os("TIDEHUNTER_HISTORY_DIAGNOSTICS").is_some_and(|value| value == "1") {
+            node.set_history_maintenance_diagnostics(true);
+            Some(Path::new(&file).with_extension("history-maintenance.json"))
+        } else {
+            None
+        };
     if config.drop_first_append_response {
         #[cfg(feature = "test-utils")]
         node.inject_drop_next_append_response();
@@ -290,6 +297,19 @@ pub fn maybe_run_storage_node() -> Result<bool> {
         .join()
         .map_err(|_| io::Error::other("node stop monitor panicked"))?;
     result?;
+    if let Some(path) = history_diagnostics {
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "scope": "owner_epoch_lifetime_before_drop",
+                "process_id": std::process::id(),
+                "epoch_stats": node.history_maintenance_stats(),
+                "clock_scope": "opt-in maintenance and full-window wait clocks; concurrent work overlaps and is not additive API wall time",
+                "snapshot_boundary": "after serving stops, before handle drop; in-flight maintenance can finish after this snapshot"
+            }))?,
+        )?;
+    }
     Ok(true)
 }
 

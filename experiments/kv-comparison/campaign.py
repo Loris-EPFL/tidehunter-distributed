@@ -436,6 +436,15 @@ def run_one(args, spec, base, job, index):
             raise RuntimeError("actual runner omitted required raw/result artifacts")
         receipt["artifacts_sha256"] = {name: digest(result_dir / name)
                                         for name in ("manifest.json", "summary.json", "samples.csv", "metrics.prom")}
+        evidence = result_dir / "measurement-read-evidence.json"
+        if evidence.is_file():
+            receipt["measurement_read_evidence"] = {"path": "result/measurement-read-evidence.json",
+                                                     "sha256": digest(evidence)}
+        marker = json.loads((result_dir / "manifest.json").read_text()).get("run", {}).get("measurement_read_evidence_schema_version")
+        if marker is not None and (type(marker) is not int or marker != 1):
+            raise RuntimeError("unsupported measurement read evidence capability")
+        if marker == 1 and not evidence.is_file():
+            raise RuntimeError("advertised measurement read evidence artifact is missing")
         verify_run_identity(result_dir, receipt, config, fdb_identity)
         receipt["validated_timing_rows_by_phase"] = verify_timing_result(result_dir, config)
         if external:

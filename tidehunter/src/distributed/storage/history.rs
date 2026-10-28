@@ -15,6 +15,7 @@ const ROOT: &str = "storage-history-root-v2";
 const DIRECTORY: &str = "storage-history-v2";
 const SLOT_BYTES: usize = 256;
 const DESCRIPTOR_BYTES: usize = 80;
+const NODE_BUFFER_BYTES: usize = 32 * SLOT_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 struct NodePointer {
@@ -92,11 +93,14 @@ pub(crate) struct HistoryReader {
     max_metadata_bytes: usize,
 }
 
-/// Sole append capability, owned by the physical stream's existing state owner.
+/// Sole append capability, serialized between the history worker and lifecycle owner.
 pub(crate) struct History {
     path: PathBuf,
     reader: HistoryReader,
     node_append: u64,
+    node_buffer: [u8; NODE_BUFFER_BYTES],
+    node_buffer_len: usize,
+    node_buffer_start: u64,
     descriptor_append: u64,
 }
 
@@ -209,6 +213,9 @@ impl History {
             path: path.to_path_buf(),
             reader,
             node_append: 0,
+            node_buffer: [0; NODE_BUFFER_BYTES],
+            node_buffer_len: 0,
+            node_buffer_start: 0,
             descriptor_append: 0,
         })
     }
@@ -252,6 +259,9 @@ impl History {
             path: path.to_path_buf(),
             reader,
             node_append,
+            node_buffer: [0; NODE_BUFFER_BYTES],
+            node_buffer_len: 0,
+            node_buffer_start: node_append,
             descriptor_append,
         })
     }
@@ -344,6 +354,7 @@ impl History {
             root.descriptors_end = self.descriptor_append;
             self.reader.descriptors.sync_all()?;
             self.reader.receipts.sync_all()?;
+            self.flush_nodes()?;
             self.reader.nodes.sync_all()?;
         }
         install_metadata(&self.path, ROOT, &encode_metadata(&root)?)?;
@@ -386,6 +397,7 @@ impl History {
         }
         root.nodes_end = self.node_append;
         self.reader.retired.sync_all()?;
+        self.flush_nodes()?;
         self.reader.nodes.sync_all()?;
         install_metadata(&self.path, ROOT, &encode_metadata(&root)?)?;
         self.reader.root = root;

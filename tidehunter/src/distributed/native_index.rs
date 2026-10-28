@@ -36,6 +36,7 @@ use typenum::U32;
 mod retention;
 mod snapshot;
 pub use retention::IndexReadPin;
+pub(crate) use retention::PublicationViewReservation;
 use retention::{CaptureLease, Retention};
 use snapshot::FrozenCell;
 pub(crate) use snapshot::{PersistedIndexImage, PreparedIndexImage};
@@ -53,19 +54,60 @@ fn cell_directory_charge(cell: &CellId) -> usize {
 
 /// `At` includes that exact mutation. `BeforeAll` is the empty checkpoint;
 /// unlike an absent optional frontier, it can never accidentally mean latest.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IndexReadCut {
     Latest,
     BeforeAll,
     At(MutationVersion),
+    Sparse(std::sync::Arc<SparseIndexView>),
 }
+
+/// An immutable, index-scoped publication view. Its lifetime retains the
+/// stable prefix needed to resolve keys whose newer versions are excluded.
+#[derive(Debug)]
+pub struct SparseIndexView {
+    upper: MutationVersion,
+    floor: Option<MutationVersion>,
+    excluded: Vec<BatchVersion>,
+    retention: std::sync::Arc<parking_lot::Mutex<Retention>>,
+    charge: usize,
+}
+
+impl PartialEq for SparseIndexView {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.retention, &other.retention)
+            && self.upper == other.upper
+            && self.floor == other.floor
+            && self.excluded == other.excluded
+    }
+}
+impl Eq for SparseIndexView {}
+
+impl Drop for SparseIndexView {
+    fn drop(&mut self) {
+        self.retention.lock().release_view(self.floor, self.charge);
+    }
+}
+
 impl IndexReadCut {
-    fn contains(self, reference: &ValueRecordReference) -> bool {
+    fn within_upper(&self, reference: &ValueRecordReference) -> bool {
         match self {
             Self::Latest => true,
             Self::BeforeAll => false,
-            Self::At(version) => reference.mutation_version() <= version,
+            Self::At(version) => reference.mutation_version() <= *version,
+            Self::Sparse(view) => reference.mutation_version() <= view.upper,
         }
+    }
+
+    fn contains(&self, reference: &ValueRecordReference) -> bool {
+        self.within_upper(reference)
+            && match self {
+                Self::Sparse(view) => view
+                    .excluded
+                    .binary_search(&reference.batch_version)
+                    .is_err(),
+                _ => true,
+            }
     }
 }
 
@@ -113,7 +155,8 @@ pub struct NativeIndexStats {
     pub pending_operations: usize,
     /// Resident dirty-reference, key and cell-directory charge; not process RSS.
     pub charged_metadata_bytes: usize,
-    /// Bounded frozen capture, separately limited by the configured budget.
+    /// Frozen capture plus sparse views and their reservations. Capture and view
+    /// allowances are independently bounded, so the sum can reach twice the budget.
     pub transient_metadata_bytes: usize,
 }
 
@@ -136,6 +179,7 @@ pub struct NativeIndex {
     retained_bytes: usize,
     retained_versions: usize,
     latest: Option<MutationVersion>,
+    live_view: Option<IndexReadCut>,
     resident_overlay_bytes: usize,
     resident_directory_bytes: usize,
     resident_loaded_bytes: usize,
@@ -177,7 +221,8 @@ impl NativeIndexHistory {
         loop {
             let identity = self.cells.last()?;
             let cell = &index.cells[identity];
-            if let Some((key, reference)) = cell.next_history(self.after.as_ref(), self.cut) {
+            if let Some((key, reference)) = cell.next_history(self.after.as_ref(), self.cut.clone())
+            {
                 self.after = Some((key.clone(), reference.mutation_version()));
                 return Some((key, reference));
             }
@@ -199,7 +244,9 @@ impl NativeIndexScan {
     }
 
     fn advance(&mut self, index: &NativeIndex, cell: usize) {
-        while let Some((key, reference)) = self.cells[cell].next(index, self.reverse, self.cut) {
+        while let Some((key, reference)) =
+            self.cells[cell].next(index, self.reverse, self.cut.clone())
+        {
             if reference.descriptor.kind == RecordKind::Put {
                 self.heads.push(ScanHead {
                     key,
@@ -233,7 +280,7 @@ impl CellScan {
         let base_position = Self::base_position(source, after.map(|key| key.as_ref()), reverse);
         let mut cursor = Self {
             identity,
-            overlay: source.next_overlay(after.map(|key| key.as_ref()), reverse, cut),
+            overlay: source.next_overlay(after.map(|key| key.as_ref()), reverse, cut.clone()),
             base: None,
             base_position,
             base_owner: source.base.as_ref().map(|block| block.bytes.clone()),
@@ -273,7 +320,7 @@ impl CellScan {
                 self.base_position += 1;
                 position
             };
-            if let Some(reference) = block.selected(position, cut) {
+            if let Some(reference) = block.selected(position, cut.clone()) {
                 self.base = Some((
                     block.bytes.slice_to_bytes(block.entry(position).0),
                     reference,
@@ -300,8 +347,8 @@ impl CellScan {
         if replaced {
             self.base_position = Self::base_position(source, self.after.as_deref(), reverse);
             self.base_owner = source.base.as_ref().map(|block| block.bytes.clone());
-            self.overlay = source.next_overlay(self.after.as_deref(), reverse, cut);
-            self.advance_base(source, reverse, cut);
+            self.overlay = source.next_overlay(self.after.as_deref(), reverse, cut.clone());
+            self.advance_base(source, reverse, cut.clone());
         }
         let order = match (&self.overlay, &self.base) {
             (None, None) => return None,
@@ -317,7 +364,7 @@ impl CellScan {
         };
         let mut result = if order != Ordering::Greater {
             let result = self.overlay.take().expect("overlay head");
-            self.overlay = source.next_overlay(Some(&result.0), reverse, cut);
+            self.overlay = source.next_overlay(Some(&result.0), reverse, cut.clone());
             result
         } else {
             self.base.take().expect("base head")
@@ -330,7 +377,7 @@ impl CellScan {
                 )
                 .expect("merged head");
             }
-            self.advance_base(source, reverse, cut);
+            self.advance_base(source, reverse, cut.clone());
         }
         self.after = Some(result.0.clone());
         Some(result)
@@ -367,6 +414,7 @@ impl NativeIndex {
             resident_directory_bytes: 0,
             resident_loaded_bytes: 0,
             retention: Default::default(),
+            live_view: None,
         })
     }
 
@@ -462,8 +510,10 @@ impl NativeIndex {
     }
 
     pub fn latest_cut(&self) -> IndexReadCut {
-        self.latest
-            .map_or(IndexReadCut::BeforeAll, IndexReadCut::At)
+        self.live_view.clone().unwrap_or_else(|| {
+            self.latest
+                .map_or(IndexReadCut::BeforeAll, IndexReadCut::At)
+        })
     }
 
     /// Promote committed native pending entries while retaining every logical
@@ -535,7 +585,8 @@ impl NativeIndex {
         full_key: &[u8],
         cut: IndexReadCut,
     ) -> Result<Option<ValueRecordReference>, NativeIndexError> {
-        self.validate_cut(cut)?;
+        let cut = self.resolve_cut(cut);
+        self.validate_cut(cut.clone())?;
         let (_, reduced, cell) = self.route(keyspace, full_key)?;
         Ok(self
             .cells
@@ -603,7 +654,7 @@ impl NativeIndex {
         cut: IndexReadCut,
     ) -> Result<NativeIndexHistory, NativeIndexError> {
         self.descriptor(keyspace)?;
-        self.validate_cut(cut)?;
+        self.validate_cut(cut.clone())?;
         Ok(NativeIndexHistory {
             cells: self
                 .cells
@@ -630,7 +681,7 @@ impl NativeIndex {
         allow_hash: bool,
     ) -> Result<NativeIndexScan, NativeIndexError> {
         let descriptor = self.descriptor(keyspace)?;
-        self.validate_cut(cut)?;
+        self.validate_cut(cut.clone())?;
         if !allow_hash && matches!(descriptor.key_indexing(), KeyIndexing::Hash) {
             return Err(NativeIndexError::Invalid(
                 "ordered scan is unsupported for hashed keys",
@@ -654,7 +705,7 @@ impl NativeIndex {
                         source,
                         after_reduced.as_ref(),
                         reverse,
-                        cut,
+                        cut.clone(),
                     )
                 })
                 .collect()
@@ -705,7 +756,7 @@ impl NativeIndex {
             return Err(NativeIndexError::PendingPublication);
         }
         let cut = self.resolve_cut(cut);
-        let lease = self.capture_lease(cut, floor)?;
+        let lease = self.capture_lease(cut.clone(), floor)?;
         let mut cells = Vec::with_capacity(self.cells.len());
         for (identity, cell) in &self.cells {
             let overlay = cell
@@ -749,7 +800,7 @@ impl NativeIndex {
             // A caller may persist an older exact cut for export. Installing it
             // must not discard newer history that has already been unloaded.
             if cell.base.as_ref().is_some_and(|base| {
-                retention::position(base.cut) > retention::position(persisted.cut)
+                retention::position(&base.cut) > retention::position(&persisted.cut)
             }) {
                 continue;
             }
@@ -1001,7 +1052,12 @@ impl CellIndex {
         let overlay = self
             .overlay
             .get(key)
-            .and_then(|values| matching_prefix(values, |value| cut.contains(value)).last())
+            .and_then(|values| {
+                matching_prefix(values, |value| cut.within_upper(value))
+                    .iter()
+                    .rev()
+                    .find(|value| cut.contains(value))
+            })
             .copied();
         let base = self.base.as_ref().and_then(|block| block.get(key, cut));
         newest(overlay, base)
@@ -1018,16 +1074,20 @@ impl CellIndex {
                 .range::<[u8], _>((Bound::Unbounded, start))
                 .rev()
                 .find_map(|(key, values)| {
-                    matching_prefix(values, |v| cut.contains(v))
-                        .last()
+                    matching_prefix(values, |v| cut.within_upper(v))
+                        .iter()
+                        .rev()
+                        .find(|v| cut.contains(v))
                         .map(|reference| (key.clone(), *reference))
                 })
         } else {
             self.overlay
                 .range::<[u8], _>((start, Bound::Unbounded))
                 .find_map(|(key, values)| {
-                    matching_prefix(values, |v| cut.contains(v))
-                        .last()
+                    matching_prefix(values, |v| cut.within_upper(v))
+                        .iter()
+                        .rev()
+                        .find(|v| cut.contains(v))
                         .map(|reference| (key.clone(), *reference))
                 })
         }
@@ -1055,10 +1115,10 @@ impl CellIndex {
                 });
                 for bytes in versions[first * REFERENCE_BYTES..].chunks_exact(REFERENCE_BYTES) {
                     let reference = decode_reference(bytes).expect("validated immutable reference");
-                    if !cut.contains(&reference) {
+                    if !cut.within_upper(&reference) {
                         break;
                     }
-                    if reference.descriptor.kind == RecordKind::Put {
+                    if cut.contains(&reference) && reference.descriptor.kind == RecordKind::Put {
                         return Some((block.bytes.slice_to_bytes(key), reference));
                     }
                 }
@@ -1078,8 +1138,8 @@ impl CellIndex {
                 });
                 versions[first..]
                     .iter()
-                    .take_while(|value| cut.contains(value))
-                    .find(|value| value.descriptor.kind == RecordKind::Put)
+                    .take_while(|value| cut.within_upper(value))
+                    .find(|value| cut.contains(value) && value.descriptor.kind == RecordKind::Put)
                     .map(|reference| (key.clone(), *reference))
             });
         match (base, overlay) {
@@ -1216,14 +1276,16 @@ impl SortedBlock {
     fn selected(&self, index: usize, cut: IndexReadCut) -> Option<ValueRecordReference> {
         let (_, values) = self.entry(index);
         let count = lower_bound_by(values.len() / REFERENCE_BYTES, |n| {
-            cut.contains(
+            cut.within_upper(
                 &decode_reference(&values[n * REFERENCE_BYTES..(n + 1) * REFERENCE_BYTES])
                     .expect("validated immutable reference"),
             )
         });
-        (count > 0).then(|| {
-            decode_reference(&values[(count - 1) * REFERENCE_BYTES..count * REFERENCE_BYTES])
-                .expect("validated immutable reference")
+        (0..count).rev().find_map(|n| {
+            let reference =
+                decode_reference(&values[n * REFERENCE_BYTES..(n + 1) * REFERENCE_BYTES])
+                    .expect("validated immutable reference");
+            cut.contains(&reference).then_some(reference)
         })
     }
     fn get(&self, key: &[u8], cut: IndexReadCut) -> Option<ValueRecordReference> {
@@ -1354,7 +1416,9 @@ fn encode_cut(cut: IndexReadCut, output: &mut Vec<u8>) {
             output.push(1);
             output.extend_from_slice(&LogicalValueId::new(version).encode());
         }
-        IndexReadCut::Latest => unreachable!("persisted cut must be concrete"),
+        IndexReadCut::Latest | IndexReadCut::Sparse(_) => {
+            unreachable!("persisted cut must be a prefix")
+        }
     }
 }
 fn decode_cut(cursor: &mut Cursor<'_>) -> Result<IndexReadCut, NativeIndexError> {
@@ -1437,6 +1501,7 @@ mod tests {
     mod cursors;
     mod lifecycle;
     mod owners;
+    mod sparse;
 
     const DATABASE: [u8; 16] = [7; 16];
     const EPOCH: u64 = 11;
@@ -1598,6 +1663,30 @@ mod tests {
             .into_iter()
             .map(|(key, _)| key.to_vec())
             .collect()
+    }
+
+    #[test]
+    fn distinct_full_keys_with_same_reduction_share_an_index_slot() {
+        let temp = tempdir::TempDir::new("native-reduced-key-conflict").unwrap();
+        let log = log(&temp.path().join("wal"));
+        let first_key = [1, 2, 3, 4, 128, 0, 0, 4];
+        let second_key = [5, 6, 7, 8, 128, 0, 0, 4];
+        let first = batch(0, vec![put(1, &first_key, b"first")]);
+        let second = batch(1, vec![put(1, &second_key, b"second")]);
+        let receipts = durable(&log, &[first.clone(), second.clone()]);
+        let mut index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
+
+        // A late lower logical version must not replace the newer reduced-key head.
+        install(&mut index, &log, &second, receipts[1]);
+        install(&mut index, &log, &first, receipts[0]);
+        let first_lookup = index
+            .get(KeySpace(1), &first_key, IndexReadCut::Latest)
+            .unwrap();
+        let second_lookup = index
+            .get(KeySpace(1), &second_key, IndexReadCut::Latest)
+            .unwrap();
+        assert_eq!(first_lookup, second_lookup);
+        assert_eq!(first_lookup.unwrap().batch_version, second.version());
     }
 
     #[test]
@@ -1946,7 +2035,7 @@ mod tests {
                     expected.reverse();
                 }
                 let mut cursor = index
-                    .scan_cursor(KeySpace(0), None, reverse, read_cut)
+                    .scan_cursor(KeySpace(0), None, reverse, read_cut.clone())
                     .unwrap();
                 let mut after: Option<Bytes> = None;
                 let heap_capacity = cursor.heads.capacity();
@@ -1959,7 +2048,7 @@ mod tests {
                     assert_eq!(
                         page,
                         index
-                            .scan(KeySpace(0), after.as_deref(), reverse, 7, read_cut)
+                            .scan(KeySpace(0), after.as_deref(), reverse, 7, read_cut.clone())
                             .unwrap(),
                         "persistent cursor must match exclusive restart bounds",
                     );

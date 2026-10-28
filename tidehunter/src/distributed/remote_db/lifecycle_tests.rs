@@ -12,6 +12,146 @@ fn put(value: u8) -> Mutation {
     }
 }
 
+fn put_key(key: u32, value: u8) -> Mutation {
+    Mutation::Put {
+        keyspace: KeySpace(0),
+        key: key.to_be_bytes().to_vec().into(),
+        value: vec![value; 32].into(),
+    }
+}
+
+#[test]
+fn checkpoint_over_gap_and_lost_response_replay_sparse_ack_and_retry_identity() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    let baseline = fixture.operation(4, 30);
+    db.write_batch(baseline, vec![put_key(0, 1)]).unwrap();
+    let connection = Arc::clone(&db.clients[0].client);
+    let held = connection.lock();
+    let gap = fixture.operation(0, 31);
+    let suffix = fixture.operation(1, 32);
+    let gap_version = db.submit(gap, vec![put_key(1, 2)]).unwrap();
+    let suffix_version = db.submit(suffix, vec![put_key(2, 3)]).unwrap();
+    db.submit(fixture.operation(1, 33), vec![put_key(3, 4)])
+        .unwrap();
+    let group = db.inflight[1].pop_front().unwrap();
+    let receipts = group
+        .reply
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    db.accept_receipts(receipts).unwrap();
+    db.publish_completed().unwrap();
+    let sparse_published = db.publication.is_published(suffix_version);
+    let gap_published = db.publication.is_published(gap_version);
+    let suffix_value = db.get(KeySpace(0), &2u32.to_be_bytes());
+    let retry = db.submit(suffix, vec![put_key(2, 3)]);
+    let retained_bytes: usize = db.submissions.iter().map(|entry| entry.encoded_bytes).sum();
+    let checkpoint_started = db.start_checkpoint();
+    drop(held);
+    assert!(sparse_published);
+    assert!(!gap_published);
+    assert_eq!(suffix_value.unwrap().unwrap().as_ref(), &[3; 32]);
+    assert_eq!(retry.unwrap(), suffix_version);
+    checkpoint_started.unwrap();
+    db.progress_checkpoint(true).unwrap();
+    assert_eq!(db.checkpoint_tail_batches, 3);
+    assert_eq!(db.checkpoint_tail_bytes, retained_bytes);
+
+    // The response loss happens after the stable image was adopted. Recovery
+    // must merge both its acknowledged sparse suffix and this uncertain WAL.
+    fixture.nodes[2].inject_drop_next_append_response();
+    let uncertain = fixture.operation(2, 34);
+    let uncertain_version = db.submit(uncertain, vec![put_key(4, 5)]).unwrap();
+    assert!(db.drain().is_err());
+    assert!(!db.healthy);
+    drop(db);
+
+    let mut reopened = fixture.open();
+    for (key, expected) in [(2u32, 3u8), (3, 4), (4, 5)] {
+        assert_eq!(
+            reopened
+                .get(KeySpace(0), &key.to_be_bytes())
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            &[expected; 32]
+        );
+    }
+    assert_eq!(
+        reopened.submit(suffix, vec![put_key(2, 3)]).unwrap(),
+        suffix_version
+    );
+    assert_eq!(
+        reopened.submit(uncertain, vec![put_key(4, 5)]).unwrap(),
+        uncertain_version
+    );
+    assert!(reopened.submit(suffix, vec![put_key(2, 9)]).is_err());
+    reopened.shutdown().unwrap();
+}
+
+#[test]
+fn sparse_ack_survives_crash_when_earlier_disjoint_batch_never_reached_wal() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    let missing = fixture.operation(0, 40);
+    let acknowledged = fixture.operation(1, 41);
+    let missing_version = db.submit(missing, vec![put_key(1, 1)]).unwrap();
+    let acknowledged_version = db.submit(acknowledged, vec![put_key(2, 2)]).unwrap();
+    db.submit(fixture.operation(1, 42), vec![put_key(3, 3)])
+        .unwrap();
+    let group = db.inflight[1].pop_front().unwrap();
+    let receipts = group
+        .reply
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    db.accept_receipts(receipts).unwrap();
+    db.publish_completed().unwrap();
+    assert!(!db.publication.is_published(missing_version));
+    assert!(db.publication.is_published(acknowledged_version));
+    assert_eq!(db.staged[0].len(), 1);
+    assert!(db.inflight[0].is_empty());
+    // Simulate abrupt authority loss without allowing Drop to dispatch the
+    // earlier batch. Its only copy is still in this process's staging queue.
+    db.concurrent_failure
+        .store(true, std::sync::atomic::Ordering::Release);
+    drop(db);
+
+    let mut reopened = fixture.open();
+    assert!(
+        reopened
+            .get(KeySpace(0), &1u32.to_be_bytes())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        reopened
+            .get(KeySpace(0), &2u32.to_be_bytes())
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        &[2; 32]
+    );
+    assert_eq!(
+        reopened
+            .get(KeySpace(0), &3u32.to_be_bytes())
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        &[3; 32]
+    );
+    assert_eq!(
+        reopened.submit(acknowledged, vec![put_key(2, 2)]).unwrap(),
+        acknowledged_version
+    );
+    // An unacknowledged absent batch can be admitted in the new epoch; its
+    // original sequence must not be reused as though the old write succeeded.
+    let retry = reopened.write_batch(missing, vec![put_key(1, 1)]).unwrap();
+    assert!(retry.epoch > missing_version.epoch);
+    reopened.shutdown().unwrap();
+}
+
 #[test]
 fn acknowledged_suffix_survives_every_background_checkpoint_adoption_stage() {
     for stage in 0..=4 {
@@ -260,7 +400,7 @@ fn drained_partition_pressure_does_not_wait_for_an_unrelated_capture() {
         partition: 1,
         records: 1,
     };
-    assert!(!db.admission_pressure_fits(pressure));
+    let initially_full = !db.admission_pressure_fits(pressure);
     let (finished, completion) = mpsc::sync_channel(1);
     let owner = thread::spawn(move || {
         let result = db.ensure_admission_pressure(pressure);
@@ -272,6 +412,7 @@ fn drained_partition_pressure_does_not_wait_for_an_unrelated_capture() {
     let observed = completion.recv_timeout(Duration::from_secs(5));
     resume.send(()).unwrap();
     let (mut db, result) = owner.join().unwrap();
+    assert!(initially_full);
     assert!(observed.unwrap());
     result.unwrap();
     assert_eq!(
@@ -486,12 +627,10 @@ fn publication_failure_fences_and_recovers_dispatched_successor_group() {
         let version = db.submit(operation, vec![put(key as u8)]).unwrap();
         identities.push((operation, version));
     }
-    assert_eq!(db.inflight[0].len(), 2);
-    assert!(db.staged[0].is_empty());
     drop(held);
 
-    // progress_pipeline dispatches every admitted group in the bounded window
-    // before ordered publication fails.
+    // Already dispatched successor work can outlive a publication failure.
+    // Recovery must reconcile its storage outcome rather than discard it.
     db.submissions[0].routing = None;
     assert!(db.drain().is_err());
     assert!(!db.healthy);

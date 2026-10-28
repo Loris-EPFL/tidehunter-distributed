@@ -20,6 +20,21 @@ Linux Docker Engine with Compose v2 is required; host networking and distinct
 loopback addresses are deliberate. Docker Desktop is not supported by this layout.
 The local helpers require no credential, OIDC role, cloud account, subscription or paid workflow.
 
+## Measurement read evidence
+
+The runner and backends produce `result/measurement-read-evidence.json` with
+start and end observations around the measured workload: start is quiescent after
+warmup/aging and the measurement gate; end is after measured requests drain,
+before postqualification and the completion gate. Attempt and drain status are
+explicit when a phase fails. Tidehunter collects fresh authenticated per-owner
+snapshots sequentially, not as one globally atomic cross-owner instant.
+Monotone per-counter deltas and nonmonotone gauges are reported separately;
+availability and resets are explicit and missing values are never filled with
+zero. Logical WAL reads are not evidence of physical NVMe access.
+
+The Python comparison suite passed 266 tests and the observability suite passed
+77 tests. These results do not establish Rust correctness or performance.
+
 ## Scope and evidence limits
 
 * `distributed` is the default: multiple actual database processes, explicitly

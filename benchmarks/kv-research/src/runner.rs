@@ -134,6 +134,9 @@ pub async fn run<B: KvBackend>(
     }
     let mut measurement_attempted = false;
     let mut profile_arm_error = None;
+    let mut read_start = serde_json::Value::Null;
+    let mut read_end = serde_json::Value::Null;
+    let mut measurement_drained = false;
     if !config.qualification_only
         && fatal_reason.is_none()
         && config.phases.measurement_operations > 0
@@ -158,7 +161,8 @@ pub async fn run<B: KvBackend>(
         if fatal_reason.is_none() {
             measurement_attempted = true;
             reporter.set_phase("measurement");
-            if let Err(error) = run_phase(
+            read_start = backend.read_observation();
+            let phase_result = run_phase(
                 Arc::clone(&backend),
                 &config,
                 &namespace,
@@ -170,14 +174,26 @@ pub async fn run<B: KvBackend>(
                 require_present_reads,
                 &mut reporter,
             )
-            .await
-            {
+            .await;
+            measurement_drained = phase_result.is_ok();
+            read_end = backend.read_observation();
+            if let Err(error) = phase_result {
                 failed = true;
                 fatal_reason = Some(format!("measurement phase stopped: {error}"));
             }
             reporter.snapshot()?;
         }
     }
+    let evidence = measurement_read_evidence(
+        &read_start,
+        &read_end,
+        measurement_attempted,
+        measurement_drained,
+    );
+    std::fs::write(
+        output.join("measurement-read-evidence.json"),
+        serde_json::to_vec_pretty(&evidence)?,
+    )?;
 
     if measurement_attempted
         && let Some(gate) = &config.measurement_completion_gate
@@ -298,6 +314,7 @@ pub async fn run<B: KvBackend>(
         "source_revision": config.source_revision.as_deref().or(option_env!("GIT_COMMIT")),
         "hardware": hardware_identity(),
         "timing": {"clock": "std::time::Instant monotonic", "timer_start": "backend API dispatch after bounded admission", "timer_end": "response materialized"},
+        "measurement_read_evidence_schema_version": 1,
         "request_timeout_ms": config.execution.request_timeout_ms,
         "data_policy": {"key_bytes": 32, "key_derivation": "BLAKE2(namespace,seed,logical_key_id), all bits hashed",
             "value_identity_header_bytes": 16, "value_entropy_fraction_of_remainder": config.dataset.entropy},
@@ -313,6 +330,144 @@ pub async fn run<B: KvBackend>(
         ));
     }
     Ok(())
+}
+
+fn counter_delta(
+    start: &serde_json::Value,
+    end: &serde_json::Value,
+    fields: &[&str],
+) -> serde_json::Value {
+    let mut delta = serde_json::Map::new();
+    for field in fields {
+        let Some((a, b)) = start
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .zip(end.get(field).and_then(serde_json::Value::as_u64))
+        else {
+            return serde_json::json!({"available": false, "error": format!("missing counter {field}")});
+        };
+        let Some(value) = b.checked_sub(a) else {
+            return serde_json::json!({"available": false, "error": format!("counter decreased: {field}")});
+        };
+        delta.insert((*field).to_owned(), value.into());
+    }
+    serde_json::json!({"available": true, "counters": delta})
+}
+
+fn partition_deltas(
+    start: &serde_json::Value,
+    end: &serde_json::Value,
+    fields: &[&str],
+) -> serde_json::Value {
+    if start["available"] != true || end["available"] != true {
+        return serde_json::json!({"available": false, "error": "partition sample unavailable at a boundary"});
+    }
+    let (Some(a), Some(b)) = (
+        start
+            .get("partitions")
+            .and_then(serde_json::Value::as_object),
+        end.get("partitions").and_then(serde_json::Value::as_object),
+    ) else {
+        return serde_json::json!({"available": false, "error": "partition snapshot unavailable"});
+    };
+    let mut partitions = serde_json::Map::new();
+    for key in a.keys().chain(b.keys()) {
+        if partitions.contains_key(key) {
+            continue;
+        }
+        let value = match (a.get(key), b.get(key)) {
+            (Some(first), Some(last)) => counter_delta(first, last, fields),
+            _ => {
+                serde_json::json!({"available": false, "error": "partition missing at one boundary"})
+            }
+        };
+        partitions.insert(key.clone(), value);
+    }
+    serde_json::json!({"available": true, "partitions": partitions})
+}
+
+fn measurement_read_evidence(
+    start: &serde_json::Value,
+    end: &serde_json::Value,
+    attempted: bool,
+    drained: bool,
+) -> serde_json::Value {
+    const COORDINATOR: &[&str] = &[
+        "read_rpc_count",
+        "hits",
+        "misses",
+        "inserts",
+        "evictions",
+        "rejected_oversize",
+        "rejected_mismatch",
+        "bypass_disabled",
+        "bypass_admission",
+        "bypass_eviction_limit",
+        "admitted_bytes",
+        "served_bytes",
+    ];
+    const OWNER: &[&str] = &[
+        "cache_hits",
+        "cache_misses",
+        "cache_inserts",
+        "cache_evictions",
+        "cache_oversized",
+        "cache_bypass_disabled",
+        "cache_bypass_eviction_limit",
+        "cache_bypass_scan",
+        "cache_bypass_generation",
+        "cache_admitted_bytes",
+        "cache_served_bytes",
+        "wal_reads",
+        "wal_read_bytes",
+        "resident_read_attempts",
+        "resident_read_successes",
+        "resident_read_fallbacks",
+        "resident_read_unsupported",
+        "resident_read_partial",
+        "resident_read_deferred",
+        "async_read_submissions",
+        "completed_reads",
+        "errors",
+        "cancellations",
+        "buffer_reuses",
+        "buffer_allocations",
+    ];
+    const RESIDENT: &[&str] = &[
+        "message_read_requests",
+        "grants_issued",
+        "grant_acquisitions",
+        "rma_completions",
+        "eligible_reads",
+        "rma_posts",
+        "rma_hits",
+        "rma_errors",
+        "fallback_missing",
+        "fallback_oversize",
+        "fallback_capacity",
+        "fallback_unsupported",
+        "fallback_stale",
+    ];
+    let deltas = if attempted && drained && start["available"] == true && end["available"] == true {
+        serde_json::json!({
+            "coordinator": counter_delta(&start["coordinator"], &end["coordinator"], COORDINATOR),
+            "owner_executor": partition_deltas(&start["owner_executor"], &end["owner_executor"], OWNER),
+            "client_resident": partition_deltas(&start["client_resident"], &end["client_resident"], RESIDENT)
+        })
+    } else {
+        serde_json::json!({"available": false, "error": if !attempted { "measurement not attempted" }
+            else if !drained { "measurement did not complete and drain successfully" }
+            else { "backend observation unavailable at a boundary" }})
+    };
+    serde_json::json!({
+        "schema_version": 1, "scope": "measurement_boundary",
+        "start_boundary": "after warmup, aging and measurement gate; before measurement run_phase",
+        "end_boundary": "after measurement run_phase and worker drain; before completion gate, profile finalization and postqualification",
+        "measurement_attempted": attempted, "measurement_drained": drained,
+        "snapshot_semantics": "sequential component and owner samples, not a globally atomic cut; raw snapshots include gauges and lifetime peaks",
+        "limitations": "logical WAL reads and async submissions are not physical IOPS; RMA counters do not establish hardware native FI_READ or per-operation hit fractions",
+        "start": start, "end": end, "deltas": deltas
+    })
 }
 
 async fn preload<B: KvBackend>(
@@ -1761,6 +1916,49 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
+    #[test]
+    fn deltas_reject_resets_and_keep_partition_identity() {
+        let start = serde_json::json!({"available": true, "partitions": {"3": {"reads": 10}, "8": {"reads": 2}}});
+        let end = serde_json::json!({"available": true, "partitions": {"3": {"reads": 12}, "9": {"reads": 4}}});
+        let delta = partition_deltas(&start, &end, &["reads"]);
+        assert_eq!(delta["partitions"]["3"]["counters"]["reads"], 2);
+        assert_eq!(delta["partitions"]["8"]["available"], false);
+        assert_eq!(delta["partitions"]["9"]["available"], false);
+        assert_eq!(
+            counter_delta(
+                &serde_json::json!({"reads": 4}),
+                &serde_json::json!({"reads": 1}),
+                &["reads"]
+            )["available"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn read_evidence_excludes_warmup_and_postqualification() {
+        let directory = result_directory("read-boundary");
+        let output = directory.join("result");
+        let mut config = read_test_config();
+        config.phases.preload = true;
+        config.phases.warmup_operations = 3;
+        config.phases.measurement_operations = 2;
+        run(
+            MemoryBackend::new(false, false),
+            config,
+            &output,
+            prometheus::Registry::new(),
+        )
+        .await
+        .unwrap();
+        let evidence: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(output.join("measurement-read-evidence.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(evidence["deltas"]["coordinator"]["counters"]["hits"], 2);
+        assert!(evidence["start"]["coordinator"]["hits"].as_u64().unwrap() >= 3);
+        assert_eq!(evidence["deltas"]["owner_executor"]["available"], false);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     struct MemoryBackend {
         data: Mutex<HashMap<Vec<u8>, Bytes>>,
@@ -1768,6 +1966,7 @@ mod tests {
         reverse_groups: bool,
         omit_put_number: Option<usize>,
         put_count: AtomicUsize,
+        read_count: AtomicUsize,
     }
 
     impl MemoryBackend {
@@ -1778,6 +1977,7 @@ mod tests {
                 reverse_groups,
                 omit_put_number: None,
                 put_count: AtomicUsize::new(0),
+                read_count: AtomicUsize::new(0),
             }
         }
 
@@ -1818,8 +2018,19 @@ mod tests {
                 configuration: serde_json::json!({}),
             }
         }
+        fn read_observation(&self) -> serde_json::Value {
+            let reads = self.read_count.load(Ordering::Relaxed);
+            serde_json::json!({"available": true, "coordinator": {
+                "read_rpc_count": reads, "hits": reads, "misses": 0, "inserts": 0,
+                "evictions": 0, "rejected_oversize": 0, "rejected_mismatch": 0,
+                "bypass_disabled": 0, "bypass_admission": 0, "bypass_eviction_limit": 0,
+                "admitted_bytes": 0, "served_bytes": 0},
+                "owner_executor": {"available": false, "error": "test unavailable"},
+                "client_resident": {"available": false, "error": "test unavailable"}})
+        }
 
         async fn get(&self, key: &[u8]) -> BackendResult<Option<Bytes>> {
+            self.read_count.fetch_add(1, Ordering::Relaxed);
             Ok(self
                 .data
                 .lock()
@@ -1848,6 +2059,7 @@ mod tests {
         }
 
         async fn get_many(&self, keys: &[Bytes]) -> BackendResult<Vec<Option<Bytes>>> {
+            self.read_count.fetch_add(1, Ordering::Relaxed);
             let data = self
                 .data
                 .lock()
@@ -1883,6 +2095,19 @@ mod tests {
         calls: AtomicUsize,
         slow_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
         slow_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[test]
+    fn unsupported_peer_observation_is_explicitly_unavailable() {
+        let peer = GatedBackend {
+            calls: AtomicUsize::new(0),
+            slow_started: Mutex::new(None),
+            slow_release: Mutex::new(None),
+        };
+        let snapshot = peer.read_observation();
+        let evidence = measurement_read_evidence(&snapshot, &snapshot, true, true);
+        assert_eq!(evidence["deltas"]["available"], false);
+        assert!(snapshot["error"].as_str().is_some());
     }
 
     impl KvBackend for GatedBackend {

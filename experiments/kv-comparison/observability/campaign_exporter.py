@@ -22,7 +22,8 @@ COORDINATOR_INTERVAL_COUNTERS = {
     "write_foreground_checkpoint_count", "write_background_checkpoint_ns",
     "write_background_checkpoint_suffix_batches", "write_durable_receipt_publication_blocked_ns",
     "write_durable_receipt_publication_blocked_batches", "write_append_requests", "write_direct_appends",
-    "write_durable_batches", "write_concurrent_admitted", "write_concurrent_completed"}
+    "write_durable_batches", "write_concurrent_admitted", "write_concurrent_completed",
+    "write_out_of_prefix_published_batches", "write_dependency_wait_batches"}
 
 
 def absolute(value):
@@ -178,6 +179,47 @@ def read_path_metrics(evidence, labels):
                 if path in row["stats"]:
                     result += sample("kv_case_read_path_calls", count(row["stats"][path]),
                                      local | {"partition": str(partition), "path": path})
+    return result
+
+
+def measurement_read_metrics(evidence, labels):
+    if evidence is None:
+        return ""
+    if not isinstance(evidence, dict) or evidence.get("scope") != "measurement_boundary":
+        raise ValueError("invalid measurement read evidence")
+    deltas = evidence.get("deltas")
+    if not isinstance(deltas, dict):
+        raise ValueError("measurement read deltas missing")
+    labels = labels | {"scope": "measurement_boundary"}
+    result = ""
+    if deltas.get("available") is False:
+        return sample("kv_case_read_evidence_available", 0, labels | {"component": "measurement"})
+    def emit(row, local):
+        if not isinstance(row, dict) or type(row.get("available")) is not bool:
+            raise ValueError("invalid measurement read component")
+        text = sample("kv_case_read_evidence_available", int(row["available"]), local)
+        if row["available"]:
+            counters = row.get("counters")
+            if not isinstance(counters, dict):
+                raise ValueError("measurement read counters missing")
+            for name, value in counters.items():
+                text += sample("kv_case_read_path_calls", count(value), local | {"path": token(name)})
+        return text
+    result += emit(deltas.get("coordinator"), labels | {"component": "coordinator"})
+    for component in ("owner_executor", "client_resident"):
+        group = deltas.get(component)
+        if not isinstance(group, dict) or type(group.get("available")) is not bool:
+            raise ValueError("invalid measurement partition group")
+        local = labels | {"component": component}
+        result += sample("kv_case_read_evidence_available", int(group["available"]), local)
+        if group["available"]:
+            partitions = group.get("partitions")
+            if not isinstance(partitions, dict) or len(partitions) > 128:
+                raise ValueError("invalid measurement partitions")
+            for partition, row in partitions.items():
+                if not partition.isascii() or not partition.isdecimal() or str(int(partition)) != partition:
+                    raise ValueError("invalid partition identity")
+                result += emit(row, local | {"partition": partition})
     return result
 
 
@@ -383,6 +425,7 @@ def terminal_metrics(terminal, labels):
             raise ValueError("write profile state must be observed boolean or absent")
         result += sample("kv_observer_write_profile_enabled", int(enabled), labels)
     result += read_path_metrics(terminal.get("read_evidence"), labels)
+    result += measurement_read_metrics(terminal.get("measurement_read_evidence"), labels)
     result += resource_interval_metrics(terminal.get("resource_evidence"), labels)
     result += write_diagnostic_metrics(terminal.get("write_diagnostics"), labels)
     metrics = terminal.get("metrics")

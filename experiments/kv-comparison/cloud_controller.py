@@ -962,6 +962,9 @@ class Controller:
             read_evidence = receipt.get("counter_evidence", {}).get("observed")
             if isinstance(read_evidence, dict):
                 observed["read_evidence"] = read_evidence
+            interval = receipt.get("measurement_read_evidence", {}).get("observed")
+            if isinstance(interval, dict):
+                observed["measurement_read_evidence"] = interval
             resources = receipt.get("resource_evidence", {}).get("observed")
             if isinstance(resources, dict):
                 observed["resource_evidence"] = resources
@@ -1326,6 +1329,9 @@ class Controller:
                     directory, job, completed=manifest["status"] == "completed")
                 if diagnostics is not None:
                     receipt["write_diagnostics"] = diagnostics
+                read_interval = cloud_campaign.admit_measurement_read_evidence(directory)
+                if read_interval is not None:
+                    receipt["measurement_read_evidence"] = read_interval
                 receipt["raw_artifacts_validated"] = True
             except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError) as exc:
                 raise SafetyError("terminal source/config/binary/schema/raw-row admission failed: " + str(exc)) from exc

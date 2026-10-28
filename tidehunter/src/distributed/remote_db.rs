@@ -16,7 +16,7 @@ use super::codec::{CompleteBatch, Mutation};
 use super::group::{CompleteGroup, GROUP_HEADER_LEN};
 use super::local_db::{LocalCheckpoint, LocalDbError, LocalDbStats};
 use super::local_inventory::LocalInventoryConfig;
-use super::native_index::{IndexReadCut, NativeIndex};
+use super::native_index::{IndexReadCut, NativeIndex, PublicationViewReservation};
 use super::native_publication::{NativePublicationRouting, PreparedNativePublication};
 use super::publication::PublicationTracker;
 use super::reference_directory::ReferenceDirectory;
@@ -36,6 +36,7 @@ use blake2::{Blake2b, Digest};
 use minibytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, VecDeque};
 use std::fs::{self, File};
@@ -352,6 +353,25 @@ pub struct ReadEvidenceMonitor {
     reads: Arc<ReadService>,
 }
 impl ReadEvidenceMonitor {
+    /// Sample owner read I/O counters outside the measured interval. Callers
+    /// must finish all reads and writes first; sequential owner replies do not
+    /// constitute a globally consistent cut.
+    pub fn sample_owner_read_io(
+        &self,
+    ) -> Result<Vec<(u32, super::tcp::ReadExecutorStats)>, LocalDbError> {
+        self.reads.ensure_idle()?;
+        self.clients
+            .iter()
+            .map(|(partition, client)| {
+                client
+                    .lock()
+                    .read_io_stats()
+                    .map(|stats| (*partition, stats))
+                    .map_err(LocalDbError::component)
+            })
+            .collect()
+    }
+
     /// Per-partition client-side RMA counters; this does not make an RPC.
     pub fn sample_resident_reads(
         &self,
@@ -381,6 +401,10 @@ const MANIFEST: &str = "tcp-database-authority-v1";
 pub const CHECKPOINT_MAX_TAIL_BATCHES: usize = 1024;
 pub const CHECKPOINT_MAX_TAIL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CHECKPOINT_METADATA_BYTES: u64 = 128 * 1024 * 1024;
+// Keep one successor in flight for small work; already-amortized groups may
+// overlap further, subject to the global admission and byte budgets.
+const OWNER_APPEND_PIPELINE_GROUPS: usize = 2;
+const APPEND_COALESCE_MIN_BYTES: usize = 32 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RemoteEndpoint {
@@ -719,9 +743,18 @@ impl RecoveryStats {
     }
 }
 
+// Own only reduced key bytes: a dependency must not pin an old value's batch.
+type DependencyKey = SmallVec<[u8; 32]>;
+
 struct Submission {
     batch: Option<CompleteBatch>,
     routing: Option<NativePublicationRouting>,
+    publication_view: Option<PublicationViewReservation>,
+    /// Immediate native-index predecessors; transitive order follows their batches.
+    predecessors: SmallVec<[u64; 4]>,
+    dependency_blocked: bool,
+    last_mutation: MutationVersion,
+    encoded_bytes: usize,
     metadata_bytes: usize,
     credit: usize,
 }
@@ -848,12 +881,16 @@ pub struct AuthorityWriteStats {
     /// New logical admissions while immutable checkpoint persistence was active.
     pub background_checkpoint_suffix_batches: u64,
     /// Receipts observed by the owner while a prior sequence is unpublished.
-    /// Elapsed time ends at contiguous publication; it is not a storage/fsync clock.
+    /// Elapsed time ends at this batch's publication; clocks can overlap.
     pub durable_receipt_publication_blocked_batches: u64,
     pub durable_receipt_publication_blocked_ns: u64,
     /// Current count of receipts in the above blocked state.
     pub durable_receipt_publication_waiting_batches: u64,
     pub durable_receipt_publication_waiting_peak: u64,
+    /// Batches published while an earlier admission remained unresolved.
+    pub out_of_prefix_published_batches: u64,
+    /// Durable batches observed waiting for a native-index predecessor, once each.
+    pub dependency_wait_batches: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -1167,6 +1204,8 @@ pub struct RemoteDatabase {
     known: HashMap<BatchId, AppendedBatch>,
     receipt_history: ReceiptHistory,
     active_identities: HashMap<BatchId, usize>,
+    pending_writers: HashMap<KeySpace, HashMap<DependencyKey, u64>>,
+    predecessor_marks: Vec<u64>,
     clock: LogicalClock,
     publication: PublicationTracker,
     submission_base: u64,
@@ -1175,6 +1214,7 @@ pub struct RemoteDatabase {
     staged: Vec<VecDeque<usize>>,
     staged_bytes: Vec<usize>,
     inflight: Vec<VecDeque<PendingAppend>>,
+    completed_nodes: Vec<bool>,
     unresolved_append: Option<BatchVersion>,
     completion_wake: mpsc::Receiver<()>,
     preparation_wake: mpsc::SyncSender<()>,
@@ -1183,7 +1223,9 @@ pub struct RemoteDatabase {
     pending_bytes: usize,
     partition_admissions: Vec<usize>,
     partition_records: Vec<usize>,
+    /// Greatest complete contiguous publication, never the live sparse upper cut.
     latest: Option<MutationVersion>,
+    live_latest: Option<MutationVersion>,
     snapshot_generation: u64,
     manifest: AuthorityManifest,
     retained_epochs: Vec<Vec<u64>>,
@@ -1245,6 +1287,32 @@ impl RemoteDatabase {
             + self.durable_wait_started.capacity() * std::mem::size_of::<Option<Instant>>()
             + self.active_identities.capacity()
                 * (std::mem::size_of::<BatchId>() + std::mem::size_of::<usize>())
+            + self.pending_writers.capacity()
+                * std::mem::size_of::<(KeySpace, HashMap<DependencyKey, u64>)>()
+            + self
+                .pending_writers
+                .values()
+                .map(|writers| {
+                    writers.capacity() * std::mem::size_of::<(DependencyKey, u64)>()
+                        + writers
+                            .keys()
+                            .filter(|key| key.spilled())
+                            .map(SmallVec::capacity)
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
+            + self.predecessor_marks.capacity() * std::mem::size_of::<u64>()
+            + self
+                .submissions
+                .iter()
+                .map(|entry| {
+                    if entry.predecessors.spilled() {
+                        entry.predecessors.capacity() * std::mem::size_of::<u64>()
+                    } else {
+                        0
+                    }
+                })
+                .sum::<usize>()
             + self.publication.resident_metadata_bytes()
             + self.receipt_history.cached_metadata_bytes()
     }
@@ -1259,7 +1327,9 @@ impl RemoteDatabase {
         self.ensure_healthy()?;
         let index = self.index.read();
         let cut = index.latest_cut();
-        let pin = index.pin_cut(cut).map_err(LocalDbError::component)?;
+        let pin = index
+            .pin_cut(cut.clone())
+            .map_err(LocalDbError::component)?;
         Ok((cut, pin))
     }
 
@@ -1627,6 +1697,8 @@ impl RemoteDatabase {
             known,
             receipt_history,
             active_identities: HashMap::new(),
+            pending_writers: HashMap::new(),
+            predecessor_marks: Vec::new(),
             clock: LogicalClock::new_fenced_epoch(epoch),
             publication: PublicationTracker::new(database, epoch, limit)
                 .map_err(LocalDbError::component)?,
@@ -1636,6 +1708,7 @@ impl RemoteDatabase {
             staged: (0..count).map(|_| VecDeque::new()).collect(),
             staged_bytes: vec![0; count],
             inflight: (0..count).map(|_| VecDeque::new()).collect(),
+            completed_nodes: vec![false; count],
             unresolved_append: None,
             completion_wake,
             preparation_wake: wake_sender,
@@ -1645,6 +1718,7 @@ impl RemoteDatabase {
             partition_admissions: vec![0; count],
             partition_records: vec![0; count],
             latest,
+            live_latest: latest,
             snapshot_generation: 0,
             manifest,
             retained_epochs: histories
@@ -1936,12 +2010,27 @@ impl RemoteDatabase {
             .len()
             .checked_mul(
                 std::mem::size_of::<Mutation>()
-                    + std::mem::size_of::<super::types::RecordDescriptor>(),
+                    + std::mem::size_of::<super::types::RecordDescriptor>()
+                    // Include geometric dependency-table slack until it shrinks.
+                    + 4 * std::mem::size_of::<(DependencyKey, u64)>()
+                    + 2 * std::mem::size_of::<u64>(),
             )
             .ok_or_else(|| LocalDbError::new("worker metadata reservation overflow"))?;
+        let dependency_key_bytes = routing
+            .operations()
+            .iter()
+            .try_fold(0usize, |bytes, operation| {
+                bytes.checked_add(if operation.reduced_key().len() > 32 {
+                    operation.reduced_key().len().checked_mul(2)?
+                } else {
+                    0
+                })
+            })
+            .ok_or_else(|| LocalDbError::new("dependency key reservation overflow"))?;
         let credit = batch
             .canonical_heap_bytes()
             .and_then(|bytes| bytes.checked_add(worker_metadata))
+            .and_then(|bytes| bytes.checked_add(dependency_key_bytes))
             .and_then(|bytes| bytes.checked_add(routing.owned_bytes(&self.shape)?))
             .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<CompleteBatch>() + 512))
             .ok_or_else(|| LocalDbError::new("pending byte overflow"))?;
@@ -2275,6 +2364,65 @@ impl RemoteDatabase {
         let staged_bytes = self.staged_bytes[partition]
             .checked_add(group_charge)
             .ok_or_else(|| LocalDbError::new("staging byte overflow"))?;
+        // Marks are indexed by the bounded dense admission window. A unique
+        // admission sequence deduplicates repeated keys without allocating a
+        // temporary set or a vector sized to every operation in a large batch.
+        self.predecessor_marks
+            .resize(self.submissions.len(), u64::MAX);
+        let mut predecessors = SmallVec::new();
+        for operation in routing.operations() {
+            if let Some(&prior) = self
+                .pending_writers
+                .get(&operation.ks())
+                .and_then(|writers| writers.get(operation.reduced_key().as_ref()))
+            {
+                let mark = &mut self.predecessor_marks[(prior - self.submission_base) as usize];
+                if *mark != version.sequence {
+                    *mark = version.sequence;
+                    predecessors.push(prior);
+                }
+            }
+        }
+        let last_mutation = batch
+            .mutation_version(batch.mutations().len() - 1)
+            .ok_or_else(|| LocalDbError::new("empty admitted batch"))?;
+        // New admissions can become exclusions in a later frozen view. Grow all
+        // outstanding reservations before exposing that possibility to WAL I/O.
+        // A serial write has no exclusions and therefore needs no view quota.
+        let publication_view = {
+            let index = self.index.write();
+            let max_excluded = self.submissions.len();
+            let mut additional = NativeIndex::publication_view_charge(max_excluded)
+                .map_err(LocalDbError::component)?;
+            for entry in &self.submissions {
+                if let Some(reservation) = &entry.publication_view {
+                    additional = additional
+                        .checked_add(
+                            reservation
+                                .additional_charge(max_excluded)
+                                .map_err(LocalDbError::component)?,
+                        )
+                        .ok_or_else(|| {
+                            LocalDbError::new("publication view reservation overflow")
+                        })?;
+                }
+            }
+            // The exclusive index guard prevents another quota consumer between
+            // preflight and conversion; concurrent view drops only free space.
+            index
+                .check_publication_view_capacity(additional)
+                .map_err(LocalDbError::component)?;
+            for entry in &mut self.submissions {
+                if let Some(reservation) = &mut entry.publication_view {
+                    index
+                        .grow_publication_view(reservation, max_excluded)
+                        .map_err(LocalDbError::component)?;
+                }
+            }
+            index
+                .reserve_publication_view(max_excluded)
+                .map_err(LocalDbError::component)?
+        };
         self.stats.validation_ns += elapsed(started).saturating_sub(validation_excluded_ns);
         self.healthy = false;
         if self.clock.allocate() != Some(version) {
@@ -2290,8 +2438,24 @@ impl RemoteDatabase {
             .mark_in_flight(id)
             .map_err(|e| LocalDbError::unknown(version, e))?;
         self.active_identities.insert(id, version.sequence as usize);
+        for operation in routing.operations() {
+            let writers = self.pending_writers.entry(operation.ks()).or_default();
+            if let Some(writer) = writers.get_mut(operation.reduced_key().as_ref()) {
+                *writer = version.sequence;
+            } else {
+                writers.insert(
+                    DependencyKey::from_slice(operation.reduced_key().as_ref()),
+                    version.sequence,
+                );
+            }
+        }
         self.submissions.push_back(Submission {
             batch: Some(batch),
+            publication_view: Some(publication_view),
+            predecessors,
+            dependency_blocked: false,
+            last_mutation,
+            encoded_bytes,
             metadata_bytes,
             credit,
             routing: Some(routing),
@@ -2462,6 +2626,7 @@ impl RemoteDatabase {
     fn progress_pipeline(&mut self, flush_tails: bool) -> Result<(), LocalDbError> {
         self.healthy = false;
         let result = (|| {
+            self.completed_nodes.fill(false);
             for node in 0..self.inflight.len() {
                 let mut position = 0;
                 while position < self.inflight[node].len() {
@@ -2485,6 +2650,7 @@ impl RemoteDatabase {
                                     self.unresolved_append = Some(first);
                                     return Err(error);
                                 }
+                                self.completed_nodes[node] = true;
                                 if !flush_tails {
                                     self.pipeline_stats.completions_before_drain += 1;
                                 }
@@ -2501,8 +2667,16 @@ impl RemoteDatabase {
             }
 
             let started = Instant::now();
+            // A completed owner refills immediately, including a partial
+            // tail; other idle owners keep the usual early-dispatch limits.
             for node in 0..self.clients.len() {
-                if self.staged[node].is_empty() || (!flush_tails && !self.ready_group(node)) {
+                let refill = self.completed_nodes[node];
+                if (self.inflight[node].len() >= OWNER_APPEND_PIPELINE_GROUPS
+                    && self.staged_bytes[node].saturating_add(GROUP_HEADER_LEN)
+                        < APPEND_COALESCE_MIN_BYTES)
+                    || self.staged[node].is_empty()
+                    || (!flush_tails && !refill && !self.ready_group(node))
+                {
                     continue;
                 }
                 let count = {
@@ -2540,7 +2714,7 @@ impl RemoteDatabase {
                     let full = count == limits.max_batches as usize
                         || count < self.staged[node].len()
                         || bytes >= limits.max_encoded_bytes - limits.max_encoded_bytes / 4;
-                    if !flush_tails && !full {
+                    if !flush_tails && !refill && !full {
                         continue;
                     }
                     count
@@ -2603,72 +2777,149 @@ impl RemoteDatabase {
     }
 
     fn publish_completed(&mut self) -> Result<(), LocalDbError> {
-        if self.publication.durable_prefix().next_sequence()
-            == self.publication.published_prefix().next_sequence()
-        {
+        if self.publication.durable_unpublished() == 0 {
             return Ok(());
         }
         let started = Instant::now();
-        let old_published_prefix = self.publication.published_prefix().next_sequence();
-        let durable_prefix = self.publication.durable_prefix().next_sequence();
-        let candidate_capacity = durable_prefix.saturating_sub(old_published_prefix) as usize;
-        let mut cache_candidates = Vec::with_capacity(candidate_capacity);
+        let mut cache_candidates = SmallVec::<[_; 4]>::new();
+        let mut publication_view = None;
         let submissions = &mut self.submissions;
         let submission_base = self.submission_base;
+        let mut contiguous_next = self.publication.published_prefix().next_sequence();
         let mut index_guard = self.index.write();
         let _poison = concurrent::FailureOnPanic(self.concurrent_failure.clone());
         let index = &mut *index_guard;
         let known = &mut self.known;
         let active = &mut self.active_identities;
+        let pending_writers = &mut self.pending_writers;
         let latest = &mut self.latest;
+        let live_latest = &mut self.live_latest;
         let reserved = &mut self.reserved_index_bytes;
+        let waits = &mut self.durable_wait_started;
+        let write_stats = &mut self.write_stats;
         let progress = self
             .publication
-            .publish_ready(|durable| {
+            .publish_available(|durable| {
                 let receipt = durable.appended();
-                let address = receipt.address();
+                let sequence = receipt.version().sequence;
+                let slot = (sequence - submission_base) as usize;
                 let entry = submissions
-                    .get_mut((receipt.version().sequence - submission_base) as usize)
+                    .get(slot)
                     .ok_or_else(|| LocalDbError::new("receipt outside admission inventory"))?;
+                if entry.predecessors.iter().any(|&prior| {
+                    prior >= submission_base
+                        && submissions[(prior - submission_base) as usize]
+                            .batch
+                            .is_some()
+                }) {
+                    let entry = &mut submissions[slot];
+                    if !entry.dependency_blocked {
+                        entry.dependency_blocked = true;
+                        write_stats.dependency_wait_batches += 1;
+                    }
+                    return Ok(false);
+                }
+                let entry = &mut submissions[slot];
                 let batch = entry
                     .batch
                     .as_ref()
                     .ok_or_else(|| LocalDbError::new("batch already published"))?;
-                entry
+                let routing = entry
                     .routing
                     .take()
-                    .ok_or_else(|| LocalDbError::new("missing prepared publication routing"))?
+                    .ok_or_else(|| LocalDbError::new("missing prepared publication routing"))?;
+                // Only the last pending writer owns this dependency-map entry.
+                // Colliding full keys intentionally share their native reduced slot.
+                for operation in routing.operations() {
+                    if let std::collections::hash_map::Entry::Occupied(mut space) =
+                        pending_writers.entry(operation.ks())
+                    {
+                        let writers = space.get_mut();
+                        if writers.get(operation.reduced_key().as_ref()) == Some(&sequence) {
+                            writers.remove(operation.reduced_key().as_ref());
+                        }
+                        // Release the table before returning its admission
+                        // credit; otherwise each keyspace retains a full window.
+                        if writers.is_empty() {
+                            space.remove();
+                        } else if writers.capacity() > writers.len().saturating_mul(4) {
+                            // A stalled writer can keep this keyspace nonempty.
+                            // Geometric shrinking bounds its retained buckets
+                            // by live dependencies, not historical batch sizes.
+                            writers.shrink_to(writers.len());
+                        }
+                    }
+                }
+                routing
                     .publish_authenticated(batch, durable, index)
                     .map_err(LocalDbError::component)?;
                 index.promote_committed().map_err(LocalDbError::component)?;
-                let mutation_version = batch.mutation_version(batch.mutations().len() - 1);
-                *latest = mutation_version;
+                *live_latest = Some(live_latest.map_or(entry.last_mutation, |previous| {
+                    previous.max(entry.last_mutation)
+                }));
                 known.insert(receipt.id(), receipt);
                 active.remove(&receipt.id());
                 *reserved -= entry.metadata_bytes;
+                if sequence != contiguous_next {
+                    write_stats.out_of_prefix_published_batches += 1;
+                }
+                if let Some(wait_started) = waits[slot].take() {
+                    write_stats.durable_receipt_publication_blocked_batches += 1;
+                    write_stats.durable_receipt_publication_blocked_ns += elapsed(wait_started);
+                    write_stats.durable_receipt_publication_waiting_batches -= 1;
+                }
                 let batch = entry
                     .batch
                     .take()
                     .ok_or_else(|| LocalDbError::new("batch disappeared during publication"))?;
-                cache_candidates.push((address, batch, entry.credit));
-                Ok::<_, LocalDbError>(())
+                entry.predecessors = SmallVec::new();
+                publication_view = entry.publication_view.take();
+                cache_candidates.push((receipt.address(), batch, entry.credit));
+                // The recovery frontier cannot include a still-unpublished slot.
+                while let Some(entry) =
+                    submissions.get((contiguous_next - submission_base) as usize)
+                    && entry.batch.is_none()
+                {
+                    *latest = Some(entry.last_mutation);
+                    contiguous_next += 1;
+                }
+                Ok::<_, LocalDbError>(true)
             })
             .inspect_err(|_| {
                 self.concurrent_failure
-                    .store(true, std::sync::atomic::Ordering::Release)
+                    .store(true, std::sync::atomic::Ordering::Release);
             })
             .map_err(LocalDbError::component)?;
         let published_prefix = self.publication.published_prefix().next_sequence();
-        for sequence in old_published_prefix..published_prefix {
-            if let Some(wait_started) = self
-                .durable_wait_started
-                .get_mut((sequence - submission_base) as usize)
-                && let Some(wait_started) = wait_started.take()
-            {
-                self.write_stats.durable_receipt_publication_blocked_batches += 1;
-                self.write_stats.durable_receipt_publication_blocked_ns += elapsed(wait_started);
-                self.write_stats.durable_receipt_publication_waiting_batches -= 1;
-            }
+        debug_assert_eq!(contiguous_next, published_prefix);
+        if progress.callbacks_completed != 0 {
+            let upper = self.live_latest.expect("published batch has a mutation");
+            let excluded_count = self
+                .publication
+                .unpublished_versions()
+                .take_while(|version| *version <= upper.batch)
+                .count();
+            let mut excluded = Vec::with_capacity(excluded_count);
+            excluded.extend(
+                self.publication
+                    .unpublished_versions()
+                    .take_while(|version| *version <= upper.batch),
+            );
+            let floor = self
+                .latest
+                .map_or(IndexReadCut::BeforeAll, IndexReadCut::At);
+            index
+                .install_reserved_live_view(
+                    upper,
+                    floor,
+                    excluded,
+                    publication_view.expect("published batch reserved a live view"),
+                )
+                .inspect_err(|_| {
+                    self.concurrent_failure
+                        .store(true, std::sync::atomic::Ordering::Release);
+                })
+                .map_err(LocalDbError::component)?;
         }
         drop(index_guard);
         for _ in submission_base..published_prefix {
@@ -2829,16 +3080,14 @@ impl RemoteDatabase {
             return Err(LocalDbError::new("read batch exceeds 256 keys"));
         }
         let resolve_started = Instant::now();
-        let cut = self
-            .latest
-            .map_or(IndexReadCut::BeforeAll, IndexReadCut::At);
+        let cut = self.index.read().latest_cut();
         let mut slots = Vec::new();
         let mut references = Vec::new();
         for (slot, key) in keys.iter().enumerate() {
             if let Some(reference) = self
                 .index
                 .read()
-                .get(ks, key, cut)
+                .get(ks, key, cut.clone())
                 .map_err(LocalDbError::component)?
             {
                 slots.push(slot);

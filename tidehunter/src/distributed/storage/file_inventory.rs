@@ -126,7 +126,7 @@ pub(super) fn validate(
     Ok(())
 }
 
-pub(super) fn remove_covered(path: &Path, file_count: u64) -> Result<(), StorageError> {
+pub(crate) fn remove_covered(path: &Path, file_count: u64) -> Result<(), StorageError> {
     let mut removed = false;
     // At most one bounded post-root window can exist. Rescan bounded pages so
     // deleting directory entries cannot make readdir skip a remaining witness.

@@ -100,8 +100,8 @@ struct Snapshot {
 }
 
 /// Consumes one opened authority. Reads never borrow or lock its write owner.
-/// A write acknowledgement means synced complete-batch storage AND contiguous
-/// atomic index publication. A pending transition does not poison old read cuts.
+/// A write acknowledgement means synced complete-batch storage AND atomic
+/// publication after its native-index predecessors, not a global storage prefix.
 pub struct ConcurrentRemoteDatabase {
     sender: Option<mpsc::SyncSender<OwnerCommand>>,
     wake: mpsc::SyncSender<()>,
@@ -245,7 +245,9 @@ impl ConcurrentRemoteDatabase {
         self.ensure_healthy()?;
         let index = self.index.read();
         let cut = index.latest_cut();
-        let pin = index.pin_cut(cut).map_err(LocalDbError::component)?;
+        let pin = index
+            .pin_cut(cut.clone())
+            .map_err(LocalDbError::component)?;
         self.ensure_healthy()?;
         Ok((cut, pin))
     }
@@ -685,11 +687,10 @@ fn drive_owner(
         // commands already ready below, then send the resulting groups at once.
         // There is no timer or wait for a second request: singletons stay prompt.
         db.progress_pipeline(false)?;
-        let prefix = db.publication.published_prefix().next_sequence();
         for _ in 0..pending.len() {
             let reply = pending.pop_front().unwrap();
             let version = reply.version.unwrap();
-            if version.epoch < db.epoch || version.sequence < prefix {
+            if version.epoch < db.epoch || db.publication.is_published(version) {
                 db.ensure_healthy()?;
                 db.pipeline_stats.concurrent_completed += 1;
                 if db.config.write_profile_limit != 0 {

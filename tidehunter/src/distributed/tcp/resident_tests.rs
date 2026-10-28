@@ -1634,6 +1634,46 @@ fn software_provider_spontaneous_poison_waits_for_client_release_notification() 
 #[cfg(feature = "experimental-fabric")]
 #[test]
 #[ignore = "requires libfabric tcp;ofi_rxm software provider"]
+fn software_provider_history_failure_drains_live_rma_grant() {
+    let fixture = ResidentFixture::new(enabled_source(), enabled_destination());
+    let mut client = fixture.client();
+    client.fence_to(1).unwrap();
+    let (batch, reference) = fixture.publish(&mut client, 70);
+    for _ in 0..2 {
+        assert_eq!(
+            client.read_records(1, &[reference]).unwrap(),
+            vec![batch.mutations()[0].clone()]
+        );
+    }
+    assert_eq!(client.resident_read_stats().rma_hits, 1);
+    let log = fixture.node.inventory.lock().active(1).unwrap();
+    let (entered, resume) = log.pause_next_history();
+    log.fail_next_history_after_root();
+    for sequence in 71..102 {
+        fixture.publish(&mut client, sequence);
+    }
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    resume.send(()).unwrap();
+    assert!(matches!(log.wait_history(), Err(StorageError::Poisoned)));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if client.progress_resident_control().is_err() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "history failure did not drain the registered holder"
+        );
+        thread::yield_now();
+    }
+    assert!(client.read_records(1, &[reference]).is_err());
+    assert_eq!(client.resident_read_stats().handles_live, 0);
+    assert_eq!(fixture.node.resident_grants.live_stats(), (0, 0, 0));
+}
+
+#[cfg(feature = "experimental-fabric")]
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm software provider"]
 fn software_provider_release_immediately_after_rpc_reply_is_accepted() {
     let fixture = ResidentFixture::new(enabled_source(), enabled_destination());
     let mut client = fixture.client();

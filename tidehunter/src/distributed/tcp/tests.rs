@@ -1073,3 +1073,42 @@ fn append_residence_contains_stage_spans_on_success_and_rejection() {
     assert_eq!(rejected.append_persist_ns, 0);
     assert!(node.inventory.lock().healthy);
 }
+
+#[test]
+fn history_failure_fences_existing_reads_and_recovery_preserves_acknowledged_value() {
+    let temp = tempdir::TempDir::new("history-failure-reader-fence").unwrap();
+    let mut config = config(&temp.path().join("node"));
+    config.partition.max_batches = 2;
+    let node = StorageNode::open(config.clone(), metrics()).unwrap();
+    node.set_history_maintenance_diagnostics(true);
+    node.inventory.lock().fence_to(1).unwrap();
+    let log = node.inventory.lock().active(1).unwrap();
+    let (entered, resume) = log.pause_next_history();
+    log.fail_next_history_after_root();
+    let batch = batch(&config, 1, 0);
+    let receipt = append(&node, 1, std::slice::from_ref(&batch)).remove(0);
+    let reference = batch.record_reference(receipt.address, 0).unwrap();
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let read = |node: &StorageNode, epoch| {
+        let Response::Records(mut records) =
+            node.read_response::<false>(epoch, vec![reference], TcpLimits::default())?
+        else {
+            return Err(TcpError::new("unexpected read response"));
+        };
+        CompleteBatch::decode_record(&shape(), &reference, records.remove(0).into_bytes())
+            .map_err(TcpError::component)
+    };
+    assert_eq!(read(&node, 1).unwrap(), batch.mutations()[0]);
+    resume.send(()).unwrap();
+    assert!(matches!(log.wait_history(), Err(StorageError::Poisoned)));
+    // No later append/control request is needed to close reader authority.
+    assert!(read(&node, 1).is_err());
+    node.finish_poison_if_quiescent();
+    assert!(node.terminal.load(Ordering::Acquire));
+    drop(log);
+    drop(node);
+
+    let reopened = StorageNode::open(config, metrics()).unwrap();
+    reopened.inventory.lock().fence_to(2).unwrap();
+    assert_eq!(read(&reopened, 2).unwrap(), batch.mutations()[0]);
+}

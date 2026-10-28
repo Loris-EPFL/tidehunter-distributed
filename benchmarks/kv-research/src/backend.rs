@@ -98,6 +98,11 @@ pub trait KvBackend: Send + Sync + 'static {
         entries: &[(Bytes, Bytes)],
     ) -> impl Future<Output = BackendResult<()>> + Send;
 
+    /// Observe read counters outside timed API calls. Unsupported backends report absence.
+    fn read_observation(&self) -> serde_json::Value {
+        serde_json::json!({"available": false, "error": "backend does not expose read observations"})
+    }
+
     /// Arm bounded write diagnostics at the measurement boundary.
     fn arm_write_profile(&self, limit: usize) -> BackendResult<()> {
         if limit == 0 {

@@ -698,7 +698,7 @@ def select_host(spec, index, job, processes):
 
 @bounded(2.5)
 def finish_case(spec, job, result_dir, *, metrics=None, status='completed', write_profile_enabled=None,
-                read_evidence=None, resource_evidence=None, write_diagnostics=None):
+                read_evidence=None, measurement_read_evidence=None, resource_evidence=None, write_diagnostics=None):
     started = time.monotonic()
     spec = validate_spec(spec)
     state, _ = state_for(spec)
@@ -718,6 +718,8 @@ def finish_case(spec, job, result_dir, *, metrics=None, status='completed', writ
         terminal['write_profile_enabled'] = write_profile_enabled
     if read_evidence is not None:
         terminal['read_evidence'] = read_evidence
+    if measurement_read_evidence is not None:
+        terminal['measurement_read_evidence'] = measurement_read_evidence
     if resource_evidence is not None:
         terminal['resource_evidence'] = resource_evidence
     if write_diagnostics is not None:
@@ -1352,6 +1354,7 @@ def main():
             command.add_argument('--status', choices=('completed', 'failed'), default='completed')
             command.add_argument('--write-profile-enabled', choices=('true', 'false'))
             command.add_argument('--read-evidence', type=Path)
+            command.add_argument('--measurement-read-evidence', type=Path)
             command.add_argument('--resource-evidence', type=Path)
             command.add_argument('--write-diagnostics', type=Path)
     command = commands.add_parser('export')
@@ -1393,6 +1396,7 @@ def main():
                     metrics=load_json(args.metrics) if args.metrics else None, status=args.status,
                     write_profile_enabled=None if args.write_profile_enabled is None else args.write_profile_enabled == 'true',
                     read_evidence=load_json(args.read_evidence) if args.read_evidence else None,
+                    measurement_read_evidence=load_json(args.measurement_read_evidence) if args.measurement_read_evidence else None,
                     resource_evidence=load_json(args.resource_evidence) if args.resource_evidence else None,
                     write_diagnostics=load_json(args.write_diagnostics) if args.write_diagnostics else None)
             elif args.command == 'export':

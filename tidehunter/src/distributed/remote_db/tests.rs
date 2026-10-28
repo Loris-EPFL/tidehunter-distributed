@@ -28,6 +28,60 @@ fn reopen_result(fixture: &Fixture) -> Result<RemoteDatabase, LocalDbError> {
         recovery_metrics(),
     )
 }
+#[test]
+fn sui_read_evidence_samples_configured_owners_at_boundaries() {
+    use crate::distributed::sui::Db;
+
+    let mut fixture = Fixture::new();
+    fixture.config.read_cache_bytes = 0;
+    let db = Db::open_remote(
+        &fixture.temp.path().join("authority"),
+        fixture.shape.clone(),
+        fixture.config.clone(),
+    )
+    .unwrap();
+    let ks = db.ks("root");
+    let key = 11u32.to_be_bytes();
+    db.insert(ks, key.to_vec(), vec![42; 32]).unwrap();
+    let monitor = db.read_evidence_monitor().unwrap();
+    let before = monitor.sample_owner_read_io().unwrap();
+    assert_eq!(
+        before
+            .iter()
+            .map(|(partition, _)| *partition)
+            .collect::<Vec<_>>(),
+        fixture
+            .config
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.partition)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(db.get(ks, &key).unwrap().unwrap().as_ref(), &[42; 32]);
+    let after = monitor.sample_owner_read_io().unwrap();
+    assert_eq!(
+        after
+            .iter()
+            .map(|(partition, _)| *partition)
+            .collect::<Vec<_>>(),
+        before
+            .iter()
+            .map(|(partition, _)| *partition)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        after
+            .iter()
+            .map(|(_, stats)| stats.completed_reads)
+            .sum::<u64>()
+            > before
+                .iter()
+                .map(|(_, stats)| stats.completed_reads)
+                .sum::<u64>()
+    );
+    drop(monitor);
+    db.wait_for_background_threads_to_finish().unwrap();
+}
 
 #[cfg(all(target_os = "linux", feature = "test-utils"))]
 #[test]
@@ -1461,6 +1515,7 @@ fn sui_native_cell_pruning_propagates_durability_barrier_failure() {
         recovery_metrics(),
     )
     .unwrap();
+    assert!(db.read_evidence_monitor().is_none());
     db.set_native_durable(true);
     let ks = db.ks("root");
     db.insert(ks, vec![0; 4], vec![7]).unwrap();

@@ -90,8 +90,8 @@ impl PreparedIndexImage {
 
     fn needs_container(&self, parent: &Path) -> bool {
         self.cells.iter().any(|cell| {
-            !reusable(cell, parent, self.cut, self.lease.floor)
-                && has_rows(cell, self.cut, self.lease.floor)
+            !reusable(cell, parent, self.cut.clone(), self.lease.floor.clone())
+                && has_rows(cell, self.cut.clone(), self.lease.floor.clone())
         })
     }
 
@@ -146,8 +146,8 @@ impl PreparedIndexImage {
                 Vec::new()
             };
             for (number, cell) in self.cells.iter_mut().enumerate() {
-                if !reusable(cell, parent, self.cut, self.lease.floor) {
-                    if !has_rows(cell, self.cut, self.lease.floor) {
+                if !reusable(cell, parent, self.cut.clone(), self.lease.floor.clone()) {
+                    if !has_rows(cell, self.cut.clone(), self.lease.floor.clone()) {
                         cell.base = None;
                         continue;
                     }
@@ -159,8 +159,8 @@ impl PreparedIndexImage {
                         writer,
                         &container_path,
                         offset,
-                        self.cut,
-                        self.lease.floor,
+                        self.cut.clone(),
+                        self.lease.floor.clone(),
                         &mut reference_bytes,
                     )?;
                     offset = offset
@@ -199,7 +199,7 @@ impl PreparedIndexImage {
                     bytes: frame.slice(8..),
                     count: encoded.count,
                     mapped: true,
-                    cut: self.cut,
+                    cut: self.cut.clone(),
                     file: Some(encoded.file),
                     retained_bytes: encoded.retained_bytes,
                     retained_versions: encoded.retained_versions,
@@ -213,8 +213,8 @@ impl PreparedIndexImage {
         payload.extend_from_slice(&0u16.to_be_bytes());
         payload.extend_from_slice(&self.database);
         payload.extend_from_slice(&self.schema);
-        encode_cut(self.cut, &mut payload);
-        encode_cut(self.lease.floor, &mut payload);
+        encode_cut(self.cut.clone(), &mut payload);
+        encode_cut(self.lease.floor.clone(), &mut payload);
         let count = self.cells.iter().filter(|cell| cell.base.is_some()).count();
         payload.extend_from_slice(
             &u32::try_from(count)
@@ -247,7 +247,7 @@ impl PreparedIndexImage {
             payload.extend_from_slice(&file.offset.to_be_bytes());
             payload.extend_from_slice(&file.bytes.to_be_bytes());
             payload.extend_from_slice(&file.digest);
-            encode_cut(file.floor, &mut payload);
+            encode_cut(file.floor.clone(), &mut payload);
             if payload.len() > MAX_IMAGE_BYTES - 8 {
                 return Err(NativeIndexError::Capacity);
             }
@@ -266,7 +266,7 @@ impl PreparedIndexImage {
         };
         Ok(PersistedIndexImage {
             cells: self.cells,
-            cut: self.cut,
+            cut: self.cut.clone(),
             lease: self.lease,
             metadata,
         })
@@ -276,10 +276,10 @@ impl PreparedIndexImage {
 fn reusable(cell: &FrozenCell, parent: &Path, cut: IndexReadCut, floor: IndexReadCut) -> bool {
     cell.overlay.is_empty()
         && cell.base.as_ref().is_some_and(|base| {
-            retention::position(base.cut) <= retention::position(cut)
+            retention::position(&base.cut) <= retention::position(&cut)
                 && base.file.as_ref().is_some_and(|file| {
                     file.path.parent() == Some(parent)
-                        && retention::position(file.floor) >= retention::position(floor)
+                        && retention::position(&file.floor) >= retention::position(&floor)
                 })
         })
 }
@@ -410,7 +410,7 @@ pub(super) fn open(
     let floor = decode_cut(&mut cursor)?;
     if cut == IndexReadCut::Latest
         || floor == IndexReadCut::Latest
-        || retention::position(floor) > retention::position(cut)
+        || retention::position(&floor) > retention::position(&cut)
     {
         return Err(NativeIndexError::Invalid(
             "persisted cut or retention floor",
@@ -446,7 +446,7 @@ pub(super) fn open(
         let digest: [u8; 32] = cursor.take(32)?.try_into().unwrap();
         let cell_floor = decode_cut(&mut cursor)?;
         if cell_floor == IndexReadCut::Latest
-            || retention::position(cell_floor) > retention::position(floor)
+            || retention::position(&cell_floor) > retention::position(&floor)
         {
             return Err(NativeIndexError::Invalid("cell retention floor"));
         }
@@ -465,7 +465,7 @@ pub(super) fn open(
             keyspace,
             index.descriptor(keyspace)?,
             &cell_id,
-            cut,
+            cut.clone(),
         )?;
         block.file = Some(CellFile {
             path: cell_path,
@@ -651,8 +651,11 @@ fn retained<'a>(
 
 fn has_rows(cell: &FrozenCell, cut: IndexReadCut, floor: IndexReadCut) -> bool {
     cut != IndexReadCut::BeforeAll
-        && Rows::new(cell)
-            .any(|(_, base, overlay)| retained(base, overlay, cut, floor).next().is_some())
+        && Rows::new(cell).any(|(_, base, overlay)| {
+            retained(base, overlay, cut.clone(), floor.clone())
+                .next()
+                .is_some()
+        })
 }
 
 struct WrittenCell {
@@ -698,7 +701,7 @@ fn encode_cell_payload(
         .checked_add(count.checked_mul(4).ok_or(NativeIndexError::Capacity)?)
         .ok_or(NativeIndexError::Capacity)?;
     for (key, base, overlay) in Rows::new(cell) {
-        let n = retained(base, overlay, cut, floor).count();
+        let n = retained(base, overlay, cut.clone(), floor.clone()).count();
         if n == 0 {
             continue;
         }
@@ -718,7 +721,7 @@ fn encode_cell_payload(
     let mut retained_bytes = 0usize;
     let mut retained_versions = 0usize;
     for (key, base, overlay) in Rows::new(cell) {
-        let n = retained(base, overlay, cut, floor).count();
+        let n = retained(base, overlay, cut.clone(), floor.clone()).count();
         if n == 0 {
             continue;
         }
@@ -733,7 +736,7 @@ fn encode_cell_payload(
                 .map_err(|_| NativeIndexError::Capacity)?
                 .to_be_bytes(),
         )?;
-        for reference in retained(base, overlay, cut, floor) {
+        for reference in retained(base, overlay, cut.clone(), floor.clone()) {
             reference_bytes.clear();
             encode_reference(&reference, reference_bytes);
             write(reference_bytes)?;
@@ -758,16 +761,27 @@ fn append_cell(
     reference_bytes: &mut Vec<u8>,
 ) -> Result<WrittenCell, NativeIndexError> {
     let count = Rows::new(cell)
-        .filter(|(_, base, overlay)| retained(base, overlay, cut, floor).next().is_some())
+        .filter(|(_, base, overlay)| {
+            retained(base, overlay, cut.clone(), floor.clone())
+                .next()
+                .is_some()
+        })
         .count();
     if count == 0 {
         return Err(NativeIndexError::Invalid("empty cell append"));
     }
     let mut crc = crc32fast::Hasher::new();
-    let summary = encode_cell_payload(cell, count, cut, floor, reference_bytes, |bytes| {
-        crc.update(bytes);
-        Ok(())
-    })?;
+    let summary = encode_cell_payload(
+        cell,
+        count,
+        cut.clone(),
+        floor.clone(),
+        reference_bytes,
+        |bytes| {
+            crc.update(bytes);
+            Ok(())
+        },
+    )?;
     let length = u32::try_from(summary.length).map_err(|_| NativeIndexError::Capacity)?;
     let bytes = u64::from(length) + 8;
     offset
@@ -779,11 +793,18 @@ fn append_cell(
     let mut hash = blake2b_simd::Params::new().hash_length(32).to_state();
     hash.update(&header);
     writer.write_all(&header)?;
-    let emitted = encode_cell_payload(cell, count, cut, floor, reference_bytes, |bytes| {
-        hash.update(bytes);
-        writer.write_all(bytes)?;
-        Ok(())
-    })?;
+    let emitted = encode_cell_payload(
+        cell,
+        count,
+        cut.clone(),
+        floor.clone(),
+        reference_bytes,
+        |bytes| {
+            hash.update(bytes);
+            writer.write_all(bytes)?;
+            Ok(())
+        },
+    )?;
     debug_assert_eq!(emitted, summary, "immutable captured cell serialization");
     let mut digest = [0; 32];
     digest.copy_from_slice(hash.finalize().as_bytes());

@@ -591,23 +591,27 @@ impl ControlContext {
         }
         let log = inventory.active(epoch)?;
         let began = profile.as_ref().map(|_| Instant::now());
-        let mut appended = if let Some(p) = profile.as_deref_mut() {
-            log.append_group_profiled(RequestAuthority { epoch }, &group, &mut p.storage_write)
-        } else {
-            log.append_group(RequestAuthority { epoch }, &group)
-        };
+        let mut appended = log.try_append_group(
+            RequestAuthority { epoch },
+            &group,
+            profile.as_deref_mut().map(|p| &mut p.storage_write),
+        );
         let elapsed = began.map_or(0, elapsed_ns);
         if let Some(p) = profile.as_deref_mut() {
             p.append_wal_ns += elapsed;
             p.append_inventory_residence_ns += residence.map_or(0, elapsed_ns);
         }
         drop(inventory);
-        if matches!(&appended, Err(StorageError::NeedsPersistence))
-            && let Some(drain) = drain
-        {
-            if drain().is_err() {
+        if matches!(&appended, Err(StorageError::NeedsPersistence)) {
+            if let Some(drain) = drain
+                && drain().is_err()
+            {
                 self.poison_readers();
                 return Err(TcpError::new("log flusher stopped before admission retry"));
+            }
+            if let Err(error) = log.wait_history() {
+                self.poison_readers();
+                return Err(TcpError::component(error));
             }
             let began = profile.as_ref().map(|_| Instant::now());
             appended = if let Some(p) = profile.as_deref_mut() {

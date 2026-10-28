@@ -640,6 +640,16 @@ impl StorageNode {
             resident_reads.source_bytes,
             resident_reads.source_regions,
         ));
+        let history_poison_registry = Arc::downgrade(&resident_grants);
+        inventory
+            .lock()
+            .set_history_failure_notifier(Arc::new(move || {
+                if let Some(registry) = history_poison_registry.upgrade() {
+                    // Request the existing notice/drain protocol. Terminal
+                    // authority must not advance before remote DMA is drained.
+                    registry.request_poison();
+                }
+            }));
         let owner_boot = rand::random::<[u8; 16]>();
         #[cfg(test)]
         let panic_after_append = Arc::new(AtomicBool::new(false));
@@ -682,6 +692,19 @@ impl StorageNode {
     }
     pub fn status(&self) -> Result<NodeStatus, TcpError> {
         self.inventory.lock().status()
+    }
+    /// Enable local maintenance diagnostics for current and later epochs.
+    /// This does not change the wire protocol or enable per-write clocks.
+    pub fn set_history_maintenance_diagnostics(&self, enabled: bool) {
+        self.inventory
+            .lock()
+            .set_history_maintenance_diagnostics(enabled);
+    }
+
+    /// Cumulative local snapshots, paired with epoch, without an RPC.
+    /// The vector is bounded by the configured retained epoch limit.
+    pub fn history_maintenance_stats(&self) -> Vec<(u64, super::storage::HistoryMaintenanceStats)> {
+        self.inventory.lock().history_maintenance_stats()
     }
     fn reader_snapshot(
         &self,

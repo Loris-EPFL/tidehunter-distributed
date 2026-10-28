@@ -880,6 +880,14 @@ impl Db {
                     "write_durable_receipt_publication_blocked_ns",
                     authority.durable_receipt_publication_blocked_ns,
                 );
+                set(
+                    "write_out_of_prefix_published_batches",
+                    authority.out_of_prefix_published_batches,
+                );
+                set(
+                    "write_dependency_wait_batches",
+                    authority.dependency_wait_batches,
+                );
                 let pipeline = snapshot.pipeline;
                 set("write_append_requests", pipeline.append_requests);
                 set("write_direct_appends", pipeline.direct_appends);
@@ -1160,6 +1168,14 @@ impl Db {
                     "write_durable_receipt_publication_blocked_ns",
                     authority.durable_receipt_publication_blocked_ns,
                 );
+                set(
+                    "write_out_of_prefix_published_batches",
+                    authority.out_of_prefix_published_batches,
+                );
+                set(
+                    "write_dependency_wait_batches",
+                    authority.dependency_wait_batches,
+                );
                 let pipeline = snapshot.pipeline;
                 set("write_append_requests", pipeline.append_requests);
                 set("write_direct_appends", pipeline.direct_appends);
@@ -1331,7 +1347,7 @@ impl Db {
         for chunk in keys.chunks(256) {
             match remote
                 .bulk_read
-                .run(|| remote.db.get_many_cut(ks, chunk, cut))
+                .run(|| remote.db.get_many_cut(ks, chunk, cut.clone()))
             {
                 Ok(values) => output.extend(values.into_iter().map(|value| value.map_err(error))),
                 Err(e) => output.extend(chunk.iter().map(|_| Err(error(&e)))),
@@ -1363,7 +1379,7 @@ impl Db {
                 };
                 keys.iter()
                     .map(|key| {
-                        db.index_reference(ks, key, cut)
+                        db.index_reference(ks, key, cut.clone())
                             .map(|v| v.is_some())
                             .map_err(error)
                     })
@@ -1491,6 +1507,15 @@ impl Db {
             ),
         }
     }
+    /// Obtain remote read evidence for quiescent measurement boundaries.
+    /// Owner samples are sequential and are not a globally consistent cut.
+    pub fn read_evidence_monitor(&self) -> Option<super::remote_db::ReadEvidenceMonitor> {
+        match &self.backend {
+            Backend::Remote(remote) => Some(remote.db.read_evidence_monitor()),
+            Backend::Native(_) => None,
+        }
+    }
+
     pub fn operational_read_io_monitor(
         &self,
     ) -> Option<super::remote_db::OperationalReadIoMonitor> {
@@ -1580,7 +1605,7 @@ impl Db {
             };
             let mut history = remote
                 .db
-                .relocation_history(descriptor.id(), cut)
+                .relocation_history(descriptor.id(), cut.clone())
                 .map_err(error)?;
             loop {
                 let row = remote
@@ -1616,7 +1641,7 @@ impl Db {
                 loop {
                     let page = remote
                         .db
-                        .index_page(descriptor.id(), after.as_deref(), false, cut)
+                        .index_page(descriptor.id(), after.as_deref(), false, cut.clone())
                         .map_err(error)?;
                     if page.is_empty() {
                         break;
@@ -1645,7 +1670,7 @@ impl Db {
             loop {
                 let page = remote
                     .db
-                    .index_page(descriptor.id(), after.as_deref(), false, cut)
+                    .index_page(descriptor.id(), after.as_deref(), false, cut.clone())
                     .map_err(error)?;
                 if page.is_empty() {
                     break;
@@ -1800,7 +1825,11 @@ impl Db {
         // below `from`; include the reduced lower key and then page exclusively.
         let mut after = Bytes::copy_from_slice(&reduced_from);
         let mut page = Vec::new();
-        if let Some(reference) = remote.db.index_reference(ks, from, cut).map_err(error)? {
+        if let Some(reference) = remote
+            .db
+            .index_reference(ks, from, cut.clone())
+            .map_err(error)?
+        {
             page.push((after.clone(), reference));
         }
         let mut deletes = Vec::with_capacity(256);
@@ -1827,7 +1856,7 @@ impl Db {
             }
             page = remote
                 .db
-                .index_page(ks, Some(&after), false, cut)
+                .index_page(ks, Some(&after), false, cut.clone())
                 .map_err(error)?;
             if page.is_empty() {
                 break;
@@ -2028,7 +2057,7 @@ impl RemoteIterator {
                 let reduced: Bytes = descriptor.reduce_key(bound).as_ref().to_vec().into();
                 if let Some(reference) = remote
                     .db
-                    .index_reference(self.ks, bound, self.cut)
+                    .index_reference(self.ks, bound, self.cut.clone())
                     .map_err(error)?
                 {
                     references.push((reduced.clone(), reference));
@@ -2044,7 +2073,7 @@ impl RemoteIterator {
                     self.after.as_deref(),
                     self.reverse,
                     target - references.len(),
-                    self.cut,
+                    self.cut.clone(),
                 )
                 .map_err(error)?;
             if rows.is_empty() {

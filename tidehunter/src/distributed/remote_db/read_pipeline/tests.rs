@@ -1,4 +1,5 @@
 use super::*;
+use crate::distributed::native_index::IndexReadCut;
 use crate::distributed::remote_db::pipeline_tests::Fixture;
 use crate::distributed::types::{
     BatchId, BatchVersion, MemberChecksum, PayloadDigest, PhysicalValueAddress, RecordDescriptor,

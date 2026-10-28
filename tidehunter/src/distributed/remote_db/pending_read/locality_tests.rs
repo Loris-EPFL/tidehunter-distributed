@@ -95,7 +95,7 @@ fn old_and_current_cut_misses_never_merge_versions() {
     let lane = db.reads.lane_client(node_for(&db, 0), 0);
     let held = lane.lock();
     let old = db
-        .submit_get_cut(KeySpace(0), &0u32.to_be_bytes(), cut)
+        .submit_get_cut(KeySpace(0), &0u32.to_be_bytes(), cut.clone())
         .unwrap();
     db.write_batch(fixture.operation(0, 1), vec![put(0, 8)])
         .unwrap();
@@ -262,7 +262,7 @@ fn sui_reseek_and_checkpoint_pins_preserve_old_cut_until_final_drop() {
         .unwrap();
     db.remove(ks, 2u32.to_be_bytes().to_vec()).unwrap();
     db.start_relocation().unwrap();
-    assert!(db.remote_for_test().pin_cut(old_cut).is_ok());
+    assert!(db.remote_for_test().pin_cut(old_cut.clone()).is_ok());
     let snapshot = checkpoint
         .iterator(ks)
         .collect::<crate::distributed::sui::Result<Vec<_>>>()
