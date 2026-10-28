@@ -6,6 +6,16 @@ For a normal run with a complete preload and no configured workload deletes, ord
 
 Closed-loop dispatch now sends work only to an idle worker and returns a worker to the available set when its completion is consumed. Earlier runner artifacts used round-robin private queues, which could place a request behind a busy worker while another worker was idle; closed-loop throughput and latency from that runner can therefore be confounded by head-of-line scheduling, especially for asymmetric request times. Open-loop arrival timing and its bounded per-worker queues are unchanged.
 
+The runner writes `measurement-read-evidence.json` for the measurement boundary.
+After warmup/aging and the measurement gate, it takes a quiescent start
+observation; the end observation follows measured-request drain and precedes
+postqualification and the completion gate. Failure to attempt or drain is
+explicit. Tidehunter owner observations are fresh authenticated snapshots,
+sampled sequentially across owners, not a globally atomic snapshot. Monotone
+counter deltas are separate from nonmonotone gauges; unavailable or reset
+counters are explicit, never imputed as zero. Logical WAL reads do not prove
+physical NVMe reads. See the [comparison evidence notes](../../experiments/kv-comparison/README.md#measurement-read-evidence).
+
 
 
 

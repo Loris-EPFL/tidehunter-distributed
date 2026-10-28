@@ -13,6 +13,29 @@ replay. The campaign observer is cohosted, not an independent measured host.
 Credential-free comparison CI does not activate the protected AWS campaign.
 One shared laptop SSD is not independent-NVMe or EFA evidence.
 
+**Dependency-aware sparse publication, 28 October 2026:** Durable, disjoint
+batches may become visible before an earlier incomplete batch; conflicting native
+reduced-key dependencies still wait. A contiguous stable prefix remains the
+checkpoint and recovery frontier. Frozen sparse cuts pin their historical anchors.
+Before sequence allocation or WAL effects, admission reserves publication-view
+quota for the actual retained window, growing outstanding tokens as needed.
+Snapshot pressure can reject a new admission cleanly; serial writes need no view quota.
+The [current design and source map](REFERENCE_DIRECTORY_DESIGN_2026-10-06.md#dependency-aware-sparse-publication-28-october-2026)
+describes the bounds, durability and failure rules.
+The [native-paper invariant mapping](REFERENCE_DIRECTORY_DESIGN_2026-10-06.md#native-tidehunter-invariants-rechecked-through-qmd)
+and [final local qualification](REFERENCE_DIRECTORY_DESIGN_2026-10-06.md#final-local-qualification-and-open-performance-gate)
+separate correctness from performance: the large-write tail/throughput regression
+remains explicit, and no cloud or native-parity claim is made.
+
+**Historical bounded authority-history maintenance, 28 October 2026:**
+[Mechanisms, native/Valkey/Raft Engine sources, limits and complete local measurements](REFERENCE_DIRECTORY_DESIGN_2026-10-06.md#bounded-background-history-28-october-2026).
+Durable-prefix metadata maintenance now runs outside append/inventory ownership;
+an 8 KiB checked node buffer combines metadata I/O. At that historical point,
+native locks, Value-WAL durability and global publication ordering were retained.
+Local scalar write tails improved, and the initially regressed large-batch path was corrected. Shared-SSD
+results do not establish cloud parity; the original and recheck results remain
+separate and include the uncertain read-tail observation.
+
 **AWS comparison report, 25 October 2026:**
 [All-eight-system graphs, complete numeric results and evidence-qualified explanations](reports/2026-10-25-kv-comparison/REPORT.md).
 Native, TCP, EFA, EFA-direct, EFA-native, TiKV, Cassandra and FoundationDB have
@@ -66,9 +89,9 @@ format change: batch v3, group v2, index v4, history/checkpoint v2,
 registration/seal v5 and wire/ALPN v9. Old experimental data is rejected.
 Bounded synchronous resident reads avoid SQ/CQ work; incomplete or unavailable
 NOWAIT reads retain their owned prefix and fall back to asynchronous I/O.
-Append and persistence owners overlap bounded work, while durable publication
-still advances only through a complete contiguous prefix. Native-message output
-retains buffers and leases through actual send completion.
+Append and persistence owners overlap bounded work. Live publication now permits
+dependency-safe durable batches beyond a gap; the stable contiguous prefix remains
+separate. Native-message output retains buffers and leases through actual send completion.
 These mechanisms do not implement one-sided RMA or NVMe-oF. The separate
 [registered-read proposal](ONE_SIDED_WAL_READS_2026-10-21.md) remains a design.
 No native Tidehunter lock was removed, and this cutover changes no Sui Rust API.
