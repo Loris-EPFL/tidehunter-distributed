@@ -312,7 +312,7 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
     );
     Ok(())
 }
-const COORDINATOR_INTERVAL_COUNTERS: [&str; 17] = [
+const COORDINATOR_INTERVAL_COUNTERS: [&str; 19] = [
     "write_storage_wait_ns",
     "write_publication_ns",
     "write_dispatch_ns",
@@ -330,6 +330,8 @@ const COORDINATOR_INTERVAL_COUNTERS: [&str; 17] = [
     "write_durable_batches",
     "write_concurrent_admitted",
     "write_concurrent_completed",
+    "write_out_of_prefix_published_batches",
+    "write_dependency_wait_batches",
 ];
 
 fn coordinator_counter_snapshot(db: &sui::Db) -> BTreeMap<&'static str, u64> {
@@ -821,9 +823,60 @@ impl TidehunterBackend {
     }
 }
 
+fn partition_snapshot<T: serde::Serialize>(
+    rows: Vec<(u32, T)>,
+    endpoints: &[(u32, String)],
+) -> serde_json::Value {
+    let mut partitions = BTreeMap::new();
+    for (partition, stats) in rows {
+        if partitions.insert(partition.to_string(), stats).is_some() {
+            return serde_json::json!({"available": false, "error": format!("duplicate partition {partition}")});
+        }
+    }
+    let expected: HashSet<String> = endpoints
+        .iter()
+        .map(|(partition, _)| partition.to_string())
+        .collect();
+    if partitions.keys().cloned().collect::<HashSet<_>>() != expected {
+        return serde_json::json!({"available": false, "error": "sampled partitions differ from configured owners", "partitions": partitions});
+    }
+    serde_json::json!({"available": true, "partitions": partitions})
+}
+
 impl KvBackend for TidehunterBackend {
     fn info(&self) -> BackendInfo {
         self.info()
+    }
+
+    fn read_observation(&self) -> serde_json::Value {
+        let Some(db) = self.db.as_ref() else {
+            return serde_json::json!({"available": false, "error": "backend is shutting down"});
+        };
+        let coordinator = db.remote_counters().map(|(cache, _, rpc)| serde_json::json!({
+            "read_rpc_count": rpc,
+            "hits": cache.hits, "misses": cache.misses, "inserts": cache.inserts,
+            "evictions": cache.evictions, "rejected_oversize": cache.rejected_oversize,
+            "rejected_mismatch": cache.rejected_mismatch, "bypass_disabled": cache.bypass_disabled,
+            "bypass_admission": cache.bypass_admission, "bypass_eviction_limit": cache.bypass_eviction_limit,
+            "admitted_bytes": cache.admitted_bytes, "served_bytes": cache.served_bytes,
+            "retained_bytes": cache.retained_bytes, "metadata_bytes": cache.metadata_bytes,
+            "entries": cache.entries, "budget_bytes": cache.budget_bytes
+        }));
+        let Some(monitor) = db.read_evidence_monitor() else {
+            return serde_json::json!({"available": true, "coordinator": coordinator,
+                "owner_executor": {"available": false, "error": "read evidence monitor unavailable"},
+                "client_resident": {"available": false, "error": "read evidence monitor unavailable"}});
+        };
+        let owners = match monitor.sample_owner_read_io() {
+            Ok(rows) => partition_snapshot(rows, &self.endpoints),
+            Err(error) => serde_json::json!({"available": false, "error": error.to_string()}),
+        };
+        let residents = match monitor.sample_resident_reads() {
+            Ok(rows) => partition_snapshot(rows, &self.endpoints),
+            Err(error) => serde_json::json!({"available": false, "error": error.to_string()}),
+        };
+        serde_json::json!({"available": true, "coordinator": coordinator,
+            "owner_executor": owners, "client_resident": residents})
     }
 
     fn arm_write_profile(&self, limit: usize) -> BackendResult<()> {
@@ -1057,6 +1110,22 @@ impl Drop for TidehunterBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partition_samples_reject_duplicates_and_missing_owners() {
+        let endpoints = vec![(3, "a".to_owned()), (8, "b".to_owned())];
+        assert_eq!(
+            partition_snapshot(vec![(3, 1), (3, 2)], &endpoints)["available"],
+            false
+        );
+        assert_eq!(
+            partition_snapshot(vec![(3, 1)], &endpoints)["available"],
+            false
+        );
+        let sample = partition_snapshot(vec![(8, 4), (3, 2)], &endpoints);
+        assert_eq!(sample["partitions"]["3"], 2);
+        assert_eq!(sample["partitions"]["8"], 4);
+    }
 
     #[test]
     fn rejects_authority_limit_above_engine_bound_before_emitting_launch_files() {

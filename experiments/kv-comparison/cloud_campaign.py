@@ -160,6 +160,38 @@ def make_run_config(job, case_root, options, source_revision, deadline_seconds=1
     return config
 
 
+def admit_measurement_read_evidence(directory):
+    result = Path(directory) / "result"
+    path = result / "measurement-read-evidence.json"
+    manifest_path = result / "manifest.json"
+    marker = None
+    if manifest_path.is_file():
+        marker = json.loads(manifest_path.read_text()).get("run", {}).get("measurement_read_evidence_schema_version")
+    if marker is not None and (type(marker) is not int or marker != 1):
+        raise ValueError("unsupported measurement read evidence capability")
+    if not path.is_file():
+        if marker == 1:
+            raise ValueError("advertised measurement read evidence artifact is missing")
+        return None  # Older source revisions did not advertise this artifact.
+    if path.stat().st_size > 256 * 1024:
+        raise ValueError("measurement read evidence exceeds bounded artifact size")
+    data = json.loads(path.read_text())
+    if (not isinstance(data, dict) or type(data.get("schema_version")) is not int
+            or data["schema_version"] != 1 or data.get("scope") != "measurement_boundary"
+            or type(data.get("measurement_attempted")) is not bool
+            or type(data.get("measurement_drained")) is not bool
+            or not isinstance(data.get("deltas"), dict)
+            or not all(isinstance(data.get(k), (dict, type(None))) for k in ("start", "end"))):
+        raise ValueError("invalid measurement read evidence schema")
+    observer_path = str(Path(__file__).resolve().parent / "observability")
+    if observer_path not in sys.path:
+        sys.path.insert(0, observer_path)
+    import campaign_exporter
+    campaign_exporter.measurement_read_metrics(data, {})
+    return {"path": "result/measurement-read-evidence.json",
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "observed": data}
+
+
 def admit_write_diagnostics(directory, job, *, completed):
     path = Path(directory) / "result/write-diagnostics.json"
     requested = job.get("diagnostics", {}).get("write_profile_limit", 0)
@@ -198,6 +230,13 @@ def summarize_case(directory):
     value = {"case_id": job["case_id"], "job": job, "status": receipt.get("status"),
              "error": receipt.get("error"), "measurement_evidence": receipt.get("measurement_evidence"),
              "counter_evidence": receipt.get("counter_evidence")}
+    read_interval = admit_measurement_read_evidence(directory)
+    if read_interval is not None:
+        if read_interval != receipt.get("measurement_read_evidence"):
+            raise ValueError("measurement read evidence differs from its receipt integrity binding")
+        value["measurement_read_evidence"] = read_interval
+    elif receipt.get("measurement_read_evidence") is not None:
+        raise ValueError("measurement read evidence artifact missing")
     resource_binding = receipt.get("resource_evidence")
     if resource_binding is not None:
         if resource_binding.get("path") != "resource-interval.json":

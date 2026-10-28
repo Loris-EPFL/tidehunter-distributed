@@ -127,6 +127,16 @@ def verify_binding(run, config, receipt, manifest, summary):
                 digest.update(block)
         if hashes.get(name) != digest.hexdigest():
             raise ValueError(f"{run}: result artifact {name} is missing its original integrity binding")
+    marker = manifest.get("run", {}).get("measurement_read_evidence_schema_version")
+    if marker is not None and (type(marker) is not int or marker != 1):
+        raise ValueError(f"{run}: unsupported measurement read evidence capability")
+    if marker == 1 and receipt.get("measurement_read_evidence") is None:
+        raise ValueError(f"{run}: advertised measurement read evidence is missing its integrity binding")
+    evidence = receipt.get("measurement_read_evidence")
+    if evidence is not None:
+        if (not isinstance(evidence, dict) or evidence.get("path") != "result/measurement-read-evidence.json"
+                or hashlib.sha256((run / evidence["path"]).read_bytes()).hexdigest() != evidence.get("sha256")):
+            raise ValueError(f"{run}: measurement read evidence integrity binding differs")
 
 
 def stable_topology(name, original):

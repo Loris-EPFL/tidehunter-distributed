@@ -246,13 +246,16 @@ class CaseIdentityTests(unittest.TestCase):
             "scope": "measurement_boundary_cumulative_delta",
             "clock_scope": "coordinator counters before release through completion gate",
             "stages": {"write_storage_wait_ns": 2000000000, "write_publication_ns": 300000000,
-                       "write_checkpoint_count": 4, "write_concurrent_completed": 100}}
+                       "write_checkpoint_count": 4, "write_concurrent_completed": 100,
+                       "write_out_of_prefix_published_batches": 3, "write_dependency_wait_batches": 2}}
         text = campaign.write_diagnostic_metrics(value, {})
         boundary = ('phase="measurement",scope="measurement_boundary_cumulative_delta",'
                     'diagnostic_backend="native",component="coordinator_interval"')
         self.assertIn('stage_seconds{' + boundary + ',stage="write_storage_wait_ns"} 2.0', text)
         self.assertIn('stage_count{' + boundary + ',counter="write_checkpoint_count"} 4', text)
         self.assertIn('stage_count{' + boundary + ',counter="write_concurrent_completed"} 100', text)
+        self.assertIn('stage_count{' + boundary + ',counter="write_out_of_prefix_published_batches"} 3', text)
+        self.assertIn('stage_count{' + boundary + ',counter="write_dependency_wait_batches"} 2', text)
         self.assertNotIn('component="stages"', text)
         self.assertIn('scope="sampled_prefix",diagnostic_backend="native"} 0', text)
         self.assertIn('scope="measurement_boundary_cumulative_delta",diagnostic_backend="native"} 1', text)

@@ -28,6 +28,32 @@ class EvidenceAdmission(unittest.TestCase):
                    'artifacts_sha256': {name: hashlib.sha256((result / name).read_bytes()).hexdigest() for name in files}}
         return config, receipt, manifest, summary
 
+    def test_measurement_read_evidence_tampering_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, receipt, manifest, summary = self.binding(root)
+            path = root / "result/measurement-read-evidence.json"
+            path.write_text('{"scope":"measurement_boundary"}')
+            receipt["measurement_read_evidence"] = {
+                "path": "result/measurement-read-evidence.json",
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            analyze.verify_binding(root, config, receipt, manifest, summary)
+            path.write_text('{"scope":"adapter_lifetime"}')
+            with self.assertRaisesRegex(ValueError, "measurement read evidence"):
+                analyze.verify_binding(root, config, receipt, manifest, summary)
+
+    def test_advertised_measurement_evidence_requires_binding_but_old_manifest_does_not(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, receipt, manifest, summary = self.binding(root)
+            analyze.verify_binding(root, config, receipt, manifest, summary)
+            manifest["run"]["measurement_read_evidence_schema_version"] = 1
+            (root / "result/manifest.json").write_text(json.dumps(manifest))
+            receipt["artifacts_sha256"]["manifest.json"] = hashlib.sha256(
+                (root / "result/manifest.json").read_bytes()).hexdigest()
+            with self.assertRaisesRegex(ValueError, "advertised measurement read evidence"):
+                analyze.verify_binding(root, config, receipt, manifest, summary)
+
     def test_result_swap_rejected_even_when_its_artifact_hash_is_updated(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

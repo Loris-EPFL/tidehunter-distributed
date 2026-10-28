@@ -9,6 +9,17 @@ import cloud_campaign as cloud
 
 
 class CloudMatrixTests(unittest.TestCase):
+    def test_advertised_read_evidence_cannot_be_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = Path(directory) / "result"
+            result.mkdir()
+            manifest = result / "manifest.json"
+            manifest.write_text(json.dumps({"run": {}}))
+            self.assertIsNone(cloud.admit_measurement_read_evidence(directory))
+            manifest.write_text(json.dumps({"run": {"measurement_read_evidence_schema_version": 1}}))
+            with self.assertRaisesRegex(ValueError, "advertised measurement read evidence"):
+                cloud.admit_measurement_read_evidence(directory)
+
     def spec(self, repeats):
         return {
             "schema_version": 1, "seed": 1775, "repeats": repeats,
