@@ -1101,6 +1101,36 @@ python3 experiments/kv-comparison/cloud_campaign.py plan \
   --backends native,tidehunter_tcp,tidehunter_efa,tidehunter_efa_direct,tidehunter_efa_native \
   --output /tmp/tidehunter-read-tier-matrix.json
 ```
+For a shorter one-repetition campaign use `--mode read-tier-focused` (and
+`kv_mode=read-tier-focused` in the workflow). With all nine tracked backends it
+selects 191 cases; with
+`native,tidehunter_tcp,tidehunter_efa_native,valkey_tcp` it selects 108.
+Native warm/cold 256-B and 1-KiB controls and each selected transport's
+256-B cold-device baseline/profiled pair come first, followed by the existing
+primary 1-KiB C16 read/write and 8-KiB batch32 comparison cases for each
+selected backend. Eight separately named C1 registered controls use 40,960
+total client handles (8,192 per owner) before the existing matched tier cases.
+The latter include 256-B/8-KiB C1 and 1-KiB scalar/8-KiB batch32 C16 remote,
+coordinator, owner, warm-WAL and registered steady/reuse controls where
+available. Existing case IDs, keys, operations, and requested settings remain
+unchanged; omitted tiers are not inferred. These
+counts are plan sizes, not guarantees of completion within the deadline.
+
+The most recent full read-tier run's 256-B registered steady control had
+8,146 FI_READ completions and 46 message fallbacks classified as missing
+grants (28 on partition 0, 18 on partition 4), despite a full-key warmup.
+The 8,192 global handle limit was divided into 1,638 per owner connection;
+the two skewed partitions reached that limit. It is not a pure registered-hit
+result. The headroom variants are separate cases, not retroactive relabelling.
+Coordinator-hit controls likewise require their own observed counters;
+configured capacity and a sweep do not prove every access hit.
+
+Read-only, non-cache-dropping snapshots without monitoring selection receive
+at most one fresh-key retry within their original all-host timeout. An exact
+late receipt can be reconciled; snapshots that drop caches or select monitoring
+processes, and other mutations, are never resent after an ambiguous acceptance.
+The measurement gate is released only after every host has an admitted result.
+
 
 For a later approved GitHub run on `bench/aws-efa`, select the existing
 **AWS EFA benchmark campaign**, `suite=kv-comparison`, `kv_mode=read-tier`,

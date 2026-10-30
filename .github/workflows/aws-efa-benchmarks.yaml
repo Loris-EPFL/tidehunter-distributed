@@ -20,9 +20,9 @@ on:
         type: string
         default: ""
       kv_mode:
-        description: "KV only: standard matrix or focused ordered read-tier controls"
+        description: "KV matrix: standard, complete read-tier, or focused read-tier and comparison"
         type: choice
-        options: [standard, read-tier]
+        options: [standard, read-tier, read-tier-focused]
         default: standard
       reconcile_run_id:
         description: "Optional closed campaign to remeasure during cost-report"
@@ -371,7 +371,7 @@ jobs:
               --output "$RUNNER_TEMP/benchmark-inputs"
           fi
       - name: Validate selected KV backends before obtaining AWS credentials
-        if: needs.selection.outputs.suite == 'kv-comparison' || inputs.backends != '' || inputs.kv_mode == 'read-tier'
+        if: needs.selection.outputs.suite == 'kv-comparison' || inputs.backends != '' || inputs.kv_mode == 'read-tier' || inputs.kv_mode == 'read-tier-focused'
         env:
           SELECTED_BACKENDS: ${{ inputs.backends || '' }}
           SELECTED_KV_MODE: ${{ inputs.kv_mode || 'standard' }}

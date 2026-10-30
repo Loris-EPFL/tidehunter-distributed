@@ -912,3 +912,153 @@ shared-SSD/software-provider evidence, not hardware EFA measurements.
 Publication diagnostics and the rebuilt executable identity are retained in
 `checkpoint-work/aws-ci-runs/2026-10-30-read-tier-publication/`.
 
+### 17.7 Cloud outcome and partial-report admission, 2026-10-30
+
+GitHub run [41072300414](https://github.com/Loris-EPFL/tidehunter-distributed/actions/runs/41072300414)
+used the merged engine revision `14361479f595207b897d6079b1e630e416578418`.
+The sealed executable SHA-256 was
+`9b59857221037fe984ae9da0a57e63ed251ccba3a0392432be497c953f62bbc2`.
+Both the downloaded GitHub input bundle and the live AWS journal carried
+these identities; this was not a reused historical benchmark executable.
+
+One fleet, `th-1f96a82ea7b1d90a`, contained six `g6.8xlarge` hosts in
+`us-east-1a`, with EFA, cluster placement and five host-local NVMe storage
+hosts. The matrix planned 258 cases, including 90 C16 cases, with one
+independent repetition. It completed 160 cases, failed one and did not start
+97. No replacement fleet was launched.
+
+| Backend | Completed cases | Failed cases | Not started |
+|---|---:|---:|---:|
+| TCP | 36 | 0 | 20 |
+| EFA | 36 | 0 | 20 |
+| EFA-direct | 34 | 1 | 21 |
+| EFA-native | 54 | 0 | 26 |
+| Native reference | 0 | 0 | 10 |
+
+Case 160 failed while the controller requested a storage-4 resource snapshot:
+SSM command `ab008623-579c-48f9-b62a-95c179d5d627` exceeded its exact-operation
+deadline. The available record does not establish the command's eventual
+execution status or an EFA data-plane defect. Native and cold-device controls
+were not reached; this run cannot establish a fresh native/distributed ratio
+or per-API cold-NVMe latency.
+
+AWS MCP confirmed all six hosts terminated and no remaining run-owned
+volumes, ENIs, placement group, security group or guest IAM roles/profiles.
+The controller archive and monitoring archive were retrieved and checked.
+All 375 monitoring members matched their size/hash manifest. Local replay
+of that TSDB snapshot passed with original timestamps and no replay
+verification gaps; the owned replay services were then stopped. This does
+not imply that unstarted benchmark cases have observations.
+
+Reporting exposed a separate bug: the failed case produced a late
+`measurement-read-evidence.json` without an original receipt binding. The
+reporter inspected that file before its existing unadmitted-failure guard
+and aborted the whole partial report. `cloud_campaign.py::summarize_case`
+now applies that guard first. It never promotes the failed case's files into
+performance observations. Completed-case and admitted-partial-case checksum
+checks remain required; original receipts and raw archives remain unchanged.
+The regression covers late failed-case evidence and rejection when a
+completed receipt makes the same unbound claim.
+
+All 315 comparison tests passed. Running the actual report command against
+the retrieved archive then produced `comparison.json`, `comparison.csv` and
+`comparison.md`, explicitly marked incomplete, with 160 completed cases.
+These are local derived reports, not an altered cloud execution receipt.
+
+Qualification must remain counter-based. All scalar baseline coordinator-hit
+controls qualified. Six other nominal coordinator-hit cases recorded one or
+more remote misses and did not qualify as pure hits. The scalar registered
+steady/reuse controls each recorded 8,146 RMA completions and 46 message/WAL
+fallbacks out of 8,192 calls: their aggregate latency is a mixed population,
+not pure one-sided-read latency. Preserve these observations; do not relabel
+the cases from their configured names alone.
+
+The original archives, regenerated reports, read-binding audit and offline
+monitoring verification are retained under
+`checkpoint-work/aws-ci-runs/2026-10-30-read-tier-publication/`.
+
+Settlement released the run's reservation. The ledger's partial observed
+resource estimate is **$11.399610308654**, not an AWS bill. Its UTC
+2026-10-30 report records $50.83190425455 for the calendar week,
+$221.756389185052 for October and the retained lifetime, and
+$158.630988253477 for the separate rolling-seven-day admission window.
+The $300 admission policy therefore has $141.369011746523 remaining.
+Coverage is partial and actual billed cost remains unavailable; do not
+interpret the calendar-week and rolling-window figures as the same period.
+
+GitHub's final conclusion is **failure**. Both the campaign step and the
+post-cleanup result-validation step exited with the receipt-binding error;
+the accounting job succeeded. Independent resource-closure and settlement
+proofs do not make either failed step successful. The admission fix above
+is local and has not been published or exercised in a new cloud workflow.
+GitHub retained results artifact `12992041465`, costs artifact `12992046581`
+and sealed inputs artifact `12985248559`. The downloaded costs artifact's
+revision 99 agrees with the final AWS ledger, including zero unresolved runs.
+
+### 17.8 Source-guided hot-path assessment, 2026-10-30
+
+The measurements do not justify a new transport or group-commit design.
+`ReadExecutor::submit_planned_profiled` now returns an all-hit result before
+the device-count scan. Its existing authority, file pins, admission and reply
+lease remain in force. This local change has not yet been validated by the
+integration owner or measured on EFA hardware.
+
+The owner investigation identified a separate metadata-residency bottleneck in
+warm-WAL case 0157: 2,547 of 8,192 reads loaded cold authority history, with
+per-owner counts 528/518/483/507/511, zero reported contention and owner LRU
+capacity and occupancy both 1,024. The value cache was disabled. The 8,192
+scalar batch keys across five owners exceed that per-owner entry ceiling despite
+the 64 MiB metadata budget. The source is
+`checkpoint-work/aws-ci-runs/2026-10-30-read-tier-publication/controller-partial/cases/0157-tidehunter_efa_direct-256-wal_warm-profiled-r0/result/measurement-read-evidence.json`.
+This is authority-cache churn, not evidence of device misses. As in the native
+index-to-WAL organization, keeping useful lookup metadata resident can avoid
+extra history lookup and worker handoff before accessing the value; distributed
+authority validation and durability checks still remain mandatory.
+`reference_directory.rs` now raises the maximum authority entry count from
+1,024 to 8,192; actual capacity remains metadata-budget-derived, with extra
+table slots and retained descriptors charged. This is not a value-cache or
+protocol change. The parent reports that the frozen baseline CLI returned all
+8,192 expected values; the after-build comparison is pending, so no latency
+improvement is claimed.
+
+The native comparison is not the same read operation. `wal/mod.rs::Wal::read`
+selects a prefaulted mapping when available, checks the complete frame CRC and
+copies the returned bytes. Distributed `PartitionLog::try_plan_record_read`
+checks health/admission and resident batch authority, validates the record
+reference and pins the authority, file and log; a cold authority uses a bounded
+worker. `plan_record_payload_range` checks the member bounds and pins a file;
+it does not prepare or copy a whole frame. The independently verified member
+path must not replace the native whole-frame CRC contract. The reactor's
+`planning_ns` interval can include cold-worker queueing and handoff, so it is
+not a measurement of payload-range arithmetic alone.
+
+| Reference | Mechanism and applicability | Current touchpoint and constraint |
+|---|---|---|
+| [Valkey `beforeSleep`](https://github.com/valkey-io/valkey/blob/a230da1a3da00747b423f5d9be3de3b0192692c3/src/server.c#L2064-L2087), [`flushAppendOnlyFile`](https://github.com/valkey-io/valkey/blob/a230da1a3da00747b423f5d9be3de3b0192692c3/src/aof.c#L1259-L1260) and [fsync](https://github.com/valkey-io/valkey/blob/a230da1a3da00747b423f5d9be3de3b0192692c3/src/aof.c#L1371-L1396) | Adaptable scheduling idea: pending commands can share the AOF buffer and an `always` sync before pending replies; this depends on configuration, including the rewrite fsync exception. | `remote_db/concurrent.rs` already drains ready commands and progresses groups without waiting for an artificial batch. Retain complete-batch ownership, exact durable receipts and publication dependencies. Valkey's memory-resident model and AOF semantics are not equivalent to this distributed WAL. |
+| [Valkey reply references and writev](https://github.com/valkey-io/valkey/blob/a230da1a3da00747b423f5d9be3de3b0192692c3/src/networking.c#L815-L829), [iovec construction](https://github.com/valkey-io/valkey/blob/a230da1a3da00747b423f5d9be3de3b0192692c3/src/networking.c#L3089-L3110) | Conceptual: eligible bulk replies retain the object and use scatter/gather, avoiding a full copy into the reply buffer; this is not a claim that all Valkey I/O is zero-copy. | Apply only where transport ownership and actual completion allow it. TLS, fragmentation, partial sends and DMA leases can require different handling. |
+| [TiKV Raft Engine `Engine::write`](https://github.com/tikv/raft-engine/blob/097c499a19fbb38754c73aa2f31532329df7c0c6/src/engine.rs#L139-L205) and [`WriteBarrier`](https://github.com/tikv/raft-engine/blob/097c499a19fbb38754c73aa2f31532329df7c0c6/src/write_barrier.rs#L151-L205) | Conceptual: a leader appends queued writers and shares a sync if any request requires it; the empty group leader proceeds immediately. | Ready-group dispatch already exists. Do not copy the unsafe barrier or conflate Raft-log durability and TiKV's replication semantics with TideHunter publication. |
+| [eRPC §§3.2, 4.2, 6.1](https://www.usenix.org/conference/nsdi19/presentation/kalia), QMD `tidehunter-papers/erpc-2019.md` | Adaptable principle: inline short handlers but move long handlers off dispatch; retain message buffers until queued transmissions and DMA references are gone. Its 2.3 µs median is a 32-byte, two-node RPC on its evaluated hardware, not an encrypted durable read. | Preserve bounded reactor work and exact CQ retirement. The observed response-retire interval includes local provider/CQ residence and scheduling; it is not a direct wire-time or coordinator-CPU measurement. |
+| [HERD §§3.2–4.3](https://dl.acm.org/doi/10.1145/2619239.2626299), QMD `tidehunter-papers/herd-2014.md` | Conceptual only: its measured WRITE/READ tradeoff and server-side request processing depend on its RNIC, transports, polling and memory-resident KV model. | Do not assume InfiniBand UC/UD verbs or HERD completion semantics on EFA; do not generalize the measured hardware ratio to EFA or cold NVMe. |
+| [TeRM §§4.1–4.4 and 5](https://www.usenix.org/conference/fast24/presentation/yang-zhe), QMD `tidehunter-papers/term-2024.md` | Conceptual tier separation: a registered-memory read can miss and trigger RPC plus SSD I/O. Its modified Mellanox driver, magic-page scheme and tiering I/O are not directly portable. | Existing bounded registered hits and explicit message/WAL fallback must retain their current authority and integrity guarantees. Neither a mixed RMA population nor a cold miss is a pure remote-memory hit. |
+
+The eRPC paper's original processed LaTeX was also inspected through the
+arXiv MCP, [arXiv:1806.00680v2](https://arxiv.org/abs/1806.00680);
+the paper was already indexed, so no duplicate paper or collection was added.
+TCP can outperform a particular EFA path if its total software, queuing, copy,
+registration or completion costs are lower; this is a hypothesis to isolate,
+not evidence that TCP is intrinsically faster or that a specific provider cost
+caused this run's tails.
+
+**Next controlled comparison.** Use the same fresh source, data, security,
+durability and offered concurrency for TCP and each EFA mode. Separate
+counter-qualified coordinator hits, owner RAM, warm WAL, registered hits and
+verified cold-device misses; report mixed fallbacks separately. Qualify warm
+authority residency with authority cold-load counters as well as value-cache
+counters. Compare C1 and
+C16 latency distributions, throughput, CPU, bounded queue/retirement and
+actual device counters, with profiled and unprofiled runs. For writes record
+ready-group sizes and sync/receipt stages with explicit durable native and
+Valkey AOF-always controls. Preserve value, recovery, ordering and ownership
+checks. Success is a repeatable reduction in the targeted stage and end-to-end
+p50/p99 without regressions in correctness; no few-microsecond cold-NVMe or
+native-parity target follows from the cited papers.
