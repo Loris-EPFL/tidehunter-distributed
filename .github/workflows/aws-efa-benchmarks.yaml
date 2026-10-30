@@ -19,6 +19,11 @@ on:
         description: "KV only: comma-separated subset of cloud-campaign.json IDs; blank uses tracked list"
         type: string
         default: ""
+      kv_mode:
+        description: "KV only: standard matrix or focused ordered read-tier controls"
+        type: choice
+        options: [standard, read-tier]
+        default: standard
       reconcile_run_id:
         description: "Optional closed campaign to remeasure during cost-report"
         type: string
@@ -366,16 +371,17 @@ jobs:
               --output "$RUNNER_TEMP/benchmark-inputs"
           fi
       - name: Validate selected KV backends before obtaining AWS credentials
-        if: needs.selection.outputs.suite == 'kv-comparison' || inputs.backends != ''
+        if: needs.selection.outputs.suite == 'kv-comparison' || inputs.backends != '' || inputs.kv_mode == 'read-tier'
         env:
           SELECTED_BACKENDS: ${{ inputs.backends || '' }}
+          SELECTED_KV_MODE: ${{ inputs.kv_mode || 'standard' }}
           SELECTED_SUITE: ${{ needs.selection.outputs.suite }}
         run: |
           if [ "$SELECTED_SUITE" != kv-comparison ]; then
             echo "backends selection is valid only for kv-comparison" >&2
             exit 1
           fi
-          args=(validate --config engine/experiments/kv-comparison/ci-config.json)
+          args=(validate --config engine/experiments/kv-comparison/ci-config.json --mode "$SELECTED_KV_MODE")
           if [ -n "$SELECTED_BACKENDS" ]; then
             args+=(--backends "$SELECTED_BACKENDS")
           fi
@@ -402,10 +408,11 @@ jobs:
         env:
           SELECTED_SUITE: ${{ needs.selection.outputs.suite }}
           SELECTED_BACKENDS: ${{ inputs.backends || '' }}
+          SELECTED_KV_MODE: ${{ inputs.kv_mode || 'standard' }}
         run: |
           echo 'invoked=true' >> "$GITHUB_OUTPUT"
           if [ "$SELECTED_SUITE" = kv-comparison ]; then
-            args=(run --config engine/experiments/kv-comparison/ci-config.json)
+            args=(run --config engine/experiments/kv-comparison/ci-config.json --mode "$SELECTED_KV_MODE")
             if [ -n "$SELECTED_BACKENDS" ]; then
               args+=(--backends "$SELECTED_BACKENDS")
             fi
