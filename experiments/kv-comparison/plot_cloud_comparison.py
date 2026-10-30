@@ -156,6 +156,9 @@ class Dataset:
                 raise ValueError("job and observed backend differ")
             contract = {name: value for name, value in job.items()
                         if name not in ("backend", "case_id", "repeat")}
+            if isinstance(contract.get("read_tier"), dict):
+                contract["read_tier"] = {k: v for k, v in contract["read_tier"].items()
+                                         if k not in ("source_id", "data_id", "effective")}
             cohort_cell = (job["cohort"], job["profile"], job["value_size"])
             if cohort_cell in contracts and contracts[cohort_cell] != contract:
                 raise ValueError("workload contract changed between repetitions or backends")
@@ -265,7 +268,7 @@ def goodput_panels():
             panel("Successful value payload", GOODPUT[2])]
 
 
-def figure_specs(backends=BACKENDS):
+def figure_specs(backends=BACKENDS, cohorts=()):
     specs = []
 
     def add(name, title, series, panels, columns, caption, xkind="size", xticks=None):
@@ -273,6 +276,19 @@ def figure_specs(backends=BACKENDS):
             return
         specs.append(dict(name=name, title=title, series=series, panels=panels, columns=columns,
                           caption=caption, xkind=xkind, xticks=xticks))
+    focused = any(name.startswith("read_tier_") for name in cohorts)
+    for cohort in sorted(name for name in cohorts if name.startswith("read_tier_") or
+                         (focused and name == "registered_ram_fullset_control")):
+        for profile, operation in (("read-tier-baseline", "read"), ("read-tier-profiled", "read"),
+                                   ("read-tier-c16-scalar-baseline", "read"),
+                                   ("read-tier-c16-scalar-profiled", "read"),
+                                   ("read-tier-c16-batch32-baseline", "get_many"),
+                                   ("read-tier-c16-batch32-profiled", "get_many")):
+            add(cohort + "-" + profile, cohort + " — " + profile,
+                size_series(backends, cohort, profile, (256, 1024, 8192, 65536)),
+                [panel("API p50", "api_ns", operation, "p50"), panel("API p99", "api_ns", operation)],
+                2, "Distinct per-case populations; configured tiers are not pure-path claims. "
+                "Consult per-case qualification and cache/device evidence; no block timing is per-API NAND latency.")
 
     for profile, operation, title in (("read-concurrent", "read", "Pure reads"),
                                       ("write-concurrent", "put", "Pure writes"),
@@ -341,6 +357,31 @@ def figure_specs(backends=BACKENDS):
         "The owner-cache cohort includes cache misses/WAL fallbacks; it is not isolated owner-cache-hit latency. "
         "Registered RAM is TH EFA native only and is mixed RMA plus message fallback, NOT isolated RDMA latency. "
         "Cumulative path counters include preload/warmup/qualification and are not timing fractions. ")
+    read_modes = (("read-concurrent", "read", 1024, "1 KiB scalar"),
+                  ("read-many32", "get_many", 8192, "8 KiB batch32"))
+    for profile, operation, size, label in (
+            read_modes if "resident_first_stage_diagnostics" in cohorts else ()):
+        modes = [{"label": STYLES[backend][0], "backend": backend,
+                  "cells": [(backend, cohort, profile, size) for cohort in
+                            ("read_stage_diagnostics", "resident_first_stage_diagnostics")],
+                  "x": [0, 1]} for backend in TH if backend in backends]
+        add("read-modes-" + profile, label + " — matched sampled read modes, c16", modes,
+            [panel("API p50", "api_ns", operation, "p50"),
+             panel("API p99", "api_ns", operation)] + goodput_panels(), 3,
+            "Separate diagnostic cohorts, unchanged key count and measured call count, explicit caches zero. "
+            "Resident-first has bounded NOWAIT attempts and async fallback; consult actual path counters. "
+            "Sampled-prefix stage clocks are not the complete API population or physical SSD service. ",
+            "category", ["Async only", "Resident first"])
+    if "tidehunter_efa_native" in backends and "registered_ram_fullset_control" in cohorts:
+        for profile, operation, size in (("registered-scalar", "read", 1024),
+                                         ("registered-many32", "get_many", 8192)):
+            add("registered-fullset-" + profile, "Qualified registered full-set " + profile + " — c1",
+                size_series(("tidehunter_efa_native",), "registered_ram_fullset_control", profile, (size,)),
+                [panel("API p50", "api_ns", operation, "p50"),
+                 panel("API p99", "api_ns", operation)] + goodput_panels(), 3,
+                "All 4096 logical keys; explicit complete warm-up, one read lane per owner, uniform measurement. "
+                "Only independently qualified no-fallback hardware-read cases enter this figure; "
+                "not a comparison against primary c16, first-access costs or a hardware-only RTT. ")
     cold = [{"label": STYLES[backend][0], "backend": backend,
              "cells": [(backend, "cold_os_cache", "cold-os-large", 65536)], "x": [i]}
             for i, backend in enumerate(backends)]
@@ -376,7 +417,7 @@ def build_figures(dataset):
     # Select from the frozen plan, never infer selection from successful cases.
     # Historical reports without explicit inventory retain their planned case rows.
     backends = tuple(name for name in BACKENDS if name in dataset.planned_backends)
-    for spec in figure_specs(backends):
+    for spec in figure_specs(backends, {case["job"]["cohort"] for case in dataset.cases}):
         unavailable = []
         if spec["name"] == "cold-os-cache":
             available = []
@@ -397,10 +438,28 @@ def build_figures(dataset):
             omitted.append({"figure": spec["name"], "reason": str(error),
                             **({"unavailable_systems": unavailable} if spec["name"] == "cold-os-cache" else {})})
             continue
+        qualifications = {}
+        if spec["name"].startswith("registered-fullset-"):
+            for cell in cells:
+                for repeat in repeats:
+                    case = dataset.index[cell + (repeat,)]
+                    proof = case.get("read_path_qualification")
+                    if (not isinstance(proof, dict) or proof.get("qualified") is not True
+                            or proof.get("hardware_read_required") is not True):
+                        unavailable.append({"case_id": case["case_id"],
+                                            "reason": "no qualified no-fallback hardware-read evidence"})
+                    else:
+                        qualifications[case["case_id"]] = proof
+            if unavailable:
+                omitted.append({"figure": spec["name"], "reason": "registered full-set qualification failed",
+                                "unavailable_systems": unavailable})
+                continue
         result = {key: value for key, value in spec.items() if key not in ("series", "panels")}
         result.update(repeats=repeats, panels=[], files=[spec["name"] + extension for extension in (".png", ".pdf")])
         result.update(dataset.repetition_metadata())
         result.update(independent_repetitions=len(repeats), run_to_run_errorbars=not dataset.single_repetition)
+        if qualifications:
+            result["read_path_qualifications"] = qualifications
         repeat_names = ", ".join("r" + str(value) for value in repeats)
         if dataset.single_repetition:
             result["title"] += f"\nOne independent repetition ({repeat_names}); no run-to-run variability estimate"

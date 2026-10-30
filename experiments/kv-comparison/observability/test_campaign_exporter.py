@@ -46,6 +46,26 @@ def write_diagnostics():
                                                   "file_ns": 1000000000}}}
 
 
+def read_diagnostics():
+    return {"schema_version": 1, "backend": "tidehunter_tcp", "phase": "measurement",
+            "phase_attempted": True, "runtime_enabled": True,
+            "runtime_observation_mode": "bounded_remote_read_requests",
+            "selection": {"requested_limit": 8, "selected_operations": 3, "completed_operations": 2,
+                          "selection_policy": "first N measurement reads",
+                          "phase_exclusions": ["preload", "warmup", "qualification"]},
+            "clock_scope": "independent clocks", "overlap_semantics": "not additive",
+            "unsupported_stages": [], "error": None,
+            "profile": {"stages": {
+                "server_async": {"available": True, "sum_ns": 2000000000, "count": 2,
+                                 "max_ns": None, "unavailable_reason": None},
+                "server_nowait": {"available": False, "sum_ns": None, "count": 0,
+                                  "max_ns": None, "unavailable_reason": "no samples"}},
+                "counters": {"read_profile_server_async_count": 2},
+                "coverage": {"selected_remote_requests": 3, "completed_remote_requests": 2,
+                             "profiled_owner_responses": 2, "reason": "sampled"},
+                "read_evidence": {}}}
+
+
 class CaseIdentityTests(unittest.TestCase):
     def test_scopes_quoted_labels_without_splitting_their_commas_or_braces(self):
         source = b'# TYPE observed counter\nobserved{op="read,brace}quote\\\""} 7\n'
@@ -167,6 +187,265 @@ class CaseIdentityTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 campaign.resource_interval_metrics({"schema_version": 1, "scope": "measurement_boundary_interval",
                                                      "processes": rows}, {})
+
+    def test_cold_device_identity_zero_unknown_and_fallback_are_distinct(self):
+        distribution = {"count": 2, "sum": 300, "max": 200, "mean": 150,
+                        "population_stddev": 50, "p50": 100, "p95": 200,
+                        "p99": 200, "p999": 200, "tail_warnings": ["small population"]}
+        identity = {"available": True, "backend": "bpftrace-request-identity",
+                    "qualified": True, "truncated": False, "lost": 0,
+                    "read_issues": 2, "read_completions": 2, "matched_reads": 2,
+                    "intervals_ns": distribution, "timestamp_unit_ns": 1,
+                    "observed_timestamp_resolution_ns": None}
+        fallback = {"available": True, "qualified": False, "truncated": False, "lost": None,
+                    "read_issues": 3, "read_completions": 3, "matched_reads": None,
+                    "intervals_ns": None, "candidate_intervals_ns": distribution}
+        rows = [{"host_index": 0, "evidence": identity},
+                {"host_index": 1, "evidence": fallback},
+                {"host_index": 2, "evidence": {"available": False, "reason": "not attached"}}]
+        text = campaign.terminal_metrics({"status": "completed", "metrics": None,
+                                          "cold_device_evidence": rows}, {})
+        self.assertIn('resource_host_index="0",trace_backend="request_identity",statistic="p99"} 2e-07', text)
+        self.assertIn('resource_host_index="1",trace_backend="tracefs_candidate",counter="lost"} 0', text)
+        self.assertIn('resource_host_index="2",trace_backend="unknown"} 0', text)
+        self.assertNotIn('trace_backend="tracefs_candidate",statistic=', text)
+        self.assertNotIn('precision="observed_timestamp_resolution_ns"} 1e-09', text)
+        empty = distribution | {"count": 0, "sum": 0, "max": None, "mean": None,
+                                "population_stddev": None, "p50": None, "p95": None, "p99": None, "p999": None}
+        text = campaign.cold_device_metrics([{"host_index": -1, "evidence": identity | {
+            "read_issues": 0, "read_completions": 0, "matched_reads": 0, "intervals_ns": empty,
+            "qualified": False}}], {})
+        self.assertIn('kv_case_block_interval_available{', text)
+        self.assertNotIn('kv_case_block_interval_seconds', text)
+        self.assertIn('counter="read_issues"} 0', text)
+        for change in ({"lost": None}, {"lost": 1}, {"truncated": True}):
+            text = campaign.cold_device_metrics([{"host_index": 0, "evidence": identity | change}], {})
+            self.assertNotIn("kv_case_block_interval_seconds", text)
+        with self.assertRaises(ValueError):
+            campaign.cold_device_metrics([{"host_index": 1, "evidence": fallback | {"intervals_ns": distribution}}], {})
+        with self.assertRaises(ValueError):
+            campaign.cold_device_metrics(rows + [rows[0]], {})
+        with self.assertRaises(ValueError):
+            campaign.cold_device_metrics([{"host_index": 0, "evidence": identity | {"raw_events": []}}], {})
+
+    def test_read_diagnostics_export_separate_observed_populations(self):
+        text = campaign.terminal_metrics({"status": "completed", "metrics": None,
+                                          "read_diagnostics": read_diagnostics(),
+                                          "read_profile_enabled": True}, {})
+        self.assertIn('kv_observer_read_profile_enabled{} 1', text)
+        self.assertIn('population="selected_operations"} 3', text)
+        self.assertIn('population="completed_operations"} 2', text)
+        self.assertIn('clock_domain="owner",stage="server_async"', text)
+        self.assertIn('stage="server_async",statistic="sum"} 2.0', text)
+        self.assertIn('counter="server_async"} 2', text)
+        self.assertNotIn('statistic="max"', text)
+        self.assertNotIn("server_nowait", text)
+        self.assertNotIn("kv_case_write_diagnostic", text)
+        evidence = read_diagnostics()
+        evidence["profile"]["coverage"]["profiled_owner_responses"] = 5
+        self.assertIn('population="profiled_owner_responses"} 5',
+                      campaign.read_diagnostic_metrics(evidence, {}))
+        self.assertNotIn("quantile", text)
+
+    def test_read_diagnostics_no_data_and_validation(self):
+        self.assertEqual(campaign.read_diagnostic_metrics(None, {}), "")
+        evidence = read_diagnostics()
+        for changes in ({"runtime_enabled": False}, {"profile": None}, {"error": "unavailable"}):
+            text = campaign.read_diagnostic_metrics(evidence | changes, {})
+            self.assertIn('diagnostic_backend="tidehunter_tcp",partition="aggregate"} 0', text)
+            self.assertNotIn("diagnostic_stage_seconds", text)
+            self.assertNotIn("diagnostic_stage_count", text)
+        evidence["profile"]["stages"]["server_async"] = {
+            "available": False, "sum_ns": None, "count": 0, "max_ns": None, "unavailable_reason": "no samples"}
+        self.assertNotIn("diagnostic_stage_seconds", campaign.read_diagnostic_metrics(evidence, {}))
+        for changes in ({"phase": "warmup"}, {"schema_version": True},
+                        {"runtime_enabled": 1}, {"clock_scope": ""}, {"overlap_semantics": "x" * 65537}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                campaign.read_diagnostic_metrics(read_diagnostics() | changes, {})
+        evidence = read_diagnostics()
+        evidence["selection"]["completed_operations"] = 4
+        with self.assertRaises(ValueError):
+            campaign.read_diagnostic_metrics(evidence, {})
+        evidence = read_diagnostics()
+        evidence["profile"]["stages"]["server_async"]["count"] = 0
+        with self.assertRaises(ValueError):
+            campaign.read_diagnostic_metrics(evidence, {})
+        evidence = read_diagnostics()
+        evidence["selection"]["selected_operations"] = 0
+        evidence["selection"]["completed_operations"] = 0
+        with self.assertRaisesRegex(ValueError, "require selected operations"):
+            campaign.read_diagnostic_metrics(evidence, {})
+
+    def test_read_diagnostics_preserve_per_owner_scopes_and_validate_partition(self):
+        evidence = read_diagnostics()
+        stage = {"available": True, "sum_ns": 500000000, "count": 1,
+                 "max_ns": 500000000, "unavailable_reason": None}
+        absent = {"available": False, "sum_ns": None, "count": 0,
+                  "max_ns": None, "unavailable_reason": "no observations"}
+        evidence["profile"]["owners"] = {
+            "0": {"stages": {"server_async": stage}, "counters": {"read_profile_completed": 1}},
+            "4": {"stages": {"server_async": absent}, "counters": {"read_profile_completed": 0}}}
+        text = campaign.read_diagnostic_metrics(evidence, {})
+        self.assertIn('partition="aggregate",clock_domain="owner",stage="server_async",statistic="sum"} 2.0', text)
+        self.assertIn('partition="0",clock_domain="owner",stage="server_async",statistic="sum"} 0.5', text)
+        self.assertIn('partition="0",clock_domain="owner",stage="server_async",statistic="max"} 0.5', text)
+        self.assertIn('partition="aggregate",clock_domain="owner",stage="server_async",statistic="mean"} 1.0', text)
+        self.assertIn('partition="0",clock_domain="owner",stage="server_async",statistic="mean"} 0.5', text)
+        self.assertIn('partition="4"} 0', text)
+        self.assertIn('partition="4",population="read_profile_completed"} 0', text)
+        evidence["profile"]["owners"]["0"]["stages"]["client_grant_install"] = stage
+        text = campaign.read_diagnostic_metrics(evidence, {})
+        self.assertIn('partition="0",clock_domain="coordinator",stage="client_grant_install"', text)
+        self.assertNotIn('partition="4",clock_domain=', text)
+        for owners in ({"aggregate": evidence["profile"]["owners"]["0"]},
+                       {"01": evidence["profile"]["owners"]["0"]},
+                       {"4294967296": evidence["profile"]["owners"]["0"]},
+                       {str(i): evidence["profile"]["owners"]["0"] for i in range(6)}):
+            with self.subTest(owners=owners), self.assertRaises(ValueError):
+                campaign.read_diagnostic_metrics(evidence | {
+                    "profile": evidence["profile"] | {"owners": owners}}, {})
+
+    def test_resolution_is_an_independent_population_with_unavailable_stages(self):
+        evidence = read_diagnostics()
+        evidence["selection"]["selected_operations"] = 0
+        evidence["selection"]["completed_operations"] = 0
+        evidence["profile"]["coverage"].update(selected_remote_requests=0, completed_remote_requests=0,
+                                                profiled_owner_responses=0)
+        evidence["profile"]["stages"] = {}
+        absent = {"available": False, "sum_ns": None, "count": 0,
+                  "max_ns": None, "unavailable_reason": "no observations"}
+        observed = {"available": True, "sum_ns": 100, "count": 2, "max_ns": 70,
+                    "unavailable_reason": None}
+        evidence["profile"]["coordinator_resolution"] = {
+            "selection_policy": "independent first N", "selected": 2, "point": 1, "bulk": 1,
+            "errors": 0, "logical_members": 3, "cache_hits": 1, "index_misses": 1,
+            "remote_misses": 1, "member_errors": 0,
+            "stages": {"index_lock_wait": observed, "index_lookup": observed,
+                       "cache_lock_wait": absent, "cache_lookup": absent,
+                       "cut_validation": observed, "cut_capture": absent, "route_preparation": observed,
+                       "pin_preparation": observed, "batch_preparation": absent}}
+        text = campaign.read_diagnostic_metrics(evidence, {})
+        self.assertIn('scope="api_resolution_prefix"', text)
+        self.assertIn('population="logical_members"} 3', text)
+        self.assertIn('stage="index_lookup",statistic="max"} 7e-08', text)
+        self.assertIn('stage="cache_lookup"} 0', text)
+        self.assertNotIn('stage="cache_lookup",statistic=', text)
+        evidence["error"] = "one selected remote flight failed"
+        evidence["profile"]["coordinator_resolution_valid"] = True
+        evidence["profile"]["coordinator_resolution"]["errors"] = 1
+        evidence["profile"]["counters"]["read_profile_failed_owner_profile_not_applicable"] = 1
+        evidence["profile"]["owners"] = {"0": {"stages": {}, "counters": {
+            "read_profile_failed_owner_profile_not_applicable": 1}}}
+        text = campaign.read_diagnostic_metrics(evidence, {})
+        self.assertIn('scope="api_resolution_prefix"', text)
+        self.assertIn('population="errors"} 1', text)
+        self.assertIn('stage="index_lookup",statistic="max"} 7e-08', text)
+        self.assertIn('partition="0",population="read_profile_failed_owner_profile_not_applicable"} 1', text)
+        self.assertIn('partition="aggregate",population="read_profile_failed_owner_profile_not_applicable"} 1', text)
+        evidence["profile"]["coordinator_resolution_valid"] = False
+        text = campaign.read_diagnostic_metrics(evidence, {})
+        self.assertNotIn('population="logical_members"} 3', text)
+        evidence["profile"]["coordinator_resolution"]["bulk"] = 2
+        with self.assertRaisesRegex(ValueError, "resolution populations"):
+            campaign.read_diagnostic_metrics(evidence, {})
+
+    def test_node_boundaries_keep_missing_and_lifetime_maxima_distinct(self):
+        names = ("read_response_encode", "read_output_queue", "read_output_submit",
+                 "read_response_retire", "read_grant_lookup", "read_grant_reservation",
+                 "read_grant_envelope", "read_grant_registration", "read_grant_recheck_publication")
+        missing = {"available": False, "error": "missing counter"}
+        stages = {name: missing for name in names}
+        stages["read_grant_registration"] = {"available": True,
+                                              "counters": {"ns": 20, "count": 1, "errors": 1}}
+        unavailable = {"available": False}
+        evidence = {"scope": "measurement_boundary", "deltas": {
+            "coordinator": unavailable, "owner_executor": unavailable, "client_resident": unavailable,
+            "owner_response": {"available": True, "partitions": {"0": stages}}},
+            "end": {"available": True, "coordinator": {"retained_bytes": 64},
+                    "owner_grants": {"available": True, "partitions": {"0": {
+                        "read_grant": {"registration": {"ns": 50, "count": 2, "errors": 1, "max_ns": 30}}}}}}}
+        text = campaign.measurement_read_metrics(evidence, {})
+        self.assertIn('stage="read_grant_registration",counter="errors"} 1', text)
+        self.assertIn('stage="read_output_queue"} 0', text)
+        self.assertIn('scope="node_lifetime_end"', text)
+        self.assertIn('statistic="max"} 3e-08', text)
+        self.assertIn('boundary="end",component="coordinator",partition="aggregate",gauge="retained_bytes"} 64', text)
+        self.assertNotIn('stage="read_output_queue",statistic=', text)
+
+    def test_lane_evidence_keeps_unknown_sessions_and_counter_scopes(self):
+        missing = {"available": False}
+        evidence = {"scope": "measurement_boundary", "deltas": {
+            "coordinator": missing, "owner_executor": missing, "client_resident": missing,
+            "client_resident_lanes": {"available": True, "partitions": {"0": {
+                "available": True, "lanes": {"0": {"available": True, "counters": {"rma_hits": 4}},
+                                               "1": {"available": False}}}}}},
+            "start": {"client_resident_lanes": {"available": True, "partitions": {"0": {"lanes": {
+                "0": {"session_present": True}, "1": {"session_present": None}}}}}}}
+        text = campaign.measurement_read_metrics(evidence, {})
+        self.assertIn('component="client_resident_lane",partition="0",lane="0",path="rma_hits"} 4', text)
+        self.assertIn('boundary="start",partition="0",lane="1"} 0', text)
+        self.assertNotIn('kv_case_read_lane_session_present{scope="measurement_boundary",boundary="start",partition="0",lane="1"}', text)
+        evidence["deltas"]["client_resident_lanes"]["partitions"]["0"]["lanes"]["8"] = {"available": False}
+        with self.assertRaises(ValueError):
+            campaign.measurement_read_metrics(evidence, {})
+
+    def test_cache_policy_does_not_invent_effective_receipt(self):
+        requested = {"coordinator_cache_bytes": 0, "owner_read_cache_bytes": 0,
+                     "registered_policy": "disabled", "page_cache_policy": "not_dropped",
+                     "warmup_operations": 10, "read_lanes": 1, "concurrency": 1}
+        text = campaign.read_tier_metrics({"read_tier": {"requested": requested, "effective": None}}, {})
+        self.assertIn('policy_scope="effective"} 0', text)
+        self.assertIn('component="page_cache_policy",policy="not_dropped"} 1', text)
+        effective = requested | {"page_cache_policy": None}
+        text = campaign.read_tier_metrics({"read_tier": {"requested": requested, "effective": None}},
+                                          {}, effective)
+        self.assertIn('policy_scope="effective",setting="page_cache_policy"} 0', text)
+        self.assertNotIn('policy_scope="effective",component="page_cache_policy"', text)
+        with self.assertRaises(ValueError):
+            campaign.read_tier_metrics({"read_tier": {"requested": requested | {"registered_policy": "unknown"}}}, {})
+
+    def test_unavailable_read_stages_reject_claimed_observations(self):
+        unavailable = {"available": False, "sum_ns": None, "count": 0,
+                       "max_ns": None, "unavailable_reason": "no observations"}
+        for change in ({"count": None}, {"count": 1}, {"sum_ns": 0}, {"max_ns": 0},
+                       {"unavailable_reason": None}, {"unavailable_reason": ""}):
+            for owner in (False, True):
+                evidence = read_diagnostics()
+                bad_stage = unavailable | change
+                if owner:
+                    evidence["profile"]["owners"] = {"0": {"stages": {"server_async": bad_stage}, "counters": {}}}
+                else:
+                    evidence["profile"]["stages"]["server_async"] = bad_stage
+                with self.subTest(change=change, owner=owner), self.assertRaises(ValueError):
+                    campaign.read_diagnostic_metrics(evidence, {})
+
+    def test_read_diagnostic_size_limit_accepts_large_evidence_and_rejects_oversize(self):
+        evidence = read_diagnostics()
+        evidence["profile"]["read_evidence"] = {str(i): "x" * 1024 for i in range(100)}
+        self.assertIn("kv_case_read_diagnostic_available", campaign.read_diagnostic_metrics(evidence, {}))
+        evidence["profile"]["read_evidence"] = {str(i): "x" * 1024 for i in range(260)}
+        with self.assertRaisesRegex(ValueError, "exceeds 256KiB"):
+            campaign.read_diagnostic_metrics(evidence, {})
+
+    def test_read_diagnostic_accepts_nested_owner_boundary_snapshots(self):
+        evidence = read_diagnostics()
+        snapshot = {"available": True, "owner_executor": {"available": True,
+                    "partitions": {str(i): {"read_requests": i, "read_bytes": i * 4096}
+                                   for i in range(5)}},
+                    "client_resident": {"available": True,
+                    "partitions": {str(i): {"cache_hits": i} for i in range(5)}},
+                    "client_resident_lanes": {"available": True, "partitions": {
+                        str(i): {"lanes": {"0": {"session_present": True,
+                                                  "stats": {"rma_hits": i}}}} for i in range(5)}},
+                    "owner_grants": {"available": True, "partitions": {
+                        str(i): {"read_grant": {"registration": {
+                            "ns": i, "count": i, "max_ns": i, "errors": 0}}}
+                        for i in range(5)}}}
+        evidence["profile"]["read_evidence"] = {"start": snapshot, "end": snapshot}
+        self.assertIn("kv_case_read_diagnostic_available", campaign.read_diagnostic_metrics(evidence, {}))
+        evidence["profile"]["read_evidence"]["extra"] = {"a": {"b": {"c": {"d": {"e": {"f": {"g": {"h": 1}}}}}}}}
+        with self.assertRaisesRegex(ValueError, "nesting exceeds bound"):
+            campaign.read_diagnostic_metrics(evidence, {})
 
     def test_write_diagnostics_export_actual_totals_counts_and_nested_clock_scopes(self):
         text = campaign.terminal_metrics({"status": "completed", "metrics": None,

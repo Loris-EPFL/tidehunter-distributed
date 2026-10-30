@@ -163,6 +163,111 @@ class CampaignMonitorBoundaries(unittest.TestCase):
             self.assertEqual((state / 'benchmark/selection.json').read_bytes(), selection)
             self.assertEqual((state / 'session.json').read_bytes(), session)
 
+    def test_terminal_read_diagnostics_validate_before_publication(self):
+        state, _, result = self.initialize_selection()
+        monitor.select_case(self.spec, self.job, result)
+        evidence = {'schema_version': 1, 'backend': 'tidehunter_tcp', 'phase': 'measurement',
+                    'phase_attempted': True, 'runtime_enabled': True,
+                    'runtime_observation_mode': 'bounded_remote_read_requests',
+                    'selection': {'requested_limit': 2, 'selected_operations': 2, 'completed_operations': 1,
+                                  'selection_policy': 'first measurement reads',
+                                  'phase_exclusions': ['warmup', 'preload']},
+                    'clock_scope': 'local accumulated clocks', 'overlap_semantics': 'overlapping totals',
+                    'unsupported_stages': [], 'error': None,
+                    'profile': {'stages': {'server_async': {'available': True, 'sum_ns': 500,
+                                'count': 1, 'max_ns': None, 'unavailable_reason': None}}, 'counters': {}}}
+        before = (state / 'benchmark/selection.json').read_bytes()
+        with self.assertRaises(ValueError):
+            monitor.finish_case(self.spec, self.job, result, read_diagnostics=evidence | {'phase': 'preload'})
+        self.assertEqual((state / 'benchmark/selection.json').read_bytes(), before)
+        observed = {'resultType': 'vector', 'result': [{'metric': {}, 'value': [time.time(), '1']}]}
+        with patch.object(monitor, 'query', return_value=observed):
+            answer = monitor.finish_case(self.spec, self.job, result, read_diagnostics=evidence,
+                                         read_profile_enabled=True)
+        self.assertTrue(answer['complete'])
+        terminal = monitor.load_json(state / 'benchmark/selection.json')['terminal']
+        self.assertEqual(terminal['read_diagnostics'], evidence)
+        self.assertIs(terminal['read_profile_enabled'], True)
+
+    def test_rich_terminal_selection_is_admitted_and_oversize_is_atomic(self):
+        import campaign_exporter
+        state, _, result = self.initialize_selection()
+        monitor.select_case(self.spec, self.job, result)
+        stats = {f"resident_read_counter_{index}": 123456789012345 for index in range(32)}
+        lane_group = {"available": True, "partitions": {
+            str(owner): {"lanes": {str(lane): {"session_present": True, "stats": stats}
+                                   for lane in range(8)}} for owner in range(5)}}
+        snapshot = {"available": True, "client_resident_lanes": lane_group}
+        boundary = {"scope": "measurement_boundary", "start": snapshot, "end": snapshot,
+                    "deltas": {"available": False, "error": "not observed"}}
+        diagnostics = {'schema_version': 1, 'backend': 'tidehunter_tcp', 'phase': 'measurement',
+                       'phase_attempted': True, 'runtime_enabled': True,
+                       'runtime_observation_mode': 'bounded_remote_read_requests',
+                       'selection': {'requested_limit': 2, 'selected_operations': 0, 'completed_operations': 0,
+                                     'selection_policy': 'first remote flights', 'phase_exclusions': []},
+                       'clock_scope': 'local clocks', 'overlap_semantics': 'not additive',
+                       'unsupported_stages': [], 'error': None,
+                       'profile': {'stages': {}, 'counters': {}, 'read_evidence': boundary}}
+        before = (state / 'benchmark/selection.json').read_bytes()
+        oversized = boundary | {"extra": "x" * campaign_exporter.MAX_SELECTION}
+        with self.assertRaises(ValueError):
+            monitor.finish_case(self.spec, self.job, result, measurement_read_evidence=oversized,
+                                read_diagnostics=diagnostics)
+        self.assertEqual((state / 'benchmark/selection.json').read_bytes(), before)
+        observed = {'resultType': 'vector', 'result': [{'metric': {}, 'value': [time.time(), '1']}]}
+        with patch.object(monitor, 'query', return_value=observed):
+            answer = monitor.finish_case(self.spec, self.job, result, measurement_read_evidence=boundary,
+                                         read_diagnostics=diagnostics)
+        self.assertTrue(answer['complete'])
+        selection_path = state / 'benchmark/selection.json'
+        self.assertGreater(selection_path.stat().st_size, 256 * 1024)
+        self.assertLessEqual(selection_path.stat().st_size, campaign_exporter.MAX_SELECTION)
+        selection = campaign_exporter.read_json(selection_path)
+        before = selection_path.read_bytes()
+        with self.assertRaises(ValueError):
+            monitor.atomic_json(selection_path, selection | {"extra": "x" * campaign_exporter.MAX_SELECTION},
+                                max_bytes=campaign_exporter.MAX_SELECTION)
+        self.assertEqual(selection_path.read_bytes(), before)
+        oversized_path = self.root / 'oversized-selection.json'
+        oversized_path.write_bytes(b' ' * (campaign_exporter.MAX_SELECTION + 1))
+        with self.assertRaises(ValueError):
+            campaign_exporter.read_json(oversized_path)
+
+    def test_effective_cache_receipt_validated_before_terminal_publication(self):
+        requested = {'coordinator_cache_bytes': 0, 'owner_read_cache_bytes': 0,
+                     'registered_policy': 'disabled', 'page_cache_policy': 'not_dropped',
+                     'warmup_operations': 10, 'read_lanes': 1, 'concurrency': 1}
+        self.job['read_tier'] = {'requested': requested, 'effective': None}
+        state, _, result = self.initialize_selection()
+        monitor.select_case(self.spec, self.job, result)
+        before = (state / 'benchmark/selection.json').read_bytes()
+        with self.assertRaises(ValueError):
+            monitor.finish_case(self.spec, self.job, result,
+                                read_tier_effective=requested | {'registered_policy': 'invalid'})
+        self.assertEqual((state / 'benchmark/selection.json').read_bytes(), before)
+        observed = {'resultType': 'vector', 'result': [{'metric': {}, 'value': [time.time(), '1']}]}
+        effective = requested | {'page_cache_policy': None}
+        with patch.object(monitor, 'query', return_value=observed):
+            monitor.finish_case(self.spec, self.job, result, read_tier_effective=effective)
+        selection = monitor.load_json(state / 'benchmark/selection.json')
+        self.assertEqual(selection['job'], self.job)
+        self.assertEqual(selection['terminal']['read_tier_effective'], effective)
+
+    def test_cold_device_evidence_rejected_before_publication_then_recorded(self):
+        state, _, result = self.initialize_selection()
+        monitor.select_case(self.spec, self.job, result)
+        before = (state / 'benchmark/selection.json').read_bytes()
+        with self.assertRaises(ValueError):
+            monitor.finish_case(self.spec, self.job, result, cold_device_evidence=[
+                {'host_index': 0, 'evidence': {'available': False, 'raw_events': []}}])
+        self.assertEqual((state / 'benchmark/selection.json').read_bytes(), before)
+        evidence = [{'host_index': 0, 'evidence': {'available': False, 'reason': 'unavailable'}}]
+        observed = {'resultType': 'vector', 'result': [{'metric': {}, 'value': [time.time(), '1']}]}
+        with patch.object(monitor, 'query', return_value=observed):
+            monitor.finish_case(self.spec, self.job, result, cold_device_evidence=evidence)
+        terminal = monitor.load_json(state / 'benchmark/selection.json')['terminal']
+        self.assertEqual(terminal['cold_device_evidence'], evidence)
+
     def test_terminal_write_diagnostics_are_validated_before_atomic_publication(self):
         state, _, result = self.initialize_selection()
         monitor.select_case(self.spec, self.job, result)

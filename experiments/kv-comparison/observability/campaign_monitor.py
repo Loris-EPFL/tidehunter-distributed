@@ -50,7 +50,18 @@ QUERY_METRICS = ('kv_observer_snapshot_final', 'kv_observer_case_terminal', 'kv_
                  'kv_observer_cgroup_cpu_periods_total', 'kv_observer_cgroup_cpu_throttled_periods_total',
                  'kv_observer_cgroup_io_read_bytes_total', 'kv_observer_cgroup_io_write_bytes_total',
                  'kv_case_write_diagnostic_available', 'kv_case_write_diagnostic_operations',
-                 'kv_case_write_diagnostic_stage_seconds', 'kv_case_write_diagnostic_stage_count')
+                 'kv_case_write_diagnostic_stage_seconds', 'kv_case_write_diagnostic_stage_count',
+                 'kv_observer_read_profile_enabled', 'kv_case_read_diagnostic_available',
+                 'kv_case_read_diagnostic_operations', 'kv_case_read_diagnostic_stage_seconds',
+                 'kv_case_read_diagnostic_stage_count', 'kv_case_read_diagnostic_stage_available',
+                 'kv_case_read_boundary_stage_available', 'kv_case_read_boundary_stage_seconds',
+                 'kv_case_read_boundary_stage_count', 'kv_case_read_boundary_gauge', 'kv_case_cache_policy_available',
+                 'kv_case_cache_policy_info', 'kv_case_cache_policy_value', 'kv_case_cache_policy_field_available',
+                 'kv_case_read_lane_session_available', 'kv_case_read_lane_session_present',
+                 'kv_case_block_trace_available', 'kv_case_block_trace_qualified', 'kv_case_block_trace_truncated',
+                 'kv_case_block_trace_count', 'kv_case_block_trace_counter_available', 'kv_case_block_trace_timestamp_available',
+                 'kv_case_block_trace_timestamp_seconds', 'kv_case_block_interval_available',
+                 'kv_case_block_interval_count', 'kv_case_block_interval_seconds')
 CAPS = {'prometheus': ('1', '1g'), 'grafana': ('0.5', '768m'),
         'benchmark': ('0.25', '256m'), 'host': ('0.1', '128m'), 'node': ('0.1', '128m')}
 TOKEN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$')
@@ -182,11 +193,11 @@ def digest(path):
     return result.hexdigest()
 
 
-def atomic_json(path, value, mode=0o600, compact=False):
+def atomic_json(path, value, mode=0o600, compact=False, max_bytes=MAX_JSON):
     path = Path(path)
     data = (json.dumps(value, sort_keys=True, indent=None if compact else 2,
                        separators=(',', ':') if compact else None, allow_nan=False) + '\n').encode()
-    if len(data) > MAX_JSON:
+    if len(data) > max_bytes:
         raise ValueError('JSON evidence exceeds size bound')
     fd, temporary = tempfile.mkstemp(prefix='.' + path.name, dir=path.parent)
     try:
@@ -660,7 +671,9 @@ def select_case(spec, job, result_dir, processes=None):
     previous = load_json(state / 'benchmark/selection.json').get('job')
     if previous and previous['case_id'] != job['case_id'] and previous['case_id'] not in session['seen_case_ids']:
         raise ValueError('previous case has no terminal Prometheus observation; refusing selection overwrite')
-    atomic_json(state / 'benchmark/selection.json', {'job': job, 'results': str(path), 'terminal': None}, 0o444)
+    import campaign_exporter
+    atomic_json(state / 'benchmark/selection.json', {'job': job, 'results': str(path), 'terminal': None},
+                0o444, max_bytes=campaign_exporter.MAX_SELECTION)
     if job['case_id'] not in session['expected_case_ids']:
         session['expected_case_ids'].append(job['case_id'])
         session['selected_case_ids'].append(job['case_id'])
@@ -691,14 +704,18 @@ def select_host(spec, index, job, processes):
         if process['role'] in seen:
             raise ValueError('duplicate process role')
         seen.add(process['role'])
-    atomic_json(state / f'host-{index}/selection.json', {'job': job, 'processes': processes}, 0o444)
+    import campaign_exporter
+    atomic_json(state / f'host-{index}/selection.json', {'job': job, 'processes': processes},
+                0o444, max_bytes=campaign_exporter.MAX_SELECTION)
     return receipt(started, host_index=index, processes=processes,
                    availability='explicit' if processes else 'unavailable: no admitted cgroups')
 
 
 @bounded(2.5)
 def finish_case(spec, job, result_dir, *, metrics=None, status='completed', write_profile_enabled=None,
-                read_evidence=None, measurement_read_evidence=None, resource_evidence=None, write_diagnostics=None):
+                read_profile_enabled=None, read_evidence=None, measurement_read_evidence=None,
+                resource_evidence=None, write_diagnostics=None, read_diagnostics=None,
+                read_tier_effective=None, cold_device_evidence=None):
     started = time.monotonic()
     spec = validate_spec(spec)
     state, _ = state_for(spec)
@@ -708,6 +725,8 @@ def finish_case(spec, job, result_dir, *, metrics=None, status='completed', writ
         raise ValueError('terminal status must be completed or failed')
     if write_profile_enabled is not None and type(write_profile_enabled) is not bool:
         raise ValueError('write profile evidence must be observed boolean or absent')
+    if read_profile_enabled is not None and type(read_profile_enabled) is not bool:
+        raise ValueError('read profile evidence must be observed boolean or absent')
     if read_evidence is not None and not isinstance(read_evidence, dict):
         raise ValueError('read evidence must be observed counter object or absent')
     selected = load_json(state / 'benchmark/selection.json')
@@ -716,6 +735,8 @@ def finish_case(spec, job, result_dir, *, metrics=None, status='completed', writ
     terminal = {'status': status, 'metrics': metrics}
     if write_profile_enabled is not None:
         terminal['write_profile_enabled'] = write_profile_enabled
+    if read_profile_enabled is not None:
+        terminal['read_profile_enabled'] = read_profile_enabled
     if read_evidence is not None:
         terminal['read_evidence'] = read_evidence
     if measurement_read_evidence is not None:
@@ -724,11 +745,20 @@ def finish_case(spec, job, result_dir, *, metrics=None, status='completed', writ
         terminal['resource_evidence'] = resource_evidence
     if write_diagnostics is not None:
         terminal['write_diagnostics'] = write_diagnostics
+    if read_diagnostics is not None:
+        terminal['read_diagnostics'] = read_diagnostics
+    if read_tier_effective is not None:
+        if not isinstance(job.get('read_tier'), dict):
+            raise ValueError('effective read tier receipt requires a requested tier')
+        terminal['read_tier_effective'] = read_tier_effective
+    if cold_device_evidence is not None:
+        terminal['cold_device_evidence'] = cold_device_evidence
     import campaign_exporter
     campaign_exporter.terminal_metrics(terminal, {})
+    campaign_exporter.read_tier_metrics(job, {}, read_tier_effective)
     selected['terminal'] = terminal
     published_at = time.time()
-    atomic_json(state / 'benchmark/selection.json', selected, 0o444)
+    atomic_json(state / 'benchmark/selection.json', selected, 0o444, max_bytes=campaign_exporter.MAX_SELECTION)
     labels = '{run_id=' + json.dumps(spec['run_id']) + ',case_id=' + json.dumps(job['case_id']) + '}'
     metric = ('kv_observer_snapshot_final' if status == 'completed' else 'kv_observer_case_terminal') + labels
     status_labels = labels[:-1] + ',status=' + json.dumps(status) + '}'
@@ -1353,10 +1383,12 @@ def main():
             command.add_argument('--metrics', type=Path)
             command.add_argument('--status', choices=('completed', 'failed'), default='completed')
             command.add_argument('--write-profile-enabled', choices=('true', 'false'))
+            command.add_argument('--read-profile-enabled', choices=('true', 'false'))
             command.add_argument('--read-evidence', type=Path)
             command.add_argument('--measurement-read-evidence', type=Path)
             command.add_argument('--resource-evidence', type=Path)
             command.add_argument('--write-diagnostics', type=Path)
+            command.add_argument('--read-diagnostics', type=Path)
     command = commands.add_parser('export')
     command.add_argument('--destination', type=Path, required=True)
     command = commands.add_parser('replay')
@@ -1395,10 +1427,12 @@ def main():
                 answer = finish_case(spec, load_json(args.job), args.result_dir,
                     metrics=load_json(args.metrics) if args.metrics else None, status=args.status,
                     write_profile_enabled=None if args.write_profile_enabled is None else args.write_profile_enabled == 'true',
+                    read_profile_enabled=None if args.read_profile_enabled is None else args.read_profile_enabled == 'true',
                     read_evidence=load_json(args.read_evidence) if args.read_evidence else None,
                     measurement_read_evidence=load_json(args.measurement_read_evidence) if args.measurement_read_evidence else None,
                     resource_evidence=load_json(args.resource_evidence) if args.resource_evidence else None,
-                    write_diagnostics=load_json(args.write_diagnostics) if args.write_diagnostics else None)
+                    write_diagnostics=load_json(args.write_diagnostics) if args.write_diagnostics else None,
+                    read_diagnostics=load_json(args.read_diagnostics) if args.read_diagnostics else None)
             elif args.command == 'export':
                 answer = export_session(spec, args.destination)
             elif args.command == 'verify':

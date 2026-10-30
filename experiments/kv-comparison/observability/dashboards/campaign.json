@@ -2040,6 +2040,87 @@
       "fieldConfig": {"defaults": {"unit": "none", "decimals": 9, "noValue": "No data"}, "overrides": [{"matcher": {"id": "byName", "options": "detail"}, "properties": [{"id": "custom.width", "value": 460}]}]},
       "options": {"showHeader": true, "cellHeight": "sm"}
     }
+    ,
+    {
+      "id": 29,
+      "title": "TERMINAL sampled read stage totals",
+      "type": "table",
+      "datasource": {"type": "prometheus", "uid": "kv-campaign-prometheus"},
+      "description": "Opt-in measurement-only read-diagnostics.json. Requested, selected and completed operations are distinct populations. partition=aggregate and actual owner partition IDs are separate views of one shared sampled prefix; do not pool them. Stage means use each stage and partition's own sum/count. Missing observations are No data, not zero. clock_domain separates owner and coordinator work; transport stages are connection-local and may include interleaved traffic. Seconds show sum, mean or observed maximum, not quantiles, pure wire/device latency or additive fractions.",
+      "gridPos": {"x": 0, "y": 124, "w": 24, "h": 12},
+      "targets": [
+        {"refId": "A", "expr": "label_replace(label_replace(label_replace(label_replace(last_over_time({__name__=~\"kv_case_read_diagnostic_(available|operations|stage_seconds|stage_count)\",job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",phase=\"measurement\",scope=\"sampled_prefix\"}[$__range]), \"metric\", \"$1\", \"__name__\", \"kv_case_read_diagnostic_(.*)\"), \"detail\", \"$1\", \"stage\", \"(.+)\"), \"detail\", \"$1\", \"counter\", \"(.+)\"), \"detail\", \"$1\", \"population\", \"(.+)\")", "format": "table", "instant": true, "range": false}
+      ],
+      "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "__name__": true, "job": true, "instance": true, "host_index": true, "host_role": true, "run_id": true, "exported_run_id": true, "case_id": true, "exported_case_id": true, "phase": true, "population": true, "counter": true, "stage": true, "cohort": true, "diagnostic_backend": true, "profile": true, "repeat": true, "requested_backend": true, "scope": true, "value_bytes": true}, "indexByName": {"partition": 0, "clock_domain": 1, "detail": 2, "metric": 3, "statistic": 4, "Value": 5}}}],
+      "fieldConfig": {"defaults": {"unit": "none", "decimals": 9, "noValue": "No data"}, "overrides": [{"matcher": {"id": "byName", "options": "detail"}, "properties": [{"id": "custom.width", "value": 340}]}, {"matcher": {"id": "byName", "options": "partition"}, "properties": [{"id": "custom.width", "value": 90}]}, {"matcher": {"id": "byName", "options": "Value"}, "properties": [{"id": "custom.width", "value": 160}]}]},
+      "options": {"showHeader": true, "cellHeight": "sm"}
+    },
+    {
+      "id": 30,
+      "title": "TERMINAL independent coordinator API resolution prefix",
+      "type": "table",
+      "datasource": {"type": "prometheus", "uid": "kv-campaign-prometheus"},
+      "description": "First N point/bulk resolution attempts, independently selected from the remote-flight prefix. Member counts can mix cache hits, index misses and remote misses within one bulk attempt. Per-stage counts are independent; unavailable stages have no timing. Never add overlapping stages or treat lookup as the entire API.",
+      "gridPos": {"x": 0, "y": 136, "w": 24, "h": 10},
+      "targets": [{"refId": "A", "expr": "last_over_time({__name__=~\"kv_case_read_diagnostic_(available|operations|stage_available|stage_seconds|stage_count)\",job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",scope=\"api_resolution_prefix\"}[$__range])", "format": "table", "instant": true, "range": false}],
+      "fieldConfig": {"defaults": {"unit": "none", "decimals": 9, "noValue": "No data"}, "overrides": []},
+      "options": {"showHeader": true, "cellHeight": "sm"}
+    },
+    {
+      "id": 31,
+      "title": "TERMINAL sampled owner response node boundaries",
+      "type": "table",
+      "datasource": {"type": "prometheus", "uid": "kv-campaign-prometheus"},
+      "description": "Per-owner sampled grant and response encode, local output queue, submission and retirement boundary deltas. Populations can differ from completed coordinator flights; retirement is local completion, not peer receipt. Scope node_lifetime_end maxima are not interval maxima. No pure wire or physical device latency.",
+      "gridPos": {"x": 0, "y": 146, "w": 24, "h": 10},
+      "targets": [{"refId": "A", "expr": "last_over_time({__name__=~\"kv_case_read_boundary_stage_(available|seconds|count)\",job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",scope=~\"measurement_boundary|node_lifetime_end\"}[$__range])", "format": "table", "instant": true, "range": false}],
+      "fieldConfig": {"defaults": {"unit": "none", "decimals": 9, "noValue": "No data"}, "overrides": []},
+      "options": {"showHeader": true, "cellHeight": "sm"}
+    },
+    {
+      "id": 32,
+      "title": "Requested and effective cache policies",
+      "type": "table",
+      "datasource": {"type": "prometheus", "uid": "kv-campaign-prometheus"},
+      "description": "Requested and verified effective policies are separate; unavailable effective policy is not zero. Coordinator and owner explicit caches, registered RAM, and Linux page cache are different tiers. Dropping page cache is not proof of physical NVMe service.",
+      "gridPos": {"x": 0, "y": 156, "w": 24, "h": 8},
+      "targets": [{"refId": "A", "expr": "last_over_time({__name__=~\"kv_case_cache_policy_(available|field_available|info|value)\",job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range])", "format": "table", "instant": true, "range": false}],
+      "fieldConfig": {"defaults": {"unit": "none", "noValue": "No data"}, "overrides": []},
+      "options": {"showHeader": true, "cellHeight": "sm"}
+    },
+    {
+      "id": 33,
+      "title": "Cache and registered-memory boundary gauges",
+      "type": "table",
+      "datasource": {"type": "prometheus", "uid": "kv-campaign-prometheus"},
+      "description": "Sequential start/end snapshots, not atomic interval averages or peaks. Explicit cache and registered-memory occupancy are distinct from Linux page-cache state.",
+      "gridPos": {"x": 0, "y": 164, "w": 24, "h": 8},
+      "targets": [{"refId": "A", "expr": "last_over_time(kv_case_read_boundary_gauge{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range])", "format": "table", "instant": true, "range": false}],
+      "fieldConfig": {"defaults": {"unit": "none", "noValue": "No data"}, "overrides": []},
+      "options": {"showHeader": true, "cellHeight": "sm"}
+    },
+    {
+      "id": 34,
+      "title": "Read-lane sessions and per-lane measurement counters",
+      "type": "table",
+      "datasource": {"type": "prometheus", "uid": "kv-campaign-prometheus"},
+      "description": "Actual instantiated lane boundary snapshots and per-lane counter deltas; session_present means locally usable constructed session, not current peer health. Unknown presence is unavailable. Do not add per-lane and aggregate counters.",
+      "gridPos": {"x": 0, "y": 172, "w": 24, "h": 10},
+      "targets": [{"refId": "A", "expr": "last_over_time({__name__=~\"kv_case_read_lane_session_(available|present)\",job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range]) or last_over_time(kv_case_read_path_calls{job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",component=\"client_resident_lane\"}[$__range])", "format": "table", "instant": true, "range": false}],
+      "fieldConfig": {"defaults": {"unit": "none", "noValue": "No data"}, "overrides": []},
+      "options": {"showHeader": true, "cellHeight": "sm"}
+    },
+    {
+      "id": 35,
+      "title": "Block-driver request observations — per host",
+      "type": "table",
+      "datasource": {"type": "prometheus", "uid": "kv-campaign-prometheus"},
+      "description": "Device-wide block-driver issue-to-completion observations during the collector window, which begins before measurement release and ends after its completion gate; not filtered to the exact measurement interval. Per host and trace backend. Only request-identity intervals are exported; tracefs sector/length candidates are not proven matches. Counts, availability, loss, truncation, timestamp unit and observed resolution remain separate. Request intervals are not pure NVMe/NAND service, per-API latency, or additive to API stages. No pooling across hosts.",
+      "gridPos": {"x": 0, "y": 182, "w": 24, "h": 12},
+      "targets": [{"refId": "A", "expr": "last_over_time({__name__=~\"kv_case_block_(trace|interval)_(available|qualified|truncated|count|counter_available|timestamp_available|timestamp_seconds|seconds)\",job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",scope=\"collector_window_block_device_wide\",resource_host_index=~\"$host_index\"}[$__range])", "format": "table", "instant": true, "range": false}],
+      "fieldConfig": {"defaults": {"unit": "none", "decimals": 9, "noValue": "No data"}, "overrides": []},
+      "options": {"showHeader": true, "cellHeight": "sm"}
+    }
   ],
   "annotations": {
     "list": []

@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 import cloud_campaign as cloud
+import cloud_controller as controller
 
 
 class CloudMatrixTests(unittest.TestCase):
@@ -30,6 +31,183 @@ class CloudMatrixTests(unittest.TestCase):
             "offered_seconds": 8, "case_deadline_seconds": 180,
             "hard_deadline_seconds": 10800, "export_reserve_seconds": 600,
         }
+
+    def test_focused_tiers_are_ordered_matched_and_bounded(self):
+        jobs = cloud.make_matrix(self.spec(1) | {"mode": "read-tier"})
+        self.assertEqual(len(jobs), 258)
+        names = list(dict.fromkeys(j["read_tier"]["name"] for j in jobs))
+        self.assertEqual(names, ["remote", "coordinator_hit", "owner_hit", "registered_steady",
+                                 "registered_steady_c16_mixed_acquisition_reuse",
+                                 "first_touch_no_promotion", "registered_acquire", "registered_reuse",
+                                 "registered_reuse_c16_mixed_acquisition_reuse", "wal_warm", "wal_warm_oversize_async_fallback",
+                                 "native_hot_wal_lru0_pagecache", "cold_device", "native_cold_os_lru0",
+                                 "bounded_mixed"])
+        native = [j for j in jobs if j["backend"] == "native"]
+        self.assertEqual(len(native), 10)
+        self.assertTrue(all("diagnostics" not in j for j in native))
+        remote = [j for j in jobs if j["backend"] != "native"]
+        twins = {}
+        for job in remote:
+            twins.setdefault((job["read_tier"]["name"], job["read_tier"]["source_id"]), []).append(job)
+        for first, second in twins.values():
+            self.assertFalse(first["read_tier"]["profiled"])
+            self.assertTrue(second["read_tier"]["profiled"])
+            self.assertEqual(first["read_tier"]["source_id"], second["read_tier"]["source_id"])
+            self.assertEqual(first["mix"], second["mix"])
+            a = cloud.make_run_config(first, Path("/tmp/owned-case"), {}, "source")
+            b = cloud.make_run_config(second, Path("/tmp/owned-case"), {}, "source")
+            self.assertEqual(a["namespace"], b["namespace"])
+            self.assertEqual(a["dataset"], b["dataset"])
+            self.assertEqual(a["phases"], b["phases"])
+            if "resident_reads" in first:
+                self.assertLessEqual(first["value_size"], first["resident_reads"]["max_read_bytes"])
+        contended = [job for job in jobs if "-c16-" in job["profile"]]
+        self.assertEqual(len(contended), 90)
+        self.assertTrue(all(job["concurrency"] == 16 and job["read_lanes"] == (0 if job["backend"] == "native" else 4)
+                            for job in contended))
+        self.assertEqual({(job["value_size"], job["mix"]["get_many"]) for job in contended}, {(1024, 0), (8192, 100)})
+        self.assertTrue(all(job["warmup_key_sweep"] and
+                            job["warmup_operations"] * (32 if job["mix"]["get_many"] else 1) >= job["keys"]
+                            for job in contended))
+        with self.assertRaises(ValueError):
+            cloud.make_matrix(self.spec(1) | {"mode": "read-tier", "backends": ["native"]})
+
+    def test_focused_data_identity_is_shared_across_backends_and_profiles(self):
+        jobs = cloud.make_matrix(self.spec(1) | {"mode": "read-tier"})
+        selected = [job for job in jobs if job["value_size"] == 8192]
+        self.assertEqual({job["backend"] for job in selected}, {"native", *cloud.TRANSPORTS})
+        self.assertGreater(len({job["read_tier"]["source_id"] for job in selected}), 4)
+        self.assertEqual(len({job["read_tier"]["data_id"] for job in selected}), 1)
+        configs = [cloud.make_run_config(job, Path("/tmp/owned-case"), {}, "source") for job in selected]
+        self.assertEqual(len({config["namespace"] for config in configs}), 1)
+        self.assertEqual(len({config["seed"] for config in configs}), 1)
+        self.assertEqual(len({json.dumps(config["dataset"], sort_keys=True) for config in configs}), 1)
+        self.assertGreater(len({json.dumps(config["workload"], sort_keys=True) for config in configs}), 1)
+        other = next(job for job in jobs if job["value_size"] == 1024)
+        self.assertNotEqual(other["read_tier"]["data_id"], selected[0]["read_tier"]["data_id"])
+
+    def test_first_touch_promotion_pair_changes_only_registered_policy(self):
+        jobs = cloud.make_matrix(self.spec(1) | {"mode": "read-tier"})
+        for size in (1024, 8192):
+            for profiled in (False, True):
+                first = next(j for j in jobs if j["read_tier"]["name"] == "first_touch_no_promotion"
+                             and j["value_size"] == size and j["read_tier"]["profiled"] == profiled)
+                promoted = next(j for j in jobs if j["read_tier"]["name"] == "registered_acquire"
+                                and j["value_size"] == size and j["read_tier"]["profiled"] == profiled)
+                self.assertTrue(first["owner_read_resident_first"])
+                self.assertEqual(first["owner_read_resident_first"], promoted["owner_read_resident_first"])
+                self.assertEqual(first["read_tier"]["source_id"], promoted["read_tier"]["source_id"])
+                self.assertEqual(first["read_tier"]["data_id"], promoted["read_tier"]["data_id"])
+                for key in ("keys", "mix", "concurrency", "read_lanes", "warmup_operations",
+                            "measurement_operations", "measurement_key_sweep", "coordinator_cache_bytes",
+                            "owner_read_cache_bytes", "drop_os_caches", "distribution"):
+                    self.assertEqual(first[key], promoted[key])
+                a = cloud.make_run_config(first, Path("/tmp/owned-case"), {}, "source")
+                b = cloud.make_run_config(promoted, Path("/tmp/owned-case"), {}, "source")
+                for key in ("seed", "namespace", "dataset", "workload", "execution", "phases"):
+                    self.assertEqual(a[key], b[key])
+                self.assertNotIn("resident_reads", first)
+                self.assertTrue(promoted["resident_reads"]["require_device_read"])
+
+    def test_pure_cache_budgets_fit_working_set_and_fleet_bounds(self):
+        jobs = cloud.make_matrix(self.spec(1) | {"mode": "read-tier"})
+        pure = [j for j in jobs if j["read_tier"]["name"] == "coordinator_hit"]
+        self.assertTrue(all(j["coordinator_cache_bytes"] >= 2 * j["keys"] * (j["value_size"] + 512)
+                            for j in pure))
+        large = next(j for j in pure if j["value_size"] == 65536)
+        self.assertGreaterEqual(large["coordinator_cache_bytes"], 1024**3)
+        self.assertGreaterEqual(large["coordinator_read_memory_allowance_bytes"],
+                                large["coordinator_cache_bytes"] + 64 * 1024**2)
+        owners = [j for j in jobs if j["read_tier"]["name"] == "owner_hit" and j["value_size"] == 65536]
+        self.assertTrue(all(j["owner_read_cache_bytes"] >= j["keys"] * (j["value_size"] + 512) // 2 for j in owners))
+        mixed = [j for j in jobs if j["read_tier"]["name"] == "bounded_mixed"]
+        self.assertTrue(all(j["coordinator_cache_bytes"] == j["owner_read_cache_bytes"] == 1024**2 for j in mixed))
+        controller.validate_read_tier_memory(jobs, {"client_memory_mib": 16384, "server_memory_mib": 16384})
+        with self.assertRaisesRegex(ValueError, "fleet memory budget"):
+            controller.validate_read_tier_memory(jobs, {"client_memory_mib": 1024, "server_memory_mib": 16384})
+
+    def test_focused_report_exposes_missing_and_partial_trace_capability(self):
+        spec = self.spec(1) | {"mode": "read-tier"}
+        jobs = cloud.make_matrix(spec)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "matrix.json").write_text(json.dumps({"spec": spec, "jobs": jobs}))
+            report = cloud.report(root)
+            self.assertFalse(report["trace_capability"]["identity_backend_available"])
+            self.assertIn("probe not completed", report["trace_capability"]["gaps"][0])
+            receipt = {"schema_version": 1, "identity_backend_available": False,
+                       "hosts": [], "gaps": [{"host_index": 3, "gaps": ["BPF unavailable"]}]}
+            (root / "trace-capability.json").write_text(json.dumps(receipt))
+            self.assertEqual(cloud.report(root)["trace_capability"], receipt)
+
+    def test_tier_qualification_never_infers_missing_or_cold_device_evidence(self):
+        job = next(j for j in cloud.make_matrix(self.spec(1) | {"mode": "read-tier"})
+                   if j["read_tier"]["name"] == "cold_device")
+        proof = cloud.qualify_read_tier(job, None, {"status": "completed"})
+        self.assertFalse(proof["qualified"])
+        self.assertIsNone(proof["observed"]["wal_reads"])
+        self.assertTrue(any("trace" in reason for reason in proof["reasons"]))
+
+    def test_tier_plot_profiles_do_not_share_identity(self):
+        jobs = cloud.make_matrix(self.spec(1) | {"mode": "read-tier"})
+        identities = {(j["backend"], j["cohort"], j["profile"], j["value_size"], j["repeat"]) for j in jobs}
+        self.assertEqual(len(identities), len(jobs))
+
+    def test_cold_trace_loss_and_missing_counts_disqualify(self):
+        job = next(j for j in cloud.make_matrix(self.spec(1) | {"mode": "read-tier"})
+                   if j["read_tier"]["name"] == "cold_device")
+        coord = {"available": True, "counters": {"hits": 0, "misses": 1, "read_rpc_count": 1}}
+        owner_counts = {"cache_hits": 0, "cache_misses": 1, "wal_reads": 1,
+                        "async_read_submissions": 1, "resident_read_successes": 0, "resident_read_fallbacks": 0}
+        client_counts = {"grant_acquisitions": 0, "rma_posts": 0, "rma_completions": 0, "rma_errors": 0}
+        def partitions(counts):
+            return {"available": True, "partitions": {str(i): {"available": True, "counters": dict(counts)}
+                                                       for i in range(5)}}
+        evidence = {"measurement_drained": True, "deltas": {"coordinator": coord,
+                    "owner_executor": partitions(owner_counts), "client_resident": partitions(client_counts)}}
+        trace = dict.fromkeys(("unmatched_completions", "unmatched_issues", "overlaps",
+            "split_or_partial_completions", "requeues", "completion_errors", "malformed_events",
+            "outstanding_overflow", "lost", "truncated"), 0)
+        trace.update(available=True, qualified=False, read_issues=1, read_completions=1)
+        receipt = {"status": "completed", "read_tier_effective": dict(job["read_tier"]["requested"]),
+                   "cold_device_evidence": [{"available": False}, *[dict(trace) for _ in range(5)]]}
+        proof = cloud.qualify_read_tier(job, evidence, receipt)
+        self.assertFalse(proof["qualified"])
+        self.assertEqual(proof["scope"], "measurement_counters_and_wider_collector_window")
+        self.assertTrue(any("wider than measurement" in reason for reason in proof["reasons"]))
+        receipt["cold_device_evidence"][2]["truncated"] = True
+        self.assertFalse(cloud.qualify_read_tier(job, evidence, receipt)["qualified"])
+        receipt["cold_device_evidence"][2] = {"available": False}
+        self.assertFalse(cloud.qualify_read_tier(job, evidence, receipt)["qualified"])
+
+    def test_first_acquisition_is_message_population_not_rma(self):
+        job = next(j for j in cloud.make_matrix(self.spec(1) | {"mode": "read-tier"})
+                   if j["read_tier"]["name"] == "registered_acquire")
+        self.assertEqual((job["measurement_operations"], job["keys"]), (8192, 8192))
+        self.assertTrue(job["measurement_key_sweep"])
+        coord = {"available": True, "counters": {"hits": 0, "misses": 1, "read_rpc_count": 1}}
+        owner = {"cache_hits": 0, "cache_misses": 0, "wal_reads": 0, "async_read_submissions": 0,
+                 "resident_read_successes": 0, "resident_read_fallbacks": 0}
+        client = dict.fromkeys(("grant_acquisitions", "rma_posts", "rma_completions", "rma_errors",
+            "fallback_missing", "fallback_oversize", "fallback_capacity", "fallback_unsupported",
+            "fallback_stale", "message_read_requests"), 0)
+        def partitions(values):
+            return {"available": True, "partitions": {str(i): {"available": True, "counters": dict(values)}
+                                                       for i in range(5)}}
+        clients = partitions(client)
+        clients["partitions"]["0"]["counters"].update(grant_acquisitions=8192, message_read_requests=8192, fallback_missing=8192)
+        lanes = {"available": True, "partitions": {str(i): {"lanes": {"0": {
+            "session_present": True, "stats": {"grants_live": 5}}}} for i in range(5)}}
+        grants = partitions({"issued": 0, "reused": 0})
+        grants["partitions"]["0"]["counters"]["issued"] = 8192
+        evidence = {"measurement_drained": True, "start": {"client_resident_lanes": lanes},
+                    "deltas": {"coordinator": coord, "owner_executor": partitions(owner),
+                               "client_resident": clients, "owner_grants": grants}}
+        receipt = {"status": "completed", "raw_artifacts_validated": True,
+                   "read_tier_effective": dict(job["read_tier"]["requested"])}
+        self.assertTrue(cloud.qualify_read_tier(job, evidence, receipt)["qualified"])
+        clients["partitions"]["0"]["counters"]["rma_posts"] = 1
+        self.assertFalse(cloud.qualify_read_tier(job, evidence, receipt)["qualified"])
 
     def test_one_repeat_preserves_every_first_repeat_job_and_run_configuration(self):
         single = cloud.make_matrix(self.spec(1))
@@ -63,6 +241,72 @@ class CloudMatrixTests(unittest.TestCase):
                           "offered_ops_per_second", "distribution", "coordinator_cache_bytes",
                           "owner_read_cache_bytes", "native_durability", "drop_os_caches"):
                 self.assertEqual(before[field], after[field])
+
+    def test_read_controls_cover_resident_bounds_and_full_working_set(self):
+        planned = cloud.make_matrix(self.spec(1) | {"diagnostics": {
+            "write_profile_limit": 256, "read_profile_limit": 256}})
+        resident = [job for job in planned if job["cohort"] == "resident_first_stage_diagnostics"]
+        expected = {(backend, size, profile) for backend in cloud.TRANSPORTS
+                    for size, profile in ((256, "read-concurrent"), (1024, "read-concurrent"),
+                        (8192, "read-concurrent"), (65536, "read-concurrent"), (8192, "read-many32"))}
+        self.assertEqual({(job["backend"], job["value_size"], job["profile"]) for job in resident}, expected)
+        for job in resident:
+            self.assertTrue(job["owner_read_resident_first"])
+            self.assertEqual((job["keys"], job["coordinator_cache_bytes"], job["owner_read_cache_bytes"]),
+                             (4096, 0, 0))
+            self.assertEqual(job["measurement_operations"], 2048 if job["profile"] == "read-many32" else 8192)
+        controls = [job for job in planned if job["cohort"] == "registered_ram_fullset_control"]
+        self.assertEqual({(job["backend"], job["value_size"], job["profile"]) for job in controls},
+                         {("tidehunter_efa_native", 1024, "registered-scalar"),
+                          ("tidehunter_efa_native", 8192, "registered-many32")})
+        for job in controls:
+            config = cloud.make_run_config(job, Path("/tmp/owned-case"), {}, "source")
+            self.assertEqual(config["dataset"]["keys"], 4096)
+            self.assertEqual((job["concurrency"], job["read_lanes"]), (1, 1))
+            self.assertTrue(config["phases"]["warmup_key_sweep"])
+            keys_per_call = 32 if job["mix"]["get_many"] else 1
+            self.assertGreaterEqual(config["phases"]["warmup_operations"] * keys_per_call, 4096)
+            self.assertTrue(job["resident_reads"]["require_device_read"])
+        with self.assertRaisesRegex(ValueError, "max_cases"):
+            cloud.make_matrix(self.spec(3) | {"max_cases": 890, "diagnostics": {
+                "write_profile_limit": 256, "read_profile_limit": 256}})
+
+    def test_fullset_qualification_rejects_fallback_and_missing_observations(self):
+        job = {"cohort": "registered_ram_fullset_control", "warmup_key_sweep": True,
+               "resident_reads": {"require_device_read": True}}
+        resident = {name: 0 for name in ("message_read_requests", "grant_acquisitions",
+            "grant_candidates", "rma_errors", "fallback_missing", "fallback_oversize",
+            "fallback_capacity", "fallback_unsupported", "fallback_stale")}
+        resident.update(rma_posts=1, rma_completions=1)
+        owners = {"wal_reads": 0, "async_read_submissions": 0, "cache_hits": 0}
+        def group(counters):
+            return {"available": True, "partitions": {
+                str(index): {"available": True, "counters": dict(counters)} for index in range(5)}}
+        evidence = {"measurement_drained": True, "deltas": {
+            "coordinator": {"available": True, "counters": {"hits": 0}},
+            "client_resident": group(resident), "owner_executor": group(owners)}}
+        self.assertTrue(cloud.qualify_fullset_read_path(job, evidence)["qualified"])
+        evidence["deltas"]["client_resident"]["partitions"]["2"]["counters"]["message_read_requests"] = 1
+        proof = cloud.qualify_fullset_read_path(job, evidence)
+        self.assertFalse(proof["qualified"])
+        self.assertEqual(proof["observed"]["message_read_requests"], 1)
+        evidence["deltas"]["client_resident"]["partitions"].pop("2")
+        proof = cloud.qualify_fullset_read_path(job, evidence)
+        self.assertFalse(proof["qualified"])
+        self.assertIsNone(proof["observed"]["message_read_requests"])
+
+
+    def test_manual_read_diagnostics_are_propagated_for_mixed_cases(self):
+        job = next(job for job in cloud.make_matrix(self.spec(1))
+                   if job["backend"] == "tidehunter_tcp" and job["profile"] == "point-mixed")
+        job["diagnostics"] = {"read_profile_limit": 7, "write_profile_limit": 0}
+        self.assertEqual(cloud.make_run_config(job, Path("/tmp/owned-case"), {}, "source")["diagnostics"],
+                         job["diagnostics"])
+
+    def test_invalid_read_diagnostic_limits_are_rejected(self):
+        for value in (True, -1, 65537, 0.5, None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                cloud.make_matrix(self.spec(1) | {"diagnostics": {"read_profile_limit": value}})
 
     def test_invalid_diagnostic_budget_is_rejected_before_launch(self):
         for value in (True, -1, 65537, {}, {"write_profile_limit": 16, "unknown": 1}):
@@ -275,6 +519,50 @@ class CloudReports(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "phase"):
                 cloud.admit_write_diagnostics(directory, job, completed=False)
 
+    def test_read_diagnostics_admission_checks_runtime_and_integrity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / "result").mkdir()
+            job = {"backend": "tidehunter_tcp", "diagnostics": {"read_profile_limit": 16}}
+            with self.assertRaisesRegex(ValueError, "artifact is missing"):
+                cloud.admit_read_diagnostics(directory, job, completed=True)
+            profile = {"schema_version": 1, "backend": "tidehunter_tcp", "phase": "measurement",
+                       "phase_attempted": True, "runtime_enabled": True,
+                       "runtime_observation_mode": "sampled_prefix",
+                       "selection": {"requested_limit": 16, "selected_operations": 1,
+                                     "completed_operations": 1, "selection_policy": "first",
+                                     "phase_exclusions": ["warmup"]},
+                       "clock_scope": "process monotonic", "overlap_semantics": "nested",
+                       "unsupported_stages": [], "profile": {"stages": {
+                           "server_async": {"available": True, "sum_ns": 10, "count": 2, "max_ns": 8,
+                                            "unavailable_reason": None},
+                           "server_nowait": {"available": False, "sum_ns": None, "count": 0,
+                                             "max_ns": None, "unavailable_reason": "no samples"}},
+                           "counters": {}, "owners": {"3": {"stages": {
+                               "server_async": {"available": True, "sum_ns": 8, "count": 1,
+                                                "max_ns": 8, "unavailable_reason": None}},
+                               "counters": {}}}}, "error": None}
+            path = directory / "result/read-diagnostics.json"
+            path.write_text(json.dumps(profile))
+            binding = cloud.admit_read_diagnostics(directory, job, completed=True)
+            self.assertEqual(binding["observed"], profile)
+            self.assertEqual(binding["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+            text = "\n".join(cloud.read_diagnostic_report([{"case_id": "case", "job": {
+                "cohort": "read_stage_diagnostics", "diagnostic_source_cohort": "owner_cache_configured"},
+                "read_diagnostics": binding}]))
+            self.assertIn("| case | owner_cache_configured | owner | aggregate | server_async | 2 | 10 | 5.000 | 8 |", text)
+            self.assertIn("| case | owner_cache_configured | owner | aggregate | server_nowait | — | — | — | — |", text)
+            self.assertIn("| case | owner_cache_configured | owner | 3 | server_async | 1 | 8 | 8.000 | 8 |", text)
+            self.assertNotIn("p99", text)
+            for change in ({"runtime_enabled": False}, {"error": "failed"}, {"phase": "warmup"}):
+                path.write_text(json.dumps(profile | change))
+                with self.assertRaises(ValueError):
+                    cloud.admit_read_diagnostics(directory, job, completed=True)
+            invalid = profile | {"selection": profile["selection"] | {"completed_operations": 2}}
+            path.write_text(json.dumps(invalid))
+            with self.assertRaises(ValueError):
+                cloud.admit_read_diagnostics(directory, job, completed=True)
+
     def test_failed_partial_cell_preserves_timeout_denominator_and_observed_quantiles(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -368,7 +656,7 @@ class CloudReports(unittest.TestCase):
             self.assertNotIn("metrics", row)
             self.assertEqual(row["status"], "failed")
 
-    def test_common_operation_order_is_identical_across_backends_with_cold_last(self):
+    def test_common_operation_order_is_identical_across_backends(self):
         spec = json.loads(Path(cloud.__file__).with_name("cloud-campaign.json").read_text())
         jobs = cloud.make_matrix(spec)
         for repeat in range(spec["repeats"]):
@@ -380,7 +668,6 @@ class CloudReports(unittest.TestCase):
                 if expected is None:
                     expected = common
                 self.assertEqual(common, expected)
-                self.assertEqual(block[-1]["cohort"], "cold_os_cache")
                 for job in block:
                     config = cloud.make_run_config(job, Path("/tmp/owned-case"), {}, None)
                     self.assertLessEqual(len(config["namespace"].encode()), 64)

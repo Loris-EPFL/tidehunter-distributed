@@ -82,7 +82,7 @@ resources. Local qualification is not a cloud cost or overhead measurement.
 
 ## What the campaign dashboard measures
 
-Dashboard UID: `kv-comparison-campaign`. It contains 28 panels. Select
+Dashboard UID: `kv-comparison-campaign`. It contains 29 panels. Select
 **one run and one case**; do not pool different value sizes,
 durability contracts, cache cohorts, repeats or backends.
 
@@ -233,6 +233,75 @@ The dashboard still cannot supply unmeasured TLS/fsync/coordination breakdowns,
 pure network RTT, hardware-RDMA latency, per-request NVMe latency, or
 vendor-specific compaction/GC internals. Use raw CSV, diagnostic artifacts,
 deployment receipts and guarantee metadata for the research comparison.
+
+## Read-stage diagnostics
+
+`finish-case --read-diagnostics FILE` publishes the real bounded schema-1
+`read-diagnostics.json` from the measured case. Read and write artifacts are
+independent. The read limit is shared across selected remote flights, not a
+fresh allowance on every connection or owner.
+
+Read artifacts are bounded to 256 KiB, ten tree levels, 512 keys per object,
+32 list items and 2,048 characters per metadata string. Stage observations
+require a positive own count; unavailable stages require count zero, null
+sum/max and a reason. `profile.owners` is keyed by actual u32 partition IDs,
+with at most five configured owners. Missing owner data is not fabricated.
+
+The combined benchmark or host selection is independently bounded to 1 MiB,
+including the actual indented JSON bytes. The monitor rejects oversized
+selections before atomic publication; individual diagnostic limits still apply.
+
+`kv_case_read_diagnostic_stage_seconds` has `statistic=sum|mean|max`, with the
+mean derived from that same stage and partition's sum/count. Max is omitted
+when not collected. `kv_case_read_diagnostic_stage_count` retains the actual
+denominator and applicable partial/error/deferred counts.
+`kv_case_read_diagnostic_available` reports observation availability.
+`partition=aggregate` and individual partition IDs are separate views of the
+same selected work; do not add or average them together.
+
+`scope=api_resolution_prefix` is a separate first-N population of point and
+bulk coordinator resolution attempts. It includes cache hits and index misses
+and cannot be combined with, or normalized by, the remote-flight prefix.
+Bulk member outcomes and stage counts have their own denominators. Stage
+availability is explicit; sums, means and maxima are not percentiles.
+The resolution snapshot is exported independently when its measurement arm and
+drain are valid, even if a separate remote-flight profile reports an error.
+Invalid or incomplete resolution boundaries remain unavailable.
+
+Actual instantiated read lanes are sampled before and after measurement.
+Per-lane counter deltas and owner aggregates are separate views; lane session
+presence indicates locally usable constructed state, not fresh peer health.
+Missing or broken session state is unavailable, not a fabricated zero.
+
+Measurement-boundary owner grant and response/output counters use sampled
+node-local populations. Missing fields remain unavailable. Their interval
+counts, sums and means are distinct from per-response profiles. A node-lifetime
+end maximum is explicitly labelled `scope=node_lifetime_end`; it cannot be
+subtracted into a measurement-interval maximum. Output retirement is local
+completion, not receipt by the peer. Provider registration calls are not proof
+of hardware pinning.
+
+The cache-policy table separates requested settings from effective receipts and
+coordinator/owner explicit caches from registered RAM and Linux page cache.
+Unavailable effective policy remains unavailable. Disabling an application
+cache or dropping page cache does not prove physical NVMe service.
+
+The terminal read table shows partition, clock domain, stage/population, metric,
+statistic and value. It preserves absent data and does not infer hardware
+network time or physical NVMe service from asynchronous file reads.
+The [adapter guide](../../../benchmarks/kv-research/ADAPTERS.md#measurement-phase-read-diagnostics)
+defines every timed boundary and the unsupported scopes.
+
+The optional terminal cold-device table shows per-host block-driver observations
+over the device-wide collector window, not the exact measurement interval: the
+collector starts before release and stops after the completion gate. It exposes
+issue and completion counts, loss/truncation and timestamp-unit/resolution
+availability. Only request-identity `intervals_ns` distributions are exported;
+tracefs sector/length candidates are never promoted to verified intervals.
+Zero counts and unknown observations differ. No raw events enter Prometheus.
+These request populations are neither per-API latency nor pure NVMe/NAND time;
+do not add them to API stages or pool them across hosts.
+
 
 ## Retain and replay offline
 
