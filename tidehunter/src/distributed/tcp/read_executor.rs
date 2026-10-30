@@ -956,6 +956,23 @@ impl ReadExecutor {
             profile.nowait_deferred += resident_deferred as u64;
         }
         let misses = records.iter().filter(|record| record.is_none()).count();
+        if misses == 0 {
+            let mut state = self.admission.state.lock();
+            state.stats.resident_read_attempts += resident_attempts as u64;
+            state.stats.resident_read_successes += resident_successes as u64;
+            state.stats.resident_read_deferred += resident_deferred as u64;
+            state.stats.cache_hits += cache_hits as u64;
+
+            state.stats.cache_misses += initial_misses as u64;
+            state.stats.cache_served_bytes += served_bytes;
+            state.stats.wal_reads += initial_misses as u64;
+            state.stats.wal_read_bytes += wal_bytes;
+            drop(state);
+            return Ok(SubmitOutcome::Ready {
+                records: records.into_iter().map(Option::unwrap).collect(),
+                lease: lease.take().expect("reserved read reply"),
+            });
+        }
         let mut devices = Vec::<(u64, usize)>::new();
         for (index, (_, plan)) in plans.iter().enumerate() {
             if records[index].is_none() {
@@ -970,21 +987,6 @@ impl ReadExecutor {
         state.stats.resident_read_attempts += resident_attempts as u64;
         state.stats.resident_read_successes += resident_successes as u64;
         state.stats.resident_read_deferred += resident_deferred as u64;
-        if misses == 0 {
-            state.stats.cache_hits += cache_hits as u64;
-
-            state.stats.cache_misses += initial_misses as u64;
-            state.stats.cache_served_bytes += served_bytes;
-            state.stats.wal_reads += initial_misses as u64;
-            state.stats.wal_read_bytes += wal_bytes;
-        }
-        if misses == 0 {
-            drop(state);
-            return Ok(SubmitOutcome::Ready {
-                records: records.into_iter().map(Option::unwrap).collect(),
-                lease: lease.take().expect("reserved read reply"),
-            });
-        }
         if devices
             .iter()
             .any(|(_, count)| *count > self.config.max_device_reads)

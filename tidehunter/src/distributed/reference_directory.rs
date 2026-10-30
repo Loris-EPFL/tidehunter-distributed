@@ -23,7 +23,9 @@ pub(crate) type HistoryWorkerHandle = Arc<Mutex<Option<JoinHandle<()>>>>;
 
 const MAX_RESIDENT_BATCHES: usize = 1024;
 const AUTHORITY_CACHE_ENTRIES: usize = 64;
-const MAX_AUTHORITY_CACHE_ENTRIES: usize = 1024;
+// The separately charged table and descriptor credits, not an artificial
+// 1,024-batch ceiling, bound useful authority residency for larger budgets.
+const MAX_AUTHORITY_CACHE_ENTRIES: usize = 8192;
 // The base allowance covers the 64-entry hash table and LRU sentinels. Charge
 // extra capacity conservatively for hashbrown's bucket/control-byte rounding.
 const CACHE_TABLE_BYTES_PER_EXTRA_ENTRY: usize = 64;

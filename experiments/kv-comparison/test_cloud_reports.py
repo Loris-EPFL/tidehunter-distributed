@@ -31,6 +31,44 @@ class CloudMatrixTests(unittest.TestCase):
             "offered_seconds": 8, "case_deadline_seconds": 180,
             "hard_deadline_seconds": 10800, "export_reserve_seconds": 600,
         }
+    def test_short_campaign_keeps_existing_cases_and_prioritizes_controls(self):
+        spec = self.spec(1)
+        jobs = cloud.make_matrix(spec | {"mode": "read-tier-focused"})
+        self.assertEqual(len(jobs), 191)
+        self.assertEqual(len({j["case_id"] for j in jobs}), len(jobs))
+        old = cloud.make_matrix(spec | {"mode": "read-tier"}) + cloud.make_matrix(spec)
+        by_id = {j["case_id"]: j for j in old}
+        self.assertTrue(all(by_id[j["case_id"]] == j for j in jobs if not j["case_id"].endswith("-handle-headroom")))
+        headroom = [j for j in jobs if j["case_id"].endswith("-handle-headroom")]
+        self.assertEqual(len(headroom), 8)
+        self.assertTrue(all(j["resident_reads"]["max_handles"] == 5 * j["keys"] for j in headroom))
+        self.assertTrue(all(j["read_tier"]["name"] in
+                            ("native_hot_wal_lru0_pagecache", "native_cold_os_lru0", "cold_device")
+                            for j in jobs[:12]))
+        selected = spec | {"mode": "read-tier-focused",
+                           "backends": ["native", "tidehunter_tcp", "tidehunter_efa_native", "valkey_tcp"]}
+        smaller = cloud.make_matrix(selected)
+        self.assertEqual(len(smaller), 108)
+        self.assertEqual({j["backend"] for j in smaller}, set(selected["backends"]))
+        self.assertEqual(sum(j["profile"] == "write-concurrent" for j in smaller), 4)
+        self.assertEqual(sum(j["profile"] == "read-many32" for j in smaller), 4)
+        with self.assertRaises(ValueError):
+            cloud.make_matrix(self.spec(2) | {"mode": "read-tier-focused"})
+    def test_short_campaign_includes_separate_write_profiles_when_requested(self):
+        spec = self.spec(1) | {"mode": "read-tier-focused",
+                              "diagnostics": {"write_profile_limit": 256, "read_profile_limit": 256}}
+        jobs = cloud.make_matrix(spec)
+        self.assertEqual(len(jobs), 196)
+        diagnostics = [j for j in jobs if j["cohort"] == "write_stage_diagnostics"]
+        self.assertEqual({j["backend"] for j in diagnostics}, {"native", *cloud.TRANSPORTS})
+        self.assertTrue(all(j["diagnostics"]["write_profile_limit"] == 256
+                            and j["measurement_operations"] == 4096 for j in diagnostics))
+        self.assertEqual(sum(j["cohort"] == "primary_rf1" and j["profile"] == "write-concurrent"
+                             for j in jobs), 9)
+        selected = spec | {"backends": ["native", "tidehunter_tcp", "tidehunter_efa_native", "valkey_tcp"]}
+        self.assertEqual(len(cloud.make_matrix(selected)), 111)
+
+
 
     def test_focused_tiers_are_ordered_matched_and_bounded(self):
         jobs = cloud.make_matrix(self.spec(1) | {"mode": "read-tier"})
@@ -179,6 +217,28 @@ class CloudMatrixTests(unittest.TestCase):
         self.assertFalse(cloud.qualify_read_tier(job, evidence, receipt)["qualified"])
         receipt["cold_device_evidence"][2] = {"available": False}
         self.assertFalse(cloud.qualify_read_tier(job, evidence, receipt)["qualified"])
+
+    def test_warm_wal_qualification_requires_no_cold_authority_loads(self):
+        job = next(j for j in cloud.make_matrix(self.spec(1) | {"mode": "read-tier"})
+                   if j["read_tier"]["name"] == "wal_warm" and j["value_size"] == 256)
+        def partitions(counts):
+            return {"available": True, "partitions": {str(i): {"available": True, "counters": dict(counts)}
+                                                       for i in range(5)}}
+        coord = {"available": True, "counters": {"hits": 0, "misses": 5, "read_rpc_count": 5}}
+        owner = {"cache_hits": 0, "cache_misses": 1, "wal_reads": 1, "async_read_submissions": 0,
+                 "resident_read_successes": 1, "resident_read_fallbacks": 0}
+        client = {"grant_acquisitions": 0, "rma_posts": 0, "rma_completions": 0, "rma_errors": 0}
+        boundary = {"owner_executor": {"available": True, "partitions": {str(i): {"authority": {"history_loads": 10}}
+                                                        for i in range(5)}}}
+        evidence = {"measurement_drained": True, "deltas": {"coordinator": coord,
+                    "owner_executor": partitions(owner), "client_resident": partitions(client)},
+                    "start": json.loads(json.dumps(boundary)), "end": json.loads(json.dumps(boundary))}
+        receipt = {"status": "completed", "read_tier_effective": dict(job["read_tier"]["requested"])}
+        self.assertTrue(cloud.qualify_read_tier(job, evidence, receipt)["qualified"])
+        evidence["end"]["owner_executor"]["partitions"]["0"]["authority"]["history_loads"] += 1
+        self.assertFalse(cloud.qualify_read_tier(job, evidence, receipt)["qualified"])
+        del evidence["end"]["owner_executor"]["partitions"]["0"]["authority"]
+        self.assertIsNone(cloud.qualify_read_tier(job, evidence, receipt)["observed"]["authority_history_loads"])
 
     def test_first_acquisition_is_message_population_not_rma(self):
         job = next(j for j in cloud.make_matrix(self.spec(1) | {"mode": "read-tier"})
@@ -652,9 +712,22 @@ class CloudReports(unittest.TestCase):
             directory, receipt = self.failure_fixture(root)
             receipt["raw_artifacts_validated"] = False
             (directory / "receipt.json").write_text(json.dumps(receipt))
+            # A timed-out client can finish writing after receipt admission failed.
+            # Those late artifacts are preserved, not promoted into observations.
+            late = directory / "result" / "measurement-read-evidence.json"
+            late.write_text(json.dumps({
+                "schema_version": 1, "scope": "measurement_boundary",
+                "measurement_attempted": True, "measurement_drained": False,
+                "start": None, "end": None, "deltas": {"available": False}}))
+            original_receipt = (directory / "receipt.json").read_bytes()
             row = cloud.summarize_case(directory)
             self.assertNotIn("metrics", row)
             self.assertEqual(row["status"], "failed")
+            self.assertEqual((directory / "receipt.json").read_bytes(), original_receipt)
+            receipt["status"] = "completed"
+            (directory / "receipt.json").write_text(json.dumps(receipt))
+            with self.assertRaises(ValueError):
+                cloud.summarize_case(directory)
 
     def test_common_operation_order_is_identical_across_backends(self):
         spec = json.loads(Path(cloud.__file__).with_name("cloud-campaign.json").read_text())

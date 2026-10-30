@@ -509,6 +509,60 @@ fn cold_old_authority_becomes_hot_without_lifetime_descriptor_residency() {
 }
 
 #[test]
+fn authority_cache_reuses_more_than_1024_sealed_batches_within_budget() {
+    let temp = tempdir::TempDir::new("storage-large-authority-cache").unwrap();
+    let mut config = config(vec![3], 3);
+    config.max_batches = 64;
+    config.max_reference_metadata_bytes = 8 * 1024 * 1024;
+    config.wal_file_bytes = 1024 * 1024;
+    let log = Arc::new(
+        PartitionLog::create(
+            &temp.path().join("stream"),
+            config.clone(),
+            &shape(),
+            metrics(),
+        )
+        .unwrap(),
+    );
+    let mut references = Vec::new();
+    for n in 0..1030 {
+        let receipt = log
+            .append_complete_batch(authority(&config), &batch(&config, n))
+            .unwrap();
+        log.persist_through(receipt).unwrap();
+        references.push(log.record_reference(receipt, 0).unwrap());
+    }
+    log.seal_epoch(authority(&config)).unwrap();
+    log.evict_authority_cache();
+    for reference in &references {
+        drop(log.plan_record_read(reference).unwrap());
+    }
+    let warmed = log.authority_cache_stats();
+    assert!(warmed.capacity >= references.len());
+    assert_eq!(warmed.entries, references.len());
+    assert!(log.stats().reference_metadata_bytes <= config.max_reference_metadata_bytes);
+    for (n, reference) in references.iter().enumerate() {
+        assert!(log.try_plan_record_read(reference).unwrap().is_some());
+        assert_eq!(
+            log.read_record(reference).unwrap(),
+            batch(&config, n as u64).mutations()[0]
+        );
+    }
+    let reused = log.authority_cache_stats();
+    assert_eq!(reused.history_loads, warmed.history_loads);
+    let mut forged = references[0];
+    forged.batch_digest.0[0] ^= 1;
+    assert!(log.try_plan_record_read(&forged).is_err());
+    log.evict_authority_cache();
+    assert_eq!(log.authority_cache_stats().entries, 0);
+    assert!(log.try_plan_record_read(&references[0]).unwrap().is_none());
+    assert_eq!(
+        log.read_record(&references[0]).unwrap(),
+        batch(&config, 0).mutations()[0]
+    );
+}
+
+#[test]
 fn metadata_cache_growth_and_pinned_reads_share_the_write_admission_budget() {
     let temp = tempdir::TempDir::new("storage-cache-table-budget").unwrap();
     let mut config = config(vec![3], 3);
@@ -523,6 +577,10 @@ fn metadata_cache_growth_and_pinned_reads_share_the_write_admission_budget() {
         )
         .unwrap(),
     );
+    let cache = log.authority_cache_stats();
+    assert!(cache.capacity < 1024);
+    assert!(cache.table_bytes <= config.max_reference_metadata_bytes);
+    assert!(log.stats().reference_metadata_bytes <= config.max_reference_metadata_bytes);
     let mut pins = Vec::new();
     let mut refused = None;
     for n in 0..512 {

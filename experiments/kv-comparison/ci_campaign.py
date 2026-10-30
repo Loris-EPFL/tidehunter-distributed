@@ -247,7 +247,7 @@ class Campaign(core.Campaign):
             bundle_key=self.run_id + '/inputs/bundle.tar.gz', bundle_sha256=runner['sha256'], bundle_bytes=runner['bytes'],
             source_sha256=bindings['source_sha256'], binary_sha256=bindings['binary_sha256'],
             deadline_utc=self.journal.data['expires_at'], ttl_seconds=self.cfg['ttl_seconds'], instance_type=candidate['instance_type'])
-        if self.cfg['spec'].get('mode', 'standard') == 'read-tier':
+        if self.cfg['spec'].get('mode', 'standard') in ('read-tier', 'read-tier-focused'):
             boot['read_tier_trace'] = True
         userdata = cloud_bootstrap.render_userdata(boot)
         self.pending_activation(boot)  # Must succeed before the allocator's RunInstances intent.
@@ -485,7 +485,7 @@ def main(argv=None):
     parser.add_argument('--inputs', type=Path)
     parser.add_argument('--output', type=Path)
     parser.add_argument('--backends', help='comma-separated nonempty subset of tracked backend IDs')
-    parser.add_argument('--mode', choices=('standard', 'read-tier'), default='standard')
+    parser.add_argument('--mode', choices=('standard', 'read-tier', 'read-tier-focused'), default='standard')
     parser.add_argument('--budget-file', type=Path, default=core.DEFAULT_BUDGET)
     args = parser.parse_args(argv)
     if args.action == 'validate':
