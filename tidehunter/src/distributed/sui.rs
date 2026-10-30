@@ -658,6 +658,23 @@ impl Db {
             remote.db.set_read_profile_limit(limit);
         }
     }
+    /// Snapshot sampled owner spans by configured partition without network I/O.
+    /// Native backends have no remote owner partitions.
+    pub fn visit_read_profile_partitions(&self, mut set: impl FnMut(u32, &'static str, u64)) {
+        if let Backend::Remote(remote) = &self.backend {
+            remote.profile.visit_partitions(&mut set);
+        }
+    }
+    /// Snapshot the separate bounded coordinator-resolution sample, including
+    /// cache hits and negative lookups that create no remote flight.
+    pub fn coordinator_resolution_snapshot(
+        &self,
+    ) -> Option<super::remote_db::CoordinatorResolutionSnapshot> {
+        match &self.backend {
+            Backend::Remote(remote) => Some(remote.profile.coordinator_resolution_snapshot()),
+            Backend::Native(_) => None,
+        }
+    }
     /// Drain admitted remote writes and finalize finite per-connection profile
     /// samples before a local metrics snapshot is collected.
     pub fn finish_write_profile(&self) -> Result<()> {
@@ -1322,7 +1339,11 @@ impl Db {
             Backend::Remote(_) => self.get(ks, key).map(|v| v.is_some()),
         }
     }
-    pub fn multi_get(&self, ks: KeySpace, keys: &[Vec<u8>]) -> Vec<Result<Option<Bytes>>> {
+    pub fn multi_get<K: AsRef<[u8]>>(
+        &self,
+        ks: KeySpace,
+        keys: &[K],
+    ) -> Vec<Result<Option<Bytes>>> {
         self.read_calls.fetch_add(1, Ordering::Relaxed);
         self.read_keys
             .fetch_add(keys.len() as u64, Ordering::Relaxed);
@@ -1331,7 +1352,7 @@ impl Db {
         }
         let Backend::Remote(remote) = &self.backend else {
             let db = self.native().expect("native backend");
-            return keys.iter().map(|key| db.get(ks, key)).collect();
+            return keys.iter().map(|key| db.get(ks, key.as_ref())).collect();
         };
         let (cut, _pin) = if keys.len() > 256 {
             match remote.db.protected_published_cut() {

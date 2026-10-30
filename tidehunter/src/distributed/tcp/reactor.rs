@@ -181,6 +181,32 @@ struct Output {
     /// Opt-in phase clock: offset zero = queued, no fence = submitting,
     /// fence present = awaiting local retirement. Reset never changes ownership.
     stage_started: Option<Instant>,
+    sampled: Option<SampledOutput>,
+}
+
+struct SampledOutput {
+    registry: Arc<resident::GrantRegistry>,
+    started: Instant,
+}
+
+impl SampledOutput {
+    fn transition(
+        &mut self,
+        stage: fn(&mut resident::ResidentGrantStats) -> &mut ReadStageProfile,
+    ) {
+        let now = Instant::now();
+        self.registry.record_promotion(|stats| {
+            let target = stage(stats);
+            let ns = now
+                .duration_since(self.started)
+                .as_nanos()
+                .min(u64::MAX as u128) as u64;
+            target.ns += ns;
+            target.count += 1;
+            target.max_ns = target.max_ns.max(ns);
+        });
+        self.started = now;
+    }
 }
 impl Output {
     #[cfg(feature = "experimental-fabric")]
@@ -443,12 +469,9 @@ impl Session {
             let mut encoded = wire_codec(limit)
                 .serialize(&empty)
                 .map_err(TcpError::component)?;
-            let tail = wire_codec(limit)
-                .serialize(&profile)
-                .map_err(TcpError::component)?;
             let prefix_len = encoded
                 .len()
-                .checked_sub(tail.len() + 8)
+                .checked_sub(SERVER_READ_PROFILE_BYTES + 8)
                 .ok_or_else(|| TcpError::new("invalid profiled response encoding"))?;
             let tail = encoded.split_off(prefix_len + 8);
             encoded.truncate(prefix_len);
@@ -585,6 +608,7 @@ impl Session {
             segment_offset: 0,
             fence: None,
             stage_started: self.time_work.then(Instant::now),
+            sampled: None,
         });
         self.stats.peak_output_frames = self.stats.peak_output_frames.max(self.output.len() as u64);
         self.stats.peak_output_bytes = self.stats.peak_output_bytes.max(self.output_bytes as u64);
@@ -656,6 +680,7 @@ impl Session {
             segment_offset: 0,
             fence: None,
             stage_started: self.time_work.then(Instant::now),
+            sampled: None,
         });
         self.stats.peak_output_frames = self.stats.peak_output_frames.max(self.output.len() as u64);
         self.stats.peak_output_bytes = self.stats.peak_output_bytes.max(self.output_bytes as u64);
@@ -671,6 +696,13 @@ impl Session {
         // cannot prove DMA quiescence it retains them, never frees live memory.
         #[cfg(feature = "experimental-fabric")]
         self.sock.fabric.take();
+        for output in &self.output {
+            if let Some(sample) = &output.sampled {
+                sample
+                    .registry
+                    .record_promotion(|stats| stats.read_output_abandoned += 1);
+            }
+        }
         self.output.clear();
         self.output_bytes = 0;
         self.submitted = 0;
@@ -703,6 +735,12 @@ impl Session {
         match result {
             Ok(n) => {
                 let output = &mut self.output[self.submitted];
+                if n != 0
+                    && start == 0
+                    && let Some(sample) = output.sampled.as_mut()
+                {
+                    sample.transition(|stats| &mut stats.read_output_queue);
+                }
                 if n != 0
                     && start == 0
                     && let Some(queued) = output.stage_started
@@ -756,6 +794,12 @@ impl Session {
         self.stats.plaintext_write.record(began, &result);
         match result {
             Ok(n) => {
+                if n != 0
+                    && output.offset == 0
+                    && let Some(sample) = output.sampled.as_mut()
+                {
+                    sample.transition(|stats| &mut stats.read_output_queue);
+                }
                 if n != 0
                     && output.offset == 0
                     && let Some(queued) = output.stage_started
@@ -1012,6 +1056,9 @@ impl Session {
             && output.offset == output.len
         {
             output.fence = Some(accepted);
+            if let Some(sample) = output.sampled.as_mut() {
+                sample.transition(|stats| &mut stats.read_output_submit);
+            }
             if let Some(started) = output.stage_started {
                 let now = *transition_time.get_or_insert_with(Instant::now);
                 self.stats.output_submit_ns = self.stats.output_submit_ns.saturating_add(
@@ -1030,7 +1077,10 @@ impl Session {
             .front()
             .is_some_and(|output| output.fence.is_some_and(|fence| fence <= completed))
         {
-            let output = self.output.pop_front().unwrap();
+            let mut output = self.output.pop_front().unwrap();
+            if let Some(sample) = output.sampled.as_mut() {
+                sample.transition(|stats| &mut stats.read_response_retire);
+            }
             if let Some(submitted) = output.stage_started {
                 let now = *transition_time.get_or_insert_with(Instant::now);
                 self.stats.output_retire_ns = self.stats.output_retire_ns.saturating_add(
@@ -1403,6 +1453,8 @@ struct PendingRead {
     charge: usize,
     profile: TcpReadProfile,
     #[cfg(feature = "experimental-fabric")]
+    original_order: Option<Vec<usize>>,
+    #[cfg(feature = "experimental-fabric")]
     rma: Option<PendingRmaRead>,
 }
 
@@ -1411,10 +1463,25 @@ struct PendingRmaRead {
     grants: Vec<ResidentGrant>,
     operations: Vec<Option<tidehunter_fabric::ReadOperation>>,
     buffers: Vec<Option<minibytes::Bytes>>,
+    posted_at: Option<Vec<Option<Instant>>>,
     next_post: usize,
     accepted: usize,
     completed: usize,
     first_error: Option<TcpError>,
+}
+
+#[cfg(feature = "experimental-fabric")]
+fn rma_error_with_profile(
+    mut error: TcpError,
+    profiled: bool,
+    profile: TcpReadProfile,
+) -> TcpError {
+    if profiled {
+        // A message error may carry an earlier snapshot; retain the final
+        // snapshot after accepted RMA operations have drained.
+        error.read_profile = Some(Box::new(profile));
+    }
+    error
 }
 impl PendingRead {
     fn has_rma(&self) -> bool {
@@ -1570,6 +1637,45 @@ impl Client {
     }
     pub(crate) fn resident_reads_enabled(&self) -> bool {
         self.resident_reads.destination_slots != 0
+    }
+    pub(crate) fn resident_grant_hits(
+        &self,
+        epoch: u64,
+        references: &[ValueRecordReference],
+    ) -> usize {
+        if self.reactor.resident_poison.is_some() || !self.resident_reads_enabled() {
+            return 0;
+        }
+        #[cfg(feature = "experimental-fabric")]
+        if self.reactor.rma_owner.is_some()
+            || self
+                .stream
+                .sock
+                .fabric
+                .as_ref()
+                .and_then(|endpoint| endpoint.rma_capabilities())
+                .is_none_or(|capabilities| {
+                    self.resident_reads.require_device_read
+                        && capabilities.read_mode != tidehunter_fabric::RmaReadMode::Native
+                })
+        {
+            return 0;
+        }
+        #[cfg(not(feature = "experimental-fabric"))]
+        {
+            let _ = (epoch, references);
+            return 0;
+        }
+        #[cfg(feature = "experimental-fabric")]
+        references
+            .iter()
+            .filter(|reference| {
+                self.reactor
+                    .resident_grants
+                    .get(*reference)
+                    .is_some_and(|bucket| bucket.iter().any(|grant| grant.request_epoch == epoch))
+            })
+            .count()
     }
     pub(crate) fn message_read_requests(&self) -> u64 {
         self.reactor.resident_stats.message_read_requests
@@ -1855,25 +1961,39 @@ impl Client {
             charge,
             profile: TcpReadProfile::default(),
             #[cfg(feature = "experimental-fabric")]
+            original_order: None,
+            #[cfg(feature = "experimental-fabric")]
             rma: None,
         };
         #[cfg(feature = "experimental-fabric")]
         let wire_queued = if self.reactor.rma_owner.is_none()
-            && let Some(rma) = self.prepare_rma_read(epoch, &pending.references)?
+            && let Some((rma, order)) = self.prepare_rma_read(epoch, &pending.references)?
         {
-            pending.end = pending.references.len();
-            pending.wire_id = 0;
+            let reordered = order
+                .iter()
+                .map(|&index| pending.references[index])
+                .collect();
+            pending.references = reordered;
+            pending.start = rma.grants.len();
+            pending.end = pending.start;
+            pending.original_order = Some(order);
             pending.rma = Some(rma);
-            self.reactor.rma_owner = Some(id);
-            false
+            pending.start < pending.references.len()
         } else {
             true
         };
         #[cfg(not(feature = "experimental-fabric"))]
         let wire_queued = true;
+        if !wire_queued {
+            pending.wire_id = 0;
+        }
         if wire_queued {
             self.queue_read_chunk(&mut pending)?;
             self.reactor.wire_reads.insert(id, id);
+        }
+        #[cfg(feature = "experimental-fabric")]
+        if pending.rma.is_some() {
+            self.reactor.rma_owner = Some(id);
         }
         self.reactor.reads.insert(id, pending);
         self.reactor.retained_bytes += charge;
@@ -1984,9 +2104,11 @@ impl Client {
             .queue(pending.wire_id, &request, self.frame_limit)?;
         if pending.grant_limit != 0 {
             self.reactor.resident_acquisition_inflight = true;
+            self.reactor.resident_stats.grant_candidates += (pending.end - pending.start) as u64;
         }
         self.reactor.resident_stats.message_read_requests += 1;
         pending.profile.request_encode_ns += began.map_or(0, elapsed_ns);
+        pending.profile.request_encode_count += u64::from(began.is_some());
         Ok(())
     }
     pub(super) fn submit_append(
@@ -2040,6 +2162,7 @@ impl Client {
                 exchange_began: profile_started.map(|_| Instant::now()),
                 profile: profile_started.map(|_| TcpReadProfile {
                     request_encode_ns,
+                    request_encode_count: 1,
                     ..TcpReadProfile::default()
                 }),
             },
@@ -2091,8 +2214,10 @@ impl Client {
             return;
         };
         profile.response_decode_ns += decoded_ns;
+        profile.response_decode_count += 1;
         profile.requests += 1;
         profile.exchange_ns = pending.exchange_began.map_or(0, elapsed_ns);
+        profile.exchange_count += u64::from(pending.exchange_began.is_some());
         if let Some(diagnostics) = self.diagnostics.as_mut() {
             diagnostics.add(profile);
         }
@@ -2133,16 +2258,17 @@ impl Client {
         }
         let (progressed, _) = self.stream.progress(None)?;
         self.reactor.progressed = progressed;
+        #[cfg(feature = "experimental-fabric")]
+        if let Some(id) = self.reactor.rma_owner {
+            self.progress_rma_read(id)?;
+        }
         // A peer can reply before our request's local CQE. Keep subsequent
         // chunks in their bounded read owner until output retirement frees a
         // frame credit; never overfill output or turn that stall into an error.
         while self.stream.output.len() < SESSION_REQUESTS {
-            let Some(id) = self
-                .reactor
-                .reads
-                .iter()
-                .find_map(|(&id, read)| (read.wire_id == 0 && !read.has_rma()).then_some(id))
-            else {
+            let Some(id) = self.reactor.reads.iter().find_map(|(&id, read)| {
+                (read.wire_id == 0 && read.start < read.references.len()).then_some(id)
+            }) else {
                 break;
             };
             let mut pending = self.reactor.reads.remove(&id).unwrap();
@@ -2267,6 +2393,7 @@ impl Client {
                 self.reactor.resident_acquisition_inflight = false;
             }
             pending.profile.response_decode_ns += decoded;
+            pending.profile.response_decode_count += u64::from(began.is_some());
             pending.profile.requests += 1;
             let (records, grants) = match envelope.body {
                 Response::Records(records) if !pending.profiled => (records, None),
@@ -2276,6 +2403,8 @@ impl Client {
                     pending.profile.server_inventory_wait_ns += profile.inventory_wait_ns;
                     pending.profile.server_authority_lookup_ns += profile.authority_lookup_ns;
                     pending.profile.server_record_read_ns += profile.record_read_ns;
+                    pending.profile.server_wal.add(profile.wal);
+                    pending.profile.server_grant.add(profile.grant);
                     pending.profile.server_response_recheck_wait_ns +=
                         profile.response_recheck_wait_ns;
                     pending.profile.server_response_recheck_ns += profile.response_recheck_ns;
@@ -2298,6 +2427,8 @@ impl Client {
                     pending.profile.server_inventory_wait_ns += profile.inventory_wait_ns;
                     pending.profile.server_authority_lookup_ns += profile.authority_lookup_ns;
                     pending.profile.server_record_read_ns += profile.record_read_ns;
+                    pending.profile.server_wal.add(profile.wal);
+                    pending.profile.server_grant.add(profile.grant);
                     pending.profile.server_response_recheck_wait_ns +=
                         profile.response_recheck_wait_ns;
                     pending.profile.server_response_recheck_ns += profile.response_recheck_ns;
@@ -2307,7 +2438,50 @@ impl Client {
                         profile.response_recheck_deferrals;
                     (records, Some(grants))
                 }
+                Response::ReadErrorProfiled { message, profile } if pending.profiled => {
+                    pending.profile.server_handler_available = true;
+                    pending.profile.server_handler_ns += profile.handler_ns;
+                    pending.profile.server_inventory_wait_ns += profile.inventory_wait_ns;
+                    pending.profile.server_authority_lookup_ns += profile.authority_lookup_ns;
+                    pending.profile.server_record_read_ns += profile.record_read_ns;
+                    pending.profile.server_wal.add(profile.wal);
+                    pending.profile.server_grant.add(profile.grant);
+                    pending.profile.server_response_recheck_wait_ns +=
+                        profile.response_recheck_wait_ns;
+                    pending.profile.server_response_recheck_ns += profile.response_recheck_ns;
+                    pending.profile.server_response_recheck_samples +=
+                        profile.response_recheck_samples;
+                    let error = TcpError::new(message);
+                    #[cfg(feature = "experimental-fabric")]
+                    if let Some(rma) = pending.rma.as_mut() {
+                        rma.first_error = Some(error);
+                        pending.start = pending.references.len();
+                        pending.wire_id = 0;
+                        self.reactor.reads.insert(aggregate, pending);
+                        continue;
+                    }
+                    pending.profile.exchange_ns = pending.began.map_or(0, elapsed_ns);
+                    pending.profile.exchange_count += u64::from(pending.began.is_some());
+                    let mut error = error;
+                    error.read_profile = Some(Box::new(pending.profile));
+                    self.reactor.ready.push_back((
+                        ReadCompletion {
+                            id: aggregate,
+                            result: Err(error),
+                        },
+                        pending.charge,
+                    ));
+                    continue;
+                }
                 Response::Error(message) => {
+                    #[cfg(feature = "experimental-fabric")]
+                    if let Some(rma) = pending.rma.as_mut() {
+                        rma.first_error = Some(TcpError::new(message));
+                        pending.start = pending.references.len();
+                        pending.wire_id = 0;
+                        self.reactor.reads.insert(aggregate, pending);
+                        continue;
+                    }
                     self.reactor.ready.push_back((
                         ReadCompletion {
                             id: aggregate,
@@ -2322,6 +2496,17 @@ impl Client {
             let references = &pending.references[pending.start..pending.end];
             if records.len() != references.len() {
                 return Err(TcpError::new("remote read count mismatch"));
+            }
+            #[cfg(feature = "experimental-fabric")]
+            if pending.original_order.is_some() && self.reactor.resident_poison.is_some() {
+                return Err(TcpError::new("resident reader authority was poisoned"));
+            }
+            if pending.grant_limit != 0 {
+                let returned = grants.as_ref().map_or(0, |grants| {
+                    grants.iter().filter(|grant| grant.is_some()).count()
+                });
+                self.reactor.resident_stats.grant_unavailable +=
+                    (references.len().saturating_sub(returned)) as u64;
             }
             let new_grants = if self.reactor.resident_poison.is_some() {
                 0
@@ -2370,21 +2555,40 @@ impl Client {
             if self.reactor.resident_poison.is_none()
                 && let Some(grants) = grants.as_ref()
             {
+                let install_started = pending.began.map(|_| Instant::now());
                 self.install_resident_grants(references, grants);
+                pending
+                    .profile
+                    .client_grant_install
+                    .record(install_started, false);
                 self.reactor.resident_stats.grants_issued += new_grants as u64;
             }
             pending.profile.record_verify_ns += began.map_or(0, elapsed_ns);
+            pending.profile.record_verify_count += u64::from(began.is_some());
             if Instant::now() >= pending.deadline {
                 return Err(TcpError::new("remote read verification exceeded deadline"));
             }
             pending.start = pending.end;
-            if pending.start != pending.references.len() {
+            pending.wire_id = 0;
+            if pending.start != pending.references.len() || pending.has_rma() {
                 pending.wire_id = 0;
                 self.reactor.reads.insert(aggregate, pending);
             } else {
                 pending.profile.exchange_ns = pending.began.map_or(0, elapsed_ns);
+                pending.profile.exchange_count += u64::from(pending.began.is_some());
                 if let Some(profile) = self.diagnostics.as_mut() {
                     profile.add(pending.profile);
+                }
+                #[cfg(feature = "experimental-fabric")]
+                if let Some(order) = pending.original_order.take() {
+                    let mut ordered: Vec<_> = (0..order.len()).map(|_| None).collect();
+                    for (index, value) in order.into_iter().zip(pending.values) {
+                        ordered[index] = Some(value);
+                    }
+                    pending.values = ordered
+                        .into_iter()
+                        .map(|value| value.expect("complete read permutation"))
+                        .collect();
                 }
                 self.reactor.ready.push_back((
                     ReadCompletion {
@@ -2408,7 +2612,7 @@ impl Client {
         &mut self,
         epoch: u64,
         references: &[ValueRecordReference],
-    ) -> Result<Option<PendingRmaRead>, TcpError> {
+    ) -> Result<Option<(PendingRmaRead, Vec<usize>)>, TcpError> {
         if references.is_empty() || self.reactor.resident_poison.is_some() {
             return Ok(None);
         }
@@ -2425,8 +2629,11 @@ impl Client {
             return Ok(None);
         }
         let mut grants = Vec::with_capacity(references.len());
+        let mut selected = Vec::with_capacity(references.len());
+        let mut missing = Vec::with_capacity(references.len());
         let mut total_bytes = 0usize;
-        for reference in references {
+        let slots = endpoint.available_read_slots()?;
+        for (index, reference) in references.iter().enumerate() {
             let Some(grant) = self
                 .reactor
                 .resident_grants
@@ -2435,40 +2642,46 @@ impl Client {
                 .copied()
             else {
                 self.reactor.resident_stats.fallback_missing += 1;
-                return Ok(None);
+                missing.push(index);
+                continue;
             };
-            let Ok(len) = usize::try_from(grant.region.len) else {
-                self.reactor.resident_stats.fallback_oversize += 1;
-                return Ok(None);
-            };
+            let len = usize::try_from(grant.region.len).map_err(TcpError::component)?;
             if len == 0
                 || len > self.resident_reads.max_read_bytes
                 || len > capabilities.max_read_bytes
             {
-                self.reactor.resident_stats.fallback_oversize += 1;
-                return Ok(None);
+                return Err(TcpError::new("cached resident grant bounds mismatch"));
             }
-            total_bytes = total_bytes
+            let next = total_bytes
                 .checked_add(len)
                 .ok_or_else(|| TcpError::new("resident group size overflow"))?;
+            if grants.len() >= slots || next > self.resident_reads.destination_bytes {
+                self.reactor.resident_stats.fallback_capacity += 1;
+                missing.push(index);
+                continue;
+            }
+            total_bytes = next;
             grants.push(grant);
+            selected.push(index);
         }
-        if total_bytes > self.resident_reads.destination_bytes
-            || endpoint.available_read_slots()? < references.len()
-        {
-            self.reactor.resident_stats.fallback_capacity += 1;
+        if grants.is_empty() {
             return Ok(None);
         }
+        selected.extend(missing);
         self.reactor.resident_stats.eligible_reads += 1;
-        Ok(Some(PendingRmaRead {
-            operations: (0..grants.len()).map(|_| None).collect(),
-            buffers: (0..grants.len()).map(|_| None).collect(),
-            grants,
-            next_post: 0,
-            accepted: 0,
-            completed: 0,
-            first_error: None,
-        }))
+        Ok(Some((
+            PendingRmaRead {
+                operations: (0..grants.len()).map(|_| None).collect(),
+                buffers: (0..grants.len()).map(|_| None).collect(),
+                posted_at: None,
+                grants,
+                next_post: 0,
+                accepted: 0,
+                completed: 0,
+                first_error: None,
+            },
+            selected,
+        )))
     }
 
     #[cfg(feature = "experimental-fabric")]
@@ -2482,15 +2695,32 @@ impl Client {
             self.reactor.rma_owner = None;
             return Ok(());
         };
+        if pending.wire_id == 0
+            && pending.start == pending.references.len()
+            && pending.profile.requests == 0
+            && !pending.profile.server_handler_not_applicable
+        {
+            // No message read exists for this pure-RMA operation, including
+            // when it later fails or is revoked before completion.
+            pending.profile.server_handler_not_applicable = true;
+            if pending.profiled {
+                pending.profile.server_wal.rma_not_applicable_requests += 1;
+            }
+        }
         if self.reactor.resident_poison.is_some() && rma.first_error.is_none() {
             rma.first_error = Some(TcpError::new("resident reader authority was poisoned"));
         }
         if rma.first_error.is_none() {
             let Some(endpoint) = self.stream.sock.fabric.as_mut() else {
+                let error = rma_error_with_profile(
+                    TcpError::new("RMA endpoint disappeared"),
+                    pending.profiled,
+                    pending.profile,
+                );
                 rma.first_error = Some(TcpError::new("RMA endpoint disappeared"));
                 pending.rma = Some(rma);
                 self.reactor.reads.insert(id, pending);
-                return Err(TcpError::new("RMA endpoint disappeared"));
+                return Err(error);
             };
             while rma.next_post < rma.grants.len() {
                 let grant = rma.grants[rma.next_post];
@@ -2501,9 +2731,22 @@ impl Client {
                     key: grant.region.key,
                     len: grant.region.len,
                 };
-                let len = usize::try_from(grant.region.len).map_err(TcpError::component)?;
+                let len = usize::try_from(grant.region.len).map_err(|error| {
+                    rma_error_with_profile(
+                        TcpError::component(error),
+                        pending.profiled,
+                        pending.profile,
+                    )
+                })?;
+                let post_started = pending.began.map(|_| Instant::now());
                 match endpoint.try_post_read(&remote, 0, len) {
                     Ok(operation) => {
+                        if let Some(started) = post_started {
+                            let times = rma
+                                .posted_at
+                                .get_or_insert_with(|| vec![None; rma.grants.len()]);
+                            times[rma.next_post] = Some(started);
+                        }
                         rma.operations[rma.next_post] = Some(operation);
                         rma.next_post += 1;
                         rma.accepted += 1;
@@ -2512,7 +2755,11 @@ impl Client {
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                     Err(error) => {
                         self.reactor.resident_stats.rma_errors += 1;
-                        return Err(TcpError::component(error));
+                        return Err(rma_error_with_profile(
+                            TcpError::component(error),
+                            pending.profiled,
+                            pending.profile,
+                        ));
                     }
                 }
             }
@@ -2522,17 +2769,32 @@ impl Client {
                 let Some(operation) = rma.operations[index].as_mut() else {
                     continue;
                 };
-                match endpoint.take_read_completion(operation)? {
+                let completion = endpoint.take_read_completion(operation).map_err(|error| {
+                    rma_error_with_profile(
+                        TcpError::component(error),
+                        pending.profiled,
+                        pending.profile,
+                    )
+                })?;
+                match completion {
                     None => {}
                     Some(Ok(buffer)) => {
+                        let started = rma.posted_at.as_mut().and_then(|times| times[index].take());
+                        pending.profile.client_fi_read.record(started, false);
                         rma.buffers[index] = Some(buffer.into_minibytes_bytes());
                         rma.operations[index] = None;
                         rma.completed += 1;
                         self.reactor.resident_stats.rma_completions += 1;
                     }
                     Some(Err(error)) => {
+                        let started = rma.posted_at.as_mut().and_then(|times| times[index].take());
+                        pending.profile.client_fi_read.record(started, true);
                         self.reactor.resident_stats.rma_errors += 1;
-                        return Err(TcpError::component(error));
+                        return Err(rma_error_with_profile(
+                            TcpError::component(error),
+                            pending.profiled,
+                            pending.profile,
+                        ));
                     }
                 }
             }
@@ -2545,11 +2807,26 @@ impl Client {
             return Ok(());
         }
         self.reactor.rma_owner = None;
+        if rma.first_error.is_some() || self.reactor.resident_poison.is_some() {
+            pending.profile.exchange_ns = pending.began.map_or(0, elapsed_ns);
+            pending.profile.exchange_count += u64::from(pending.began.is_some());
+        }
+        if rma.first_error.is_some() && pending.wire_id != 0 {
+            return Err(rma_error_with_profile(
+                TcpError::new("resident read failed while message reply was outstanding"),
+                pending.profiled,
+                pending.profile,
+            ));
+        }
         if let Some(error) = rma.first_error {
             self.reactor.ready.push_back((
                 ReadCompletion {
                     id,
-                    result: Err(error),
+                    result: Err(rma_error_with_profile(
+                        error,
+                        pending.profiled,
+                        pending.profile,
+                    )),
                 },
                 pending.charge,
             ));
@@ -2559,20 +2836,25 @@ impl Client {
             self.reactor.ready.push_back((
                 ReadCompletion {
                     id,
-                    result: Err(TcpError::new("resident reader authority was poisoned")),
+                    result: Err(rma_error_with_profile(
+                        TcpError::new("resident reader authority was poisoned"),
+                        pending.profiled,
+                        pending.profile,
+                    )),
                 },
                 pending.charge,
             ));
             return Ok(());
         }
         let verify_started = pending.began.map(|_| Instant::now());
+        let mut rma_values = Vec::with_capacity(rma.grants.len());
         for index in 0..rma.grants.len() {
             let bytes = rma.buffers[index]
                 .take()
                 .ok_or_else(|| TcpError::new("RMA completion omitted a destination"))?;
             let member = super::resident::checked_member(rma.grants[index], &bytes)?;
             let member_start = bytes.len() - member.len();
-            pending.values.push(
+            rma_values.push(
                 CompleteBatch::decode_record(
                     &self.shape,
                     &rma.grants[index].reference,
@@ -2581,18 +2863,35 @@ impl Client {
                 .map_err(TcpError::component)?,
             );
         }
+        pending.values.splice(0..0, rma_values);
         if Instant::now() >= pending.deadline {
             return Err(TcpError::new(
                 "resident read verification exceeded deadline",
             ));
         }
         pending.profile.record_verify_ns += verify_started.map_or(0, elapsed_ns);
+        pending.profile.record_verify_count += u64::from(verify_started.is_some());
+        self.reactor.resident_stats.rma_hits += 1;
+        if pending.start != pending.references.len() || pending.wire_id != 0 {
+            self.reactor.reads.insert(id, pending);
+            self.reactor.progressed = true;
+            return Ok(());
+        }
+        if let Some(order) = pending.original_order.take() {
+            let mut ordered: Vec<_> = (0..order.len()).map(|_| None).collect();
+            for (index, value) in order.into_iter().zip(pending.values) {
+                ordered[index] = Some(value);
+            }
+            pending.values = ordered
+                .into_iter()
+                .map(|value| value.expect("complete read permutation"))
+                .collect();
+        }
         pending.profile.exchange_ns = pending.began.map_or(0, elapsed_ns);
-        pending.profile.server_handler_not_applicable = true;
+        pending.profile.exchange_count += u64::from(pending.began.is_some());
         if let Some(profile) = self.diagnostics.as_mut() {
             profile.add(pending.profile);
         }
-        self.reactor.resident_stats.rma_hits += 1;
         self.reactor.ready.push_back((
             ReadCompletion {
                 id,
@@ -2791,6 +3090,7 @@ impl Client {
         self.stream.queue(id, request, self.frame_limit)?;
         if let Some(profile) = profile.as_deref_mut() {
             profile.request_encode_ns += size_ns + queue_began.map_or(0, elapsed_ns);
+            profile.request_encode_count += 1;
         }
         self.reactor.control = Some((id, deadline));
         self.reactor.control_decode_ns = 0;
@@ -2808,6 +3108,8 @@ impl Client {
                 if let Some(profile) = profile.as_deref_mut() {
                     profile.exchange_ns += began.map_or(0, elapsed_ns);
                     profile.response_decode_ns += self.reactor.control_decode_ns;
+                    profile.exchange_count += 1;
+                    profile.response_decode_count += 1;
                     profile.requests += 1;
                 }
                 return match response {
@@ -2835,6 +3137,7 @@ struct ServerPending {
     grant_max_bytes: usize,
     profile: Option<Instant>,
     record_started: Option<Instant>,
+    executor_started: Option<Instant>,
     read_profile: ServerReadProfile,
     response_queued: bool,
     ready_response: Option<Response>,
@@ -3219,13 +3522,19 @@ pub(super) fn serve_session(
                     ));
                 }
                 if !initialized {
-                    if matches!(&envelope.body, Request::OperationalReadIoStats) {
+                    if matches!(
+                        &envelope.body,
+                        Request::OperationalReadIoStats | Request::ResidentGrantStats
+                    ) {
                         diagnostic_only = true;
                     } else if !matches!(&envelope.body, Request::Status { protocol: PROTOCOL }) {
                         return Err(TcpError::new("status/protocol handshake required"));
                     }
                 } else if diagnostic_only
-                    && !matches!(&envelope.body, Request::OperationalReadIoStats)
+                    && !matches!(
+                        &envelope.body,
+                        Request::OperationalReadIoStats | Request::ResidentGrantStats
+                    )
                 {
                     return Err(TcpError::new(
                         "diagnostic session cannot serve data requests",
@@ -3366,7 +3675,15 @@ pub(super) fn serve_session(
                         grant_max_bytes,
                         profile: profiled.then(Instant::now),
                         record_started: None,
-                        read_profile: ServerReadProfile::default(),
+                        executor_started: None,
+                        read_profile: ServerReadProfile {
+                            wal: WalReadProfile {
+                                executor_requests: u64::from(profiled && executor.is_some()),
+                                sync_reader_requests: u64::from(profiled && executor.is_none()),
+                                ..WalReadProfile::default()
+                            },
+                            ..ServerReadProfile::default()
+                        },
                         response_queued: false,
                         ready_response: None,
                         response_ready_at: None,
@@ -3572,6 +3889,14 @@ pub(super) fn serve_session(
                     }
                 }
                 let request = pending.get_mut(&read.id).unwrap();
+                if request.read_profile.wal.planning_count == 0
+                    && let Some(started) = request.record_started
+                {
+                    let ns = elapsed_ns(started);
+                    request.read_profile.wal.planning_ns = ns;
+                    request.read_profile.wal.planning_count = 1;
+                    request.read_profile.wal.planning_max_ns = ns;
+                }
                 // File/authority pins exist before this check, including on
                 // the entirely resident path and after a Full retry.
                 if !node.reader_authority_valid(read.epoch, request.read_generation) {
@@ -3617,12 +3942,29 @@ pub(super) fn serve_session(
                         .map(|(_, plan)| plan.resident_owner())
                         .collect();
                 }
-                match executor.as_mut().unwrap().submit_planned(
+                if request.profile.is_some() {
+                    request.executor_started.get_or_insert_with(Instant::now);
+                }
+                let outcome = executor.as_mut().unwrap().submit_planned_profiled(
                     read.id,
                     read.plans.take().unwrap(),
                     read.class,
                     &mut request._lease,
-                ) {
+                    request.profile.map(|_| &mut request.read_profile.wal),
+                );
+                if matches!(
+                    &outcome,
+                    Ok(read_executor::SubmitOutcome::Ready { .. }
+                        | read_executor::SubmitOutcome::Pending)
+                ) && let Some(started) = request.executor_started.take()
+                {
+                    let ns = elapsed_ns(started);
+                    request.read_profile.wal.executor_residence_ns += ns;
+                    request.read_profile.wal.executor_residence_count += 1;
+                    request.read_profile.wal.executor_residence_max_ns =
+                        request.read_profile.wal.executor_residence_max_ns.max(ns);
+                }
+                match outcome {
                     Ok(read_executor::SubmitOutcome::Ready { records, lease }) => {
                         pending.get_mut(&read.id).unwrap()._lease = Some(lease);
                         #[cfg(feature = "experimental-fabric")]
@@ -3647,6 +3989,11 @@ pub(super) fn serve_session(
                     Ok(read_executor::SubmitOutcome::Full(plans)) => {
                         read.plans = Some(plans);
                         deferred.push_back(read);
+                    }
+                    Ok(read_executor::SubmitOutcome::Deferred(plans)) => {
+                        read.plans = Some(plans);
+                        deferred.push_back(read);
+                        progressed = true;
                     }
                     Err(error) => {
                         queue_response(&mut pending, read.id, Response::Error(error.to_string()))?;
@@ -3684,6 +4031,18 @@ pub(super) fn serve_session(
                         Response::OperationalReadIoStats(Box::new((
                             node.control_context.partition.clone(),
                             node.read_admission.try_stats(),
+                        ))),
+                    )?;
+                    progressed = true;
+                    continue;
+                }
+                if matches!(&request, Request::ResidentGrantStats) {
+                    queue_response(
+                        &mut pending,
+                        id,
+                        Response::ResidentGrantStats(Box::new((
+                            node.control_context.partition.clone(),
+                            node.resident_grants.try_promotion_stats(),
                         ))),
                     )?;
                     progressed = true;
@@ -3876,10 +4235,14 @@ fn resident_grants_for_read(
     session_id: u64,
     source: ResidentReadConfig,
     resident_grants: &mut Vec<ServerResidentGrant>,
-    request: &ServerPending,
+    request: &mut ServerPending,
     records: &[minibytes::Bytes],
 ) -> Result<Option<Vec<Option<ResidentGrant>>>, TcpError> {
     let mut attached = None;
+    if request.grant_limit != 0 {
+        node.resident_grants
+            .record_promotion(|stats| stats.attempts += records.len() as u64);
+    }
     if !source.source_enabled()
         || stream
             .sock
@@ -3890,6 +4253,10 @@ fn resident_grants_for_read(
         || request.grant_max_bytes == 0
         || records.len() != request.read_references.len()
     {
+        if request.grant_limit != 0 {
+            node.resident_grants
+                .record_promotion(|stats| stats.denied_source_unavailable += records.len() as u64);
+        }
         return Ok(None);
     }
     let (Some(epoch), Some(reader_generation)) = (request.epoch, request.read_generation) else {
@@ -3899,9 +4266,6 @@ fn resident_grants_for_read(
         return Err(TcpError::new(
             "resident read authority is no longer current",
         ));
-    }
-    if request.authority_owners.len() != records.len() {
-        return Ok(None);
     }
     let owner_boot = node.owner_boot;
     let grant_max_bytes = source.max_read_bytes.min(request.grant_max_bytes);
@@ -3914,20 +4278,39 @@ fn resident_grants_for_read(
                 "resident member length does not match its reference",
             ));
         }
-        if let Some(existing) = resident_grants.iter().find(|entry| {
+        let began = request.profile.map(|_| Instant::now());
+        let existing = resident_grants.iter().find(|entry| {
             entry.grant.reference == reference
                 && entry.grant.request_epoch == epoch
                 && entry.grant.reader_generation == reader_generation
                 && entry.grant.owner_boot == owner_boot
                 && entry.grant.session_id == session_id
-        }) {
+        });
+        request.read_profile.grant.lookup.record(began, false);
+        if let Some(existing) = existing {
+            node.resident_grants
+                .record_promotion(|stats| stats.reused += 1);
             attached.get_or_insert_with(|| vec![None; records.len()])[index] = Some(existing.grant);
             continue;
         }
-        if new_grants >= request.grant_limit
-            || resident_grants.len() >= source.source_regions
-            || member.len() > grant_max_bytes.saturating_sub(512)
-        {
+        if new_grants >= request.grant_limit {
+            node.resident_grants
+                .record_promotion(|stats| stats.denied_request_limit += 1);
+            continue;
+        }
+        if resident_grants.len() >= source.source_regions {
+            node.resident_grants
+                .record_promotion(|stats| stats.denied_regions += 1);
+            continue;
+        }
+        if member.len() > grant_max_bytes.saturating_sub(512) {
+            node.resident_grants
+                .record_promotion(|stats| stats.denied_oversize += 1);
+            continue;
+        }
+        if request.authority_owners.len() != records.len() {
+            node.resident_grants
+                .record_promotion(|stats| stats.denied_owner_unavailable += 1);
             continue;
         }
         let reserved_bytes = member
@@ -3935,12 +4318,15 @@ fn resident_grants_for_read(
             .checked_add(512)
             .ok_or_else(|| TcpError::new("resident envelope length overflow"))?;
         let grant_generation = next_resident_id(&super::NEXT_RESIDENT_GRANT)?;
-        let Some(source_owner) = node.resident_grants.try_reserve(
+        let began = request.profile.map(|_| Instant::now());
+        let source_owner = node.resident_grants.try_reserve(
             session_id,
             grant_generation,
             reserved_bytes,
             request.authority_owners[index].clone(),
-        ) else {
+        );
+        let Some(source_owner) = source_owner else {
+            request.read_profile.grant.reservation.record(began, true);
             continue;
         };
         let region = match stream
@@ -3950,8 +4336,12 @@ fn resident_grants_for_read(
             .ok_or_else(|| TcpError::new("resident source endpoint is unavailable"))?
             .reserve_read_region(session_id, grant_generation)
         {
-            Ok(region) => region,
+            Ok(region) => {
+                request.read_profile.grant.reservation.record(began, false);
+                region
+            }
             Err(error) => {
+                request.read_profile.grant.reservation.record(began, true);
                 node.resident_grants
                     .cancel_reservation(session_id, grant_generation);
                 if matches!(
@@ -3960,6 +4350,8 @@ fn resident_grants_for_read(
                         | io::ErrorKind::Unsupported
                         | io::ErrorKind::OutOfMemory
                 ) {
+                    node.resident_grants
+                        .record_promotion(|stats| stats.denied_provider += 1);
                     continue;
                 }
                 return Err(TcpError::component(error));
@@ -3983,7 +4375,14 @@ fn resident_grants_for_read(
             source_region_id: region.region_id(),
             source_region_generation: region.generation(),
         };
-        let envelope = match encode_envelope(grant, member) {
+        let began = request.profile.map(|_| Instant::now());
+        let encoded = encode_envelope(grant, member);
+        request
+            .read_profile
+            .grant
+            .envelope
+            .record(began, encoded.is_err());
+        let envelope = match encoded {
             Ok(envelope) => envelope,
             Err(error) => {
                 let retire = unsafe {
@@ -4001,7 +4400,8 @@ fn resident_grants_for_read(
                 return Err(error);
             }
         };
-        if envelope.len() > grant_max_bytes
+        let oversize = envelope.len() > grant_max_bytes;
+        if oversize
             || !node.resident_grants.shrink_reservation(
                 session_id,
                 grant_generation,
@@ -4022,17 +4422,37 @@ fn resident_grants_for_read(
                     .cancel_reservation(session_id, grant_generation),
                 Err(error) => return Err(TcpError::component(error)),
             }
+            node.resident_grants.record_promotion(|stats| {
+                if oversize {
+                    stats.denied_oversize += 1;
+                } else {
+                    stats.denied_admission += 1;
+                }
+            });
             continue;
         }
         let source_bytes = envelope.len();
         // Arc unsizing to the fabric's type-erased owner reuses this allocation.
-        let remote = match stream
+        let mut registration = None;
+        let registered = stream
             .sock
             .fabric
             .as_mut()
             .ok_or_else(|| TcpError::new("resident source endpoint disappeared"))?
-            .register_read_region_with_owner(&region, envelope, source_owner)
-        {
+            .register_read_region_with_owner_profiled(
+                &region,
+                envelope,
+                source_owner,
+                request.profile.map(|_| &mut registration),
+            );
+        if let Some((ns, error)) = registration {
+            let stage = &mut request.read_profile.grant.registration;
+            stage.ns += ns;
+            stage.count += 1;
+            stage.max_ns = stage.max_ns.max(ns);
+            stage.errors += u64::from(error);
+        }
+        let remote = match registered {
             Ok(remote) => remote,
             Err(error) => {
                 let retire = unsafe {
@@ -4053,6 +4473,8 @@ fn resident_grants_for_read(
                     error.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::Unsupported
                 ) {
+                    node.resident_grants
+                        .record_promotion(|stats| stats.denied_provider += 1);
                     continue;
                 }
                 return Err(TcpError::component(error));
@@ -4068,7 +4490,14 @@ fn resident_grants_for_read(
             },
             ..grant
         };
-        if !node.reader_authority_valid(epoch, Some(reader_generation)) {
+        let began = request.profile.map(|_| Instant::now());
+        let authority_valid = node.reader_authority_valid(epoch, Some(reader_generation));
+        if !authority_valid {
+            request
+                .read_profile
+                .grant
+                .recheck_publication
+                .record(began, true);
             let retire = unsafe {
                 stream
                     .sock
@@ -4085,10 +4514,15 @@ fn resident_grants_for_read(
                 "resident read authority changed during grant setup",
             ));
         }
-        if !node
+        let published = node
             .resident_grants
-            .publish(session_id, grant_generation, source_bytes)
-        {
+            .publish(session_id, grant_generation, source_bytes);
+        request
+            .read_profile
+            .grant
+            .recheck_publication
+            .record(began, !published);
+        if !published {
             unsafe {
                 stream
                     .sock
@@ -4100,10 +4534,14 @@ fn resident_grants_for_read(
             .map_err(TcpError::component)?;
             node.resident_grants
                 .cancel_reservation(session_id, grant_generation);
+            node.resident_grants
+                .record_promotion(|stats| stats.denied_admission += 1);
             continue;
         }
         resident_grants.push(ServerResidentGrant { grant, region });
         attached.get_or_insert_with(|| vec![None; records.len()])[index] = Some(grant);
+        node.resident_grants
+            .record_promotion(|stats| stats.issued += 1);
         new_grants += 1;
     }
     Ok(attached)
@@ -4168,10 +4606,13 @@ fn harvest_reads(
     let completions = executor.poll_completed().map_err(TcpError::component)?;
     let progressed = !completions.is_empty();
     for completion in completions {
-        pending
+        let request = pending
             .get_mut(&completion.request_id)
-            .ok_or_else(|| TcpError::new("unknown executor completion ID"))?
-            ._lease = completion.lease;
+            .ok_or_else(|| TcpError::new("unknown executor completion ID"))?;
+        request._lease = completion.lease;
+        if let Some(profile) = completion.profile {
+            request.read_profile.wal.add(profile);
+        }
         finish_read_with_rma(
             node,
             stream,
@@ -4195,10 +4636,13 @@ fn harvest_reads(
     let completions = executor.poll_completed().map_err(TcpError::component)?;
     let progressed = !completions.is_empty();
     for completion in completions {
-        pending
+        let request = pending
             .get_mut(&completion.request_id)
-            .ok_or_else(|| TcpError::new("unknown executor completion ID"))?
-            ._lease = completion.lease;
+            .ok_or_else(|| TcpError::new("unknown executor completion ID"))?;
+        request._lease = completion.lease;
+        if let Some(profile) = completion.profile {
+            request.read_profile.wal.add(profile);
+        }
         finish_read(
             node,
             pending,
@@ -4220,7 +4664,15 @@ fn finish_read(
         .ok_or_else(|| TcpError::new("unknown read completion ID"))?;
     let response = match records {
         Ok(records) => {
+            let response_started = request.profile.map(|_| Instant::now());
             let records = records.into_iter().map(WireBytes::from).collect();
+            if let Some(started) = response_started {
+                let ns = elapsed_ns(started);
+                request.read_profile.wal.response_ready_ns += ns;
+                request.read_profile.wal.response_ready_count += 1;
+                request.read_profile.wal.response_ready_max_ns =
+                    request.read_profile.wal.response_ready_max_ns.max(ns);
+            }
             if let Some(began) = request.profile {
                 request.read_profile.handler_ns = elapsed_ns(began);
                 request.read_profile.record_read_ns = request.record_started.map_or(0, elapsed_ns);
@@ -4253,9 +4705,9 @@ fn finish_read_with_rma(
     let grants = match &records {
         Ok(records) => {
             let request = pending
-                .get(&id)
+                .get_mut(&id)
                 .ok_or_else(|| TcpError::new("unknown read completion ID"))?;
-            resident_grants_for_read(
+            let result = resident_grants_for_read(
                 node,
                 stream,
                 session_id,
@@ -4263,7 +4715,13 @@ fn finish_read_with_rma(
                 resident_grants,
                 request,
                 records,
-            )?
+            );
+            if request.profile.is_some() {
+                node.resident_grants.record_promotion(|stats| {
+                    stats.read_grant.add(request.read_profile.grant);
+                });
+            }
+            result?
         }
         Err(_) => None,
     };
@@ -4277,7 +4735,15 @@ fn finish_read_with_rma(
     let request = pending
         .get_mut(&id)
         .ok_or_else(|| TcpError::new("unknown read completion ID"))?;
+    let response_started = request.profile.map(|_| Instant::now());
     let records = records.into_iter().map(WireBytes::from).collect();
+    if let Some(started) = response_started {
+        let ns = elapsed_ns(started);
+        request.read_profile.wal.response_ready_ns += ns;
+        request.read_profile.wal.response_ready_count += 1;
+        request.read_profile.wal.response_ready_max_ns =
+            request.read_profile.wal.response_ready_max_ns.max(ns);
+    }
     let response = if let Some(began) = request.profile {
         request.read_profile.handler_ns = elapsed_ns(began);
         request.read_profile.record_read_ns = request.record_started.map_or(0, elapsed_ns);
@@ -4303,10 +4769,36 @@ fn queue_response(
     if request.response_queued || request.ready_response.is_some() {
         return Err(TcpError::new("duplicate server completion"));
     }
+    if let Response::RecordsProfiled { profile, .. }
+    | Response::ResidentRecordsProfiled { profile, .. } = &response
+    {
+        // A synchronous worker owns its profile until completion; retain it
+        // before a later authority recheck can replace the successful reply.
+        request.read_profile = *profile;
+    }
+    if let Response::ReadErrorProfiled { profile, .. } = &response {
+        request.read_profile = **profile;
+    }
     request.async_handler_ns = request.async_started.map_or(0, elapsed_ns);
     request.response_ready_at = (request.epoch.is_some()
         && (request.measured || request.profile.is_some()))
     .then(Instant::now);
+    if matches!(&response, Response::Error(_))
+        && let (Some(started), Some(ready)) = (request.profile, request.response_ready_at)
+    {
+        // Match successful replies: handler/record service ends when the result
+        // becomes ready, before the response queue and final authority recheck.
+        request.read_profile.handler_ns = ready
+            .duration_since(started)
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
+        request.read_profile.record_read_ns = request.record_started.map_or(0, |started| {
+            ready
+                .duration_since(started)
+                .as_nanos()
+                .min(u64::MAX as u128) as u64
+        });
+    }
     request.ready_response = Some(response);
     Ok(())
 }
@@ -4355,9 +4847,25 @@ fn flush_responses(
                 profile.response_recheck_deferrals =
                     request.read_profile.response_recheck_deferrals;
             }
+            request.read_profile.response_recheck_wait_ns = wait_ns;
+            request.read_profile.response_recheck_ns = recheck_ns;
+            request.read_profile.response_recheck_samples = 1;
+            if let Response::ReadErrorProfiled { profile, .. } = &mut response {
+                **profile = request.read_profile;
+            }
         }
         if let Some(error) = recheck_error {
             response = Response::Error(error.to_string());
+        }
+        if let Response::Error(message) = response {
+            response = if request.profile.is_some() {
+                Response::ReadErrorProfiled {
+                    message,
+                    profile: Box::new(request.read_profile),
+                }
+            } else {
+                Response::Error(message)
+            };
         }
         #[cfg(any(test, feature = "test-utils"))]
         if matches!(response, Response::Appended(_))
@@ -4365,9 +4873,32 @@ fn flush_responses(
         {
             return Err(TcpError::new("injected lost durable append response"));
         }
-        let began = request.measured.then(Instant::now);
-        stream.queue_response(id, response, limits.max_frame_bytes)?;
-        if let Some(profile) = diagnostics.as_deref_mut() {
+        let began = (request.measured || request.profile.is_some()).then(Instant::now);
+        let queued = stream.queue_response(id, response, limits.max_frame_bytes);
+        let encoded_at = began.map(|_| Instant::now());
+        if let (Some(started), Some(finished), Some(_)) = (began, encoded_at, request.profile) {
+            let ns = finished
+                .duration_since(started)
+                .as_nanos()
+                .min(u64::MAX as u128) as u64;
+            node.resident_grants.record_promotion(|stats| {
+                stats.read_response_encode.record_ns(ns, queued.is_err());
+            });
+        }
+        queued?;
+        if let (Some(started), true, Some(output)) = (
+            encoded_at,
+            request.profile.is_some(),
+            stream.output.back_mut(),
+        ) {
+            output.sampled = Some(SampledOutput {
+                registry: node.resident_grants.clone(),
+                started,
+            });
+        }
+        if request.measured
+            && let Some(profile) = diagnostics.as_deref_mut()
+        {
             profile.response_encode_ns += began.map_or(0, elapsed_ns);
             profile.handler_ns += request.async_handler_ns;
         }
@@ -4395,7 +4926,9 @@ fn retire_responses(
         if !keep {
             *retained_bytes -= request.charge;
             stream.stats.retained_reply_credit_bytes -= request.charge as u64;
-            if let Some(profile) = diagnostics.as_deref_mut() {
+            if request.measured
+                && let Some(profile) = diagnostics.as_deref_mut()
+            {
                 profile.response_send_ns += request.output_started.map_or(0, elapsed_ns);
             }
         }

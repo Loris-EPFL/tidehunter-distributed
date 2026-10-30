@@ -20,6 +20,8 @@
 const RESIDENT_NOWAIT_MAX_CALLS: usize = 4;
 const RESIDENT_NOWAIT_MAX_BYTES: usize = 64 * 1024;
 const RESIDENT_NOWAIT_MAX_MEMBER_BYTES: usize = 16 * 1024;
+// At most 32 successful probes per request, spread over fair owner sweeps.
+const RESIDENT_NOWAIT_MAX_SWEEPS: usize = 8;
 mod cache;
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
@@ -388,12 +390,14 @@ pub(crate) enum SubmitOutcome {
         lease: ReadLease,
     },
     Pending,
+    Deferred(Vec<PlannedRead>),
     Full(Vec<PlannedRead>),
 }
 pub(crate) struct ReadCompletion {
     pub(crate) request_id: u64,
     pub(crate) result: Result<Vec<Bytes>, StorageError>,
     pub(crate) lease: Option<ReadLease>,
+    pub(crate) profile: Option<super::WalReadProfile>,
 }
 struct PendingRequest {
     records: Vec<Option<Bytes>>,
@@ -404,14 +408,15 @@ struct PendingRequest {
     class: ReadClass,
     error: Option<StorageError>,
     cancelled: bool,
+    profile: Option<super::WalReadProfile>,
 }
 struct ResidentPrefix {
     bytes: Box<[MaybeUninit<u8>]>,
     filled: usize,
 }
 
-/// Resident progress held across async admission retries. The caller's reply
-/// lease charges this state while `SubmitOutcome::Full` leaves it unsubmitted.
+/// Resident progress held across sweep continuations and async admission retries.
+/// The caller's reply lease charges this state while it remains unsubmitted.
 struct PreparedRead {
     signature: Vec<(ValueRecordReference, u64, usize, u64)>,
     records: Vec<Option<Bytes>>,
@@ -425,6 +430,7 @@ struct PreparedRead {
     resident_partial: usize,
     generation: u64,
     class: ReadClass,
+    warm_sweeps: usize,
 }
 
 /// The single final Bytes owner returns the allocation, never a CQ callback
@@ -456,6 +462,7 @@ struct Operation {
     buffer: Box<[MaybeUninit<u8>]>,
     /// Initialized resident prefix; no Bytes is published until the suffix completes.
     filled: usize,
+    queued_at: Option<Instant>,
 }
 
 #[cfg(target_os = "linux")]
@@ -656,15 +663,27 @@ impl ReadExecutor {
         self.submit_planned(request_id, plans, class, &mut None)
     }
 
-    /// Plans already own validated immutable authority and native file pins.
-    /// No cold metadata lookup runs here. Full/errors retain the caller's reply
-    /// reservation; only Ready or an admitted kernel request takes its lease.
+    #[cfg(test)]
     pub(crate) fn submit_planned(
         &mut self,
         request_id: u64,
         plans: Vec<PlannedRead>,
         class: ReadClass,
         lease: &mut Option<ReadLease>,
+    ) -> Result<SubmitOutcome, StorageError> {
+        self.submit_planned_profiled(request_id, plans, class, lease, None)
+    }
+
+    /// Plans already own validated immutable authority and native file pins.
+    /// No cold metadata lookup runs here. Full/errors retain the caller's reply
+    /// reservation; only Ready or an admitted kernel request takes its lease.
+    pub(crate) fn submit_planned_profiled(
+        &mut self,
+        request_id: u64,
+        plans: Vec<PlannedRead>,
+        class: ReadClass,
+        lease: &mut Option<ReadLease>,
+        mut profile: Option<&mut super::WalReadProfile>,
     ) -> Result<SubmitOutcome, StorageError> {
         if self.closed || self.failed {
             return Err(StorageError::Poisoned);
@@ -714,6 +733,7 @@ impl ReadExecutor {
             mut resident_fallbacks,
             mut resident_unsupported,
             mut resident_partial,
+            warm_sweeps,
         ) = if let Some(prepared) = prepared {
             if prepared.signature.len() != plans.len()
                 || prepared
@@ -742,8 +762,10 @@ impl ReadExecutor {
                 prepared.resident_fallbacks,
                 prepared.resident_unsupported,
                 prepared.resident_partial,
+                prepared.warm_sweeps,
             )
         } else {
+            let cache_started = profile.as_ref().map(|_| Instant::now());
             let mut cache = self.admission.cache.lock();
             let generation = cache.generation;
             let records = plans
@@ -761,6 +783,13 @@ impl ReadExecutor {
                 }
             }
             drop(cache);
+            if let (Some(profile), Some(started)) = (profile.as_deref_mut(), cache_started) {
+                let ns = super::elapsed_ns(started);
+                profile.cache_resolution_ns += ns;
+                profile.cache_resolution_count += 1;
+                profile.cache_only_requests += u64::from(initial_misses == 0);
+                profile.cache_resolution_max_ns = profile.cache_resolution_max_ns.max(ns);
+            }
             (
                 generation,
                 records,
@@ -776,6 +805,7 @@ impl ReadExecutor {
                 0,
                 0,
                 0,
+                0,
             )
         };
 
@@ -784,7 +814,10 @@ impl ReadExecutor {
         let mut resident_attempts = 0usize;
         let mut resident_successes = 0usize;
         let mut resident_deferred = 0usize;
-        if self.config.resident_first && !resuming_prepared && initial_misses != 0 {
+        if self.config.resident_first
+            && (!resuming_prepared || warm_sweeps > 0)
+            && initial_misses != 0
+        {
             for (index, (reference, plan)) in plans.iter().enumerate() {
                 if records[index].is_some() || resident_buffers[index].is_some() {
                     continue;
@@ -795,11 +828,14 @@ impl ReadExecutor {
                     || self.resident_bytes_remaining < len
                 {
                     resident_deferred += 1;
+                    // Count only members ultimately sent to async I/O, not
+                    // the same member on each continuation.
                     continue;
                 }
                 let mut buffer = self.admission.take_buffer(len);
 
                 let mut syscall_attempted = false;
+                let nowait_started = profile.as_ref().map(|_| Instant::now());
                 let result = {
                     #[cfg(all(test, target_os = "linux"))]
                     {
@@ -819,6 +855,16 @@ impl ReadExecutor {
                         resident_preadv2(plan, &mut buffer, &mut syscall_attempted)
                     }
                 };
+                if syscall_attempted
+                    && let (Some(profile), Some(started)) = (profile.as_deref_mut(), nowait_started)
+                {
+                    let ns = super::elapsed_ns(started);
+                    profile.nowait_ns += ns;
+                    profile.nowait_count += 1;
+                    profile.nowait_max_ns = profile.nowait_max_ns.max(ns);
+                    profile.nowait_errors += u64::from(result.is_err());
+                    profile.nowait_partial += u64::from(matches!(&result, Ok(n) if *n < len));
+                }
                 if syscall_attempted {
                     resident_attempts += 1;
                     self.resident_calls_remaining -= 1;
@@ -877,6 +923,38 @@ impl ReadExecutor {
                 }
             }
         }
+        let can_continue = resident_deferred > 0
+            && resident_fallbacks == 0
+            && (resident_successes > 0 || warm_sweeps > 0)
+            && warm_sweeps + 1 < RESIDENT_NOWAIT_MAX_SWEEPS
+            && plans.iter().enumerate().all(|(index, (_, plan))| {
+                records[index].is_some() || plan.member.len <= RESIDENT_NOWAIT_MAX_MEMBER_BYTES
+            });
+        if can_continue {
+            let mut state = self.admission.state.lock();
+            state.stats.resident_read_attempts += resident_attempts as u64;
+            state.stats.resident_read_successes += resident_successes as u64;
+            drop(state);
+            lease.as_mut().unwrap().prepared = Some(PreparedRead {
+                signature: retained_signature.unwrap_or_else(|| read_plan_signature(&plans)),
+                records,
+                resident_buffers,
+                cache_hits,
+                cache_misses: initial_misses,
+                wal_bytes,
+                served_bytes,
+                resident_fallbacks,
+                resident_unsupported,
+                resident_partial,
+                generation,
+                class,
+                warm_sweeps: warm_sweeps + 1,
+            });
+            return Ok(SubmitOutcome::Deferred(plans));
+        }
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.nowait_deferred += resident_deferred as u64;
+        }
         let misses = records.iter().filter(|record| record.is_none()).count();
         let mut devices = Vec::<(u64, usize)>::new();
         for (index, (_, plan)) in plans.iter().enumerate() {
@@ -934,6 +1012,7 @@ impl ReadExecutor {
                 resident_partial,
                 generation,
                 class,
+                warm_sweeps: 0,
             });
             return Ok(SubmitOutcome::Full(plans));
         }
@@ -955,6 +1034,7 @@ impl ReadExecutor {
                     resident_partial,
                     generation,
                     class,
+                    warm_sweeps: 0,
                 });
                 return Ok(SubmitOutcome::Full(plans));
             }
@@ -985,6 +1065,7 @@ impl ReadExecutor {
                 class,
                 error: None,
                 cancelled: false,
+                profile: profile.as_ref().map(|_| super::WalReadProfile::default()),
             },
         );
         #[cfg(target_os = "linux")]
@@ -1012,6 +1093,7 @@ impl ReadExecutor {
                 buffer,
                 plan,
                 filled,
+                queued_at: profile.as_ref().map(|_| Instant::now()),
             };
             #[cfg(target_os = "linux")]
             self.entries.push(op.entry(token));
@@ -1103,6 +1185,16 @@ impl ReadExecutor {
                 .requests
                 .get_mut(&op.request_id)
                 .expect("owned read request");
+            if let (Some(profile), Some(started)) = (&mut request.profile, op.queued_at) {
+                let ns = super::elapsed_ns(started);
+                profile.async_ns += ns;
+                profile.async_count += 1;
+                profile.async_max_ns = profile.async_max_ns.max(ns);
+                profile.async_errors +=
+                    u64::from(result < 0 || result as usize != op.plan.member.len - op.filled);
+                profile.async_partial +=
+                    u64::from(result >= 0 && result as usize != op.plan.member.len - op.filled);
+            }
             if result < 0 || result as usize != op.plan.member.len - op.filled {
                 self.admission.state.lock().stats.errors += 1;
                 if request.error.is_none() {
@@ -1152,6 +1244,7 @@ impl ReadExecutor {
                         request_id: op.request_id,
                         result,
                         lease: request.lease.take(),
+                        profile: request.profile,
                     });
                 }
             }

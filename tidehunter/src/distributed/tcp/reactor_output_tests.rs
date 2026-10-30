@@ -166,6 +166,45 @@ fn work_profiles_disable_reset_and_preserve_live_frames() {
     let _: Envelope<Vec<u8>> = pair.session.decode(&frame, 1024).unwrap();
     assert_eq!(pair.session.transport_stats().frame_decode.calls, 0);
 }
+
+#[test]
+fn sampled_output_abort_is_not_a_retirement() {
+    let mut pair = pair();
+    let registry = Arc::new(resident::GrantRegistry::new(0, 0));
+    pair.session.queue(1, &7_u8, 1024).unwrap();
+    pair.session.output.back_mut().unwrap().sampled = Some(SampledOutput {
+        registry: registry.clone(),
+        started: Instant::now(),
+    });
+    pair.session.abort();
+    let stats = registry.try_promotion_stats().unwrap();
+    assert_eq!(stats.read_output_abandoned, 1);
+    assert_eq!(stats.read_response_retire.count, 0);
+}
+
+#[cfg(feature = "experimental-fabric")]
+#[test]
+fn rma_failure_preserves_latest_sampled_completion_profile() {
+    let mut previous = TcpError::new("resident reader authority was poisoned");
+    previous.read_profile = Some(Box::new(TcpReadProfile::default()));
+    let mut profile = TcpReadProfile::default();
+    profile.client_fi_read.count = 2;
+    profile.client_fi_read.errors = 1;
+    profile.client_fi_read.ns = 37;
+    profile.client_fi_read.max_ns = 29;
+    let error = rma_error_with_profile(previous, true, profile);
+    let retained = error.read_profile.unwrap();
+    assert_eq!(retained.client_fi_read.count, 2);
+    assert_eq!(retained.client_fi_read.errors, 1);
+    assert_eq!(retained.client_fi_read.ns, 37);
+    assert_eq!(retained.client_fi_read.max_ns, 29);
+    assert!(
+        rma_error_with_profile(TcpError::new("unprofiled"), false, profile)
+            .read_profile
+            .is_none()
+    );
+}
+
 fn send_tls_plaintext(pair: &mut Pair, bytes: &[u8]) {
     pair.peer.writer().write_all(bytes).unwrap();
     let mut encrypted = Vec::new();
@@ -419,6 +458,7 @@ fn stalled_fences_bound_output_and_keep_actual_reply_leases() {
                 grant_max_bytes: 0,
                 profile: None,
                 record_started: None,
+                executor_started: None,
                 read_profile: ServerReadProfile::default(),
                 response_queued: true,
                 ready_response: None,
@@ -817,6 +857,7 @@ fn completed_read(measured: bool, profiled: bool) -> HashMap<u64, ServerPending>
             grant_max_bytes: 0,
             profile: profiled.then(Instant::now),
             record_started: profiled.then(Instant::now),
+            executor_started: None,
             read_profile: ServerReadProfile::default(),
             response_queued: false,
             ready_response: None,
@@ -905,7 +946,7 @@ fn forced_server_grant_request_with_real_authority_uses_message_only_fallback() 
         batch.mutations()[0]
     );
 
-    let request = ServerPending {
+    let mut request = ServerPending {
         deadline: Instant::now() + Duration::from_secs(2),
         charge: read_charge(&[reference]).unwrap(),
         epoch: Some(1),
@@ -916,6 +957,7 @@ fn forced_server_grant_request_with_real_authority_uses_message_only_fallback() 
         grant_max_bytes: 1024,
         profile: None,
         record_started: None,
+        executor_started: None,
         read_profile: ServerReadProfile::default(),
         response_queued: false,
         ready_response: None,
@@ -935,7 +977,7 @@ fn forced_server_grant_request_with_real_authority_uses_message_only_fallback() 
             1,
             source,
             &mut Vec::new(),
-            &request,
+            &mut request,
             &records,
         )
         .unwrap()
@@ -966,6 +1008,7 @@ fn completed_response_rejects_fenced_or_poisoned_authority() {
             Ok(vec![b"completed record"[..].into()]),
         )
         .unwrap();
+        let handler_ns = pending[&1].read_profile.handler_ns;
         pending.get_mut(&1).unwrap().response_ready_at =
             Some(Instant::now() - Duration::from_millis(1));
         let mut profile = ConnectionProfile::default();
@@ -993,10 +1036,74 @@ fn completed_response_rejects_fenced_or_poisoned_authority() {
         assert_eq!(profile.response_send_ns, 0);
         let frame = pair.session.output.front().unwrap().flatten()[4..].to_vec();
         let reply: Envelope<Response> = pair.session.decode(&frame, 4096).unwrap();
-        assert!(matches!(reply.body, Response::Error(_)));
+        let Response::ReadErrorProfiled {
+            profile: rejected, ..
+        } = reply.body
+        else {
+            panic!("fenced read did not retain its error profile");
+        };
+        assert_eq!(rejected.handler_ns, handler_ns);
+        assert_eq!(rejected.response_recheck_samples, 1);
         assert!(pending[&1]._lease.is_some());
         assert!(queue_response(&mut pending, 1, Response::Error("duplicate".into())).is_err());
     }
+}
+
+#[test]
+fn fenced_sync_worker_response_retains_its_actual_read_profile() {
+    use super::super::tests::{batch, config, metrics};
+    use crate::distributed::storage::WalMemberReadPolicy;
+
+    let mut pair = pair();
+    let mut config = config(&pair._temp.path().join("sync-node"));
+    config.wal_member_read = WalMemberReadPolicy::Mapped;
+    let node = StorageNode::open(config.clone(), metrics()).unwrap();
+    node.inventory.lock().fence_to(1).unwrap();
+    let batch = batch(&config, 1, 0);
+    let Response::Appended(receipts) = node
+        .handle(
+            Request::Append {
+                epoch: 1,
+                batches: vec![batch.encoded().clone().into()],
+            },
+            TcpLimits::default(),
+        )
+        .unwrap()
+    else {
+        panic!("append did not return receipts");
+    };
+    let reference = batch.record_reference(receipts[0].address, 0).unwrap();
+    let generation = node.reader_snapshot(1, &[reference]).unwrap().generation;
+    let response = node
+        .read_response::<true>(1, vec![reference], TcpLimits::default())
+        .unwrap();
+    let Response::RecordsProfiled { profile, .. } = &response else {
+        panic!("sync worker did not return a profile");
+    };
+    let expected = *profile;
+    let mut pending = completed_read(false, true);
+    pending.get_mut(&1).unwrap().read_generation = Some(generation);
+    queue_response(&mut pending, 1, response).unwrap();
+    node.inventory.lock().fence_to(2).unwrap();
+    pending.get_mut(&1).unwrap().deadline = Instant::now() + Duration::from_secs(2);
+    flush_responses(
+        &node,
+        &mut pair.session,
+        &mut pending,
+        TcpLimits::default(),
+        None,
+    )
+    .unwrap();
+    let frame = pair.session.output.front().unwrap().flatten()[4..].to_vec();
+    let reply: Envelope<Response> = pair.session.decode(&frame, 4096).unwrap();
+    let Response::ReadErrorProfiled { profile, .. } = reply.body else {
+        panic!("fenced sync response lost its error profile");
+    };
+    assert_eq!(profile.handler_ns, expected.handler_ns);
+    assert_eq!(profile.authority_lookup_ns, expected.authority_lookup_ns);
+    assert_eq!(profile.record_read_ns, expected.record_read_ns);
+    assert_eq!(profile.wal.sync_reader_requests, 1);
+    assert_eq!(profile.response_recheck_samples, 1);
 }
 
 #[test]
@@ -1037,8 +1144,9 @@ fn recheck_profiles_success_and_preserves_member_errors() {
                     SERVER_READ_PROFILE_BYTES,
                 );
             }
-            Response::Error(message) if failed_read => {
+            Response::ReadErrorProfiled { message, profile } if failed_read => {
                 assert_eq!(message, "member read failed");
+                assert_eq!(profile.response_recheck_samples, 1);
             }
             _ => panic!("read error or profile was lost"),
         }
@@ -1100,11 +1208,12 @@ fn submitted_ready_cqes_share_rechecks_deadlines_and_reply_retirement() {
         };
         assert!(matches!(
             executor
-                .submit_planned(
+                .submit_planned_profiled(
                     1,
                     plans,
                     ReadClass::Point,
-                    &mut pending.get_mut(&1).unwrap()._lease,
+                    &mut request._lease,
+                    Some(&mut request.read_profile.wal),
                 )
                 .unwrap(),
             read_executor::SubmitOutcome::Pending,
@@ -1170,10 +1279,19 @@ fn submitted_ready_cqes_share_rechecks_deadlines_and_reply_retirement() {
             continue;
         }
         assert!(queued.unwrap());
+        let stats = node.resident_grants.try_promotion_stats().unwrap();
+        assert_eq!(stats.read_response_encode.count, 1);
+        assert_eq!(stats.read_output_queue.count, 0);
+        assert_eq!(stats.read_output_submit.count, 0);
+        assert_eq!(stats.read_response_retire.count, 0);
         let frame = pair.session.output.front().unwrap().flatten()[4..].to_vec();
         let reply: Envelope<Response> = pair.session.decode(&frame, 4096).unwrap();
         if fenced {
-            assert!(matches!(reply.body, Response::Error(_)));
+            let Response::ReadErrorProfiled { profile, .. } = reply.body else {
+                panic!("fenced asynchronous read lost its error profile");
+            };
+            assert_eq!(profile.response_recheck_samples, 1);
+            assert_eq!(profile.wal.async_count, 1);
         } else {
             let Response::RecordsProfiled { records, .. } = reply.body else {
                 panic!("completed read lost its profile")
@@ -1193,12 +1311,18 @@ fn submitted_ready_cqes_share_rechecks_deadlines_and_reply_retirement() {
             ..Wire::default()
         };
         submit_frames(&mut pair.session, &mut wire, 1);
+        let stats = node.resident_grants.try_promotion_stats().unwrap();
+        assert_eq!(stats.read_output_queue.count, 1);
+        assert_eq!(stats.read_output_submit.count, 1);
+        assert_eq!(stats.read_response_retire.count, 0);
         let mut retained = pending[&1].charge;
         retire_responses(&mut pair.session, &mut pending, &mut retained, None);
         assert_eq!(pending.len(), 1, "TLS acceptance is not CQ retirement");
         assert_eq!(node.read_admission.stats().inflight_requests, 1);
         pair.session.finish_output(wire.accepted, wire.accepted);
         retire_responses(&mut pair.session, &mut pending, &mut retained, None);
+        let stats = node.resident_grants.try_promotion_stats().unwrap();
+        assert_eq!(stats.read_response_retire.count, 1);
         assert!(pending.is_empty());
         assert_eq!(retained, 0);
         assert_eq!(node.read_admission.stats().inflight_requests, 0);
@@ -1266,25 +1390,34 @@ fn expired_posted_rma_read_fail_stops_with_grant_memory_quarantined() {
     )
     .unwrap();
     client.fence_to(1).unwrap();
-    let batch = batch(&node_config, 1, 0);
-    let receipt = client.append_many(1, std::slice::from_ref(&batch)).unwrap();
-    let reference = batch
+    let first = batch(&node_config, 1, 0);
+    let receipt = client.append_many(1, std::slice::from_ref(&first)).unwrap();
+    let reference = first
         .record_reference(receipt[0].appended().address(), 0)
         .unwrap();
     client
         .read_records_correlated(1, &[reference], ReadClass::Point, None)
         .unwrap();
+    let second = batch(&node_config, 1, 1);
+    let second_receipt = client
+        .append_many(1, std::slice::from_ref(&second))
+        .unwrap();
+    let missing = second
+        .record_reference(second_receipt[0].appended().address(), 0)
+        .unwrap();
+    let messages_before = client.resident_read_stats().message_read_requests;
 
     let read_id = client
         .submit_read(
             1,
-            vec![reference],
+            vec![missing, reference],
             Instant::now() + Duration::from_secs(3),
             ReadClass::Point,
             false,
         )
         .unwrap()
         .unwrap();
+    assert!(client.resident_read_stats().message_read_requests > messages_before);
     assert!(client.progress_reads().unwrap().is_empty());
     assert_eq!(client.resident_read_stats().rma_posts, 1);
     client.reactor.reads.get_mut(&read_id).unwrap().deadline = Instant::now();

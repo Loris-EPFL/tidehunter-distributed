@@ -43,6 +43,10 @@ pub(super) struct ReadBatch {
     class: ReadClass,
     pub(super) pin: Option<IndexReadPin>,
     groups: VecDeque<(usize, VecDeque<(usize, ValueRecordReference)>)>,
+    owned_lanes: Vec<OwnedLane>,
+    state: Arc<State>,
+    epoch: u64,
+    resident_enabled: bool,
 }
 
 impl ReadBatch {
@@ -72,6 +76,10 @@ impl ReadBatch {
             pin: None,
             reads: VecDeque::new(),
             deadline: Instant::now() + service.timeout,
+            owned_lanes: Vec::new(),
+            state: service.state.clone(),
+            epoch: service.epoch,
+            resident_enabled: service.resident_enabled,
             groups: groups
                 .into_iter()
                 .enumerate()
@@ -90,7 +98,9 @@ impl ReadBatch {
     }
 
     pub(super) fn dispatch(&mut self, service: &ReadService) -> Result<(), LocalDbError> {
-        while let Some((node, group)) = self.groups.front_mut() {
+        let mut skipped = 0;
+        while skipped < self.groups.len() {
+            let (node, group) = self.groups.front_mut().expect("nonempty groups");
             let retained = *service.state.retained.lock();
             let available = service.max_bytes - retained.1;
             let mut bytes = 512usize;
@@ -104,12 +114,14 @@ impl ReadBatch {
                 count += 1;
             }
             if count == 0 {
-                break;
+                self.groups.rotate_left(1);
+                skipped += 1;
+                continue;
             }
             // Other callers can reserve credits after the snapshot above.
             // Retain every source slot until this request is actually admitted.
             let (slots, references) = group.iter().take(count).copied().unzip();
-            let request = match service.submit_until(
+            let request = match service.submit_until_owned(
                 *node,
                 references,
                 0,
@@ -119,12 +131,18 @@ impl ReadBatch {
                     class: self.class,
                     pin: self.pin.clone(),
                 },
+                (self.class == ReadClass::Point).then_some(&mut self.owned_lanes),
             ) {
                 Ok(request) => request,
-                Err(error) if RemoteDatabase::read_backpressured(&error) => break,
+                Err(error) if RemoteDatabase::read_backpressured(&error) => {
+                    self.groups.rotate_left(1);
+                    skipped += 1;
+                    continue;
+                }
                 Err(error) => return Err(error),
             };
             drop(group.drain(..count));
+            skipped = 0;
             self.reads.push_back((slots, request));
             if group.is_empty() {
                 self.groups.pop_front();
@@ -134,10 +152,73 @@ impl ReadBatch {
     }
 
     pub(super) fn finish_one(&mut self) -> Result<(), LocalDbError> {
-        let (slots, request) = self
+        let state = self
             .reads
-            .pop_front()
-            .ok_or_else(|| LocalDbError::new(BACKPRESSURE))?;
+            .front()
+            .ok_or_else(|| LocalDbError::new(BACKPRESSURE))?
+            .1
+            .credit
+            .state
+            .clone();
+        // The same generation/condition variable used for admission also
+        // advances after flight readiness is published. Hold its mutex while
+        // checking all flights to avoid sleeping through a completion.
+        let mut empty_sweeps = 0u8;
+        let ready = loop {
+            let mut progressed = false;
+            for owned in &self.owned_lanes {
+                if let Some(mut driver) = owned.lane.driver.try_lock() {
+                    progressed |= progress_read_lane(
+                        &self.state,
+                        &mut driver,
+                        self.epoch,
+                        self.resident_enabled,
+                    );
+                }
+            }
+            if progressed {
+                empty_sweeps = 0;
+            } else if !self.owned_lanes.is_empty() {
+                empty_sweeps += 1;
+                if empty_sweeps == 64 {
+                    // Accepted work stays in the shared drivers; dropping the
+                    // reservations wakes the actor without releasing its credits.
+                    self.owned_lanes.clear();
+                }
+            }
+            self.owned_lanes
+                .retain(|owned| owned.lane.outstanding.load(Ordering::Acquire) != 0);
+            let mut retained = state.retained.lock();
+            if let Some(index) = self.reads.iter().position(|(_, request)| {
+                request
+                    .parts
+                    .iter()
+                    .all(|(flight, _)| state.flight_ready[flight.slot].is_ready())
+            }) {
+                break index;
+            }
+            if state.failed.load(Ordering::Acquire) || state.stopped.load(Ordering::Acquire) {
+                return Err(LocalDbError::new("read authority is poisoned or closed"));
+            }
+            if Instant::now() >= self.deadline {
+                drop(retained);
+                state.poison();
+                return Err(LocalDbError::new(
+                    "remote read deadline expired or worker stopped",
+                ));
+            }
+            if self.owned_lanes.is_empty() {
+                state
+                    .admission_changed
+                    .wait_until(&mut retained, self.deadline);
+            } else {
+                drop(retained);
+                thread::yield_now();
+            }
+        };
+        self.owned_lanes
+            .retain(|owned| owned.lane.outstanding.load(Ordering::Acquire) != 0);
+        let (slots, request) = self.reads.remove(ready).expect("ready request exists");
         let (values, _) = request.finish()?;
         if slots.len() != values.len() {
             return Err(LocalDbError::new("remote read count mismatch"));
@@ -167,6 +248,12 @@ macro_rules! read_diagnostics {
                     self.server_response_recheck_samples.load(Ordering::Relaxed) != 0));
                 set("read_profile_transport_progress_available", u64::from(
                     self.transport_sweeps.load(Ordering::Relaxed) != 0));
+                set("read_profile_server_executor_available", u64::from(self.server_executor_requests.load(Ordering::Relaxed) != 0));
+                set("read_profile_server_planning_available", u64::from(self.server_planning_count.load(Ordering::Relaxed) != 0));
+                set("read_profile_server_cache_resolution_available", u64::from(self.server_cache_resolution_count.load(Ordering::Relaxed) != 0));
+                set("read_profile_server_nowait_available", u64::from(self.server_nowait_count.load(Ordering::Relaxed) != 0));
+                set("read_profile_server_async_available", u64::from(self.server_async_count.load(Ordering::Relaxed) != 0));
+                set("read_profile_server_response_ready_available", u64::from(self.server_response_ready_count.load(Ordering::Relaxed) != 0));
                 $(set(concat!("read_profile_", stringify!($name)),
                     self.$name.load(Ordering::Relaxed));)+
             }
@@ -177,15 +264,24 @@ read_diagnostics!(
     selected,
     completed,
     errors,
+    failed_owner_profile_unavailable,
+    failed_owner_profile_not_applicable,
+    failed_owner_profile_retained,
     returned,
     wire_requests,
     inline_completed,
+    grouped_inline_completed,
     inline_ns,
     actor_completed,
+    actor_timed_success_count,
     actor_queue_ns,
     actor_service_ns,
     actor_return_ns,
     request_encode_ns,
+    request_encode_count,
+    exchange_count,
+    response_decode_count,
+    record_verify_count,
     exchange_ns,
     response_decode_ns,
     record_verify_ns,
@@ -197,6 +293,61 @@ read_diagnostics!(
     server_response_recheck_ns,
     server_response_recheck_samples,
     server_response_recheck_deferrals,
+    server_executor_requests,
+    server_sync_reader_requests,
+    server_cache_only_requests,
+    server_rma_not_applicable_requests,
+    server_planning_ns,
+    server_planning_count,
+    server_planning_max_ns,
+    server_executor_residence_ns,
+    server_executor_residence_count,
+    server_executor_residence_max_ns,
+    server_cache_resolution_ns,
+    server_cache_resolution_count,
+    server_cache_resolution_max_ns,
+    server_nowait_ns,
+    server_nowait_count,
+    server_nowait_max_ns,
+    server_nowait_errors,
+    server_nowait_partial,
+    server_nowait_deferred,
+    server_async_ns,
+    server_async_count,
+    server_async_max_ns,
+    server_async_errors,
+    server_async_partial,
+    server_response_ready_ns,
+    server_response_ready_count,
+    server_response_ready_max_ns,
+    server_grant_lookup_ns,
+    server_grant_lookup_count,
+    server_grant_lookup_max_ns,
+    server_grant_lookup_errors,
+    server_grant_reservation_ns,
+    server_grant_reservation_count,
+    server_grant_reservation_max_ns,
+    server_grant_reservation_errors,
+    server_grant_envelope_ns,
+    server_grant_envelope_count,
+    server_grant_envelope_max_ns,
+    server_grant_envelope_errors,
+    server_grant_registration_ns,
+    server_grant_registration_count,
+    server_grant_registration_max_ns,
+    server_grant_registration_errors,
+    server_grant_recheck_publication_ns,
+    server_grant_recheck_publication_count,
+    server_grant_recheck_publication_max_ns,
+    server_grant_recheck_publication_errors,
+    client_grant_install_ns,
+    client_grant_install_count,
+    client_grant_install_max_ns,
+    client_grant_install_errors,
+    client_fi_read_ns,
+    client_fi_read_count,
+    client_fi_read_max_ns,
+    client_fi_read_errors,
     transport_sweeps,
     transport_output_queue_ns,
     transport_output_queue_samples,
@@ -213,11 +364,123 @@ read_diagnostics!(
     transport_cq_timed_calls,
 );
 impl ReadDiagnostics {
-    fn inline_complete(&self, elapsed_ns: u64, profile: Option<super::super::tcp::TcpReadProfile>) {
+    fn add_grant_stages(&self, tcp: &super::super::tcp::TcpReadProfile) {
+        macro_rules! stage {
+            ($value:expr, $ns:ident, $count:ident, $max:ident, $errors:ident) => {{
+                let value = $value;
+                self.$ns.fetch_add(value.ns, Ordering::Relaxed);
+                self.$count.fetch_add(value.count, Ordering::Relaxed);
+                self.$max.fetch_max(value.max_ns, Ordering::Relaxed);
+                self.$errors.fetch_add(value.errors, Ordering::Relaxed);
+            }};
+        }
+        stage!(
+            &tcp.server_grant.lookup,
+            server_grant_lookup_ns,
+            server_grant_lookup_count,
+            server_grant_lookup_max_ns,
+            server_grant_lookup_errors
+        );
+        stage!(
+            &tcp.server_grant.reservation,
+            server_grant_reservation_ns,
+            server_grant_reservation_count,
+            server_grant_reservation_max_ns,
+            server_grant_reservation_errors
+        );
+        stage!(
+            &tcp.server_grant.envelope,
+            server_grant_envelope_ns,
+            server_grant_envelope_count,
+            server_grant_envelope_max_ns,
+            server_grant_envelope_errors
+        );
+        stage!(
+            &tcp.server_grant.registration,
+            server_grant_registration_ns,
+            server_grant_registration_count,
+            server_grant_registration_max_ns,
+            server_grant_registration_errors
+        );
+        stage!(
+            &tcp.server_grant.recheck_publication,
+            server_grant_recheck_publication_ns,
+            server_grant_recheck_publication_count,
+            server_grant_recheck_publication_max_ns,
+            server_grant_recheck_publication_errors
+        );
+        stage!(
+            &tcp.client_grant_install,
+            client_grant_install_ns,
+            client_grant_install_count,
+            client_grant_install_max_ns,
+            client_grant_install_errors
+        );
+        stage!(
+            &tcp.client_fi_read,
+            client_fi_read_ns,
+            client_fi_read_count,
+            client_fi_read_max_ns,
+            client_fi_read_errors
+        );
+    }
+    fn add_wal(&self, wal: super::super::tcp::WalReadProfile) {
+        macro_rules! add {
+            ($(($counter:ident, $field:ident)),* $(,)?) => {
+                $(self.$counter.fetch_add(wal.$field, Ordering::Relaxed);)*
+            };
+        }
+        add!(
+            (server_executor_requests, executor_requests),
+            (server_sync_reader_requests, sync_reader_requests),
+            (server_cache_only_requests, cache_only_requests),
+            (
+                server_rma_not_applicable_requests,
+                rma_not_applicable_requests
+            ),
+            (server_planning_ns, planning_ns),
+            (server_planning_count, planning_count),
+            (server_executor_residence_ns, executor_residence_ns),
+            (server_executor_residence_count, executor_residence_count),
+            (server_cache_resolution_ns, cache_resolution_ns),
+            (server_cache_resolution_count, cache_resolution_count),
+            (server_nowait_ns, nowait_ns),
+            (server_nowait_count, nowait_count),
+            (server_nowait_errors, nowait_errors),
+            (server_nowait_partial, nowait_partial),
+            (server_nowait_deferred, nowait_deferred),
+            (server_async_ns, async_ns),
+            (server_async_count, async_count),
+            (server_async_errors, async_errors),
+            (server_async_partial, async_partial),
+            (server_response_ready_ns, response_ready_ns),
+            (server_response_ready_count, response_ready_count),
+        );
+        self.server_planning_max_ns
+            .fetch_max(wal.planning_max_ns, Ordering::Relaxed);
+        self.server_executor_residence_max_ns
+            .fetch_max(wal.executor_residence_max_ns, Ordering::Relaxed);
+        self.server_cache_resolution_max_ns
+            .fetch_max(wal.cache_resolution_max_ns, Ordering::Relaxed);
+        self.server_nowait_max_ns
+            .fetch_max(wal.nowait_max_ns, Ordering::Relaxed);
+        self.server_async_max_ns
+            .fetch_max(wal.async_max_ns, Ordering::Relaxed);
+        self.server_response_ready_max_ns
+            .fetch_max(wal.response_ready_max_ns, Ordering::Relaxed);
+    }
+    fn inline_complete(
+        &self,
+        elapsed_ns: u64,
+        profile: Option<super::super::tcp::TcpReadProfile>,
+        failed: bool,
+    ) {
         self.completed.fetch_add(1, Ordering::Relaxed);
         self.inline_completed.fetch_add(1, Ordering::Relaxed);
         self.inline_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
         if let Some(tcp) = profile {
+            self.add_grant_stages(&tcp);
+            self.add_wal(tcp.server_wal);
             self.wire_requests
                 .fetch_add(tcp.requests, Ordering::Relaxed);
             macro_rules! add {
@@ -227,6 +490,10 @@ impl ReadDiagnostics {
             }
             add!(
                 request_encode_ns,
+                request_encode_count,
+                exchange_count,
+                response_decode_count,
+                record_verify_count,
                 exchange_ns,
                 response_decode_ns,
                 record_verify_ns,
@@ -239,8 +506,19 @@ impl ReadDiagnostics {
                 server_response_recheck_samples,
                 server_response_recheck_deferrals
             );
-        } else {
+        }
+        if failed {
             self.errors.fetch_add(1, Ordering::Relaxed);
+            if profile.is_some_and(|profile| profile.server_handler_available) {
+                self.failed_owner_profile_retained
+                    .fetch_add(1, Ordering::Relaxed);
+            } else if profile.is_some_and(|profile| profile.server_handler_not_applicable) {
+                self.failed_owner_profile_not_applicable
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.failed_owner_profile_unavailable
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
     // Connection-local work during sweeps with sampled requests outstanding.
@@ -290,16 +568,24 @@ impl ReadDiagnostics {
         }
         selected
     }
-    fn complete(&self, result: &ReadCompletion) {
+    fn complete(
+        &self,
+        result: &ReadCompletion,
+        failed_profile: Option<super::super::tcp::TcpReadProfile>,
+    ) {
         self.completed.fetch_add(1, Ordering::Relaxed);
         self.actor_completed.fetch_add(1, Ordering::Relaxed);
         match result {
             Ok((_, Some(worker))) => {
+                self.actor_timed_success_count
+                    .fetch_add(1, Ordering::Relaxed);
                 self.actor_queue_ns
                     .fetch_add(worker.queue_ns, Ordering::Relaxed);
                 self.actor_service_ns
                     .fetch_add(worker.service_ns, Ordering::Relaxed);
                 let tcp = &worker.tcp;
+                self.add_grant_stages(tcp);
+                self.add_wal(tcp.server_wal);
                 self.wire_requests
                     .fetch_add(tcp.requests, Ordering::Relaxed);
                 macro_rules! add {
@@ -309,6 +595,10 @@ impl ReadDiagnostics {
                 }
                 add!(
                     request_encode_ns,
+                    request_encode_count,
+                    exchange_count,
+                    response_decode_count,
+                    record_verify_count,
                     exchange_ns,
                     response_decode_ns,
                     record_verify_ns,
@@ -324,6 +614,56 @@ impl ReadDiagnostics {
             }
             _ => {
                 self.errors.fetch_add(1, Ordering::Relaxed);
+                if let Some(profile) = failed_profile {
+                    self.add_grant_stages(&profile);
+                    self.add_wal(profile.server_wal);
+                    self.wire_requests
+                        .fetch_add(profile.requests, Ordering::Relaxed);
+                    self.request_encode_ns
+                        .fetch_add(profile.request_encode_ns, Ordering::Relaxed);
+                    self.request_encode_count
+                        .fetch_add(profile.request_encode_count, Ordering::Relaxed);
+                    self.exchange_count
+                        .fetch_add(profile.exchange_count, Ordering::Relaxed);
+                    self.response_decode_count
+                        .fetch_add(profile.response_decode_count, Ordering::Relaxed);
+                    self.record_verify_count
+                        .fetch_add(profile.record_verify_count, Ordering::Relaxed);
+                    self.exchange_ns
+                        .fetch_add(profile.exchange_ns, Ordering::Relaxed);
+                    self.response_decode_ns
+                        .fetch_add(profile.response_decode_ns, Ordering::Relaxed);
+                    self.record_verify_ns
+                        .fetch_add(profile.record_verify_ns, Ordering::Relaxed);
+                    self.server_handler_ns
+                        .fetch_add(profile.server_handler_ns, Ordering::Relaxed);
+                    self.server_inventory_wait_ns
+                        .fetch_add(profile.server_inventory_wait_ns, Ordering::Relaxed);
+                    self.server_authority_lookup_ns
+                        .fetch_add(profile.server_authority_lookup_ns, Ordering::Relaxed);
+                    self.server_record_read_ns
+                        .fetch_add(profile.server_record_read_ns, Ordering::Relaxed);
+                    self.server_response_recheck_wait_ns
+                        .fetch_add(profile.server_response_recheck_wait_ns, Ordering::Relaxed);
+                    self.server_response_recheck_ns
+                        .fetch_add(profile.server_response_recheck_ns, Ordering::Relaxed);
+                    self.server_response_recheck_samples
+                        .fetch_add(profile.server_response_recheck_samples, Ordering::Relaxed);
+                    self.server_response_recheck_deferrals
+                        .fetch_add(profile.server_response_recheck_deferrals, Ordering::Relaxed);
+                }
+                if failed_profile.is_some_and(|profile| profile.server_handler_available) {
+                    self.failed_owner_profile_retained
+                        .fetch_add(1, Ordering::Relaxed);
+                } else if failed_profile
+                    .is_some_and(|profile| profile.server_handler_not_applicable)
+                {
+                    self.failed_owner_profile_not_applicable
+                        .fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.failed_owner_profile_unavailable
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -335,6 +675,18 @@ pub struct ReadProfileMonitor {
     fabric: bool,
 }
 impl ReadProfileMonitor {
+    pub(super) fn select_resolution(
+        &self,
+        bulk: bool,
+        members: usize,
+    ) -> Option<ResolutionSample<'_>> {
+        self.state.coordinator_diagnostics.select(bulk, members)
+    }
+    /// Cumulative independent first-N API-resolution samples. Drain callers before
+    /// taking a boundary snapshot; stage counts determine availability.
+    pub fn coordinator_resolution_snapshot(&self) -> CoordinatorResolutionSnapshot {
+        self.state.coordinator_diagnostics.snapshot()
+    }
     pub fn visit(&self, set: &mut impl FnMut(&'static str, u64)) {
         self.state.diagnostics.visit(set);
         set(
@@ -357,6 +709,30 @@ impl ReadProfileMonitor {
                         != 0,
             ),
         );
+    }
+    /// Sequential, lock-free snapshots of configured partitions; not a global cut.
+    pub fn visit_partitions(&self, set: &mut impl FnMut(u32, &'static str, u64)) {
+        for (partition, diagnostics) in self.state.owner_diagnostics.iter() {
+            diagnostics.visit(&mut |name, value| {
+                if name.starts_with("read_profile_server_")
+                    || name.starts_with("read_profile_client_grant_install_")
+                    || name.starts_with("read_profile_client_fi_read_")
+                    || matches!(
+                        name,
+                        "read_profile_completed"
+                            | "read_profile_inline_completed"
+                            | "read_profile_grouped_inline_completed"
+                            | "read_profile_actor_completed"
+                            | "read_profile_errors"
+                            | "read_profile_failed_owner_profile_not_applicable"
+                            | "read_profile_failed_owner_profile_retained"
+                            | "read_profile_failed_owner_profile_unavailable"
+                    )
+                {
+                    set(*partition, name, value);
+                }
+            });
+        }
     }
 }
 struct FlightSignal {
@@ -416,11 +792,15 @@ struct State {
     flight_ready: Box<[FlightSignal]>,
     read_rpcs: AtomicU64,
     diagnostics: ReadDiagnostics,
+    coordinator_diagnostics: CoordinatorResolutionDiagnostics,
+    owner_diagnostics: Box<[(u32, ReadDiagnostics)]>,
     flights: Mutex<Box<[Weak<ReadFlight>]>>,
     coalesced_members: AtomicU64,
     flight_metadata_bytes: usize,
     #[cfg(test)]
     peak_connection_reads: AtomicUsize,
+    #[cfg(test)]
+    inline_pause: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
 }
 impl State {
     fn poison(&self) {
@@ -501,10 +881,56 @@ struct Request {
     _credit: Arc<Credit>,
     _lane_credit: LaneCredit,
 }
+enum ReadCommand {
+    Request(Request),
+    Wake,
+}
+
+struct OwnedLane {
+    lane: Lane,
+    reservation: Option<InlineLaneReservation>,
+    sender: mpsc::SyncSender<ReadCommand>,
+}
+impl Drop for OwnedLane {
+    fn drop(&mut self) {
+        drop(self.reservation.take());
+        // A full queue already wakes the actor; accepted work remains in the
+        // shared driver until it is retired by that actor.
+        let _ = self.sender.try_send(ReadCommand::Wake);
+    }
+}
+
 impl Request {
     fn complete(self, result: Result<(Vec<Mutation>, Option<WorkerReadProfile>), LocalDbError>) {
+        self.complete_with_profile(result, None);
+    }
+    fn complete_with_profile(
+        self,
+        result: Result<(Vec<Mutation>, Option<WorkerReadProfile>), LocalDbError>,
+        failed_profile: Option<super::super::tcp::TcpReadProfile>,
+    ) {
         if self.sampled {
-            self._credit.state.diagnostics.complete(&result);
+            let diagnostics = &self._credit.state.diagnostics;
+            let owner = &self._credit.state.owner_diagnostics[self.flight.node].1;
+            if self.flight.grouped_inline.load(Ordering::Acquire) {
+                let profile = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|(_, worker)| worker.as_ref().map(|worker| worker.tcp))
+                    .or(failed_profile);
+                let duration = self.submitted.map_or(0, elapsed);
+                diagnostics.inline_complete(duration, profile, result.is_err());
+                owner.inline_complete(duration, profile, result.is_err());
+                diagnostics
+                    .grouped_inline_completed
+                    .fetch_add(1, Ordering::Relaxed);
+                owner
+                    .grouped_inline_completed
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                diagnostics.complete(&result, failed_profile);
+                owner.complete(&result, failed_profile);
+            }
         }
         if result.is_err() {
             self._credit.state.poison();
@@ -535,6 +961,7 @@ struct ReadFlight {
     node: usize,
     references: Vec<ValueRecordReference>,
     slot: usize,
+    grouped_inline: AtomicBool,
     completion: Arc<FlightCompletion>,
     _pin: Option<IndexReadPin>,
     // The flight, rather than a notifier's temporary completion Arc, owns the
@@ -573,6 +1000,7 @@ struct Lane {
     client: Arc<Mutex<Client>>,
     outstanding: Arc<AtomicUsize>,
     scheduling: Arc<Mutex<LaneScheduling>>,
+    driver: Arc<Mutex<ReactorLane>>,
 }
 struct InflightRead {
     request: Request,
@@ -585,11 +1013,208 @@ struct ReactorLane {
     profiling: bool,
 }
 
+fn progress_read_lane(
+    state: &Arc<State>,
+    lane: &mut ReactorLane,
+    epoch: u64,
+    resident_enabled: bool,
+) -> bool {
+    let mut progressed = false;
+    let now = Instant::now();
+    if lane.queued.iter().any(|request| now >= request.deadline)
+        || lane
+            .active
+            .values()
+            .any(|read| now >= read.request.deadline)
+    {
+        state.poison();
+    }
+    if state.failed.load(Ordering::Acquire) {
+        for request in lane.queued.drain(..) {
+            request.complete(Err(LocalDbError::new("read authority is poisoned")));
+            progressed = true;
+        }
+    }
+    if lane.queued.is_empty() && lane.active.is_empty() && !lane.profiling && !resident_enabled {
+        return progressed;
+    }
+    // Diagnostics and the deterministic test hook may own a mutex.
+    // Never let one such connection stall another connection's reads.
+    let Some(mut client) = lane.client.try_lock() else {
+        return progressed;
+    };
+    let diagnostics = &state.diagnostics;
+    let selected = diagnostics.selected.load(Ordering::Relaxed);
+    let sampling = lane.profiling
+        || (selected != 0 && selected > diagnostics.completed.load(Ordering::Relaxed));
+    let profiling = sampling
+        && (lane.queued.iter().any(|request| request.sampled)
+            || lane.active.values().any(|read| read.request.sampled));
+    if profiling != lane.profiling || profiling {
+        client.profile_read_transport(profiling);
+        lane.profiling = profiling;
+    }
+    if lane.queued.is_empty() && lane.active.is_empty() {
+        match client.progress_resident_control() {
+            Ok(made_progress) => progressed |= made_progress,
+            Err(_) => {
+                state.poison();
+                progressed = true;
+            }
+        }
+        return progressed;
+    }
+    let transport_before = profiling.then(|| client.transport_progress_stats());
+    while let Some(request) = lane.queued.front() {
+        if state.failed.load(Ordering::Acquire) {
+            break;
+        }
+        match client.read_admission(&request.references, request.submitted.is_some()) {
+            Ok(false) => break,
+            Err(error) => {
+                lane.queued
+                    .pop_front()
+                    .unwrap()
+                    .complete(Err(LocalDbError::component(error)));
+                progressed = true;
+                break;
+            }
+            Ok(true) => {}
+        }
+        let mut request = lane.queued.pop_front().unwrap();
+        let started = request.submitted.map(|_| Instant::now());
+        let references = std::mem::take(&mut request.references);
+        let message_requests = client.message_read_requests();
+        match client.submit_read(
+            epoch,
+            references,
+            request.deadline,
+            request.class,
+            request.submitted.is_some(),
+        ) {
+            Ok(Some(id)) => {
+                if client.message_read_requests() != message_requests {
+                    state.read_rpcs.fetch_add(1, Ordering::Relaxed);
+                }
+                lane.active.insert(id, InflightRead { request, started });
+                #[cfg(test)]
+                state
+                    .peak_connection_reads
+                    .fetch_max(lane.active.len(), Ordering::Relaxed);
+            }
+            Ok(None) => {
+                request.complete(Err(LocalDbError::new(
+                    "read admission changed under exclusive ownership",
+                )));
+                break;
+            }
+            Err(error) => {
+                request.complete(Err(LocalDbError::component(error)));
+                break;
+            }
+        }
+        progressed = true;
+    }
+    // Even after global poisoning, accepted transport work is driven to
+    // completion/error before releasing its application-buffer credits.
+    let completions = client.progress_reads();
+    progressed |= client.read_progress_made();
+    if let Some(before) = transport_before {
+        state
+            .diagnostics
+            .transport_delta(before, client.transport_progress_stats());
+        let active_samples = lane
+            .active
+            .values()
+            .filter(|read| read.request.sampled)
+            .count();
+        let completed_samples = match &completions {
+            Ok(ready) => ready
+                .iter()
+                .filter(|completion| {
+                    lane.active
+                        .get(&completion.id)
+                        .is_some_and(|read| read.request.sampled)
+                })
+                .count(),
+            Err(_) => active_samples,
+        };
+        if active_samples == completed_samples && !lane.queued.iter().any(|request| request.sampled)
+        {
+            // Disable before releasing the client or retiring actor
+            // ownership; pooled lanes must not retain sample clocks.
+            client.profile_read_transport(false);
+            lane.profiling = false;
+        }
+    }
+    drop(client);
+    match completions {
+        Ok(completions) => {
+            progressed |= !completions.is_empty();
+            for completion in completions {
+                let Some(inflight) = lane.active.remove(&completion.id) else {
+                    state.poison();
+                    continue;
+                };
+                let finished = Instant::now();
+                let failed_profile = completion
+                    .result
+                    .as_ref()
+                    .err()
+                    .and_then(|error| error.read_profile.as_deref().copied());
+                let result =
+                    completion
+                        .result
+                        .map_err(LocalDbError::component)
+                        .and_then(|(values, tcp)| {
+                            if finished >= inflight.request.deadline {
+                                return Err(LocalDbError::new(
+                                    "remote read operation deadline expired",
+                                ));
+                            }
+                            let profile = inflight.request.submitted.map(|submitted| {
+                                let started = inflight.started.unwrap();
+                                WorkerReadProfile {
+                                    queue_ns: started
+                                        .duration_since(submitted)
+                                        .as_nanos()
+                                        .min(u64::MAX as u128)
+                                        as u64,
+                                    service_ns: finished
+                                        .duration_since(started)
+                                        .as_nanos()
+                                        .min(u64::MAX as u128)
+                                        as u64,
+                                    finished,
+                                    tcp,
+                                }
+                            });
+                            Ok((values, profile))
+                        });
+                inflight
+                    .request
+                    .complete_with_profile(result, failed_profile);
+            }
+        }
+        Err(error) => {
+            state.poison();
+            // Client's fail-stop path relinquishes every request buffer
+            // before returning; endpoint-owned DMA slots are separate.
+            let message = error.to_string();
+            for (_, inflight) in lane.active.drain() {
+                inflight.request.complete(Err(LocalDbError::new(&message)));
+            }
+            progressed = true;
+        }
+    }
+    progressed
+}
+
 #[allow(clippy::too_many_arguments)] // The actor takes explicit ownership, admission and polling inputs once.
 fn drive_reads(
     state: Arc<State>,
-    receiver: mpsc::Receiver<Request>,
-    mut lanes: Vec<ReactorLane>,
+    receiver: mpsc::Receiver<ReadCommand>,
+    lanes: Vec<Lane>,
     epoch: u64,
     max_requests: usize,
     fabric: bool,
@@ -606,10 +1231,11 @@ fn drive_reads(
         // requests and undelivered completions, not merely the channel length.
         for _ in 0..max_requests {
             match receiver.try_recv() {
-                Ok(request) => {
-                    lanes[request.lane].queued.push_back(request);
+                Ok(ReadCommand::Request(request)) => {
+                    lanes[request.lane].driver.lock().queued.push_back(request);
                     progressed = true;
                 }
+                Ok(ReadCommand::Wake) => progressed = true,
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     disconnected = true;
@@ -619,195 +1245,21 @@ fn drive_reads(
         }
         for offset in 0..lanes.len() {
             let index = (first_lane + offset) % lanes.len();
-            let lane = &mut lanes[index];
-            let now = Instant::now();
-            if lane.queued.iter().any(|request| now >= request.deadline)
-                || lane
-                    .active
-                    .values()
-                    .any(|read| now >= read.request.deadline)
-            {
-                state.poison();
-            }
-            if state.failed.load(Ordering::Acquire) {
-                for request in lane.queued.drain(..) {
-                    request.complete(Err(LocalDbError::new("read authority is poisoned")));
-                    progressed = true;
-                }
-            }
-            if lane.queued.is_empty()
-                && lane.active.is_empty()
-                && !lane.profiling
-                && !resident_enabled
-            {
+            let lane = &lanes[index];
+            let scheduling = lane.scheduling.lock();
+            if scheduling.inline_reserved {
                 continue;
             }
-            // Diagnostics and the deterministic test hook may own a mutex.
-            // Never let one such connection stall another connection's reads.
-            let Some(mut client) = lane.client.try_lock() else {
-                continue;
-            };
-            let diagnostics = &state.diagnostics;
-            let selected = diagnostics.selected.load(Ordering::Relaxed);
-            let sampling = lane.profiling
-                || (selected != 0 && selected > diagnostics.completed.load(Ordering::Relaxed));
-            let profiling = sampling
-                && (lane.queued.iter().any(|request| request.sampled)
-                    || lane.active.values().any(|read| read.request.sampled));
-            if profiling != lane.profiling || profiling {
-                client.profile_read_transport(profiling);
-                lane.profiling = profiling;
-            }
-            if lane.queued.is_empty() && lane.active.is_empty() {
-                match client.progress_resident_control() {
-                    Ok(made_progress) => progressed |= made_progress,
-                    Err(_) => {
-                        state.poison();
-                        progressed = true;
-                    }
-                }
-                continue;
-            }
-            let transport_before = profiling.then(|| client.transport_progress_stats());
-            while let Some(request) = lane.queued.front() {
-                if state.failed.load(Ordering::Acquire) {
-                    break;
-                }
-                match client.read_admission(&request.references, request.submitted.is_some()) {
-                    Ok(false) => break,
-                    Err(error) => {
-                        lane.queued
-                            .pop_front()
-                            .unwrap()
-                            .complete(Err(LocalDbError::component(error)));
-                        progressed = true;
-                        break;
-                    }
-                    Ok(true) => {}
-                }
-                let mut request = lane.queued.pop_front().unwrap();
-                let started = request.submitted.map(|_| Instant::now());
-                let references = std::mem::take(&mut request.references);
-                let message_requests = client.message_read_requests();
-                match client.submit_read(
-                    epoch,
-                    references,
-                    request.deadline,
-                    request.class,
-                    request.submitted.is_some(),
-                ) {
-                    Ok(Some(id)) => {
-                        if client.message_read_requests() != message_requests {
-                            state.read_rpcs.fetch_add(1, Ordering::Relaxed);
-                        }
-                        lane.active.insert(id, InflightRead { request, started });
-                        #[cfg(test)]
-                        state
-                            .peak_connection_reads
-                            .fetch_max(lane.active.len(), Ordering::Relaxed);
-                    }
-                    Ok(None) => {
-                        request.complete(Err(LocalDbError::new(
-                            "read admission changed under exclusive ownership",
-                        )));
-                        break;
-                    }
-                    Err(error) => {
-                        request.complete(Err(LocalDbError::component(error)));
-                        break;
-                    }
-                }
-                progressed = true;
-            }
-            // Even after global poisoning, accepted transport work is driven to
-            // completion/error before releasing its application-buffer credits.
-            let completions = client.progress_reads();
-            progressed |= client.read_progress_made();
-            if let Some(before) = transport_before {
-                state
-                    .diagnostics
-                    .transport_delta(before, client.transport_progress_stats());
-                let active_samples = lane
-                    .active
-                    .values()
-                    .filter(|read| read.request.sampled)
-                    .count();
-                let completed_samples = match &completions {
-                    Ok(ready) => ready
-                        .iter()
-                        .filter(|completion| {
-                            lane.active
-                                .get(&completion.id)
-                                .is_some_and(|read| read.request.sampled)
-                        })
-                        .count(),
-                    Err(_) => active_samples,
-                };
-                if active_samples == completed_samples
-                    && !lane.queued.iter().any(|request| request.sampled)
-                {
-                    // Disable before releasing the client or retiring actor
-                    // ownership; pooled lanes must not retain sample clocks.
-                    client.profile_read_transport(false);
-                    lane.profiling = false;
-                }
-            }
-            drop(client);
-            match completions {
-                Ok(completions) => {
-                    progressed |= !completions.is_empty();
-                    for completion in completions {
-                        let Some(inflight) = lane.active.remove(&completion.id) else {
-                            state.poison();
-                            continue;
-                        };
-                        let finished = Instant::now();
-                        let result = completion.result.map_err(LocalDbError::component).and_then(
-                            |(values, tcp)| {
-                                if finished >= inflight.request.deadline {
-                                    return Err(LocalDbError::new(
-                                        "remote read operation deadline expired",
-                                    ));
-                                }
-                                let profile = inflight.request.submitted.map(|submitted| {
-                                    let started = inflight.started.unwrap();
-                                    WorkerReadProfile {
-                                        queue_ns: started
-                                            .duration_since(submitted)
-                                            .as_nanos()
-                                            .min(u64::MAX as u128)
-                                            as u64,
-                                        service_ns: finished
-                                            .duration_since(started)
-                                            .as_nanos()
-                                            .min(u64::MAX as u128)
-                                            as u64,
-                                        finished,
-                                        tcp,
-                                    }
-                                });
-                                Ok((values, profile))
-                            },
-                        );
-                        inflight.request.complete(result);
-                    }
-                }
-                Err(error) => {
-                    state.poison();
-                    // Client's fail-stop path relinquishes every request buffer
-                    // before returning; endpoint-owned DMA slots are separate.
-                    let message = error.to_string();
-                    for (_, inflight) in lane.active.drain() {
-                        inflight.request.complete(Err(LocalDbError::new(&message)));
-                    }
-                    progressed = true;
-                }
+            if let Some(mut driver) = lane.driver.try_lock() {
+                drop(scheduling);
+                progressed |= progress_read_lane(&state, &mut driver, epoch, resident_enabled);
             }
         }
         if disconnected
-            && lanes
-                .iter()
-                .all(|lane| lane.queued.is_empty() && lane.active.is_empty())
+            && lanes.iter().all(|lane| {
+                !lane.scheduling.lock().inline_reserved
+                    && lane.outstanding.load(Ordering::Acquire) == 0
+            })
         {
             break;
         }
@@ -819,7 +1271,7 @@ fn drive_reads(
                 std::hint::spin_loop();
             } else if lanes
                 .iter()
-                .any(|lane| !lane.queued.is_empty() || !lane.active.is_empty())
+                .any(|lane| lane.outstanding.load(Ordering::Acquire) != 0)
             {
                 // EFA's manual progress stays on its owner for a bounded burst;
                 // TCP keeps scheduler-driven waits. Neither sleeps through I/O.
@@ -838,7 +1290,10 @@ fn drive_reads(
                 // No accepted I/O needs polling. Wake on admission rather than
                 // periodically sleeping through the next scalar request.
                 match receiver.recv_timeout(Duration::from_millis(50)) {
-                    Ok(request) => lanes[request.lane].queued.push_back(request),
+                    Ok(ReadCommand::Request(request)) => {
+                        lanes[request.lane].driver.lock().queued.push_back(request)
+                    }
+                    Ok(ReadCommand::Wake) => {}
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => disconnected = true,
                 }
@@ -852,13 +1307,25 @@ fn drive_reads(
 pub(super) struct ReadService {
     state: Arc<State>,
     lanes: RwLock<Vec<Vec<Lane>>>,
-    sender: Mutex<Option<mpsc::SyncSender<Request>>>,
+    sender: Mutex<Option<mpsc::SyncSender<ReadCommand>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
     next: Vec<AtomicUsize>,
     max_requests: usize,
     max_bytes: usize,
     timeout: Duration,
+    epoch: u64,
     resident_enabled: bool,
+}
+impl ReadService {
+    pub(super) fn resolution_monitor(&self) -> Option<ReadProfileMonitor> {
+        self.state
+            .coordinator_diagnostics
+            .enabled()
+            .then(|| ReadProfileMonitor {
+                state: self.state.clone(),
+                fabric: false,
+            })
+    }
 }
 pub(super) struct ReadRequest {
     parts: SmallVec<[(Arc<ReadFlight>, usize); 1]>,
@@ -917,6 +1384,10 @@ impl ReadRequest {
             .try_result()?
             .ok_or_else(|| self.failure("remote read did not complete"))?;
         if self.sampled
+            && !self
+                .profile
+                .as_ref()
+                .is_some_and(|flight| flight.grouped_inline.load(Ordering::Acquire))
             && let Some(worker) = &result.1
         {
             let diagnostics = &self.credit.state.diagnostics;
@@ -966,11 +1437,20 @@ impl ReadService {
                 .into_boxed_slice(),
             read_rpcs: AtomicU64::new(0),
             diagnostics: ReadDiagnostics::default(),
+            coordinator_diagnostics: CoordinatorResolutionDiagnostics::default(),
+            owner_diagnostics: config
+                .endpoints
+                .iter()
+                .map(|endpoint| (endpoint.partition, ReadDiagnostics::default()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             flights: Mutex::new((0..flight_slots).map(|_| Weak::new()).collect()),
             coalesced_members: AtomicU64::new(0),
             flight_metadata_bytes,
             #[cfg(test)]
             peak_connection_reads: AtomicUsize::new(0),
+            #[cfg(test)]
+            inline_pause: Mutex::new(None),
         });
         let mut service = Self {
             state,
@@ -985,6 +1465,7 @@ impl ReadService {
                 .max_pending_read_bytes
                 .saturating_sub(flight_metadata_bytes),
             timeout: config.timeout,
+            epoch,
             resident_enabled: config.tls.resident_reads.enabled(),
         };
         let mut reactor_lanes = Vec::new();
@@ -999,18 +1480,21 @@ impl ReadService {
                 let scheduling = Arc::new(Mutex::new(LaneScheduling {
                     inline_reserved: false,
                 }));
-                reactor_lanes.push(ReactorLane {
+                let driver = Arc::new(Mutex::new(ReactorLane {
                     client: client.clone(),
                     queued: VecDeque::new(),
                     active: HashMap::new(),
                     profiling: false,
-                });
-                lanes.push(Lane {
+                }));
+                let lane = Lane {
                     index,
                     client,
                     outstanding: Arc::new(AtomicUsize::new(0)),
                     scheduling,
-                });
+                    driver,
+                };
+                reactor_lanes.push(lane.clone());
+                lanes.push(lane);
             }
             service.lanes.get_mut().push(lanes);
         }
@@ -1155,6 +1639,30 @@ impl ReadService {
             .into_iter()
             .map(|(node, lane, client)| (node, lane, client.lock().resident_read_stats()))
             .collect()
+    }
+    pub(super) fn resident_read_lane_snapshots(
+        &self,
+        partition_for: impl Fn(usize) -> Option<u32>,
+    ) -> Result<Vec<super::ResidentReadLaneSnapshot>, LocalDbError> {
+        let lanes = self.lanes.read();
+        if self.state.stopped.load(Ordering::Acquire) {
+            return Err(LocalDbError::new("read reactor stopped"));
+        }
+        let mut samples = Vec::new();
+        for (node, node_lanes) in lanes.iter().enumerate() {
+            let partition = partition_for(node)
+                .ok_or_else(|| LocalDbError::new("read lane has no configured owner"))?;
+            for (lane, entry) in node_lanes.iter().enumerate() {
+                let client = entry.client.lock();
+                samples.push(super::ResidentReadLaneSnapshot {
+                    partition,
+                    lane,
+                    session_present: client.session_present(),
+                    stats: client.resident_read_stats(),
+                });
+            }
+        }
+        Ok(samples)
     }
     pub(super) fn profiles(
         &self,
@@ -1333,12 +1841,18 @@ impl ReadService {
             node,
             references: vec![*reference],
             slot: flight_slot,
+            grouped_inline: AtomicBool::new(false),
             completion: Arc::new(FlightCompletion::new()),
             _pin: pin,
             _credit: credit,
         });
         flights[flight_slot] = Arc::downgrade(&flight);
         drop(flights);
+        #[cfg(test)]
+        if let Some((entered, resume)) = self.state.inline_pause.lock().take() {
+            entered.send(()).unwrap();
+            resume.recv().unwrap();
+        }
         let _poison = PoisonOnPanic(self.state.clone());
         let sampled = self.state.diagnostics.select();
         let started = sampled.then(Instant::now);
@@ -1350,9 +1864,20 @@ impl ReadService {
         let result = if sampled || profile.is_some() {
             let result = client.read_records_profiled(epoch, std::slice::from_ref(reference));
             if sampled {
-                self.state.diagnostics.inline_complete(
-                    elapsed(started.unwrap()),
-                    result.as_ref().ok().map(|(_, tcp)| *tcp),
+                let elapsed_ns = elapsed(started.unwrap());
+                let measured = result.as_ref().ok().map(|(_, tcp)| *tcp).or_else(|| {
+                    result
+                        .as_ref()
+                        .err()
+                        .and_then(|error| error.read_profile.as_deref().copied())
+                });
+                self.state
+                    .diagnostics
+                    .inline_complete(elapsed_ns, measured, result.is_err());
+                self.state.owner_diagnostics[node].1.inline_complete(
+                    elapsed_ns,
+                    measured,
+                    result.is_err(),
                 );
             }
             result.map(|(values, measured)| {
@@ -1382,6 +1907,7 @@ impl ReadService {
             Err(error) => Err(copied_read_error(error)),
         });
         self.state.flight_ready[flight_slot].retire();
+        self.state.notify_admission();
         result.map(Some)
     }
     pub(super) fn submit(
@@ -1411,6 +1937,17 @@ impl ReadService {
         extra_bytes: usize,
         profiled: bool,
         context: ReadContext,
+    ) -> Result<ReadRequest, LocalDbError> {
+        self.submit_until_owned(node, references, extra_bytes, profiled, context, None)
+    }
+    fn submit_until_owned(
+        &self,
+        node: usize,
+        references: Vec<ValueRecordReference>,
+        extra_bytes: usize,
+        profiled: bool,
+        context: ReadContext,
+        mut owned_lanes: Option<&mut Vec<OwnedLane>>,
     ) -> Result<ReadRequest, LocalDbError> {
         let ReadContext {
             deadline,
@@ -1476,6 +2013,27 @@ impl ReadService {
         } else {
             None
         };
+        let preferred = if self.resident_enabled && new_request != 0 {
+            let lanes = self.lanes.read();
+            lanes.get(node).and_then(|lanes| {
+                lanes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, lane)| {
+                        if lane.outstanding.load(Ordering::Acquire) != 0 {
+                            return None;
+                        }
+                        let client = lane.client.try_lock()?;
+                        let hits = client.resident_grant_hits(self.epoch, &missing);
+                        (hits != 0).then_some((index, hits))
+                    })
+                    .max_by_key(|&(_, hits)| hits)
+                    .map(|(index, _)| index)
+            })
+        } else {
+            None
+        };
+        let mut reserved = false;
         let (credit, lane) = {
             let mut retained = self.state.retained.lock();
             if self.failed() {
@@ -1499,7 +2057,7 @@ impl ReadService {
             // Prefer an idle lane so work can progress independently instead
             // of queueing behind an unrelated slow or stalled request. If all
             // lanes are occupied, fall back to a non-inline-reserved lane.
-            let next = self.next[node].fetch_add(1, Ordering::Relaxed);
+            let next = preferred.unwrap_or_else(|| self.next[node].fetch_add(1, Ordering::Relaxed));
             let lane = if new_request == 0 {
                 None
             } else {
@@ -1509,11 +2067,15 @@ impl ReadService {
                         .find_map(|idle_only| {
                             (0..lanes.len()).find_map(|offset| {
                                 let lane = &lanes[next.wrapping_add(offset) % lanes.len()];
-                                let scheduling = lane.scheduling.lock();
+                                let mut scheduling = lane.scheduling.lock();
                                 if scheduling.inline_reserved
                                     || (idle_only && lane.outstanding.load(Ordering::Acquire) != 0)
                                 {
                                     return None;
+                                }
+                                if idle_only && owned_lanes.is_some() {
+                                    scheduling.inline_reserved = true;
+                                    reserved = true;
                                 }
                                 lane.outstanding.fetch_add(1, Ordering::AcqRel);
                                 Some(lane.clone())
@@ -1539,6 +2101,7 @@ impl ReadService {
                 node,
                 references: missing.clone(),
                 slot,
+                grouped_inline: AtomicBool::new(false),
                 completion: Arc::new(FlightCompletion::new()),
                 _pin: pin,
                 _credit: credit.clone(),
@@ -1560,13 +2123,51 @@ impl ReadService {
             };
             let sender_guard = self.sender.lock();
             let Some(sender) = sender_guard.as_ref() else {
+                if reserved {
+                    drop(InlineLaneReservation(lane.scheduling.clone()));
+                }
                 drop(request);
                 drop(sender_guard);
                 self.state.flight_ready[slot].retire();
                 return Err(LocalDbError::new("read reactor stopped"));
             };
-            let sent = sender.try_send(request);
+            let sender = sender.clone();
             drop(sender_guard);
+            if reserved {
+                let reservation = InlineLaneReservation(lane.scheduling.clone());
+                if lane.client.try_lock().is_some()
+                    && let Some(mut driver) = lane.driver.try_lock()
+                {
+                    flight.grouped_inline.store(true, Ordering::Release);
+                    driver.queued.push_back(request);
+                    drop(driver);
+                    owned_lanes
+                        .as_mut()
+                        .expect("reserved for batch")
+                        .push(OwnedLane {
+                            lane: lane.clone(),
+                            reservation: Some(reservation),
+                            sender,
+                        });
+                    drop(flights);
+                    self.state
+                        .coalesced_members
+                        .fetch_add(coalesced_members as u64, Ordering::Relaxed);
+                    let parts = parts
+                        .into_iter()
+                        .map(|(existing, slot)| (existing.unwrap_or_else(|| flight.clone()), slot))
+                        .collect();
+                    return Ok(ReadRequest {
+                        parts,
+                        credit,
+                        deadline,
+                        sampled,
+                        profile: Some(flight),
+                    });
+                }
+                drop(reservation);
+            }
+            let sent = sender.try_send(ReadCommand::Request(request));
             if let Err(error) = sent {
                 if sampled {
                     self.state
@@ -1749,9 +2350,11 @@ impl RemoteDatabase {
             .diagnostics
             .remaining
             .store(limit, Ordering::Relaxed);
+        self.reads.state.coordinator_diagnostics.arm(limit);
     }
-    /// Cumulative sampled RPC counters, never per-request means. Successful
-    /// server spans nest inside exchange/service; errors have no server spans.
+    /// Cumulative first-N sampled RPC counters, never per-request means.
+    /// Server spans nest inside exchange/service. Failures without a profiled
+    /// owner reply are explicitly counted as unavailable.
     pub fn read_profile_monitor(&self) -> ReadProfileMonitor {
         ReadProfileMonitor {
             state: self.reads.state.clone(),
@@ -1870,20 +2473,65 @@ impl RemoteDatabase {
         mut profile: Option<&mut RemoteReadProfile>,
         inline: bool,
     ) -> Result<PendingGet, LocalDbError> {
+        let mut sample = self.reads.state.coordinator_diagnostics.select(false, 1);
         self.ensure_healthy()?;
         let index_started = Instant::now();
         let (reference, pin, cached) = {
+            let clock = ResolutionSample::start(&sample);
             let index = self.index.read();
+            if let Some(sample) = &sample {
+                sample.stage(ResolutionStage::IndexLockWait, clock);
+            }
+            let clock = ResolutionSample::start(&sample);
             let reference = index
                 .get(ks, key, cut.clone())
-                .map_err(LocalDbError::component)?;
-            let cached = reference
-                .and_then(|reference| self.read_cache.lock().get_point(&reference, ks, key));
-            let pin = if reference.is_some() && cached.is_none() {
-                Some(index.pin_cut(cut).map_err(LocalDbError::component)?)
+                .map_err(LocalDbError::component);
+            if let Some(sample) = &sample {
+                sample.stage(ResolutionStage::IndexLookup, clock);
+            }
+            let reference = match reference {
+                Ok(reference) => reference,
+                Err(error) => {
+                    if let Some(sample) = &sample {
+                        sample.member(MemberOutcome::Error);
+                    }
+                    return Err(error);
+                }
+            };
+            let cached = if let Some(reference) = reference {
+                let clock = ResolutionSample::start(&sample);
+                let mut cache = self.read_cache.lock();
+                if let Some(sample) = &sample {
+                    sample.stage(ResolutionStage::CacheLockWait, clock);
+                }
+                let clock = ResolutionSample::start(&sample);
+                let cached = cache.get_point(&reference, ks, key);
+                if let Some(sample) = &sample {
+                    sample.stage(ResolutionStage::CacheLookup, clock);
+                }
+                cached
             } else {
                 None
             };
+            let pin = if reference.is_some() && cached.is_none() {
+                let clock = ResolutionSample::start(&sample);
+                let pin = index.pin_cut(cut).map_err(LocalDbError::component);
+                if let Some(sample) = &sample {
+                    sample.stage(ResolutionStage::PinPreparation, clock);
+                }
+                Some(pin?)
+            } else {
+                None
+            };
+            if let Some(sample) = &sample {
+                sample.member(if reference.is_none() {
+                    MemberOutcome::IndexMiss
+                } else if cached.is_some() {
+                    MemberOutcome::CacheHit
+                } else {
+                    MemberOutcome::RemoteMiss
+                });
+            }
             (reference, pin, cached)
         };
         let index_ns = elapsed(index_started);
@@ -1893,6 +2541,10 @@ impl RemoteDatabase {
         }
         let state = if let Some(reference) = reference {
             if let Some(value) = cached {
+                if let Some(sample) = &mut sample {
+                    sample.success();
+                }
+                drop(sample);
                 if let Some(profile) = profile {
                     profile.cache_hits += 1;
                 }
@@ -1902,10 +2554,20 @@ impl RemoteDatabase {
                 if let Some(profile) = profile.as_deref_mut() {
                     profile.cache_misses += 1;
                 }
-                let node = *self
+                let clock = ResolutionSample::start(&sample);
+                let node = self
                     .partition_indexes
                     .get(&reference.batch_address.partition)
-                    .ok_or_else(|| LocalDbError::new("reference names unregistered partition"))?;
+                    .copied()
+                    .ok_or_else(|| LocalDbError::new("reference names unregistered partition"));
+                if let Some(sample) = &sample {
+                    sample.stage(ResolutionStage::RoutePreparation, clock);
+                }
+                let node = node?;
+                if let Some(sample) = &mut sample {
+                    sample.success();
+                }
+                drop(sample);
                 let inline_started = inline.then(Instant::now);
                 let immediate = if inline {
                     self.reads
@@ -1952,6 +2614,10 @@ impl RemoteDatabase {
                 }
             }
         } else {
+            if let Some(sample) = &mut sample {
+                sample.success();
+            }
+            drop(sample);
             GetState::Ready(None)
         };
         self.ensure_healthy()?;

@@ -13,12 +13,16 @@ struct Fixture {
     shape: KeyShape,
     log: Arc<PartitionLog>,
     references: Vec<ValueRecordReference>,
+    value_len: usize,
 }
 impl Fixture {
     fn new(count: usize) -> Self {
+        Self::with_value_len(count, 64)
+    }
+    fn with_value_len(count: usize, value_len: usize) -> Self {
         let temp = tempdir::TempDir::new("uring-member-test").unwrap();
         let shape = KeyShape::new_single(4, 1, KeyType::uniform(1));
-        let max_encoded_bytes = 64 + 512;
+        let max_encoded_bytes = value_len + 512;
         let max_group_bytes = max_encoded_bytes + 512;
         let fragment_bytes = ((max_group_bytes as u64 + 15) / 8) * 8;
         let config = PartitionConfig {
@@ -65,7 +69,7 @@ impl Fixture {
                     epoch: 5,
                     sequence: n as u64,
                 },
-                vec![Self::mutation(n)],
+                vec![Self::mutation(n, value_len)],
                 config.batch_limits,
             )
             .unwrap();
@@ -81,13 +85,14 @@ impl Fixture {
             shape,
             log,
             references,
+            value_len,
         }
     }
-    fn mutation(n: usize) -> Mutation {
+    fn mutation(n: usize, value_len: usize) -> Mutation {
         Mutation::Put {
             keyspace: KeySpace(0),
             key: b"key1"[..].into(),
-            value: vec![n as u8; 64].into(),
+            value: vec![n as u8; value_len].into(),
         }
     }
     fn member(&self, n: usize) -> Vec<(Arc<PartitionLog>, ValueRecordReference)> {
@@ -96,7 +101,7 @@ impl Fixture {
     fn assert_value(&self, n: usize, bytes: Bytes) {
         assert_eq!(
             CompleteBatch::decode_record(&self.shape, &self.references[n], bytes).unwrap(),
-            Self::mutation(n)
+            Self::mutation(n, self.value_len)
         );
     }
 }
@@ -131,6 +136,7 @@ fn read(executor: &mut ReadExecutor, fixture: &Fixture, n: usize, id: u64) -> By
             lease: _lease,
         } => records.remove(0),
         SubmitOutcome::Pending => finish(executor, 1).remove(0).result.unwrap().remove(0),
+        SubmitOutcome::Deferred(_) => panic!("scalar request unexpectedly deferred"),
         SubmitOutcome::Full(_) => panic!("unexpected admission pressure"),
     }
 }
@@ -407,9 +413,16 @@ fn short_read_is_reported_and_never_cached_even_after_cancellation() {
             cache_bytes: 8192,
             ..ReadExecutorConfig::default()
         });
+        let mut profile = super::super::WalReadProfile::default();
         assert!(matches!(
             executor
-                .submit(1, fixture.member(0), ReadClass::Point)
+                .submit_planned_profiled(
+                    1,
+                    vec![(fixture.references[0], plan)],
+                    ReadClass::Point,
+                    &mut None,
+                    Some(&mut profile)
+                )
                 .unwrap(),
             SubmitOutcome::Pending
         ));
@@ -420,6 +433,10 @@ fn short_read_is_reported_and_never_cached_even_after_cancellation() {
         assert!(
             matches!(&completion.result, Err(StorageError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof)
         );
+        let profile = completion.profile.unwrap();
+        assert_eq!(profile.async_count, 1);
+        assert_eq!(profile.async_partial, 1);
+        assert_eq!(profile.async_errors, 1);
         assert_eq!(admission.stats().errors, 1);
         assert_eq!(admission.stats().cache_entries, 0);
         drop(completion);
@@ -681,6 +698,7 @@ fn scans_consult_hot_records_without_filling_or_evicting_point_cache() {
                 lease: _lease,
             } => records.remove(0),
             SubmitOutcome::Pending => finish(&mut executor, 1).remove(0).result.unwrap().remove(0),
+            SubmitOutcome::Deferred(_) => panic!("scalar scan unexpectedly deferred"),
             SubmitOutcome::Full(_) => panic!("sequential scan unexpectedly full"),
         };
         fixture.assert_value(n, encoded);
@@ -1128,8 +1146,9 @@ fn full_retry_retains_partial_prefix_and_completed_resident_member() {
         })
         .collect();
     let mut lease = None;
+    let mut profile = super::super::WalReadProfile::default();
     let SubmitOutcome::Full(plans) = second
-        .submit_planned(2, plans, ReadClass::Point, &mut lease)
+        .submit_planned_profiled(2, plans, ReadClass::Point, &mut lease, Some(&mut profile))
         .unwrap()
     else {
         panic!("occupied device slot should defer the async suffix")
@@ -1138,6 +1157,10 @@ fn full_retry_retains_partial_prefix_and_completed_resident_member() {
     assert_eq!(admission.stats().resident_read_attempts, 3);
     assert_eq!(admission.stats().resident_read_successes, 1);
     assert_eq!(admission.stats().resident_read_partial, 0);
+    assert_eq!(profile.cache_resolution_count, 1);
+    assert_eq!(profile.nowait_count, 2);
+    assert_eq!(profile.nowait_partial, 1);
+    assert_eq!(profile.cache_only_requests, 0);
 
     let first_completion = finish(&mut first, 1).remove(0);
     assert_eq!(first_completion.request_id, 1);
@@ -1145,16 +1168,22 @@ fn full_retry_retains_partial_prefix_and_completed_resident_member() {
     second.begin_sweep();
     assert!(matches!(
         second
-            .submit_planned(2, plans, ReadClass::Point, &mut lease)
+            .submit_planned_profiled(2, plans, ReadClass::Point, &mut lease, Some(&mut profile))
             .unwrap(),
         SubmitOutcome::Pending
     ));
+    assert_eq!(profile.cache_resolution_count, 1);
+    assert_eq!(profile.nowait_count, 2);
     assert!(lease.is_none());
     assert_eq!(second.operations.len(), 1);
     assert_eq!(second.operations.values().next().unwrap().filled, 7);
 
     let mut completion = finish(&mut second, 1).remove(0);
     assert_eq!(completion.request_id, 2);
+    let io_profile = completion.profile.unwrap();
+    assert_eq!(io_profile.async_count, 1);
+    assert_eq!(io_profile.async_errors, 0);
+    assert_eq!(io_profile.async_partial, 0);
     let records = completion.result.as_mut().unwrap();
     assert_eq!(records.len(), 2);
     for n in 0..2 {
@@ -1305,57 +1334,287 @@ fn unsupported_and_partial_nowait_results_keep_suffix_owners_until_cq() {
 }
 
 #[test]
-fn resident_attempt_budget_defers_larger_request_tail_and_keeps_order() {
-    let fixture = Fixture::new(5);
+fn warm_group_resumes_across_sweeps_without_reprobing_or_recharging() {
+    let fixture = Fixture::new(9);
+    let (admission, mut executor) = executor(ReadExecutorConfig {
+        resident_first: true,
+        max_device_reads: 16,
+        ..ReadExecutorConfig::default()
+    });
+    let order = [8, 1, 2, 3, 4, 5, 6, 7, 8];
+    let mut plans = order
+        .iter()
+        .map(|&n| {
+            let reference = fixture.references[n];
+            (reference, fixture.log.plan_record_read(&reference).unwrap())
+        })
+        .collect();
+    executor
+        .resident_test_results
+        .extend((0..order.len()).map(|_| ResidentTestResult::Complete));
+    let mut lease = None;
+    let mut profile = super::super::WalReadProfile::default();
+    let mut charge = None;
+    for sweep in 0..3 {
+        executor.begin_sweep();
+        match executor
+            .submit_planned_profiled(1, plans, ReadClass::Point, &mut lease, Some(&mut profile))
+            .unwrap()
+        {
+            SubmitOutcome::Deferred(next) if sweep < 2 => {
+                plans = next;
+                let current = admission.stats().inflight_bytes;
+                assert_eq!(*charge.get_or_insert(current), current);
+                assert_eq!(profile.cache_resolution_count, 1);
+            }
+            SubmitOutcome::Ready {
+                records,
+                lease: reply,
+            } if sweep == 2 => {
+                for (n, bytes) in order.into_iter().zip(records) {
+                    fixture.assert_value(n, bytes);
+                }
+                drop(reply);
+                let stats = admission.stats();
+                assert_eq!(stats.resident_read_attempts, 9);
+                assert_eq!(stats.resident_read_successes, 9);
+                assert_eq!(stats.resident_read_deferred, 0);
+                assert_eq!(stats.async_read_submissions, 0);
+                assert_eq!(stats.wal_reads, 9);
+                assert_eq!(stats.inflight_bytes, 0);
+                assert_eq!(profile.nowait_count, 9);
+                assert_eq!(profile.nowait_deferred, 0);
+                return;
+            }
+            _ => panic!("unexpected warm sweep outcome"),
+        }
+    }
+    panic!("warm request did not finish");
+}
+
+#[test]
+fn cold_after_warm_sweep_falls_back_without_another_sweep() {
+    let fixture = Fixture::new(6);
     let (admission, mut executor) = executor(ReadExecutorConfig {
         resident_first: true,
         max_device_reads: 8,
         ..ReadExecutorConfig::default()
     });
-    let mut plans = (0..5)
+    let plans = (0..6)
         .map(|n| {
-            (
-                fixture.references[n],
-                fixture
-                    .log
-                    .plan_record_read(&fixture.references[n])
-                    .unwrap(),
-            )
+            let reference = fixture.references[n];
+            (reference, fixture.log.plan_record_read(&reference).unwrap())
         })
-        .collect::<Vec<_>>();
-    let second_plans = plans.split_off(2);
+        .collect();
+    executor
+        .resident_test_results
+        .extend((0..4).map(|_| ResidentTestResult::Complete));
+    executor
+        .resident_test_results
+        .push_back(ResidentTestResult::Partial(7));
+    executor
+        .resident_test_results
+        .push_back(ResidentTestResult::Complete);
+    let mut lease = None;
     executor.begin_sweep();
-    let first = executor
-        .submit_planned(1, plans, ReadClass::Point, &mut None)
-        .unwrap();
-    let mut records = match first {
-        SubmitOutcome::Ready {
-            records,
-            lease: _lease,
-        } => records,
-        SubmitOutcome::Pending => finish(&mut executor, 1).remove(0).result.unwrap(),
-        SubmitOutcome::Full(_) => panic!("first bounded request unexpectedly full"),
+    let SubmitOutcome::Deferred(plans) = executor
+        .submit_planned(1, plans, ReadClass::Point, &mut lease)
+        .unwrap()
+    else {
+        panic!("warm first sweep should defer");
     };
-    let second = executor
-        .submit_planned(2, second_plans, ReadClass::Point, &mut None)
-        .unwrap();
-    records.extend(match second {
-        SubmitOutcome::Ready {
-            records,
-            lease: _lease,
-        } => records,
-        SubmitOutcome::Pending => finish(&mut executor, 1).remove(0).result.unwrap(),
-        SubmitOutcome::Full(_) => panic!("second bounded request unexpectedly full"),
-    });
-    for (n, bytes) in records.into_iter().enumerate() {
+    executor.begin_sweep();
+    assert!(matches!(
+        executor
+            .submit_planned(1, plans, ReadClass::Point, &mut lease)
+            .unwrap(),
+        SubmitOutcome::Pending
+    ));
+    let mut completion = finish(&mut executor, 1).remove(0);
+    for (n, bytes) in completion.result.as_mut().unwrap().drain(..).enumerate() {
         fixture.assert_value(n, bytes);
     }
+    drop(completion);
     let stats = admission.stats();
-    assert_eq!(stats.resident_read_attempts, 4);
-    assert_eq!(stats.resident_read_deferred, 1);
-    assert_eq!(stats.completed_reads, 5);
+    assert_eq!(stats.resident_read_attempts, 6);
+    assert_eq!(stats.resident_read_partial, 1);
+    assert_eq!(stats.async_read_submissions, 1);
+    assert_eq!(stats.wal_reads, 6);
     assert_eq!(stats.inflight_bytes, 0);
-    assert_eq!(stats.inflight_reads, 0);
+}
+
+#[test]
+fn large_encoded_member_uses_real_async_fallback_without_probe() {
+    let fixture = Fixture::with_value_len(1, 64 * 1024);
+    let (admission, mut executor) = executor(ReadExecutorConfig {
+        resident_first: true,
+        ..ReadExecutorConfig::default()
+    });
+    executor.begin_sweep();
+    assert!(matches!(
+        executor
+            .submit(1, fixture.member(0), ReadClass::Point)
+            .unwrap(),
+        SubmitOutcome::Pending
+    ));
+    let mut completion = finish(&mut executor, 1).remove(0);
+    fixture.assert_value(0, completion.result.as_mut().unwrap().remove(0));
+    drop(completion);
+    let stats = admission.stats();
+    assert_eq!(stats.resident_read_attempts, 0);
+    assert_eq!(stats.resident_read_deferred, 1);
+    assert_eq!(stats.async_read_submissions, 1);
+    assert_eq!(stats.wal_reads, 1);
+    assert_eq!(stats.inflight_bytes, 0);
+}
+
+#[test]
+fn warm_continuation_has_a_hard_sweep_limit_and_async_tail() {
+    let fixture = Fixture::new(1);
+    let (admission, mut executor) = executor(ReadExecutorConfig {
+        resident_first: true,
+        max_device_reads: 64,
+        ..ReadExecutorConfig::default()
+    });
+    let mut plans = (0..33)
+        .map(|_| {
+            let reference = fixture.references[0];
+            (reference, fixture.log.plan_record_read(&reference).unwrap())
+        })
+        .collect();
+    executor
+        .resident_test_results
+        .extend((0..32).map(|_| ResidentTestResult::Complete));
+    let mut lease = None;
+    for sweep in 0..RESIDENT_NOWAIT_MAX_SWEEPS {
+        executor.begin_sweep();
+        match executor
+            .submit_planned(1, plans, ReadClass::Point, &mut lease)
+            .unwrap()
+        {
+            SubmitOutcome::Deferred(next) if sweep + 1 < RESIDENT_NOWAIT_MAX_SWEEPS => {
+                plans = next;
+            }
+            SubmitOutcome::Pending if sweep + 1 == RESIDENT_NOWAIT_MAX_SWEEPS => {
+                let mut completion = finish(&mut executor, 1).remove(0);
+                for bytes in completion.result.as_mut().unwrap().drain(..) {
+                    fixture.assert_value(0, bytes);
+                }
+                drop(completion);
+                let stats = admission.stats();
+                assert_eq!(stats.resident_read_attempts, 32);
+                assert_eq!(stats.resident_read_deferred, 1);
+                assert_eq!(stats.async_read_submissions, 1);
+                assert_eq!(stats.wal_reads, 33);
+                assert_eq!(stats.inflight_bytes, 0);
+                return;
+            }
+            _ => panic!("unexpected bounded continuation outcome"),
+        }
+    }
+    panic!("bounded request did not submit");
+}
+
+#[test]
+fn dropping_deferred_reply_releases_prepared_buffers_and_credit() {
+    let fixture = Fixture::new(5);
+    let (admission, mut executor) = executor(ReadExecutorConfig {
+        resident_first: true,
+        ..ReadExecutorConfig::default()
+    });
+    let plans = (0..5)
+        .map(|n| {
+            let reference = fixture.references[n];
+            (reference, fixture.log.plan_record_read(&reference).unwrap())
+        })
+        .collect();
+    executor
+        .resident_test_results
+        .extend((0..4).map(|_| ResidentTestResult::Complete));
+    let mut lease = None;
+    executor.begin_sweep();
+    let SubmitOutcome::Deferred(plans) = executor
+        .submit_planned(1, plans, ReadClass::Point, &mut lease)
+        .unwrap()
+    else {
+        panic!("warm request should defer");
+    };
+    assert!(admission.stats().inflight_bytes > 0);
+    drop(plans);
+    drop(lease);
+    assert_eq!(admission.stats().inflight_bytes, 0);
+    assert_eq!(admission.stats().inflight_requests, 0);
+    assert!(executor.operations.is_empty());
+}
+
+#[test]
+fn continued_partial_read_survives_full_credit_retry() {
+    let fixture = Fixture::new(6);
+    let config = ReadExecutorConfig {
+        resident_first: true,
+        max_requests: 4,
+        max_device_reads: 1,
+        ..ReadExecutorConfig::default()
+    };
+    let (admission, mut blocker) = executor(config);
+    let mut reader = ReadExecutor::new(config, admission.clone()).unwrap();
+    blocker
+        .resident_test_results
+        .push_back(ResidentTestResult::Unsupported);
+    assert!(matches!(
+        blocker
+            .submit(1, fixture.member(5), ReadClass::Point)
+            .unwrap(),
+        SubmitOutcome::Pending
+    ));
+    reader
+        .resident_test_results
+        .extend((0..4).map(|_| ResidentTestResult::Complete));
+    reader
+        .resident_test_results
+        .push_back(ResidentTestResult::Partial(7));
+    let plans = (0..5)
+        .map(|n| {
+            let reference = fixture.references[n];
+            (reference, fixture.log.plan_record_read(&reference).unwrap())
+        })
+        .collect();
+    let mut lease = None;
+    reader.begin_sweep();
+    let SubmitOutcome::Deferred(plans) = reader
+        .submit_planned(2, plans, ReadClass::Point, &mut lease)
+        .unwrap()
+    else {
+        panic!("warm first sweep should defer");
+    };
+    let charge = admission.stats().inflight_bytes;
+    reader.begin_sweep();
+    let SubmitOutcome::Full(plans) = reader
+        .submit_planned(2, plans, ReadClass::Point, &mut lease)
+        .unwrap()
+    else {
+        panic!("partial suffix should wait for device credit");
+    };
+    assert_eq!(admission.stats().inflight_bytes, charge);
+    drop(finish(&mut blocker, 1));
+    reader.begin_sweep();
+    assert!(matches!(
+        reader
+            .submit_planned(2, plans, ReadClass::Point, &mut lease)
+            .unwrap(),
+        SubmitOutcome::Pending
+    ));
+    assert_eq!(reader.operations.values().next().unwrap().filled, 7);
+    let mut completion = finish(&mut reader, 1).remove(0);
+    for (n, bytes) in completion.result.as_mut().unwrap().drain(..).enumerate() {
+        fixture.assert_value(n, bytes);
+    }
+    drop(completion);
+    let stats = admission.stats();
+    assert_eq!(stats.resident_read_attempts, 6);
+    assert_eq!(stats.resident_read_partial, 1);
+    assert_eq!(stats.async_read_submissions, 2);
+    assert_eq!(stats.inflight_bytes, 0);
 }
 
 #[test]

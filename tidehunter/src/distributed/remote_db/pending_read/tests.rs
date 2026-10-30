@@ -27,6 +27,168 @@ pub(super) fn value(byte: u8) -> Option<Bytes> {
 }
 
 #[test]
+fn nonconcurrent_bulk_records_pin_lock_separately() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
+        .unwrap();
+    db.set_read_profile_limit(1);
+    let monitor = db.read_profile_monitor();
+    let values = db
+        .get_many(KeySpace(0), &[0u32.to_be_bytes().to_vec()])
+        .unwrap();
+    assert_eq!(values[0], value(7));
+    let snapshot = monitor.coordinator_resolution_snapshot();
+    // One acquisition for cut capture, one for member lookup, one for pinning.
+    assert_eq!(snapshot.index_lock_wait.count, 3);
+    assert_eq!(snapshot.index_lookup.count, 1);
+    assert_eq!(snapshot.cut_capture.count, 1);
+    assert_eq!(snapshot.pin_preparation.count, 1);
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn owner_grant_stage_aggregation_retains_counts_and_maxima() {
+    let diagnostics = ReadDiagnostics::default();
+    let mut profile = super::super::super::tcp::TcpReadProfile::default();
+    profile.server_grant.registration.ns = 12;
+    profile.server_grant.registration.count = 1;
+    profile.server_grant.registration.max_ns = 12;
+    profile.server_grant.registration.errors = 1;
+    diagnostics.add_grant_stages(&profile);
+    profile.server_grant.registration.ns = 7;
+    profile.server_grant.registration.max_ns = 7;
+    profile.server_grant.registration.errors = 0;
+    diagnostics.add_grant_stages(&profile);
+    assert_eq!(
+        diagnostics
+            .server_grant_registration_ns
+            .load(Ordering::Relaxed),
+        19
+    );
+    assert_eq!(
+        diagnostics
+            .server_grant_registration_count
+            .load(Ordering::Relaxed),
+        2
+    );
+    assert_eq!(
+        diagnostics
+            .server_grant_registration_max_ns
+            .load(Ordering::Relaxed),
+        12
+    );
+    assert_eq!(
+        diagnostics
+            .server_grant_registration_errors
+            .load(Ordering::Relaxed),
+        1
+    );
+}
+
+#[test]
+fn failed_client_only_profiles_do_not_claim_owner_timing() {
+    let diagnostics = ReadDiagnostics::default();
+    let mut profile = super::super::super::tcp::TcpReadProfile {
+        server_handler_not_applicable: true,
+        client_fi_read: super::super::super::tcp::ReadStageProfile {
+            count: 1,
+            errors: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    diagnostics.inline_complete(0, Some(profile), true);
+    diagnostics.complete(&Err(LocalDbError::new("failed read")), Some(profile));
+    assert_eq!(diagnostics.client_fi_read_count.load(Ordering::Relaxed), 2);
+    assert_eq!(diagnostics.client_fi_read_errors.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        diagnostics
+            .failed_owner_profile_retained
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        diagnostics
+            .failed_owner_profile_not_applicable
+            .load(Ordering::Relaxed),
+        2
+    );
+    profile.server_handler_not_applicable = false;
+    diagnostics.inline_complete(0, Some(profile), true);
+    assert_eq!(
+        diagnostics
+            .failed_owner_profile_unavailable
+            .load(Ordering::Relaxed),
+        1
+    );
+    profile.server_handler_available = true;
+    diagnostics.complete(&Err(LocalDbError::new("failed read")), Some(profile));
+    assert_eq!(
+        diagnostics
+            .failed_owner_profile_retained
+            .load(Ordering::Relaxed),
+        1
+    );
+}
+
+#[test]
+fn partition_visitor_exports_client_grant_and_fi_read_stages() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    let monitor = db.read_profile_monitor();
+    let (partition, diagnostics) = &monitor.state.owner_diagnostics[0];
+    let mut profile = super::super::super::tcp::TcpReadProfile::default();
+    profile.client_grant_install.ns = 11;
+    profile.client_grant_install.count = 1;
+    profile.client_grant_install.max_ns = 11;
+    profile.client_fi_read.ns = 23;
+    profile.client_fi_read.count = 1;
+    profile.client_fi_read.max_ns = 23;
+    diagnostics.inline_complete(0, Some(profile), false);
+    let mut exported = std::collections::HashMap::new();
+    monitor.visit_partitions(&mut |owner, name, value| {
+        if owner == *partition {
+            exported.insert(name, value);
+        }
+    });
+    assert_eq!(exported["read_profile_client_grant_install_ns"], 11);
+    assert_eq!(exported["read_profile_client_grant_install_count"], 1);
+    assert_eq!(exported["read_profile_client_grant_install_max_ns"], 11);
+    assert_eq!(exported["read_profile_client_fi_read_ns"], 23);
+    assert_eq!(exported["read_profile_client_fi_read_count"], 1);
+    assert_eq!(exported["read_profile_client_fi_read_max_ns"], 23);
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn resident_lane_snapshots_cover_actual_sessions_and_reject_stopped_service() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    let monitor = db.read_evidence_monitor();
+    let snapshots = monitor.sample_resident_read_lane_snapshots().unwrap();
+    assert_eq!(
+        snapshots.len(),
+        fixture.config.endpoints.len() * fixture.config.read_lanes
+    );
+    for endpoint in &fixture.config.endpoints {
+        let lanes = snapshots
+            .iter()
+            .filter(|row| row.partition == endpoint.partition)
+            .collect::<Vec<_>>();
+        assert_eq!(lanes.len(), fixture.config.read_lanes);
+        for (lane, row) in lanes.iter().enumerate() {
+            assert_eq!(row.lane, lane);
+            assert_eq!(row.session_present, Some(true));
+            assert_eq!(row.stats.grants_live, 0);
+        }
+    }
+    db.shutdown().unwrap();
+    assert!(monitor.sample_resident_read_lane_snapshots().is_err());
+}
+
+#[test]
 fn operational_sampling_releases_read_ownership_before_activation_and_after_shutdown() {
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 0;
@@ -34,6 +196,20 @@ fn operational_sampling_releases_read_ownership_before_activation_and_after_shut
     db.write_batch(fixture.operation(0, 0), vec![put(42, 7)])
         .unwrap();
     assert_eq!(db.get(KeySpace(0), &42u32.to_be_bytes()).unwrap(), value(7));
+    let grants = db.read_evidence_monitor().sample_owner_grants().unwrap();
+    assert_eq!(grants.len(), fixture.config.endpoints.len());
+    assert_eq!(
+        grants
+            .iter()
+            .map(|(partition, _)| *partition)
+            .collect::<Vec<_>>(),
+        fixture
+            .config
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.partition)
+            .collect::<Vec<_>>()
+    );
     assert!(Arc::get_mut(&mut db.reads).is_some());
 
     let monitor = db.operational_read_io_monitor();
@@ -43,7 +219,7 @@ fn operational_sampling_releases_read_ownership_before_activation_and_after_shut
         let mut complete = None;
         monitor.visit(|snapshot, stopped| {
             assert!(!stopped);
-            if snapshot.available && snapshot.resident_available {
+            if snapshot.available && snapshot.resident_available && snapshot.grants_available {
                 assert_eq!(
                     snapshot
                         .owners
@@ -53,6 +229,7 @@ fn operational_sampling_releases_read_ownership_before_activation_and_after_shut
                     1
                 );
                 complete = Some(snapshot.generation);
+                assert_eq!(snapshot.grants.len(), fixture.config.endpoints.len());
             }
         });
         if let Some(generation) = complete {
@@ -76,6 +253,7 @@ fn operational_sampling_releases_read_ownership_before_activation_and_after_shut
     monitor.visit(|snapshot, stopped| {
         assert!(stopped);
         assert!(!snapshot.available && !snapshot.resident_available);
+        assert!(!snapshot.grants_available);
         generation_at_stop = snapshot.generation;
     });
     let after_stop_monitor = db.operational_read_io_monitor();
@@ -94,6 +272,52 @@ fn operational_sampling_releases_read_ownership_before_activation_and_after_shut
     );
     reopened.shutdown().unwrap();
 }
+#[test]
+fn sampled_owner_profiles_are_attributed_to_configured_partitions() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
+        .unwrap();
+    db.write_batch(fixture.operation(1, 1), vec![put(1, 8)])
+        .unwrap();
+    db.set_read_profile_limit(2);
+    let monitor = db.read_profile_monitor();
+    assert_eq!(db.get(KeySpace(0), &0u32.to_be_bytes()).unwrap(), value(7));
+    assert_eq!(db.get(KeySpace(0), &1u32.to_be_bytes()).unwrap(), value(8));
+    let mut global = std::collections::BTreeMap::new();
+    monitor.visit(&mut |name, value| {
+        global.insert(name, value);
+    });
+    let mut owners = std::collections::BTreeMap::new();
+    monitor.visit_partitions(&mut |partition, name, value| {
+        owners.insert((partition, name), value);
+    });
+    for partition in [0, 1] {
+        assert_eq!(owners[&(partition, "read_profile_completed")], 1);
+        assert_eq!(
+            owners[&(partition, "read_profile_server_response_recheck_samples")],
+            1
+        );
+    }
+    for name in [
+        "read_profile_completed",
+        "read_profile_server_response_recheck_samples",
+        "read_profile_server_executor_requests",
+        "read_profile_server_async_count",
+    ] {
+        assert_eq!(
+            owners
+                .iter()
+                .filter(|((_, key), _)| *key == name)
+                .map(|(_, value)| *value)
+                .sum::<u64>(),
+            global[name]
+        );
+    }
+    db.shutdown().unwrap();
+}
+
 #[test]
 fn bounded_read_profiles_count_rpc_misses_not_hits_absences_or_backpressure() {
     let mut fixture = Fixture::new();
@@ -304,6 +528,301 @@ fn oversized_scalar_read_does_not_poison_write_authority() {
     db.write_batch(fixture.operation(1, 1), vec![put(1, 8)])
         .unwrap();
     assert!(db.exists(KeySpace(0), &1u32.to_be_bytes()).unwrap());
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn sui_bulk_accepts_borrowed_keys_with_duplicates() {
+    let fixture = Fixture::new();
+    let mut original = fixture.open();
+    original
+        .write_batch(fixture.operation(0, 0), vec![put(0, 7)])
+        .unwrap();
+    original.shutdown().unwrap();
+    drop(original);
+    let db = crate::distributed::sui::Db::open_remote(
+        &fixture.temp.path().join("authority"),
+        fixture.shape.clone(),
+        fixture.config.clone(),
+    )
+    .unwrap();
+    let key = 0u32.to_be_bytes();
+    let absent = 99u32.to_be_bytes();
+    let keys: [&[u8]; 3] = [&key, &absent, &key];
+    let results = db.multi_get(db.ks("root"), &keys);
+    assert_eq!(results[0].as_ref().unwrap(), &value(7));
+    assert_eq!(results[1].as_ref().unwrap(), &None);
+    assert_eq!(results[2].as_ref().unwrap(), &value(7));
+    db.wait_for_background_threads_to_finish().unwrap();
+}
+
+#[test]
+fn cancelled_batch_keeps_accepted_flight_until_completion() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_lanes = 1;
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
+        .unwrap();
+    let reference = db
+        .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let node = db.partition_indexes[&reference.batch_address.partition];
+    let lane = db.reads.lane_client(node, 0);
+    let held = lane.lock();
+    let mut groups = vec![Vec::new(); db.partition_indexes.len()];
+    groups[node].extend([(0, reference), (1, reference)]);
+    let mut batch = ReadBatch::new(&db.reads, vec![None; 2], groups).unwrap();
+    batch.dispatch(&db.reads).unwrap();
+    let slot = batch.reads[0].1.parts[0].0.slot;
+    drop(batch);
+    assert_eq!(db.reads.state.retained.lock().0, 1);
+    drop(held);
+    assert!(db.reads.state.flight_ready[slot].wait_until(Instant::now() + Duration::from_secs(5)));
+    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    assert_eq!(db.get(KeySpace(0), &0u32.to_be_bytes()).unwrap(), value(7));
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn cancelled_owned_batch_hands_accepted_transport_work_back_to_actor() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_lanes = 1;
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
+        .unwrap();
+    let reference = db
+        .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let node = db.partition_indexes[&reference.batch_address.partition];
+    let mut groups = vec![Vec::new(); db.partition_indexes.len()];
+    groups[node].extend([(0, reference), (1, reference)]);
+    let mut batch = ReadBatch::new(&db.reads, vec![None; 2], groups).unwrap();
+    batch.dispatch(&db.reads).unwrap();
+    assert_eq!(
+        batch.owned_lanes.len(),
+        1,
+        "the caller must own the idle lane"
+    );
+    let slot = batch.reads[0].1.parts[0].0.slot;
+    let driver = batch.owned_lanes[0].lane.driver.clone();
+    let mut driver = driver.lock();
+    let client = driver.client.clone();
+    let mut client = client.lock();
+    let mut request = driver.queued.pop_front().unwrap();
+    assert!(client.read_admission(&request.references, false).unwrap());
+    let references = std::mem::take(&mut request.references);
+    let id = client
+        .submit_read(db.epoch, references, request.deadline, request.class, false)
+        .unwrap()
+        .expect("idle transport must accept the request");
+    driver.active.insert(
+        id,
+        InflightRead {
+            request,
+            started: None,
+        },
+    );
+    drop(client);
+
+    // Do not poll the transport before cancellation: the active request and
+    // its credits must survive ownership handback, even if a reply is ready.
+    drop(batch);
+    assert_eq!(driver.active.len(), 1);
+    assert_eq!(db.reads.state.retained.lock().0, 1);
+    drop(driver);
+    assert!(db.reads.state.flight_ready[slot].wait_until(Instant::now() + Duration::from_secs(5)));
+    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    assert_eq!(db.get(KeySpace(0), &0u32.to_be_bytes()).unwrap(), value(7));
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn empty_caller_progress_hands_accepted_work_to_actor_and_preserves_order() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_lanes = 1;
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7), put(1, 8)])
+        .unwrap();
+    let reference = |key: u32| {
+        db.index_reference(KeySpace(0), &key.to_be_bytes(), IndexReadCut::Latest)
+            .unwrap()
+            .unwrap()
+    };
+    let first = reference(0);
+    let second = reference(1);
+    let node = db.partition_indexes[&first.batch_address.partition];
+    assert_eq!(node, db.partition_indexes[&second.batch_address.partition]);
+    let mut groups = vec![Vec::new(); db.partition_indexes.len()];
+    groups[node].extend([(0, first), (1, second), (2, first)]);
+    let mut batch = ReadBatch::new(&db.reads, vec![None; 3], groups).unwrap();
+    batch.dispatch(&db.reads).unwrap();
+    assert_eq!(batch.owned_lanes.len(), 1);
+    let lane = batch.owned_lanes[0].lane.clone();
+    let mut driver = lane.driver.lock();
+    let mut client = lane.client.lock();
+    let mut request = driver.queued.pop_front().unwrap();
+    assert!(client.read_admission(&request.references, false).unwrap());
+    let references = std::mem::take(&mut request.references);
+    let id = client
+        .submit_read(db.epoch, references, request.deadline, request.class, false)
+        .unwrap()
+        .expect("idle transport must accept the request");
+    driver.active.insert(
+        id,
+        InflightRead {
+            request,
+            started: None,
+        },
+    );
+    drop(driver);
+
+    // Holding the client forces every caller sweep to be empty and prevents
+    // the actor from retiring the accepted request before handback is observed.
+    let (done, result) = mpsc::sync_channel(1);
+    let waiter = thread::spawn(move || {
+        let outcome = batch.finish_one();
+        done.send((outcome, batch)).unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while lane.scheduling.lock().inline_reserved {
+        assert!(
+            Instant::now() < deadline,
+            "empty progress did not hand the lane back"
+        );
+        thread::yield_now();
+    }
+    assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    assert_eq!(db.reads.state.retained.lock().0, 1);
+    drop(client);
+    let (outcome, batch) = result.recv_timeout(Duration::from_secs(5)).unwrap();
+    outcome.unwrap();
+    waiter.join().unwrap();
+    assert_eq!(
+        batch.values,
+        vec![Some(put(0, 7)), Some(put(1, 8)), Some(put(0, 7))]
+    );
+    assert!(batch.complete());
+    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn grouped_join_of_inline_flight_notifies_admission_after_readiness() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_lanes = 1;
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
+        .unwrap();
+    let reference = db
+        .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let node = db.partition_indexes[&reference.batch_address.partition];
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (release, resumed) = mpsc::sync_channel(1);
+    *db.reads.state.inline_pause.lock() = Some((entered, resumed));
+    let reads = db.reads.clone();
+    let epoch = db.epoch;
+    let scalar = thread::spawn(move || reads.read_inline(node, epoch, &reference, 0, None, None));
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    let mut groups = vec![Vec::new(); db.partition_indexes.len()];
+    groups[node].push((0, reference));
+    let mut batch = ReadBatch::new(&db.reads, vec![None], groups).unwrap();
+    batch.dispatch(&db.reads).unwrap();
+    assert_eq!(batch.reads.len(), 1);
+    assert!(batch.owned_lanes.is_empty());
+    let generation = db.reads.admission_generation();
+    release.send(()).unwrap();
+    assert!(scalar.join().unwrap().unwrap().is_some());
+    // The joiner still owns the flight and both credits, so a credit drop
+    // cannot be responsible for advancing this generation.
+    assert!(db.reads.admission_generation() > generation);
+    batch.finish_one().unwrap();
+    assert_eq!(batch.values[0], Some(put(0, 7)));
+    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn batch_retires_ready_owner_before_blocked_owner_and_preserves_duplicates() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_lanes = 1;
+    fixture.config.max_pending_reads = 4;
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
+        .unwrap();
+    db.write_batch(fixture.operation(1, 1), vec![put(1, 8)])
+        .unwrap();
+    let first = db
+        .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let second = db
+        .index_reference(KeySpace(0), &1u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let first_node = db.partition_indexes[&first.batch_address.partition];
+    let second_node = db.partition_indexes[&second.batch_address.partition];
+    assert!(first_node < second_node);
+    db.set_read_profile_limit(2);
+    let lane = db.reads.lane_client(first_node, 0);
+    let held = lane.lock();
+    let mut groups = vec![Vec::new(); db.partition_indexes.len()];
+    groups[first_node].push((0, first));
+    groups[second_node].extend([(1, second), (2, second)]);
+    let mut batch = ReadBatch::new(&db.reads, vec![None; 3], groups).unwrap();
+    batch.dispatch(&db.reads).unwrap();
+    assert_eq!(batch.reads.len(), 2);
+    batch.finish_one().unwrap();
+    assert!(batch.values[0].is_none());
+    assert!(
+        matches!(&batch.values[1], Some(Mutation::Put { value, .. }) if value.as_ref() == [8; 32])
+    );
+    assert!(
+        matches!(&batch.values[2], Some(Mutation::Put { value, .. }) if value.as_ref() == [8; 32])
+    );
+    assert_eq!(db.reads.state.retained.lock().0, 1);
+    drop(held);
+    batch.finish_one().unwrap();
+    assert!(
+        matches!(&batch.values[0], Some(Mutation::Put { value, .. }) if value.as_ref() == [7; 32])
+    );
+    assert!(batch.complete());
+    assert_eq!(
+        db.reads.state.diagnostics.completed.load(Ordering::Relaxed),
+        2
+    );
+    assert_eq!(
+        db.reads
+            .state
+            .diagnostics
+            .inline_completed
+            .load(Ordering::Relaxed)
+            + db.reads
+                .state
+                .diagnostics
+                .actor_completed
+                .load(Ordering::Relaxed),
+        2
+    );
+    for node in [first_node, second_node] {
+        assert_eq!(
+            db.reads.state.owner_diagnostics[node]
+                .1
+                .completed
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
     db.shutdown().unwrap();
 }
 
@@ -607,6 +1126,7 @@ fn published_result_stays_unavailable_until_credit_retirement() {
         node: 0,
         references: Vec::new(),
         slot: 0,
+        grouped_inline: AtomicBool::new(false),
         completion: Arc::new(FlightCompletion::new()),
         _pin: None,
         _credit: credit.clone(),
@@ -719,8 +1239,22 @@ fn dropped_failed_read_poison_cannot_be_hidden_by_a_cached_hit() {
     assert_eq!(counts["read_profile_completed"], 1);
     assert_eq!(counts["read_profile_errors"], 1);
     assert_eq!(counts["read_profile_returned"], 0);
-    assert_eq!(counts["read_profile_server_response_recheck_samples"], 0);
-    assert_eq!(counts["read_profile_server_available"], 0);
+    assert_eq!(counts["read_profile_failed_owner_profile_retained"], 1);
+    assert_eq!(counts["read_profile_failed_owner_profile_unavailable"], 0);
+    assert_eq!(counts["read_profile_server_response_recheck_samples"], 1);
+    assert_eq!(counts["read_profile_server_available"], 1);
+    let mut owner_counts = std::collections::BTreeMap::new();
+    profile.visit_partitions(&mut |partition, name, value| {
+        owner_counts.insert((partition, name), value);
+    });
+    assert_eq!(
+        owner_counts[&(0, "read_profile_failed_owner_profile_retained")],
+        1
+    );
+    assert_eq!(
+        owner_counts[&(0, "read_profile_server_response_recheck_samples")],
+        1
+    );
     let hits = db.read_cache_stats().hits;
     assert!(db.get(KeySpace(0), &1u32.to_be_bytes()).is_err());
     assert_eq!(db.read_cache_stats().hits, hits);

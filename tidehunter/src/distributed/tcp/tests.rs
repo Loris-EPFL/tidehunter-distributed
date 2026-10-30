@@ -465,18 +465,30 @@ fn profiled_reads_preserve_authority_membership_and_frame_bounds() {
         }
         _ => panic!("missing server profile"),
     }
-    assert!(node.handle(request(1, vec![]), limits).is_err());
-    assert!(
-        node.handle(request(1, vec![reference; limits.max_reads + 1]), limits)
-            .is_err()
-    );
-    assert!(node.handle(request(2, vec![reference]), limits).is_err());
+    assert!(matches!(
+        node.handle(request(1, vec![]), limits),
+        Ok(Response::ReadErrorProfiled { .. })
+    ));
+    assert!(matches!(
+        node.handle(request(1, vec![reference; limits.max_reads + 1]), limits),
+        Ok(Response::ReadErrorProfiled { .. })
+    ));
+    assert!(matches!(
+        node.handle(request(2, vec![reference]), limits),
+        Ok(Response::ReadErrorProfiled { .. })
+    ));
     let mut forged = reference;
     forged.descriptor.checksum.0 ^= 1;
-    assert!(node.handle(request(1, vec![forged]), limits).is_err());
+    assert!(matches!(
+        node.handle(request(1, vec![forged]), limits),
+        Ok(Response::ReadErrorProfiled { .. })
+    ));
     let mut outside = reference;
     outside.descriptor.len = u32::MAX;
-    assert!(node.handle(request(1, vec![outside]), limits).is_err());
+    assert!(matches!(
+        node.handle(request(1, vec![outside]), limits),
+        Ok(Response::ReadErrorProfiled { .. })
+    ));
 
     // A response budget that admits a normal record must still reserve the
     // diagnostic payload. Both variants retain their ordinary frame limits.
@@ -498,9 +510,17 @@ fn profiled_reads_preserve_authority_membership_and_frame_bounds() {
         .unwrap(),
         Response::Records(_)
     ));
-    assert!(node.handle(request(1, vec![reference]), small).is_err());
+    let Response::ReadErrorProfiled { profile, .. } =
+        node.handle(request(1, vec![reference]), small).unwrap()
+    else {
+        panic!("profiled frame-bound error was not retained");
+    };
+    assert!(profile.handler_ns > 0 && profile.record_read_ns > 0);
     node.inventory.lock().fence_to(2).unwrap();
-    assert!(node.handle(request(1, vec![reference]), limits).is_err());
+    assert!(matches!(
+        node.handle(request(1, vec![reference]), limits),
+        Ok(Response::ReadErrorProfiled { .. })
+    ));
     assert!(node.handle(request(2, vec![reference]), limits).is_ok());
 }
 
@@ -809,6 +829,9 @@ fn authenticated_roundtrip(transport: Transport) {
     let append_socket = client.stream.sock.profile.unwrap_or_default();
     let append_profile = client.connection_profile(true, false).unwrap();
     assert_eq!(append_profile.client.requests, 1);
+    assert_eq!(append_profile.client.request_encode_count, 1);
+    assert_eq!(append_profile.client.exchange_count, 1);
+    assert_eq!(append_profile.client.response_decode_count, 1);
     assert_eq!(
         append_profile.client.socket.read_calls,
         append_socket.read_calls
@@ -827,6 +850,9 @@ fn authenticated_roundtrip(transport: Transport) {
     let (profiled, profile) = client.read_record_profiled(1, &reference).unwrap();
     assert_eq!(profiled, batches[0].mutations()[0]);
     assert_eq!(profile.requests, 1);
+    assert_eq!(profile.request_encode_count, 1);
+    assert_eq!(profile.exchange_count, 1);
+    assert_eq!(profile.response_decode_count, 1);
     assert!(
         profile.request_encode_ns > 0
             && profile.exchange_ns > 0
@@ -855,6 +881,9 @@ fn authenticated_roundtrip(transport: Transport) {
     let server = client.connection_profile(false, false).unwrap();
     assert_eq!(server.requests, 3); // append, grouped read, profiled read
     assert_eq!(server.client.requests, 3);
+    assert_eq!(server.client.request_encode_count, 3);
+    assert_eq!(server.client.exchange_count, 3);
+    assert_eq!(server.client.response_decode_count, 3);
     assert!(server.client.request_encode_ns > 0 && server.client.exchange_ns > 0);
     assert!(server.client.response_decode_ns > 0 && server.client.socket.read_calls > 0);
     assert!(
@@ -966,6 +995,27 @@ fn authenticated_roundtrip(transport: Transport) {
     drop(client);
     shutdown.store(true, Ordering::Release);
     worker.join().unwrap();
+}
+
+#[test]
+fn server_read_profile_wire_size_matches_native_segment_layout() {
+    let profile = ServerReadProfile::default();
+    let bytes = wire_codec(HARD_FRAME_LIMIT).serialize(&profile).unwrap();
+    assert_eq!(bytes.len(), SERVER_READ_PROFILE_BYTES);
+    let decoded: ServerReadProfile = wire_codec(HARD_FRAME_LIMIT).deserialize(&bytes).unwrap();
+    assert_eq!(decoded.grant.registration.count, 0);
+}
+
+#[test]
+fn profiled_read_error_has_feature_independent_wire_discriminant() {
+    let response = Response::ReadErrorProfiled {
+        message: "fenced".to_owned(),
+        profile: Box::new(ServerReadProfile::default()),
+    };
+    let bytes = wire_codec(HARD_FRAME_LIMIT).serialize(&response).unwrap();
+    assert_eq!(&bytes[..4], &20_u32.to_le_bytes());
+    let decoded: Response = wire_codec(HARD_FRAME_LIMIT).deserialize(&bytes).unwrap();
+    assert!(matches!(decoded, Response::ReadErrorProfiled { message, .. } if message == "fenced"));
 }
 
 #[test]

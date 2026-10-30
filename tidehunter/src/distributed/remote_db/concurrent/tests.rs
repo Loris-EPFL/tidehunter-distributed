@@ -188,6 +188,67 @@ fn unknown_append_fences_cached_absent_and_detached_reads_until_reopen() {
     );
     reopened.shutdown().unwrap();
 }
+#[test]
+fn coordinator_resolution_samples_include_mixed_and_local_outcomes() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_cache_bytes = 64 * 1024;
+    let mut original = fixture.open();
+    original
+        .write_batch(fixture.operation(0, 29), vec![put(0, 5), put(1, 6)])
+        .unwrap();
+    original.shutdown().unwrap();
+    drop(original);
+    let original = fixture.open();
+    let db = ConcurrentRemoteDatabase::new(original).unwrap();
+    // Populate only key 0 before selecting the measurement population.
+    assert_eq!(get(&db, 0), Some(vec![5; 32]));
+    db.set_read_profile_limit(2);
+    let monitor = db.read_profile_monitor();
+    let keys = [0u32.to_be_bytes(), 1u32.to_be_bytes(), 99u32.to_be_bytes()];
+    let values = db
+        .get_many_cut(KeySpace(0), &keys, IndexReadCut::Latest)
+        .unwrap();
+    assert!(values[0].as_ref().unwrap().is_some());
+    assert!(values[1].as_ref().unwrap().is_some());
+    assert!(values[2].as_ref().unwrap().is_none());
+    assert_eq!(get(&db, 99), None);
+    let snapshot = monitor.coordinator_resolution_snapshot();
+    assert_eq!(
+        (snapshot.selected, snapshot.point, snapshot.bulk),
+        (2, 1, 1)
+    );
+    assert_eq!(snapshot.logical_members, 4);
+    assert_eq!(
+        (
+            snapshot.cache_hits,
+            snapshot.remote_misses,
+            snapshot.index_misses
+        ),
+        (1, 1, 2)
+    );
+    assert_eq!(snapshot.errors, 0);
+    assert_eq!(snapshot.cache_lookup.count, 2);
+    assert_eq!(snapshot.index_lock_wait.count, 2);
+    assert_eq!(snapshot.index_lookup.count, 4);
+    assert_eq!(snapshot.cut_validation.count, 1);
+    assert_eq!(snapshot.cut_capture.count, 0);
+    assert_eq!(snapshot.route_preparation.count, 1);
+    assert_eq!(snapshot.pin_preparation.count, 1);
+    assert_eq!(snapshot.batch_preparation.count, 1);
+    assert_eq!(get(&db, 99), None);
+    assert_eq!(monitor.coordinator_resolution_snapshot().selected, 2);
+    db.set_read_profile_limit(0);
+    assert_eq!(monitor.coordinator_resolution_snapshot().selected, 2);
+    db.set_read_profile_limit(1);
+    assert_eq!(monitor.coordinator_resolution_snapshot().selected, 0);
+    assert_eq!(get(&db, 99), None);
+    let reset = monitor.coordinator_resolution_snapshot();
+    assert_eq!(
+        (reset.selected, reset.index_misses, reset.cache_lookup.count),
+        (1, 1, 0)
+    );
+    db.shutdown().unwrap();
+}
 
 #[test]
 fn scalar_and_actor_samples_have_separate_populations_and_credit_wakeups() {
@@ -233,6 +294,11 @@ fn scalar_and_actor_samples_have_separate_populations_and_credit_wakeups() {
     assert_eq!(counters["read_profile_returned"], 1);
     assert!(counters["read_profile_inline_ns"] > 0);
     assert_eq!(counters["read_profile_server_response_recheck_samples"], 2);
+    let resolution = monitor.coordinator_resolution_snapshot();
+    assert_eq!(resolution.remote_misses, 2);
+    assert_eq!(resolution.route_preparation.count, 2);
+    assert_eq!(resolution.pin_preparation.count, 2);
+    assert_eq!(resolution.batch_preparation.count, 0);
     assert_eq!(db.read_rpc_count(), 2);
     db.shutdown().unwrap();
 }

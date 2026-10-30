@@ -250,12 +250,23 @@ fn operational_session_for_transport(transport: Transport) {
     };
     let mut wrong_owner = server.config.partition.clone();
     wrong_owner.inventory.database[0] ^= 1;
-    assert!(diagnostic(wrong_owner).operational_read_io_stats().is_err());
+    assert!(
+        diagnostic(wrong_owner.clone())
+            .operational_read_io_stats()
+            .is_err()
+    );
+    assert!(diagnostic(wrong_owner).resident_grant_stats().is_err());
     let next = batch(&server.config, 1, 2);
     for try_status_upgrade in [false, true] {
         let mut client = diagnostic(server.config.partition.clone());
+        assert_eq!(client.session_present(), Some(true));
+        client.broken = true;
+        assert_eq!(client.session_present(), None);
+        client.broken = false;
         let stats = client.operational_read_io_stats().unwrap().unwrap();
         assert_eq!(stats.completed_reads, 1);
+        let grants = client.resident_grant_stats().unwrap().unwrap();
+        assert_eq!(grants.issued, 0);
         if try_status_upgrade {
             assert!(client.status().is_err());
         } else {
