@@ -1110,3 +1110,28 @@ Local binaries, raw cases, logs and qualification evidence are under
 `checkpoint-work/local-owner-authority-2026-10-30/`. The new hardware campaign
 must bind and verify its own fresh source/build identities before allocation.
 
+
+### 17.10 Capacity fallback and budget policy, 2026-10-30
+
+Campaign `th-37d0baaf0c77991e` exhausted all 30 admitted G6 candidates:
+24 capacity and six quota rejections, with zero hosts allocated. This is an
+allocation failure, not a benchmark or engine failure, and yields no hardware
+performance result. Scoped AWS MCP reconciliation found no remaining owned
+resources; ledger revision 101 settled $0.004500263545 for this attempt.
+
+On 30 October, AWS MCP instance-type descriptions and AWS documentation confirmed
+that `g6e.8xlarge` and `c6id.32xlarge` support EFA hardware RDMA reads and
+writes, local NVMe and cluster placement. Both are already permitted by the
+campaign, bootstrap and launcher allowlists. They extend, rather than replace,
+the G6 candidates; the existing selector orders eligible regional candidates
+by price. All five regions and mandatory cluster placement remain unchanged.
+Availability and quota are not guaranteed.
+
+The editable weekly admission limit increases from $300 to $400; it is a policy
+limit, not a charge or a modification of the cost ledger. The target is one
+three-hour fleet with projected actual cost below approximately $200. At the
+30 October quoted rates, six `c6id.32xlarge` hosts for three hours cost $116.12
+in us-east-1 or $134.2656 in eu-central-1 for compute alone, before storage,
+requests and other extras. The higher limit covers conservative worst-region
+reservation alongside prior spending; actual admission still uses the existing
+reservation and reconciliation rules.
