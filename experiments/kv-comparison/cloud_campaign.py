@@ -95,6 +95,8 @@ def make_matrix(spec):
         comparisons = [job for job in standard_jobs if job["cohort"] == "primary_rf1" and
                        (job["value_size"], job["profile"]) in ((1024, "write-concurrent"),
                            (1024, "read-concurrent"), (8192, "read-many32"))]
+        comparisons += [job for job in standard_jobs if job["cohort"] == "write_stage_diagnostics"
+                        and job["value_size"] == 1024 and job["profile"] == "write-concurrent"]
         jobs = early + comparisons + headroom + later
         if len(jobs) > spec["max_cases"]:
             raise ValueError(f"matrix contains {len(jobs)} cases, exceeding explicit max_cases")

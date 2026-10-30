@@ -1103,12 +1103,15 @@ python3 experiments/kv-comparison/cloud_campaign.py plan \
 ```
 For a shorter one-repetition campaign use `--mode read-tier-focused` (and
 `kv_mode=read-tier-focused` in the workflow). With all nine tracked backends it
-selects 191 cases; with
-`native,tidehunter_tcp,tidehunter_efa_native,valkey_tcp` it selects 108.
+selects 196 cases with the committed 256-sample write diagnostics enabled; with
+`native,tidehunter_tcp,tidehunter_efa_native,valkey_tcp` it selects 111.
+Without write diagnostics these counts are 191 and 108 respectively.
 Native warm/cold 256-B and 1-KiB controls and each selected transport's
 256-B cold-device baseline/profiled pair come first, followed by the existing
 primary 1-KiB C16 read/write and 8-KiB batch32 comparison cases for each
-selected backend. Eight separately named C1 registered controls use 40,960
+selected backend. Each selected native or Tidehunter backend also has a
+separate 1-KiB write-stage diagnostic case when configured; headline cases
+remain unprofiled. Eight separately named C1 registered controls use 40,960
 total client handles (8,192 per owner) before the existing matched tier cases.
 The latter include 256-B/8-KiB C1 and 1-KiB scalar/8-KiB batch32 C16 remote,
 coordinator, owner, warm-WAL and registered steady/reuse controls where
@@ -1130,6 +1133,10 @@ at most one fresh-key retry within their original all-host timeout. An exact
 late receipt can be reconciled; snapshots that drop caches or select monitoring
 processes, and other mutations, are never resent after an ambiguous acceptance.
 The measurement gate is released only after every host has an admitted result.
+The completion snapshot has an overall 110-second budget: up to 60 seconds
+for the first attempt and the remaining time for one retry. The engine's
+120-second completion gate and overall case/campaign deadlines still apply;
+time spent stopping a cold-device tracer also consumes that gate.
 
 
 For a later approved GitHub run on `bench/aws-efa`, select the existing

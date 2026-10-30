@@ -54,6 +54,20 @@ class CloudMatrixTests(unittest.TestCase):
         self.assertEqual(sum(j["profile"] == "read-many32" for j in smaller), 4)
         with self.assertRaises(ValueError):
             cloud.make_matrix(self.spec(2) | {"mode": "read-tier-focused"})
+    def test_short_campaign_includes_separate_write_profiles_when_requested(self):
+        spec = self.spec(1) | {"mode": "read-tier-focused",
+                              "diagnostics": {"write_profile_limit": 256, "read_profile_limit": 256}}
+        jobs = cloud.make_matrix(spec)
+        self.assertEqual(len(jobs), 196)
+        diagnostics = [j for j in jobs if j["cohort"] == "write_stage_diagnostics"]
+        self.assertEqual({j["backend"] for j in diagnostics}, {"native", *cloud.TRANSPORTS})
+        self.assertTrue(all(j["diagnostics"]["write_profile_limit"] == 256
+                            and j["measurement_operations"] == 4096 for j in diagnostics))
+        self.assertEqual(sum(j["cohort"] == "primary_rf1" and j["profile"] == "write-concurrent"
+                             for j in jobs), 9)
+        selected = spec | {"backends": ["native", "tidehunter_tcp", "tidehunter_efa_native", "valkey_tcp"]}
+        self.assertEqual(len(cloud.make_matrix(selected)), 111)
+
 
 
     def test_focused_tiers_are_ordered_matched_and_bounded(self):

@@ -488,6 +488,13 @@ class CommandSafetyTests(unittest.TestCase):
                 runtime.all_hosts(mutation, timeout=60)
             self.assertEqual(sum(index == 3 for index, _ in calls), 1)
 
+    def test_snapshot_first_attempt_keeps_sixty_second_budget(self):
+        runtime = controller.Controller(config_fixture(), clients_fixture(config_fixture()))
+        runtime.request = Mock(side_effect=lambda index, req, **kwargs: {"index": index})
+        runtime.all_hosts({"action": "snapshot"}, timeout=110)
+        remote = [call.kwargs["timeout"] for call in runtime.request.call_args_list if call.args[0] != -1]
+        self.assertEqual(remote, [60] * 5)
+
     def test_snapshot_retry_does_not_hide_safety_errors(self):
         runtime = controller.Controller(config_fixture(), clients_fixture(config_fixture()))
         runtime.request = Mock(side_effect=controller.SafetyError("bad receipt"))

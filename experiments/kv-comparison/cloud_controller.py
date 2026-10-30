@@ -1033,7 +1033,7 @@ class Controller:
             if index == -1 or not read_only_snapshot(request) or timeout < 4:
                 return self.request(index, request, case=case, timeout=timeout, export=export)
             end = min(self.end if export else self.work_end, self.clock() + timeout)
-            first = max(1, int(timeout / 2))
+            first = min(60, max(1, timeout - 10))
             try:
                 return self.request(index, request, case=case, timeout=first, export=export)
             except SnapshotTimeout:
@@ -1502,7 +1502,7 @@ class Controller:
                                 if k not in ("raw_events", "raw_intervals_ns", "candidate_raw_intervals_ns")}
                             receipt["cold_device_raw_location"] = "native-device-trace.json"
                         ended = self.all_hosts({"action": "snapshot", "drop": False,
-                            "resource_job": job}, case=job["case_id"], timeout=60)
+                            "resource_job": job}, case=job["case_id"], timeout=110)
                         dump(directory / "measurement-end.json", {"hosts": ended,
                             "client": snapshot(self.config, client)})
                         resources = resource_accounting.interval(
