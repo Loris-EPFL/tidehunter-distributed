@@ -61,6 +61,44 @@ def make_matrix(spec):
         raise ValueError("diagnostics limits must be integers between 0 and 65536")
     diagnostics = {"write_profile_limit": diagnostics.get("write_profile_limit", 0),
                    "read_profile_limit": diagnostics.get("read_profile_limit", 0)}
+    if spec.get("mode", "standard") == "read-tier-focused":
+        if spec["repeats"] != 1:
+            raise ValueError("focused campaign requires one repetition")
+        expanded = {**spec, "mode": "read-tier", "max_cases": 2000}
+        tier_jobs = make_read_tier_matrix(expanded, backends, diagnostics)
+        standard_jobs = make_matrix({**expanded, "mode": "standard"})
+        early = [job for job in tier_jobs if
+                 (job["read_tier"]["name"] in ("native_hot_wal_lru0_pagecache", "native_cold_os_lru0")
+                  and job["value_size"] in (256, 1024) and job["concurrency"] == 1)
+                 or (job["read_tier"]["name"] == "cold_device" and job["value_size"] == 256
+                     and job["concurrency"] == 1)]
+        wanted = {"remote", "coordinator_hit", "owner_hit", "registered_steady", "registered_reuse",
+                  "wal_warm", "registered_steady_c16_mixed_acquisition_reuse",
+                  "registered_reuse_c16_mixed_acquisition_reuse"}
+        later = [job for job in tier_jobs if job["read_tier"]["name"] in wanted
+                 and ((job["concurrency"] == 1 and job["value_size"] in (256, 8192))
+                      or (job["concurrency"] == 16 and job["value_size"] in (1024, 8192)))]
+        # Keep legacy controls unchanged, and separately measure full-set
+        # headroom: destination handle limits are divided across five owners.
+        headroom = []
+        for original in later:
+            if original["read_tier"]["name"] not in ("registered_steady", "registered_reuse") or original["concurrency"] != 1:
+                continue
+            job = copy.deepcopy(original)
+            job["read_tier"]["name"] += "_handle_headroom"
+            job["cohort"] = "read_tier_" + job["read_tier"]["name"]
+            job["resident_reads"]["max_handles"] = 5 * job["keys"]
+            job["read_tier"]["requested"]["registered_budgets"]["max_handles"] = 5 * job["keys"]
+            job["read_tier"]["source_id"] += "-handle-headroom"
+            job["case_id"] += "-handle-headroom"
+            headroom.append(job)
+        comparisons = [job for job in standard_jobs if job["cohort"] == "primary_rf1" and
+                       (job["value_size"], job["profile"]) in ((1024, "write-concurrent"),
+                           (1024, "read-concurrent"), (8192, "read-many32"))]
+        jobs = early + comparisons + headroom + later
+        if len(jobs) > spec["max_cases"]:
+            raise ValueError(f"matrix contains {len(jobs)} cases, exceeding explicit max_cases")
+        return jobs
     if spec.get("mode", "standard") == "read-tier":
         return make_read_tier_matrix(spec, backends, diagnostics)
     if spec.get("mode", "standard") != "standard":
@@ -523,6 +561,22 @@ def qualify_read_tier(job, evidence, receipt):
     for name in ("fallback_missing", "fallback_oversize", "fallback_capacity", "fallback_unsupported", "fallback_stale"):
         observed[name] = counter("client_resident", name)
     observed["message_reads"] = counter("client_resident", "message_read_requests")
+    # Authority counters are cumulative in raw boundary snapshots, not in
+    # owner_executor deltas. Never interpret a missing/reset counter as zero.
+    authority_loads = []
+    for partition in map(str, range(5)):
+        try:
+            if any(evidence[side]["owner_executor"].get("available") is not True for side in ("start", "end")):
+                raise ValueError("authority boundary unavailable")
+            start = evidence["start"]["owner_executor"]["partitions"][partition]["authority"]["history_loads"]
+            end = evidence["end"]["owner_executor"]["partitions"][partition]["authority"]["history_loads"]
+            if type(start) is not int or type(end) is not int or start < 0 or end < start:
+                raise ValueError("invalid authority boundary")
+            authority_loads.append(end - start)
+        except (TypeError, KeyError, ValueError):
+            authority_loads = []
+            break
+    observed["authority_history_loads"] = sum(authority_loads) if len(authority_loads) == 5 else None
     observed["owner_grants"] = observed_owner_grants
     reasons = []
     if receipt.get("status") != "completed" or not isinstance(evidence, dict) or evidence.get("measurement_drained") is not True:
@@ -556,12 +610,14 @@ def qualify_read_tier(job, evidence, receipt):
     elif tier == "wal_warm":
         for name in ("coord_hits", "owner_hits", "async", "resident_fallback", "posts"):
             expect(name, zero, name + " must be zero")
+        expect("authority_history_loads", zero, "cold authority history loads must be zero")
         expect("wal_reads", positive, "owner WAL reads required")
         if job["value_size"] > 16384:
             reasons.append("value exceeds 16 KiB resident-first member limit")
         if observed["resident_success"] is None or observed["resident_success"] != observed["wal_reads"]:
             reasons.append("resident-first successes do not cover WAL reads")
-    elif tier in ("registered_steady", "registered_reuse",
+    elif tier in ("registered_steady", "registered_reuse", "registered_steady_handle_headroom",
+                   "registered_reuse_handle_headroom",
                    "registered_steady_c16_mixed_acquisition_reuse", "registered_reuse_c16_mixed_acquisition_reuse"):
         full = qualify_fullset_read_path(job | {"cohort": "registered_ram_fullset_control"}, evidence)
         reasons.extend(full["reasons"])
@@ -625,6 +681,8 @@ def summarize_case(directory):
     value = {"case_id": job["case_id"], "job": job, "status": receipt.get("status"),
              "error": receipt.get("error"), "measurement_evidence": receipt.get("measurement_evidence"),
              "counter_evidence": receipt.get("counter_evidence")}
+    if receipt.get("status") != "completed" and not receipt.get("raw_artifacts_validated"):
+        return {**value, "metrics_unavailable": "failed before trustworthy raw artifact admission"}
     read_interval = admit_measurement_read_evidence(directory)
     if read_interval is not None:
         if read_interval != receipt.get("measurement_read_evidence"):
@@ -686,8 +744,6 @@ def summarize_case(directory):
     elif receipt.get("read_diagnostics") is not None:
         raise ValueError("read-stage diagnostics artifact missing")
     names = ("manifest.json", "summary.json", "samples.csv", "metrics.prom")
-    if receipt.get("status") != "completed" and not receipt.get("raw_artifacts_validated"):
-        return {**value, "metrics_unavailable": "failed before trustworthy raw artifact admission"}
     if any(name not in receipt.get("artifacts_sha256", {}) for name in names):
         raise ValueError("admitted raw artifacts lack their complete integrity binding")
     result = directory / "result"
@@ -857,7 +913,7 @@ def report(root):
             "OS-cache eviction does not evict engine caches; qualified device intervals, when available, are retained separately.",
             "Valkey GET is memory-resident even after OS-cache eviction; AOF always is write acknowledgment, not a value-WAL-backed read.",
             "No Sui checkpoint/application or sustainable infinite-aging claim."]}
-    if planned.get("spec", {}).get("mode") == "read-tier":
+    if planned.get("spec", {}).get("mode") in ("read-tier", "read-tier-focused"):
         capability = root / "trace-capability.json"
         value["trace_capability"] = (json.loads(capability.read_text()) if capability.is_file() else
             {"identity_backend_available": False, "gaps": ["fleet capability probe not completed"]})
@@ -939,7 +995,7 @@ def main():
     plan.add_argument("--spec", type=Path, default=Path(__file__).with_name("cloud-campaign.json"))
     plan.add_argument("--output", type=Path, required=True)
     plan.add_argument("--backends", help="comma-separated nonempty subset of tracked backend IDs")
-    plan.add_argument("--mode", choices=("standard", "read-tier"), default="standard")
+    plan.add_argument("--mode", choices=("standard", "read-tier", "read-tier-focused"), default="standard")
     plan.add_argument("--write-profile-limit", type=int,
                       help="diagnostic-only 1KiB write cohort for native/Tidehunter; leaves normal plans unprofiled")
     plan.add_argument("--read-profile-limit", type=int,

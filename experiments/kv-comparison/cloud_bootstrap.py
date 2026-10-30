@@ -95,7 +95,7 @@ def activation_config(plan, value):
         raise ValueError("ready controller config differs from admitted run/source/binary/account/bucket")
     if config["fleet"]["run_id"] != plan["run_id"] or config["fleet"]["region"] != plan["region"]:
         raise ValueError("ready fleet differs from admitted run/region")
-    if plan.get("read_tier_trace", False) != (config["spec"].get("mode", "standard") == "read-tier"):
+    if plan.get("read_tier_trace", False) != (config["spec"].get("mode", "standard") in ("read-tier", "read-tier-focused")):
         raise ValueError("read-tier trace preparation differs from admitted campaign mode")
     configured_deadline = datetime.fromisoformat(config["deadline_utc"].replace("Z", "+00:00"))
     planned_deadline = datetime.fromisoformat(plan["deadline_utc"].replace("Z", "+00:00"))

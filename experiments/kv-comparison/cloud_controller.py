@@ -16,7 +16,7 @@ is an internal exact-node SSM RPC; it is not a local qualification shortcut.
 """
 import argparse
 import base64
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -62,6 +62,17 @@ class SafetyError(RuntimeError):
 
 class InfrastructureError(RuntimeError):
     """Infrastructure or an uncertain side effect makes continuation unsafe."""
+
+
+class SnapshotTimeout(InfrastructureError):
+    """A read-only snapshot did not produce an admitted receipt in time."""
+
+
+def read_only_snapshot(request):
+    # Cache eviction and monitoring selection are mutations, even though they
+    # are bundled into the snapshot action.
+    return (request.get("action") == "snapshot" and request.get("drop", False) is False
+            and request.get("monitor_job") is None)
 
 
 class DeadlineError(InfrastructureError):
@@ -669,7 +680,7 @@ def guest_operation(config, request, clients):
         monitor_images = (json.loads(monitor_images_path.read_text()) if monitor_images_path.is_file()
                           else {"complete": False, "gaps": ["bootstrap monitoring image receipt missing"]})
         trace_tool = None
-        if config["spec"].get("mode", "standard") == "read-tier":
+        if config["spec"].get("mode", "standard") in ("read-tier", "read-tier-focused"):
             binary = shutil.which("bpftrace")
             trace_tool = {"requested": True, "binary": binary, "binary_sha256": None,
                           "version": None, "package_version": None, "kernel_release": os.uname().release,
@@ -690,7 +701,7 @@ def guest_operation(config, request, clients):
                 "ldd": command(["ldd", config["binary"]], timeout=30, env=environment(config)),
                 "snapshot": snapshot(config)}
     if action == "cold_trace_probe":
-        if config["spec"].get("mode", "standard") != "read-tier":
+        if config["spec"].get("mode", "standard") not in ("read-tier", "read-tier-focused"):
             raise SafetyError("trace capability probe is restricted to focused mode")
         control_root = guarded(Path("/var/lib/tidehunter-kv-control") / config["prefix"],
                                Path("/var/lib/tidehunter-kv-control"))
@@ -941,8 +952,8 @@ class Controller:
         record("intent")
         ambiguous = 0
         # Explicit bootstrap nonacceptance can wait for agent registration.
-        # Ambiguous replay is separately bounded and always uses the identical
-        # payload, S3 key and deadline guarded by the guest's durable execution gate.
+        # Ambiguous replay is permitted only for a read-only snapshot; it uses
+        # the identical payload, key and guest execution gate.
         for _ in range(timeout + 1):
             if self.clock() >= deadline:
                 break
@@ -978,7 +989,7 @@ class Controller:
                 result = receipt_if_present()
                 if result is not None:
                     return admit(result, reconciled=True)
-                if ambiguous == MAX_AMBIGUOUS_REPLAYS:
+                if not read_only_snapshot(request) or ambiguous == MAX_AMBIGUOUS_REPLAYS:
                     break
                 ambiguous += 1
                 time.sleep(min(0.5, max(0, deadline - self.clock())))
@@ -1000,18 +1011,56 @@ class Controller:
                 status = invocation.get("Status")
                 if status not in ("Pending", "InProgress", "Delayed"):
                     record("invocation_terminal", command_id=command_id, invocation=invocation)
+                    if status in ("TimedOut", "DeliveryTimedOut", "ExecutionTimedOut") and read_only_snapshot(request):
+                        result = receipt_if_present()
+                        if result is not None:
+                            return admit(result, reconciled=True)
+                        raise SnapshotTimeout("read-only snapshot SSM invocation timed out")
                     if status != "Success" or invocation.get("ResponseCode") != 0:
                         raise InfrastructureError("SSM command failed/unknown terminal status: " + str(status))
                     return admit(read_s3_json(self.clients["s3"], self.config, key), reconciled=False)
             time.sleep(min(0.5, max(0, deadline - self.clock())))
         record("deadline_exceeded", command_id=command_id)
+        if read_only_snapshot(request):
+            raise SnapshotTimeout("SSM read-only snapshot deadline exceeded")
         raise InfrastructureError("SSM exact operation deadline exceeded; state may still be live")
 
     def all_hosts(self, request, *, case="startup", timeout=180, export=False):
-        # Calls are bounded and each mutating SSM request rechecks all six tags.
-        with ThreadPoolExecutor(max_workers=6) as pool:
-            futures = [pool.submit(self.request, index, request, case=case, timeout=timeout, export=export) for index in range(-1, 5)]
+        # A retry gets a fresh operation key only for a genuinely read-only
+        # snapshot. The measurement gate remains closed until all hosts return.
+        cancelled = threading.Event()
+        def capture(index):
+            if index == -1 or not read_only_snapshot(request) or timeout < 4:
+                return self.request(index, request, case=case, timeout=timeout, export=export)
+            end = min(self.end if export else self.work_end, self.clock() + timeout)
+            first = max(1, int(timeout / 2))
+            try:
+                return self.request(index, request, case=case, timeout=first, export=export)
+            except SnapshotTimeout:
+                if cancelled.is_set():
+                    raise
+                remaining = int(end - self.clock())
+                if remaining < 1:
+                    raise
+                return self.request(index, request, case=case, timeout=remaining, export=export)
+
+        pool = ThreadPoolExecutor(max_workers=6)
+        futures = [pool.submit(capture, index) for index in range(-1, 5)]
+        try:
+            done, _ = wait(futures, return_when=FIRST_EXCEPTION)
+            for future in futures:
+                if future in done and future.exception() is not None:
+                    cancelled.set()
+                    for pending in futures:
+                        pending.cancel()
+                    raise future.exception()
             return [future.result() for future in futures]
+        finally:
+            # A read-only snapshot may still be finishing on another host, but
+            # it cannot release the case gate or mutate the measured state.
+            # Mutations must settle before cleanup can safely begin.
+            pool.shutdown(wait=not (cancelled.is_set() and read_only_snapshot(request)),
+                          cancel_futures=cancelled.is_set())
 
     def bootstrap(self):
         self.root.mkdir(parents=True, exist_ok=False)
@@ -1710,7 +1759,7 @@ class Controller:
             self.bootstrap()
             jobs = cloud_campaign.make_matrix(self.config["spec"])
             dump(self.root / "matrix.json", {"schema_version": 1, "spec": self.config["spec"], "jobs": jobs})
-            if self.config["spec"].get("mode", "standard") == "read-tier":
+            if self.config["spec"].get("mode", "standard") in ("read-tier", "read-tier-focused"):
                 probes = self.all_hosts({"action": "cold_trace_probe"}, timeout=120)
                 if not isinstance(probes, list) or len(probes) != 6:
                     raise InfrastructureError("trace capability probe returned incomplete fleet evidence")

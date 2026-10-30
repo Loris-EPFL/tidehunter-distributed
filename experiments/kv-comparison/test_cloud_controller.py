@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import tarfile
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -452,6 +453,94 @@ class CommandSafetyTests(unittest.TestCase):
                 self.assertEqual(read_receipt.call_count, 1)
         clients["ssm"].send_command.assert_called_once()
         clients["ssm"].get_command_invocation.assert_not_called()
+    def test_unknown_mutating_snapshot_is_reconciled_without_resending(self):
+        config = config_fixture()
+        clients = clients_fixture(config)
+        clients["ssm"].send_command.side_effect = TimeoutError("lost ack")
+        now = [100.0]
+        runtime = controller.Controller(config, clients, clock=lambda: now[0])
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime.root = Path(tmp)
+            with patch.object(controller, "read_s3_json", side_effect=MissingS3ObjectError()), \
+                 patch.object(controller.time, "sleep", side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)):
+                with self.assertRaises(controller.InfrastructureError):
+                    runtime.request(0, {"action": "snapshot", "drop": True}, timeout=3)
+        clients["ssm"].send_command.assert_called_once()
+
+    def test_snapshot_retry_is_per_host_and_never_retries_mutations(self):
+        runtime = controller.Controller(config_fixture(), clients_fixture(config_fixture()))
+        calls = []
+        def request(index, req, **kwargs):
+            calls.append((index, kwargs["timeout"]))
+            if index == 3 and sum(i == 3 for i, _ in calls) == 1:
+                raise controller.SnapshotTimeout("late")
+            return {"index": index}
+        runtime.request = request
+        result = runtime.all_hosts({"action": "snapshot", "drop": False}, timeout=60)
+        self.assertEqual([row["index"] for row in result], list(range(-1, 5)))
+        self.assertEqual(sum(index == 3 for index, _ in calls), 2)
+        self.assertTrue(all(sum(i == index for i, _ in calls) == 1 for index in (-1, 0, 1, 2, 4)))
+        for mutation in ({"action": "snapshot", "drop": True},
+                         {"action": "snapshot", "monitor_job": {"case_id": "x"}},
+                         {"action": "layout", "operation": "start"}):
+            calls.clear()
+            with self.assertRaises(controller.SnapshotTimeout):
+                runtime.all_hosts(mutation, timeout=60)
+            self.assertEqual(sum(index == 3 for index, _ in calls), 1)
+
+    def test_snapshot_retry_does_not_hide_safety_errors(self):
+        runtime = controller.Controller(config_fixture(), clients_fixture(config_fixture()))
+        runtime.request = Mock(side_effect=controller.SafetyError("bad receipt"))
+        with self.assertRaises(controller.SafetyError):
+            runtime.all_hosts({"action": "snapshot"}, timeout=60)
+        self.assertLessEqual(runtime.request.call_count, 6)
+
+    def test_read_snapshot_safety_failure_does_not_wait_for_slow_host(self):
+        runtime = controller.Controller(config_fixture(), clients_fixture(config_fixture()))
+        slow_started = threading.Event()
+        release = threading.Event()
+        returned = threading.Event()
+        errors = []
+        def request(index, req, **kwargs):
+            if index == -1:
+                slow_started.set()
+                release.wait(5)
+            elif index == 0:
+                self.assertTrue(slow_started.wait(5))
+                raise controller.SafetyError("bad binding")
+            return {"index": index}
+        def run():
+            try:
+                runtime.all_hosts({"action": "snapshot", "drop": False}, timeout=60)
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                returned.set()
+        runtime.request = request
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            self.assertTrue(returned.wait(2), "snapshot failure waited for unrelated host")
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], controller.SafetyError)
+        finally:
+            release.set()
+            thread.join(5)
+
+    def test_timed_out_read_snapshot_reconciles_exact_receipt(self):
+        config = config_fixture()
+        clients = clients_fixture(config)
+        clients["ssm"].send_command.return_value = {"Command": {"CommandId": "00000000-0000-0000-0000-000000000000"}}
+        clients["ssm"].get_command_invocation.return_value = {"Status": "TimedOut", "ResponseCode": -1}
+        runtime = controller.Controller(config, clients)
+        receipt = {"request": {"action": "snapshot", "index": 0}, "instance_id": runtime.ids[1],
+                   "status": "completed", "result": {"snapshot": "bound"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime.root = Path(tmp)
+            with patch.object(controller, "read_s3_json", return_value=receipt):
+                self.assertEqual(runtime.request(0, {"action": "snapshot"}), {"snapshot": "bound"})
+        clients["ssm"].send_command.assert_called_once()
+
 
     def test_absent_receipt_replays_only_identical_invocation_with_bounded_attempts(self):
         config = config_fixture()
