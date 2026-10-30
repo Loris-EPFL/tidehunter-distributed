@@ -1286,7 +1286,9 @@ fn ram_probe_does_not_acquire_inventory_or_dispatch_read_workers() {
         releases.push(release_tx);
         let started = started_tx.clone();
         server.node.read_pool.spawn(move || {
-            started.send(()).unwrap();
+            if started.send(()).is_err() {
+                return;
+            }
             let _ = release_rx.recv();
         });
     }
@@ -1369,8 +1371,10 @@ fn cold_authority_does_not_move_hot_reads_to_the_pool(transport: Transport, fenc
     let (blocked, blocking) = mpsc::sync_channel(1);
     let (resume, resumed) = mpsc::sync_channel(1);
     server.node.read_pool.spawn(move || {
-        blocked.send(()).unwrap();
-        resumed.recv_timeout(Duration::from_secs(5)).unwrap();
+        if blocked.send(()).is_err() {
+            return;
+        }
+        let _ = resumed.recv();
     });
     blocking.recv_timeout(Duration::from_secs(2)).unwrap();
     let fast = client

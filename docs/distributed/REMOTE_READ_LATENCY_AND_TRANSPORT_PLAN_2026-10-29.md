@@ -1135,3 +1135,31 @@ in us-east-1 or $134.2656 in eu-central-1 for compute alone, before storage,
 requests and other extras. The higher limit covers conservative worst-region
 reservation alongside prior spending; actual admission still uses the existing
 reservation and reconciliation rules.
+
+### 17.11 CI fixture abort diagnostics, 2026-10-30
+
+The hardware-fallback PR's distributed-library job ended with SIGABRT without
+a captured panic location. Comparison with the preceding successful job
+identified `tcp_cold_authority_preserves_hot_progress_and_rechecks_fencing`
+as the only earlier queued test without a completion line. This is a candidate,
+not proof of the aborting stack.
+
+That fixture's detached Rayon blocker could panic on a disconnected channel
+or its independent five-second timeout. Rayon's detached-task panic handler
+can then abort libtest and mask the controlling test's failure. The blocker
+now returns on a disconnected start receiver and waits for explicit release
+or sender drop. The neighboring RAM-probe blocker uses the same disconnect
+handling. Stack-local release senders drop before the earlier-created server
+during unwind. Main-thread deadlines and behavioral assertions remain; no
+production executor, DMA drain, fencing or durability rule changed.
+
+Rust CI now keeps libtest output uncaptured, with the existing backtraces,
+so a future fatal failure retains its preceding diagnostics. The original
+abort trigger remains unproven; a subsequent green run is not a causal proof.
+
+After the fixture change, the complete distributed library passed 862 tests
+with seven ignored. The exact software-provider cold-authority/fencing test
+also ran and passed. Format and strict engine lint passed; the all-adapter
+release binary was rebuilt and exercised with the 240-second gate config.
+Logs and the fresh executable are retained under the local qualification
+directory from section 17.9. No hardware allocation occurred during this repair.
