@@ -245,7 +245,7 @@ An optional `RunConfig.measurement_completion_gate` uses the same shape and mark
 
 Native scalar `put`/`delete` samples time the existing `WalWriter::write` append and `LargeTable` index application separately through benchmark-only entry points; those entry points preserve the native write algorithm and add clocks only on selected operations. A configured Value-WAL barrier has a separate existing file/namespace persistence profile; page-cache mode reports that barrier as not applicable. Native batch writes are explicitly excluded from native append/index stage sampling.
 
-TCP/EFA adapters arm the existing append-owner connection profiler dynamically at the measurement boundary. Their cap is per append-owning connection; the artifact reports expected/captured connections, sampled requests, transport/client/server scopes and owner append/persistence scopes. A zero sample count or incomplete profile remains visibly unavailable. Connection receive-frame time includes idle waiting; client, transport and owner timers can overlap and are not additive shares of API latency. These clocked samples are bounded diagnostic evidence, not per-operation percentiles, physical device I/O, or a representative latency distribution. The artifact records unsupported stages and phase/selection policy explicitly.
+TCP/EFA adapters arm the existing append-owner connection profiler dynamically at the measurement boundary. Their cap is per append-owning connection; the artifact reports expected/captured connections, sampled requests, transport/client/server scopes and owner append/persistence scopes. A zero sample count or incomplete profile remains visibly unavailable. The legacy receive-frame clock is not collected under multiplexing; zero is not a measured receive cost. Client, transport and owner timers can overlap and are not additive shares of API latency. These clocked samples are bounded diagnostic evidence, not per-operation percentiles, physical device I/O, or a representative latency distribution. The artifact records unsupported stages and phase/selection policy explicitly.
 
 Distributed evidence also includes an optional `coordinator_interval` of whitelisted monotone coordinator counters, computed from a fresh snapshot immediately after profile arm and a fresh snapshot after the last measured write reply, before profile finalization drains or sends control requests. It is separate from sampled owner-prefix clocks and excludes pre-measurement counters by subtraction. Its nanosecond stages are cumulative stage-clock deltas, not wall time; overlapping coordinator stages and checkpoint work must not be added as disjoint fractions. Missing or decreased counters are reported as unavailable rather than zero-filled.
 
@@ -256,3 +256,230 @@ own count, not the owner sample count, when interpreting its accumulated clocks.
 The 4096 logical measured writes are a third count; append grouping can coalesce
 multiple logical batches into one RPC. None of these totals is a per-operation
 stage latency percentile.
+
+## Measurement-phase read diagnostics
+
+`diagnostics.read_profile_limit` defaults to `0`: no read artifact or selected
+stage clocks. Values `1..=65536` enable the finite distributed Tidehunter sampler.
+Native and other stores reject a nonzero read limit before opening a database:
+their complete API measurements are not a substitute for owner WAL timers.
+
+For a distributed case, both profiles can be enabled:
+
+```json
+{"diagnostics":{"read_profile_limit":256,"write_profile_limit":256}}
+```
+
+Read profiling covers real scalar and grouped misses, including reads in mixed
+workloads. It selects the first N remote flight admissions, not N logical keys
+or N requests on every connection. Coordinator cache hits, local negative
+lookups, and waiters reusing a flight do not create new sampled remote I/O.
+The runner arms after warmup/aging and the release gate, snapshots counters
+around the measured calls, then captures/disables profiling before subsequent
+qualification. The optional completion gate remains outside the measurement.
+
+`result/read-diagnostics.json` retains:
+
+- Requested/armed status, selected/completed counts, scope, coverage and errors.
+- `profile.stages`: each stage's own `available`, `sum_ns`, `count`, `max_ns`
+  and `unavailable_reason`; absent maxima and unobserved durations are `null`.
+- `profile.counters`: exact engine counts, including partial/deferred/error
+  outcomes and failures whose owner profile was retained or unavailable.
+- `profile.read_evidence`: the separate measurement-boundary cache, WAL, async
+  and registered-read counters. These are not the sampled-prefix population.
+
+`profile.owners` maps actual partition IDs to their own server stages and
+counters. It reuses the globally selected requests; it does not give each
+owner a fresh sample budget. The monitor visits preallocated atomic collectors
+sequentially, not as a globally atomic cut. After a drained phase, verify the
+per-owner counts sum to their aggregate before attributing a slow shard.
+Prometheus labels the aggregate as `partition="aggregate"` and owner rows with
+their actual IDs. Do not pool these two views of the same work.
+
+| Stage | Actual boundary and denominator |
+|---|---|
+| `server_planning` | Owner range/authority planning until plans are ready, including cold-planning wait; counted planned requests |
+| `server_executor_residence` | First executor submission attempt through successful admission or synchronous completion; retains `Full` retry residence; counted admitted/completed requests |
+| `server_cache_resolution` | Owner cache lookup/result preparation for a new request, not repeated on a prepared retry; counted cache-resolution passes |
+| `server_nowait` | Actual bounded `preadv2(RWF_NOWAIT)` call elapsed time; counted syscall attempts, including fallback errors/partial results |
+| `server_async` | Each member's SQE preparation through CQE observation; counted observed member completions, including retained failed replies |
+| `server_response_ready` | Construction of owned response records; counted construction passes, not encoding or output |
+| `server_handler` / `server_record_read` | Broader owner service scopes, excluding the final recheck; nested with the narrower WAL stages |
+| `server_response_recheck_wait` / `server_response_recheck` | Ready-result wait and authority recheck; counted profiled replies |
+| `actor_queue` / `actor_service` | Selected successful actor-origin requests; caller-owned admission origins are separate |
+| `request_encode` / `exchange` / `response_decode` / `record_verify` | Each timer's actual client-side call count; RMA does not fabricate an encode/decode observation |
+| `transport_output_queue` / `transport_output_submit` / `transport_output_retire` | Client connection progress during selected work, with each transition's frame count; may include interleaved work |
+| `transport_cq_call` | Instrumented local provider CQ-call wall time and its timed-call count; not hardware transit |
+| `inline` | Submission-to-completion elapsed time for scalar/grouped caller-owned admission origins; includes any later actor takeover, not exclusive caller CPU time |
+
+For an available stage, `mean_ns = sum_ns / count`. A member-duration sum may
+exceed the request's wall time because members run concurrently. Do not add
+nested clocks, subtract unrelated percentiles, or subtract host timestamps.
+Exact API/scheduling/response percentiles still come from every raw operation;
+these stage aggregates do not supply stage p50/p99.
+
+Async elapsed includes user-space submission preparation/retries, kernel work
+and completion polling/scheduling. It does **not** prove an NVMe fetch or isolate
+device service from the kernel page cache. NOWAIT unsupported/partial results
+retain normal async fallback. RMA has no owner read handler for a direct hit;
+sync diagnostic readers have no async-executor observation. Cache-only phases
+remain valid, but owner WAL timing is unavailable instead of a fabricated zero.
+Successful cancellations suppress replies as before; a disconnected request
+cannot return an owner profile. Received profiled owner errors preserve their
+timings without converting the error into success.
+
+Protocol **14** includes sampled grant/provider-registration spans and bounded
+owner post-response diagnostics; rebuild clients and owners together. Ordinary
+replies do not carry the profile. There is no mixed-version shim or native
+WAL-format change.
+The normal unprofiled cohort is the performance baseline, not its diagnostic
+twin. Response encoding and local output transitions are now collected through
+owner boundary snapshots; pure wire and physical-media latency remain unsupported.
+
+The cloud planner adds separately labelled representative read diagnostic twins,
+preserving original cases and operation counts. Configuration, artifact hash
+admission, `comparison.md` and the campaign Prometheus/Grafana exports retain
+the new evidence. See [campaign settings](../../experiments/kv-comparison/README.md#read-stage-diagnostic-campaigns).
+
+
+### Resident and registered read controls
+
+The async-only primary cases remain unchanged. New
+`resident_first_stage_diagnostics` cases set `owner_read_resident_first=true`
+with both explicit value caches at zero. A sweep still permits four NOWAIT
+calls and 64 KiB, with a 16-KiB encoded-member limit. Proven-warm groups can
+retain their prepared state for at most eight continuation sweeps; cold,
+partial or unsupported reads retain asynchronous fallback. A budget deferral
+is not evidence of physical NVMe I/O.
+
+Grouped point reads fan out before waiting, retire ready owners rather than
+the first submitted owner, and may drive idle lanes in the caller. After 64
+consecutive empty progress sweeps, they return ownership to the actor.
+Accepted work and its buffer/byte credits stay in the shared driver through
+handoff, cancellation and retirement. Detached scans remain actor-driven.
+The Sui-compatible bulk API accepts borrowed `AsRef<[u8]>` keys; the benchmark
+adapter no longer copies every key into a new `Vec<u8>`.
+
+Registered groups use valid grants for eligible members while missing members
+take the message path concurrently; one missing grant no longer forces every
+member through message fallback. Original order, duplicates, protected cuts
+and error/DMA ownership remain unchanged. Idle-lane selection considers actual
+session-local grant coverage. Source metadata is allocated/charged per
+reservation instead of statically dividing region slots over the maximum
+connection count. Node/process limits and quarantine charges still apply.
+
+Measurement boundary snapshots query each owner's cumulative grant decisions
+once outside API timing. `owner_grants` deltas include attempts, issued/reused
+grants and denial reasons. Source live/pending/quarantined byte and region
+occupancy remains a raw gauge in the start/end snapshots, never a subtracted
+monotonic counter. Passive lifetime snapshots retain their separate freshness
+labels. Client grant candidates/unavailable counts are not owner-wide counts.
+
+`phases.warmup_key_sweep=true` is an explicit, preloaded closed-loop read-only
+control. It covers the unchanged logical working set during warm-up and
+advances the usual random generator; measured requests still use the configured
+random distribution. Validation rejects an incomplete sweep or mutating mix.
+Existing cases default to false and retain their original warm-up.
+
+The two new `registered_ram_fullset_control` cases use all 4,096 keys, C1 and
+one read lane per owner, so qualification concerns the actual selected
+sessions. They retain 8,192 scalar or 2,048 batch32 measured API calls and use
+an explicit full-set warm-up. They are not replacements for C16/mixed or
+first-access results. Cloud requires native device reads; software-provider
+local executions are functional evidence only.
+
+The report labels a control qualified only with nonzero matching FI_READ
+posts/completions, no observed message/grant-acquisition/error/fallback,
+no explicit-cache hits and no owner WAL reads. Missing observations remain
+unknown; an unqualified configured control is not called pure RMA.
+
+
+### Coordinator, acquisition and output decomposition
+
+The coordinator has an independent first-N API-resolution sampler. It includes
+point/bulk cache hits, negative index results, remote misses and errors, unlike
+the unchanged first-N *physical remote-flight* sampler. Its snapshot records
+index-lock wait, member-only index lookup, cache-lock wait and cache lookup,
+plus separate cut validation/capture, route, pin and batch-construction clocks.
+Each has its own count, accumulated ns and maximum; bulk envelopes are not
+pooled with member lookups. Logical member outcomes
+and API resolution counts are distinct. `profile.coordinator_resolution_valid`
+requires a correctly armed, attempted and drained interval; missing remote
+flight evidence does not invalidate an otherwise valid cache-only resolution
+sample. Nonzero rearm resets after drain; disarm preserves the snapshot.
+The legacy combined resolve clock is not an index-only measurement.
+
+Sampled owner grant setup now distinguishes lookup/reuse, reservation/admission,
+envelope preparation, the actual `fi_mr_reg` call, and authority
+recheck/publication. Each has its own count/sum/max/errors. Registration failure
+is retained when observed; a provider call is not necessarily a fresh hardware
+pin because providers can cache registrations. Client grant installation and
+accepted FI_READ submission through locally observed completion are separate
+stages. Neither timer is a pure network or disk-service measurement.
+
+Owner response encoding, enqueue-to-first-write, local submission and local
+retirement are sampled node-cumulative observations queried outside API timing.
+They are not retroactively inserted into an already encoded reply and do not
+require encoding the response twice. Abandoned output is counted separately
+from retirement. Boundary counter deltas retain their populations; a cumulative
+maximum is reported as a node-lifetime maximum, never subtracted.
+Fatal connection failures can leave other in-flight profiles unavailable.
+A pure FI_READ failure has no owner handler and is not misclassified as a
+retained owner profile.
+
+Raw measurement boundaries also retain actual instantiated read-lane counters
+and local session presence per owner/lane. Locally constructed-session usability
+does not establish current peer health or complete key coverage. C1/one-lane
+full-set controls and C16/four-lane mixed controls remain separate.
+
+### First-access controls and cache policy
+
+`phases.measurement_key_sweep=true` is opt-in. It requires a preloaded,
+closed-loop, read-only workload with enough distinct keys for the complete
+measured call count, including every full batch member. It does not wrap into
+repeated keys. Default false preserves the ordinary random measurement sequence.
+This deterministic first-touch sweep is labelled explicitly; it is not an IID
+uniform-random population. Paired promotion-disabled and acquisition controls
+use identical data and order. Connections are established before activation;
+the preflight qualifier uses a separate namespace. Its unrelated grants can
+remain in lifetime occupancy, so first-access proof uses namespace/sweep binding
+and measured new-issuance/message counters rather than requiring globally empty
+grant caches.
+
+Focused campaign receipts name requested/effective coordinator and owner value
+cache budgets, registered-value budgets/policy, Linux page-cache policy,
+resident-first setting, warm-up, sweep flags, concurrency and lane evidence.
+Turning off both value caches and value grants forces remote value service; it
+does **not** turn off the Linux page cache, coordinator metadata residency or
+the registered transport buffers needed by the provider itself.
+Pure-hit claims require observed paths, not just a configured nonzero budget.
+
+The opt-in `read-tier` campaign uses the existing single fleet sequentially:
+application-cache-disabled remote controls first, then labelled cache,
+registered, acquisition/reuse, warm-WAL, cold-device and bounded-mixed controls.
+Baseline/profiled twins are separate populations with the same input data.
+Backend-independent `data_id` binds matching key/value bytes; `source_id`
+separately identifies backend/workload/concurrency/lane populations.
+The 64-KiB warmed owner control is labelled `oversize_async_fallback`, since it
+exceeds the 16-KiB NOWAIT member limit; configured registered controls do not
+pretend 64-KiB values fit a 32-KiB registered-read limit.
+
+### Cold-device evidence is not a per-API NAND timer
+
+The controller can bracket a measured interval with an owned, bounded Linux
+block collector. Where permitted, bpftrace/BTF tracks request identity internally,
+including partial completions and requeues, without exporting kernel addresses.
+Its issue-to-completion intervals are block/driver residence on the mapped
+backing device, not application request latency or NAND service. Maps, perf
+buffers, output and wall duration are bounded; loss, incomplete requests,
+errors and unavailable permissions remain explicit.
+
+Tracefs sector/length events are a counts-only fallback: boundary-straddling,
+overlapping and split requests cannot establish request identity. Candidate
+correlations are not promoted to proven device intervals. Device-wide activity
+can include metadata, read-ahead and background work. OS-cache-drop receipts,
+actual device activity and logical WAL reads support the cold *protocol* claim,
+not that every API call missed every cache. Coordinator index temperature is
+independent. Full API/scheduling/response distributions remain in `samples.csv`;
+do not subtract cross-host timestamps, pool incompatible tiers, or turn nested
+stage means into additive time shares.

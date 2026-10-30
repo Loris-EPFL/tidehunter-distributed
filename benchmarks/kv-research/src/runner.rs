@@ -134,6 +134,8 @@ pub async fn run<B: KvBackend>(
     }
     let mut measurement_attempted = false;
     let mut profile_arm_error = None;
+    let mut read_profile_arm_error = None;
+    let mut read_profile_armed = false;
     let mut read_start = serde_json::Value::Null;
     let mut read_end = serde_json::Value::Null;
     let mut measurement_drained = false;
@@ -157,6 +159,18 @@ pub async fn run<B: KvBackend>(
             profile_arm_error = Some(reason.clone());
             fatal_reason = Some(reason);
             reporter.snapshot()?;
+        }
+        if fatal_reason.is_none() && config.diagnostics.read_profile_limit > 0 {
+            match backend.arm_read_profile(config.diagnostics.read_profile_limit) {
+                Ok(()) => read_profile_armed = true,
+                Err(error) => {
+                    failed = true;
+                    let reason = format!("measurement read profile arm failed: {error}");
+                    read_profile_arm_error = Some(reason.clone());
+                    fatal_reason = Some(reason);
+                    reporter.snapshot()?;
+                }
+            }
         }
         if fatal_reason.is_none() {
             measurement_attempted = true;
@@ -233,6 +247,38 @@ pub async fn run<B: KvBackend>(
                 fatal_reason = Some(fatal_reason.map_or_else(
                     || format!("write diagnostics export failed: {error}"),
                     |previous| format!("{previous}; write diagnostics export failed: {error}"),
+                ));
+            }
+        }
+    }
+    if config.diagnostics.read_profile_limit > 0 {
+        let profile_deadline = deadline + Duration::from_secs(config.limits.shutdown_grace_seconds);
+        match export_read_diagnostics(
+            backend.as_ref(),
+            &config,
+            output,
+            measurement_attempted,
+            measurement_drained,
+            read_profile_armed,
+            read_profile_arm_error.as_deref(),
+            profile_deadline,
+            &evidence,
+        )
+        .await
+        {
+            Ok(Some(error)) => {
+                failed = true;
+                fatal_reason = Some(fatal_reason.map_or_else(
+                    || format!("read diagnostics finalization failed: {error}"),
+                    |previous| format!("{previous}; read diagnostics finalization failed: {error}"),
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                failed = true;
+                fatal_reason = Some(fatal_reason.map_or_else(
+                    || format!("read diagnostics export failed: {error}"),
+                    |previous| format!("{previous}; read diagnostics export failed: {error}"),
                 ));
             }
         }
@@ -319,7 +365,9 @@ pub async fn run<B: KvBackend>(
         "data_policy": {"key_bytes": 32, "key_derivation": "BLAKE2(namespace,seed,logical_key_id), all bits hashed",
             "value_identity_header_bytes": 16, "value_entropy_fraction_of_remainder": config.dataset.entropy},
         "phase_semantics": {"preload": config.phases.preload, "warmup_operations": config.phases.warmup_operations,
+            "warmup_key_sweep": config.phases.warmup_key_sweep,
             "aging_operations": config.phases.aging_operations, "measurement_operations": config.phases.measurement_operations,
+            "measurement_key_sweep": config.phases.measurement_key_sweep,
             "sustainability_claim": false},
         "qualification_failure": fatal_reason,
     });
@@ -386,6 +434,112 @@ fn partition_deltas(
     serde_json::json!({"available": true, "partitions": partitions})
 }
 
+fn lane_deltas(
+    start: &serde_json::Value,
+    end: &serde_json::Value,
+    fields: &[&str],
+) -> serde_json::Value {
+    if start["available"] != true || end["available"] != true {
+        return serde_json::json!({"available": false, "error": "lane snapshots unavailable at a boundary"});
+    }
+    let (Some(first), Some(last)) = (
+        start
+            .get("partitions")
+            .and_then(serde_json::Value::as_object),
+        end.get("partitions").and_then(serde_json::Value::as_object),
+    ) else {
+        return serde_json::json!({"available": false, "error": "lane partitions unavailable"});
+    };
+    let mut partitions = serde_json::Map::new();
+    for key in first.keys().chain(last.keys()) {
+        if partitions.contains_key(key) {
+            continue;
+        }
+        let delta = match (first.get(key), last.get(key)) {
+            (Some(a), Some(b)) => {
+                let snapshot = |row: &serde_json::Value| {
+                    let lanes = row.get("lanes").and_then(serde_json::Value::as_object);
+                    let counters: serde_json::Map<String, serde_json::Value> = lanes
+                        .into_iter()
+                        .flat_map(|lanes| lanes.iter())
+                        .map(|(lane, value)| {
+                            (
+                                lane.clone(),
+                                value.get("stats").cloned().unwrap_or_default(),
+                            )
+                        })
+                        .collect();
+                    serde_json::json!({"available": lanes.is_some(), "partitions": counters})
+                };
+                let delta = partition_deltas(&snapshot(a), &snapshot(b), fields);
+                serde_json::json!({"available": delta["available"], "lanes": delta["partitions"], "error": delta.get("error")})
+            }
+            _ => {
+                serde_json::json!({"available": false, "error": "partition missing at one boundary"})
+            }
+        };
+        partitions.insert(key.clone(), delta);
+    }
+    serde_json::json!({"available": true, "partitions": partitions})
+}
+
+fn owner_response_deltas(start: &serde_json::Value, end: &serde_json::Value) -> serde_json::Value {
+    if start["available"] != true || end["available"] != true {
+        return serde_json::json!({"available": false, "error": "owner snapshots unavailable at a boundary"});
+    }
+    let (Some(first), Some(last)) = (
+        start
+            .get("partitions")
+            .and_then(serde_json::Value::as_object),
+        end.get("partitions").and_then(serde_json::Value::as_object),
+    ) else {
+        return serde_json::json!({"available": false, "error": "owner partitions unavailable"});
+    };
+    let mut partitions = serde_json::Map::new();
+    for key in first.keys().chain(last.keys()) {
+        if partitions.contains_key(key) {
+            continue;
+        }
+        let mut stages = serde_json::Map::new();
+        for (stage, parent, field) in [
+            ("read_response_encode", "", "read_response_encode"),
+            ("read_output_queue", "", "read_output_queue"),
+            ("read_output_submit", "", "read_output_submit"),
+            ("read_response_retire", "", "read_response_retire"),
+            ("read_grant_lookup", "read_grant", "lookup"),
+            ("read_grant_reservation", "read_grant", "reservation"),
+            ("read_grant_envelope", "read_grant", "envelope"),
+            ("read_grant_registration", "read_grant", "registration"),
+            (
+                "read_grant_recheck_publication",
+                "read_grant",
+                "recheck_publication",
+            ),
+        ] {
+            let value = match (first.get(key), last.get(key)) {
+                (Some(a), Some(b)) => {
+                    let (a, b) = if parent.is_empty() {
+                        (a, b)
+                    } else {
+                        (&a[parent], &b[parent])
+                    };
+                    counter_delta(&a[field], &b[field], &["ns", "count", "errors"])
+                }
+                _ => {
+                    serde_json::json!({"available": false, "error": "partition missing at one boundary"})
+                }
+            };
+            stages.insert(stage.to_owned(), value);
+        }
+        partitions.insert(key.clone(), serde_json::Value::Object(stages));
+    }
+    serde_json::json!({
+        "available": true, "partitions": partitions,
+        "population": "sampled owner grant attempts and response frames across node boundary snapshots; each stage has its own count, independent of completed coordinator flights",
+        "max_semantics": "lifetime maxima in raw start/end snapshots cannot be differenced into measurement maxima"
+    })
+}
+
 fn measurement_read_evidence(
     start: &serde_json::Value,
     end: &serde_json::Value,
@@ -436,6 +590,8 @@ fn measurement_read_evidence(
     const RESIDENT: &[&str] = &[
         "message_read_requests",
         "grants_issued",
+        "grant_candidates",
+        "grant_unavailable",
         "grant_acquisitions",
         "rma_completions",
         "eligible_reads",
@@ -448,11 +604,28 @@ fn measurement_read_evidence(
         "fallback_unsupported",
         "fallback_stale",
     ];
+    const OWNER_GRANTS: &[&str] = &[
+        "attempts",
+        "issued",
+        "reused",
+        "denied_request_limit",
+        "denied_oversize",
+        "denied_regions",
+        "denied_bytes",
+        "denied_admission",
+        "denied_source_unavailable",
+        "denied_owner_unavailable",
+        "denied_provider",
+    ];
     let deltas = if attempted && drained && start["available"] == true && end["available"] == true {
         serde_json::json!({
             "coordinator": counter_delta(&start["coordinator"], &end["coordinator"], COORDINATOR),
             "owner_executor": partition_deltas(&start["owner_executor"], &end["owner_executor"], OWNER),
-            "client_resident": partition_deltas(&start["client_resident"], &end["client_resident"], RESIDENT)
+            "client_resident": partition_deltas(&start["client_resident"], &end["client_resident"], RESIDENT),
+            "client_resident_lanes": lane_deltas(&start["client_resident_lanes"], &end["client_resident_lanes"], RESIDENT),
+            "owner_response": owner_response_deltas(&start["owner_grants"], &end["owner_grants"]),
+            "owner_output_abandoned": partition_deltas(&start["owner_grants"], &end["owner_grants"], &["read_output_abandoned"]),
+            "owner_grants": partition_deltas(&start["owner_grants"], &end["owner_grants"], OWNER_GRANTS)
         })
     } else {
         serde_json::json!({"available": false, "error": if !attempted { "measurement not attempted" }
@@ -1157,6 +1330,152 @@ async fn wait_for_measurement_gate(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn export_read_diagnostics<B: KvBackend>(
+    backend: &B,
+    config: &RunConfig,
+    output: &Path,
+    measurement_attempted: bool,
+    measurement_drained: bool,
+    armed: bool,
+    arm_error: Option<&str>,
+    finish_deadline: Instant,
+    read_evidence: &serde_json::Value,
+) -> BackendResult<Option<String>> {
+    let mut finish_error = arm_error.map(str::to_owned);
+    let mut profile = if armed {
+        match timeout_at(
+            TokioInstant::from_std(finish_deadline),
+            backend.finish_read_profile(),
+        )
+        .await
+        {
+            Ok(Ok(profile)) => Some(profile),
+            Ok(Err(error)) => {
+                finish_error = Some(error.to_string());
+                None
+            }
+            Err(_) => {
+                finish_error = Some("read profile finalization exceeded shutdown grace".to_owned());
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if finish_error.is_none() {
+        finish_error = profile
+            .as_ref()
+            .and_then(|value| value.get("finalization_error"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+    }
+    if armed && !measurement_drained {
+        let incomplete = "measurement did not complete and drain successfully";
+        finish_error = Some(match finish_error {
+            Some(error) => format!("{error}; {incomplete}"),
+            None => incomplete.to_owned(),
+        });
+    }
+    let runtime_enabled = profile
+        .as_ref()
+        .and_then(|value| value.get("runtime_enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if armed && profile.is_some() {
+        let runtime_limit = profile
+            .as_ref()
+            .and_then(|value| value.get("runtime_limit"))
+            .and_then(serde_json::Value::as_u64);
+        if !runtime_enabled || runtime_limit != Some(config.diagnostics.read_profile_limit as u64) {
+            let error = format!(
+                "read profile activation mismatch: enabled={runtime_enabled}, observed limit={runtime_limit:?}, requested limit={}",
+                config.diagnostics.read_profile_limit
+            );
+            finish_error = Some(match finish_error {
+                Some(previous) => format!("{previous}; {error}"),
+                None => error,
+            });
+        }
+        let selected = profile
+            .as_ref()
+            .and_then(|value| value.get("selected_operations"))
+            .and_then(serde_json::Value::as_u64);
+        let rpcs = read_evidence
+            .pointer("/deltas/coordinator/counters/read_rpc_count")
+            .and_then(serde_json::Value::as_u64);
+        if selected == Some(0) && rpcs.is_some_and(|count| count > 0) {
+            let error = format!(
+                "read profile selected no requests despite {} observed remote read RPCs",
+                rpcs.unwrap_or(0)
+            );
+            finish_error = Some(match finish_error {
+                Some(previous) => format!("{previous}; {error}"),
+                None => error,
+            });
+        }
+    }
+    if let Some(object) = profile.as_mut().and_then(serde_json::Value::as_object_mut) {
+        if object
+            .get("selected_operations")
+            .and_then(serde_json::Value::as_u64)
+            == Some(0)
+            && let Some(hits) = read_evidence
+                .pointer("/deltas/coordinator/counters/hits")
+                .and_then(serde_json::Value::as_u64)
+            && let Some(rpcs) = read_evidence
+                .pointer("/deltas/coordinator/counters/read_rpc_count")
+                .and_then(serde_json::Value::as_u64)
+            && let Some(coverage) = object
+                .get_mut("coverage")
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            coverage.insert("reason".to_owned(), serde_json::json!(format!(
+                "no remote read requests selected; measurement observed {hits} coordinator cache hits and {rpcs} remote read RPCs"
+            )));
+        }
+        let resolution_valid = armed
+            && measurement_attempted
+            && measurement_drained
+            && runtime_enabled
+            && object
+                .get("runtime_limit")
+                .and_then(serde_json::Value::as_u64)
+                == Some(config.diagnostics.read_profile_limit as u64);
+        object.insert(
+            "coordinator_resolution_valid".to_owned(),
+            resolution_valid.into(),
+        );
+        object.insert("read_evidence".to_owned(), read_evidence.clone());
+    }
+    let field = |name: &str| profile.as_ref().and_then(|value| value.get(name));
+    let evidence = serde_json::json!({
+        "schema_version": 1,
+        "backend": backend.info().name,
+        "phase": "measurement",
+        "phase_attempted": measurement_attempted,
+        "runtime_enabled": runtime_enabled,
+        "runtime_observation_mode": field("runtime_observation_mode").and_then(serde_json::Value::as_str).unwrap_or("not_armed"),
+        "selection": {
+            "requested_limit": config.diagnostics.read_profile_limit,
+            "selected_operations": field("selected_operations").and_then(serde_json::Value::as_u64).unwrap_or(0),
+            "completed_operations": field("completed_operations").and_then(serde_json::Value::as_u64).unwrap_or(0),
+            "selection_policy": field("selection_policy").and_then(serde_json::Value::as_str).unwrap_or("not armed"),
+            "phase_exclusions": ["qualification", "preload", "warmup", "aging", "post-measurement qualification"]
+        },
+        "clock_scope": field("clock_scope").cloned().unwrap_or_else(|| serde_json::json!("no engine stages captured")),
+        "overlap_semantics": field("overlap_semantics").cloned().unwrap_or_else(|| serde_json::json!("stage clocks overlap and are not additive")),
+        "unsupported_stages": field("unsupported_stages").cloned().unwrap_or_else(|| serde_json::json!(["measurement_read_stage_profile"])),
+        "profile": profile,
+        "error": finish_error.clone()
+    });
+    std::fs::write(
+        output.join("read-diagnostics.json"),
+        serde_json::to_vec_pretty(&evidence)?,
+    )?;
+    Ok(finish_error)
+}
+
 async fn export_write_diagnostics<B: KvBackend>(
     backend: &B,
     config: &RunConfig,
@@ -1281,6 +1600,9 @@ async fn run_phase<B: KvBackend>(
     let mut phase_expired = false;
     let mut next_snapshot = Instant::now() + Duration::from_secs(1);
     let mut profiled_selected = 0usize;
+    let sweep_keys = (phase == "warmup" && config.phases.warmup_key_sweep)
+        || (phase == "measurement" && config.phases.measurement_key_sweep);
+    let mut sweep_cursor = 0;
     match config.execution.mode {
         ExecutionMode::ClosedLoop => {
             while scheduled_index < count {
@@ -1313,7 +1635,11 @@ async fn run_phase<B: KvBackend>(
                     }
                     continue;
                 }
-                let work = generator.next_item()?;
+                let work = if sweep_keys {
+                    generator.next_sweep_item(&mut sweep_cursor)?
+                } else {
+                    generator.next_item()?
+                };
                 let scheduled = duration_ns(origin.elapsed());
                 reporter.offered(phase, work.operation.as_str(), work.keys.len() as u64);
                 if Instant::now() >= next_snapshot {
@@ -1384,7 +1710,11 @@ async fn run_phase<B: KvBackend>(
                         continue;
                     }
                 }
-                let work = generator.next_item()?;
+                let work = if sweep_keys {
+                    generator.next_sweep_item(&mut sweep_cursor)?
+                } else {
+                    generator.next_item()?
+                };
                 let scheduled = duration_ns(due.saturating_duration_since(origin));
                 reporter.offered(phase, work.operation.as_str(), work.keys.len() as u64);
                 let profiled_write = is_profile_candidate(
@@ -1934,6 +2264,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lane_deltas_preserve_missing_and_reset_lanes() {
+        let start = serde_json::json!({"available": true, "partitions": {"0": {"lanes": {
+            "0": {"session_present": true, "stats": {"hits": 3}},
+            "1": {"session_present": null, "stats": {"hits": 5}},
+            "2": {"session_present": true, "stats": {"hits": 1}}
+        }}}});
+        let end = serde_json::json!({"available": true, "partitions": {"0": {"lanes": {
+            "0": {"session_present": true, "stats": {"hits": 7}},
+            "1": {"session_present": null, "stats": {"hits": 1}}
+        }}}});
+        let delta = lane_deltas(&start, &end, &["hits"]);
+        assert_eq!(
+            delta["partitions"]["0"]["lanes"]["0"]["counters"]["hits"],
+            4
+        );
+        assert_eq!(delta["partitions"]["0"]["lanes"]["1"]["available"], false);
+        assert_eq!(delta["partitions"]["0"]["lanes"]["2"]["available"], false);
+    }
+
+    #[test]
+    fn owner_boundary_stages_keep_errors_missing_and_lifetime_max_separate() {
+        let start = serde_json::json!({"available": true, "partitions": {"0": {
+            "read_grant": {"registration": {"ns": 10, "count": 1, "errors": 0, "max_ns": 10}}
+        }}});
+        let end = serde_json::json!({"available": true, "partitions": {"0": {
+            "read_grant": {"registration": {"ns": 30, "count": 2, "errors": 1, "max_ns": 20}}
+        }}});
+        let delta = owner_response_deltas(&start, &end);
+        let registration = &delta["partitions"]["0"]["read_grant_registration"];
+        assert_eq!(registration["counters"]["ns"], 20);
+        assert_eq!(registration["counters"]["count"], 1);
+        assert_eq!(registration["counters"]["errors"], 1);
+        assert!(registration["counters"].get("max_ns").is_none());
+        assert_eq!(
+            delta["partitions"]["0"]["read_response_encode"]["available"],
+            false
+        );
+        assert_eq!(
+            owner_response_deltas(&start, &serde_json::json!({"available": false}))["available"],
+            false
+        );
+    }
+
     #[tokio::test]
     async fn read_evidence_excludes_warmup_and_postqualification() {
         let directory = result_directory("read-boundary");
@@ -1956,7 +2330,142 @@ mod tests {
         .unwrap();
         assert_eq!(evidence["deltas"]["coordinator"]["counters"]["hits"], 2);
         assert!(evidence["start"]["coordinator"]["hits"].as_u64().unwrap() >= 3);
+        assert!(!output.join("read-diagnostics.json").exists());
         assert_eq!(evidence["deltas"]["owner_executor"]["available"], false);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_profile_is_confined_to_measurement_and_exports_empty_coverage() {
+        let directory = result_directory("read-profile-boundary");
+        let output = directory.join("result");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = MemoryBackend::new(false, false);
+        backend.profile_events = Some(Arc::clone(&events));
+        let mut config = read_test_config();
+        config.backend.kind = "tidehunter".to_owned();
+        config.phases.warmup_operations = 3;
+        config.phases.measurement_operations = 2;
+        config.diagnostics.read_profile_limit = 4;
+        run(backend, config, &output, prometheus::Registry::new())
+            .await
+            .unwrap();
+        let events = events.lock().unwrap();
+        let arm = events.iter().position(|event| *event == "arm").unwrap();
+        let finish = events.iter().position(|event| *event == "finish").unwrap();
+        assert!(events[..arm].contains(&"read"));
+        assert_eq!(
+            events[arm + 1..finish]
+                .iter()
+                .filter(|event| **event == "read")
+                .count(),
+            2
+        );
+        assert!(events[finish + 1..].contains(&"read"));
+        let evidence: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output.join("read-diagnostics.json")).unwrap())
+                .unwrap();
+        assert_eq!(evidence["runtime_enabled"], true);
+        assert_eq!(evidence["selection"]["requested_limit"], 4);
+        assert_eq!(evidence["selection"]["selected_operations"], 0);
+        assert_eq!(
+            evidence["profile"]["owners"]["7"]["stages"]["server_async"]["available"],
+            false
+        );
+        assert_eq!(
+            evidence["profile"]["owners"]["7"]["counters"]["read_profile_server_async_count"],
+            0
+        );
+        assert!(evidence["error"].is_null());
+        assert_eq!(
+            evidence["profile"]["read_evidence"]["measurement_attempted"],
+            true
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_profile_exports_arm_failure_and_incomplete_measurement() {
+        let directory = result_directory("read-profile-failure");
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut config = read_test_config();
+        config.diagnostics.read_profile_limit = 1;
+        let mut backend = MemoryBackend::new(false, false);
+        let read_evidence = serde_json::json!({});
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let error = export_read_diagnostics(
+            &backend,
+            &config,
+            &directory,
+            false,
+            false,
+            false,
+            Some("arm failed"),
+            deadline,
+            &read_evidence,
+        )
+        .await
+        .unwrap();
+        assert_eq!(error.as_deref(), Some("arm failed"));
+        let artifact: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.join("read-diagnostics.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(artifact["runtime_enabled"], false);
+        assert!(artifact["profile"].is_null());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        backend.profile_events = Some(Arc::clone(&events));
+        backend.arm_read_profile(1).unwrap();
+        let error = export_read_diagnostics(
+            &backend,
+            &config,
+            &directory,
+            true,
+            false,
+            true,
+            None,
+            deadline,
+            &read_evidence,
+        )
+        .await
+        .unwrap();
+        assert!(error.unwrap().contains("did not complete and drain"));
+        assert_eq!(events.lock().unwrap().as_slice(), ["arm", "finish"]);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_profile_rejects_unobserved_activation_and_missing_rpc_samples() {
+        let directory = result_directory("read-profile-missing-coverage");
+        let mut config = read_test_config();
+        config.diagnostics.read_profile_limit = 2;
+        let mut backend = MemoryBackend::new(false, false);
+        backend.profile_events = Some(Arc::new(Mutex::new(Vec::new())));
+        backend.arm_read_profile(1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let evidence = serde_json::json!({"deltas": {"coordinator": {"counters": {
+            "hits": 0, "read_rpc_count": 3
+        }}}});
+        let error = export_read_diagnostics(
+            &backend, &config, &directory, true, true, true, None, deadline, &evidence,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(error.contains("activation mismatch"));
+        assert!(error.contains("selected no requests"));
+        let artifact: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.join("read-diagnostics.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(artifact["runtime_enabled"], true);
+        assert_eq!(artifact["profile"]["runtime_limit"], 1);
+        assert!(
+            artifact["error"]
+                .as_str()
+                .unwrap()
+                .contains("selected no requests")
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1967,6 +2476,8 @@ mod tests {
         omit_put_number: Option<usize>,
         put_count: AtomicUsize,
         read_count: AtomicUsize,
+        profile_events: Option<Arc<Mutex<Vec<&'static str>>>>,
+        profile_limit: AtomicUsize,
     }
 
     impl MemoryBackend {
@@ -1978,6 +2489,8 @@ mod tests {
                 omit_put_number: None,
                 put_count: AtomicUsize::new(0),
                 read_count: AtomicUsize::new(0),
+                profile_limit: AtomicUsize::new(0),
+                profile_events: None,
             }
         }
 
@@ -2021,15 +2534,49 @@ mod tests {
         fn read_observation(&self) -> serde_json::Value {
             let reads = self.read_count.load(Ordering::Relaxed);
             serde_json::json!({"available": true, "coordinator": {
-                "read_rpc_count": reads, "hits": reads, "misses": 0, "inserts": 0,
+                "read_rpc_count": 0, "hits": reads, "misses": 0, "inserts": 0,
                 "evictions": 0, "rejected_oversize": 0, "rejected_mismatch": 0,
                 "bypass_disabled": 0, "bypass_admission": 0, "bypass_eviction_limit": 0,
                 "admitted_bytes": 0, "served_bytes": 0},
                 "owner_executor": {"available": false, "error": "test unavailable"},
                 "client_resident": {"available": false, "error": "test unavailable"}})
         }
+        fn arm_read_profile(&self, limit: usize) -> BackendResult<()> {
+            let events = self
+                .profile_events
+                .as_ref()
+                .ok_or_else(|| invalid("read profile unsupported"))?;
+            assert!(limit > 0);
+            self.profile_limit.store(limit, Ordering::Relaxed);
+            events.lock().unwrap().push("arm");
+            Ok(())
+        }
+
+        async fn finish_read_profile(&self) -> BackendResult<serde_json::Value> {
+            let events = self
+                .profile_events
+                .as_ref()
+                .ok_or_else(|| invalid("read profile unsupported"))?;
+            events.lock().unwrap().push("finish");
+            Ok(serde_json::json!({
+                "runtime_enabled": true,
+                "runtime_limit": self.profile_limit.swap(0, Ordering::Relaxed),
+                "runtime_observation_mode": "test",
+                "selected_operations": 0,
+                "completed_operations": 0,
+                "stages": {},
+                "owners": {"7": {
+                    "stages": {"server_async": {"available": false, "sum_ns": null, "count": 0, "max_ns": null, "unavailable_reason": "no profiled owner responses for this partition"}},
+                    "counters": {"read_profile_server_async_count": 0}
+                }},
+                "coverage": {"reason": "no remote reads in test backend"}
+            }))
+        }
 
         async fn get(&self, key: &[u8]) -> BackendResult<Option<Bytes>> {
+            if let Some(events) = &self.profile_events {
+                events.lock().unwrap().push("read");
+            }
             self.read_count.fetch_add(1, Ordering::Relaxed);
             Ok(self
                 .data

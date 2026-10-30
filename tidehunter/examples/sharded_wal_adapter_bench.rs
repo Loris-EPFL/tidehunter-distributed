@@ -243,7 +243,7 @@ fn run_case(
         1,
         0,
         1024,
-        |_, _| Ok(db.multi_get(ks, &[])),
+        |_, _| Ok(db.multi_get(ks, &[] as &[Vec<u8>])),
         |values| values.is_empty(),
     )?);
     rows.push(measure(
