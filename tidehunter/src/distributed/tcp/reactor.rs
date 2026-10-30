@@ -1664,7 +1664,7 @@ impl Client {
         #[cfg(not(feature = "experimental-fabric"))]
         {
             let _ = (epoch, references);
-            return 0;
+            0
         }
         #[cfg(feature = "experimental-fabric")]
         references
