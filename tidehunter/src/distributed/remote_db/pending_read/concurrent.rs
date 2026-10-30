@@ -27,6 +27,7 @@ impl ConcurrentRemoteDatabase {
             .diagnostics
             .remaining
             .store(limit, Ordering::Relaxed);
+        self.reads.state.coordinator_diagnostics.arm(limit);
     }
     pub(crate) fn read_profile_enabled(&self) -> bool {
         self.reads.state.diagnostics.limit.load(Ordering::Relaxed) != 0
@@ -47,14 +48,16 @@ impl ConcurrentRemoteDatabase {
     /// # Errors
     /// Returns key, admission, authority, transport, or value-integrity errors.
     pub fn get(&self, ks: KeySpace, key: &[u8]) -> Result<Option<Bytes>, LocalDbError> {
-        let (reference, pin) = match self.resolve_concurrent_get(ks, key, IndexReadCut::Latest)? {
+        let (resolution, node) = self.resolve_concurrent_get(ks, key, IndexReadCut::Latest)?;
+        let (reference, pin) = match resolution {
             GetResolution::Ready(value) => return Ok(value),
             GetResolution::Miss { reference, pin } => (reference, pin),
         };
+        let node = node.expect("a miss has a route");
         let deadline = Instant::now() + self.config.timeout;
         loop {
             let generation = self.read_admission_generation();
-            match self.prepare_concurrent_miss(ks, key, reference, true, pin.clone()) {
+            match self.prepare_concurrent_miss(ks, key, reference, node, true, pin.clone()) {
                 Ok(pending) => return self.finish_ready_get(pending.wait()),
                 Err(error) if RemoteDatabase::read_backpressured(&error) => {
                     self.wait_read_admission(generation, deadline)?;
@@ -87,12 +90,17 @@ impl ConcurrentRemoteDatabase {
     /// Read one bounded key window at a caller-captured cut. Misses share the
     /// existing per-shard RPC batching and credit limits, not one RPC per key.
     /// Key validation errors remain per-key; authority and RPC errors fail the window.
-    pub(crate) fn get_many_cut(
+    pub(crate) fn get_many_cut<K: AsRef<[u8]>>(
         &self,
         ks: KeySpace,
-        keys: &[Vec<u8>],
+        keys: &[K],
         cut: IndexReadCut,
     ) -> Result<Vec<Result<Option<Bytes>, LocalDbError>>, LocalDbError> {
+        let mut sample = self
+            .reads
+            .state
+            .coordinator_diagnostics
+            .select(true, keys.len());
         self.ensure_healthy()?;
         if keys.len() > 256 {
             return Err(LocalDbError::new("read batch exceeds 256 keys"));
@@ -102,39 +110,93 @@ impl ConcurrentRemoteDatabase {
         let mut missing = Vec::new();
         let mut groups = vec![Vec::new(); self.partition_indexes.len()];
         let (references, pin) = {
+            let clock = ResolutionSample::start(&sample);
             let index = self.index.read();
-            index
+            if let Some(sample) = &sample {
+                sample.stage(ResolutionStage::IndexLockWait, clock);
+            }
+            let clock = ResolutionSample::start(&sample);
+            let validation = index
                 .validate_cut(cut.clone())
-                .map_err(LocalDbError::component)?;
+                .map_err(LocalDbError::component);
+            if let Some(sample) = &sample {
+                sample.stage(ResolutionStage::CutValidation, clock);
+            }
+            validation?;
             let references = keys
                 .iter()
                 .map(|key| {
-                    index
-                        .get(ks, key, cut.clone())
-                        .map_err(LocalDbError::component)
+                    let clock = ResolutionSample::start(&sample);
+                    let result = index
+                        .get(ks, key.as_ref(), cut.clone())
+                        .map_err(LocalDbError::component);
+                    if let Some(sample) = &sample {
+                        sample.stage(ResolutionStage::IndexLookup, clock);
+                    }
+                    result
                 })
                 .collect::<Vec<_>>();
             for (slot, reference) in references.iter().enumerate() {
-                let Ok(Some(reference)) = reference else {
-                    continue;
+                let reference = match reference {
+                    Ok(Some(reference)) => reference,
+                    Ok(None) => {
+                        if let Some(sample) = &sample {
+                            sample.member(MemberOutcome::IndexMiss);
+                        }
+                        continue;
+                    }
+                    Err(_) => {
+                        if let Some(sample) = &sample {
+                            sample.member(MemberOutcome::Error);
+                        }
+                        continue;
+                    }
                 };
-                if let Some(value) = self.cache.lock().get(reference) {
+                let clock = ResolutionSample::start(&sample);
+                let mut cache = self.cache.lock();
+                if let Some(sample) = &sample {
+                    sample.stage(ResolutionStage::CacheLockWait, clock);
+                }
+                let clock = ResolutionSample::start(&sample);
+                let cached = cache.get(reference);
+                if let Some(sample) = &sample {
+                    sample.stage(ResolutionStage::CacheLookup, clock);
+                }
+                drop(cache);
+                if let Some(value) = cached {
+                    if let Some(sample) = &sample {
+                        sample.member(MemberOutcome::CacheHit);
+                    }
                     values[slot] = Some(value);
                 } else {
-                    let node = *self
+                    if let Some(sample) = &sample {
+                        sample.member(MemberOutcome::RemoteMiss);
+                    }
+                    let clock = ResolutionSample::start(&sample);
+                    let node = self
                         .partition_indexes
                         .get(&reference.batch_address.partition)
-                        .ok_or_else(|| {
-                            LocalDbError::new("reference names unregistered partition")
-                        })?;
-                    groups[node].push((slot, *reference));
-                    missing.push(slot);
+                        .copied()
+                        .ok_or_else(|| LocalDbError::new("reference names unregistered partition"));
+                    if let Ok(node) = node.as_ref() {
+                        groups[*node].push((slot, *reference));
+                        missing.push(slot);
+                    }
+                    if let Some(sample) = &sample {
+                        sample.stage(ResolutionStage::RoutePreparation, clock);
+                    }
+                    node?;
                 }
             }
             let pin = if missing.is_empty() {
                 None
             } else {
-                Some(index.pin_cut(cut).map_err(LocalDbError::component)?)
+                let clock = ResolutionSample::start(&sample);
+                let pin = index.pin_cut(cut).map_err(LocalDbError::component);
+                if let Some(sample) = &sample {
+                    sample.stage(ResolutionStage::PinPreparation, clock);
+                }
+                Some(pin?)
             };
             (references, pin)
         };
@@ -142,7 +204,15 @@ impl ConcurrentRemoteDatabase {
             self.read_resolve_ns
                 .fetch_add(elapsed(started), Ordering::Relaxed);
         }
-        let mut batch = ReadBatch::new(&self.reads, values, groups)?;
+        let clock = ResolutionSample::start(&sample);
+        let batch = ReadBatch::new(&self.reads, values, groups);
+        if let Some(sample) = &sample {
+            sample.stage(ResolutionStage::BatchPreparation, clock);
+        }
+        let mut batch = batch?;
+        if let Some(sample) = &mut sample {
+            sample.success();
+        }
         batch.pin = pin;
         while !batch.complete() {
             self.ensure_healthy()?;
@@ -183,7 +253,7 @@ impl ConcurrentRemoteDatabase {
                 Ok(None) => Ok(None),
                 Ok(Some(_)) => RemoteDatabase::point_value(
                     ks,
-                    key,
+                    key.as_ref(),
                     mutation.expect("every live reference was resolved"),
                 )
                 .inspect_err(|_| self.poison()),
@@ -215,25 +285,68 @@ impl ConcurrentRemoteDatabase {
         ks: KeySpace,
         key: &[u8],
         cut: IndexReadCut,
-    ) -> Result<GetResolution, LocalDbError> {
+    ) -> Result<(GetResolution, Option<usize>), LocalDbError> {
+        let mut sample = self.reads.state.coordinator_diagnostics.select(false, 1);
         self.ensure_healthy()?;
         let started = self.read_profile_enabled().then(Instant::now);
         let resolution = {
-            // A cache-only result already owns its Bytes before releasing the
-            // index guard. Only asynchronous/storage work needs an allocated pin.
+            let clock = ResolutionSample::start(&sample);
             let index = self.index.read();
-            match index
+            if let Some(sample) = &sample {
+                sample.stage(ResolutionStage::IndexLockWait, clock);
+            }
+            let clock = ResolutionSample::start(&sample);
+            let reference = index
                 .get(ks, key, cut.clone())
-                .map_err(LocalDbError::component)?
-            {
-                None => GetResolution::Ready(None),
-                Some(reference) => match self.cache.lock().get_point(&reference, ks, key) {
-                    Some(value) => GetResolution::Ready(Some(value)),
-                    None => GetResolution::Miss {
-                        reference,
-                        pin: index.pin_cut(cut).map_err(LocalDbError::component)?,
-                    },
-                },
+                .map_err(LocalDbError::component);
+            if let Some(sample) = &sample {
+                sample.stage(ResolutionStage::IndexLookup, clock);
+            }
+            match reference {
+                Err(error) => {
+                    if let Some(sample) = &sample {
+                        sample.member(MemberOutcome::Error);
+                    }
+                    return Err(error);
+                }
+                Ok(None) => {
+                    if let Some(sample) = &sample {
+                        sample.member(MemberOutcome::IndexMiss);
+                    }
+                    GetResolution::Ready(None)
+                }
+                Ok(Some(reference)) => {
+                    let clock = ResolutionSample::start(&sample);
+                    let mut cache = self.cache.lock();
+                    if let Some(sample) = &sample {
+                        sample.stage(ResolutionStage::CacheLockWait, clock);
+                    }
+                    let clock = ResolutionSample::start(&sample);
+                    let cached = cache.get_point(&reference, ks, key);
+                    if let Some(sample) = &sample {
+                        sample.stage(ResolutionStage::CacheLookup, clock);
+                    }
+                    drop(cache);
+                    if let Some(value) = cached {
+                        if let Some(sample) = &sample {
+                            sample.member(MemberOutcome::CacheHit);
+                        }
+                        GetResolution::Ready(Some(value))
+                    } else {
+                        if let Some(sample) = &sample {
+                            sample.member(MemberOutcome::RemoteMiss);
+                        }
+                        let clock = ResolutionSample::start(&sample);
+                        let pin = index.pin_cut(cut).map_err(LocalDbError::component);
+                        if let Some(sample) = &sample {
+                            sample.stage(ResolutionStage::PinPreparation, clock);
+                        }
+                        GetResolution::Miss {
+                            reference,
+                            pin: pin?,
+                        }
+                    }
+                }
             }
         };
         if let Some(started) = started {
@@ -241,7 +354,24 @@ impl ConcurrentRemoteDatabase {
                 .fetch_add(elapsed(started), Ordering::Relaxed);
         }
         self.ensure_healthy()?;
-        Ok(resolution)
+        let node = if let GetResolution::Miss { reference, .. } = &resolution {
+            let clock = ResolutionSample::start(&sample);
+            let node = self
+                .partition_indexes
+                .get(&reference.batch_address.partition)
+                .copied()
+                .ok_or_else(|| LocalDbError::new("reference names unregistered partition"));
+            if let Some(sample) = &sample {
+                sample.stage(ResolutionStage::RoutePreparation, clock);
+            }
+            Some(node?)
+        } else {
+            None
+        };
+        if let Some(sample) = &mut sample {
+            sample.success();
+        }
+        Ok((resolution, node))
     }
 
     fn prepare_concurrent_get(
@@ -251,14 +381,20 @@ impl ConcurrentRemoteDatabase {
         cut: IndexReadCut,
         inline: bool,
     ) -> Result<PendingGet, LocalDbError> {
-        match self.resolve_concurrent_get(ks, key, cut)? {
+        let (resolution, node) = self.resolve_concurrent_get(ks, key, cut)?;
+        match resolution {
             GetResolution::Ready(value) => Ok(PendingGet {
                 owner: self.reads.state.clone(),
                 state: GetState::Ready(value),
             }),
-            GetResolution::Miss { reference, pin } => {
-                self.prepare_concurrent_miss(ks, key, reference, inline, pin)
-            }
+            GetResolution::Miss { reference, pin } => self.prepare_concurrent_miss(
+                ks,
+                key,
+                reference,
+                node.expect("a miss has a route"),
+                inline,
+                pin,
+            ),
         }
     }
 
@@ -267,14 +403,11 @@ impl ConcurrentRemoteDatabase {
         ks: KeySpace,
         key: &[u8],
         reference: ValueRecordReference,
+        node: usize,
         inline: bool,
         pin: IndexReadPin,
     ) -> Result<PendingGet, LocalDbError> {
         self.ensure_healthy()?;
-        let node = *self
-            .partition_indexes
-            .get(&reference.batch_address.partition)
-            .ok_or_else(|| LocalDbError::new("reference names unregistered partition"))?;
         let started = Instant::now();
         let immediate = if inline {
             self.reads.read_inline(

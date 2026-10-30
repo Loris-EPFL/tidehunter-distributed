@@ -49,6 +49,74 @@ def clients_fixture(config):
     ssm.exceptions.InvalidInstanceId = type("InvalidInstanceId", (Exception,), {})
     return {"ec2": ec2, "ssm": ssm, "s3": Mock(), "sts": Mock()}
 
+class TracerCleanupTests(unittest.TestCase):
+    def test_partial_start_is_stopped_and_evidence_is_bounded(self):
+        receipt = {}
+        rows = [{"available": False, "reason": "coordinator"}] + [
+            {"available": False, "state_dir": f"/owned/{i}", "reason": "tracing unavailable",
+             "raw_events": ["retained separately"]} for i in range(5)]
+        stop = Mock(return_value=rows)
+        self.assertTrue(controller.cleanup_unfinished_tracer(True, False, stop, receipt))
+        stop.assert_called_once_with()
+        self.assertTrue(receipt["cold_device_cleanup_complete"])
+        self.assertNotIn("raw_events", receipt["cold_device_cleanup"][1])
+
+    def test_unconfirmed_stop_aborts_next_case_and_retains_error(self):
+        for stop in (Mock(side_effect=TimeoutError("lost response")),
+                     Mock(return_value={"available": False, "state_dir": "/owned", "reason": "collector stop timed out"}),
+                     Mock(return_value={"available": False, "state_dir": "/owned", "cleanup_error": "instance busy"})):
+            receipt = {}
+            self.assertFalse(controller.cleanup_unfinished_tracer(True, False, stop, receipt))
+            self.assertFalse(receipt["cold_device_cleanup_complete"])
+            stop.assert_called_once_with()
+
+    def test_completed_or_never_started_tracer_is_not_stopped_twice(self):
+        stop = Mock(side_effect=AssertionError("unexpected stop"))
+        self.assertTrue(controller.cleanup_unfinished_tracer(False, False, stop, {}))
+        self.assertTrue(controller.cleanup_unfinished_tracer(True, True, stop, {}))
+        stop.assert_not_called()
+
+    def test_identity_probe_zero_events_is_ready_and_stops(self):
+        start = {"available": True, "backend": "bpftrace-request-identity", "state_dir": "/owned"}
+        end = start | {"read_issues": 0, "read_completions": 0, "qualified": False}
+        with patch.object(controller, "command", side_effect=[json.dumps(start), json.dumps(end)]) as run:
+            proof = controller.probe_trace_capability("/collector", "/wal", "/owned", 30, {})
+        self.assertTrue(proof["identity_backend_available"])
+        self.assertTrue(proof["cleanup_complete"])
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[1].args[0][3], "stop")
+
+    def test_probe_reports_attach_gap_and_always_attempts_stop(self):
+        fallback = {"available": True, "state_dir": "/owned"}
+        with patch.object(controller, "command", side_effect=[json.dumps(fallback), json.dumps(fallback)]) as run:
+            proof = controller.probe_trace_capability("/collector", "/wal", "/owned", 30, {})
+        self.assertFalse(proof["identity_backend_available"])
+        self.assertTrue(proof["cleanup_complete"])
+        self.assertTrue(proof["gaps"])
+        self.assertEqual(run.call_count, 2)
+        with patch.object(controller, "command", side_effect=[RuntimeError("start lost"), RuntimeError("stop lost")]) as run:
+            proof = controller.probe_trace_capability("/collector", "/wal", "/owned", 30, {})
+        self.assertFalse(proof["cleanup_complete"])
+        self.assertEqual(run.call_count, 2)
+
+    def test_device_terminal_evidence_preserves_host_scope_and_unknowns(self):
+        stop = [{"available": False, "reason": "coordinator not traced"}] + [
+            {"available": i != 2, "read_issues": None if i == 2 else i,
+             "matched_reads": None, "raw_events": ["not exported"]} for i in range(5)]
+        stop[3]["reason"] = "tracefs startup ring unavailable"
+        stop[3]["identity_attempt"] = {"returncode": 1, "stderr": "root required"}
+        actual = controller.terminal_device_evidence({"backend": "tidehunter_tcp"}, {"cold_device_evidence": stop})
+        self.assertEqual([row["host_index"] for row in actual], list(range(5)))
+        self.assertIsNone(actual[2]["evidence"]["read_issues"])
+        self.assertEqual(actual[2]["evidence"]["identity_attempt"]["returncode"], 1)
+        self.assertEqual(actual[2]["evidence"]["reason"], "tracefs startup ring unavailable")
+        self.assertNotIn("raw_events", actual[0]["evidence"])
+        native = controller.terminal_device_evidence({"backend": "native"},
+                    {"cold_device_evidence": {"available": False, "reason": "unavailable"}})
+        self.assertEqual(native, [{"host_index": -1, "evidence": {"available": False, "reason": "unavailable"}}])
+        self.assertIsNone(controller.terminal_device_evidence({"backend": "tidehunter_tcp"},
+                    {"cold_device_evidence": {"available": False, "reason": "host unknown"}}))
+
 
 def physical_fixture():
     return [{"qualification_only": False, "independent_nvme_admitted": True,
@@ -256,11 +324,12 @@ class CounterAdmissionTests(unittest.TestCase):
         job = {"backend": "tidehunter_tcp", "coordinator_cache_bytes": 128 * 1024**2, "owner_read_cache_bytes": 0}
         evidence = {"schema_version": 1, "backend": "tidehunter_tcp",
             "coordinator": {"read_rpc_count": 42, "cache": {"budget_bytes": 128 * 1024**2, "hits": 0}},
-            "owner_read_configuration": [{"partition": i, "read_cache_bytes": 0,
+            "owner_read_configuration": [{"partition": i, "read_cache_bytes": 0, "read_resident_first": False,
                 "resident_reads": dict(controller.DISABLED_RESIDENT_READS)} for i in range(5)]}
         controller.verify_counter_evidence(job, evidence)
         for mutation in (lambda x: x["coordinator"]["cache"].update(budget_bytes=0),
                          lambda x: x.update(coordinator=None),
+                         lambda x: x["owner_read_configuration"][0].update(read_resident_first=True),
                          lambda x: x["owner_read_configuration"].pop()):
             broken = copy.deepcopy(evidence)
             mutation(broken)
@@ -276,7 +345,7 @@ class CounterAdmissionTests(unittest.TestCase):
                "owner_read_cache_bytes": 0, "resident_reads": resident}
         evidence = {"schema_version": 1, "backend": job["backend"],
             "coordinator": {"read_rpc_count": 1, "cache": {"budget_bytes": 0}},
-            "owner_read_configuration": [{"partition": i, "read_cache_bytes": 0,
+            "owner_read_configuration": [{"partition": i, "read_cache_bytes": 0, "read_resident_first": True,
                 "resident_reads": dict(resident)} for i in range(5)]}
         controller.verify_counter_evidence(job, evidence)
         for value in (False, 1):
@@ -629,6 +698,7 @@ class CapsuleAndExportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "results"
             for name in ("matrix.json", "cases/case/config.json", "cases/case/result/samples.csv",
+                         "cases/case/result/read-diagnostics.json",
                          "cases/case/prepared/tls/ca.key", "cases/case/prepared/tls/node.pk8",
                          "cases/case/database/wal", "cases/case/storage-0.tar.gz"):
                 path = root / name
@@ -636,7 +706,8 @@ class CapsuleAndExportTests(unittest.TestCase):
                 path.write_bytes(b"retained-or-denied")
             archive = Path(tmp) / "result.tar.gz"
             records = controller.archive_results(root, archive)
-            self.assertEqual(set(records), {"matrix.json", "cases/case/config.json", "cases/case/result/samples.csv"})
+            self.assertEqual(set(records), {"matrix.json", "cases/case/config.json",
+                "cases/case/result/samples.csv", "cases/case/result/read-diagnostics.json"})
             with tarfile.open(archive) as bundle:
                 self.assertEqual(set(bundle.getnames()), set(records))
                 self.assertTrue(all(m.isfile() for m in bundle.getmembers()))

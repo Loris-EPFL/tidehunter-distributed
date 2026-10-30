@@ -65,14 +65,13 @@ impl ResidentReadConfig {
         Ok(())
     }
 
-    // Libfabric precharges source-region metadata per endpoint. Partition only
-    // that fixed table across admitted connections; source bytes remain a
-    // node-wide budget enforced by GrantRegistry.
+    // Source metadata is charged on reservation, while GrantRegistry enforces
+    // the node-wide bytes and region limits across all sessions.
     pub(crate) fn source_per_connection(self, connections: usize) -> Self {
         if connections == 0 || !self.source_enabled() {
             return Self::default();
         }
-        let source_regions = self.source_regions.div_ceil(connections).max(1);
+        let source_regions = self.source_regions;
         Self {
             source_bytes: self.source_bytes,
             source_regions,
@@ -256,9 +255,14 @@ pub(crate) fn checked_member(grant: ResidentGrant, bytes: &[u8]) -> Result<&[u8]
 
 /// Cumulative process snapshot. Occupancy includes revoking and quarantined owners.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ResidentReadStats {
     pub message_read_requests: u64,
     pub grants_issued: u64,
+    /// Members requested for grant promotion; not all are necessarily admitted.
+    pub grant_candidates: u64,
+    /// Candidates for which the owner did not return a grant.
+    pub grant_unavailable: u64,
     pub grant_acquisitions: u64,
     pub rma_completions: u64,
     pub eligible_reads: u64,
@@ -282,6 +286,8 @@ impl ResidentReadStats {
     pub(crate) fn add(&mut self, other: Self) {
         self.message_read_requests += other.message_read_requests;
         self.grants_issued += other.grants_issued;
+        self.grant_candidates += other.grant_candidates;
+        self.grant_unavailable += other.grant_unavailable;
         self.grant_acquisitions += other.grant_acquisitions;
         self.rma_completions += other.rma_completions;
         self.eligible_reads += other.eligible_reads;
@@ -301,6 +307,38 @@ impl ResidentReadStats {
         self.grants_live += other.grants_live;
     }
 }
+/// Owner-side cumulative grant promotion decisions and current source occupancy.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct ResidentGrantStats {
+    pub attempts: u64,
+    pub issued: u64,
+    pub reused: u64,
+    pub denied_request_limit: u64,
+    pub denied_oversize: u64,
+    pub denied_regions: u64,
+    pub denied_bytes: u64,
+    pub denied_admission: u64,
+    pub denied_source_unavailable: u64,
+    pub denied_owner_unavailable: u64,
+    pub denied_provider: u64,
+    pub source_bytes_live: u64,
+    pub source_regions_live: u64,
+    pub source_bytes_pending: u64,
+    pub source_regions_pending: u64,
+    pub source_bytes_quarantined: u64,
+    /// Sampled grant setup, including setup errors, cumulative since startup.
+    pub read_grant: super::GrantReadProfile,
+    /// Sampled read response encoding and enqueue, node cumulative since startup.
+    pub read_response_encode: super::ReadStageProfile,
+    /// Sampled enqueue to first successful output write.
+    pub read_output_queue: super::ReadStageProfile,
+    /// Sampled first write to complete local submission.
+    pub read_output_submit: super::ReadStageProfile,
+    /// Sampled complete local submission to local retirement; not peer receipt.
+    pub read_response_retire: super::ReadStageProfile,
+    /// Sampled frames discarded on session abort before local retirement.
+    pub read_output_abandoned: u64,
+}
 
 #[cfg(feature = "experimental-fabric")]
 struct PendingGrant {
@@ -318,6 +356,7 @@ struct GrantOwner {
 struct GrantRegistryState {
     accepting: bool,
     poison_requested: bool,
+    promotion: ResidentGrantStats,
     #[cfg(feature = "experimental-fabric")]
     poison_notified: std::collections::HashSet<u64>,
     #[cfg(feature = "experimental-fabric")]
@@ -347,6 +386,7 @@ impl GrantRegistry {
             state: parking_lot::Mutex::new(GrantRegistryState {
                 accepting: source_bytes != 0 && source_regions != 0,
                 poison_requested: false,
+                promotion: ResidentGrantStats::default(),
                 #[cfg(feature = "experimental-fabric")]
                 poison_notified: std::collections::HashSet::new(),
                 #[cfg(feature = "experimental-fabric")]
@@ -368,6 +408,33 @@ impl GrantRegistry {
         }
     }
 
+    fn snapshot_promotion(state: &GrantRegistryState) -> ResidentGrantStats {
+        #[cfg(feature = "experimental-fabric")]
+        {
+            let mut stats = state.promotion;
+            stats.source_bytes_live = state.live_bytes as u64;
+            stats.source_regions_live = state.owners.len() as u64;
+            stats.source_bytes_pending = state.pending_bytes as u64;
+            stats.source_regions_pending = state.pending.len() as u64;
+            stats.source_bytes_quarantined = state.quarantined_bytes as u64;
+            stats
+        }
+        #[cfg(not(feature = "experimental-fabric"))]
+        {
+            state.promotion
+        }
+    }
+
+    pub(crate) fn try_promotion_stats(&self) -> Option<ResidentGrantStats> {
+        self.state
+            .try_lock()
+            .map(|state| Self::snapshot_promotion(&state))
+    }
+
+    pub(crate) fn record_promotion(&self, update: impl FnOnce(&mut ResidentGrantStats)) {
+        update(&mut self.state.lock().promotion);
+    }
+
     #[cfg(feature = "experimental-fabric")]
     pub(crate) fn try_reserve(
         &self,
@@ -382,17 +449,26 @@ impl GrantRegistry {
             || bytes == 0
             || state.pending.contains_key(&key)
             || state.owners.contains_key(&key)
-            || state
-                .pending
-                .len()
-                .checked_add(state.owners.len())
-                .is_none_or(|used| used >= state.source_regions_limit)
-            || state
-                .live_bytes
-                .checked_add(state.pending_bytes)
-                .and_then(|used| used.checked_add(bytes))
-                .is_none_or(|used| used > state.source_bytes_limit)
         {
+            state.promotion.denied_admission += 1;
+            return None;
+        }
+        if state
+            .pending
+            .len()
+            .checked_add(state.owners.len())
+            .is_none_or(|used| used >= state.source_regions_limit)
+        {
+            state.promotion.denied_regions += 1;
+            return None;
+        }
+        if state
+            .live_bytes
+            .checked_add(state.pending_bytes)
+            .and_then(|used| used.checked_add(bytes))
+            .is_none_or(|used| used > state.source_bytes_limit)
+        {
+            state.promotion.denied_bytes += 1;
             return None;
         }
         let owner = Arc::new(owner);

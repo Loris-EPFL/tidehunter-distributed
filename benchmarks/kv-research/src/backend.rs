@@ -102,6 +102,19 @@ pub trait KvBackend: Send + Sync + 'static {
     fn read_observation(&self) -> serde_json::Value {
         serde_json::json!({"available": false, "error": "backend does not expose read observations"})
     }
+    /// Arm bounded engine-owned read diagnostics at the measurement boundary.
+    fn arm_read_profile(&self, limit: usize) -> BackendResult<()> {
+        if limit == 0 {
+            Ok(())
+        } else {
+            Err(unsupported("measurement-phase read profiling"))
+        }
+    }
+
+    /// Capture and disable the selected read profile.
+    fn finish_read_profile(&self) -> impl Future<Output = BackendResult<serde_json::Value>> + Send {
+        async { Err(unsupported("measurement-phase read profiling")) }
+    }
 
     /// Arm bounded write diagnostics at the measurement boundary.
     fn arm_write_profile(&self, limit: usize) -> BackendResult<()> {

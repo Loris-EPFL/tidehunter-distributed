@@ -103,6 +103,23 @@ impl WorkloadGenerator {
             distribution,
         }
     }
+    /// Advance the normal RNG while visiting logical keys in cursor order.
+    /// The caller validates a read-only mix; measurement sweeps also bound calls to avoid wrap.
+    pub(crate) fn next_sweep_item(
+        &mut self,
+        cursor: &mut u64,
+    ) -> crate::backend::BackendResult<WorkItem> {
+        let mut item = self.next_item()?;
+        for key in &mut item.keys {
+            *key = *cursor;
+            *cursor = if *cursor == self.key_count - 1 {
+                0
+            } else {
+                *cursor + 1
+            };
+        }
+        Ok(item)
+    }
 
     pub fn next_item(&mut self) -> crate::backend::BackendResult<WorkItem> {
         let choice = self.rng.gen_range(0..self.mix.total_weight());
@@ -258,5 +275,40 @@ mod tests {
         assert_eq!(left.operation, OperationKind::GetMany);
         assert_eq!(left.keys.len(), 32);
         assert_eq!(left.keys, right.keys);
+    }
+
+    #[test]
+    fn bounded_measurement_sweep_has_distinct_full_batch_members() {
+        let mix = OperationMix {
+            get_many: 1,
+            ..OperationMix::default()
+        };
+        let mut generator = WorkloadGenerator::new(7, 8, mix, 2, KeyDistribution::Uniform);
+        let mut cursor = 0;
+        let keys: Vec<_> = (0..4)
+            .flat_map(|_| generator.next_sweep_item(&mut cursor).unwrap().keys)
+            .collect();
+        assert_eq!(keys, (0..8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn warmup_sweep_covers_tail_keys_without_changing_measurement_rng() {
+        let mix = OperationMix {
+            get_many: 1,
+            ..OperationMix::default()
+        };
+        let mut sweep = WorkloadGenerator::new(4, 7, mix.clone(), 3, KeyDistribution::Uniform);
+        let mut random = WorkloadGenerator::new(4, 7, mix, 3, KeyDistribution::Uniform);
+        let mut cursor = 0;
+        let mut keys = Vec::new();
+        for _ in 0..3 {
+            keys.extend(sweep.next_sweep_item(&mut cursor).unwrap().keys);
+            random.next_item().unwrap();
+        }
+        assert_eq!(keys, vec![0, 1, 2, 3, 4, 5, 6, 0, 1]);
+        assert_eq!(
+            sweep.next_item().unwrap().keys,
+            random.next_item().unwrap().keys
+        );
     }
 }

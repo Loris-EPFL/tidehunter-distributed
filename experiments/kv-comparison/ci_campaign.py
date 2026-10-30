@@ -36,7 +36,7 @@ _spec.loader.exec_module(core)
 from portable_transport import select_backends
 
 
-def load_config(path, env=None, backend_selection=None):
+def load_config(path, env=None, backend_selection=None, mode="standard"):
     """Separate KV admission; the original Sui lifetime/matrix stays unchanged."""
     env = os.environ if env is None else env
     cfg = core.read_json(path)
@@ -84,7 +84,8 @@ def load_config(path, env=None, backend_selection=None):
         raise ValueError('committed campaign lifetime must match approved CI reservations')
     spec['backends'] = select_backends(backend_selection, spec.get('backends'),
                                        set(cloud_campaign.BACKENDS))
-    cloud_campaign.make_matrix(spec)
+    spec['mode'] = mode
+    cloud_controller.validate_read_tier_memory(cloud_campaign.make_matrix(spec), resources)
     cfg['spec'] = spec
     return cfg
 
@@ -246,6 +247,8 @@ class Campaign(core.Campaign):
             bundle_key=self.run_id + '/inputs/bundle.tar.gz', bundle_sha256=runner['sha256'], bundle_bytes=runner['bytes'],
             source_sha256=bindings['source_sha256'], binary_sha256=bindings['binary_sha256'],
             deadline_utc=self.journal.data['expires_at'], ttl_seconds=self.cfg['ttl_seconds'], instance_type=candidate['instance_type'])
+        if self.cfg['spec'].get('mode', 'standard') == 'read-tier':
+            boot['read_tier_trace'] = True
         userdata = cloud_bootstrap.render_userdata(boot)
         self.pending_activation(boot)  # Must succeed before the allocator's RunInstances intent.
         tags = core.ownership(self.run_id) | cloud_controller.TAGS | {
@@ -482,10 +485,11 @@ def main(argv=None):
     parser.add_argument('--inputs', type=Path)
     parser.add_argument('--output', type=Path)
     parser.add_argument('--backends', help='comma-separated nonempty subset of tracked backend IDs')
+    parser.add_argument('--mode', choices=('standard', 'read-tier'), default='standard')
     parser.add_argument('--budget-file', type=Path, default=core.DEFAULT_BUDGET)
     args = parser.parse_args(argv)
     if args.action == 'validate':
-        cfg = load_config(args.config, backend_selection=args.backends)
+        cfg = load_config(args.config, backend_selection=args.backends, mode=args.mode)
         jobs = cloud_campaign.make_matrix(cfg['spec'])
         print(json.dumps({'status': 'valid', 'selected_backends': cfg['spec']['backends'],
                           'planned_cases': len(jobs)}))
@@ -495,7 +499,7 @@ def main(argv=None):
     cfg = run_id = campaign = aws = None
     work_started = False
     try:
-        cfg = load_config(args.config, backend_selection=args.backends)
+        cfg = load_config(args.config, backend_selection=args.backends, mode=args.mode)
         cfg['budget_path'] = str(args.budget_file.absolute())
         # Derive before source admission so a restarted/cancelled same-attempt
         # process can reconcile owned hosts even if its local inputs vanished.

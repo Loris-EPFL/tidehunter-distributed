@@ -720,6 +720,10 @@ impl ControlContext {
                 self.partition.clone(),
                 self.read_admission.try_stats(),
             )))),
+            Request::ResidentGrantStats => Ok(Response::ResidentGrantStats(Box::new((
+                self.partition.clone(),
+                self.resident_grants.try_promotion_stats(),
+            )))),
             Request::Status { protocol } => {
                 if protocol != PROTOCOL {
                     return Err(TcpError::new("unsupported wire protocol"));

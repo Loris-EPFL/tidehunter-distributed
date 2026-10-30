@@ -49,8 +49,13 @@ use typenum::U32;
 
 mod checkpoint_lifecycle;
 mod concurrent;
+mod coordinator_profile;
 use checkpoint_lifecycle::BackgroundCheckpoint;
 pub use concurrent::ConcurrentRemoteDatabase;
+use coordinator_profile::{
+    CoordinatorResolutionDiagnostics, MemberOutcome, ResolutionSample, ResolutionStage,
+};
+pub use coordinator_profile::{CoordinatorResolutionSnapshot, CoordinatorResolutionStage};
 mod pending_read;
 mod preparation;
 mod receipt_history;
@@ -79,6 +84,8 @@ pub struct OperationalReadIoSnapshot {
     pub owners: Vec<(u32, super::tcp::ReadExecutorStats)>,
     pub resident_available: bool,
     pub residents: Vec<(u32, super::tcp::ResidentReadStats)>,
+    pub grants_available: bool,
+    pub grants: Vec<(u32, super::tcp::ResidentGrantStats)>,
 }
 struct OperationalReadIoState {
     snapshot: RwLock<OperationalReadIoSnapshot>,
@@ -245,6 +252,8 @@ impl OperationalReadIoSampler {
             snapshot.resident_available = false;
             snapshot.owners.clear();
             snapshot.residents.clear();
+            snapshot.grants_available = false;
+            snapshot.grants.clear();
         }
     }
 }
@@ -261,6 +270,8 @@ fn mark_operational_sample_failed(state: &OperationalReadIoState) {
         snapshot.owners.clear();
         snapshot.resident_available = false;
         snapshot.residents.clear();
+        snapshot.grants_available = false;
+        snapshot.grants.clear();
     }
 }
 
@@ -286,6 +297,8 @@ fn operational_sample_loop(
         let attempt_started = Instant::now();
         let mut owners = Vec::with_capacity(config.endpoints.len());
         let mut available = true;
+        let mut grants = Vec::with_capacity(config.endpoints.len());
+        let mut grants_available = true;
         for (index, endpoint) in config.endpoints.iter().enumerate() {
             if stop.try_recv().is_ok() {
                 available = false;
@@ -316,6 +329,14 @@ fn operational_sample_loop(
                     available = false;
                 }
             }
+            match clients[index].as_mut().map(Client::resident_grant_stats) {
+                Some(Ok(Some(stats))) => grants.push((endpoint.partition, stats)),
+                Some(Err(_)) => {
+                    clients[index] = None;
+                    grants_available = false;
+                }
+                Some(Ok(None)) | None => grants_available = false,
+            }
         }
         let residents = reads.try_resident_read_stats().and_then(|samples| {
             let mut rows = Vec::with_capacity(samples.len());
@@ -340,6 +361,12 @@ fn operational_sample_loop(
             };
             snapshot.resident_available = residents.is_some();
             snapshot.residents = residents.unwrap_or_default();
+            snapshot.grants_available = grants_available && grants.len() == config.endpoints.len();
+            snapshot.grants = if snapshot.grants_available {
+                grants
+            } else {
+                Vec::new()
+            };
         }
         match stop.recv_timeout(OPERATIONAL_SAMPLE_INTERVAL) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -347,6 +374,15 @@ fn operational_sample_loop(
         }
     }
 }
+/// A sequential local snapshot of one instantiated read lane.
+/// Session presence is local state, not a fresh peer-health probe.
+pub struct ResidentReadLaneSnapshot {
+    pub partition: u32,
+    pub lane: usize,
+    pub session_present: Option<bool>,
+    pub stats: super::tcp::ResidentReadStats,
+}
+
 /// Explicit benchmark evidence handle; resident-lane reads may wait on a lane.
 pub struct ReadEvidenceMonitor {
     clients: Vec<(u32, Arc<Mutex<Client>>)>,
@@ -371,6 +407,24 @@ impl ReadEvidenceMonitor {
             })
             .collect()
     }
+    /// Sample node-cumulative grant decisions and source occupancy once per
+    /// owner outside the measured interval. Replies are not a global cut.
+    pub fn sample_owner_grants(
+        &self,
+    ) -> Result<Vec<(u32, super::tcp::ResidentGrantStats)>, LocalDbError> {
+        self.reads.ensure_idle()?;
+        self.clients
+            .iter()
+            .map(|(partition, client)| {
+                let stats = client
+                    .lock()
+                    .resident_grant_stats()
+                    .map_err(LocalDbError::component)?
+                    .ok_or_else(|| LocalDbError::new("owner grant statistics unavailable"))?;
+                Ok((*partition, stats))
+            })
+            .collect()
+    }
 
     /// Per-partition client-side RMA counters; this does not make an RPC.
     pub fn sample_resident_reads(
@@ -391,6 +445,16 @@ impl ReadEvidenceMonitor {
             *node = self.clients[*node as usize].0;
         }
         Ok(samples)
+    }
+    /// Sample actual instantiated lanes after reads drain. A stopped service
+    /// returns an error rather than an apparently valid empty population.
+    pub fn sample_resident_read_lane_snapshots(
+        &self,
+    ) -> Result<Vec<ResidentReadLaneSnapshot>, LocalDbError> {
+        self.reads.ensure_idle()?;
+        self.reads.resident_read_lane_snapshots(|node| {
+            self.clients.get(node).map(|(partition, _)| *partition)
+        })
     }
 }
 
@@ -2969,6 +3033,7 @@ impl RemoteDatabase {
     fn fetch(
         &mut self,
         references: &[ValueRecordReference],
+        sample: &mut Option<ResolutionSample<'_>>,
     ) -> Result<Vec<Mutation>, LocalDbError> {
         self.ensure_healthy()?;
         if references.len() > 256 {
@@ -2978,15 +3043,32 @@ impl RemoteDatabase {
         let mut missing = Vec::new();
         let mut slots = Vec::new();
         for (slot, reference) in references.iter().enumerate() {
-            if let Some(value) = self.read_cache.lock().get(reference) {
+            let clock = ResolutionSample::start(sample);
+            let mut cache = self.read_cache.lock();
+            if let Some(sample) = sample.as_ref() {
+                sample.stage(ResolutionStage::CacheLockWait, clock);
+            }
+            let clock = ResolutionSample::start(sample);
+            let cached = cache.get(reference);
+            if let Some(sample) = sample.as_ref() {
+                sample.stage(ResolutionStage::CacheLookup, clock);
+            }
+            drop(cache);
+            if let Some(value) = cached {
+                if let Some(sample) = sample.as_ref() {
+                    sample.member(MemberOutcome::CacheHit);
+                }
                 output[slot] = Some(value);
             } else {
+                if let Some(sample) = sample.as_ref() {
+                    sample.member(MemberOutcome::RemoteMiss);
+                }
                 slots.push(slot);
                 missing.push(*reference);
             }
         }
         if !missing.is_empty() {
-            let values = self.fetch_uncached(&missing)?;
+            let values = self.fetch_uncached(&missing, sample)?;
             if values.len() != missing.len() {
                 self.healthy = false;
                 return Err(LocalDbError::new("read result count mismatch"));
@@ -3002,6 +3084,8 @@ impl RemoteDatabase {
                 self.read_cache.lock().insert_prepared(prepared);
                 output[slot] = Some(value);
             }
+        } else if let Some(sample) = sample.as_mut() {
+            sample.success();
         }
         Ok(output.into_iter().map(Option::unwrap).collect())
     }
@@ -3009,6 +3093,7 @@ impl RemoteDatabase {
     fn fetch_uncached(
         &mut self,
         references: &[ValueRecordReference],
+        sample: &mut Option<ResolutionSample<'_>>,
     ) -> Result<Vec<Mutation>, LocalDbError> {
         if references.len() > 256 {
             return Err(LocalDbError::new("read window exceeds 256 records"));
@@ -3017,18 +3102,48 @@ impl RemoteDatabase {
         let mut groups: Vec<Vec<(usize, ValueRecordReference)>> =
             vec![Vec::new(); self.clients.len()];
         for (i, reference) in references.iter().enumerate() {
-            let node = *self
+            let clock = ResolutionSample::start(sample);
+            let node = self
                 .partition_indexes
                 .get(&reference.batch_address.partition)
-                .ok_or_else(|| LocalDbError::new("reference names unregistered partition"))?;
-            groups[node].push((i, *reference));
+                .copied()
+                .ok_or_else(|| LocalDbError::new("reference names unregistered partition"));
+            if let Ok(node) = node.as_ref() {
+                groups[*node].push((i, *reference));
+            }
+            if let Some(sample) = sample.as_ref() {
+                sample.stage(ResolutionStage::RoutePreparation, clock);
+            }
+            node?;
         }
-        let mut batch =
-            pending_read::ReadBatch::new(&self.reads, vec![None; references.len()], groups)?;
+        let values = vec![None; references.len()];
+        let clock = ResolutionSample::start(sample);
+        let batch = pending_read::ReadBatch::new(&self.reads, values, groups);
+        if let Some(sample) = sample.as_ref() {
+            sample.stage(ResolutionStage::BatchPreparation, clock);
+        }
+        let mut batch = batch?;
         // These private grouped fetch callers resolve the current committed cut
         // under the sole owner. Transfer its protection through physical read
         // completion, even if the aggregate caller exits early on an error.
-        batch.pin = Some(self.pin_cut(IndexReadCut::Latest)?);
+        self.ensure_healthy()?;
+        let clock = ResolutionSample::start(sample);
+        let index = self.index.read();
+        if let Some(sample) = sample.as_ref() {
+            sample.stage(ResolutionStage::IndexLockWait, clock);
+        }
+        let clock = ResolutionSample::start(sample);
+        let pin = index
+            .pin_cut(IndexReadCut::Latest)
+            .map_err(LocalDbError::component);
+        if let Some(sample) = sample.as_ref() {
+            sample.stage(ResolutionStage::PinPreparation, clock);
+        }
+        drop(index);
+        batch.pin = Some(pin?);
+        if let Some(sample) = sample.as_mut() {
+            sample.success();
+        }
         while !batch.complete() {
             batch.dispatch(&self.reads)?;
             // If nothing belongs to this call, only external handles hold the
@@ -3075,31 +3190,66 @@ impl RemoteDatabase {
         ks: KeySpace,
         keys: &[Vec<u8>],
     ) -> Result<Vec<Option<Bytes>>, LocalDbError> {
+        let monitor = self.reads.resolution_monitor();
+        let mut sample = monitor
+            .as_ref()
+            .and_then(|monitor| monitor.select_resolution(true, keys.len()));
         self.ensure_healthy()?;
         if keys.len() > 256 {
             return Err(LocalDbError::new("read batch exceeds 256 keys"));
         }
         let resolve_started = Instant::now();
-        let cut = self.index.read().latest_cut();
+        let clock = ResolutionSample::start(&sample);
+        let index = self.index.read();
+        if let Some(sample) = &sample {
+            sample.stage(ResolutionStage::IndexLockWait, clock);
+        }
+        let clock = ResolutionSample::start(&sample);
+        let cut = index.latest_cut();
+        if let Some(sample) = &sample {
+            sample.stage(ResolutionStage::CutCapture, clock);
+        }
+        drop(index);
         let mut slots = Vec::new();
         let mut references = Vec::new();
         for (slot, key) in keys.iter().enumerate() {
-            if let Some(reference) = self
-                .index
-                .read()
+            let clock = ResolutionSample::start(&sample);
+            let index = self.index.read();
+            if let Some(sample) = &sample {
+                sample.stage(ResolutionStage::IndexLockWait, clock);
+            }
+            let clock = ResolutionSample::start(&sample);
+            let reference = index
                 .get(ks, key, cut.clone())
-                .map_err(LocalDbError::component)?
-            {
-                slots.push(slot);
-                references.push(reference);
+                .map_err(LocalDbError::component);
+            if let Some(sample) = &sample {
+                sample.stage(ResolutionStage::IndexLookup, clock);
+            }
+            match reference {
+                Ok(Some(reference)) => {
+                    slots.push(slot);
+                    references.push(reference);
+                }
+                Ok(None) => {
+                    if let Some(sample) = &sample {
+                        sample.member(MemberOutcome::IndexMiss);
+                    }
+                }
+                Err(error) => {
+                    if let Some(sample) = &sample {
+                        sample.member(MemberOutcome::Error);
+                    }
+                    return Err(error);
+                }
             }
         }
         self.stats.read_resolve_ns += elapsed(resolve_started);
-        // Preserve per-shard RPC batching; independent scalar windows use the
-        // split-phase API instead, so these remain distinct benchmark paths.
         let mut output = vec![None; keys.len()];
-        for (slot, mutation) in slots.into_iter().zip(self.fetch(&references)?) {
+        for (slot, mutation) in slots.into_iter().zip(self.fetch(&references, &mut sample)?) {
             output[slot] = Self::point_value(ks, &keys[slot], mutation)?;
+        }
+        if let Some(sample) = &mut sample {
+            sample.success();
         }
         Ok(output)
     }
@@ -3118,7 +3268,7 @@ impl RemoteDatabase {
         if !self.shape.ks(ks).need_check_index_key() {
             return Ok(true);
         }
-        match self.fetch(&[reference])?.remove(0) {
+        match self.fetch(&[reference], &mut None)?.remove(0) {
             Mutation::Put {
                 keyspace,
                 key: actual,

@@ -137,6 +137,16 @@ def verify_binding(run, config, receipt, manifest, summary):
         if (not isinstance(evidence, dict) or evidence.get("path") != "result/measurement-read-evidence.json"
                 or hashlib.sha256((run / evidence["path"]).read_bytes()).hexdigest() != evidence.get("sha256")):
             raise ValueError(f"{run}: measurement read evidence integrity binding differs")
+    diagnostics = receipt.get("read_diagnostics")
+    requested = config.get("diagnostics", {}).get("read_profile_limit", 0)
+    path = run / "result/read-diagnostics.json"
+    if diagnostics is None:
+        if requested or path.exists():
+            raise ValueError(f"{run}: read diagnostics are missing their integrity binding")
+    elif (not isinstance(diagnostics, dict) or diagnostics.get("path") != "result/read-diagnostics.json"
+          or hashlib.sha256(path.read_bytes()).hexdigest() != diagnostics.get("sha256")
+          or json.loads(path.read_text()) != diagnostics.get("observed")):
+        raise ValueError(f"{run}: read diagnostics integrity binding differs")
 
 
 def stable_topology(name, original):
@@ -302,7 +312,7 @@ def boundary(run):
             "hardware": hardware, "deployment": deployment_budget, "client_budget": receipt["client_budget"],
             "binary_sha256": receipt["binary_sha256"], "claim_boundary": receipt["claim_boundary"],
             "observation": receipt["observation"],
-            "diagnostics": config.get("diagnostics", {"write_profile_limit": 0}),
+            "diagnostics": {"write_profile_limit": 0, "read_profile_limit": 0, **config.get("diagnostics", {})},
             "completion_accounting_gate": config.get("measurement_completion_gate") is not None,
             "storage_population": receipt["storage_population"]}
 

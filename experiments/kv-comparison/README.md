@@ -995,15 +995,16 @@ covered without the native dependency.
 ## Development repetition policy
 
 Future development campaigns use **one independent repetition**, not fewer
-measurements within each case. Adding Valkey TCP preserves all previous 228
-ordinary cells and adds its 25 common cells: **253 unprofiled cases**. The default
-also adds five separately labelled `write_stage_diagnostics` cases, one 1-KiB
-concurrent-write case for native and each Tidehunter transport, giving **258
-cases**, not extra independent repetitions.
-`diagnostics.write_profile_limit=0` disables these additions and restores 253.
-With `repeats=3`, those plans contain 774 and 759 cases, respectively.
-Publication and explicit reproducibility checks keep multiple independent
-repetitions; two or three runs alone do not justify a confidence or significance claim.
+measurements within each case. All nine backend/transport variants retain
+**253 unprofiled cases**. The default adds five labelled write diagnostics,
+seventeen existing read diagnostics, twenty resident-first read diagnostics,
+and two full-working-set registered-read controls: **297 cases**. These are
+separate controls, not extra independent repetitions or replacements for
+primary results. Both diagnostic limits zero retain 253 cases; write-only
+diagnostics retain the historical 258-case layout. Three repetitions give
+891, 759 and 774 cases, respectively; `max_cases=900` admits that explicit
+publication/reproducibility setting. Multiple repetitions do not by themselves
+justify confidence or significance claims.
 
 The one-repetition default leaves all nine backends/transports, five sizes,
 workloads, concurrency and offered-load levels, cache/registered-RAM/cold-storage
@@ -1015,6 +1016,161 @@ deviation, maximum, throughput and rejection counts. Means and standard deviatio
 for all three clocks are computed after the measurement; undispatched rejections
 have response timing but no invented API/scheduling timing. Tail sample-count
 warnings remain.
+
+### Read-stage diagnostic campaigns
+
+`cloud-campaign.json` sets `diagnostics.read_profile_limit=256` and retains
+`write_profile_limit=256`. The read sampler is global to the database's selected
+remote flights; the write cap is per append-owning connection. Neither cap
+changes measurement operations or sampling inside the ordinary cases.
+
+Read diagnostic twins cover the four distributed transports' 1 KiB scalar and
+8 KiB x 32 batch reads, their 8 KiB coordinator/owner cache controls, and the
+8 KiB registered-memory cohort for EFA-native. All copied effective cache,
+registration, source workload, warmup and read-count settings remain intact;
+`diagnostic_source_cohort` identifies the original population. New read twins
+are appended after existing jobs to preserve existing IDs and namespace inputs.
+Native keeps its ordinary controls and write diagnostics, not a falsely
+equivalent owner-read timer.
+
+The additional `resident_first_stage_diagnostics` cohorts cover 256 B, 1 KiB,
+8 KiB and 64 KiB scalar reads plus 8 KiB batch32 for every distributed
+transport, with both explicit value caches zero. They preserve the source
+workload/counts and enable the bounded owner NOWAIT path; 64-KiB members still
+exceed its 16-KiB attempt limit and retain async fallback.
+
+The two `registered_ram_fullset_control` cases select EFA-native, all 4,096
+keys, C1 and one actual read lane per owner. Their deterministic complete
+warm-up is explicit; measurement remains uniform random, with 8,192 scalar
+or 2,048 batch32 calls. Source budgets stay 16 MiB/4,096 regions per owner;
+the destination remains 20 MiB/640 slots, with 8,192 metadata handles.
+`require_device_read=true` prevents software emulation from passing a cloud
+hardware claim. The full-set controls do not replace the existing mixed,
+first-access or C16 workloads.
+
+`comparison.json`, CSV and Markdown retain observed full-set qualification:
+nonzero matching FI_READ posts/completions and no measured message,
+grant-acquisition, cache-hit or owner-WAL fallback. Unavailable data is unknown,
+not zero. A configured but unqualified control is not described as pure RMA.
+The current parser preserves old artifacts without inventing their new counters.
+The plotter adds matched async/resident diagnostic figures only when those
+cohorts exist in the input. Full-set hardware figures require an explicit
+successful no-fallback qualification and `hardware_read_required=true`;
+unqualified or software-only observations are omitted with a reason.
+
+To inspect a selected read-diagnostic matrix without launching anything:
+
+```sh
+python3 experiments/kv-comparison/cloud_campaign.py plan \
+  --backends tidehunter_tcp --write-profile-limit 0 --read-profile-limit 256 \
+  --output /tmp/tidehunter-read-diagnostic-plan.json
+```
+
+Runtime `diagnostics.read_profile_limit` can be enabled on any supported
+distributed scalar, grouped or mixed workload, not only these default twins.
+Profiling is off by default in the ordinary Rust example configuration.
+
+`result/read-diagnostics.json` is hash-bound to the receipt and comparison.
+A completed requested case without a valid artifact fails admission.
+Artifacts are bounded to 256 KiB, including the five-owner boundary snapshots.
+The report emits each stage's own count, accumulated nanoseconds, mean and
+available maximum; missing observations remain unavailable. It does not
+manufacture stage percentiles or an EFA-wire fraction. Original raw API,
+scheduling and response distributions are unchanged.
+
+The campaign exporter/Grafana panel exposes terminal read-stage sums, maxima,
+counts and availability separately from write stages. These are gauges from
+the selected-prefix population, not live rates. See the
+[exact timer boundaries and limitations](../../benchmarks/kv-research/ADAPTERS.md#measurement-phase-read-diagnostics).
+
+### Focused read-tier campaign: one fleet, explicit cache policies
+
+`read-tier` is an opt-in mode of the existing AWS workflow/controller, not a
+second launcher or fleet. The historical standard matrix remains 297 cases.
+The default focused plan contains 258 cases at one independent repetition:
+C1 scalar tier controls, relevant C16/four-lane 1-KiB scalar and 8-KiB×32
+controls, and native LRU-disabled warm/cold references. All normal per-case
+operation/sample counts remain intact; first-access controls measure 8,192
+distinct keys rather than reporting a one-request percentile.
+
+Inspect the plan without credentials or EC2:
+
+```bash
+python3 experiments/kv-comparison/cloud_campaign.py plan \
+  --mode read-tier \
+  --backends native,tidehunter_tcp,tidehunter_efa,tidehunter_efa_direct,tidehunter_efa_native \
+  --output /tmp/tidehunter-read-tier-matrix.json
+```
+
+For a later approved GitHub run on `bench/aws-efa`, select the existing
+**AWS EFA benchmark campaign**, `suite=kv-comparison`, `kv_mode=read-tier`,
+and the desired backend subset. This documentation does not activate AWS.
+The same admitted fleet, cluster placement, source-bound release binary,
+hard deadline, export reserve, watchdog and unconditional termination path
+cover every tier. Owners/endpoint state are stopped/reset between cases;
+changing cache policy does not allocate a second fleet.
+
+The ordered run starts with both explicit value caches and registered-value
+grants disabled. It then measures coordinator-only hits, owner-only hits,
+registered steady/reuse, promotion-disabled first touch versus grant acquisition,
+warm owner WAL, native references, cold-device protocols and a bounded mixed
+workload. “Cache disabled” never means Linux page cache, coordinator-index
+residency or the provider's transport registrations are disabled. Every case
+records requested/effective settings, warm-up/sweep flags, concurrency, lanes,
+session observations and its qualification result/reasons.
+
+`data_id` is independent of backend/cache/profile and binds identical key/value
+bytes and seed. `source_id` identifies backend, workload, concurrency and lane
+populations. Profiled/unprofiled twins use matching input, but remain separate
+results; do not pool C1/C16, scalar/batch, first-touch/reuse or cache tiers.
+The deterministic unique-key first-touch sweep is not an IID uniform-random
+population. Native references retain `value_cache_size=0`; they do not pretend
+to be native value-LRU-hit measurements.
+
+Pure coordinator/owner controls have explicit finite-working-set capacity
+margins and checked read-memory allowances. The ordinary 512-MiB coordinator
+allowance remains the default; larger diagnostic caches require an explicit
+allowance and fleet-budget admission. The representative mixed case keeps
+1-MiB value caches. A budget that can hold the working set still does not prove
+every access hits: strict observed-path qualification decides the claim.
+
+C1 registered controls use one lane per owner. C16 registered controls are
+labelled mixed acquisition/reuse until their own interval proves zero messages,
+acquisitions and fallback with nonzero matching FI_READ completions. Per-lane
+start/end and delta evidence is retained. A session-present flag describes a
+locally constructed connection, not a new peer-health check or proof that every
+key was warmed on every lane. First-access proof permits unrelated preflight
+grants but requires the fresh namespace/sweep and measured issuance population.
+
+The 64-KiB warm-WAL control explicitly says `oversize_async_fallback` because
+the resident-first encoded-member cap is 16 KiB. Registered controls do not
+claim that 64-KiB values fit their 32-KiB registered-read limit.
+
+Cold-device diagnostics prepare the optional distribution-packaged bpftrace
+tool before measurement, with version/hash, kernel/BTF and capability evidence.
+Its private bounded maps track kernel request identity; partial completions,
+requeues, missing events, errors and incomplete requests remain visible.
+Completed driver/block intervals are **not** per-API or NAND-media latency.
+The counts-only tracefs fallback cannot prove request matches from sectors and
+lengths. Unsupported capability stays unavailable, not zero. Tracer state is
+outside the benchmark data mount; failure cleanup stops exact-owned collectors
+before another case can start. Native device-traced references are explicitly
+labelled: read-profile-off does not mean observer-free.
+
+`comparison.json`, Markdown/CSV, diagnostic figures and Prometheus/Grafana
+retain tier settings, availability and qualification. Raw API/scheduling/response
+samples retain their existing percentile definitions and tail warnings.
+Coordinator resolution, remote-flight stages, owner-node boundary samples and
+block-request intervals have independent denominators; nested means are not
+additive time shares or evidence of pure wire time. See the
+[instrumentation contract](../../benchmarks/kv-research/ADAPTERS.md#coordinator-acquisition-and-output-decomposition).
+
+Protocol 14 is required for profiled replies and bounded owner grant telemetry;
+rebuild both client and owners before a future hardware run. This local
+preparation does not activate AWS. Grant decision deltas use real boundary
+queries; source occupancy remains a start/end gauge, and passive lifetime
+observations retain their age/generation.
+
 
 ### Single-run figures
 

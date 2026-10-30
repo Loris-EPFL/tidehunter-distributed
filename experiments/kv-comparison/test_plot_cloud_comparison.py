@@ -82,6 +82,14 @@ def full_matrix_cases(repeats=(0,)):
 
 
 class SingleRepeatPolicy(unittest.TestCase):
+    def test_focused_read_tier_figures_keep_profiled_and_baseline_separate(self):
+        specs = plots.figure_specs(("tidehunter_tcp",), {"read_tier_remote"})
+        names = {item["name"] for item in specs}
+        self.assertIn("read_tier_remote-read-tier-baseline", names)
+        self.assertIn("read_tier_remote-read-tier-profiled", names)
+        standard = plots.figure_specs(("tidehunter_efa_native",), {"registered_ram_fullset_control"})
+        self.assertNotIn("registered_ram_fullset_control-read-tier-baseline", {item["name"] for item in standard})
+
     def test_historical_eight_system_report_keeps_coverage_and_single_repeat_policy(self):
         original = [row for row in full_matrix_cases() if row["job"]["backend"] != "valkey_tcp"]
         frozen = copy.deepcopy(original)
@@ -137,6 +145,23 @@ class SingleRepeatPolicy(unittest.TestCase):
     def test_declared_inventory_cannot_hide_an_observed_backend(self):
         with self.assertRaises(ValueError):
             dataset([case("native")], ("valkey_tcp",))
+
+    def test_fullset_figure_rejects_unqualified_or_emulated_read_evidence(self):
+        item = case("tidehunter_efa_native")
+        item["job"].update(cohort="registered_ram_fullset_control",
+                           profile="registered-scalar", value_size=1024, concurrency=1)
+        name = "registered-fullset-registered-scalar"
+        for proof in (None, {"qualified": False, "hardware_read_required": True},
+                      {"qualified": True, "hardware_read_required": False}):
+            item["read_path_qualification"] = proof
+            figures, omitted = plots.build_figures(dataset([item], ("tidehunter_efa_native",)))
+            self.assertNotIn(name, {figure["name"] for figure in figures})
+            self.assertIn(name, {figure["figure"] for figure in omitted})
+        item["read_path_qualification"] = {"qualified": True, "hardware_read_required": True}
+        figures, _ = plots.build_figures(dataset([item], ("tidehunter_efa_native",)))
+        figure = next(figure for figure in figures if figure["name"] == name)
+        self.assertEqual(figure["panels"][0]["series"][0]["points"][0]["median"], 100)
+        self.assertFalse(figure["run_to_run_errorbars"])
 
     def test_one_planned_identity_accepts_one_shared_complete_repeat(self):
         data = dataset([case(backend, 7) for backend in plots.BACKENDS])

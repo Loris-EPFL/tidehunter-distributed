@@ -21,7 +21,7 @@ mod resident;
 #[cfg(feature = "experimental-fabric")]
 use resident::encode_envelope;
 use resident::{RemoteRegion, ResidentGrant};
-pub use resident::{ResidentReadConfig, ResidentReadStats};
+pub use resident::{ResidentGrantStats, ResidentReadConfig, ResidentReadStats};
 mod payload;
 pub use diagnostics::{ConnectionProfile, PollingProfile, SocketProfile, WorkProfile};
 use payload::WireBytes;
@@ -62,7 +62,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub use inventory::NodeInventory;
-const PROTOCOL: u32 = 11;
+const PROTOCOL: u32 = 14;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
 static NEXT_RESIDENT_SESSION: AtomicU64 = AtomicU64::new(1);
 #[cfg(feature = "experimental-fabric")]
@@ -268,6 +268,58 @@ pub struct RecoveryPage {
     pub next: Option<usize>,
 }
 
+/// A sampled local elapsed interval. Counts describe this stage's own population.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct ReadStageProfile {
+    pub ns: u64,
+    pub count: u64,
+    pub max_ns: u64,
+    pub errors: u64,
+}
+
+impl ReadStageProfile {
+    fn record(&mut self, began: Option<Instant>, error: bool) {
+        if let Some(began) = began {
+            self.record_ns(elapsed_ns(began), error);
+        }
+    }
+
+    fn record_ns(&mut self, ns: u64, error: bool) {
+        self.ns += ns;
+        self.count += 1;
+        self.max_ns = self.max_ns.max(ns);
+        self.errors += u64::from(error);
+    }
+
+    fn add(&mut self, other: Self) {
+        self.ns += other.ns;
+        self.count += other.count;
+        self.max_ns = self.max_ns.max(other.max_ns);
+        self.errors += other.errors;
+    }
+}
+
+/// Owner grant setup scopes, nested within sampled read handler residence.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct GrantReadProfile {
+    pub lookup: ReadStageProfile,
+    pub reservation: ReadStageProfile,
+    pub envelope: ReadStageProfile,
+    /// Actual provider registration calls only, including failed calls.
+    pub registration: ReadStageProfile,
+    pub recheck_publication: ReadStageProfile,
+}
+
+impl GrantReadProfile {
+    fn add(&mut self, other: Self) {
+        self.lookup.add(other.lookup);
+        self.reservation.add(other.reservation);
+        self.envelope.add(other.envelope);
+        self.registration.add(other.registration);
+        self.recheck_publication.add(other.recheck_publication);
+    }
+}
+
 /// Explicit diagnostic timings; ordinary requests take no extra stage clocks.
 /// WAL-read exchange spans encoding through authenticated, verified completion
 /// (including interleaved progress), not wire-only RTT. Encode/decode/verification
@@ -279,14 +331,18 @@ pub struct RecoveryPage {
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct TcpReadProfile {
     pub request_encode_ns: u64,
+    pub request_encode_count: u64,
     pub exchange_ns: u64,
+    pub exchange_count: u64,
     /// Not attributable per request under multiplexing; zero in protocol v2.
     pub request_send_ns: u64,
     pub response_header_ns: u64,
     pub response_body_ns: u64,
     pub socket: SocketProfile,
     pub response_decode_ns: u64,
+    pub response_decode_count: u64,
     pub record_verify_ns: u64,
+    pub record_verify_count: u64,
     /// RAM probe payload verification after exchange, not nested inside it.
     pub ram_payload_verify_ns: u64,
     pub ram_payload_verify_calls: u64,
@@ -312,22 +368,101 @@ pub struct TcpReadProfile {
     pub server_response_recheck_wait_ns: u64,
     /// Active-authority recheck before TLS enqueueing.
     pub server_response_recheck_ns: u64,
-    /// Successful profiled read replies carrying the above spans.
+    /// Profiled owner read replies carrying the above spans, including retained errors.
     pub server_response_recheck_samples: u64,
     /// Retained as a zero-valued compatibility field; authority rechecks do not defer.
     pub server_response_recheck_deferrals: u64,
+    pub server_grant: GrantReadProfile,
+    pub client_grant_install: ReadStageProfile,
+    /// Accepted FI_READ submission to locally observed completion, not wire time.
+    pub client_fi_read: ReadStageProfile,
+    pub server_wal: WalReadProfile,
+}
+
+/// Local owner observations. Member durations overlap and are not request wall time.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct WalReadProfile {
+    pub executor_requests: u64,
+    pub sync_reader_requests: u64,
+    pub cache_only_requests: u64,
+    pub rma_not_applicable_requests: u64,
+    pub planning_ns: u64,
+    pub planning_count: u64,
+    pub planning_max_ns: u64,
+    pub executor_residence_ns: u64,
+    pub executor_residence_count: u64,
+    pub executor_residence_max_ns: u64,
+    pub cache_resolution_ns: u64,
+    pub cache_resolution_count: u64,
+    pub cache_resolution_max_ns: u64,
+    pub nowait_ns: u64,
+    pub nowait_count: u64,
+    pub nowait_max_ns: u64,
+    pub nowait_errors: u64,
+    pub nowait_partial: u64,
+    pub nowait_deferred: u64,
+    pub async_ns: u64,
+    pub async_count: u64,
+    pub async_max_ns: u64,
+    pub async_errors: u64,
+    pub async_partial: u64,
+    pub response_ready_ns: u64,
+    pub response_ready_count: u64,
+    pub response_ready_max_ns: u64,
+}
+impl WalReadProfile {
+    fn add(&mut self, other: Self) {
+        macro_rules! sums { ($($field:ident),*) => { $(self.$field += other.$field;)* }; }
+        sums!(
+            executor_requests,
+            sync_reader_requests,
+            cache_only_requests,
+            rma_not_applicable_requests,
+            planning_ns,
+            planning_count,
+            executor_residence_ns,
+            executor_residence_count,
+            cache_resolution_ns,
+            cache_resolution_count,
+            nowait_ns,
+            nowait_count,
+            nowait_errors,
+            nowait_partial,
+            nowait_deferred,
+            async_ns,
+            async_count,
+            async_errors,
+            async_partial,
+            response_ready_ns,
+            response_ready_count
+        );
+        self.planning_max_ns = self.planning_max_ns.max(other.planning_max_ns);
+        self.executor_residence_max_ns = self
+            .executor_residence_max_ns
+            .max(other.executor_residence_max_ns);
+        self.cache_resolution_max_ns = self
+            .cache_resolution_max_ns
+            .max(other.cache_resolution_max_ns);
+        self.nowait_max_ns = self.nowait_max_ns.max(other.nowait_max_ns);
+        self.async_max_ns = self.async_max_ns.max(other.async_max_ns);
+        self.response_ready_max_ns = self.response_ready_max_ns.max(other.response_ready_max_ns);
+    }
 }
 
 impl TcpReadProfile {
     pub(crate) fn add(&mut self, next: Self) {
         self.request_encode_ns += next.request_encode_ns;
+        self.request_encode_count += next.request_encode_count;
         self.exchange_ns += next.exchange_ns;
+        self.exchange_count += next.exchange_count;
         self.request_send_ns += next.request_send_ns;
         self.response_header_ns += next.response_header_ns;
         self.response_body_ns += next.response_body_ns;
         self.socket.add(next.socket);
         self.response_decode_ns += next.response_decode_ns;
+        self.response_decode_count += next.response_decode_count;
         self.record_verify_ns += next.record_verify_ns;
+        self.record_verify_count += next.record_verify_count;
         self.ram_payload_verify_ns += next.ram_payload_verify_ns;
         self.ram_payload_verify_calls += next.ram_payload_verify_calls;
         self.ram_payload_verified_bytes += next.ram_payload_verified_bytes;
@@ -342,6 +477,10 @@ impl TcpReadProfile {
         self.server_response_recheck_ns += next.server_response_recheck_ns;
         self.server_response_recheck_samples += next.server_response_recheck_samples;
         self.server_response_recheck_deferrals += next.server_response_recheck_deferrals;
+        self.server_grant.add(next.server_grant);
+        self.client_grant_install.add(next.client_grant_install);
+        self.client_fi_read.add(next.client_fi_read);
+        self.server_wal.add(next.server_wal);
     }
 }
 
@@ -355,19 +494,22 @@ struct ServerReadProfile {
     response_recheck_ns: u64,
     response_recheck_samples: u64,
     response_recheck_deferrals: u64,
+    grant: GrantReadProfile,
+    wal: WalReadProfile,
 }
-// Fixed-integer bincode encodes eight u64 values. Reserve this additional space
-// in both server response accounting and client profiled-read chunking.
-const SERVER_READ_PROFILE_BYTES: usize = 8 * 8;
+// Fixed-integer bincode: eight legacy, twenty-seven WAL, twenty grant u64 values.
+const SERVER_READ_PROFILE_BYTES: usize = 55 * 8;
 
 #[derive(Debug)]
 pub struct TcpError {
     message: String,
+    pub(crate) read_profile: Option<Box<TcpReadProfile>>,
 }
 impl TcpError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            read_profile: None,
         }
     }
     fn component(error: impl fmt::Display) -> Self {
@@ -457,6 +599,7 @@ enum Request {
     },
     /// Nonblocking operational snapshot; not a durability barrier or evidence cut.
     OperationalReadIoStats,
+    ResidentGrantStats,
     #[cfg(all(target_os = "linux", feature = "test-utils"))]
     ReadEvidence {
         epoch: u64,
@@ -480,6 +623,7 @@ impl Request {
             | Self::StatsDetailed
             | Self::ReadIoStats
             | Self::OperationalReadIoStats
+            | Self::ResidentGrantStats
             | Self::ConnectionProfile { .. } => true,
             #[cfg(all(target_os = "linux", feature = "test-utils"))]
             Self::ReadEvidence { .. } => true,
@@ -562,6 +706,11 @@ enum Response {
     // Diagnostics must not enlarge every ordinary read/write response value.
     ConnectionProfile(Box<ConnectionProfile>),
     OperationalReadIoStats(Box<(PartitionConfig, Option<ReadExecutorStats>)>),
+    ResidentGrantStats(Box<(PartitionConfig, Option<ResidentGrantStats>)>),
+    ReadErrorProfiled {
+        message: String,
+        profile: Box<ServerReadProfile>,
+    },
     #[cfg(all(target_os = "linux", feature = "test-utils"))]
     ReadEvidence(crate::read_probe::ReadEvidence),
     #[cfg(all(target_os = "linux", feature = "test-utils"))]
@@ -1045,73 +1194,83 @@ impl StorageNode {
         limits: TcpLimits,
     ) -> Result<Response, TcpError> {
         let started = PROFILE.then(Instant::now);
-        if references.is_empty() || references.len() > limits.max_reads {
-            return Err(TcpError::new("read request count exceeds bound"));
-        }
         let mut profile = ServerReadProfile::default();
-        let began = PROFILE.then(Instant::now);
-        let snapshot = self.reader_snapshot(epoch, &references)?;
-        let generation = snapshot.generation;
-        // This diagnostic handler runs off the network owner. Snapshot capture
-        // itself only pins epoch/log identity under the short authority lock.
-        for (log, reference) in &snapshot.members {
-            log.validate_durable_record_reference(reference)
-                .map_err(TcpError::component)?;
-        }
-        let logs = snapshot
-            .members
-            .into_iter()
-            .map(|(log, _)| log)
-            .collect::<Vec<_>>();
-        if let Some(began) = began {
-            profile.authority_lookup_ns = elapsed_ns(began);
-        }
-        let began = PROFILE.then(Instant::now);
-        let mut size = 16usize
-            + if PROFILE {
-                SERVER_READ_PROFILE_BYTES
-            } else {
-                0
-            };
-        for reference in &references {
-            size = size
-                .checked_add(reference.descriptor.len as usize + 8)
-                .ok_or_else(|| TcpError::new("read response overflow"))?;
-            if size > limits.max_frame_bytes {
-                return Err(TcpError::new("read response exceeds frame bound"));
+        let mut record_started = None;
+        let result = (|| -> Result<Vec<WireBytes>, TcpError> {
+            if references.is_empty() || references.len() > limits.max_reads {
+                return Err(TcpError::new("read request count exceeds bound"));
             }
-        }
-        // Explicit mapped/positional diagnostic controls only. Session count
-        // and byte credits bound queued work; indexed collection preserves order.
-        let records = self.read_pool.install(|| {
-            logs.par_iter()
-                .zip(references.par_iter())
-                .map(|(log, reference)| {
-                    #[cfg(test)]
-                    {
-                        let hook = self.read_hook.lock().clone();
-                        if let Some(hook) = hook {
-                            hook(reference);
+            let began = PROFILE.then(Instant::now);
+            let snapshot = self.reader_snapshot(epoch, &references)?;
+            let generation = snapshot.generation;
+            // This diagnostic handler runs off the network owner. Snapshot capture
+            // itself only pins epoch/log identity under the short authority lock.
+            for (log, reference) in &snapshot.members {
+                log.validate_durable_record_reference(reference)
+                    .map_err(TcpError::component)?;
+            }
+            let logs = snapshot
+                .members
+                .into_iter()
+                .map(|(log, _)| log)
+                .collect::<Vec<_>>();
+            if let Some(began) = began {
+                profile.authority_lookup_ns = elapsed_ns(began);
+            }
+            record_started = PROFILE.then(Instant::now);
+            let mut size = 16usize
+                + if PROFILE {
+                    SERVER_READ_PROFILE_BYTES
+                } else {
+                    0
+                };
+            for reference in &references {
+                size = size
+                    .checked_add(reference.descriptor.len as usize + 8)
+                    .ok_or_else(|| TcpError::new("read response overflow"))?;
+                if size > limits.max_frame_bytes {
+                    return Err(TcpError::new("read response exceeds frame bound"));
+                }
+            }
+            // Explicit mapped/positional diagnostic controls only. Session count
+            // and byte credits bound queued work; indexed collection preserves order.
+            let records = self.read_pool.install(|| {
+                logs.par_iter()
+                    .zip(references.par_iter())
+                    .map(|(log, reference)| {
+                        #[cfg(test)]
+                        {
+                            let hook = self.read_hook.lock().clone();
+                            if let Some(hook) = hook {
+                                hook(reference);
+                            }
                         }
-                    }
-                    let result =
-                        log.read_record_encoded_with_policy(reference, self.wal_member_read);
-                    self.read_admission
-                        .record_sync_read(reference.descriptor.len as usize, result.is_ok());
-                    result.map(Into::into).map_err(TcpError::component)
-                })
-                .collect::<Result<Vec<WireBytes>, TcpError>>()
-        })?;
-        if !self.reader_authority_valid(epoch, Some(generation)) {
-            return Err(TcpError::new("read authority was fenced or poisoned"));
-        }
-        if let (Some(began), Some(started)) = (began, started) {
-            profile.record_read_ns = elapsed_ns(began);
+                        let result =
+                            log.read_record_encoded_with_policy(reference, self.wal_member_read);
+                        self.read_admission
+                            .record_sync_read(reference.descriptor.len as usize, result.is_ok());
+                        result.map(Into::into).map_err(TcpError::component)
+                    })
+                    .collect::<Result<Vec<WireBytes>, TcpError>>()
+            })?;
+            if !self.reader_authority_valid(epoch, Some(generation)) {
+                return Err(TcpError::new("read authority was fenced or poisoned"));
+            }
+            Ok(records)
+        })();
+        if let Some(started) = started {
+            profile.wal.sync_reader_requests = 1;
+            profile.record_read_ns = record_started.map_or(0, elapsed_ns);
             profile.handler_ns = elapsed_ns(started);
-            Ok(Response::RecordsProfiled { records, profile })
-        } else {
-            Ok(Response::Records(records))
+            return Ok(match result {
+                Ok(records) => Response::RecordsProfiled { records, profile },
+                Err(error) => Response::ReadErrorProfiled {
+                    message: error.to_string(),
+                    profile: Box::new(profile),
+                },
+            });
         }
+        result.map(Response::Records)
     }
 }
 
@@ -1232,6 +1391,19 @@ impl Client {
     pub fn operational_read_io_stats(&mut self) -> Result<Option<ReadExecutorStats>, TcpError> {
         match self.request(Request::OperationalReadIoStats)? {
             Response::OperationalReadIoStats(snapshot) => {
+                let (partition, stats) = *snapshot;
+                if partition != self.expected {
+                    return self.wrong_response();
+                }
+                Ok(stats)
+            }
+            _ => self.wrong_response(),
+        }
+    }
+    /// Snapshot owner-side grant decisions and source occupancy.
+    pub fn resident_grant_stats(&mut self) -> Result<Option<ResidentGrantStats>, TcpError> {
+        match self.request(Request::ResidentGrantStats)? {
+            Response::ResidentGrantStats(snapshot) => {
                 let (partition, stats) = *snapshot;
                 if partition != self.expected {
                     return self.wrong_response();
@@ -1434,6 +1606,13 @@ impl Client {
             .as_ref()
             .expect("connected client status")
     }
+    /// Whether this client retains a locally usable session, not a live peer
+    /// health probe. A broken client returns `None`: its underlying session may
+    /// have been aborted or merely marked unusable, so absence is not proven.
+    pub fn session_present(&self) -> Option<bool> {
+        (!self.broken).then_some(true)
+    }
+
     pub(crate) fn connect_profile(&self) -> ClientConnectProfile {
         self.connect_profile
     }

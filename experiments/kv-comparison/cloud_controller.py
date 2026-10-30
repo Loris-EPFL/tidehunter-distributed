@@ -108,6 +108,87 @@ def guarded(path, root, *, must_exist=False):
         raise SafetyError("required owned path missing: " + str(path))
     return path
 
+def validate_read_tier_memory(jobs, fleet):
+    """Reserve headroom for non-cache work within the exact guest cgroup caps."""
+    for job in jobs:
+        if "read_tier" not in job or job["backend"] not in cloud_campaign.TRANSPORTS:
+            continue
+        for prefix, cap_name in (("coordinator", "client_memory_mib"), ("owner_read", "server_memory_mib")):
+            allowance = job[prefix + "_read_memory_allowance_bytes"] if prefix == "coordinator" else job["owner_read_memory_allowance_bytes"]
+            cache = job["coordinator_cache_bytes"] if prefix == "coordinator" else job["owner_read_cache_bytes"]
+            cap = fleet[cap_name] * 1024**2 * 3 // 4
+            if allowance < cache + 64 * 1024**2 or allowance > cap:
+                raise ValueError(prefix + " read allowance exceeds the bounded fleet memory budget or lacks pending-read headroom")
+
+def tracer_terminal(result):
+    """Only a completed exact-owned collector result proves teardown finished."""
+    rows = result[1:] if isinstance(result, list) and len(result) == 6 else [result]
+    return bool(rows) and all(isinstance(row, dict) and isinstance(row.get("state_dir"), str)
+        and not row.get("cleanup_error") and row.get("reason") != "collector stop timed out"
+        for row in rows)
+
+
+def cleanup_unfinished_tracer(attempted, terminal, stop, receipt):
+    if not attempted or terminal:
+        return True
+    try:
+        result = stop()
+        rows = result if isinstance(result, list) else [result]
+        receipt["cold_device_cleanup"] = [
+            {key: value for key, value in row.items()
+             if key not in ("raw_events", "raw_intervals_ns", "candidate_raw_intervals_ns")}
+            for row in rows]
+        complete = tracer_terminal(result)
+    except Exception as error:
+        receipt["cold_device_cleanup"] = {"available": False, "reason": repr(error)}
+        complete = False
+    receipt["cold_device_cleanup_complete"] = complete
+    return complete
+
+
+def terminal_device_evidence(job, receipt):
+    """Keep node-local evidence separate and never invent missing host results."""
+    evidence = receipt.get("cold_device_evidence")
+    if isinstance(evidence, list) and len(evidence) == 6:
+        rows = [(index, value) for index, value in enumerate(evidence[1:])]
+    elif job.get("backend") == "native" and isinstance(evidence, dict):
+        rows = [(-1, evidence)]
+    else:
+        return None
+    return [{"host_index": index, "evidence": {
+        key: value for key, value in row.items()
+        if key not in ("raw_events", "raw_intervals_ns", "candidate_raw_intervals_ns")}}
+        for index, row in rows if isinstance(row, dict)]
+
+
+def probe_trace_capability(script, wal_root, state, duration, env):
+    """Attach and stop once; zero I/O is not a capability failure."""
+    start = {"available": False, "reason": "probe did not start"}
+    stop = {"available": False, "reason": "probe did not stop"}
+    try:
+        start = json.loads(command([sys.executable, "-B", script, "start", "--wal-path", wal_root,
+                                    "--state-dir", state, "--duration-seconds", str(duration)],
+                                   timeout=45, env=env))
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+        start = {"available": False, "reason": type(error).__name__ + ": " + str(error)}
+    finally:
+        try:
+            stop = json.loads(command([sys.executable, "-B", script, "stop", "--state-dir", state],
+                                      timeout=45, env=env))
+        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+            stop = {"available": False, "reason": type(error).__name__ + ": " + str(error)}
+    cleanup = tracer_terminal(stop)
+    ready = (cleanup and start.get("available") is True and stop.get("available") is True
+             and start.get("backend") == "bpftrace-request-identity"
+             and stop.get("backend") == "bpftrace-request-identity")
+    compact = {key: value for key, value in stop.items()
+               if key not in ("raw_events", "raw_intervals_ns", "candidate_raw_intervals_ns")}
+    return {"identity_backend_available": ready, "cleanup_complete": cleanup,
+            "start": start, "stop": compact,
+            "gaps": [] if ready else ["request-identity BPF attach/stop unavailable"],
+            "scope": "attachment capability only; zero block events do not indicate failure or establish device timing"}
+
+
 
 def validate_config(config):
     required = {"fleet", "bucket", "bucket_region", "prefix", "account", "source_revision",
@@ -145,7 +226,7 @@ def validate_config(config):
     for name in ("binary", "fdb_library_dir"):
         guarded(config[name], stage)
     timestamp(config["deadline_utc"])
-    cloud_campaign.make_matrix(config["spec"])
+    validate_read_tier_memory(cloud_campaign.make_matrix(config["spec"]), fleet)
     guarded(fleet["data_root"], Path("/mnt/tidehunter-kv-comparison"))
     return config
 
@@ -587,11 +668,40 @@ def guest_operation(config, request, clients):
         monitor_images_path = Path("/mnt/tidehunter") / config["prefix"] / "monitor-image-proof.json"
         monitor_images = (json.loads(monitor_images_path.read_text()) if monitor_images_path.is_file()
                           else {"complete": False, "gaps": ["bootstrap monitoring image receipt missing"]})
+        trace_tool = None
+        if config["spec"].get("mode", "standard") == "read-tier":
+            binary = shutil.which("bpftrace")
+            trace_tool = {"requested": True, "binary": binary, "binary_sha256": None,
+                          "version": None, "package_version": None, "kernel_release": os.uname().release,
+                          "kernel_btf_readable": os.access("/sys/kernel/btf/vmlinux", os.R_OK),
+                          "permission_probe": "deferred to per-case collector; binary/BTF presence does not prove capability"}
+            if binary:
+                try:
+                    trace_tool["binary_sha256"] = digest(binary)
+                    trace_tool["version"] = command([binary, "--version"], timeout=10).strip()
+                    trace_tool["package_version"] = command(
+                        ["dpkg-query", "-W", "-f=${Version}", "bpftrace"], timeout=10).strip()
+                except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+                    trace_tool["probe_error"] = type(exc).__name__ + ": " + str(exc)
         return {"identity": identity, "package": package, "bootstrap": receipt, "ready": ready, "monitor_images": monitor_images,
+                "read_tier_trace_tool": trace_tool,
                 "expiry_timer": command(["systemctl", "show", timer], timeout=10), "images": images,
                 "fabric_admission": admit_fabrics(config, index, clients, root),
                 "ldd": command(["ldd", config["binary"]], timeout=30, env=environment(config)),
                 "snapshot": snapshot(config)}
+    if action == "cold_trace_probe":
+        if config["spec"].get("mode", "standard") != "read-tier":
+            raise SafetyError("trace capability probe is restricted to focused mode")
+        control_root = guarded(Path("/var/lib/tidehunter-kv-control") / config["prefix"],
+                               Path("/var/lib/tidehunter-kv-control"))
+        control_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        state = guarded(control_root / ("trace-capability-" + str(index + 1)), control_root)
+        script = Path(config["repository_root"]) / "experiments/kv-comparison/cold_device_trace.py"
+        duration = min(45, int((timestamp(config["deadline_utc"]) - utc()).total_seconds()))
+        if duration < 1:
+            return {"identity_backend_available": False, "cleanup_complete": True,
+                    "gaps": ["campaign deadline reached before probe"]}
+        return probe_trace_capability(script, root, state, duration, environment(config))
     if action in ("monitor_start", "monitor_stop"):
         observer = monitor_module(config)
         spec = monitoring_spec(config, root / "results")
@@ -635,9 +745,31 @@ def guest_operation(config, request, clients):
                 argv.append("--cluster")
         return json.loads(command(argv, timeout=request["operation_timeout"], env=environment(config)))
     case = request["case_id"]
-    name = unit_name(config, case, "storage-" + str(index))
     guest_root = guarded(root / "cells" / case, root)
     capsule_root = guarded(guest_root / ("node-" + str(index)), root)
+    if action in ("cold_trace_start", "cold_trace_stop"):
+        if index < 0:
+            return {"available": False, "reason": "coordinator has no owner WAL"}
+        import yaml
+        launch = yaml.safe_load((capsule_root / "launch.yaml").read_text())
+        validate_launch(config, launch, case, index)
+        wal_root = guarded(launch["node"]["root"], capsule_root, must_exist=True)
+        state = guarded(Path("/var/lib/tidehunter-kv-control") / config["prefix"] /
+                        ("cold-" + hashlib.sha256(case.encode()).hexdigest()[:16] + "-" + str(index)),
+                        Path("/var/lib/tidehunter-kv-control") / config["prefix"])
+        script = Path(config["repository_root"]) / "experiments/kv-comparison/cold_device_trace.py"
+        argv = [sys.executable, "-B", script, "start" if action == "cold_trace_start" else "stop",
+                "--state-dir", state]
+        if action == "cold_trace_start":
+            duration = min(int(request["duration_seconds"]), int((timestamp(config["deadline_utc"]) - utc()).total_seconds()))
+            if duration < 1:
+                return {"available": False, "reason": "campaign deadline reached"}
+            argv += ["--wal-path", wal_root, "--duration-seconds", str(duration)]
+        try:
+            return json.loads(command(argv, timeout=45, env=environment(config)))
+        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            return {"available": False, "reason": type(exc).__name__ + ": " + str(exc)}
+    name = unit_name(config, case, "storage-" + str(index))
     if action == "tide_start":
         expected_key = f"{config['prefix']}/deploy/cells/{case}/storage-{index}.tar.gz"
         if request["key"] != expected_key:
@@ -972,9 +1104,15 @@ class Controller:
             if isinstance(diagnostics, dict):
                 observed["write_diagnostics"] = diagnostics
                 observed["write_profile_enabled"] = diagnostics["runtime_enabled"]
+            diagnostics = receipt.get("read_diagnostics", {}).get("observed")
+            if isinstance(diagnostics, dict):
+                observed["read_diagnostics"] = diagnostics
+                observed["read_profile_enabled"] = diagnostics["runtime_enabled"]
             return monitor_module(self.config).finish_case(monitoring_spec(self.config, self.root),
                 job, directory / "result", metrics=summary.get("metrics") if summary else None,
-                status=receipt["status"], timeout_seconds=min(2, self.remaining(export=True)), **observed)
+                status=receipt["status"], timeout_seconds=min(2, self.remaining(export=True)),
+                read_tier_effective=receipt.get("read_tier_effective"),
+                cold_device_evidence=terminal_device_evidence(job, receipt), **observed)
         self.observe("case_finish:" + job["case_id"], finish)
 
     def export_monitoring(self):
@@ -1094,7 +1232,8 @@ class Controller:
         import yaml
         case = job["case_id"]
         guest_root = str(Path(self.config["fleet"]["data_root"]) / "cells" / case)
-        allowance = min(512 * 1024**2, int(self.config["fleet"]["server_memory_mib"] * 1024**2 // 4))
+        allowance = job.get("owner_read_memory_allowance_bytes",
+            min(512 * 1024**2, int(self.config["fleet"]["server_memory_mib"] * 1024**2 // 4)))
         prep = {"guest_root": guest_root, "addresses": [h["address"] + ":9400" for h in self.config["fleet"]["nodes"]],
                 "transport": cloud_campaign.TRANSPORTS[job["backend"]],
                 "max_batches_per_partition": max(16384, job["keys"] + job["warmup_operations"] + job["measurement_operations"]),
@@ -1102,15 +1241,19 @@ class Controller:
                 "coordinator_cache_bytes": job["coordinator_cache_bytes"], "owner_read_workers": 4,
                 "owner_wal_member_read": "async", "owner_read_cache_bytes": job["owner_read_cache_bytes"],
                 "owner_read_memory_allowance_bytes": allowance,
-                "owner_read_resident_first": "resident_reads" in job,
+                "owner_read_resident_first": job.get("owner_read_resident_first", "resident_reads" in job),
                 "resident_reads": job.get("resident_reads", DISABLED_RESIDENT_READS),
                 "polling": "adaptive"}
+        if "coordinator_read_memory_allowance_bytes" in job:
+            prep["coordinator_read_memory_allowance_bytes"] = job["coordinator_read_memory_allowance_bytes"]
         dump(directory / "prepare-input.json", prep)
         prepared = directory / "prepared"
         command([self.config["binary"], "--prepare-external-case", directory / "prepare-input.json", "--output", prepared],
                 timeout=min(60, self.remaining()), env=environment(self.config))
         self.active_tide = (job, directory, [])
         remote = json.loads((prepared / "remote.json").read_text())
+        if "read_lanes" in job:
+            remote["read_lanes"] = job["read_lanes"]
         # The typed remote config references guest_root on the coordinator too.
         # Stage just its client identity there without rebasing engine serde.
         for field in ("ca", "cert", "key"):
@@ -1194,7 +1337,24 @@ class Controller:
         started = False
         client_quiesced = False
         completion_observed = False
+        tracer_attempted = False
+        tracer_stopped = False
+        tracer_clean = True
         failure = None
+        def native_trace(action, duration=None):
+            control_root = guarded(Path("/var/lib/tidehunter-kv-control") / self.config["prefix"],
+                                   Path("/var/lib/tidehunter-kv-control"))
+            control_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            state = guarded(control_root / ("native-cold-" + hashlib.sha256(job["case_id"].encode()).hexdigest()[:16]), control_root)
+            script = Path(self.config["repository_root"]) / "experiments/kv-comparison/cold_device_trace.py"
+            argv = [sys.executable, "-B", script, action, "--state-dir", state]
+            if action == "start":
+                argv += ["--wal-path", guarded(directory / "database", directory, must_exist=True),
+                         "--duration-seconds", str(duration)]
+            try:
+                return json.loads(command(argv, timeout=45, env=environment(self.config)))
+            except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+                return {"available": False, "reason": type(exc).__name__ + ": " + str(exc)}
         self.select_monitoring(job, directory)
         try:
             self.guard()
@@ -1255,12 +1415,43 @@ class Controller:
                 dump(directory / "measurement-before.json", {"hosts": before, "client": process_before})
                 receipt["measurement_evidence"].update({"gate_released": True,
                     "before": "measurement-before.json", "before_sha256": digest(directory / "measurement-before.json")})
+                if job.get("read_tier", {}).get("name") == "cold_device":
+                    tracer_attempted = True
+                    try:
+                        receipt["cold_device_start"] = self.all_hosts(
+                            {"action": "cold_trace_start", "case_id": job["case_id"], "duration_seconds": min(seconds, int(self.remaining()))},
+                            case=job["case_id"], timeout=60)
+                    except Exception as exc:
+                        receipt["cold_device_start"] = {"available": False, "reason": repr(exc)}
+                if job.get("read_tier", {}).get("name", "").startswith("native_"):
+                    tracer_attempted = True
+                    receipt["cold_device_start"] = native_trace("start", min(seconds, int(self.remaining())))
                 (directory / "measurement.release").touch(exist_ok=False)
                 gate_released = True
                 while True:
                     self.remaining()
                     completed = directory / "measurement.complete"
                     if completed.exists() and not completion_observed:
+                        if job.get("read_tier", {}).get("name") == "cold_device":
+                            try:
+                                traces = self.all_hosts(
+                                    {"action": "cold_trace_stop", "case_id": job["case_id"]}, case=job["case_id"], timeout=60)
+                                tracer_stopped = tracer_terminal(traces)
+                                # Full bounded raw traces remain in the individual guest receipts.
+                                # Do not duplicate five large event streams in the case receipt.
+                                receipt["cold_device_evidence"] = [
+                                    {k: v for k, v in trace.items() if k not in ("raw_events", "raw_intervals_ns", "candidate_raw_intervals_ns")}
+                                    for trace in traces]
+                                receipt["cold_device_raw_location"] = "guest/<case>/storage-<index>-<sequence>.json (request.action=cold_trace_stop)"
+                            except Exception as exc:
+                                receipt["cold_device_evidence"] = {"available": False, "reason": repr(exc)}
+                        if job.get("read_tier", {}).get("name", "").startswith("native_"):
+                            trace = native_trace("stop")
+                            tracer_stopped = tracer_terminal(trace)
+                            dump(directory / "native-device-trace.json", trace)
+                            receipt["cold_device_evidence"] = {k: v for k, v in trace.items()
+                                if k not in ("raw_events", "raw_intervals_ns", "candidate_raw_intervals_ns")}
+                            receipt["cold_device_raw_location"] = "native-device-trace.json"
                         ended = self.all_hosts({"action": "snapshot", "drop": False,
                             "resource_job": job}, case=job["case_id"], timeout=60)
                         dump(directory / "measurement-end.json", {"hosts": ended,
@@ -1329,6 +1520,10 @@ class Controller:
                     directory, job, completed=manifest["status"] == "completed")
                 if diagnostics is not None:
                     receipt["write_diagnostics"] = diagnostics
+                diagnostics = cloud_campaign.admit_read_diagnostics(
+                    directory, job, completed=manifest["status"] == "completed")
+                if diagnostics is not None:
+                    receipt["read_diagnostics"] = diagnostics
                 read_interval = cloud_campaign.admit_measurement_read_evidence(directory)
                 if read_interval is not None:
                     receipt["measurement_read_evidence"] = read_interval
@@ -1346,6 +1541,23 @@ class Controller:
                                                        "coordinator_scope": "cumulative_adapter_lifetime_not_measurement_interval",
                                                        "owner_io_scope": "latest_passive_sample_may_be_stale_not_measurement_interval",
                                                        "observed": observed}
+                        if "read_tier" in job:
+                            receipt["read_tier_effective"] = {
+                                "coordinator_cache_bytes": observed["coordinator"]["cache"]["budget_bytes"],
+                                "owner_read_cache_bytes": observed["owner_read_configuration"][0]["read_cache_bytes"],
+                                "coordinator_read_memory_allowance_bytes": observed.get("effective_configuration", {}).get("coordinator", {}).get("read_memory_allowance_bytes"),
+                                "owner_read_memory_allowance_bytes": observed["owner_read_configuration"][0].get("read_memory_allowance_bytes"),
+                                "registered_policy": ("hardware_required" if observed["owner_read_configuration"][0]["resident_reads"]["require_device_read"]
+                                    else "disabled" if observed["owner_read_configuration"][0]["resident_reads"] == DISABLED_RESIDENT_READS else None),
+                                "registered_budgets": observed["owner_read_configuration"][0]["resident_reads"],
+                                "owner_read_resident_first": observed["owner_read_configuration"][0]["read_resident_first"],
+                                "page_cache_policy": ("drop_at_measurement_gate" if receipt["measurement_evidence"].get("os_caches_dropped") is True
+                                    else "not_dropped" if receipt["measurement_evidence"].get("os_caches_dropped") is False else None),
+                                "warmup_operations": admitted["phases"]["warmup_operations"],
+                                "warmup_key_sweep": admitted["phases"].get("warmup_key_sweep", False),
+                                "measurement_key_sweep": admitted["phases"].get("measurement_key_sweep", False),
+                                "read_lanes": job["read_lanes"], "concurrency": admitted["execution"]["concurrency"],
+                                "sessions": None}
                     except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError) as exc:
                         raise SafetyError("actual coordinator/owner counter schema admission failed: " + str(exc)) from exc
                 else:
@@ -1367,6 +1579,14 @@ class Controller:
                 receipt["raw_artifacts_validated"] = False
             receipt["error"] = type(exc).__name__ + ": " + str(exc)
         finally:
+            def stop_after_failure():
+                if job.get("read_tier", {}).get("name") == "cold_device":
+                    return self.all_hosts({"action": "cold_trace_stop", "case_id": job["case_id"]},
+                                          case=job["case_id"], timeout=60, export=True)
+                result = native_trace("stop")
+                dump(directory / "native-device-trace-cleanup.json", result)
+                return result
+            tracer_clean = cleanup_unfinished_tracer(tracer_attempted, tracer_stopped, stop_after_failure, receipt)
             # Publish the terminal snapshot while exact-owned cgroups still
             # exist. The scrape barrier and CSV reduction are outside API timers.
             self.observe("case_terminal_receipt:" + job["case_id"], lambda: dump(directory / "receipt.json", receipt))
@@ -1390,6 +1610,8 @@ class Controller:
                 self.stop_tide()
             except Exception as exc:
                 failure = exc
+            if not tracer_clean and not isinstance(failure, InfrastructureError):
+                failure = InfrastructureError("exact-owned trace cleanup unconfirmed; refusing next case; prior failure: " + repr(failure))
             receipt["artifacts_sha256"] = {name: digest(directory / "result" / name)
                 for name in RAW_FILES if (directory / "result" / name).is_file()}
             if failure:
@@ -1488,6 +1710,19 @@ class Controller:
             self.bootstrap()
             jobs = cloud_campaign.make_matrix(self.config["spec"])
             dump(self.root / "matrix.json", {"schema_version": 1, "spec": self.config["spec"], "jobs": jobs})
+            if self.config["spec"].get("mode", "standard") == "read-tier":
+                probes = self.all_hosts({"action": "cold_trace_probe"}, timeout=120)
+                if not isinstance(probes, list) or len(probes) != 6:
+                    raise InfrastructureError("trace capability probe returned incomplete fleet evidence")
+                capability = {"schema_version": 1, "hosts": probes,
+                    "identity_backend_available": all(p.get("identity_backend_available") is True for p in probes),
+                    "gaps": [{"host_index": index, "gaps": proof.get("gaps", [])}
+                             for index, proof in zip(range(-1, 5), probes)
+                             if proof.get("identity_backend_available") is not True],
+                    "scope": "premeasurement attach/stop only; no device-I/O or timing claim"}
+                dump(self.root / "trace-capability.json", capability)
+                if any(proof.get("cleanup_complete") is not True for proof in probes):
+                    raise InfrastructureError("trace capability probe teardown unconfirmed")
             active_block = None
             for position, job in enumerate(jobs):
                 self.remaining()
@@ -1572,6 +1807,15 @@ def verify_counter_evidence(job, evidence):
             {owner.get("partition") for owner in owners} != set(range(5)) or
             any(owner.get("read_cache_bytes") != job["owner_read_cache_bytes"] for owner in owners)):
         raise SafetyError("actual owner cache configurations differ from declared cohort")
+    if "coordinator_read_memory_allowance_bytes" in job:
+        actual = evidence.get("effective_configuration", {}).get("coordinator", {}).get("read_memory_allowance_bytes")
+        if actual != job["coordinator_read_memory_allowance_bytes"]:
+            raise SafetyError("actual coordinator read allowance differs from declared cohort")
+        if any(owner.get("read_memory_allowance_bytes") != job["owner_read_memory_allowance_bytes"] for owner in owners):
+            raise SafetyError("actual owner read allowance differs from declared cohort")
+    expected_nowait = job.get("owner_read_resident_first", "resident_reads" in job)
+    if any(owner.get("read_resident_first") is not expected_nowait for owner in owners):
+        raise SafetyError("actual owner resident-first policy differs from declared cohort")
     expected_resident = job.get("resident_reads", DISABLED_RESIDENT_READS)
     if not isinstance(expected_resident, dict) or type(expected_resident.get("require_device_read")) is not bool:
         raise SafetyError("job must declare a typed resident-read policy")

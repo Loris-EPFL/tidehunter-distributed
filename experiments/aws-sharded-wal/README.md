@@ -90,9 +90,18 @@ This checks local integration, not cloud performance or a new full Sui replay.
 
 For the selected KV comparison, current configuration files are authoritative:
 `experiments/kv-comparison/ci-config.json` sets the three-hour fleet lifetime,
-and `budget.json` sets the approved $220 rolling weekly cap. Dated campaign notes
-below retain historical deadlines, budgets and results; they do not override
-these tracked policies.
+and `budget.json` sets the rolling weekly cap. Dated campaign notes below retain
+historical deadlines, budgets and results; they do not override these policies.
+
+Both suites' `ci-config.json` files restrict automatic hardware selection to
+`g6.8xlarge` and `g6.16xlarge`, the two cheapest of the four integrated profiles
+in the 28 October 2026 AWS Pricing observations. `g6e.8xlarge` and
+`c6id.32xlarge` remain recognized by the tooling but are not automatic fallbacks.
+Discovery still sorts compatible candidates across regions by live host cost.
+Cluster placement, exact local-SSD inventory, native-read runtime qualification,
+budget admission and absolute expiry remain required. If neither selected type
+can be allocated within those limits, the campaign fails closed rather than
+selecting a larger or more expensive type.
 
 
 ## 24 October bounded SSM metadata and complete-matrix retry

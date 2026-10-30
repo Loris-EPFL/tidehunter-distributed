@@ -68,6 +68,8 @@ struct ExternalPreparationInput {
     max_admitted_batches: usize,
     max_index_bytes: usize,
     coordinator_cache_bytes: usize,
+    #[serde(default = "default_coordinator_read_memory_allowance_bytes")]
+    coordinator_read_memory_allowance_bytes: usize,
     owner_read_workers: usize,
     owner_wal_member_read: tidehunter::distributed::storage::WalMemberReadPolicy,
     owner_read_cache_bytes: usize,
@@ -75,6 +77,10 @@ struct ExternalPreparationInput {
     owner_read_resident_first: bool,
     resident_reads: tidehunter::distributed::tcp::ResidentReadConfig,
     polling: PollingPolicy,
+}
+
+fn default_coordinator_read_memory_allowance_bytes() -> usize {
+    512 * 1024 * 1024
 }
 
 fn backend_name(transport: &Transport) -> &'static str {
@@ -178,7 +184,7 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
         || input
             .coordinator_cache_bytes
             .checked_add(64 * 1024 * 1024)
-            .is_none_or(|bytes| bytes > 512 * 1024 * 1024)
+            .is_none_or(|bytes| bytes > input.coordinator_read_memory_allowance_bytes)
         || ((input.owner_read_cache_bytes != 0
             || input.owner_read_resident_first
             || resident_enabled)
@@ -252,6 +258,7 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
     let mut remote: tidehunter::distributed::remote_db::RemoteDatabaseConfig =
         serde_yaml::from_slice(&fs::read(&remote_path)?)?;
     remote.read_cache_bytes = input.coordinator_cache_bytes;
+    remote.read_memory_allowance_bytes = input.coordinator_read_memory_allowance_bytes;
     if remote
         .read_cache_bytes
         .checked_add(remote.max_pending_read_bytes)
@@ -306,6 +313,7 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
             "transport": input.transport.label(),
             "remote_config_yaml": output.join("remote.yaml"),
             "remote_config_json": output.join("remote.json"),
+            "coordinator_read_memory_allowance_bytes": remote.read_memory_allowance_bytes,
             "owner_read_configuration": output.join("external_owner_read_config.json"),
             "owner_launch_files": (0..5).map(|partition| output.join(format!("node-{partition}/launch.yaml"))).collect::<Vec<_>>()
         }))?
@@ -651,6 +659,26 @@ async fn open_for(
             "max_reference_metadata_bytes": remote_config.storage.max_reference_metadata_bytes,
             "max_epochs": remote_config.storage.max_epochs
         },
+        "cache_policy_receipt": {
+            "coordinator_explicit_cache": {
+                "requested_bytes": options.coordinator_read_cache_bytes,
+                "configured_bytes": remote_config.read_cache_bytes,
+                "effective_observation": "configured coordinator limit; usage is in measurement boundary snapshots"
+            },
+            "owner_explicit_cache": {
+                "configured_per_owner": owner_read_configuration,
+                "effective_observation": "launch configuration, not a runtime owner attestation"
+            },
+            "registered_ram": {
+                "configured_per_owner": owner_read_configuration,
+                "effective_observation": "configured limits are not proof of grant or hardware FI_READ"
+            },
+            "linux_page_cache": {
+                "requested_policy": null,
+                "effective_policy": null,
+                "observation": "not controlled or verified by this adapter; application cache disablement does not disable Linux page cache or prove physical NVMe"
+            }
+        },
         "owner_read_configuration": owner_read_configuration,
         "coordinator": {
             "read_cache_bytes": remote_config.read_cache_bytes,
@@ -723,6 +751,7 @@ impl TidehunterBackend {
             })
         });
         let mut owner_io = serde_json::Value::Null;
+        let mut owner_grants = serde_json::json!({"available": false});
         if let Some(monitor) = &self.operational_read_io {
             // Fast workloads can finish before the one-second passive sampler.
             // Wait only after timing, before drain; never add probes to API calls.
@@ -734,7 +763,8 @@ impl TidehunterBackend {
                     finished = stopped
                         || (snapshot.last_attempt.is_some_and(|attempt| attempt >= cut)
                             && snapshot.available
-                            && snapshot.resident_available);
+                            && snapshot.resident_available
+                            && snapshot.grants_available);
                 });
                 if finished || Instant::now() >= deadline {
                     break;
@@ -742,6 +772,15 @@ impl TidehunterBackend {
                 std::thread::sleep(Duration::from_millis(10));
             }
             monitor.visit(|snapshot, stopped| {
+                owner_grants = if snapshot.grants_available && !stopped {
+                    let mut value = partition_snapshot(snapshot.grants.clone(), &self.endpoints);
+                    value["generation"] = snapshot.generation.into();
+                    value["post_workload_sample"] = snapshot.last_attempt.is_some_and(|attempt| attempt >= cut).into();
+                    value["last_sample_age_ms"] = serde_json::json!(snapshot.last_attempt.map(|time| time.elapsed().as_millis()));
+                    value
+                } else {
+                    serde_json::json!({"available": false, "stopped": stopped, "generation": snapshot.generation})
+                };
                 owner_io = serde_json::json!({
                     "available": snapshot.available,
                     "resident_available": snapshot.resident_available,
@@ -771,6 +810,7 @@ impl TidehunterBackend {
             "counter_scope": "cumulative from adapter open through post-workload qualification; owner IO fields come from the latest passive sample",
             "coordinator": coordinator,
             "owner_io": owner_io,
+            "owner_grants": owner_grants,
             "owner_read_configuration": self.effective_configuration["owner_read_configuration"],
             "effective_configuration": self.effective_configuration
         });
@@ -843,6 +883,35 @@ fn partition_snapshot<T: serde::Serialize>(
     serde_json::json!({"available": true, "partitions": partitions})
 }
 
+fn lane_snapshot<T: serde::Serialize>(
+    rows: Vec<(u32, usize, T)>,
+    endpoints: &[(u32, String)],
+) -> serde_json::Value {
+    let expected: HashSet<u32> = endpoints.iter().map(|(partition, _)| *partition).collect();
+    let mut partitions: BTreeMap<u32, BTreeMap<usize, T>> = BTreeMap::new();
+    for (partition, lane, stats) in rows {
+        if !expected.contains(&partition) {
+            return serde_json::json!({"available": false, "error": "lane snapshot contains unknown partition"});
+        }
+        if partitions
+            .entry(partition)
+            .or_default()
+            .insert(lane, stats)
+            .is_some()
+        {
+            return serde_json::json!({"available": false, "error": format!("duplicate lane {partition}/{lane}")});
+        }
+    }
+    if partitions.len() != expected.len() {
+        return serde_json::json!({"available": false, "error": "lane snapshot missing a configured partition"});
+    }
+    let partitions: BTreeMap<String, serde_json::Value> = partitions
+        .into_iter()
+        .map(|(partition, lanes)| (partition.to_string(), serde_json::json!({"lanes": lanes})))
+        .collect();
+    serde_json::json!({"available": true, "partitions": partitions})
+}
+
 impl KvBackend for TidehunterBackend {
     fn info(&self) -> BackendInfo {
         self.info()
@@ -865,7 +934,9 @@ impl KvBackend for TidehunterBackend {
         let Some(monitor) = db.read_evidence_monitor() else {
             return serde_json::json!({"available": true, "coordinator": coordinator,
                 "owner_executor": {"available": false, "error": "read evidence monitor unavailable"},
-                "client_resident": {"available": false, "error": "read evidence monitor unavailable"}});
+                "client_resident": {"available": false, "error": "read evidence monitor unavailable"},
+                "client_resident_lanes": {"available": false, "error": "read evidence monitor unavailable"},
+                "owner_grants": {"available": false, "error": "read evidence monitor unavailable"}});
         };
         let owners = match monitor.sample_owner_read_io() {
             Ok(rows) => partition_snapshot(rows, &self.endpoints),
@@ -875,8 +946,350 @@ impl KvBackend for TidehunterBackend {
             Ok(rows) => partition_snapshot(rows, &self.endpoints),
             Err(error) => serde_json::json!({"available": false, "error": error.to_string()}),
         };
+        let resident_lanes = match monitor.sample_resident_read_lane_snapshots() {
+            Ok(rows) => lane_snapshot(
+                rows.into_iter()
+                    .map(|row| {
+                        (
+                            row.partition,
+                            row.lane,
+                            serde_json::json!({
+                                "session_present": row.session_present, "stats": row.stats
+                            }),
+                        )
+                    })
+                    .collect(),
+                &self.endpoints,
+            ),
+            Err(error) => serde_json::json!({"available": false, "error": error.to_string()}),
+        };
+        let owner_grants = match monitor.sample_owner_grants() {
+            Ok(rows) => partition_snapshot(rows, &self.endpoints),
+            Err(error) => serde_json::json!({"available": false, "error": error.to_string()}),
+        };
         serde_json::json!({"available": true, "coordinator": coordinator,
-            "owner_executor": owners, "client_resident": residents})
+            "owner_executor": owners, "client_resident": residents,
+            "client_resident_lanes": resident_lanes, "owner_grants": owner_grants})
+    }
+
+    fn arm_read_profile(&self, limit: usize) -> BackendResult<()> {
+        if limit > 65_536 {
+            return Err("read profile limit exceeds 65536".into());
+        }
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("backend is shutting down"))?;
+        db.set_read_profile_limit(limit as u64);
+        Ok(())
+    }
+
+    async fn finish_read_profile(&self) -> BackendResult<serde_json::Value> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("backend is shutting down"))?;
+        let mut counters = BTreeMap::new();
+        db.visit_timing_metrics(|name, value| {
+            if name.starts_with("read_profile_") {
+                counters.insert(name.to_owned(), value);
+            }
+        });
+        let mut partition_counters: BTreeMap<u32, BTreeMap<String, u64>> = BTreeMap::new();
+        db.visit_read_profile_partitions(|partition, name, value| {
+            partition_counters
+                .entry(partition)
+                .or_default()
+                .insert(name.to_owned(), value);
+        });
+        let resolution = db.coordinator_resolution_snapshot().map(|snapshot| {
+            macro_rules! stage {
+                ($name:ident) => {{
+                    let value = &snapshot.$name;
+                    serde_json::json!({
+                        "available": value.count > 0,
+                        "sum_ns": (value.count > 0).then_some(value.sum_ns),
+                        "count": value.count,
+                        "max_ns": (value.count > 0).then_some(value.max_ns),
+                        "unavailable_reason": if value.count > 0 { None } else { Some("no observations for this stage") }
+                    })
+                }};
+            }
+            serde_json::json!({
+                "selection_policy": "independent first N point and bulk API resolution attempts; not the remote-flight prefix",
+                "selected": snapshot.selected,
+                "point": snapshot.point,
+                "bulk": snapshot.bulk,
+                "errors": snapshot.errors,
+                "logical_members": snapshot.logical_members,
+                "cache_hits": snapshot.cache_hits,
+                "index_misses": snapshot.index_misses,
+                "remote_misses": snapshot.remote_misses,
+                "member_errors": snapshot.member_errors,
+                "stages": {
+                    "index_lock_wait": stage!(index_lock_wait),
+                    "index_lookup": stage!(index_lookup),
+                    "cache_lock_wait": stage!(cache_lock_wait),
+                    "cache_lookup": stage!(cache_lookup),
+                    "cut_validation": stage!(cut_validation),
+                    "cut_capture": stage!(cut_capture),
+                    "route_preparation": stage!(route_preparation),
+                    "pin_preparation": stage!(pin_preparation),
+                    "batch_preparation": stage!(batch_preparation)
+                }
+            })
+        });
+        // Disable before any later qualification, even when evidence is incomplete.
+        db.set_read_profile_limit(0);
+        let get = |name: &str| counters.get(name).copied().unwrap_or(0);
+        let selected = get("read_profile_selected");
+        let completed = get("read_profile_completed");
+        let owner_responses = get("read_profile_server_response_recheck_samples");
+        let coverage_reason = if selected == 0 {
+            "no remote read requests selected (reads may have resolved locally or workload contained no reads)"
+        } else if owner_responses == 0 {
+            "no selected owner responses supplied timing"
+        } else {
+            "owner timing covers selected successful responses and error responses with retained profiles; other failures have no owner timing"
+        };
+        let errors = get("read_profile_errors");
+        let finalization_error = if selected != completed || errors != 0 {
+            Some(format!(
+                "incomplete read profile: {completed}/{selected} selected requests completed; {errors} selected requests failed or lacked a profile"
+            ))
+        } else {
+            None
+        };
+        let make_stages = |counters: &BTreeMap<String, u64>,
+                           owner_only: bool,
+                           coverage_reason: &str| {
+            let get = |name: &str| counters.get(name).copied().unwrap_or(0);
+            let owner_responses = get("read_profile_server_response_recheck_samples");
+            let mut stages = serde_json::Map::new();
+            for (name, sum, count, max) in [
+                (
+                    "server_planning",
+                    "read_profile_server_planning_ns",
+                    "read_profile_server_planning_count",
+                    Some("read_profile_server_planning_max_ns"),
+                ),
+                (
+                    "server_executor_residence",
+                    "read_profile_server_executor_residence_ns",
+                    "read_profile_server_executor_residence_count",
+                    Some("read_profile_server_executor_residence_max_ns"),
+                ),
+                (
+                    "server_cache_resolution",
+                    "read_profile_server_cache_resolution_ns",
+                    "read_profile_server_cache_resolution_count",
+                    Some("read_profile_server_cache_resolution_max_ns"),
+                ),
+                (
+                    "server_nowait",
+                    "read_profile_server_nowait_ns",
+                    "read_profile_server_nowait_count",
+                    Some("read_profile_server_nowait_max_ns"),
+                ),
+                (
+                    "server_async",
+                    "read_profile_server_async_ns",
+                    "read_profile_server_async_count",
+                    Some("read_profile_server_async_max_ns"),
+                ),
+                (
+                    "server_response_ready",
+                    "read_profile_server_response_ready_ns",
+                    "read_profile_server_response_ready_count",
+                    Some("read_profile_server_response_ready_max_ns"),
+                ),
+                (
+                    "server_grant_lookup",
+                    "read_profile_server_grant_lookup_ns",
+                    "read_profile_server_grant_lookup_count",
+                    Some("read_profile_server_grant_lookup_max_ns"),
+                ),
+                (
+                    "server_grant_reservation",
+                    "read_profile_server_grant_reservation_ns",
+                    "read_profile_server_grant_reservation_count",
+                    Some("read_profile_server_grant_reservation_max_ns"),
+                ),
+                (
+                    "server_grant_envelope",
+                    "read_profile_server_grant_envelope_ns",
+                    "read_profile_server_grant_envelope_count",
+                    Some("read_profile_server_grant_envelope_max_ns"),
+                ),
+                (
+                    "server_grant_registration",
+                    "read_profile_server_grant_registration_ns",
+                    "read_profile_server_grant_registration_count",
+                    Some("read_profile_server_grant_registration_max_ns"),
+                ),
+                (
+                    "server_grant_recheck_publication",
+                    "read_profile_server_grant_recheck_publication_ns",
+                    "read_profile_server_grant_recheck_publication_count",
+                    Some("read_profile_server_grant_recheck_publication_max_ns"),
+                ),
+                (
+                    "client_grant_install",
+                    "read_profile_client_grant_install_ns",
+                    "read_profile_client_grant_install_count",
+                    Some("read_profile_client_grant_install_max_ns"),
+                ),
+                (
+                    "client_fi_read",
+                    "read_profile_client_fi_read_ns",
+                    "read_profile_client_fi_read_count",
+                    Some("read_profile_client_fi_read_max_ns"),
+                ),
+                (
+                    "actor_queue",
+                    "read_profile_actor_queue_ns",
+                    "read_profile_actor_timed_success_count",
+                    None,
+                ),
+                (
+                    "actor_service",
+                    "read_profile_actor_service_ns",
+                    "read_profile_actor_timed_success_count",
+                    None,
+                ),
+                (
+                    "inline",
+                    "read_profile_inline_ns",
+                    "read_profile_inline_completed",
+                    None,
+                ),
+                (
+                    "request_encode",
+                    "read_profile_request_encode_ns",
+                    "read_profile_request_encode_count",
+                    None,
+                ),
+                (
+                    "exchange",
+                    "read_profile_exchange_ns",
+                    "read_profile_exchange_count",
+                    None,
+                ),
+                (
+                    "response_decode",
+                    "read_profile_response_decode_ns",
+                    "read_profile_response_decode_count",
+                    None,
+                ),
+                (
+                    "record_verify",
+                    "read_profile_record_verify_ns",
+                    "read_profile_record_verify_count",
+                    None,
+                ),
+                (
+                    "server_handler",
+                    "read_profile_server_handler_ns",
+                    "read_profile_server_response_recheck_samples",
+                    None,
+                ),
+                (
+                    "server_authority_lookup",
+                    "read_profile_server_authority_lookup_ns",
+                    "read_profile_server_response_recheck_samples",
+                    None,
+                ),
+                (
+                    "server_response_recheck_wait",
+                    "read_profile_server_response_recheck_wait_ns",
+                    "read_profile_server_response_recheck_samples",
+                    None,
+                ),
+                (
+                    "server_response_recheck",
+                    "read_profile_server_response_recheck_ns",
+                    "read_profile_server_response_recheck_samples",
+                    None,
+                ),
+                (
+                    "server_record_read",
+                    "read_profile_server_record_read_ns",
+                    "read_profile_server_response_recheck_samples",
+                    None,
+                ),
+                (
+                    "transport_output_queue",
+                    "read_profile_transport_output_queue_ns",
+                    "read_profile_transport_output_queue_samples",
+                    None,
+                ),
+                (
+                    "transport_output_submit",
+                    "read_profile_transport_output_submit_ns",
+                    "read_profile_transport_output_submit_samples",
+                    None,
+                ),
+                (
+                    "transport_output_retire",
+                    "read_profile_transport_output_retire_ns",
+                    "read_profile_transport_output_retire_samples",
+                    None,
+                ),
+                (
+                    "transport_cq_call",
+                    "read_profile_transport_cq_call_ns",
+                    "read_profile_transport_cq_timed_calls",
+                    None,
+                ),
+            ] {
+                if owner_only && !name.starts_with("server_") && !name.starts_with("client_") {
+                    continue;
+                }
+                let n = get(count);
+                let available = n > 0 && counters.contains_key(sum);
+                stages.insert(name.to_owned(), serde_json::json!({
+                "available": available,
+                "sum_ns": if available { Some(get(sum)) } else { None },
+                "count": n,
+                "max_ns": if available { max.and_then(|key| counters.get(key).copied()) } else { None },
+                "unavailable_reason": if available { None } else { Some(if owner_responses == 0 { coverage_reason } else { "no observations for this stage" }) }
+            }));
+            }
+            stages
+        };
+        let stages = make_stages(&counters, false, coverage_reason);
+        let owners: BTreeMap<String, serde_json::Value> = partition_counters
+            .into_iter()
+            .map(|(partition, counters)| {
+                let stages = make_stages(
+                    &counters,
+                    true,
+                    "no profiled owner responses for this partition",
+                );
+                (
+                    partition.to_string(),
+                    serde_json::json!({"stages": stages, "counters": counters}),
+                )
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "runtime_enabled": get("read_profile_enabled") == 1,
+            "runtime_limit": get("read_profile_limit"),
+            "runtime_observation_mode": "bounded_remote_read_requests",
+            "selection_policy": "first N newly admitted remote physical flights (scalar caller-owned, grouped caller-owned or actor); includes failures, excludes coordinator cache hits, index misses and coalesced followers",
+            "grouped_inline_scope": "admission origin, not exclusive caller execution: flights can be handed to the actor after cancellation or the bounded empty-progress burst; inline_ns measures submission to completion and can include actor takeover",
+            "selected_operations": selected,
+            "completed_operations": completed,
+            "coverage": {"selected_remote_requests": selected, "completed_remote_requests": completed, "profiled_owner_responses": owner_responses, "reason": coverage_reason},
+            "stages": stages,
+            "owners": owners,
+            "coordinator_resolution": resolution,
+            "counters": counters,
+            "clock_scope": "local monotonic elapsed clocks in coordinator, transport and owner; async starts during SQE preparation before kernel acceptance and ends at CQE observation, including submission retry and progress, not physical device latency; transport CQ call is local provider-call wall time, not wire latency; grant registration times actual provider calls, not proof of hardware pinning",
+            "overlap_semantics": "API-resolution and remote-flight prefixes are independently selected; stage scopes overlap and may be nested; sums and percentiles are not additive; host timestamps are not subtracted; global and partition snapshots are sequential rather than globally atomic",
+            "unsupported_stages": ["physical_device_io", "wire_latency", "per_stage_percentiles", "per_response_owner_response_codec", "per_response_owner_response_output"],
+            "finalization_error": finalization_error
+        }))
     }
 
     fn arm_write_profile(&self, limit: usize) -> BackendResult<()> {
@@ -1025,8 +1438,7 @@ impl KvBackend for TidehunterBackend {
             .db
             .as_ref()
             .ok_or_else(|| std::io::Error::other("backend is shutting down"))?;
-        let keys: Vec<Vec<u8>> = keys.iter().map(|key| key.to_vec()).collect();
-        db.multi_get(self.keyspace, &keys)
+        db.multi_get(self.keyspace, keys)
             .into_iter()
             .map(|result| result.map_err(native_error))
             .collect()
@@ -1125,6 +1537,61 @@ mod tests {
         let sample = partition_snapshot(vec![(8, 4), (3, 2)], &endpoints);
         assert_eq!(sample["partitions"]["3"], 2);
         assert_eq!(sample["partitions"]["8"], 4);
+    }
+
+    #[test]
+    fn external_coordinator_cache_requires_explicit_adequate_allowance() {
+        let root = std::env::temp_dir().join(format!(
+            "kv-external-cache-budget-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir(&root).unwrap();
+        let input = root.join("input.json");
+        let mut config = serde_json::json!({
+            "guest_root": root.join("guest"),
+            "addresses": (0..5).map(|i| format!("127.0.0.1:{}", 44000 + i)).collect::<Vec<_>>(),
+            "transport": {"kind": "tcp"},
+            "max_batches_per_partition": 16384, "max_admitted_batches": 16384,
+            "max_index_bytes": 512 * 1024 * 1024,
+            "coordinator_cache_bytes": 1024_u64 * 1024 * 1024,
+            "owner_read_workers": 4, "owner_wal_member_read": "async",
+            "owner_read_cache_bytes": 0, "owner_read_memory_allowance_bytes": 256 * 1024 * 1024,
+            "owner_read_resident_first": false,
+            "resident_reads": {"source_bytes": 0, "source_regions": 0, "destination_bytes": 0,
+                "destination_slots": 0, "max_read_bytes": 0, "max_handles": 0, "require_device_read": false},
+            "polling": "adaptive"
+        });
+        let write_input = |value: &serde_json::Value| {
+            fs::write(&input, serde_json::to_vec(value).unwrap()).unwrap();
+        };
+        let default_input: ExternalPreparationInput =
+            serde_json::from_value(config.clone()).unwrap();
+        assert_eq!(
+            default_input.coordinator_read_memory_allowance_bytes,
+            512 * 1024 * 1024
+        );
+        write_input(&config);
+        assert!(prepare_external_case_file(&input, &root.join("default-large")).is_err());
+        config["coordinator_read_memory_allowance_bytes"] =
+            serde_json::json!(1024_u64 * 1024 * 1024);
+        write_input(&config);
+        assert!(prepare_external_case_file(&input, &root.join("insufficient")).is_err());
+        config["coordinator_cache_bytes"] = serde_json::json!(usize::MAX);
+        config["coordinator_read_memory_allowance_bytes"] = serde_json::json!(usize::MAX);
+        write_input(&config);
+        assert!(prepare_external_case_file(&input, &root.join("overflow")).is_err());
+        config["coordinator_cache_bytes"] = serde_json::json!(1024_u64 * 1024 * 1024);
+        let allowance = 1024_u64 * 1024 * 1024 + 64 * 1024 * 1024;
+        config["coordinator_read_memory_allowance_bytes"] = serde_json::json!(allowance);
+        write_input(&config);
+        let output = root.join("explicit");
+        prepare_external_case_file(&input, &output).unwrap();
+        let remote: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("remote.json")).unwrap()).unwrap();
+        assert_eq!(remote["read_cache_bytes"], 1024_u64 * 1024 * 1024);
+        assert_eq!(remote["read_memory_allowance_bytes"], allowance);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

@@ -13,6 +13,14 @@ replay. The campaign observer is cohosted, not an independent measured host.
 Credential-free comparison CI does not activate the protected AWS campaign.
 One shared laptop SSD is not independent-NVMe or EFA evidence.
 
+**Remote-read latency plan, 29 October 2026:**
+[Measured budgets, source map and ordered implementation work](REMOTE_READ_LATENCY_AND_TRANSPORT_PLAN_2026-10-29.md)
+separate EFA progress from owner actions and retain the historical measurement limits.
+The [implemented read diagnostics](../../benchmarks/kv-research/ADAPTERS.md#measurement-phase-read-diagnostics)
+now export bounded owner WAL timing, per-partition attribution and explicit cache/RMA
+availability. The [completed cloud comparison report](../research/supervisor-report-2026-10-29/main.pdf)
+remains the measured hardware baseline; the new diagnostic work is local only.
+
 **Dependency-aware sparse publication, 28 October 2026:** Durable, disjoint
 batches may become visible before an earlier incomplete batch; conflicting native
 reduced-key dependencies still wait. A contiguous stable prefix remains the

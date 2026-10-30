@@ -39,7 +39,8 @@
   },
   "measurement_completion_gate": null,
   "diagnostics": {
-    "write_profile_limit": 0
+    "write_profile_limit": 0,
+    "read_profile_limit": 0
   },
   "qualification_only": false,
   "source_revision": null,

@@ -58,6 +58,44 @@ fn regular_efa_rma_is_rejected_instead_of_promoted_to_direct() {
 
 #[test]
 #[ignore = "requires libfabric tcp;ofi_rxm and local network permission"]
+fn software_provider_source_byte_budget_tracks_registration_and_retirement() -> io::Result<()> {
+    let config = RmaConfig {
+        source_bytes: 10,
+        source_region_slots: 3,
+        destination_bytes: 0,
+        destination_slots: 0,
+        max_read_bytes: 10,
+        require_device_read: false,
+    };
+    let mut source = Endpoint::open(&software_config(Some("lo")), Some(config))?;
+    let mut peer = Endpoint::open(&software_config(Some("lo")), Some(config))?;
+    source.set_peer(&peer.address()?)?;
+    peer.set_peer(&source.address()?)?;
+    let first = source.reserve_read_region(44, 1)?;
+    let middle = source.reserve_read_region(44, 2)?;
+    let last = source.reserve_read_region(44, 3)?;
+    // Register out of reservation order to exercise both the appended fast path
+    // and the full identity lookup for an older reservation.
+    source.register_read_region(&last, vec![3; 6])?;
+    source.register_read_region(&first, vec![1; 4])?;
+    assert!(matches!(
+        source.register_read_region(&middle, vec![2; 1]),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    // No descriptor was sent to the peer, so this retirement is unpublished.
+    unsafe { source.retire_unpublished_read_region(first)? };
+    source.register_read_region(&middle, vec![2; 4])?;
+    assert!(matches!(
+        source.register_read_region(&middle, vec![9; 1]),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput
+    ));
+    unsafe { source.retire_unpublished_read_region(last)? };
+    unsafe { source.retire_unpublished_read_region(middle)? };
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm and local network permission"]
 #[allow(
     clippy::too_many_lines,
     reason = "Exercise one registered grant through CQ mixing, retained ownership, cancellation and reuse."

@@ -554,6 +554,121 @@ fn enabled_destination() -> ResidentReadConfig {
 #[cfg(feature = "experimental-fabric")]
 #[test]
 #[ignore = "requires libfabric tcp;ofi_rxm software provider"]
+fn software_provider_one_session_can_use_node_source_budget() {
+    let source = ResidentReadConfig {
+        source_bytes: 40 * 4096,
+        source_regions: 40,
+        ..enabled_source()
+    };
+    let destination = ResidentReadConfig {
+        max_handles: 40,
+        ..enabled_destination()
+    };
+    let fixture = ResidentFixture::new(source, destination);
+    let mut client = fixture.client();
+    client.fence_to(1).unwrap();
+    for sequence in 1..=35 {
+        let (batch, reference) = fixture.publish(&mut client, sequence);
+        assert_eq!(
+            client.read_records(1, &[reference]).unwrap(),
+            vec![batch.mutations()[0].clone()]
+        );
+    }
+    assert_eq!(client.resident_read_stats().grant_acquisitions, 35);
+    assert_eq!(fixture.node.resident_grants.live_stats().1, 35);
+    client.revoke_resident_grants().unwrap();
+    client.fence_to(2).unwrap();
+}
+
+#[cfg(feature = "experimental-fabric")]
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm software provider"]
+fn software_provider_partial_grant_does_not_hide_message_authority_error() {
+    let fixture = ResidentFixture::new(enabled_source(), enabled_destination());
+    let mut client = fixture.client();
+    client.fence_to(1).unwrap();
+    let (_, first) = fixture.publish(&mut client, 41);
+    let (_, mut invalid) = fixture.publish(&mut client, 42);
+    client.read_records(1, &[first]).unwrap();
+    invalid.batch_digest.0[0] ^= 1;
+    let before = client.resident_read_stats();
+    let error = client
+        .read_records_profiled(1, &[invalid, first])
+        .unwrap_err();
+    let profile = error.read_profile.expect("sampled mixed failure profile");
+    assert_eq!(profile.exchange_count, 1);
+    assert_eq!(profile.client_fi_read.count, 1);
+    assert!(profile.exchange_ns >= profile.client_fi_read.ns);
+    assert!(profile.server_handler_available);
+    let after = client.resident_read_stats();
+    assert_eq!(after.rma_completions - before.rma_completions, 1);
+    assert!(after.message_read_requests > before.message_read_requests);
+    client.revoke_resident_grants().unwrap();
+    client.fence_to(2).unwrap();
+}
+
+#[cfg(feature = "experimental-fabric")]
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm software provider"]
+fn software_provider_partial_grants_merge_duplicate_references_in_order() {
+    let fixture = ResidentFixture::new(enabled_source(), enabled_destination());
+    let mut client = fixture.client();
+    client.fence_to(1).unwrap();
+    let (first, first_ref) = fixture.publish(&mut client, 31);
+    let (second, second_ref) = fixture.publish(&mut client, 32);
+    let first_value = first.mutations()[0].clone();
+    let second_value = second.mutations()[0].clone();
+    assert_eq!(
+        client.read_records(1, &[first_ref]).unwrap(),
+        vec![first_value.clone()]
+    );
+    let before = client.resident_read_stats();
+    assert_eq!(before.grant_acquisitions, 1);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let id = client
+        .submit_read(
+            1,
+            vec![second_ref, first_ref, second_ref, first_ref],
+            deadline,
+            ReadClass::Point,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(client.resident_read_stats().message_read_requests > before.message_read_requests);
+    assert!(client.revoke_resident_grants().is_err());
+    let values = loop {
+        if let Some(completion) = client
+            .progress_reads()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == id)
+        {
+            break completion.result.unwrap().0;
+        }
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    };
+    assert_eq!(
+        values,
+        vec![
+            second_value.clone(),
+            first_value.clone(),
+            second_value,
+            first_value
+        ]
+    );
+    let after = client.resident_read_stats();
+    assert_eq!(after.rma_posts - before.rma_posts, 2);
+    assert_eq!(after.rma_completions - before.rma_completions, 2);
+    assert!(after.message_read_requests > before.message_read_requests);
+    client.revoke_resident_grants().unwrap();
+    client.fence_to(2).unwrap();
+}
+
+#[cfg(feature = "experimental-fabric")]
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm software provider"]
 fn software_provider_durable_grant_reads_real_member_without_read_rpc() {
     let fixture = ResidentFixture::new(enabled_source(), enabled_destination());
     let mut client = fixture.client();
@@ -565,6 +680,12 @@ fn software_provider_durable_grant_reads_real_member_without_read_rpc() {
     let (values, profile) = client.read_records_profiled(1, &[reference]).unwrap();
     assert_eq!(values, vec![expected.clone()]);
     assert!(profile.server_handler_ns > 0 && profile.server_record_read_ns > 0);
+    assert_eq!(profile.server_grant.lookup.count, 1);
+    assert_eq!(profile.server_grant.reservation.count, 1);
+    assert_eq!(profile.server_grant.envelope.count, 1);
+    assert_eq!(profile.server_grant.registration.count, 1);
+    assert_eq!(profile.server_grant.registration.errors, 0);
+    assert_eq!(profile.server_grant.recheck_publication.count, 1);
     assert_eq!(profile.server_response_recheck_samples, profile.requests);
     let before = client.resident_read_stats();
     assert_eq!(before.grant_acquisitions, 1);
@@ -600,6 +721,8 @@ fn software_provider_durable_grant_reads_real_member_without_read_rpc() {
     assert_eq!(profile.server_response_recheck_samples, 0);
     assert_eq!(profile.server_handler_ns, 0);
     assert_eq!(profile.server_record_read_ns, 0);
+    assert_eq!(profile.client_fi_read.count, 1);
+    assert_eq!(profile.client_fi_read.errors, 0);
     let after = client.resident_read_stats();
     assert_eq!(after.rma_posts - before.rma_posts, 1);
     assert_eq!(after.rma_completions - before.rma_completions, 1);
@@ -836,6 +959,11 @@ fn software_provider_source_and_destination_limits_preserve_rpc_values() {
     assert!(source_stats.message_read_requests > rpc_before);
     assert_eq!(source_stats.rma_hits, 0);
     assert!(source_stats.fallback_missing > 0);
+    let owner_stats = client.resident_grant_stats().unwrap().unwrap();
+    assert!(owner_stats.attempts >= 2);
+    assert!(owner_stats.denied_bytes >= 2);
+    assert_eq!(owner_stats.issued, 0);
+    assert_eq!(owner_stats.source_regions_live, 0);
 
     client.revoke_resident_grants().unwrap();
     client.fence_to(2).unwrap();
@@ -931,8 +1059,8 @@ fn software_provider_group_above_destination_slots_falls_back_without_reordering
         })
         .collect::<Vec<_>>();
 
-    // A group larger than the configured destination slots cannot be partially
-    // posted. The duplicate position must survive the complete RPC fallback.
+    // Available destinations serve a bounded subset; the rest use RPC.
+    // The duplicate position must survive the merged result.
     let mut request = references.clone();
     request.reverse();
     request.insert(destination_slots, references[destination_slots]);
@@ -964,7 +1092,7 @@ fn software_provider_group_above_destination_slots_falls_back_without_reordering
             false,
         )
         .unwrap()
-        .expect("group beyond destination slots must use a complete RPC read");
+        .expect("group beyond destination slots must be admitted");
     let deadline = Instant::now() + Duration::from_secs(3);
     let completion = loop {
         if let Some(completion) = client
@@ -984,7 +1112,7 @@ fn software_provider_group_above_destination_slots_falls_back_without_reordering
     assert_eq!(completion.result.unwrap().0, expected);
     let stats = client.resident_read_stats();
     assert!(stats.message_read_requests > rpc_before);
-    assert_eq!(stats.rma_posts, 0);
+    assert_eq!(stats.rma_posts, destination_slots as u64);
     assert!(stats.fallback_capacity > 0);
     client.revoke_resident_grants().unwrap();
     client.fence_to(2).unwrap();

@@ -96,6 +96,13 @@ pub struct PhaseConfig {
     pub preload: bool,
     #[serde(default)]
     pub warmup_operations: u64,
+    /// Visit the full unchanged working set during a labelled read-only warm-up.
+    /// Measurement continues to use the configured random key distribution.
+    #[serde(default)]
+    pub warmup_key_sweep: bool,
+    /// Visit distinct keys during measurement, without wrapping or changing normal workloads.
+    #[serde(default)]
+    pub measurement_key_sweep: bool,
     #[serde(default)]
     pub aging_operations: u64,
     /// Zero is allowed only when `qualification_only` is true.
@@ -148,6 +155,9 @@ pub struct DiagnosticsConfig {
     /// Maximum write operations to sample in the measured phase. Zero disables profiling.
     #[serde(default)]
     pub write_profile_limit: usize,
+    /// Maximum remote read requests to sample in the measured phase. Zero disables profiling.
+    #[serde(default)]
+    pub read_profile_limit: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -234,6 +244,12 @@ impl RunConfig {
         if self.diagnostics.write_profile_limit > 65_536 {
             return invalid("diagnostics.write_profile_limit must not exceed 65536");
         }
+        if self.diagnostics.read_profile_limit > 65_536 {
+            return invalid("diagnostics.read_profile_limit must not exceed 65536");
+        }
+        if self.diagnostics.read_profile_limit > 0 && self.backend.kind != "tidehunter" {
+            return invalid("diagnostics.read_profile_limit is only supported by tidehunter");
+        }
         if self.schema_version != 1 {
             return invalid("schema_version must be 1");
         }
@@ -317,6 +333,57 @@ impl RunConfig {
             && (!exponent.is_finite() || !(0.0..=2.0).contains(exponent) || *exponent == 0.0)
         {
             return invalid("Zipf exponent must be finite and in (0, 2]");
+        }
+        if self.phases.warmup_key_sweep {
+            let only_reads = self.workload.mix.put == 0
+                && self.workload.mix.delete == 0
+                && self.workload.mix.missing_read == 0
+                && self.workload.mix.put_batch == 0;
+            let keys_per_operation = if self.workload.mix.read > 0 {
+                1
+            } else {
+                self.workload.batch_size as u64
+            };
+            if self.qualification_only
+                || !self.phases.preload
+                || !only_reads
+                || self.execution.mode != ExecutionMode::ClosedLoop
+                || self
+                    .phases
+                    .warmup_operations
+                    .checked_mul(keys_per_operation)
+                    .is_none_or(|keys| keys < self.dataset.keys)
+            {
+                return invalid(
+                    "warmup_key_sweep requires a preloaded closed-loop read-only run and enough warm-up operations to visit every key",
+                );
+            }
+        }
+        if self.phases.measurement_key_sweep {
+            let only_reads = self.workload.mix.put == 0
+                && self.workload.mix.delete == 0
+                && self.workload.mix.missing_read == 0
+                && self.workload.mix.put_batch == 0;
+            // A mixed scalar/batch workload can select a full batch on every call.
+            let keys_per_operation = if self.workload.mix.get_many > 0 {
+                self.workload.batch_size as u64
+            } else {
+                1
+            };
+            if self.qualification_only
+                || !self.phases.preload
+                || !only_reads
+                || self.execution.mode != ExecutionMode::ClosedLoop
+                || self
+                    .phases
+                    .measurement_operations
+                    .checked_mul(keys_per_operation)
+                    .is_none_or(|keys| keys > self.dataset.keys)
+            {
+                return invalid(
+                    "measurement_key_sweep requires a preloaded closed-loop read-only run and no more measurement keys than the dataset",
+                );
+            }
         }
         if self.execution.request_timeout_ms == 0 || self.execution.request_timeout_ms > 300_000 {
             return invalid("execution.request_timeout_ms must be between 1 and 300000");
@@ -428,6 +495,8 @@ mod tests {
             phases: PhaseConfig {
                 preload: true,
                 warmup_operations: 1,
+                warmup_key_sweep: false,
+                measurement_key_sweep: false,
                 aging_operations: 0,
                 measurement_operations: 2,
             },
@@ -452,6 +521,52 @@ mod tests {
         let mut too_few = config();
         too_few.limits.max_operations = 102;
         assert!(too_few.validate().is_err());
+    }
+
+    #[test]
+    fn warmup_sweep_rejects_partial_or_mutating_working_sets() {
+        let mut config = config();
+        config.phases.warmup_key_sweep = true;
+        assert!(config.validate().is_err());
+        config.phases.warmup_operations = config.dataset.keys;
+        config.limits.max_operations = 1000;
+        assert!(config.validate().is_ok());
+        config.workload.mix.put = 1;
+        assert!(config.validate().is_err());
+        config.workload.mix.put = 0;
+        config.phases.preload = false;
+        assert!(config.validate().is_err());
+        config.phases.preload = true;
+        config.workload.mix.read = 0;
+        config.workload.mix.get_many = 1;
+        config.phases.warmup_operations = config.dataset.keys.div_ceil(32);
+        assert!(config.validate().is_ok());
+        config.phases.warmup_operations -= 1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn measurement_sweep_rejects_wrap_mutation_and_nonclosed_loop() {
+        let mut config = config();
+        config.phases.measurement_key_sweep = true;
+        assert!(config.validate().is_ok());
+        config.phases.measurement_operations = config.dataset.keys + 1;
+        config.limits.max_operations = 1000;
+        assert!(config.validate().is_err());
+        config.phases.measurement_operations = 2;
+        config.workload.mix.get_many = 1;
+        config.workload.batch_size = 64;
+        assert!(config.validate().is_err());
+        config.workload.batch_size = 32;
+        assert!(config.validate().is_ok());
+        config.workload.mix.put = 1;
+        assert!(config.validate().is_err());
+        config.workload.mix.put = 0;
+        config.phases.preload = false;
+        assert!(config.validate().is_err());
+        config.phases.preload = true;
+        config.execution.mode = ExecutionMode::OpenLoop;
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -542,6 +657,26 @@ mod tests {
         config.backend.options["external_remote_config"]["storage"]["batch_limits"]["max_operations"] =
             serde_json::json!(1);
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn read_profile_is_bounded_and_requires_distributed_tidehunter() {
+        let mut config = config();
+        assert_eq!(config.diagnostics.read_profile_limit, 0);
+        config.diagnostics.read_profile_limit = 1;
+        assert!(config.validate().is_err());
+        config.backend.kind = "tidehunter".to_owned();
+        assert!(config.validate().is_ok());
+        config.diagnostics.read_profile_limit = 65_536;
+        assert!(config.validate().is_ok());
+        config.diagnostics.read_profile_limit = 65_537;
+        assert!(config.validate().is_err());
+        assert_eq!(
+            serde_json::from_str::<DiagnosticsConfig>(r#"{"write_profile_limit":0}"#)
+                .unwrap()
+                .read_profile_limit,
+            0
+        );
     }
 
     #[test]
