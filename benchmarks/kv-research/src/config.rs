@@ -225,10 +225,10 @@ impl RunConfig {
                 && (!gate.ready_file.is_absolute()
                     || !gate.release_file.is_absolute()
                     || gate.ready_file == gate.release_file
-                    || !(1..=120).contains(&gate.timeout_seconds))
+                    || !(1..=300).contains(&gate.timeout_seconds))
             {
                 return invalid(&format!(
-                    "{name} requires distinct absolute marker paths and timeout_seconds between 1 and 120"
+                    "{name} requires distinct absolute marker paths and timeout_seconds between 1 and 300"
                 ));
             }
         }
@@ -701,9 +701,33 @@ mod tests {
             .unwrap()
             .release_file = PathBuf::from("/tmp/kv-completion-release");
         assert!(config.validate().is_ok());
-        config.measurement_gate.as_mut().unwrap().timeout_seconds = 121;
-        assert!(config.validate().is_err());
-        config.measurement_gate.as_mut().unwrap().timeout_seconds = 60;
+        for gate in [
+            config.measurement_gate.as_mut().unwrap(),
+            config.measurement_completion_gate.as_mut().unwrap(),
+        ] {
+            gate.timeout_seconds = 240;
+        }
+        assert!(config.validate().is_ok());
+        for completion in [false, true] {
+            for invalid in [0, 301] {
+                let gate = if completion {
+                    config.measurement_completion_gate.as_mut().unwrap()
+                } else {
+                    config.measurement_gate.as_mut().unwrap()
+                };
+                gate.timeout_seconds = invalid;
+                assert!(config.validate().is_err());
+            }
+            if completion {
+                config
+                    .measurement_completion_gate
+                    .as_mut()
+                    .unwrap()
+                    .timeout_seconds = 240;
+            } else {
+                config.measurement_gate.as_mut().unwrap().timeout_seconds = 240;
+            }
+        }
         config
             .measurement_completion_gate
             .as_mut()

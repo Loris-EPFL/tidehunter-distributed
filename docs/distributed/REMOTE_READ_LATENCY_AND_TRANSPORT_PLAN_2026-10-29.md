@@ -1062,3 +1062,51 @@ Valkey AOF-always controls. Preserve value, recovery, ordering and ownership
 checks. Success is a repeatable reduction in the targeted stage and end-to-end
 p50/p99 without regressions in correctness; no few-microsecond cold-NVMe or
 native-parity target follows from the cited papers.
+
+### 17.9 Local qualification before the next hardware campaign
+
+The rebuilt all-adapter executable passed 18,432 actual measured API calls:
+8,192 warm-WAL scalar reads, 2,048 C16 batches of 32 x 8 KiB owner-cache reads,
+and 8,192 software-provider registered-memory reads. Every returned value was
+validated and all fifteen owner processes exited cleanly. The software
+registered cohort recorded 8,192 posts/completions, zero message reads,
+zero missing-grant fallbacks and zero RMA errors; this is not hardware EFA proof.
+
+The retained 8,192-key loopback warm-WAL comparison, with application value
+caches disabled, observed:
+
+| Observation | Frozen before | Rebuilt after |
+|---|---:|---:|
+| Measurement authority history loads | 2,677 | 0 |
+| Selected planning mean, microseconds | 12.632 | 0.660 |
+| API p50, microseconds | 26.107 | 12.909 |
+| API p99, microseconds | 93.771 | 56.900 |
+
+Each case has one repetition and 8,192 calls; stage profiling selects 256
+flights. These are descriptive shared-SSD loopback observations, not a
+cluster forecast or statistical-significance result. The old executable had
+fewer benchmark adapter features; the engine fabric feature is the same.
+Do not claim that this comparison isolates every binary-layout effect.
+
+Strict engine/fabric lint passed. Distributed tests: 862 passed, 7 ignored;
+fabric engine: 864 passed, 45 ignored; fabric library: 51 passed, 2 ignored;
+all-adapter benchmark crate: 55 passed; comparison Python: 324 passed;
+observation Python: 92 passed. Software transport/engine checks ran, including
+an actual raw-RMA software probe. Its final Python check initially used the
+system interpreter without boto3; the fresh probe and all 20 checks then
+passed with the prepared project interpreter. Hardware tests remain ignored.
+
+The focused cloud mode selects 196 cases across all nine backends, including
+early native/cold controls, unchanged matched primary comparisons, separate
+write diagnostics and separately named registered-handle-headroom controls.
+No operation/sample count or percentile definition changes. Read-only snapshot
+retries remain bounded; cache eviction and monitor-selection mutations are
+not classified as read-only. The old 120-second gate could not cover a
+60-second tracer operation plus a 110-second snapshot allowance. Cloud gates
+now allow 240 seconds, the CLI cap is 300, and cases allow 600 seconds.
+The absolute three-hour fleet deadline and ten-minute export reserve remain.
+
+Local binaries, raw cases, logs and qualification evidence are under
+`checkpoint-work/local-owner-authority-2026-10-30/`. The new hardware campaign
+must bind and verify its own fresh source/build identities before allocation.
+

@@ -1135,8 +1135,9 @@ processes, and other mutations, are never resent after an ambiguous acceptance.
 The measurement gate is released only after every host has an admitted result.
 The completion snapshot has an overall 110-second budget: up to 60 seconds
 for the first attempt and the remaining time for one retry. The engine's
-120-second completion gate and overall case/campaign deadlines still apply;
-time spent stopping a cold-device tracer also consumes that gate.
+240-second control gates leave room for tracer start/stop and snapshot retries;
+the CLI admits finite gates up to 300 seconds. The case deadline is 600 seconds
+and the absolute campaign deadline remains three hours, including export reserve.
 
 
 For a later approved GitHub run on `bench/aws-efa`, select the existing

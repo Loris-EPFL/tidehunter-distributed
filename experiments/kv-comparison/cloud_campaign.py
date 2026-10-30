@@ -370,9 +370,9 @@ def make_run_config(job, case_root, options, source_revision, deadline_seconds=1
             "aging_operations": 0, "measurement_operations": job["measurement_operations"]},
         "qualification_only": False, "source_revision": source_revision,
         "measurement_gate": {"ready_file": str(case_root / "measurement.ready"),
-            "release_file": str(case_root / "measurement.release"), "timeout_seconds": 120},
+            "release_file": str(case_root / "measurement.release"), "timeout_seconds": 240},
         "measurement_completion_gate": {"ready_file": str(case_root / "measurement.complete"),
-            "release_file": str(case_root / "measurement.observed"), "timeout_seconds": 120},
+            "release_file": str(case_root / "measurement.observed"), "timeout_seconds": 240},
         "limits": {"max_keys": max(job["keys"], 1000000), "max_bytes": 16 * 1024**3,
             "max_operations": maximum, "deadline_seconds": max(deadline_seconds, 600 if job["keys"] > 65536 else deadline_seconds),
             "shutdown_grace_seconds": 20}}
