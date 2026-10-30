@@ -25,7 +25,9 @@ def validate_plan(plan):
     required = {"run_id", "account", "region", "bucket", "bucket_region", "bundle_key",
                 "bundle_sha256", "bundle_bytes", "source_sha256", "binary_sha256",
                 "deadline_utc", "ttl_seconds", "instance_type"}
-    if not isinstance(plan, dict) or set(plan) != required:
+    if (not isinstance(plan, dict) or not required <= set(plan)
+            or set(plan) - required - {"read_tier_trace"}
+            or ("read_tier_trace" in plan and type(plan["read_tier_trace"]) is not bool)):
         raise ValueError("exact bootstrap plan schema required")
     if plan["account"] != "354775971805" or not re.fullmatch(r"th-[a-f0-9]{16}", plan["run_id"]):
         raise ValueError("wrong account or run ID")
@@ -93,6 +95,8 @@ def activation_config(plan, value):
         raise ValueError("ready controller config differs from admitted run/source/binary/account/bucket")
     if config["fleet"]["run_id"] != plan["run_id"] or config["fleet"]["region"] != plan["region"]:
         raise ValueError("ready fleet differs from admitted run/region")
+    if plan.get("read_tier_trace", False) != (config["spec"].get("mode", "standard") == "read-tier"):
+        raise ValueError("read-tier trace preparation differs from admitted campaign mode")
     configured_deadline = datetime.fromisoformat(config["deadline_utc"].replace("Z", "+00:00"))
     planned_deadline = datetime.fromisoformat(plan["deadline_utc"].replace("Z", "+00:00"))
     if configured_deadline != planned_deadline:
@@ -123,6 +127,9 @@ def render_userdata(plan):
         efa = module.efa_install_script(plan)
     finally:
         sys.path.pop(0)
+    trace_install = ("if ! timeout 180 apt-get install -y bpftrace; then "
+                     "echo 'optional bpftrace unavailable; collector will report capability gap' >&2; fi"
+                     if plan.get("read_tier_trace", False) else "")
     capsule = base64.b85encode(lzma.compress(json.dumps({
         "bootstrap": (old / "bootstrap.py").read_text(),
         "install": Path(__file__).read_text(), "plan": plan}).encode())).decode()
@@ -142,6 +149,7 @@ export DEBIAN_FRONTEND=noninteractive
 export PYTHONDONTWRITEBYTECODE=1
 timeout 600 apt-get update -o Acquire::Retries=2
 timeout 900 apt-get install -y python3-boto3 python3-yaml docker.io binutils curl ca-certificates openssl pkg-config libclang-dev rdma-core
+{trace_install}
 systemctl enable --now docker
 {efa}
 if systemctl cat snap.amazon-ssm-agent.amazon-ssm-agent.service >/dev/null 2>&1; then

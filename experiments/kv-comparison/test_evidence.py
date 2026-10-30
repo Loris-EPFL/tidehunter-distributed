@@ -54,6 +54,26 @@ class EvidenceAdmission(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "advertised measurement read evidence"):
                 analyze.verify_binding(root, config, receipt, manifest, summary)
 
+    def test_read_diagnostics_require_exact_receipt_binding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, receipt, manifest, summary = self.binding(root)
+            path = root / "result/read-diagnostics.json"
+            data = {"schema_version": 1, "phase": "measurement"}
+            path.write_text(json.dumps(data))
+            with self.assertRaisesRegex(ValueError, "read diagnostics.*integrity binding"):
+                analyze.verify_binding(root, config, receipt, manifest, summary)
+            receipt["read_diagnostics"] = {"path": "result/read-diagnostics.json",
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "observed": data}
+            analyze.verify_binding(root, config, receipt, manifest, summary)
+            receipt["read_diagnostics"]["observed"] = {"schema_version": 2}
+            with self.assertRaisesRegex(ValueError, "read diagnostics.*integrity binding"):
+                analyze.verify_binding(root, config, receipt, manifest, summary)
+            receipt["read_diagnostics"]["observed"] = data
+            path.write_text('{"schema_version": 2}')
+            with self.assertRaisesRegex(ValueError, "read diagnostics.*integrity binding"):
+                analyze.verify_binding(root, config, receipt, manifest, summary)
+
     def test_result_swap_rejected_even_when_its_artifact_hash_is_updated(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

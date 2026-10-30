@@ -5,11 +5,11 @@
   "value_sizes": [64, 256, 1024, 8192, 65536],
   "backends": ["native", "tidehunter_tcp", "tidehunter_efa", "tidehunter_efa_direct", "tidehunter_efa_native", "tikv", "cassandra", "foundationdb", "valkey_tcp"],
   "keys": 4096,
-  "max_cases": 774,
+  "max_cases": 900,
   "offered_rates": [1000, 10000, 50000],
   "offered_seconds": 8,
   "case_deadline_seconds": 180,
   "hard_deadline_seconds": 10800,
   "export_reserve_seconds": 600,
-  "diagnostics": {"write_profile_limit": 256}
+  "diagnostics": {"write_profile_limit": 256, "read_profile_limit": 256}
 }

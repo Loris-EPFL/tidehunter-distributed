@@ -41,6 +41,18 @@ class ConfigTests(unittest.TestCase):
             with patch.object(ci.core, 'read_json', side_effect=read):
                 return ci.load_config(path, ENV, backend_selection)
 
+    def test_read_tier_mode_uses_the_same_protected_fleet_config(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'cfg.json'
+            ci.core.dump(path, ci.core.read_json(ci.HERE / 'ci-config.json'))
+            standard = ci.load_config(path, ENV)
+            focused = ci.load_config(path, ENV, mode='read-tier')
+        self.assertEqual(focused['spec']['mode'], 'read-tier')
+        self.assertEqual(standard['ttl_seconds'], focused['ttl_seconds'])
+        self.assertEqual(standard['export_reserve_seconds'], focused['export_reserve_seconds'])
+        self.assertEqual(standard['fleet'], focused['fleet'])
+        self.assertEqual(len(ci.cloud_campaign.make_matrix(focused['spec'])), 258)
+
     def test_full_single_and_three_repeat_matrices_are_admitted(self):
         spec = ci.core.read_json(ci.HERE / 'cloud-campaign.json')
         for limit in (0, 256):
@@ -54,6 +66,21 @@ class ConfigTests(unittest.TestCase):
                     self.assertEqual(len(diagnostics), 5 * repeats if limit else 0)
                     self.assertEqual({job['backend'] for job in jobs}, set(ci.cloud_campaign.BACKENDS))
                     self.assertEqual((cfg['ttl_seconds'], cfg['export_reserve_seconds']), (10800, 600))
+
+    def test_default_read_diagnostics_are_explicit_additional_cases(self):
+        spec = ci.core.read_json(ci.HERE / 'cloud-campaign.json')
+        for repeats in (1, 3):
+            cfg = self.config(matrix=spec | {'repeats': repeats})
+            jobs = ci.cloud_campaign.make_matrix(cfg['spec'])
+            self.assertEqual(len(jobs), 297 * repeats)
+            self.assertEqual(sum(job['cohort'] == 'read_stage_diagnostics' for job in jobs),
+                             17 * repeats)
+            self.assertEqual(sum(job['cohort'] == 'write_stage_diagnostics' for job in jobs),
+                             5 * repeats)
+            self.assertEqual(sum(job['cohort'] == 'resident_first_stage_diagnostics' for job in jobs),
+                             20 * repeats)
+            self.assertEqual(sum(job['cohort'] == 'registered_ram_fullset_control' for job in jobs),
+                             2 * repeats)
     def test_explicit_backend_subset_is_frozen_and_resizes_expected_jobs(self):
         spec = ci.core.read_json(ci.HERE / 'cloud-campaign.json')
         selected = self.config(matrix=spec, backend_selection='valkey_tcp')

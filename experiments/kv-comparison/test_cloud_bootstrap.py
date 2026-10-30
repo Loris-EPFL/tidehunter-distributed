@@ -131,6 +131,26 @@ class ActivationStateTests(unittest.TestCase):
         admitted = bootstrap.activation_config(self.plan, ready_fixture(self.plan, config))
         self.assertEqual(admitted["deadline_utc"], config["deadline_utc"])
 
+    def test_read_tier_tool_preparation_is_bound_to_activation(self):
+        config = copy.deepcopy(self.config)
+        config["spec"]["mode"] = "read-tier"
+        with self.assertRaisesRegex(ValueError, "trace preparation"):
+            bootstrap.activation_config(self.plan, ready_fixture(self.plan, config))
+        plan = self.plan | {"read_tier_trace": True}
+        self.assertEqual(bootstrap.activation_config(plan, ready_fixture(plan, config)), config)
+        with self.assertRaises(ValueError):
+            bootstrap.validate_plan(self.plan | {"read_tier_trace": "yes"})
+
+    def test_trace_install_is_optional_and_only_rendered_for_focused_mode(self):
+        now = datetime(2026, 10, 25, 6, 29, 19, tzinfo=timezone.utc)
+        plan = self.plan | {"deadline_utc": (now + timedelta(seconds=10000)).isoformat()}
+        with patch.object(bootstrap, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = now
+            ordinary = bootstrap.render_userdata(plan)
+            focused = bootstrap.render_userdata(plan | {"read_tier_trace": True})
+        self.assertNotIn("apt-get install -y bpftrace", ordinary)
+        self.assertIn("if ! timeout 180 apt-get install -y bpftrace", focused)
+
 
 class LaunchLifetimeTests(unittest.TestCase):
     def test_render_rejects_unreachable_or_expired_deadline_before_launch(self):
