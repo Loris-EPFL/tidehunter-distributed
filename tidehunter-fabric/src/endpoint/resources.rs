@@ -226,13 +226,19 @@ struct RmaState {
     owner_id: u64,
     config: RmaConfig,
     capabilities: RmaCapabilities,
-    sources: Vec<SourceRegion>,
+    // Each cold grant owns one charged node; retirement frees that allocation
+    // immediately. Vec/VecDeque retain capacity after removal and would keep
+    // uncharged metadata. This list is not traversed by one-sided data reads.
+    #[allow(clippy::linkedlist)]
+    sources: std::collections::LinkedList<SourceRegion>,
+    // Includes live registrations and sources quarantined after uncertain MR close.
+    source_bytes_live: usize,
     // Fixed before any fi_context2 is posted; neither elements nor contexts move.
     destinations: Box<[ReadSlot]>,
     next_destination: usize,
     next_region: u64,
     next_generation: u64,
-    _metadata: PoolMetadataCharge,
+    metadata: PoolMetadataCharge,
 }
 
 impl RmaState {
@@ -258,7 +264,6 @@ impl RmaState {
             || destination_invalid
             || (!source_enabled && !destination_enabled)
             || config.source_bytes > GLOBAL_RMA_SOURCE_BYTES
-            || config.source_region_slots > GLOBAL_RMA_REGION_SLOTS
             || config.destination_bytes > GLOBAL_RMA_DESTINATION_BYTES
             || config.destination_slots > GLOBAL_RMA_DESTINATION_SLOTS
             || (destination_enabled
@@ -304,28 +309,17 @@ impl RmaState {
         }
         let owner_id = next_rma_owner_id()?;
         if !Self::reserve(
-            &RMA_REGION_SLOTS,
-            GLOBAL_RMA_REGION_SLOTS,
-            config.source_region_slots,
-        ) {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "global RMA source metadata slots exhausted",
-            ));
-        }
-        if !Self::reserve(
             &RMA_DESTINATION_METADATA_SLOTS,
             GLOBAL_RMA_DESTINATION_METADATA_SLOTS,
             config.destination_slots,
         ) {
-            Self::release(&RMA_REGION_SLOTS, config.source_region_slots);
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "global RMA destination metadata slots exhausted",
             ));
         }
         let metadata = PoolMetadataCharge {
-            source_slots: config.source_region_slots,
+            source_slots: 0,
             destination_slots: config.destination_slots,
         };
         let mut destinations = Vec::with_capacity(config.destination_slots);
@@ -414,17 +408,18 @@ impl RmaState {
                 });
             }
         }
-        let sources = Vec::with_capacity(config.source_region_slots);
+        let sources = std::collections::LinkedList::new();
         Ok(Self {
             owner_id,
             config,
             capabilities,
             sources,
+            source_bytes_live: 0,
             destinations: destinations.into_boxed_slice(),
             next_destination: 0,
             next_region: 1,
             next_generation: 1,
-            _metadata: metadata,
+            metadata,
         })
     }
 
@@ -434,7 +429,7 @@ impl RmaState {
         }
         self.sources
             .iter()
-            .position(|source| {
+            .rposition(|source| {
                 source.id == region.region_id
                     && source.generation == region.generation
                     && source.session_id == region.session_id
@@ -1399,7 +1394,14 @@ impl Resources {
             .ok_or_else(|| invalid("RMA region generations exhausted"))?;
         rma.next_region = next_id;
         rma.next_generation = next_generation;
-        rma.sources.push(SourceRegion {
+        if !RmaState::reserve(&RMA_REGION_SLOTS, GLOBAL_RMA_REGION_SLOTS, 1) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "global RMA source metadata slots exhausted",
+            ));
+        }
+        rma.metadata.source_slots += 1;
+        rma.sources.push_back(SourceRegion {
             id,
             generation,
             session_id,
@@ -1422,14 +1424,18 @@ impl Resources {
         region: &RegisteredReadRegion,
         bytes: Vec<u8>,
     ) -> io::Result<RemoteReadRegion> {
-        self.register_read_region_with_owner(region, bytes, None)
+        self.register_read_region_with_owner(region, bytes, None, None)
     }
 
+    // Keep MR registration, uncertain-close retention and both resource charges
+    // in one ownership scope so every rollback can be audited together.
+    #[allow(clippy::too_many_lines)]
     pub(super) fn register_read_region_with_owner(
         &mut self,
         region: &RegisteredReadRegion,
         bytes: Vec<u8>,
         owner: Option<Arc<dyn Any + Send + Sync>>,
+        observation: Option<&mut Option<(u64, bool)>>,
     ) -> io::Result<RemoteReadRegion> {
         if self.peer.is_none() {
             return Err(invalid("read region requires a bound peer"));
@@ -1438,21 +1444,30 @@ impl Resources {
             .rma
             .as_mut()
             .ok_or_else(|| invalid("endpoint was not opened for RMA"))?;
-        let source_index = rma.source_index(region)?;
-        let source = &rma.sources[source_index];
+        if region.owner_id != rma.owner_id {
+            return Err(invalid("read region belongs to another endpoint"));
+        }
+        let source = rma
+            .sources
+            .iter_mut()
+            .rev()
+            .find(|source| {
+                source.id == region.region_id
+                    && source.generation == region.generation
+                    && source.session_id == region.session_id
+                    && source.grant_generation == region.grant_generation
+            })
+            .ok_or_else(|| invalid("read region reservation is not active"))?;
         if source.bytes.is_some() || !source.mr.is_null() {
             return Err(invalid("read region reservation is already registered"));
         }
         let len = bytes.len();
-        let resident = rma.sources.iter().try_fold(0_usize, |sum, source| {
-            sum.checked_add(source.bytes.as_ref().map_or(0, |bytes| bytes.len()))
-        });
+        let resident = rma.source_bytes_live;
         if len == 0
             || len > rma.config.source_bytes
-            || resident.is_none_or(|used| {
-                used.checked_add(len)
-                    .is_none_or(|total| total > rma.config.source_bytes)
-            })
+            || resident
+                .checked_add(len)
+                .is_none_or(|total| total > rma.config.source_bytes)
         {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -1484,6 +1499,7 @@ impl Resources {
         let mut mr = ptr::null_mut();
         // SAFETY: The boxed immutable source never moves while its MR is live.
         // Remote peers receive read-only permission; no remote writes are enabled.
+        let began = observation.as_ref().map(|_| std::time::Instant::now());
         let status = unsafe {
             ffi::fi_mr_reg(
                 self.domain,
@@ -1497,6 +1513,12 @@ impl Resources {
                 ptr::null_mut(),
             )
         };
+        if let (Some(observation), Some(began)) = (observation, began) {
+            *observation = Some((
+                u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                status != 0 || mr.is_null(),
+            ));
+        }
         if status != 0 || mr.is_null() {
             let registration_error = if status != 0 {
                 error("register read-only source region", status.unsigned_abs())
@@ -1509,7 +1531,7 @@ impl Resources {
                 // has not escaped. Failed close quarantines the source allocation.
                 let close_status = unsafe { ffi::fi_close(&raw mut (*mr).fid) };
                 if close_status != 0 {
-                    let source = &mut rma.sources[source_index];
+                    rma.source_bytes_live += len;
                     source.bytes = Some(bytes);
                     source.retained_owner = owner;
                     source.mr = ptr::null_mut();
@@ -1521,9 +1543,10 @@ impl Resources {
             }
             return Err(registration_error);
         }
-        rma.sources[source_index].bytes = Some(bytes);
-        rma.sources[source_index].retained_owner = owner;
-        rma.sources[source_index].mr = mr;
+        rma.source_bytes_live += len;
+        source.bytes = Some(bytes);
+        source.retained_owner = owner;
+        source.mr = mr;
         Ok(RemoteReadRegion {
             region_id: region.region_id,
             generation: region.generation,
@@ -1569,14 +1592,18 @@ impl Resources {
             .as_mut()
             .ok_or_else(|| invalid("endpoint was not opened for RMA"))?;
         let index = rma.source_index(&region)?;
-        let source = &mut rma.sources[index];
+        let source = rma.sources.iter_mut().nth(index).unwrap();
         if source.bytes.is_none() {
             if !source.mr.is_null() {
                 return Err(invalid(
                     "unregistered source reservation unexpectedly has an MR",
                 ));
             }
-            rma.sources.swap_remove(index);
+            let mut suffix = rma.sources.split_off(index);
+            suffix.pop_front();
+            rma.sources.append(&mut suffix);
+            rma.metadata.source_slots -= 1;
+            RmaState::release(&RMA_REGION_SLOTS, 1);
             return Ok(());
         }
         if source.mr.is_null() {
@@ -1596,7 +1623,12 @@ impl Resources {
                 status.unsigned_abs(),
             ));
         }
-        let source = rma.sources.swap_remove(index);
+        let mut suffix = rma.sources.split_off(index);
+        let source = suffix.pop_front().unwrap();
+        rma.sources.append(&mut suffix);
+        rma.metadata.source_slots -= 1;
+        RmaState::release(&RMA_REGION_SLOTS, 1);
+        rma.source_bytes_live -= source.bytes.as_ref().map_or(0, |bytes| bytes.len());
         RmaState::release(
             &RMA_SOURCE_BYTES,
             source.bytes.as_ref().map_or(0, |bytes| bytes.len()),
@@ -2364,6 +2396,100 @@ fn posted(stage: &str, code: isize) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_configuration_above_global_slots_is_admitted_without_preallocation() {
+        let config = RmaConfig {
+            source_bytes: 4096,
+            source_region_slots: GLOBAL_RMA_REGION_SLOTS + 1,
+            destination_bytes: 0,
+            destination_slots: 0,
+            max_read_bytes: 4096,
+            require_device_read: false,
+        };
+        assert!(RmaState::validate_config(config).is_ok());
+    }
+
+    #[test]
+    fn quarantined_source_stays_charged_and_cannot_be_retired_or_reused() {
+        let config = RmaConfig {
+            source_bytes: 4,
+            source_region_slots: 2,
+            destination_bytes: 0,
+            destination_slots: 0,
+            max_read_bytes: 4,
+            require_device_read: false,
+        };
+        let mut sources = std::collections::LinkedList::new();
+        // This is the state left by uncertain MR close: allocation retained,
+        // FID no longer safe to close again. No provider or DMA is involved.
+        sources.push_back(SourceRegion {
+            id: 1,
+            generation: 1,
+            session_id: 7,
+            grant_generation: 11,
+            bytes: Some(vec![1; 4].into_boxed_slice()),
+            retained_owner: None,
+            mr: ptr::null_mut(),
+        });
+        sources.push_back(SourceRegion {
+            id: 2,
+            generation: 2,
+            session_id: 7,
+            grant_generation: 12,
+            bytes: None,
+            retained_owner: None,
+            mr: ptr::null_mut(),
+        });
+        let mut resources = Resources {
+            peer: Some(0),
+            rma: Some(RmaState {
+                owner_id: 9,
+                config,
+                capabilities: RmaCapabilities {
+                    address_mode: RmaAddressMode::Offset,
+                    read_mode: RmaReadMode::Emulated,
+                    max_read_bytes: 4,
+                    max_iov: 1,
+                },
+                sources,
+                source_bytes_live: 4,
+                destinations: Vec::new().into_boxed_slice(),
+                next_destination: 0,
+                next_region: 3,
+                next_generation: 3,
+                metadata: PoolMetadataCharge {
+                    source_slots: 0,
+                    destination_slots: 0,
+                },
+            }),
+            ..Resources::default()
+        };
+        let quarantined = RegisteredReadRegion {
+            owner_id: 9,
+            region_id: 1,
+            generation: 1,
+            session_id: 7,
+            grant_generation: 11,
+        };
+        let available = RegisteredReadRegion {
+            owner_id: 9,
+            region_id: 2,
+            generation: 2,
+            session_id: 7,
+            grant_generation: 12,
+        };
+        assert!(resources.retire_source_region(quarantined).is_err());
+        assert_eq!(resources.rma.as_ref().unwrap().source_bytes_live, 4);
+        assert_eq!(
+            resources
+                .register_read_region(&available, vec![2])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock,
+        );
+        assert_eq!(resources.rma.as_ref().unwrap().source_bytes_live, 4);
+    }
 
     #[test]
     fn only_efa_requests_bounded_packet_queues_not_application_slot_counts() {

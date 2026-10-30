@@ -455,20 +455,24 @@ impl Endpoint {
     /// pinned while remote DMA may still address the registration. The owner is
     /// retained on uncertain registration teardown and endpoint quarantine, and
     /// released after exact peer drain and successful MR retirement.
+    /// The optional observation records only the provider `fi_mr_reg` call;
+    /// pre-registration admission errors leave it unchanged. Provider caching
+    /// means a successful call does not prove a new hardware pin.
+    ///
     /// # Errors
     /// Rejects foreign or inactive reservations and exhausted source budgets.
-    /// Provider registration errors retain the owner whenever native ownership
-    /// is uncertain.
-    pub fn register_read_region_with_owner(
+    /// Provider errors retain the owner whenever native ownership is uncertain.
+    pub fn register_read_region_with_owner_profiled(
         &mut self,
         region: &RegisteredReadRegion,
         bytes: Vec<u8>,
         owner: Arc<dyn Any + Send + Sync>,
+        observation: Option<&mut Option<(u64, bool)>>,
     ) -> io::Result<RemoteReadRegion> {
         self.ready()?;
-        let result = self
-            .inner()
-            .register_read_region_with_owner(region, bytes, Some(owner));
+        let result =
+            self.inner()
+                .register_read_region_with_owner(region, bytes, Some(owner), observation);
         if result.as_ref().is_err_and(|error| {
             !matches!(
                 error.kind(),
@@ -478,6 +482,18 @@ impl Endpoint {
             self.failed = true;
         }
         result
+    }
+
+    /// Registers a source and retains its owner until safe retirement.
+    /// # Errors
+    /// Rejects invalid reservations and exhausted budgets; uncertain ownership is retained.
+    pub fn register_read_region_with_owner(
+        &mut self,
+        region: &RegisteredReadRegion,
+        bytes: Vec<u8>,
+        owner: Arc<dyn Any + Send + Sync>,
+    ) -> io::Result<RemoteReadRegion> {
+        self.register_read_region_with_owner_profiled(region, bytes, owner, None)
     }
 
     /// Retires a source region only after the matching peer drain acknowledgement.
