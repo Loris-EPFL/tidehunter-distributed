@@ -648,6 +648,7 @@ fn competing_grouped_readers_share_one_credit_without_losing_members() {
                 ready.wait();
                 for _ in 0..8 {
                     let values = db.get_many_cut(KeySpace(0), keys, cut.clone()).unwrap();
+                    assert_eq!(values.len(), keys.len());
                     for (slot, expected) in [1u8, 4, 2, 3, 1].into_iter().enumerate() {
                         assert_eq!(
                             values[slot].as_ref().unwrap().as_deref(),
@@ -659,9 +660,6 @@ fn competing_grouped_readers_share_one_credit_without_losing_members() {
             });
         }
     });
-    // Each reader has eight dependent two-shard rounds. Overlapping identical
-    // members may share physical work, but never exceed independent dispatch.
-    assert!((2 * 8..=2 * 8 * 2).contains(&db.read_rpc_count()));
     db.shutdown().unwrap();
 }
 

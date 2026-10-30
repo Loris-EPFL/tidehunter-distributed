@@ -786,6 +786,7 @@ struct State {
     admission_paused: AtomicBool,
     admission_generation: AtomicU64,
     admission_changed: parking_lot::Condvar,
+    wake_pending: AtomicBool,
     active_wait: Mutex<()>,
     active_changed: parking_lot::Condvar,
     // Fixed flight signals and weak slots are reserved from pending bytes.
@@ -801,6 +802,12 @@ struct State {
     peak_connection_reads: AtomicUsize,
     #[cfg(test)]
     inline_pause: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
+    #[cfg(test)]
+    inline_published_pause: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
+    #[cfg(test)]
+    completion_pause: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
+    #[cfg(test)]
+    reactor_pause: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
 }
 impl State {
     fn poison(&self) {
@@ -890,13 +897,18 @@ struct OwnedLane {
     lane: Lane,
     reservation: Option<InlineLaneReservation>,
     sender: mpsc::SyncSender<ReadCommand>,
+    state: Arc<State>,
 }
 impl Drop for OwnedLane {
     fn drop(&mut self) {
         drop(self.reservation.take());
-        // A full queue already wakes the actor; accepted work remains in the
-        // shared driver until it is retired by that actor.
-        let _ = self.sender.try_send(ReadCommand::Wake);
+        // At most one control wake occupies the channel independently of
+        // request credits. Accepted work remains in the shared driver.
+        if !self.state.wake_pending.swap(true, Ordering::AcqRel)
+            && self.sender.try_send(ReadCommand::Wake).is_err()
+        {
+            self.state.wake_pending.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -943,6 +955,11 @@ impl Request {
         let completion = self.flight.completion.clone();
         *completion.result.lock() = Some(result);
         drop(completion);
+        #[cfg(test)]
+        if let Some((entered, resume)) = state.completion_pause.lock().take() {
+            entered.send(()).unwrap();
+            resume.recv().unwrap();
+        }
         // Keep pending bytes charged until this notifier no longer owns the
         // completed payload; live flights keep their own charge for consumers.
         drop(self);
@@ -1227,6 +1244,11 @@ fn drive_reads(
     let mut empty_polls = 0u8;
     loop {
         let mut progressed = false;
+        #[cfg(test)]
+        if let Some((entered, resume)) = state.reactor_pause.lock().take() {
+            entered.send(()).unwrap();
+            resume.recv().unwrap();
+        }
         // Credits bound the sum of this queue, lane scheduling state, transport
         // requests and undelivered completions, not merely the channel length.
         for _ in 0..max_requests {
@@ -1235,7 +1257,10 @@ fn drive_reads(
                     lanes[request.lane].driver.lock().queued.push_back(request);
                     progressed = true;
                 }
-                Ok(ReadCommand::Wake) => progressed = true,
+                Ok(ReadCommand::Wake) => {
+                    state.wake_pending.store(false, Ordering::Release);
+                    progressed = true;
+                }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     disconnected = true;
@@ -1293,7 +1318,9 @@ fn drive_reads(
                     Ok(ReadCommand::Request(request)) => {
                         lanes[request.lane].driver.lock().queued.push_back(request)
                     }
-                    Ok(ReadCommand::Wake) => {}
+                    Ok(ReadCommand::Wake) => {
+                        state.wake_pending.store(false, Ordering::Release);
+                    }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => disconnected = true,
                 }
@@ -1429,6 +1456,7 @@ impl ReadService {
             admission_paused: AtomicBool::new(false),
             admission_generation: AtomicU64::new(0),
             admission_changed: parking_lot::Condvar::new(),
+            wake_pending: AtomicBool::new(false),
             active_wait: Mutex::new(()),
             active_changed: parking_lot::Condvar::new(),
             flight_ready: (0..flight_slots)
@@ -1451,6 +1479,12 @@ impl ReadService {
             peak_connection_reads: AtomicUsize::new(0),
             #[cfg(test)]
             inline_pause: Mutex::new(None),
+            #[cfg(test)]
+            inline_published_pause: Mutex::new(None),
+            #[cfg(test)]
+            completion_pause: Mutex::new(None),
+            #[cfg(test)]
+            reactor_pause: Mutex::new(None),
         });
         let mut service = Self {
             state,
@@ -1498,8 +1532,8 @@ impl ReadService {
             }
             service.lanes.get_mut().push(lanes);
         }
-        // Each queued request owns a distinct, byte-bounded flight slot.
-        let (sender, receiver) = mpsc::sync_channel(flight_slots);
+        // Up to flight_slots charged requests plus one coalesced control wake.
+        let (sender, receiver) = mpsc::sync_channel(flight_slots + 1);
         let state = service.state.clone();
         let fabric = config.tls.transport.is_fabric();
         let resident_enabled = service.resident_enabled;
@@ -1906,8 +1940,20 @@ impl ReadService {
             Ok(values) => Ok((values.clone(), None)),
             Err(error) => Err(copied_read_error(error)),
         });
+        // The transport has completed and the scalar result is now owned by
+        // this caller. Release producer ownership before waking coalesced
+        // consumers; their flight references retain the completion and credit.
+        drop(client);
+        drop(_lane_credit);
+        drop(_reservation);
+        drop(flight);
         self.state.flight_ready[flight_slot].retire();
         self.state.notify_admission();
+        #[cfg(test)]
+        if let Some((entered, resume)) = self.state.inline_published_pause.lock().take() {
+            entered.send(()).unwrap();
+            resume.recv().unwrap();
+        }
         result.map(Some)
     }
     pub(super) fn submit(
@@ -2148,6 +2194,7 @@ impl ReadService {
                             lane: lane.clone(),
                             reservation: Some(reservation),
                             sender,
+                            state: self.state.clone(),
                         });
                     drop(flights);
                     self.state

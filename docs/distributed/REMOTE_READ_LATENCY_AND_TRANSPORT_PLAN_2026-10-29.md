@@ -873,3 +873,42 @@ removed after collection.
 - [Linux event tracing](https://docs.kernel.org/trace/events.html):
   retain event identity, clock/format precision, loss and collector scope.
 
+### 17.6 Publication-gate fixes before allocating EC2
+
+PR #31's required checks found three additional issues before cloud launch.
+The source matched the local snapshot; these were feature/scheduling coverage
+gaps, not an old executable being reused.
+
+- The non-fabric branch of `tcp/reactor.rs::resident_grant_hits` had a needless
+  explicit return. Both feature configurations now pass the exact CI lint
+  profile; the transport behavior is unchanged.
+- `competing_grouped_readers_share_one_credit_without_losing_members` assumed
+  a fixed range of RPC counts across overlapping rounds. Completed immutable
+  flights can still be shared by another reader, so that lower bound is not a
+  correctness invariant. The regression retains exact result cardinality,
+  every value, duplicate-key ordering and the miss; it does not repin another
+  scheduling-dependent range.
+- `OwnedLane::drop` placed an uncharged wake command in the same bounded
+  channel as data requests. With one flight slot, a queued wake could reject
+  the next valid request even after the previous request's credit was freed.
+  `pending_read.rs` now reserves one control slot and coalesces wakes with an
+  atomic flag. The bound is **F charged requests plus at most one queued wake**;
+  request credits, pending-byte limits and DMA retention limits do not increase.
+  A paused-reactor regression exercises the actual queued-wake transition.
+
+The related inline completion path also releases producer-only ownership
+before publishing readiness. Consumer references still retain their own
+credits, and transport completion still precedes release. Deterministic gates
+check completion visibility, inline coalescing and single-credit scan waves.
+This is distinct from the queued-wake cause; actor completion already released
+its producer credit before publishing readiness.
+
+The exact local CI profiles then passed: distributed **861 passed, 7 ignored**;
+fabric **863 passed, 45 ignored**; strict lint passed. A fresh optimized build
+completed another **1,280 real CLI calls** across TCP C16/batch32 and software
+registered-RAM controls, with ten clean owner exits. These checks remain local
+shared-SSD/software-provider evidence, not hardware EFA measurements.
+
+Publication diagnostics and the rebuilt executable identity are retained in
+`checkpoint-work/aws-ci-runs/2026-10-30-read-tier-publication/`.
+

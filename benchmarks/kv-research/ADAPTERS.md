@@ -409,6 +409,13 @@ flight evidence does not invalidate an otherwise valid cache-only resolution
 sample. Nonzero rearm resets after drain; disarm preserves the snapshot.
 The legacy combined resolve clock is not an index-only measurement.
 
+`read_rpc_count` increments once for an admitted owner group that starts
+message-read work. Coalesced consumers can share completed work, so logical
+rounds do not imply a minimum dispatch count. The counter is not a packet
+count and does not enumerate multiple internal messages for one group.
+Use per-lane `message_read_requests` and RMA posts/completions for those
+transport-operation populations.
+
 Sampled owner grant setup now distinguishes lookup/reuse, reservation/admission,
 envelope preparation, the actual `fi_mr_reg` call, and authority
 recheck/publication. Each has its own count/sum/max/errors. Registration failure

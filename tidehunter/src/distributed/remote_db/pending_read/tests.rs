@@ -465,9 +465,11 @@ fn external_read_pressure_does_not_poison_synchronous_conveniences() {
     let held = lane.lock();
     let pending = db.submit_get(KeySpace(0), &0u32.to_be_bytes()).unwrap();
     let keys = vec![1u32.to_be_bytes().to_vec()];
+    let rpcs_before_rejection = db.read_rpc_count();
     assert!(RemoteDatabase::read_backpressured(
         &db.get_many(KeySpace(0), &keys).unwrap_err()
     ));
+    assert_eq!(db.read_rpc_count(), rpcs_before_rejection);
     // A scan may join the occupied immutable reference. Let that real I/O
     // complete; the original unconsumed handle still owns the only physical
     // credit, so the scan's distinct next shard must report backpressure.
@@ -483,6 +485,126 @@ fn external_read_pressure_does_not_poison_synchronous_conveniences() {
     assert_eq!(db.finish_get(pending).unwrap(), value(7));
     assert_eq!(db.get_many(KeySpace(0), &keys).unwrap(), vec![value(8)]);
     assert_eq!(db.scan(KeySpace(0)).unwrap().len(), 2);
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn completion_is_not_visible_before_actor_releases_its_credit() {
+    let mut fixture = Fixture::new();
+    fixture.config.max_pending_reads = 1;
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
+        .unwrap();
+    db.write_batch(fixture.operation(1, 1), vec![put(1, 8)])
+        .unwrap();
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (release, resumed) = mpsc::sync_channel(1);
+    *db.reads.state.completion_pause.lock() = Some((entered, resumed));
+    let mut pending = db.submit_get(KeySpace(0), &0u32.to_be_bytes()).unwrap();
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    let observed = db.poll_get(&mut pending);
+    let rejected = db.submit_get(KeySpace(0), &1u32.to_be_bytes());
+    let rpcs_after_rejection = db.read_rpc_count();
+    release.send(()).unwrap();
+
+    assert_eq!(observed.unwrap(), None);
+    assert!(RemoteDatabase::read_backpressured(&rejected.err().unwrap()));
+    assert_eq!(rpcs_after_rejection, 1);
+    assert_eq!(db.finish_get(pending).unwrap(), value(7));
+    assert_eq!(
+        db.get_many(KeySpace(0), &[1u32.to_be_bytes().to_vec()])
+            .unwrap(),
+        vec![value(8)]
+    );
+    assert_eq!(db.scan(KeySpace(0)).unwrap().len(), 2);
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn scan_releases_each_completed_wave_before_admitting_the_next() {
+    let mut fixture = Fixture::new();
+    fixture.config.max_pending_reads = 1;
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
+        .unwrap();
+    db.write_batch(fixture.operation(1, 1), vec![put(1, 8)])
+        .unwrap();
+    assert_eq!(
+        db.get_many(KeySpace(0), &[1u32.to_be_bytes().to_vec()])
+            .unwrap(),
+        vec![value(8)]
+    );
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (release, resumed) = mpsc::sync_channel(1);
+    *db.reads.state.completion_pause.lock() = Some((entered, resumed));
+    let (done, result) = mpsc::sync_channel(1);
+    let scan = thread::spawn(move || {
+        let rows = db.scan(KeySpace(0));
+        done.send((db, rows)).unwrap();
+    });
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    let early = result.try_recv();
+    release.send(()).unwrap();
+    let (mut db, rows) = result.recv_timeout(Duration::from_secs(5)).unwrap();
+    scan.join().unwrap();
+    assert!(matches!(early, Err(mpsc::TryRecvError::Empty)));
+    assert_eq!(rows.unwrap().len(), 2);
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn queued_lane_wake_does_not_consume_read_admission() {
+    let mut fixture = Fixture::new();
+    fixture.config.max_pending_reads = 1;
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
+        .unwrap();
+    db.write_batch(fixture.operation(1, 1), vec![put(1, 8)])
+        .unwrap();
+    let reference = db
+        .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let node = db.partition_indexes[&reference.batch_address.partition];
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (release, resumed) = mpsc::sync_channel(1);
+    *db.reads.state.reactor_pause.lock() = Some((entered, resumed));
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    let mut groups = vec![Vec::new(); db.partition_indexes.len()];
+    groups[node].push((0, reference));
+    let mut batch = ReadBatch::new(&db.reads, vec![None], groups).unwrap();
+    batch.dispatch(&db.reads).unwrap();
+    let lane = batch.owned_lanes[0].lane.clone();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !db.reads.state.flight_ready[batch.reads[0].1.parts[0].0.slot].is_ready()
+        && Instant::now() < deadline
+    {
+        progress_read_lane(
+            &db.reads.state,
+            &mut lane.driver.lock(),
+            db.epoch,
+            db.reads.resident_enabled,
+        );
+        thread::yield_now();
+    }
+    if !db.reads.state.flight_ready[batch.reads[0].1.parts[0].0.slot].is_ready() {
+        release.send(()).unwrap();
+        panic!("caller-owned read did not complete");
+    }
+    let completed = batch.finish_one();
+    let wake_queued = db.reads.state.wake_pending.load(Ordering::Acquire);
+    let next = db.submit_get(KeySpace(0), &1u32.to_be_bytes());
+    release.send(()).unwrap();
+
+    completed.unwrap();
+    assert_eq!(batch.values[0], Some(put(0, 7)));
+    assert!(wake_queued);
+    assert_eq!(db.finish_get(next.unwrap()).unwrap(), value(8));
     db.shutdown().unwrap();
 }
 
@@ -747,6 +869,52 @@ fn grouped_join_of_inline_flight_notifies_admission_after_readiness() {
     batch.finish_one().unwrap();
     assert_eq!(batch.values[0], Some(put(0, 7)));
     assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn inline_joiner_releases_credit_before_producer_returns() {
+    let mut fixture = Fixture::new();
+    fixture.config.max_pending_reads = 1;
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
+        .unwrap();
+    db.write_batch(fixture.operation(1, 1), vec![put(1, 8)])
+        .unwrap();
+    let reference = db
+        .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let node = db.partition_indexes[&reference.batch_address.partition];
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (release, resumed) = mpsc::sync_channel(1);
+    *db.reads.state.inline_pause.lock() = Some((entered, resumed));
+    let (published, waiting_published) = mpsc::sync_channel(1);
+    let (finish, finishing) = mpsc::sync_channel(1);
+    *db.reads.state.inline_published_pause.lock() = Some((published, finishing));
+    let reads = db.reads.clone();
+    let epoch = db.epoch;
+    let scalar = thread::spawn(move || reads.read_inline(node, epoch, &reference, 0, None, None));
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    let mut groups = vec![Vec::new(); db.partition_indexes.len()];
+    groups[node].push((0, reference));
+    let mut batch = ReadBatch::new(&db.reads, vec![None], groups).unwrap();
+    batch.dispatch(&db.reads).unwrap();
+    release.send(()).unwrap();
+    waiting_published
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    let joined = batch.finish_one();
+    let next = db.get_many(KeySpace(0), &[1u32.to_be_bytes().to_vec()]);
+    finish.send(()).unwrap();
+    let scalar_result = scalar.join().unwrap();
+
+    joined.unwrap();
+    assert_eq!(batch.values[0], Some(put(0, 7)));
+    assert_eq!(next.unwrap(), vec![value(8)]);
+    assert!(scalar_result.unwrap().is_some());
     db.shutdown().unwrap();
 }
 
