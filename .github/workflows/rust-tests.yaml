@@ -24,6 +24,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: "2"
   RUST_BACKTRACE: "1"
+  # Keep panic diagnostics visible if a detached worker aborts libtest.
+  RUST_TEST_NOCAPTURE: "1"
 
 jobs:
   test:
