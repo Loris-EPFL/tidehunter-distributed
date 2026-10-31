@@ -121,8 +121,12 @@ struct Authority {
     pending: Vec<Arc<RegisteredBatch>>,
     last_end: u64,
 }
+struct CachedAuthority {
+    batch: Arc<RegisteredBatch>,
+    _entry_credit: MetadataCredit,
+}
 struct AuthorityCache {
-    entries: LruCache<PhysicalValueAddress, Arc<RegisteredBatch>>,
+    entries: LruCache<PhysicalValueAddress, CachedAuthority>,
     bytes: usize,
 }
 impl AuthorityCache {
@@ -130,10 +134,10 @@ impl AuthorityCache {
         batch_charge() + batch.descriptors.len() * size_of::<RecordDescriptor>() + CACHE_ENTRY_BYTES
     }
     fn evict(&mut self) -> bool {
-        let Some((_, batch)) = self.entries.pop_lru() else {
+        let Some((_, entry)) = self.entries.pop_lru() else {
             return false;
         };
-        self.bytes -= Self::charge(&batch);
+        self.bytes -= Self::charge(&entry.batch);
         true
     }
     fn trim(&mut self, budget: usize) {
@@ -547,9 +551,9 @@ impl ReferenceDirectory {
             return None;
         }
         if let Some(mut cache) = self.cache.try_lock() {
-            if let Some(batch) = cache.entries.get(&address) {
+            if let Some(entry) = cache.entries.get(&address) {
                 self.reads.resident_hits.fetch_add(1, Ordering::Relaxed);
-                return Some(batch.clone());
+                return Some(entry.batch.clone());
             }
         } else {
             self.reads.contention.fetch_add(1, Ordering::Relaxed);
@@ -601,6 +605,33 @@ impl ReferenceDirectory {
         }
         Err(StorageError::Capacity)
     }
+    /// Carry already charged descriptors across root adoption without making
+    /// optional cache residency part of the durable publication boundary.
+    fn retain_adopted(&self, captured: Vec<Arc<RegisteredBatch>>) {
+        let mut captured = captured.into_iter();
+        while let Some(first) = captured.next() {
+            let mut cache = self.cache.lock();
+            for batch in std::iter::once(first).chain(captured.by_ref().take(31)) {
+                if cache.entries.contains(&batch.address) {
+                    continue;
+                }
+                if cache.entries.len() == cache.entries.cap().get() {
+                    cache.evict();
+                }
+                let Some(entry_credit) = self.budget.reserve(CACHE_ENTRY_BYTES, 0) else {
+                    continue;
+                };
+                cache.bytes += AuthorityCache::charge(&batch);
+                cache.entries.put(
+                    batch.address,
+                    CachedAuthority {
+                        batch,
+                        _entry_credit: entry_credit,
+                    },
+                );
+            }
+        }
+    }
     pub(crate) fn lookup(
         &self,
         address: PhysicalValueAddress,
@@ -609,8 +640,8 @@ impl ReferenceDirectory {
         if address.partition != self.partition || address.segment_generation != self.generation {
             return Ok(None);
         }
-        if let Some(batch) = self.cache.lock().entries.get(&address).cloned() {
-            return Ok(Some(batch));
+        if let Some(entry) = self.cache.lock().entries.get(&address) {
+            return Ok(Some(entry.batch.clone()));
         }
         let reader = {
             let authority = self.authority.read();
@@ -634,15 +665,18 @@ impl ReferenceDirectory {
         let charge = core
             .checked_add(CACHE_ENTRY_BYTES)
             .ok_or(StorageError::Capacity)?;
-        let (credit, cacheable) = {
+        let (credit, entry_credit) = {
             let mut cache = self.cache.lock();
-            if let Some(batch) = cache.entries.get(&address).cloned() {
-                return Ok(Some(batch));
+            if let Some(entry) = cache.entries.get(&address) {
+                return Ok(Some(entry.batch.clone()));
             }
             match self.reserve_with_cache(&mut cache, charge, count) {
-                Ok(credit) => (credit, true),
+                Ok(mut credit) => {
+                    let core_credit = credit.take_batch(count)?;
+                    (core_credit, Some(credit))
+                }
                 Err(StorageError::Capacity) => {
-                    (self.reserve_with_cache(&mut cache, core, count)?, false)
+                    (self.reserve_with_cache(&mut cache, core, count)?, None)
                 }
                 Err(error) => return Err(error),
             }
@@ -650,16 +684,22 @@ impl ReferenceDirectory {
         // The complete decoded heap is reserved BEFORE the first descriptor is
         // allocated. Streaming fixed slots need only a bounded stack buffer.
         let batch = Arc::new(reader.read_registered(&page)?.with_credit(credit));
-        if cacheable {
+        if let Some(entry_credit) = entry_credit {
             let mut cache = self.cache.lock();
-            if let Some(existing) = cache.entries.get(&address).cloned() {
-                return Ok(Some(existing));
+            if let Some(existing) = cache.entries.get(&address) {
+                return Ok(Some(existing.batch.clone()));
             }
             if cache.entries.len() == cache.entries.cap().get() {
                 cache.evict();
             }
             cache.bytes += charge;
-            cache.entries.put(address, batch.clone());
+            cache.entries.put(
+                address,
+                CachedAuthority {
+                    batch: batch.clone(),
+                    _entry_credit: entry_credit,
+                },
+            );
         }
         Ok(Some(batch))
     }
@@ -1058,8 +1098,9 @@ impl ReferenceDirectoryWriter {
                             }
                             authority.history = root;
                             drop(authority.pending.drain(..captured.len()));
-                            drop(captured);
                         }
+                        drop(history);
+                        directory.retain_adopted(captured);
                         if let Some(adopting) = adopting {
                             directory.maintenance.adoption_ns.fetch_add(
                                 adopting.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
@@ -1117,9 +1158,13 @@ impl ReferenceDirectoryWriter {
         let captured = self.directory.authority.read().pending.to_vec();
         let mut history = self.history.lock();
         history.append(&captured, file_count)?;
-        let mut authority = self.directory.authority.write();
-        authority.history = history.reader();
-        drop(authority.pending.drain(..captured.len()));
+        {
+            let mut authority = self.directory.authority.write();
+            authority.history = history.reader();
+            drop(authority.pending.drain(..captured.len()));
+        }
+        drop(history);
+        self.directory.retain_adopted(captured);
         Ok(())
     }
     pub(crate) fn retire(&mut self, offsets: &[u64]) -> Result<(), StorageError> {

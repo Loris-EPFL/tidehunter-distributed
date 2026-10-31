@@ -115,6 +115,10 @@ fn background_root_install_failure_poisons_and_reopens_rooted_suffix() {
     drop(log);
     let recovered = PartitionLog::recover_sealed(&path, &config, metrics()).unwrap();
     assert_eq!(recovered.receipt_page(0, 2).unwrap(), vec![first, second]);
+    assert_eq!(
+        recovered.read_record(&reference).unwrap(),
+        batch(&config, 0).mutations()[0]
+    );
 }
 
 #[test]
@@ -204,10 +208,6 @@ fn completed_history_exceeds_resident_limit_with_stable_paged_retries_and_prefix
             .unwrap();
         log.persist_through(receipt).unwrap();
         receipts.push(receipt);
-        assert!(
-            log.stats().registered_records <= 4,
-            "completed descriptors exceeded bounded window"
-        );
         assert!(log.stats().reference_metadata_bytes <= config.max_reference_metadata_bytes);
         if n == 1 {
             proof = Some(log.checkpoint_prefix(2).unwrap());
@@ -240,6 +240,7 @@ fn completed_history_exceeds_resident_limit_with_stable_paged_retries_and_prefix
             log.persist_through(receipts[0]).unwrap().appended(),
             receipts[0]
         );
+        log.evict_authority_cache();
         assert_eq!(log.stats().registered_records, 0);
     }
 }
@@ -315,10 +316,13 @@ fn in_flight_file_and_descriptor_owners_survive_retirement_but_new_reads_fail() 
     log.seal_epoch(authority(&config)).unwrap();
     let charged = log.stats().reference_metadata_bytes;
     log.evict_authority_cache();
-    assert_eq!(
-        log.stats().reference_metadata_bytes,
-        charged,
-        "eviction released live descriptor pin credit"
+    assert!(
+        log.stats().reference_metadata_bytes < charged,
+        "eviction should release cache-entry overhead"
+    );
+    assert!(
+        log.stats().registered_records > 0,
+        "reader retains descriptor credit"
     );
     let cached = log.plan_record_read(&reference).unwrap();
     drop(cached);
@@ -470,6 +474,74 @@ fn extra_suffix_or_unfinished_retired_name_cannot_hide_missing_rooted_file() {
 }
 
 #[test]
+fn adopted_history_retains_resident_authority_without_first_read_reload() {
+    let temp = tempdir::TempDir::new("storage-adopted-residency").unwrap();
+    let mut config = config(vec![3], 3);
+    config.max_batches = 2;
+    let log = Arc::new(
+        PartitionLog::create(
+            &temp.path().join("stream"),
+            config.clone(),
+            &shape(),
+            metrics(),
+        )
+        .unwrap(),
+    );
+    let first = batch(&config, 0);
+    let receipt = log
+        .append_complete_batch(authority(&config), &first)
+        .unwrap();
+    log.persist_through(receipt).unwrap();
+    log.wait_history().unwrap();
+    assert_eq!(log.references.root().count, 1);
+    let before = log.authority_cache_stats();
+    let reference = log.record_reference(receipt, 0).unwrap();
+    assert!(log.try_plan_record_read(&reference).unwrap().is_some());
+    assert_eq!(log.read_record(&reference).unwrap(), first.mutations()[0]);
+    assert_eq!(
+        log.authority_cache_stats().history_loads,
+        before.history_loads
+    );
+    assert!(log.stats().reference_metadata_bytes <= config.max_reference_metadata_bytes);
+}
+
+#[test]
+fn adopted_residency_yields_to_bounded_metadata_pressure() {
+    let temp = tempdir::TempDir::new("storage-adopted-pressure").unwrap();
+    let mut config = config(vec![3], 3);
+    config.max_batches = 1;
+    config.max_reference_metadata_bytes = 64 * 1024;
+    let log = Arc::new(
+        PartitionLog::create(
+            &temp.path().join("stream"),
+            config.clone(),
+            &shape(),
+            metrics(),
+        )
+        .unwrap(),
+    );
+    let mut first_reference = None;
+    for n in 0..256 {
+        let receipt = log
+            .append_complete_batch(authority(&config), &batch(&config, n))
+            .unwrap();
+        log.persist_through(receipt).unwrap();
+        log.wait_history().unwrap();
+        if n == 0 {
+            first_reference = Some(log.record_reference(receipt, 0).unwrap());
+        }
+        assert!(log.stats().reference_metadata_bytes <= config.max_reference_metadata_bytes);
+    }
+    let reference = first_reference.unwrap();
+    assert!(log.try_plan_record_read(&reference).unwrap().is_none());
+    assert_eq!(
+        log.read_record(&reference).unwrap(),
+        batch(&config, 0).mutations()[0]
+    );
+    assert!(log.stats().reference_metadata_bytes <= config.max_reference_metadata_bytes);
+}
+
+#[test]
 fn cold_old_authority_becomes_hot_without_lifetime_descriptor_residency() {
     let temp = tempdir::TempDir::new("storage-cold-authority-cache").unwrap();
     let mut config = config(vec![3], 3);
@@ -487,6 +559,7 @@ fn cold_old_authority_becomes_hot_without_lifetime_descriptor_residency() {
         .append_complete_batch(authority(&config), &batch(&config, 0))
         .unwrap();
     log.persist_through(first).unwrap();
+    log.wait_history().unwrap();
     let reference = log.record_reference(first, 0).unwrap();
     log.evict_authority_cache();
     let second = log
@@ -773,6 +846,7 @@ fn cold_authority_pressure_waits_for_background_window() {
         .unwrap();
     log.persist_through(first).unwrap();
     let reference = log.record_reference(first, 0).unwrap();
+    log.evict_authority_cache();
     let second = log
         .append_complete_batch(authority(&config), &batch(&config, 1))
         .unwrap();
