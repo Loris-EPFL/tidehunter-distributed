@@ -136,56 +136,73 @@ impl ConcurrentRemoteDatabase {
                     result
                 })
                 .collect::<Vec<_>>();
-            for (slot, reference) in references.iter().enumerate() {
-                let reference = match reference {
-                    Ok(Some(reference)) => reference,
-                    Ok(None) => {
-                        if let Some(sample) = &sample {
-                            sample.member(MemberOutcome::IndexMiss);
-                        }
-                        continue;
-                    }
-                    Err(_) => {
-                        if let Some(sample) = &sample {
-                            sample.member(MemberOutcome::Error);
-                        }
-                        continue;
-                    }
-                };
-                let clock = ResolutionSample::start(&sample);
-                let mut cache = self.cache.lock();
-                if let Some(sample) = &sample {
-                    sample.stage(ResolutionStage::CacheLockWait, clock);
-                }
-                let clock = ResolutionSample::start(&sample);
-                let cached = cache.get(reference);
-                if let Some(sample) = &sample {
-                    sample.stage(ResolutionStage::CacheLookup, clock);
-                }
-                drop(cache);
-                if let Some(value) = cached {
-                    if let Some(sample) = &sample {
-                        sample.member(MemberOutcome::CacheHit);
-                    }
-                    values[slot] = Some(value);
-                } else {
-                    if let Some(sample) = &sample {
-                        sample.member(MemberOutcome::RemoteMiss);
-                    }
+            // Bound cache ownership independently of the 256-key outer window.
+            // Keep lookup order, including duplicate references, and perform
+            // routing and allocation only after releasing the cache guard.
+            for (chunk_index, chunk) in references.chunks(32).enumerate() {
+                let base = chunk_index * 32;
+                if chunk
+                    .iter()
+                    .any(|reference| matches!(reference, Ok(Some(_))))
+                {
                     let clock = ResolutionSample::start(&sample);
-                    let node = self
-                        .partition_indexes
-                        .get(&reference.batch_address.partition)
-                        .copied()
-                        .ok_or_else(|| LocalDbError::new("reference names unregistered partition"));
-                    if let Ok(node) = node.as_ref() {
-                        groups[*node].push((slot, *reference));
-                        missing.push(slot);
-                    }
+                    let mut cache = self.cache.lock();
                     if let Some(sample) = &sample {
-                        sample.stage(ResolutionStage::RoutePreparation, clock);
+                        sample.stage(ResolutionStage::CacheLockWait, clock);
                     }
-                    node?;
+                    for (offset, reference) in chunk.iter().enumerate() {
+                        let Ok(Some(reference)) = reference else {
+                            continue;
+                        };
+                        let clock = ResolutionSample::start(&sample);
+                        values[base + offset] = cache.get(reference);
+                        if let Some(sample) = &sample {
+                            sample.stage(ResolutionStage::CacheLookup, clock);
+                        }
+                    }
+                }
+                for (offset, reference) in chunk.iter().enumerate() {
+                    let slot = base + offset;
+                    let reference = match reference {
+                        Ok(Some(reference)) => reference,
+                        Ok(None) => {
+                            if let Some(sample) = &sample {
+                                sample.member(MemberOutcome::IndexMiss);
+                            }
+                            continue;
+                        }
+                        Err(_) => {
+                            if let Some(sample) = &sample {
+                                sample.member(MemberOutcome::Error);
+                            }
+                            continue;
+                        }
+                    };
+                    if values[slot].is_some() {
+                        if let Some(sample) = &sample {
+                            sample.member(MemberOutcome::CacheHit);
+                        }
+                    } else {
+                        if let Some(sample) = &sample {
+                            sample.member(MemberOutcome::RemoteMiss);
+                        }
+                        let clock = ResolutionSample::start(&sample);
+                        let node = self
+                            .partition_indexes
+                            .get(&reference.batch_address.partition)
+                            .copied()
+                            .ok_or_else(|| {
+                                LocalDbError::new("reference names unregistered partition")
+                            });
+                        if let Ok(node) = node.as_ref() {
+                            groups[*node].push((slot, *reference));
+                            missing.push(slot);
+                        }
+                        if let Some(sample) = &sample {
+                            sample.stage(ResolutionStage::RoutePreparation, clock);
+                        }
+                        node?;
+                    }
                 }
             }
             let pin = if missing.is_empty() {

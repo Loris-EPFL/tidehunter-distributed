@@ -409,6 +409,19 @@ flight evidence does not invalidate an otherwise valid cache-only resolution
 sample. Nonzero rearm resets after drain; disarm preserves the snapshot.
 The legacy combined resolve clock is not an index-only measurement.
 
+Batch cache lookup holds the cache for at most 32 consecutive request slots.
+Cache-lock-wait counts are actual acquisitions/windows; cache-lookup counts are
+member lookups. Compare total lock wait per selected API as well as per
+acquisition; do not divide both stages by the same member count or add overlapping
+clocks into an end-to-end latency estimate.
+
+Successful history adoption can retain immutable authority descriptors within
+the existing metadata budget; persistence does not require immediate eviction.
+Eviction releases cache-entry overhead independently of descriptor credits held
+by readers. With `TIDEHUNTER_HISTORY_DIAGNOSTICS=1`, `adoption_ns` includes root
+adoption and bounded post-adoption cache warming. It is not authority-lock hold
+time and must not be added to overlapping request clocks.
+
 `read_rpc_count` increments once for an admitted owner group that starts
 message-read work. Coalesced consumers can share completed work, so logical
 rounds do not imply a minimum dispatch count. The counter is not a packet
