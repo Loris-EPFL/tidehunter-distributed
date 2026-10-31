@@ -24,7 +24,10 @@ fn bounded_windows_pins_compaction_retirement_and_exact_retries_survive_reopen()
         assert!(db.submissions.is_empty());
         assert_eq!(db.publication.retained_batches(), 0);
         assert_eq!(db.completions.retained_batches(), 0);
-        assert!(db.storage_stats().registered_records <= 2);
+        assert!(
+            db.storage_stats().reference_metadata_bytes
+                <= config.storage.max_reference_metadata_bytes
+        );
     }
     let latest = IndexReadCut::At(MutationVersion {
         batch: last,

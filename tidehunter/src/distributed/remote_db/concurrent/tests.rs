@@ -622,6 +622,62 @@ fn sui_bulk_reads_group_shards_preserve_key_errors_and_cache_cuts() {
 }
 
 #[test]
+fn bulk_read_windows_preserve_mixed_duplicate_results_across_cache_chunks_and_cuts() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_cache_bytes = 64 * 1024;
+    let mut original = fixture.open();
+    original
+        .write_batch(fixture.operation(0, 72), vec![put(0, 1), put(1, 2)])
+        .unwrap();
+    original.shutdown().unwrap();
+    drop(original);
+
+    let db = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
+    // Leave key 1 cold while key 0 is resident, then retain the old cut.
+    assert_eq!(get(&db, 0), Some(vec![1; 32]));
+    let old_cut = db.published_cut().unwrap();
+    db.write_batch(
+        fixture.operation(1, 73),
+        vec![
+            put(0, 9),
+            Mutation::Delete {
+                keyspace: KeySpace(0),
+                key: 1u32.to_be_bytes().to_vec().into(),
+            },
+        ],
+    )
+    .unwrap();
+    let latest = db.published_cut().unwrap();
+    let keys: Vec<Vec<u8>> = (0..70)
+        .map(|slot| match slot % 4 {
+            0 => 0u32.to_be_bytes().to_vec(),
+            1 => 1u32.to_be_bytes().to_vec(),
+            2 => 99u32.to_be_bytes().to_vec(),
+            _ => Vec::new(),
+        })
+        .collect();
+    for (cut, first, second) in [(old_cut, Some(1), Some(2)), (latest, Some(9), None)] {
+        let values = db.get_many_cut(KeySpace(0), &keys, cut).unwrap();
+        assert_eq!(values.len(), keys.len());
+        for (slot, value) in values.iter().enumerate() {
+            match slot % 4 {
+                0 | 1 => {
+                    let expected = if slot % 4 == 0 { first } else { second };
+                    let expected = expected.map(|byte| [byte; 32]);
+                    assert_eq!(
+                        value.as_ref().unwrap().as_deref(),
+                        expected.as_ref().map(<[u8; 32]>::as_slice)
+                    );
+                }
+                2 => assert!(value.as_ref().unwrap().is_none()),
+                _ => assert!(value.is_err()),
+            }
+        }
+    }
+    db.shutdown().unwrap();
+}
+
+#[test]
 fn competing_grouped_readers_share_one_credit_without_losing_members() {
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 0;
