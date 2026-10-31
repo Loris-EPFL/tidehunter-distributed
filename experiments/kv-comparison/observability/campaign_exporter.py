@@ -881,6 +881,64 @@ def read_diagnostic_metrics(evidence, labels):
     return result
 
 
+def nvmeof_target_metrics(evidence, labels):
+    """Export independently sampled target aggregates, never infer request stages."""
+    if evidence is None:
+        return ""
+    if not isinstance(evidence, dict) or evidence.get("version") != 1:
+        raise ValueError("invalid NVMe-oF target evidence")
+    device = token(evidence["block_device"])
+    result = ""
+    for component, allowed in (
+        ("block", ("reads_completed", "reads_merged", "read_sectors", "read_ms",
+                   "writes_completed", "writes_merged", "write_sectors", "write_ms",
+                   "io_ms", "weighted_io_ms", "read_bytes", "write_bytes")),
+        ("cpu", ("user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal"))):
+        interval = evidence[component]
+        start = count(interval["start_monotonic_ns"])
+        end = count(interval["end_monotonic_ns"])
+        if end <= start or not isinstance(interval["delta"], dict):
+            raise ValueError("invalid NVMe-oF target interval")
+        local = labels | {"component": component, "device": device}
+        result += sample("kv_nvmeof_target_interval_seconds", (end - start) / 1e9, local)
+        for field in allowed:
+            if field in interval["delta"]:
+                result += sample("kv_nvmeof_target_interval_delta", count(interval["delta"][field]),
+                                 local | {"counter": field})
+    trace = evidence.get("trace")
+    if isinstance(trace, dict) and isinstance(trace.get("available"), bool):
+        result += sample("kv_nvmeof_target_trace_available", int(trace["available"]), labels | {"device": device})
+    if "clock_ticks_per_second" in evidence:
+        result += sample("kv_nvmeof_target_cpu_ticks_per_second",
+                         count(evidence["clock_ticks_per_second"]), labels | {"device": device})
+    return result
+
+
+def nvmeof_trace_metrics(evidence, labels):
+    if evidence is None:
+        return ""
+    if not isinstance(evidence, dict) or evidence.get("version") != 1 or evidence.get("available") is not True:
+        raise ValueError("invalid NVMe-oF trace evidence")
+    start = count(evidence["start_monotonic_ns"])
+    end = count(evidence["end_monotonic_ns"])
+    if end <= start:
+        raise ValueError("invalid NVMe-oF trace interval")
+    local = labels | {"device": token(evidence["block_device"]),
+                      "controller_id": str(count(evidence["controller_id"]))}
+    result = sample("kv_nvmeof_trace_interval_seconds", (end - start) / 1e9, local)
+    result += sample("kv_nvmeof_trace_dropped_events", count(evidence["overrun_or_dropped"]), local)
+    for stage in ("nvmet", "block"):
+        data = evidence["stages"][stage]
+        for field in ("count", "unmatched_start", "unmatched_completion", "ambiguous"):
+            result += sample("kv_nvmeof_trace_stage_events", count(data[field]),
+                             local | {"stage": stage, "statistic": field})
+        if count(data["count"]):
+            for field in ("sum_ns", "max_ns"):
+                result += sample("kv_nvmeof_trace_stage_seconds", count(data[field]) / 1e9,
+                                 local | {"stage": stage, "statistic": field.removesuffix("_ns")})
+    return result
+
+
 def terminal_metrics(terminal, labels):
     if terminal is None:
         return sample("kv_observer_case_terminal", 0, labels)
@@ -904,6 +962,8 @@ def terminal_metrics(terminal, labels):
     result += resource_interval_metrics(terminal.get("resource_evidence"), labels)
     result += write_diagnostic_metrics(terminal.get("write_diagnostics"), labels)
     result += read_diagnostic_metrics(terminal.get("read_diagnostics"), labels)
+    result += nvmeof_target_metrics(terminal.get("nvmeof_target_evidence"), labels)
+    result += nvmeof_trace_metrics(terminal.get("nvmeof_trace_evidence"), labels)
     metrics = terminal.get("metrics")
     if metrics is None:
         return result

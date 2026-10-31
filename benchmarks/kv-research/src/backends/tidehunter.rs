@@ -55,6 +55,13 @@ struct Options {
     external_remote_config: Option<tidehunter::distributed::remote_db::RemoteDatabaseConfig>,
     #[serde(default)]
     external_owner_read_config: Option<Vec<ExternalOwnerReadConfig>>,
+    /// Independently admitted sealed-WAL namespaces; control/write transport stays separate.
+    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
+    #[serde(default)]
+    nvmeof_readers: Vec<tidehunter::distributed::nvmeof::NvmeofReaderConfig>,
+    #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
+    #[serde(default)]
+    nvmeof_readers: Vec<serde_json::Value>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -390,6 +397,28 @@ pub struct TidehunterBackend {
 fn parse_options(value: &serde_json::Value) -> BackendResult<Options> {
     let options: Options = serde_json::from_value(value.clone())?;
     let name = backend_name(&options.transport);
+    if !options.nvmeof_readers.is_empty() {
+        if !cfg!(all(feature = "nvmeof", target_os = "linux")) {
+            return Err("NVMe-oF requires the Linux nvmeof benchmark feature".into());
+        }
+        if options.external_remote_config.is_none() {
+            return Err("NVMe-oF readers require explicit external owner configuration and prepared sealed data".into());
+        }
+        if options.coordinator_read_cache_bytes != Some(0) {
+            return Err(
+                "remote NVMe-oF measurement requires coordinator_read_cache_bytes=0".into(),
+            );
+        }
+    }
+    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
+    if let Some(first) = options.nvmeof_readers.first()
+        && options
+            .nvmeof_readers
+            .iter()
+            .any(|reader| reader.binding.transport != first.binding.transport)
+    {
+        return Err("one benchmark case cannot pool different NVMe-oF transports".into());
+    }
     if options.path.as_os_str().is_empty()
         || options
             .evidence
@@ -517,7 +546,7 @@ pub async fn open(
 #[allow(clippy::too_many_lines)]
 async fn open_for(
     value: &serde_json::Value,
-    _registry: &prometheus::Registry,
+    registry: &prometheus::Registry,
 ) -> BackendResult<TidehunterBackend> {
     let options = parse_options(value)?;
     let transport = options.transport.clone();
@@ -633,8 +662,17 @@ async fn open_for(
     } else {
         "external topology; placement and physical-device independence are not observed here"
     };
+    let selected_backend = backend_name(&transport);
+    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
+    let selected_backend = options
+        .nvmeof_readers
+        .first()
+        .map_or(selected_backend, |reader| match reader.binding.transport {
+            tidehunter::distributed::nvmeof::NvmeofTransport::Tcp => "tidehunter_nvme_tcp",
+            tidehunter::distributed::nvmeof::NvmeofTransport::Rdma => "tidehunter_nvme_rdma",
+        });
     let effective_configuration = serde_json::json!({
-        "backend": backend_name(&transport),
+        "backend": selected_backend,
         "transport": transport.label(),
         "transport_security": if transport.is_native() { "trusted_network_no_tls" } else { "mutual_tls" },
         "owner_count": options.owners,
@@ -704,6 +742,25 @@ async fn open_for(
     });
     fs::create_dir_all(&coordinator_path)?;
     let db = sui::Db::open_remote(&coordinator_path, shape, remote_config).map_err(native_error)?;
+    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
+    for reader in &options.nvmeof_readers {
+        db.install_nvmeof_reader(reader.clone())
+            .map_err(native_error)?;
+    }
+    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
+    if !options.nvmeof_readers.is_empty() {
+        db.register_nvmeof_metrics(registry).map_err(native_error)?;
+    }
+    #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
+    let _ = registry;
+    let mut effective_configuration = effective_configuration;
+    effective_configuration["nvmeof_readers"] = serde_json::to_value(&options.nvmeof_readers)?;
+    effective_configuration["read_backend"] =
+        serde_json::json!(if options.nvmeof_readers.is_empty() {
+            "owner_record_protocol"
+        } else {
+            "linux_nvmeof"
+        });
     let keyspace = db.ks("root");
     let operational_read_io = db.operational_read_io_monitor();
     Ok(TidehunterBackend {
@@ -712,7 +769,7 @@ async fn open_for(
         cluster: std::sync::Mutex::new(cluster),
         endpoints,
         owners: options.owners,
-        backend_name: backend_name(&transport),
+        backend_name: selected_backend,
         evidence_path,
         effective_configuration,
         operational_read_io,
@@ -921,6 +978,15 @@ impl KvBackend for TidehunterBackend {
         let Some(db) = self.db.as_ref() else {
             return serde_json::json!({"available": false, "error": "backend is shutting down"});
         };
+        #[cfg(all(feature = "nvmeof", target_os = "linux"))]
+        let nvmeof = serde_json::json!({
+            "available": true,
+            "readers": db.nvmeof_stats(),
+            "scope": "host reader counters; submit_to_cq includes kernel/network/target/device",
+        });
+        #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
+        let nvmeof =
+            serde_json::json!({"available": false, "reason": "Linux NVMe-oF feature not enabled"});
         let coordinator = db.remote_counters().map(|(cache, _, rpc)| serde_json::json!({
             "read_rpc_count": rpc,
             "hits": cache.hits, "misses": cache.misses, "inserts": cache.inserts,
@@ -933,6 +999,7 @@ impl KvBackend for TidehunterBackend {
         }));
         let Some(monitor) = db.read_evidence_monitor() else {
             return serde_json::json!({"available": true, "coordinator": coordinator,
+                "nvmeof": nvmeof,
                 "owner_executor": {"available": false, "error": "read evidence monitor unavailable"},
                 "client_resident": {"available": false, "error": "read evidence monitor unavailable"},
                 "client_resident_lanes": {"available": false, "error": "read evidence monitor unavailable"},
@@ -969,7 +1036,8 @@ impl KvBackend for TidehunterBackend {
         };
         serde_json::json!({"available": true, "coordinator": coordinator,
             "owner_executor": owners, "client_resident": residents,
-            "client_resident_lanes": resident_lanes, "owner_grants": owner_grants})
+            "client_resident_lanes": resident_lanes, "owner_grants": owner_grants,
+            "nvmeof": nvmeof})
     }
 
     fn arm_read_profile(&self, limit: usize) -> BackendResult<()> {

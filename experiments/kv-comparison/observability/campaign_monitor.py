@@ -532,6 +532,23 @@ def configure_collector(spec, state, offline=False, dashboard=None, time_range=N
                              'to': datetime.fromtimestamp(time_range['end'], timezone.utc).isoformat()}
         dashboard['refresh'] = ''
     atomic_json(config / 'dashboards/campaign.json', dashboard, 0o444)
+    nvmeof = load_json(ROOT / 'dashboards/nvmeof.json')
+    if nvmeof.get('uid') != 'kv-nvmeof-evidence':
+        raise ValueError('NVMe-oF dashboard source UID mismatch')
+    panels = list(nvmeof.get('panels', []))
+    while panels:
+        panel = panels.pop()
+        panels.extend(panel.get('panels', []))
+        for item in [panel, *panel.get('targets', [])]:
+            datasource = item.get('datasource')
+            if datasource is not None:
+                if datasource != {'type': 'prometheus', 'uid': 'kv-comparison-prometheus'}:
+                    raise ValueError('NVMe-oF dashboard references unexpected datasource')
+                item['datasource'] = {'type': 'prometheus', 'uid': DATASOURCE}
+    if offline:
+        nvmeof['time'] = dashboard['time']
+        nvmeof['refresh'] = ''
+    atomic_json(config / 'dashboards/nvmeof.json', nvmeof, 0o444)
     provider = {'apiVersion': 1, 'providers': [{'name': 'campaign', 'orgId': 1, 'type': 'file',
                 'disableDeletion': True, 'editable': False, 'options': {'path': '/campaign-dashboards'}}]}
     atomic_json(config / 'provisioning/dashboards/campaign.yaml', provider, 0o444)

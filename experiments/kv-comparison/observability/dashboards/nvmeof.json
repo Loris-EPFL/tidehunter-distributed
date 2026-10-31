@@ -1,0 +1,35 @@
+{
+  "uid": "kv-nvmeof-evidence",
+  "title": "KV NVMe-oF — qualified evidence",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "timezone": "utc",
+  "refresh": "5s",
+  "description": "Target sysfs block and CPU deltas use their own interval. They are device-level aggregates, not per-operation NAND or network latency. Missing evidence is absent. Target tracing availability is explicitly reported.",
+  "tags": ["kv-research", "nvmeof"],
+  "time": {"from": "now-30m", "to": "now"},
+  "panels": [
+    {"id": 1, "type": "timeseries", "title": "Target interval read/write bytes — aggregate block device", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}, "datasource": {"type": "prometheus", "uid": "kv-comparison-prometheus"}, "targets": [{"refId": "A", "expr": "kv_nvmeof_target_interval_delta{component=\"block\",counter=~\"read_bytes|write_bytes\"}", "legendFormat": "{{run_id}} {{case_id}} {{device}} {{counter}}"}], "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []}},
+    {"id": 2, "type": "timeseries", "title": "Target interval block operations and device time (ms)", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}, "datasource": {"type": "prometheus", "uid": "kv-comparison-prometheus"}, "targets": [{"refId": "A", "expr": "kv_nvmeof_target_interval_delta{component=\"block\",counter=~\"reads_completed|writes_completed|read_ms|write_ms|io_ms\"}", "legendFormat": "{{run_id}} {{case_id}} {{device}} {{counter}}"}]},
+    {"id": 3, "type": "timeseries", "title": "Target CPU interval ticks (separate interval)", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}, "datasource": {"type": "prometheus", "uid": "kv-comparison-prometheus"}, "targets": [{"refId": "A", "expr": "kv_nvmeof_target_interval_delta{component=\"cpu\"}", "legendFormat": "{{run_id}} {{case_id}} {{counter}}"}]},
+    {"id": 4, "type": "timeseries", "title": "Target interval lengths and trace availability", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}, "datasource": {"type": "prometheus", "uid": "kv-comparison-prometheus"}, "targets": [{"refId": "A", "expr": "kv_nvmeof_target_interval_seconds", "legendFormat": "{{run_id}} {{case_id}} {{component}} seconds"}, {"refId": "B", "expr": "kv_nvmeof_target_trace_available", "legendFormat": "{{run_id}} {{case_id}} interval sampler trace available"}]},
+    {"id": 5, "type": "timeseries", "title": "Rust reader lifetime requests, submissions, completions, failures", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16}, "datasource": {"type": "prometheus", "uid": "kv-comparison-prometheus"}, "targets": [{"refId": "A", "expr": "{__name__=~\"tidehunter_nvmeof_(logical_requests|logical_members|eligible_hits|ineligible_fallbacks|io_submissions|io_completions|io_errors|io_timeouts)_total\"}", "legendFormat": "{{__name__}} {{run_id}} {{case_id}}"}]},
+    {"id": 6, "type": "timeseries", "title": "Rust reader lifetime aligned bytes", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16}, "datasource": {"type": "prometheus", "uid": "kv-comparison-prometheus"}, "targets": [{"refId": "A", "expr": "{__name__=~\"tidehunter_nvmeof_aligned_(requested|read)_bytes_total\"}", "legendFormat": "{{__name__}} {{run_id}} {{case_id}}"}], "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []}},
+    {"id": 7, "type": "timeseries", "title": "Rust stage lifetime mean and maximum", "description": "Cumulative mean is total seconds divided by observed stage count, shown only when count is positive; max is lifetime maximum. Submit-to-CQ includes kernel, network, target and device, not pure network or NAND latency.", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24}, "datasource": {"type": "prometheus", "uid": "kv-comparison-prometheus"}, "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []}, "targets": [
+      {"refId": "A", "expr": "tidehunter_nvmeof_alignment_seconds_total / (tidehunter_nvmeof_alignment_observations_total > 0)", "legendFormat": "alignment lifetime mean {{run_id}} {{case_id}}"},
+      {"refId": "B", "expr": "tidehunter_nvmeof_alignment_max_seconds and (tidehunter_nvmeof_alignment_observations_total > 0)", "legendFormat": "alignment lifetime max {{run_id}} {{case_id}}"},
+      {"refId": "C", "expr": "tidehunter_nvmeof_admission_seconds_total / (tidehunter_nvmeof_admission_observations_total > 0)", "legendFormat": "admission lifetime mean {{run_id}} {{case_id}}"},
+      {"refId": "D", "expr": "tidehunter_nvmeof_admission_max_seconds and (tidehunter_nvmeof_admission_observations_total > 0)", "legendFormat": "admission lifetime max {{run_id}} {{case_id}}"},
+      {"refId": "E", "expr": "tidehunter_nvmeof_queue_seconds_total / (tidehunter_nvmeof_queue_observations_total > 0)", "legendFormat": "queue lifetime mean {{run_id}} {{case_id}}"},
+      {"refId": "F", "expr": "tidehunter_nvmeof_queue_max_seconds and (tidehunter_nvmeof_queue_observations_total > 0)", "legendFormat": "queue lifetime max {{run_id}} {{case_id}}"},
+      {"refId": "G", "expr": "tidehunter_nvmeof_submit_to_cq_seconds_total / (tidehunter_nvmeof_submit_to_cq_observations_total > 0)", "legendFormat": "submit-to-CQ lifetime mean {{run_id}} {{case_id}}"},
+      {"refId": "H", "expr": "tidehunter_nvmeof_submit_to_cq_max_seconds and (tidehunter_nvmeof_submit_to_cq_observations_total > 0)", "legendFormat": "submit-to-CQ lifetime max {{run_id}} {{case_id}}"},
+      {"refId": "I", "expr": "tidehunter_nvmeof_extraction_seconds_total / (tidehunter_nvmeof_extraction_observations_total > 0)", "legendFormat": "extraction lifetime mean {{run_id}} {{case_id}}"},
+      {"refId": "J", "expr": "tidehunter_nvmeof_extraction_max_seconds and (tidehunter_nvmeof_extraction_observations_total > 0)", "legendFormat": "extraction lifetime max {{run_id}} {{case_id}}"},
+      {"refId": "K", "expr": "tidehunter_nvmeof_verification_seconds_total / (tidehunter_nvmeof_verification_observations_total > 0)", "legendFormat": "verification lifetime mean {{run_id}} {{case_id}}"},
+      {"refId": "L", "expr": "tidehunter_nvmeof_verification_max_seconds and (tidehunter_nvmeof_verification_observations_total > 0)", "legendFormat": "verification lifetime max {{run_id}} {{case_id}}"}
+    ]},
+    {"id": 8, "type": "timeseries", "title": "Target traced stage sums/max and event qualification", "description": "Target nvmet lifetime and block issue-to-complete are independent, imperfect correlations. Check dropped and ambiguous events and raw trace.", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24}, "datasource": {"type": "prometheus", "uid": "kv-comparison-prometheus"}, "targets": [{"refId": "A", "expr": "kv_nvmeof_trace_stage_seconds", "legendFormat": "{{run_id}} {{case_id}} {{stage}} {{statistic}} seconds"}, {"refId": "B", "expr": "kv_nvmeof_trace_stage_events", "legendFormat": "{{run_id}} {{case_id}} {{stage}} {{statistic}}"}, {"refId": "C", "expr": "kv_nvmeof_trace_dropped_events", "legendFormat": "{{run_id}} {{case_id}} dropped"}]}
+  ]
+}

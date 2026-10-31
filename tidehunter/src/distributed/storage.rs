@@ -1936,6 +1936,90 @@ impl PartitionLog {
         Ok(())
     }
 
+    /// Validate owner authority and return the exact pinned source-file mapping.
+    /// This is control-plane metadata, not a per-value data read.
+    #[cfg(feature = "experimental-nvmeof")]
+    pub(crate) fn nvmeof_record_location(
+        self: &Arc<Self>,
+        reference: &ValueRecordReference,
+    ) -> Result<super::tcp::ValidatedRecordLocation, StorageError> {
+        {
+            let state = self.state.lock();
+            if state.poisoned || state.references.background_failed() {
+                return Err(StorageError::Poisoned);
+            }
+            if !state.sealed || state.writer.is_some() {
+                return Err(StorageError::Invalid(
+                    "export requires durably sealed storage",
+                ));
+            }
+        }
+        let plan = self.plan_record_read(reference)?;
+        let source = plan.member.file.metadata()?;
+        let wal_file_bytes = self.config().wal_file_bytes;
+        Ok(super::tcp::ValidatedRecordLocation {
+            reference: *reference,
+            wal_file_bytes,
+            source_file_index: reference.batch_address.offset / wal_file_bytes,
+            source_device: source.dev(),
+            source_inode: source.ino(),
+            source_file_len: source.len(),
+            durable_frontier: self.durable_frontier.load(Ordering::Acquire),
+            offset: plan.member.offset,
+            len: plan.member.len as u64,
+        })
+    }
+
+    /// Export exactly the supplied durable references from one sealed WAL file.
+    /// The copied file is independent of subsequent native segment retirement.
+    #[cfg(feature = "experimental-nvmeof")]
+    pub fn export_sealed_readset(
+        self: &Arc<Self>,
+        directory: &Path,
+        references: &[ValueRecordReference],
+        config: &super::nvmeof::ExportConfig,
+    ) -> Result<super::nvmeof::ExportManifest, StorageError> {
+        {
+            let state = self.state.lock();
+            if state.poisoned || state.references.background_failed() {
+                return Err(StorageError::Poisoned);
+            }
+            if !state.sealed || state.writer.is_some() {
+                return Err(StorageError::Invalid(
+                    "export requires durably sealed storage",
+                ));
+            }
+        }
+        // Charge plans, hash-set spare capacity, catalog and serialized JSON
+        // before allocating any of them. This intentionally overestimates.
+        let catalog_bytes = references
+            .len()
+            .checked_mul(4096)
+            .and_then(|n| n.checked_add(config.nqn.len()))
+            .and_then(|n| n.checked_add(4096))
+            .ok_or(StorageError::Capacity)?;
+        if references.is_empty() || catalog_bytes > config.max_catalog_bytes {
+            return Err(StorageError::Capacity);
+        }
+        let mut plans = Vec::with_capacity(references.len());
+        let mut unique = std::collections::HashSet::with_capacity(references.len());
+        for reference in references {
+            if !unique.insert(*reference) {
+                return Err(StorageError::Invalid("duplicate export reference"));
+            }
+            plans.push((*reference, self.plan_record_read(reference)?));
+        }
+        super::nvmeof::publish_export(
+            directory,
+            config,
+            &self.config().inventory,
+            self.config().partition,
+            self.durable_frontier.load(Ordering::Acquire),
+            self.config().wal_file_bytes,
+            &plans,
+        )
+    }
+
     pub fn seal_epoch(&self, authority: RequestAuthority) -> Result<(), StorageError> {
         if authority.epoch != self.config().inventory.epoch {
             return Err(StorageError::Fenced);

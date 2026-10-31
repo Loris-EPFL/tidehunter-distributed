@@ -84,10 +84,18 @@ pub async fn run<B: KvBackend>(
         config.workload.batch_size,
         config.workload.distribution.clone(),
     );
-    let require_present_reads =
-        !config.qualification_only && config.phases.preload && config.workload.mix.delete == 0;
-    if fatal_reason.is_none() && !config.qualification_only && config.phases.preload {
-        reporter.set_phase("preload");
+    let require_present_reads = !config.qualification_only
+        && (config.phases.preload || config.phases.verify_existing_dataset)
+        && config.workload.mix.delete == 0;
+    if fatal_reason.is_none()
+        && !config.qualification_only
+        && (config.phases.preload || config.phases.verify_existing_dataset)
+    {
+        reporter.set_phase(if config.phases.verify_existing_dataset {
+            "verify_existing_dataset"
+        } else {
+            "preload"
+        });
         match preload(
             Arc::clone(&backend),
             &config,
@@ -101,7 +109,7 @@ pub async fn run<B: KvBackend>(
             Ok(()) => reporter.snapshot()?,
             Err(error) => {
                 failed = true;
-                fatal_reason = Some(format!("preload failed: {error}"));
+                fatal_reason = Some(format!("dataset preparation failed: {error}"));
             }
         }
     }
@@ -540,6 +548,73 @@ fn owner_response_deltas(start: &serde_json::Value, end: &serde_json::Value) -> 
     })
 }
 
+fn nvmeof_deltas(start: &serde_json::Value, end: &serde_json::Value) -> serde_json::Value {
+    const COUNTERS: &[&str] = &[
+        "logical_requests",
+        "logical_members",
+        "eligible_hits",
+        "ineligible_fallbacks",
+        "aligned_requested_bytes",
+        "aligned_read_bytes",
+        "io_submissions",
+        "io_completions",
+        "io_errors",
+        "io_timeouts",
+    ];
+    const STAGES: &[&str] = &[
+        "alignment",
+        "admission",
+        "queue",
+        "submit_to_cq",
+        "extraction",
+        "verification",
+    ];
+    let index = |snapshot: &serde_json::Value| -> Option<std::collections::BTreeMap<String, serde_json::Value>> {
+        if snapshot["available"] != true { return None; }
+        let mut readers = std::collections::BTreeMap::new();
+        for reader in snapshot["readers"].as_array()? {
+            let identity = serde_json::json!([
+                reader.get("database_uuid")?, reader.get("epoch")?,
+                reader.get("partition")?, reader.get("export_uuid")?
+            ]).to_string();
+            if readers.insert(identity, reader.clone()).is_some() { return None; }
+        }
+        Some(readers)
+    };
+    let (Some(a), Some(b)) = (index(start), index(end)) else {
+        return serde_json::json!({"available":false,"error":"NVMe-oF reader identity or boundary unavailable"});
+    };
+    if a.keys().ne(b.keys()) {
+        return serde_json::json!({"available":false,"error":"NVMe-oF reader set changed during measurement"});
+    }
+    let mut readers = serde_json::Map::new();
+    for (identity, first) in a {
+        let last = &b[&identity];
+        let mut stages = serde_json::Map::new();
+        for stage in STAGES {
+            stages.insert(
+                (*stage).to_owned(),
+                serde_json::json!({
+                    "delta":counter_delta(&first[stage], &last[stage], &["count","sum_ns"]),
+                    "lifetime_max_ns_at_end":last[stage]["max_ns"]
+                }),
+            );
+        }
+        readers.insert(
+            identity,
+            serde_json::json!({
+                "counters":counter_delta(&first,last,COUNTERS),"stages":stages
+            }),
+        );
+    }
+    serde_json::json!({
+        "available":true,"active_readers":readers.len(),"readers":readers,
+        "timing_scope":"submit_to_cq includes host kernel, transport, target and storage; overlapping physical reads cannot be added into API latency",
+        "cold_storage_limit":"O_DIRECT bypasses host/target page cache, not device cache; require target configuration and block-I/O evidence",
+        "max_semantics":"lifetime maxima are not measurement-window maxima or percentile distributions"
+    })
+}
+
 fn measurement_read_evidence(
     start: &serde_json::Value,
     end: &serde_json::Value,
@@ -632,6 +707,11 @@ fn measurement_read_evidence(
             else if !drained { "measurement did not complete and drain successfully" }
             else { "backend observation unavailable at a boundary" }})
     };
+    let nvmeof = if attempted && drained {
+        nvmeof_deltas(&start["nvmeof"], &end["nvmeof"])
+    } else {
+        serde_json::json!({"available":false,"error":"measurement not attempted or not drained"})
+    };
     serde_json::json!({
         "schema_version": 1, "scope": "measurement_boundary",
         "start_boundary": "after warmup, aging and measurement gate; before measurement run_phase",
@@ -639,7 +719,7 @@ fn measurement_read_evidence(
         "measurement_attempted": attempted, "measurement_drained": drained,
         "snapshot_semantics": "sequential component and owner samples, not a globally atomic cut; raw snapshots include gauges and lifetime peaks",
         "limitations": "logical WAL reads and async submissions are not physical IOPS; RMA counters do not establish hardware native FI_READ or per-operation hit fractions",
-        "start": start, "end": end, "deltas": deltas
+        "start": start, "end": end, "deltas": deltas, "nvmeof":nvmeof
     })
 }
 
@@ -651,7 +731,14 @@ async fn preload<B: KvBackend>(
     deadline: Instant,
     reporter: &mut Reporter,
 ) -> BackendResult<()> {
-    let mut pool = WorkerPool::new(&backend, config, namespace, origin, false)?;
+    let verify_existing = config.phases.verify_existing_dataset;
+    let phase = if verify_existing {
+        "verify_existing_dataset"
+    } else {
+        "preload"
+    };
+    let mut preparation_failed = false;
+    let mut pool = WorkerPool::new(&backend, config, namespace, origin, verify_existing)?;
     let drain_deadline = deadline + Duration::from_secs(config.limits.shutdown_grace_seconds);
     let mut next_snapshot = Instant::now() + Duration::from_secs(1);
     let mut expired = false;
@@ -664,7 +751,10 @@ async fn preload<B: KvBackend>(
             match receive_with_snapshots(&mut pool, reporter, drain_deadline, &mut next_snapshot)
                 .await
             {
-                Ok(completion) => pool.record_completion(completion, reporter)?,
+                Ok(completion) => {
+                    preparation_failed |= completion.sample.outcome != "success";
+                    pool.record_completion(completion, reporter)?;
+                }
                 Err(error) => {
                     let _ = pool.record_unknown_pending(reporter);
                     pool.shutdown(false);
@@ -673,14 +763,19 @@ async fn preload<B: KvBackend>(
             }
         }
         let work = WorkItem {
-            operation: OperationKind::Put,
+            operation: if verify_existing {
+                OperationKind::Read
+            } else {
+                OperationKind::Put
+            },
             keys: vec![id],
         };
         let scheduled = duration_ns(origin.elapsed());
-        reporter.offered("preload", "put", 1);
-        if let Err(work) = pool.try_dispatch(work, "preload", scheduled, deadline, false) {
+        reporter.offered(phase, work.operation.as_str(), 1);
+        if let Err(work) = pool.try_dispatch(work, phase, scheduled, deadline, false) {
+            preparation_failed = true;
             reporter.rejected(rejected_sample(
-                "preload",
+                phase,
                 &work,
                 scheduled,
                 origin,
@@ -695,7 +790,10 @@ async fn preload<B: KvBackend>(
     while !pool.pending.is_empty() {
         match receive_with_snapshots(&mut pool, reporter, drain_deadline, &mut next_snapshot).await
         {
-            Ok(completion) => pool.record_completion(completion, reporter)?,
+            Ok(completion) => {
+                preparation_failed |= completion.sample.outcome != "success";
+                pool.record_completion(completion, reporter)?;
+            }
             Err(error) => {
                 let _ = pool.record_unknown_pending(reporter);
                 pool.shutdown(false);
@@ -705,7 +803,12 @@ async fn preload<B: KvBackend>(
     }
     pool.shutdown(true);
     if expired {
-        return Err(invalid("global deadline expired before preload completed"));
+        return Err(invalid(
+            "global deadline expired before dataset preparation completed",
+        ));
+    }
+    if preparation_failed {
+        return Err(invalid("dataset preparation did not succeed for every key"));
     }
     Ok(())
 }
@@ -3125,5 +3228,105 @@ mod tests {
             4,
             4
         ));
+    }
+    #[tokio::test]
+    async fn existing_dataset_checks_all_values_before_measurement_without_overwriting() {
+        for scenario in ["present", "missing", "corrupt"] {
+            let directory = result_directory(&format!("existing-{scenario}"));
+            let mut config = read_test_config();
+            let namespace = [9; 16];
+            config.key_namespace_hex = Some(hex(&namespace));
+            config.dataset.keys = 2;
+            config.phases.preload = false;
+            config.phases.verify_existing_dataset = true;
+            let backend = MemoryBackend::new(false, false);
+            for id in 0..2 {
+                if scenario == "missing" && id == 1 {
+                    continue;
+                }
+                let mut value = value_bytes(
+                    &namespace,
+                    config.seed,
+                    id,
+                    config.dataset.value_size,
+                    config.dataset.entropy,
+                )
+                .to_vec();
+                if scenario == "corrupt" && id == 1 {
+                    value[32] ^= 1;
+                }
+                backend.data.lock().unwrap().insert(
+                    key_bytes(&namespace, config.seed, id).to_vec(),
+                    value.into(),
+                );
+            }
+            let output = directory.join("result");
+            let result = run(backend, config, &output, prometheus::Registry::new()).await;
+            assert_eq!(result.is_ok(), scenario == "present");
+            if scenario != "present" {
+                assert!(measurement_outcomes(&output).is_empty());
+                let samples = std::fs::read_to_string(output.join("samples.csv")).unwrap();
+                assert!(
+                    samples
+                        .lines()
+                        .any(|line| line.starts_with("verify_existing_dataset,read,wrong_value,"))
+                );
+            }
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn nvmeof_boundaries_reject_identity_changes_resets_and_missing_samples() {
+        let mut reader = serde_json::json!({
+            "database_uuid":[1],"epoch":1,"partition":2,"export_uuid":[3],
+            "logical_requests":0,"logical_members":0,"eligible_hits":0,
+            "ineligible_fallbacks":0,"aligned_requested_bytes":0,"aligned_read_bytes":0,
+            "io_submissions":0,"io_completions":0,"io_errors":0,"io_timeouts":0
+        });
+        for stage in [
+            "alignment",
+            "admission",
+            "queue",
+            "submit_to_cq",
+            "extraction",
+            "verification",
+        ] {
+            reader[stage] = serde_json::json!({"count":1,"sum_ns":10,"max_ns":10});
+        }
+        let start = serde_json::json!({"available":true,"readers":[reader]});
+        let mut end = start.clone();
+        end["readers"][0]["io_completions"] = serde_json::json!(2);
+        end["readers"][0]["submit_to_cq"] = serde_json::json!({"count":3,"sum_ns":40,"max_ns":20});
+        let delta = nvmeof_deltas(&start, &end);
+        let row = delta["readers"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        assert_eq!(row["counters"]["counters"]["io_completions"], 2);
+        assert_eq!(
+            row["stages"]["submit_to_cq"]["delta"]["counters"]["sum_ns"],
+            30
+        );
+        assert_eq!(row["stages"]["submit_to_cq"]["lifetime_max_ns_at_end"], 20);
+        end["readers"][0]["submit_to_cq"]["count"] = serde_json::json!(0);
+        let delta = nvmeof_deltas(&start, &end);
+        let row = delta["readers"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        assert_eq!(row["stages"]["submit_to_cq"]["delta"]["available"], false);
+        end["readers"][0]["export_uuid"] = serde_json::json!([4]);
+        assert_eq!(nvmeof_deltas(&start, &end)["available"], false);
+        assert_eq!(
+            nvmeof_deltas(&start, &serde_json::json!({}))["available"],
+            false
+        );
+        let duplicate = serde_json::json!({"available":true,"readers":[start["readers"][0],start["readers"][0]]});
+        assert_eq!(nvmeof_deltas(&duplicate, &duplicate)["available"], false);
     }
 }

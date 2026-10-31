@@ -66,7 +66,7 @@ impl ReadBatch {
     ) -> Result<Self, LocalDbError> {
         // Reject an impossible member before issuing any of this batch's RPCs.
         for (_, reference) in groups.iter().flatten() {
-            if member_charge(reference)? > service.max_bytes.saturating_sub(512) {
+            if service.member_charge(reference)? > service.max_bytes.saturating_sub(512) {
                 return Err(LocalDbError::new(BYTE_BUDGET));
             }
         }
@@ -105,8 +105,28 @@ impl ReadBatch {
             let available = service.max_bytes - retained.1;
             let mut bytes = 512usize;
             let mut count = 0;
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            let first_eligible = service.nvmeof_eligible(&group.front().unwrap().1)?;
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            let mut nvme_bytes = 0usize;
             for (_, reference) in group.iter().take(256) {
-                let charge = member_charge(reference)?;
+                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                if service.nvmeof_eligible(reference)? != first_eligible {
+                    break;
+                }
+                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                if let Some(index) = first_eligible {
+                    let (member_bytes, max_bytes, max_members) =
+                        service.nvmeof_limits(index, reference)?;
+                    if member_bytes > max_bytes || max_members == 0 {
+                        return Err(LocalDbError::new("record exceeds NVMe-oF reader capacity"));
+                    }
+                    if count >= max_members || member_bytes > max_bytes.saturating_sub(nvme_bytes) {
+                        break;
+                    }
+                    nvme_bytes += member_bytes;
+                }
+                let charge = service.member_charge(reference)?;
                 if charge > available.saturating_sub(bytes) {
                     break;
                 }
@@ -798,6 +818,12 @@ struct State {
     flights: Mutex<Box<[Weak<ReadFlight>]>>,
     coalesced_members: AtomicU64,
     flight_metadata_bytes: usize,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    nvmeof: Mutex<Vec<NvmeDispatch>>,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    nvmeof_metrics: Mutex<Vec<super::super::nvmeof::NvmeofMetrics>>,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    nvmeof_enabled: AtomicBool,
     #[cfg(test)]
     peak_connection_reads: AtomicUsize,
     #[cfg(test)]
@@ -809,6 +835,25 @@ struct State {
     #[cfg(test)]
     reactor_pause: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
 }
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+struct NvmeDispatch {
+    reader: super::super::nvmeof::NvmeofReader,
+    lease_client: Arc<Mutex<Client>>,
+    lease_epoch: u64,
+    lease_token: [u8; 16],
+    shape: Arc<KeyShape>,
+    metadata_budget: usize,
+    next: u64,
+    active: HashMap<u64, Request>,
+}
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+struct NvmeEpochPin {
+    client: Arc<Mutex<Client>>,
+    epoch: u64,
+    token: [u8; 16],
+}
+
 impl State {
     fn poison(&self) {
         self.failed.store(true, Ordering::Release);
@@ -1029,6 +1074,125 @@ struct ReactorLane {
     active: HashMap<u64, InflightRead>,
     profiling: bool,
 }
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+fn progress_nvmeof(state: &Arc<State>) -> bool {
+    let mut guard = state.nvmeof.lock();
+    let mut ready = Vec::new();
+    for (index, dispatch) in guard.iter_mut().enumerate() {
+        if dispatch.active.is_empty() {
+            continue;
+        }
+        let completions = match dispatch.reader.progress() {
+            Ok(completions) => completions,
+            Err(_) => {
+                // Retain requests, credits and pins while the queue owns DMA.
+                state.poison();
+                continue;
+            }
+        };
+        for completion in completions {
+            if let Some(request) = dispatch.active.remove(&completion.id) {
+                ready.push((index, dispatch.shape.clone(), request, completion.result));
+            } else {
+                state.poison();
+            }
+        }
+    }
+    drop(guard);
+    let progressed = !ready.is_empty();
+    for (index, shape, request, result) in ready {
+        let verifying = result
+            .as_ref()
+            .is_ok_and(|members| members.len() == request.flight.references.len());
+        let verification_started = Instant::now();
+        let result = result.map_err(LocalDbError::component).and_then(|members| {
+            if members.len() != request.flight.references.len() {
+                return Err(LocalDbError::new("NVMe-oF completion count mismatch"));
+            }
+            let values = request
+                .flight
+                .references
+                .iter()
+                .zip(members)
+                .map(|(reference, bytes)| {
+                    CompleteBatch::decode_record(&shape, reference, bytes)
+                        .map_err(LocalDbError::component)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if Instant::now() >= request.deadline {
+                return Err(LocalDbError::new("remote read operation deadline expired"));
+            }
+            Ok((values, None))
+        });
+        if verifying && let Some(dispatch) = state.nvmeof.lock().get(index) {
+            dispatch
+                .reader
+                .record_verification(verification_started.elapsed());
+        }
+        request.complete(result);
+    }
+    progressed
+}
+
+// Returns whether the head belongs to NVMe-oF and whether it made progress.
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+fn submit_nvmeof(state: &Arc<State>, lane: &mut ReactorLane) -> (bool, bool) {
+    let mut guard = state.nvmeof.lock();
+    let Some(request) = lane.queued.front() else {
+        return (false, false);
+    };
+    let mut selected = None;
+    for reference in &request.references {
+        let mut member = None;
+        for (index, dispatch) in guard.iter().enumerate() {
+            match dispatch.reader.eligibility(reference) {
+                Ok(super::super::nvmeof::Eligibility::Eligible) => member = Some(index),
+                Ok(super::super::nvmeof::Eligibility::Ineligible) => {}
+                Err(error) => {
+                    let request = lane.queued.pop_front().unwrap();
+                    drop(guard);
+                    request.complete(Err(LocalDbError::component(error)));
+                    return (true, true);
+                }
+            }
+        }
+        if let Some(previous) = selected {
+            if previous != member {
+                let request = lane.queued.pop_front().unwrap();
+                drop(guard);
+                request.complete(Err(LocalDbError::new(
+                    "mixed NVMe-oF request was not partitioned",
+                )));
+                return (true, true);
+            }
+        } else {
+            selected = Some(member);
+        }
+    }
+    let Some(Some(index)) = selected else {
+        return (false, false);
+    };
+    let dispatch = &mut guard[index];
+    let id = dispatch.next;
+    dispatch.next = dispatch.next.wrapping_add(1);
+    match dispatch
+        .reader
+        .submit(id, request.references.clone(), request.deadline)
+    {
+        Ok(super::super::nvmeof::SubmitOutcome::Submitted) => {
+            let request = lane.queued.pop_front().unwrap();
+            dispatch.active.insert(id, request);
+            (true, true)
+        }
+        Ok(super::super::nvmeof::SubmitOutcome::Full) => (true, false),
+        Err(error) => {
+            let request = lane.queued.pop_front().unwrap();
+            drop(guard);
+            request.complete(Err(LocalDbError::component(error)));
+            (true, true)
+        }
+    }
+}
 
 fn progress_read_lane(
     state: &Arc<State>,
@@ -1056,6 +1220,19 @@ fn progress_read_lane(
         return progressed;
     }
     // Diagnostics and the deterministic test hook may own a mutex.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    let nvme_head = loop {
+        let (handled, made_progress) = submit_nvmeof(state, lane);
+        progressed |= made_progress;
+        if !handled || !made_progress {
+            break handled;
+        }
+    };
+    #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+    let nvme_head = false;
+    if nvme_head && lane.active.is_empty() && !lane.profiling && !resident_enabled {
+        return progressed;
+    }
     // Never let one such connection stall another connection's reads.
     let Some(mut client) = lane.client.try_lock() else {
         return progressed;
@@ -1082,7 +1259,12 @@ fn progress_read_lane(
         return progressed;
     }
     let transport_before = profiling.then(|| client.transport_progress_stats());
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    let mut fallback = None;
     while let Some(request) = lane.queued.front() {
+        if nvme_head {
+            break;
+        }
         if state.failed.load(Ordering::Acquire) {
             break;
         }
@@ -1110,6 +1292,13 @@ fn progress_read_lane(
             request.submitted.is_some(),
         ) {
             Ok(Some(id)) => {
+                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                if state.nvmeof_enabled.load(Ordering::Acquire) {
+                    fallback = Some((
+                        request.flight.references[0].batch_address.partition,
+                        request.flight.references.len(),
+                    ));
+                }
                 if client.message_read_requests() != message_requests {
                     state.read_rpcs.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1131,6 +1320,10 @@ fn progress_read_lane(
             }
         }
         progressed = true;
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if state.nvmeof_enabled.load(Ordering::Acquire) {
+            break;
+        }
     }
     // Even after global poisoning, accepted transport work is driven to
     // completion/error before releasing its application-buffer credits.
@@ -1165,6 +1358,16 @@ fn progress_read_lane(
         }
     }
     drop(client);
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    if let Some((partition, count)) = fallback
+        && let Some(dispatch) = state
+            .nvmeof
+            .lock()
+            .iter()
+            .find(|dispatch| dispatch.reader.manifest().partition == partition)
+    {
+        dispatch.reader.record_ineligible_fallbacks(count);
+    }
     match completions {
         Ok(completions) => {
             progressed |= !completions.is_empty();
@@ -1242,8 +1445,14 @@ fn drive_reads(
     let mut disconnected = false;
     let mut first_lane = 0;
     let mut empty_polls = 0u8;
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    let mut nvme_shutdown_started = false;
     loop {
         let mut progressed = false;
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        {
+            progressed |= progress_nvmeof(&state);
+        }
         #[cfg(test)]
         if let Some((entered, resume)) = state.reactor_pause.lock().take() {
             entered.send(()).unwrap();
@@ -1279,6 +1488,26 @@ fn drive_reads(
                 drop(scheduling);
                 progressed |= progress_read_lane(&state, &mut driver, epoch, resident_enabled);
             }
+        }
+        // Sender disconnection proves no producer can enqueue another accepted
+        // request. Preserve existing drain semantics by submitting every queued
+        // request before closing reader admission, then keep polling terminal CQEs.
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if disconnected
+            && !nvme_shutdown_started
+            && lanes.iter().all(|lane| {
+                !lane.scheduling.lock().inline_reserved
+                    && lane
+                        .driver
+                        .try_lock()
+                        .is_some_and(|driver| driver.queued.is_empty())
+            })
+        {
+            let mut readers = state.nvmeof.lock();
+            for dispatch in readers.iter_mut() {
+                dispatch.reader.begin_shutdown();
+            }
+            nvme_shutdown_started = true;
         }
         if disconnected
             && lanes.iter().all(|lane| {
@@ -1335,6 +1564,12 @@ pub(super) struct ReadService {
     state: Arc<State>,
     lanes: RwLock<Vec<Vec<Lane>>>,
     sender: Mutex<Option<mpsc::SyncSender<ReadCommand>>>,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    nvmeof_maintenance: Mutex<()>,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    nvmeof_epoch_pins: Mutex<Vec<NvmeEpochPin>>,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    nvmeof_pin_uncertain: AtomicBool,
     thread: Mutex<Option<JoinHandle<()>>>,
     next: Vec<AtomicUsize>,
     max_requests: usize,
@@ -1427,6 +1662,80 @@ impl ReadRequest {
     }
 }
 impl ReadService {
+    fn nvmeof_enabled(&self) -> bool {
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        {
+            self.state.nvmeof_enabled.load(Ordering::Acquire)
+        }
+        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+        {
+            false
+        }
+    }
+
+    fn member_charge(&self, reference: &ValueRecordReference) -> Result<usize, LocalDbError> {
+        let charge = member_charge(reference)?;
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        for dispatch in self.state.nvmeof.lock().iter() {
+            if dispatch.reader.eligibility(reference).map_err(|error| {
+                self.state.poison();
+                LocalDbError::component(error)
+            })? == super::super::nvmeof::Eligibility::Eligible
+            {
+                let aligned = dispatch
+                    .reader
+                    .aligned_charge(reference)
+                    .map_err(LocalDbError::component)?;
+                if aligned > dispatch.reader.max_request_bytes()
+                    || dispatch.reader.max_request_members() == 0
+                {
+                    return Err(LocalDbError::new("record exceeds NVMe-oF reader capacity"));
+                }
+                return charge
+                    .checked_add(aligned)
+                    .ok_or_else(|| LocalDbError::new("read budget overflow"));
+            }
+        }
+        Ok(charge)
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    fn nvmeof_eligible(
+        &self,
+        reference: &ValueRecordReference,
+    ) -> Result<Option<usize>, LocalDbError> {
+        let mut selected = None;
+        for (index, dispatch) in self.state.nvmeof.lock().iter().enumerate() {
+            if dispatch.reader.eligibility(reference).map_err(|error| {
+                self.state.poison();
+                LocalDbError::component(error)
+            })? == super::super::nvmeof::Eligibility::Eligible
+            {
+                selected = Some(index);
+            }
+        }
+        Ok(selected)
+    }
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    fn nvmeof_limits(
+        &self,
+        index: usize,
+        reference: &ValueRecordReference,
+    ) -> Result<(usize, usize, usize), LocalDbError> {
+        let guard = self.state.nvmeof.lock();
+        let reader = &guard
+            .get(index)
+            .ok_or_else(|| LocalDbError::new(BACKPRESSURE))?
+            .reader;
+        Ok((
+            reader
+                .aligned_charge(reference)
+                .map_err(LocalDbError::component)?,
+            reader.max_request_bytes(),
+            reader.max_request_members(),
+        ))
+    }
+
     const FLIGHT_SLOT_BYTES: usize = std::mem::size_of::<Weak<ReadFlight>>()
         + std::mem::size_of::<ReadFlight>()
         + std::mem::size_of::<FlightCompletion>()
@@ -1475,6 +1784,12 @@ impl ReadService {
             flights: Mutex::new((0..flight_slots).map(|_| Weak::new()).collect()),
             coalesced_members: AtomicU64::new(0),
             flight_metadata_bytes,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            nvmeof: Mutex::new(Vec::new()),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            nvmeof_metrics: Mutex::new(Vec::new()),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            nvmeof_enabled: AtomicBool::new(false),
             #[cfg(test)]
             peak_connection_reads: AtomicUsize::new(0),
             #[cfg(test)]
@@ -1490,6 +1805,12 @@ impl ReadService {
             state,
             lanes: RwLock::new(Vec::new()),
             sender: Mutex::new(None),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            nvmeof_maintenance: Mutex::new(()),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            nvmeof_epoch_pins: Mutex::new(Vec::new()),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            nvmeof_pin_uncertain: AtomicBool::new(false),
             thread: Mutex::new(None),
             next: (0..config.endpoints.len())
                 .map(|_| AtomicUsize::new(0))
@@ -1557,6 +1878,380 @@ impl ReadService {
         *service.sender.get_mut() = Some(sender);
         Ok(service)
     }
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    fn pause_idle_nvmeof(&self, allow_failed: bool) -> Result<AdmissionPause, LocalDbError> {
+        let retained = self.state.retained.lock();
+        if (!allow_failed && self.failed()) || self.state.stopped.load(Ordering::Acquire) {
+            return Err(LocalDbError::new("read authority is poisoned or closed"));
+        }
+        if retained.0 != 0
+            || retained.1 != 0
+            || self.state.admission_paused.swap(true, Ordering::AcqRel)
+        {
+            return Err(LocalDbError::new(
+                "finish or drop outstanding reads before changing NVMe-oF",
+            ));
+        }
+        let pause = AdmissionPause(self.state.clone());
+        drop(retained);
+        for lane in self.lanes.read().iter().flatten() {
+            let client = lane
+                .client
+                .try_lock()
+                .ok_or_else(|| LocalDbError::new("read lane is busy"))?;
+            let stats = client.resident_read_stats();
+            if stats.handles_live != 0 || stats.grants_live != 0 {
+                return Err(LocalDbError::new(
+                    "release resident grants before changing NVMe-oF",
+                ));
+            }
+        }
+        Ok(pause)
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(super) fn clear_nvmeof_reader(&self) -> Result<(), LocalDbError> {
+        let _maintenance = self.nvmeof_maintenance.lock();
+        let _pause = self.pause_idle_nvmeof(true)?;
+        self.release_nvmeof_readers()
+    }
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    fn acquire_nvmeof_epoch_pins(&self) -> Result<bool, LocalDbError> {
+        if !self.nvmeof_epoch_pins.lock().is_empty() {
+            return Ok(false);
+        }
+        let clients: Vec<_> = self
+            .lanes
+            .read()
+            .iter()
+            .map(|lanes| {
+                lanes
+                    .first()
+                    .map(|lane| lane.client.clone())
+                    .ok_or_else(|| LocalDbError::new("owner has no read lane"))
+            })
+            .collect::<Result<_, _>>()?;
+        let mut acquired = Vec::with_capacity(clients.len());
+        for client in clients {
+            let result = client.lock().register_nvmeof_epoch_pin(self.epoch);
+            match result {
+                Ok(token) => acquired.push(NvmeEpochPin {
+                    client,
+                    epoch: self.epoch,
+                    token,
+                }),
+                Err(error) => {
+                    // The owner may have persisted a pin before its reply was
+                    // lost. Preserve all known pins as well as the unknown one.
+                    *self.nvmeof_epoch_pins.lock() = acquired;
+                    self.nvmeof_pin_uncertain.store(true, Ordering::Release);
+                    self.state.poison();
+                    return Err(LocalDbError::component(error));
+                }
+            }
+        }
+        *self.nvmeof_epoch_pins.lock() = acquired;
+        Ok(true)
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    fn release_nvmeof_epoch_pins(&self) -> Result<(), LocalDbError> {
+        if self.nvmeof_pin_uncertain.load(Ordering::Acquire) {
+            return Err(LocalDbError::new(
+                "uncertain NVMe-oF owner pins remain quarantined",
+            ));
+        }
+        let pins = std::mem::take(&mut *self.nvmeof_epoch_pins.lock());
+        let mut pins = pins.into_iter();
+        while let Some(pin) = pins.next() {
+            let result = pin
+                .client
+                .lock()
+                .release_nvmeof_epoch_pin(pin.epoch, pin.token);
+            if let Err(error) = result {
+                let mut remaining = self.nvmeof_epoch_pins.lock();
+                remaining.push(pin);
+                remaining.extend(pins);
+                self.nvmeof_pin_uncertain.store(true, Ordering::Release);
+                self.state.poison();
+                return Err(LocalDbError::component(error));
+            }
+        }
+        Ok(())
+    }
+
+    // The caller has stopped admissions and drained the reactor. Close every
+    // namespace FD before acknowledging any owner lease release.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    fn release_nvmeof_readers(&self) -> Result<(), LocalDbError> {
+        let mut guard = self.state.nvmeof.lock();
+        if guard.iter().any(|dispatch| !dispatch.active.is_empty()) {
+            return Err(LocalDbError::new("NVMe-oF requests have not drained"));
+        }
+        self.state.nvmeof_enabled.store(false, Ordering::Release);
+        let readers = std::mem::take(&mut *guard);
+        for metrics in self.state.nvmeof_metrics.lock().iter() {
+            metrics.replace_sources(&[]);
+        }
+        drop(guard);
+        let mut releases = Vec::with_capacity(readers.len());
+        for dispatch in readers {
+            let NvmeDispatch {
+                reader,
+                lease_client,
+                lease_epoch,
+                lease_token,
+                ..
+            } = dispatch;
+            drop(reader);
+            releases.push((lease_client, lease_epoch, lease_token));
+        }
+        let mut error = None;
+        for (client, epoch, token) in releases {
+            if let Err(cause) = client.lock().release_nvmeof_export(epoch, token) {
+                self.nvmeof_pin_uncertain.store(true, Ordering::Release);
+                self.state.poison();
+                if error.is_none() {
+                    error = Some(LocalDbError::component(cause));
+                }
+            }
+        }
+        match error {
+            Some(error) => Err(error),
+            None => self.release_nvmeof_epoch_pins(),
+        }
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(super) fn nvmeof_stats(&self) -> Vec<super::super::nvmeof::NvmeofStats> {
+        self.state
+            .nvmeof
+            .lock()
+            .iter()
+            .map(|dispatch| dispatch.reader.snapshot())
+            .collect()
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(super) fn register_nvmeof_metrics(
+        &self,
+        registry: &prometheus::Registry,
+    ) -> Result<(), LocalDbError> {
+        let guard = self.state.nvmeof.lock();
+        let metrics = super::super::nvmeof::NvmeofMetrics::register(registry)
+            .map_err(LocalDbError::component)?;
+        let readers: Vec<_> = guard.iter().map(|dispatch| &dispatch.reader).collect();
+        metrics.replace_sources(&readers);
+        self.state.nvmeof_metrics.lock().push(metrics);
+        Ok(())
+    }
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(super) fn install_nvmeof_reader(
+        &self,
+        config: super::super::nvmeof::NvmeofReaderConfig,
+        database: &RemoteDatabaseConfig,
+        shape: &KeyShape,
+    ) -> Result<(), LocalDbError> {
+        self.install_nvmeof_with(
+            config,
+            database,
+            shape,
+            super::super::nvmeof::NvmeofReader::open_verified,
+        )
+    }
+
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(super) fn install_nvmeof_file_fixture(
+        &self,
+        config: super::super::nvmeof::NvmeofReaderConfig,
+        database: &RemoteDatabaseConfig,
+        shape: &KeyShape,
+        path: &std::path::Path,
+    ) -> Result<(), LocalDbError> {
+        self.install_nvmeof_with(config, database, shape, |config| {
+            super::super::nvmeof::NvmeofReader::open_verified_file(config, path)
+        })
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    fn install_nvmeof_with(
+        &self,
+        config: super::super::nvmeof::NvmeofReaderConfig,
+        database: &RemoteDatabaseConfig,
+        shape: &KeyShape,
+        open: impl FnOnce(
+            super::super::nvmeof::NvmeofReaderConfig,
+        ) -> Result<
+            super::super::nvmeof::NvmeofReader,
+            super::super::nvmeof::NvmeofError,
+        >,
+    ) -> Result<(), LocalDbError> {
+        let _maintenance = self.nvmeof_maintenance.lock();
+        let _pause = self.pause_idle_nvmeof(false)?;
+        if database.read_cache_bytes != 0 {
+            return Err(LocalDbError::new(
+                "NVMe-oF requires the coordinator read cache to be disabled",
+            ));
+        }
+        let manifest = &config.manifest;
+        let metadata_budget = config
+            .max_inflight_members
+            .checked_mul(2048)
+            .and_then(|bytes| {
+                config
+                    .max_inflight_requests
+                    .checked_mul(1024)
+                    .and_then(|requests| bytes.checked_add(requests))
+            })
+            .and_then(|bytes| bytes.checked_add(config.max_catalog_bytes))
+            .ok_or_else(|| LocalDbError::new("NVMe-oF metadata budget overflow"))?;
+        let allowance = database
+            .read_memory_allowance_bytes
+            .saturating_sub(database.read_cache_bytes)
+            .saturating_sub(database.max_pending_read_bytes);
+        let reserved = self
+            .state
+            .nvmeof
+            .lock()
+            .iter()
+            .try_fold(0usize, |total, reader| {
+                total.checked_add(reader.metadata_budget)
+            })
+            .ok_or_else(|| LocalDbError::new("NVMe-oF metadata budget overflow"))?;
+        if metadata_budget > allowance.saturating_sub(reserved) {
+            return Err(LocalDbError::new(
+                "NVMe-oF metadata exceeds read memory allowance",
+            ));
+        }
+        if manifest.database_uuid != database.storage.database
+            || manifest.epoch > self.epoch
+            || manifest.wal_file_bytes != database.storage.wal_file_bytes
+            || manifest.catalog.is_empty()
+            || manifest
+                .catalog
+                .len()
+                .checked_mul(4096)
+                .and_then(|bytes| bytes.checked_add(manifest.nqn.len()))
+                .is_none_or(|bytes| bytes > config.max_catalog_bytes)
+        {
+            return Err(LocalDbError::new("NVMe-oF manifest authority mismatch"));
+        }
+        {
+            let readers = self.state.nvmeof.lock();
+            for entry in &manifest.catalog {
+                for existing in readers.iter() {
+                    match existing
+                        .reader
+                        .eligibility(&entry.reference)
+                        .map_err(LocalDbError::component)?
+                    {
+                        super::super::nvmeof::Eligibility::Eligible => {
+                            return Err(LocalDbError::new("overlapping NVMe-oF catalogs"));
+                        }
+                        super::super::nvmeof::Eligibility::Ineligible => {}
+                    }
+                }
+            }
+        }
+        let node = database
+            .endpoints
+            .iter()
+            .position(|endpoint| endpoint.partition == manifest.partition)
+            .ok_or_else(|| LocalDbError::new("NVMe-oF partition is not registered"))?;
+        let client = {
+            let lanes = self.lanes.read();
+            lanes[node][0].client.clone()
+        };
+        for entries in manifest.catalog.chunks(1) {
+            let references: Vec<_> = entries.iter().map(|entry| entry.reference).collect();
+            let locations = client
+                .lock()
+                .validate_record_references(self.epoch, &references)
+                .map_err(LocalDbError::component)?;
+            if locations.len() != entries.len() {
+                return Err(LocalDbError::new("NVMe-oF owner validation count mismatch"));
+            }
+            for (entry, location) in entries.iter().zip(locations) {
+                if location.reference != entry.reference
+                    || location.wal_file_bytes != manifest.wal_file_bytes
+                    || location.source_file_index != manifest.source_file_index
+                    || location.source_device != manifest.source_device
+                    || location.source_inode != manifest.source_inode
+                    || location.source_file_len != manifest.image_len
+                    || location.durable_frontier != manifest.durable_frontier
+                    || location.offset != entry.offset
+                    || location.len != entry.len as u64
+                    || entry.reference.batch_address.partition != manifest.partition
+                    || entry.reference.batch_address.segment_generation != manifest.generation
+                    || entry.reference.batch_version.epoch != manifest.epoch
+                {
+                    return Err(LocalDbError::new(
+                        "NVMe-oF catalog differs from owner authority",
+                    ));
+                }
+            }
+        }
+        // Direct reads require the entire coordinator epoch, including owners
+        // without an export, to remain pinned for the reader lifetime.
+        let first_reader = self.acquire_nvmeof_epoch_pins()?;
+        // Admission is serialized with the owner's authority transitions. A
+        // lost reply is uncertain and therefore poisons this coordinator.
+        let binding = super::super::nvmeof::lease::ExportBinding::from(manifest);
+        let token = client
+            .lock()
+            .register_nvmeof_export(self.epoch, binding, manifest.catalog[0].reference)
+            .map_err(|error| {
+                self.nvmeof_pin_uncertain.store(true, Ordering::Release);
+                self.state.poison();
+                LocalDbError::component(error)
+            })?;
+        let opened = open(config)
+            .map_err(LocalDbError::component)
+            .and_then(|reader| {
+                reader
+                    .validate_authority(
+                        database.storage.database,
+                        self.epoch,
+                        &database.storage.partitions,
+                    )
+                    .map_err(LocalDbError::component)?;
+                Ok(reader)
+            });
+        let reader = match opened {
+            Ok(reader) => reader,
+            Err(error) => {
+                if client
+                    .lock()
+                    .release_nvmeof_export(self.epoch, token)
+                    .is_err()
+                {
+                    self.nvmeof_pin_uncertain.store(true, Ordering::Release);
+                    self.state.poison();
+                } else if first_reader {
+                    let _ = self.release_nvmeof_epoch_pins();
+                }
+                return Err(error);
+            }
+        };
+        let mut readers = self.state.nvmeof.lock();
+        readers.push(NvmeDispatch {
+            reader,
+            lease_client: client,
+            lease_epoch: self.epoch,
+            lease_token: token,
+            shape: Arc::new(shape.clone()),
+            next: 0,
+            active: HashMap::new(),
+            metadata_budget,
+        });
+        let sources: Vec<_> = readers.iter().map(|dispatch| &dispatch.reader).collect();
+        for metrics in self.state.nvmeof_metrics.lock().iter() {
+            metrics.replace_sources(&sources);
+        }
+        self.state.nvmeof_enabled.store(true, Ordering::Release);
+        Ok(())
+    }
+
     pub(super) fn ensure_idle(&self) -> Result<(), LocalDbError> {
         if self.state.retained.lock().0 != 0 {
             return Err(LocalDbError::new(
@@ -1734,10 +2429,16 @@ impl ReadService {
             .collect()
     }
     fn stop_actor(&self) {
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        let _maintenance = self.nvmeof_maintenance.lock();
         self.state.stopped.store(true, Ordering::Release);
         self.notify_admission();
         self.sender.lock().take();
-        if let Some(thread) = self.thread.lock().take()
+        // Serialize all shutdown callers through join and lease release. A
+        // second caller must not release an owner token while the first one is
+        // still waiting for the reactor's terminal completions.
+        let mut thread_guard = self.thread.lock();
+        if let Some(thread) = thread_guard.take()
             && thread.join().is_err()
         {
             self.poison();
@@ -1745,6 +2446,10 @@ impl ReadService {
         // Join any caller-owned lane before the authority directory lock drops.
         for lane in self.lanes.read().iter().flatten() {
             drop(lane.client.lock());
+        }
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if self.release_nvmeof_readers().is_err() {
+            self.poison();
         }
     }
 
@@ -1798,6 +2503,9 @@ impl ReadService {
         if self.failed() || self.state.stopped.load(Ordering::Acquire) {
             return Err(LocalDbError::new("read authority is poisoned or closed"));
         }
+        if self.nvmeof_enabled() {
+            return Ok(None);
+        }
         let bytes = member_charge(reference)?
             .checked_add(extra_bytes)
             .and_then(|bytes| bytes.checked_add(512))
@@ -1830,6 +2538,9 @@ impl ReadService {
             }
             if self.state.admission_paused.load(Ordering::Acquire) {
                 return Err(LocalDbError::new(BACKPRESSURE));
+            }
+            if self.nvmeof_enabled() {
+                return Ok(None);
             }
             if retained.0 == self.max_requests || bytes > self.max_bytes - retained.1 {
                 return Ok(None);
@@ -2006,11 +2717,13 @@ impl ReadService {
         if references.is_empty() || references.len() > 256 {
             return Err(LocalDbError::new("read request count exceeds bound"));
         }
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        let generation = self.state.admission_generation.load(Ordering::Acquire);
         let bytes = references
             .iter()
             .try_fold(extra_bytes + 512, |bytes, reference| {
                 bytes
-                    .checked_add(member_charge(reference)?)
+                    .checked_add(self.member_charge(reference)?)
                     .ok_or_else(|| LocalDbError::new("read budget overflow"))
             })?;
         if bytes > self.max_bytes {
@@ -2042,6 +2755,15 @@ impl ReadService {
                     }
                 };
                 parts.push((None, slot));
+            }
+        }
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if let Some(first) = missing.first() {
+            let eligible = self.nvmeof_eligible(first)?;
+            for reference in &missing[1..] {
+                if self.nvmeof_eligible(reference)? != eligible {
+                    return Err(LocalDbError::new(BACKPRESSURE));
+                }
             }
         }
         let coalesced_members = references.len() - missing.len();
@@ -2082,6 +2804,10 @@ impl ReadService {
         let mut reserved = false;
         let (credit, lane) = {
             let mut retained = self.state.retained.lock();
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            if self.state.admission_generation.load(Ordering::Acquire) != generation {
+                return Err(LocalDbError::new(BACKPRESSURE));
+            }
             if self.failed() {
                 return Err(LocalDbError::new("read authority is poisoned"));
             }
@@ -2119,7 +2845,7 @@ impl ReadService {
                                 {
                                     return None;
                                 }
-                                if idle_only && owned_lanes.is_some() {
+                                if idle_only && owned_lanes.is_some() && !self.nvmeof_enabled() {
                                     scheduling.inline_reserved = true;
                                     reserved = true;
                                 }

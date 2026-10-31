@@ -1303,4 +1303,222 @@ fn profiled_pre_io_failure_never_counts_a_barrier_or_durable_receipt() {
     assert_profile_stage_bounds(profile);
 }
 
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn sealed_export_preserves_native_offsets_and_rejects_forged_or_existing_paths() {
+    use crate::distributed::nvmeof::ExportConfig;
+    let temp = tempdir::TempDir::new("sealed-export").unwrap();
+    let config = config(vec![3], 3);
+    let log = Arc::new(
+        PartitionLog::create(
+            &temp.path().join("stream"),
+            config.clone(),
+            &shape(),
+            metrics(),
+        )
+        .unwrap(),
+    );
+    let receipt = log
+        .append_complete_batch(authority(&config), &batch(&config, 0))
+        .unwrap();
+    log.persist_through(receipt).unwrap();
+    let reference = log.record_reference(receipt, 0).unwrap();
+    let export = ExportConfig {
+        export_uuid: [7; 16],
+        nqn: "nqn.2026-01.test:wal".into(),
+        nsid: 1,
+        block_size: 512,
+        max_catalog_bytes: 65536,
+    };
+    let path = temp.path().join("export");
+    assert!(
+        log.export_sealed_readset(&path, &[reference], &export)
+            .is_err()
+    );
+    assert!(log.nvmeof_record_location(&reference).is_err());
+    assert!(!path.exists());
+    log.seal_epoch(authority(&config)).unwrap();
+    let mut forged = reference;
+    forged.batch_digest.0[0] ^= 1;
+    assert!(log.nvmeof_record_location(&forged).is_err());
+    assert!(
+        log.export_sealed_readset(&path, &[forged], &export)
+            .is_err()
+    );
+    assert!(!path.exists());
+    let manifest = log
+        .export_sealed_readset(&path, &[reference], &export)
+        .unwrap();
+    let entry = &manifest.catalog[0];
+    let location = log.nvmeof_record_location(&reference).unwrap();
+    assert_eq!(location.offset, entry.offset);
+    assert_eq!(location.source_inode, manifest.source_inode);
+    assert_eq!(location.source_device, manifest.source_device);
+    assert_eq!(
+        entry.offset,
+        reference.batch_address.offset % config.wal_file_bytes
+            + 8
+            + u64::from(reference.descriptor.offset)
+    );
+    let image = File::open(path.join("image.wal")).unwrap();
+    let mut bytes = vec![0; entry.len];
+    image.read_exact_at(&mut bytes, entry.offset).unwrap();
+    let decoded = CompleteBatch::decode_record(&shape(), &reference, bytes.into()).unwrap();
+    assert_eq!(decoded, batch(&config, 0).mutations()[0]);
+    assert!(
+        log.export_sealed_readset(&path, &[reference], &export)
+            .is_err()
+    );
+    assert!(
+        !temp
+            .path()
+            .join(".nvmeof-export-07070707070707070707070707070707.partial")
+            .exists()
+    );
+    assert_eq!(
+        std::fs::metadata(path.join("image.wal")).unwrap().len(),
+        manifest.image_len
+    );
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+#[test]
+fn sealed_export_async_reads_keep_duplicate_order_and_enforce_bounds() {
+    use crate::distributed::nvmeof::{
+        Eligibility, ExportConfig, NamespaceBinding, NvmeofReader, NvmeofReaderConfig,
+        NvmeofTransport, SubmitOutcome,
+    };
+    let temp = tempdir::TempDir::new("sealed-export-async").unwrap();
+    let config = config(vec![3], 3);
+    let log = Arc::new(
+        PartitionLog::create(
+            &temp.path().join("stream"),
+            config.clone(),
+            &shape(),
+            metrics(),
+        )
+        .unwrap(),
+    );
+    let receipt = log
+        .append_complete_batch(authority(&config), &batch(&config, 0))
+        .unwrap();
+    log.persist_through(receipt).unwrap();
+    let first = log.record_reference(receipt, 0).unwrap();
+    let second = log.record_reference(receipt, 1).unwrap();
+    log.seal_epoch(authority(&config)).unwrap();
+    let path = temp.path().join("export");
+    let manifest = log
+        .export_sealed_readset(
+            &path,
+            &[first, second],
+            &ExportConfig {
+                export_uuid: [8; 16],
+                nqn: "nqn.2026-01.test:wal".into(),
+                nsid: 1,
+                block_size: 512,
+                max_catalog_bytes: 65536,
+            },
+        )
+        .unwrap();
+    let reader_config = NvmeofReaderConfig {
+        binding: NamespaceBinding {
+            namespace_path: path.join("image.wal"),
+            transport: NvmeofTransport::Tcp,
+        },
+        manifest,
+        max_inflight_requests: 1,
+        max_inflight_members: 4,
+        max_inflight_bytes: 65536,
+        max_catalog_bytes: 65536,
+    };
+    // Production never treats an ordinary file as a qualified namespace.
+    assert!(NvmeofReader::open_verified(reader_config.clone()).is_err());
+    let mut bad = reader_config.clone();
+    bad.manifest.catalog[0].offset += 1;
+    assert!(NvmeofReader::open_verified_file(bad, &path.join("image.wal")).is_err());
+    let mut oversized = reader_config.clone();
+    oversized.max_inflight_requests = usize::MAX;
+    assert!(NvmeofReader::open_verified_file(oversized, &path.join("image.wal")).is_err());
+    let mut underfunded = reader_config.clone();
+    underfunded.max_catalog_bytes = 8192;
+    assert!(NvmeofReader::open_verified_file(underfunded, &path.join("image.wal")).is_err());
+    let mut reader =
+        NvmeofReader::open_verified_file(reader_config, &path.join("image.wal")).unwrap();
+    assert_eq!(reader.eligibility(&first).unwrap(), Eligibility::Eligible);
+    let mut forged = first;
+    forged.descriptor.checksum.0 ^= 1;
+    assert!(reader.eligibility(&forged).is_err());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    assert!(reader.submit(4, vec![first; 5], deadline).is_err());
+    assert_eq!(
+        reader
+            .submit(1, vec![second, first, second], deadline)
+            .unwrap(),
+        SubmitOutcome::Submitted
+    );
+    assert_eq!(
+        reader.submit(2, vec![first], deadline).unwrap(),
+        SubmitOutcome::Full
+    );
+    let completion = loop {
+        if let Some(done) = reader.progress().unwrap().pop() {
+            break done;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    };
+    assert_eq!(completion.id, 1);
+    let records = completion.result.unwrap();
+    assert_eq!(records.len(), 3);
+    for (reference, bytes) in [second, first, second].iter().zip(records) {
+        assert_eq!(
+            CompleteBatch::decode_record(&shape(), reference, bytes).unwrap(),
+            batch(&config, 0).mutations()[reference.descriptor.operation_index as usize]
+        );
+    }
+    let stats = reader.snapshot();
+    assert_eq!(stats.io_submissions, 3);
+    assert_eq!(stats.io_completions, 3);
+    assert!(stats.aligned_read_bytes >= stats.aligned_requested_bytes);
+    assert_eq!(
+        reader
+            .submit(3, vec![first], Instant::now() + Duration::from_secs(10))
+            .unwrap(),
+        SubmitOutcome::Submitted
+    );
+    reader.cancel(3);
+    let cancel_deadline = Instant::now() + Duration::from_secs(10);
+    let cancelled = loop {
+        if let Some(done) = reader.progress().unwrap().pop() {
+            break done;
+        }
+        assert!(Instant::now() < cancel_deadline);
+        std::thread::yield_now();
+    };
+    assert!(matches!(
+        cancelled.result,
+        Err(crate::distributed::nvmeof::NvmeofError::Cancelled)
+    ));
+    let failure_deadline = Instant::now() + Duration::from_secs(10);
+    assert_eq!(
+        reader.submit(5, vec![first], failure_deadline).unwrap(),
+        SubmitOutcome::Submitted
+    );
+    reader.fail_next_submit(libc::EIO);
+    assert!(reader.progress().unwrap().is_empty());
+    assert!(reader.submit(6, vec![first], failure_deadline).is_err());
+    let failed = loop {
+        if let Some(done) = reader.progress().unwrap().pop() {
+            break done;
+        }
+        assert!(Instant::now() < failure_deadline);
+        std::thread::yield_now();
+    };
+    assert_eq!(failed.id, 5);
+    assert!(matches!(
+        failed.result,
+        Err(crate::distributed::nvmeof::NvmeofError::Io(_))
+    ));
+}
+
 mod history;

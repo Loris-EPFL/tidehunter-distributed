@@ -46,6 +46,8 @@ pub struct NodeInventory {
     history_diagnostics: bool,
     history_failure_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
     // Partition handles each retain this root lock as well.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(super) nvmeof_leases: Arc<Mutex<super::super::nvmeof::lease::ExportLeaseRegistry>>,
     lock: Arc<DbLock>,
 }
 
@@ -179,6 +181,18 @@ impl NodeInventory {
         directory(&config.root)?;
         config.root = config.root.canonicalize()?;
         let lock = Arc::new(DbLock::acquire(&config.root, Duration::ZERO)?);
+        // A build without the NVMe-oF revoker must never silently open an
+        // owner whose prior kernel namespace capabilities may still exist.
+        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+        match fs::symlink_metadata(config.root.join("nvmeof-export-leases-v1")) {
+            Ok(_) => {
+                return Err(TcpError::new(
+                    "NVMe-oF lease registry requires recovery with the Linux NVMe-oF feature",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let manifest_path = config.root.join(MANIFEST);
         let mut manifest = match fs::symlink_metadata(&manifest_path) {
             Ok(metadata) if metadata.file_type().is_file() => {
@@ -220,6 +234,19 @@ impl NodeInventory {
             })
         {
             return Err(TcpError::new("node inventory/configuration differs"));
+        }
+        // Registry recovery occurs under the node lock, before any old epoch is
+        // recovered or sealed. Orphaned admissions stay quarantined.
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        let nvmeof_leases = Arc::new(Mutex::new(
+            super::super::nvmeof::lease::ExportLeaseRegistry::open(&config.root, 1024, 1024 * 1024)
+                .map_err(TcpError::component)?,
+        ));
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if nvmeof_leases.lock().has_live_or_quarantined() {
+            return Err(TcpError::new(
+                "unreleased NVMe-oF leases are quarantined; owner recovery requires proven initiator fencing",
+            ));
         }
         for entry in fs::read_dir(&config.root)? {
             let entry = entry?;
@@ -276,6 +303,8 @@ impl NodeInventory {
             metrics,
             history_diagnostics: false,
             history_failure_notifier: None,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            nvmeof_leases,
             lock,
         })
     }
@@ -412,6 +441,24 @@ impl NodeInventory {
             .get(&epoch)
             .cloned()
             .ok_or_else(|| TcpError::new("active stream missing"))
+    }
+    #[cfg(all(feature = "experimental-nvmeof", any(test, feature = "test-utils")))]
+    pub(super) fn sealed_nvmeof_log(&self, epoch: u64) -> Result<Arc<PartitionLog>, TcpError> {
+        self.ensure_healthy()?;
+        if !self
+            .manifest
+            .epochs
+            .iter()
+            .any(|entry| entry.epoch == epoch && entry.state == EpochState::Sealed)
+        {
+            return Err(TcpError::new(
+                "NVMe-oF export requires a sealed source epoch",
+            ));
+        }
+        self.logs
+            .get(&epoch)
+            .cloned()
+            .ok_or_else(|| TcpError::new("sealed export source is absent"))
     }
     pub fn seal(&mut self, epoch: u64) -> Result<(), TcpError> {
         self.ensure_healthy()?;
@@ -636,6 +683,23 @@ fn persist(root: &Path, manifest: &Manifest) -> Result<(), TcpError> {
 mod tests {
     use super::*;
     use crate::distributed::tcp::tests::{config, metrics};
+    #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+    #[test]
+    fn feature_disabled_reopen_rejects_unreleased_nvme_capability() {
+        let temporary = tempdir::TempDir::new("node-nvme-feature-downgrade").unwrap();
+        let config = config(&temporary.path().join("node"));
+        let mut inventory = NodeInventory::open(config.clone(), metrics()).unwrap();
+        inventory.fence_to(1).unwrap();
+        drop(inventory);
+        let before = fs::read(config.root.join(MANIFEST)).unwrap();
+        let marker = config.root.join("nvmeof-export-leases-v1");
+        fs::write(&marker, b"unreleased or corrupt capability state").unwrap();
+        assert!(NodeInventory::open(config.clone(), metrics()).is_err());
+        assert_eq!(fs::read(config.root.join(MANIFEST)).unwrap(), before);
+        fs::remove_file(marker).unwrap();
+        let reopened = NodeInventory::open(config, metrics()).unwrap();
+        assert_eq!(reopened.status().unwrap().active_epoch, None);
+    }
 
     #[test]
     fn interrupted_preparing_epoch_is_retained_and_never_activated() {

@@ -2,6 +2,366 @@ use super::tests::{node_for, put, reopen_cold, value};
 use super::*;
 use crate::distributed::remote_db::pipeline_tests::Fixture;
 
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+fn nvme_fixture(
+    fixture: &Fixture,
+    partition: usize,
+    references: &[ValueRecordReference],
+    name: &str,
+) -> (
+    super::super::super::nvmeof::NvmeofReaderConfig,
+    std::path::PathBuf,
+) {
+    use super::super::super::nvmeof::{
+        ExportConfig, NamespaceBinding, NvmeofReaderConfig, NvmeofTransport,
+    };
+    let directory = fixture.temp.path().join(name);
+    let export = ExportConfig {
+        export_uuid: [partition as u8 + 1; 16],
+        nqn: format!("nqn.2026-01.test:partition-{partition}"),
+        nsid: 1,
+        block_size: 4096,
+        max_catalog_bytes: 1024 * 1024,
+    };
+    let manifest = fixture.nodes[partition]
+        .export_sealed_nvmeof_readset(
+            references[0].batch_address.segment_generation,
+            &directory,
+            references,
+            &export,
+        )
+        .unwrap();
+    let path = directory.join("image.wal");
+    // This cfg(test)-only target models configfs ownership; the data reader
+    // still uses real O_DIRECT io_uring against the immutable export image.
+    for (owner, node) in fixture.nodes.iter().enumerate() {
+        let configfs = fixture.temp.path().join(format!("test-nvmet-{owner}"));
+        if !configfs.exists() {
+            std::fs::create_dir_all(&configfs).unwrap();
+            node.set_nvmeof_lease_fixture(&configfs).unwrap();
+        }
+    }
+    let configfs = fixture.temp.path().join(format!("test-nvmet-{partition}"));
+    let ns = configfs
+        .join("subsystems")
+        .join(&manifest.nqn)
+        .join("namespaces")
+        .join(manifest.nsid.to_string());
+    std::fs::create_dir_all(&ns).unwrap();
+    let hex: String = manifest
+        .export_uuid
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let uuid = format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    );
+    std::fs::write(ns.join("device_uuid"), uuid).unwrap();
+    std::fs::write(ns.join("device_path"), path.to_str().unwrap()).unwrap();
+    std::fs::write(ns.join("enable"), "1\n").unwrap();
+    let config = NvmeofReaderConfig {
+        binding: NamespaceBinding {
+            namespace_path: path.clone(),
+            transport: NvmeofTransport::Tcp,
+        },
+        manifest,
+        max_inflight_requests: 32,
+        max_inflight_members: 32,
+        max_inflight_bytes: 1024 * 1024,
+        max_catalog_bytes: 1024 * 1024,
+    };
+    (config, path)
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+#[test]
+fn file_backed_routes_mixed_ordered_reads_and_concurrent_calls() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7), put(1, 8)])
+        .unwrap();
+    db.write_batch(fixture.operation(1, 1), vec![put(2, 9)])
+        .unwrap();
+    let mut db = reopen_cold(&fixture, db);
+    let references: Vec<_> = (0u32..3)
+        .map(|key| {
+            db.index_reference(KeySpace(0), &key.to_be_bytes(), IndexReadCut::Latest)
+                .unwrap()
+                .unwrap()
+        })
+        .collect();
+    let (first, first_path) = nvme_fixture(&fixture, 0, &references[..1], "nvme-first");
+    let (second, second_path) = nvme_fixture(&fixture, 1, &references[2..], "nvme-second");
+    let mut forged = first.clone();
+    forged.manifest.catalog[0].offset += 1;
+    assert!(
+        db.reads
+            .install_nvmeof_file_fixture(forged, &db.config, &db.shape, &first_path)
+            .is_err()
+    );
+    assert!(db.nvmeof_stats().is_empty());
+    db.reads
+        .install_nvmeof_file_fixture(first.clone(), &db.config, &db.shape, &first_path)
+        .unwrap();
+    assert!(
+        db.reads
+            .install_nvmeof_file_fixture(first, &db.config, &db.shape, &first_path)
+            .is_err()
+    );
+    db.reads
+        .install_nvmeof_file_fixture(second, &db.config, &db.shape, &second_path)
+        .unwrap();
+    let keys: Vec<_> = [2u32, 1, 0, 2, 1]
+        .iter()
+        .map(|k| k.to_be_bytes().to_vec())
+        .collect();
+    let before = db.read_rpc_count();
+    assert_eq!(
+        db.get_many(KeySpace(0), &keys).unwrap(),
+        vec![value(9), value(8), value(7), value(9), value(8)]
+    );
+    assert!(
+        db.read_rpc_count() > before,
+        "unexported member must use the owner"
+    );
+    let stats = db.nvmeof_stats();
+    assert_eq!(stats.len(), 2);
+    assert!(stats[0].eligible_hits > 0 && stats[0].ineligible_fallbacks > 0);
+    assert!(stats[1].eligible_hits > 0);
+    let old_cut = db.published_cut().unwrap();
+    let _pin = db.pin_cut(old_cut.clone()).unwrap();
+    db.write_batch(fixture.operation(0, 2), vec![put(0, 10)])
+        .unwrap();
+    let before_old = db.read_rpc_count();
+    assert_eq!(
+        db.get_cut(KeySpace(0), &0u32.to_be_bytes(), old_cut)
+            .unwrap(),
+        value(7)
+    );
+    assert_eq!(
+        db.read_rpc_count(),
+        before_old,
+        "pinned old cut must use its exported reference"
+    );
+    let concurrent = ConcurrentRemoteDatabase::new(db).unwrap();
+    let before = concurrent.read_rpc_count();
+    assert_eq!(
+        concurrent.get(KeySpace(0), &0u32.to_be_bytes()).unwrap(),
+        value(10)
+    );
+    assert!(
+        concurrent.read_rpc_count() > before,
+        "new reference must fall back"
+    );
+    let before = concurrent.read_rpc_count();
+    assert_eq!(
+        concurrent.get(KeySpace(0), &2u32.to_be_bytes()).unwrap(),
+        value(9)
+    );
+    assert_eq!(concurrent.read_rpc_count(), before);
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+#[test]
+fn sui_adapter_reads_through_verified_file_fixture_after_reopen() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(5, 42)])
+        .unwrap();
+    let mut db = reopen_cold(&fixture, db);
+    let reference = db
+        .index_reference(KeySpace(0), &5u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let (config, path) = nvme_fixture(&fixture, 0, &[reference], "nvme-sui");
+    db.shutdown().unwrap();
+    drop(db);
+    let sui = super::super::super::sui::Db::open_remote(
+        &fixture.temp.path().join("authority"),
+        fixture.shape.clone(),
+        fixture.config.clone(),
+    )
+    .unwrap();
+    assert!(
+        sui.nvmeof_stats().is_empty(),
+        "reopen must not retain a stale reader"
+    );
+    sui.install_nvmeof_file_fixture(config, &path).unwrap();
+    assert_eq!(
+        sui.get(KeySpace(0), &5u32.to_be_bytes()).unwrap(),
+        value(42)
+    );
+    let stats = sui.nvmeof_stats();
+    assert_eq!(stats.len(), 1);
+    assert_eq!(stats[0].logical_members, 1);
+    assert_eq!(stats[0].io_completions, 1);
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+#[test]
+fn file_backed_corruption_is_fail_closed_and_idle_is_required() {
+    use std::os::unix::fs::FileExt;
+    let mut fixture = Fixture::new();
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(3, 7)])
+        .unwrap();
+    let mut db = reopen_cold(&fixture, db);
+    let reference = db
+        .index_reference(KeySpace(0), &3u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let (config, path) = nvme_fixture(&fixture, 0, &[reference], "nvme-corrupt");
+    let lane = db.reads.lane_client(node_for(&db, 3), 0);
+    let held = lane.lock();
+    let pending = db.submit_get(KeySpace(0), &3u32.to_be_bytes()).unwrap();
+    assert!(
+        db.reads
+            .install_nvmeof_file_fixture(config.clone(), &db.config, &db.shape, &path)
+            .is_err()
+    );
+    drop(held);
+    assert_eq!(db.finish_get(pending).unwrap(), value(7));
+    wait_read_retirement(&db.reads);
+    db.reads
+        .install_nvmeof_file_fixture(config.clone(), &db.config, &db.shape, &path)
+        .unwrap();
+    // Deliberately break the immutable test image to exercise consumer checks.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let offset = config.manifest.catalog[0].offset;
+    let mut byte = [0];
+    file.read_exact_at(&mut byte, offset).unwrap();
+    byte[0] ^= 0x80;
+    file.write_all_at(&byte, offset).unwrap();
+    file.sync_all().unwrap();
+    assert!(db.get(KeySpace(0), &3u32.to_be_bytes()).is_err());
+    assert!(db.get(KeySpace(0), &3u32.to_be_bytes()).is_err());
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+#[test]
+fn nvmeof_shutdown_drains_an_already_admitted_read() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(4, 11)])
+        .unwrap();
+    let mut db = reopen_cold(&fixture, db);
+    let reference = db
+        .index_reference(KeySpace(0), &4u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let (config, path) = nvme_fixture(&fixture, 0, &[reference], "nvme-shutdown");
+    db.reads
+        .install_nvmeof_file_fixture(config, &db.config, &db.shape, &path)
+        .unwrap();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+    *db.reads.state.reactor_pause.lock() = Some((entered_tx, resume_rx));
+    assert!(
+        db.reads
+            .sender
+            .lock()
+            .as_ref()
+            .unwrap()
+            .send(ReadCommand::Wake)
+            .is_ok()
+    );
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let pin = db.pin_cut(IndexReadCut::Latest).unwrap();
+    let node = db.partition_indexes[&reference.batch_address.partition];
+    let pending = db
+        .reads
+        .submit(node, vec![reference], 0, false, Some(pin))
+        .unwrap();
+    let reads = db.reads.clone();
+    let stopped = reads.state.clone();
+    let stop = thread::spawn(move || reads.stop());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !stopped.stopped.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "shutdown did not begin");
+        thread::yield_now();
+    }
+    resume_tx.send(()).unwrap();
+    stop.join().unwrap();
+    assert_eq!(pending.finish().unwrap().0, vec![put(4, 11)]);
+    assert!(!db.reads.failed());
+    assert!(
+        db.nvmeof_stats().is_empty(),
+        "drained readers must release their leases"
+    );
+    db.shutdown().unwrap();
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+#[test]
+fn nvmeof_reader_cannot_serve_after_owner_fence() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(6, 12)])
+        .unwrap();
+    let mut db = reopen_cold(&fixture, db);
+    let reference = db
+        .index_reference(KeySpace(0), &6u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let (config, path) = nvme_fixture(&fixture, 0, &[reference], "nvme-fence");
+    db.reads
+        .install_nvmeof_file_fixture(config, &db.config, &db.shape, &path)
+        .unwrap();
+    let node = db.partition_indexes[&reference.batch_address.partition];
+    assert!(
+        db.clients[node]
+            .client
+            .lock()
+            .fence_to(db.epoch + 1)
+            .is_err(),
+        "owner must refuse fencing while an NVMe-oF lease is live"
+    );
+    let other = db.partition_indexes[&1];
+    assert!(
+        db.clients[other]
+            .client
+            .lock()
+            .fence_to(db.epoch + 1)
+            .is_err(),
+        "an owner without an export must also pin the coordinator epoch"
+    );
+    assert_eq!(db.get(KeySpace(0), &6u32.to_be_bytes()).unwrap(), value(12));
+    db.clear_nvmeof_reader().unwrap();
+    assert!(
+        db.clients[node]
+            .client
+            .lock()
+            .fence_to(db.epoch + 1)
+            .is_ok(),
+        "fencing must proceed after the reader is drained, closed, and released"
+    );
+    assert!(
+        db.clients[other]
+            .client
+            .lock()
+            .fence_to(db.epoch + 1)
+            .is_ok(),
+        "all owner epoch pins must be released after the reader closes"
+    );
+    let _ = db.shutdown();
+}
+
 #[test]
 fn identical_misses_share_one_physical_credit_and_survive_leader_drop() {
     let mut fixture = Fixture::new();

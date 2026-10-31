@@ -35,6 +35,8 @@ pub(super) struct ControlContext {
     pub(super) read_config: read_executor::ReadExecutorConfig,
     pub(super) read_admission: Arc<read_executor::ReadAdmission>,
     pub(super) resident_grants: Arc<resident::GrantRegistry>,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(super) nvmeof_leases: Arc<Mutex<super::super::nvmeof::lease::ExportLeaseRegistry>>,
     #[cfg(test)]
     pub(super) panic_after_append: Arc<AtomicBool>,
 }
@@ -529,6 +531,16 @@ impl ControlContext {
         self.finish_poison_if_quiescent();
     }
     pub(super) fn finish_poison_if_quiescent(&self) {
+        // A poison transition is also an authority change. An NVMe initiator
+        // must close and release its pinned lease before it can be published.
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        let Some(leases) = self.nvmeof_leases.try_lock() else {
+            return;
+        };
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if leases.has_live_or_quarantined() {
+            return;
+        }
         if self.resident_grants.poison_quiescent() && !self.terminal.swap(true, Ordering::AcqRel) {
             // The terminal authority boundary is after every session's exact
             // drain acknowledgment. Readers remain valid while notifications
@@ -659,6 +671,24 @@ impl ControlContext {
         limits: TcpLimits,
         mut profile: Option<&mut ConnectionProfile>,
     ) -> Result<Response, TcpError> {
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if let Request::ReleaseNvmeofExport { epoch, token } = &request {
+            self.nvmeof_leases
+                .lock()
+                .release(*epoch, *token)
+                .map_err(TcpError::component)?;
+            self.finish_poison_if_quiescent();
+            return Ok(Response::NvmeofExportReleased);
+        }
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if let Request::ReleaseNvmeofEpochPin { epoch, token } = &request {
+            self.nvmeof_leases
+                .lock()
+                .release_epoch_pin(*epoch, *token)
+                .map_err(TcpError::component)?;
+            self.finish_poison_if_quiescent();
+            return Ok(Response::NvmeofEpochReleased);
+        }
         // Admission can precede an earlier command's panic or uncertain I/O.
         // Queued work must recheck terminal health before decoding or mutation.
         if self.terminal.load(Ordering::Acquire) || self.resident_grants.poison_requested() {
@@ -667,6 +697,130 @@ impl ControlContext {
             ));
         }
         match request {
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            Request::RegisterNvmeofEpochPin { epoch } => {
+                let mut leases = self.nvmeof_leases.lock();
+                if self.resident_grants.poison_requested()
+                    || !self.readers.read().active_valid(epoch, &self.terminal)
+                {
+                    return Err(TcpError::new("NVMe-oF epoch pin authority mismatch"));
+                }
+                let token = leases
+                    .register_epoch_pin(epoch)
+                    .map_err(TcpError::component)?;
+                if self.resident_grants.poison_requested()
+                    || !self.readers.read().active_valid(epoch, &self.terminal)
+                {
+                    leases
+                        .release_epoch_pin(epoch, token)
+                        .map_err(TcpError::component)?;
+                    return Err(TcpError::new("authority changed during NVMe-oF epoch pin"));
+                }
+                Ok(Response::NvmeofEpochPinned(token))
+            }
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            Request::ReleaseNvmeofEpochPin { .. } => {
+                unreachable!("release handled before health check")
+            }
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            Request::RegisterNvmeofExport {
+                epoch,
+                binding,
+                reference,
+            } => {
+                let mut leases = self.nvmeof_leases.lock();
+                if self.resident_grants.poison_requested()
+                    || !self.readers.read().active_valid(epoch, &self.terminal)
+                    || binding.database_uuid != self.partition.inventory.database
+                    || binding.partition != self.partition.partition
+                    || binding.epoch > epoch
+                    || binding.generation != binding.epoch
+                    || binding.wal_file_bytes != self.partition.wal_file_bytes
+                {
+                    return Err(TcpError::new("NVMe-oF export authority mismatch"));
+                }
+                // Retirement is serialized by this same lease gate. Recheck a
+                // durable member of the exact source file at the admission
+                // boundary, after any earlier paged catalog validation.
+                let snapshot = self.readers.read().snapshot(
+                    epoch,
+                    std::slice::from_ref(&reference),
+                    &self.terminal,
+                )?;
+                let (log, member) = snapshot
+                    .members
+                    .first()
+                    .ok_or_else(|| TcpError::new("missing export authority member"))?;
+                let location = log
+                    .nvmeof_record_location(member)
+                    .map_err(TcpError::component)?;
+                if location.reference != reference
+                    || reference.batch_version.epoch != binding.epoch
+                    || reference.batch_address.segment_generation != binding.generation
+                    || location.wal_file_bytes != binding.wal_file_bytes
+                    || location.source_file_index != binding.source_file_index
+                    || location.source_device != binding.source_device
+                    || location.source_inode != binding.source_inode
+                    || location.source_file_len != binding.image_len
+                    || location.durable_frontier != binding.durable_frontier
+                    || !self.readers.read().snapshot_valid(
+                        epoch,
+                        snapshot.generation,
+                        &self.terminal,
+                    )
+                {
+                    return Err(TcpError::new(
+                        "NVMe-oF source no longer matches owner authority",
+                    ));
+                }
+                let token = leases
+                    .register(epoch, &binding)
+                    .map_err(TcpError::component)?;
+                if self.resident_grants.poison_requested()
+                    || !self.readers.read().active_valid(epoch, &self.terminal)
+                {
+                    leases.release(epoch, token).map_err(TcpError::component)?;
+                    return Err(TcpError::new(
+                        "authority changed during NVMe-oF registration",
+                    ));
+                }
+                Ok(Response::NvmeofExportRegistered(token))
+            }
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            Request::ReleaseNvmeofExport { .. } => {
+                unreachable!("release handled before health check")
+            }
+            #[cfg(feature = "experimental-nvmeof")]
+            Request::ValidateRecordReferences { epoch, references } => {
+                if references.is_empty() || references.len() > limits.max_reads.min(256) {
+                    return Err(TcpError::new("record validation count exceeds bound"));
+                }
+                let snapshot = self
+                    .readers
+                    .read()
+                    .snapshot(epoch, &references, &self.terminal)?;
+                let generation = snapshot.generation;
+                // Pageable descriptor I/O runs on this bounded control owner,
+                // never under reader authority or on the network reactor.
+                let locations = snapshot
+                    .members
+                    .iter()
+                    .map(|(log, reference)| {
+                        log.nvmeof_record_location(reference)
+                            .map_err(TcpError::component)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if !self
+                    .readers
+                    .read()
+                    .snapshot_valid(epoch, generation, &self.terminal)
+                {
+                    return Err(TcpError::new(
+                        "reader authority changed during export admission",
+                    ));
+                }
+                Ok(Response::ValidatedRecordReferences(locations))
+            }
             Request::Checkpoint {
                 authority_epoch,
                 epoch,
@@ -692,6 +846,14 @@ impl ControlContext {
                 prefix,
                 files,
             } => {
+                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                let _leases = {
+                    let leases = self.nvmeof_leases.lock();
+                    if leases.has_live_or_quarantined() {
+                        return Err(TcpError::new("NVMe-oF leases must drain before retirement"));
+                    }
+                    leases
+                };
                 if !self.resident_grants.close_admission() {
                     return Err(TcpError::new(
                         "resident grants are live or being issued; release them before retirement",
@@ -737,6 +899,14 @@ impl ControlContext {
                 Ok(Response::Status(status))
             }
             Request::Fence { epoch } => {
+                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                let _leases = {
+                    let leases = self.nvmeof_leases.lock();
+                    if leases.has_live_or_quarantined() {
+                        return Err(TcpError::new("NVMe-oF leases must drain before fencing"));
+                    }
+                    leases
+                };
                 if !self.resident_grants.close_admission() {
                     return Err(TcpError::new(
                         "resident grants are live or being issued; release them before fencing",
@@ -786,6 +956,14 @@ impl ControlContext {
                 .lock()
                 .recovery_page(epoch, cursor, limit, limits),
             Request::Seal { epoch } => {
+                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                let _leases = {
+                    let leases = self.nvmeof_leases.lock();
+                    if leases.has_live_or_quarantined() {
+                        return Err(TcpError::new("NVMe-oF leases must drain before sealing"));
+                    }
+                    leases
+                };
                 if !self.resident_grants.close_admission() {
                     return Err(TcpError::new(
                         "resident grants are live or being issued; release them before sealing",

@@ -14,6 +14,8 @@ pub mod local_db;
 pub mod local_inventory;
 pub mod native_index;
 pub mod native_publication;
+#[cfg(feature = "experimental-nvmeof")]
+pub mod nvmeof;
 pub mod publication;
 pub mod reference_directory;
 pub mod remote_db;

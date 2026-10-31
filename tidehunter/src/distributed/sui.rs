@@ -540,6 +540,54 @@ impl Remote {
     }
 }
 impl Db {
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(crate) fn install_nvmeof_file_fixture(
+        &self,
+        config: super::nvmeof::NvmeofReaderConfig,
+        path: &Path,
+    ) -> Result<()> {
+        match &self.backend {
+            Backend::Remote(remote) => remote
+                .db
+                .install_nvmeof_file_fixture(config, path)
+                .map_err(error),
+            Backend::Native(_) => Err(error("NVMe-oF requires a remote backend")),
+        }
+    }
+
+    /// Install the optional sealed-WAL reader on a remote backend.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub fn install_nvmeof_reader(&self, config: super::nvmeof::NvmeofReaderConfig) -> Result<()> {
+        match &self.backend {
+            Backend::Remote(remote) => remote.db.install_nvmeof_reader(config).map_err(error),
+            Backend::Native(_) => Err(error("NVMe-oF requires a remote backend")),
+        }
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub fn clear_nvmeof_reader(&self) -> Result<()> {
+        match &self.backend {
+            Backend::Remote(remote) => remote.db.clear_nvmeof_reader().map_err(error),
+            Backend::Native(_) => Err(error("NVMe-oF requires a remote backend")),
+        }
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub fn nvmeof_stats(&self) -> Vec<super::nvmeof::NvmeofStats> {
+        match &self.backend {
+            Backend::Remote(remote) => remote.db.nvmeof_stats(),
+            Backend::Native(_) => Vec::new(),
+        }
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub fn register_nvmeof_metrics(&self, registry: &prometheus::Registry) -> Result<()> {
+        match &self.backend {
+            Backend::Remote(remote) => remote.db.register_nvmeof_metrics(registry).map_err(error),
+            Backend::Native(_) => Err(error("NVMe-oF requires a remote backend")),
+        }
+    }
+
     pub fn drop_db(path: &Path) -> std::io::Result<()> {
         if path.join("tcp-database-authority-v1").exists() {
             return Err(std::io::Error::new(

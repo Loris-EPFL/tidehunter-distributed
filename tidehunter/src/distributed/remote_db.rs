@@ -1329,6 +1329,35 @@ pub struct RemoteDatabase {
 }
 
 impl RemoteDatabase {
+    /// Install a verified sealed-WAL reader while all reads and grants are idle.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub fn install_nvmeof_reader(
+        &self,
+        config: super::nvmeof::NvmeofReaderConfig,
+    ) -> Result<(), LocalDbError> {
+        self.ensure_healthy()?;
+        self.reads
+            .install_nvmeof_reader(config, &self.config, &self.shape)
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub fn clear_nvmeof_reader(&self) -> Result<(), LocalDbError> {
+        self.reads.clear_nvmeof_reader()
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub fn nvmeof_stats(&self) -> Vec<super::nvmeof::NvmeofStats> {
+        self.reads.nvmeof_stats()
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub fn register_nvmeof_metrics(
+        &self,
+        registry: &prometheus::Registry,
+    ) -> Result<(), LocalDbError> {
+        self.reads.register_nvmeof_metrics(registry)
+    }
+
     fn submission_next(&self) -> u64 {
         self.submission_base + self.submissions.len() as u64
     }

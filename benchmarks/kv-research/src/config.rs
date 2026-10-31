@@ -94,6 +94,10 @@ pub struct ExecutionConfig {
 pub struct PhaseConfig {
     #[serde(default = "default_true")]
     pub preload: bool,
+    /// Verify every externally prepared key and its deterministic payload instead
+    /// of overwriting a sealed, read-only dataset during preload.
+    #[serde(default)]
+    pub verify_existing_dataset: bool,
     #[serde(default)]
     pub warmup_operations: u64,
     /// Visit the full unchanged working set during a labelled read-only warm-up.
@@ -169,7 +173,7 @@ pub struct RunConfig {
     /// Non-secret human label; does not select the physical key namespace.
     #[serde(default)]
     pub namespace: Option<String>,
-    /// Explicit owned-cloud dataset identity; requires a complete preload before reuse.
+    /// Explicit owned dataset identity; requires preload or full existing-data verification.
     #[serde(default)]
     pub key_namespace_hex: Option<String>,
     pub dataset: DatasetConfig,
@@ -208,10 +212,24 @@ impl RunConfig {
                 || !namespace
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                || !self.phases.preload)
+                || !(self.phases.preload || self.phases.verify_existing_dataset))
         {
             return invalid(
-                "key_namespace_hex requires 32 lowercase hex digits and complete preload",
+                "key_namespace_hex requires 32 lowercase hex digits and preload or full existing-data verification",
+            );
+        }
+        if self.phases.verify_existing_dataset
+            && (self.phases.preload
+                || self.qualification_only
+                || self.key_namespace_hex.is_none()
+                || self.phases.aging_operations != 0
+                || self.workload.mix.put != 0
+                || self.workload.mix.put_batch != 0
+                || self.workload.mix.delete != 0
+                || self.workload.mix.missing_read != 0)
+        {
+            return invalid(
+                "verify_existing_dataset requires an explicit namespace, no preload or aging, and a read-only measured run",
             );
         }
         for (gate, name) in [
@@ -345,7 +363,7 @@ impl RunConfig {
                 self.workload.batch_size as u64
             };
             if self.qualification_only
-                || !self.phases.preload
+                || !(self.phases.preload || self.phases.verify_existing_dataset)
                 || !only_reads
                 || self.execution.mode != ExecutionMode::ClosedLoop
                 || self
@@ -371,7 +389,7 @@ impl RunConfig {
                 1
             };
             if self.qualification_only
-                || !self.phases.preload
+                || !(self.phases.preload || self.phases.verify_existing_dataset)
                 || !only_reads
                 || self.execution.mode != ExecutionMode::ClosedLoop
                 || self
@@ -425,11 +443,13 @@ impl RunConfig {
             .checked_add(self.phases.aging_operations)
             .and_then(|count| count.checked_add(self.phases.measurement_operations))
             .and_then(|count| {
-                count.checked_add(if self.phases.preload {
-                    self.dataset.keys
-                } else {
-                    0
-                })
+                count.checked_add(
+                    if self.phases.preload || self.phases.verify_existing_dataset {
+                        self.dataset.keys
+                    } else {
+                        0
+                    },
+                )
             });
         if operations.is_none_or(|count| count > self.limits.max_operations) {
             return invalid(
@@ -494,6 +514,7 @@ mod tests {
             },
             phases: PhaseConfig {
                 preload: true,
+                verify_existing_dataset: false,
                 warmup_operations: 1,
                 warmup_key_sweep: false,
                 measurement_key_sweep: false,
@@ -741,5 +762,28 @@ mod tests {
             .release_file = PathBuf::from("/tmp/kv-completion-release");
         config.diagnostics.write_profile_limit = 65_537;
         assert!(config.validate().is_err());
+    }
+    #[test]
+    fn existing_dataset_verification_requires_read_only_owned_namespace() {
+        let mut config = config();
+        config.phases.preload = false;
+        config.phases.verify_existing_dataset = true;
+        assert!(config.validate().is_err());
+        config.key_namespace_hex = Some("09090909090909090909090909090909".into());
+        assert!(config.validate().is_ok());
+        config.phases.preload = true;
+        assert!(config.validate().is_err());
+        config.phases.preload = false;
+        config.phases.aging_operations = 1;
+        assert!(config.validate().is_err());
+        config.phases.aging_operations = 0;
+        config.workload.mix.put = 1;
+        assert!(config.validate().is_err());
+        config.workload.mix.put = 0;
+        config.limits.max_operations = 102;
+        assert!(
+            config.validate().is_err(),
+            "existing-data checks consume the operation budget"
+        );
     }
 }
