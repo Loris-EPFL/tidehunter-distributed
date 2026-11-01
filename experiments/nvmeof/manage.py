@@ -70,21 +70,57 @@ def image_for(path, data):
     return image
 
 
-def preflight(transport, target):
-    if os.geteuid() != 0:
-        fail('root privileges required')
-    if not shutil.which('nvme'):
-        fail('nvme-cli is required')
+def readiness(transport, target):
+    """Inspect local prerequisites only; an active port is not a proven route."""
+    missing = []
+    checks = {}
+    def check(name, ok):
+        checks[name] = bool(ok)
+        if not ok:
+            missing.append(name)
+    check('root', os.geteuid() == 0)
+    check('nvme_cli', shutil.which('nvme') is not None)
     required = ['nvmet', 'nvmet_' + transport] if target else ['nvme_fabrics', 'nvme_' + transport]
+    if transport == 'rdma':
+        required.append('rdma_cm')
     for module in required:
-        if not (Path('/sys/module') / module).is_dir():
-            fail('required kernel module not loaded: ' + module)
-    if transport == 'rdma' and not list(Path('/sys/class/infiniband').glob('*')):
-        fail('RDMA requires a usable RDMA-CM/RC device; no RDMA device found')
-    if target and not CONFIG.is_dir():
-        fail('nvmet configfs is not mounted')
-    if not target and not (DEV / 'nvme-fabrics').exists():
-        fail('/dev/nvme-fabrics unavailable')
+        check('kernel_module:' + module, (Path('/sys/module') / module).is_dir())
+    check('nvmet_configfs' if target else 'nvme_fabrics_device',
+          CONFIG.is_dir() if target else (DEV / 'nvme-fabrics').exists())
+    ports = []
+    if transport == 'rdma':
+        for state in Path('/sys/class/infiniband').glob('*/ports/*/state'):
+            try:
+                value = state.read_text().strip()
+                layer = (state.parent / 'link_layer').read_text().strip()
+                if value.startswith('4:') or value == 'ACTIVE':
+                    device = state.parent.parent.parent
+                    driver = device / 'device' / 'driver'
+                    ports.append({'device': device.name, 'port': state.parent.name,
+                                  'state': value, 'link_layer': layer,
+                                  'driver': driver.resolve().name if driver.is_symlink() else None})
+            except OSError:
+                continue
+        check('active_rdma_port', bool(ports))
+    return {'role': 'target' if target else 'initiator', 'transport': transport,
+            'ready': not missing and transport != 'rdma',
+            'local_prerequisites_ready': not missing,
+            'readiness_reason': ('rdma_cm_path_and_rc_capability_not_verified'
+                                 if not missing and transport == 'rdma' else
+                                 'missing_local_prerequisites' if missing else 'local_prerequisites_met'),
+            'checks': checks, 'missing': missing,
+            'active_rdma_ports': ports,
+            'rdma_cm_path': 'not_verified' if transport == 'rdma' else 'not_applicable',
+            'provider_rc_capability': 'not_verified' if transport == 'rdma' else 'not_applicable',
+            'target_cache_policy': 'buffered_file_page_cache' if target else 'owner_verified_at_admission',
+            'initiator_io': 'O_DIRECT'}
+
+
+def preflight(transport, target):
+    evidence = readiness(transport, target)
+    if not evidence['local_prerequisites_ready']:
+        fail('preflight failed: ' + ', '.join(evidence['missing']))
+    return evidence
 
 
 def run(argv, timeout=20, binary=False):
@@ -102,8 +138,13 @@ class StateDirectory:
     def __init__(self, fd):
         self.fd = fd
 
+    def close(self):
+        if self.fd is not None:
+            fd, self.fd = self.fd, None
+            os.close(fd)
+
     def __del__(self):
-        os.close(self.fd)
+        self.close()
 
 
 def trusted_directory(path):
@@ -136,7 +177,7 @@ def save(directory, data):
         fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
         try:
             with os.fdopen(fd, 'w') as f:
-                json.dump(data, f, sort_keys=True, indent=2)
+                json.dump(data, f, sort_keys=True, separators=(',', ':'))
                 f.write('\n')
                 f.flush()
                 os.fsync(f.fileno())
@@ -186,6 +227,13 @@ def load_state(path, kind):
 
 def put(path, value):
     path.write_text(str(value))
+
+
+def enable_buffered_io(namespace):
+    attribute = namespace / 'buffered_io'
+    put(attribute, '1')
+    if attribute.read_text().strip() != '1':
+        fail('target buffered_io readback failed')
 
 
 def owned_link(path, destination):
@@ -255,7 +303,7 @@ def target_cleanup(directory, s):
 
 
 def target_setup(args):
-    preflight(args.transport, True)
+    readiness_evidence = preflight(args.transport, True)
     mpath = Path(args.manifest)
     m = manifest(mpath)
     image = image_for(mpath, m)
@@ -272,7 +320,8 @@ def target_setup(args):
          'image': str(image), 'image_device': image.stat().st_dev, 'image_inode': image.stat().st_ino,
          'nqn': m['nqn'], 'hostnqn': hostnqn, 'nsid': m['nsid'], 'uuid': m['uuid_string'],
          'port_id': args.port_id, 'service': args.service, 'address': str(addr),
-         'transport': args.transport, 'target_cache': args.target_cache,
+         'transport': args.transport, 'target_cache': 'buffered_file_page_cache',
+         'preflight': readiness_evidence,
          'initiator_cache': 'O_DIRECT required by reader', 'created_at_unix_ns': time.time_ns()}
     directory = new_state(args.state, s)
     try:
@@ -290,11 +339,15 @@ def target_setup(args):
         save(directory, s)
         put(ns / 'device_path', image)
         put(ns / 'device_uuid', m['uuid_string'])
-        put(ns / 'buffered_io', '1' if args.target_cache == 'buffered' else '0')
+        enable_buffered_io(ns)
+        s['target_cache_verified'] = True
         put(ns / 'enable', '1')
         for key, value in [('addr_trtype', args.transport), ('addr_adrfam', 'ipv4' if addr.version == 4 else 'ipv6'),
                            ('addr_traddr', addr), ('addr_trsvcid', args.service)]:
             put(port / key, value)
+        if (port / 'addr_trtype').read_text().strip() != args.transport:
+            fail('target transport readback failed')
+        s['selected_transport'] = args.transport
         (port / 'subsystems' / m['nqn']).symlink_to(sub)
         s['phase'] = 'published_unprotected'; save(directory, s)
     except BaseException:
@@ -304,7 +357,70 @@ def target_setup(args):
 
 
 def controllers():
-    return {p.name for p in SYS_NVME.glob('nvme*') if CONTROLLER.fullmatch(p.name)}
+    # scandir propagates permission/I/O failures rather than treating an
+    # unreadable sysfs directory as an empty inventory.
+    with os.scandir(SYS_NVME) as entries:
+        return {entry.name for entry in entries if CONTROLLER.fullmatch(entry.name)}
+
+
+def controller_snapshot(timeout=5.0):
+    """Return two matching complete sysfs inventories, or fail closed.
+
+    A controller can disappear between enumeration and attribute reads while a
+    different owned disconnect is running. ENOENT is a rescan signal, never
+    evidence by itself that an enumerated controller was absent.
+    """
+    if timeout <= 0:
+        fail('positive controller inventory timeout required')
+    deadline = time.monotonic() + timeout
+    previous = None
+    while True:
+        names = controllers()
+        current = {}
+        try:
+            for name in sorted(names):
+                path = SYS_NVME / name
+                before = path.stat().st_ino
+                nqn_value = (path / 'subsysnqn').read_text().strip()
+                transport = (path / 'transport').read_text().strip()
+                address = (path / 'address').read_text().strip()
+                after = path.stat().st_ino
+                if before != after:
+                    raise FileNotFoundError('controller changed during inventory')
+                if not nqn_value or not transport or not address:
+                    fail('controller inventory contains an empty identity attribute')
+                current[name] = {'nqn': nqn_value, 'transport': transport,
+                                 'address': address, 'inode': before}
+        except FileNotFoundError:
+            current = None
+        if current is not None and controllers() == names:
+            if current == previous:
+                return current
+            previous = current
+        else:
+            previous = None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fail('controller inventory did not stabilize; controller identity remains unknown')
+        time.sleep(min(.02, remaining))
+
+
+def controller_matches(identity, expected_nqn, transport, address, service):
+    if identity['nqn'] != expected_nqn or identity['transport'] != transport:
+        return False
+    fields = dict(item.split('=', 1) for item in identity['address'].split(',') if '=' in item)
+    return fields.get('traddr') == address and fields.get('trsvcid') == str(service)
+
+def new_controller_matches(before, current, expected_nqn, transport, address, service):
+    """Select only a new, exact requested identity; unrelated churn is irrelevant."""
+    candidates = [(name, identity) for name, identity in current.items()
+                  if identity['nqn'] == expected_nqn]
+    if (len(candidates) > 1 or any(
+            (name in before and before[name]['inode'] == identity['inode'])
+            or not controller_matches(identity, expected_nqn, transport, address, service)
+            for name, identity in candidates)):
+        fail('requested NQN has ambiguous controller identity')
+    return [name for name, _ in candidates]
 
 
 def disconnect(s):
@@ -313,16 +429,26 @@ def disconnect(s):
         return
     if not CONTROLLER.fullmatch(ctrl):
         fail('invalid recorded controller')
-    p = SYS_NVME / ctrl
-    if not p.exists():
+    inventory = controller_snapshot()
+    identity = inventory.get(ctrl)
+    if identity is None:
+        if any(row['nqn'] == s['nqn'] for row in inventory.values()):
+            fail('recorded controller absent but matching NQN remains; refusing to infer retirement')
         return
-    if (p / 'subsysnqn').read_text().strip() != s['nqn'] or (p / 'transport').read_text().strip() != s['transport']:
+    if identity['nqn'] != s['nqn'] or identity['transport'] != s['transport']:
         fail('recorded controller identity changed; refusing disconnect')
-    if 'controller_inode' not in s or p.stat().st_ino != s['controller_inode']:
+    if 'controller_inode' not in s or identity['inode'] != s['controller_inode']:
         fail('recorded controller has been replaced; refusing disconnect')
-    if (p / 'address').read_text().strip() != s['controller_address']:
+    if identity['address'] != s['controller_address']:
         fail('recorded controller address changed; refusing disconnect')
-    run(['nvme', 'disconnect', '-d', str(DEV / ctrl)])
+    try:
+        run(['nvme', 'disconnect', '-d', str(DEV / ctrl)])
+    except ValueError:
+        # A failed command is benign only after a fresh complete inventory
+        # proves the recorded name and every matching NQN absent.
+        current = controller_snapshot()
+        if ctrl in current or any(row['nqn'] == s['nqn'] for row in current.values()):
+            raise
 
 
 def discovery_has_endpoint(value, expected_nqn, transport, address, service):
@@ -340,46 +466,60 @@ def discovery_has_endpoint(value, expected_nqn, transport, address, service):
                for v in value.values())
 
 
-def controller_matches(path, expected_nqn, transport, address, service):
-    if (path / 'subsysnqn').read_text().strip() != expected_nqn:
-        return False
-    if (path / 'transport').read_text().strip() != transport:
-        return False
-    fields = dict(item.split('=', 1) for item in (path / 'address').read_text().strip().split(',')
-                  if '=' in item)
-    return fields.get('traddr') == address and fields.get('trsvcid') == str(service)
+
+def namespace_candidates(ctrl, m, timeout=5.0):
+    """Rescan transient sysfs removals; persistent or inaccessible state is unknown."""
+    if timeout <= 0:
+        fail('positive namespace inventory timeout required')
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return _namespace_candidates_once(ctrl, m)
+        except FileNotFoundError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail('namespace inventory did not stabilize; identity remains unknown')
+            time.sleep(min(.02, remaining))
 
 
-def namespace_candidates(ctrl, m):
-    subsystems = []
-    for subsystem in SYS_SUBSYSTEM.glob('nvme-subsys*'):
-        member = subsystem / ctrl.name
-        if member.exists() and member.resolve() == ctrl.resolve():
-            subsystems.append(subsystem)
-    if not subsystems:
+def _namespace_candidates_once(ctrl, m):
+    ctrl_inode = ctrl.stat().st_ino
+    ctrl_path = ctrl.resolve(strict=True)
+    with os.scandir(SYS_SUBSYSTEM) as entries:
+        subsystems = [SYS_SUBSYSTEM / entry.name for entry in entries if entry.name.startswith('nvme-subsys')]
+    matches = []
+    for subsystem in subsystems:
+        with os.scandir(subsystem) as entries:
+            names = {entry.name for entry in entries if CONTROLLER.fullmatch(entry.name)}
+        if ctrl.name in names and (subsystem / ctrl.name).resolve(strict=True) == ctrl_path:
+            matches.append((subsystem, names))
+    if not matches:
+        if ctrl.stat().st_ino != ctrl_inode:
+            raise FileNotFoundError('controller changed during namespace inventory')
         return []
-    if len(subsystems) != 1:
+    if len(matches) != 1:
         fail('controller has ambiguous subsystem membership')
-    subsystem = subsystems[0]
+    subsystem, names = matches[0]
     if (subsystem / 'subsysnqn').read_text().strip() != m['nqn']:
         fail('subsystem NQN mismatch')
-    members = [p for p in subsystem.glob('nvme*') if CONTROLLER.fullmatch(p.name)]
-    if len(members) != 1 or members[0].resolve() != ctrl.resolve():
+    if names != {ctrl.name} or (subsystem / ctrl.name).resolve(strict=True) != ctrl_path:
         fail('subsystem has multiple or unexpected controllers')
+    subsystem_path = subsystem.resolve(strict=True)
+    with os.scandir(SYS_BLOCK) as entries:
+        paths = [SYS_BLOCK / entry.name for entry in entries
+                 if re.fullmatch(r'nvme[0-9]+n[0-9]+', entry.name)]
     candidates = []
-    for path in SYS_BLOCK.glob('nvme*n*'):
-        if not re.fullmatch(r'nvme[0-9]+n[0-9]+', path.name):
+    for path in paths:
+        if (path / 'device').resolve(strict=True) not in (ctrl_path, subsystem_path):
             continue
-        if not (path / 'device').exists():
-            continue
-        if (path / 'device').resolve() not in (ctrl.resolve(), subsystem.resolve()):
-            continue
-        if not (path / 'nsid').exists() or (path / 'nsid').read_text().strip() != str(m['nsid']):
+        if (path / 'nsid').read_text().strip() != str(m['nsid']):
             continue
         if ((path / 'uuid').read_text().strip().lower() != m['uuid_string']
                 or (path / 'wwid').read_text().strip() != 'uuid.' + m['uuid_string']):
             fail('namespace UUID mismatch')
         candidates.append(path)
+    if ctrl.stat().st_ino != ctrl_inode:
+        raise FileNotFoundError('controller changed during namespace inventory')
     return candidates
 
 
@@ -402,16 +542,15 @@ def ensure_host_readonly(device):
 
 
 def host_connect(args):
-    preflight(args.transport, False)
+    readiness_evidence = preflight(args.transport, False)
     m = manifest(Path(args.manifest))
     hostnqn = nqn(args.hostnqn)
     addr = str(ipaddress.ip_address(args.address))
     if not 1 <= args.service <= 65535:
         fail('service out of range')
-    before = controllers()
-    for ctrl in before:
-        if (SYS_NVME / ctrl / 'subsysnqn').read_text().strip() == m['nqn']:
-            fail('a controller for this NQN already exists; refusing to share')
+    before = controller_snapshot()
+    if any(identity['nqn'] == m['nqn'] for identity in before.values()):
+        fail('a controller for this NQN already exists; refusing to share')
     # The kernel binds each host ID to one NQN. Do not reuse the machine's
     # ambient host ID for a private experiment NQN or change /etc/nvme.
     hostid = str(uuid.uuid5(uuid.NAMESPACE_URL, hostnqn))
@@ -424,25 +563,31 @@ def host_connect(args):
          'nqn': m['nqn'], 'uuid': m['uuid_string'], 'nsid': m['nsid'], 'hostnqn': hostnqn, 'hostid': hostid,
          'address': addr, 'service': args.service, 'transport': args.transport,
          'created_at_unix_ns': time.time_ns(), 'initiator_cache': 'O_DIRECT required by reader'}
+    s['preflight'] = readiness_evidence
     directory = new_state(args.state, s)
     try:
         run(['nvme', 'connect', *common, '-n', m['nqn'], '-l', '0'])
         deadline = time.monotonic() + 20
         while True:
-            new = controllers() - before
-            matching = [c for c in new if controller_matches(SYS_NVME / c, m['nqn'], args.transport, addr, args.service)]
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail('expected exactly one newly connected controller')
+            current = controller_snapshot(timeout=min(5.0, remaining))
+            matching = new_controller_matches(before, current, m['nqn'], args.transport, addr, args.service)
             if len(matching) == 1:
                 break
             if len(matching) > 1 or time.monotonic() >= deadline:
                 fail('expected exactly one newly connected controller')
             time.sleep(.1)
         s['controller'] = matching[0]
-        s['controller_inode'] = (SYS_NVME / matching[0]).stat().st_ino
-        s['controller_address'] = (SYS_NVME / matching[0] / 'address').read_text().strip()
+        s['controller_inode'] = current[matching[0]]['inode']
+        s['controller_address'] = current[matching[0]]['address']
         save(directory, s)
         ctrl = SYS_NVME / s['controller']
-        if (ctrl / 'transport').read_text().strip() != args.transport:
+        if current[matching[0]]['transport'] != args.transport:
             fail('controller transport mismatch')
+        s['selected_transport'] = current[matching[0]]['transport']
+        s['rdma_cm_path'] = 'connected' if args.transport == 'rdma' else 'not_applicable'
         devctrl = DEV / s['controller']
         run(['nvme', 'set-feature', str(devctrl), '-f', '0x84', '-n', str(m['nsid']), '-V', '1'])
         feature = run(['nvme', 'get-feature', str(devctrl), '-f', '0x84', '-n', str(m['nsid'])])
@@ -458,7 +603,10 @@ def host_connect(args):
             fail('namespace geometry mismatch')
         deadline = time.monotonic() + 20
         while True:
-            namespaces = namespace_candidates(ctrl, m)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail('namespace not uniquely present in sysfs')
+            namespaces = namespace_candidates(ctrl, m, timeout=min(5.0, remaining))
             if len(namespaces) == 1:
                 break
             if len(namespaces) > 1 or time.monotonic() >= deadline:
@@ -474,13 +622,15 @@ def host_connect(args):
     except BaseException:
         # A failed connect may nevertheless have created a controller.
         if not s.get('controller'):
-            for c in controllers() - before:
-                p = SYS_NVME / c
-                if controller_matches(p, m['nqn'], args.transport, addr, args.service):
-                    s['controller'] = c
-                    s['controller_inode'] = p.stat().st_ino
-                    s['controller_address'] = (p / 'address').read_text().strip()
-                    save(directory, s); disconnect(s)
+            current = controller_snapshot()
+            candidates = new_controller_matches(before, current, m['nqn'], args.transport, addr, args.service)
+            if candidates:
+                c = candidates[0]
+                identity = current[c]
+                s['controller'] = c
+                s['controller_inode'] = identity['inode']
+                s['controller_address'] = identity['address']
+                save(directory, s); disconnect(s)
         else:
             disconnect(s)
         s['phase'] = 'disconnected'; save(directory, s)
@@ -490,6 +640,9 @@ def host_connect(args):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     commands = p.add_subparsers(dest='command', required=True)
+    c = commands.add_parser('preflight')
+    c.add_argument('--role', choices=('target', 'initiator'), required=True)
+    c.add_argument('--transport', choices=('tcp', 'rdma'), required=True)
     for name in ('target-setup', 'host-connect'):
         c = commands.add_parser(name)
         c.add_argument('--manifest', required=True); c.add_argument('--state', required=True)
@@ -498,13 +651,18 @@ def main():
         c.add_argument('--hostnqn', required=True)
         if name == 'target-setup':
             c.add_argument('--port-id', type=int, required=True)
-            c.add_argument('--target-cache', choices=('direct', 'buffered'), default='direct')
     for name in ('target-cleanup', 'host-disconnect'):
         c = commands.add_parser(name); c.add_argument('--state', required=True)
         if name == 'target-cleanup':
             c.add_argument('--readers-drained', action='store_true', required=True,
                            help='attest all initiators and readers have been quiesced and disconnected')
     a = p.parse_args()
+    if a.command == 'preflight':
+        result = readiness(a.transport, a.role == 'target')
+        print(json.dumps(result, sort_keys=True))
+        if not result['ready']:
+            sys.exit(1)
+        return
     if a.command == 'target-setup':
         result = target_setup(a)
     elif a.command == 'host-connect':

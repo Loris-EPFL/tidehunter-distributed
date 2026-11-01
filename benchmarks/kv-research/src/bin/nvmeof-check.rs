@@ -81,6 +81,17 @@ fn metrics() -> Arc<Metrics> {
 fn elapsed_ns(start: Instant) -> u64 {
     start.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
+fn qualification_batch_ids(keys: u64) -> Vec<u64> {
+    (0..32)
+        .map(|slot| match slot {
+            0 => 0,
+            1 => keys - 1,
+            _ if slot % 3 == 0 => keys - 1,
+            _ => (slot * 7) % keys,
+        })
+        .collect()
+}
+
 fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.write_all(bytes)?;
@@ -215,7 +226,7 @@ fn main() -> Result<()> {
         32 * MIB,
         None,
     )?;
-    cluster.config.read_cache_bytes = 0;
+    cluster.config.read_cache_bytes = 32 * MIB;
     let coordinator = root.join("coordinator");
     let mut db = RemoteDatabase::open(&coordinator, &shape, cluster.config.clone(), metrics())?;
     let source_epoch = db.epoch();
@@ -381,6 +392,120 @@ fn main() -> Result<()> {
     sui.register_nvmeof_metrics(&registry)
         .map_err(|e| fail(format!("{e:?}")))?;
     let mut samples = Vec::with_capacity(keys as usize + 1);
+    let key = key_bytes(&namespace, SEED, 0);
+    let expected = value_bytes(&namespace, SEED, 0, value_size, 1.0);
+    let cache_before = sui
+        .remote_counters()
+        .ok_or_else(|| fail("missing coordinator counters"))?
+        .0;
+    let first_before: u64 = sui.nvmeof_stats().iter().map(|s| s.eligible_hits).sum();
+    if sui
+        .get(ks, &key)
+        .map_err(|e| fail(format!("{e:?}")))?
+        .as_ref()
+        != Some(&expected)
+    {
+        return Err(fail("first scalar value mismatch").into());
+    }
+    let cache_after = sui
+        .remote_counters()
+        .ok_or_else(|| fail("missing coordinator counters"))?
+        .0;
+    let first_after: u64 = sui.nvmeof_stats().iter().map(|s| s.eligible_hits).sum();
+    if cache_after.misses <= cache_before.misses || first_after <= first_before {
+        return Err(fail("first read did not exercise coordinator miss and NVMe reader").into());
+    }
+
+    // Key zero is cached; the remaining distinct keys have not been read.
+    // Duplicates exercise ordering and coalescing across both cached and NVMe members.
+    let ids = qualification_batch_ids(keys);
+    let batch: Vec<_> = ids
+        .iter()
+        .map(|&id| key_bytes(&namespace, SEED, id))
+        .collect();
+    let batch_cache_before = sui
+        .remote_counters()
+        .ok_or_else(|| fail("missing coordinator counters"))?
+        .0;
+    let batch_before = sui.nvmeof_stats();
+    let start = Instant::now();
+    let values = sui.multi_get(ks, &batch);
+    let elapsed = elapsed_ns(start);
+    if values.len() != ids.len() {
+        return Err(fail("batch result count mismatch").into());
+    }
+    for (result, &id) in values.into_iter().zip(&ids) {
+        if result.map_err(|e| fail(format!("{e:?}")))?.as_ref()
+            != Some(&value_bytes(&namespace, SEED, id, value_size, 1.0))
+        {
+            return Err(fail(format!("batch value mismatch for {id}")).into());
+        }
+    }
+    let batch_after = sui.nvmeof_stats();
+    let batch_cache_after = sui
+        .remote_counters()
+        .ok_or_else(|| fail("missing coordinator counters"))?
+        .0;
+    let totals = |stats: &[tidehunter::distributed::nvmeof::NvmeofStats]| {
+        stats
+            .iter()
+            .fold((0u64, 0u64, 0u64), |(eligible, submitted, completed), s| {
+                (
+                    eligible + s.eligible_hits,
+                    submitted + s.io_submissions,
+                    completed + s.io_completions,
+                )
+            })
+    };
+    let before = totals(&batch_before);
+    let after = totals(&batch_after);
+    if after.0 <= before.0
+        || after.1 <= before.1
+        || after.2 <= before.2
+        || batch_cache_after.hits <= batch_cache_before.hits
+        || batch_cache_after.misses <= batch_cache_before.misses
+    {
+        return Err(fail("mixed batch did not exercise cache and completed NVMe I/O").into());
+    }
+    let repeated = sui.multi_get(ks, &batch);
+    if repeated.len() != ids.len() {
+        return Err(fail("cached batch result count mismatch").into());
+    }
+    for (result, &id) in repeated.into_iter().zip(&ids) {
+        if result.map_err(|e| fail(format!("{e:?}")))?.as_ref()
+            != Some(&value_bytes(&namespace, SEED, id, value_size, 1.0))
+        {
+            return Err(fail(format!("cached batch value mismatch for {id}")).into());
+        }
+    }
+    let repeat_cache = sui
+        .remote_counters()
+        .ok_or_else(|| fail("missing coordinator counters"))?
+        .0;
+    let repeat_nvme = totals(&sui.nvmeof_stats());
+    if repeat_cache.hits <= batch_cache_after.hits || repeat_nvme != after {
+        return Err(fail("repeated batch did not stay in coordinator cache").into());
+    }
+    let coordinator_evidence = serde_json::json!({
+        "first_read_cache_misses": cache_after.misses - cache_before.misses,
+        "first_read_nvme_eligible_members": first_after - first_before,
+        "batch_operations": 1,
+        "batch_members": ids.len(),
+        "batch_cache_hits": batch_cache_after.hits - batch_cache_before.hits,
+        "batch_cache_misses": batch_cache_after.misses - batch_cache_before.misses,
+        "batch_nvme_eligible_members": after.0 - before.0,
+        "batch_nvme_submissions": after.1 - before.1,
+        "batch_nvme_completions": after.2 - before.2,
+        "repeat_batch_operations": 1,
+        "repeat_batch_members": ids.len(),
+        "repeat_batch_cache_hits": repeat_cache.hits - batch_cache_after.hits,
+        "repeat_batch_nvme_eligible_members": repeat_nvme.0 - after.0
+    });
+    samples.push(Sample {
+        kind: "batch_with_duplicates",
+        ids,
+        elapsed_ns: elapsed,
+    });
     for id in 0..keys {
         let key = key_bytes(&namespace, SEED, id);
         let expected = value_bytes(&namespace, SEED, id, value_size, 1.0);
@@ -396,37 +521,6 @@ fn main() -> Result<()> {
             elapsed_ns: elapsed,
         });
     }
-    let ids: Vec<u64> = (0..32)
-        .map(|slot| {
-            if slot % 3 == 0 {
-                keys - 1
-            } else {
-                (slot * 7) % keys
-            }
-        })
-        .collect();
-    let batch: Vec<_> = ids
-        .iter()
-        .map(|&id| key_bytes(&namespace, SEED, id))
-        .collect();
-    let start = Instant::now();
-    let values = sui.multi_get(ks, &batch);
-    let elapsed = elapsed_ns(start);
-    if values.len() != ids.len() {
-        return Err(fail("batch result count mismatch").into());
-    }
-    for (result, &id) in values.into_iter().zip(&ids) {
-        if result.map_err(|e| fail(format!("{e:?}")))?.as_ref()
-            != Some(&value_bytes(&namespace, SEED, id, value_size, 1.0))
-        {
-            return Err(fail(format!("batch value mismatch for {id}")).into());
-        }
-    }
-    samples.push(Sample {
-        kind: "batch_with_duplicates",
-        ids,
-        elapsed_ns: elapsed,
-    });
     let stats = sui.nvmeof_stats();
     if stats.is_empty() || stats.iter().any(|s| s.io_completions == 0) {
         return Err(fail("at least one exported reader did not complete namespace IO").into());
@@ -434,6 +528,10 @@ fn main() -> Result<()> {
     write_new(
         &root.join("samples.json"),
         &serde_json::to_vec_pretty(&samples)?,
+    )?;
+    write_new(
+        &root.join("coordinator-cache-evidence.json"),
+        &serde_json::to_vec_pretty(&coordinator_evidence)?,
     )?;
     write_new(
         &root.join("nvmeof-stats.json"),
@@ -504,12 +602,10 @@ fn main() -> Result<()> {
                 "read_workers": 2,
                 "wal_member_read": "async",
                 "read_resident_first": false,
-                "read_cache_bytes": 0,
                 "read_memory_allowance_bytes": 512 * MIB,
                 "read_max_inflight_requests": 32,
                 "read_max_inflight_bytes": 64 * MIB,
-                "read_max_device_reads": 128,
-                "resident_reads": tidehunter::distributed::tcp::ResidentReadConfig::default()
+                "read_max_device_reads": 128
             })
         })
         .collect();
@@ -565,4 +661,20 @@ fn main() -> Result<()> {
     cluster.shutdown()?;
     println!("qualification complete: {}", root.display());
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::qualification_batch_ids;
+
+    #[test]
+    fn qualification_batch_has_cached_unread_and_duplicate_members() {
+        for keys in 2..=1024 {
+            let ids = qualification_batch_ids(keys);
+            assert_eq!(ids.len(), 32);
+            assert_eq!(ids[0], 0);
+            assert_eq!(ids[1], keys - 1);
+            assert!(ids.iter().all(|&id| id < keys));
+            assert!(ids.iter().filter(|&&id| id == keys - 1).count() > 1);
+        }
+    }
 }

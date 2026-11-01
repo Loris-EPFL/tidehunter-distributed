@@ -21,7 +21,7 @@ import tempfile
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
-FEATURES = ["tikv", "cassandra", "foundationdb", "valkey-tcp", "fabric"]
+FEATURES = ["tikv", "cassandra", "foundationdb", "valkey-tcp", "fabric", "nvmeof", "test-utils"]
 TARGET = "x86_64-unknown-linux-gnu"
 MAX_GLIBC = (2, 39)  # Ubuntu 24.04, not the build host's version.
 MAX_GLIBCXX = (3, 4, 33)  # Ubuntu 24.04 libstdc++6 (GCC 14).
@@ -38,7 +38,8 @@ EFA = {"installer_version": "1.50.0", "installer_sha256": "fa6dff8593d866866c13c
        "upstream_commit": "3cc1095272b07ebeb5cc8f44851af6aa3eb75e41",
        "runtime_library_dir": "/opt/amazon/efa/lib", "required_environment": {"FI_EFA_USE_DEVICE_RDMA": "1"},
        "hardware_admission": "provider efa, RDM fabrics efa (MSG|DIRECTED_RECV) and efa-direct (MSG); registered-RAM additionally requires efa-direct RMA|READ|REMOTE_READ; Rust enforces geometry and native device reads; no TCP fallback"}
-NEW_ROOTS = ("benchmarks/kv-research/", "experiments/kv-comparison/", "experiments/portable_transport.py")
+NEW_ROOTS = ("benchmarks/kv-research/", "tidehunter/src/distributed/",
+             "experiments/kv-comparison/", "experiments/nvmeof/", "experiments/portable_transport.py")
 SUFFIXES = {".rs", ".toml", ".lock", ".py", ".json", ".yaml", ".yml", ".sh", ".md", ".c", ".h", ".cpp", ".proto", ".html", ".css", ".js", ".txt"}
 EXCLUDED = {".git", "target", "checkpoint-work", "logs", "results", "artifacts", "data", "secrets", "credentials", ".state", "__pycache__", ".aws", ".ssh", "node_modules", ".venv"}
 REQUIRED = {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml", "benchmarks/kv-research/Cargo.toml",
@@ -52,7 +53,17 @@ REQUIRED = {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.to
             "experiments/kv-comparison/observability/campaign_exporter.py",
             "experiments/kv-comparison/observability/exporter.py",
             "experiments/kv-comparison/observability/images.lock.json",
-            "experiments/kv-comparison/observability/dashboards/campaign.json"}
+            "experiments/kv-comparison/observability/dashboards/campaign.json",
+            "experiments/kv-comparison/observability/dashboards/nvmeof.json",
+            "experiments/kv-comparison/cloud_bootstrap.py",
+            "experiments/kv-comparison/cloud-nvmeof-campaign.json",
+            "experiments/kv-comparison/nvme_campaign_owner.py",
+            "experiments/kv-comparison/nvme_campaign_native.py",
+            "experiments/kv-comparison/nvme_campaign_trace.py",
+            "experiments/kv-comparison/mcp_nvmeof_campaign.py",
+            "benchmarks/kv-research/src/backends/tidehunter/nvmeof_campaign.rs",
+            "experiments/nvmeof/manage.py", "experiments/nvmeof/trace.py",
+            "experiments/nvmeof/collect.py", "experiments/nvmeof/campaign_targets.py"}
 
 
 def command(argv, *, cwd=None, env=None, timeout=60):
@@ -359,7 +370,8 @@ def build(snapshot_dir, output, fdb_prefix, fabric_prefix, timeout=5400):
     flags = ["-C", "target-cpu=x86-64", f"--remap-path-prefix={source}=/tidehunter-src"]
     argv = ["cargo", "--config", "build.rustflags=" + json.dumps(flags),
             "--config", f"target.{TARGET}.rustflags=" + json.dumps(flags), "build", "--release", "--frozen",
-            "--target", TARGET, "-p", "kv-research", "--no-default-features", "--features", ",".join(FEATURES)]
+            "--target", TARGET, "-p", "kv-research", "--bin", "kv-research",
+            "--no-default-features", "--features", ",".join(FEATURES)]
     rustc = command(["rustc", "-vV"], cwd=source, env=environment)
     if not rustc.startswith("rustc 1.90.0 "):
         raise ValueError("the source-pinned Rust1.90.0 toolchain is required")

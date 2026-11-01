@@ -62,6 +62,9 @@ def collect(device, seconds):
     return {'version': 1, 'block_device': device, 'block': block, 'cpu': delta(c0, c1),
             'clock_ticks_per_second': os.sysconf('SC_CLK_TCK'),
             'qualification': 'sysfs device-level aggregate; 512-byte accounting sectors; not per-request NAND latency or network time',
+            'target_cache': {'warm_hits': None, 'storage_misses': None,
+                             'denominator': None,
+                             'reason': 'device-wide counters cannot attribute page-cache hits or misses to exports'},
             'trace': {'available': False, 'reason': 'per-request nvmet/file/block trace correlation is not collected by this interval sampler'}}
 
 

@@ -9,13 +9,13 @@ BASELINE_SOURCE_SHA256 = '97f18475bb15b8ad7ae20ac799fd2a39d5399ccdbc7d3ce8c88d59
 BASELINE_BINARY_SHA256 = 'a7f2d3fe0fbe41df070527e810ae736c5e3f1a8ac7d0fe0654fedfcde25e74ab'
 
 
-def case(family, build, value, rep, transport, cache=0, shard_cache=0):
+def case(family, build, value, rep, transport, cache=0):
     spec = efa_progress.case(family, build, value, 32, 32, rep, transport,
                              cache=cache, lanes=4 if build == 'baseline' else 1,
                              workers=1 if build == 'baseline' else 2,
                              member='mapped' if build == 'baseline' else 'async', cold=family != 'pressure')
-    spec.update(family=f'{family}-f{cache}-s{shard_cache}-{transport}',
-                shard_cache=shard_cache, native_workers=32,
+    spec.update(family=f'{family}-f{cache}-{transport}',
+                native_workers=32,
                 reads=256 if family == 'qual' else 8192,
                 modes=['tcp'] if family in ('qual', 'pressure') else ['native-sync', 'tcp'])
     spec['case_id'] = f"{spec['family']}-{build}-v{value}-b32-w32-r{rep}"
@@ -38,8 +38,7 @@ def main_cases():
             for transport in ('tcp', 'efa'):
                 result.extend(case('core', build, value, rep, transport) for build in builds)
         for transport in ('tcp', 'efa'):
-            for frontend, shard in ((131072, 0), (0, 65536), (131072, 65536)):
-                result.append(case('pressure', 'current', 8192, rep, transport, frontend, shard))
+            result.append(case('pressure', 'current', 8192, rep, transport, 131072))
     return result
 
 
@@ -62,6 +61,32 @@ def plan(scope='full'):
     if scope not in ('full', 'recovery'):
         raise ValueError('unknown checkpoint campaign scope')
     return qualification_cases() + (main_cases() if scope == 'full' else []) + recovery_cases()
+
+
+def historical_plan(scope='full'):
+    """Reconstruct the frozen pre-cutover campaign identities for archived evidence."""
+    if scope not in ('full', 'recovery'):
+        raise ValueError('unknown checkpoint campaign scope')
+    def old_case(family, build, value, rep, transport, cache=0, shard_cache=0):
+        spec = case(family, build, value, rep, transport, cache)
+        spec.update(family=f'{family}-f{cache}-s{shard_cache}-{transport}', shard_cache=shard_cache)
+        spec['case_id'] = f"{spec['family']}-{build}-v{value}-b32-w32-r{rep}"
+        return spec
+    result = [old_case('qual', build, value, 0, 'efa')
+              for value in (1024, 8192) for build in ('baseline', 'current')]
+    if scope == 'full':
+        for rep in range(5):
+            builds = ('baseline', 'current') if rep % 2 == 0 else ('current', 'baseline')
+            for value in (1024, 8192):
+                for transport in ('tcp', 'efa'):
+                    result.extend(old_case('core', build, value, rep, transport) for build in builds)
+            for transport in ('tcp', 'efa'):
+                for frontend, shard in ((131072, 0), (0, 65536), (131072, 65536)):
+                    result.append(old_case('pressure', 'current', 8192, rep, transport, frontend, shard))
+    for spec in recovery_cases():
+        spec['shard_cache'] = 0
+        result.append(spec)
+    return result
 
 
 def expected_cases(scope='full'):
@@ -124,7 +149,7 @@ def validate_recovery_json(row, spec, action):
         raise ValueError('baseline must not claim current-only recovery statistics')
 
 
-def read_path_metrics(path, spec, backend):
+def historical_read_path_metrics(path, spec, backend):
     """Validate per-phase, per-tier accounting, not success markers or hot labels."""
     phases = {'point_get', 'point_get_many', 'point_get_window'}
     phases |= ({'cache_evicted_get', 'cache_evicted_get_many', 'cache_evicted_get_window'}
@@ -182,5 +207,74 @@ def read_path_metrics(path, spec, backend):
                 if budget and any(totals[role][key] <= 0 for key in ('cache_misses', 'cache_evictions')):
                     raise ValueError('pressure tier lacks real misses/evictions')
         if not phase.endswith('_hot') and any(totals['storage'][key] <= 0 for key in ('wal_reads', 'wal_read_bytes')):
+            raise ValueError('read phase lacks actual WAL reads')
+    return result
+
+
+def read_path_metrics(path, spec, backend):
+    """Validate current coordinator cache and owner WAL/admission evidence."""
+    if {'shard_cache', 'shard_cache_bytes', 'resident_reads'} & spec.keys():
+        raise ValueError('owner cache and registered-value controls are obsolete')
+    phases = {'point_get', 'point_get_many', 'point_get_window'}
+    phases |= ({'cache_evicted_get', 'cache_evicted_get_many', 'cache_evicted_get_window'}
+               if spec['cold'] else {'point_get_hot', 'point_get_many_hot'})
+    audited = phases | {'point_get_missing', 'exists', 'exists_missing', 'post_flush_get'}
+    roles = {('frontend', '')} | {('storage', str(p)) for p in range(5)}
+    inventory, result = {}, {}
+    with Path(path).open() as stream:
+        for row in csv.DictReader(stream):
+            phase, boundary, role = row['phase'], row['boundary'], (row['role'], row['partition'])
+            if (row['backend'], int(row['value_bytes']), int(row['batch_size']), int(row['window']), int(row['repetition'])) != (backend, spec['value'], 32, 32, 0):
+                raise ValueError('read path dimensions differ')
+            key = phase, boundary, role
+            if phase not in audited or boundary not in ('before', 'after') or role not in roles or key in inventory:
+                raise ValueError('unplanned or duplicate read-path evidence')
+            coordinator = [k for k in row if k.startswith('coordinator_cache_')]
+            if role[0] == 'storage':
+                if any(row[k] != '' for k in coordinator):
+                    raise ValueError('owner row contains coordinator cache evidence')
+            else:
+                budget = int(row['coordinator_cache_budget_bytes'])
+                retained = int(row['coordinator_cache_retained_bytes'])
+                metadata = int(row['coordinator_cache_metadata_bytes'])
+                if budget != spec['cache'] or not 0 <= metadata <= retained <= budget:
+                    raise ValueError('coordinator cache accounting exceeds selected budget')
+                if not budget and any(int(row['coordinator_cache_' + k]) for k in ('retained_bytes', 'metadata_bytes', 'entries', 'hits', 'evictions')):
+                    raise ValueError('disabled coordinator cache retained/hit/evicted entries')
+            if row.get('authority_available', '') not in ('', 'true', 'false'):
+                raise ValueError('invalid authority availability')
+            values = {k: int(v) for k, v in row.items() if k not in
+                      ('backend', 'value_bytes', 'batch_size', 'window', 'repetition', 'phase', 'boundary',
+                       'role', 'partition', 'authority_available') and v != ''}
+            if min(values.values()) < 0:
+                raise ValueError('negative read-path counter')
+            if role[0] == 'storage':
+                for current, peak, limit in (('inflight_requests', 'peak_inflight_requests', 32),
+                                             ('inflight_bytes', 'peak_inflight_bytes', 64 * 1024 * 1024),
+                                             ('inflight_reads', 'peak_inflight_reads', 128)):
+                    if not values[current] <= values[peak] <= limit:
+                        raise ValueError('node admission exceeds configured bound')
+                if values['peak_device_reads'] > 128:
+                    raise ValueError('device admission exceeds configured bound')
+            inventory[key] = values
+    if set(inventory) != {(p, b, r) for p in audited for b in ('before', 'after') for r in roles}:
+        raise ValueError('missing per-phase read-path inventory')
+    for phase in sorted(phases):
+        totals = dict.fromkeys(('cache_misses', 'cache_evictions', 'wal_reads', 'wal_read_bytes'), 0)
+        for role in sorted(roles):
+            before, after = (inventory[phase, b, role] for b in ('before', 'after'))
+            keys = (('coordinator_cache_hits', 'coordinator_cache_misses', 'coordinator_cache_evictions')
+                    if role[0] == 'frontend' else ('wal_reads', 'wal_read_bytes'))
+            for key in keys:
+                delta = after[key] - before[key]
+                if delta < 0:
+                    raise ValueError('read-path counters decreased')
+                short = key.removeprefix('coordinator_')
+                if short in totals:
+                    totals[short] += delta
+                result['read_path', phase, '-'.join(role) + '-' + short] = delta
+        if phase in ('point_get', 'point_get_window') and spec['cache'] and any(totals[k] <= 0 for k in ('cache_misses', 'cache_evictions')):
+            raise ValueError('pressure tier lacks real misses/evictions')
+        if not phase.endswith('_hot') and any(totals[k] <= 0 for k in ('wal_reads', 'wal_read_bytes')):
             raise ValueError('read phase lacks actual WAL reads')
     return result

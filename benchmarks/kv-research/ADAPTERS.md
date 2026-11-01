@@ -170,20 +170,10 @@ Every distributed adapter accepts the existing `external_remote_config` object p
   "read_workers": 2,
   "wal_member_read": "async",
   "read_resident_first": false,
-  "read_cache_bytes": 8388608,
   "read_memory_allowance_bytes": 536870912,
   "read_max_inflight_requests": 32,
   "read_max_inflight_bytes": 67108864,
-  "read_max_device_reads": 128,
-  "resident_reads": {
-    "source_bytes": 0,
-    "source_regions": 0,
-    "destination_bytes": 0,
-    "destination_slots": 0,
-    "max_read_bytes": 0,
-    "max_handles": 0,
-    "require_device_read": false
-  }
+  "read_max_device_reads": 128
 }
 ```
 
@@ -212,10 +202,10 @@ kv-research --prepare-external-case input.json --output FRESH_DIR
 engine `Transport`; optional `owner_transports` for per-owner selectors;
 positive `max_batches_per_partition`, `max_admitted_batches`, and
 `max_index_bytes`; nonnegative `coordinator_cache_bytes`; positive
-`owner_read_workers` and `owner_read_memory_allowance_bytes`; nonnegative
-`owner_read_cache_bytes`; `owner_wal_member_read` (`async`, `mapped`, or
-`positional`); `owner_read_resident_first`; `resident_reads`; and `polling`
-(`adaptive` or `busy`). The helper fixes the comparison keyshape at 16 mutexes
+`owner_read_workers` and `owner_read_memory_allowance_bytes`;
+`owner_wal_member_read` (`async`, `mapped`, or `positional`); optional
+`owner_read_resident_first` enables Linux page-cache NOWAIT with async reads;
+and `polling` (`adaptive` or `busy`). The helper fixes the keyshape at 16 mutexes
 × 64 cells and writes `node-{0..4}/launch.yaml`, `remote.yaml`, `remote.json`,
 `shape.yaml`, generated `tls/` material when TLS is selected, and
 `external_owner_read_config.json` extracted from each actual launch file. Owner
@@ -225,7 +215,36 @@ coordinator-side TLS tree; stage each node's launch config and required CA
 certificate/server leaf certificate+key to that owner, never the CA signing
 key. The coordinator uses `remote.json` credentials.
 
-At shutdown, `read-evidence.json` records coordinator cache hits/misses/bytes and read RPC count separately from the most recent available owner read-executor and resident/RDMA counters. Owner `wal_reads` are logical member reads, not device IOPS; async submissions are not proof of physical NVMe activity. Evidence includes sample generation/age/availability and the effective cache/read configuration. It adds no per-operation sampling calls; a passive bounded owner monitor samples outside the measured API calls.
+At shutdown, `read-evidence.json` records coordinator cache hits/misses/bytes and read RPC count separately from the most recent available owner read-executor counters. Owner `wal_reads` are logical member reads, not device IOPS; async submissions are not proof of physical NVMe activity. Evidence includes sample generation/age/availability and the effective read configuration. It adds no per-operation sampling calls; a passive bounded owner monitor samples outside the measured API calls.
+
+### Linux NVMe-oF read selection
+
+Linux builds with the `nvmeof` feature accept `nvmeof_readers` in an external
+Tidehunter adapter configuration. Each reader binds the verified namespace to
+its sealed export manifest; TCP and RDMA are distinct transport selections.
+The [local management commands](../../experiments/nvmeof/README.md) describe
+target setup, initiator connection and non-mutating preflight. RDMA requires a
+compatible RDMA-CM path and is never replaced with TCP or EFA/SRD.
+The target uses a verified buffered file and the initiator uses `O_DIRECT`;
+neither establishes a page-cache hit or NAND access.
+
+Set `coordinator_read_cache_bytes` to zero for remote-path controls or to an
+adequate positive budget for coordinator-hit controls. The receipt names
+the configured budget; measurement counters, not that setting, establish hits.
+Target and reader transport evidence must match the selected transport.
+
+To write a local plan without launching or configuring resources:
+
+```sh
+python3 experiments/kv-comparison/cloud_campaign.py plan \
+  --spec experiments/kv-comparison/cloud-nvmeof-campaign.json \
+  --mode nvmeof-focused \
+  --backends native,tidehunter_tcp,tidehunter_nvme_tcp,tidehunter_nvme_rdma \
+  --output /tmp/nvmeof-plan.json
+```
+
+The plan is not hardware qualification. AWS CI rejects NVMe/RDMA before
+allocation; a compatible provider and verified path remain required elsewhere.
 
 ## Measurement gate for external cold-state capture
 
@@ -285,8 +304,8 @@ qualification. The optional completion gate remains outside the measurement.
   and `unavailable_reason`; absent maxima and unobserved durations are `null`.
 - `profile.counters`: exact engine counts, including partial/deferred/error
   outcomes and failures whose owner profile was retained or unavailable.
-- `profile.read_evidence`: the separate measurement-boundary cache, WAL, async
-  and registered-read counters. These are not the sampled-prefix population.
+- `profile.read_evidence`: separate measurement-boundary coordinator-cache,
+  WAL, NOWAIT, async and NVMe-reader observations. These are not the sampled prefix.
 
 `profile.owners` maps actual partition IDs to their own server stages and
 counters. It reuses the globally selected requests; it does not give each
@@ -300,14 +319,13 @@ their actual IDs. Do not pool these two views of the same work.
 |---|---|
 | `server_planning` | Owner range/authority planning until plans are ready, including cold-planning wait; counted planned requests |
 | `server_executor_residence` | First executor submission attempt through successful admission or synchronous completion; retains `Full` retry residence; counted admitted/completed requests |
-| `server_cache_resolution` | Owner cache lookup/result preparation for a new request, not repeated on a prepared retry; counted cache-resolution passes |
 | `server_nowait` | Actual bounded `preadv2(RWF_NOWAIT)` call elapsed time; counted syscall attempts, including fallback errors/partial results |
 | `server_async` | Each member's SQE preparation through CQE observation; counted observed member completions, including retained failed replies |
 | `server_response_ready` | Construction of owned response records; counted construction passes, not encoding or output |
 | `server_handler` / `server_record_read` | Broader owner service scopes, excluding the final recheck; nested with the narrower WAL stages |
 | `server_response_recheck_wait` / `server_response_recheck` | Ready-result wait and authority recheck; counted profiled replies |
 | `actor_queue` / `actor_service` | Selected successful actor-origin requests; caller-owned admission origins are separate |
-| `request_encode` / `exchange` / `response_decode` / `record_verify` | Each timer's actual client-side call count; RMA does not fabricate an encode/decode observation |
+| `request_encode` / `exchange` / `response_decode` / `record_verify` | Actual message-path call counts; NVMe flights do not fabricate RPC encode/decode observations |
 | `transport_output_queue` / `transport_output_submit` / `transport_output_retire` | Client connection progress during selected work, with each transition's frame count; may include interleaved work |
 | `transport_cq_call` | Instrumented local provider CQ-call wall time and its timed-call count; not hardware transit |
 | `inline` | Submission-to-completion elapsed time for scalar/grouped caller-owned admission origins; includes any later actor takeover, not exclusive caller CPU time |
@@ -328,13 +346,8 @@ Successful cancellations suppress replies as before; a disconnected request
 cannot return an owner profile. Received profiled owner errors preserve their
 timings without converting the error into success.
 
-Protocol **14** includes sampled grant/provider-registration spans and bounded
-owner post-response diagnostics; rebuild clients and owners together. Ordinary
-replies do not carry the profile. There is no mixed-version shim or native
-WAL-format change.
 The normal unprofiled cohort is the performance baseline, not its diagnostic
-twin. Response encoding and local output transitions are now collected through
-owner boundary snapshots; pure wire and physical-media latency remain unsupported.
+twin. Pure wire and physical-media latency remain unsupported.
 
 The cloud planner adds separately labelled representative read diagnostic twins,
 preserving original cases and operation counts. Configuration, artifact hash
@@ -342,15 +355,11 @@ admission, `comparison.md` and the campaign Prometheus/Grafana exports retain
 the new evidence. See [campaign settings](../../experiments/kv-comparison/README.md#read-stage-diagnostic-campaigns).
 
 
-### Resident and registered read controls
+### Read controls
 
-The async-only primary cases remain unchanged. New
-`resident_first_stage_diagnostics` cases set `owner_read_resident_first=true`
-with both explicit value caches at zero. A sweep still permits four NOWAIT
-calls and 64 KiB, with a 16-KiB encoded-member limit. Proven-warm groups can
-retain their prepared state for at most eight continuation sweeps; cold,
-partial or unsupported reads retain asynchronous fallback. A budget deferral
-is not evidence of physical NVMe I/O.
+The current controls use coordinator cache hits or owner WAL reads. Owner WAL
+reads may be served by the Linux page cache or storage; the counters do not
+distinguish them.
 
 Grouped point reads fan out before waiting, retire ready owners rather than
 the first submitted owner, and may drive idle lanes in the caller. After 64
@@ -360,20 +369,6 @@ handoff, cancellation and retirement. Detached scans remain actor-driven.
 The Sui-compatible bulk API accepts borrowed `AsRef<[u8]>` keys; the benchmark
 adapter no longer copies every key into a new `Vec<u8>`.
 
-Registered groups use valid grants for eligible members while missing members
-take the message path concurrently; one missing grant no longer forces every
-member through message fallback. Original order, duplicates, protected cuts
-and error/DMA ownership remain unchanged. Idle-lane selection considers actual
-session-local grant coverage. Source metadata is allocated/charged per
-reservation instead of statically dividing region slots over the maximum
-connection count. Node/process limits and quarantine charges still apply.
-
-Measurement boundary snapshots query each owner's cumulative grant decisions
-once outside API timing. `owner_grants` deltas include attempts, issued/reused
-grants and denial reasons. Source live/pending/quarantined byte and region
-occupancy remains a raw gauge in the start/end snapshots, never a subtracted
-monotonic counter. Passive lifetime snapshots retain their separate freshness
-labels. Client grant candidates/unavailable counts are not owner-wide counts.
 
 `phases.warmup_key_sweep=true` is an explicit, preloaded closed-loop read-only
 control. It covers the unchanged logical working set during warm-up and
@@ -381,17 +376,6 @@ advances the usual random generator; measured requests still use the configured
 random distribution. Validation rejects an incomplete sweep or mutating mix.
 Existing cases default to false and retain their original warm-up.
 
-The two new `registered_ram_fullset_control` cases use all 4,096 keys, C1 and
-one read lane per owner, so qualification concerns the actual selected
-sessions. They retain 8,192 scalar or 2,048 batch32 measured API calls and use
-an explicit full-set warm-up. They are not replacements for C16/mixed or
-first-access results. Cloud requires native device reads; software-provider
-local executions are functional evidence only.
-
-The report labels a control qualified only with nonzero matching FI_READ
-posts/completions, no observed message/grant-acquisition/error/fallback,
-no explicit-cache hits and no owner WAL reads. Missing observations remain
-unknown; an unqualified configured control is not called pure RMA.
 
 
 ### Coordinator, acquisition and output decomposition
@@ -444,13 +428,10 @@ require encoding the response twice. Abandoned output is counted separately
 from retirement. Boundary counter deltas retain their populations; a cumulative
 maximum is reported as a node-lifetime maximum, never subtracted.
 Fatal connection failures can leave other in-flight profiles unavailable.
-A pure FI_READ failure has no owner handler and is not misclassified as a
-retained owner profile.
-
-Raw measurement boundaries also retain actual instantiated read-lane counters
-and local session presence per owner/lane. Locally constructed-session usability
-does not establish current peer health or complete key coverage. C1/one-lane
-full-set controls and C16/four-lane mixed controls remain separate.
+An NVMe flight has no owner record-read RPC handler; its reader stages and
+errors are reported separately rather than filled with zero owner durations.
+Historical grant/session records remain readable when present, but the current
+producer no longer emits registered-value cache observations.
 
 ### First-access controls and cache policy
 
@@ -459,30 +440,20 @@ closed-loop, read-only workload with enough distinct keys for the complete
 measured call count, including every full batch member. It does not wrap into
 repeated keys. Default false preserves the ordinary random measurement sequence.
 This deterministic first-touch sweep is labelled explicitly; it is not an IID
-uniform-random population. Paired promotion-disabled and acquisition controls
-use identical data and order. Connections are established before activation;
-the preflight qualifier uses a separate namespace. Its unrelated grants can
-remain in lifetime occupancy, so first-access proof uses namespace/sweep binding
-and measured new-issuance/message counters rather than requiring globally empty
-grant caches.
+uniform-random population.
 
-Focused campaign receipts name requested/effective coordinator and owner value
-cache budgets, registered-value budgets/policy, Linux page-cache policy,
-resident-first setting, warm-up, sweep flags, concurrency and lane evidence.
-Turning off both value caches and value grants forces remote value service; it
-does **not** turn off the Linux page cache, coordinator metadata residency or
-the registered transport buffers needed by the provider itself.
-Pure-hit claims require observed paths, not just a configured nonzero budget.
+Focused campaign receipts name requested/effective coordinator cache budgets,
+Linux page-cache policy, warm-up, sweep flags, concurrency and lane evidence.
+Disabling the coordinator cache forces remote value service but does not disable
+Linux page cache or metadata residency. Owner value caches and long-lived
+registered-value grants are no longer runtime options. Transient transport
+buffers remain. Pure-hit claims require observed paths, not a configured budget.
 
-The opt-in `read-tier` campaign uses the existing single fleet sequentially:
-application-cache-disabled remote controls first, then labelled cache,
-registered, acquisition/reuse, warm-WAL, cold-device and bounded-mixed controls.
-Baseline/profiled twins are separate populations with the same input data.
-Backend-independent `data_id` binds matching key/value bytes; `source_id`
-separately identifies backend/workload/concurrency/lane populations.
-The 64-KiB warmed owner control is labelled `oversize_async_fallback`, since it
-exceeds the 16-KiB NOWAIT member limit; configured registered controls do not
-pretend 64-KiB values fit a 32-KiB registered-read limit.
+The opt-in `read-tier` campaign uses labelled remote, coordinator-cache,
+warm-WAL, storage-observation and bounded-mixed controls. Baseline/profiled
+twins are separate populations with the same input data. Backend-independent
+`data_id` binds matching key/value bytes; `source_id` identifies each population.
+Warm-up does not prove that every WAL read hit the Linux page cache.
 
 ### Cold-device evidence is not a per-API NAND timer
 

@@ -202,11 +202,9 @@ fn run_case(
             transport.clone(),
             2,
             WalMemberReadPolicy::Async,
-            0,
             128 * MIB,
             PollingPolicy::Adaptive,
             true,
-            tidehunter::distributed::tcp::ResidentReadConfig::default(),
         )?);
         let mut config = cluster
             .as_ref()

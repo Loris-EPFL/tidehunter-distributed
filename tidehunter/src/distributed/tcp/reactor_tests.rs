@@ -30,21 +30,11 @@ impl Running {
         bytes: usize,
         device_reads: usize,
     ) -> Self {
-        Self::with_cache(transport, policy, bytes, device_reads, 0)
-    }
-    fn with_cache(
-        transport: Transport,
-        policy: WalMemberReadPolicy,
-        bytes: usize,
-        device_reads: usize,
-        cache_bytes: usize,
-    ) -> Self {
         Self::with_limits(
             transport,
             policy,
             bytes,
             device_reads,
-            cache_bytes,
             TcpLimits {
                 io_timeout: Duration::from_secs(3),
                 max_frame_bytes: 2 * 1024 * 1024,
@@ -57,25 +47,15 @@ impl Running {
         policy: WalMemberReadPolicy,
         bytes: usize,
         device_reads: usize,
-        cache_bytes: usize,
         limits: TcpLimits,
     ) -> Self {
-        Self::with_config(
-            transport,
-            policy,
-            bytes,
-            device_reads,
-            cache_bytes,
-            limits,
-            |_| {},
-        )
+        Self::with_config(transport, policy, bytes, device_reads, limits, |_| {})
     }
     fn with_config(
         transport: Transport,
         policy: WalMemberReadPolicy,
         bytes: usize,
         device_reads: usize,
-        cache_bytes: usize,
         limits: TcpLimits,
         configure: impl FnOnce(&mut NodeConfig),
     ) -> Self {
@@ -87,7 +67,6 @@ impl Running {
                 cert: PathBuf::new(),
                 key: PathBuf::new(),
                 server_name: "trusted-test-cluster".to_owned(),
-                resident_reads: ResidentReadConfig::default(),
             }
         } else {
             let mut tls = certificates(temp.path());
@@ -98,7 +77,6 @@ impl Running {
         config.wal_member_read = policy;
         config.read_max_inflight_bytes = bytes;
         config.read_max_device_reads = device_reads;
-        config.read_cache_bytes = cache_bytes;
         configure(&mut config);
         let node = StorageNode::open(config.clone(), metrics()).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -191,7 +169,6 @@ fn adaptive_idle_reads_and_shutdown(transport: Transport) {
         WalMemberReadPolicy::Positional,
         default_read_bytes(),
         default_device_reads(),
-        0,
         TcpLimits {
             polling: PollingPolicy::Adaptive,
             ..TcpLimits::default()
@@ -255,7 +232,6 @@ fn operational_session_for_transport(transport: Transport) {
             .operational_read_io_stats()
             .is_err()
     );
-    assert!(diagnostic(wrong_owner).resident_grant_stats().is_err());
     let next = batch(&server.config, 1, 2);
     for try_status_upgrade in [false, true] {
         let mut client = diagnostic(server.config.partition.clone());
@@ -265,8 +241,6 @@ fn operational_session_for_transport(transport: Transport) {
         client.broken = false;
         let stats = client.operational_read_io_stats().unwrap().unwrap();
         assert_eq!(stats.completed_reads, 1);
-        let grants = client.resident_grant_stats().unwrap().unwrap();
-        assert_eq!(grants.issued, 0);
         if try_status_upgrade {
             assert!(client.status().is_err());
         } else {
@@ -311,7 +285,6 @@ fn established_connection_survives_idle_timeout(transport: Transport) {
         WalMemberReadPolicy::Positional,
         default_read_bytes(),
         default_device_reads(),
-        0,
         limits,
     );
     // Fencing and appending persist the fixture. Do that before opening the
@@ -378,7 +351,6 @@ fn delayed_independent(transport: Transport) {
             1,
             vec![references[0]],
             Instant::now() + Duration::from_secs(2),
-            ReadClass::Point,
             false,
         )
         .unwrap()
@@ -388,7 +360,6 @@ fn delayed_independent(transport: Transport) {
             1,
             vec![references[1]],
             Instant::now() + Duration::from_secs(2),
-            ReadClass::Point,
             false,
         )
         .unwrap()
@@ -413,7 +384,6 @@ fn delayed_independent(transport: Transport) {
             1,
             vec![references[1]],
             Instant::now() + Duration::from_secs(2),
-            ReadClass::Point,
             false,
         )
         .unwrap()
@@ -510,7 +480,6 @@ fn fabric_tcp_native_mode_mismatch_with_tls_fails_closed() {
         cert: PathBuf::new(),
         key: PathBuf::new(),
         server_name: "trusted-test-cluster".into(),
-        resident_reads: ResidentReadConfig::default(),
     };
     assert!(
         Client::connect(
@@ -544,7 +513,6 @@ fn fence_while_read_pending_is_rechecked_before_reply() {
             1,
             vec![references[0]],
             Instant::now() + Duration::from_secs(2),
-            ReadClass::Point,
             false,
         )
         .unwrap()
@@ -581,7 +549,6 @@ fn async_tcp_multiple_misses_are_bounded_and_report_real_wal_submissions() {
                     1,
                     vec![references[index % 2]],
                     Instant::now() + Duration::from_secs(2),
-                    ReadClass::Point,
                     false,
                 )
                 .unwrap()
@@ -595,7 +562,6 @@ fn async_tcp_multiple_misses_are_bounded_and_report_real_wal_submissions() {
                 1,
                 vec![references[0]],
                 Instant::now() + Duration::from_secs(2),
-                ReadClass::Point,
                 false
             )
             .unwrap()
@@ -609,10 +575,7 @@ fn async_tcp_multiple_misses_are_bounded_and_report_real_wal_submissions() {
         );
     }
     let after = client.read_io_stats().unwrap();
-    assert_eq!(after.cache_budget, 0);
-    assert_eq!(after.cache_bytes, 0);
     assert_eq!(after.wal_reads - before.wal_reads, 32);
-    assert_eq!(after.cache_misses - before.cache_misses, 32);
     assert!(after.peak_inflight_requests <= server.config.read_max_inflight_requests);
     assert!(after.peak_inflight_bytes <= server.config.read_max_inflight_bytes);
     assert!(after.peak_inflight_reads <= server.config.read_max_device_reads);
@@ -634,7 +597,6 @@ fn async_reader_disconnects_do_not_block_new_authenticated_connections() {
     }
     let stats = client.read_io_stats().unwrap();
     assert_eq!(stats.wal_reads, 32);
-    assert_eq!(stats.cache_entries, 0);
 }
 
 #[cfg(target_os = "linux")]
@@ -709,7 +671,6 @@ fn faulty_peer(fault: Fault, transport: Transport) {
             cert: PathBuf::new(),
             key: PathBuf::new(),
             server_name: "trusted-test-cluster".to_owned(),
-            resident_reads: ResidentReadConfig::default(),
         }
     } else {
         certificates(temp.path())
@@ -728,9 +689,6 @@ fn faulty_peer(fault: Fault, transport: Transport) {
             Request::Read {
                 epoch: 1,
                 references: vec![reference],
-                class: ReadClass::Point,
-                grant_limit: 0,
-                grant_max_bytes: 0,
             },
             TcpLimits::default(),
         )
@@ -755,8 +713,7 @@ fn faulty_peer(fault: Fault, transport: Transport) {
             #[cfg(feature = "experimental-fabric")]
             {
                 read_transport_mode(&mut io, &transport).unwrap();
-                let endpoint =
-                    fabric::bootstrap(&mut io, &transport, ResidentReadConfig::default()).unwrap();
+                let endpoint = fabric::bootstrap(&mut io, &transport).unwrap();
                 Box::new(NativeFaultPeer {
                     endpoint,
                     _control: io,
@@ -833,13 +790,7 @@ fn faulty_peer(fault: Fault, transport: Transport) {
         Duration::from_secs(2)
     };
     client
-        .submit_read(
-            1,
-            vec![reference],
-            Instant::now() + timeout,
-            ReadClass::Point,
-            false,
-        )
+        .submit_read(1, vec![reference], Instant::now() + timeout, false)
         .unwrap()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -913,65 +864,11 @@ fn fabric_tcp_native_rejects_corrupt_member_reply_without_tls() {
 fn diagnostic_read_policies_reject_async_executor_options() {
     let temp = tempdir::TempDir::new("diagnostic-cache-policy").unwrap();
     for policy in [WalMemberReadPolicy::Mapped, WalMemberReadPolicy::Positional] {
-        for (cache_bytes, resident_first) in [(1024 * 1024, false), (0, true)] {
-            let mut config = config(&temp.path().join("node"));
-            config.wal_member_read = policy;
-            config.read_cache_bytes = cache_bytes;
-            config.read_resident_first = resident_first;
-            assert!(StorageNode::open(config, metrics()).is_err());
-        }
+        let mut config = config(&temp.path().join("node"));
+        config.wal_member_read = policy;
+        config.read_resident_first = true;
+        assert!(StorageNode::open(config, metrics()).is_err());
     }
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn authenticated_scan_class_uses_hits_without_filling_point_cache() {
-    let server = Running::with_cache(
-        Transport::Tcp,
-        WalMemberReadPolicy::Async,
-        default_read_bytes(),
-        default_device_reads(),
-        1024 * 1024,
-    );
-    let mut client = server.client();
-    let (batches, references) = server.data(&mut client);
-    assert_eq!(
-        client.read_record(1, &references[0]).unwrap(),
-        batches[0].mutations()[0]
-    );
-    let warm = client.read_io_stats().unwrap();
-    assert_eq!(warm.cache_inserts, 1);
-    for index in [1, 0] {
-        let id = client
-            .submit_read(
-                1,
-                vec![references[index]],
-                Instant::now() + Duration::from_secs(2),
-                ReadClass::ScanNoFill,
-                false,
-            )
-            .unwrap()
-            .unwrap();
-        let result = collect(&mut client, 1).pop().unwrap();
-        assert_eq!(result.id, id);
-        assert_eq!(
-            result.result.unwrap().0,
-            vec![batches[index].mutations()[0].clone()]
-        );
-        let stats = client.read_io_stats().unwrap();
-        assert_eq!(stats.cache_inserts, warm.cache_inserts);
-        assert_eq!(stats.cache_bypass_scan, warm.cache_bypass_scan + 1);
-        assert_eq!(stats.cache_entries, warm.cache_entries);
-        if index == 0 {
-            assert_eq!(stats.cache_hits, warm.cache_hits + 1);
-        }
-    }
-    let before_point = client.read_io_stats().unwrap();
-    client.read_record(1, &references[0]).unwrap();
-    assert_eq!(
-        client.read_io_stats().unwrap().cache_hits,
-        before_point.cache_hits + 1
-    );
 }
 
 #[test]
@@ -1008,7 +905,6 @@ fn reuse_rejects_live_read_without_consuming_its_result() {
             1,
             vec![references[0]],
             Instant::now() + Duration::from_secs(2),
-            ReadClass::Point,
             false,
         )
         .unwrap()
@@ -1104,7 +1000,6 @@ fn ram_probe_round_trip(transport: Transport, polling: PollingPolicy) {
         WalMemberReadPolicy::Positional,
         default_read_bytes(),
         default_device_reads(),
-        0,
         TcpLimits {
             polling,
             ..TcpLimits::default()
@@ -1242,7 +1137,6 @@ fn ram_probe_frame_bound_and_expired_request_preserve_fail_stop() {
         WalMemberReadPolicy::Positional,
         default_read_bytes(),
         default_device_reads(),
-        0,
         TcpLimits {
             max_frame_bytes: 8192,
             polling: PollingPolicy::Busy,
@@ -1309,7 +1203,6 @@ fn cold_authority_does_not_move_hot_reads_to_the_pool(transport: Transport, fenc
         WalMemberReadPolicy::Async,
         default_read_bytes(),
         default_device_reads(),
-        64 * 1024,
         TcpLimits {
             io_timeout: Duration::from_secs(3),
             ..TcpLimits::default()
@@ -1349,7 +1242,6 @@ fn cold_authority_does_not_move_hot_reads_to_the_pool(transport: Transport, fenc
             1,
             vec![references[0]],
             Instant::now() + Duration::from_secs(2),
-            ReadClass::Point,
             false,
         )
         .unwrap()
@@ -1382,7 +1274,6 @@ fn cold_authority_does_not_move_hot_reads_to_the_pool(transport: Transport, fenc
             1,
             vec![references[1]],
             Instant::now() + Duration::from_secs(2),
-            ReadClass::Point,
             false,
         )
         .unwrap()
@@ -1394,11 +1285,7 @@ fn cold_authority_does_not_move_hot_reads_to_the_pool(transport: Transport, fenc
         vec![batches[1].mutations()[0].clone()]
     );
     let after = client.read_io_stats().unwrap();
-    assert_eq!(after.cache_hits, before.cache_hits + 1);
-    assert_eq!(
-        after.wal_reads, before.wal_reads,
-        "cold metadata has not submitted value I/O"
-    );
+    assert_eq!(after.wal_reads, before.wal_reads + 1);
     if fenced {
         server.client().fence_to(2).unwrap();
     }
@@ -1444,7 +1331,6 @@ fn disconnect_retains_cold_planning_credits_until_the_worker_retires_for(transpo
         WalMemberReadPolicy::Async,
         default_read_bytes(),
         default_device_reads(),
-        0,
         TcpLimits {
             io_timeout: Duration::from_secs(3),
             ..TcpLimits::default()
@@ -1472,7 +1358,7 @@ fn disconnect_retains_cold_planning_credits_until_the_worker_retires_for(transpo
     let (entered, release) = log.pause_next_authority_load();
     let read_deadline = Instant::now() + Duration::from_secs(2);
     client
-        .submit_read(1, vec![reference], read_deadline, ReadClass::Point, false)
+        .submit_read(1, vec![reference], read_deadline, false)
         .unwrap()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);

@@ -595,8 +595,7 @@ class SafetyTests(unittest.TestCase):
                          for label in ('baseline', 'current')}
             with patch.multiple(guest.scalar_transport,
                                 BASELINE_SOURCE_SHA256=manifests['baseline']['source_tree_sha256'],
-                                BASELINE_BINARY_SHA256=manifests['baseline']['binary_sha256'],
-                                CURRENT_SOURCE_SHA256=manifests['current']['source_tree_sha256']), \
+                                BASELINE_BINARY_SHA256=manifests['baseline']['binary_sha256']), \
                  patch.object(guest, 'run_recorded', side_effect=run), \
                  patch.object(guest.subprocess, 'check_output', return_value='pinned\n'), \
                  patch.object(guest, 'sha', side_effect=lambda path: 'fabric-hash'
@@ -638,8 +637,7 @@ class SafetyTests(unittest.TestCase):
             real_sha = guest.sha
             with patch.multiple(guest.transport_floor,
                                 BASELINE_SOURCE_SHA256=manifests['baseline']['source_tree_sha256'],
-                                BASELINE_BINARY_SHA256=manifests['baseline']['binary_sha256'],
-                                CURRENT_SOURCE_SHA256=manifests['current']['source_tree_sha256']), \
+                                BASELINE_BINARY_SHA256=manifests['baseline']['binary_sha256']), \
                  patch.object(guest, 'run_recorded', side_effect=run), \
                  patch.object(guest.subprocess, 'check_output', return_value='pinned\n'), \
                  patch.object(guest, 'sha', side_effect=lambda path: 'fabric-hash'
@@ -753,7 +751,7 @@ class SafetyTests(unittest.TestCase):
                                      '--transport --transport-config --owner-transports '
                                      '--native-read-workers --read-resource-evidence --read-window '
                                      '--native-read-cache-bytes --tcp-read-lanes --tcp-server-read-workers '
-                                     '--tcp-wal-member-read --cold-read-pass --hot-read-pass --tcp-shard-cache-bytes '
+                                     '--tcp-wal-member-read --cold-read-pass --hot-read-pass '
                                      '--read-memory-allowance-bytes --shard-read-memory-allowance-bytes '
                                      '--cache-probe-keys --concurrent-mixed').split()
                             if 'current' in Path(command[0]).parts:
@@ -1109,6 +1107,11 @@ class ProgressCampaignTests(unittest.TestCase):
                 return [binary] + [str(item) for pair in opts.items() for item in pair]
             save(root / (case + '-prepare.command.json'), {'exit_code': 0, 'command': command(prepare)})
             transport = guest.transport_for_case(spec['transport'])
+            import yaml
+            policy_spec = dict(shape=[spec['value'], 32, 32], repetition=0,
+                               transport=spec['transport'], cached=False, cold=True,
+                               diagnostics=False, authority_resident_batches=None)
+            _, launch_policies, _ = guest.kv_case_policy(cfg, policy_spec)
             owners = guest.select_transports(transport, None, len(cfg['nodes']))
             save(root / (case + '-transport-config.json'), transport)
             save(root / (case + '-owner-transports-requested.json'), owners)
@@ -1119,7 +1122,15 @@ class ProgressCampaignTests(unittest.TestCase):
             launch_hashes = {}
             for node, owner in zip(cfg['nodes'], owners):
                 path = root / (case + f"-node-{node['partition']}-launch.yaml")
-                path.write_text('tls:\n  transport: ' + json.dumps(owner) + '\n')
+                partition = node['partition']
+                policy = launch_policies[partition]
+                policy['node'].update(root=f'{case_root}/node-{partition}/storage',
+                                     read_workers=spec['workers'], wal_member_read=spec['member'])
+                policy['ready_file'] = f'{case_root}/node-{partition}/ready'
+                policy['stop_file'] = f'{case_root}/node-{partition}/stop'
+                policy['tls']['transport'] = owner
+                launch = yaml.safe_dump(json.loads(json.dumps(policy)), sort_keys=False)
+                path.write_text(launch)
                 launch_hashes[str(node['partition'])] = guest.sha(path)
             save(root / (case + '-prepared-transports.json'), dict(schema=1,
                 requested_transport_sha256=guest.sha(root / (case + '-transport-config.json')),
@@ -1135,7 +1146,7 @@ class ProgressCampaignTests(unittest.TestCase):
                     'before.json': json.dumps(sensor(node['instance_id'], partition=p)),
                     'after.json': json.dumps(sensor(node['instance_id'], True, p)),
                     'efa-provider.txt': 'prov_name: efa\n',
-                    'launch.yaml': 'read_workers: 1\nwal_member_read: mapped\n',
+                    'launch.yaml': (root / (case + f"-node-{p}-launch.yaml")).read_text(),
                     'process-status.txt': f'Pid: {p+100}\nVmRSS: 100 kB\nVmHWM: 200 kB\nVmSwap: 0 kB\n'}
                 with tarfile.open(archive, 'w:gz') as stream:
                     for name, text in members.items():

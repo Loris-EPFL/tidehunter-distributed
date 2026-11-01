@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -51,12 +52,14 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(standard['ttl_seconds'], focused['ttl_seconds'])
         self.assertEqual(standard['export_reserve_seconds'], focused['export_reserve_seconds'])
         self.assertEqual(standard['fleet'], focused['fleet'])
-        self.assertEqual(len(ci.cloud_campaign.make_matrix(focused['spec'])), 258)
+        jobs = ci.cloud_campaign.make_matrix(focused['spec'])
+        self.assertTrue(jobs)
+        self.assertFalse(any(j['read_tier']['name'].startswith(('owner_hit', 'registered_')) for j in jobs))
 
     def test_full_single_and_three_repeat_matrices_are_admitted(self):
         spec = ci.core.read_json(ci.HERE / 'cloud-campaign.json')
         for limit in (0, 256):
-            for repeats, ordinary_cases in ((1, 253), (3, 759)):
+            for repeats, ordinary_cases in ((1, 243), (3, 729)):
                 with self.subTest(repeats=repeats, write_profile_limit=limit):
                     cfg = self.config(matrix=spec | {
                         'repeats': repeats, 'diagnostics': {'write_profile_limit': limit}})
@@ -72,15 +75,60 @@ class ConfigTests(unittest.TestCase):
         for repeats in (1, 3):
             cfg = self.config(matrix=spec | {'repeats': repeats})
             jobs = ci.cloud_campaign.make_matrix(cfg['spec'])
-            self.assertEqual(len(jobs), 297 * repeats)
+            self.assertEqual(len(jobs), 260 * repeats)
             self.assertEqual(sum(job['cohort'] == 'read_stage_diagnostics' for job in jobs),
-                             17 * repeats)
+                             12 * repeats)
             self.assertEqual(sum(job['cohort'] == 'write_stage_diagnostics' for job in jobs),
                              5 * repeats)
-            self.assertEqual(sum(job['cohort'] == 'resident_first_stage_diagnostics' for job in jobs),
-                             20 * repeats)
-            self.assertEqual(sum(job['cohort'] == 'registered_ram_fullset_control' for job in jobs),
-                             2 * repeats)
+            self.assertFalse(any('resident_reads' in job or 'owner_read_cache_bytes' in job for job in jobs))
+
+    def test_nvme_rdma_planner_keeps_control_and_target_transports_distinct(self):
+        spec = ci.core.read_json(ci.HERE / 'cloud-nvmeof-campaign.json')
+        spec['mode'] = 'nvmeof-focused'
+        spec['backends'] = ['native', 'tidehunter_tcp', 'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma']
+        jobs = ci.cloud_campaign.make_matrix(spec)
+        rdma = [job for job in jobs if job['backend'] == 'tidehunter_nvme_rdma']
+        self.assertTrue(rdma)
+        self.assertTrue(all(job['sealed_dataset']['target_cache'] == 'buffered_file_page_cache'
+                            and job['drop_os_caches'] == (job['sealed_dataset']['tier'] == 'first_touch')
+                            and not job['evict_mapped_wal_before_measurement'] for job in rdma))
+        config = ci.cloud_campaign.make_run_config(rdma[0], Path('/tmp/rdma-case'), {}, 'source')
+        self.assertEqual(config['backend']['kind'], 'tidehunter')
+        self.assertEqual(config['backend']['options']['transport'], {'kind': 'tcp'})
+
+    def test_local_cli_plans_explicit_nvme_rdma_backend(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "plan.json"
+            backends = ["native", "tidehunter_tcp", "tidehunter_nvme_tcp", "tidehunter_nvme_rdma"]
+            subprocess.run([
+                sys.executable, str(ci.HERE / "cloud_campaign.py"), "plan",
+                "--spec", str(ci.HERE / "cloud-nvmeof-campaign.json"),
+                "--output", str(output), "--mode", "nvmeof-focused",
+                "--backends", ",".join(backends),
+            ], check=True, capture_output=True, text=True)
+            planned = json.loads(output.read_text())
+            self.assertEqual(planned["spec"]["backends"], backends)
+            self.assertEqual({job["backend"] for job in planned["jobs"]}, set(backends))
+            rdma = [job for job in planned["jobs"]
+                    if job["backend"] == "tidehunter_nvme_rdma"
+                    and job["value_size"] == 1024
+                    and job["profile"] == "first_touch-scalar-c1-baseline"]
+            self.assertEqual(len(rdma), 1)
+            job = rdma[0]
+            self.assertEqual((job["repeat"], job["keys"], job["concurrency"],
+                              job["coordinator_cache_bytes"], job["drop_os_caches"]),
+                             (0, 65536, 1, 0, True))
+            self.assertEqual(job["sealed_dataset"]["target_cache"], "buffered_file_page_cache")
+            self.assertEqual(job["sealed_dataset"]["directness"], "initiator_O_DIRECT_target_buffered")
+            self.assertTrue(job["measurement_key_sweep"])
+
+    def test_aws_nvme_rdma_rejected_before_allocation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'cfg.json'
+            ci.core.dump(path, ci.core.read_json(ci.HERE / 'ci-config.json'))
+            with self.assertRaises(ValueError):
+                ci.load_config(path, ENV, backend_selection='native,tidehunter_tcp,tidehunter_nvme_tcp,tidehunter_nvme_rdma', mode='nvmeof-focused')
+
     def test_explicit_backend_subset_is_frozen_and_resizes_expected_jobs(self):
         spec = ci.core.read_json(ci.HERE / 'cloud-campaign.json')
         selected = self.config(matrix=spec, backend_selection='valkey_tcp')

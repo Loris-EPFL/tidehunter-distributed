@@ -234,8 +234,7 @@ class CampaignMonitorBoundaries(unittest.TestCase):
             campaign_exporter.read_json(oversized_path)
 
     def test_effective_cache_receipt_validated_before_terminal_publication(self):
-        requested = {'coordinator_cache_bytes': 0, 'owner_read_cache_bytes': 0,
-                     'registered_policy': 'disabled', 'page_cache_policy': 'not_dropped',
+        requested = {'coordinator_cache_bytes': 0, 'page_cache_policy': 'not_dropped',
                      'warmup_operations': 10, 'read_lanes': 1, 'concurrency': 1}
         self.job['read_tier'] = {'requested': requested, 'effective': None}
         state, _, result = self.initialize_selection()
@@ -243,7 +242,7 @@ class CampaignMonitorBoundaries(unittest.TestCase):
         before = (state / 'benchmark/selection.json').read_bytes()
         with self.assertRaises(ValueError):
             monitor.finish_case(self.spec, self.job, result,
-                                read_tier_effective=requested | {'registered_policy': 'invalid'})
+                                read_tier_effective=requested | {'page_cache_policy': 'invalid'})
         self.assertEqual((state / 'benchmark/selection.json').read_bytes(), before)
         observed = {'resultType': 'vector', 'result': [{'metric': {}, 'value': [time.time(), '1']}]}
         effective = requested | {'page_cache_policy': None}

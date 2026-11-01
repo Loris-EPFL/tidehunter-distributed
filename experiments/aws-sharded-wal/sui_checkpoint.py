@@ -37,9 +37,8 @@ import boto3
 from botocore.config import Config
 from checkpoint_matrix import (matrix_plan, check_cell, validate_provider, efa_snapshot,
                                efa_proof, validate_efa_proof, validate_matrix, validate_placement,
-                               HARDWARE_TRANSPORTS, DIRECT_TRANSPORTS, fabric_name, cell_resident_reads)
+                               HARDWARE_TRANSPORTS, DIRECT_TRANSPORTS, fabric_name)
 from checkpoint_kv import run_suite as run_kv_suite, validate_options as validate_kv_options
-from resident_config import resident_read_config
 from portable_transport import transport_for_case, validate_transport, protocol_key, select_transports, write_transport_config
 
 # SendCommand has no idempotency token. An ambiguous HTTP acknowledgement must
@@ -71,7 +70,7 @@ def schema():
             'write_profile_limits': [0, 128, 128, 0],
             'native_write_profile_limits': [0, 640, 640, 0],
             'port': 24000, 'coordinator_cache_mib': 8,
-            'shard_cache_mib': 0, 'replay_deadline_seconds': 900,
+            'replay_deadline_seconds': 900,
             'kv_suite': None,
             'build_bundle': {'key': 'th-0123456789abcdef/inputs/build-bundle.tar.gz', 'sha256': 'SHA256'},
             'fixture_bundle': {'key': 'th-0123456789abcdef/inputs/fixture.tar.gz', 'sha256': 'SHA256'},
@@ -231,10 +230,6 @@ def read_json(path):
 
 def validate_prepared_cell(cfg, cell, prepared, external):
     """Admit actual coordinator and manifest policy, not a transport-only label."""
-    resident = cell_resident_reads(cfg, cell['transport'], cell)
-    if cell.get('resident_reads') != (resident if resident['destination_slots'] else None):
-        raise ValueError('prepared cell resident-read metadata differs from canonical matrix policy')
-    resident_read_config(cell.get('resident_reads'))
     if external.get('schema') != 2:
         raise ValueError('prepared external manifest schema differs from structured transports')
     expected = transport_for_case(cell['transport'])
@@ -255,12 +250,13 @@ def validate_prepared_cell(cfg, cell, prepared, external):
     if not prepared['databases'] or any(
             validate_transport(database['tls']['transport']) != client
             or database.get('write_profile_limit', 0) != cell['write_profile_limit']
-            or resident_read_config(database['tls'].get('resident_reads')) != resident
+            or database.get('read_cache_bytes') != cell['coordinator_cache_mib'] * 1024**2
+            or 'resident_reads' in database['tls']
             for database in prepared['databases'].values()):
-        raise ValueError('prepared transport/profiling/resident reads differs from matrix cell; no fallback')
+        raise ValueError('prepared transport/profiling differs from matrix cell; no fallback')
     if (external.get('transport') != client or external.get('owner_transports') != owners
-            or resident_read_config(external.get('resident_reads')) != resident):
-        raise ValueError('prepared manifest transport/resident-read policy differs from matrix cell; no fallback')
+            or 'resident_reads' in external or 'shard_cache_bytes' in external):
+        raise ValueError('prepared manifest transport policy differs from matrix cell; no fallback')
 
 
 def scoped_path(root, path):
@@ -300,7 +296,7 @@ def validate_cfg(cfg):
     validate_kv_options(cfg.get('kv_suite'))
     if not 1024 <= cfg.get('port', 24000) <= 64920:
         raise ValueError('port range cannot accommodate all namespaces')
-    if any(not 0 <= cfg.get(name, default) <= 128 for name, default in [('coordinator_cache_mib', 8), ('shard_cache_mib', 0)]):
+    if not 0 <= cfg.get('coordinator_cache_mib', 8) <= 128:
         raise ValueError('invalid per-database cache bound')
     if not 30 <= cfg.get('replay_deadline_seconds', 900) <= 3600:
         raise ValueError('invalid replay deadline')
@@ -923,12 +919,7 @@ class SuiCampaign(Campaign):
             '--guest-root', self.cell_root / 'storage', '--hosts', ','.join(n['private_ip'] for n in self.nodes),
             '--transport-config', transport_path, '--owner-transports', owner_path, '--port', str(self.cfg.get('port', 24000)),
             '--write-profile-limit', str(self.cell['write_profile_limit']),
-            '--coordinator-cache-mib', str(self.cell['coordinator_cache_mib']), '--shard-cache-mib', str(self.cell['shard_cache_mib'])]
-        resident = cell_resident_reads(self.cfg, self.cell['transport'], self.cell)
-        if resident['destination_slots']:
-            policy = self.cell_root / 'resident-reads.json'
-            write_json(policy, resident)
-            command += ['--resident-reads', policy]
+            '--coordinator-cache-mib', str(self.cell['coordinator_cache_mib'])]
         self.run_command('prepare-external', command, 120)
         prepared = read_json(self.deployment / 'config.json')
         self.external = read_json(self.deployment / 'external-manifest.json')
@@ -941,8 +932,6 @@ class SuiCampaign(Campaign):
             raise ValueError('prepared deployment source binding differs')
         shutil.copy2(self.deployment / 'config.json', self.results / 'external-config.json')
         shutil.copy2(self.deployment / 'external-manifest.json', self.results / 'external-manifest.json')
-        if resident['destination_slots']:
-            shutil.copy2(policy, self.results / 'resident-reads.json')
         source_manifest = self.build / 'source-manifest.json'
         if sha(source_manifest) != self.cfg['source_manifest_sha256']:
             raise ValueError('per-cell runner source manifest differs from admitted build')
@@ -1106,7 +1095,7 @@ class SuiCampaign(Campaign):
             '--read-profile-limit', str(self.cell['read_profile_limit']),
             '--write-profile-limit', str(self.cell['write_profile_limit']),
             '--native-write-profile-limit', str(self.cell['native_write_profile_limit']),
-            '--coordinator-cache-mib', str(self.cell['coordinator_cache_mib']), '--shard-cache-mib', str(self.cell['shard_cache_mib'])]
+            '--coordinator-cache-mib', str(self.cell['coordinator_cache_mib'])]
         write_json(self.results / 'replay-command.json', [str(value) for value in command])
         with (self.results / 'replay-supervisor.log').open('xb') as log:
             self.child = subprocess.Popen(list(map(str, command)), stdout=log, stderr=subprocess.STDOUT, start_new_session=True)

@@ -127,10 +127,7 @@ fn finish(executor: &mut ReadExecutor, count: usize) -> Vec<ReadCompletion> {
 }
 fn read(executor: &mut ReadExecutor, fixture: &Fixture, n: usize, id: u64) -> Bytes {
     executor.begin_sweep();
-    match executor
-        .submit(id, fixture.member(n), ReadClass::Point)
-        .unwrap()
-    {
+    match executor.submit(id, fixture.member(n)).unwrap() {
         SubmitOutcome::Ready {
             mut records,
             lease: _lease,
@@ -146,9 +143,7 @@ fn independent_misses_are_inflight_together_and_members_keep_wire_order() {
     let fixture = Fixture::new(3);
     let (admission, mut executor) = executor(ReadExecutorConfig::default());
     assert!(matches!(
-        executor
-            .submit(11, fixture.member(0), ReadClass::Point)
-            .unwrap(),
+        executor.submit(11, fixture.member(0)).unwrap(),
         SubmitOutcome::Pending
     ));
     let members = vec![
@@ -156,7 +151,7 @@ fn independent_misses_are_inflight_together_and_members_keep_wire_order() {
         (fixture.log.clone(), fixture.references[1]),
     ];
     assert!(matches!(
-        executor.submit(22, members, ReadClass::Point).unwrap(),
+        executor.submit(22, members).unwrap(),
         SubmitOutcome::Pending
     ));
     let stats = admission.stats();
@@ -175,18 +170,13 @@ fn independent_misses_are_inflight_together_and_members_keep_wire_order() {
 }
 
 #[test]
-fn disabled_cache_repeated_reads_consult_wal_and_sync_async_is_rejected() {
+fn repeated_reads_consult_wal_and_sync_async_is_rejected() {
     let fixture = Fixture::new(1);
     let (admission, mut executor) = executor(ReadExecutorConfig::default());
     for id in 0..3 {
         fixture.assert_value(0, read(&mut executor, &fixture, 0, id));
     }
     let stats = admission.stats();
-    assert_eq!(stats.cache_budget, 0);
-    assert_eq!(stats.cache_entries, 0);
-    assert_eq!(stats.cache_bytes, 0);
-    assert_eq!(stats.cache_hits, 0);
-    assert_eq!(stats.cache_misses, 3);
     assert_eq!(stats.wal_reads, 3);
     assert!(
         fixture
@@ -206,113 +196,38 @@ fn disabled_cache_repeated_reads_consult_wal_and_sync_async_is_rejected() {
 }
 
 #[test]
-fn resident_cache_is_node_bounded_evictable_and_hit_does_not_queue_disk() {
-    let fixture = Fixture::new(12);
-    let config = ReadExecutorConfig {
-        cache_bytes: 8192,
-        max_requests: 2,
-        max_device_reads: 1,
-        ..ReadExecutorConfig::default()
-    };
-    let (admission, mut first) = executor(config);
-    let mut second = ReadExecutor::new(config, admission.clone()).unwrap();
-    let survivor = read(&mut first, &fixture, 0, 1);
-    let wal_reads = admission.stats().wal_reads;
-    assert!(matches!(
-        second
-            .submit(2, fixture.member(1), ReadClass::Point)
-            .unwrap(),
-        SubmitOutcome::Pending
-    ));
-    // Even while the sole device credit is occupied, hits stay immediate.
-    assert!(matches!(
-        first
-            .submit(3, fixture.member(0), ReadClass::Point)
-            .unwrap(),
-        SubmitOutcome::Ready { .. }
-    ));
-    assert_eq!(admission.stats().wal_reads, wal_reads + 1);
-    finish(&mut second, 1);
-    for n in 2..12 {
-        fixture.assert_value(n, read(&mut first, &fixture, n, n as u64 + 10));
-        let stats = admission.stats();
-        assert!(stats.cache_bytes <= config.cache_bytes);
-        assert!(stats.cache_metadata_bytes > 0);
-    }
-    assert!(admission.stats().cache_evictions > 0);
-    assert!(admission.stats().cache_entries < fixture.references.len());
-    // Responses own their bytes independently of subsequent cache eviction.
-    fixture.assert_value(0, survivor);
-    admission.clear_cache();
-    let cleared = admission.stats();
-    assert_eq!(cleared.cache_entries, 0);
-    assert_eq!(cleared.cache_bytes, cleared.cache_metadata_bytes);
-    fixture.assert_value(0, read(&mut second, &fixture, 0, 100));
-    assert_eq!(admission.stats().wal_reads, cleared.wal_reads + 1);
-}
-
-#[test]
-fn oversized_entries_bypass_without_exceeding_cache_budget() {
+fn repeated_read_observes_wal_changes_not_prior_response() {
     let fixture = Fixture::new(1);
-    let mut stats = ReadExecutorStats::default();
-    let mut cache = cache::Cache::new(8192, &mut stats);
-    let huge = Bytes::from(vec![9; 16384].into_boxed_slice());
-    cache.insert(fixture.references[0], &huge, &mut stats);
-    assert_eq!(stats.cache_entries, 0);
-    assert_eq!(stats.cache_oversized, 1);
-    assert!(stats.cache_bytes <= stats.cache_budget);
-    assert!(cache.get(&fixture.references[0]).is_none());
-    // A nonzero budget smaller than table metadata is a bypass too, not growth.
-    let (admission, mut executor) = executor(ReadExecutorConfig {
-        cache_bytes: 1,
-        ..ReadExecutorConfig::default()
-    });
-    for id in 0..2 {
-        fixture.assert_value(0, read(&mut executor, &fixture, 0, id));
-    }
+    let (admission, mut executor) = executor(ReadExecutorConfig::default());
+    let first = read(&mut executor, &fixture, 0, 1);
+    let plan = fixture
+        .log
+        .plan_record_read(&fixture.references[0])
+        .unwrap();
+    let offset = plan.member.offset + plan.member.len as u64 - 1;
+    let changed = first[first.len() - 1] ^ 0xff;
+    plan.member.file.write_all_at(&[changed], offset).unwrap();
+    let second = read(&mut executor, &fixture, 0, 2);
+    assert_ne!(first[first.len() - 1], second[second.len() - 1]);
+    assert_eq!(second[second.len() - 1], changed);
     assert_eq!(admission.stats().wal_reads, 2);
-    assert_eq!(admission.stats().cache_bytes, 0);
-    assert_eq!(admission.stats().cache_oversized, 2);
+    assert_eq!(admission.stats().async_read_submissions, 2);
 }
 
 #[test]
-fn cache_hits_cannot_bypass_full_reference_membership_validation() {
+fn reads_validate_full_reference_membership() {
     let fixture = Fixture::new(1);
-    let (admission, mut executor) = executor(ReadExecutorConfig {
-        cache_bytes: 8192,
-        ..ReadExecutorConfig::default()
-    });
+    let (admission, mut executor) = executor(ReadExecutorConfig::default());
     read(&mut executor, &fixture, 0, 1);
     let before = admission.stats();
     let mut forged = fixture.references[0];
     forged.batch_digest.0[0] ^= 1;
     assert!(
         executor
-            .submit(2, vec![(fixture.log.clone(), forged)], ReadClass::Point)
+            .submit(2, vec![(fixture.log.clone(), forged)])
             .is_err()
     );
     assert_eq!(admission.stats(), before);
-}
-
-#[test]
-fn clear_prevents_older_inflight_reads_refilling_resident_cache() {
-    let fixture = Fixture::new(1);
-    let (admission, mut executor) = executor(ReadExecutorConfig {
-        cache_bytes: 8192,
-        ..ReadExecutorConfig::default()
-    });
-    assert!(matches!(
-        executor
-            .submit(1, fixture.member(0), ReadClass::Point)
-            .unwrap(),
-        SubmitOutcome::Pending
-    ));
-    admission.clear_cache();
-    finish(&mut executor, 1);
-    assert_eq!(admission.stats().cache_entries, 0);
-    read(&mut executor, &fixture, 0, 2);
-    assert_eq!(admission.stats().wal_reads, 2);
-    assert_eq!(admission.stats().cache_entries, 1);
 }
 
 #[test]
@@ -331,24 +246,17 @@ fn aggregate_request_and_device_limits_cover_independent_connection_rings() {
         let (admission, mut first) = executor(config);
         let mut second = ReadExecutor::new(config, admission.clone()).unwrap();
         assert!(matches!(
-            first
-                .submit(1, fixture.member(0), ReadClass::Point)
-                .unwrap(),
+            first.submit(1, fixture.member(0)).unwrap(),
             SubmitOutcome::Pending
         ));
         assert!(matches!(
-            second
-                .submit(2, fixture.member(1), ReadClass::Point)
-                .unwrap(),
+            second.submit(2, fixture.member(1)).unwrap(),
             SubmitOutcome::Full(_)
         ));
         assert_eq!(admission.stats().wal_reads, 1);
-        assert_eq!(admission.stats().cache_misses, 1);
         finish(&mut first, 1);
         assert!(matches!(
-            second
-                .submit(2, fixture.member(1), ReadClass::Point)
-                .unwrap(),
+            second.submit(2, fixture.member(1)).unwrap(),
             SubmitOutcome::Pending
         ));
         finish(&mut second, 1);
@@ -361,9 +269,7 @@ fn aggregate_request_and_device_limits_cover_independent_connection_rings() {
 fn aggregate_byte_budget_and_per_request_oversize_are_distinct() {
     let fixture = Fixture::new(2);
     let (sizing_admission, mut sizing) = executor(ReadExecutorConfig::default());
-    sizing
-        .submit(1, fixture.member(0), ReadClass::Point)
-        .unwrap();
+    sizing.submit(1, fixture.member(0)).unwrap();
     let charge = sizing_admission.stats().inflight_bytes;
     finish(&mut sizing, 1);
     let config = ReadExecutorConfig {
@@ -373,15 +279,11 @@ fn aggregate_byte_budget_and_per_request_oversize_are_distinct() {
     let (admission, mut first) = executor(config);
     let mut second = ReadExecutor::new(config, admission.clone()).unwrap();
     assert!(matches!(
-        first
-            .submit(1, fixture.member(0), ReadClass::Point)
-            .unwrap(),
+        first.submit(1, fixture.member(0)).unwrap(),
         SubmitOutcome::Pending
     ));
     assert!(matches!(
-        second
-            .submit(2, fixture.member(1), ReadClass::Point)
-            .unwrap(),
+        second.submit(2, fixture.member(1)).unwrap(),
         SubmitOutcome::Full(_)
     ));
     assert_eq!(admission.stats().inflight_bytes, charge);
@@ -391,14 +293,14 @@ fn aggregate_byte_budget_and_per_request_oversize_are_distinct() {
         (fixture.log.clone(), fixture.references[1]),
     ];
     assert!(matches!(
-        second.submit(3, too_large, ReadClass::Point),
+        second.submit(3, too_large),
         Err(StorageError::Capacity)
     ));
     assert_eq!(admission.stats().inflight_bytes, 0);
 }
 
 #[test]
-fn short_read_is_reported_and_never_cached_even_after_cancellation() {
+fn short_read_is_reported_even_after_cancellation() {
     for cancel in [false, true] {
         let fixture = Fixture::new(1);
         let plan = fixture
@@ -410,7 +312,6 @@ fn short_read_is_reported_and_never_cached_even_after_cancellation() {
             .set_len(plan.member.offset + plan.member.len as u64 - 1)
             .unwrap();
         let (admission, mut executor) = executor(ReadExecutorConfig {
-            cache_bytes: 8192,
             ..ReadExecutorConfig::default()
         });
         let mut profile = super::super::WalReadProfile::default();
@@ -419,7 +320,6 @@ fn short_read_is_reported_and_never_cached_even_after_cancellation() {
                 .submit_planned_profiled(
                     1,
                     vec![(fixture.references[0], plan)],
-                    ReadClass::Point,
                     &mut None,
                     Some(&mut profile)
                 )
@@ -438,7 +338,6 @@ fn short_read_is_reported_and_never_cached_even_after_cancellation() {
         assert_eq!(profile.async_partial, 1);
         assert_eq!(profile.async_errors, 1);
         assert_eq!(admission.stats().errors, 1);
-        assert_eq!(admission.stats().cache_entries, 0);
         drop(completion);
         assert_eq!(admission.stats().inflight_bytes, 0);
     }
@@ -455,9 +354,7 @@ fn cancellation_and_drop_keep_file_segment_and_authority_until_drain() {
     let log = Arc::downgrade(&fixture.log);
     drop(plan);
     let (admission, mut executor) = executor(ReadExecutorConfig::default());
-    executor
-        .submit(1, fixture.member(0), ReadClass::Point)
-        .unwrap();
+    executor.submit(1, fixture.member(0)).unwrap();
     let before = admission.stats().inflight_bytes;
     executor.cancel(1);
     drop(fixture.log);
@@ -474,9 +371,7 @@ fn cancellation_and_drop_keep_file_segment_and_authority_until_drain() {
     let fixture = Fixture::new(1);
     let log = Arc::downgrade(&fixture.log);
     let (admission, mut executor) = self::executor(ReadExecutorConfig::default());
-    executor
-        .submit(2, fixture.member(0), ReadClass::Point)
-        .unwrap();
+    executor.submit(2, fixture.member(0)).unwrap();
     drop(fixture.log);
     drop(executor); // Drop itself drains; no thread or kernel-pointer leak.
     assert!(log.upgrade().is_none());
@@ -498,9 +393,7 @@ fn shutdown_retries_submission_pressure_before_releasing_operation_owners() {
         .submit_errors
         .extend([libc::EAGAIN, libc::EBUSY, libc::EINTR]);
     assert!(matches!(
-        executor
-            .submit(1, fixture.member(0), ReadClass::Point)
-            .unwrap(),
+        executor.submit(1, fixture.member(0)).unwrap(),
         SubmitOutcome::Pending
     ));
     drop(fixture.log);
@@ -524,43 +417,37 @@ fn shutdown_retries_submission_pressure_before_releasing_operation_owners() {
 fn response_lease_retains_request_and_byte_credit_after_device_retirement() {
     let fixture = Fixture::new(2);
     let config = ReadExecutorConfig {
-        cache_bytes: 8192,
         max_requests: 1,
         ..ReadExecutorConfig::default()
     };
     let (admission, mut executor) = executor(config);
-    executor
-        .submit(1, fixture.member(0), ReadClass::Point)
-        .unwrap();
+    executor.submit(1, fixture.member(0)).unwrap();
     let charged = admission.stats().inflight_bytes;
     let mut completion = finish(&mut executor, 1).remove(0);
     assert_eq!(admission.stats().inflight_reads, 0);
     assert_eq!(admission.stats().inflight_requests, 1);
     assert_eq!(admission.stats().inflight_bytes, charged);
     assert!(matches!(
-        executor
-            .submit(2, fixture.member(1), ReadClass::Point)
-            .unwrap(),
+        executor.submit(2, fixture.member(1)).unwrap(),
         SubmitOutcome::Full(_)
     ));
     drop(completion.lease.take());
     assert_eq!(admission.stats().inflight_bytes, 0);
-    let SubmitOutcome::Ready { records, lease } = executor
-        .submit(3, fixture.member(0), ReadClass::Point)
-        .unwrap()
-    else {
-        panic!("resident reply must be immediate");
-    };
-    assert_eq!(admission.stats().wal_reads, 1);
+    assert!(matches!(
+        executor.submit(3, fixture.member(0)).unwrap(),
+        SubmitOutcome::Pending
+    ));
+    let mut next = finish(&mut executor, 1).remove(0);
+    assert_eq!(admission.stats().wal_reads, 2);
     assert_eq!(admission.stats().inflight_requests, 1);
     assert!(admission.stats().inflight_bytes > 0);
-    fixture.assert_value(0, records.into_iter().next().unwrap());
-    drop(lease);
+    fixture.assert_value(0, next.result.as_mut().unwrap().remove(0));
+    drop(next.lease.take());
     assert_eq!(admission.stats().inflight_requests, 0);
 }
 
 #[test]
-fn consuming_boundary_detects_corruption_on_wal_miss_and_resident_hit() {
+fn consuming_boundary_detects_corruption_on_repeated_wal_reads() {
     let fixture = Fixture::new(1);
     let plan = fixture
         .log
@@ -571,7 +458,6 @@ fn consuming_boundary_detects_corruption_on_wal_miss_and_resident_hit() {
         .write_all_at(&[0xff], plan.member.offset + plan.member.len as u64 - 1)
         .unwrap();
     let (admission, mut executor) = executor(ReadExecutorConfig {
-        cache_bytes: 8192,
         ..ReadExecutorConfig::default()
     });
     for id in 0..2 {
@@ -580,10 +466,7 @@ fn consuming_boundary_detects_corruption_on_wal_miss_and_resident_hit() {
             CompleteBatch::decode_record(&fixture.shape, &fixture.references[0], encoded).is_err()
         );
     }
-    assert_eq!(admission.stats().wal_reads, 1);
-    assert_eq!(admission.stats().cache_hits, 1);
-    // The encoded cache never claims integrity verification or suppresses the
-    // client's check; it saves I/O, not the authoritative consuming boundary.
+    assert_eq!(admission.stats().wal_reads, 2);
 }
 
 #[test]
@@ -633,10 +516,6 @@ fn invalid_admission_configuration_is_rejected() {
             ..ReadExecutorConfig::default()
         },
         ReadExecutorConfig {
-            cache_bytes: usize::MAX,
-            ..ReadExecutorConfig::default()
-        },
-        ReadExecutorConfig {
             memory_allowance_bytes: 0,
             ..ReadExecutorConfig::default()
         },
@@ -650,127 +529,20 @@ fn invalid_admission_configuration_is_rejected() {
 }
 
 #[test]
-fn large_cache_budget_requires_explicit_checked_host_allowance() {
-    let cache_bytes = 2 * 1024 * 1024 * 1024;
+fn read_budget_requires_sufficient_host_allowance() {
     let config = ReadExecutorConfig {
-        cache_bytes,
-        memory_allowance_bytes: cache_bytes + 64 * 1024 * 1024,
+        memory_allowance_bytes: 64 * 1024 * 1024,
         ..ReadExecutorConfig::default()
     };
     assert!(config.validate().is_ok());
-    assert!(config.cache_metadata_bytes() > 0);
-    assert!(config.cache_metadata_bytes() < cache_bytes);
     assert!(
         ReadExecutorConfig {
-            memory_allowance_bytes: config.memory_allowance_bytes - 1,
+            memory_allowance_bytes: config.max_bytes - 1,
             ..config
         }
         .validate()
         .is_err()
     );
-    assert!(
-        ReadExecutorConfig {
-            cache_bytes: usize::MAX,
-            memory_allowance_bytes: usize::MAX,
-            ..config
-        }
-        .validate()
-        .is_err()
-    );
-}
-
-#[test]
-fn scans_consult_hot_records_without_filling_or_evicting_point_cache() {
-    let fixture = Fixture::new(12);
-    let (admission, mut executor) = executor(ReadExecutorConfig {
-        cache_bytes: 8192,
-        ..ReadExecutorConfig::default()
-    });
-    let held = read(&mut executor, &fixture, 0, 1);
-    let before = admission.stats();
-    for n in 0..12 {
-        let encoded = match executor
-            .submit(n as u64 + 2, fixture.member(n), ReadClass::ScanNoFill)
-            .unwrap()
-        {
-            SubmitOutcome::Ready {
-                mut records,
-                lease: _lease,
-            } => records.remove(0),
-            SubmitOutcome::Pending => finish(&mut executor, 1).remove(0).result.unwrap().remove(0),
-            SubmitOutcome::Deferred(_) => panic!("scalar scan unexpectedly deferred"),
-            SubmitOutcome::Full(_) => panic!("sequential scan unexpectedly full"),
-        };
-        fixture.assert_value(n, encoded);
-    }
-    let after = admission.stats();
-    assert_eq!(after.cache_inserts, before.cache_inserts);
-    assert_eq!(after.cache_evictions, before.cache_evictions);
-    assert_eq!(after.cache_bytes, before.cache_bytes);
-    assert_eq!(after.cache_bypass_scan - before.cache_bypass_scan, 11);
-    assert_eq!(after.cache_hits - before.cache_hits, 1);
-    assert!(matches!(
-        executor
-            .submit(99, fixture.member(0), ReadClass::Point)
-            .unwrap(),
-        SubmitOutcome::Ready { .. }
-    ));
-    fixture.assert_value(0, held);
-    let mut forged = fixture.references[0];
-    forged.batch_digest.0[0] ^= 1;
-    assert!(
-        executor
-            .submit(
-                100,
-                vec![(fixture.log.clone(), forged)],
-                ReadClass::ScanNoFill
-            )
-            .is_err()
-    );
-}
-
-#[test]
-fn cache_lock_does_not_block_reply_credit_retirement() {
-    let admission = Arc::new(ReadAdmission::new(ReadExecutorConfig::default()).unwrap());
-    let lease = admission.reserve_reply(1024).unwrap().unwrap();
-    let cache_guard = admission.cache.lock();
-    // This same-thread release would deadlock if credits still used the cache lock.
-    drop(lease);
-    assert_eq!(admission.state.lock().stats.inflight_bytes, 0);
-    drop(cache_guard);
-}
-
-#[test]
-fn shard_cache_pressure_bypasses_instead_of_sweeping_large_table() {
-    let fixture = Fixture::new(1);
-    let budget = 1024 * 1024;
-    let mut stats = ReadExecutorStats::default();
-    let mut cache = cache::Cache::new(budget, &mut stats);
-    let bytes = Bytes::from(vec![1; 1024].into_boxed_slice());
-    for sequence in 0..4096 {
-        let mut reference = fixture.references[0];
-        reference.batch_version.sequence = sequence;
-        cache.insert(reference, &bytes, &mut stats);
-        assert!(cache.get(&reference).is_some());
-        if stats.cache_entries >= 128 {
-            break;
-        }
-    }
-    assert!(stats.cache_entries >= 128);
-    let before = stats;
-    let large = Bytes::from(
-        vec![2; budget - stats.cache_metadata_bytes - cache::OWNER_BYTES].into_boxed_slice(),
-    );
-    let mut reference = fixture.references[0];
-    reference.batch_version.sequence = 10000;
-    cache.insert(reference, &large, &mut stats);
-    assert_eq!(
-        stats.cache_bypass_eviction_limit,
-        before.cache_bypass_eviction_limit + 1
-    );
-    assert!(stats.cache_evictions - before.cache_evictions <= 65);
-    assert!(stats.cache_bytes <= budget);
-    assert!(cache.get(&reference).is_none());
 }
 
 #[test]
@@ -803,9 +575,7 @@ fn cancelled_buffers_stay_owned_until_cq_then_reuse_across_connection_rings() {
     let fixture = Fixture::new(2);
     let (admission, mut first) = executor(ReadExecutorConfig::default());
     let mut second = ReadExecutor::new(admission.config, admission.clone()).unwrap();
-    first
-        .submit(1, fixture.member(0), ReadClass::Point)
-        .unwrap();
+    first.submit(1, fixture.member(0)).unwrap();
     first.cancel(1);
     assert_eq!(admission.stats().idle_buffers, 0);
     assert_eq!(admission.stats().inflight_reads, 1);
@@ -853,11 +623,10 @@ fn buffer_pool_uses_exact_sizes_and_existing_node_budget() {
 }
 
 #[test]
-fn all_resident_and_cache_hits_bypass_full_async_device_capacity() {
+fn resident_reads_bypass_full_async_device_capacity() {
     let fixture = Fixture::new(2);
     let uncached_config = ReadExecutorConfig {
         resident_first: true,
-        cache_bytes: 0,
         max_requests: 4,
         max_device_reads: 1,
         ..ReadExecutorConfig::default()
@@ -869,18 +638,14 @@ fn all_resident_and_cache_hits_bypass_full_async_device_capacity() {
         .resident_test_results
         .push_back(ResidentTestResult::Unsupported);
     assert!(matches!(
-        blocker
-            .submit(1, fixture.member(1), ReadClass::Point)
-            .unwrap(),
+        blocker.submit(1, fixture.member(1)).unwrap(),
         SubmitOutcome::Pending
     ));
     resident.begin_sweep();
     resident
         .resident_test_results
         .push_back(ResidentTestResult::Complete);
-    let SubmitOutcome::Ready { records, lease } = resident
-        .submit(2, fixture.member(0), ReadClass::Point)
-        .unwrap()
+    let SubmitOutcome::Ready { records, lease } = resident.submit(2, fixture.member(0)).unwrap()
     else {
         panic!("an exact resident read must bypass full async device capacity")
     };
@@ -889,225 +654,6 @@ fn all_resident_and_cache_hits_bypass_full_async_device_capacity() {
     assert!(resident.operations.is_empty());
     assert_eq!(admission.stats().async_read_submissions, 1);
     drop(finish(&mut blocker, 1));
-
-    let cached_config = ReadExecutorConfig {
-        cache_bytes: 1024 * 1024,
-        ..uncached_config
-    };
-    let (admission, mut blocker) = executor(cached_config);
-    let mut cache_reader = ReadExecutor::new(cached_config, admission.clone()).unwrap();
-    blocker
-        .resident_test_results
-        .push_back(ResidentTestResult::Complete);
-    let SubmitOutcome::Ready { records, lease } = blocker
-        .submit(10, fixture.member(0), ReadClass::Point)
-        .unwrap()
-    else {
-        panic!("the injected resident read should seed the shard cache")
-    };
-    fixture.assert_value(0, records.into_iter().next().unwrap());
-    drop(lease);
-    blocker.begin_sweep();
-    blocker
-        .resident_test_results
-        .push_back(ResidentTestResult::Unsupported);
-    assert!(matches!(
-        blocker
-            .submit(11, fixture.member(1), ReadClass::Point)
-            .unwrap(),
-        SubmitOutcome::Pending
-    ));
-    let SubmitOutcome::Ready { records, lease } = cache_reader
-        .submit(12, fixture.member(0), ReadClass::Point)
-        .unwrap()
-    else {
-        panic!("a warmed cache hit must bypass full async device capacity")
-    };
-    fixture.assert_value(0, records.into_iter().next().unwrap());
-    drop(lease);
-    assert!(cache_reader.operations.is_empty());
-    assert_eq!(admission.stats().async_read_submissions, 1);
-    assert_eq!(admission.stats().cache_hits, 1);
-    drop(finish(&mut blocker, 1));
-}
-
-#[test]
-fn warm_multi_read_preserves_order_and_nowait_budget_and_reply_ownership() {
-    let fixture = Fixture::new(3);
-    let config = ReadExecutorConfig {
-        resident_first: true,
-        cache_bytes: 1024 * 1024,
-        ..ReadExecutorConfig::default()
-    };
-    let (admission, mut executor) = executor(config);
-    for n in 0..2 {
-        executor.begin_sweep();
-        executor
-            .resident_test_results
-            .push_back(ResidentTestResult::Complete);
-        drop(read(&mut executor, &fixture, n, n as u64 + 1));
-    }
-    executor.begin_sweep();
-    let attempts = admission.stats().resident_read_attempts;
-    let members = [1, 0, 1]
-        .into_iter()
-        .map(|n| (fixture.log.clone(), fixture.references[n]))
-        .collect();
-    let SubmitOutcome::Ready { records, lease } =
-        executor.submit(10, members, ReadClass::Point).unwrap()
-    else {
-        panic!("all cached members must complete inline")
-    };
-    assert_eq!(admission.stats().resident_read_attempts, attempts);
-    assert_eq!(executor.resident_calls_remaining, RESIDENT_NOWAIT_MAX_CALLS);
-    admission.clear_cache();
-    for (n, bytes) in [1, 0, 1].into_iter().zip(records) {
-        fixture.assert_value(n, bytes);
-    }
-    assert!(admission.stats().inflight_requests > 0);
-    drop(lease);
-    assert_eq!(admission.stats().inflight_requests, 0);
-
-    executor
-        .resident_test_results
-        .push_back(ResidentTestResult::Complete);
-    let SubmitOutcome::Ready { records, lease } = executor
-        .submit(11, fixture.member(2), ReadClass::Point)
-        .unwrap()
-    else {
-        panic!("warm reads must leave the NOWAIT budget for a subsequent miss")
-    };
-    fixture.assert_value(2, records.into_iter().next().unwrap());
-    drop(lease);
-    assert_eq!(admission.stats().resident_read_attempts, attempts + 1);
-}
-
-#[test]
-fn cache_hit_and_generation_survive_repeated_full_retries_without_refill() {
-    let fixture = Fixture::new(3);
-    let config = ReadExecutorConfig {
-        resident_first: true,
-        cache_bytes: 1024 * 1024,
-        max_requests: 4,
-        max_device_reads: 1,
-        ..ReadExecutorConfig::default()
-    };
-    let (admission, mut blocker) = executor(config);
-    let mut reader = ReadExecutor::new(config, admission.clone()).unwrap();
-
-    blocker
-        .resident_test_results
-        .push_back(ResidentTestResult::Complete);
-    let SubmitOutcome::Ready { records, lease } = blocker
-        .submit(10, fixture.member(0), ReadClass::Point)
-        .unwrap()
-    else {
-        panic!("injected resident read should populate the cache synchronously")
-    };
-    fixture.assert_value(0, records[0].clone());
-    drop(records);
-    drop(lease);
-    assert_eq!(admission.stats().cache_entries, 1);
-
-    blocker.begin_sweep();
-    blocker
-        .resident_test_results
-        .push_back(ResidentTestResult::Unsupported);
-    assert!(matches!(
-        blocker
-            .submit(11, fixture.member(2), ReadClass::Point)
-            .unwrap(),
-        SubmitOutcome::Pending
-    ));
-
-    reader.begin_sweep();
-    reader
-        .resident_test_results
-        .push_back(ResidentTestResult::Partial(7));
-    let plans = [0, 1]
-        .into_iter()
-        .map(|index| {
-            let reference = fixture.references[index];
-            (reference, fixture.log.plan_record_read(&reference).unwrap())
-        })
-        .collect();
-    let mut lease = None;
-    let SubmitOutcome::Full(plans) = reader
-        .submit_planned(12, plans, ReadClass::Point, &mut lease)
-        .unwrap()
-    else {
-        panic!("the occupied device slot should retain the mixed hit/miss preparation")
-    };
-    let first_full = admission.stats();
-    assert_eq!(first_full.resident_read_attempts, 3);
-    assert_eq!(first_full.cache_hits, 0);
-    assert_eq!(first_full.cache_misses, 2);
-
-    let completion = finish(&mut blocker, 1).remove(0);
-    assert_eq!(completion.request_id, 11);
-    drop(completion);
-    admission.clear_cache();
-    assert_eq!(admission.stats().cache_entries, 0);
-
-    blocker.begin_sweep();
-    blocker
-        .resident_test_results
-        .push_back(ResidentTestResult::Unsupported);
-    assert!(matches!(
-        blocker
-            .submit(13, fixture.member(2), ReadClass::ScanNoFill)
-            .unwrap(),
-        SubmitOutcome::Pending
-    ));
-    reader.begin_sweep();
-    let SubmitOutcome::Full(plans) = reader
-        .submit_planned(12, plans, ReadClass::Point, &mut lease)
-        .unwrap()
-    else {
-        panic!("the second blocker should keep this request Full")
-    };
-    let second_full = admission.stats();
-    assert_eq!(second_full.cache_hits, first_full.cache_hits);
-    assert_eq!(second_full.cache_misses, first_full.cache_misses + 1);
-    assert_eq!(
-        second_full.resident_read_attempts,
-        first_full.resident_read_attempts + 1
-    );
-
-    let completion = finish(&mut blocker, 1).remove(0);
-    assert_eq!(completion.request_id, 13);
-    drop(completion);
-    reader.begin_sweep();
-    assert!(matches!(
-        reader
-            .submit_planned(12, plans, ReadClass::Point, &mut lease)
-            .unwrap(),
-        SubmitOutcome::Pending
-    ));
-    assert!(lease.is_none());
-    assert_eq!(
-        admission.stats().resident_read_attempts,
-        second_full.resident_read_attempts
-    );
-
-    let mut completion = finish(&mut reader, 1).remove(0);
-    assert_eq!(completion.request_id, 12);
-    let records = completion.result.as_mut().unwrap();
-    fixture.assert_value(0, records.remove(0));
-    fixture.assert_value(1, records.remove(0));
-    drop(completion);
-
-    let stats = admission.stats();
-    assert_eq!(stats.cache_hits, first_full.cache_hits + 1);
-    assert_eq!(stats.cache_misses, first_full.cache_misses + 2);
-    assert_eq!(
-        stats.resident_read_attempts,
-        second_full.resident_read_attempts
-    );
-    assert_eq!(stats.resident_read_fallbacks, 3);
-    assert_eq!(stats.async_read_submissions, 3);
-    assert_eq!(stats.cache_entries, 0);
-    assert_eq!(stats.cache_bypass_generation, 1);
 }
 
 #[test]
@@ -1115,7 +661,6 @@ fn full_retry_retains_partial_prefix_and_completed_resident_member() {
     let fixture = Fixture::new(3);
     let config = ReadExecutorConfig {
         resident_first: true,
-        cache_bytes: 0,
         max_requests: 4,
         max_device_reads: 1,
         ..ReadExecutorConfig::default()
@@ -1126,9 +671,7 @@ fn full_retry_retains_partial_prefix_and_completed_resident_member() {
         .resident_test_results
         .push_back(ResidentTestResult::Unsupported);
     assert!(matches!(
-        first
-            .submit(1, fixture.member(2), ReadClass::Point)
-            .unwrap(),
+        first.submit(1, fixture.member(2)).unwrap(),
         SubmitOutcome::Pending
     ));
 
@@ -1148,7 +691,7 @@ fn full_retry_retains_partial_prefix_and_completed_resident_member() {
     let mut lease = None;
     let mut profile = super::super::WalReadProfile::default();
     let SubmitOutcome::Full(plans) = second
-        .submit_planned_profiled(2, plans, ReadClass::Point, &mut lease, Some(&mut profile))
+        .submit_planned_profiled(2, plans, &mut lease, Some(&mut profile))
         .unwrap()
     else {
         panic!("occupied device slot should defer the async suffix")
@@ -1157,10 +700,8 @@ fn full_retry_retains_partial_prefix_and_completed_resident_member() {
     assert_eq!(admission.stats().resident_read_attempts, 3);
     assert_eq!(admission.stats().resident_read_successes, 1);
     assert_eq!(admission.stats().resident_read_partial, 0);
-    assert_eq!(profile.cache_resolution_count, 1);
     assert_eq!(profile.nowait_count, 2);
     assert_eq!(profile.nowait_partial, 1);
-    assert_eq!(profile.cache_only_requests, 0);
 
     let first_completion = finish(&mut first, 1).remove(0);
     assert_eq!(first_completion.request_id, 1);
@@ -1168,11 +709,10 @@ fn full_retry_retains_partial_prefix_and_completed_resident_member() {
     second.begin_sweep();
     assert!(matches!(
         second
-            .submit_planned_profiled(2, plans, ReadClass::Point, &mut lease, Some(&mut profile))
+            .submit_planned_profiled(2, plans, &mut lease, Some(&mut profile))
             .unwrap(),
         SubmitOutcome::Pending
     ));
-    assert_eq!(profile.cache_resolution_count, 1);
     assert_eq!(profile.nowait_count, 2);
     assert!(lease.is_none());
     assert_eq!(second.operations.len(), 1);
@@ -1206,7 +746,6 @@ fn dropping_full_preparation_releases_prefix_and_reply_credit() {
     let fixture = Fixture::new(2);
     let config = ReadExecutorConfig {
         resident_first: true,
-        cache_bytes: 0,
         max_requests: 3,
         max_device_reads: 1,
         ..ReadExecutorConfig::default()
@@ -1217,9 +756,7 @@ fn dropping_full_preparation_releases_prefix_and_reply_credit() {
         .resident_test_results
         .push_back(ResidentTestResult::Unsupported);
     assert!(matches!(
-        first
-            .submit(1, fixture.member(1), ReadClass::Point)
-            .unwrap(),
+        first.submit(1, fixture.member(1)).unwrap(),
         SubmitOutcome::Pending
     ));
 
@@ -1231,9 +768,7 @@ fn dropping_full_preparation_releases_prefix_and_reply_credit() {
     let plans = vec![(reference, fixture.log.plan_record_read(&reference).unwrap())];
     let mut lease = None;
     assert!(matches!(
-        second
-            .submit_planned(2, plans, ReadClass::Point, &mut lease)
-            .unwrap(),
+        second.submit_planned(2, plans, &mut lease).unwrap(),
         SubmitOutcome::Full(_)
     ));
     assert!(lease.as_ref().unwrap().prepared.is_some());
@@ -1296,9 +831,7 @@ fn unsupported_and_partial_nowait_results_keep_suffix_owners_until_cq() {
         executor.begin_sweep();
         executor.resident_test_results.push_back(result);
         assert!(matches!(
-            executor
-                .submit(1, fixture.member(0), ReadClass::Point)
-                .unwrap(),
+            executor.submit(1, fixture.member(0)).unwrap(),
             SubmitOutcome::Pending
         ));
         let operation = executor.operations.values().next().unwrap();
@@ -1358,14 +891,13 @@ fn warm_group_resumes_across_sweeps_without_reprobing_or_recharging() {
     for sweep in 0..3 {
         executor.begin_sweep();
         match executor
-            .submit_planned_profiled(1, plans, ReadClass::Point, &mut lease, Some(&mut profile))
+            .submit_planned_profiled(1, plans, &mut lease, Some(&mut profile))
             .unwrap()
         {
             SubmitOutcome::Deferred(next) if sweep < 2 => {
                 plans = next;
                 let current = admission.stats().inflight_bytes;
                 assert_eq!(*charge.get_or_insert(current), current);
-                assert_eq!(profile.cache_resolution_count, 1);
             }
             SubmitOutcome::Ready {
                 records,
@@ -1417,17 +949,13 @@ fn cold_after_warm_sweep_falls_back_without_another_sweep() {
         .push_back(ResidentTestResult::Complete);
     let mut lease = None;
     executor.begin_sweep();
-    let SubmitOutcome::Deferred(plans) = executor
-        .submit_planned(1, plans, ReadClass::Point, &mut lease)
-        .unwrap()
+    let SubmitOutcome::Deferred(plans) = executor.submit_planned(1, plans, &mut lease).unwrap()
     else {
         panic!("warm first sweep should defer");
     };
     executor.begin_sweep();
     assert!(matches!(
-        executor
-            .submit_planned(1, plans, ReadClass::Point, &mut lease)
-            .unwrap(),
+        executor.submit_planned(1, plans, &mut lease).unwrap(),
         SubmitOutcome::Pending
     ));
     let mut completion = finish(&mut executor, 1).remove(0);
@@ -1452,9 +980,7 @@ fn large_encoded_member_uses_real_async_fallback_without_probe() {
     });
     executor.begin_sweep();
     assert!(matches!(
-        executor
-            .submit(1, fixture.member(0), ReadClass::Point)
-            .unwrap(),
+        executor.submit(1, fixture.member(0)).unwrap(),
         SubmitOutcome::Pending
     ));
     let mut completion = finish(&mut executor, 1).remove(0);
@@ -1488,10 +1014,7 @@ fn warm_continuation_has_a_hard_sweep_limit_and_async_tail() {
     let mut lease = None;
     for sweep in 0..RESIDENT_NOWAIT_MAX_SWEEPS {
         executor.begin_sweep();
-        match executor
-            .submit_planned(1, plans, ReadClass::Point, &mut lease)
-            .unwrap()
-        {
+        match executor.submit_planned(1, plans, &mut lease).unwrap() {
             SubmitOutcome::Deferred(next) if sweep + 1 < RESIDENT_NOWAIT_MAX_SWEEPS => {
                 plans = next;
             }
@@ -1533,9 +1056,7 @@ fn dropping_deferred_reply_releases_prepared_buffers_and_credit() {
         .extend((0..4).map(|_| ResidentTestResult::Complete));
     let mut lease = None;
     executor.begin_sweep();
-    let SubmitOutcome::Deferred(plans) = executor
-        .submit_planned(1, plans, ReadClass::Point, &mut lease)
-        .unwrap()
+    let SubmitOutcome::Deferred(plans) = executor.submit_planned(1, plans, &mut lease).unwrap()
     else {
         panic!("warm request should defer");
     };
@@ -1562,9 +1083,7 @@ fn continued_partial_read_survives_full_credit_retry() {
         .resident_test_results
         .push_back(ResidentTestResult::Unsupported);
     assert!(matches!(
-        blocker
-            .submit(1, fixture.member(5), ReadClass::Point)
-            .unwrap(),
+        blocker.submit(1, fixture.member(5)).unwrap(),
         SubmitOutcome::Pending
     ));
     reader
@@ -1581,27 +1100,20 @@ fn continued_partial_read_survives_full_credit_retry() {
         .collect();
     let mut lease = None;
     reader.begin_sweep();
-    let SubmitOutcome::Deferred(plans) = reader
-        .submit_planned(2, plans, ReadClass::Point, &mut lease)
-        .unwrap()
+    let SubmitOutcome::Deferred(plans) = reader.submit_planned(2, plans, &mut lease).unwrap()
     else {
         panic!("warm first sweep should defer");
     };
     let charge = admission.stats().inflight_bytes;
     reader.begin_sweep();
-    let SubmitOutcome::Full(plans) = reader
-        .submit_planned(2, plans, ReadClass::Point, &mut lease)
-        .unwrap()
-    else {
+    let SubmitOutcome::Full(plans) = reader.submit_planned(2, plans, &mut lease).unwrap() else {
         panic!("partial suffix should wait for device credit");
     };
     assert_eq!(admission.stats().inflight_bytes, charge);
     drop(finish(&mut blocker, 1));
     reader.begin_sweep();
     assert!(matches!(
-        reader
-            .submit_planned(2, plans, ReadClass::Point, &mut lease)
-            .unwrap(),
+        reader.submit_planned(2, plans, &mut lease).unwrap(),
         SubmitOutcome::Pending
     ));
     assert_eq!(reader.operations.values().next().unwrap().filled, 7);
@@ -1625,9 +1137,7 @@ fn successful_nowait_reply_keeps_credit_until_response_lease_retires() {
         ..ReadExecutorConfig::default()
     });
     executor.begin_sweep();
-    let outcome = executor
-        .submit(1, fixture.member(0), ReadClass::Point)
-        .unwrap();
+    let outcome = executor.submit(1, fixture.member(0)).unwrap();
     let SubmitOutcome::Ready { records, lease } = outcome else {
         // Filesystems that reject NOWAIT still exercise the asynchronous
         // owner path in other executor tests.
@@ -1654,9 +1164,7 @@ fn preclaimed_planning_credit_survives_full_and_transfers_only_on_admission() {
     let (admission, mut first) = executor(config);
     let mut second = ReadExecutor::new(config, admission.clone()).unwrap();
     assert!(matches!(
-        first
-            .submit(1, fixture.member(0), ReadClass::Point)
-            .unwrap(),
+        first.submit(1, fixture.member(0)).unwrap(),
         SubmitOutcome::Pending,
     ));
     let reference = fixture.references[1];
@@ -1666,10 +1174,7 @@ fn preclaimed_planning_credit_survives_full_and_transfers_only_on_admission() {
     let mut lease = admission.reserve_reply(reservation).unwrap();
     assert!(lease.is_some());
     let charged = admission.stats().inflight_bytes;
-    let SubmitOutcome::Full(plans) = second
-        .submit_planned(2, plans, ReadClass::Point, &mut lease)
-        .unwrap()
-    else {
+    let SubmitOutcome::Full(plans) = second.submit_planned(2, plans, &mut lease).unwrap() else {
         panic!("device credit should still belong to the first read")
     };
     assert!(
@@ -1680,9 +1185,7 @@ fn preclaimed_planning_credit_survives_full_and_transfers_only_on_admission() {
     assert_eq!(admission.stats().inflight_bytes, charged);
     drop(finish(&mut first, 1));
     assert!(matches!(
-        second
-            .submit_planned(2, plans, ReadClass::Point, &mut lease)
-            .unwrap(),
+        second.submit_planned(2, plans, &mut lease).unwrap(),
         SubmitOutcome::Pending,
     ));
     assert!(
@@ -1704,11 +1207,7 @@ fn invalid_preclaimed_plan_charge_keeps_reply_credit_for_the_error_response() {
     let mut lease = admission.reserve_reply(1).unwrap();
     let reference = fixture.references[0];
     let plans = vec![(reference, fixture.log.plan_record_read(&reference).unwrap())];
-    assert!(
-        executor
-            .submit_planned(1, plans, ReadClass::Point, &mut lease)
-            .is_err()
-    );
+    assert!(executor.submit_planned(1, plans, &mut lease).is_err());
     assert!(lease.is_some());
     assert_eq!(admission.stats().inflight_requests, 1);
     assert_eq!(admission.stats().wal_reads, 0);

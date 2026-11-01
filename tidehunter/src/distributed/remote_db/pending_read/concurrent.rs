@@ -217,14 +217,14 @@ impl ConcurrentRemoteDatabase {
             };
             (references, pin)
         };
-        if let Some(started) = started {
-            self.read_resolve_ns
-                .fetch_add(elapsed(started), Ordering::Relaxed);
-        }
         let clock = ResolutionSample::start(&sample);
         let batch = ReadBatch::new(&self.reads, values, groups);
         if let Some(sample) = &sample {
             sample.stage(ResolutionStage::BatchPreparation, clock);
+        }
+        if let Some(started) = started {
+            self.read_resolve_ns
+                .fetch_add(elapsed(started), Ordering::Relaxed);
         }
         let mut batch = batch?;
         if let Some(sample) = &mut sample {
@@ -366,10 +366,6 @@ impl ConcurrentRemoteDatabase {
                 }
             }
         };
-        if let Some(started) = started {
-            self.read_resolve_ns
-                .fetch_add(elapsed(started), Ordering::Relaxed);
-        }
         self.ensure_healthy()?;
         let node = if let GetResolution::Miss { reference, .. } = &resolution {
             let clock = ResolutionSample::start(&sample);
@@ -385,6 +381,10 @@ impl ConcurrentRemoteDatabase {
         } else {
             None
         };
+        if let Some(started) = started {
+            self.read_resolve_ns
+                .fetch_add(elapsed(started), Ordering::Relaxed);
+        }
         if let Some(sample) = &mut sample {
             sample.success();
         }
@@ -548,7 +548,6 @@ impl ConcurrentRemoteDatabase {
                 false,
                 ReadContext {
                     deadline: Instant::now() + self.config.timeout,
-                    class: ReadClass::ScanNoFill,
                     pin: Some(pin),
                 },
             )?)

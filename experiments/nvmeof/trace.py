@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import re
 import signal
+import subprocess
+import sys
 import time
 import uuid
 
@@ -18,6 +20,35 @@ EVENTS = ('nvmet/nvmet_req_init', 'nvmet/nvmet_req_complete',
 LINE = re.compile(r'\s(\d+\.\d+):\s+(nvmet_req_init|nvmet_req_complete|block_rq_issue|block_rq_complete):\s+(.*)$')
 NVMET = re.compile(r'nvmet(\d+):.*?qid=(\d+),\s*cmdid=(\d+)')
 BLOCK = re.compile(r'^(\d+),(\d+)\s+.*?\s(\d+)\s*\+\s*(\d+)')
+START_TIMEOUT = 10
+STOP_TIMEOUT = 15
+POLL_INTERVAL = 0.05
+
+
+def stop_requested(directory):
+    try:
+        os.stat('stop', dir_fd=directory.fd, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def request_stop(directory):
+    try:
+        fd = os.open('stop', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=directory.fd)
+    except FileExistsError:
+        return
+    os.close(fd)
+
+
+def wait_capture(directory, seconds):
+    deadline = time.monotonic() + seconds
+    while not stop_requested(directory):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(POLL_INTERVAL, remaining))
 
 
 def summarize(lines, ctrl_id, block_dev):
@@ -144,7 +175,10 @@ def capture(args):
         (instance / 'trace').write_text('')
         started = time.monotonic_ns()
         (instance / 'tracing_on').write_text('1')
-        time.sleep(args.seconds)
+        state['phase'] = 'running'
+        state['start_monotonic_ns'] = started
+        manage.save(directory, state)
+        wait_capture(directory, args.seconds)
         (instance / 'tracing_on').write_text('0')
         stopped = time.monotonic_ns()
         # The kernel ring is bounded per CPU. Refuse excessive capture rather than
@@ -174,7 +208,13 @@ def capture(args):
                   'stages': summarize(raw.decode('utf-8', errors='replace').splitlines(), args.ctrl_id, block_dev),
                   'qualification': 'nvmet ctrl_id/qid/cid pairs are target-side request lifetime, not NAND or network latency; ctrl_id can collide between subsystems. Block dev/sector/length pairs can alias, merge or split. No cross-layer request correlation is claimed. Unmatched, ambiguous and lost events invalidate completeness; isolate the target and inspect raw trace.'}
         (output / 'summary.json').write_text(json.dumps(result, indent=2, sort_keys=True) + '\n')
+        state['result'] = result
+        manage.save(directory, state)
         return result
+    except Exception as error:
+        state['error'] = f'{type(error).__name__}: {error}'[:500]
+        manage.save(directory, state)
+        raise
     finally:
         try:
             if created:
@@ -186,6 +226,65 @@ def capture(args):
             signal.signal(signal.SIGTERM, previous)
 
 
+def start(args):
+    command = [sys.executable, str(Path(__file__).resolve()), '--seconds', str(args.seconds),
+               '--buffer-kb', str(args.buffer_kb), '--ctrl-id', str(args.ctrl_id),
+               '--block-device', args.block_device, '--output', args.output]
+    process = subprocess.Popen(command, start_new_session=True, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+    deadline = time.monotonic() + START_TIMEOUT
+    directory = None
+    while time.monotonic() < deadline:
+        try:
+            current, state = manage.load_state(args.output, 'trace')
+        except FileNotFoundError:
+            state = None
+        if state is not None and state.get('pid') == process.pid:
+            directory = current
+            if state.get('phase') == 'running':
+                return {'available': True, 'output': args.output, 'pid': process.pid,
+                        'start_monotonic_ns': state['start_monotonic_ns']}
+            if state.get('phase') == 'cleaned':
+                if 'result' in state and 'error' not in state:
+                    return state['result']
+                return {'available': False, 'output': args.output,
+                        'reason': state.get('error', 'capture ended before startup was observed')}
+        if process.poll() is not None:
+            return {'available': False, 'output': args.output,
+                    'reason': (state or {}).get('error', 'collector exited before tracing started')}
+        time.sleep(POLL_INTERVAL)
+    if directory is not None:
+        request_stop(directory)
+    else:
+        process.terminate()
+    return {'available': False, 'output': args.output, 'reason': 'collector startup timed out'}
+
+
+def stop(path):
+    directory, state = manage.load_state(path, 'trace')
+    if state.get('phase') != 'cleaned':
+        request_stop(directory)
+    deadline = time.monotonic() + STOP_TIMEOUT
+    while True:
+        _, state = manage.load_state(path, 'trace')
+        if state.get('phase') == 'cleaned':
+            if 'result' in state and 'error' not in state:
+                return state['result']
+            return {'available': False, 'output': path,
+                    'reason': state.get('error', 'capture ended without a summary')}
+        pid = state.get('pid')
+        if type(pid) is not int or pid <= 0:
+            raise ValueError('invalid trace owner pid')
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return {'available': False, 'output': path,
+                    'reason': 'collector exited before cleanup; use --recover'}
+        if time.monotonic() >= deadline:
+            return {'available': False, 'output': path, 'reason': 'collector stop timed out'}
+        time.sleep(POLL_INTERVAL)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--seconds', type=float)
@@ -193,16 +292,20 @@ def main():
     p.add_argument('--ctrl-id', type=int, help='target controller ID')
     p.add_argument('--block-device', help='target block device sysfs name')
     p.add_argument('--output', help='new absolute output directory')
-    p.add_argument('--recover', help='owned output directory of interrupted trace')
+    modes = p.add_mutually_exclusive_group()
+    modes.add_argument('--start', action='store_true', help='start a bounded background capture')
+    modes.add_argument('--stop', help='stop and collect an owned background capture')
+    modes.add_argument('--recover', help='owned output directory of interrupted trace')
     args = p.parse_args()
-    if args.recover:
+    if args.recover or args.stop:
         if any(x is not None for x in (args.seconds, args.ctrl_id, args.block_device, args.output)):
-            p.error('--recover cannot be combined with capture arguments')
-        print(json.dumps(recover(args.recover), sort_keys=True))
+            p.error('--stop and --recover cannot be combined with capture arguments')
+        result = recover(args.recover) if args.recover else stop(args.stop)
     else:
         if any(x is None for x in (args.seconds, args.ctrl_id, args.block_device, args.output)):
             p.error('capture requires --seconds, --ctrl-id, --block-device and --output')
-        print(json.dumps(capture(args), sort_keys=True))
+        result = start(args) if args.start else capture(args)
+    print(json.dumps(result, sort_keys=True))
 
 
 if __name__ == '__main__':

@@ -19,10 +19,6 @@ from portable_transport import metadata_transport_label, transport_for_case
 
 BASELINE_SOURCE_SHA256 = '2e694cb0be9fe0738c217b75afb9fe0ba5d2eef170573bd95f092fa40e93dc57'
 BASELINE_BINARY_SHA256 = '7f692391ec6b6acbc5c12c31cb64878764c0ef96d98d82e1b0dfb6a67594db2c'
-CURRENT_SOURCE_SHA256 = '4facb657c3b84720991cd02f18a97b3a53934e3edd1c8b49a5c139616d582239'
-CURRENT_BINARY_SHA256 = '032402ee15960d55267774826412d6de0b127a88627e1a549b9010f2331862b6'
-CURRENT_FLOOR_BINARY_SHA256 = 'd2e6690120ac97e19b5dd2a4c1e61ff9e4c648db3da5d7750e0b00b2e25d8701'
-CURRENT_RECOVERY_BINARY_SHA256 = '035a8b62d9838b254e1417e2744ea350bf6f479c2f1ae873e1931e09d3d41739'
 SCOPES = ('full', 'core', 'recovery')
 POLICIES = (('adaptive', False), ('busy', False), ('adaptive', True), ('busy', True))
 FABRIC_VERSION = scalar_transport.FABRIC_VERSION
@@ -93,6 +89,10 @@ def plan(scope='full'):
     return qualification_cases() + main_cases(scope) + (recovery_cases() if scope != 'core' else [])
 
 
+def historical_plan(scope='full'):
+    return [spec | {'shard_cache': 0} for spec in plan(scope)]
+
+
 def expected_cases(scope='full'):
     return {spec['case_id'] + '-' + mode:
             (spec['family'], spec['build'], spec['value'], spec['batch'], spec['window'], spec['rep'], mode, spec['case_id'])
@@ -103,6 +103,13 @@ def flags(spec, mode, external=False, prepare=False, transport_config=None):
     result = cluster_ram.flags(spec, mode, external, prepare, transport_config)
     # External node policy belongs to prepared servers, not an
     # ignored coordinator flag. The old binary predates these two options.
+    if spec['build'] == 'current' and (prepare or not external):
+        result += ['--tcp-polling', spec['polling'], '--tcp-resident-first', str(spec['resident_first']).lower()]
+    return result
+
+
+def historical_flags(spec, mode, external=False, prepare=False, transport_config=None):
+    result = cluster_ram.historical_flags(spec, mode, external, prepare, transport_config)
     if spec['build'] == 'current' and (prepare or not external):
         result += ['--tcp-polling', spec['polling'], '--tcp-resident-first', str(spec['resident_first']).lower()]
     return result
@@ -132,8 +139,10 @@ def validate_build_identity(root, label):
     root = Path(root)
     if label not in ('baseline', 'current'):
         raise ValueError('unplanned transport-floor build')
-    source = BASELINE_SOURCE_SHA256 if label == 'baseline' else CURRENT_SOURCE_SHA256
     receipt = audit.read_json(root / f'cloud-build-{label}.json')
+    source = receipt.get('source_tree_sha256')
+    if label == 'baseline' and source != BASELINE_SOURCE_SHA256:
+        raise ValueError('baseline source differs from preserved scalar transport source')
     hashes = ('binary_sha256', 'local_binary_sha256', 'source_manifest_sha256',
               'source_archive_sha256', 'libfabric_sha256', 'recovery_binary_sha256')
     if (not audit.is_sha256(source) or receipt.get('label') != label or receipt.get('source_tree_sha256') != source
@@ -154,11 +163,6 @@ def validate_build_identity(root, label):
     for kind in ('floor', 'recovery'):
         if kind + '_binary_sha256' in manifest and receipt.get('local_' + kind + '_binary_sha256') != manifest[kind + '_binary_sha256']:
             raise ValueError('local auxiliary binary differs from frozen manifest')
-    if label == 'current':
-        if (receipt['local_binary_sha256'] != CURRENT_BINARY_SHA256
-                or manifest.get('floor_binary_sha256') != CURRENT_FLOOR_BINARY_SHA256
-                or manifest.get('recovery_binary_sha256') != CURRENT_RECOVERY_BINARY_SHA256):
-            raise ValueError('current local binaries differ from completed frozen build')
     pair = audit.read_json(root / 'cloud-build-pair-verified.json')
     if pair.get('binary_sha256', {}).get(label) != receipt['binary_sha256']:
         raise ValueError('executable differs from verified pair')
@@ -213,12 +217,20 @@ def validate_node_policy(root, spec, launch_text, partition):
     launch = yaml_one(launch_text)
     if launch['node']['partition']['partition'] != partition:
         raise ValueError('launch partition differs')
-    expected_transport = transport_for_case(spec['transport']) if spec['build'] == 'current' else spec['transport']
+    expected_transport = (transport_for_case(spec['transport'])
+                          if spec['build'] == 'current' and 'shard_cache' not in spec else spec['transport'])
     if launch['tls']['transport'] != expected_transport:
         raise ValueError('launch transport differs')
-    if (launch['node']['read_cache_bytes'] != spec['shard_cache']
-            or launch['node']['read_memory_allowance_bytes'] != spec['shard_allowance']):
-        raise ValueError('launched cache/read-memory policy differs')
+    if launch['node']['read_memory_allowance_bytes'] != spec['shard_allowance']:
+        raise ValueError('launched read-memory policy differs')
+    if 'shard_cache' in spec:
+        if launch['node']['read_cache_bytes'] != spec['shard_cache']:
+            raise ValueError('historical owner cache policy differs')
+    elif spec['build'] == 'current':
+        if 'read_cache_bytes' in launch['node'] or 'resident_reads' in launch['node'] or 'resident_reads' in launch['tls']:
+            raise ValueError('obsolete owner cache or registered-value policy in launch')
+    elif launch['node']['read_cache_bytes'] != 0:
+        raise ValueError('baseline owner cache must be disabled')
     node_shape = yaml_one(launch['node']['shape_yaml'])
     spaces = node_shape['key_spaces']
     if not isinstance(spaces, list) or len(spaces) != 1:
@@ -288,8 +300,10 @@ def validate_polling(profile, spec):
         polling = profile['polling']
         if integer(polling['progress_sweeps']) == 0 or integer(polling['request_first_poll_samples']) == 0:
             raise ValueError('missing measured polling progress')
+        idle_fields = (('idle_sleep_calls', 'idle_sleep_ns') if 'shard_cache' in spec
+                       else ('idle_wait_calls', 'idle_wait_ns'))
         if spec['polling'] == 'busy' and any(integer(polling[key]) != 0 for key in
-                                            ('idle_wait_calls', 'idle_wait_ns', 'scheduler_yields')):
+                                            (*idle_fields, 'scheduler_yields')):
             raise ValueError('Busy established session blocked or yielded')
     return counters
 
@@ -307,7 +321,8 @@ def read_floor_metrics(path, spec):
     scope = ('trusted_native_exchange_decode_and_full_payload_validation'
              if spec['transport'] in ('efa-native', 'fabric-tcp-native') else
              'authenticated_exchange_decode_and_full_payload_validation')
-    runtime_label = metadata_transport_label(spec['transport']) if spec['build'] == 'current' else spec['transport']
+    runtime_label = (metadata_transport_label(spec['transport'])
+                     if spec['build'] == 'current' and 'shard_cache' not in spec else spec['transport'])
     required = dict(transport=runtime_label, polling=spec['polling'].title(), instrumented=str(spec['profile']).lower(),
                     topology='external_nodes', shards='5', timed_scope=scope,
                     wall_scope='measured_requests_and_offered_idle_including_scheduler_delay',
@@ -373,6 +388,8 @@ def validate_recovery_json(row, spec, action):
 def read_wal_metrics(path, spec, mode, expected_profiles=None):
     # The new baseline was the previous scalar campaign's current binary.
     parser_spec = spec | {'build': 'current'}
+    if spec['build'] == 'baseline':
+        parser_spec['shard_cache'] = 0
     metrics = cluster_ram.read_metrics(path, parser_spec, mode)
     scalar_transport.validate_lifecycle(metrics, parser_spec, mode)
     summaries = {row['phase']: row for row in cluster_ram.read_csv(Path(path) / 'summary.csv')}
@@ -390,7 +407,8 @@ def read_wal_metrics(path, spec, mode, expected_profiles=None):
     if any(int(summaries[p]['logical_operations']) != spec['reads'] for p in read_phases):
         raise ValueError('read phase omitted planned full workload')
     for row in summaries.values():
-        expected_label = metadata_transport_label(spec['transport']) if spec['build'] == 'current' else spec['transport']
+        expected_label = (metadata_transport_label(spec['transport'])
+                          if spec['build'] == 'current' and 'shard_cache' not in spec else spec['transport'])
         if row['durability'] != 'value_wal_file_and_directory_barrier' or row['transport'] != expected_label:
             raise ValueError('WAL durability/transport differs')
         if spec['build'] == 'current':
@@ -458,22 +476,27 @@ def read_cloud_case(root, name, spec, mode, profile=None):
     campaign = 'transport-floor' if profile.__name__ == __name__ else 'stage-timing'
     root = Path(root)
     cfg = audit.read_json(root / 'campaign-config.json')
-    if (cfg.get('campaign') != campaign or spec not in profile.plan(cfg.get('checkpoint_scope', 'full'))
+    historical = 'shard_cache' in spec
+    plans = profile.historical_plan if historical else profile.plan
+    if (cfg.get('campaign') != campaign or spec not in plans(cfg.get('checkpoint_scope', 'full'))
             or mode not in spec['modes'] or name != spec['case_id'] + '-' + mode
             or audit.read_json(root / (spec['case_id'] + '-plan.json')) != spec):
         raise ValueError('unplanned transport-floor case/mode')
-    receipt = profile.validate_build_identity(root, spec['build'])
+    identity_reader = (getattr(profile, 'historical_validate_build_identity', profile.validate_build_identity)
+                       if historical else profile.validate_build_identity)
+    receipt = identity_reader(root, spec['build'])
     base = PurePosixPath(cfg['run_root'])
     case_root = base / 'cases' / spec['case_id']
     binary = str(base / 'cloud-bin' / spec['build'] / 'sharded_wal_bench')
     prep = audit.read_json(root / (spec['case_id'] + '-prepare.command.json'))
     endpoints = ','.join(n['private_ip'] + ':7700' for n in sorted(cfg['nodes'], key=lambda n: n['partition']))
     transport_config = (case_root.parent / 'requested-configs' / spec['case_id'] / 'transport.json'
-                        if spec['build'] == 'current' else None)
+                        if spec['build'] == 'current' and not historical else None)
+    command_flags = profile.historical_flags if historical else profile.flags
     expected = [binary, '--prepare-external-case', str(case_root), '--guest-case-root', str(case_root),
-                '--remote-endpoints', endpoints] + profile.flags(
+                '--remote-endpoints', endpoints] + command_flags(
                     spec, 'tcp', prepare=True, transport_config=transport_config)
-    if spec['build'] == 'current':
+    if spec['build'] == 'current' and not historical:
         expected += ['--owner-transports', str(case_root.parent / 'requested-configs' / spec['case_id'] / 'owner-transports.json')]
     validate_command(prep, expected, receipt['binary_sha256'])
     if mode == 'recovery':
@@ -484,30 +507,31 @@ def read_cloud_case(root, name, spec, mode, profile=None):
         return audit.read_recovery_case(root, name, spec, audit.transport_floor)
     process = audit.read_json(root / (name + '-process.command.json'))
     transport_config = (case_root.parent / 'requested-configs' / spec['case_id'] / 'transport.json'
-                        if spec['build'] == 'current' else None)
+                        if spec['build'] == 'current' and not historical else None)
     if mode == 'floor':
         binary = str(base / 'cloud-bin' / spec['build'] / 'sharded_wal_transport_bench')
         transport_config = (case_root.parent / 'requested-configs' / spec['case_id'] / 'transport.json'
-                            if spec['build'] == 'current' else None)
+                            if spec['build'] == 'current' and not historical else None)
         expected = [binary, '--output', str(base / 'results' / name), '--remote-config',
                     str(case_root / 'remote.yaml')] + profile.floor_flags(spec, transport_config)
         digest = receipt['floor_binary_sha256']
     else:
         command_backend = 'tcp' if mode == 'tcp' else mode
         expected = [binary, '--output', str(base / 'results' / name), '--backend', command_backend]
-        expected += profile.flags(spec, mode, external=mode == 'tcp', transport_config=transport_config)
+        expected += command_flags(spec, mode, external=mode == 'tcp', transport_config=transport_config)
         if mode == 'tcp':
             expected += ['--remote-config', str(case_root / 'remote.yaml')]
         digest = receipt['binary_sha256']
     validate_command(process, expected, digest)
-    if spec['build'] == 'current':
+    if spec['build'] == 'current' and not historical:
         remote = audit.validate_prepared_transport(root, spec['case_id'], spec['transport'], cfg['nodes'])
     else:
         documents = yaml_documents((root / (spec['case_id'] + '-remote.yaml')).read_text())
         if len(documents) != 1:
             raise ValueError('ambiguous prepared remote configuration')
         remote = documents[0]
-    expected_transport = transport_for_case(spec['transport']) if spec['build'] == 'current' else spec['transport']
+    expected_transport = (transport_for_case(spec['transport'])
+                          if spec['build'] == 'current' and not historical else spec['transport'])
     if (remote['read_lanes'] != spec['lanes'] or remote['read_cache_bytes'] != spec['cache']
             or remote['read_memory_allowance_bytes'] != spec['read_allowance']
             or remote['tls']['transport'] != expected_transport
@@ -526,7 +550,12 @@ def read_cloud_case(root, name, spec, mode, profile=None):
     for partition, node in nodes.items():
         if node['instance_id'] != next(n['instance_id'] for n in cfg['nodes'] if n['partition'] == partition):
             raise ValueError('storage instance differs')
-    metrics = profile.read_floor_metrics(root / name, spec) if mode == 'floor' else profile.read_wal_metrics(root / name, spec, mode)
+    if mode == 'floor':
+        metrics = profile.read_floor_metrics(root / name, spec)
+    else:
+        wal_reader = (getattr(profile, 'historical_read_wal_metrics', profile.read_wal_metrics)
+                      if historical else profile.read_wal_metrics)
+        metrics = wal_reader(root / name, spec, mode)
     if mode != 'floor':
         if spec['cold']:
             for row in cluster_ram.read_csv(root / name / 'read_io.csv'):

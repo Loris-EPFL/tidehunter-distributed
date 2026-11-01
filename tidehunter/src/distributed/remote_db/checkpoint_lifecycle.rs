@@ -477,7 +477,6 @@ impl RemoteDatabase {
             (IndexReadCut::At(_), IndexReadCut::BeforeAll) => true,
             _ => false,
         };
-        let _resident_pause = self.reads.pause_and_release_resident_grants()?;
         let result = (|| {
             if advances {
                 self.start_checkpoint_with_floor(Some(floor))?;

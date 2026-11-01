@@ -7,6 +7,7 @@ import time
 TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}")
 MAX_PROCESSES = 16
 MAX_KERNEL_BYTES = 64 * 1024
+MAX_IO_DIAGNOSTIC_CHARS = 4096
 SCOPE = "measurement_boundary_interval"
 
 
@@ -84,13 +85,26 @@ def capture(host_index, boot_id, processes, *, cgroup_root=Path("/sys/fs/cgroup"
                     row["memory_" + name + "_bytes"] = integer(read_kernel(directory / ("memory." + name)).strip())
                 except FileNotFoundError:
                     pass  # Unsupported kernel fields remain absent, not zero.
+            io_error = None
             try:
-                row["io_devices"] = io_devices(read_kernel(directory / "io.stat"))
+                io_text = read_kernel(directory / "io.stat")
+                try:
+                    row["io_devices"] = io_devices(io_text)
+                except ValueError as error:
+                    io_error = error
+                    row["io_diagnostic"] = {
+                        "text_prefix": io_text[:MAX_IO_DIAGNOSTIC_CHARS],
+                        "truncated": len(io_text) > MAX_IO_DIAGNOSTIC_CHARS,
+                    }
             except FileNotFoundError:
                 pass
             if directory.stat().st_ino != inode:
                 raise ValueError("owned cgroup changed during accounting capture")
-            row["available"] = True
+            if io_error is not None:
+                row["core_available"] = True
+                row["reason"] = (type(io_error).__name__ + ": " + str(io_error))[:300]
+            else:
+                row["available"] = True
         except (OSError, ValueError) as error:
             row["reason"] = (type(error).__name__ + ": " + str(error))[:300]
         rows.append(row)
@@ -134,7 +148,9 @@ def interval(before_hosts, after_hosts):
             row = {"host_index": index, "process_role": role, "available": False}
             start, end = initial.get(role), final.get(role)
             try:
-                if not start or not end or not start.get("available") or not end.get("available"):
+                if (not start or not end
+                        or not (start.get("available") or start.get("core_available"))
+                        or not (end.get("available") or end.get("core_available"))):
                     raise ValueError("owned process counters unavailable at a boundary")
                 if not before.get("boot_id") or before["boot_id"] != after.get("boot_id"):
                     raise ValueError("host boot identity changed or is unavailable")
@@ -155,13 +171,13 @@ def interval(before_hosts, after_hosts):
                     raise ValueError("CPU usage is missing at a boundary")
                 if observed.get("cpu_throttled_periods", 0) > observed.get("cpu_periods", math.inf):
                     raise ValueError("throttled periods exceed observed CPU periods")
-                if "io_devices" in start and "io_devices" in end:
-                    devices = start["io_devices"].keys() | end["io_devices"].keys()
+                if start.get("available") and end.get("available") and "io_devices" in start and "io_devices" in end:
+                    devices = start["io_devices"].keys()
+                    if devices != end["io_devices"].keys():
+                        raise ValueError("cgroup IO device population changed between boundaries")
                     reads = writes = 0
                     for device in devices:
-                        if device in start["io_devices"] and device not in end["io_devices"]:
-                            raise ValueError("previous cgroup IO device counters disappeared")
-                        previous = start["io_devices"].get(device, {"rbytes": 0, "wbytes": 0})
+                        previous = start["io_devices"][device]
                         current = end["io_devices"][device]
                         reads += difference(previous["rbytes"], current["rbytes"])
                         writes += difference(previous["wbytes"], current["wbytes"])
@@ -172,7 +188,11 @@ def interval(before_hosts, after_hosts):
                         if type(value) is not int or value < 0:
                             raise ValueError("invalid observed memory counter")
                         observed[name] = value
-                row.update(available=True, **observed)
+                if not start.get("available") or not end.get("available"):
+                    row.update(core_available=True, **observed)
+                    row["reason"] = "cgroup IO counters unavailable or ambiguous at a boundary"
+                else:
+                    row.update(available=True, **observed)
             except (KeyError, TypeError, ValueError) as error:
                 row["reason"] = str(error)[:300]
             rows.append(row)

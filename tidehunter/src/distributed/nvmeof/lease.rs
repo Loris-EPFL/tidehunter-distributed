@@ -4,7 +4,7 @@
 //! Persisted admissions survive a crash and remain quarantined until explicitly
 //! released after the initiator has drained and closed its namespace FD.
 
-use super::ExportManifest;
+use super::{ExportManifest, MAX_EXPORT_MANIFEST_BYTES};
 use crate::distributed::storage::{StorageError, encode_metadata, read_metadata};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -181,7 +181,7 @@ impl ExportLeaseRegistry {
         if max_entries == 0
             || max_entries > 4096
             || max_manifest_bytes == 0
-            || max_manifest_bytes > 1024 * 1024
+            || max_manifest_bytes > MAX_EXPORT_MANIFEST_BYTES
         {
             return Err(invalid("invalid export registry limits"));
         }
@@ -313,6 +313,9 @@ impl ExportLeaseRegistry {
             || attr(&ns.join("enable"))? != "1"
         {
             return Err(invalid("unmatched or disabled target namespace"));
+        }
+        if attr(&ns.join("buffered_io"))? != "1" {
+            return Err(invalid("target namespace must use buffered file I/O"));
         }
         let image = PathBuf::from(attr(&ns.join("device_path"))?);
         let file = self.trusted_image(&image)?;
@@ -608,6 +611,119 @@ mod tests {
     use super::*;
 
     #[test]
+    fn owner_manifest_limit_admits_large_catalog_but_keeps_provenance_and_nofollow() {
+        use super::super::CatalogEntry;
+        use crate::distributed::types::{
+            BatchId, BatchVersion, MemberChecksum, PayloadDigest, PhysicalValueAddress,
+            RecordDescriptor, RecordKind, ValueRecordReference,
+        };
+        use std::os::unix::fs::symlink;
+        let temp = tempdir::TempDir::new("nvmeof-large-manifest").unwrap();
+        let root = temp.path().join("owner");
+        let configfs = temp.path().join("configfs");
+        let export = temp.path().join("export");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&export).unwrap();
+        fs::write(export.join("image.wal"), vec![0; 4096]).unwrap();
+        let reference = ValueRecordReference {
+            batch_id: BatchId {
+                database: [1; 16],
+                operation: [2; 16],
+            },
+            batch_version: BatchVersion {
+                epoch: 1,
+                sequence: 0,
+            },
+            batch_digest: PayloadDigest([3; 32]),
+            batch_address: PhysicalValueAddress {
+                partition: 3,
+                segment_generation: 1,
+                offset: 0,
+                len: 64,
+            },
+            descriptor: RecordDescriptor {
+                operation_index: 0,
+                offset: 8,
+                len: 32,
+                keyspace: 0,
+                kind: RecordKind::Put,
+                key_len: 4,
+                value_offset: 16,
+                value_len: 8,
+                checksum: MemberChecksum(9),
+            },
+        };
+        let manifest = ExportManifest {
+            version: 1,
+            database_uuid: [1; 16],
+            epoch: 1,
+            partition: 3,
+            generation: 1,
+            export_uuid: [7; 16],
+            nqn: "nqn.2026-01.test:large".into(),
+            nsid: 1,
+            wal_file_bytes: 4096,
+            source_file_index: 0,
+            image_len: 4096,
+            block_size: 512,
+            source_device: 10,
+            source_inode: 11,
+            durable_frontier: 4096,
+            catalog: vec![
+                CatalogEntry {
+                    reference,
+                    offset: 16,
+                    len: 32
+                };
+                5000
+            ],
+        };
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        assert!(bytes.len() > 1024 * 1024 && bytes.len() < MAX_EXPORT_MANIFEST_BYTES);
+        let manifest_path = export.join("manifest.json");
+        fs::write(&manifest_path, &bytes).unwrap();
+        let binding = ExportBinding::from(&manifest);
+        let ns = configfs
+            .join("subsystems")
+            .join(&binding.nqn)
+            .join("namespaces/1");
+        fs::create_dir_all(&ns).unwrap();
+        fs::write(ns.join("device_uuid"), uuid_string(binding.export_uuid)).unwrap();
+        fs::write(
+            ns.join("device_path"),
+            export.join("image.wal").to_str().unwrap(),
+        )
+        .unwrap();
+        fs::write(ns.join("enable"), "1\n").unwrap();
+        fs::write(ns.join("buffered_io"), "1\n").unwrap();
+        let small = ExportLeaseRegistry::open_fixture(&root, &configfs, 8, 1024 * 1024).unwrap();
+        assert!(small.inspect(&binding).is_err());
+        let registry =
+            ExportLeaseRegistry::open_fixture(&root, &configfs, 8, MAX_EXPORT_MANIFEST_BYTES)
+                .unwrap();
+        assert!(registry.inspect(&binding).is_ok());
+        fs::write(ns.join("buffered_io"), "0\n").unwrap();
+        assert!(registry.inspect(&binding).is_err());
+        fs::write(ns.join("buffered_io"), "1\n").unwrap();
+        let mut forged = binding.clone();
+        forged.source_inode += 1;
+        assert!(registry.inspect(&forged).is_err());
+        fs::rename(&manifest_path, export.join("real.json")).unwrap();
+        symlink("real.json", &manifest_path).unwrap();
+        assert!(registry.inspect(&binding).is_err());
+        fs::remove_file(&manifest_path).unwrap();
+        let oversized = File::create(&manifest_path).unwrap();
+        oversized
+            .set_len(MAX_EXPORT_MANIFEST_BYTES as u64 + 1)
+            .unwrap();
+        assert!(registry.inspect(&binding).is_err());
+        assert!(
+            ExportLeaseRegistry::open_fixture(&root, &configfs, 8, MAX_EXPORT_MANIFEST_BYTES + 1)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn admissions_survive_restart_and_only_last_drained_release_disables() {
         let temp = tempdir::TempDir::new("nvmeof-lease").unwrap();
         let root = temp.path().join("owner");
@@ -652,6 +768,7 @@ mod tests {
         )
         .unwrap();
         fs::write(ns.join("enable"), "1\n").unwrap();
+        fs::write(ns.join("buffered_io"), "1\n").unwrap();
         let mut registry = ExportLeaseRegistry::open_fixture(&root, &configfs, 8, 65536).unwrap();
         let mut forged = binding.clone();
         forged.source_inode += 1;

@@ -41,42 +41,21 @@ class MatrixEvidenceTests(unittest.TestCase):
         self.cfg = example_config()
         self.cells = completed_matrix(self.cfg)
 
-    def test_single_registered_profile_changes_only_trusted_native_cell_metadata(self):
-        cfg = self.cfg | dict(transports=['tcp', 'efa', 'efa-direct', 'efa-native'])
-        baseline = matrix.matrix_plan(cfg)
-        registered = cfg | dict(kv_suite=dict(resident_reads=fixtures.resident_profile()))
-        observed = matrix.matrix_plan(registered)
-        self.assertEqual(len(observed), len(baseline))
-        for before, after in zip(baseline, observed, strict=True):
-            if before['transport'] == 'efa-native':
-                self.assertEqual(after, before | dict(resident_reads=fixtures.resident_profile()))
-            else:
-                self.assertEqual(after, before)
-        matrix.validate_matrix(registered, completed_matrix(registered))
-        for index, cell in enumerate(observed):
-            changed = completed_matrix(registered)
-            if cell['transport'] == 'efa-native':
-                changed[index].pop('resident_reads')
-            else:
-                changed[index]['resident_reads'] = fixtures.resident_profile()
-            with self.subTest(transport=cell['transport']), self.assertRaises(ValueError):
-                matrix.validate_matrix(registered, changed)
+    def test_matrix_rejects_retired_runtime_configuration(self):
+        for changed in (dict(shard_cache_mib=0), dict(shard_cache_mib_by_repetition=[0]),
+                        dict(kv_suite=dict(resident_reads={}))):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                matrix.matrix_plan(self.cfg | changed)
 
-    def test_disabled_registered_profile_preserves_historical_matrix_shape(self):
-        cfg = self.cfg | dict(transports=['tcp', 'efa-native'])
-        baseline = matrix.matrix_plan(cfg)
-        for profile in (None, matrix.resident_read_config()):
-            observed = matrix.matrix_plan(cfg | dict(kv_suite=dict(resident_reads=profile)))
-            self.assertEqual(observed, baseline)
-            self.assertTrue(all('resident_reads' not in cell for cell in observed))
-
-    def test_matrix_rejects_invalid_canonical_registered_profile_before_work(self):
-        for profile in ({'destination_slots': 4}, [],
-                        fixtures.resident_profile() | dict(require_device_read=1),
-                        fixtures.resident_profile() | dict(max_read_bytes=1024**2)):
-            cfg = self.cfg | dict(kv_suite=dict(resident_reads=profile))
-            with self.subTest(profile=profile), self.assertRaises(ValueError):
-                matrix.matrix_plan(cfg)
+    def test_historical_matrix_is_explicitly_offline_only(self):
+        cfg = self.cfg | dict(shard_cache_mib=0)
+        cells = [cell | dict(shard_cache_mib=0) for cell in self.cells]
+        matrix.validate_historical_matrix(cfg, cells)
+        with self.assertRaises(ValueError):
+            matrix.validate_matrix(cfg, cells)
+        cells[0]['shard_cache_mib'] = 8
+        with self.assertRaises(ValueError):
+            matrix.validate_historical_matrix(cfg, cells)
 
     def test_local_fabric_windows_keep_peer_absence_and_nonwire_scope(self):
         records = [
@@ -298,11 +277,18 @@ class MatrixEvidenceTests(unittest.TestCase):
         self.assertEqual({spec[3].get('transport', 'tcp') for spec in efa_cases()}, {'tcp', 'efa'})
         options = dict(repetitions=1, diagnostics=False, scope='targeted')
         planned = checkpoint_kv.plan(options, ['tcp', 'efa', 'efa-direct'])
-        self.assertEqual(len(planned), 36)
         for transport in ('tcp', 'efa', 'efa-direct'):
             rows = [spec for spec in planned if spec['transport'] == transport]
-            self.assertEqual(len(rows), 12)
+            self.assertTrue(any(spec['cached'] for spec in rows))
+            self.assertTrue(any(spec['cold'] for spec in rows))
+            self.assertTrue(any(not spec['cached'] and not spec['cold'] for spec in rows))
             self.assertEqual(sum(spec['transport_floor'] for spec in rows), 1)
+            self.assertTrue(all('shard_cache_bytes' not in spec and 'resident_reads' not in spec for spec in rows))
+        controls = [{key: value for key, value in spec.items() if key != 'transport'}
+                    for spec in planned if spec['transport'] == 'tcp']
+        for transport in ('efa', 'efa-direct'):
+            self.assertEqual(controls, [{key: value for key, value in spec.items() if key != 'transport'}
+                                        for spec in planned if spec['transport'] == transport])
 
     def diagnostic_fixture(self, root, transport='efa-native', mode='tcp', cold=True,
                            shape=(256, 1, 1), reads=256):
@@ -336,10 +322,10 @@ class MatrixEvidenceTests(unittest.TestCase):
         table('remote_read_profiles.csv', [
             'index_ns', 'dispatch_ns', 'wait_ns', 'actor_queue_ns', 'actor_service_ns', 'actor_return_ns',
             'request_encode_ns', 'exchange_ns', 'response_decode_ns', 'record_verify_ns',
-            'server_handler_ns', 'server_inventory_wait_ns', 'server_authority_lookup_ns',
+            'server_handler_ns', 'server_authority_lookup_ns',
             'server_record_read_ns', 'cache_hits', 'cache_misses', 'whole_call_ns', 'inline_read_ns',
             'server_response_recheck_wait_ns', 'server_response_recheck_ns',
-            'server_response_recheck_samples', 'server_response_recheck_deferrals',
+            'server_response_recheck_samples',
             'wire_read_requests', 'server_timing_available'], not native)
         phases = ['load-write-diagnostics',
                   'warm-profiled-read-diagnostics', 'warm-window-read-diagnostics',
@@ -889,22 +875,22 @@ class MatrixEvidenceTests(unittest.TestCase):
                 checkpoint_kv.validate_checkpoint_records(directory, spec | dict(diagnostics=False), 'tcp')
 
     def test_cache_schedules_are_bound_to_each_cell_and_cannot_be_forged(self):
-        cfg = self.cfg | dict(shard_cache_mib_by_repetition=[0, 16, 16, 0])
+        cfg = self.cfg | dict(coordinator_cache_mib_by_repetition=[0, 16, 16, 0])
         cells = completed_matrix(cfg)
         matrix.validate_matrix(cfg, cells)
         for index, cell in enumerate(cells):
             changed = copy.deepcopy(cells)
-            changed[index]['shard_cache_mib'] = 0 if cell['shard_cache_mib'] else 16
+            changed[index]['coordinator_cache_mib'] = 0 if cell['coordinator_cache_mib'] else 16
             with self.subTest(cell=cell['cell_id']), self.assertRaises(ValueError):
                 matrix.validate_matrix(cfg, changed)
-        for field in ('coordinator_cache_mib', 'shard_cache_mib'):
+        for field in ('coordinator_cache_mib',):
             changed = copy.deepcopy(cells)
             changed[0][field] = False
             with self.subTest(field=field), self.assertRaises(ValueError):
                 matrix.validate_matrix(cfg, changed)
         for budgets in ([0], [0, 16, 16, True], [0, -1, 16, 0], [0, 129, 16, 0], None):
             with self.subTest(budgets=budgets), self.assertRaises(ValueError):
-                supervisor.validate_cfg(self.cfg | dict(shard_cache_mib_by_repetition=budgets))
+                supervisor.validate_cfg(self.cfg | dict(coordinator_cache_mib_by_repetition=budgets))
 
     def test_profile_limits_are_bound_to_repetition_not_transport(self):
         cfg = self.cfg | dict(repetitions=2, read_profile_limits=[65536, 0],

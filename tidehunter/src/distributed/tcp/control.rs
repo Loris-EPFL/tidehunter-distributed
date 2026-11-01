@@ -28,13 +28,13 @@ pub(super) struct ControlContext {
     pub(super) inventory: Arc<Mutex<NodeInventory>>,
     pub(super) readers: Arc<parking_lot::RwLock<inventory::ReaderAuthority>>,
     pub(super) terminal: Arc<AtomicBool>,
+    pub(super) poison_pending: Arc<AtomicBool>,
     pub(super) append_shape: KeyShape,
     pub(super) append_batch_limits: BatchLimits,
     pub(super) append_group_limits: GroupLimits,
     pub(super) wal_member_read: super::super::storage::WalMemberReadPolicy,
     pub(super) read_config: read_executor::ReadExecutorConfig,
     pub(super) read_admission: Arc<read_executor::ReadAdmission>,
-    pub(super) resident_grants: Arc<resident::GrantRegistry>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) nvmeof_leases: Arc<Mutex<super::super::nvmeof::lease::ExportLeaseRegistry>>,
     #[cfg(test)]
@@ -527,12 +527,14 @@ impl ControlContext {
         }
     }
     pub(super) fn poison_readers(&self) {
-        self.resident_grants.request_poison();
+        self.poison_pending.store(true, Ordering::Release);
         self.finish_poison_if_quiescent();
     }
     pub(super) fn finish_poison_if_quiescent(&self) {
-        // A poison transition is also an authority change. An NVMe initiator
-        // must close and release its pinned lease before it can be published.
+        if !self.poison_pending.load(Ordering::Acquire) {
+            return;
+        }
+        // Existing NVMe pins must drain before terminal authority is published.
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let Some(leases) = self.nvmeof_leases.try_lock() else {
             return;
@@ -541,13 +543,7 @@ impl ControlContext {
         if leases.has_live_or_quarantined() {
             return;
         }
-        if self.resident_grants.poison_quiescent() && !self.terminal.swap(true, Ordering::AcqRel) {
-            // The terminal authority boundary is after every session's exact
-            // drain acknowledgment. Readers remain valid while notifications
-            // are in flight; no successful cached result can cross this point.
-            // A lost or unknown session stays represented as a live/quarantined
-            // owner: poison cannot publish terminal authority until remote DMA
-            // is proven impossible (operationally, restart the affected process).
+        if !self.terminal.swap(true, Ordering::AcqRel) {
             self.readers.write().invalidate();
         }
     }
@@ -558,7 +554,7 @@ impl ControlContext {
         mut profile: Option<&mut ConnectionProfile>,
         drain: Option<&mut dyn FnMut() -> Result<(), TcpError>>,
     ) -> Result<(Arc<super::super::storage::PartitionLog>, Vec<AppendedBatch>), TcpError> {
-        if self.terminal.load(Ordering::Acquire) || self.resident_grants.poison_requested() {
+        if self.poison_pending.load(Ordering::Acquire) || self.terminal.load(Ordering::Acquire) {
             return Err(TcpError::new(
                 "log control authority is poisoned; reopen required",
             ));
@@ -691,7 +687,7 @@ impl ControlContext {
         }
         // Admission can precede an earlier command's panic or uncertain I/O.
         // Queued work must recheck terminal health before decoding or mutation.
-        if self.terminal.load(Ordering::Acquire) || self.resident_grants.poison_requested() {
+        if self.poison_pending.load(Ordering::Acquire) || self.terminal.load(Ordering::Acquire) {
             return Err(TcpError::new(
                 "log control authority is poisoned; reopen required",
             ));
@@ -700,7 +696,7 @@ impl ControlContext {
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::RegisterNvmeofEpochPin { epoch } => {
                 let mut leases = self.nvmeof_leases.lock();
-                if self.resident_grants.poison_requested()
+                if self.poison_pending.load(Ordering::Acquire)
                     || !self.readers.read().active_valid(epoch, &self.terminal)
                 {
                     return Err(TcpError::new("NVMe-oF epoch pin authority mismatch"));
@@ -708,7 +704,7 @@ impl ControlContext {
                 let token = leases
                     .register_epoch_pin(epoch)
                     .map_err(TcpError::component)?;
-                if self.resident_grants.poison_requested()
+                if self.poison_pending.load(Ordering::Acquire)
                     || !self.readers.read().active_valid(epoch, &self.terminal)
                 {
                     leases
@@ -729,7 +725,7 @@ impl ControlContext {
                 reference,
             } => {
                 let mut leases = self.nvmeof_leases.lock();
-                if self.resident_grants.poison_requested()
+                if self.poison_pending.load(Ordering::Acquire)
                     || !self.readers.read().active_valid(epoch, &self.terminal)
                     || binding.database_uuid != self.partition.inventory.database
                     || binding.partition != self.partition.partition
@@ -776,7 +772,7 @@ impl ControlContext {
                 let token = leases
                     .register(epoch, &binding)
                     .map_err(TcpError::component)?;
-                if self.resident_grants.poison_requested()
+                if self.poison_pending.load(Ordering::Acquire)
                     || !self.readers.read().active_valid(epoch, &self.terminal)
                 {
                     leases.release(epoch, token).map_err(TcpError::component)?;
@@ -854,18 +850,10 @@ impl ControlContext {
                     }
                     leases
                 };
-                if !self.resident_grants.close_admission() {
-                    return Err(TcpError::new(
-                        "resident grants are live or being issued; release them before retirement",
-                    ));
-                }
                 let result =
                     self.inventory
                         .lock()
                         .retire_files(authority_epoch, epoch, prefix, &files);
-                if result.is_ok() {
-                    self.resident_grants.reopen_admission();
-                }
                 result.map(|()| Response::Retired)
             }
             Request::ReadIoStats => {
@@ -881,10 +869,6 @@ impl ControlContext {
             Request::OperationalReadIoStats => Ok(Response::OperationalReadIoStats(Box::new((
                 self.partition.clone(),
                 self.read_admission.try_stats(),
-            )))),
-            Request::ResidentGrantStats => Ok(Response::ResidentGrantStats(Box::new((
-                self.partition.clone(),
-                self.resident_grants.try_promotion_stats(),
             )))),
             Request::Status { protocol } => {
                 if protocol != PROTOCOL {
@@ -907,18 +891,12 @@ impl ControlContext {
                     }
                     leases
                 };
-                if !self.resident_grants.close_admission() {
-                    return Err(TcpError::new(
-                        "resident grants are live or being issued; release them before fencing",
-                    ));
-                }
                 let mut status = self.inventory.lock().fence_to(epoch)?;
                 status.max_frame_bytes = limits.max_frame_bytes;
                 status.max_reads = self.effective_max_reads(limits);
                 status.max_read_bytes = self.read_config.max_bytes;
                 status.recovery_page_batches = limits.recovery_page_batches;
                 status.polling = limits.polling;
-                self.resident_grants.reopen_admission();
                 Ok(Response::Status(status))
             }
             Request::Append { epoch, batches } => {
@@ -944,9 +922,6 @@ impl ControlContext {
             Request::Read { .. } | Request::ReadProfiled { .. } => {
                 Err(TcpError::new("read sent to the log control owner"))
             }
-            Request::RevokeGrants { .. } => Err(TcpError::new(
-                "resident grant revocation requires the session owner",
-            )),
             Request::Recover {
                 epoch,
                 cursor,
@@ -964,11 +939,6 @@ impl ControlContext {
                     }
                     leases
                 };
-                if !self.resident_grants.close_admission() {
-                    return Err(TcpError::new(
-                        "resident grants are live or being issued; release them before sealing",
-                    ));
-                }
                 self.inventory.lock().seal(epoch)?;
                 Ok(Response::Sealed)
             }
@@ -1004,9 +974,6 @@ impl ControlContext {
             Request::ReadEvidence { epoch, evict } => {
                 let inventory = self.inventory.lock();
                 inventory.active(epoch)?;
-                if evict {
-                    self.read_admission.clear_cache();
-                }
                 inventory
                     .read_evidence_for_benchmark(epoch, evict)
                     .map(Response::ReadEvidence)

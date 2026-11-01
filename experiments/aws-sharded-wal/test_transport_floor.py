@@ -36,12 +36,13 @@ class Evidence(ScalarEvidence):
             if label == 'current':
                 files['tidehunter/examples/sharded_wal_transport_bench.rs'] = '3' * 64
             source = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-            pin = patch.object(profile, label.upper() + '_SOURCE_SHA256', source)
-            pin.start()
-            self.pins.append(pin)
+            if label == 'baseline':
+                pin = patch.object(profile, 'BASELINE_SOURCE_SHA256', source)
+                pin.start()
+                self.pins.append(pin)
             build = self.builds[label]
             build.update(source_tree_sha256=source, source_archive_sha256='4' * 64,
-                         local_binary_sha256=profile.BASELINE_BINARY_SHA256 if label == 'baseline' else profile.CURRENT_BINARY_SHA256,
+                         local_binary_sha256=profile.BASELINE_BINARY_SHA256 if label == 'baseline' else 'd' * 64,
                          features='experimental-fabric,test-utils')
             build['command'] = ['cargo', '+1.90.0', 'build', '--release', '--locked', '--manifest-path',
                                 self.base + f'/build-source/{label}/Cargo.toml', '-p', 'tidehunter',
@@ -49,10 +50,10 @@ class Evidence(ScalarEvidence):
             manifest = dict(source_sha256=files, source_tree_sha256=source, binary_sha256=build['local_binary_sha256'],
                             features=build['features'])
             if label == 'current':
-                manifest.update(floor_binary_sha256=profile.CURRENT_FLOOR_BINARY_SHA256,
-                                recovery_binary_sha256=profile.CURRENT_RECOVERY_BINARY_SHA256)
-                build.update(local_floor_binary_sha256=profile.CURRENT_FLOOR_BINARY_SHA256,
-                             local_recovery_binary_sha256=profile.CURRENT_RECOVERY_BINARY_SHA256)
+                manifest.update(floor_binary_sha256='7' * 64,
+                                recovery_binary_sha256='8' * 64)
+                build.update(local_floor_binary_sha256='7' * 64,
+                             local_recovery_binary_sha256='8' * 64)
             save(root / f'source-manifest-{label}.json', manifest)
             build['source_manifest_sha256'] = hashlib.sha256((root / f'source-manifest-{label}.json').read_bytes()).hexdigest()
             if label == 'current':
@@ -77,12 +78,14 @@ class Evidence(ScalarEvidence):
         members = super().node_members(spec, partition)
         launch = dict(node=dict(partition={'partition': partition}, shape_yaml=SHAPE,
                                read_workers=spec['workers'], wal_member_read=spec['member'],
-                               read_cache_bytes=spec['shard_cache'], read_memory_allowance_bytes=spec['shard_allowance']),
+                               read_memory_allowance_bytes=spec['shard_allowance']),
                       tls={'transport': (transport_for_case(spec['transport']) if spec['build'] == 'current'
                                          else spec['transport'])}, limits={})
         if spec['build'] == 'current':
             launch['node']['read_resident_first'] = spec['resident_first']
             launch['limits']['polling'] = spec['polling']
+        else:
+            launch['node']['read_cache_bytes'] = 0
         import yaml
         members['launch.yaml'] = yaml.safe_dump(launch)
         return members
@@ -205,6 +208,19 @@ def floor_files(path, spec):
 
 
 class ProfileAvailabilityMetadataTests(unittest.TestCase):
+    def test_historical_polling_uses_recorded_sleep_counters(self):
+        spec = dict(transport='tcp', profile=True, polling='busy', shard_cache=0)
+        polling = dict(progress_sweeps=1, request_first_poll_samples=1,
+                       idle_sleep_calls=0, idle_sleep_ns=0, scheduler_yields=0)
+        counters = profile.validate_polling(dict(polling=polling), spec)
+        self.assertIn('polling.idle_sleep_calls', counters)
+        with self.assertRaisesRegex(ValueError, 'blocked or yielded'):
+            profile.validate_polling(dict(polling=polling | {'idle_sleep_calls': 1}), spec)
+        with self.assertRaises(KeyError):
+            profile.validate_polling(dict(polling=polling), {k: v for k, v in spec.items() if k != 'shard_cache'})
+        with self.assertRaises(KeyError):
+            profile.validate_polling(dict(polling={k: v for k, v in polling.items() if k != 'idle_sleep_ns'}), spec)
+
     def test_unavailable_authority_cache_stays_missing_not_zero(self):
         raw = dict(authority=None, wal_reads=3)
         self.assertEqual(profile.flatten_counters(raw), dict(wal_reads=3))
@@ -301,6 +317,19 @@ class ProfileAvailabilityMetadataTests(unittest.TestCase):
                     self.assertIs(retained['client']['server_handler_not_applicable'], True)
 
 class PlanAndComparisonTests(unittest.TestCase):
+    def test_current_policies_use_only_linux_resident_control(self):
+        for spec in profile.plan():
+            self.assertNotIn('shard_cache', spec)
+            if spec['build'] != 'current':
+                continue
+            args = profile.flags(spec, 'tcp', prepare=True)
+            self.assertIn('--tcp-resident-first', args)
+            self.assertNotIn('--tcp-shard-cache-bytes', args)
+            self.assertNotIn('--tcp-resident-reads', args)
+            with self.assertRaisesRegex(ValueError, 'obsolete'):
+                profile.flags(spec | {'shard_cache': 0}, 'tcp', prepare=True)
+        self.assertTrue(all('shard_cache' in spec for spec in profile.historical_plan()))
+
     def test_bounded_scopes_and_no_synthetic_native_controls(self):
         for scope, specs, apis in [('full', 164, 216), ('core', 148, 200), ('recovery', 20, 20)]:
             with self.subTest(scope=scope):
@@ -321,7 +350,6 @@ class PlanAndComparisonTests(unittest.TestCase):
                 self.assertEqual(spec['build'], 'current')
         with self.assertRaises(ValueError):
             profile.plan('capacity')
-        self.assertEqual(profile.BASELINE_SOURCE_SHA256, scalar_transport.CURRENT_SOURCE_SHA256)
         self.assertNotEqual(profile.BASELINE_BINARY_SHA256, scalar_transport.BASELINE_BINARY_SHA256)
 
     def test_ratios_use_measured_matching_control_and_never_pool_transports(self):
@@ -353,6 +381,19 @@ class CloudEvidenceTests(unittest.TestCase):
 
     def read(self, name):
         return audit.read_case(self.root, name, profile.expected_cases()[name], 'transport-floor')
+
+    def test_current_node_rejects_removed_owner_and_tls_fields(self):
+        spec = next(s for s in profile.qualification_cases() if s['build'] == 'current')
+        self.evidence.prepare(spec)
+        members = self.evidence.node_members(spec, 0)
+        launch = profile.yaml_one(members['launch.yaml'])
+        profile.validate_node_policy(self.root, spec, members['launch.yaml'], 0)
+        for section, field in (('node', 'read_cache_bytes'), ('node', 'resident_reads'),
+                               ('tls', 'resident_reads')):
+            mutated = copy.deepcopy(launch)
+            mutated[section][field] = 0
+            with self.subTest(field=field, section=section), self.assertRaisesRegex(ValueError, 'obsolete'):
+                profile.validate_node_policy(self.root, spec, json.dumps(mutated), 0)
 
     def inventory(self, **config):
         cfg = self.evidence.cfg | {'availability_zone': 'us-east-1b'} | config

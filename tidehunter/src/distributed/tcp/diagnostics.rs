@@ -130,8 +130,6 @@ pub struct ConnectionProfile {
     pub read_response_recheck_ns: u64,
     /// Measured read responses rechecked, including read errors and fenced replies.
     pub read_response_recheck_samples: u64,
-    /// Retained for protocol compatibility; reader-authority rechecks do not defer.
-    pub read_response_recheck_deferrals: u64,
     /// Rechecks rejecting unhealthy, recovering or superseded authority.
     pub read_response_recheck_errors: u64,
     pub append_inventory_wait_ns: u64,
@@ -168,7 +166,6 @@ impl ConnectionProfile {
         self.read_response_recheck_wait_ns += other.read_response_recheck_wait_ns;
         self.read_response_recheck_ns += other.read_response_recheck_ns;
         self.read_response_recheck_samples += other.read_response_recheck_samples;
-        self.read_response_recheck_deferrals += other.read_response_recheck_deferrals;
         self.read_response_recheck_errors += other.read_response_recheck_errors;
         self.append_inventory_wait_ns += other.append_inventory_wait_ns;
         self.append_inventory_residence_ns += other.append_inventory_residence_ns;

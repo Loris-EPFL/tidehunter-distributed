@@ -16,9 +16,48 @@ from unittest.mock import Mock, patch
 import analyze_cloud as analysis
 import checkpoint_async as profile
 import guest
+import cluster_ram
 
 
 class CheckpointEvidenceTests(unittest.TestCase):
+    def test_current_plans_keep_coordinator_controls_without_owner_cohorts(self):
+        for cases in (profile.plan(), cluster_ram.plan()):
+            self.assertTrue(any(case['cache'] for case in cases))
+            self.assertTrue(any(not case['cache'] for case in cases))
+            self.assertEqual({case['transport'] for case in cases}, {'tcp', 'efa'})
+            self.assertTrue(any('native-sync' in case['modes'] for case in cases))
+            self.assertTrue(all('shard_cache' not in case for case in cases))
+        spec = next(case for case in cluster_ram.main_cases('capacity') if case['build'] == 'current')
+        for obsolete in ('shard_cache', 'shard_cache_bytes', 'shard_cache_mib',
+                         'shard_cache_mib_by_repetition', 'resident_reads', 'registered_value', 'registration_profile'):
+            with self.subTest(obsolete=obsolete), self.assertRaisesRegex(ValueError, 'obsolete'):
+                cluster_ram.flags(spec | {obsolete: 0}, 'tcp', prepare=True)
+        with self.assertRaises(TypeError):
+            profile.case('pressure', 'current', 8192, 0, 'tcp', shard_cache=0)
+        for mode in ('tcp', 'native-sync'):
+            for prepare in (False, True):
+                flags = cluster_ram.flags(spec, mode, prepare=prepare)
+                self.assertNotIn('--tcp-shard-cache-bytes', flags)
+                self.assertNotIn('--tcp-resident-reads', flags)
+                self.assertIn('--tcp-read-cache-bytes', flags)
+
+    def test_historical_plans_preserve_owner_cache_cohorts_without_launching_them(self):
+        for campaign in (profile, cluster_ram):
+            old = campaign.historical_plan()
+            self.assertTrue(any(case['shard_cache'] > 0 for case in old))
+            self.assertEqual(len(old), len({case['case_id'] for case in old}))
+        historical = cluster_ram.historical_plan('capacity')
+        first = [case for case in historical if case['rep'] == 0 and case['transport'] == 'tcp'
+                 and case['workload'] in ('capacity', 'pressure')]
+        self.assertEqual([(case['cache'], case['shard_cache']) for case in first],
+                         [(2 * cluster_ram.MIB, 0), (8 * cluster_ram.MIB, 0),
+                          (128 * cluster_ram.MIB, 0), (0, 16 * cluster_ram.MIB),
+                          (8 * cluster_ram.MIB, 16 * cluster_ram.MIB), (128 * 1024, 64 * 1024)])
+        old = first[3]
+        with self.assertRaisesRegex(ValueError, 'obsolete'):
+            cluster_ram.flags(old, 'tcp', prepare=True)
+
+
     def test_unplanned_case_is_rejected_before_preparation(self):
         campaign = object.__new__(guest.Campaign)
         campaign.cfg = {'campaign': 'checkpoint-async'}
@@ -141,23 +180,29 @@ class CheckpointEvidenceTests(unittest.TestCase):
             for boundary in ('before', 'after'):
                 for role, partition in [('frontend', '')] + [('storage', str(p)) for p in range(5)]:
                     after = boundary == 'after'
-                    budget = spec['cache'] if role == 'frontend' else spec['shard_cache']
+                    budget = spec['cache']
                     hot = phase.endswith('_hot')
+                    coordinator = role == 'frontend'
                     rows.append(dict(backend='experimental_tcp_authority', value_bytes=8192,
                         batch_size=32, window=32, repetition=0, phase=phase, boundary=boundary,
-                        role=role, partition=partition, cache_budget_bytes=budget,
-                        cache_retained_bytes=8192 if budget else 0, cache_metadata_bytes=64 if budget else 0,
-                        cache_entries=1 if budget else 0, cache_hits=int(after and hot and bool(budget)),
-                        cache_misses=int(after and not hot), cache_evictions=int(after and not hot and bool(budget)),
+                        role=role, partition=partition, coordinator_cache_budget_bytes=budget if coordinator else '',
+                        coordinator_cache_retained_bytes=8192 if coordinator and budget else (0 if coordinator else ''),
+                        coordinator_cache_metadata_bytes=64 if coordinator and budget else (0 if coordinator else ''),
+                        coordinator_cache_entries=int(bool(budget)) if coordinator else '',
+                        coordinator_cache_hits=int(after and hot and bool(budget)) if coordinator else '',
+                        coordinator_cache_misses=int(after and not hot) if coordinator else '',
+                        coordinator_cache_evictions=int(after and not hot and bool(budget)) if coordinator else '',
                         wal_reads=int(after and not hot and role == 'storage'),
                         wal_read_bytes=8192 * int(after and not hot and role == 'storage'),
                         inflight_requests=0, inflight_bytes=0, inflight_reads=0,
                         peak_inflight_requests=1, peak_inflight_bytes=16384,
-                        peak_inflight_reads=1, peak_device_reads=1))
+                        peak_inflight_reads=1, peak_device_reads=1,
+                        authority_available='true' if role == 'storage' else '',
+                        authority_resident_hits=1 if role == 'storage' else ''))
         return rows
 
     def test_pressure_rejects_cache_fitting_missing_wal_and_unbounded_budgets(self):
-        spec = next(s for s in profile.main_cases() if s['cache'] and s['shard_cache'] and s['transport'] == 'tcp')
+        spec = next(s for s in profile.main_cases() if s['family'].startswith('pressure') and s['transport'] == 'tcp')
         rows = self.path_rows(spec)
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / 'read_path_evidence.csv'
@@ -168,13 +213,18 @@ class CheckpointEvidenceTests(unittest.TestCase):
                     writer.writerows(values)
                 return profile.read_path_metrics(path, spec, 'experimental_tcp_authority')
             self.assertTrue(consume(rows))
-            for field, value in [('cache_evictions', 0), ('cache_misses', 0), ('wal_reads', 0),
-                                 ('cache_retained_bytes', 9999999), ('cache_budget_bytes', 0),
-                                 ('peak_inflight_requests', 33), ('peak_inflight_bytes', 64 * 1024 * 1024 + 1),
-                                 ('peak_device_reads', 129)]:
+            for field, value, role in [('coordinator_cache_evictions', 0, 'frontend'),
+                                       ('coordinator_cache_misses', 0, 'frontend'),
+                                       ('wal_reads', 0, 'storage'),
+                                       ('coordinator_cache_retained_bytes', 9999999, 'frontend'),
+                                       ('coordinator_cache_budget_bytes', 0, 'frontend'),
+                                       ('coordinator_cache_hits', 0, 'storage'),
+                                       ('peak_inflight_requests', 33, 'storage'),
+                                       ('peak_inflight_bytes', 64 * 1024 * 1024 + 1, 'storage'),
+                                       ('peak_device_reads', 129, 'storage')]:
                 bad = copy.deepcopy(rows)
                 for selected in bad:
-                    if selected['phase'] == 'point_get' and selected['boundary'] == 'after' and selected['role'] == 'storage':
+                    if selected['phase'] == 'point_get' and selected['boundary'] == 'after' and selected['role'] == role:
                         selected[field] = value
                 with self.subTest(field=field), self.assertRaises(ValueError):
                     consume(bad)
@@ -185,7 +235,7 @@ class CheckpointEvidenceTests(unittest.TestCase):
             unbalanced = copy.deepcopy(rows)
             for row in unbalanced:
                 if row['role'] == 'storage' and row['partition'] != '0':
-                    for field in ('cache_misses', 'cache_evictions', 'wal_reads', 'wal_read_bytes'):
+                    for field in ('wal_reads', 'wal_read_bytes'):
                         row[field] = 0
             self.assertEqual(
                 consume(unbalanced)['read_path', 'point_get', 'storage-0-wal_reads'], 1)

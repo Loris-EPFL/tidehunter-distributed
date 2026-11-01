@@ -78,12 +78,19 @@ def load_config(path, env=None, backend_selection=None, mode="standard"):
         low, high = (2, 256) if name.endswith('cpus') else (4096, 1048576)
         if type(value) is not int or not low <= value <= high:
             raise ValueError('invalid fleet resource cap: ' + name)
-    spec = core.read_json(HERE / 'cloud-campaign.json')
+    if mode not in ("standard", "read-tier", "read-tier-focused", "nvmeof-focused"):
+        raise ValueError("unsupported campaign mode")
+    spec_name = "cloud-nvmeof-campaign.json" if mode == "nvmeof-focused" else "cloud-campaign.json"
+    spec = core.read_json(HERE / spec_name)
     if (spec.get('hard_deadline_seconds') != cfg['ttl_seconds']
             or spec.get('export_reserve_seconds') != cfg['export_reserve_seconds']):
         raise ValueError('committed campaign lifetime must match approved CI reservations')
-    spec['backends'] = select_backends(backend_selection, spec.get('backends'),
-                                       set(cloud_campaign.BACKENDS))
+    supported = set(cloud_campaign.BACKENDS)
+    if mode == "nvmeof-focused":
+        supported.update(cloud_campaign.NVME_BACKENDS)
+    spec['backends'] = select_backends(backend_selection, spec.get('backends'), supported)
+    if "tidehunter_nvme_rdma" in spec['backends']:
+        raise ValueError("AWS CI does not qualify an NVMe/RDMA provider; EFA/SRD is not NVMe/RDMA")
     spec['mode'] = mode
     cloud_controller.validate_read_tier_memory(cloud_campaign.make_matrix(spec), resources)
     cfg['spec'] = spec
@@ -247,8 +254,10 @@ class Campaign(core.Campaign):
             bundle_key=self.run_id + '/inputs/bundle.tar.gz', bundle_sha256=runner['sha256'], bundle_bytes=runner['bytes'],
             source_sha256=bindings['source_sha256'], binary_sha256=bindings['binary_sha256'],
             deadline_utc=self.journal.data['expires_at'], ttl_seconds=self.cfg['ttl_seconds'], instance_type=candidate['instance_type'])
-        if self.cfg['spec'].get('mode', 'standard') in ('read-tier', 'read-tier-focused'):
+        if self.cfg['spec'].get('mode', 'standard') in ('read-tier', 'read-tier-focused', 'nvmeof-focused'):
             boot['read_tier_trace'] = True
+        if self.cfg['spec'].get('mode') == 'nvmeof-focused':
+            boot['nvmeof'] = True
         userdata = cloud_bootstrap.render_userdata(boot)
         self.pending_activation(boot)  # Must succeed before the allocator's RunInstances intent.
         tags = core.ownership(self.run_id) | cloud_controller.TAGS | {
@@ -485,7 +494,7 @@ def main(argv=None):
     parser.add_argument('--inputs', type=Path)
     parser.add_argument('--output', type=Path)
     parser.add_argument('--backends', help='comma-separated nonempty subset of tracked backend IDs')
-    parser.add_argument('--mode', choices=('standard', 'read-tier', 'read-tier-focused'), default='standard')
+    parser.add_argument('--mode', choices=('standard', 'read-tier', 'read-tier-focused', 'nvmeof-focused'), default='standard')
     parser.add_argument('--budget-file', type=Path, default=core.DEFAULT_BUDGET)
     args = parser.parse_args(argv)
     if args.action == 'validate':

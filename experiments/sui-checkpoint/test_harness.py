@@ -4,6 +4,7 @@ import hashlib
 import io
 import os
 import signal
+import socket
 import shutil
 import subprocess
 import sys
@@ -118,7 +119,7 @@ class DeploymentContract(unittest.TestCase):
             root=Path(tmp)
             config,nodes=deployment.prepare(root/'deployment',{'live/perpetual':{'key_spaces':[]},'live/checkpoints':{'key_spaces':[]}},
                 root/'remote',shape_yamls={name:'key_spaces: []\n' for name in ('live/perpetual','live/checkpoints')},
-                hosts=['127.0.0.1']*5,port=24000,transport={'kind':'tcp'},coordinator_cache=0,shard_cache=0)
+                hosts=['127.0.0.1']*5,port=24000,transport={'kind':'tcp'},coordinator_cache=0)
             self.assertEqual(len(nodes),10)
             self.assertEqual(len(set(node['launch'] for node in nodes)),10)
             identities=[db['storage']['database'] for db in config['databases'].values()]
@@ -126,13 +127,76 @@ class DeploymentContract(unittest.TestCase):
             for db in config['databases'].values():
                 self.assertEqual(db['storage']['partitions'],list(range(5)))
                 self.assertEqual(len(db['endpoints']),5)
+            for record in nodes:
+                launch = yaml.safe_load(Path(record['launch']).read_text())
+                self.assertEqual(set(launch['node']), {'root', 'partition', 'shape_yaml', 'max_epochs',
+                    'read_workers', 'wal_member_read', 'read_resident_first',
+                    'read_memory_allowance_bytes', 'read_max_inflight_requests',
+                    'read_max_inflight_bytes', 'read_max_device_reads'})
+                self.assertTrue(launch['node']['read_resident_first'])
+                self.assertNotIn('resident_reads', launch['tls'])
+            for db in config['databases'].values():
+                self.assertNotIn('resident_reads', db['tls'])
+                self.assertEqual(db['read_cache_bytes'], 0)
+
+    @unittest.skipUnless(os.environ.get('SUI_STORAGE_NODE_BINARY') and
+                         os.environ.get('SUI_NATIVE_SHAPE_YAML'),
+                         'set SUI_STORAGE_NODE_BINARY and SUI_NATIVE_SHAPE_YAML for engine qualification')
+    def test_generated_local_and_external_yaml_start_current_engine(self):
+        binary = Path(os.environ['SUI_STORAGE_NODE_BINARY']).resolve(strict=True)
+        shape = Path(os.environ['SUI_NATIVE_SHAPE_YAML']).read_text()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for external in (False, True):
+                with self.subTest(external=external):
+                    directory = root / ('external' if external else 'local')
+                    with socket.socket() as sock:
+                        sock.bind(('127.0.0.1', 0))
+                        port = sock.getsockname()[1]
+                    if port > 64995:
+                        self.skipTest('ephemeral port too close to upper bound')
+                    _, nodes = deployment.prepare(directory, {'db': {}}, root/'remote',
+                        shape_yamls={'db': shape}, hosts=['127.0.0.1'] * 5, port=port,
+                        transport={'kind': 'tcp'}, coordinator_cache=0,
+                        guest_root=directory if external else None)
+                    node = nodes[0]
+                    with (root / ('external.log' if external else 'local.log')).open('wb') as log:
+                        child = subprocess.Popen([str(binary), '--experimental-storage-node', node['launch']],
+                                                 stdout=log, stderr=subprocess.STDOUT)
+                        try:
+                            end = time.monotonic() + 30
+                            while not Path(node['ready']).exists():
+                                if child.poll() is not None:
+                                    self.fail('engine rejected generated launch YAML; see captured log')
+                                if time.monotonic() >= end:
+                                    self.fail('engine did not become ready for generated launch YAML')
+                                time.sleep(.05)
+                            Path(node['stop']).touch()
+                            self.assertEqual(child.wait(timeout=15), 0)
+                        finally:
+                            if child.poll() is None:
+                                child.kill()
+                                child.wait(timeout=5)
+                    launch = yaml.safe_load(Path(node['launch']).read_text())
+                    for section, field, value in (
+                            ('node', 'read_cache_bytes', 0),
+                            ('node', 'resident_reads', {}),
+                            ('tls', 'resident_reads', {})):
+                        invalid = copy.deepcopy(launch)
+                        invalid[section][field] = value
+                        path = directory / 'invalid-launch.yaml'
+                        path.write_text(yaml.safe_dump(invalid))
+                        rejected = subprocess.run([str(binary), '--experimental-storage-node', str(path)],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15)
+                        self.assertNotEqual(rejected.returncode, 0)
+
 
     def test_external_client_identity_stays_local(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(deployment,'certificates',lambda path:path.mkdir()):
             root=Path(tmp)
             config,nodes=deployment.prepare(root/'deployment',{'live/perpetual':{'key_spaces':[]}},root/'remote',
                 shape_yamls={'live/perpetual':'key_spaces: []\n'},hosts=['10.0.0.'+str(i) for i in range(1,6)],port=24000,
-                transport=transport_for_case('efa'),coordinator_cache=8388608,shard_cache=8388608,guest_root=Path('/owned/remote'))
+                transport=transport_for_case('efa'),coordinator_cache=8388608,guest_root=Path('/owned/remote'))
             self.assertTrue(config['databases']['live/perpetual']['tls']['key'].startswith(str(root)))
             self.assertTrue(nodes[0]['ready'].startswith('/owned/remote'))
 
@@ -187,7 +251,7 @@ class DeploymentContract(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     deployment.prepare(Path(tmp)/'x',{},Path(tmp),shape_yamls={},hosts=['127.0.0.1']*5,
                         port=24000,transport=transport_for_case(transport),
-                        coordinator_cache=0,shard_cache=0)
+                        coordinator_cache=0)
 
     def test_software_fabric_rejects_nonloopback_hosts(self):
         for transport in ('fabric-tcp', 'fabric-tcp-native'):
@@ -196,7 +260,7 @@ class DeploymentContract(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'loopback-only'):
                     deployment.prepare(root, {}, Path(tmp), shape_yamls={},
                         hosts=['127.0.0.1'] * 4 + ['10.0.0.1'], port=24000,
-                        transport=transport_for_case(transport), coordinator_cache=0, shard_cache=0)
+                        transport=transport_for_case(transport), coordinator_cache=0)
                 self.assertFalse(root.exists())
 
     def test_invalid_write_profile_budget_fails_before_deployment(self):
@@ -206,54 +270,9 @@ class DeploymentContract(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'write profile limit'):
                     deployment.prepare(root, {}, Path(tmp), shape_yamls={},
                         hosts=['127.0.0.1'] * 5, port=24000, transport={'kind':'tcp'},
-                        coordinator_cache=0, shard_cache=0, write_profile_limit=limit)
+                        coordinator_cache=0, write_profile_limit=limit)
                 self.assertFalse(root.exists())
 
-    def test_registered_reads_cannot_bypass_encrypted_transport_policy(self):
-        resident = dict(source_bytes=8192, source_regions=4, destination_bytes=8192,
-                        destination_slots=2, max_read_bytes=4096, max_handles=4,
-                        require_device_read=False)
-        for transport in ('tcp', 'fabric-tcp', 'efa', 'efa-direct'):
-            with self.subTest(transport=transport), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp) / 'deployment'
-                hardware = transport in deployment.HARDWARE_TRANSPORTS
-                with self.assertRaises(ValueError):
-                    deployment.prepare(root, {'db': {}}, Path(tmp) / 'remote',
-                        shape_yamls={'db': 'key_spaces: []\n'},
-                        hosts=['10.0.0.' + str(i) for i in range(1, 6)] if hardware else ['127.0.0.1'] * 5,
-                        port=24000, transport=transport_for_case(transport), coordinator_cache=0, shard_cache=0,
-                        guest_root=Path('/owned') if hardware else None, resident_reads=resident)
-                self.assertFalse(root.exists())
-
-    def test_registered_destination_budgets_include_every_namespace(self):
-        for destination_bytes, destination_slots in ((128 * deployment.MIB, 64),
-                                                     (64 * deployment.MIB, 4096)):
-            with self.subTest(bytes=destination_bytes, slots=destination_slots), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp) / 'deployment'
-                schema = {f'db-{i}': {} for i in range(3)}
-                resident = dict(source_bytes=8192, source_regions=4,
-                    destination_bytes=destination_bytes, destination_slots=destination_slots,
-                    max_read_bytes=4096, max_handles=4, require_device_read=False)
-                with self.assertRaises(ValueError):
-                    deployment.prepare(root, schema, Path(tmp) / 'remote',
-                        shape_yamls={name: 'key_spaces: []\n' for name in schema},
-                        hosts=['127.0.0.1'] * 5, port=24000,
-                        transport=transport_for_case('fabric-tcp-native'),
-                        coordinator_cache=0, shard_cache=0, resident_reads=resident)
-                self.assertFalse(root.exists())
-
-    def test_registered_read_limit_must_fit_each_destination_not_just_total_bytes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / 'deployment'
-            resident = dict(source_bytes=8192, source_regions=4, destination_bytes=8192,
-                            destination_slots=2, max_read_bytes=4097, max_handles=4,
-                            require_device_read=False)
-            with self.assertRaises(ValueError):
-                deployment.prepare(root, {'db': {}}, Path(tmp) / 'remote',
-                    shape_yamls={'db': 'key_spaces: []\n'}, hosts=['127.0.0.1'] * 5,
-                    port=24000, transport=transport_for_case('fabric-tcp-native'), coordinator_cache=0,
-                    shard_cache=0, resident_reads=resident)
-            self.assertFalse(root.exists())
 
     def test_cache_only_reads_do_not_require_invented_rpc_samples(self):
         databases = {'db': dict(tls={'transport': {'kind':'tcp'}}, endpoints=[{}])}
@@ -703,14 +722,14 @@ class PassiveMetricFreshness(unittest.TestCase):
                         for key, value in stats.items())
             if remote:
                 stats = dict(shard_sample_generation=owner, shard_sample_errors=0,
-                    shard_sample_available=int(namespace not in unavailable), resident_sample_available=1,
+                    shard_sample_available=int(namespace not in unavailable),
                     shard_sample_age_ms=3001 if namespace in stale else 0,
                     shard_sampler_stopped=int(namespace in stopped))
                 rows.extend(f'tidehunter_operational_read_io{{namespace="{namespace}",stat="{key}"}} {value}'
                             for key, value in stats.items())
                 if namespace not in unavailable:
                     owner_stats = dict.fromkeys(analyze.OWNER_KNOWN_STATS, 0)
-                    owner_stats.update(wal_reads=1, authority_available=1, initiator_available=1)
+                    owner_stats.update(wal_reads=1, authority_available=1)
                     rows.extend(f'tidehunter_shard_read{{namespace="{namespace}",partition="{p}",stat="{key}"}} {value}'
                                 for p in range(5) for key, value in owner_stats.items())
         return '\n'.join(rows) + '\n'
@@ -767,13 +786,6 @@ class PassiveMetricFreshness(unittest.TestCase):
         self.assertTrue(observation['unavailable'])
         self.assertNotIn('shard_sample_generation', observation['streams']['a']['owner'])
         self.assertIn('shard_sample_generation', observation['missing'][0]['missing'])
-        resident_busy = busy.replace(
-            'namespace="a",stat="shard_sample_available"} 0',
-            'namespace="a",stat="shard_sample_available"} 1').replace(
-            'namespace="a",stat="resident_sample_available"} 1',
-            'namespace="a",stat="resident_sample_available"} 0')
-        _, cut = self.wait([baseline, resident_busy, final])
-        self.assertEqual(cut['unavailable_observations'], 1)
 
     def test_sparse_local_before_baseline_waits_for_complete_metadata_without_rebaselining(self):
         baseline = self.scrape({'a': (50, 0), 'b': (90, 0)}, remote=False)
@@ -801,7 +813,7 @@ class PassiveMetricFreshness(unittest.TestCase):
         malformed = (
             busy + 'tidehunter_operational_read_io{namespace="a",stat="shard_sample_generation"} -1\n',
             busy + 'tidehunter_operational_read_io{namespace="a",stat="unknown"} 0\n',
-            busy.replace('stat="resident_sample_available"} 1', 'stat="resident_sample_available"} 2'),
+            busy.replace('stat="shard_sample_available"} 0', 'stat="shard_sample_available"} 2'),
             '\n'.join(row for row in busy.splitlines() if 'namespace="b"' not in row) + '\n',
             self.sparse(baseline, stream='local') + 'tidehunter_adapter{namespace="a",stat="local_sample_unknown"} 0\n')
         for text in malformed:
@@ -896,40 +908,29 @@ class PassiveMetricFreshness(unittest.TestCase):
                     ValueError, 'partial mandatory owner'):
                 analyze.validate_final_metric_cut(analyze.parse_metrics(incomplete),
                     {'a', 'b'}, cut, remote=True)
-
-    def test_optional_owner_groups_require_full_population_only_when_available(self):
+    def test_authority_metadata_counters_require_complete_available_population(self):
         baseline = self.scrape({'a': (5, 5), 'b': (9, 9)})
         final = self.scrape({'a': (7, 7), 'b': (11, 11)})
-        _, cut = self.wait([baseline, final])
-        for flag, fields in analyze.OWNER_OPTIONAL_STATS.items():
-            for stat in fields:
-                incomplete = '\n'.join(row for row in final.splitlines() if not (
-                    row.startswith('tidehunter_shard_read{') and f'stat="{stat}"' in row)) + '\n'
-                with self.subTest(flag=flag, stat=stat), self.assertRaisesRegex(
-                        ValueError, 'partial available owner'):
-                    self.wait([baseline, incomplete])
-                with self.subTest(flag=flag, stat=stat, boundary='archive'), self.assertRaisesRegex(
-                        ValueError, 'partial available owner'):
-                    analyze.validate_final_metric_cut(analyze.parse_metrics(incomplete),
-                        {'a', 'b'}, cut, remote=True)
-            # Owners may independently lack an optional facility. Missing gated
-            # rows are not mandatory when its explicit availability flag is zero.
-            unavailable = '\n'.join(row for row in final.splitlines() if not (
-                row.startswith('tidehunter_shard_read{') and 'partition="0"' in row
-                and any(f'stat="{stat}"' in row for stat in fields))) + '\n'
-            unavailable = '\n'.join(row.rsplit(' ', 1)[0] + ' 0' if (
-                row.startswith('tidehunter_shard_read{') and 'partition="0"' in row
-                and f'stat="{flag}"' in row) else row for row in unavailable.splitlines()) + '\n'
-            self.wait([baseline, unavailable])
-            analyze.validate_final_metric_cut(analyze.parse_metrics(unavailable),
-                {'a', 'b'}, cut, remote=True)
+        for stat in analyze.OWNER_OPTIONAL_STATS['authority_available']:
+            incomplete = '\n'.join(row for row in final.splitlines()
+                                   if f'stat="{stat}"' not in row) + '\n'
+            with self.subTest(stat=stat), self.assertRaisesRegex(ValueError, 'partial available owner'):
+                self.wait([baseline, incomplete])
+        unavailable = '\n'.join(row for row in final.splitlines() if not (
+            'partition="0"' in row and any(f'stat="{stat}"' in row
+                for stat in analyze.OWNER_OPTIONAL_STATS['authority_available']))) + '\n'
+        unavailable = unavailable.replace('partition="0",stat="authority_available"} 1',
+                                          'partition="0",stat="authority_available"} 0')
+        self.wait([baseline, unavailable])
+
+
 
     def test_current_owner_unknown_fields_and_invalid_availability_fail_closed(self):
         baseline = self.scrape({'a': (5, 5), 'b': (9, 9)})
         final = self.scrape({'a': (7, 7), 'b': (11, 11)})
         for invalid in (
             final + 'tidehunter_shard_read{namespace="a",partition="0",stat="unknown"} 0\n',
-            final.replace('stat="authority_available"} 1', 'stat="authority_available"} 2')):
+            final.replace('stat="shard_sample_available"} 1', 'stat="shard_sample_available"} 2')):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 self.wait([baseline, invalid])
 
@@ -946,7 +947,7 @@ class PassiveMetricFreshness(unittest.TestCase):
             self.wait([baseline, advanced, reset])
         final = self.scrape({'a': (7, 7), 'b': (7, 7)})
         partial = '\n'.join(row for row in final.splitlines() if
-            'namespace="a",partition="0",stat="cache_hits"' not in row) + '\n'
+            'namespace="a",partition="0",stat="wal_reads"' not in row) + '\n'
         with self.assertRaisesRegex(ValueError, 'partial mandatory owner'):
             self.wait([baseline, partial])
 
@@ -1063,7 +1064,7 @@ class EvidenceBoundaries(unittest.TestCase):
                 deployment.prepare(Path(tmp)/'deployment', {}, Path(tmp), shape_yamls={},
                     hosts=['10.0.0.'+str(i) for i in range(5)], port=24000,
                     transport=transport_for_case('fabric-tcp'),
-                    coordinator_cache=0, shard_cache=0, guest_root=Path('/owned'))
+                    coordinator_cache=0, guest_root=Path('/owned'))
             self.assertFalse((Path(tmp)/'deployment').exists())
 
     def test_audit_timeout_kills_owned_descendants(self):

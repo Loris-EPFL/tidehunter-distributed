@@ -1163,3 +1163,53 @@ also ran and passed. Format and strict engine lint passed; the all-adapter
 release binary was rebuilt and exercised with the 240-second gate config.
 Logs and the fresh executable are retained under the local qualification
 directory from section 17.9. No hardware allocation occurred during this repair.
+
+### 17.12 Completed cluster measurement, 2026-10-30
+
+GitHub campaign `41109588049`, frozen source `d34022d18aed2e1b7b029d595f43992868453b28`,
+completed all 196 cases on six `c6id.32xlarge` hosts in `eu-west-1c`, with cluster
+placement and distinct owner NVMe devices. The source/binary/export inventories
+were verified. AWS MCP independently confirmed all six terminated and no owned
+infrastructure residuals. Results, complete statistics, plots and limitations:
+[campaign summary](reports/2026-10-30-kv-comparison-41109588049/SUMMARY.md).
+
+The intended warm-WAL metadata result is observed: all 32 warm-WAL cases have
+zero measurement-boundary authority-history loads. For matched case `0157`,
+loads changed from 2,547 to zero and selected planning mean from 22.738 to
+0.876 microseconds. The prior fleet used G6/us-east-1; do not attribute the
+entire end-to-end change to code across different hardware and regions.
+
+Qualified coordinator-cache C16 scalar baselines have API medians
+0.919/0.920/0.968 microseconds for TCP/EFA/EFA-native. This reaches the same
+microsecond order as the native primary median of 1.350 microseconds, not
+equal paths or equal tails. Remote registered headroom controls remain about
+47–52 microseconds. The selected 8-KiB FI_READ mean is 46.496 microseconds
+from accepted post to observed completion/progress, not isolated wire latency.
+
+Primary versus warm-tier results are not otherwise matched: primary uses
+4,096 keys, 512 nonsweeping warmup operations, two lanes and resident-first
+disabled; warm controls use 8,192 keys, a full sweep, four lanes and
+resident-first enabled. Primary EFA-native/TCP still load history 1,937/1,936
+times while their caches remain below capacity. Successful history spill
+adoption drops captured pending descriptors without carrying them into the
+existing bounded history LRU. Evaluate budgeted immutable-Arc carry-over at
+adoption; do not claim it is implemented or that it alone explains the gap.
+
+Keep the 8-KiB×32 C16 throughput/tail regressions visible. Sampled coordinator
+batch-cache locking, flight scheduling, CQ gaps and response retirement remain
+measured optimization targets. Test a bounded batch cache lookup and split
+worker queue/load/return and receipt/publication/caller clocks before another
+architecture change. No DMA, fencing or durability rule may be removed.
+
+All eight distributed cold cases have real collector-window block activity,
+but none qualifies as measurement-scoped pure NVMe API latency. Native nominal
+cold controls also lack actual-miss evidence. Fix exact window/request/file
+attribution before making a remote-versus-native cold-device latency claim;
+these results do not justify NVMe-oF.
+
+The retained Prometheus snapshot restored offline without live scrape targets;
+all 196 cases, 34 query panels and Grafana datasource checks passed with no
+gaps. Resource intervals include control/background overlap, not pure API CPU.
+Single repetition, tail-sample warnings and uncalibrated cohost-observer
+overhead remain explicit. Estimated run cost is $67.7440 with partial coverage,
+not a final AWS bill; no further fleet was launched.

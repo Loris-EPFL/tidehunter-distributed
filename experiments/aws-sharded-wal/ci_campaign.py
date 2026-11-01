@@ -195,14 +195,14 @@ def load_config(path, env=None):
             or len(set(cfg['instance_types'])) != len(cfg['instance_types'])
             or set(cfg.get('transports', [])) != set(TRANSPORTS)
             or len(cfg['transports']) != len(TRANSPORTS)
-            or cfg.get('kv_suite', {}).get('scope') not in ('full', 'hardware-populations')
+            or cfg.get('kv_suite', {}).get('scope') not in ('full', 'targeted')
             or cfg.get('kv_suite', {}).get('diagnostics') is not True):
         raise ValueError('CI config must retain exact branch, approved hardware, fixed TTL and complete TCP/EFA/Direct/Native/Sui/KV populations')
     from checkpoint_matrix import matrix_plan
     from checkpoint_kv import validate_options
     matrix_plan(cfg)
     validate_options(cfg['kv_suite'])
-    for name in ('coordinator_cache_mib', 'shard_cache_mib'):
+    for name in ('coordinator_cache_mib',):
         if type(cfg.get(name)) is not int or not 0 <= cfg[name] <= 128:
             raise ValueError('invalid cache budget')
     if type(cfg.get('replay_deadline_seconds')) is not int or not 30 <= cfg['replay_deadline_seconds'] <= 3600:
@@ -1213,7 +1213,7 @@ class Campaign:
         bindings.update({name: self.cfg[name] for name in ('transports', 'repetitions', 'read_profile_limits',
                          'write_profile_limits', 'native_write_profile_limits', 'kv_suite')})
         bindings.update({name: self.cfg[name] for name in
-            ('coordinator_cache_mib_by_repetition', 'shard_cache_mib_by_repetition') if name in self.cfg})
+            ('coordinator_cache_mib_by_repetition',) if name in self.cfg})
         runner = admission['inputs']['runner_bundle']
         plan = dict(run_id=self.run_id, account=self.cfg['account'], region=candidate['region'],
             bucket=self.cfg['bucket'], prefix=self.run_id, ttl_seconds=self.cfg['ttl_seconds'], export_reserve_seconds=600,
@@ -1424,9 +1424,9 @@ class Campaign:
                        *(parsed(item['LaunchTime']) + timedelta(seconds=self.cfg['ttl_seconds']) for item in current))
         cfg = {key: self.cfg[key] for key in ('transports', 'repetitions', 'read_profile_limits',
             'write_profile_limits', 'native_write_profile_limits', 'kv_suite', 'coordinator_cache_mib',
-            'shard_cache_mib', 'replay_deadline_seconds')}
+            'replay_deadline_seconds')}
         cfg.update({name: self.cfg[name] for name in
-            ('coordinator_cache_mib_by_repetition', 'shard_cache_mib_by_repetition') if name in self.cfg})
+            ('coordinator_cache_mib_by_repetition',) if name in self.cfg})
         cfg.update(plan['atomic_bindings'])
         cfg.update(campaign='sui-checkpoint', run_id=self.run_id, account=self.cfg['account'], region=candidate['region'],
             availability_zone=candidate['az'], placement_group=self.run_id, bucket=self.cfg['bucket'], s3_prefix=self.run_id,

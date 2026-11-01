@@ -26,6 +26,32 @@ pub(super) fn value(byte: u8) -> Option<Bytes> {
     Some(vec![byte; 32].into())
 }
 
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+#[test]
+fn nvme_profile_counts_completion_without_inventing_owner_timing() {
+    let diagnostics = ReadDiagnostics::default();
+    diagnostics.nvme_complete(Some(41), false);
+    diagnostics.nvme_complete(None, true);
+    assert_eq!(diagnostics.completed.load(Ordering::Relaxed), 2);
+    assert_eq!(diagnostics.nvme_completed.load(Ordering::Relaxed), 2);
+    assert_eq!(diagnostics.nvme_flight_count.load(Ordering::Relaxed), 1);
+    assert_eq!(diagnostics.nvme_flight_ns.load(Ordering::Relaxed), 41);
+    assert_eq!(diagnostics.nvme_flight_max_ns.load(Ordering::Relaxed), 41);
+    assert_eq!(diagnostics.errors.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        diagnostics
+            .failed_owner_profile_not_applicable
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        diagnostics
+            .server_response_recheck_samples
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
 #[test]
 fn nonconcurrent_bulk_records_pin_lock_separately() {
     let mut fixture = Fixture::new();
@@ -49,60 +75,11 @@ fn nonconcurrent_bulk_records_pin_lock_separately() {
 }
 
 #[test]
-fn owner_grant_stage_aggregation_retains_counts_and_maxima() {
-    let diagnostics = ReadDiagnostics::default();
-    let mut profile = super::super::super::tcp::TcpReadProfile::default();
-    profile.server_grant.registration.ns = 12;
-    profile.server_grant.registration.count = 1;
-    profile.server_grant.registration.max_ns = 12;
-    profile.server_grant.registration.errors = 1;
-    diagnostics.add_grant_stages(&profile);
-    profile.server_grant.registration.ns = 7;
-    profile.server_grant.registration.max_ns = 7;
-    profile.server_grant.registration.errors = 0;
-    diagnostics.add_grant_stages(&profile);
-    assert_eq!(
-        diagnostics
-            .server_grant_registration_ns
-            .load(Ordering::Relaxed),
-        19
-    );
-    assert_eq!(
-        diagnostics
-            .server_grant_registration_count
-            .load(Ordering::Relaxed),
-        2
-    );
-    assert_eq!(
-        diagnostics
-            .server_grant_registration_max_ns
-            .load(Ordering::Relaxed),
-        12
-    );
-    assert_eq!(
-        diagnostics
-            .server_grant_registration_errors
-            .load(Ordering::Relaxed),
-        1
-    );
-}
-
-#[test]
 fn failed_client_only_profiles_do_not_claim_owner_timing() {
     let diagnostics = ReadDiagnostics::default();
-    let mut profile = super::super::super::tcp::TcpReadProfile {
-        server_handler_not_applicable: true,
-        client_fi_read: super::super::super::tcp::ReadStageProfile {
-            count: 1,
-            errors: 1,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
+    let mut profile = super::super::super::tcp::TcpReadProfile::default();
     diagnostics.inline_complete(0, Some(profile), true);
     diagnostics.complete(&Err(LocalDbError::new("failed read")), Some(profile));
-    assert_eq!(diagnostics.client_fi_read_count.load(Ordering::Relaxed), 2);
-    assert_eq!(diagnostics.client_fi_read_errors.load(Ordering::Relaxed), 2);
     assert_eq!(
         diagnostics
             .failed_owner_profile_retained
@@ -111,17 +88,9 @@ fn failed_client_only_profiles_do_not_claim_owner_timing() {
     );
     assert_eq!(
         diagnostics
-            .failed_owner_profile_not_applicable
-            .load(Ordering::Relaxed),
-        2
-    );
-    profile.server_handler_not_applicable = false;
-    diagnostics.inline_complete(0, Some(profile), true);
-    assert_eq!(
-        diagnostics
             .failed_owner_profile_unavailable
             .load(Ordering::Relaxed),
-        1
+        2
     );
     profile.server_handler_available = true;
     diagnostics.complete(&Err(LocalDbError::new("failed read")), Some(profile));
@@ -134,61 +103,6 @@ fn failed_client_only_profiles_do_not_claim_owner_timing() {
 }
 
 #[test]
-fn partition_visitor_exports_client_grant_and_fi_read_stages() {
-    let fixture = Fixture::new();
-    let mut db = fixture.open();
-    let monitor = db.read_profile_monitor();
-    let (partition, diagnostics) = &monitor.state.owner_diagnostics[0];
-    let mut profile = super::super::super::tcp::TcpReadProfile::default();
-    profile.client_grant_install.ns = 11;
-    profile.client_grant_install.count = 1;
-    profile.client_grant_install.max_ns = 11;
-    profile.client_fi_read.ns = 23;
-    profile.client_fi_read.count = 1;
-    profile.client_fi_read.max_ns = 23;
-    diagnostics.inline_complete(0, Some(profile), false);
-    let mut exported = std::collections::HashMap::new();
-    monitor.visit_partitions(&mut |owner, name, value| {
-        if owner == *partition {
-            exported.insert(name, value);
-        }
-    });
-    assert_eq!(exported["read_profile_client_grant_install_ns"], 11);
-    assert_eq!(exported["read_profile_client_grant_install_count"], 1);
-    assert_eq!(exported["read_profile_client_grant_install_max_ns"], 11);
-    assert_eq!(exported["read_profile_client_fi_read_ns"], 23);
-    assert_eq!(exported["read_profile_client_fi_read_count"], 1);
-    assert_eq!(exported["read_profile_client_fi_read_max_ns"], 23);
-    db.shutdown().unwrap();
-}
-
-#[test]
-fn resident_lane_snapshots_cover_actual_sessions_and_reject_stopped_service() {
-    let fixture = Fixture::new();
-    let mut db = fixture.open();
-    let monitor = db.read_evidence_monitor();
-    let snapshots = monitor.sample_resident_read_lane_snapshots().unwrap();
-    assert_eq!(
-        snapshots.len(),
-        fixture.config.endpoints.len() * fixture.config.read_lanes
-    );
-    for endpoint in &fixture.config.endpoints {
-        let lanes = snapshots
-            .iter()
-            .filter(|row| row.partition == endpoint.partition)
-            .collect::<Vec<_>>();
-        assert_eq!(lanes.len(), fixture.config.read_lanes);
-        for (lane, row) in lanes.iter().enumerate() {
-            assert_eq!(row.lane, lane);
-            assert_eq!(row.session_present, Some(true));
-            assert_eq!(row.stats.grants_live, 0);
-        }
-    }
-    db.shutdown().unwrap();
-    assert!(monitor.sample_resident_read_lane_snapshots().is_err());
-}
-
-#[test]
 fn operational_sampling_releases_read_ownership_before_activation_and_after_shutdown() {
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 0;
@@ -196,10 +110,10 @@ fn operational_sampling_releases_read_ownership_before_activation_and_after_shut
     db.write_batch(fixture.operation(0, 0), vec![put(42, 7)])
         .unwrap();
     assert_eq!(db.get(KeySpace(0), &42u32.to_be_bytes()).unwrap(), value(7));
-    let grants = db.read_evidence_monitor().sample_owner_grants().unwrap();
-    assert_eq!(grants.len(), fixture.config.endpoints.len());
+    let owners = db.read_evidence_monitor().sample_owner_read_io().unwrap();
+    assert_eq!(owners.len(), fixture.config.endpoints.len());
     assert_eq!(
-        grants
+        owners
             .iter()
             .map(|(partition, _)| *partition)
             .collect::<Vec<_>>(),
@@ -219,7 +133,7 @@ fn operational_sampling_releases_read_ownership_before_activation_and_after_shut
         let mut complete = None;
         monitor.visit(|snapshot, stopped| {
             assert!(!stopped);
-            if snapshot.available && snapshot.resident_available && snapshot.grants_available {
+            if snapshot.available {
                 assert_eq!(
                     snapshot
                         .owners
@@ -229,7 +143,6 @@ fn operational_sampling_releases_read_ownership_before_activation_and_after_shut
                     1
                 );
                 complete = Some(snapshot.generation);
-                assert_eq!(snapshot.grants.len(), fixture.config.endpoints.len());
             }
         });
         if let Some(generation) = complete {
@@ -244,7 +157,7 @@ fn operational_sampling_releases_read_ownership_before_activation_and_after_shut
     second_monitor.visit(|snapshot, stopped| {
         assert!(!stopped);
         assert!(snapshot.generation >= generation);
-        assert!(snapshot.available && snapshot.resident_available);
+        assert!(snapshot.available);
     });
 
     db.shutdown().unwrap();
@@ -252,8 +165,7 @@ fn operational_sampling_releases_read_ownership_before_activation_and_after_shut
     let mut generation_at_stop = 0;
     monitor.visit(|snapshot, stopped| {
         assert!(stopped);
-        assert!(!snapshot.available && !snapshot.resident_available);
-        assert!(!snapshot.grants_available);
+        assert!(!snapshot.available);
         generation_at_stop = snapshot.generation;
     });
     let after_stop_monitor = db.operational_read_io_monitor();
@@ -261,7 +173,7 @@ fn operational_sampling_releases_read_ownership_before_activation_and_after_shut
     std::thread::sleep(Duration::from_millis(1100));
     after_stop_monitor.visit(|snapshot, stopped| {
         assert!(stopped);
-        assert!(!snapshot.available && !snapshot.resident_available);
+        assert!(!snapshot.available);
         assert_eq!(snapshot.generation, generation_at_stop);
     });
     drop(db);
@@ -584,12 +496,7 @@ fn queued_lane_wake_does_not_consume_read_admission() {
     while !db.reads.state.flight_ready[batch.reads[0].1.parts[0].0.slot].is_ready()
         && Instant::now() < deadline
     {
-        progress_read_lane(
-            &db.reads.state,
-            &mut lane.driver.lock(),
-            db.epoch,
-            db.reads.resident_enabled,
-        );
+        progress_read_lane(&db.reads.state, &mut lane.driver.lock(), db.epoch);
         thread::yield_now();
     }
     if !db.reads.state.flight_ready[batch.reads[0].1.parts[0].0.slot].is_ready() {
@@ -738,7 +645,7 @@ fn cancelled_owned_batch_hands_accepted_transport_work_back_to_actor() {
     assert!(client.read_admission(&request.references, false).unwrap());
     let references = std::mem::take(&mut request.references);
     let id = client
-        .submit_read(db.epoch, references, request.deadline, request.class, false)
+        .submit_read(db.epoch, references, request.deadline, false)
         .unwrap()
         .expect("idle transport must accept the request");
     driver.active.insert(
@@ -791,7 +698,7 @@ fn empty_caller_progress_hands_accepted_work_to_actor_and_preserves_order() {
     assert!(client.read_admission(&request.references, false).unwrap());
     let references = std::mem::take(&mut request.references);
     let id = client
-        .submit_read(db.epoch, references, request.deadline, request.class, false)
+        .submit_read(db.epoch, references, request.deadline, false)
         .unwrap()
         .expect("idle transport must accept the request");
     driver.active.insert(

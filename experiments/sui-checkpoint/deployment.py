@@ -8,7 +8,7 @@ import yaml
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from resident_config import resident_read_config, validate_destination_total, software_fabric_environment
+from resident_config import software_fabric_environment
 from portable_transport import (validate_transport, select_transports,
                                 is_trusted, is_software, is_fabric)
 
@@ -73,7 +73,7 @@ def schemas(directory, expected_backend=None):
     return result
 
 
-def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, coordinator_cache, shard_cache, guest_root=None, write_profile_limit=0, resident_reads=None, owner_transports=None):
+def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, coordinator_cache, guest_root=None, write_profile_limit=0, owner_transports=None):
     if type(write_profile_limit) is not int or not 0 <= write_profile_limit <= 65536:
         raise ValueError('write profile limit must be an integer 0..65536')
     transport = validate_transport(transport)
@@ -86,12 +86,6 @@ def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, 
         raise ValueError('hardware fabric needs explicit external mode')
     if set(shape_yamls) != set(schema):
         raise ValueError('canonical engine YAML must cover every selected namespace')
-    resident = resident_read_config(resident_reads)
-    if resident['destination_slots'] and not is_trusted(transport):
-        raise ValueError('resident_reads requires an explicit trusted-native transport')
-    if resident['require_device_read'] and is_software(transport):
-        raise ValueError('software fabric cannot qualify hardware device reads')
-    validate_destination_total(resident, len(schema))
     directory.mkdir(mode=0o700)
     if not is_trusted(transport):
         certificates(directory / 'tls')
@@ -124,11 +118,9 @@ def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, 
                 max_batches=storage['max_batches_per_partition'], max_reference_metadata_bytes=storage['max_reference_metadata_bytes'])
             node = dict(root=str(runtime_node / 'storage'), partition=partition_config,
                 shape_yaml=shape_yamls[namespace], max_epochs=32, read_workers=2,
-                wal_member_read='async', read_resident_first=True, read_cache_bytes=shard_cache,
-                read_memory_allowance_bytes=128*MIB + 2*shard_cache,
+                wal_member_read='async', read_resident_first=True,
+                read_memory_allowance_bytes=128*MIB,
                 read_max_inflight_requests=32, read_max_inflight_bytes=64*MIB, read_max_device_reads=128)
-            if resident['destination_slots']:
-                node['resident_reads'] = resident
             # Adaptive parks drained TCP on readiness and keeps fabric CQ
             # progress live; neither transport uses periodic idle sleeps.
             launch = dict(node=node, tls=tls(f'node-{partition}', tls_root, owners[partition]),
@@ -152,8 +144,6 @@ def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, 
             read_cache_bytes=coordinator_cache, read_memory_allowance_bytes=128*MIB+2*coordinator_cache,
             preparation_workers=2, scan_prefetch_pages=2, read_lanes=2,
             max_pending_reads=256, max_pending_read_bytes=64*MIB)
-        if resident['destination_slots']:
-            client_tls['resident_reads'] = resident
     config = dict(root=str(db_root), databases=databases)
     (directory / 'config.json').write_text(json.dumps(config, indent=2)+'\n')
     (directory / 'nodes.json').write_text(json.dumps(nodes, indent=2)+'\n')

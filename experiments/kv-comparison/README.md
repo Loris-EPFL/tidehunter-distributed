@@ -15,10 +15,27 @@ for canonical JSON, per-host selectors, security matching, and evidence rules.
 Do not interpret a software-provider FI_READ control as hardware proof or claim
 EFA/verbs qualification without actual provider metadata and measured hardware.
 
-Run from the repository root. Python helpers use only the standard library.
+Run from the repository root. The local lifecycle helper uses the Python standard library; campaign/CI tools need the pinned PyYAML and boto3 environment, and plotting also needs matplotlib.
 Linux Docker Engine with Compose v2 is required; host networking and distinct
 loopback addresses are deliberate. Docker Desktop is not supported by this layout.
 The local helpers require no credential, OIDC role, cloud account, subscription or paid workflow.
+
+## Linux page-cache owner branch
+
+On `experiment/linux-pagecache-nvme-rdma`, the coordinator value cache remains,
+but owner application value caches and long-lived registered-value grants are
+removed. Ordinary record reads use buffered native WAL I/O; eligible sealed
+exports can instead use file-backed Linux NVMe/TCP or qualified NVMe/RDMA with
+verified `buffered_io=1`. Initiator direct I/O does not disable target page cache.
+Active plans exclude the retired cache/grant cohorts; older descriptions and
+retained results below document historical experiments.
+
+Focused first-touch cases evict OS cache on all hosts after verification and
+before measurement, including buffered targets; repeat-read cases leave it
+intact. Neither setting proves per-call RAM or SSD service. Transport and target
+policy receipts, boundary counters and scoped device observations remain distinct.
+See the [current implementation and hardware qualification limits](../../docs/distributed/LINUX_NVME_OF_READ_BACKEND_2026-10-31.md#current-linux-page-cache-branch).
+
 
 ## Measurement read evidence
 
@@ -32,8 +49,8 @@ Monotone per-counter deltas and nonmonotone gauges are reported separately;
 availability and resets are explicit and missing values are never filled with
 zero. Logical WAL reads are not evidence of physical NVMe access.
 
-The Python comparison suite passed 266 tests and the observability suite passed
-77 tests. These results do not establish Rust correctness or performance.
+The current comparison suite passed 390 tests with 4 explicit skips; the
+observability suite passed 97 tests. These checks do not establish cluster performance.
 
 ## Scope and evidence limits
 

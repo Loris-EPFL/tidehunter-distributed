@@ -8,8 +8,6 @@ use std::process::Command;
 
 #[path = "reactor_tests.rs"]
 pub(in crate::distributed::tcp) mod multiplexed;
-#[path = "resident_tests.rs"]
-pub(in crate::distributed::tcp) mod resident_reads;
 #[test]
 fn structured_transport_identity_ignores_local_selectors_only() {
     let left = Transport::Ofi {
@@ -80,12 +78,10 @@ pub(super) fn config(root: &Path) -> NodeConfig {
         read_workers: 2,
         wal_member_read: Default::default(),
         read_resident_first: false,
-        read_cache_bytes: 0,
         read_memory_allowance_bytes: default_read_memory_allowance_bytes(),
         read_max_inflight_requests: default_read_requests(),
         read_max_inflight_bytes: default_read_bytes(),
         read_max_device_reads: default_device_reads(),
-        resident_reads: ResidentReadConfig::default(),
     }
 }
 pub(super) fn batch(config: &NodeConfig, epoch: u64, sequence: u64) -> CompleteBatch {
@@ -359,11 +355,8 @@ fn node_restart_seals_replays_and_never_reactivates_old_epoch() {
     assert!(
         node.handle(
             Request::Read {
-                class: ReadClass::Point,
                 epoch: 7,
                 references: vec![reference],
-                grant_limit: 0,
-                grant_max_bytes: 0,
             },
             TcpLimits::default()
         )
@@ -372,11 +365,8 @@ fn node_restart_seals_replays_and_never_reactivates_old_epoch() {
     match node
         .handle(
             Request::Read {
-                class: ReadClass::Point,
                 epoch: 9,
                 references: vec![reference],
-                grant_limit: 0,
-                grant_max_bytes: 0,
             },
             TcpLimits::default(),
         )
@@ -432,13 +422,7 @@ fn profiled_reads_preserve_authority_membership_and_frame_bounds() {
     let batch = batch(&config, 1, 0);
     let receipt = append(&node, 1, std::slice::from_ref(&batch))[0];
     let reference = batch.record_reference(receipt.address, 0).unwrap();
-    let request = |epoch, references| Request::ReadProfiled {
-        epoch,
-        references,
-        class: ReadClass::Point,
-        grant_limit: 0,
-        grant_max_bytes: 0,
-    };
+    let request = |epoch, references| Request::ReadProfiled { epoch, references };
     let limits = TcpLimits::default();
     let response = node.handle(request(1, vec![reference]), limits).unwrap();
     match response {
@@ -450,12 +434,7 @@ fn profiled_reads_preserve_authority_membership_and_frame_bounds() {
                 batch.mutations()[0]
             );
             assert!(profile.handler_ns > 0 && profile.record_read_ns > 0);
-            assert!(
-                profile.handler_ns
-                    >= profile.inventory_wait_ns
-                        + profile.authority_lookup_ns
-                        + profile.record_read_ns
-            );
+            assert!(profile.handler_ns >= profile.authority_lookup_ns + profile.record_read_ns);
             assert_eq!(
                 wire_codec(HARD_FRAME_LIMIT)
                     .serialized_size(&profile)
@@ -499,11 +478,8 @@ fn profiled_reads_preserve_authority_membership_and_frame_bounds() {
     assert!(matches!(
         node.handle(
             Request::Read {
-                class: ReadClass::Point,
                 epoch: 1,
                 references: vec![reference],
-                grant_limit: 0,
-                grant_max_bytes: 0,
             },
             small
         )
@@ -709,7 +685,6 @@ pub(super) fn certificates(root: &Path) -> TlsFiles {
         cert: root.join("leaf.der"),
         key: root.join("key.der"),
         server_name: "localhost".into(),
-        resident_reads: ResidentReadConfig::default(),
     }
 }
 
@@ -862,9 +837,7 @@ fn authenticated_roundtrip(transport: Transport) {
     assert!(profile.server_handler_ns > 0 && profile.server_record_read_ns > 0);
     assert!(
         profile.server_handler_ns
-            >= profile.server_inventory_wait_ns
-                + profile.server_authority_lookup_ns
-                + profile.server_record_read_ns
+            >= profile.server_authority_lookup_ns + profile.server_record_read_ns
     );
     assert!(profile.exchange_ns >= profile.server_handler_ns);
     // Interleaved TLS writes/reads are not attributed to one request.
@@ -1002,83 +975,36 @@ fn server_read_profile_wire_size_matches_native_segment_layout() {
     let profile = ServerReadProfile::default();
     let bytes = wire_codec(HARD_FRAME_LIMIT).serialize(&profile).unwrap();
     assert_eq!(bytes.len(), SERVER_READ_PROFILE_BYTES);
-    let decoded: ServerReadProfile = wire_codec(HARD_FRAME_LIMIT).deserialize(&bytes).unwrap();
-    assert_eq!(decoded.grant.registration.count, 0);
 }
 
 #[test]
-fn profiled_read_error_has_feature_independent_wire_discriminant() {
-    let response = Response::ReadErrorProfiled {
-        message: "fenced".to_owned(),
-        profile: Box::new(ServerReadProfile::default()),
-    };
-    let bytes = wire_codec(HARD_FRAME_LIMIT).serialize(&response).unwrap();
-    assert_eq!(&bytes[..4], &20_u32.to_le_bytes());
-    let decoded: Response = wire_codec(HARD_FRAME_LIMIT).deserialize(&bytes).unwrap();
-    assert!(matches!(decoded, Response::ReadErrorProfiled { message, .. } if message == "fenced"));
-}
-
-#[test]
-fn read_admission_class_is_required_and_roundtrips() {
-    for class in [ReadClass::Point, ReadClass::ScanNoFill] {
-        let request = reactor::Envelope {
-            protocol: PROTOCOL,
-            id: 41,
-            body: Request::Read {
-                epoch: 7,
-                references: Vec::new(),
-                class,
-                grant_limit: 0,
-                grant_max_bytes: 0,
-            },
-        };
-        let bytes = wire_codec(HARD_FRAME_LIMIT).serialize(&request).unwrap();
-        let decoded: reactor::Envelope<Request> =
-            wire_codec(HARD_FRAME_LIMIT).deserialize(&bytes).unwrap();
-        assert!(matches!(decoded.body, Request::Read { class: decoded, .. } if decoded == class));
-        // v2 Read stopped after references; it cannot be silently treated as Point.
-        assert!(
-            wire_codec(HARD_FRAME_LIMIT)
-                .deserialize::<reactor::Envelope<Request>>(&bytes[..bytes.len() - 4])
-                .is_err()
-        );
-    }
-    assert!(
-        wire_codec(HARD_FRAME_LIMIT)
-            .deserialize::<ReadClass>(&[2, 0, 0, 0])
-            .is_err()
-    );
-}
-
-#[test]
-fn node_yaml_preserves_large_cache_and_explicit_read_allowance() {
+fn node_yaml_rejects_removed_cache_and_resident_settings() {
     let temp = tempdir::TempDir::new("node-memory-envelope").unwrap();
-    let mut config = config(temp.path());
-    config.read_cache_bytes = 2 * 1024 * 1024 * 1024;
-    config.read_memory_allowance_bytes = config.read_cache_bytes + config.read_max_inflight_bytes;
+    let config = config(temp.path());
     let yaml = serde_yaml::to_string(&config).unwrap();
     let parsed: NodeConfig = serde_yaml::from_str(&yaml).unwrap();
-    assert_eq!(parsed.read_cache_bytes, config.read_cache_bytes);
     assert_eq!(
         parsed.read_memory_allowance_bytes,
         config.read_memory_allowance_bytes
     );
-    assert!(parsed.read_cache_metadata_bytes() < parsed.read_cache_bytes);
-    // Validation alone avoids allocating a multi-GiB table in a unit test.
+    for field in [
+        "read_cache_bytes: 4096",
+        "read_cache_metadata_bytes: 1024",
+        "resident_reads: {}",
+    ] {
+        assert!(serde_yaml::from_str::<NodeConfig>(&format!("{yaml}\n{field}\n")).is_err());
+    }
+    let tls_yaml = serde_yaml::to_string(&TlsFiles {
+        transport: Transport::Tcp,
+        ca: PathBuf::new(),
+        cert: PathBuf::new(),
+        key: PathBuf::new(),
+        server_name: String::new(),
+    })
+    .unwrap();
     assert!(
-        read_executor::ReadExecutorConfig {
-            cache_bytes: parsed.read_cache_bytes,
-            memory_allowance_bytes: parsed.read_memory_allowance_bytes,
-            max_bytes: parsed.read_max_inflight_bytes,
-            max_requests: parsed.read_max_inflight_requests,
-            max_device_reads: parsed.read_max_device_reads,
-            resident_first: parsed.read_resident_first,
-        }
-        .validate()
-        .is_ok()
+        serde_yaml::from_str::<TlsFiles>(&format!("{tls_yaml}\nresident_reads: {{}}\n")).is_err()
     );
-    config.read_memory_allowance_bytes -= 1;
-    assert!(StorageNode::open(config, metrics()).is_err());
 }
 
 #[test]
@@ -1153,7 +1079,6 @@ fn history_failure_fences_existing_reads_and_recovery_preserves_acknowledged_val
     assert!(matches!(log.wait_history(), Err(StorageError::Poisoned)));
     // No later append/control request is needed to close reader authority.
     assert!(read(&node, 1).is_err());
-    node.finish_poison_if_quiescent();
     assert!(node.terminal.load(Ordering::Acquire));
     drop(log);
     drop(node);
@@ -1161,4 +1086,39 @@ fn history_failure_fences_existing_reads_and_recovery_preserves_acknowledged_val
     let reopened = StorageNode::open(config, metrics()).unwrap();
     reopened.inventory.lock().fence_to(2).unwrap();
     assert_eq!(read(&reopened, 2).unwrap(), batch.mutations()[0]);
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+#[test]
+fn poison_rejects_reads_before_nvme_epoch_pin_drains() {
+    let temp = tempdir::TempDir::new("poison-nvme-pin").unwrap();
+    let configfs = temp.path().join("configfs");
+    std::fs::create_dir_all(&configfs).unwrap();
+    let node = StorageNode::open(config(&temp.path().join("node")), metrics()).unwrap();
+    node.set_nvmeof_lease_fixture(&configfs).unwrap();
+    node.inventory.lock().fence_to(1).unwrap();
+    let Response::NvmeofEpochPinned(token) = node
+        .handle(
+            Request::RegisterNvmeofEpochPin { epoch: 1 },
+            TcpLimits::default(),
+        )
+        .unwrap()
+    else {
+        panic!("expected epoch pin");
+    };
+    node.poison_readers();
+    assert!(!node.terminal.load(Ordering::Acquire));
+    assert!(!node.reader_authority_valid(1, None));
+    assert!(
+        node.handle(Request::Status { protocol: PROTOCOL }, TcpLimits::default())
+            .is_err()
+    );
+    assert!(matches!(
+        node.handle(
+            Request::ReleaseNvmeofEpochPin { epoch: 1, token },
+            TcpLimits::default()
+        ),
+        Ok(Response::NvmeofEpochReleased)
+    ));
+    assert!(node.terminal.load(Ordering::Acquire));
 }

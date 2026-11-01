@@ -90,6 +90,18 @@ class SingleRepeatPolicy(unittest.TestCase):
         standard = plots.figure_specs(("tidehunter_efa_native",), {"registered_ram_fullset_control"})
         self.assertNotIn("registered_ram_fullset_control-read-tier-baseline", {item["name"] for item in standard})
 
+    def test_removed_cohorts_are_only_plotted_when_present_and_are_historical(self):
+        current = plots.figure_specs(("tidehunter_efa_native",), {"read_tier_wal_warm"})
+        cache = next(item for item in current if item["name"] == "cache-cohorts")
+        self.assertTrue(all(cell[1] == "coordinator_cache_configured"
+                            for series in cache["series"] for cell in series["cells"]))
+        old = plots.figure_specs(("tidehunter_efa_native",),
+                                 {"read_tier_owner_hit", "registered_ram_configured"})
+        owner = next(item for item in old if item["name"] == "read_tier_owner_hit-read-tier-baseline")
+        self.assertIn("Historical", owner["title"])
+        cache = next(item for item in old if item["name"] == "cache-cohorts")
+        self.assertIn("Historical registered RAM", cache["caption"])
+
     def test_historical_eight_system_report_keeps_coverage_and_single_repeat_policy(self):
         original = [row for row in full_matrix_cases() if row["job"]["backend"] != "valkey_tcp"]
         frozen = copy.deepcopy(original)
@@ -485,6 +497,152 @@ class DuplicateIdentityIntegrity(unittest.TestCase):
         valid["backend"]["name"] = "cassandra_cql_vendor_unverified"
         with self.assertRaisesRegex(ValueError, "job and observed backend differ"):
             dataset([valid])
+
+
+class NvmeTcpEvidenceReporting(unittest.TestCase):
+    def sealed_case(self, backend, profile="baseline", repeat=0, status="completed"):
+        item = case(backend, repeat, status)
+        identity = f"{backend}-{profile}-r{repeat}"
+        item["case_id"] = item["job"]["case_id"] = identity
+        item["job"].update(cohort="sealed_read", profile=profile, mix={"read": 100, "get_many": 0, "put": 0},
+                           read_lanes=0 if backend == "native" else 1,
+                           sealed_dataset={"source_id": f"{backend}-r{repeat}",
+                                           "data_id": f"dataset-r{repeat}", "keys": 10,
+                                           "target_cache": "direct" if backend == "tidehunter_nvme_tcp" else "not_applicable"})
+        if profile == "diagnostic" and backend != "native":
+            item["job"]["diagnostics"] = {"read_profile_limit": 256}
+        return item
+
+    def test_sealed_observations_retain_backend_source_and_case_identity(self):
+        native = self.sealed_case("native")
+        remote = self.sealed_case("tidehunter_nvme_tcp")
+        data = dataset([native, remote])
+        point, reason = plots.aggregate_point(
+            data, ("tidehunter_nvme_tcp", "sealed_read", "baseline", 64), [0], "api_ns", "read")
+        self.assertIsNone(reason)
+        self.assertEqual(point["observations"][0]["case_id"], remote["case_id"])
+        self.assertEqual(point["observations"][0]["backend"], "tidehunter_nvme_tcp")
+        self.assertEqual(point["observations"][0]["source_id"], "tidehunter_nvme_tcp-r0")
+        self.assertEqual(point["observations"][0]["data_id"], "dataset-r0")
+        figures, _ = plots.build_figures(data)
+        figure = next(row for row in figures if row["name"] == "sealed_read-baseline")
+        self.assertEqual({row["backend"] for row in figure["panels"][0]["series"]},
+                         {"native", "tidehunter_nvme_tcp"})
+        with tempfile.TemporaryDirectory() as temporary:
+            plots.export_data(figures, plots.coverage(data), Path(temporary))
+            with (Path(temporary) / "plot-data.csv").open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+        row = next(row for row in rows if row["figure"] == "sealed_read-baseline"
+                   and row["case_id"] == remote["case_id"])
+        self.assertEqual(row["source_id"], "tidehunter_nvme_tcp-r0")
+        self.assertEqual(row["backend"], "tidehunter_nvme_tcp")
+
+    def test_evidence_is_per_case_unmodified_and_missing_is_not_zero(self):
+        item = self.sealed_case("tidehunter_nvme_tcp", "diagnostic")
+        trace = {"available": True, "raw_events": ["one", "two"],
+                 "raw_intervals_ns": [0, 37], "unsupported_timing_ns": None}
+        profiler = {"observed": {"phase_attempted": True, "runtime_enabled": True,
+                                 "profile": {"stages": {"nvme": {"available": False,
+                                                                  "sum_ns": None}}}}}
+        item["nvmeof_trace_evidence"] = trace
+        item["trace_event_ratios"] = [{"ratio": None, "reason": "unsupported"}]
+        item["dataset_source"] = {"database": "owner", "epoch": 3, "blocks": ["device"]}
+        item["read_diagnostics"] = profiler
+        failed = self.sealed_case("tidehunter_nvme_tcp", "baseline", status="failed")
+        before = copy.deepcopy([item, failed])
+        appendix = plots.evidence_appendix(dataset([item, failed]))
+        self.assertEqual([item, failed], before)
+        self.assertEqual(appendix[0]["evidence"]["trace_event_ratios"], item["trace_event_ratios"])
+        self.assertEqual(appendix[0]["evidence"]["dataset_source"], item["dataset_source"])
+        self.assertEqual(appendix[0]["evidence"]["nvmeof_trace_evidence"], trace)
+        self.assertEqual(appendix[0]["evidence"]["read_diagnostics"], profiler)
+        self.assertIsNone(appendix[1]["evidence"]["nvmeof_trace_evidence"])
+        self.assertIsNone(appendix[1]["evidence"]["read_diagnostics"])
+        self.assertIn("not a measured zero", appendix[1]["availability_note"])
+
+    def test_profiles_are_separate_and_untimed_is_not_zero(self):
+        baseline = self.sealed_case("tidehunter_nvme_tcp")
+        diagnostic = self.sealed_case("tidehunter_nvme_tcp", "diagnostic")
+        diagnostic["metrics"]["populations"][0]["api_ns"] = {
+            "sample_count": 0, "p50": None, "p95": None, "p99": None,
+            "p999": None, "max": None}
+        data = dataset([baseline, diagnostic])
+        point, reason = plots.aggregate_point(
+            data, ("tidehunter_nvme_tcp", "sealed_read", "diagnostic", 64), [0], "api_ns", "read")
+        self.assertIsNone(point)
+        self.assertIn("not zero", reason)
+        figures, _ = plots.build_figures(data)
+        baseline_figure = next(row for row in figures if row["name"] == "sealed_read-baseline")
+        diagnostic_figure = next(row for row in figures if row["name"] == "sealed_read-diagnostic")
+        self.assertEqual(baseline_figure["panels"][0]["status"], "available")
+        self.assertEqual(diagnostic_figure["panels"][0]["status"], "unavailable")
+
+    def test_actual_batch32_and_diagnostic_backend_settings(self):
+        cases = []
+        for backend in ("native", "tidehunter_tcp", "tidehunter_nvme_tcp"):
+            item = self.sealed_case(backend, "batch32-c16-diagnostic")
+            item["job"].update(mix={"read": 0, "get_many": 100, "put": 0},
+                               read_lanes=0 if backend == "native" else 4,
+                               value_size=1024)
+            if backend != "native":
+                item["job"]["diagnostics"] = {"read_profile_limit": 256}
+            item["metrics"]["populations"][0]["operation"] = "get_many"
+            cases.append(item)
+        data = dataset(cases)
+        figures, _ = plots.build_figures(data)
+        figure = next(row for row in figures if row["name"] == "sealed_read-batch32-c16-diagnostic")
+        self.assertEqual(figure["panels"][0]["operation"], "get_many")
+        self.assertEqual({row["backend"] for row in figure["panels"][0]["series"]},
+                         {"native", "tidehunter_tcp", "tidehunter_nvme_tcp"})
+        appendix = plots.evidence_appendix(data)
+        self.assertEqual(appendix[0]["job"]["read_lanes"], 0)
+        self.assertEqual(appendix[2]["job"]["sealed_dataset"]["target_cache"], "direct")
+
+    def test_backend_exceptions_do_not_hide_workload_changes(self):
+        native = self.sealed_case("native")
+        remote = self.sealed_case("tidehunter_nvme_tcp")
+        remote["job"]["concurrency"] = 1
+        with self.assertRaisesRegex(ValueError, "workload contract changed"):
+            dataset([native, remote])
+
+    def test_write_regression_uses_put_and_backend_specific_profiler(self):
+        cases = []
+        for backend in ("native", "tidehunter_tcp"):
+            item = self.sealed_case(backend, "write-c16-diagnostic")
+            item["job"].update(cohort="native_write_regression",
+                               mix={"read": 0, "get_many": 0, "put": 100},
+                               read_lanes=0 if backend == "native" else 4)
+            item["job"].pop("sealed_dataset")
+            if backend != "native":
+                item["job"]["diagnostics"] = {"write_profile_limit": 256}
+            item["metrics"]["populations"][0]["operation"] = "put"
+            cases.append(item)
+        figures, _ = plots.build_figures(dataset(cases))
+        figure = next(row for row in figures if row["name"] == "native_write_regression-write-c16-diagnostic")
+        self.assertEqual(figure["panels"][0]["operation"], "put")
+        self.assertEqual(len(figure["panels"][0]["series"]), 2)
+
+    def test_first_touch_backend_cache_policy_and_unprofiled_native_control(self):
+        native = self.sealed_case("native", "first_touch-scalar-c1-unprofiled-control")
+        remote = self.sealed_case("tidehunter_nvme_tcp", "first_touch-scalar-c1-diagnostic")
+        baseline_native = self.sealed_case("native", "first_touch-scalar-c1-baseline")
+        baseline_remote = self.sealed_case("tidehunter_nvme_tcp", "first_touch-scalar-c1-baseline")
+        for item in (native, remote, baseline_native, baseline_remote):
+            direct = item["job"]["backend"] == "tidehunter_nvme_tcp"
+            item["job"]["drop_os_caches"] = not direct
+            item["job"]["sealed_dataset"].update(
+                tier="first_touch",
+                profiled=not item["job"]["profile"].endswith("baseline"),
+                instrumentation="read_profile" if direct and item is remote else "none",
+                page_cache_policy="not_dropped" if direct else "drop_at_measurement_gate")
+        remote["job"]["diagnostics"] = {"read_profile_limit": 256}
+        data = dataset([native, remote, baseline_native, baseline_remote])
+        figures, _ = plots.build_figures(data)
+        control = next(row for row in figures if row["name"] == "sealed_read-first_touch-scalar-c1-unprofiled-control")
+        diagnostic = next(row for row in figures if row["name"] == "sealed_read-first_touch-scalar-c1-diagnostic")
+        self.assertEqual({row["backend"] for row in control["panels"][0]["series"]}, {"native"})
+        self.assertEqual({row["backend"] for row in diagnostic["panels"][0]["series"]}, {"tidehunter_nvme_tcp"})
+        self.assertEqual(plots.evidence_appendix(data)[0]["job"]["sealed_dataset"]["instrumentation"], "none")
 
 
 if __name__ == "__main__":

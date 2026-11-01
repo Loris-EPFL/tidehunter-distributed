@@ -174,7 +174,6 @@ fn visit_write_connection_profile(
         read_response_recheck_wait_ns,
         read_response_recheck_ns,
         read_response_recheck_samples,
-        read_response_recheck_deferrals,
         read_response_recheck_errors,
         append_inventory_wait_ns,
         append_inventory_residence_ns,
@@ -202,13 +201,11 @@ fn visit_write_connection_profile(
         ram_payload_verified_bytes,
         requests,
         server_handler_ns,
-        server_inventory_wait_ns,
         server_authority_lookup_ns,
         server_record_read_ns,
         server_response_recheck_wait_ns,
         server_response_recheck_ns,
         server_response_recheck_samples,
-        server_response_recheck_deferrals,
     );
     fields!(
         "write_profile_client_socket_",
@@ -1533,6 +1530,18 @@ impl Db {
             payload_bytes: 0,
         }
     }
+    /// Advisory mapped-WAL eviction at a caller-enforced quiescent benchmark boundary.
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    pub fn evict_mapped_wal_for_benchmark(
+        &self,
+    ) -> Result<Vec<(u32, crate::read_probe::ReadEvidence)>> {
+        let _guard = self.write_gate();
+        match &self.backend {
+            Backend::Remote(remote) => remote.db.evict_mapped_wal_for_benchmark().map_err(error),
+            Backend::Native(_) => Err(error("mapped-WAL owner eviction requires a remote backend")),
+        }
+    }
+
     pub fn flush(&self) -> Result<()> {
         let _guard = self.write_gate();
         match &self.backend {

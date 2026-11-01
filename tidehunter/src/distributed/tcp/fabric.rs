@@ -321,24 +321,11 @@ impl Transport {
     }
 
     #[cfg(feature = "experimental-fabric")]
-    fn open(
-        &self,
-        rma: Option<super::resident::ResidentReadConfig>,
-    ) -> io::Result<tidehunter_fabric::Endpoint> {
+    fn open(&self) -> io::Result<tidehunter_fabric::Endpoint> {
         let Self::Ofi { fabric, .. } = self else {
             return Err(io::Error::other("TCP needs no fabric endpoint"));
         };
-        let rma =
-            rma.filter(|config| config.enabled())
-                .map(|config| tidehunter_fabric::RmaConfig {
-                    source_bytes: config.source_bytes,
-                    source_region_slots: config.source_regions,
-                    destination_bytes: config.destination_bytes,
-                    destination_slots: config.destination_slots,
-                    max_read_bytes: config.max_read_bytes,
-                    require_device_read: config.require_device_read,
-                });
-        tidehunter_fabric::Endpoint::open(fabric, rma)
+        tidehunter_fabric::Endpoint::open(fabric, None)
     }
 }
 
@@ -348,9 +335,8 @@ impl Transport {
 pub(super) fn bootstrap(
     stream: &mut (impl Read + Write),
     transport: &Transport,
-    resident_reads: super::resident::ResidentReadConfig,
 ) -> Result<tidehunter_fabric::Endpoint, TcpError> {
-    let mut endpoint = transport.open(Some(resident_reads))?;
+    let mut endpoint = transport.open()?;
     let address = endpoint.address()?;
     let len = u16::try_from(address.len()).map_err(TcpError::component)?;
     stream.write_all(&len.to_be_bytes())?;

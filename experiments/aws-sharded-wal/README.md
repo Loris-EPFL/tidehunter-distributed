@@ -1,3 +1,14 @@
+## Current Linux page-cache cutover
+
+The current Sui campaign uses coordinator-cache budgets `[0, 8, 0]` MiB
+and TCP, EFA, EFA Direct and trusted-native record-read controls. Its targeted
+KV cases retain native references, bounded working-set reads, cold probes and
+separate diagnostic samples. Owner value caches and registered-value grants
+are no longer runtime configuration or measurement populations. Linux NOWAIT
+resident-read counters describe page-cache attempts, not registered reads or
+proof of physical device latency. Earlier dated campaign descriptions below
+describe historical sources and their frozen results, not current CLI options.
+
 ## Protected AWS suite selection
 
 The single paid workflow is `.github/workflows/aws-efa-benchmarks.yaml`.

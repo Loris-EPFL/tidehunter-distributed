@@ -75,10 +75,11 @@ def benchmark_case_identity(label, shape, repetition, *, storage=False, capacity
         prefix = f'authority{authority_resident_batches}-' + prefix
     if workload_batches is not None:
         prefix = f'load{workload_batches}-' + prefix
-    resident = resident_read_config(resident_reads)
-    if resident != resident_read_config():
-        digest = hashlib.sha256(json.dumps(resident, sort_keys=True).encode()).hexdigest()[:8]
-        prefix = f'rma{digest}-' + prefix
+    if resident_reads is not None:
+        resident = resident_read_config(resident_reads)
+        if resident != resident_read_config():
+            digest = hashlib.sha256(json.dumps(resident, sort_keys=True).encode()).hexdigest()[:8]
+            prefix = f'rma{digest}-' + prefix
     if bounded_hot_reads is not None:
         if type(bounded_hot_reads) is not int or not 32 <= bounded_hot_reads <= 131072:
             raise ValueError('bounded_hot_reads requires an integer 32..131072')
@@ -101,15 +102,16 @@ def kv_case_commands(cfg, spec):
     or the local archive extraction directory. Other campaigns retain their own
     command construction and CLI controls.
     """
+    if 'resident_reads' in spec or 'shard_cache_bytes' in spec:
+        raise ValueError('owner cache and registered-value controls are obsolete')
     root = Path(cfg['run_root'])
     case_id, _ = benchmark_case_identity('current', spec['shape'], spec['repetition'],
         storage=True, cold=spec['cold'], diagnostics=spec['diagnostics'],
         transport=spec['transport'], cached=spec['cached'],
         authority_resident_batches=spec['authority_resident_batches'],
-        shard_cache_bytes=spec.get('shard_cache_bytes', 0),
         preparation_chunk_batches=spec.get('preparation_chunk_batches', 16),
         wal_layout=spec.get('wal_layout'), workload_batches=spec.get('workload_batches'),
-        resident_reads=spec.get('resident_reads'), bounded_hot_reads=spec.get('bounded_hot_reads'),
+        bounded_hot_reads=spec.get('bounded_hot_reads'),
         cold_single_probes=spec.get('cold_single_probes'), cold_group_probes=spec.get('cold_group_probes'))
     case_root = root / 'cases' / case_id
     transport = transport_for_case(spec['transport'])
@@ -135,31 +137,18 @@ def kv_case_commands(cfg, spec):
                '--remote-endpoints', endpoints, '--tcp-read-cache-bytes', str(cache_bytes),
                '--transport-config', transport_path, '--owner-transports', owner_transports_path,
                '--tcp-server-read-workers', '2', '--tcp-wal-member-read', 'async',
-               '--tcp-resident-first', 'true', '--tcp-polling', 'adaptive',
-               '--tcp-shard-cache-bytes', str(spec.get('shard_cache_bytes', 0))]
+               '--tcp-resident-first', 'true', '--tcp-polling', 'adaptive']
     prepare += shape_args
-    resident = resident_read_config(spec.get('resident_reads'))
-    if resident != resident_read_config():
-        if spec['cold'] or not is_trusted(transport):
-            raise ValueError('resident KV reads require trusted fabric and are disabled for cold controls')
-        prepare += ['--backend', 'tcp']
-        for field, value in resident.items():
-            prepare += ['--rma-' + field.replace('_', '-'),
-                        str(value).lower() if isinstance(value, bool) else str(value)]
     commands = {}
     for mode in ('native-sync', 'tcp'):
         output = root / 'checkpoint-results/kv' / (case_id + '-' + mode)
         command_backend = 'tcp' if mode == 'tcp' else mode
         command = [binary, '--output', str(output), '--backend', command_backend] + shape_args
-        if not spec['cold'] and (resident['destination_slots'] or spec.get('bounded_hot_reads') is not None):
-            # The Native reference shares preparation/samples, never RMA flags.
+        if not spec['cold'] and spec.get('bounded_hot_reads') is not None:
             command += ['--bounded-hot-pass', 'true']
-        if spec.get('bounded_hot_reads') is not None:
+        if not spec['cold'] and spec.get('bounded_hot_reads') is not None:
             command += ['--bounded-hot-reads', str(spec['bounded_hot_reads']),
                         '--tcp-read-lanes', '2']
-        if spec.get('shard_cache_bytes', 0) and not spec['cached']:
-            # Coordinator caching stays off: this population reaches the owner.
-            command += ['--cache-probe-keys', '256']
         if spec.get('cache_hit_contention', False):
             command += ['--cache-hit-contention', 'true']
         if spec['cold']:
@@ -210,9 +199,8 @@ def kv_case_policy(cfg, spec):
     case_root = Path(arguments['--guest-case-root'])
     transport = transport_for_case(spec['transport'])
     owner_transports = select_transports(transport, None, len(cfg['nodes']))
-    resident_reads = resident_read_config(spec.get('resident_reads'))
     def tls(identity, server_name, selected):
-        base = dict(transport=selected, server_name=server_name, resident_reads=resident_reads)
+        base = dict(transport=selected, server_name=server_name)
         if is_trusted(selected):
             return base | dict(ca='', cert='', key='')
         return base | dict(ca=str(case_root / 'tls/ca.der'),
@@ -247,10 +235,8 @@ def kv_case_policy(cfg, spec):
                 read_workers=int(arguments['--tcp-server-read-workers']),
                 wal_member_read=arguments['--tcp-wal-member-read'],
                 read_resident_first=arguments['--tcp-resident-first'] == 'true',
-                read_cache_bytes=int(arguments['--tcp-shard-cache-bytes']),
                 read_memory_allowance_bytes=512 * 1024**2, read_max_inflight_requests=32,
-                read_max_inflight_bytes=64 * 1024**2, read_max_device_reads=128,
-                resident_reads=resident_reads),
+                read_max_inflight_bytes=64 * 1024**2, read_max_device_reads=128),
             tls=tls(f'tidehunter-node-{partition}', f'tidehunter-node-{partition}', owner_transports[owner_index]),
             limits=dict(max_frame_bytes=16 * 1024**2, max_connections=16, max_reads=256,
                         recovery_page_batches=128, io_timeout=dict(secs=60, nanos=0),
@@ -896,21 +882,20 @@ class Campaign:
             if self.cfg.get('campaign') in ('scalar-transport', 'transport-floor', 'stage-timing'):
                 prepare_bundle.validate_source_archive(self.bundle / label / 'source.tar.gz', original)
                 profile = transport_floor if self.cfg['campaign'] == 'transport-floor' else scalar_transport
-                expected_source = (self.cfg['source_identities'][label]['source_tree_sha256']
-                                   if self.cfg['campaign'] == 'stage-timing' else
-                                   profile.BASELINE_SOURCE_SHA256 if label == 'baseline' else profile.CURRENT_SOURCE_SHA256)
                 if self.cfg['campaign'] == 'stage-timing':
                     if stage_timing.source_identity(self.bundle / label, label) != self.cfg['source_identities'][label]:
                         raise ValueError('uploaded artifacts differ from immutable plan binding')
                     shutil.copy2(self.bundle / label / 'source.tar.gz', self.results / f'source-{label}.tar.gz')
-                if original['source_tree_sha256'] != expected_source:
-                    raise ValueError('source-bound transport source differs from campaign pin')
+                if (self.cfg['campaign'] != 'stage-timing' and label == 'baseline'
+                        and original['source_tree_sha256'] != profile.BASELINE_SOURCE_SHA256):
+                    raise ValueError('baseline transport source differs from campaign pin')
                 if sha(self.bundle / label / 'sharded_wal_bench') != original['binary_sha256']:
                     raise ValueError('archived executable differs from source manifest')
             local_auxiliary = {}
-            if self.cfg.get('campaign') in ('transport-floor', 'stage-timing'):
+            if self.cfg.get('campaign') in ('scalar-transport', 'transport-floor', 'stage-timing'):
                 shutil.copy2(self.bundle / label / 'source-manifest.json',
                              self.results / f'source-manifest-{label}.json')
+            if self.cfg.get('campaign') in ('transport-floor', 'stage-timing'):
                 for kind, executable in [('recovery', 'sharded_wal_recovery_bench'),
                                          ('floor', 'sharded_wal_transport_bench')]:
                     key = kind + '_binary_sha256'
@@ -1066,8 +1051,6 @@ class Campaign:
                     required += ['--native-read-workers', '--read-resource-evidence', '--read-window',
                                  '--native-read-cache-bytes', '--tcp-read-lanes', '--tcp-server-read-workers',
                                  '--tcp-wal-member-read', '--cold-read-pass', '--hot-read-pass']
-                if self.cfg.get('campaign') in ('checkpoint-async', 'cluster-ram', 'scalar-transport', 'transport-floor', 'stage-timing') and label == 'current':
-                    required += ['--tcp-shard-cache-bytes']
                 if self.cfg.get('campaign') in ('cluster-ram', 'scalar-transport', 'transport-floor', 'stage-timing') and label == 'current':
                     required += ['--read-memory-allowance-bytes', '--shard-read-memory-allowance-bytes',
                                  '--cache-probe-keys', '--concurrent-mixed']
@@ -1160,15 +1143,14 @@ class Campaign:
     def run_case(self, label, shape, rep, storage=False, capacity=False, chunk_control=False,
                  cold=False, diagnostics=False, transport='tcp', cached=False, progress_case=None,
                  resource_evidence=False, authority_resident_batches=None,
-                 shard_cache_bytes=0, transport_floor_probe=False,
+                 transport_floor_probe=False,
                  preparation_chunk_batches=16, workload_batches=None, workload_reads=None,
-                 wal_layout=None, cache_hit_contention=False, resident_reads=None, bounded_hot_reads=None,
+                 wal_layout=None, cache_hit_contention=False, bounded_hot_reads=None,
                  cold_single_probes=None, cold_group_probes=None):
-        if ((shard_cache_bytes or transport_floor_probe or preparation_chunk_batches != 16
+        if ((transport_floor_probe or preparation_chunk_batches != 16
                 or workload_batches is not None or workload_reads is not None or wal_layout is not None
-                or cache_hit_contention or resident_reads is not None or bounded_hot_reads is not None
+                or cache_hit_contention or bounded_hot_reads is not None
                 or cold_single_probes is not None or cold_group_probes is not None) and not self.cfg.get('kv_subsuite')
-                or type(shard_cache_bytes) is not int or not 0 <= shard_cache_bytes <= 128 * 1024**2
                 or type(transport_floor_probe) is not bool
                 or type(cache_hit_contention) is not bool
                 or (cache_hit_contention and (not cached or cold or diagnostics or shape[1] != 1))
@@ -1177,7 +1159,6 @@ class Campaign:
                        for value, bound in ((workload_batches, 4096), (workload_reads, 8192)))
                 or wal_layout not in (None, 'small', 'sui')):
             raise ValueError('bounded cache, RAM-floor and workload controls require a KV subsuite')
-        resident_read_config(resident_reads)
         if bounded_hot_reads is not None and (type(bounded_hot_reads) is not int or not 32 <= bounded_hot_reads <= 131072):
             raise ValueError('bounded_hot_reads requires an integer 32..131072')
         checkpoint = self.cfg.get('campaign') in ('checkpoint-async', 'cluster-ram', 'scalar-transport', 'transport-floor', 'stage-timing')
@@ -1213,9 +1194,9 @@ class Campaign:
         case_id, prefix = benchmark_case_identity(label, shape, rep,
             storage=storage, capacity=capacity, chunk_control=chunk_control, cold=cold,
             diagnostics=diagnostics, transport=transport, cached=cached,
-            authority_resident_batches=authority_resident_batches, shard_cache_bytes=shard_cache_bytes,
+            authority_resident_batches=authority_resident_batches,
             preparation_chunk_batches=preparation_chunk_batches, wal_layout=wal_layout,
-            workload_batches=workload_batches, resident_reads=resident_reads, bounded_hot_reads=bounded_hot_reads,
+            workload_batches=workload_batches, bounded_hot_reads=bounded_hot_reads,
             cold_single_probes=cold_single_probes, cold_group_probes=cold_group_probes)
         if progress:
             case_id, prefix = spec['case_id'], spec['family']
@@ -1240,9 +1221,9 @@ class Campaign:
                 raise ValueError('KV execution differs from its fixed admitted runner')
             kv_spec = dict(shape=shape, repetition=rep, cold=cold, diagnostics=diagnostics,
                 transport=transport, cached=cached, authority_resident_batches=authority_resident_batches,
-                shard_cache_bytes=shard_cache_bytes, preparation_chunk_batches=preparation_chunk_batches,
+                preparation_chunk_batches=preparation_chunk_batches,
                 workload_batches=workload_batches, workload_reads=workload_reads, wal_layout=wal_layout,
-                cache_hit_contention=cache_hit_contention, resident_reads=resident_reads,
+                cache_hit_contention=cache_hit_contention,
                 bounded_hot_reads=bounded_hot_reads, cold_single_probes=cold_single_probes,
                 cold_group_probes=cold_group_probes)
             prepare, kv_commands = kv_case_commands(self.cfg, kv_spec)
@@ -1274,8 +1255,6 @@ class Campaign:
                 prepare += ['--tcp-read-lanes', str(spec['lanes']),
                             '--tcp-server-read-workers', str(spec['workers']),
                             '--tcp-wal-member-read', spec['member']]
-            if checkpoint and label == 'current':
-                prepare += ['--tcp-shard-cache-bytes', str(spec['shard_cache'])]
             if ram:
                 prepare = [str(generator), '--prepare-external-case', str(case_root),
                            '--guest-case-root', str(case_root), '--remote-endpoints', endpoints]

@@ -102,17 +102,25 @@ class Evidence:
             Tags=[dict(Key=k, Value=v) for k, v in tags.items()])
             for n in [dict(instance_id=self.cfg['coordinator_instance_id'])] + self.cfg['nodes']])
         self.builds = {}
+        files = {'tidehunter/examples/sharded_wal_bench.rs': '2' * 64}
+        current_source = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
         for label, digest, source in [('baseline', 'a' * 64, profile.BASELINE_SOURCE_SHA256),
-                                      ('current', 'b' * 64, profile.CURRENT_SOURCE_SHA256)]:
+                                      ('current', 'b' * 64, current_source)]:
             features = 'experimental-fabric,test-utils'
             command = ['cargo', '+1.90.0', 'build', '--manifest-path',
                        self.base + f'/build-source/{label}/Cargo.toml', '--features', features]
             receipt = dict(label=label, binary_sha256=digest, source_tree_sha256=source,
-                source_manifest_sha256='c' * 64, features=features,
+                source_manifest_sha256='c' * 64, source_archive_sha256='4' * 64, features=features,
                 local_binary_sha256=profile.BASELINE_BINARY_SHA256 if label == 'baseline' else 'd' * 64,
                 libfabric_version=profile.FABRIC_VERSION, libfabric_sha256='e' * 64,
                 recovery_binary_sha256=('f' if label == 'current' else '0') * 64,
                 target_directory=self.base + f'/build-target/{label}', command=command)
+            if label == 'current':
+                manifest = dict(source_sha256=files, source_tree_sha256=source,
+                                binary_sha256=receipt['local_binary_sha256'])
+                manifest_path = root / 'source-manifest-current.json'
+                save(manifest_path, manifest)
+                receipt['source_manifest_sha256'] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
             self.builds[label] = receipt
             save(root / f'cloud-build-{label}.json', receipt)
             save(root / f'build-{label}.command.json', dict(exit_code=0, command=command))
@@ -166,11 +174,42 @@ class Evidence:
         pid = partition + (200 if full else 100)
         start = dict(pid=partition + 100, deadline_utc=self.cfg['deadline_utc'], ready='ready',
                      build=spec['build'], binary_sha256=self.builds[spec['build']]['binary_sha256'])
+        import yaml
+        node_root = f"{self.base}/cases/{spec['case_id']}/node-{partition}"
+        transport = (transport_for_case(spec['transport'])
+                     if spec['build'] == 'current' else spec['transport'])
+        node_config = dict(
+            root=node_root + '/storage',
+            partition=dict(inventory=dict(database=[0] * 16, epoch=1, segment_generation=1,
+                                          partitions=list(range(5))),
+                           partition=partition,
+                           batch_limits=dict(max_operations=32, max_encoded_bytes=524288),
+                           group_limits=dict(max_batches=32, max_encoded_bytes=1048568),
+                           fragment_bytes=1048576, wal_file_bytes=134217728,
+                           max_batches=1024, max_reference_metadata_bytes=67108864),
+            shape_yaml=('key_spaces:\n- inner:\n    id: 0\n    key_indexing: !Fixed 8\n'
+                        '    mutexes: 16\n    key_type: !Uniform {cells_per_mutex: 64}\n'
+                        '    config: {value_cache_size: 0}\n'),
+            max_epochs=2, read_workers=spec['workers'],
+            wal_member_read=spec['member'], read_resident_first=False,
+            read_memory_allowance_bytes=spec['shard_allowance'], read_max_inflight_requests=32,
+            read_max_inflight_bytes=64 * 1024 * 1024, read_max_device_reads=128)
+        if spec['build'] == 'baseline':
+            node_config['read_cache_bytes'] = 0
+        launch = dict(node=node_config,
+                      tls=dict(transport=transport, ca=self.base + '/cases/tls/ca.der',
+                               cert=self.base + f'/cases/tls/tidehunter-node-{partition}.der',
+                               key=self.base + f'/cases/tls/tidehunter-node-{partition}.pk8',
+                               server_name=f'tidehunter-node-{partition}'),
+                      limits=dict(max_frame_bytes=16777216, max_connections=16, max_reads=256,
+                                  recovery_page_batches=128, io_timeout=dict(secs=60, nanos=0),
+                                  polling='adaptive'),
+                      listen=node['private_ip'] + ':7700', ready_file=node_root + '/ready',
+                      stop_file=node_root + '/stop', drop_first_append_response=False)
         members = {'before.json': json.dumps(sensor(node['instance_id'], partition=partition)),
             'after.json': json.dumps(sensor(node['instance_id'], True, partition)),
             'efa-provider.txt': 'prov_name: efa\n',
-            'launch.yaml': 'read_workers: 2\nwal_member_read: async\nread_cache_bytes: 0\n'
-                           'read_memory_allowance_bytes: 536870912\n',
+            'launch.yaml': yaml.safe_dump(launch),
             'process-status.txt': f'Pid: {pid}\nVmRSS: 100 kB\nVmHWM: 200 kB\nVmSwap: 0 kB\n',
             f'threads-{pid}.json': json.dumps(threads(pid)), 'start.json': json.dumps(start)}
         if full:
@@ -204,9 +243,10 @@ class Evidence:
             remote = 'read_lanes: 1\nread_cache_bytes: 0\nread_memory_allowance_bytes: 536870912\n'
         (self.root / (case + '-remote.yaml')).write_text(remote)
         if spec['build'] == 'current':
-            for node, owner_transport in zip(self.cfg['nodes'], owner_transports):
-                (self.root / (case + f"-node-{node['partition']}-launch.yaml")).write_text(
-                    'tls:\n  transport: ' + json.dumps(owner_transport) + '\n')
+            for node in self.cfg['nodes']:
+                partition = node['partition']
+                (self.root / (case + f'-node-{partition}-launch.yaml')).write_text(
+                    self.node_members(spec, partition)['launch.yaml'])
             launch_hashes = {str(node['partition']): hashlib.sha256(
                 (self.root / (case + f"-node-{node['partition']}-launch.yaml")).read_bytes()).hexdigest()
                 for node in self.cfg['nodes']}
@@ -285,15 +325,28 @@ class Evidence:
                 for p in (range(5) if mode == 'tcp' else [0])])
         roles = [('frontend', '', 42)] + [('storage', str(p), p + 100) for p in range(5)]
         if mode == 'tcp':
-            counters = dict.fromkeys(('cache_budget_bytes', 'cache_metadata_bytes', 'cache_retained_bytes',
-                'cache_hits', 'cache_misses', 'cache_evictions', 'wal_reads', 'wal_read_bytes',
-                'inflight_requests', 'peak_inflight_requests', 'inflight_bytes', 'peak_inflight_bytes',
-                'inflight_reads', 'peak_inflight_reads', 'cache_bypass_disabled', 'cache_bypass_eviction_limit',
-                'cache_bypass_scan', 'cache_bypass_generation', 'cache_admitted_charge_bytes',
-                'cache_served_accounted_bytes'), 0)
-            table(path / 'read_path_evidence.csv', [dimensions | counters | dict(phase=phase, boundary=boundary,
-                role=role, partition=p) for phase in ('point_get', 'point_get_window')
-                for boundary in ('before', 'after') for role, p, _ in roles])
+            if spec['build'] == 'baseline':
+                counters = dict.fromkeys(('cache_budget_bytes', 'cache_metadata_bytes', 'cache_retained_bytes',
+                    'cache_hits', 'cache_misses', 'cache_evictions', 'wal_reads', 'wal_read_bytes',
+                    'inflight_requests', 'peak_inflight_requests', 'inflight_bytes', 'peak_inflight_bytes',
+                    'inflight_reads', 'peak_inflight_reads', 'cache_bypass_disabled', 'cache_bypass_eviction_limit',
+                    'cache_bypass_scan', 'cache_bypass_generation', 'cache_admitted_charge_bytes',
+                    'cache_served_accounted_bytes'), 0)
+                rows = [dimensions | counters | dict(phase=phase, boundary=boundary, role=role, partition=p)
+                        for phase in ('point_get', 'point_get_window')
+                        for boundary in ('before', 'after') for role, p, _ in roles]
+            else:
+                coordinator = ('budget_bytes', 'metadata_bytes', 'retained_bytes', 'entries', 'hits', 'misses',
+                               'evictions', 'bypass_disabled', 'bypass_eviction_limit',
+                               'admitted_charge_bytes', 'served_accounted_bytes')
+                owner = ('wal_reads', 'wal_read_bytes', 'inflight_requests', 'peak_inflight_requests',
+                         'inflight_bytes', 'peak_inflight_bytes', 'inflight_reads', 'peak_inflight_reads',
+                         'peak_device_reads', 'idle_buffer_bytes', 'idle_buffers', 'buffer_reuses', 'buffer_allocations')
+                rows = [dimensions | {('coordinator_cache_' + key): (0 if role == 'frontend' else '') for key in coordinator}
+                        | dict.fromkeys(owner, 0 if role == 'storage' else '') | dict(phase=phase, boundary=boundary, role=role, partition=p)
+                        for phase in ('point_get', 'point_get_window')
+                        for boundary in ('before', 'after') for role, p, _ in roles]
+            table(path / 'read_path_evidence.csv', rows)
             table(path / 'write_windows.csv', [dimensions | dict(phase=phase, sample=0, transport=runtime_label,
                 preparation_admission_ns=1, storage_wait_ns=1, publication_ns=1, dispatch_ns=1,
                 checkpoint_ns=1, foreground_checkpoint_ns=1, api_ns=100, checkpoint_count=1,
@@ -343,6 +396,15 @@ class ScalarEvidenceTests(unittest.TestCase):
 
     def read(self, name):
         return audit.read_case(self.root, name, profile.expected_cases()[name], 'scalar-transport')
+
+    def test_current_build_requires_source_manifest_binding(self):
+        profile.validate_build_identity(self.root, 'current')
+        path = self.root / 'source-manifest-current.json'
+        manifest = json.loads(path.read_text())
+        manifest['binary_sha256'] = '9' * 64
+        save(path, manifest)
+        with self.assertRaisesRegex(ValueError, 'manifest'):
+            profile.validate_build_identity(self.root, 'current')
 
     def test_complete_qualification_accepts_actual_archive_schemas(self):
         for spec in profile.qualification_cases():

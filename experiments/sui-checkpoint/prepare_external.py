@@ -24,9 +24,6 @@ def main():
     parser.add_argument('--owner-transports',type=Path,
                         help='JSON array of five per-owner Transports; data NIC selectors are independent of control hosts')
     parser.add_argument('--coordinator-cache-mib',type=int,default=8)
-    parser.add_argument('--shard-cache-mib',type=int,default=0)
-    parser.add_argument('--resident-reads',type=Path,
-                        help='bounded per-database registered-read JSON policy; trusted-native fabric only')
     parser.add_argument('--write-profile-limit',type=int,default=0,
                         help='maximum profiled append RPCs per owning connection, 0 disables diagnostics')
     args=parser.parse_args()
@@ -36,12 +33,10 @@ def main():
     hosts=args.hosts.split(',')
     if len(set(hosts))!=5 or not args.guest_root.is_absolute() or not args.db_root.is_absolute():
         raise ValueError('five distinct hosts and absolute owned roots required')
-    if not 1024<=args.port<=65000 or any(not 0<=v<=128 for v in (args.coordinator_cache_mib,args.shard_cache_mib)):
+    if not 1024<=args.port<=65000 or not 0<=args.coordinator_cache_mib<=128:
         raise ValueError('port/cache outside bounded limits')
     if not 0<=args.write_profile_limit<=65536:
         raise ValueError('write profile limit must be 0..65536')
-    resident = (deployment.resident_read_config(json.loads(args.resident_reads.read_text()))
-                if args.resident_reads else None)
     manifest=json.loads((args.build/'build-manifest.json').read_text())
     plan=json.loads((args.build/'plan.json').read_text())
     binary=args.build/'binaries/storage-node'
@@ -54,8 +49,7 @@ def main():
     config,nodes=deployment.prepare(output,schema,args.db_root,
         shape_yamls={name:(args.schema/name/'shape.yaml').read_text() for name in schema},hosts=hosts,port=args.port,
         transport=transport,owner_transports=owners,coordinator_cache=args.coordinator_cache_mib*deployment.MIB,
-        shard_cache=args.shard_cache_mib*deployment.MIB,guest_root=args.guest_root,
-        write_profile_limit=args.write_profile_limit,resident_reads=resident)
+        guest_root=args.guest_root,write_profile_limit=args.write_profile_limit)
     host_records=[]
     for partition,host in enumerate(hosts):
         selected=[node for node in nodes if node['partition']==partition]
@@ -76,8 +70,7 @@ def main():
     build.save(output/'external-manifest.json',dict(schema=2,protocol=manifest['protocol'],transport=transport,owner_transports=owners,
         config_sha256=build.digest(output/'config.json'),build_manifest_sha256=build.digest(args.build/'build-manifest.json'),
         source_archive_sha256=manifest['source_archive_sha256'],storage_binary_sha256=manifest['binaries']['storage-node'],
-        shard_cache_bytes=args.shard_cache_mib*deployment.MIB,write_profile_limit=args.write_profile_limit,hosts=host_records,
-        resident_reads=deployment.resident_read_config(resident),
+        write_profile_limit=args.write_profile_limit,hosts=host_records,
         ownership='controller creates each fresh guest root, starts only listed process groups, bounds deadlines, collects /proc IO/RSS/swap and stops only owned groups',
         security=('trusted isolated cluster; no application TLS or certificate files'
                   if deployment.is_trusted(transport) else

@@ -19,11 +19,11 @@ BASELINE_BINARY_SHA256 = '081a77b68a54b3f165dbadaaade8d2a87d28398d5c6723eeab522a
 SCOPES = ('full', 'core', 'capacity', 'recovery')
 
 
-def case(workload, build, value, rep, transport, batch=32, window=32, cache=0, shard_cache=0):
+def case(workload, build, value, rep, transport, batch=32, window=32, cache=0):
     spec = efa_progress.case('qual' if workload == 'qual' else workload, build, value, batch,
                              window, rep, transport, cache=cache, lanes=1, workers=2,
                              member='async', cold=workload in ('qual', 'core', 'diag'))
-    spec.update(workload=workload, shard_cache=shard_cache, native_workers=32,
+    spec.update(workload=workload, native_workers=32,
                 read_allowance=512 * MIB, shard_allowance=512 * MIB,
                 cache_probe_keys=4096 if workload == 'capacity' else 0,
                 concurrent_mixed=workload == 'concurrent',
@@ -34,7 +34,7 @@ def case(workload, build, value, rep, transport, batch=32, window=32, cache=0, s
     if workload == 'large-config':
         spec.update(read_allowance=2 * 1024 * MIB, shard_allowance=2 * 1024 * MIB,
                     cache_probe_keys=256, batches=64, mixed=16, reads=512)
-    spec['family'] = f'ram-{workload}-f{cache}-s{shard_cache}-{transport}'
+    spec['family'] = f'ram-{workload}-f{cache}-{transport}'
     spec['case_id'] = f"{spec['family']}-{build}-v{value}-b{batch}-w{window}-r{rep}"
     spec['native_control_id'] = f'{build}-v{value}-b{batch}-w{window}-r{rep}-cache{cache}-workers32'
     return spec
@@ -60,12 +60,9 @@ def main_cases(scope='full', repetitions=5, transports=('tcp', 'efa')):
             for transport in transports:
                 for build in builds:
                     result.append(case('equal-cache', build, 8192, rep, transport, cache=8 * MIB))
-                for frontend, shard in ((2 * MIB, 0), (8 * MIB, 0), (128 * MIB, 0),
-                                        (0, 16 * MIB), (8 * MIB, 16 * MIB)):
-                    result.append(case('capacity', 'current', 8192, rep, transport,
-                                       cache=frontend, shard_cache=shard))
-                result.append(case('pressure', 'current', 8192, rep, transport,
-                                   cache=128 * 1024, shard_cache=64 * 1024))
+                for frontend in (2 * MIB, 8 * MIB, 128 * MIB):
+                    result.append(case('capacity', 'current', 8192, rep, transport, cache=frontend))
+                result.append(case('pressure', 'current', 8192, rep, transport, cache=128 * 1024))
                 result.append(case('concurrent', 'current', 8192, rep, transport))
     if scope in ('full', 'core'):
         for transport in transports:
@@ -73,8 +70,7 @@ def main_cases(scope='full', repetitions=5, transports=('tcp', 'efa')):
                 result.append(case('diag', 'current', value, 0, transport))
     if scope in ('full', 'capacity'):
         for transport in transports:
-            result.append(case('large-config', 'current', 8192, 0, transport,
-                               cache=1024 * MIB, shard_cache=512 * MIB))
+            result.append(case('large-config', 'current', 8192, 0, transport, cache=1024 * MIB))
     return result
 
 
@@ -94,6 +90,27 @@ def plan(scope='full'):
     return qualification_cases() + main_cases(scope) + (recovery_cases() if scope in ('full', 'recovery') else [])
 
 
+def historical_plan(scope='full'):
+    """Reconstruct the frozen owner-cache campaign, for archived evidence only."""
+    specs = []
+    for spec in plan(scope):
+        if spec['workload'] == 'pressure':
+            for cache in (0, 8 * MIB):
+                extra = case('capacity', 'current', 8192, spec['rep'], spec['transport'], cache=cache)
+                extra['shard_cache'] = 16 * MIB
+                specs.append(extra)
+        specs.append(spec)
+    for spec in specs:
+        shard = (64 * 1024 if spec['workload'] == 'pressure' else
+                 512 * MIB if spec['workload'] == 'large-config' else
+                 spec.get('shard_cache', 0))
+        spec['shard_cache'] = shard
+        if spec['workload'] != 'recovery':
+            spec['family'] = f"ram-{spec['workload']}-f{spec['cache']}-s{shard}-{spec['transport']}"
+            spec['case_id'] = f"{spec['family']}-{spec['build']}-v{spec['value']}-b{spec['batch']}-w{spec['window']}-r{spec['rep']}"
+    return specs
+
+
 def expected_cases(scope='full'):
     return {spec['case_id'] + '-' + mode:
             (spec['family'], spec['build'], spec['value'], spec['batch'], spec['window'], spec['rep'], mode, spec['case_id'])
@@ -101,6 +118,9 @@ def expected_cases(scope='full'):
 
 
 def flags(spec, mode, external=False, prepare=False, transport_config=None):
+    if {'shard_cache', 'shard_cache_bytes', 'shard_cache_mib', 'shard_cache_mib_by_repetition',
+        'resident_reads', 'registered_value', 'registration_profile'} & spec.keys():
+        raise ValueError('owner cache and registered-value controls are obsolete')
     if transport_config is None:
         transport_args = ['--transport', spec['transport']]
     else:
@@ -118,8 +138,7 @@ def flags(spec, mode, external=False, prepare=False, transport_config=None):
         result += ['--tcp-read-lanes', str(spec['lanes'])]
         if not external or prepare:
             result += ['--tcp-server-read-workers', str(spec['workers']),
-                       '--tcp-wal-member-read', spec['member'],
-                       '--tcp-shard-cache-bytes', str(spec['shard_cache'])]
+                       '--tcp-wal-member-read', spec['member']]
     if spec['build'] == 'current':
         result += ['--read-memory-allowance-bytes', str(spec['read_allowance']),
                    '--cache-probe-keys', str(spec['cache_probe_keys']),
@@ -128,6 +147,16 @@ def flags(spec, mode, external=False, prepare=False, transport_config=None):
             result += ['--shard-read-memory-allowance-bytes', str(spec['shard_allowance'])]
     if prepare:
         result += ['--backend', 'tcp']
+    return result
+
+
+def historical_flags(spec, mode, external=False, prepare=False, transport_config=None):
+    """Reconstruct archived commands; never use to launch current cases."""
+    current = {key: value for key, value in spec.items() if key != 'shard_cache'}
+    result = flags(current, mode, external, prepare, transport_config)
+    if (mode == 'tcp' or prepare) and (not external or prepare):
+        index = result.index('--tcp-wal-member-read') + 2
+        result[index:index] = ['--tcp-shard-cache-bytes', str(spec['shard_cache'])]
     return result
 
 
@@ -208,7 +237,8 @@ def read_metrics(path, spec, mode):
         if not math.isclose(float(row['instrumented_phase_ops_per_sec']), rate, rel_tol=1e-8):
             raise ValueError('throughput differs from operation count/wall')
         if spec['build'] == 'current':
-            if row['transport'] != metadata_transport_label(spec['transport']):
+            expected_transport = (spec['transport'] if 'shard_cache' in spec else metadata_transport_label(spec['transport']))
+            if row['transport'] != expected_transport:
                 raise ValueError('paired transport identity differs')
             mixed = phase.startswith(('mixed_', 'concurrent_mixed_'))
             if row['rate_scope'] != ('shared_read_write_wall' if mixed else 'phase_wall'):
@@ -260,7 +290,8 @@ def read_metrics(path, spec, mode):
             for row in read_csv(path / 'write_windows.csv'):
                 dimensions(row)
                 phase = row['phase']
-                if int(row['sample']) != len(windows[phase]) or row['transport'] != metadata_transport_label(spec['transport']):
+                expected_transport = (spec['transport'] if 'shard_cache' in spec else metadata_transport_label(spec['transport']))
+                if int(row['sample']) != len(windows[phase]) or row['transport'] != expected_transport:
                     raise ValueError('write-window identity differs')
                 windows[phase].append(row)
                 parents = sum(number(row[k]) for k in ('preparation_admission_ns', 'storage_wait_ns', 'publication_ns', 'dispatch_ns', 'checkpoint_ns'))
@@ -298,7 +329,7 @@ def read_metrics(path, spec, mode):
     return metrics
 
 
-def read_cache_metrics(path, spec, dimensions):
+def historical_read_cache_metrics(path, spec, dimensions):
     snapshots, metrics = {}, {}
     roles = {('frontend', '')} | {('storage', str(n)) for n in range(5)}
     counters = ('cache_hits', 'cache_misses', 'cache_evictions', 'wal_reads', 'wal_read_bytes')
@@ -311,7 +342,7 @@ def read_cache_metrics(path, spec, dimensions):
         identity = row['phase'], row['boundary'], role
         if identity in snapshots or role not in roles or row['boundary'] not in ('before', 'after'):
             raise ValueError('duplicate/invalid cache snapshot')
-        budget = spec['cache'] if role[0] == 'frontend' else spec['shard_cache']
+        budget = spec['cache'] if role[0] == 'frontend' else spec.get('shard_cache', 0)
         if int(row['cache_budget_bytes']) != budget or not 0 <= int(row['cache_metadata_bytes']) <= int(row['cache_retained_bytes']) <= budget:
             raise ValueError('cache budget/ownership evidence differs')
         if role[0] == 'storage':
@@ -355,6 +386,68 @@ def read_cache_metrics(path, spec, dimensions):
     return metrics
 
 
+def read_cache_metrics(path, spec, dimensions):
+    if spec['build'] == 'baseline' or 'shard_cache' in spec:
+        return historical_read_cache_metrics(path, spec, dimensions)
+    if {'shard_cache', 'shard_cache_bytes', 'resident_reads'} & spec.keys():
+        raise ValueError('owner cache and registered-value controls are obsolete')
+    snapshots, metrics = {}, {}
+    roles = {('frontend', '')} | {('storage', str(n)) for n in range(5)}
+    for row in read_csv(path / 'read_path_evidence.csv'):
+        dimensions(row)
+        role = row['role'], row['partition']
+        identity = row['phase'], row['boundary'], role
+        if identity in snapshots or role not in roles or row['boundary'] not in ('before', 'after'):
+            raise ValueError('duplicate/invalid cache snapshot')
+        if role[0] == 'frontend':
+            budget = int(row['coordinator_cache_budget_bytes'])
+            retained = int(row['coordinator_cache_retained_bytes'])
+            metadata = int(row['coordinator_cache_metadata_bytes'])
+            if budget != spec['cache'] or not 0 <= metadata <= retained <= budget:
+                raise ValueError('coordinator cache budget/ownership evidence differs')
+            if not budget and any(int(row['coordinator_cache_' + k]) for k in ('entries', 'hits', 'evictions')):
+                raise ValueError('disabled coordinator cache retained/hit/evicted entries')
+        else:
+            if any(value != '' for key, value in row.items() if key.startswith('coordinator_cache_')):
+                raise ValueError('owner row contains coordinator cache evidence')
+            for current, peak, limit in (('inflight_requests', 'peak_inflight_requests', 32),
+                                         ('inflight_bytes', 'peak_inflight_bytes', 64 * MIB),
+                                         ('inflight_reads', 'peak_inflight_reads', 128)):
+                if not 0 <= int(row[current]) <= int(row[peak]) <= limit:
+                    raise ValueError('shard credit bound exceeded')
+            if int(row['peak_device_reads']) > 128:
+                raise ValueError('device credit bound exceeded')
+            if not 0 <= int(row['idle_buffer_bytes']) <= 64 * MIB - int(row['inflight_bytes']):
+                raise ValueError('idle buffers exceeded pending-byte budget')
+            if not 0 <= int(row['idle_buffers']) <= 128:
+                raise ValueError('idle buffer count exceeded its bound')
+        snapshots[identity] = row
+    phases = {identity[0] for identity in snapshots}
+    if not {'point_get', 'point_get_window'} <= phases:
+        raise ValueError('missing cache tier evidence')
+    if set(snapshots) != {(phase, boundary, role) for phase in phases for boundary in ('before', 'after') for role in roles}:
+        raise ValueError('missing cache snapshot')
+    for phase in phases:
+        for role in roles:
+            before, after = (snapshots[phase, boundary, role] for boundary in ('before', 'after'))
+            counters = (('cache_hits', 'cache_misses', 'cache_evictions', 'cache_bypass_disabled',
+                         'cache_bypass_eviction_limit', 'cache_admitted_charge_bytes', 'cache_served_accounted_bytes')
+                        if role[0] == 'frontend' else
+                        ('wal_reads', 'wal_read_bytes', 'buffer_reuses', 'buffer_allocations'))
+            for key in counters:
+                field = 'coordinator_' + key if role[0] == 'frontend' else key
+                delta = int(after[field]) - int(before[field])
+                if min(int(before[field]), int(after[field]), delta) < 0:
+                    raise ValueError('read-path counter regressed')
+                identity = 'read_path', phase, role[0] + '-' + key
+                metrics[identity] = metrics.get(identity, 0) + delta
+    if spec['cache_probe_keys'] and metrics['read_path', 'cache_probe_scan', 'frontend-cache_admitted_charge_bytes'] != 0:
+        raise ValueError('scan polluted coordinator point cache')
+    if spec['workload'] == 'pressure' and metrics['read_path', 'point_get', 'frontend-cache_misses'] <= 0:
+        raise ValueError('pressure case lacks coordinator misses')
+    return metrics
+
+
 def read_cloud_case(root, name, spec, mode):
     """Apply the same workload validator plus exact remote ownership/provenance."""
     from pathlib import PurePosixPath
@@ -370,9 +463,11 @@ def read_cloud_case(root, name, spec, mode):
     process = audit.read_json(root / (name + '-process.command.json'))
     command_backend = 'tcp' if mode == 'tcp' else mode
     expected = [binary, '--output', str(base / 'results' / name), '--backend', command_backend]
+    historical = 'shard_cache' in spec
     transport_config = (case_root.parent / 'requested-configs' / spec['case_id'] / 'transport.json'
-                        if spec['build'] == 'current' else None)
-    expected += flags(spec, mode, external=mode == 'tcp', transport_config=transport_config)
+                        if spec['build'] == 'current' and not historical else None)
+    command_flags = historical_flags if historical else flags
+    expected += command_flags(spec, mode, external=mode == 'tcp', transport_config=transport_config)
     if mode == 'tcp':
         expected += ['--remote-config', str(case_root / 'remote.yaml')]
     if (process.get('exit_code') != 0 or process['command'][0] != binary or
@@ -381,18 +476,23 @@ def read_cloud_case(root, name, spec, mode):
     preparation = audit.read_json(root / (spec['case_id'] + '-prepare.command.json'))
     endpoints = ','.join(n['private_ip'] + ':7700' for n in sorted(cfg['nodes'], key=lambda n: n['partition']))
     transport_config = (case_root.parent / 'requested-configs' / spec['case_id'] / 'transport.json'
-                        if spec['build'] == 'current' else None)
+                        if spec['build'] == 'current' and not historical else None)
     expected = [binary, '--prepare-external-case', str(case_root), '--guest-case-root', str(case_root),
-                '--remote-endpoints', endpoints] + flags(spec, 'tcp', prepare=True,
+                '--remote-endpoints', endpoints] + command_flags(spec, 'tcp', prepare=True,
                                                          transport_config=transport_config)
-    if spec['build'] == 'current':
+    if spec['build'] == 'current' and not historical:
         expected += ['--owner-transports', str(case_root.parent / 'requested-configs' / spec['case_id'] / 'owner-transports.json')]
     if (preparation.get('exit_code') != 0 or preparation['command'][0] != binary or
             efa_progress.command_options(preparation['command']) != efa_progress.command_options(expected)):
         raise ValueError('prepared RAM node/coordinator controls differ')
-    if spec['build'] == 'current':
+    if spec['build'] == 'current' and not historical:
         audit.validate_prepared_transport(root, spec['case_id'], spec['transport'], cfg['nodes'])
     remote = (root / (spec['case_id'] + '-remote.yaml')).read_text()
+    if historical:
+        from transport_floor import yaml_one
+        document = yaml_one(remote)
+        if document['tls']['transport'] != spec['transport']:
+            raise ValueError('historical remote transport differs')
     settings = [('read_lanes', spec['lanes']), ('read_cache_bytes', spec['cache'])]
     if spec['build'] == 'current':
         settings.append(('read_memory_allowance_bytes', spec['read_allowance']))

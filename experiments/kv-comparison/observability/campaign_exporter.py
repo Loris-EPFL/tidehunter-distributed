@@ -152,9 +152,13 @@ def read_path_metrics(evidence, labels):
     owner = evidence.get("owner_io")
     if not isinstance(owner, dict):
         return result
+    # Historical snapshots may contain owner-cache counters; emit only observed fields.
     families = (("owner", "available", "owner_read_executor_stats",
-                 ("cache_hits", "cache_misses", "wal_reads", "async_read_submissions",
-                  "resident_read_successes", "errors")),
+                 ("wal_reads", "wal_read_bytes", "async_read_submissions", "completed_reads",
+                  "errors", "cancellations", "buffer_reuses", "buffer_allocations",
+                  "resident_read_attempts", "resident_read_successes", "resident_read_fallbacks",
+                  "resident_read_unsupported", "resident_read_partial", "resident_read_deferred",
+                  "cache_hits", "cache_misses")),
                 ("resident", "resident_available", "resident_read_stats",
                  ("rma_hits", "rma_errors", "fallback_missing", "fallback_capacity",
                   "message_read_requests", "grant_candidates", "grant_unavailable")))
@@ -193,7 +197,8 @@ def measurement_read_metrics(evidence, labels):
     labels = labels | {"scope": "measurement_boundary"}
     result = ""
     if deltas.get("available") is False:
-        return sample("kv_case_read_evidence_available", 0, labels | {"component": "measurement"})
+        return (sample("kv_case_read_evidence_available", 0, labels | {"component": "measurement"})
+                + nvmeof_reader_metrics(evidence.get("nvmeof"), labels))
     def emit(row, local):
         if not isinstance(row, dict) or type(row.get("available")) is not bool:
             raise ValueError("invalid measurement read component")
@@ -206,7 +211,9 @@ def measurement_read_metrics(evidence, labels):
                 text += sample("kv_case_read_path_calls", count(value), local | {"path": token(name)})
         return text
     result += emit(deltas.get("coordinator"), labels | {"component": "coordinator"})
-    components = ("owner_executor", "client_resident")
+    components = ("owner_executor",)
+    if "client_resident" in deltas:
+        components += ("client_resident",)
     if "owner_grants" in deltas:
         components += ("owner_grants",)
     if "owner_output_abandoned" in deltas:
@@ -291,10 +298,12 @@ def measurement_read_metrics(evidence, labels):
             for partition, stages in partitions.items():
                 if not partition.isascii() or not partition.isdecimal() or str(int(partition)) != partition:
                     raise ValueError("invalid owner response partition")
-                if not isinstance(stages, dict) or set(stages) != {
-                        "read_response_encode", "read_output_queue", "read_output_submit", "read_response_retire",
-                        "read_grant_lookup", "read_grant_reservation", "read_grant_envelope",
-                        "read_grant_registration", "read_grant_recheck_publication"}:
+                current_stages = {"read_response_encode", "read_output_queue", "read_output_submit",
+                                  "read_response_retire"}
+                historical_stages = current_stages | {
+                    "read_grant_lookup", "read_grant_reservation", "read_grant_envelope",
+                    "read_grant_registration", "read_grant_recheck_publication"}
+                if not isinstance(stages, dict) or set(stages) not in (current_stages, historical_stages):
                     raise ValueError("invalid owner response stages")
                 for stage, row in stages.items():
                     dimensions = local | {"partition": partition, "stage": stage}
@@ -375,6 +384,56 @@ def measurement_read_metrics(evidence, labels):
                         result += sample("kv_case_read_boundary_gauge", count(row[field]),
                                          labels | {"boundary": boundary, "component": component,
                                                    "partition": partition, "gauge": field})
+    return result + nvmeof_reader_metrics(evidence.get("nvmeof"), labels)
+
+
+def nvmeof_reader_metrics(nvme, labels):
+    result = ""
+    if nvme is not None:
+        if not isinstance(nvme, dict) or type(nvme.get("available")) is not bool:
+            raise ValueError("invalid NVMe measurement evidence")
+        result += sample("kv_nvmeof_reader_evidence_available", int(nvme["available"]), labels)
+        readers = nvme.get("readers")
+        if readers is not None:
+            if not isinstance(readers, dict) or len(readers) > 128:
+                raise ValueError("invalid NVMe measurement readers")
+            for index, row in enumerate(readers.values()):
+                if not isinstance(row, dict) or type(row.get("available")) is not bool:
+                    raise ValueError("invalid NVMe reader")
+                identity = row.get("identity")
+                if not isinstance(identity, dict):
+                    raise ValueError("missing NVMe reader identity")
+                transport = identity.get("transport")
+                if transport not in (None, "tcp", "rdma"):
+                    raise ValueError("invalid NVMe reader transport")
+                local = labels | {"reader": str(index), "partition": str(count(identity.get("partition"))),
+                                  "transport": transport or "unknown"}
+                result += sample("kv_nvmeof_reader_available", int(row["available"]), local)
+                counters = row.get("counters")
+                if isinstance(counters, dict) and counters.get("available") is True:
+                    values = counters.get("counters")
+                    if not isinstance(values, dict):
+                        raise ValueError("invalid NVMe reader counters")
+                    for name, value in values.items():
+                        result += sample("kv_nvmeof_reader_count", count(value), local | {"counter": token(name)})
+                stages = row.get("stages")
+                if not isinstance(stages, dict):
+                    raise ValueError("invalid NVMe reader stages")
+                for stage, stage_row in stages.items():
+                    if not isinstance(stage_row, dict):
+                        raise ValueError("invalid NVMe reader stage")
+                    delta = stage_row.get("delta")
+                    if not isinstance(delta, dict) or type(delta.get("available")) is not bool:
+                        raise ValueError("invalid NVMe stage availability")
+                    stage_labels = local | {"stage": token(stage)}
+                    result += sample("kv_nvmeof_reader_stage_available", int(delta["available"]), stage_labels)
+                    if delta["available"]:
+                        values = delta.get("counters")
+                        if not isinstance(values, dict):
+                            raise ValueError("invalid NVMe stage counters")
+                        result += sample("kv_nvmeof_reader_stage_count", count(values.get("count")), stage_labels)
+                        result += sample("kv_nvmeof_reader_stage_seconds", count(values.get("sum_ns")) / 1e9,
+                                         stage_labels | {"statistic": "sum"})
     return result
 
 
@@ -515,13 +574,22 @@ def resource_interval_metrics(evidence, labels):
         local = labels | {"scope": evidence["scope"], "resource_host_index": str(host), "process_role": role}
         result += sample("kv_case_resource_interval_available", int(row["available"]), local)
         required = {"host_index", "process_role", "available"}
+        partial = not row["available"] and row.get("core_available") is True
         if not row["available"]:
             reason = row.get("reason")
-            if (set(row) != required | {"reason"} or not isinstance(reason, str)
-                    or not reason.strip() or len(reason) > 512):
-                raise ValueError("unavailable resource evidence requires only a bounded reason")
-            continue
-        if (not required | {"elapsed_seconds"} <= set(row)
+            if not isinstance(reason, str) or not reason.strip() or len(reason) > 512:
+                raise ValueError("unavailable resource evidence requires a bounded reason")
+            if not partial:
+                if set(row) != required | {"reason"}:
+                    raise ValueError("unavailable resource evidence requires only a bounded reason")
+                continue
+            core_integers = integers - {"io_read_bytes", "io_write_bytes"}
+            if (not required | {"reason", "core_available", "elapsed_seconds", "cpu_seconds"} <= set(row)
+                    or set(row) - required - seconds - core_integers - {"reason", "core_available", "elapsed_seconds"}):
+                raise ValueError("invalid partially available resource fields")
+            result += sample("kv_case_resource_interval_core_available", 1, local)
+            result += sample("kv_case_resource_interval_io_available", 0, local)
+        elif (not required | {"elapsed_seconds"} <= set(row)
                 or set(row) - required - seconds - integers - {"elapsed_seconds"}):
             raise ValueError("invalid available resource fields")
         elapsed = number(row["elapsed_seconds"])
@@ -706,7 +774,10 @@ def read_diagnostic_metrics(evidence, labels):
             if len(value) > 2048:
                 raise ValueError("read diagnostic string exceeds bound")
         elif value is not None and not isinstance(value, bool):
-            count(value)
+            if isinstance(value, float):
+                number(value)
+            else:
+                count(value)
 
     bounded(evidence)
     if (type(evidence["schema_version"]) is not int or evidence["schema_version"] != 1
@@ -745,16 +816,24 @@ def read_diagnostic_metrics(evidence, labels):
     if counters is not None and not isinstance(counters, dict):
         raise ValueError("invalid read diagnostic counters")
     coverage = profile.get("coverage") if profile is not None else None
+    coverage_populations = ("selected_remote_requests", "completed_remote_requests", "profiled_owner_responses")
     if coverage is not None:
-        if (not isinstance(coverage, dict) or set(coverage) != {
-                "selected_remote_requests", "completed_remote_requests", "profiled_owner_responses", "reason"}
+        coverage_fields = set(coverage_populations) | {"reason"}
+        if (not isinstance(coverage, dict)
+                or set(coverage) not in (coverage_fields, coverage_fields | {"nvme_completed"})
                 or not isinstance(coverage["reason"], str)):
             raise ValueError("invalid read diagnostic coverage")
-        for field in ("selected_remote_requests", "completed_remote_requests", "profiled_owner_responses"):
+        # Historical artifacts lack this counter. Do not invent an observed zero.
+        if "nvme_completed" in coverage:
+            coverage_populations += ("nvme_completed",)
+        for field in coverage_populations:
             count(coverage[field])
         if not (coverage["completed_remote_requests"] <= coverage["selected_remote_requests"]
                 <= selection["requested_limit"]):
             raise ValueError("invalid read diagnostic coverage populations")
+        if ("nvme_completed" in coverage
+                and coverage["nvme_completed"] > coverage["completed_remote_requests"]):
+            raise ValueError("NVMe diagnostic completions exceed completed remote requests")
     def stage_group(group_stages, group_counters, selected_population=selected):
         if not isinstance(group_stages, dict) or not isinstance(group_counters, dict):
             raise ValueError("invalid read diagnostic stages or counters")
@@ -800,7 +879,7 @@ def read_diagnostic_metrics(evidence, labels):
     for population in ("requested_limit", "selected_operations", "completed_operations"):
         result += sample("kv_case_read_diagnostic_operations", selection[population], local | {"population": population})
     if coverage is not None and eligible:
-        for population in ("selected_remote_requests", "completed_remote_requests", "profiled_owner_responses"):
+        for population in coverage_populations:
             result += sample("kv_case_read_diagnostic_operations", coverage[population], local | {"population": population})
     for partition, observations, group_counters in groups:
         population_eligible = eligible or (
@@ -1032,8 +1111,10 @@ def read_tier_metrics(job, labels, effective=None):
             raise ValueError("invalid read tier policy")
         for key, allowed in (("registered_policy", {"disabled", "hardware_required"}),
                              ("page_cache_policy", {"not_dropped", "drop_at_measurement_gate"})):
+            if key == "registered_policy" and key not in policy:
+                continue
             value = policy.get(key)
-            if value is None and policy_scope == "effective":
+            if value is None and (policy_scope == "effective" or key == "registered_policy"):
                 result += sample("kv_case_cache_policy_field_available", 0,
                                  labels | {"policy_scope": policy_scope, "setting": key})
                 continue
@@ -1045,10 +1126,12 @@ def read_tier_metrics(job, labels, effective=None):
                              labels | {"policy_scope": policy_scope, "component": key, "policy": value})
         for key in ("coordinator_cache_bytes", "owner_read_cache_bytes", "warmup_operations",
                     "read_lanes", "concurrency"):
+            if key == "owner_read_cache_bytes" and key not in policy:
+                continue
             value = policy.get(key)
             result += sample("kv_case_cache_policy_field_available", int(value is not None),
                              labels | {"policy_scope": policy_scope, "setting": key})
-            if value is None and policy_scope == "effective":
+            if value is None and (policy_scope == "effective" or key == "owner_read_cache_bytes"):
                 continue
             result += sample("kv_case_cache_policy_value", count(value),
                              labels | {"policy_scope": policy_scope, "setting": key})

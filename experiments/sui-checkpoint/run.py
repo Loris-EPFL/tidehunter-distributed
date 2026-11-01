@@ -484,11 +484,8 @@ def main():
     parser.add_argument('--deadline', type=int, default=900)
     parser.add_argument('--port', type=int, default=24000)
     parser.add_argument('--coordinator-cache-mib', type=int, default=8)
-    parser.add_argument('--shard-cache-mib', type=int, default=0)
     parser.add_argument('--transport-config', type=Path,
                         help='canonical client Transport JSON for local/manual replay; defaults to TCP')
-    parser.add_argument('--resident-reads', type=Path,
-                        help='bounded per-database registered-read JSON policy; requires trusted-native fabric')
     parser.add_argument('--read-profile-limit', type=int, default=0,
                         help='maximum profiled remote read RPCs per DB, 0 disables diagnostics')
     parser.add_argument('--write-profile-limit', type=int, default=0,
@@ -504,7 +501,7 @@ def main():
         raise ValueError('external config, resources and stage directory must be supplied together')
     if not 30 <= args.deadline <= 3600 or not 1024 <= args.port <= 65000:
         raise ValueError('deadline/port outside bounds')
-    if any(not 0 <= value <= 128 for value in (args.coordinator_cache_mib,args.shard_cache_mib)):
+    if not 0 <= args.coordinator_cache_mib <= 128:
         raise ValueError('per-database cache bound is 0..128 MiB')
     if not 0 <= args.read_profile_limit <= 65536:
         raise ValueError('read profile limit must be 0..65536')
@@ -519,8 +516,6 @@ def main():
     if (not args.external_config and deployment.is_fabric(local_transport)
             and not deployment.is_software(local_transport)):
         raise ValueError('local replay accepts only TCP or software OFI; hardware uses external deployment')
-    resident = (deployment.resident_read_config(read_json(args.resident_reads.resolve(strict=True)))
-                if args.resident_reads else None)
     build_root, fixture, root = args.build.resolve(strict=True), args.fixture.resolve(strict=True), args.output.resolve()
     manifest = read_json(build_root / 'build-manifest.json')
     plan = read_json(build_root / 'plan.json')
@@ -592,12 +587,12 @@ def main():
     env = deployment.process_environment(env, transport={'kind': 'tcp'} if args.external_config else local_transport)
     owned=Owned(output,env)
     producer_env = checkpoint.source_environment(prior)
-    result=dict(schema=1,metrics_schema=2,protocol=manifest['protocol'],backend='tidehunter-sharded-wal',durability='synchronous durable whole-batch publication',
+    result=dict(schema=1,metrics_schema=3,protocol=manifest['protocol'],backend='tidehunter-sharded-wal',durability='synchronous durable whole-batch publication',
         fixture=str(fixture),fixture_files=fixture_files,checkpoint_limit=tip,checkpoint_digest=expected_digest,
         build_manifest_sha256=build.digest(build_root/'build-manifest.json'),source_archive_sha256=manifest['source_archive_sha256'],
         binaries=manifest['binaries'],configurations=configs,
         environment={k:v for k,v in env.items() if k.startswith(('RUST_LOG','TOKIO_','USE_TIDEHUNTER','TH_','SUI_TH_','LD_LIBRARY_PATH','FI_'))},
-        cache=dict(coordinator_bytes=args.coordinator_cache_mib*deployment.MIB,shard_bytes=args.shard_cache_mib*deployment.MIB),
+        cache=dict(coordinator_bytes=args.coordinator_cache_mib*deployment.MIB),
         topology='five physical shards per database; '+('external hosts' if args.external_config else 'loopback, one SSD/shared host memory'),
         local_transport=None if args.external_config else local_transport,
         read_profile_limit=args.read_profile_limit,write_profile_limit=args.write_profile_limit,
@@ -652,21 +647,16 @@ def main():
                     raise ValueError('external control endpoints differ from five prepared storage hosts')
                 if database['read_cache_bytes'] != result['cache']['coordinator_bytes']:
                     raise ValueError('external coordinator cache differs')
-                if (resident is not None and
-                        deployment.resident_read_config(database['tls'].get('resident_reads')) != resident):
-                    raise ValueError('external resident-read policy differs from requested population')
             if (external_manifest['config_sha256'] != build.digest(config_path)
-                    or external_manifest['build_manifest_sha256'] != result['build_manifest_sha256']
-                    or external_manifest['shard_cache_bytes'] != result['cache']['shard_bytes']):
-                raise ValueError('external storage source/config/cache binding differs')
+                    or external_manifest['build_manifest_sha256'] != result['build_manifest_sha256']):
+                raise ValueError('external storage source/config binding differs')
             result['external_manifest']=external_manifest
         else:
             config_path=output/'deployment/config.json'
             config,nodes=deployment.prepare(config_path.parent,schema,remote_root,
                 shape_yamls={name:(output/'native-schema'/name/'shape.yaml').read_text() for name in schema},hosts=['127.0.0.1']*5,
                 port=args.port,transport=local_transport,coordinator_cache=result['cache']['coordinator_bytes'],
-                shard_cache=result['cache']['shard_bytes'],write_profile_limit=args.write_profile_limit,
-                resident_reads=resident)
+                write_profile_limit=args.write_profile_limit)
             for index,node in enumerate(nodes):
                 child=owned.start(f'storage-{index}',[bins/'storage-node','--experimental-storage-node',node['launch']])
                 shards.append(child)
@@ -679,9 +669,6 @@ def main():
                for database in config['databases'].values()):
             raise ValueError('prepared write profiling differs from requested population')
         result['deployment']=config
-        result['resident_reads_by_namespace'] = {
-            name: deployment.resident_read_config(database['tls'].get('resident_reads'))
-            for name, database in config['databases'].items()}
         remote_extra=dict(SUI_SHARDED_WAL_CONFIG=str(config_path),SUI_SHARDED_WAL_SCHEMA_OUTPUT=str(output/'remote-schema'))
         if args.external_config:
             binding = dict(config_sha256=build.digest(config_path),

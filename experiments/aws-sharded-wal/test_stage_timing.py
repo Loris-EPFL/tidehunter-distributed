@@ -29,7 +29,7 @@ def configuration():
         protocol=version) for label, version in profile.PROTOCOLS.items()}
     identities['baseline'].update(source_tree_sha256=profile.BASELINE_SOURCE_SHA256,
         local_binary_sha256=profile.BASELINE_BINARY_SHA256,
-        local_floor_binary_sha256=transport_floor.CURRENT_FLOOR_BINARY_SHA256)
+        local_floor_binary_sha256=profile.BASELINE_FLOOR_BINARY_SHA256)
     return dict(campaign='stage-timing', run_id=run, account=control.ACCOUNT, region='us-east-1',
         instance_type='c6id.32xlarge', availability_zone='us-east-1a', placement_group=run,
         placement_strategy='cluster', ttl_seconds=1500, export_reserve_seconds=300,
@@ -103,13 +103,80 @@ class StageTimingTests(unittest.TestCase):
                 self.assertEqual((s['samples'], s['floor_repetitions'], s['floor_values'], s['idle_us'], s['profile']),
                                  (1000, 3, [1024, 8192], 0, False))
                 self.assertIn('--transport', profile.flags(s, 'tcp', prepare=True))
-                self.assertNotIn('--tcp-polling', profile.flags(s, 'tcp', prepare=True))
+                self.assertIn('--tcp-polling', profile.flags(s, 'tcp', prepare=True))
                 self.assertEqual(profile.floor_flags(s)[-4:], ['--warmup', '64', '--shards', '5'])
         self.assertEqual(len(transport_floor.expected_cases()), 216)
-        self.assertEqual(transport_floor.CURRENT_SOURCE_SHA256,
+        self.assertEqual(profile.BASELINE_SOURCE_SHA256,
                          '4facb657c3b84720991cd02f18a97b3a53934e3edd1c8b49a5c139616d582239')
         with self.assertRaises(ValueError):
             profile.plan('core')
+
+    def test_stage_baseline_retains_supported_policy_controls(self):
+        spec = next(s for s in profile.plan() if s['build'] == 'baseline')
+        live = profile.flags(spec, 'tcp', prepare=True)
+        historical = profile.historical_flags(spec | {'shard_cache': 0}, 'tcp', prepare=True)
+        for args in (live, historical):
+            self.assertIn('--tcp-polling', args)
+            self.assertIn('--tcp-resident-first', args)
+            self.assertIn('--read-memory-allowance-bytes', args)
+            self.assertIn('--shard-read-memory-allowance-bytes', args)
+        self.assertNotIn('--tcp-shard-cache-bytes', live)
+        self.assertIn('--tcp-shard-cache-bytes', historical)
+
+    def test_historical_configuration_is_source_bound_and_never_admitted_as_current(self):
+        cfg = configuration()
+        identity = cfg['source_identities']['current']
+        identity.update(protocol=6, source_tree_sha256=profile.HISTORICAL_CURRENT_SOURCE_SHA256,
+                        local_binary_sha256=profile.HISTORICAL_CURRENT_BINARY_SHA256,
+                        local_floor_binary_sha256=profile.HISTORICAL_CURRENT_FLOOR_SHA256)
+        profile.historical_validate_configuration(cfg)
+        with self.assertRaises(ValueError):
+            profile.validate_configuration(cfg)
+        identity['source_tree_sha256'] = 'f' * 64
+        with self.assertRaises(ValueError):
+            profile.historical_validate_configuration(cfg)
+
+    def test_current_and_historical_timing_schema_are_distinct(self):
+        spec = next(s for s in profile.plan() if s['build'] == 'current' and not s['diagnostics'])
+        metadata = ('stage_times_are_nested_not_additive=true\n'
+                    'transport_io_time_includes_provider_work=true\n'
+                    'storage_persist_time_includes_file_lookup_and_sync=true\n')
+        with patch.object(profile.transport_floor, 'read_wal_metrics', return_value={}):
+            (self.root / 'campaign.txt').write_text(metadata + 'diagnostic_timing_schema=7\n')
+            profile.read_wal_metrics(self.root, spec, 'tcp')
+            with self.assertRaises(ValueError):
+                profile.historical_read_wal_metrics(self.root, spec | {'shard_cache': 0}, 'tcp')
+            (self.root / 'campaign.txt').write_text(metadata + 'diagnostic_timing_schema=6\n')
+            profile.historical_read_wal_metrics(self.root, spec | {'shard_cache': 0}, 'tcp')
+            with self.assertRaises(ValueError):
+                profile.read_wal_metrics(self.root, spec, 'tcp')
+
+    def test_baseline_node_policy_keeps_its_real_build_and_checks_polling(self):
+        spec = next(s for s in profile.plan() if s['build'] == 'baseline')
+        launch = {'limits': {'polling': spec['polling']},
+                  'node': {'read_resident_first': spec['resident_first']}}
+        with patch.object(profile.transport_floor, 'validate_node_policy') as validate, \
+             patch.object(profile.transport_floor, 'yaml_one', return_value=launch):
+            profile.validate_node_policy(self.root, spec, 'baseline launch', 0)
+            validate.assert_called_once_with(self.root, spec, 'baseline launch', 0)
+            launch['limits']['polling'] = 'not-the-requested-policy'
+            with self.assertRaises(ValueError):
+                profile.validate_node_policy(self.root, spec, 'baseline launch', 0)
+
+    def test_frozen_protocol6_samples_keep_their_legacy_schema_and_bound(self):
+        spec = next(s for s in profile.historical_plan() if s['diagnostics'])
+        fields = ('index_ns', 'dispatch_ns', 'wait_ns', 'actor_queue_ns', 'actor_service_ns',
+                  'actor_return_ns', 'request_encode_ns', 'exchange_ns', 'response_decode_ns',
+                  'record_verify_ns', 'server_handler_ns', 'server_inventory_wait_ns',
+                  'server_authority_lookup_ns', 'server_record_read_ns', 'cache_hits',
+                  'cache_misses', 'whole_call_ns', 'inline_read_ns')
+        rows = [dict(state=state, sample=sample) | dict.fromkeys(fields, 1)
+                for state in ('warm', 'reopened-cache-cleared', 'cache-evicted')
+                for sample in range(min(spec['reads'], 256))]
+        table(self.root / 'remote_read_profiles.csv', rows)
+        profile.validate_read_samples(self.root, spec, 'tcp', historical=True)
+        with self.assertRaises(ValueError):
+            profile.validate_read_samples(self.root, spec, 'tcp')
 
     def test_actual_placement_group_type_zone_and_ownership_are_required(self):
         cfg = configuration()
@@ -245,12 +312,16 @@ class StageTimingTests(unittest.TestCase):
         spec = next(s for s in profile.plan() if s['diagnostics'])
         for mode, filename, reopened in [('tcp', 'remote_read_profiles.csv', 'reopened-cache-cleared'),
                                          ('native-sync', 'native_read_profiles.csv', 'reopened-warm')]:
-            rows = [dict(state=state, sample=sample) for state in ('warm', reopened, 'cache-evicted') for sample in range(256)]
+            rows = [dict(state=state, sample=sample) for state in ('warm', reopened, 'cache-evicted')
+                    for sample in range(min(spec['reads'], 256) if state == 'cache-evicted' else spec['reads'])]
             fields = ('index_ns', 'wal_and_decode_ns', 'whole_call_ns', 'dispatch_ns', 'wait_ns',
                       'actor_queue_ns', 'actor_service_ns', 'actor_return_ns', 'request_encode_ns',
                       'exchange_ns', 'response_decode_ns', 'record_verify_ns', 'server_handler_ns',
-                      'server_inventory_wait_ns', 'server_authority_lookup_ns', 'server_record_read_ns', 'inline_read_ns')
-            rows = [row | {field: 1 for field in fields} for row in rows]
+                      'server_authority_lookup_ns', 'server_record_read_ns', 'inline_read_ns',
+                      'server_response_recheck_wait_ns', 'server_response_recheck_ns',
+                      'server_response_recheck_samples', 'wire_read_requests', 'cache_hits', 'cache_misses')
+            rows = [row | {field: 1 for field in fields} | dict(value_cache_hit='false',
+                    server_timing_available='true') for row in rows]
             table(self.root / filename, rows)
             profile.validate_read_samples(self.root, spec, mode)
             table(self.root / filename, rows[:-1])
@@ -460,7 +531,7 @@ class SourceBindingTests(unittest.TestCase):
             self.manifests[label] = manifest
         for module, key, value in [(profile, 'BASELINE_SOURCE_SHA256', self.manifests['baseline']['source_tree_sha256']),
                                     (profile, 'BASELINE_BINARY_SHA256', self.manifests['baseline']['binary_sha256']),
-                                    (transport_floor, 'CURRENT_FLOOR_BINARY_SHA256', self.manifests['baseline']['floor_binary_sha256'])]:
+                                    (profile, 'BASELINE_FLOOR_BINARY_SHA256', self.manifests['baseline']['floor_binary_sha256'])]:
             patcher = patch.object(module, key, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -480,7 +551,7 @@ class SourceBindingTests(unittest.TestCase):
         self.assertEqual(plan['placement_strategy'], 'cluster')
         self.assertEqual(plan['placement_group'], plan['run_id'])
         self.assertEqual(plan['source_identities']['baseline']['protocol'], 5)
-        self.assertEqual(plan['source_identities']['current']['protocol'], 6)
+        self.assertEqual(plan['source_identities']['current']['protocol'], 15)
         self.assertEqual(plan['source_identities']['current']['source_tree_sha256'], self.manifests['current']['source_tree_sha256'])
         control.Control(run_dir)
         for kwargs in ({'ttl_seconds': 3000}, {'ttl_seconds': 1500, 'efa_instance_type': 'g6.16xlarge'},

@@ -5,7 +5,6 @@
 //! A fixed weak registry is reserved from the pending byte allowance. Every
 //! caller owns bounded result/slot credits; only new storage work owns a request
 //! credit. Pins and authenticated completion checks survive delivery cancellation.
-use super::super::tcp::ReadClass;
 use super::*;
 use crate::distributed::native_index::IndexReadPin;
 use smallvec::SmallVec;
@@ -14,6 +13,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 const BACKPRESSURE: &str = "remote read admission is full";
 const BYTE_BUDGET: &str = "request exceeds pending read byte budget";
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ReadClass {
+    Point,
+    ScanNoFill,
+}
 
 fn member_charge(reference: &ValueRecordReference) -> Result<usize, LocalDbError> {
     let wire = (reference.descriptor.len as usize)
@@ -29,7 +34,6 @@ pub(super) fn admission_error(error: &LocalDbError) -> bool {
 
 struct ReadContext {
     deadline: Instant,
-    class: ReadClass,
     pin: Option<IndexReadPin>,
 }
 
@@ -46,7 +50,6 @@ pub(super) struct ReadBatch {
     owned_lanes: Vec<OwnedLane>,
     state: Arc<State>,
     epoch: u64,
-    resident_enabled: bool,
 }
 
 impl ReadBatch {
@@ -79,7 +82,6 @@ impl ReadBatch {
             owned_lanes: Vec::new(),
             state: service.state.clone(),
             epoch: service.epoch,
-            resident_enabled: service.resident_enabled,
             groups: groups
                 .into_iter()
                 .enumerate()
@@ -148,7 +150,6 @@ impl ReadBatch {
                 false,
                 ReadContext {
                     deadline: self.deadline,
-                    class: self.class,
                     pin: self.pin.clone(),
                 },
                 (self.class == ReadClass::Point).then_some(&mut self.owned_lanes),
@@ -188,12 +189,7 @@ impl ReadBatch {
             let mut progressed = false;
             for owned in &self.owned_lanes {
                 if let Some(mut driver) = owned.lane.driver.try_lock() {
-                    progressed |= progress_read_lane(
-                        &self.state,
-                        &mut driver,
-                        self.epoch,
-                        self.resident_enabled,
-                    );
+                    progressed |= progress_read_lane(&self.state, &mut driver, self.epoch);
                 }
             }
             if progressed {
@@ -270,7 +266,6 @@ macro_rules! read_diagnostics {
                     self.transport_sweeps.load(Ordering::Relaxed) != 0));
                 set("read_profile_server_executor_available", u64::from(self.server_executor_requests.load(Ordering::Relaxed) != 0));
                 set("read_profile_server_planning_available", u64::from(self.server_planning_count.load(Ordering::Relaxed) != 0));
-                set("read_profile_server_cache_resolution_available", u64::from(self.server_cache_resolution_count.load(Ordering::Relaxed) != 0));
                 set("read_profile_server_nowait_available", u64::from(self.server_nowait_count.load(Ordering::Relaxed) != 0));
                 set("read_profile_server_async_available", u64::from(self.server_async_count.load(Ordering::Relaxed) != 0));
                 set("read_profile_server_response_ready_available", u64::from(self.server_response_ready_count.load(Ordering::Relaxed) != 0));
@@ -293,6 +288,10 @@ read_diagnostics!(
     grouped_inline_completed,
     inline_ns,
     actor_completed,
+    nvme_completed,
+    nvme_flight_ns,
+    nvme_flight_count,
+    nvme_flight_max_ns,
     actor_timed_success_count,
     actor_queue_ns,
     actor_service_ns,
@@ -306,26 +305,19 @@ read_diagnostics!(
     response_decode_ns,
     record_verify_ns,
     server_handler_ns,
-    server_inventory_wait_ns,
     server_authority_lookup_ns,
     server_record_read_ns,
     server_response_recheck_wait_ns,
     server_response_recheck_ns,
     server_response_recheck_samples,
-    server_response_recheck_deferrals,
     server_executor_requests,
     server_sync_reader_requests,
-    server_cache_only_requests,
-    server_rma_not_applicable_requests,
     server_planning_ns,
     server_planning_count,
     server_planning_max_ns,
     server_executor_residence_ns,
     server_executor_residence_count,
     server_executor_residence_max_ns,
-    server_cache_resolution_ns,
-    server_cache_resolution_count,
-    server_cache_resolution_max_ns,
     server_nowait_ns,
     server_nowait_count,
     server_nowait_max_ns,
@@ -340,34 +332,6 @@ read_diagnostics!(
     server_response_ready_ns,
     server_response_ready_count,
     server_response_ready_max_ns,
-    server_grant_lookup_ns,
-    server_grant_lookup_count,
-    server_grant_lookup_max_ns,
-    server_grant_lookup_errors,
-    server_grant_reservation_ns,
-    server_grant_reservation_count,
-    server_grant_reservation_max_ns,
-    server_grant_reservation_errors,
-    server_grant_envelope_ns,
-    server_grant_envelope_count,
-    server_grant_envelope_max_ns,
-    server_grant_envelope_errors,
-    server_grant_registration_ns,
-    server_grant_registration_count,
-    server_grant_registration_max_ns,
-    server_grant_registration_errors,
-    server_grant_recheck_publication_ns,
-    server_grant_recheck_publication_count,
-    server_grant_recheck_publication_max_ns,
-    server_grant_recheck_publication_errors,
-    client_grant_install_ns,
-    client_grant_install_count,
-    client_grant_install_max_ns,
-    client_grant_install_errors,
-    client_fi_read_ns,
-    client_fi_read_count,
-    client_fi_read_max_ns,
-    client_fi_read_errors,
     transport_sweeps,
     transport_output_queue_ns,
     transport_output_queue_samples,
@@ -384,66 +348,6 @@ read_diagnostics!(
     transport_cq_timed_calls,
 );
 impl ReadDiagnostics {
-    fn add_grant_stages(&self, tcp: &super::super::tcp::TcpReadProfile) {
-        macro_rules! stage {
-            ($value:expr, $ns:ident, $count:ident, $max:ident, $errors:ident) => {{
-                let value = $value;
-                self.$ns.fetch_add(value.ns, Ordering::Relaxed);
-                self.$count.fetch_add(value.count, Ordering::Relaxed);
-                self.$max.fetch_max(value.max_ns, Ordering::Relaxed);
-                self.$errors.fetch_add(value.errors, Ordering::Relaxed);
-            }};
-        }
-        stage!(
-            &tcp.server_grant.lookup,
-            server_grant_lookup_ns,
-            server_grant_lookup_count,
-            server_grant_lookup_max_ns,
-            server_grant_lookup_errors
-        );
-        stage!(
-            &tcp.server_grant.reservation,
-            server_grant_reservation_ns,
-            server_grant_reservation_count,
-            server_grant_reservation_max_ns,
-            server_grant_reservation_errors
-        );
-        stage!(
-            &tcp.server_grant.envelope,
-            server_grant_envelope_ns,
-            server_grant_envelope_count,
-            server_grant_envelope_max_ns,
-            server_grant_envelope_errors
-        );
-        stage!(
-            &tcp.server_grant.registration,
-            server_grant_registration_ns,
-            server_grant_registration_count,
-            server_grant_registration_max_ns,
-            server_grant_registration_errors
-        );
-        stage!(
-            &tcp.server_grant.recheck_publication,
-            server_grant_recheck_publication_ns,
-            server_grant_recheck_publication_count,
-            server_grant_recheck_publication_max_ns,
-            server_grant_recheck_publication_errors
-        );
-        stage!(
-            &tcp.client_grant_install,
-            client_grant_install_ns,
-            client_grant_install_count,
-            client_grant_install_max_ns,
-            client_grant_install_errors
-        );
-        stage!(
-            &tcp.client_fi_read,
-            client_fi_read_ns,
-            client_fi_read_count,
-            client_fi_read_max_ns,
-            client_fi_read_errors
-        );
-    }
     fn add_wal(&self, wal: super::super::tcp::WalReadProfile) {
         macro_rules! add {
             ($(($counter:ident, $field:ident)),* $(,)?) => {
@@ -453,17 +357,10 @@ impl ReadDiagnostics {
         add!(
             (server_executor_requests, executor_requests),
             (server_sync_reader_requests, sync_reader_requests),
-            (server_cache_only_requests, cache_only_requests),
-            (
-                server_rma_not_applicable_requests,
-                rma_not_applicable_requests
-            ),
             (server_planning_ns, planning_ns),
             (server_planning_count, planning_count),
             (server_executor_residence_ns, executor_residence_ns),
             (server_executor_residence_count, executor_residence_count),
-            (server_cache_resolution_ns, cache_resolution_ns),
-            (server_cache_resolution_count, cache_resolution_count),
             (server_nowait_ns, nowait_ns),
             (server_nowait_count, nowait_count),
             (server_nowait_errors, nowait_errors),
@@ -480,8 +377,6 @@ impl ReadDiagnostics {
             .fetch_max(wal.planning_max_ns, Ordering::Relaxed);
         self.server_executor_residence_max_ns
             .fetch_max(wal.executor_residence_max_ns, Ordering::Relaxed);
-        self.server_cache_resolution_max_ns
-            .fetch_max(wal.cache_resolution_max_ns, Ordering::Relaxed);
         self.server_nowait_max_ns
             .fetch_max(wal.nowait_max_ns, Ordering::Relaxed);
         self.server_async_max_ns
@@ -499,7 +394,6 @@ impl ReadDiagnostics {
         self.inline_completed.fetch_add(1, Ordering::Relaxed);
         self.inline_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
         if let Some(tcp) = profile {
-            self.add_grant_stages(&tcp);
             self.add_wal(tcp.server_wal);
             self.wire_requests
                 .fetch_add(tcp.requests, Ordering::Relaxed);
@@ -518,22 +412,17 @@ impl ReadDiagnostics {
                 response_decode_ns,
                 record_verify_ns,
                 server_handler_ns,
-                server_inventory_wait_ns,
                 server_authority_lookup_ns,
                 server_record_read_ns,
                 server_response_recheck_wait_ns,
                 server_response_recheck_ns,
-                server_response_recheck_samples,
-                server_response_recheck_deferrals
+                server_response_recheck_samples
             );
         }
         if failed {
             self.errors.fetch_add(1, Ordering::Relaxed);
             if profile.is_some_and(|profile| profile.server_handler_available) {
                 self.failed_owner_profile_retained
-                    .fetch_add(1, Ordering::Relaxed);
-            } else if profile.is_some_and(|profile| profile.server_handler_not_applicable) {
-                self.failed_owner_profile_not_applicable
                     .fetch_add(1, Ordering::Relaxed);
             } else {
                 self.failed_owner_profile_unavailable
@@ -588,6 +477,23 @@ impl ReadDiagnostics {
         }
         selected
     }
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    fn nvme_complete(&self, elapsed_ns: Option<u64>, failed: bool) {
+        self.nvme_completed.fetch_add(1, Ordering::Relaxed);
+        if let Some(ns) = elapsed_ns {
+            self.nvme_flight_ns.fetch_add(ns, Ordering::Relaxed);
+            self.nvme_flight_count.fetch_add(1, Ordering::Relaxed);
+            self.nvme_flight_max_ns.fetch_max(ns, Ordering::Relaxed);
+        }
+        self.completed.fetch_add(1, Ordering::Relaxed);
+        self.actor_completed.fetch_add(1, Ordering::Relaxed);
+        if failed {
+            self.errors.fetch_add(1, Ordering::Relaxed);
+            self.failed_owner_profile_not_applicable
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn complete(
         &self,
         result: &ReadCompletion,
@@ -604,7 +510,6 @@ impl ReadDiagnostics {
                 self.actor_service_ns
                     .fetch_add(worker.service_ns, Ordering::Relaxed);
                 let tcp = &worker.tcp;
-                self.add_grant_stages(tcp);
                 self.add_wal(tcp.server_wal);
                 self.wire_requests
                     .fetch_add(tcp.requests, Ordering::Relaxed);
@@ -623,19 +528,16 @@ impl ReadDiagnostics {
                     response_decode_ns,
                     record_verify_ns,
                     server_handler_ns,
-                    server_inventory_wait_ns,
                     server_authority_lookup_ns,
                     server_record_read_ns,
                     server_response_recheck_wait_ns,
                     server_response_recheck_ns,
                     server_response_recheck_samples,
-                    server_response_recheck_deferrals,
                 );
             }
             _ => {
                 self.errors.fetch_add(1, Ordering::Relaxed);
                 if let Some(profile) = failed_profile {
-                    self.add_grant_stages(&profile);
                     self.add_wal(profile.server_wal);
                     self.wire_requests
                         .fetch_add(profile.requests, Ordering::Relaxed);
@@ -657,8 +559,6 @@ impl ReadDiagnostics {
                         .fetch_add(profile.record_verify_ns, Ordering::Relaxed);
                     self.server_handler_ns
                         .fetch_add(profile.server_handler_ns, Ordering::Relaxed);
-                    self.server_inventory_wait_ns
-                        .fetch_add(profile.server_inventory_wait_ns, Ordering::Relaxed);
                     self.server_authority_lookup_ns
                         .fetch_add(profile.server_authority_lookup_ns, Ordering::Relaxed);
                     self.server_record_read_ns
@@ -669,16 +569,9 @@ impl ReadDiagnostics {
                         .fetch_add(profile.server_response_recheck_ns, Ordering::Relaxed);
                     self.server_response_recheck_samples
                         .fetch_add(profile.server_response_recheck_samples, Ordering::Relaxed);
-                    self.server_response_recheck_deferrals
-                        .fetch_add(profile.server_response_recheck_deferrals, Ordering::Relaxed);
                 }
                 if failed_profile.is_some_and(|profile| profile.server_handler_available) {
                     self.failed_owner_profile_retained
-                        .fetch_add(1, Ordering::Relaxed);
-                } else if failed_profile
-                    .is_some_and(|profile| profile.server_handler_not_applicable)
-                {
-                    self.failed_owner_profile_not_applicable
                         .fetch_add(1, Ordering::Relaxed);
                 } else {
                     self.failed_owner_profile_unavailable
@@ -735,8 +628,6 @@ impl ReadProfileMonitor {
         for (partition, diagnostics) in self.state.owner_diagnostics.iter() {
             diagnostics.visit(&mut |name, value| {
                 if name.starts_with("read_profile_server_")
-                    || name.starts_with("read_profile_client_grant_install_")
-                    || name.starts_with("read_profile_client_fi_read_")
                     || matches!(
                         name,
                         "read_profile_completed"
@@ -807,8 +698,6 @@ struct State {
     admission_generation: AtomicU64,
     admission_changed: parking_lot::Condvar,
     wake_pending: AtomicBool,
-    active_wait: Mutex<()>,
-    active_changed: parking_lot::Condvar,
     // Fixed flight signals and weak slots are reserved from pending bytes.
     flight_ready: Box<[FlightSignal]>,
     read_rpcs: AtomicU64,
@@ -913,20 +802,16 @@ impl Drop for InlineLaneReservation {
 
 struct LaneCredit {
     outstanding: Arc<AtomicUsize>,
-    state: Arc<State>,
 }
 impl Drop for LaneCredit {
     fn drop(&mut self) {
         self.outstanding.fetch_sub(1, Ordering::Release);
-        let _wait = self.state.active_wait.lock();
-        self.state.active_changed.notify_all();
     }
 }
 struct Request {
     lane: usize,
     references: Vec<ValueRecordReference>,
     deadline: Instant,
-    class: ReadClass,
     submitted: Option<Instant>,
     sampled: bool,
     flight: Arc<ReadFlight>,
@@ -961,12 +846,37 @@ impl Request {
     fn complete(self, result: Result<(Vec<Mutation>, Option<WorkerReadProfile>), LocalDbError>) {
         self.complete_with_profile(result, None);
     }
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    fn complete_nvme(
+        self,
+        result: Result<(Vec<Mutation>, Option<WorkerReadProfile>), LocalDbError>,
+    ) {
+        if self.sampled {
+            let duration = self.submitted.map(elapsed);
+            self._credit
+                .state
+                .diagnostics
+                .nvme_complete(duration, result.is_err());
+            self._credit.state.owner_diagnostics[self.flight.node]
+                .1
+                .nvme_complete(duration, result.is_err());
+        }
+        self.complete_with_profile_inner(result, None, false);
+    }
     fn complete_with_profile(
         self,
         result: Result<(Vec<Mutation>, Option<WorkerReadProfile>), LocalDbError>,
         failed_profile: Option<super::super::tcp::TcpReadProfile>,
     ) {
-        if self.sampled {
+        self.complete_with_profile_inner(result, failed_profile, true);
+    }
+    fn complete_with_profile_inner(
+        self,
+        result: Result<(Vec<Mutation>, Option<WorkerReadProfile>), LocalDbError>,
+        failed_profile: Option<super::super::tcp::TcpReadProfile>,
+        record_profile: bool,
+    ) {
+        if self.sampled && record_profile {
             let diagnostics = &self._credit.state.diagnostics;
             let owner = &self._credit.state.owner_diagnostics[self.flight.node].1;
             if self.flight.grouped_inline.load(Ordering::Acquire) {
@@ -1129,7 +1039,7 @@ fn progress_nvmeof(state: &Arc<State>) -> bool {
                 .reader
                 .record_verification(verification_started.elapsed());
         }
-        request.complete(result);
+        request.complete_nvme(result);
     }
     progressed
 }
@@ -1194,12 +1104,7 @@ fn submit_nvmeof(state: &Arc<State>, lane: &mut ReactorLane) -> (bool, bool) {
     }
 }
 
-fn progress_read_lane(
-    state: &Arc<State>,
-    lane: &mut ReactorLane,
-    epoch: u64,
-    resident_enabled: bool,
-) -> bool {
+fn progress_read_lane(state: &Arc<State>, lane: &mut ReactorLane, epoch: u64) -> bool {
     let mut progressed = false;
     let now = Instant::now();
     if lane.queued.iter().any(|request| now >= request.deadline)
@@ -1216,7 +1121,7 @@ fn progress_read_lane(
             progressed = true;
         }
     }
-    if lane.queued.is_empty() && lane.active.is_empty() && !lane.profiling && !resident_enabled {
+    if lane.queued.is_empty() && lane.active.is_empty() && !lane.profiling {
         return progressed;
     }
     // Diagnostics and the deterministic test hook may own a mutex.
@@ -1230,7 +1135,7 @@ fn progress_read_lane(
     };
     #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
     let nvme_head = false;
-    if nvme_head && lane.active.is_empty() && !lane.profiling && !resident_enabled {
+    if nvme_head && lane.active.is_empty() && !lane.profiling {
         return progressed;
     }
     // Never let one such connection stall another connection's reads.
@@ -1249,13 +1154,6 @@ fn progress_read_lane(
         lane.profiling = profiling;
     }
     if lane.queued.is_empty() && lane.active.is_empty() {
-        match client.progress_resident_control() {
-            Ok(made_progress) => progressed |= made_progress,
-            Err(_) => {
-                state.poison();
-                progressed = true;
-            }
-        }
         return progressed;
     }
     let transport_before = profiling.then(|| client.transport_progress_stats());
@@ -1288,7 +1186,6 @@ fn progress_read_lane(
             epoch,
             references,
             request.deadline,
-            request.class,
             request.submitted.is_some(),
         ) {
             Ok(Some(id)) => {
@@ -1439,7 +1336,6 @@ fn drive_reads(
     max_requests: usize,
     fabric: bool,
     busy: bool,
-    resident_enabled: bool,
 ) {
     let _poison = PoisonOnPanic(state.clone());
     let mut disconnected = false;
@@ -1486,7 +1382,7 @@ fn drive_reads(
             }
             if let Some(mut driver) = lane.driver.try_lock() {
                 drop(scheduling);
-                progressed |= progress_read_lane(&state, &mut driver, epoch, resident_enabled);
+                progressed |= progress_read_lane(&state, &mut driver, epoch);
             }
         }
         // Sender disconnection proves no producer can enqueue another accepted
@@ -1536,9 +1432,6 @@ fn drive_reads(
                     empty_polls = 0;
                     thread::yield_now();
                 }
-            } else if resident_enabled {
-                empty_polls = 0;
-                thread::yield_now();
             } else {
                 empty_polls = 0;
                 // No accepted I/O needs polling. Wake on admission rather than
@@ -1576,7 +1469,6 @@ pub(super) struct ReadService {
     max_bytes: usize,
     timeout: Duration,
     epoch: u64,
-    resident_enabled: bool,
 }
 impl ReadService {
     pub(super) fn resolution_monitor(&self) -> Option<ReadProfileMonitor> {
@@ -1766,8 +1658,6 @@ impl ReadService {
             admission_generation: AtomicU64::new(0),
             admission_changed: parking_lot::Condvar::new(),
             wake_pending: AtomicBool::new(false),
-            active_wait: Mutex::new(()),
-            active_changed: parking_lot::Condvar::new(),
             flight_ready: (0..flight_slots)
                 .map(|_| FlightSignal::new())
                 .collect::<Vec<_>>()
@@ -1821,7 +1711,6 @@ impl ReadService {
                 .saturating_sub(flight_metadata_bytes),
             timeout: config.timeout,
             epoch,
-            resident_enabled: config.tls.resident_reads.enabled(),
         };
         let mut reactor_lanes = Vec::new();
         let mut clients = clients.into_iter();
@@ -1857,7 +1746,6 @@ impl ReadService {
         let (sender, receiver) = mpsc::sync_channel(flight_slots + 1);
         let state = service.state.clone();
         let fabric = config.tls.transport.is_fabric();
-        let resident_enabled = service.resident_enabled;
         *service.thread.get_mut() = Some(
             thread::Builder::new()
                 .name("wal-read-reactor".to_owned())
@@ -1870,7 +1758,6 @@ impl ReadService {
                         flight_slots,
                         fabric,
                         busy,
-                        resident_enabled,
                     )
                 })
                 .map_err(LocalDbError::component)?,
@@ -1894,18 +1781,6 @@ impl ReadService {
         }
         let pause = AdmissionPause(self.state.clone());
         drop(retained);
-        for lane in self.lanes.read().iter().flatten() {
-            let client = lane
-                .client
-                .try_lock()
-                .ok_or_else(|| LocalDbError::new("read lane is busy"))?;
-            let stats = client.resident_read_stats();
-            if stats.handles_live != 0 || stats.grants_live != 0 {
-                return Err(LocalDbError::new(
-                    "release resident grants before changing NVMe-oF",
-                ));
-            }
-        }
         Ok(pause)
     }
 
@@ -2088,11 +1963,6 @@ impl ReadService {
     ) -> Result<(), LocalDbError> {
         let _maintenance = self.nvmeof_maintenance.lock();
         let _pause = self.pause_idle_nvmeof(false)?;
-        if database.read_cache_bytes != 0 {
-            return Err(LocalDbError::new(
-                "NVMe-oF requires the coordinator read cache to be disabled",
-            ));
-        }
         let manifest = &config.manifest;
         let metadata_budget = config
             .max_inflight_members
@@ -2260,138 +2130,12 @@ impl ReadService {
         }
         Ok(())
     }
-    pub(super) fn pause_and_release_resident_grants(
-        &self,
-    ) -> Result<Option<AdmissionPause>, LocalDbError> {
-        if !self.resident_enabled {
-            return Ok(None);
-        }
-        let deadline = Instant::now() + self.timeout;
-        let retained = self.state.retained.lock();
-        if self.state.admission_paused.swap(true, Ordering::AcqRel) {
-            return Err(LocalDbError::new(
-                "resident maintenance is already in progress",
-            ));
-        }
-        let pause = AdmissionPause(self.state.clone());
-        self.state
-            .admission_generation
-            .fetch_add(1, Ordering::Release);
-        self.state.admission_changed.notify_all();
-        drop(retained);
-        let mut active_wait = self.state.active_wait.lock();
-        while self
-            .lanes
-            .read()
-            .iter()
-            .flatten()
-            .any(|lane| lane.outstanding.load(Ordering::Acquire) != 0)
-        {
-            if self.failed() || self.state.stopped.load(Ordering::Acquire) {
-                drop(active_wait);
-                return Err(LocalDbError::new("read authority is poisoned or closed"));
-            }
-            if Instant::now() >= deadline {
-                drop(active_wait);
-                return Err(LocalDbError::new("resident read drain deadline expired"));
-            }
-            self.state
-                .active_changed
-                .wait_until(&mut active_wait, deadline);
-        }
-        drop(active_wait);
-        let clients = self
-            .lanes
-            .read()
-            .iter()
-            .flat_map(|lanes| lanes.iter().map(|lane| lane.client.clone()))
-            .collect::<Vec<_>>();
-        for client in clients {
-            if let Err(error) = client.lock().revoke_resident_grants() {
-                self.state.poison();
-                return Err(LocalDbError::component(error));
-            }
-        }
-        Ok(Some(pause))
-    }
     pub(super) fn failed(&self) -> bool {
         self.state.failed.load(Ordering::Acquire)
     }
     #[cfg(test)]
     pub(super) fn lane_client(&self, node: usize, lane: usize) -> Arc<Mutex<Client>> {
         self.lanes.read()[node][lane].client.clone()
-    }
-    pub(super) fn resident_read_stats(&self) -> Vec<(u32, super::super::tcp::ResidentReadStats)> {
-        self.lanes
-            .read()
-            .iter()
-            .enumerate()
-            .map(|(node, lanes)| {
-                let mut stats = super::super::tcp::ResidentReadStats::default();
-                for lane in lanes {
-                    stats.add(lane.client.lock().resident_read_stats());
-                }
-                (node as u32, stats)
-            })
-            .collect()
-    }
-    pub(super) fn try_resident_read_stats(
-        &self,
-    ) -> Option<Vec<(u32, super::super::tcp::ResidentReadStats)>> {
-        let lanes = self.lanes.try_read()?;
-        let mut samples = Vec::with_capacity(lanes.len());
-        for (node, node_lanes) in lanes.iter().enumerate() {
-            let mut stats = super::super::tcp::ResidentReadStats::default();
-            for lane in node_lanes {
-                stats.add(lane.client.try_lock()?.resident_read_stats());
-            }
-            samples.push((node as u32, stats));
-        }
-        Some(samples)
-    }
-    pub(super) fn resident_read_lane_stats(
-        &self,
-    ) -> Vec<(u32, usize, super::super::tcp::ResidentReadStats)> {
-        let clients = self
-            .lanes
-            .read()
-            .iter()
-            .enumerate()
-            .flat_map(|(node, lanes)| {
-                lanes
-                    .iter()
-                    .enumerate()
-                    .map(move |(lane, client)| (node as u32, lane, client.client.clone()))
-            })
-            .collect::<Vec<_>>();
-        clients
-            .into_iter()
-            .map(|(node, lane, client)| (node, lane, client.lock().resident_read_stats()))
-            .collect()
-    }
-    pub(super) fn resident_read_lane_snapshots(
-        &self,
-        partition_for: impl Fn(usize) -> Option<u32>,
-    ) -> Result<Vec<super::ResidentReadLaneSnapshot>, LocalDbError> {
-        let lanes = self.lanes.read();
-        if self.state.stopped.load(Ordering::Acquire) {
-            return Err(LocalDbError::new("read reactor stopped"));
-        }
-        let mut samples = Vec::new();
-        for (node, node_lanes) in lanes.iter().enumerate() {
-            let partition = partition_for(node)
-                .ok_or_else(|| LocalDbError::new("read lane has no configured owner"))?;
-            for (lane, entry) in node_lanes.iter().enumerate() {
-                let client = entry.client.lock();
-                samples.push(super::ResidentReadLaneSnapshot {
-                    partition,
-                    lane,
-                    session_present: client.session_present(),
-                    stats: client.resident_read_stats(),
-                });
-            }
-        }
-        Ok(samples)
     }
     pub(super) fn profiles(
         &self,
@@ -2576,7 +2320,6 @@ impl ReadService {
         let _reservation = reservation;
         let _lane_credit = LaneCredit {
             outstanding: lane.outstanding.clone(),
-            state: self.state.clone(),
         };
         let Some(mut client) = lane.client.try_lock() else {
             return Ok(None);
@@ -2682,7 +2425,6 @@ impl ReadService {
             profiled,
             ReadContext {
                 deadline: Instant::now() + self.timeout,
-                class: ReadClass::Point,
                 pin,
             },
         )
@@ -2706,11 +2448,7 @@ impl ReadService {
         context: ReadContext,
         mut owned_lanes: Option<&mut Vec<OwnedLane>>,
     ) -> Result<ReadRequest, LocalDbError> {
-        let ReadContext {
-            deadline,
-            class,
-            pin,
-        } = context;
+        let ReadContext { deadline, pin } = context;
         if self.failed() || self.state.stopped.load(Ordering::Acquire) {
             return Err(LocalDbError::new("read authority is poisoned or closed"));
         }
@@ -2781,26 +2519,6 @@ impl ReadService {
         } else {
             None
         };
-        let preferred = if self.resident_enabled && new_request != 0 {
-            let lanes = self.lanes.read();
-            lanes.get(node).and_then(|lanes| {
-                lanes
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, lane)| {
-                        if lane.outstanding.load(Ordering::Acquire) != 0 {
-                            return None;
-                        }
-                        let client = lane.client.try_lock()?;
-                        let hits = client.resident_grant_hits(self.epoch, &missing);
-                        (hits != 0).then_some((index, hits))
-                    })
-                    .max_by_key(|&(_, hits)| hits)
-                    .map(|(index, _)| index)
-            })
-        } else {
-            None
-        };
         let mut reserved = false;
         let (credit, lane) = {
             let mut retained = self.state.retained.lock();
@@ -2829,7 +2547,7 @@ impl ReadService {
             // Prefer an idle lane so work can progress independently instead
             // of queueing behind an unrelated slow or stalled request. If all
             // lanes are occupied, fall back to a non-inline-reserved lane.
-            let next = preferred.unwrap_or_else(|| self.next[node].fetch_add(1, Ordering::Relaxed));
+            let next = self.next[node].fetch_add(1, Ordering::Relaxed);
             let lane = if new_request == 0 {
                 None
             } else {
@@ -2883,14 +2601,12 @@ impl ReadService {
                 lane: lane.index,
                 references: missing,
                 deadline,
-                class,
                 submitted: (profiled || sampled).then(Instant::now),
                 sampled,
                 flight: flight.clone(),
                 _credit: credit.clone(),
                 _lane_credit: LaneCredit {
                     outstanding: lane.outstanding.clone(),
-                    state: self.state.clone(),
                 },
             };
             let sender_guard = self.sender.lock();
@@ -3163,7 +2879,6 @@ impl RemoteDatabase {
                 false,
                 ReadContext {
                     deadline: Instant::now() + self.config.timeout,
-                    class: ReadClass::ScanNoFill,
                     pin: Some(pin),
                 },
             )?)

@@ -24,10 +24,11 @@ spec = importlib.util.spec_from_file_location(
 local = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(local)
 MIB = 1024 * 1024
-READ_COUNTERS = ("cache_hits", "cache_misses", "cache_evictions", "wal_reads", "wal_read_bytes",
-                 "resident_read_attempts", "resident_read_successes", "resident_read_fallbacks",
-                 "resident_read_unsupported", "resident_read_partial", "resident_read_deferred",
-                 "async_read_submissions")
+OWNER_COUNTERS = ("wal_reads", "wal_read_bytes", "resident_read_attempts",
+                  "resident_read_successes", "resident_read_fallbacks",
+                  "resident_read_unsupported", "resident_read_partial",
+                  "resident_read_deferred", "async_read_submissions")
+COORDINATOR_COUNTERS = ("cache_hits", "cache_misses", "cache_evictions")
 
 
 def digest(path):
@@ -63,12 +64,9 @@ def configurations(suite):
                               cold=False, cache=0, read_window=32,
                               lanes=1, workers=2, policy=policy))
     if suite in ("all", "pressure"):
-        for frontend, shard in ((128 * 1024, 0), (0, 64 * 1024),
-                                (128 * 1024, 64 * 1024)):
-            cases.append(dict(label=f"pressure-front{frontend}-shard{shard}",
-                              backend="tcp", cold=False, cache=frontend,
-                              shard_cache=shard, pressure=True, read_window=32,
-                              lanes=1, workers=2, policy="async"))
+        cases.append(dict(label="pressure-coordinator128k", backend="tcp",
+                          cold=False, cache=128 * 1024, pressure=True, read_window=32,
+                          lanes=1, workers=2, policy="async"))
     return cases
 
 
@@ -89,39 +87,43 @@ def read_path_evidence(path, case):
         if identity in snapshot:
             raise ValueError(f"duplicate read-path process: {path}")
         snapshot[identity] = row
-        budget = int(row["cache_budget_bytes"])
-        configured = case["cache"] if row["role"] == "frontend" else case.get("shard_cache", 0)
-        if budget != configured or not 0 <= int(row["cache_retained_bytes"]) <= budget:
-            raise ValueError(f"cache exceeds its configured budget: {path}")
-        if not 0 <= int(row["cache_metadata_bytes"]) <= int(row["cache_retained_bytes"]):
-            raise ValueError(f"cache metadata is not accounted: {path}")
-        if budget == 0 and int(row["cache_entries"]) != 0:
-            raise ValueError(f"disabled cache retains values: {path}")
+        if row["role"] == "frontend":
+            budget = int(row["coordinator_cache_budget_bytes"])
+            retained = int(row["coordinator_cache_retained_bytes"])
+            if budget != case["cache"] or not 0 <= retained <= budget:
+                raise ValueError(f"coordinator cache exceeds its budget: {path}")
+            if not 0 <= int(row["coordinator_cache_metadata_bytes"]) <= retained:
+                raise ValueError(f"coordinator cache metadata is not accounted: {path}")
+            if budget == 0 and int(row["coordinator_cache_entries"]) != 0:
+                raise ValueError(f"disabled coordinator cache retains values: {path}")
+        elif any(value for field, value in row.items() if field.startswith("coordinator_cache_")):
+            raise ValueError(f"owner row contains coordinator cache observations: {path}")
         for field, limit in (("peak_inflight_requests", 32),
                              ("peak_inflight_bytes", 64 * MIB),
                              ("peak_device_reads", 128)):
             if row["role"] == "storage" and not 0 <= int(row[field]) <= limit:
                 raise ValueError(f"shard read admission bound exceeded: {path}: {field}")
     output = {}
-    counters = READ_COUNTERS[:5] + tuple(
-        counter for counter in READ_COUNTERS[5:] if snapshots and counter in snapshots[0])
     for phase, boundaries in phases.items():
         if set(boundaries) != {"before", "after"} or any(set(rows) != expected for rows in boundaries.values()):
             raise ValueError(f"incomplete read-path evidence: {path}: {phase}")
-        totals = {f"{role}_{counter}": 0 for role in ("frontend", "storage") for counter in counters}
+        totals = {}
         for identity in expected:
             before, after = (boundaries[boundary][identity] for boundary in ("before", "after"))
+            counters = COORDINATOR_COUNTERS if identity[0] == "frontend" else OWNER_COUNTERS
             for counter in counters:
-                delta = int(after[counter]) - int(before[counter])
+                field = "coordinator_" + counter if identity[0] == "frontend" else counter
+                delta = int(after[field]) - int(before[field])
                 if delta < 0:
                     raise ValueError(f"read-path counter regressed: {path}: {phase}: {counter}")
-                totals[f"{identity[0]}_{counter}"] += delta
+                key = f"{identity[0]}_{counter}"
+                totals[key] = totals.get(key, 0) + delta
         if case.get("pressure") and phase in ("point_get", "point_get_window"):
             if totals["storage_wal_reads"] <= 0 or totals["storage_wal_read_bytes"] <= 0:
                 raise ValueError(f"cache-pressure phase did not fetch the WAL: {path}: {phase}")
-            for role, budget in (("frontend", case["cache"]), ("storage", case.get("shard_cache", 0))):
-                if budget and (totals[f"{role}_cache_misses"] <= 0 or totals[f"{role}_cache_evictions"] <= 0):
-                    raise ValueError(f"configured cache was not pressured: {path}: {phase}: {role}")
+            if case["cache"] and (totals["frontend_cache_misses"] <= 0
+                                  or totals["frontend_cache_evictions"] <= 0):
+                raise ValueError(f"coordinator cache was not pressured: {path}: {phase}")
         output[phase] = totals
     if not {"point_get", "point_get_window"} <= output.keys():
         raise ValueError(f"missing scalar/windowed read-path evidence: {path}")
@@ -168,7 +170,6 @@ def collect(path, case, value_bytes, repetition, reads):
                          cache_bytes=case["cache"], read_window=case["read_window"],
                          wal_member_read=case.get("policy") if case["backend"] == "tcp" else "native",
                          resident_first=case.get("resident_first") if case["backend"] == "tcp" else None,
-                         shard_cache_bytes=case.get("shard_cache", 0),
                          native_read_workers=case.get("native_workers", 1),
                          read_lanes=case.get("lanes") if case["backend"] == "tcp" else None,
                          server_read_workers=case.get("workers") if case["backend"] == "tcp" else None,
@@ -178,8 +179,9 @@ def collect(path, case, value_bytes, repetition, reads):
                          **{key: sum(item[key] for item in evidence.values()) if evidence else None
                             for key in ("physical_read_bytes", "minor_faults", "major_faults")},
                          **{f"{role}_{counter}": paths.get(row["phase"], {}).get(f"{role}_{counter}")
-                            for role in ("frontend", "storage")
-                            for counter in READ_COUNTERS}))
+                            for role, counters in (("frontend", COORDINATOR_COUNTERS),
+                                                   ("storage", OWNER_COUNTERS))
+                            for counter in counters}))
     return rows
 
 
@@ -191,7 +193,7 @@ def main():
     parser.add_argument("--transport", choices=("tcp", "fabric-tcp", "fabric-tcp-native"), default="tcp")
     parser.add_argument("--resident-first", choices=("true", "false"), default="true")
     parser.add_argument("--values", default="1024,8192")
-    parser.add_argument("--repetitions", type=int, default=3)
+    parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--batches", type=int, default=320)
     parser.add_argument("--reads", type=int, default=4096)
     args = parser.parse_args()
@@ -209,7 +211,7 @@ def main():
     for case in cases:
         if case["backend"] == "tcp":
             case["resident_first"] = args.resident_first == "true" and case["policy"] == "async"
-        combined_cache = case["cache"] + 5 * case.get("shard_cache", 0)
+        combined_cache = case["cache"]
         if case.get("pressure") and min(values) * args.batches * 32 <= 4 * combined_cache:
             raise ValueError("cache-pressure dataset must exceed combined application caches by 4x")
         if case.get("pressure") and args.reads < 1024:
@@ -227,8 +229,8 @@ def main():
                 case_timeout_seconds=600,
                 topology="five loopback storage processes on one shared SSD; no hardware RDMA",
                 limits="bounded cold-start comparison, not NVMe saturation or larger-than-RAM scaling",
-                cache_policy="finite on-demand caches; cold caches disabled; pressure working set "
-                             "exceeds combined frontend and five shard budgets by more than 4x; "
+                cache_policy="bounded coordinator/native value caches; owners use Linux page cache; "
+                             "pressure working set exceeds coordinator budget by more than 4x; "
                              "native nominal values exclude metadata",
                 latency_scope="scalar/window samples are per-request; windows include queue/retirement delay; "
                               "multi-get samples cover complete calls; native windows use up to 32 shared-Db workers")
@@ -260,7 +262,6 @@ def main():
                     flags += ["--tcp-read-lanes", str(case["lanes"]),
                               "--tcp-server-read-workers", str(case["workers"]),
                               "--tcp-wal-member-read", case["policy"],
-                              "--tcp-shard-cache-bytes", str(case.get("shard_cache", 0)),
                               "--tcp-resident-first", str(case["resident_first"]).lower()]
                 local.run([timeout, "--signal=TERM", "--kill-after=5s", "600s",
                            str(binary), "--output", str(output), *flags], output)

@@ -21,6 +21,9 @@ BACKENDS = ("native", "tidehunter_tcp", "tidehunter_efa", "tidehunter_efa_direct
             "tidehunter_efa_native", "tikv", "cassandra", "foundationdb", "valkey_tcp")
 LEGACY_BACKENDS = BACKENDS[:-1]
 TRANSPORTS = {name: transport_for_case(name) for name in BACKENDS if name.startswith("tidehunter_")}
+NVME_BACKENDS = {"tidehunter_nvme_tcp", "tidehunter_nvme_rdma"}
+for name in NVME_BACKENDS:
+    TRANSPORTS[name] = transport_for_case("tidehunter_tcp")
 MIX_FIELDS = ("read", "put", "delete", "missing_read", "get_many", "put_batch")
 
 
@@ -48,7 +51,8 @@ def make_matrix(spec):
     sizes, backends, rates = spec["value_sizes"], spec["backends"], spec["offered_rates"]
     if set(sizes) != {64, 256, 1024, 8192, 65536} or len(sizes) != 5:
         raise ValueError("full campaign requires all five value sizes without duplicates")
-    backends = select_backends(None, backends, set(BACKENDS))
+    supported = set(BACKENDS) | (NVME_BACKENDS if spec.get("mode") == "nvmeof-focused" else set())
+    backends = select_backends(None, backends, supported)
     rates = spec["offered_rates"]
     if set(rates) != {1000, 10000, 50000} or len(rates) != 3 or any(type(rate) is not int for rate in rates):
         raise ValueError("full campaign requires all three offered rates without duplicates")
@@ -61,6 +65,8 @@ def make_matrix(spec):
         raise ValueError("diagnostics limits must be integers between 0 and 65536")
     diagnostics = {"write_profile_limit": diagnostics.get("write_profile_limit", 0),
                    "read_profile_limit": diagnostics.get("read_profile_limit", 0)}
+    if spec.get("mode") == "nvmeof-focused":
+        return make_nvmeof_matrix(spec, backends, diagnostics)
     if spec.get("mode", "standard") == "read-tier-focused":
         if spec["repeats"] != 1:
             raise ValueError("focused campaign requires one repetition")
@@ -72,32 +78,16 @@ def make_matrix(spec):
                   and job["value_size"] in (256, 1024) and job["concurrency"] == 1)
                  or (job["read_tier"]["name"] == "cold_device" and job["value_size"] == 256
                      and job["concurrency"] == 1)]
-        wanted = {"remote", "coordinator_hit", "owner_hit", "registered_steady", "registered_reuse",
-                  "wal_warm", "registered_steady_c16_mixed_acquisition_reuse",
-                  "registered_reuse_c16_mixed_acquisition_reuse"}
+        wanted = {"remote", "coordinator_hit", "wal_warm"}
         later = [job for job in tier_jobs if job["read_tier"]["name"] in wanted
                  and ((job["concurrency"] == 1 and job["value_size"] in (256, 8192))
                       or (job["concurrency"] == 16 and job["value_size"] in (1024, 8192)))]
-        # Keep legacy controls unchanged, and separately measure full-set
-        # headroom: destination handle limits are divided across five owners.
-        headroom = []
-        for original in later:
-            if original["read_tier"]["name"] not in ("registered_steady", "registered_reuse") or original["concurrency"] != 1:
-                continue
-            job = copy.deepcopy(original)
-            job["read_tier"]["name"] += "_handle_headroom"
-            job["cohort"] = "read_tier_" + job["read_tier"]["name"]
-            job["resident_reads"]["max_handles"] = 5 * job["keys"]
-            job["read_tier"]["requested"]["registered_budgets"]["max_handles"] = 5 * job["keys"]
-            job["read_tier"]["source_id"] += "-handle-headroom"
-            job["case_id"] += "-handle-headroom"
-            headroom.append(job)
         comparisons = [job for job in standard_jobs if job["cohort"] == "primary_rf1" and
                        (job["value_size"], job["profile"]) in ((1024, "write-concurrent"),
                            (1024, "read-concurrent"), (8192, "read-many32"))]
         comparisons += [job for job in standard_jobs if job["cohort"] == "write_stage_diagnostics"
                         and job["value_size"] == 1024 and job["profile"] == "write-concurrent"]
-        jobs = early + comparisons + headroom + later
+        jobs = early + comparisons + later
         if len(jobs) > spec["max_cases"]:
             raise ValueError(f"matrix contains {len(jobs)} cases, exceeding explicit max_cases")
         return jobs
@@ -118,13 +108,13 @@ def make_matrix(spec):
         for backend in order:
             block = []
             def add(label, size, operation_mix, concurrency, count, *, cohort="primary_rf1",
-                    rate=None, distribution="uniform", keys=None, cache=0, owner_cache=0, warmup=512):
+                    rate=None, distribution="uniform", keys=None, cache=0, warmup=512):
                 block.append({"backend": backend, "repeat": repeat, "profile": label,
                     "cohort": cohort, "value_size": size, "keys": keys or spec["keys"],
                     "mix": operation_mix, "concurrency": concurrency, "measurement_operations": count,
                     "warmup_operations": warmup, "offered_ops_per_second": rate,
                     "distribution": distribution, "coordinator_cache_bytes": cache,
-                    "owner_read_cache_bytes": owner_cache, "drop_os_caches": cohort == "cold_os_cache",
+                    "drop_os_caches": cohort == "cold_os_cache",
                     "native_durability": "page_cache" if cohort == "native_pagecache" else "value_wal_barrier"})
             for size in sizes:
                 for label, operation_mix, concurrency, count in profiles:
@@ -141,17 +131,6 @@ def make_matrix(spec):
                 for size in (256, 8192):
                     add("coordinator-cache", size, mix(read=100), 1, 8192,
                         cohort="coordinator_cache_configured", cache=128 * 1024**2, warmup=1024)
-                    add("owner-cache", size, mix(read=100), 1, 8192,
-                        cohort="owner_cache_configured", owner_cache=128 * 1024**2, warmup=1024)
-            if backend == "tidehunter_efa_native":
-                for size in (256, 8192):
-                    add("registered-ram", size, mix(read=100), 1, 8192,
-                        cohort="registered_ram_configured", warmup=1024)
-                    block[-1]["resident_reads"] = {
-                        "source_bytes": 16 * 1024**2, "source_regions": 4096,
-                        "destination_bytes": 20 * 1024**2, "destination_slots": 640,
-                        "max_read_bytes": 32768, "max_handles": 4096,
-                        "require_device_read": True}
             if backend == "native":
                 for size in sizes:
                     for label, operation_mix, concurrency, count in (profiles[0], profiles[3]):
@@ -172,45 +151,11 @@ def make_matrix(spec):
                            if (job["value_size"], job["profile"]) in
                            ((1024, "read-concurrent"), (8192, "read-many32"))]
                 sources += [job for job in extra if job["value_size"] == 8192
-                            and job["cohort"] in ("coordinator_cache_configured",
-                                                  "owner_cache_configured",
-                                                  "registered_ram_configured")]
+                            and job["cohort"] == "coordinator_cache_configured"]
                 read_jobs += [job | {"cohort": "read_stage_diagnostics",
                     "diagnostic_source_cohort": job["cohort"],
                     "diagnostics": {"read_profile_limit": diagnostics["read_profile_limit"]}}
                     for job in sources]
-                resident_sources = [job for job in primary
-                    if (job["value_size"], job["profile"]) in (
-                        (256, "read-concurrent"), (1024, "read-concurrent"),
-                        (8192, "read-concurrent"), (65536, "read-concurrent"),
-                        (8192, "read-many32"))]
-                fast_read_jobs += [job | {
-                    "cohort": "resident_first_stage_diagnostics",
-                    "diagnostic_source_cohort": job["cohort"],
-                    "owner_read_resident_first": True,
-                    "diagnostics": {"read_profile_limit": diagnostics["read_profile_limit"]}}
-                    for job in resident_sources]
-                if backend == "tidehunter_efa_native":
-                    for job in sources:
-                        if job["cohort"] != "primary_rf1":
-                            continue
-                        keys_per_call = 32 if job["mix"]["get_many"] else 1
-                        fast_read_jobs.append(job | {
-                            "cohort": "registered_ram_fullset_control",
-                            "diagnostic_source_cohort": job["cohort"],
-                            "profile": "registered-many32" if keys_per_call == 32 else "registered-scalar",
-                            "concurrency": 1,
-                            "read_lanes": 1,
-                            "owner_read_resident_first": True,
-                            "warmup_key_sweep": True,
-                            "warmup_operations": max(job["warmup_operations"],
-                                                     -(-job["keys"] // keys_per_call)),
-                            "resident_reads": {
-                                "source_bytes": 16 * 1024**2, "source_regions": 4096,
-                                "destination_bytes": 20 * 1024**2, "destination_slots": 640,
-                                "max_read_bytes": 32768, "max_handles": 8192,
-                                "require_device_read": True},
-                            "diagnostics": {"read_profile_limit": diagnostics["read_profile_limit"]}})
             jobs.extend(primary + extra + diagnostic_jobs + cold)
     # Keep every pre-existing case ID and its derived namespace stable.
     jobs.extend(read_jobs)
@@ -222,6 +167,86 @@ def make_matrix(spec):
     return jobs
 
 
+def make_nvmeof_matrix(spec, backends, diagnostics):
+    """Matched sealed-source read cohorts; profiled twins are independent runs."""
+    if spec["repeats"] != 1:
+        raise ValueError("NVMe/TCP comparison requires one repetition")
+    required = {"native", "tidehunter_tcp", "tidehunter_nvme_tcp"}
+    if not required <= set(backends):
+        raise ValueError("NVMe/TCP comparison requires native, RPC TCP and NVMe/TCP")
+    allowed = required | NVME_BACKENDS | {"tidehunter_efa", "tidehunter_efa_direct", "tidehunter_efa_native"}
+    if set(backends) - allowed:
+        raise ValueError("NVMe/TCP comparison excludes unrelated KV backends")
+    # These two readers must share one physical source block. A native or
+    # different transport case ends that block; its evidence directory remains
+    # immutable and cannot be recreated later in the same matrix.
+    tcp_readers = {"tidehunter_tcp"} | NVME_BACKENDS
+    first_tcp = next(index for index, backend in enumerate(backends) if backend in tcp_readers)
+    backends = (list(backends[:first_tcp])
+                + [backend for backend in backends if backend in tcp_readers]
+                + [backend for backend in backends[first_tcp:] if backend not in tcp_readers])
+    jobs, writes = [], []
+    for size in (1024, 8192, 64, 256, 65536):
+        keys = max(spec["keys"], 65536 if size in (1024, 8192) else 8192)
+        source = f"sealed-v2-seed{spec['seed']}-size{size}-keys{keys}"
+        shapes = (("scalar", 1), ("scalar", 16), ("batch32", 1), ("batch32", 16)) if size in (1024, 8192) else (("scalar", 1),)
+        for backend in backends:
+            for shape, concurrency in shapes:
+                for tier in ("first_touch", "repeat_read"):
+                    for profiled in ((False, True) if backend != "native" and
+                                     (size, shape, concurrency) in ((1024, "scalar", 1), (8192, "batch32", 16))
+                                     else (False,)):
+                        drop = tier == "first_touch"
+                        mapped_eviction = drop and backend not in NVME_BACKENDS
+                        job = {"backend": backend, "repeat": 0,
+                               "profile": f"{tier}-{shape}-c{concurrency}-{'diagnostic' if profiled else 'baseline'}",
+                               "cohort": "sealed_read", "value_size": size, "keys": keys,
+                               "mix": mix(get_many=100) if shape == "batch32" else mix(read=100),
+                               "concurrency": concurrency, "read_lanes": 0 if backend == "native" else (4 if concurrency == 16 else 1),
+                               "measurement_operations": 2048 if shape == "batch32" else 8192,
+                               "warmup_operations": 0, "offered_ops_per_second": None,
+                               "distribution": "uniform", "coordinator_cache_bytes": 0,
+                               "drop_os_caches": drop,
+                               "native_durability": "value_wal_barrier",
+                               "measurement_key_sweep": tier == "first_touch",
+                               "evict_mapped_wal_before_measurement": mapped_eviction,
+                               "sealed_dataset": {"source_id": source, "data_id": source, "seed": spec["seed"], "profiled": profiled,
+                                                  "tier": tier, "instrumentation": "read_profile" if profiled and backend != "native" else "none",
+                                                  "page_cache_policy": "drop_at_measurement_gate" if drop else "not_dropped",
+                                                  "mapped_wal_eviction": "before_measurement_gate" if mapped_eviction else "not_requested",
+                                                  "directness": "initiator_O_DIRECT_target_buffered" if backend in NVME_BACKENDS else "buffered_WAL_pagecache_or_device",
+                                                  "cold_claim": "distinct keys after OS cache drop do not prove per-call device reads; shared pages, readahead and device caches remain",
+                                                  "target_cache": "buffered_file_page_cache" if backend in NVME_BACKENDS else "not_applicable"}}
+                        if profiled and backend != "native":
+                            job["diagnostics"] = {"read_profile_limit": diagnostics["read_profile_limit"] or 256}
+                        jobs.append(job)
+        for backend in (name for name in backends if name not in NVME_BACKENDS):
+            for profiled in ((False, True) if backend != "native" and size in (1024, 8192) else (False,)):
+                job = {"backend": backend, "repeat": 0, "profile": "write-c16-" + ("diagnostic" if profiled else "baseline"),
+                       "cohort": "native_write_regression", "value_size": size, "keys": keys,
+                       "write_path": "native_local_WAL" if backend == "native" else "common_RF1_owner_WAL_existing_transport_no_NVMe_reader_installed",
+                       "mix": mix(put=100), "concurrency": 16, "read_lanes": 0 if backend == "native" else 4,
+                       "measurement_operations": 4096, "warmup_operations": 512,
+                       "offered_ops_per_second": None, "distribution": "uniform",
+                       "coordinator_cache_bytes": 0,
+                       "drop_os_caches": False, "native_durability": "value_wal_barrier"}
+                if profiled and backend != "native":
+                    job["diagnostics"] = {"write_profile_limit": diagnostics["write_profile_limit"] or 256}
+                writes.append(job)
+                if size in (1024, 8192) and not profiled:
+                    batch = copy.deepcopy(job)
+                    batch["profile"] = job["profile"].replace("write-c16-", "write-batch32-c16-", 1)
+                    batch["mix"] = mix(put_batch=100)
+                    batch["measurement_operations"] = 2048
+                    writes.append(batch)
+    jobs.extend(writes)
+    if len(jobs) > spec["max_cases"]:
+        raise ValueError(f"matrix contains {len(jobs)} cases, exceeding explicit max_cases")
+    for number, job in enumerate(jobs):
+        job["case_id"] = f"{number:04d}-{job['backend']}-{job['value_size']}-{job['profile']}"
+    return jobs
+
+
 def make_read_tier_matrix(spec, backends, diagnostics):
     """A single ordered fleet experiment; each instrumented twin has its own population."""
     selected = [backend for backend in backends if backend in TRANSPORTS]
@@ -229,63 +254,45 @@ def make_read_tier_matrix(spec, backends, diagnostics):
         raise ValueError("read-tier mode requires at least one distributed Tidehunter backend")
     limit = diagnostics["read_profile_limit"] or 4096
     working_keys = max(spec["keys"], 8192)
-    resident = {"source_bytes": 64 * 1024**2, "source_regions": 8192,
-                "destination_bytes": 20 * 1024**2, "destination_slots": 640,
-                "max_read_bytes": 32768, "max_handles": 8192, "require_device_read": True}
-    tiers = ("remote", "coordinator_hit", "owner_hit", "registered_steady",
-             "first_touch_no_promotion", "registered_acquire", "registered_reuse",
-             "wal_warm", "native_hot_wal_lru0_pagecache", "cold_device",
-             "native_cold_os_lru0", "bounded_mixed")
+    tiers = ("remote", "coordinator_hit", "wal_warm", "native_hot_wal_lru0_pagecache",
+             "cold_device", "native_cold_os_lru0", "bounded_mixed")
     jobs = []
     for tier in tiers:
         for repeat in range(spec["repeats"]):
             for backend in (["native"] if tier.startswith("native_") and "native" in backends
                             else [] if tier.startswith("native_") else selected):
-                if (tier.startswith("registered_") or tier == "first_touch_no_promotion") and backend != "tidehunter_efa_native":
-                    continue
-                for size in ((1024, 8192) if tier in ("first_touch_no_promotion", "registered_acquire")
-                             else (256, 1024, 8192, 65536) if backend == "native"
+                for size in ((256, 1024, 8192, 65536) if backend == "native"
                              else (256, 8192, 65536)):
-                    if (tier.startswith("registered_") or tier == "first_touch_no_promotion") and size > resident["max_read_bytes"]:
-                        continue
                     for profiled in ((False,) if backend == "native" else (False, True)):
                         # Size pure-hit controls for the finite dataset plus cache metadata,
                         # without claiming four-way placement can retain every key.
                         footprint = working_keys * (size + 512)
                         cache = max(128 * 1024**2, 2 * footprint) if tier == "coordinator_hit" else (1024**2 if tier == "bounded_mixed" else 0)
-                        owner = max(128 * 1024**2, (footprint + 1) // 2) if tier == "owner_hit" else (1024**2 if tier == "bounded_mixed" else 0)
                         coordinator_allowance = max(512 * 1024**2, cache + 64 * 1024**2)
-                        owner_allowance = max(512 * 1024**2, owner + 64 * 1024**2)
-                        registered = tier.startswith("registered_")
-                        sweep = tier in ("coordinator_hit", "owner_hit", "registered_steady", "registered_reuse",
-                                         "wal_warm", "native_hot_wal_lru0_pagecache")
-                        warmup = working_keys if sweep else (0 if tier in ("registered_acquire", "first_touch_no_promotion", "cold_device", "native_cold_os_lru0") else 512)
+                        owner_allowance = 512 * 1024**2
+                        sweep = tier in ("coordinator_hit", "wal_warm", "native_hot_wal_lru0_pagecache")
+                        warmup = working_keys if sweep else (0 if tier in ("cold_device", "native_cold_os_lru0") else 512)
                         source = f"{backend}-{size}-keys{working_keys}-scalar-c1-l{'0' if backend == 'native' else '1'}-seed{1775 + repeat}-r{repeat}"
-                        tier_name = "wal_warm_oversize_async_fallback" if tier == "wal_warm" and size > 16384 else tier
+                        tier_name = tier
                         job = {"backend": backend, "repeat": repeat, "profile": "read-tier-profiled" if profiled else "read-tier-baseline",
-                            "cohort": "registered_ram_fullset_control" if tier == "registered_steady" else "read_tier_" + tier_name,
+                            "cohort": "read_tier_" + tier_name,
                             "value_size": size, "keys": working_keys, "mix": mix(read=100),
                             "concurrency": 1, "read_lanes": 1,
                             "measurement_operations": 8192,
                             "warmup_operations": warmup, "offered_ops_per_second": None,
                             "distribution": "uniform", "coordinator_cache_bytes": cache,
-                            "owner_read_cache_bytes": owner, "drop_os_caches": tier in ("cold_device", "native_cold_os_lru0"),
+                            "drop_os_caches": tier in ("cold_device", "native_cold_os_lru0"),
                             "native_durability": "value_wal_barrier", "warmup_key_sweep": sweep,
-                            "owner_read_resident_first": registered or tier in ("wal_warm", "first_touch_no_promotion"),
+                            "owner_read_resident_first": tier == "wal_warm",
                             "read_tier": {"name": tier_name, "source_id": source,
                                 "data_id": f"read-tier-v1-seed{1775 + repeat}-r{repeat}-size{size}-keys{working_keys}",
                                 "profiled": profiled,
-                                "requested": {"coordinator_cache_bytes": cache, "owner_read_cache_bytes": owner,
-                                    "registered_policy": "hardware_required" if registered else "disabled",
-                                    "registered_budgets": resident.copy() if registered else {
-                                        "source_bytes": 0, "source_regions": 0, "destination_bytes": 0,
-                                        "destination_slots": 0, "max_read_bytes": 0, "max_handles": 0,
-                                        "require_device_read": False},
-                                    "owner_read_resident_first": registered or tier in ("wal_warm", "first_touch_no_promotion"),
+                                "requested": {"coordinator_cache_bytes": cache,
+                                    "owner_read_resident_first": tier == "wal_warm",
                                     "page_cache_policy": "drop_at_measurement_gate" if tier in ("cold_device", "native_cold_os_lru0") else "not_dropped",
                                     "warmup_operations": warmup, "warmup_key_sweep": sweep,
                                     "device_trace": "enabled" if backend == "native" or tier == "cold_device" else "disabled",
-                                    "measurement_key_sweep": tier in ("first_touch_no_promotion", "registered_acquire"),
+                                    "measurement_key_sweep": False,
                                     "read_lanes": 0 if backend == "native" else 1, "concurrency": 1,
                                     "sessions": "not_applicable" if backend == "native" else "runtime_default"},
                                 "effective": None}}
@@ -297,16 +304,12 @@ def make_read_tier_matrix(spec, backends, diagnostics):
                         if backend == "native":
                             job["read_tier"]["requested"]["native_value_lru_bytes"] = 0
                             job["read_tier"]["requested"]["native_value_lru_source"] = "KeyShape::new_single default"
-                        if registered:
-                            job["resident_reads"] = resident.copy()
-                        if tier in ("first_touch_no_promotion", "registered_acquire"):
-                            job["measurement_key_sweep"] = True
                         if profiled:
                             job["diagnostics"] = {"read_profile_limit": limit}
                         jobs.append(job)
     supplemental = []
-    wanted = {"remote", "coordinator_hit", "owner_hit", "wal_warm", "bounded_mixed",
-              "registered_steady", "registered_reuse", "native_hot_wal_lru0_pagecache"}
+    wanted = {"remote", "coordinator_hit", "wal_warm", "bounded_mixed",
+              "native_hot_wal_lru0_pagecache"}
     for original in jobs:
         tier = original["read_tier"]["name"]
         if tier not in wanted or original["value_size"] != 8192:
@@ -314,9 +317,6 @@ def make_read_tier_matrix(spec, backends, diagnostics):
         for size, shape, calls in ((1024, "scalar", 8192), (8192, "batch32", 2048)):
             job = copy.deepcopy(original)
             profiled = job["read_tier"]["profiled"]
-            if tier in ("registered_steady", "registered_reuse"):
-                job["read_tier"]["name"] = tier + "_c16_mixed_acquisition_reuse"
-                job["cohort"] = "read_tier_" + job["read_tier"]["name"]
             job["value_size"] = size
             job["profile"] = f"read-tier-c16-{shape}-{'profiled' if profiled else 'baseline'}"
             job["mix"] = mix(get_many=100) if shape == "batch32" else mix(read=100)
@@ -334,9 +334,6 @@ def make_read_tier_matrix(spec, backends, diagnostics):
             supplemental.append(job)
     jobs.extend(supplemental)
     tier_order = {name: index for index, name in enumerate(tiers)}
-    tier_order["wal_warm_oversize_async_fallback"] = tier_order["wal_warm"]
-    for name in ("registered_steady", "registered_reuse"):
-        tier_order[name + "_c16_mixed_acquisition_reuse"] = tier_order[name]
     jobs.sort(key=lambda job: tier_order[job["read_tier"]["name"]])
     if len(jobs) > spec["max_cases"]:
         raise ValueError(f"matrix contains {len(jobs)} cases, exceeding explicit max_cases")
@@ -358,9 +355,9 @@ def make_run_config(job, case_root, options, source_revision, deadline_seconds=1
         if protocol_key(selected) != protocol_key(expected):
             raise ValueError("runtime transport differs from research case provider/security")
         options["transport"] = selected
-    config = {"schema_version": 1, "backend": {"kind": runtime_backend(job["backend"]), "options": options},
-        "seed": 1775 + job["repeat"],
-        "namespace": "cloud-" + hashlib.blake2b(job.get("read_tier", {}).get("data_id", job["case_id"]).encode(), digest_size=12).hexdigest(),
+    config = {"schema_version": 1, "backend": {"kind": "tidehunter" if job["backend"] in NVME_BACKENDS else runtime_backend(job["backend"]), "options": options},
+        "seed": job.get("sealed_dataset", {}).get("seed", 1775 + job["repeat"]),
+        "namespace": "cloud-" + hashlib.blake2b(job.get("sealed_dataset", job.get("read_tier", {})).get("data_id", job["case_id"]).encode(), digest_size=12).hexdigest(),
         "dataset": {"keys": job["keys"], "value_size": job["value_size"], "entropy": 1.0},
         "workload": {"distribution": job["distribution"], "mix": job["mix"], "batch_size": 32},
         "execution": {"mode": "open_loop" if job["offered_ops_per_second"] else "closed_loop",
@@ -376,6 +373,10 @@ def make_run_config(job, case_root, options, source_revision, deadline_seconds=1
         "limits": {"max_keys": max(job["keys"], 1000000), "max_bytes": 16 * 1024**3,
             "max_operations": maximum, "deadline_seconds": max(deadline_seconds, 600 if job["keys"] > 65536 else deadline_seconds),
             "shutdown_grace_seconds": 20}}
+    if "sealed_dataset" in job:
+        config["phases"]["preload"] = False
+        config["phases"]["verify_existing_dataset"] = True
+        config["phases"]["evict_mapped_wal_before_measurement"] = job.get("evict_mapped_wal_before_measurement", False)
     if "diagnostics" in job:
         config["diagnostics"] = job["diagnostics"]
     if job.get("warmup_key_sweep"):
@@ -383,6 +384,25 @@ def make_run_config(job, case_root, options, source_revision, deadline_seconds=1
     if job.get("measurement_key_sweep"):
         config["phases"]["measurement_key_sweep"] = True
     return config
+
+
+def admit_wal_eviction_evidence(directory, job, *, completed):
+    if not job.get("evict_mapped_wal_before_measurement"):
+        return None
+    path = Path(directory) / "result/pre-measurement-wal-eviction.json"
+    if not path.is_file():
+        if completed:
+            raise ValueError("requested mapped WAL eviction evidence missing")
+        return None
+    if path.stat().st_size > 1024 * 1024:
+        raise ValueError("mapped WAL eviction evidence exceeds bound")
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict) or data.get("requested") is not True or type(data.get("available")) is not bool:
+        raise ValueError("invalid mapped WAL eviction evidence")
+    if completed and (data["available"] is not True or not isinstance(data.get("evidence"), dict)):
+        raise ValueError("requested mapped WAL eviction did not succeed")
+    return {"path": "result/pre-measurement-wal-eviction.json",
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "observed": data}
 
 
 def admit_measurement_read_evidence(directory):
@@ -475,6 +495,79 @@ def admit_read_diagnostics(directory, job, *, completed):
     campaign_exporter.read_diagnostic_metrics(data, {})
     return {"path": "result/read-diagnostics.json", "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             "observed": data}
+
+
+def qualify_nvme_measurement(evidence, expected_readers, expected_transport, targets):
+    """Require actual interval activity, not startup verification or lifetime counters."""
+    reasons = []
+    if expected_transport not in ("tcp", "rdma"):
+        reasons.append("expected NVMe transport is invalid")
+    exports = []
+    if isinstance(targets, list):
+        for owner in targets:
+            target = owner.get("target") if isinstance(owner, dict) else None
+            entries = target.get("exports") if isinstance(target, dict) else None
+            if not isinstance(entries, list) or not entries:
+                reasons.append("target export receipts unavailable")
+                continue
+            exports.extend(entries)
+    if len(exports) != expected_readers:
+        reasons.append("target export receipt count differs from reader count")
+    target_policies = []
+    for entry in exports:
+        policy = entry.get("target_receipt") if isinstance(entry, dict) else None
+        target_policies.append({key: policy.get(key) if isinstance(policy, dict) else None
+                                for key in ("target_cache", "target_cache_verified", "selected_transport")})
+        if (not isinstance(policy, dict)
+                or policy.get("target_cache") != "buffered_file_page_cache"
+                or policy.get("target_cache_verified") is not True
+                or policy.get("selected_transport") != expected_transport):
+            reasons.append("target buffered cache or selected transport is unverified")
+            continue
+    nvme = evidence.get("nvmeof") if isinstance(evidence, dict) else None
+    readers = nvme.get("readers") if isinstance(nvme, dict) else None
+    if not isinstance(readers, dict) or not readers or len(readers) != expected_readers or nvme.get("available") is not True:
+        reasons.append("measurement-boundary NVMe reader evidence unavailable or incomplete")
+        readers = {}
+    fields = ("eligible_hits", "ineligible_fallbacks", "io_submissions", "io_completions", "io_errors", "io_timeouts")
+    totals = dict.fromkeys(fields, 0)
+    reader_transports = {}
+    for key, reader in readers.items():
+        identity = reader.get("identity") if isinstance(reader, dict) else None
+        reader_transports[key] = identity.get("transport") if isinstance(identity, dict) else None
+        if reader_transports[key] != expected_transport:
+            reasons.append("measurement reader transport is unavailable or differs from target")
+    for reader in readers.values():
+        counter = reader.get("counters") if isinstance(reader, dict) else None
+        values = counter.get("counters") if isinstance(counter, dict) else None
+        if (not isinstance(values, dict) or counter.get("available") is not True
+                or any(type(values.get(field)) is not int or values[field] < 0 for field in fields)):
+            reasons.append("measurement reader counters unavailable")
+            totals = None
+            break
+        for field in fields:
+            totals[field] += values[field]
+    if not readers:
+        totals = None
+    if totals is not None and (totals["eligible_hits"] <= 0 or totals["io_submissions"] <= 0
+            or totals["io_submissions"] != totals["io_completions"]
+            or any(totals[name] != 0 for name in ("ineligible_fallbacks", "io_errors", "io_timeouts"))):
+        reasons.append("NVMe measurement lacks successful eligible I/O or observed a fallback/error")
+    coordinator = (evidence.get("deltas", {}).get("coordinator") if isinstance(evidence, dict) else None)
+    values = coordinator.get("counters") if isinstance(coordinator, dict) else None
+    if (not isinstance(values, dict) or coordinator.get("available") is not True
+            or type(values.get("read_rpc_count")) is not int or type(values.get("hits")) is not int
+            or values["read_rpc_count"] < 0 or values["hits"] < 0):
+        reasons.append("measurement coordinator RPC/cache counters unavailable")
+        values = None
+    elif values["read_rpc_count"] != 0 or values["hits"] != 0:
+        reasons.append("measurement used owner record RPC or coordinator cache")
+    return {"qualified": not reasons, "reasons": reasons, "nvmeof_totals": totals,
+            "expected_transport": expected_transport, "reader_transports": reader_transports,
+            "target_policies": target_policies,
+            "coordinator_read_rpc_count": values.get("read_rpc_count") if values is not None else None,
+            "coordinator_cache_hits": values.get("hits") if values is not None else None,
+            "scope": "drained measurement interval; excludes full-key dataset verification; not NAND or wire timing"}
 
 
 def qualify_fullset_read_path(job, evidence):
@@ -588,10 +681,10 @@ def qualify_read_tier(job, evidence, receipt):
     else:
         requested = job["read_tier"]["requested"]
         effective = receipt["read_tier_effective"]
-        for name in ("coordinator_cache_bytes", "owner_read_cache_bytes", "registered_policy",
+        for name in ("coordinator_cache_bytes",
                      "coordinator_read_memory_allowance_bytes", "owner_read_memory_allowance_bytes",
-                     "registered_budgets", "owner_read_resident_first", "page_cache_policy",
-                     "warmup_operations", "warmup_key_sweep", "measurement_key_sweep", "read_lanes", "concurrency"):
+                     "page_cache_policy", "warmup_operations", "warmup_key_sweep",
+                     "measurement_key_sweep", "read_lanes", "concurrency"):
             if effective.get(name) != requested.get(name):
                 reasons.append(name + " effective configuration differs or is unavailable")
     def expect(name, predicate, description):
@@ -601,7 +694,7 @@ def qualify_read_tier(job, evidence, receipt):
     zero = lambda value: value == 0
     positive = lambda value: value > 0
     if tier == "coordinator_hit":
-        for name in ("coord_misses", "rpc", "owner_hits", "wal_reads", "posts"):
+        for name in ("coord_misses", "rpc", "wal_reads"):
             expect(name, zero, name + " must be zero")
         expect("coord_hits", positive, "coordinator hits required")
     elif tier == "owner_hit":
@@ -610,14 +703,9 @@ def qualify_read_tier(job, evidence, receipt):
         for name in ("rpc", "owner_hits"):
             expect(name, positive, name + " required")
     elif tier == "wal_warm":
-        for name in ("coord_hits", "owner_hits", "async", "resident_fallback", "posts"):
-            expect(name, zero, name + " must be zero")
-        expect("authority_history_loads", zero, "cold authority history loads must be zero")
+        expect("coord_hits", zero, "coordinator hits must be zero")
         expect("wal_reads", positive, "owner WAL reads required")
-        if job["value_size"] > 16384:
-            reasons.append("value exceeds 16 KiB resident-first member limit")
-        if observed["resident_success"] is None or observed["resident_success"] != observed["wal_reads"]:
-            reasons.append("resident-first successes do not cover WAL reads")
+        reasons.append("warm-up does not establish that every WAL read hit the Linux page cache")
     elif tier in ("registered_steady", "registered_reuse", "registered_steady_handle_headroom",
                    "registered_reuse_handle_headroom",
                    "registered_steady_c16_mixed_acquisition_reuse", "registered_reuse_c16_mixed_acquisition_reuse"):
@@ -648,7 +736,7 @@ def qualify_read_tier(job, evidence, receipt):
             expect(name, zero, name + " must be zero")
     elif tier == "cold_device":
         reasons.append("device events cover a collector window wider than measurement; activity cannot establish measurement-scoped device I/O")
-        for name in ("coord_hits", "owner_hits", "posts"):
+        for name in ("coord_hits",):
             expect(name, zero, name + " must be zero")
         expect("wal_reads", positive, "owner WAL reads required")
         hosts = receipt.get("cold_device_evidence")
@@ -683,6 +771,14 @@ def summarize_case(directory):
     value = {"case_id": job["case_id"], "job": job, "status": receipt.get("status"),
              "error": receipt.get("error"), "measurement_evidence": receipt.get("measurement_evidence"),
              "counter_evidence": receipt.get("counter_evidence")}
+    if "sealed_dataset" in job:
+        value["nvmeof_trace_evidence"] = receipt.get("nvmeof_trace_evidence")
+        value["nvmeof_trace_raw_location"] = receipt.get("nvmeof_trace_raw_location")
+        value["nvmeof_trace_upload_complete"] = receipt.get("nvmeof_trace_upload_complete")
+        value["cold_device_evidence"] = receipt.get("cold_device_evidence")
+        value["cold_device_raw_location"] = receipt.get("cold_device_raw_location")
+        value["nvmeof_measurement_qualification"] = receipt.get("nvmeof_measurement_qualification")
+        value["dataset_source"] = receipt.get("dataset_source")
     if receipt.get("status") != "completed" and not receipt.get("raw_artifacts_validated"):
         return {**value, "metrics_unavailable": "failed before trustworthy raw artifact admission"}
     read_interval = admit_measurement_read_evidence(directory)
@@ -713,6 +809,21 @@ def summarize_case(directory):
         value["cold_device_raw_location"] = receipt.get("cold_device_raw_location")
         value["read_tier_qualification"] = qualify_read_tier(
             job, read_interval["observed"] if read_interval else None, receipt)
+    eviction = admit_wal_eviction_evidence(directory, job, completed=receipt.get("status") == "completed")
+    if eviction is not None:
+        if eviction != receipt.get("wal_eviction_evidence"):
+            raise ValueError("mapped WAL eviction evidence differs from its receipt")
+        value["wal_eviction_evidence"] = eviction
+    elif receipt.get("wal_eviction_evidence") is not None:
+        raise ValueError("mapped WAL eviction artifact missing")
+    cpu_binding = receipt.get("host_cpu_evidence")
+    if cpu_binding is not None:
+        if cpu_binding.get("path") != "host-cpu-interval.json":
+            raise ValueError("host CPU evidence path differs from the owned interval artifact")
+        path = directory / "host-cpu-interval.json"
+        if hashlib.sha256(path.read_bytes()).hexdigest() != cpu_binding.get("sha256") or json.loads(path.read_text()) != cpu_binding.get("observed"):
+            raise ValueError("host CPU interval differs from its integrity binding")
+        value["host_cpu_evidence"] = cpu_binding
     resource_binding = receipt.get("resource_evidence")
     if resource_binding is not None:
         if resource_binding.get("path") != "resource-interval.json":
@@ -752,6 +863,32 @@ def summarize_case(directory):
     config = json.loads((directory / "config.json").read_text())
     normalized = json.loads((directory / "normalized-config.json").read_text())
     analyze.verify_normalization(config, normalized)
+    if job["backend"] in NVME_BACKENDS:
+        expected = len(config["backend"]["options"]["nvmeof_readers"])
+        transport = "rdma" if job["backend"] == "tidehunter_nvme_rdma" else "tcp"
+        binding = receipt.get("nvmeof_target_evidence")
+        admitted_qualification = receipt.get("nvmeof_measurement_qualification")
+        if receipt.get("status") == "completed" and (binding is None or admitted_qualification is None):
+            raise ValueError("completed NVMe result lacks bound target evidence or measurement qualification")
+        targets = None
+        if binding is not None:
+            if not isinstance(binding, dict) or binding.get("path") != "nvme-targets.json":
+                raise ValueError("invalid NVMe target evidence binding")
+            artifact = directory / binding["path"]
+            if hashlib.sha256(artifact.read_bytes()).hexdigest() != binding.get("sha256"):
+                raise ValueError("NVMe target evidence differs from its integrity binding")
+            targets = json.loads(artifact.read_text())
+        qualification = qualify_nvme_measurement(
+            read_interval["observed"] if read_interval else None, expected, transport, targets)
+        if admitted_qualification is None:
+            qualification["qualified"] = False
+            qualification["reasons"].append("measurement qualification receipt unavailable")
+        value["nvmeof_measurement_qualification"] = qualification
+        if binding is not None and admitted_qualification is not None:
+            if qualification != admitted_qualification:
+                raise ValueError("NVMe path qualification differs from measurement evidence")
+        if receipt.get("status") == "completed" and not qualification["qualified"]:
+            raise ValueError("completed NVMe result lacks qualified measurement path")
     manifest = json.loads((result / "manifest.json").read_text())
     summary = json.loads((result / "summary.json").read_text())
     if manifest.get("status") not in ("completed", "failed") or summary.get("status") != manifest.get("status"):
@@ -782,6 +919,46 @@ def summarize_case(directory):
         "success_calls_per_second": len(good) / elapsed,
         "success_logical_keys_per_second": sum(row["logical_keys"] for row in good) / elapsed,
         "success_value_mib_per_second": sum(row["bytes"] for row in good) / elapsed / 1024**2})
+    traces = value.get("nvmeof_trace_evidence")
+    if isinstance(traces, list):
+        ratios = []
+        for host in traces:
+            if not isinstance(host, dict):
+                continue
+            for trace in host.get("traces", []):
+                observed = trace.get("summary") or {}
+                for kind in ("nvmet", "block"):
+                    stage = (observed.get("stages") or {}).get(kind) or {}
+                    count = stage.get("count")
+                    complete = (host.get("complete") is True and observed.get("available") is True
+                                and observed.get("overrun_or_dropped") == 0
+                                and all(stage.get(field) == 0 for field in
+                                        ("unmatched_start", "unmatched_completion", "ambiguous")))
+                    ratios.append({"owner_index": host.get("index"), "export_uuid": trace.get("export_uuid"),
+                        "event": kind, "paired_events": count if type(count) is int else None,
+                        "measurement_api_calls": len(samples),
+                        "events_per_api_call": count / len(samples) if complete and type(count) is int else None,
+                        "complete": complete,
+                        "scope": "collector-window pairs divided by measured API calls; populations differ, "
+                                 "block events are device-wide and can be duplicated across export collectors; "
+                                 "not per-call attribution or NAND latency"})
+        value["trace_event_ratios"] = ratios
+    device = value.get("cold_device_evidence")
+    device_rows = list(enumerate(device, start=-1)) if isinstance(device, list) else [(-1, device)] if isinstance(device, dict) else []
+    if device_rows:
+        ratios = value.setdefault("trace_event_ratios", [])
+        for index, observed in device_rows:
+            if not isinstance(observed, dict):
+                continue
+            count = observed.get("read_issues")
+            complete = (observed.get("available") is True and observed.get("lost") == 0
+                        and observed.get("truncated") is False)
+            ratios.append({"owner_index": index, "event": "block_read_issue",
+                "observed_events": count if type(count) is int else None,
+                "measurement_api_calls": len(samples),
+                "events_per_api_call": count / len(samples) if complete and type(count) is int else None,
+                "complete": complete,
+                "scope": "device-wide collector window versus API calls; overlapping gates and background I/O prevent per-call attribution"})
     for population in totals["populations"]:
         selected = [row for row in samples if row["operation"] == population["operation"]
                     and row["outcome"] == population["outcome"]]
@@ -997,7 +1174,7 @@ def main():
     plan.add_argument("--spec", type=Path, default=Path(__file__).with_name("cloud-campaign.json"))
     plan.add_argument("--output", type=Path, required=True)
     plan.add_argument("--backends", help="comma-separated nonempty subset of tracked backend IDs")
-    plan.add_argument("--mode", choices=("standard", "read-tier", "read-tier-focused"), default="standard")
+    plan.add_argument("--mode", choices=("standard", "read-tier", "read-tier-focused", "nvmeof-focused"), default="standard")
     plan.add_argument("--write-profile-limit", type=int,
                       help="diagnostic-only 1KiB write cohort for native/Tidehunter; leaves normal plans unprofiled")
     plan.add_argument("--read-profile-limit", type=int,
@@ -1015,10 +1192,12 @@ def main():
             if args.read_profile_limit is not None:
                 diagnostics["read_profile_limit"] = args.read_profile_limit
             spec["diagnostics"] = diagnostics
-        if args.backends is not None:
-            spec["backends"] = select_backends(args.backends, spec.get("backends"), set(BACKENDS))
-        else:
-            spec["backends"] = select_backends(None, spec.get("backends"), set(BACKENDS))
+        supported = set(BACKENDS) | (NVME_BACKENDS if args.mode == "nvmeof-focused" else set())
+        configured = select_backends(None, spec.get("backends"), supported)
+        if args.mode == "nvmeof-focused" and args.backends is not None:
+            # Local RDMA planning is explicit; AWS CI admits its own provider set.
+            configured += sorted(NVME_BACKENDS.difference(configured))
+        spec["backends"] = select_backends(args.backends, configured, supported)
         value = {"schema_version": 1, "spec": spec, "jobs": make_matrix(spec)}
         local.dump(args.output, value)
         print(json.dumps({"planned_cases": len(value["jobs"]),

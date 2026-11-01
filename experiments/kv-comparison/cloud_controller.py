@@ -16,6 +16,7 @@ is an internal exact-node SSM RPC; it is not a local qualification shortcut.
 """
 import argparse
 import base64
+import copy
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 import hashlib
@@ -52,8 +53,6 @@ TAGS = {"Project": "TideHunter", "ManagedBy": "sharded-wal-benchmark",
 RAW_FILES = ("manifest.json", "summary.json", "samples.csv", "metrics.prom")
 MAX_JSON_BYTES = 32 * 1024 * 1024
 MAX_AMBIGUOUS_REPLAYS = 2
-DISABLED_RESIDENT_READS = {"source_bytes": 0, "source_regions": 0, "destination_bytes": 0,
-    "destination_slots": 0, "max_read_bytes": 0, "max_handles": 0, "require_device_read": False}
 
 
 class SafetyError(RuntimeError):
@@ -101,6 +100,15 @@ def dump(path, value):
     guarded(path.with_suffix(path.suffix + ".tmp"), path.parent)
     local.dump(path, value)
 
+def dump_compact(path, value):
+    path = Path(path).absolute()
+    guarded(path, path.parent)
+    temporary = guarded(path.with_suffix(path.suffix + ".tmp"), path.parent)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+    temporary.chmod(0o600)
+    temporary.replace(path)
+
 
 def digest(path, algorithm="sha256"):
     return campaign.digest(Path(path), algorithm)
@@ -126,7 +134,7 @@ def validate_read_tier_memory(jobs, fleet):
             continue
         for prefix, cap_name in (("coordinator", "client_memory_mib"), ("owner_read", "server_memory_mib")):
             allowance = job[prefix + "_read_memory_allowance_bytes"] if prefix == "coordinator" else job["owner_read_memory_allowance_bytes"]
-            cache = job["coordinator_cache_bytes"] if prefix == "coordinator" else job["owner_read_cache_bytes"]
+            cache = job["coordinator_cache_bytes"] if prefix == "coordinator" else 0
             cap = fleet[cap_name] * 1024**2 * 3 // 4
             if allowance < cache + 64 * 1024**2 or allowance > cap:
                 raise ValueError(prefix + " read allowance exceeds the bounded fleet memory budget or lacks pending-read headroom")
@@ -371,7 +379,7 @@ def make_clients(config, *, guest=False):
 def s3_json(client, config, key, value):
     if not key.startswith(config["prefix"] + "/") or ".." in key.split("/"):
         raise SafetyError("S3 key escapes exact run prefix")
-    raw = (json.dumps(value, sort_keys=True, indent=2, default=str) + "\n").encode()
+    raw = (json.dumps(value, sort_keys=True, separators=(",", ":"), default=str) + "\n").encode()
     if len(raw) > MAX_JSON_BYTES:
         raise SafetyError("S3 JSON export exceeds its bounded metadata budget")
     checksum = hashlib.sha256(raw).hexdigest()
@@ -547,12 +555,12 @@ def docker_monitor_identity(item, proc_root=Path("/proc")):
     return {"container_id": identifier, "pid": pid, "cgroup": groups[0]}
 
 
-def owned_monitor_processes(config, index, job):
+def owned_monitor_processes(config, index, job, owner_case=None):
     """Observe known deployment PIDs only; never scan /proc for candidates."""
     processes, missing, identities = [], [], []
     role = "client" if index == -1 else "storage-" + str(index)
     if index == -1 or job["backend"] in cloud_campaign.TRANSPORTS:
-        name = unit_name(config, job["case_id"], role) + ".service"
+        name = unit_name(config, owner_case if index >= 0 and owner_case is not None else job["case_id"], role) + ".service"
         processes.append({"role": role, "cgroup": "/system.slice/" + name})
     if job["backend"] in cloud_layout.BACKENDS:
         deployment = cloud_layout.node_config(config["fleet"], job["backend"], index)
@@ -575,7 +583,8 @@ def snapshot(config, name=None, *, drop=False, completed=False):
         Path("/proc/sys/vm/drop_caches").write_text("3\n")
     result = {"observed_utc": utc().isoformat(), "monotonic_ns": time.monotonic_ns(), "nvme": nvme,
               "drop_os_caches": drop, "application_caches_evicted": False,
-              "diskstats": Path("/proc/diskstats").read_text(), "vmstat": Path("/proc/vmstat").read_text()}
+              "diskstats": Path("/proc/diskstats").read_text(), "vmstat": Path("/proc/vmstat").read_text(),
+              "host_cpu_stat": Path("/proc/stat").read_text(), "host_cpu_hz": os.sysconf("SC_CLK_TCK")}
     if name:
         status = unit_status(name)
         result["unit"] = status
@@ -596,6 +605,39 @@ def snapshot(config, name=None, *, drop=False, completed=False):
         else:
             raise InfrastructureError("live workload cgroup missing")
     return result
+
+
+def host_cpu_interval(before, after):
+    """Host-wide CPU, including kernel workers, not a cgroup or target attribution."""
+    if len(before) != 6 or len(after) != 6:
+        raise ValueError("six host CPU snapshots required")
+    rows = []
+    for index, (start, end) in enumerate(zip(before, after), start=-1):
+        row = {"host_index": index, "available": False}
+        try:
+            if start["nvme"]["host_identity"]["boot_id"] != end["nvme"]["host_identity"]["boot_id"]:
+                raise ValueError("host rebooted")
+            hz = start["host_cpu_hz"]
+            if type(hz) is not int or hz <= 0 or hz != end["host_cpu_hz"]:
+                raise ValueError("CPU tick frequency unavailable or changed")
+            def fields(frame):
+                line = frame["host_cpu_stat"].splitlines()[0].split()
+                if line[0] != "cpu" or len(line) < 9:
+                    raise ValueError("aggregate CPU counters unavailable")
+                return [int(value) for value in line[1:9]]
+            a, b = fields(start), fields(end)
+            delta = [y - x for x, y in zip(a, b)]
+            if any(value < 0 for value in delta):
+                raise ValueError("CPU counter reset")
+            row.update(available=True, user_seconds=(delta[0] + delta[1]) / hz,
+                       system_seconds=(delta[2] + delta[5] + delta[6]) / hz,
+                       idle_seconds=delta[3] / hz, iowait_seconds=delta[4] / hz,
+                       steal_seconds=delta[7] / hz)
+        except (KeyError, TypeError, ValueError, IndexError) as exc:
+            row["reason"] = str(exc)
+        rows.append(row)
+    return {"schema_version": 1, "hosts": rows,
+            "scope": "host-wide CPU between independently sampled gates; includes unrelated work and nvmet kernel workers, not attribution to this workload"}
 
 
 def safe_extract_capsule(archive, destination, expected):
@@ -723,7 +765,7 @@ def guest_operation(config, request, clients):
         if resource_job is not None:
             if request.get("monitor_job") is not None and request["monitor_job"] != resource_job:
                 raise SafetyError("resource and monitoring selections disagree")
-            accounting = owned_monitor_processes(config, index, resource_job)
+            accounting = owned_monitor_processes(config, index, resource_job, request.get("resource_owner_case"))
             observed["resource_accounting"] = resource_accounting.capture(
                 index, observed["nvme"]["host_identity"]["boot_id"], accounting["processes"])
             for missing in accounting["missing"]:
@@ -732,7 +774,7 @@ def guest_operation(config, request, clients):
         if request.get("monitor_job") is not None:
             started = time.monotonic()
             try:
-                evidence = owned_monitor_processes(config, index, request["monitor_job"])
+                evidence = owned_monitor_processes(config, index, request["monitor_job"], request.get("resource_owner_case"))
                 selected = monitor_module(config).select_host(monitoring_spec(config, root / "results"),
                     index, request["monitor_job"], evidence["processes"])
                 observed["monitoring"] = {"complete": not evidence["missing"] and selected.get("complete") is not False,
@@ -755,6 +797,43 @@ def guest_operation(config, request, clients):
             if request.get("cluster"):
                 argv.append("--cluster")
         return json.loads(command(argv, timeout=request["operation_timeout"], env=environment(config)))
+    if action in ("nvme_owner_stop", "nvme_owner_restart", "nvme_owner_export",
+                  "nvme_owner_target_setup", "nvme_owner_target_cleanup", "nvme_owner_cleanup_export"):
+        if config["spec"].get("mode") != "nvmeof-focused" or index < 0:
+            raise SafetyError("NVMe owner operations require a focused fleet owner")
+        if action == "nvme_owner_target_cleanup":
+            expected = f"{config['prefix']}/results/cells/{request['case_id']}/storage/{index}/nvme-disconnect/{request['generation']}.json"
+            if request.get("host_disconnected_key") != expected:
+                raise SafetyError("unexpected disconnect proof location")
+            request = {**request, "host_disconnected": read_s3_json(clients["s3"], config, expected)}
+        import nvme_campaign_owner
+        result = nvme_campaign_owner.execute(config, request, command=command,
+            validate_launch=validate_launch, unit_status=unit_status, unit_name=unit_name)
+        if action == "nvme_owner_export" and result.get("complete") is True:
+            for entry in result["ready"]["exports"]:
+                raw = nvme_campaign_owner.read_export_manifest(
+                    config, request["case_id"], index, entry["manifest_path"], validate_launch=validate_launch)
+                checksum = hashlib.sha256(raw).hexdigest()
+                if checksum != entry["manifest_sha256"]:
+                    raise SafetyError("owner manifest changed before upload")
+                ident = entry["export_uuid"]
+                if not isinstance(ident, list) or len(ident) != 16 or any(type(b) is not int or not 0 <= b <= 255 for b in ident):
+                    raise SafetyError("invalid export UUID")
+                key = f"{config['prefix']}/results/cells/{request['case_id']}/storage/{index}/nvme-manifests/{bytes(ident).hex()}.json"
+                clients["s3"].put_object(Bucket=config["bucket"], Key=key, Body=raw,
+                    ExpectedBucketOwner=config["account"], ServerSideEncryption="AES256",
+                    Metadata={"sha256": checksum}, ContentType="application/json")
+                head = clients["s3"].head_object(Bucket=config["bucket"], Key=key, ExpectedBucketOwner=config["account"])
+                if head.get("ContentLength") != len(raw) or head.get("Metadata", {}).get("sha256") != checksum:
+                    raise InfrastructureError("owner manifest upload identity unconfirmed")
+                entry["manifest_key"] = key
+                entry["manifest_bytes"] = len(raw)
+        return result
+    if action in ("nvme_trace_start", "nvme_trace_stop"):
+        if config["spec"].get("mode") != "nvmeof-focused" or index < 0:
+            raise SafetyError("NVMe trace requires a focused fleet owner")
+        import nvme_campaign_trace
+        return nvme_campaign_trace.execute(config, request, clients, command=command)
     case = request["case_id"]
     guest_root = guarded(root / "cells" / case, root)
     capsule_root = guarded(guest_root / ("node-" + str(index)), root)
@@ -765,8 +844,11 @@ def guest_operation(config, request, clients):
         launch = yaml.safe_load((capsule_root / "launch.yaml").read_text())
         validate_launch(config, launch, case, index)
         wal_root = guarded(launch["node"]["root"], capsule_root, must_exist=True)
+        trace_id = request.get("trace_id", case)
+        if not isinstance(trace_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", trace_id):
+            raise SafetyError("invalid exact trace identity")
         state = guarded(Path("/var/lib/tidehunter-kv-control") / config["prefix"] /
-                        ("cold-" + hashlib.sha256(case.encode()).hexdigest()[:16] + "-" + str(index)),
+                        ("cold-" + hashlib.sha256(trace_id.encode()).hexdigest()[:16] + "-" + str(index)),
                         Path("/var/lib/tidehunter-kv-control") / config["prefix"])
         script = Path(config["repository_root"]) / "experiments/kv-comparison/cold_device_trace.py"
         argv = [sys.executable, "-B", script, "start" if action == "cold_trace_start" else "stop",
@@ -858,6 +940,10 @@ class Controller:
         self.sequence_lock = threading.Lock()
         self.active_backend = None
         self.active_tide = None
+        self.tide_cleanup_forbidden = False
+        self.shared_tide = None
+        self.shared_native = {}
+        self.active_nvme = None
         self.package = None
         self.root_owned = False
         self.expiry = None
@@ -1288,11 +1374,13 @@ class Controller:
                 "max_batches_per_partition": max(16384, job["keys"] + job["warmup_operations"] + job["measurement_operations"]),
                 "max_admitted_batches": 1_000_000, "max_index_bytes": 512 * 1024**2,
                 "coordinator_cache_bytes": job["coordinator_cache_bytes"], "owner_read_workers": 4,
-                "owner_wal_member_read": "async", "owner_read_cache_bytes": job["owner_read_cache_bytes"],
+                "owner_wal_member_read": "async",
+                "owner_read_resident_first": job.get("owner_read_resident_first", False),
                 "owner_read_memory_allowance_bytes": allowance,
-                "owner_read_resident_first": job.get("owner_read_resident_first", "resident_reads" in job),
-                "resident_reads": job.get("resident_reads", DISABLED_RESIDENT_READS),
                 "polling": "adaptive"}
+        if "sealed_dataset" in job:
+            # The bounded block has at most 32 measured reopens plus preparation.
+            prep["max_epochs"] = 40
         if "coordinator_read_memory_allowance_bytes" in job:
             prep["coordinator_read_memory_allowance_bytes"] = job["coordinator_read_memory_allowance_bytes"]
         dump(directory / "prepare-input.json", prep)
@@ -1339,8 +1427,9 @@ class Controller:
             # Mark before send; even an unknown response must be cleaned up.
             with self.sequence_lock:
                 self.active_tide[2].append(index)
-            service_seconds = min(int(self.remaining()), max(self.config["spec"]["case_deadline_seconds"],
-                600 if job["keys"] > 65536 else 0) + 300)
+            service_seconds = (int(self.remaining()) if "sealed_dataset" in job else
+                min(int(self.remaining()), max(self.config["spec"]["case_deadline_seconds"],
+                    600 if job["keys"] > 65536 else 0) + 300))
             proof = self.request(index, {"action": "tide_start", "case_id": case, "key": key,
                 "sha256": digest(archive), "files": list(files), "timeout": service_seconds}, case=case, timeout=120)
             dump(directory / "server-proofs" / f"start-{index}.json", proof)
@@ -1355,9 +1444,18 @@ class Controller:
                 "external_owner_read_config": json.loads((prepared / "external_owner_read_config.json").read_text())}
 
     def stop_tide(self):
+        if self.active_nvme is not None:
+            raise InfrastructureError("NVMe ownership remains live or quarantined; owner removal forbidden")
+        if self.tide_cleanup_forbidden:
+            raise InfrastructureError("client quiescence unconfirmed; shared owner data retained")
         if not self.active_tide:
             return
         job, directory, indices = self.active_tide
+        if self.shared_tide is not None and self.shared_tide.get("ready") is not None:
+            cleanup = self.owner_batch("nvme_owner_cleanup_export", job["case_id"], timeout=120,
+                                       export=True, no_targets_published=not self.shared_tide.get("target_attempted", False))
+            dump(directory / "owner-export-cleanup.json", cleanup)
+            self.shared_tide["ready"] = None
         errors = []
         deadline = self.cleanup_deadline()
         def stop(index):
@@ -1372,9 +1470,272 @@ class Controller:
                     future.result()
                 except Exception as exc:
                     errors.append(repr(exc))
-        self.active_tide = None
         if errors:
             raise InfrastructureError("Tidehunter exact unit cleanup incomplete: " + "; ".join(errors))
+        if self.shared_tide is not None:
+            database = guarded(directory / "database", self.root)
+            if database.exists():
+                shutil.rmtree(database)
+            control = Path("/var/lib/tidehunter-kv-control") / self.config["prefix"]
+            for mirror in self.shared_tide.get("mirror_roots", []):
+                shutil.rmtree(guarded(mirror, control, must_exist=True))
+        self.active_tide = None
+
+    def owner_batch(self, action, case, *, timeout=120, export=False, **fields):
+        timeout = max(1, min(timeout, int(self.remaining(export=export))))
+        def execute(index):
+            request = {"action": action, "case_id": case, "timeout": timeout, **fields}
+            if action == "nvme_owner_target_setup":
+                request["address"] = self.config["fleet"]["nodes"][index]["address"]
+            result = self.request(index, request, case=case, timeout=timeout, export=export)
+            if result.get("complete") is not True:
+                raise InfrastructureError("owner lifecycle failed: " + json.dumps(result))
+            return result
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            return list(pool.map(execute, range(5)))
+
+    def stage_nvme_manifests(self, case, exports):
+        control = guarded(Path("/var/lib/tidehunter-kv-control") / self.config["prefix"],
+                          Path("/var/lib/tidehunter-kv-control"))
+        control.mkdir(mode=0o700, parents=True, exist_ok=True)
+        mirrors = []
+        for index, owner in enumerate(exports):
+            source = Path(self.config["fleet"]["data_root"]) / "cells" / case / f"node-{index}" / "nvmeof/export"
+            if Path(owner["work_dir"]) / "export" != source:
+                raise SafetyError("manifest source differs from exact owner export")
+            mirror = control / ("source-" + hashlib.sha256(case.encode()).hexdigest()[:16] + "-" + str(index))
+            mirror.mkdir(mode=0o700)
+            mirrors.append(str(mirror))
+            for entry in owner["ready"]["exports"]:
+                original = Path(entry["manifest_path"])
+                if not original.is_absolute() or ".." in original.parts or not original.is_relative_to(source) or original.name != "manifest.json":
+                    raise SafetyError("manifest path escapes owner export")
+                ident = entry["export_uuid"]
+                if not isinstance(ident, list) or len(ident) != 16 or any(type(b) is not int or not 0 <= b <= 255 for b in ident):
+                    raise SafetyError("invalid export UUID")
+                key = f"{self.config['prefix']}/results/cells/{case}/storage/{index}/nvme-manifests/{bytes(ident).hex()}.json"
+                checksum, size = entry.get("manifest_sha256"), entry.get("manifest_bytes")
+                if (entry.get("manifest_key") != key or not isinstance(checksum, str)
+                        or not re.fullmatch(r"[a-f0-9]{64}", checksum)
+                        or type(size) is not int or not 0 < size <= 64 * 1024**2):
+                    raise SafetyError("manifest S3 identity or size differs from admission")
+                head = self.clients["s3"].head_object(Bucket=self.config["bucket"], Key=key,
+                                                       ExpectedBucketOwner=self.config["account"])
+                if head.get("ContentLength") != size or head.get("Metadata", {}).get("sha256") != checksum:
+                    raise InfrastructureError("source manifest HEAD differs from owner receipt")
+                destination = mirror / original.relative_to(source)
+                guarded(destination, mirror)
+                destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                self.clients["s3"].download_file(self.config["bucket"], key, str(destination),
+                    ExtraArgs={"ExpectedBucketOwner": self.config["account"]})
+                destination.chmod(0o600)
+                if destination.stat().st_size != size or digest(destination) != checksum:
+                    raise SafetyError("downloaded source manifest differs from owner receipt")
+        return mirrors
+
+    def prepared_tide_options(self, job, directory):
+        source = job["sealed_dataset"]["source_id"]
+        transport = "tcp" if job["backend"] == "tidehunter_tcp" or job["backend"] in cloud_campaign.NVME_BACKENDS else job["backend"]
+        identity = (source, transport)
+        if self.shared_tide is not None and self.shared_tide["identity"] != identity:
+            if self.active_nvme is not None:
+                raise SafetyError("cannot replace a dataset with outstanding NVMe namespaces")
+            self.stop_tide()
+            self.shared_tide = None
+        if self.shared_tide is None:
+            block = guarded(self.root / "datasets" / (source + "-" + transport), self.root)
+            block.mkdir(parents=True, exist_ok=False)
+            options = self.prepare_tide(job, block)
+            prep_config = cloud_campaign.make_run_config(job, block, options, self.config["source_revision"],
+                                                        min(600, int(self.remaining())))
+            prep_config["key_namespace_hex"] = hashlib.blake2b(
+                f"{self.config['prefix']}:{job['repeat']}".encode(), digest_size=16).hexdigest()
+            dump(block / "dataset-config.json", prep_config)
+            command([self.config["binary"], "prepare-nvmeof-dataset", block / "dataset-config.json",
+                     block / "dataset-prepared.json"], timeout=min(600, self.remaining()), env=environment(self.config))
+            prepared = json.loads((block / "dataset-prepared.json").read_text())
+            if (prepared.get("schema_version") != 1 or prepared.get("keys") != job["keys"]
+                    or prepared.get("value_bytes") != job["value_size"]
+                    or prepared.get("seed") != prep_config["seed"]
+                    or prepared.get("preload_recipe") != "kv-research-native-sealed-batch-v2"
+                    or type(prepared.get("preload_batch_max_members")) is not int
+                    or not 1 <= prepared["preload_batch_max_members"] <= 32
+                    or prepared.get("namespace") != list(bytes.fromhex(prep_config["key_namespace_hex"]))):
+                raise SafetyError("sealed dataset preparation identity differs from requested source")
+            ready, mirrors = None, []
+            if transport == "tcp":
+                case = job["case_id"]
+                stopped = self.owner_batch("nvme_owner_stop", case, timeout=120)
+                dump(block / "owner-stopped.json", stopped)
+                exports = self.owner_batch("nvme_owner_export", case, timeout=600, prepared=prepared)
+                dump(block / "owner-exports.json", exports)
+                ready = [row["ready"] for row in exports]
+                if (len(ready) != len(prepared["partitions"])
+                        or {row.get("partition") for row in ready} != set(prepared["partitions"])
+                        or sum(row.get("members", -1) for row in ready) != job["keys"]
+                        or any(any(row.get(key) != prepared[key] for key in
+                                   ("namespace", "seed", "keys", "value_bytes", "entropy", "source_epoch",
+                                    "preload_recipe", "preload_batch_max_members"))
+                               or not isinstance(row.get("exports"), list)
+                               or sum(item.get("members", -1) for item in row["exports"]) != row.get("members")
+                               for row in ready)):
+                    raise SafetyError("owner exports do not cover the exact sealed dataset")
+                mirrors = self.stage_nvme_manifests(case, exports)
+                restarted = self.owner_batch("nvme_owner_restart", case, timeout=120,
+                                             runtime_seconds=int(self.remaining()))
+                dump(block / "owner-restarted.json", restarted)
+            self.shared_tide = {"identity": identity, "job": job, "block": block,
+                                "options": options, "prepared": prepared, "ready": ready, "mirror_roots": mirrors}
+        options = copy.deepcopy(self.shared_tide["options"])
+        options["evidence"] = str(directory / "read-evidence")
+        options["external_remote_config"]["read_lanes"] = job["read_lanes"]
+        return options
+
+    def connect_nvme(self, job, directory):
+        shared = self.shared_tide
+        if not shared or self.active_nvme is not None:
+            raise SafetyError("NVMe connection requires one prepared, idle dataset")
+        transport = {"tidehunter_nvme_tcp": "tcp", "tidehunter_nvme_rdma": "rdma"}[job["backend"]]
+        generation = hashlib.sha256(job["case_id"].encode()).hexdigest()[:16]
+        case = shared["job"]["case_id"]
+        active = {"generation": generation, "case": case, "case_directory": str(directory),
+                  "transport": transport, "hosts": []}
+        self.active_nvme = active
+        shared["target_attempted"] = True
+        targets = self.owner_batch("nvme_owner_target_setup", case, timeout=120,
+                                   generation=generation, base_port_id=1000, base_service=4420,
+                                   transport=transport)
+        dump(directory / "nvme-targets.json", targets)
+        active["targets"] = targets
+        script = Path(self.config["repository_root"]) / "experiments/nvmeof/campaign_targets.py"
+        control = Path("/var/lib/tidehunter-kv-control") / self.config["prefix"]
+        control.mkdir(mode=0o700, parents=True, exist_ok=True)
+        readers = []
+        for index, (owner, ready) in enumerate(zip(targets, shared["ready"])):
+            target = owner["target"]
+            if target.get("transport") != transport or not target.get("exports"):
+                raise SafetyError("target transport or exported namespace set differs from admission")
+            for entry in target["exports"]:
+                policy = entry.get("target_receipt", {})
+                if (policy.get("selected_transport") != transport
+                        or policy.get("target_cache") != "buffered_file_page_cache"
+                        or policy.get("target_cache_verified") is not True):
+                    raise SafetyError("actual target transport and buffered page-cache policy are unconfirmed")
+            root = Path(shared["mirror_roots"][index])
+            remote_root = Path(target["export_root"])
+            expected_root = Path(self.config["fleet"]["data_root"]) / "cells" / case / f"node-{index}" / "nvmeof/export"
+            if remote_root != expected_root:
+                raise SafetyError("target export root differs from prepared owner")
+            ready_path = control / ("ready-" + generation + "-" + str(index) + ".json")
+            target_path = control / ("target-" + generation + "-" + str(index) + ".json")
+            dump_compact(ready_path, ready)
+            dump_compact(target_path, target)
+            host_state = control / ("host-" + generation + "-" + str(index))
+            active["hosts"].append({"index": index, "state": str(host_state), "target": target,
+                                    "ready_path": str(ready_path), "target_path": str(target_path)})
+            result = json.loads(command([sys.executable, "-B", script, "host-connect",
+                "--ready", ready_path, "--export-root", root, "--state", host_state,
+                "--targets", target_path], timeout=min(120, self.remaining())))
+            if result.get("phase") != "connected" or result.get("transport") != transport:
+                raise InfrastructureError("namespace connection/protection incomplete")
+            dump(directory / f"nvme-host-{index}.json", result)
+            active["hosts"][-1]["controllers"] = []
+            for item in result["exports"]:
+                controller = item["host_receipt"]["controller"]
+                if not re.fullmatch(r"nvme[0-9]+", controller):
+                    raise SafetyError("invalid protected controller identity")
+                identify = json.loads(command(["nvme", "id-ctrl", "/dev/" + controller, "-o", "json"], timeout=20))
+                raw_id = identify.get("cntlid")
+                ctrl_id = int(raw_id, 0) if isinstance(raw_id, str) else raw_id
+                if type(ctrl_id) is not int or not 1 <= ctrl_id <= 65535:
+                    raise SafetyError("controller Identify did not provide a usable target controller ID")
+                active["hosts"][-1]["controllers"].append({"export_uuid": item["export_uuid"], "ctrl_id": ctrl_id})
+            bindings = {tuple(item["export_uuid"]): item for item in result["bindings"]}
+            for entry in target["exports"]:
+                binding = bindings.pop(tuple(entry["export_uuid"]), None)
+                if binding is None:
+                    raise SafetyError("namespace binding missing for protected export")
+                if binding.get("transport") != transport:
+                    raise SafetyError("namespace binding transport differs from selected transport")
+                manifest_path = guarded(root / Path(entry["manifest"]).relative_to(remote_root), root, must_exist=True)
+                if digest(manifest_path) != entry.get("manifest_sha256"):
+                    raise SafetyError("protected target manifest differs from source bytes")
+                manifest = json.loads(manifest_path.read_text())
+                catalog = manifest.get("catalog")
+                if not isinstance(catalog, list) or not catalog:
+                    raise SafetyError("protected export has no bounded catalog")
+                charged = len(catalog) * 4096 + len(manifest["nqn"].encode()) + 32 * 4096 + 128 * 8192 + 4096
+                catalog_budget = ((charged + 1024**2 - 1) // 1024**2) * 1024**2
+                readers.append({"binding": {"namespace_path": binding["namespace_path"], "transport": transport},
+                    "manifest": manifest, "max_inflight_requests": 32,
+                    "max_inflight_members": 128, "max_inflight_bytes": 16 * 1024**2,
+                    "max_catalog_bytes": catalog_budget})
+            if bindings:
+                raise SafetyError("unexpected namespace binding")
+        if not readers:
+            raise SafetyError("sealed dataset produced no namespace readers")
+        remote = shared["options"]["external_remote_config"]
+        allowance = remote["read_memory_allowance_bytes"] - remote["read_cache_bytes"] - remote["max_pending_read_bytes"]
+        reserved = sum(reader["max_catalog_bytes"] + reader["max_inflight_bytes"]
+                       + reader["max_inflight_members"] * 2048 + reader["max_inflight_requests"] * 1024
+                       for reader in readers)
+        if allowance < 0 or reserved > allowance:
+            raise SafetyError("namespace catalog and inflight budgets exceed coordinator read allowance")
+        dump(directory / "nvme-reader-budget.json", {"allowance_bytes": allowance,
+             "reserved_bytes": reserved, "reader_count": len(readers),
+             "scope": "conservative sum of catalog, reader metadata and maximum inflight bytes"})
+        return readers
+
+    def nvme_trace(self, action, duration=None, *, export=False):
+        active = self.active_nvme
+        if not active or len(active["hosts"]) != 5:
+            raise SafetyError("target trace requires every protected host binding")
+        def capture(host):
+            if action == "stop" and host.get("trace_already_stopped") is not None:
+                return host["trace_already_stopped"]
+            request = {"action": "nvme_trace_" + action, "case_id": active["case"],
+                       "generation": active["generation"], "controllers": host["controllers"],
+                       "timeout": 90}
+            if action == "start":
+                request["duration_seconds"] = duration
+            result = self.request(host["index"], request, case=active["case"], timeout=90, export=export)
+            if action == "start" and result.get("complete") is not True and result.get("cleanup_complete") is True:
+                host["trace_already_stopped"] = result
+            return result
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            return list(pool.map(capture, active["hosts"]))
+
+    def disconnect_nvme(self, *, drained):
+        active = self.active_nvme
+        if active is None:
+            return
+        if not drained or len(active["hosts"]) != 5:
+            raise InfrastructureError("reader drain or complete namespace ownership is unconfirmed; quarantine retained")
+        script = Path(self.config["repository_root"]) / "experiments/nvmeof/campaign_targets.py"
+        deadline = self.cleanup_deadline()
+        def disconnect(host):
+            timeout = self.cleanup_timeout(deadline, 60)
+            proof = json.loads(command([sys.executable, "-B", script, "host-disconnect",
+                "--state", host["state"], "--readers-drained"], timeout=timeout))
+            key = f"{self.config['prefix']}/results/cells/{active['case']}/storage/{host['index']}/nvme-disconnect/{active['generation']}.json"
+            s3_json(self.clients["s3"], self.config, key, proof)
+            timeout = self.cleanup_timeout(deadline, 60)
+            result = self.request(host["index"], {"action": "nvme_owner_target_cleanup",
+                "case_id": active["case"], "timeout": timeout, "generation": active["generation"],
+                "readers_drained": True, "host_disconnected_key": key},
+                case=active["case"], timeout=timeout, export=True)
+            if result.get("complete") is not True:
+                raise InfrastructureError("target cleanup unconfirmed: " + json.dumps(result))
+            dump(Path(active["case_directory"]) / f"nvme-cleanup-{host['index']}.json",
+                 {"host_disconnect_s3": key, "target_cleanup": result, "readers_drained": True})
+            control = Path("/var/lib/tidehunter-kv-control") / self.config["prefix"]
+            shutil.rmtree(guarded(host["state"], control, must_exist=True))
+            guarded(host["ready_path"], control, must_exist=True).unlink()
+            guarded(host["target_path"], control, must_exist=True).unlink()
+            return result
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            list(pool.map(disconnect, active["hosts"]))
+        self.active_nvme = None
 
     def run_case(self, job):
         directory = guarded(self.root / "cases" / job["case_id"], self.root)
@@ -1386,9 +1747,18 @@ class Controller:
         started = False
         client_quiesced = False
         completion_observed = False
+        drain_proved = False
         tracer_attempted = False
         tracer_stopped = False
         tracer_clean = True
+        nvme_trace_attempted = False
+        nvme_trace_stopped = False
+        sealed_diagnostic = job.get("sealed_dataset", {}).get("profiled") is True
+        owner_trace = job.get("read_tier", {}).get("name") == "cold_device" or (
+            sealed_diagnostic and job["backend"] != "native" and job["backend"] not in cloud_campaign.NVME_BACKENDS)
+        local_trace = job.get("read_tier", {}).get("name", "").startswith("native_") or (
+            sealed_diagnostic and job["backend"] == "native")
+        trace_case = job["case_id"]
         failure = None
         def native_trace(action, duration=None):
             control_root = guarded(Path("/var/lib/tidehunter-kv-control") / self.config["prefix"],
@@ -1398,7 +1768,8 @@ class Controller:
             script = Path(self.config["repository_root"]) / "experiments/kv-comparison/cold_device_trace.py"
             argv = [sys.executable, "-B", script, action, "--state-dir", state]
             if action == "start":
-                argv += ["--wal-path", guarded(directory / "database", directory, must_exist=True),
+                wal = Path(config["backend"]["options"]["path"]) if "sealed_dataset" in job else directory / "database"
+                argv += ["--wal-path", guarded(wal, self.root, must_exist=True),
                          "--duration-seconds", str(duration)]
             try:
                 return json.loads(command(argv, timeout=45, env=environment(self.config)))
@@ -1418,17 +1789,47 @@ class Controller:
             elif backend == "native":
                 options = {"path": str(directory / "database"), "key_count": max(1048576, job["keys"]), "durability": job["native_durability"]}
             else:
-                options = self.prepare_tide(job, directory)
+                options = (self.prepared_tide_options(job, directory) if "sealed_dataset" in job
+                           else self.prepare_tide(job, directory))
+                if backend in cloud_campaign.NVME_BACKENDS:
+                    options["nvmeof_readers"] = self.connect_nvme(job, directory)
+                    receipt["nvmeof_target_evidence"] = {"path": "nvme-targets.json",
+                                                        "sha256": digest(directory / "nvme-targets.json")}
             seconds = min(self.config["spec"]["case_deadline_seconds"], int(self.remaining()))
             config = cloud_campaign.make_run_config(job, directory, options, self.config["source_revision"], seconds)
-            # Fully overwrite the same bounded logical keyset across all stores
-            # in a repetition; backend identity must not change physical keys.
-            config["key_namespace_hex"] = hashlib.blake2b(
-                f"{self.config['prefix']}:{job['repeat']}".encode(), digest_size=16).hexdigest()
+            # Write controls use a separate namespace and run after every sealed read.
+            namespace = f"{self.config['prefix']}:{job['repeat']}"
+            if job.get("cohort") == "native_write_regression":
+                namespace += ":write-control"
+            config["key_namespace_hex"] = hashlib.blake2b(namespace.encode(), digest_size=16).hexdigest()
+            if backend == "native" and "sealed_dataset" in job:
+                import nvme_campaign_native
+                source = job["sealed_dataset"]["source_id"]
+                if source not in self.shared_native:
+                    path = guarded(self.root / "datasets" / (source + "-native"), self.root)
+                    self.shared_native[source] = nvme_campaign_native.prepare_native(
+                        self.config["binary"], config, path, min(600, self.remaining()), environment=environment(self.config))
+                config = nvme_campaign_native.read_config(self.shared_native[source], config)
+            if "sealed_dataset" in job:
+                if backend == "native":
+                    receipt["dataset_source"] = {"logical_id": job["sealed_dataset"]["data_id"],
+                        "physical_scope": "native local dataset", "preparation_receipt":
+                            str(Path(self.shared_native[source]["database_path"]).parent / "receipt.json")}
+                else:
+                    shared = self.shared_tide
+                    receipt["dataset_source"] = {"logical_id": job["sealed_dataset"]["data_id"],
+                        "physical_scope": "shared owner sealed WAL block",
+                        "block": str(shared["block"]), "transport_block": shared["identity"][1],
+                        "source_epoch": shared["prepared"]["source_epoch"],
+                        "preload_recipe": shared["prepared"]["preload_recipe"],
+                        "preload_batch_max_members": shared["prepared"]["preload_batch_max_members"],
+                        "database": shared["prepared"]["database"]}
             config["limits"]["deadline_seconds"] = min(config["limits"]["deadline_seconds"], int(self.remaining()))
-            dump(directory / "config.json", config)
+            (dump_compact if backend in cloud_campaign.NVME_BACKENDS else dump)(directory / "config.json", config)
             try:
-                admitted = campaign.admit_config(Path(self.config["binary"]), directory / "config.json", directory, environment(self.config))
+                admission_timeout = min(120 if backend in cloud_campaign.NVME_BACKENDS else 30, self.remaining())
+                admitted = campaign.admit_config(Path(self.config["binary"]), directory / "config.json", directory,
+                                                 environment(self.config), timeout=admission_timeout)
                 analyze.verify_normalization(config, admitted)
             except (RuntimeError, ValueError, KeyError) as exc:
                 raise SafetyError("typed configuration admission failed: " + str(exc)) from exc
@@ -1455,6 +1856,8 @@ class Controller:
             if ready.exists() and status.get("SubState") != "exited" and status.get("ActiveState") not in ("failed", "inactive"):
                 before = self.all_hosts({"action": "snapshot", "drop": job["drop_os_caches"],
                     "resource_job": job,
+                    **({"resource_owner_case": self.shared_tide["job"]["case_id"]}
+                       if "sealed_dataset" in job and backend != "native" else {}),
                     **({"monitor_job": job} if self.monitoring_attempted else {})}, case=job["case_id"], timeout=60)
                 if self.monitoring_attempted:
                     for index, host in zip(range(-1, 5), before):
@@ -1464,27 +1867,42 @@ class Controller:
                 dump(directory / "measurement-before.json", {"hosts": before, "client": process_before})
                 receipt["measurement_evidence"].update({"gate_released": True,
                     "before": "measurement-before.json", "before_sha256": digest(directory / "measurement-before.json")})
-                if job.get("read_tier", {}).get("name") == "cold_device":
+                if owner_trace:
+                    if "sealed_dataset" in job:
+                        trace_case = self.shared_tide["job"]["case_id"]
                     tracer_attempted = True
                     try:
                         receipt["cold_device_start"] = self.all_hosts(
-                            {"action": "cold_trace_start", "case_id": job["case_id"], "duration_seconds": min(seconds, int(self.remaining()))},
+                            {"action": "cold_trace_start", "case_id": trace_case, "duration_seconds": min(seconds, int(self.remaining())),
+                             **({"trace_id": job["case_id"]} if "sealed_dataset" in job else {})},
                             case=job["case_id"], timeout=60)
                     except Exception as exc:
                         receipt["cold_device_start"] = {"available": False, "reason": repr(exc)}
-                if job.get("read_tier", {}).get("name", "").startswith("native_"):
+                if local_trace:
                     tracer_attempted = True
                     receipt["cold_device_start"] = native_trace("start", min(seconds, int(self.remaining())))
+                if sealed_diagnostic and backend in cloud_campaign.NVME_BACKENDS:
+                    nvme_trace_attempted = True
+                    try:
+                        receipt["nvmeof_trace_start"] = self.nvme_trace("start", min(seconds, int(self.remaining())))
+                    except Exception as exc:
+                        receipt["nvmeof_trace_start"] = {"available": False, "reason": repr(exc)}
                 (directory / "measurement.release").touch(exist_ok=False)
                 gate_released = True
                 while True:
                     self.remaining()
                     completed = directory / "measurement.complete"
                     if completed.exists() and not completion_observed:
-                        if job.get("read_tier", {}).get("name") == "cold_device":
+                        ended = self.all_hosts({"action": "snapshot", "drop": False,
+                            "resource_job": job, **({"resource_owner_case": self.shared_tide["job"]["case_id"]}
+                            if "sealed_dataset" in job and backend != "native" else {})}, case=job["case_id"], timeout=110)
+                        dump(directory / "measurement-end.json", {"hosts": ended,
+                            "client": snapshot(self.config, client)})
+                        if owner_trace:
                             try:
                                 traces = self.all_hosts(
-                                    {"action": "cold_trace_stop", "case_id": job["case_id"]}, case=job["case_id"], timeout=60)
+                                    {"action": "cold_trace_stop", "case_id": trace_case,
+                                     **({"trace_id": job["case_id"]} if "sealed_dataset" in job else {})}, case=job["case_id"], timeout=60)
                                 tracer_stopped = tracer_terminal(traces)
                                 # Full bounded raw traces remain in the individual guest receipts.
                                 # Do not duplicate five large event streams in the case receipt.
@@ -1494,26 +1912,38 @@ class Controller:
                                 receipt["cold_device_raw_location"] = "guest/<case>/storage-<index>-<sequence>.json (request.action=cold_trace_stop)"
                             except Exception as exc:
                                 receipt["cold_device_evidence"] = {"available": False, "reason": repr(exc)}
-                        if job.get("read_tier", {}).get("name", "").startswith("native_"):
+                        if local_trace:
                             trace = native_trace("stop")
                             tracer_stopped = tracer_terminal(trace)
                             dump(directory / "native-device-trace.json", trace)
                             receipt["cold_device_evidence"] = {k: v for k, v in trace.items()
                                 if k not in ("raw_events", "raw_intervals_ns", "candidate_raw_intervals_ns")}
                             receipt["cold_device_raw_location"] = "native-device-trace.json"
-                        ended = self.all_hosts({"action": "snapshot", "drop": False,
-                            "resource_job": job}, case=job["case_id"], timeout=110)
-                        dump(directory / "measurement-end.json", {"hosts": ended,
-                            "client": snapshot(self.config, client)})
+                        if nvme_trace_attempted:
+                            try:
+                                traces = self.nvme_trace("stop")
+                                nvme_trace_stopped = all(row.get("cleanup_complete") is True for row in traces)
+                                receipt["nvmeof_trace_evidence"] = traces
+                                uploaded = all(row.get("upload_complete") is True for row in traces)
+                                receipt["nvmeof_trace_upload_complete"] = uploaded
+                                receipt["nvmeof_trace_raw_location"] = ("S3 keys in nvmeof_trace_evidence; exact owner and case generation"
+                                    if uploaded and all(row.get("complete") is True for row in traces) else None)
+                            except Exception as exc:
+                                receipt["nvmeof_trace_evidence"] = {"available": False, "reason": repr(exc)}
                         resources = resource_accounting.interval(
                             [host["resource_accounting"] for host in before],
                             [host["resource_accounting"] for host in ended])
                         dump(directory / "resource-interval.json", resources)
+                        host_cpu = host_cpu_interval(before, ended)
+                        dump(directory / "host-cpu-interval.json", host_cpu)
+                        receipt["host_cpu_evidence"] = {"path": "host-cpu-interval.json",
+                            "sha256": digest(directory / "host-cpu-interval.json"), "observed": host_cpu}
                         receipt["resource_evidence"] = {"path": "resource-interval.json",
                             "sha256": digest(directory / "resource-interval.json"), "observed": resources,
                             "complete": bool(resources["processes"]) and all(
-                                process["available"] for process in resources["processes"]),
-                            "scope": "host-local premeasurement through completion-gate accounting; includes driver, oracle, gate overlap and background work; IO totals span all cgroup devices"}
+                                process["available"] and "io_read_bytes" in process and "io_write_bytes" in process
+                                for process in resources["processes"]),
+                            "scope": "host-local premeasurement through completion-gate accounting; includes driver, oracle, gate overlap and background work; available IO totals sum observed cgroup device entries, which may overlap"}
                         self.observe("resource_interval:" + job["case_id"],
                             lambda: {"complete": receipt["resource_evidence"]["complete"],
                                 "path": "resource-interval.json",
@@ -1536,7 +1966,13 @@ class Controller:
                 "before": "measurement-before.json" if gate_released else None, "after": "measurement-after.json",
                 "before_sha256": digest(directory / "measurement-before.json") if gate_released else None,
                 "after_sha256": digest(directory / "measurement-after.json"),
-                "os_caches_dropped": job["drop_os_caches"] if gate_released else False, "engine_caches_evicted": False})
+                "os_caches_dropped": job["drop_os_caches"] if gate_released else False,
+                "engine_caches_evicted": None if job.get("evict_mapped_wal_before_measurement") else False})
+            if "sealed_dataset" in job:
+                receipt["measurement_evidence"]["mapped_wal_eviction"] = (
+                    "completed_before_gate" if gate_released and job.get("evict_mapped_wal_before_measurement")
+                    else "not_requested" if not job.get("evict_mapped_wal_before_measurement")
+                    else "unconfirmed")
             receipt["measurement_evidence"].update({
                 "completion_gate_observed": completion_observed,
                 "end": "measurement-end.json" if completion_observed else None,
@@ -1562,9 +1998,15 @@ class Controller:
                     "warmup": admitted["phases"]["warmup_operations"],
                     "aging": admitted["phases"]["aging_operations"],
                     "measurement": admitted["phases"]["measurement_operations"]}
+                if admitted["phases"].get("verify_existing_dataset", False):
+                    receipt["planned_timing_rows_by_phase"]["verify_existing_dataset"] = admitted["dataset"]["keys"]
                 receipt["artifacts_sha256"] = {name: digest(directory / "result" / name) for name in RAW_FILES}
                 receipt["core_manifest_status"] = manifest["status"]
                 receipt["core_summary_status"] = summary["status"]
+                eviction = cloud_campaign.admit_wal_eviction_evidence(
+                    directory, job, completed=manifest["status"] == "completed")
+                if eviction is not None:
+                    receipt["wal_eviction_evidence"] = eviction
                 diagnostics = cloud_campaign.admit_write_diagnostics(
                     directory, job, completed=manifest["status"] == "completed")
                 if diagnostics is not None:
@@ -1579,6 +2021,16 @@ class Controller:
                 receipt["raw_artifacts_validated"] = True
             except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError) as exc:
                 raise SafetyError("terminal source/config/binary/schema/raw-row admission failed: " + str(exc)) from exc
+            drain_proved = (completion_observed and status.get("Result") == "success"
+                            and status.get("ExecMainStatus") == "0" and manifest["status"] == "completed")
+            if backend in cloud_campaign.NVME_BACKENDS:
+                qualification = cloud_campaign.qualify_nvme_measurement(
+                    read_interval["observed"] if read_interval is not None else None,
+                    len(config["backend"]["options"]["nvmeof_readers"]),
+                    self.active_nvme["transport"], self.active_nvme["targets"])
+                receipt["nvmeof_measurement_qualification"] = qualification
+                if not qualification["qualified"]:
+                    raise RuntimeError("NVMe measurement path was not qualified: " + "; ".join(qualification["reasons"]))
             counters_missing = False
             if backend in cloud_campaign.TRANSPORTS:
                 evidence = directory / "read-evidence/read-evidence.json"
@@ -1593,13 +2045,9 @@ class Controller:
                         if "read_tier" in job:
                             receipt["read_tier_effective"] = {
                                 "coordinator_cache_bytes": observed["coordinator"]["cache"]["budget_bytes"],
-                                "owner_read_cache_bytes": observed["owner_read_configuration"][0]["read_cache_bytes"],
                                 "coordinator_read_memory_allowance_bytes": observed.get("effective_configuration", {}).get("coordinator", {}).get("read_memory_allowance_bytes"),
                                 "owner_read_memory_allowance_bytes": observed["owner_read_configuration"][0].get("read_memory_allowance_bytes"),
-                                "registered_policy": ("hardware_required" if observed["owner_read_configuration"][0]["resident_reads"]["require_device_read"]
-                                    else "disabled" if observed["owner_read_configuration"][0]["resident_reads"] == DISABLED_RESIDENT_READS else None),
-                                "registered_budgets": observed["owner_read_configuration"][0]["resident_reads"],
-                                "owner_read_resident_first": observed["owner_read_configuration"][0]["read_resident_first"],
+                                "owner_read_resident_first": observed["owner_read_configuration"][0].get("read_resident_first"),
                                 "page_cache_policy": ("drop_at_measurement_gate" if receipt["measurement_evidence"].get("os_caches_dropped") is True
                                     else "not_dropped" if receipt["measurement_evidence"].get("os_caches_dropped") is False else None),
                                 "warmup_operations": admitted["phases"]["warmup_operations"],
@@ -1629,13 +2077,23 @@ class Controller:
             receipt["error"] = type(exc).__name__ + ": " + str(exc)
         finally:
             def stop_after_failure():
-                if job.get("read_tier", {}).get("name") == "cold_device":
-                    return self.all_hosts({"action": "cold_trace_stop", "case_id": job["case_id"]},
+                if owner_trace:
+                    return self.all_hosts({"action": "cold_trace_stop", "case_id": trace_case,
+                        **({"trace_id": job["case_id"]} if "sealed_dataset" in job else {})},
                                           case=job["case_id"], timeout=60, export=True)
                 result = native_trace("stop")
                 dump(directory / "native-device-trace-cleanup.json", result)
                 return result
             tracer_clean = cleanup_unfinished_tracer(tracer_attempted, tracer_stopped, stop_after_failure, receipt)
+            if nvme_trace_attempted and not nvme_trace_stopped:
+                try:
+                    traces = self.nvme_trace("stop", export=True)
+                    nvme_trace_stopped = all(row.get("cleanup_complete") is True for row in traces)
+                    receipt["nvmeof_trace_cleanup"] = traces
+                except Exception as exc:
+                    receipt["nvmeof_trace_cleanup"] = {"available": False, "reason": repr(exc)}
+                if not nvme_trace_stopped:
+                    tracer_clean = False
             # Publish the terminal snapshot while exact-owned cgroups still
             # exist. The scrape barrier and CSV reduction are outside API timers.
             self.observe("case_terminal_receipt:" + job["case_id"], lambda: dump(directory / "receipt.json", receipt))
@@ -1643,10 +2101,16 @@ class Controller:
             if started:
                 try:
                     command(["systemctl", "stop", client], timeout=35)
+                    stopped = unit_status(client)
+                    if stopped.get("LoadState") != "not-found" and (
+                            stopped.get("ActiveState") not in ("inactive", "failed") or stopped.get("MainPID") != "0"):
+                        raise InfrastructureError("client unit did not quiesce")
                     client_quiesced = True
                     (directory / "client.log").write_text(command(["journalctl", "--no-pager", "--unit", client, "--output=short-precise"], timeout=30))
                 except Exception as exc:
                     failure = InfrastructureError("client cleanup/export failed: " + repr(exc))
+            if started and not client_quiesced and self.shared_tide is not None:
+                self.tide_cleanup_forbidden = True
             database = guarded(directory / "database", directory)
             receipt["database_files_retained"] = database.exists()
             if database.exists() and (not started or client_quiesced):
@@ -1656,7 +2120,10 @@ class Controller:
                 except OSError as exc:
                     failure = InfrastructureError("owned coordinator database cleanup failed: " + repr(exc))
             try:
-                self.stop_tide()
+                if self.active_nvme is not None:
+                    self.disconnect_nvme(drained=drain_proved and client_quiesced)
+                if "sealed_dataset" not in job:
+                    self.stop_tide()
             except Exception as exc:
                 failure = exc
             if not tracer_clean and not isinstance(failure, InfrastructureError):
@@ -1776,6 +2243,14 @@ class Controller:
             for position, job in enumerate(jobs):
                 self.remaining()
                 backend = job["backend"]
+                if self.shared_tide is not None and (backend == "native" or "sealed_dataset" not in job):
+                    self.stop_tide()
+                    self.shared_tide = None
+                if job.get("cohort") == "native_write_regression" and self.shared_native:
+                    for prepared in self.shared_native.values():
+                        database = guarded(prepared["database_path"], self.root, must_exist=True)
+                        shutil.rmtree(database)
+                    self.shared_native.clear()
                 desired = backend if backend in cloud_layout.BACKENDS else None
                 block = (backend, job["repeat"])
                 if block != active_block:
@@ -1853,27 +2328,17 @@ def verify_counter_evidence(job, evidence):
     if coordinator["cache"].get("budget_bytes") != job["coordinator_cache_bytes"]:
         raise SafetyError("actual coordinator cache budget differs from declared cohort")
     if (not isinstance(owners, list) or len(owners) != 5 or
-            {owner.get("partition") for owner in owners} != set(range(5)) or
-            any(owner.get("read_cache_bytes") != job["owner_read_cache_bytes"] for owner in owners)):
-        raise SafetyError("actual owner cache configurations differ from declared cohort")
+            {owner.get("partition") for owner in owners} != set(range(5))):
+        raise SafetyError("actual owner configurations differ from declared partitions")
     if "coordinator_read_memory_allowance_bytes" in job:
         actual = evidence.get("effective_configuration", {}).get("coordinator", {}).get("read_memory_allowance_bytes")
         if actual != job["coordinator_read_memory_allowance_bytes"]:
             raise SafetyError("actual coordinator read allowance differs from declared cohort")
         if any(owner.get("read_memory_allowance_bytes") != job["owner_read_memory_allowance_bytes"] for owner in owners):
             raise SafetyError("actual owner read allowance differs from declared cohort")
-    expected_nowait = job.get("owner_read_resident_first", "resident_reads" in job)
-    if any(owner.get("read_resident_first") is not expected_nowait for owner in owners):
-        raise SafetyError("actual owner resident-first policy differs from declared cohort")
-    expected_resident = job.get("resident_reads", DISABLED_RESIDENT_READS)
-    if not isinstance(expected_resident, dict) or type(expected_resident.get("require_device_read")) is not bool:
-        raise SafetyError("job must declare a typed resident-read policy")
-    for owner in owners:
-        resident = owner.get("resident_reads")
-        if (not isinstance(resident, dict) or resident != expected_resident
-                or type(resident.get("require_device_read")) is not bool
-                or resident["require_device_read"] is not expected_resident["require_device_read"]):
-            raise SafetyError("actual owner resident-read/RMA policy differs from declared job")
+    if "owner_read_resident_first" in job and any(
+            owner.get("read_resident_first") != job["owner_read_resident_first"] for owner in owners):
+        raise SafetyError("actual owner NOWAIT policy differs from declared cohort")
     # Hit counts and passive sample availability are observations, not admission
     # requirements. Configuring a cache must never manufacture a hit population.
     return evidence

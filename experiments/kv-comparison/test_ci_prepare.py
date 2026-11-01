@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import tarfile
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -67,7 +68,9 @@ class PrepareTests(unittest.TestCase):
 
     def test_all_real_software_adapter_receipts_and_raw_hashes_are_required(self):
         ready = self.proof()
-        ci.admit_qualification(self.inputs / 'qualification', ready)
+        with patch.object(ci, 'admit_tcp_diagnostic') as diagnostic:
+            ci.admit_qualification(self.inputs / 'qualification', ready)
+            diagnostic.assert_called_once()
         receipt = self.inputs / 'qualification/tikv/receipt.json'
         data = json.loads(receipt.read_text())
         for changes in ({'status': 'failed'}, {'binary_sha256': 'c' * 64}, {'cleanup_errors': ['not stopped']},
@@ -86,10 +89,11 @@ class PrepareTests(unittest.TestCase):
         bundle = self.write('bundle.tar.gz', 'sealed runtime')
         ready = dict(schema_version=1, complete=True, suite='kv-comparison', engine_sha='a' * 40,
                      source_commit='a' * 40, qualification_complete=True, bundle_sha256=ci.sha(bundle),
-                     source_sha256='source', binary_sha256='binary', source_tree_sha256='tree', manifest_sha256='manifest')
+                     source_sha256='source', binary_sha256='binary', binary_blake2b512='d' * 128,
+                     tcp_diagnostic_sha256='e' * 64, source_tree_sha256='tree', manifest_sha256='manifest')
         self.write('READY.json', ready)
         source = dict(revision='a' * 40, dirty=False, sha256={'source.py': 'digest'}, tree_sha256='tree')
-        verified = dict(source_sha256='source', binary_sha256='binary', manifest_sha256='manifest')
+        verified = dict(source_sha256='source', binary_sha256='binary', binary_blake2b512='d' * 128, manifest_sha256='manifest')
         with patch.object(ci, 'trusted_checkout', return_value='a' * 40), \
                 patch.object(ci.cloud_package, 'verify_directory', return_value=verified), \
                 patch.object(ci.cloud_package, 'admit_source', return_value=source), \
@@ -97,6 +101,7 @@ class PrepareTests(unittest.TestCase):
                 patch.object(ci, 'admit_qualification'):
             self.assertEqual(ci.admit_inputs(self.inputs), ready)
             for changes in ({'source_commit': 'b' * 40}, {'binary_sha256': 'other'}, {'suite': 'sui-transport'},
+                            {'tcp_diagnostic_sha256': None}, {'binary_blake2b512': None},
                             {'qualification_complete': False}, {'complete': False}):
                 self.write('READY.json', ready | changes)
                 with self.subTest(changes=changes), self.assertRaises(ValueError):
@@ -109,6 +114,29 @@ class PrepareTests(unittest.TestCase):
             source['sha256'] = {'source.py': 'changed committed source'}
             with self.assertRaises(ValueError):
                 ci.admit_inputs(self.inputs)
+
+    def test_tcp_diagnostic_missing_or_unbound_proof_cannot_be_admitted(self):
+        directory = self.inputs / 'qualification/tcp-diagnostic'
+        ready = {'engine_sha': 'a' * 40, 'binary_sha256': 'b' * 64,
+                 'binary_blake2b512': 'c' * 128, 'tcp_diagnostic_sha256': 'd' * 64}
+        with self.assertRaises((OSError, ValueError)):
+            ci.admit_tcp_diagnostic(directory, ready)
+        path = self.write('qualification/tcp-diagnostic/diagnostic-proof.json',
+                          {'schema_version': 1, 'status': 'failed'})
+        with self.assertRaises(ValueError):
+            ci.admit_tcp_diagnostic(directory, ready)
+        ready['tcp_diagnostic_sha256'] = ci.sha(path)
+        with self.assertRaises(ValueError):
+            ci.admit_tcp_diagnostic(directory, ready)
+
+    @unittest.skipUnless(os.environ.get('TIDEHUNTER_LOCAL_DIAGNOSTIC_BINARY'),
+                         'set TIDEHUNTER_LOCAL_DIAGNOSTIC_BINARY to exercise five real TCP owners')
+    def test_real_built_binary_tcp_diagnostic_and_admission(self):
+        binary = Path(os.environ['TIDEHUNTER_LOCAL_DIAGNOSTIC_BINARY']).resolve(strict=True)
+        proof = self.root / 'real-tcp-proof'
+        ready = ci.run_tcp_diagnostic(binary, self.root / 'real-tcp-work', proof,
+                                      'a' * 40, time.monotonic() + 240, dict(os.environ))
+        self.assertEqual(ci.admit_tcp_diagnostic(proof, ready)['owner_exit_codes'], [0] * 5)
 
     def test_archive_roundtrip_keeps_modes_and_excludes_build_databases(self):
         ready = self.proof()

@@ -370,16 +370,15 @@ class AtomicStartupTests(unittest.TestCase):
             with self.subTest(lifetime=lifetime), self.assertRaises(ValueError):
                 atomic.launch_contract(self.fleet.plan | {'ttl_seconds': lifetime})
 
-    def test_hardware_cache_schedules_are_closed_atomic_bindings(self):
+    def test_coordinator_cache_schedule_is_a_closed_atomic_binding(self):
         plan = copy.deepcopy(self.fleet.plan)
         plan['atomic_bindings']['kv_suite'] = dict(scope='hardware-populations')
         with self.assertRaises(ValueError):
             atomic.launch_contract(plan)
-        plan['atomic_bindings'].update(coordinator_cache_mib_by_repetition=[0, 8, 0],
-                                       shard_cache_mib_by_repetition=[8, 8, 8])
+        plan['atomic_bindings']['kv_suite'] = self.fleet.plan['atomic_bindings']['kv_suite']
+        plan['atomic_bindings'].update(coordinator_cache_mib_by_repetition=[0, 8, 0])
         contract = atomic.launch_contract(plan)
         self.assertEqual(contract['atomic_bindings']['coordinator_cache_mib_by_repetition'], [0, 8, 0])
-        self.assertEqual(contract['atomic_bindings']['shard_cache_mib_by_repetition'], [8, 8, 8])
         plan['atomic_bindings']['unadmitted_cache_schedule'] = [8]
         with self.assertRaises(ValueError):
             atomic.launch_contract(plan)

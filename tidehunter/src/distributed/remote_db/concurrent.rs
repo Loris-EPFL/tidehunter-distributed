@@ -133,16 +133,18 @@ impl ConcurrentRemoteDatabase {
         config: super::super::nvmeof::NvmeofReaderConfig,
         path: &std::path::Path,
     ) -> Result<(), LocalDbError> {
+        self.ensure_healthy()?;
         self.reads
             .install_nvmeof_file_fixture(config, &self.config, &self.shape, path)
     }
 
-    /// Install a verified sealed-WAL reader while all reads and grants are idle.
+    /// Install a verified sealed-WAL reader while all reads are idle.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn install_nvmeof_reader(
         &self,
         config: super::super::nvmeof::NvmeofReaderConfig,
     ) -> Result<(), LocalDbError> {
+        self.ensure_healthy()?;
         self.reads
             .install_nvmeof_reader(config, &self.config, &self.shape)
     }
@@ -605,10 +607,53 @@ impl ConcurrentRemoteDatabase {
             reads: self.reads.clone(),
         }
     }
+    /// Request advisory mapped-WAL eviction on every owner at a quiescent boundary.
+    /// The owner control handler visits all retained source epochs, not just the
+    /// current writer epoch. Callers must exclude concurrent reads and writes.
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    pub fn evict_mapped_wal_for_benchmark(
+        &self,
+    ) -> Result<Vec<(u32, crate::read_probe::ReadEvidence)>, LocalDbError> {
+        self.ensure_healthy()?;
+        self.reads.ensure_idle()?;
+        // The reply can wake its caller just before the owner drops its credit.
+        // Wait for that bounded retirement rather than spuriously failing.
+        let deadline = Instant::now() + self.config.timeout;
+        let mut budget = self.admission.budget.lock();
+        while budget.requests != 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(LocalDbError::new(
+                    "writes did not drain before mapped-WAL eviction",
+                ));
+            }
+            self.admission.changed.wait_for(&mut budget, deadline - now);
+        }
+        drop(budget);
+        if self.config.read_cache_bytes != 0 {
+            return Err(LocalDbError::new(
+                "mapped-WAL eviction requires disabled coordinator read cache",
+            ));
+        }
+        let result = self
+            .io_clients
+            .iter()
+            .map(|(partition, client)| {
+                client
+                    .lock()
+                    .read_evidence_for_benchmark(self.epoch, true)
+                    .map(|evidence| (*partition, evidence))
+                    .map_err(LocalDbError::component)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.ensure_healthy()?;
+        Ok(result)
+    }
+
     /// Passive snapshots do not keep the write owner or its connections alive.
     pub fn operational_read_io_monitor(&self) -> OperationalReadIoMonitor {
         if let Some(lifecycle) = self.operational_lifecycle.upgrade() {
-            OperationalReadIoSampler::activate_lifecycle(&lifecycle, &self.reads);
+            OperationalReadIoSampler::activate_lifecycle(&lifecycle);
         }
         self.operational_monitor.clone()
     }

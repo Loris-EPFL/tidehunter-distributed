@@ -1,20 +1,20 @@
-//! Protocol-v10 exclusive-owner progress. Adapted mechanisms (not copied code):
+//! Exclusive-owner protocol progress. Adapted mechanisms (not copied code):
 //! eRPC §§3.1–3.2, 4.2.2, 4.3; erpc-io/eRPC at
 //! de83dab3eab4a0fb19bfc4881c11d4a6b89ff17d, src/session.h and
 //! src/rpc_impl/{rpc_ev_loop,rpc_resp}.cc. IDs name live slots, not durability.
 //! ReFlex §§3.1/4.1: bounded two-stage progress, never disk waits on this owner.
 //! HERD §4.1.1: advance ready pipeline work without waiting for another arrival.
-//! Here newly admitted resident reads and their bounded output turn stay in the
-//! same sweep; cold io_uring/worker execution and manual CQ ownership do not move.
+//! Newly admitted page-cache reads and bounded output stay in the same sweep;
+//! cold io_uring/worker execution and manual CQ ownership do not move.
 //! Provider contract: libfabric 3cc1095272b07ebeb5cc8f44851af6aa3eb75e41,
 //! man/fi_efa.7.md Progress: normal `efa` RDM requires manual CQ progress;
 //! it does not require a TCP syscall per CQ poll.
 //! Adaptive TCP parks only a drained owner on socket readability, never on a
 //! periodic sleep. Adaptive fabric keeps manual progress even with no RPCs.
-//! eRPC §3.2 / ReFlex §§3.1, 4.1 motivate keeping resident completion and reply
+//! eRPC §3.2 / ReFlex §§3.1, 4.1 motivate keeping completion and reply
 //! submission inline while cold I/O remains asynchronous, not weakening sync
-//! durability. Inventory try-locks for admission/response epoch validation and
-//! node-wide read cache/admission locks remain; no storage lock is removed.
+//! durability. Inventory try-locks for admission and response epoch validation
+//! and node-wide read admission locks remain; no storage lock is removed.
 //! https://www.usenix.org/system/files/nsdi19-kalia.pdf
 //! ReFlex source: papers/parsed/ReFlex-2017.md, §§3.1 and 4.1.
 use super::*;
@@ -181,33 +181,8 @@ struct Output {
     /// Opt-in phase clock: offset zero = queued, no fence = submitting,
     /// fence present = awaiting local retirement. Reset never changes ownership.
     stage_started: Option<Instant>,
-    sampled: Option<SampledOutput>,
 }
 
-struct SampledOutput {
-    registry: Arc<resident::GrantRegistry>,
-    started: Instant,
-}
-
-impl SampledOutput {
-    fn transition(
-        &mut self,
-        stage: fn(&mut resident::ResidentGrantStats) -> &mut ReadStageProfile,
-    ) {
-        let now = Instant::now();
-        self.registry.record_promotion(|stats| {
-            let target = stage(stats);
-            let ns = now
-                .duration_since(self.started)
-                .as_nanos()
-                .min(u64::MAX as u128) as u64;
-            target.ns += ns;
-            target.count += 1;
-            target.max_ns = target.max_ns.max(ns);
-        });
-        self.started = now;
-    }
-}
 impl Output {
     #[cfg(feature = "experimental-fabric")]
     fn advance(&mut self, mut amount: usize) {
@@ -409,20 +384,10 @@ impl Session {
         if self.conn.is_none() {
             let began = self.time_work.then(Instant::now);
             let result = match response {
-                Response::Records(records) => {
-                    self.queue_native_records(id, records, None, None, limit)
-                }
+                Response::Records(records) => self.queue_native_records(id, records, None, limit),
                 Response::RecordsProfiled { records, profile } => {
-                    self.queue_native_records(id, records, None, Some(profile), limit)
+                    self.queue_native_records(id, records, Some(profile), limit)
                 }
-                Response::ResidentRecords { grants, records } => {
-                    self.queue_native_records(id, records, Some(grants), None, limit)
-                }
-                Response::ResidentRecordsProfiled {
-                    grants,
-                    records,
-                    profile,
-                } => self.queue_native_records(id, records, Some(grants), Some(profile), limit),
                 response => return self.queue(id, &response, limit),
             };
             let measured = result
@@ -439,7 +404,6 @@ impl Session {
         &mut self,
         id: u64,
         records: Vec<WireBytes>,
-        grants: Option<Vec<Option<ResidentGrant>>>,
         profile: Option<ServerReadProfile>,
         limit: usize,
     ) -> Result<(), TcpError> {
@@ -450,16 +414,9 @@ impl Session {
         // prefix. Remove only the fixed-width empty sequence count, then insert
         // codec-encoded lengths alongside the original owned record buffers.
         let (mut prefix, tail) = if let Some(profile) = profile {
-            let body = match grants.as_ref() {
-                Some(grants) => Response::ResidentRecordsProfiled {
-                    grants: grants.clone(),
-                    records: Vec::new(),
-                    profile,
-                },
-                None => Response::RecordsProfiled {
-                    records: Vec::new(),
-                    profile,
-                },
+            let body = Response::RecordsProfiled {
+                records: Vec::new(),
+                profile,
             };
             let empty = Envelope {
                 protocol: PROTOCOL,
@@ -477,13 +434,7 @@ impl Session {
             encoded.truncate(prefix_len);
             (encoded, tail)
         } else {
-            let body = match grants.as_ref() {
-                Some(grants) => Response::ResidentRecords {
-                    grants: grants.clone(),
-                    records: Vec::new(),
-                },
-                None => Response::Records(Vec::new()),
-            };
+            let body = Response::Records(Vec::new());
             let empty = Envelope {
                 protocol: PROTOCOL,
                 id,
@@ -608,7 +559,6 @@ impl Session {
             segment_offset: 0,
             fence: None,
             stage_started: self.time_work.then(Instant::now),
-            sampled: None,
         });
         self.stats.peak_output_frames = self.stats.peak_output_frames.max(self.output.len() as u64);
         self.stats.peak_output_bytes = self.stats.peak_output_bytes.max(self.output_bytes as u64);
@@ -680,7 +630,6 @@ impl Session {
             segment_offset: 0,
             fence: None,
             stage_started: self.time_work.then(Instant::now),
-            sampled: None,
         });
         self.stats.peak_output_frames = self.stats.peak_output_frames.max(self.output.len() as u64);
         self.stats.peak_output_bytes = self.stats.peak_output_bytes.max(self.output_bytes as u64);
@@ -696,13 +645,6 @@ impl Session {
         // cannot prove DMA quiescence it retains them, never frees live memory.
         #[cfg(feature = "experimental-fabric")]
         self.sock.fabric.take();
-        for output in &self.output {
-            if let Some(sample) = &output.sampled {
-                sample
-                    .registry
-                    .record_promotion(|stats| stats.read_output_abandoned += 1);
-            }
-        }
         self.output.clear();
         self.output_bytes = 0;
         self.submitted = 0;
@@ -735,12 +677,6 @@ impl Session {
         match result {
             Ok(n) => {
                 let output = &mut self.output[self.submitted];
-                if n != 0
-                    && start == 0
-                    && let Some(sample) = output.sampled.as_mut()
-                {
-                    sample.transition(|stats| &mut stats.read_output_queue);
-                }
                 if n != 0
                     && start == 0
                     && let Some(queued) = output.stage_started
@@ -794,12 +730,6 @@ impl Session {
         self.stats.plaintext_write.record(began, &result);
         match result {
             Ok(n) => {
-                if n != 0
-                    && output.offset == 0
-                    && let Some(sample) = output.sampled.as_mut()
-                {
-                    sample.transition(|stats| &mut stats.read_output_queue);
-                }
                 if n != 0
                     && output.offset == 0
                     && let Some(queued) = output.stage_started
@@ -1056,9 +986,6 @@ impl Session {
             && output.offset == output.len
         {
             output.fence = Some(accepted);
-            if let Some(sample) = output.sampled.as_mut() {
-                sample.transition(|stats| &mut stats.read_output_submit);
-            }
             if let Some(started) = output.stage_started {
                 let now = *transition_time.get_or_insert_with(Instant::now);
                 self.stats.output_submit_ns = self.stats.output_submit_ns.saturating_add(
@@ -1077,10 +1004,7 @@ impl Session {
             .front()
             .is_some_and(|output| output.fence.is_some_and(|fence| fence <= completed))
         {
-            let mut output = self.output.pop_front().unwrap();
-            if let Some(sample) = output.sampled.as_mut() {
-                sample.transition(|stats| &mut stats.read_response_retire);
-            }
+            let output = self.output.pop_front().unwrap();
             if let Some(submitted) = output.stage_started {
                 let now = *transition_time.get_or_insert_with(Instant::now);
                 self.stats.output_retire_ns = self.stats.output_retire_ns.saturating_add(
@@ -1448,53 +1372,10 @@ struct PendingRead {
     deadline: Instant,
     began: Option<Instant>,
     profiled: bool,
-    class: ReadClass,
-    grant_limit: usize,
     charge: usize,
     profile: TcpReadProfile,
-    #[cfg(feature = "experimental-fabric")]
-    original_order: Option<Vec<usize>>,
-    #[cfg(feature = "experimental-fabric")]
-    rma: Option<PendingRmaRead>,
 }
 
-#[cfg(feature = "experimental-fabric")]
-struct PendingRmaRead {
-    grants: Vec<ResidentGrant>,
-    operations: Vec<Option<tidehunter_fabric::ReadOperation>>,
-    buffers: Vec<Option<minibytes::Bytes>>,
-    posted_at: Option<Vec<Option<Instant>>>,
-    next_post: usize,
-    accepted: usize,
-    completed: usize,
-    first_error: Option<TcpError>,
-}
-
-#[cfg(feature = "experimental-fabric")]
-fn rma_error_with_profile(
-    mut error: TcpError,
-    profiled: bool,
-    profile: TcpReadProfile,
-) -> TcpError {
-    if profiled {
-        // A message error may carry an earlier snapshot; retain the final
-        // snapshot after accepted RMA operations have drained.
-        error.read_profile = Some(Box::new(profile));
-    }
-    error
-}
-impl PendingRead {
-    fn has_rma(&self) -> bool {
-        #[cfg(feature = "experimental-fabric")]
-        {
-            self.rma.is_some()
-        }
-        #[cfg(not(feature = "experimental-fabric"))]
-        {
-            false
-        }
-    }
-}
 #[derive(Default)]
 pub(super) struct ClientState {
     next_id: u64,
@@ -1505,19 +1386,12 @@ pub(super) struct ClientState {
     appends: HashMap<u64, PendingAppend>,
     wire_appends: HashMap<u64, u64>,
     append_ready: VecDeque<QueuedAppendCompletion>,
-    #[cfg(feature = "experimental-fabric")]
-    rma_owner: Option<u64>,
     retained_append_bytes: usize,
     control: Option<(u64, Instant)>,
     control_result: Option<Response>,
     control_decode_ns: u64,
     control_profiled: bool,
-    resident_grants: HashMap<ValueRecordReference, Vec<ResidentGrant>>,
-    resident_handle_count: usize,
-    resident_session: Option<(u64, [u8; 16])>,
-    resident_acquisition_inflight: bool,
-    resident_poison: Option<([u8; 16], u64, Vec<u64>)>,
-    resident_stats: ResidentReadStats,
+    message_read_requests: u64,
     progressed: bool,
 }
 impl ClientState {
@@ -1527,25 +1401,6 @@ impl ClientState {
             .checked_add(1)
             .ok_or_else(|| TcpError::new("request ID space exhausted"))?;
         Ok(self.next_id)
-    }
-    pub(super) fn resident_read_stats(&self) -> ResidentReadStats {
-        let mut stats = self.resident_stats;
-        stats.handles_live = self.resident_handle_count as u64;
-        stats.grants_live = stats.handles_live;
-        stats
-    }
-}
-fn client_grant_limit(
-    class: ReadClass,
-    acquisition_inflight: bool,
-    rma_available: bool,
-    max_handles: usize,
-    live_handles: usize,
-) -> usize {
-    if class == ReadClass::Point && !acquisition_inflight && rma_available {
-        max_handles.saturating_sub(live_handles)
-    } else {
-        0
     }
 }
 
@@ -1559,30 +1414,6 @@ fn member_charge(reference: &ValueRecordReference) -> Result<usize, TcpError> {
         .ok_or_else(|| TcpError::new("read credit overflow"))
 }
 
-fn resident_grant_wire_size(reference: ValueRecordReference) -> Result<usize, TcpError> {
-    let grant = Some(ResidentGrant {
-        reference,
-        request_epoch: 0,
-        reader_generation: 0,
-        owner_boot: [0; 16],
-        session_id: 0,
-        grant_id: 0,
-        grant_generation: 0,
-        region: RemoteRegion {
-            region_id: 0,
-            generation: 0,
-            remote_address: 0,
-            key: 0,
-            len: 0,
-        },
-        source_region_id: 0,
-        source_region_generation: 0,
-    });
-    let size = wire_codec(usize::MAX)
-        .serialized_size(&grant)
-        .map_err(TcpError::component)?;
-    usize::try_from(size).map_err(TcpError::component)
-}
 fn read_charge(references: &[ValueRecordReference]) -> Result<usize, TcpError> {
     // Executor asserts its per-request/member metadata is <=4096. The other
     // term covers explicit positional/mapped results and serialized copies.
@@ -1592,130 +1423,10 @@ fn read_charge(references: &[ValueRecordReference]) -> Result<usize, TcpError> {
     })
 }
 impl Client {
-    /// Cooperatively stop using every cached grant and wait for the owner's exact
-    /// drain acknowledgment before a fence, seal or retirement can be acknowledged.
-    pub fn revoke_resident_grants(&mut self) -> Result<(), TcpError> {
-        if self.reactor.resident_grants.is_empty() {
-            return Ok(());
-        }
-        if !self.reactor.reads.is_empty()
-            || !self.reactor.wire_reads.is_empty()
-            || !self.reactor.ready.is_empty()
-        {
-            return Err(TcpError::new(
-                "resident grant revocation requires drained client reads",
-            ));
-        }
-        let mut generations = self
-            .reactor
-            .resident_grants
-            .values()
-            .flat_map(|grants| grants.iter())
-            .map(|grant| grant.grant_generation)
-            .collect::<Vec<_>>();
-        generations.sort_unstable();
-        let response = match self.request(Request::RevokeGrants {
-            generations: generations.clone(),
-        }) {
-            Ok(response) => response,
-            Err(error) => {
-                self.fail_connection();
-                return Err(error);
-            }
-        };
-        match response {
-            Response::GrantsRevoked(acknowledged) if acknowledged == generations => {
-                self.reactor.resident_grants.clear();
-                self.reactor.resident_handle_count = 0;
-                Ok(())
-            }
-            _ => {
-                self.fail_connection();
-                Err(TcpError::new("invalid resident grant drain acknowledgment"))
-            }
-        }
-    }
-    pub(crate) fn resident_reads_enabled(&self) -> bool {
-        self.resident_reads.destination_slots != 0
-    }
-    pub(crate) fn resident_grant_hits(
-        &self,
-        epoch: u64,
-        references: &[ValueRecordReference],
-    ) -> usize {
-        if self.reactor.resident_poison.is_some() || !self.resident_reads_enabled() {
-            return 0;
-        }
-        #[cfg(feature = "experimental-fabric")]
-        if self.reactor.rma_owner.is_some()
-            || self
-                .stream
-                .sock
-                .fabric
-                .as_ref()
-                .and_then(|endpoint| endpoint.rma_capabilities())
-                .is_none_or(|capabilities| {
-                    self.resident_reads.require_device_read
-                        && capabilities.read_mode != tidehunter_fabric::RmaReadMode::Native
-                })
-        {
-            return 0;
-        }
-        #[cfg(not(feature = "experimental-fabric"))]
-        {
-            let _ = (epoch, references);
-            0
-        }
-        #[cfg(feature = "experimental-fabric")]
-        references
-            .iter()
-            .filter(|reference| {
-                self.reactor
-                    .resident_grants
-                    .get(*reference)
-                    .is_some_and(|bucket| bucket.iter().any(|grant| grant.request_epoch == epoch))
-            })
-            .count()
-    }
     pub(crate) fn message_read_requests(&self) -> u64 {
-        self.reactor.resident_stats.message_read_requests
+        self.reactor.message_read_requests
     }
 
-    /// Progress one nonblocking control/CQ sweep for idle resident-read lanes.
-    /// Revocation is acknowledged only after all owned work and result acceptance
-    /// have drained on this lane.
-    pub(crate) fn progress_resident_control(&mut self) -> Result<bool, TcpError> {
-        if !self.resident_reads_enabled() {
-            return Ok(false);
-        }
-        if let Err(error) = self.progress_correlated() {
-            self.fail_connection();
-            return Err(error);
-        }
-        let progressed = self.reactor.progressed;
-        if self.reactor.resident_poison.is_none() {
-            return Ok(progressed);
-        }
-        if !self.reactor.reads.is_empty()
-            || !self.reactor.wire_reads.is_empty()
-            || !self.reactor.ready.is_empty()
-            || {
-                #[cfg(feature = "experimental-fabric")]
-                {
-                    self.reactor.rma_owner.is_some()
-                }
-                #[cfg(not(feature = "experimental-fabric"))]
-                {
-                    false
-                }
-            }
-        {
-            return Ok(true);
-        }
-        self.revoke_resident_grants()?;
-        self.fail_connection();
-        Err(TcpError::new("resident reader authority was poisoned"))
-    }
     pub(super) fn revalidate_peer_at(
         &self,
         now: rustls::pki_types::UnixTime,
@@ -1933,7 +1644,6 @@ impl Client {
         epoch: u64,
         references: Vec<ValueRecordReference>,
         deadline: Instant,
-        class: ReadClass,
         profiled: bool,
     ) -> Result<Option<u64>, TcpError> {
         if !self.read_admission(&references, profiled)? {
@@ -1956,71 +1666,17 @@ impl Client {
             deadline,
             began: (profiled || self.diagnostics.is_some()).then(Instant::now),
             profiled,
-            class,
-            grant_limit: 0,
             charge,
             profile: TcpReadProfile::default(),
-            #[cfg(feature = "experimental-fabric")]
-            original_order: None,
-            #[cfg(feature = "experimental-fabric")]
-            rma: None,
         };
-        #[cfg(feature = "experimental-fabric")]
-        let wire_queued = if self.reactor.rma_owner.is_none()
-            && let Some((rma, order)) = self.prepare_rma_read(epoch, &pending.references)?
-        {
-            let reordered = order
-                .iter()
-                .map(|&index| pending.references[index])
-                .collect();
-            pending.references = reordered;
-            pending.start = rma.grants.len();
-            pending.end = pending.start;
-            pending.original_order = Some(order);
-            pending.rma = Some(rma);
-            pending.start < pending.references.len()
-        } else {
-            true
-        };
-        #[cfg(not(feature = "experimental-fabric"))]
-        let wire_queued = true;
-        if !wire_queued {
-            pending.wire_id = 0;
-        }
-        if wire_queued {
-            self.queue_read_chunk(&mut pending)?;
-            self.reactor.wire_reads.insert(id, id);
-        }
-        #[cfg(feature = "experimental-fabric")]
-        if pending.rma.is_some() {
-            self.reactor.rma_owner = Some(id);
-        }
+        self.queue_read_chunk(&mut pending)?;
+        self.reactor.wire_reads.insert(id, id);
         self.reactor.reads.insert(id, pending);
         self.reactor.retained_bytes += charge;
         Ok(Some(id))
     }
     fn queue_read_chunk(&mut self, pending: &mut PendingRead) -> Result<(), TcpError> {
         let began = pending.began.map(|_| Instant::now());
-        #[cfg(feature = "experimental-fabric")]
-        let rma_available = self
-            .stream
-            .sock
-            .fabric
-            .as_ref()
-            .is_some_and(|endpoint| endpoint.rma_capabilities().is_some());
-        #[cfg(not(feature = "experimental-fabric"))]
-        let rma_available = false;
-        #[cfg(feature = "experimental-fabric")]
-        if !rma_available && self.resident_reads.enabled() {
-            self.reactor.resident_stats.fallback_unsupported += 1;
-        }
-        let requested_grant_limit = client_grant_limit(
-            pending.class,
-            self.reactor.resident_acquisition_inflight,
-            rma_available,
-            self.resident_reads.max_handles,
-            self.reactor.resident_handle_count,
-        );
         let mut bytes = 64
             + if pending.profiled {
                 SERVER_READ_PROFILE_BYTES
@@ -2056,57 +1712,20 @@ impl Client {
             return Err(TcpError::new("read cannot fit negotiated frame"));
         }
         let references = pending.references[pending.start..pending.end].to_vec();
-        let mut grant_limit = requested_grant_limit;
-        if grant_limit != 0 {
-            if self.resident_reads.destination_slots == 0 {
-                grant_limit = 0;
-            } else {
-                let mut response_bytes = bytes;
-                let mut retained_with_grants = retained;
-                for reference in &references {
-                    let grant_charge = resident_grant_wire_size(*reference)?;
-                    response_bytes = response_bytes
-                        .checked_add(grant_charge)
-                        .ok_or_else(|| TcpError::new("resident response size overflow"))?;
-                    retained_with_grants = retained_with_grants
-                        .checked_add(grant_charge)
-                        .ok_or_else(|| TcpError::new("resident read credit overflow"))?;
-                }
-                if response_bytes > self.frame_limit || retained_with_grants > self.max_read_bytes {
-                    grant_limit = 0;
-                }
-            }
-        }
-        pending.grant_limit = grant_limit;
-        let grant_max_bytes = if grant_limit == 0 {
-            0
-        } else {
-            self.resident_reads.max_read_bytes
-        };
         let request = if pending.profiled {
             Request::ReadProfiled {
                 epoch: pending.epoch,
                 references,
-                class: pending.class,
-                grant_limit,
-                grant_max_bytes,
             }
         } else {
             Request::Read {
                 epoch: pending.epoch,
                 references,
-                class: pending.class,
-                grant_limit,
-                grant_max_bytes,
             }
         };
         self.stream
             .queue(pending.wire_id, &request, self.frame_limit)?;
-        if pending.grant_limit != 0 {
-            self.reactor.resident_acquisition_inflight = true;
-            self.reactor.resident_stats.grant_candidates += (pending.end - pending.start) as u64;
-        }
-        self.reactor.resident_stats.message_read_requests += 1;
+        self.reactor.message_read_requests += 1;
         pending.profile.request_encode_ns += began.map_or(0, elapsed_ns);
         pending.profile.request_encode_count += u64::from(began.is_some());
         Ok(())
@@ -2258,10 +1877,6 @@ impl Client {
         }
         let (progressed, _) = self.stream.progress(None)?;
         self.reactor.progressed = progressed;
-        #[cfg(feature = "experimental-fabric")]
-        if let Some(id) = self.reactor.rma_owner {
-            self.progress_rma_read(id)?;
-        }
         // A peer can reply before our request's local CQE. Keep subsequent
         // chunks in their bounded read owner until output retirement frees a
         // frame credit; never overfill output or turn that stall into an error.
@@ -2300,33 +1915,7 @@ impl Client {
                 return Err(TcpError::new("invalid response protocol"));
             }
             if envelope.id == 0 {
-                let Response::ResidentPoison {
-                    owner_boot,
-                    session_id,
-                    mut generations,
-                } = envelope.body
-                else {
-                    return Err(TcpError::new("invalid unsolicited response"));
-                };
-                if self.reactor.resident_poison.is_some()
-                    || self.reactor.resident_session != Some((session_id, owner_boot))
-                {
-                    return Err(TcpError::new("resident poison session identity mismatch"));
-                }
-                let mut expected: Vec<_> = self
-                    .reactor
-                    .resident_grants
-                    .values()
-                    .flat_map(|bucket| bucket.iter())
-                    .map(|grant| grant.grant_generation)
-                    .collect();
-                expected.sort_unstable();
-                generations.sort_unstable();
-                if expected != generations {
-                    return Err(TcpError::new("resident poison grant set mismatch"));
-                }
-                self.reactor.resident_poison = Some((owner_boot, session_id, generations));
-                continue;
+                return Err(TcpError::new("invalid unsolicited response"));
             }
             if self
                 .reactor
@@ -2389,77 +1978,36 @@ impl Client {
                 .reads
                 .remove(&aggregate)
                 .ok_or_else(|| TcpError::new("missing response owner"))?;
-            if pending.grant_limit != 0 {
-                self.reactor.resident_acquisition_inflight = false;
-            }
             pending.profile.response_decode_ns += decoded;
             pending.profile.response_decode_count += u64::from(began.is_some());
             pending.profile.requests += 1;
-            let (records, grants) = match envelope.body {
-                Response::Records(records) if !pending.profiled => (records, None),
+            let records = match envelope.body {
+                Response::Records(records) if !pending.profiled => records,
                 Response::RecordsProfiled { records, profile } if pending.profiled => {
                     pending.profile.server_handler_available = true;
                     pending.profile.server_handler_ns += profile.handler_ns;
-                    pending.profile.server_inventory_wait_ns += profile.inventory_wait_ns;
                     pending.profile.server_authority_lookup_ns += profile.authority_lookup_ns;
                     pending.profile.server_record_read_ns += profile.record_read_ns;
                     pending.profile.server_wal.add(profile.wal);
-                    pending.profile.server_grant.add(profile.grant);
                     pending.profile.server_response_recheck_wait_ns +=
                         profile.response_recheck_wait_ns;
                     pending.profile.server_response_recheck_ns += profile.response_recheck_ns;
                     pending.profile.server_response_recheck_samples +=
                         profile.response_recheck_samples;
-                    pending.profile.server_response_recheck_deferrals +=
-                        profile.response_recheck_deferrals;
-                    (records, None)
-                }
-                Response::ResidentRecords { records, grants } if !pending.profiled => {
-                    (records, Some(grants))
-                }
-                Response::ResidentRecordsProfiled {
-                    records,
-                    grants,
-                    profile,
-                } if pending.profiled => {
-                    pending.profile.server_handler_available = true;
-                    pending.profile.server_handler_ns += profile.handler_ns;
-                    pending.profile.server_inventory_wait_ns += profile.inventory_wait_ns;
-                    pending.profile.server_authority_lookup_ns += profile.authority_lookup_ns;
-                    pending.profile.server_record_read_ns += profile.record_read_ns;
-                    pending.profile.server_wal.add(profile.wal);
-                    pending.profile.server_grant.add(profile.grant);
-                    pending.profile.server_response_recheck_wait_ns +=
-                        profile.response_recheck_wait_ns;
-                    pending.profile.server_response_recheck_ns += profile.response_recheck_ns;
-                    pending.profile.server_response_recheck_samples +=
-                        profile.response_recheck_samples;
-                    pending.profile.server_response_recheck_deferrals +=
-                        profile.response_recheck_deferrals;
-                    (records, Some(grants))
+                    records
                 }
                 Response::ReadErrorProfiled { message, profile } if pending.profiled => {
                     pending.profile.server_handler_available = true;
                     pending.profile.server_handler_ns += profile.handler_ns;
-                    pending.profile.server_inventory_wait_ns += profile.inventory_wait_ns;
                     pending.profile.server_authority_lookup_ns += profile.authority_lookup_ns;
                     pending.profile.server_record_read_ns += profile.record_read_ns;
                     pending.profile.server_wal.add(profile.wal);
-                    pending.profile.server_grant.add(profile.grant);
                     pending.profile.server_response_recheck_wait_ns +=
                         profile.response_recheck_wait_ns;
                     pending.profile.server_response_recheck_ns += profile.response_recheck_ns;
                     pending.profile.server_response_recheck_samples +=
                         profile.response_recheck_samples;
                     let error = TcpError::new(message);
-                    #[cfg(feature = "experimental-fabric")]
-                    if let Some(rma) = pending.rma.as_mut() {
-                        rma.first_error = Some(error);
-                        pending.start = pending.references.len();
-                        pending.wire_id = 0;
-                        self.reactor.reads.insert(aggregate, pending);
-                        continue;
-                    }
                     pending.profile.exchange_ns = pending.began.map_or(0, elapsed_ns);
                     pending.profile.exchange_count += u64::from(pending.began.is_some());
                     let mut error = error;
@@ -2474,14 +2022,6 @@ impl Client {
                     continue;
                 }
                 Response::Error(message) => {
-                    #[cfg(feature = "experimental-fabric")]
-                    if let Some(rma) = pending.rma.as_mut() {
-                        rma.first_error = Some(TcpError::new(message));
-                        pending.start = pending.references.len();
-                        pending.wire_id = 0;
-                        self.reactor.reads.insert(aggregate, pending);
-                        continue;
-                    }
                     self.reactor.ready.push_back((
                         ReadCompletion {
                             id: aggregate,
@@ -2497,33 +2037,6 @@ impl Client {
             if records.len() != references.len() {
                 return Err(TcpError::new("remote read count mismatch"));
             }
-            #[cfg(feature = "experimental-fabric")]
-            if pending.original_order.is_some() && self.reactor.resident_poison.is_some() {
-                return Err(TcpError::new("resident reader authority was poisoned"));
-            }
-            if pending.grant_limit != 0 {
-                let returned = grants.as_ref().map_or(0, |grants| {
-                    grants.iter().filter(|grant| grant.is_some()).count()
-                });
-                self.reactor.resident_stats.grant_unavailable +=
-                    (references.len().saturating_sub(returned)) as u64;
-            }
-            let new_grants = if self.reactor.resident_poison.is_some() {
-                0
-            } else {
-                grants
-                    .as_ref()
-                    .map(|grants| {
-                        self.validate_resident_grants(
-                            pending.epoch,
-                            references,
-                            grants,
-                            pending.grant_limit,
-                        )
-                    })
-                    .transpose()?
-                    .unwrap_or(0)
-            };
             let began = pending.began.map(|_| Instant::now());
             if let [reference] = references {
                 // The common scalar reply already has its final result allocation.
@@ -2552,17 +2065,6 @@ impl Client {
                         .map_err(TcpError::component)?,
                 );
             }
-            if self.reactor.resident_poison.is_none()
-                && let Some(grants) = grants.as_ref()
-            {
-                let install_started = pending.began.map(|_| Instant::now());
-                self.install_resident_grants(references, grants);
-                pending
-                    .profile
-                    .client_grant_install
-                    .record(install_started, false);
-                self.reactor.resident_stats.grants_issued += new_grants as u64;
-            }
             pending.profile.record_verify_ns += began.map_or(0, elapsed_ns);
             pending.profile.record_verify_count += u64::from(began.is_some());
             if Instant::now() >= pending.deadline {
@@ -2570,7 +2072,7 @@ impl Client {
             }
             pending.start = pending.end;
             pending.wire_id = 0;
-            if pending.start != pending.references.len() || pending.has_rma() {
+            if pending.start != pending.references.len() {
                 pending.wire_id = 0;
                 self.reactor.reads.insert(aggregate, pending);
             } else {
@@ -2578,17 +2080,6 @@ impl Client {
                 pending.profile.exchange_count += u64::from(pending.began.is_some());
                 if let Some(profile) = self.diagnostics.as_mut() {
                     profile.add(pending.profile);
-                }
-                #[cfg(feature = "experimental-fabric")]
-                if let Some(order) = pending.original_order.take() {
-                    let mut ordered: Vec<_> = (0..order.len()).map(|_| None).collect();
-                    for (index, value) in order.into_iter().zip(pending.values) {
-                        ordered[index] = Some(value);
-                    }
-                    pending.values = ordered
-                        .into_iter()
-                        .map(|value| value.expect("complete read permutation"))
-                        .collect();
                 }
                 self.reactor.ready.push_back((
                     ReadCompletion {
@@ -2599,433 +2090,20 @@ impl Client {
                 ));
             }
         }
-        #[cfg(feature = "experimental-fabric")]
-        if let Some(id) = self.reactor.rma_owner {
-            self.progress_rma_read(id)?;
-        }
         self.reactor.progressed |= self.stream.progress_output()?;
         self.reactor.progressed |= self.stream.finish_fabric_sweep()?;
         Ok(())
     }
-    #[cfg(feature = "experimental-fabric")]
-    fn prepare_rma_read(
-        &mut self,
-        epoch: u64,
-        references: &[ValueRecordReference],
-    ) -> Result<Option<(PendingRmaRead, Vec<usize>)>, TcpError> {
-        if references.is_empty() || self.reactor.resident_poison.is_some() {
-            return Ok(None);
-        }
-        let Some(endpoint) = self.stream.sock.fabric.as_mut() else {
-            return Ok(None);
-        };
-        let Some(capabilities) = endpoint.rma_capabilities() else {
-            return Ok(None);
-        };
-        if self.resident_reads.require_device_read
-            && capabilities.read_mode != tidehunter_fabric::RmaReadMode::Native
-        {
-            self.reactor.resident_stats.fallback_unsupported += 1;
-            return Ok(None);
-        }
-        let mut grants = Vec::with_capacity(references.len());
-        let mut selected = Vec::with_capacity(references.len());
-        let mut missing = Vec::with_capacity(references.len());
-        let mut total_bytes = 0usize;
-        let slots = endpoint.available_read_slots()?;
-        for (index, reference) in references.iter().enumerate() {
-            let Some(grant) = self
-                .reactor
-                .resident_grants
-                .get(reference)
-                .and_then(|bucket| bucket.iter().find(|grant| grant.request_epoch == epoch))
-                .copied()
-            else {
-                self.reactor.resident_stats.fallback_missing += 1;
-                missing.push(index);
-                continue;
-            };
-            let len = usize::try_from(grant.region.len).map_err(TcpError::component)?;
-            if len == 0
-                || len > self.resident_reads.max_read_bytes
-                || len > capabilities.max_read_bytes
-            {
-                return Err(TcpError::new("cached resident grant bounds mismatch"));
-            }
-            let next = total_bytes
-                .checked_add(len)
-                .ok_or_else(|| TcpError::new("resident group size overflow"))?;
-            if grants.len() >= slots || next > self.resident_reads.destination_bytes {
-                self.reactor.resident_stats.fallback_capacity += 1;
-                missing.push(index);
-                continue;
-            }
-            total_bytes = next;
-            grants.push(grant);
-            selected.push(index);
-        }
-        if grants.is_empty() {
-            return Ok(None);
-        }
-        selected.extend(missing);
-        self.reactor.resident_stats.eligible_reads += 1;
-        Ok(Some((
-            PendingRmaRead {
-                operations: (0..grants.len()).map(|_| None).collect(),
-                buffers: (0..grants.len()).map(|_| None).collect(),
-                posted_at: None,
-                grants,
-                next_post: 0,
-                accepted: 0,
-                completed: 0,
-                first_error: None,
-            },
-            selected,
-        )))
-    }
 
-    #[cfg(feature = "experimental-fabric")]
-    fn progress_rma_read(&mut self, id: u64) -> Result<(), TcpError> {
-        let Some(mut pending) = self.reactor.reads.remove(&id) else {
-            self.reactor.rma_owner = None;
-            return Ok(());
-        };
-        let Some(mut rma) = pending.rma.take() else {
-            self.reactor.reads.insert(id, pending);
-            self.reactor.rma_owner = None;
-            return Ok(());
-        };
-        if pending.wire_id == 0
-            && pending.start == pending.references.len()
-            && pending.profile.requests == 0
-            && !pending.profile.server_handler_not_applicable
-        {
-            // No message read exists for this pure-RMA operation, including
-            // when it later fails or is revoked before completion.
-            pending.profile.server_handler_not_applicable = true;
-            if pending.profiled {
-                pending.profile.server_wal.rma_not_applicable_requests += 1;
-            }
-        }
-        if self.reactor.resident_poison.is_some() && rma.first_error.is_none() {
-            rma.first_error = Some(TcpError::new("resident reader authority was poisoned"));
-        }
-        if rma.first_error.is_none() {
-            let Some(endpoint) = self.stream.sock.fabric.as_mut() else {
-                let error = rma_error_with_profile(
-                    TcpError::new("RMA endpoint disappeared"),
-                    pending.profiled,
-                    pending.profile,
-                );
-                rma.first_error = Some(TcpError::new("RMA endpoint disappeared"));
-                pending.rma = Some(rma);
-                self.reactor.reads.insert(id, pending);
-                return Err(error);
-            };
-            while rma.next_post < rma.grants.len() {
-                let grant = rma.grants[rma.next_post];
-                let remote = tidehunter_fabric::RemoteReadRegion {
-                    region_id: grant.region.region_id,
-                    generation: grant.region.generation,
-                    remote_address: grant.region.remote_address,
-                    key: grant.region.key,
-                    len: grant.region.len,
-                };
-                let len = usize::try_from(grant.region.len).map_err(|error| {
-                    rma_error_with_profile(
-                        TcpError::component(error),
-                        pending.profiled,
-                        pending.profile,
-                    )
-                })?;
-                let post_started = pending.began.map(|_| Instant::now());
-                match endpoint.try_post_read(&remote, 0, len) {
-                    Ok(operation) => {
-                        if let Some(started) = post_started {
-                            let times = rma
-                                .posted_at
-                                .get_or_insert_with(|| vec![None; rma.grants.len()]);
-                            times[rma.next_post] = Some(started);
-                        }
-                        rma.operations[rma.next_post] = Some(operation);
-                        rma.next_post += 1;
-                        rma.accepted += 1;
-                        self.reactor.resident_stats.rma_posts += 1;
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(error) => {
-                        self.reactor.resident_stats.rma_errors += 1;
-                        return Err(rma_error_with_profile(
-                            TcpError::component(error),
-                            pending.profiled,
-                            pending.profile,
-                        ));
-                    }
-                }
-            }
-        }
-        if let Some(endpoint) = self.stream.sock.fabric.as_mut() {
-            for index in 0..rma.operations.len() {
-                let Some(operation) = rma.operations[index].as_mut() else {
-                    continue;
-                };
-                let completion = endpoint.take_read_completion(operation).map_err(|error| {
-                    rma_error_with_profile(
-                        TcpError::component(error),
-                        pending.profiled,
-                        pending.profile,
-                    )
-                })?;
-                match completion {
-                    None => {}
-                    Some(Ok(buffer)) => {
-                        let started = rma.posted_at.as_mut().and_then(|times| times[index].take());
-                        pending.profile.client_fi_read.record(started, false);
-                        rma.buffers[index] = Some(buffer.into_minibytes_bytes());
-                        rma.operations[index] = None;
-                        rma.completed += 1;
-                        self.reactor.resident_stats.rma_completions += 1;
-                    }
-                    Some(Err(error)) => {
-                        let started = rma.posted_at.as_mut().and_then(|times| times[index].take());
-                        pending.profile.client_fi_read.record(started, true);
-                        self.reactor.resident_stats.rma_errors += 1;
-                        return Err(rma_error_with_profile(
-                            TcpError::component(error),
-                            pending.profiled,
-                            pending.profile,
-                        ));
-                    }
-                }
-            }
-        }
-        let terminal = (rma.next_post == rma.grants.len() || rma.first_error.is_some())
-            && rma.completed == rma.accepted;
-        if !terminal {
-            pending.rma = Some(rma);
-            self.reactor.reads.insert(id, pending);
-            return Ok(());
-        }
-        self.reactor.rma_owner = None;
-        if rma.first_error.is_some() || self.reactor.resident_poison.is_some() {
-            pending.profile.exchange_ns = pending.began.map_or(0, elapsed_ns);
-            pending.profile.exchange_count += u64::from(pending.began.is_some());
-        }
-        if rma.first_error.is_some() && pending.wire_id != 0 {
-            return Err(rma_error_with_profile(
-                TcpError::new("resident read failed while message reply was outstanding"),
-                pending.profiled,
-                pending.profile,
-            ));
-        }
-        if let Some(error) = rma.first_error {
-            self.reactor.ready.push_back((
-                ReadCompletion {
-                    id,
-                    result: Err(rma_error_with_profile(
-                        error,
-                        pending.profiled,
-                        pending.profile,
-                    )),
-                },
-                pending.charge,
-            ));
-            return Ok(());
-        }
-        if self.reactor.resident_poison.is_some() {
-            self.reactor.ready.push_back((
-                ReadCompletion {
-                    id,
-                    result: Err(rma_error_with_profile(
-                        TcpError::new("resident reader authority was poisoned"),
-                        pending.profiled,
-                        pending.profile,
-                    )),
-                },
-                pending.charge,
-            ));
-            return Ok(());
-        }
-        let verify_started = pending.began.map(|_| Instant::now());
-        let mut rma_values = Vec::with_capacity(rma.grants.len());
-        for index in 0..rma.grants.len() {
-            let bytes = rma.buffers[index]
-                .take()
-                .ok_or_else(|| TcpError::new("RMA completion omitted a destination"))?;
-            let member = super::resident::checked_member(rma.grants[index], &bytes)?;
-            let member_start = bytes.len() - member.len();
-            rma_values.push(
-                CompleteBatch::decode_record(
-                    &self.shape,
-                    &rma.grants[index].reference,
-                    bytes.slice(member_start..),
-                )
-                .map_err(TcpError::component)?,
-            );
-        }
-        pending.values.splice(0..0, rma_values);
-        if Instant::now() >= pending.deadline {
-            return Err(TcpError::new(
-                "resident read verification exceeded deadline",
-            ));
-        }
-        pending.profile.record_verify_ns += verify_started.map_or(0, elapsed_ns);
-        pending.profile.record_verify_count += u64::from(verify_started.is_some());
-        self.reactor.resident_stats.rma_hits += 1;
-        if pending.start != pending.references.len() || pending.wire_id != 0 {
-            self.reactor.reads.insert(id, pending);
-            self.reactor.progressed = true;
-            return Ok(());
-        }
-        if let Some(order) = pending.original_order.take() {
-            let mut ordered: Vec<_> = (0..order.len()).map(|_| None).collect();
-            for (index, value) in order.into_iter().zip(pending.values) {
-                ordered[index] = Some(value);
-            }
-            pending.values = ordered
-                .into_iter()
-                .map(|value| value.expect("complete read permutation"))
-                .collect();
-        }
-        pending.profile.exchange_ns = pending.began.map_or(0, elapsed_ns);
-        pending.profile.exchange_count += u64::from(pending.began.is_some());
-        if let Some(profile) = self.diagnostics.as_mut() {
-            profile.add(pending.profile);
-        }
-        self.reactor.ready.push_back((
-            ReadCompletion {
-                id,
-                result: Ok((pending.values, pending.profile)),
-            },
-            pending.charge,
-        ));
-        Ok(())
-    }
-
-    fn validate_resident_grants(
-        &self,
-        epoch: u64,
-        references: &[ValueRecordReference],
-        grants: &[Option<ResidentGrant>],
-        requested_new: usize,
-    ) -> Result<usize, TcpError> {
-        if grants.len() != references.len() {
-            return Err(TcpError::new("resident grant/reference count mismatch"));
-        }
-        #[cfg(feature = "experimental-fabric")]
-        let has_rma = self
-            .stream
-            .sock
-            .fabric
-            .as_ref()
-            .and_then(tidehunter_fabric::Endpoint::rma_capabilities)
-            .is_some();
-        #[cfg(not(feature = "experimental-fabric"))]
-        let has_rma = false;
-        if !has_rma || self.resident_reads.destination_slots == 0 {
-            return Err(TcpError::new(
-                "peer returned grants without an RMA destination",
-            ));
-        }
-        let mut fresh_handles = Vec::<ResidentGrant>::new();
-        let mut identity = self.reactor.resident_session;
-        for (reference, grant) in references.iter().zip(grants) {
-            let Some(grant) = grant else {
-                continue;
-            };
-            let current = (grant.session_id, grant.owner_boot);
-            if identity.is_some_and(|known| known != current) {
-                return Err(TcpError::new("resident grant belongs to another session"));
-            }
-            identity = Some(current);
-            if grant.reference != *reference
-                || grant.request_epoch != epoch
-                || grant.session_id == 0
-                || grant.source_region_id != grant.region.region_id
-                || usize::try_from(grant.region.len).map_or(true, |len| {
-                    len == 0 || len > self.resident_reads.max_read_bytes
-                })
-            {
-                return Err(TcpError::new("resident grant identity or bounds mismatch"));
-            }
-            match self
-                .reactor
-                .resident_grants
-                .get(reference)
-                .and_then(|bucket| {
-                    bucket.iter().find(|existing| {
-                        existing.request_epoch == epoch
-                            && existing.reader_generation == grant.reader_generation
-                            && existing.session_id == grant.session_id
-                            && existing.owner_boot == grant.owner_boot
-                    })
-                }) {
-                Some(existing) if *existing == *grant => {}
-                Some(_) => {
-                    return Err(TcpError::new(
-                        "resident reference was rebound to another grant",
-                    ));
-                }
-                None => {
-                    if !fresh_handles.contains(grant) {
-                        fresh_handles.push(*grant);
-                    }
-                }
-            }
-        }
-        let new_handles = fresh_handles.len();
-        if new_handles > requested_new
-            || self
-                .reactor
-                .resident_handle_count
-                .checked_add(new_handles)
-                .is_none_or(|count| count > self.resident_reads.max_handles)
-        {
-            return Err(TcpError::new("resident grant handle budget exceeded"));
-        }
-        Ok(new_handles)
-    }
-
-    fn install_resident_grants(
-        &mut self,
-        references: &[ValueRecordReference],
-        grants: &[Option<ResidentGrant>],
-    ) {
-        for (reference, grant) in references.iter().zip(grants) {
-            if let Some(grant) = grant {
-                let bucket = self.reactor.resident_grants.entry(*reference).or_default();
-                if !bucket.iter().any(|existing| {
-                    existing.request_epoch == grant.request_epoch
-                        && existing.reader_generation == grant.reader_generation
-                        && existing.session_id == grant.session_id
-                        && existing.owner_boot == grant.owner_boot
-                }) {
-                    bucket.push(*grant);
-                    self.reactor.resident_handle_count += 1;
-                    self.reactor.resident_session = Some((grant.session_id, grant.owner_boot));
-                    self.reactor.resident_stats.grant_acquisitions += 1;
-                }
-            }
-        }
-        self.reactor.resident_stats.handles_live = self.reactor.resident_handle_count as u64;
-        self.reactor.resident_stats.grants_live = self.reactor.resident_handle_count as u64;
-    }
     pub(super) fn read_records_correlated(
         &mut self,
         epoch: u64,
         references: &[ValueRecordReference],
-        class: ReadClass,
         profile: Option<&mut TcpReadProfile>,
     ) -> Result<Vec<Mutation>, TcpError> {
         let deadline = Instant::now() + self.timeout;
         let id = self
-            .submit_read(
-                epoch,
-                references.to_vec(),
-                deadline,
-                class,
-                profile.is_some(),
-            )?
+            .submit_read(epoch, references.to_vec(), deadline, profile.is_some())?
             .ok_or_else(|| TcpError::new("session read admission is full"))?;
         let mut polling = ActivePoll::default();
         loop {
@@ -3131,10 +2209,6 @@ struct ServerPending {
     charge: usize,
     epoch: Option<u64>,
     read_generation: Option<u64>,
-    read_references: Vec<ValueRecordReference>,
-    authority_owners: Vec<super::super::storage::ResidentReadOwner>,
-    grant_limit: usize,
-    grant_max_bytes: usize,
     profile: Option<Instant>,
     record_started: Option<Instant>,
     executor_started: Option<Instant>,
@@ -3151,19 +2225,6 @@ struct ServerPending {
     is_append: bool,
 }
 
-struct ServerResidentGrant {
-    grant: ResidentGrant,
-    #[cfg(feature = "experimental-fabric")]
-    region: tidehunter_fabric::RegisteredReadRegion,
-}
-
-fn next_resident_id(counter: &AtomicU64) -> Result<u64, TcpError> {
-    counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
-            next.checked_add(1)
-        })
-        .map_err(|_| TcpError::new("resident identity space exhausted"))
-}
 pub(super) struct WorkCompletion {
     pub(super) id: u64,
     pub(super) response: Result<Response, TcpError>,
@@ -3174,7 +2235,6 @@ struct DeferredRead {
     id: u64,
     epoch: u64,
     references: Vec<ValueRecordReference>,
-    class: ReadClass,
     members: Option<
         Vec<(
             Arc<super::super::storage::PartitionLog>,
@@ -3282,35 +2342,12 @@ pub(super) fn serve_session(
     } else {
         None
     };
-    let resident_source = node
-        .resident_reads
-        .source_per_connection(limits.max_connections);
-    #[cfg(feature = "experimental-fabric")]
-    let resident_source_available = resident_source.source_enabled()
-        && stream
-            .sock
-            .fabric
-            .as_ref()
-            .is_some_and(|endpoint| endpoint.rma_capabilities().is_some());
-    #[cfg(not(feature = "experimental-fabric"))]
-    let resident_source_available = false;
-    let resident_session_id = if resident_source.source_enabled() {
-        next_resident_id(&super::NEXT_RESIDENT_SESSION)?
-    } else {
-        0
-    };
-    #[cfg(feature = "experimental-fabric")]
-    let mut resident_grants = Vec::<ServerResidentGrant>::new();
-    #[cfg(not(feature = "experimental-fabric"))]
-    let resident_grants = Vec::<ServerResidentGrant>::new();
     let (completed, completions) = mpsc::sync_channel::<WorkCompletion>(SESSION_REQUESTS);
     let (plans_completed, plan_completions) =
         mpsc::sync_channel::<PlanCompletion>(SESSION_REQUESTS);
     let mut planners = 0usize;
     let mut pending = HashMap::<u64, ServerPending>::new();
     let mut deferred = VecDeque::<DeferredRead>::new();
-    #[cfg(feature = "experimental-fabric")]
-    let mut deferred_revokes = VecDeque::<(u64, Vec<u64>)>::new();
     let mut controls = VecDeque::<(u64, Request)>::new();
     // One decoded input frame may await byte credits; never drain more input
     // behind it. Its original deadline and the negotiated frame bound apply.
@@ -3374,57 +2411,8 @@ pub(super) fn serve_session(
                 &mut retained_bytes,
                 diagnostics.as_mut(),
             );
-            #[cfg(feature = "experimental-fabric")]
-            if pending.is_empty()
-                && let Some(generations) =
-                    node.resident_grants.take_poison_notice(resident_session_id)
-            {
-                stream.queue(
-                    0,
-                    &Response::ResidentPoison {
-                        owner_boot: node.owner_boot,
-                        session_id: resident_session_id,
-                        generations,
-                    },
-                    limits.max_frame_bytes,
-                )?;
-                progressed = true;
-            }
-            #[cfg(feature = "experimental-fabric")]
-            if pending.len() == 1
-                && deferred.is_empty()
-                && controls.is_empty()
-                && active_appends == 0
-                && workers == 0
-                && let Some((id, generations)) = deferred_revokes.pop_front()
-            {
-                revoke_server_grants(
-                    node,
-                    &mut stream,
-                    resident_session_id,
-                    &mut resident_grants,
-                    &generations,
-                )?;
-                queue_response(&mut pending, id, Response::GrantsRevoked(generations))?;
-                progressed = true;
-            }
             if let Some(executor) = executor.as_mut() {
-                #[cfg(feature = "experimental-fabric")]
-                {
-                    progressed |= harvest_reads(
-                        node,
-                        &mut stream,
-                        resident_session_id,
-                        resident_source,
-                        &mut resident_grants,
-                        executor,
-                        &mut pending,
-                    )?;
-                }
-                #[cfg(not(feature = "experimental-fabric"))]
-                {
-                    progressed |= harvest_reads(node, executor, &mut pending)?;
-                }
+                progressed |= harvest_reads(executor, &mut pending)?;
             }
             while let Ok(completion) = completions.try_recv() {
                 progressed = true;
@@ -3522,19 +2510,13 @@ pub(super) fn serve_session(
                     ));
                 }
                 if !initialized {
-                    if matches!(
-                        &envelope.body,
-                        Request::OperationalReadIoStats | Request::ResidentGrantStats
-                    ) {
+                    if matches!(&envelope.body, Request::OperationalReadIoStats) {
                         diagnostic_only = true;
                     } else if !matches!(&envelope.body, Request::Status { protocol: PROTOCOL }) {
                         return Err(TcpError::new("status/protocol handshake required"));
                     }
                 } else if diagnostic_only
-                    && !matches!(
-                        &envelope.body,
-                        Request::OperationalReadIoStats | Request::ResidentGrantStats
-                    )
+                    && !matches!(&envelope.body, Request::OperationalReadIoStats)
                 {
                     return Err(TcpError::new(
                         "diagnostic session cannot serve data requests",
@@ -3552,16 +2534,10 @@ pub(super) fn serve_session(
                 }
                 let (charge, epoch, profiled) = match &envelope.body {
                     Request::Read {
-                        epoch,
-                        references,
-                        grant_limit,
-                        ..
+                        epoch, references, ..
                     }
                     | Request::ReadProfiled {
-                        epoch,
-                        references,
-                        grant_limit,
-                        ..
+                        epoch, references, ..
                     } => {
                         if references.is_empty()
                             || references.len() > node.effective_max_reads(limits)
@@ -3585,11 +2561,6 @@ pub(super) fn serve_session(
                                         .ok_or_else(|| TcpError::new("read response overflow"))?,
                                 )
                                 .ok_or_else(|| TcpError::new("read response overflow"))?;
-                            if *grant_limit != 0 && node.resident_reads.source_enabled() {
-                                size = size
-                                    .checked_add(resident_grant_wire_size(*reference)?)
-                                    .ok_or_else(|| TcpError::new("read response overflow"))?;
-                            }
                         }
                         if size > limits.max_frame_bytes {
                             return Err(TcpError::new("read response exceeds frame bound"));
@@ -3630,38 +2601,6 @@ pub(super) fn serve_session(
                 if let Some(profile) = diagnostics.as_mut() {
                     profile.requests += u64::from(measured);
                 }
-                // Only grant promotion needs a second copy after the request
-                // moves into deferred planning. Ordinary RPC reads retain their
-                // original references there, including across Full retries.
-                let read_references = match &envelope.body {
-                    Request::Read {
-                        references,
-                        grant_limit,
-                        ..
-                    }
-                    | Request::ReadProfiled {
-                        references,
-                        grant_limit,
-                        ..
-                    } if *grant_limit != 0 && node.resident_reads.source_enabled() => {
-                        references.clone()
-                    }
-                    _ => Vec::new(),
-                };
-                let grant_limit = match &envelope.body {
-                    Request::Read { grant_limit, .. }
-                    | Request::ReadProfiled { grant_limit, .. } => *grant_limit,
-                    _ => 0,
-                };
-                let grant_max_bytes = match &envelope.body {
-                    Request::Read {
-                        grant_max_bytes, ..
-                    }
-                    | Request::ReadProfiled {
-                        grant_max_bytes, ..
-                    } => *grant_max_bytes,
-                    _ => 0,
-                };
                 pending.insert(
                     envelope.id,
                     ServerPending {
@@ -3669,10 +2608,6 @@ pub(super) fn serve_session(
                         charge,
                         epoch,
                         read_generation: None,
-                        read_references,
-                        authority_owners: Vec::new(),
-                        grant_limit,
-                        grant_max_bytes,
                         profile: profiled.then(Instant::now),
                         record_started: None,
                         executor_started: None,
@@ -3738,66 +2673,19 @@ pub(super) fn serve_session(
                         queue_response(&mut pending, envelope.id, response)?;
                     }
                     Request::Read {
-                        epoch,
-                        references,
-                        class,
-                        ..
+                        epoch, references, ..
                     }
                     | Request::ReadProfiled {
-                        epoch,
-                        references,
-                        class,
-                        ..
+                        epoch, references, ..
                     } if executor.is_some() => {
                         deferred.push_back(DeferredRead {
                             id: envelope.id,
                             epoch,
                             references,
-                            class,
                             members: None,
                             plans: None,
                         });
                     }
-                    #[cfg(feature = "experimental-fabric")]
-                    Request::RevokeGrants { generations } => {
-                        let can_defer_for_tx_retirement = pending.len() != 1
-                            && deferred.is_empty()
-                            && controls.is_empty()
-                            && active_appends == 0
-                            && workers == 0;
-                        if can_defer_for_tx_retirement {
-                            deferred_revokes.push_back((envelope.id, generations));
-                            continue;
-                        }
-                        let response = if !deferred_revokes.is_empty()
-                            || !deferred.is_empty()
-                            || !controls.is_empty()
-                            || active_appends != 0
-                            || workers != 0
-                        {
-                            Response::Error(
-                                "resident grant revoke requires drained session work".into(),
-                            )
-                        } else {
-                            match revoke_server_grants(
-                                node,
-                                &mut stream,
-                                resident_session_id,
-                                &mut resident_grants,
-                                &generations,
-                            ) {
-                                Ok(()) => Response::GrantsRevoked(generations),
-                                Err(error) => Response::Error(error.to_string()),
-                            }
-                        };
-                        queue_response(&mut pending, envelope.id, response)?;
-                    }
-                    #[cfg(not(feature = "experimental-fabric"))]
-                    Request::RevokeGrants { .. } => queue_response(
-                        &mut pending,
-                        envelope.id,
-                        Response::Error("resident grants are unavailable in this build".into()),
-                    )?,
                     request => controls.push_back((envelope.id, request)),
                 }
             }
@@ -3912,43 +2800,12 @@ pub(super) fn serve_session(
                 if Instant::now() >= request.deadline {
                     return Err(TcpError::new("session request deadline expired"));
                 }
-                let can_capture_authority_owners =
-                    request.grant_limit != 0
-                        && resident_source_available
-                        && resident_grants.len() < resident_source.source_regions
-                        && request.grant_max_bytes > 512
-                        && request.epoch.zip(request.read_generation).is_some_and(
-                            |(epoch, generation)| {
-                                request.read_references.iter().any(|reference| {
-                                    usize::try_from(reference.descriptor.len).ok().is_some_and(
-                                        |len| len <= request.grant_max_bytes.saturating_sub(512),
-                                    ) && !resident_grants.iter().any(|entry| {
-                                        entry.grant.reference == *reference
-                                            && entry.grant.request_epoch == epoch
-                                            && entry.grant.reader_generation == generation
-                                            && entry.grant.owner_boot == node.owner_boot
-                                            && entry.grant.session_id == resident_session_id
-                                    })
-                                })
-                            },
-                        );
-                if can_capture_authority_owners {
-                    let plans = read
-                        .plans
-                        .as_ref()
-                        .ok_or_else(|| TcpError::new("resident grant request has no read plans"))?;
-                    request.authority_owners = plans
-                        .iter()
-                        .map(|(_, plan)| plan.resident_owner())
-                        .collect();
-                }
                 if request.profile.is_some() {
                     request.executor_started.get_or_insert_with(Instant::now);
                 }
                 let outcome = executor.as_mut().unwrap().submit_planned_profiled(
                     read.id,
                     read.plans.take().unwrap(),
-                    read.class,
                     &mut request._lease,
                     request.profile.map(|_| &mut request.read_profile.wal),
                 );
@@ -3967,19 +2824,7 @@ pub(super) fn serve_session(
                 match outcome {
                     Ok(read_executor::SubmitOutcome::Ready { records, lease }) => {
                         pending.get_mut(&read.id).unwrap()._lease = Some(lease);
-                        #[cfg(feature = "experimental-fabric")]
-                        finish_read_with_rma(
-                            node,
-                            &mut stream,
-                            resident_session_id,
-                            resident_source,
-                            &mut resident_grants,
-                            &mut pending,
-                            read.id,
-                            Ok(records),
-                        )?;
-                        #[cfg(not(feature = "experimental-fabric"))]
-                        finish_read(node, &mut pending, read.id, Ok(records))?;
+                        finish_read(&mut pending, read.id, Ok(records))?;
                         progressed = true;
                     }
                     Ok(read_executor::SubmitOutcome::Pending) => {
@@ -4004,22 +2849,7 @@ pub(super) fn serve_session(
                 // Seastar reactor.cc:3333-3355 (19ecc0d39feb36c8a10692ba262e9924e9f7df33):
                 // reap again after submission, since resident I/O can already
                 // have completed. One bounded, nonblocking CQ harvest only.
-                #[cfg(feature = "experimental-fabric")]
-                {
-                    progressed |= harvest_reads(
-                        node,
-                        &mut stream,
-                        resident_session_id,
-                        resident_source,
-                        &mut resident_grants,
-                        executor.as_mut().unwrap(),
-                        &mut pending,
-                    )?;
-                }
-                #[cfg(not(feature = "experimental-fabric"))]
-                {
-                    progressed |= harvest_reads(node, executor.as_mut().unwrap(), &mut pending)?;
-                }
+                progressed |= harvest_reads(executor.as_mut().unwrap(), &mut pending)?;
             }
             let mut blocked_control = false;
             for _ in 0..controls.len() {
@@ -4031,18 +2861,6 @@ pub(super) fn serve_session(
                         Response::OperationalReadIoStats(Box::new((
                             node.control_context.partition.clone(),
                             node.read_admission.try_stats(),
-                        ))),
-                    )?;
-                    progressed = true;
-                    continue;
-                }
-                if matches!(&request, Request::ResidentGrantStats) {
-                    queue_response(
-                        &mut pending,
-                        id,
-                        Response::ResidentGrantStats(Box::new((
-                            node.control_context.partition.clone(),
-                            node.resident_grants.try_promotion_stats(),
                         ))),
                     )?;
                     progressed = true;
@@ -4197,11 +3015,6 @@ pub(super) fn serve_session(
         }
         Ok(())
     })();
-    // No timeout or disconnect proves remote FI_READ quiescence. Keep every
-    // registered source owner and its admission credits quarantined until restart.
-    #[cfg(feature = "experimental-fabric")]
-    node.resident_grants.quarantine_session(resident_session_id);
-    node.finish_poison_if_quiescent();
     stream.abort();
     // A disconnected caller cancels delivery, not accepted control work. Join
     // the bounded worker completions before releasing this session's credits.
@@ -4228,408 +3041,7 @@ pub(super) fn serve_session(
     }
 }
 
-#[cfg(feature = "experimental-fabric")]
-fn resident_grants_for_read(
-    node: &StorageNode,
-    stream: &mut Session,
-    session_id: u64,
-    source: ResidentReadConfig,
-    resident_grants: &mut Vec<ServerResidentGrant>,
-    request: &mut ServerPending,
-    records: &[minibytes::Bytes],
-) -> Result<Option<Vec<Option<ResidentGrant>>>, TcpError> {
-    let mut attached = None;
-    if request.grant_limit != 0 {
-        node.resident_grants
-            .record_promotion(|stats| stats.attempts += records.len() as u64);
-    }
-    if !source.source_enabled()
-        || stream
-            .sock
-            .fabric
-            .as_ref()
-            .is_none_or(|endpoint| endpoint.rma_capabilities().is_none())
-        || request.grant_limit == 0
-        || request.grant_max_bytes == 0
-        || records.len() != request.read_references.len()
-    {
-        if request.grant_limit != 0 {
-            node.resident_grants
-                .record_promotion(|stats| stats.denied_source_unavailable += records.len() as u64);
-        }
-        return Ok(None);
-    }
-    let (Some(epoch), Some(reader_generation)) = (request.epoch, request.read_generation) else {
-        return Ok(None);
-    };
-    if !node.reader_authority_valid(epoch, Some(reader_generation)) {
-        return Err(TcpError::new(
-            "resident read authority is no longer current",
-        ));
-    }
-    let owner_boot = node.owner_boot;
-    let grant_max_bytes = source.max_read_bytes.min(request.grant_max_bytes);
-    let mut new_grants = 0usize;
-    for index in 0..records.len() {
-        let reference = request.read_references[index];
-        let member = records[index].as_ref();
-        if u32::try_from(member.len()).ok() != Some(reference.descriptor.len) {
-            return Err(TcpError::new(
-                "resident member length does not match its reference",
-            ));
-        }
-        let began = request.profile.map(|_| Instant::now());
-        let existing = resident_grants.iter().find(|entry| {
-            entry.grant.reference == reference
-                && entry.grant.request_epoch == epoch
-                && entry.grant.reader_generation == reader_generation
-                && entry.grant.owner_boot == owner_boot
-                && entry.grant.session_id == session_id
-        });
-        request.read_profile.grant.lookup.record(began, false);
-        if let Some(existing) = existing {
-            node.resident_grants
-                .record_promotion(|stats| stats.reused += 1);
-            attached.get_or_insert_with(|| vec![None; records.len()])[index] = Some(existing.grant);
-            continue;
-        }
-        if new_grants >= request.grant_limit {
-            node.resident_grants
-                .record_promotion(|stats| stats.denied_request_limit += 1);
-            continue;
-        }
-        if resident_grants.len() >= source.source_regions {
-            node.resident_grants
-                .record_promotion(|stats| stats.denied_regions += 1);
-            continue;
-        }
-        if member.len() > grant_max_bytes.saturating_sub(512) {
-            node.resident_grants
-                .record_promotion(|stats| stats.denied_oversize += 1);
-            continue;
-        }
-        if request.authority_owners.len() != records.len() {
-            node.resident_grants
-                .record_promotion(|stats| stats.denied_owner_unavailable += 1);
-            continue;
-        }
-        let reserved_bytes = member
-            .len()
-            .checked_add(512)
-            .ok_or_else(|| TcpError::new("resident envelope length overflow"))?;
-        let grant_generation = next_resident_id(&super::NEXT_RESIDENT_GRANT)?;
-        let began = request.profile.map(|_| Instant::now());
-        let source_owner = node.resident_grants.try_reserve(
-            session_id,
-            grant_generation,
-            reserved_bytes,
-            request.authority_owners[index].clone(),
-        );
-        let Some(source_owner) = source_owner else {
-            request.read_profile.grant.reservation.record(began, true);
-            continue;
-        };
-        let region = match stream
-            .sock
-            .fabric
-            .as_mut()
-            .ok_or_else(|| TcpError::new("resident source endpoint is unavailable"))?
-            .reserve_read_region(session_id, grant_generation)
-        {
-            Ok(region) => {
-                request.read_profile.grant.reservation.record(began, false);
-                region
-            }
-            Err(error) => {
-                request.read_profile.grant.reservation.record(began, true);
-                node.resident_grants
-                    .cancel_reservation(session_id, grant_generation);
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::Unsupported
-                        | io::ErrorKind::OutOfMemory
-                ) {
-                    node.resident_grants
-                        .record_promotion(|stats| stats.denied_provider += 1);
-                    continue;
-                }
-                return Err(TcpError::component(error));
-            }
-        };
-        let grant = ResidentGrant {
-            reference,
-            request_epoch: epoch,
-            reader_generation,
-            owner_boot,
-            session_id,
-            grant_id: grant_generation,
-            grant_generation,
-            region: RemoteRegion {
-                region_id: 0,
-                generation: 0,
-                remote_address: 0,
-                key: 0,
-                len: 0,
-            },
-            source_region_id: region.region_id(),
-            source_region_generation: region.generation(),
-        };
-        let began = request.profile.map(|_| Instant::now());
-        let encoded = encode_envelope(grant, member);
-        request
-            .read_profile
-            .grant
-            .envelope
-            .record(began, encoded.is_err());
-        let envelope = match encoded {
-            Ok(envelope) => envelope,
-            Err(error) => {
-                let retire = unsafe {
-                    stream
-                        .sock
-                        .fabric
-                        .as_mut()
-                        .ok_or_else(|| TcpError::new("resident source endpoint disappeared"))?
-                        .retire_unpublished_read_region(region)
-                };
-                if retire.is_ok() {
-                    node.resident_grants
-                        .cancel_reservation(session_id, grant_generation);
-                }
-                return Err(error);
-            }
-        };
-        let oversize = envelope.len() > grant_max_bytes;
-        if oversize
-            || !node.resident_grants.shrink_reservation(
-                session_id,
-                grant_generation,
-                envelope.len(),
-            )
-        {
-            let retire = unsafe {
-                stream
-                    .sock
-                    .fabric
-                    .as_mut()
-                    .ok_or_else(|| TcpError::new("resident source endpoint disappeared"))?
-                    .retire_unpublished_read_region(region)
-            };
-            match retire {
-                Ok(()) => node
-                    .resident_grants
-                    .cancel_reservation(session_id, grant_generation),
-                Err(error) => return Err(TcpError::component(error)),
-            }
-            node.resident_grants.record_promotion(|stats| {
-                if oversize {
-                    stats.denied_oversize += 1;
-                } else {
-                    stats.denied_admission += 1;
-                }
-            });
-            continue;
-        }
-        let source_bytes = envelope.len();
-        // Arc unsizing to the fabric's type-erased owner reuses this allocation.
-        let mut registration = None;
-        let registered = stream
-            .sock
-            .fabric
-            .as_mut()
-            .ok_or_else(|| TcpError::new("resident source endpoint disappeared"))?
-            .register_read_region_with_owner_profiled(
-                &region,
-                envelope,
-                source_owner,
-                request.profile.map(|_| &mut registration),
-            );
-        if let Some((ns, error)) = registration {
-            let stage = &mut request.read_profile.grant.registration;
-            stage.ns += ns;
-            stage.count += 1;
-            stage.max_ns = stage.max_ns.max(ns);
-            stage.errors += u64::from(error);
-        }
-        let remote = match registered {
-            Ok(remote) => remote,
-            Err(error) => {
-                let retire = unsafe {
-                    stream
-                        .sock
-                        .fabric
-                        .as_mut()
-                        .ok_or_else(|| TcpError::new("resident source endpoint disappeared"))?
-                        .retire_unpublished_read_region(region)
-                };
-                match retire {
-                    Ok(()) => node
-                        .resident_grants
-                        .cancel_reservation(session_id, grant_generation),
-                    Err(retire_error) => return Err(TcpError::component(retire_error)),
-                }
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Unsupported
-                ) {
-                    node.resident_grants
-                        .record_promotion(|stats| stats.denied_provider += 1);
-                    continue;
-                }
-                return Err(TcpError::component(error));
-            }
-        };
-        let grant = ResidentGrant {
-            region: RemoteRegion {
-                region_id: remote.region_id,
-                generation: remote.generation,
-                remote_address: remote.remote_address,
-                key: remote.key,
-                len: remote.len,
-            },
-            ..grant
-        };
-        let began = request.profile.map(|_| Instant::now());
-        let authority_valid = node.reader_authority_valid(epoch, Some(reader_generation));
-        if !authority_valid {
-            request
-                .read_profile
-                .grant
-                .recheck_publication
-                .record(began, true);
-            let retire = unsafe {
-                stream
-                    .sock
-                    .fabric
-                    .as_mut()
-                    .ok_or_else(|| TcpError::new("resident source endpoint disappeared"))?
-                    .retire_unpublished_read_region(region)
-            };
-            if retire.is_ok() {
-                node.resident_grants
-                    .cancel_reservation(session_id, grant_generation);
-            }
-            return Err(TcpError::new(
-                "resident read authority changed during grant setup",
-            ));
-        }
-        let published = node
-            .resident_grants
-            .publish(session_id, grant_generation, source_bytes);
-        request
-            .read_profile
-            .grant
-            .recheck_publication
-            .record(began, !published);
-        if !published {
-            unsafe {
-                stream
-                    .sock
-                    .fabric
-                    .as_mut()
-                    .ok_or_else(|| TcpError::new("resident source endpoint disappeared"))?
-                    .retire_unpublished_read_region(region)
-            }
-            .map_err(TcpError::component)?;
-            node.resident_grants
-                .cancel_reservation(session_id, grant_generation);
-            node.resident_grants
-                .record_promotion(|stats| stats.denied_admission += 1);
-            continue;
-        }
-        resident_grants.push(ServerResidentGrant { grant, region });
-        attached.get_or_insert_with(|| vec![None; records.len()])[index] = Some(grant);
-        node.resident_grants
-            .record_promotion(|stats| stats.issued += 1);
-        new_grants += 1;
-    }
-    Ok(attached)
-}
-
-#[cfg(feature = "experimental-fabric")]
-fn revoke_server_grants(
-    node: &StorageNode,
-    stream: &mut Session,
-    session_id: u64,
-    resident_grants: &mut Vec<ServerResidentGrant>,
-    generations: &[u64],
-) -> Result<(), TcpError> {
-    let mut expected: Vec<_> = resident_grants
-        .iter()
-        .map(|entry| entry.grant.grant_generation)
-        .collect();
-    expected.sort_unstable();
-    if generations != expected {
-        return Err(TcpError::new(
-            "resident grant revocation did not name every session grant",
-        ));
-    }
-    if generations.is_empty() {
-        return Ok(());
-    }
-    let endpoint = stream
-        .sock
-        .fabric
-        .as_mut()
-        .ok_or_else(|| TcpError::new("resident source endpoint is unavailable"))?;
-    for entry in resident_grants.drain(..) {
-        // SAFETY: This is the exact authenticated session's release request.
-        // The client closes admission and drains every FI_READ before sending
-        // this request; the response is sent only after all source MRs retire.
-        let token = unsafe {
-            tidehunter_fabric::PeerDrainToken::after_ack(session_id, entry.grant.grant_generation)
-        };
-        endpoint
-            .retire_read_region(entry.region, token)
-            .map_err(TcpError::component)?;
-    }
-    if !node.resident_grants.release(session_id, generations) {
-        return Err(TcpError::new(
-            "resident grant registry lost an active session owner",
-        ));
-    }
-    node.finish_poison_if_quiescent();
-    Ok(())
-}
-
-#[cfg(feature = "experimental-fabric")]
 fn harvest_reads(
-    node: &StorageNode,
-    stream: &mut Session,
-    session_id: u64,
-    source: ResidentReadConfig,
-    resident_grants: &mut Vec<ServerResidentGrant>,
-    executor: &mut read_executor::ReadExecutor,
-    pending: &mut HashMap<u64, ServerPending>,
-) -> Result<bool, TcpError> {
-    let completions = executor.poll_completed().map_err(TcpError::component)?;
-    let progressed = !completions.is_empty();
-    for completion in completions {
-        let request = pending
-            .get_mut(&completion.request_id)
-            .ok_or_else(|| TcpError::new("unknown executor completion ID"))?;
-        request._lease = completion.lease;
-        if let Some(profile) = completion.profile {
-            request.read_profile.wal.add(profile);
-        }
-        finish_read_with_rma(
-            node,
-            stream,
-            session_id,
-            source,
-            resident_grants,
-            pending,
-            completion.request_id,
-            completion.result.map_err(TcpError::component),
-        )?;
-    }
-    Ok(progressed)
-}
-
-#[cfg(not(feature = "experimental-fabric"))]
-fn harvest_reads(
-    node: &StorageNode,
     executor: &mut read_executor::ReadExecutor,
     pending: &mut HashMap<u64, ServerPending>,
 ) -> Result<bool, TcpError> {
@@ -4644,7 +3056,6 @@ fn harvest_reads(
             request.read_profile.wal.add(profile);
         }
         finish_read(
-            node,
             pending,
             completion.request_id,
             completion.result.map_err(TcpError::component),
@@ -4654,7 +3065,6 @@ fn harvest_reads(
 }
 
 fn finish_read(
-    node: &StorageNode,
     pending: &mut HashMap<u64, ServerPending>,
     id: u64,
     records: Result<Vec<minibytes::Bytes>, TcpError>,
@@ -4686,78 +3096,9 @@ fn finish_read(
         }
         Err(error) => Response::Error(error.to_string()),
     };
-    node.finish_poison_if_quiescent();
     queue_response(pending, id, response)
 }
 
-#[cfg(feature = "experimental-fabric")]
-#[allow(clippy::too_many_arguments)] // Exact session grant ownership accompanies the completed reply and its lease.
-fn finish_read_with_rma(
-    node: &StorageNode,
-    stream: &mut Session,
-    session_id: u64,
-    source: ResidentReadConfig,
-    resident_grants: &mut Vec<ServerResidentGrant>,
-    pending: &mut HashMap<u64, ServerPending>,
-    id: u64,
-    records: Result<Vec<minibytes::Bytes>, TcpError>,
-) -> Result<(), TcpError> {
-    let grants = match &records {
-        Ok(records) => {
-            let request = pending
-                .get_mut(&id)
-                .ok_or_else(|| TcpError::new("unknown read completion ID"))?;
-            let result = resident_grants_for_read(
-                node,
-                stream,
-                session_id,
-                source,
-                resident_grants,
-                request,
-                records,
-            );
-            if request.profile.is_some() {
-                node.resident_grants.record_promotion(|stats| {
-                    stats.read_grant.add(request.read_profile.grant);
-                });
-            }
-            result?
-        }
-        Err(_) => None,
-    };
-    let Some(grants) = grants else {
-        return finish_read(node, pending, id, records);
-    };
-    let records = match records {
-        Ok(records) => records,
-        Err(error) => return finish_read(node, pending, id, Err(error)),
-    };
-    let request = pending
-        .get_mut(&id)
-        .ok_or_else(|| TcpError::new("unknown read completion ID"))?;
-    let response_started = request.profile.map(|_| Instant::now());
-    let records = records.into_iter().map(WireBytes::from).collect();
-    if let Some(started) = response_started {
-        let ns = elapsed_ns(started);
-        request.read_profile.wal.response_ready_ns += ns;
-        request.read_profile.wal.response_ready_count += 1;
-        request.read_profile.wal.response_ready_max_ns =
-            request.read_profile.wal.response_ready_max_ns.max(ns);
-    }
-    let response = if let Some(began) = request.profile {
-        request.read_profile.handler_ns = elapsed_ns(began);
-        request.read_profile.record_read_ns = request.record_started.map_or(0, elapsed_ns);
-        Response::ResidentRecordsProfiled {
-            grants,
-            records,
-            profile: request.read_profile,
-        }
-    } else {
-        Response::ResidentRecords { grants, records }
-    };
-    node.finish_poison_if_quiescent();
-    queue_response(pending, id, response)
-}
 fn queue_response(
     pending: &mut HashMap<u64, ServerPending>,
     id: u64,
@@ -4769,9 +3110,7 @@ fn queue_response(
     if request.response_queued || request.ready_response.is_some() {
         return Err(TcpError::new("duplicate server completion"));
     }
-    if let Response::RecordsProfiled { profile, .. }
-    | Response::ResidentRecordsProfiled { profile, .. } = &response
-    {
+    if let Response::RecordsProfiled { profile, .. } = &response {
         // A synchronous worker owns its profile until completion; retain it
         // before a later authority recheck can replace the successful reply.
         request.read_profile = *profile;
@@ -4834,18 +3173,12 @@ fn flush_responses(
                 profile.read_response_recheck_wait_ns += wait_ns;
                 profile.read_response_recheck_ns += recheck_ns;
                 profile.read_response_recheck_samples += 1;
-                profile.read_response_recheck_deferrals +=
-                    request.read_profile.response_recheck_deferrals;
                 profile.read_response_recheck_errors += u64::from(recheck_error.is_some());
             }
-            if let Response::RecordsProfiled { profile, .. }
-            | Response::ResidentRecordsProfiled { profile, .. } = &mut response
-            {
+            if let Response::RecordsProfiled { profile, .. } = &mut response {
                 profile.response_recheck_wait_ns = wait_ns;
                 profile.response_recheck_ns = recheck_ns;
                 profile.response_recheck_samples = 1;
-                profile.response_recheck_deferrals =
-                    request.read_profile.response_recheck_deferrals;
             }
             request.read_profile.response_recheck_wait_ns = wait_ns;
             request.read_profile.response_recheck_ns = recheck_ns;
@@ -4874,28 +3207,7 @@ fn flush_responses(
             return Err(TcpError::new("injected lost durable append response"));
         }
         let began = (request.measured || request.profile.is_some()).then(Instant::now);
-        let queued = stream.queue_response(id, response, limits.max_frame_bytes);
-        let encoded_at = began.map(|_| Instant::now());
-        if let (Some(started), Some(finished), Some(_)) = (began, encoded_at, request.profile) {
-            let ns = finished
-                .duration_since(started)
-                .as_nanos()
-                .min(u64::MAX as u128) as u64;
-            node.resident_grants.record_promotion(|stats| {
-                stats.read_response_encode.record_ns(ns, queued.is_err());
-            });
-        }
-        queued?;
-        if let (Some(started), true, Some(output)) = (
-            encoded_at,
-            request.profile.is_some(),
-            stream.output.back_mut(),
-        ) {
-            output.sampled = Some(SampledOutput {
-                registry: node.resident_grants.clone(),
-                started,
-            });
-        }
+        stream.queue_response(id, response, limits.max_frame_bytes)?;
         if request.measured
             && let Some(profile) = diagnostics.as_deref_mut()
         {

@@ -79,20 +79,23 @@ def checkpoint_sequence_cache_stats(values):
 
 
 OWNER_SAMPLE_STATS = frozenset(('shard_sample_generation', 'shard_sample_errors',
-    'shard_sample_age_ms', 'shard_sample_available', 'resident_sample_available',
-    'shard_sampler_stopped'))
+    'shard_sample_age_ms', 'shard_sample_available', 'shard_sampler_stopped'))
+LEGACY_OWNER_SAMPLE_STATS = OWNER_SAMPLE_STATS | {'resident_sample_available'}
 LOCAL_SAMPLE_STATS = frozenset(('local_sample_generation', 'local_sample_available',
     'local_sample_age_ms', 'local_sampler_stopped'))
 
 # Current Sui update_operational_metrics owner export. Historical owner decoding
 # remains permissive; live/final qualification requires this complete population.
-OWNER_BASE_STATS = frozenset(('cache_hits', 'cache_misses', 'cache_inserts',
-    'cache_evictions', 'cache_bytes', 'cache_budget', 'wal_reads', 'wal_read_bytes',
+OWNER_BASE_STATS = frozenset(('wal_reads', 'wal_read_bytes',
     'resident_read_attempts', 'resident_read_successes', 'resident_read_fallbacks',
     'resident_read_unsupported', 'resident_read_partial', 'resident_read_deferred',
     'async_read_submissions', 'completed_reads', 'errors', 'cancellations',
-    'inflight_requests', 'inflight_bytes', 'inflight_reads',
+    'inflight_requests', 'inflight_bytes', 'inflight_reads', 'authority_available'))
+LEGACY_OWNER_BASE_STATS = OWNER_BASE_STATS | frozenset(('cache_hits', 'cache_misses',
+    'cache_inserts', 'cache_evictions', 'cache_bytes', 'cache_budget',
     'authority_available', 'initiator_available'))
+OWNER_BASE_STATS = OWNER_BASE_STATS | frozenset((
+    'idle_buffer_bytes', 'idle_buffers', 'buffer_reuses', 'buffer_allocations'))
 RESIDENT_REPLAY_FIELDS = ('initiator_message_read_requests', 'initiator_rma_posts',
     'initiator_rma_completions', 'initiator_rma_hits', 'initiator_rma_errors',
     'initiator_grant_acquisitions', 'initiator_fallback_missing',
@@ -105,7 +108,8 @@ OWNER_OPTIONAL_STATS = {
     'initiator_available': frozenset(RESIDENT_REPLAY_FIELDS) | {
         'initiator_eligible_reads', 'initiator_handles_live', 'initiator_destination_slots_live'},
 }
-OWNER_KNOWN_STATS = OWNER_BASE_STATS.union(*OWNER_OPTIONAL_STATS.values())
+OWNER_KNOWN_STATS = OWNER_BASE_STATS | OWNER_OPTIONAL_STATS['authority_available']
+LEGACY_OWNER_KNOWN_STATS = LEGACY_OWNER_BASE_STATS.union(*OWNER_OPTIONAL_STATS.values())
 
 class MetricStreamsUnavailable(Exception):
     """Explicitly unavailable current streams whose metadata is not yet published."""
@@ -125,7 +129,7 @@ def operational_read_io_stats(values):
         labels = {name: json.loads('"' + encoded + '"') for name, encoded in
                   re.findall(r'(\w+)="((?:\\.|[^"\\])*)"', metric)}
         if (set(labels) - {'db'} != {'namespace', 'stat'} or
-                labels['stat'] not in OWNER_SAMPLE_STATS or value < 0 or value != int(value)):
+                labels['stat'] not in LEGACY_OWNER_SAMPLE_STATS or value < 0 or value != int(value)):
             raise ValueError('invalid operational read-I/O status identity/value')
         stats = result.setdefault(labels['namespace'], {})
         if labels['stat'] in stats:
@@ -136,15 +140,18 @@ def operational_read_io_stats(values):
 
 def owner_sample_usable(stats):
     return (OWNER_SAMPLE_STATS.issubset(stats) and stats.get('shard_sample_available') == 1 and
-        stats.get('resident_sample_available') == 1 and
+        stats.get('resident_sample_available', 1) == 1 and
         stats.get('shard_sampler_stopped') == 0 and
         0 <= stats.get('shard_sample_age_ms', float('inf')) <= 3000)
 
 
-def current_metric_streams(values, namespaces, *, remote, allow_sparse_unavailable=False):
+def current_metric_streams(values, namespaces, *, remote, allow_sparse_unavailable=False, legacy=False):
     """Decode current streams; only the live wait may tolerate explicit sparse unavailability."""
     adapters = adapter_stats(values)
     owners = operational_read_io_stats(values)
+    owner_fields = LEGACY_OWNER_SAMPLE_STATS if legacy else OWNER_SAMPLE_STATS
+    if not legacy and any(set(owner) - owner_fields for owner in owners.values()):
+        raise ValueError('unknown current owner publication metadata')
     result, sparse = {}, []
     for namespace in namespaces:
         local = adapters.get(namespace, {})
@@ -168,12 +175,13 @@ def current_metric_streams(values, namespaces, *, remote, allow_sparse_unavailab
             if any(owner[key] not in (0, 1) for key in
                    set(owner).intersection(('shard_sample_available', 'resident_sample_available', 'shard_sampler_stopped'))):
                 raise ValueError(f'{namespace}: invalid owner publication flags')
-            if set(owner) != OWNER_SAMPLE_STATS:
+            if set(owner) != owner_fields:
                 if not allow_sparse_unavailable or not (
-                        owner.get('shard_sample_available') == 0 or owner.get('resident_sample_available') == 0):
+                        owner.get('shard_sample_available') == 0 or
+                        (legacy and owner.get('resident_sample_available') == 0)):
                     raise ValueError(f'{namespace}: missing current owner publication metadata')
                 sparse.append(dict(namespace=namespace, stream='owner',
-                    missing=sorted(OWNER_SAMPLE_STATS - set(owner))))
+                    missing=sorted(owner_fields - set(owner))))
             result[namespace]['owner'] = owner
     # Validate the entire required population before allowing a transient signal:
     # one unavailable namespace must not hide malformed or missing peers.
@@ -189,8 +197,8 @@ def metric_stream_usable(stream, name):
         and stream['local_sample_age_ms'] <= 3000)
 
 
-def validate_final_metric_cut(values, namespaces, cut, *, remote):
-    streams = current_metric_streams(values, namespaces, remote=remote)
+def validate_final_metric_cut(values, namespaces, cut, *, remote, legacy=False):
+    streams = current_metric_streams(values, namespaces, remote=remote, legacy=legacy)
     if (cut.get('status') != 'post-certified-two-generation-cut' or
             cut.get('required_namespaces') != sorted(namespaces) or cut.get('final') != streams or
             set(cut.get('baseline', {})) != set(namespaces)):
@@ -211,11 +219,13 @@ def validate_final_metric_cut(values, namespaces, cut, *, remote):
             if set(partitions) != {str(i) for i in range(5)} or any(not stats for stats in partitions.values()):
                 raise ValueError('final metrics lack all five live owners')
             for stats in partitions.values():
-                if set(stats) - OWNER_KNOWN_STATS:
+                if set(stats) - (LEGACY_OWNER_KNOWN_STATS if legacy else OWNER_KNOWN_STATS):
                     raise ValueError('final metrics contain unknown owner counters')
-                if not OWNER_BASE_STATS.issubset(stats):
+                if not (LEGACY_OWNER_BASE_STATS if legacy else OWNER_BASE_STATS).issubset(stats):
                     raise ValueError('final metrics have partial mandatory owner counter populations')
-                for available, fields in OWNER_OPTIONAL_STATS.items():
+                optional = OWNER_OPTIONAL_STATS if legacy else {
+                    'authority_available': OWNER_OPTIONAL_STATS['authority_available']}
+                for available, fields in optional.items():
                     if stats[available] not in (0, 1):
                         raise ValueError('final metrics contain invalid owner availability flags')
                     if stats[available] == 1 and (
@@ -240,14 +250,14 @@ def adapter_stats(values):
     owners = operational_read_io_stats(values)
     for namespace, owner in owners.items():
         stats = result.setdefault(namespace, {})
-        if OWNER_SAMPLE_STATS.intersection(stats):
+        if LEGACY_OWNER_SAMPLE_STATS.intersection(stats):
             raise ValueError('mixed legacy adapter and current owner status families')
         stats.update(owner)
     for namespace, stats in result.items():
         usable = owner_sample_usable(stats) if namespace in owners else stats.get('shard_sample_available') == 1
         if not usable:
             for name in list(stats):
-                if name.startswith('shard_') and name not in OWNER_SAMPLE_STATS:
+                if name.startswith('shard_') and name not in LEGACY_OWNER_SAMPLE_STATS:
                     stats[name] = None
         for name in ('scalar_read_ns', 'read_index_ns'):
             if name in stats and stats.get(name + '_available') != 1:
@@ -344,7 +354,8 @@ def shard_read_deltas(before, after):
                       or stat.endswith(('_live', '_available')) or stat in {
                         'cache_bytes', 'cache_budget', 'cache_budget_bytes',
                         'cache_metadata_bytes', 'cache_retained_bytes', 'cache_entries',
-                        'authority_entries', 'authority_capacity', 'authority_table_bytes'}):
+                        'authority_entries', 'authority_capacity', 'authority_table_bytes',
+                        'idle_buffer_bytes', 'idle_buffers'}):
                     # Gauges are endpoint observations, not monotonically increasing work.
                     delta = dict(before=previous, after=value)
                 elif value < previous:
@@ -449,7 +460,7 @@ def verified_replay(root):
         audit = archived_json(archive, 'experiment/audit.json')
         foreground_by_mode = {mode:parse_metrics(archived_bytes(archive, f'experiment/{mode}-foreground.prom').decode())
                               for mode in ('native', 'remote')}
-        current = (result.get('metrics_schema') == 2 or any(
+        current = (result.get('metrics_schema') in (2, 3) or any(
             operational_read_io_stats(values) or any(
                 LOCAL_SAMPLE_STATS.intersection(stats) for stats in adapter_stats(values).values())
             for values in foreground_by_mode.values()))
@@ -463,7 +474,8 @@ def verified_replay(root):
                 expected = live_metric_namespaces(audit['databases'], result[mode].get('completed_checkpoint_epoch'))
                 if set(namespaces) != expected:
                     raise ValueError('final metric cut lacks audited live namespaces')
-                validate_final_metric_cut(values, namespaces, cut, remote=mode == 'remote')
+                validate_final_metric_cut(values, namespaces, cut, remote=mode == 'remote',
+                                          legacy=result.get('metrics_schema') != 3)
         build_bytes = archived_bytes(archive, 'provenance/build-manifest.json')
         manifest = json.loads(build_bytes)
         if (hashlib.sha256(build_bytes).hexdigest() != receipt['build_manifest_sha256']
@@ -542,7 +554,9 @@ def summarize_verified(verified):
         'object_by_version fallback includes get and exists; cache hits may suppress physical reads.',
         'OS read_bytes/write_bytes are charged physical I/O, not logical WAL member bytes; mapped/page-cache access may charge differently.',
         'Host swap and diskstats include unrelated processes; per-process RSS maxima are sampled.',
-        'Native cache shape and remote coordinator/shard budgets are recorded separately, not equal-total-memory claims.',
+        ('Native and coordinator caches have different budgets; owner reads use Linux page cache.'
+         if result.get('metrics_schema') == 3 else
+         'Historical native, coordinator and owner cache budgets are recorded separately.'),
         'No exact-version readiness prefetch: readiness returns no payload and DB reads do not populate the execution cache.',
         'Transport recheck/output spans overlap exchange intervals; no one-way network or pure NVMe attribution.',
         'Bounded read diagnostics sample admitted inline/actor RPCs, including startup/scans; cache hits and absent keys are outside that population.',
@@ -881,7 +895,12 @@ def verified_campaign(root):
         campaign = archived_json(archive, 'results/campaign-receipt.json')
         if campaign.get('run_id') != cfg['run_id'] or campaign.get('complete') is not True or campaign.get('failures'):
             raise ValueError('campaign is incomplete')
-        matrix.validate_matrix(cfg, campaign['cells'])
+        historical = (bool({'shard_cache_mib', 'shard_cache_mib_by_repetition'} & cfg.keys())
+                      or 'resident_reads' in (cfg.get('kv_suite') or {})
+                      or any({'shard_cache_mib', 'resident_reads'} & cell.keys()
+                             for cell in campaign['cells']))
+        (matrix.validate_historical_matrix if historical else matrix.validate_matrix)(
+            cfg, campaign['cells'])
         placement = archived_json(archive, 'results/placement-proof.json')
         matrix.validate_placement(cfg, placement['instances'], placement['groups'])
         for cell in campaign['cells']:
@@ -891,6 +910,9 @@ def verified_campaign(root):
                 raise ValueError('controller cell receipt differs')
             replay = verified_replay(root / 'paired-results' / cell_id)
             replay_receipt, result, _, _, _ = replay
+            expected_cache = dict(coordinator_bytes=cell['coordinator_cache_mib'] * 1024**2)
+            if 'shard_cache_mib' in cell:
+                expected_cache['shard_bytes'] = cell['shard_cache_mib'] * 1024**2
             if (replay_receipt != archived_json(archive, prefix + 'replay-receipt.json')
                     or replay_receipt['evidence_sha256'] != cell['replay_evidence_sha256']
                     or result['source_archive_sha256'] != cfg['source_archive_sha256']
@@ -900,18 +922,17 @@ def verified_campaign(root):
                     or result.get('write_profile_limit', 0) != cell.get('write_profile_limit', 0)
                     or result.get('native_write_profile_limit', 0) != cell.get('native_write_profile_limit', 0)
                     or result.get('checkpoint_limit') != cfg['checkpoint_limit']
-                    or result.get('cache') != dict(coordinator_bytes=cell['coordinator_cache_mib'] * 1024**2,
-                                                   shard_bytes=cell['shard_cache_mib'] * 1024**2)
+                    or result.get('cache') != expected_cache
                     or result.get('external_manifest', {}).get('transport') != cell['transport']
                     or result.get('external_manifest', {}).get('config_sha256') != cell['config_sha256']):
                 raise ValueError('paired replay cell/source/population binding differs')
-            expected_resident = matrix.resident_read_config(cell.get('resident_reads'))
-            if (cfg.get('kv_suite') or {}).get('scope') == 'hardware-populations':
+            if 'resident_reads' in cell and (cfg.get('kv_suite') or {}).get('scope') == 'hardware-populations':
+                from resident_config import resident_read_config
+                expected_resident = resident_read_config(cell['resident_reads'])
                 observed = result.get('resident_reads_by_namespace')
                 if (not observed or set(observed) != set(result.get('deployment', {}).get('databases', {}))
-                        or any(matrix.resident_read_config(value) != expected_resident
-                                        for value in observed.values())
-                        or matrix.resident_read_config(result.get('external_manifest', {}).get('resident_reads')) != expected_resident):
+                        or any(resident_read_config(value) != expected_resident for value in observed.values())
+                        or resident_read_config(result.get('external_manifest', {}).get('resident_reads')) != expected_resident):
                     raise ValueError('paired replay resident population differs from admitted cell')
             resources = archived_bytes(archive, prefix + 'resources.json')
             if (hashlib.sha256(resources).hexdigest() != cell['resources_sha256']
@@ -1043,9 +1064,11 @@ def transport_comparison(cells):
                           'build_manifest_sha256', 'checkpoint_digest', 'durability', 'table_counts'):
                 if reference.get(field) != candidate.get(field):
                     raise ValueError('transport pair source/workload populations differ: ' + field)
+            if 'resident_reads' in reference or 'resident_reads' in candidate:
+                pair['registration_profiles'] = dict(reference=reference.get('resident_reads'),
+                                                     candidate=candidate.get('resident_reads'))
             pairs.append(pair | dict(available=True, population=reference['population'],
                 cache=reference.get('cache'), source_range=reference.get('source_range'),
-                registration_profiles=dict(reference=reference.get('resident_reads'), candidate=candidate.get('resident_reads')),
                 reference_cell=reference['cell_id'], candidate_cell=candidate['cell_id'],
                 reference_native_seconds=reference['native_seconds'],
                 candidate_native_seconds=candidate['native_seconds'],
@@ -1082,7 +1105,9 @@ def compare_campaign(root):
         row = {k: identity[k] for k in ('cell_id', 'transport', 'ordinal', 'repetition', 'read_profile_limit')}
         row['write_profile_limit'] = identity.get('write_profile_limit', 0)
         row['native_write_profile_limit'] = identity.get('native_write_profile_limit', 0)
-        row['resident_reads'] = helpers.resident_read_config(identity.get('resident_reads'))
+        if 'resident_reads' in identity:
+            from resident_config import resident_read_config
+            row['resident_reads'] = resident_read_config(identity['resident_reads'])
         row.update({key: cfg[key] for key in ('source_archive_sha256', 'source_manifest_sha256',
                                              'build_manifest_sha256', 'checkpoint_digest')})
         row.update(population='profiled' if any(row[key] for key in
@@ -1101,12 +1126,13 @@ def compare_campaign(root):
                 raise ValueError('empty elapsed population')
         for mode, measured in summary['modes'].items():
             stats = measured['adapter_by_namespace']
-            measured['registered_read_population'] = {
-                namespace: resident_replay_population(
-                    measured['shard_read_by_owner']['by_namespace'].get(namespace, {}),
-                    configured=mode == 'remote' and bool(row['resident_reads']['destination_slots']),
-                    native=mode == 'native')
-                for namespace in sorted(set(summary['table_counts']) | set(stats))}
+            if 'resident_reads' in row:
+                measured['registered_read_population'] = {
+                    namespace: resident_replay_population(
+                        measured['shard_read_by_owner']['by_namespace'].get(namespace, {}),
+                        configured=mode == 'remote' and bool(row['resident_reads']['destination_slots']),
+                        native=mode == 'native')
+                    for namespace in sorted(set(summary['table_counts']) | set(stats))}
             measured['wrapper_latencies'] = wrapper_latencies(measured['foreground_metrics'])
             measured['wrapper_latency_availability'] = (
                 'observed histograms; empty/missing bucket populations reported individually'
@@ -1126,15 +1152,17 @@ def compare_campaign(root):
                 for ns, values in stats.items()}
             measured['cache_counter_availability'] = {ns: dict(
                 coordinator='observed' if 'cache_hits' in values else 'unavailable: no coordinator cache counters',
-                shard='observed' if values.get('shard_sample_available') == 1 else 'unavailable: no valid shard sample')
+                shard='observed' if 'shard_cache_hits' in values and values.get('shard_sample_available') == 1 else 'unavailable: no owner application cache observation')
                 for ns, values in stats.items()}
             row['modes'][mode] = measured
         cells.append(row)
     cache_groups = {}
     for cell in cells:
         cache = cell['cache']
-        name = f"coordinator-{cache['coordinator_bytes']}-shard-{cache['shard_bytes']}"
-        if cell['resident_reads']['destination_slots']:
+        name = f"coordinator-{cache['coordinator_bytes']}"
+        if 'shard_bytes' in cache:
+            name += f"-shard-{cache['shard_bytes']}"
+        if cell.get('resident_reads', {}).get('destination_slots'):
             digest = hashlib.sha256(json.dumps(cell['resident_reads'], sort_keys=True).encode()).hexdigest()[:12]
             name += '-rma-' + digest
         cache_groups.setdefault(name, []).append(cell)
@@ -1169,9 +1197,11 @@ def write_campaign_report(root, report):
     for cell in report['cells']:
         identity = binding | {k: cell[k] for k in ('cell_id', 'transport', 'repetition', 'ordinal',
                               'population', 'read_profile_limit', 'write_profile_limit', 'native_write_profile_limit', 'replay_evidence_sha256')}
-        identity.update(coordinator_cache_bytes=cell['cache']['coordinator_bytes'],
-                        shard_cache_bytes=cell['cache']['shard_bytes'])
-        identity['resident_reads'] = json.dumps(cell.get('resident_reads'), sort_keys=True)
+        identity['coordinator_cache_bytes'] = cell['cache']['coordinator_bytes']
+        if 'shard_bytes' in cell['cache']:
+            identity['shard_cache_bytes'] = cell['cache']['shard_bytes']
+        if 'resident_reads' in cell:
+            identity['resident_reads'] = json.dumps(cell['resident_reads'], sort_keys=True)
         cells.append(identity | {k: cell[k] for k in ('native_seconds', 'remote_seconds', 'remote_over_native')})
         for mode, measured in cell['modes'].items():
             completion = measured.get('checkpoint_completion')

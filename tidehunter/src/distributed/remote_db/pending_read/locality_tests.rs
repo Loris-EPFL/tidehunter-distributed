@@ -63,6 +63,7 @@ fn nvme_fixture(
     );
     std::fs::write(ns.join("device_uuid"), uuid).unwrap();
     std::fs::write(ns.join("device_path"), path.to_str().unwrap()).unwrap();
+    std::fs::write(ns.join("buffered_io"), "1\n").unwrap();
     std::fs::write(ns.join("enable"), "1\n").unwrap();
     let config = NvmeofReaderConfig {
         binding: NamespaceBinding {
@@ -76,6 +77,82 @@ fn nvme_fixture(
         max_catalog_bytes: 1024 * 1024,
     };
     (config, path)
+}
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+#[test]
+fn coordinator_cache_and_nvme_reader_preserve_retained_cut() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_cache_bytes = 64 * 1024;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7), put(1, 8)])
+        .unwrap();
+    let mut db = reopen_cold(&fixture, db);
+    let references: Vec<_> = (0u32..2)
+        .map(|key| {
+            db.index_reference(KeySpace(0), &key.to_be_bytes(), IndexReadCut::Latest)
+                .unwrap()
+                .unwrap()
+        })
+        .collect();
+    let (config, path) = nvme_fixture(&fixture, 0, &references, "nvme-cache");
+    assert_eq!(db.get(KeySpace(0), &0u32.to_be_bytes()).unwrap(), value(7));
+    wait_read_retirement(&db.reads);
+    db.reads
+        .install_nvmeof_file_fixture(config.clone(), &db.config, &db.shape, &path)
+        .unwrap();
+    let old_cut = db.published_cut().unwrap();
+    let _pin = db.pin_cut(old_cut.clone()).unwrap();
+    let cache_hits = db.read_cache_stats().hits;
+    let nvme_hits = db.nvmeof_stats()[0].eligible_hits;
+    assert_eq!(db.get(KeySpace(0), &0u32.to_be_bytes()).unwrap(), value(7));
+    assert!(db.read_cache_stats().hits > cache_hits);
+    let keys = [1u32, 0, 1, 0]
+        .into_iter()
+        .map(|key| key.to_be_bytes().to_vec())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        db.get_many(KeySpace(0), &keys).unwrap(),
+        vec![value(8), value(7), value(8), value(7)]
+    );
+    assert_eq!(db.get(KeySpace(0), &1u32.to_be_bytes()).unwrap(), value(8));
+    assert!(db.nvmeof_stats()[0].eligible_hits > nvme_hits);
+    db.write_batch(fixture.operation(0, 1), vec![put(0, 9)])
+        .unwrap();
+    assert_eq!(
+        db.get_cut(KeySpace(0), &0u32.to_be_bytes(), old_cut)
+            .unwrap(),
+        value(7)
+    );
+    assert_eq!(db.get(KeySpace(0), &0u32.to_be_bytes()).unwrap(), value(9));
+    wait_read_retirement(&db.reads);
+    let cache_hits = db.read_cache_stats().hits;
+    let rpc_count = db.read_rpc_count();
+    db.clear_nvmeof_reader().unwrap();
+    assert!(db.nvmeof_stats().is_empty());
+    assert_eq!(db.get(KeySpace(0), &1u32.to_be_bytes()).unwrap(), value(8));
+    assert!(db.read_cache_stats().hits > cache_hits);
+    assert_eq!(db.read_rpc_count(), rpc_count);
+    let ns = fixture
+        .temp
+        .path()
+        .join("test-nvmet-0")
+        .join("subsystems")
+        .join(&config.manifest.nqn)
+        .join("namespaces")
+        .join(config.manifest.nsid.to_string());
+    std::fs::write(ns.join("enable"), "1\n").unwrap();
+    wait_read_retirement(&db.reads);
+    db.reads
+        .install_nvmeof_file_fixture(config, &db.config, &db.shape, &path)
+        .unwrap();
+    let cache_hits = db.read_cache_stats().hits;
+    assert_eq!(db.get(KeySpace(0), &1u32.to_be_bytes()).unwrap(), value(8));
+    assert!(db.read_cache_stats().hits > cache_hits);
+    db.reads.state.poison();
+    assert!(db.get(KeySpace(0), &1u32.to_be_bytes()).is_err());
+    wait_read_retirement(&db.reads);
+    db.clear_nvmeof_reader().unwrap();
+    assert!(db.get(KeySpace(0), &1u32.to_be_bytes()).is_err());
 }
 
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -425,7 +502,6 @@ fn overlapping_groups_share_members_and_preserve_each_callers_slot_order() {
             false,
             ReadContext {
                 deadline: Instant::now() + db.config.timeout,
-                class: ReadClass::ScanNoFill,
                 pin: Some(pin),
             },
         )

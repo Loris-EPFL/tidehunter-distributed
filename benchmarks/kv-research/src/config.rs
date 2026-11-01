@@ -98,6 +98,9 @@ pub struct PhaseConfig {
     /// of overwriting a sealed, read-only dataset during preload.
     #[serde(default)]
     pub verify_existing_dataset: bool,
+    /// One advisory mapped-WAL eviction after warmup/aging, before the measurement gate.
+    #[serde(default)]
+    pub evict_mapped_wal_before_measurement: bool,
     #[serde(default)]
     pub warmup_operations: u64,
     /// Visit the full unchanged working set during a labelled read-only warm-up.
@@ -230,6 +233,15 @@ impl RunConfig {
         {
             return invalid(
                 "verify_existing_dataset requires an explicit namespace, no preload or aging, and a read-only measured run",
+            );
+        }
+        if self.phases.evict_mapped_wal_before_measurement
+            && (self.qualification_only
+                || !matches!(self.backend.kind.as_str(), "native" | "tidehunter")
+                || !cfg!(all(target_os = "linux", feature = "test-utils")))
+        {
+            return invalid(
+                "mapped-WAL eviction requires Linux, test-utils, a native or tidehunter backend, and a measurement phase",
             );
         }
         for (gate, name) in [
@@ -515,6 +527,7 @@ mod tests {
             phases: PhaseConfig {
                 preload: true,
                 verify_existing_dataset: false,
+                evict_mapped_wal_before_measurement: false,
                 warmup_operations: 1,
                 warmup_key_sweep: false,
                 measurement_key_sweep: false,
@@ -542,6 +555,21 @@ mod tests {
         let mut too_few = config();
         too_few.limits.max_operations = 102;
         assert!(too_few.validate().is_err());
+    }
+
+    #[test]
+    fn mapped_wal_eviction_is_opt_in_and_rejects_unsupported_backends() {
+        let mut c = config();
+        c.phases.evict_mapped_wal_before_measurement = true;
+        c.backend.kind = "valkey_tcp".into();
+        assert!(c.validate().is_err());
+        c.backend.kind = "native".into();
+        assert_eq!(
+            c.validate().is_ok(),
+            cfg!(all(target_os = "linux", feature = "test-utils"))
+        );
+        c.qualification_only = true;
+        assert!(c.validate().is_err());
     }
 
     #[test]

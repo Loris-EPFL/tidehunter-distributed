@@ -193,6 +193,7 @@ impl NvmeofReader {
                 return Err(NvmeofError::Invalid("invalid catalog mapping"));
             }
         }
+        let transport = fixture.is_none().then_some(config.binding.transport);
         let namespace = match fixture {
             Some(file) => file,
             None => open_namespace(&config.binding, m)?,
@@ -208,6 +209,7 @@ impl NvmeofReader {
             epoch: m.epoch,
             partition: m.partition,
             export_uuid: m.export_uuid,
+            transport,
             ..NvmeofStats::default()
         };
         Ok(Self {

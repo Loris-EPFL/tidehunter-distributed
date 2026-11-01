@@ -1,9 +1,21 @@
 // Reuse the engine's existing harness unchanged, including its explicit startup sequences.
+#[cfg(all(feature = "nvmeof", target_os = "linux"))]
+mod nvmeof_campaign;
 #[allow(clippy::too_many_lines)]
 // Its TLS setup is inherited and outside timed calls; do not restyle the shared engine helper.
 #[allow(clippy::assigning_clones)]
 #[path = "../../../../tidehunter/examples/support/tcp_cluster.rs"]
 mod tcp_cluster;
+
+#[cfg(all(feature = "nvmeof", target_os = "linux"))]
+pub fn prepare_nvmeof_dataset(input: &Path, output: &Path) -> BackendResult<()> {
+    nvmeof_campaign::prepare(input, output)
+}
+
+#[cfg(all(feature = "nvmeof", target_os = "linux"))]
+pub fn export_nvmeof_dataset(launch: &Path, prepared: &Path, output: &Path) -> BackendResult<()> {
+    nvmeof_campaign::export(launch, prepared, output)
+}
 
 use crate::backend::{BackendInfo, BackendResult, BatchAtomicity, KvBackend, native_error};
 use serde::Deserialize;
@@ -17,6 +29,10 @@ use tidehunter::distributed::tcp::{FabricSecurity, PollingPolicy, Transport};
 use tidehunter::key_shape::{KeyShape, KeyType};
 use tidehunter::minibytes::Bytes;
 
+// A 32-member batch of 64 KiB values must remain one native atomic batch.
+const RESEARCH_BATCH_BYTES: usize = 3 * 1024 * 1024;
+const RESEARCH_FRAGMENT_BYTES: usize = 4 * 1024 * 1024;
+
 pub fn maybe_run_storage_node() -> BackendResult<bool> {
     tcp_cluster::maybe_run_storage_node().map_err(|error| error.to_string().into())
 }
@@ -28,12 +44,10 @@ struct ExternalOwnerReadConfig {
     read_workers: usize,
     wal_member_read: tidehunter::distributed::storage::WalMemberReadPolicy,
     read_resident_first: bool,
-    read_cache_bytes: usize,
     read_memory_allowance_bytes: usize,
     read_max_inflight_requests: usize,
     read_max_inflight_bytes: usize,
     read_max_device_reads: usize,
-    resident_reads: tidehunter::distributed::tcp::ResidentReadConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,6 +86,8 @@ struct ExternalPreparationInput {
     #[serde(default)]
     owner_transports: Option<Vec<Transport>>,
     max_batches_per_partition: usize,
+    #[serde(default = "default_external_max_epochs")]
+    max_epochs: usize,
     max_admitted_batches: usize,
     max_index_bytes: usize,
     coordinator_cache_bytes: usize,
@@ -79,15 +95,18 @@ struct ExternalPreparationInput {
     coordinator_read_memory_allowance_bytes: usize,
     owner_read_workers: usize,
     owner_wal_member_read: tidehunter::distributed::storage::WalMemberReadPolicy,
-    owner_read_cache_bytes: usize,
     owner_read_memory_allowance_bytes: usize,
+    #[serde(default)]
     owner_read_resident_first: bool,
-    resident_reads: tidehunter::distributed::tcp::ResidentReadConfig,
     polling: PollingPolicy,
 }
 
 fn default_coordinator_read_memory_allowance_bytes() -> usize {
     512 * 1024 * 1024
+}
+
+fn default_external_max_epochs() -> usize {
+    4
 }
 
 fn backend_name(transport: &Transport) -> &'static str {
@@ -172,42 +191,26 @@ fn default_retained_batches() -> usize {
 #[allow(clippy::too_many_lines)]
 pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<()> {
     let input: ExternalPreparationInput = serde_json::from_slice(&fs::read(input)?)?;
-    let resident = input.resident_reads;
-    let resident_enabled = (resident.source_bytes != 0 && resident.source_regions != 0)
-        || resident.destination_slots != 0;
     if !input.guest_root.is_absolute()
         || input.addresses.len() != 5
         || input.max_batches_per_partition == 0
         || input.max_batches_per_partition > 1_000_000
+        || !(1..=1024).contains(&input.max_epochs)
         || input.max_admitted_batches == 0
         || input.max_admitted_batches > 1_000_000
         || input.max_index_bytes == 0
         || input.owner_read_workers == 0
         || input.owner_read_memory_allowance_bytes == 0
-        || input
-            .owner_read_cache_bytes
-            .checked_add(64 * 1024 * 1024)
-            .is_none_or(|bytes| bytes > input.owner_read_memory_allowance_bytes)
+        || input.owner_read_memory_allowance_bytes < 64 * 1024 * 1024
         || input
             .coordinator_cache_bytes
             .checked_add(64 * 1024 * 1024)
             .is_none_or(|bytes| bytes > input.coordinator_read_memory_allowance_bytes)
-        || ((input.owner_read_cache_bytes != 0
-            || input.owner_read_resident_first
-            || resident_enabled)
+        || (input.owner_read_resident_first
             && input.owner_wal_member_read
                 != tidehunter::distributed::storage::WalMemberReadPolicy::Async)
     {
-        return Err("external case requires five nodes, absolute guest_root, supported positive limits, async reads for caches/resident reads, and an owner budget including the 64MiB in-flight allowance".into());
-    }
-    if (resident.source_bytes == 0) != (resident.source_regions == 0)
-        || (resident.destination_bytes == 0) != (resident.destination_slots == 0)
-        || (resident.destination_bytes == 0) != (resident.max_handles == 0)
-        || resident_enabled != (resident.max_read_bytes != 0)
-        || (resident.require_device_read && !resident_enabled)
-        || (resident.destination_bytes != 0 && resident.max_read_bytes > resident.destination_bytes)
-    {
-        return Err("invalid external resident_reads limits".into());
+        return Err("external case requires five nodes, absolute guest_root, supported positive limits, and budgets including the 64MiB in-flight allowance".into());
     }
     let addresses = input
         .addresses
@@ -228,17 +231,17 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
         partitions: (0..5).collect(),
         batch_limits: tidehunter::distributed::codec::BatchLimits {
             max_operations: 32,
-            max_encoded_bytes: 320 * 1024,
+            max_encoded_bytes: RESEARCH_BATCH_BYTES,
         },
         group_limits: tidehunter::distributed::group::GroupLimits {
             max_batches: 32,
-            max_encoded_bytes: 1024 * 1024 - 8,
+            max_encoded_bytes: RESEARCH_FRAGMENT_BYTES - 8,
         },
-        fragment_bytes: 1024 * 1024,
+        fragment_bytes: RESEARCH_FRAGMENT_BYTES as u64,
         wal_file_bytes: 1024 * 1024 * 1024,
         max_batches_per_partition: input.max_batches_per_partition,
         max_reference_metadata_bytes: 64 * 1024 * 1024,
-        max_epochs: 4,
+        max_epochs: input.max_epochs,
     };
     let shape = KeyShape::new_single(32, 16, KeyType::uniform(64));
     tcp_cluster::prepare_external_case(
@@ -253,11 +256,9 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
         &owner_transports,
         input.owner_read_workers,
         input.owner_wal_member_read,
-        input.owner_read_cache_bytes,
         input.owner_read_memory_allowance_bytes,
         input.polling,
         input.owner_read_resident_first,
-        input.resident_reads,
     )
     .map_err(|error| std::io::Error::other(error.to_string()))?;
 
@@ -296,7 +297,6 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
             read_workers: serde_yaml::from_value(field("read_workers")?)?,
             wal_member_read: serde_yaml::from_value(field("wal_member_read")?)?,
             read_resident_first: serde_yaml::from_value(field("read_resident_first")?)?,
-            read_cache_bytes: serde_yaml::from_value(field("read_cache_bytes")?)?,
             read_memory_allowance_bytes: serde_yaml::from_value(field(
                 "read_memory_allowance_bytes",
             )?)?,
@@ -305,7 +305,6 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
             )?)?,
             read_max_inflight_bytes: serde_yaml::from_value(field("read_max_inflight_bytes")?)?,
             read_max_device_reads: serde_yaml::from_value(field("read_max_device_reads")?)?,
-            resident_reads: serde_yaml::from_value(field("resident_reads")?)?,
         };
         owner_configs.push(owner);
     }
@@ -403,11 +402,6 @@ fn parse_options(value: &serde_json::Value) -> BackendResult<Options> {
         }
         if options.external_remote_config.is_none() {
             return Err("NVMe-oF readers require explicit external owner configuration and prepared sealed data".into());
-        }
-        if options.coordinator_read_cache_bytes != Some(0) {
-            return Err(
-                "remote NVMe-oF measurement requires coordinator_read_cache_bytes=0".into(),
-            );
         }
     }
     #[cfg(all(feature = "nvmeof", target_os = "linux"))]
@@ -509,13 +503,10 @@ fn parse_options(value: &serde_json::Value) -> BackendResult<Options> {
                 || owner.read_max_inflight_requests == 0
                 || owner.read_max_inflight_bytes == 0
                 || owner.read_max_device_reads == 0
-                || ((owner.read_cache_bytes != 0 || owner.read_resident_first)
+                || (owner.read_resident_first
                     && owner.wal_member_read
                         != tidehunter::distributed::storage::WalMemberReadPolicy::Async)
-                || owner
-                    .read_cache_bytes
-                    .checked_add(owner.read_max_inflight_bytes)
-                    .is_none_or(|bytes| bytes > owner.read_memory_allowance_bytes)
+                || owner.read_max_inflight_bytes > owner.read_memory_allowance_bytes
             {
                 return Err(format!(
                     "invalid external owner read configuration for partition {}",
@@ -532,6 +523,60 @@ fn parse_options(value: &serde_json::Value) -> BackendResult<Options> {
 
 pub fn validate_options(value: &serde_json::Value) -> BackendResult<()> {
     parse_options(value).map(|_| ())
+}
+
+#[cfg(all(feature = "nvmeof", target_os = "linux"))]
+fn compact_nvmeof_reader(
+    reader: &tidehunter::distributed::nvmeof::NvmeofReaderConfig,
+) -> BackendResult<serde_json::Value> {
+    use blake2::{Blake2b512, Digest};
+    struct DigestWriter(Blake2b512);
+    impl std::io::Write for DigestWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let manifest = &reader.manifest;
+    let mut digest = DigestWriter(Blake2b512::new());
+    // Hash the compact serde serialization without allocating a second catalog.
+    serde_json::to_writer(&mut digest, manifest)?;
+    let hash: String = digest
+        .0
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(serde_json::json!({
+        "binding": reader.binding,
+        "manifest": {
+            "version": manifest.version,
+            "database_uuid": manifest.database_uuid,
+            "epoch": manifest.epoch,
+            "partition": manifest.partition,
+            "generation": manifest.generation,
+            "export_uuid": manifest.export_uuid,
+            "nqn": manifest.nqn,
+            "nsid": manifest.nsid,
+            "wal_file_bytes": manifest.wal_file_bytes,
+            "source_file_index": manifest.source_file_index,
+            "image_len": manifest.image_len,
+            "block_size": manifest.block_size,
+            "source_device": manifest.source_device,
+            "source_inode": manifest.source_inode,
+            "durable_frontier": manifest.durable_frontier,
+            "catalog_count": manifest.catalog.len(),
+            "manifest_hash_blake2b512": hash,
+            "hash_encoding": "compact serde_json serialization of ExportManifest"
+        },
+        "max_inflight_requests": reader.max_inflight_requests,
+        "max_inflight_members": reader.max_inflight_members,
+        "max_inflight_bytes": reader.max_inflight_bytes,
+        "max_catalog_bytes": reader.max_catalog_bytes
+    }))
 }
 
 pub async fn open(
@@ -575,32 +620,34 @@ async fn open_for(
                 partitions,
                 batch_limits: tidehunter::distributed::codec::BatchLimits {
                     max_operations: 32,
-                    max_encoded_bytes: 320 * 1024,
+                    max_encoded_bytes: RESEARCH_BATCH_BYTES,
                 },
                 group_limits: tidehunter::distributed::group::GroupLimits {
                     max_batches: 32,
-                    max_encoded_bytes: 1024 * 1024 - 8,
+                    max_encoded_bytes: RESEARCH_FRAGMENT_BYTES - 8,
                 },
-                fragment_bytes: 1024 * 1024,
+                fragment_bytes: RESEARCH_FRAGMENT_BYTES as u64,
                 wal_file_bytes: 1024 * 1024 * 1024,
                 max_batches_per_partition: options.max_batches_per_partition,
                 max_reference_metadata_bytes: 64 * 1024 * 1024,
                 max_epochs: 4,
             };
-            owner_read_configuration = serde_json::json!((0..options.owners).map(|partition| {
-            serde_json::json!({
-                "partition": partition,
-                "read_workers": 2,
-                "wal_member_read": "async",
-                "read_resident_first": false,
-                "read_cache_bytes": 8 * 1024 * 1024,
-                "read_memory_allowance_bytes": 512 * 1024 * 1024,
-                "read_max_inflight_requests": 32,
-                "read_max_inflight_bytes": 64 * 1024 * 1024,
-                "read_max_device_reads": 128,
-                "resident_reads": tidehunter::distributed::tcp::ResidentReadConfig::default()
-            })
-        }).collect::<Vec<_>>());
+            owner_read_configuration = serde_json::json!(
+                (0..options.owners)
+                    .map(|partition| {
+                        serde_json::json!({
+                            "partition": partition,
+                            "read_workers": 2,
+                            "wal_member_read": "async",
+                            "read_resident_first": false,
+                            "read_memory_allowance_bytes": 512 * 1024 * 1024,
+                            "read_max_inflight_requests": 32,
+                            "read_max_inflight_bytes": 64 * 1024 * 1024,
+                            "read_max_device_reads": 128
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            );
             let cluster = tcp_cluster::LoopbackCluster::start_with_transport(
                 &options.path.join("owners"),
                 &evidence_path,
@@ -612,11 +659,9 @@ async fn open_for(
                 transport.clone(),
                 2,
                 tidehunter::distributed::storage::WalMemberReadPolicy::Async,
-                8 * 1024 * 1024,
                 512 * 1024 * 1024,
                 PollingPolicy::Adaptive,
                 false,
-                tidehunter::distributed::tcp::ResidentReadConfig::default(),
             )
             .map_err(|error| std::io::Error::other(error.to_string()))?;
             let config = cluster.config.clone();
@@ -703,14 +748,6 @@ async fn open_for(
                 "configured_bytes": remote_config.read_cache_bytes,
                 "effective_observation": "configured coordinator limit; usage is in measurement boundary snapshots"
             },
-            "owner_explicit_cache": {
-                "configured_per_owner": owner_read_configuration,
-                "effective_observation": "launch configuration, not a runtime owner attestation"
-            },
-            "registered_ram": {
-                "configured_per_owner": owner_read_configuration,
-                "effective_observation": "configured limits are not proof of grant or hardware FI_READ"
-            },
             "linux_page_cache": {
                 "requested_policy": null,
                 "effective_policy": null,
@@ -754,7 +791,20 @@ async fn open_for(
     #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
     let _ = registry;
     let mut effective_configuration = effective_configuration;
-    effective_configuration["nvmeof_readers"] = serde_json::to_value(&options.nvmeof_readers)?;
+    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
+    {
+        effective_configuration["nvmeof_readers"] = serde_json::Value::Array(
+            options
+                .nvmeof_readers
+                .iter()
+                .map(compact_nvmeof_reader)
+                .collect::<BackendResult<Vec<_>>>()?,
+        );
+    }
+    #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
+    {
+        effective_configuration["nvmeof_readers"] = serde_json::json!([]);
+    }
     effective_configuration["read_backend"] =
         serde_json::json!(if options.nvmeof_readers.is_empty() {
             "owner_record_protocol"
@@ -808,7 +858,6 @@ impl TidehunterBackend {
             })
         });
         let mut owner_io = serde_json::Value::Null;
-        let mut owner_grants = serde_json::json!({"available": false});
         if let Some(monitor) = &self.operational_read_io {
             // Fast workloads can finish before the one-second passive sampler.
             // Wait only after timing, before drain; never add probes to API calls.
@@ -819,9 +868,7 @@ impl TidehunterBackend {
                 monitor.visit(|snapshot, stopped| {
                     finished = stopped
                         || (snapshot.last_attempt.is_some_and(|attempt| attempt >= cut)
-                            && snapshot.available
-                            && snapshot.resident_available
-                            && snapshot.grants_available);
+                            && snapshot.available);
                 });
                 if finished || Instant::now() >= deadline {
                     break;
@@ -829,18 +876,8 @@ impl TidehunterBackend {
                 std::thread::sleep(Duration::from_millis(10));
             }
             monitor.visit(|snapshot, stopped| {
-                owner_grants = if snapshot.grants_available && !stopped {
-                    let mut value = partition_snapshot(snapshot.grants.clone(), &self.endpoints);
-                    value["generation"] = snapshot.generation.into();
-                    value["post_workload_sample"] = snapshot.last_attempt.is_some_and(|attempt| attempt >= cut).into();
-                    value["last_sample_age_ms"] = serde_json::json!(snapshot.last_attempt.map(|time| time.elapsed().as_millis()));
-                    value
-                } else {
-                    serde_json::json!({"available": false, "stopped": stopped, "generation": snapshot.generation})
-                };
                 owner_io = serde_json::json!({
                     "available": snapshot.available,
-                    "resident_available": snapshot.resident_available,
                     "generation": snapshot.generation,
                     "failed_samples": snapshot.failed_samples,
                     "stopped": stopped,
@@ -849,14 +886,9 @@ impl TidehunterBackend {
                     "owner_read_executor_stats": snapshot.owners.iter().map(|(partition, stats)| {
                         serde_json::json!({"partition": partition, "stats": stats})
                     }).collect::<Vec<_>>(),
-                    "resident_read_stats": snapshot.residents.iter().map(|(partition, stats)| {
-                        serde_json::json!({"partition": partition, "stats": stats})
-                    }).collect::<Vec<_>>(),
                     "counter_semantics": {
                         "wal_reads": "logical owner Value-WAL member reads, not device IOPS",
-                        "async_read_submissions": "io_uring submissions, not confirmed physical-device reads",
-                        "resident_read_successes": "successful NOWAIT prefix reads",
-                        "rma_hits": "completed client-side RDMA reads"
+                        "async_read_submissions": "io_uring submissions, not confirmed physical-device reads"
                     }
                 });
             });
@@ -867,7 +899,6 @@ impl TidehunterBackend {
             "counter_scope": "cumulative from adapter open through post-workload qualification; owner IO fields come from the latest passive sample",
             "coordinator": coordinator,
             "owner_io": owner_io,
-            "owner_grants": owner_grants,
             "owner_read_configuration": self.effective_configuration["owner_read_configuration"],
             "effective_configuration": self.effective_configuration
         });
@@ -940,38 +971,20 @@ fn partition_snapshot<T: serde::Serialize>(
     serde_json::json!({"available": true, "partitions": partitions})
 }
 
-fn lane_snapshot<T: serde::Serialize>(
-    rows: Vec<(u32, usize, T)>,
-    endpoints: &[(u32, String)],
-) -> serde_json::Value {
-    let expected: HashSet<u32> = endpoints.iter().map(|(partition, _)| *partition).collect();
-    let mut partitions: BTreeMap<u32, BTreeMap<usize, T>> = BTreeMap::new();
-    for (partition, lane, stats) in rows {
-        if !expected.contains(&partition) {
-            return serde_json::json!({"available": false, "error": "lane snapshot contains unknown partition"});
-        }
-        if partitions
-            .entry(partition)
-            .or_default()
-            .insert(lane, stats)
-            .is_some()
-        {
-            return serde_json::json!({"available": false, "error": format!("duplicate lane {partition}/{lane}")});
-        }
-    }
-    if partitions.len() != expected.len() {
-        return serde_json::json!({"available": false, "error": "lane snapshot missing a configured partition"});
-    }
-    let partitions: BTreeMap<String, serde_json::Value> = partitions
-        .into_iter()
-        .map(|(partition, lanes)| (partition.to_string(), serde_json::json!({"lanes": lanes})))
-        .collect();
-    serde_json::json!({"available": true, "partitions": partitions})
-}
-
 impl KvBackend for TidehunterBackend {
     fn info(&self) -> BackendInfo {
         self.info()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    fn evict_mapped_wal_before_measurement(&self) -> BackendResult<serde_json::Value> {
+        let db = self.db.as_ref().ok_or("backend is shutting down")?;
+        let owners = db.evict_mapped_wal_for_benchmark().map_err(native_error)?;
+        Ok(
+            serde_json::json!({"backend":"tidehunter", "owners": owners.into_iter()
+            .map(|(partition, evidence)| serde_json::json!({"partition":partition,"process":evidence}))
+            .collect::<Vec<_>>()}),
+        )
     }
 
     fn read_observation(&self) -> serde_json::Value {
@@ -979,11 +992,14 @@ impl KvBackend for TidehunterBackend {
             return serde_json::json!({"available": false, "error": "backend is shutting down"});
         };
         #[cfg(all(feature = "nvmeof", target_os = "linux"))]
-        let nvmeof = serde_json::json!({
-            "available": true,
-            "readers": db.nvmeof_stats(),
-            "scope": "host reader counters; submit_to_cq includes kernel/network/target/device",
-        });
+        let nvmeof = {
+            let readers = db.nvmeof_stats();
+            serde_json::json!({
+                "available": !readers.is_empty(),
+                "readers": readers,
+                "scope": "lifetime host reader counters; submit_to_cq includes kernel/network/target/device",
+            })
+        };
         #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
         let nvmeof =
             serde_json::json!({"available": false, "reason": "Linux NVMe-oF feature not enabled"});
@@ -1000,43 +1016,14 @@ impl KvBackend for TidehunterBackend {
         let Some(monitor) = db.read_evidence_monitor() else {
             return serde_json::json!({"available": true, "coordinator": coordinator,
                 "nvmeof": nvmeof,
-                "owner_executor": {"available": false, "error": "read evidence monitor unavailable"},
-                "client_resident": {"available": false, "error": "read evidence monitor unavailable"},
-                "client_resident_lanes": {"available": false, "error": "read evidence monitor unavailable"},
-                "owner_grants": {"available": false, "error": "read evidence monitor unavailable"}});
+                "owner_executor": {"available": false, "error": "read evidence monitor unavailable"}});
         };
         let owners = match monitor.sample_owner_read_io() {
             Ok(rows) => partition_snapshot(rows, &self.endpoints),
             Err(error) => serde_json::json!({"available": false, "error": error.to_string()}),
         };
-        let residents = match monitor.sample_resident_reads() {
-            Ok(rows) => partition_snapshot(rows, &self.endpoints),
-            Err(error) => serde_json::json!({"available": false, "error": error.to_string()}),
-        };
-        let resident_lanes = match monitor.sample_resident_read_lane_snapshots() {
-            Ok(rows) => lane_snapshot(
-                rows.into_iter()
-                    .map(|row| {
-                        (
-                            row.partition,
-                            row.lane,
-                            serde_json::json!({
-                                "session_present": row.session_present, "stats": row.stats
-                            }),
-                        )
-                    })
-                    .collect(),
-                &self.endpoints,
-            ),
-            Err(error) => serde_json::json!({"available": false, "error": error.to_string()}),
-        };
-        let owner_grants = match monitor.sample_owner_grants() {
-            Ok(rows) => partition_snapshot(rows, &self.endpoints),
-            Err(error) => serde_json::json!({"available": false, "error": error.to_string()}),
-        };
         serde_json::json!({"available": true, "coordinator": coordinator,
-            "owner_executor": owners, "client_resident": residents,
-            "client_resident_lanes": resident_lanes, "owner_grants": owner_grants,
+            "owner_executor": owners,
             "nvmeof": nvmeof})
     }
 
@@ -1113,8 +1100,11 @@ impl KvBackend for TidehunterBackend {
         let selected = get("read_profile_selected");
         let completed = get("read_profile_completed");
         let owner_responses = get("read_profile_server_response_recheck_samples");
+        let nvme_completed = get("read_profile_nvme_completed");
         let coverage_reason = if selected == 0 {
-            "no remote read requests selected (reads may have resolved locally or workload contained no reads)"
+            "no read flights selected (reads may have resolved locally or workload contained no reads)"
+        } else if owner_responses == 0 && nvme_completed > 0 {
+            "selected NVMe flights bypass owner record-read RPCs; owner timing is not applicable"
         } else if owner_responses == 0 {
             "no selected owner responses supplied timing"
         } else {
@@ -1136,6 +1126,12 @@ impl KvBackend for TidehunterBackend {
             let mut stages = serde_json::Map::new();
             for (name, sum, count, max) in [
                 (
+                    "nvme_flight",
+                    "read_profile_nvme_flight_ns",
+                    "read_profile_nvme_flight_count",
+                    Some("read_profile_nvme_flight_max_ns"),
+                ),
+                (
                     "server_planning",
                     "read_profile_server_planning_ns",
                     "read_profile_server_planning_count",
@@ -1146,12 +1142,6 @@ impl KvBackend for TidehunterBackend {
                     "read_profile_server_executor_residence_ns",
                     "read_profile_server_executor_residence_count",
                     Some("read_profile_server_executor_residence_max_ns"),
-                ),
-                (
-                    "server_cache_resolution",
-                    "read_profile_server_cache_resolution_ns",
-                    "read_profile_server_cache_resolution_count",
-                    Some("read_profile_server_cache_resolution_max_ns"),
                 ),
                 (
                     "server_nowait",
@@ -1170,48 +1160,6 @@ impl KvBackend for TidehunterBackend {
                     "read_profile_server_response_ready_ns",
                     "read_profile_server_response_ready_count",
                     Some("read_profile_server_response_ready_max_ns"),
-                ),
-                (
-                    "server_grant_lookup",
-                    "read_profile_server_grant_lookup_ns",
-                    "read_profile_server_grant_lookup_count",
-                    Some("read_profile_server_grant_lookup_max_ns"),
-                ),
-                (
-                    "server_grant_reservation",
-                    "read_profile_server_grant_reservation_ns",
-                    "read_profile_server_grant_reservation_count",
-                    Some("read_profile_server_grant_reservation_max_ns"),
-                ),
-                (
-                    "server_grant_envelope",
-                    "read_profile_server_grant_envelope_ns",
-                    "read_profile_server_grant_envelope_count",
-                    Some("read_profile_server_grant_envelope_max_ns"),
-                ),
-                (
-                    "server_grant_registration",
-                    "read_profile_server_grant_registration_ns",
-                    "read_profile_server_grant_registration_count",
-                    Some("read_profile_server_grant_registration_max_ns"),
-                ),
-                (
-                    "server_grant_recheck_publication",
-                    "read_profile_server_grant_recheck_publication_ns",
-                    "read_profile_server_grant_recheck_publication_count",
-                    Some("read_profile_server_grant_recheck_publication_max_ns"),
-                ),
-                (
-                    "client_grant_install",
-                    "read_profile_client_grant_install_ns",
-                    "read_profile_client_grant_install_count",
-                    Some("read_profile_client_grant_install_max_ns"),
-                ),
-                (
-                    "client_fi_read",
-                    "read_profile_client_fi_read_ns",
-                    "read_profile_client_fi_read_count",
-                    Some("read_profile_client_fi_read_max_ns"),
                 ),
                 (
                     "actor_queue",
@@ -1348,12 +1296,12 @@ impl KvBackend for TidehunterBackend {
             "grouped_inline_scope": "admission origin, not exclusive caller execution: flights can be handed to the actor after cancellation or the bounded empty-progress burst; inline_ns measures submission to completion and can include actor takeover",
             "selected_operations": selected,
             "completed_operations": completed,
-            "coverage": {"selected_remote_requests": selected, "completed_remote_requests": completed, "profiled_owner_responses": owner_responses, "reason": coverage_reason},
+            "coverage": {"selected_remote_requests": selected, "completed_remote_requests": completed, "nvme_completed": nvme_completed, "profiled_owner_responses": owner_responses, "reason": coverage_reason},
             "stages": stages,
             "owners": owners,
             "coordinator_resolution": resolution,
             "counters": counters,
-            "clock_scope": "local monotonic elapsed clocks in coordinator, transport and owner; async starts during SQE preparation before kernel acceptance and ends at CQE observation, including submission retry and progress, not physical device latency; transport CQ call is local provider-call wall time, not wire latency; grant registration times actual provider calls, not proof of hardware pinning",
+            "clock_scope": "local monotonic elapsed clocks in coordinator, transport and owner; nvme_flight runs from flight admission to terminal completion and verification, including queueing, not pure network or device time; async starts during SQE preparation before kernel acceptance and ends at CQE observation, including submission retry and progress, not physical device latency; transport CQ call is local provider-call wall time, not wire latency",
             "overlap_semantics": "API-resolution and remote-flight prefixes are independently selected; stage scopes overlap and may be nested; sums and percentiles are not additive; host timestamps are not subtracted; global and partition snapshots are sequential rather than globally atomic",
             "unsupported_stages": ["physical_device_io", "wire_latency", "per_stage_percentiles", "per_response_owner_response_codec", "per_response_owner_response_output"],
             "finalization_error": finalization_error
@@ -1592,6 +1540,121 @@ mod tests {
     use super::*;
 
     #[test]
+    fn owner_read_configuration_rejects_retired_value_cache_and_grants() {
+        let base = serde_json::json!({
+            "partition": 0, "read_workers": 2, "wal_member_read": "async", "read_resident_first": true,
+            "read_memory_allowance_bytes": 536870912,
+            "read_max_inflight_requests": 32, "read_max_inflight_bytes": 67108864,
+            "read_max_device_reads": 128
+        });
+        assert!(serde_json::from_value::<ExternalOwnerReadConfig>(base.clone()).is_ok());
+        for (field, retired) in [
+            ("read_cache_bytes", serde_json::json!(0)),
+            (
+                "resident_reads",
+                serde_json::json!({
+                    "source_bytes": 0, "source_regions": 0, "destination_bytes": 0,
+                    "destination_slots": 0, "max_read_bytes": 0, "max_handles": 0,
+                    "require_device_read": false
+                }),
+            ),
+        ] {
+            let mut value = base.clone();
+            value[field] = retired;
+            assert!(serde_json::from_value::<ExternalOwnerReadConfig>(value).is_err());
+        }
+    }
+
+    #[cfg(all(feature = "nvmeof", target_os = "linux"))]
+    #[test]
+    fn compact_reader_receipt_keeps_identity_and_hash_without_catalog() {
+        use blake2::{Blake2b512, Digest};
+        use tidehunter::distributed::nvmeof::{
+            ExportManifest, NamespaceBinding, NvmeofReaderConfig, NvmeofTransport,
+        };
+        let reader = NvmeofReaderConfig {
+            binding: NamespaceBinding {
+                namespace_path: "/dev/nvme0n1".into(),
+                transport: NvmeofTransport::Tcp,
+            },
+            manifest: ExportManifest {
+                version: 1,
+                database_uuid: [1; 16],
+                epoch: 2,
+                partition: 3,
+                generation: 2,
+                export_uuid: [4; 16],
+                nqn: "nqn.2026-01.local.tidehunter:test".into(),
+                wal_file_bytes: 4096,
+                source_file_index: 1,
+                nsid: 1,
+                image_len: 4096,
+                block_size: 4096,
+                source_device: 7,
+                source_inode: 8,
+                durable_frontier: 8192,
+                catalog: Vec::new(),
+            },
+            max_inflight_requests: 2,
+            max_inflight_members: 4,
+            max_inflight_bytes: 8192,
+            max_catalog_bytes: 65536,
+        };
+        let receipt = compact_nvmeof_reader(&reader).unwrap();
+        let hash: String = Blake2b512::digest(serde_json::to_vec(&reader.manifest).unwrap())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(receipt["manifest"]["manifest_hash_blake2b512"], hash);
+        assert_eq!(receipt["manifest"]["catalog_count"], 0);
+        assert!(receipt["manifest"].get("catalog").is_none());
+        assert_eq!(receipt["binding"]["transport"], "tcp");
+    }
+
+    #[test]
+    fn largest_research_batch_fits_native_group_and_fragment() {
+        use tidehunter::distributed::{
+            codec::{BatchLimits, CompleteBatch, Mutation},
+            group::{CompleteGroup, GroupLimits},
+            types::{BatchId, BatchVersion},
+        };
+        let shape = KeyShape::new_single(32, 16, KeyType::uniform(64));
+        let keyspace = shape.iter_ks().next().unwrap().id();
+        let batch_limits = BatchLimits {
+            max_operations: 32,
+            max_encoded_bytes: RESEARCH_BATCH_BYTES,
+        };
+        let group_limits = GroupLimits {
+            max_batches: 32,
+            max_encoded_bytes: RESEARCH_FRAGMENT_BYTES - 8,
+        };
+        let mutations = (0..32)
+            .map(|id| Mutation::Put {
+                keyspace,
+                key: crate::workload::key_bytes(&[1; 16], 5, id),
+                value: crate::workload::value_bytes(&[1; 16], 5, id, 65_536, 1.0),
+            })
+            .collect();
+        let batch = CompleteBatch::new(
+            &shape,
+            BatchId {
+                database: [1; 16],
+                operation: [2; 16],
+            },
+            BatchVersion {
+                epoch: 1,
+                sequence: 1,
+            },
+            mutations,
+            batch_limits,
+        )
+        .unwrap();
+        assert!(batch.encoded().len() > 2 * 1024 * 1024);
+        CompleteGroup::new(&shape, vec![batch], batch_limits, group_limits).unwrap();
+        assert_eq!((1024 * 1024 * 1024) % RESEARCH_FRAGMENT_BYTES, 0);
+    }
+
+    #[test]
     fn partition_samples_reject_duplicates_and_missing_owners() {
         let endpoints = vec![(3, "a".to_owned()), (8, "b".to_owned())];
         assert_eq!(
@@ -1624,10 +1687,7 @@ mod tests {
             "max_index_bytes": 512 * 1024 * 1024,
             "coordinator_cache_bytes": 1024_u64 * 1024 * 1024,
             "owner_read_workers": 4, "owner_wal_member_read": "async",
-            "owner_read_cache_bytes": 0, "owner_read_memory_allowance_bytes": 256 * 1024 * 1024,
-            "owner_read_resident_first": false,
-            "resident_reads": {"source_bytes": 0, "source_regions": 0, "destination_bytes": 0,
-                "destination_slots": 0, "max_read_bytes": 0, "max_handles": 0, "require_device_read": false},
+            "owner_read_memory_allowance_bytes": 256 * 1024 * 1024,
             "polling": "adaptive"
         });
         let write_input = |value: &serde_json::Value| {
@@ -1682,14 +1742,7 @@ mod tests {
             "coordinator_cache_bytes": 0,
             "owner_read_workers": 4,
             "owner_wal_member_read": "async",
-            "owner_read_cache_bytes": 0,
             "owner_read_memory_allowance_bytes": 256 * 1024 * 1024,
-            "owner_read_resident_first": false,
-            "resident_reads": {
-                "source_bytes": 0, "source_regions": 0,
-                "destination_bytes": 0, "destination_slots": 0,
-                "max_read_bytes": 0, "max_handles": 0, "require_device_read": false
-            },
             "polling": "adaptive"
         });
         fs::write(&input, serde_json::to_vec(&config).unwrap()).unwrap();

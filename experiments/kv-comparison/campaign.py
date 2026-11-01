@@ -33,9 +33,13 @@ def digest(path, algorithm="sha256"):
     return h.hexdigest()
 
 
-def admit_config(binary, config_path, run_dir, environment=None):
+def admit_config(binary, config_path, run_dir, environment=None, *, timeout=30):
     result = subprocess.run([str(binary), "--config", str(config_path), "--validate-config"],
-                            cwd=local.ROOT, capture_output=True, text=True, timeout=30, env=environment)
+                            cwd=local.ROOT, capture_output=True, text=True, timeout=timeout, env=environment)
+    # Full NVMe read catalogs can exceed the ordinary control-receipt limit;
+    # this is local output from the admitted binary, not an SSM/S3 envelope.
+    if len(result.stdout) + len(result.stderr) > 96 * 1024 * 1024:
+        raise ValueError("configuration admission output exceeds bounded local limit")
     (run_dir / "admission.log").write_text(result.stdout + result.stderr)
     if result.returncode:
         raise RuntimeError(f"configuration preflight failed ({result.returncode}); see admission.log")
@@ -43,7 +47,10 @@ def admit_config(binary, config_path, run_dir, environment=None):
     normalized = envelope.get("admitted_config")
     if not isinstance(normalized, dict):
         raise ValueError("preflight omitted JSON admitted_config; no database was started")
-    local.dump(run_dir / "normalized-config.json", normalized)
+    normalized_path = run_dir / "normalized-config.json"
+    temporary = normalized_path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(normalized, sort_keys=True, separators=(",", ":")) + "\n")
+    temporary.replace(normalized_path)
     return normalized
 
 
@@ -78,6 +85,8 @@ def verify_run_identity(result_dir, receipt, normalized_config, fdb_identity=Non
 
 def verify_timing_result(result_dir, config, *, allow_partial=False):
     counts = dict.fromkeys(("preload", "warmup", "aging", "measurement"), 0)
+    if config["phases"].get("verify_existing_dataset", False):
+        counts["verify_existing_dataset"] = 0
     for row in analyze.read_samples(result_dir / "samples.csv", measurement_only=False):
         if row["phase"] not in counts:
             raise ValueError("unrecognized raw timing phase")
@@ -88,6 +97,8 @@ def verify_timing_result(result_dir, config, *, allow_partial=False):
         "aging": config["phases"]["aging_operations"],
         "measurement": config["phases"]["measurement_operations"],
     }
+    if "verify_existing_dataset" in counts:
+        expected["verify_existing_dataset"] = config["dataset"]["keys"]
     if config["qualification_only"]:
         expected = dict.fromkeys(expected, 0)
     if any(counts[name] > expected[name] for name in counts) or (not allow_partial and counts != expected):

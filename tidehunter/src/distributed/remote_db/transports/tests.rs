@@ -43,9 +43,7 @@ fn clean_reuse_recovers_retry_identity_and_rejects_old_read_handles() {
     operational.visit(|snapshot, stopped| {
         assert!(stopped);
         assert!(!snapshot.available);
-        assert!(!snapshot.resident_available);
         assert!(snapshot.owners.is_empty());
-        assert!(snapshot.residents.is_empty());
     });
     drop(db);
 

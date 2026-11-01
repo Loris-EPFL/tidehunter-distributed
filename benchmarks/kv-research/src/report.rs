@@ -573,7 +573,7 @@ impl Reporter {
         });
         atomic_write(
             &self.output.join("manifest.json"),
-            &serde_json::to_vec_pretty(&manifest)?,
+            &serde_json::to_vec(&manifest)?,
         )?;
         atomic_write(&self.output.join("metrics.prom"), &encoded)?;
         atomic_write(&self.output.join("live.prom"), &encoded)?;

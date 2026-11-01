@@ -561,33 +561,6 @@ pub(crate) struct RecordReadPlan {
     // Holds both immutable segment ownership and the directory authority lock.
     pub(crate) _log: Arc<PartitionLog>,
 }
-/// Exact native ownership retained by a remote resident grant. The authority
-/// Arc keeps registered-descriptor metadata credit charged; the file and log
-/// keep the original native source and its directory authority alive.
-pub(crate) struct ResidentReadOwner {
-    _authority: Arc<RegisteredBatch>,
-    _file: Arc<File>,
-    _log: Arc<PartitionLog>,
-}
-impl Clone for ResidentReadOwner {
-    fn clone(&self) -> Self {
-        Self {
-            _authority: Arc::clone(&self._authority),
-            _file: Arc::clone(&self._file),
-            _log: Arc::clone(&self._log),
-        }
-    }
-}
-
-impl RecordReadPlan {
-    pub(crate) fn resident_owner(&self) -> ResidentReadOwner {
-        ResidentReadOwner {
-            _authority: Arc::clone(&self._authority),
-            _file: Arc::clone(&self.member.file),
-            _log: Arc::clone(&self._log),
-        }
-    }
-}
 
 impl RecordReadPlan {
     #[cfg(test)]

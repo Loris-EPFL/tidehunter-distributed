@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 import checkpoint_kv as kv
-from checkpoint_matrix import matrix_plan, cell_resident_reads, check_cell
+from checkpoint_matrix import matrix_plan, check_cell
 from guest import kv_case_commands, kv_case_policy
 
 
@@ -18,60 +18,44 @@ class HardwarePopulations(unittest.TestCase):
                                             for p in range(5)])
         return cfg
 
-    def test_exact_population_counts_and_reversed_clean_order(self):
+    def test_current_cases_and_generated_policy(self):
         cfg = self.config()
         cases = kv.plan(cfg['kv_suite'], cfg['transports'])
-        self.assertEqual(len(cases), 93)
-        self.assertEqual(sum(not c['diagnostics'] for c in cases), 88)
-        self.assertEqual(sum(c['diagnostics'] for c in cases), 5)
-        for repeat in (0, 1):
-            clean = [c for c in cases if c['repetition'] == repeat]
-            ordered = list(dict.fromkeys(c['transport'] for c in clean))
-            self.assertEqual(ordered, cfg['transports'] if repeat == 0 else cfg['transports'][::-1])
+        paths = set()
+        for repeat in range(cfg['kv_suite']['repetitions']):
+            clean = [case for case in cases if case['repetition'] == repeat]
+            self.assertEqual(list(dict.fromkeys(c['transport'] for c in clean)),
+                             cfg['transports'] if repeat == 0 else cfg['transports'][::-1])
             for transport in cfg['transports']:
                 selected = [c for c in clean if c['transport'] == transport]
-                for value in (256, 8192):
-                    scalar = [c for c in selected if c['shape'] == [value, 1, 1]]
-                    self.assertTrue(any(c['cached'] for c in scalar))
-                    self.assertTrue(any(c['shard_cache_bytes'] == 8 * 1024**2 for c in scalar))
-                    self.assertTrue(any(c['cold'] and not c['cached'] and c['shard_cache_bytes'] == 0
-                                        and 'resident_reads' not in c for c in scalar))
-                batches = [c for c in selected if c['shape'] == [8192, 32, 32]]
-                self.assertEqual({c['workload_batches'] for c in batches}, {320, 3200})
-                for load in (320, 3200):
-                    arms = [c for c in batches if c['workload_batches'] == load]
-                    self.assertTrue(any('resident_reads' not in c for c in arms))
-                    self.assertEqual(sum('resident_reads' in c for c in arms), int(transport == 'efa-native'))
-
-    def test_exact_commands_native_never_receives_rma_flags_and_sampling_is_hashed(self):
-        cfg = self.config()
-        paths = set()
-        for spec in kv.plan(cfg['kv_suite'], cfg['transports']):
+                self.assertTrue(any(c['cached'] for c in selected))
+                self.assertTrue(any(c['cold'] for c in selected))
+                self.assertTrue(any(not c['cached'] and not c['cold'] for c in selected))
+        for spec in cases:
+            self.assertNotIn('resident_reads', spec)
+            self.assertNotIn('shard_cache_bytes', spec)
             prepare, commands = kv_case_commands(cfg, spec)
-            remote, owners, owner_transports = kv_case_policy(cfg, spec)
-            self.assertEqual(len(owner_transports), len(cfg['nodes']))
+            remote, owners, transports = kv_case_policy(cfg, spec)
+            self.assertEqual(len(transports), 5)
             self.assertEqual(remote['read_cache_bytes'], 8 * 1024**2 if spec['cached'] else 0)
-            self.assertEqual({o['node']['read_cache_bytes'] for o in owners.values()}, {spec['shard_cache_bytes']})
-            self.assertEqual(remote['tls']['resident_reads']['require_device_read'], 'resident_reads' in spec)
-            for mode, command in commands.items():
-                self.assertEqual(command[command.index('--bounded-hot-reads') + 1], '32768')
-                self.assertEqual('--bounded-hot-pass' in command, not spec['cold'])
+            self.assertNotIn('resident_reads', remote['tls'])
+            self.assertNotIn('--tcp-shard-cache-bytes', prepare)
+            self.assertFalse(any(arg.startswith('--rma-') for arg in prepare))
+            for owner in owners.values():
+                self.assertNotIn('read_cache_bytes', owner['node'])
+                self.assertNotIn('resident_reads', owner['node'])
+                self.assertNotIn('resident_reads', owner['tls'])
+            for command in commands.values():
+                if not spec['cold']:
+                    self.assertEqual(command[command.index('--bounded-hot-reads') + 1], '32768')
+                else:
+                    self.assertNotIn('--bounded-hot-reads', command)
+                output = command[command.index('--output') + 1]
+                self.assertNotIn(output, paths)
+                paths.add(output)
                 if spec['cold']:
                     self.assertEqual(command[command.index('--cold-single-probes') + 1], '1024')
                     self.assertEqual(command[command.index('--cold-group-probes') + 1], '1024')
-                else:
-                    self.assertNotIn('--cold-single-probes', command)
-                    self.assertNotIn('--cold-group-probes', command)
-                self.assertFalse(any(arg.startswith('--rma-') for arg in command))
-                output = command[command.index('--output') + 1]
-                self.assertIn('hotreads32768-', output)
-                self.assertNotIn(output, paths)
-                paths.add(output)
-            if 'resident_reads' in spec:
-                self.assertIn('--rma-require-device-read', prepare)
-                self.assertEqual(prepare[prepare.index('--rma-require-device-read') + 1], 'true')
-            else:
-                self.assertFalse(any(arg.startswith('--rma-') for arg in prepare))
 
     def test_explicit_samples_do_not_change_legacy_policy(self):
         legacy = kv.bounded_hot_policy(8192, 2, True)
@@ -121,25 +105,21 @@ class HardwarePopulations(unittest.TestCase):
         with self.assertRaises(ValueError):
             kv_case_commands(self.config(), selected | dict(cold=False))
 
-    def test_sui_fixture_has_off_and_on_cells_and_explicit_cache_schedules(self):
-        cfg = self.config()
-        cells = matrix_plan(cfg)
+    def test_sui_matrix_uses_coordinator_schedule(self):
+        cells = matrix_plan(self.config())
         self.assertEqual(len(cells), 12)
-        self.assertEqual(sum(c['read_profile_limit'] == 0 for c in cells), 10)
         for cell in cells:
             check_cell(cell['cell_id'], cell['transport'])
-            observed = cell_resident_reads(cfg, cell['transport'], cell)
-            self.assertEqual(observed['require_device_read'], cell['cell_id'].endswith('-rma'))
-            self.assertEqual(cell['shard_cache_mib'], 8)
             self.assertEqual(cell['coordinator_cache_mib'], 8 if cell['repetition'] == 2 else 0)
-        for repeat in (1, 2, 3):
-            native = [c for c in cells if c['repetition'] == repeat and c['transport'] == 'efa-native']
-            self.assertEqual(len(native), 2)
-            self.assertEqual(sum('resident_reads' in c for c in native), 1)
-        damaged = copy.deepcopy(cfg)
-        damaged['coordinator_cache_mib_by_repetition'] = [8, 8, 8]
-        with self.assertRaises(ValueError):
-            matrix_plan(damaged)
+            self.assertNotIn('resident_reads', cell)
+            self.assertNotIn('shard_cache_mib', cell)
+
+    def test_obsolete_options_are_rejected(self):
+        base = dict(repetitions=1, diagnostics=False)
+        for options in (base | dict(scope='hardware-populations'),
+                        base | dict(resident_reads={})):
+            with self.assertRaises(ValueError):
+                kv.validate_options(options)
 
     def test_real_write_and_reopen_population_missing_is_rejected(self):
         cfg = self.config()
@@ -167,7 +147,8 @@ class HardwarePopulations(unittest.TestCase):
                     writer.writeheader()
                     for phase in ('cache_evicted_get', 'cache_evicted_get_many', 'cache_evicted_get_window'):
                         for owner in ([0] if mode == 'native-sync' else range(4 if omit else 5)):
-                            writer.writerow(dict(backend=backend, value_bytes=256, batch_size=1, window=1,
+                            writer.writerow(dict(backend=backend, value_bytes=spec['shape'][0],
+                                batch_size=spec['shape'][1], window=spec['shape'][2],
                                 repetition=0, phase=phase, partition=owner, pid=100 + owner,
                                 physical_read_bytes=charged, file_bytes=4096,
                                 resident_bytes_before=0, resident_bytes_after=4096))

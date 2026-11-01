@@ -145,6 +145,45 @@ class CaseIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicated"):
             campaign.read_path_metrics(evidence, {})
 
+    def test_cacheless_owner_boundary_keeps_absent_counters_absent(self):
+        owner = {"available": True, "partitions": {"0": {
+            "available": True, "counters": {"wal_reads": 3, "wal_read_bytes": 768,
+                                             "resident_read_attempts": 3, "resident_read_successes": 1,
+                                             "async_read_submissions": 2}}}}
+        evidence = {"scope": "measurement_boundary", "deltas": {
+            "coordinator": {"available": True, "counters": {"hits": 0}},
+            "owner_executor": owner}}
+        text = campaign.measurement_read_metrics(evidence, {})
+        self.assertIn('component="owner_executor",partition="0",path="wal_read_bytes"} 768', text)
+        self.assertIn('component="owner_executor",partition="0",path="resident_read_successes"} 1', text)
+        self.assertNotIn("client_resident", text)
+        self.assertNotIn("cache_misses", text)
+        del owner["partitions"]["0"]["counters"]["async_read_submissions"]
+        self.assertNotIn("async_read_submissions", campaign.measurement_read_metrics(evidence, {}))
+
+    def test_nvme_reader_exports_transport_and_unavailable_stages(self):
+        row = {"available": True, "identity": {"partition": 0, "transport": "rdma"},
+               "counters": {"available": True, "counters": {"aligned_read_bytes": 4096}},
+               "stages": {"queue": {"delta": {"available": True, "counters": {
+                   "count": 2, "sum_ns": 100}}},
+                          "submit_to_cq": {"delta": {"available": False}}}}
+        evidence = {"scope": "measurement_boundary", "deltas": {
+            "coordinator": {"available": False}, "owner_executor": {"available": False}},
+            "nvmeof": {"available": True, "readers": {"identity": row}}}
+        text = campaign.measurement_read_metrics(evidence, {})
+        self.assertIn('transport="rdma",counter="aligned_read_bytes"} 4096', text)
+        self.assertIn('transport="rdma",stage="submit_to_cq"} 0', text)
+        self.assertNotIn('stage="submit_to_cq",statistic="sum"', text)
+        row["identity"]["transport"] = None
+        self.assertIn('transport="unknown"', campaign.measurement_read_metrics(evidence, {}))
+        evidence["deltas"] = {"available": False}
+        text = campaign.measurement_read_metrics(evidence, {})
+        self.assertIn('component="measurement"} 0', text)
+        self.assertIn('transport="unknown",counter="aligned_read_bytes"} 4096', text)
+        evidence["nvmeof"] = {"available": False}
+        text = campaign.measurement_read_metrics(evidence, {})
+        self.assertIn('kv_nvmeof_reader_evidence_available{scope="measurement_boundary"} 0', text)
+
     def test_malformed_label_separator_is_not_emitted_to_prometheus(self):
         with self.assertRaisesRegex(ValueError, "trailing"):
             campaign.scoped(b'observed{op="read",} 7\n', {"case_id": "owned"})
@@ -173,6 +212,32 @@ class CaseIdentityTests(unittest.TestCase):
         self.assertIn('resource_interval_available{', text)
         self.assertNotIn('resource_interval_elapsed_seconds', text)
         self.assertNotIn('resource_interval_cpu_seconds', text)
+
+    def test_resource_partial_core_exports_without_claiming_io(self):
+        row = {"host_index": -1, "process_role": "client", "available": False,
+               "core_available": True, "reason": "ambiguous IO", "elapsed_seconds": 2,
+               "cpu_seconds": .7, "cpu_periods": 4, "cpu_throttled_periods": 1,
+               "memory_current_bytes": 123}
+        evidence = {"schema_version": 1, "scope": "measurement_boundary_interval", "processes": [row]}
+        text = campaign.resource_interval_metrics(evidence, {})
+        self.assertIn('kv_case_resource_interval_available{scope="measurement_boundary_interval",resource_host_index="-1",process_role="client"} 0', text)
+        self.assertIn('kv_case_resource_interval_core_available{scope="measurement_boundary_interval",resource_host_index="-1",process_role="client"} 1', text)
+        self.assertIn('kv_case_resource_interval_io_available{scope="measurement_boundary_interval",resource_host_index="-1",process_role="client"} 0', text)
+        self.assertIn('kv_case_resource_interval_cpu_seconds{scope="measurement_boundary_interval",resource_host_index="-1",process_role="client"} 0.7', text)
+        self.assertIn('kv_case_resource_interval_memory_current_bytes{scope="measurement_boundary_interval",resource_host_index="-1",process_role="client"} 123', text)
+        self.assertNotIn("io_read_bytes", text)
+        self.assertNotIn("io_write_bytes", text)
+        for change in ({"io_read_bytes": 0}, {"io_write_bytes": 1}, {"cpu_seconds": -1},
+                       {"cpu_seconds": float("nan")}, {"elapsed_seconds": 0},
+                       {"cpu_throttled_periods": 5}, {"host_index": True}, {"extra": 1},
+                       {"core_available": False}, {"core_available": 1}, {"reason": ""}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                campaign.resource_interval_metrics(evidence | {"processes": [row | change]}, {})
+        for missing in ("cpu_seconds", "elapsed_seconds", "reason"):
+            broken = row.copy()
+            del broken[missing]
+            with self.subTest(missing=missing), self.assertRaises(ValueError):
+                campaign.resource_interval_metrics(evidence | {"processes": [broken]}, {})
 
     def test_resource_rejects_reset_impossible_or_unavailable_counter_claims(self):
         valid = {"host_index": -1, "process_role": "client", "available": True, "elapsed_seconds": 1,
@@ -246,6 +311,38 @@ class CaseIdentityTests(unittest.TestCase):
         self.assertIn('population="profiled_owner_responses"} 5',
                       campaign.read_diagnostic_metrics(evidence, {}))
         self.assertNotIn("quantile", text)
+
+    def test_nvme_coverage_rejects_impossible_counts_and_does_not_fill_historical_gaps(self):
+        evidence = read_diagnostics()
+        self.assertNotIn('population="nvme_completed"', campaign.read_diagnostic_metrics(evidence, {}))
+        for completed in (0, 2):
+            with self.subTest(completed=completed):
+                evidence["profile"]["coverage"]["nvme_completed"] = completed
+                text = campaign.read_diagnostic_metrics(evidence, {})
+                self.assertIn(f'population="nvme_completed"}} {completed}', text)
+        for invalid in (True, -1, 1.5, 3):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                evidence["profile"]["coverage"]["nvme_completed"] = invalid
+                campaign.read_diagnostic_metrics(evidence, {})
+        evidence["profile"]["coverage"]["nvme_completed"] = 0
+        evidence["profile"]["coverage"]["unobserved_population"] = 0
+        with self.assertRaisesRegex(ValueError, "invalid read diagnostic coverage"):
+            campaign.read_diagnostic_metrics(evidence, {})
+
+    def test_read_evidence_accepts_fractional_means_but_rejects_nonfinite_measurements(self):
+        evidence = read_diagnostics()
+        stage = {"mean_ns": 3095.6875, "count": 32, "sum_ns": 99062, "max_ns": None}
+        evidence["profile"]["read_evidence"] = {
+            "nvmeof": {"readers": {"reader": {"stages": {"admission": stage}}}}}
+        campaign.read_diagnostic_metrics(evidence, {})
+        for invalid in (-1.0, float("nan"), float("inf"), -float("inf")):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                stage["mean_ns"] = invalid
+                campaign.read_diagnostic_metrics(evidence, {})
+        stage["mean_ns"] = 3095.6875
+        evidence["profile"]["counters"]["read_profile_server_async_count"] = 2.5
+        with self.assertRaisesRegex(ValueError, "expected a nonnegative count"):
+            campaign.read_diagnostic_metrics(evidence, {})
 
     def test_read_diagnostics_no_data_and_validation(self):
         self.assertEqual(campaign.read_diagnostic_metrics(None, {}), "")
@@ -390,12 +487,13 @@ class CaseIdentityTests(unittest.TestCase):
             campaign.measurement_read_metrics(evidence, {})
 
     def test_cache_policy_does_not_invent_effective_receipt(self):
-        requested = {"coordinator_cache_bytes": 0, "owner_read_cache_bytes": 0,
-                     "registered_policy": "disabled", "page_cache_policy": "not_dropped",
+        requested = {"coordinator_cache_bytes": 0, "page_cache_policy": "not_dropped",
                      "warmup_operations": 10, "read_lanes": 1, "concurrency": 1}
         text = campaign.read_tier_metrics({"read_tier": {"requested": requested, "effective": None}}, {})
         self.assertIn('policy_scope="effective"} 0', text)
         self.assertIn('component="page_cache_policy",policy="not_dropped"} 1', text)
+        self.assertNotIn("owner_read_cache_bytes", text)
+        self.assertNotIn("registered_policy", text)
         effective = requested | {"page_cache_policy": None}
         text = campaign.read_tier_metrics({"read_tier": {"requested": requested, "effective": None}},
                                           {}, effective)

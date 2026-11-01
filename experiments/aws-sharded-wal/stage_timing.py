@@ -1,4 +1,4 @@
-"""Source-bound protocol-v5/v6 cluster-placement stage timing campaign.
+"""Source-bound protocol-v5/v15 cluster-placement stage timing campaign.
 
 Local monotonic spans are nested/parallel diagnostics, not wire or one-way latency.
 Historical transport-floor definitions and pins remain independent.
@@ -16,11 +16,16 @@ import prepare_bundle
 import transport_floor
 from checkpoint_matrix import HARDWARE_TRANSPORTS
 
-BASELINE_SOURCE_SHA256 = transport_floor.CURRENT_SOURCE_SHA256
-BASELINE_BINARY_SHA256 = transport_floor.CURRENT_BINARY_SHA256
+BASELINE_SOURCE_SHA256 = '4facb657c3b84720991cd02f18a97b3a53934e3edd1c8b49a5c139616d582239'
+BASELINE_BINARY_SHA256 = '032402ee15960d55267774826412d6de0b127a88627e1a549b9010f2331862b6'
+BASELINE_FLOOR_BINARY_SHA256 = 'd2e6690120ac97e19b5dd2a4c1e61ff9e4c648db3da5d7750e0b00b2e25d8701'
 SCOPES = ('full',)
 FABRIC_VERSION = transport_floor.FABRIC_VERSION
-PROTOCOLS = {'baseline': 5, 'current': 6}
+PROTOCOLS = {'baseline': 5, 'current': 15}
+HISTORICAL_PROTOCOLS = {'baseline': 5, 'current': 6}
+HISTORICAL_CURRENT_SOURCE_SHA256 = '0848d53851fba812f5f0d19b636b8ad4f2a032aa8e4217f065ed3cb35c2d548d'
+HISTORICAL_CURRENT_BINARY_SHA256 = '611429861d3a24b0cb474e80bfd35c4ba529a86ca75082eacb3ec5c3f1da26e4'
+HISTORICAL_CURRENT_FLOOR_SHA256 = '4b79aa6276ae864f98b6350fced6897a4acb98107aa9b0d683c9a5b489abd14a'
 
 
 def case(workload, build, value, rep, transport, batch=32, window=32):
@@ -79,6 +84,14 @@ def recovery_cases():
 def plan(scope='full'):
     return qualification_cases() + main_cases(scope)
 
+def historical_plan(scope='full'):
+    """Reconstruct frozen pre-cutover cases only for offline analysis."""
+    return [spec | {'shard_cache': 0} for spec in plan(scope)]
+
+
+def historical_flags(spec, mode, external=False, prepare=False, transport_config=None):
+    return transport_floor.historical_flags(spec | {'build': 'current'}, mode, external, prepare, transport_config)
+
 
 def expected_cases(scope='full'):
     return {s['case_id'] + '-' + mode:
@@ -88,7 +101,7 @@ def expected_cases(scope='full'):
 
 def flags(spec, mode, external=False, prepare=False, transport_config=None):
     # Both revisions implement Busy/resident-first and the memory policy flags.
-    return transport_floor.flags(spec, mode, external, prepare, transport_config)
+    return transport_floor.flags(spec | {'build': 'current'}, mode, external, prepare, transport_config)
 
 
 floor_flags = transport_floor.floor_flags
@@ -105,14 +118,14 @@ def source_identity(directory, label):
     with tarfile.open(directory / 'source.tar.gz') as archive:
         protocol = archive.extractfile('tidehunter/src/distributed/tcp.rs').read().decode()
     if re.findall(r'^const PROTOCOL: u32 = (\d+);$', protocol, re.M) != [str(PROTOCOLS[label])]:
-        raise ValueError('baseline-v5/current-v6 protocol binding differs')
+        raise ValueError('baseline-v5/current-v15 protocol binding differs')
     for executable, key in [('sharded_wal_bench', 'binary_sha256'),
                             ('sharded_wal_transport_bench', 'floor_binary_sha256')]:
         if prepare_bundle.sha(directory / executable) != manifest[key]:
             raise ValueError('stage binary differs from source-bound manifest')
     if label == 'baseline' and (manifest['source_tree_sha256'] != BASELINE_SOURCE_SHA256
             or manifest['binary_sha256'] != BASELINE_BINARY_SHA256
-            or manifest['floor_binary_sha256'] != transport_floor.CURRENT_FLOOR_BINARY_SHA256):
+            or manifest['floor_binary_sha256'] != BASELINE_FLOOR_BINARY_SHA256):
         raise ValueError('baseline differs from preserved previous-current build')
     return dict(source_tree_sha256=manifest['source_tree_sha256'],
                 source_manifest_sha256=prepare_bundle.sha(manifest_path),
@@ -141,6 +154,14 @@ def bundle_identities(bundle):
 
 
 def validate_configuration(cfg):
+    return _validate_configuration(cfg, historical=False)
+
+
+def historical_validate_configuration(cfg):
+    return _validate_configuration(cfg, historical=True)
+
+
+def _validate_configuration(cfg, *, historical):
     if (cfg.get('campaign') != 'stage-timing' or cfg.get('instance_type') != 'c6id.32xlarge'
             or cfg.get('placement_strategy') != 'cluster' or cfg.get('placement_group') != cfg.get('run_id')
             or not re.fullmatch(r'us-east-1[a-f]', cfg.get('availability_zone', ''))
@@ -148,23 +169,37 @@ def validate_configuration(cfg):
             or cfg.get('checkpoint_scope') != 'full' or cfg.get('terminate_on_finish') is not True):
         raise ValueError('stage campaign requires reviewed cluster placement and bounded lifetime')
     identities = cfg['source_identities']
-    if set(identities) != set(PROTOCOLS):
+    protocols = HISTORICAL_PROTOCOLS if historical else PROTOCOLS
+    if set(identities) != set(protocols):
         raise ValueError('missing source-bound build identities')
     for label, identity in identities.items():
-        if identity.get('protocol') != PROTOCOLS[label] or any(
+        if identity.get('protocol') != protocols[label] or any(
                 not re.fullmatch('[a-f0-9]{64}', identity.get(key, '')) for key in (
                     'source_tree_sha256', 'source_manifest_sha256', 'source_archive_sha256',
                     'local_binary_sha256', 'local_floor_binary_sha256')):
             raise ValueError('unbound stage build identity')
     if (identities['baseline']['source_tree_sha256'] != BASELINE_SOURCE_SHA256
             or identities['baseline']['local_binary_sha256'] != BASELINE_BINARY_SHA256
-            or identities['baseline']['local_floor_binary_sha256'] != transport_floor.CURRENT_FLOOR_BINARY_SHA256
+            or identities['baseline']['local_floor_binary_sha256'] != BASELINE_FLOOR_BINARY_SHA256
             or identities['current']['source_tree_sha256'] == BASELINE_SOURCE_SHA256):
         raise ValueError('baseline/current source identity differs')
+    if historical and (identities['current']['source_tree_sha256'] != HISTORICAL_CURRENT_SOURCE_SHA256
+                       or identities['current']['local_binary_sha256'] != HISTORICAL_CURRENT_BINARY_SHA256
+                       or identities['current']['local_floor_binary_sha256'] != HISTORICAL_CURRENT_FLOOR_SHA256):
+        raise ValueError('historical stage source/binaries differ from the preserved protocol-v6 build')
 
 
 def validate_placement(cfg, instances, groups):
     validate_configuration(cfg)
+    return _validate_placement(cfg, instances, groups)
+
+
+def historical_validate_placement(cfg, instances, groups):
+    historical_validate_configuration(cfg)
+    return _validate_placement(cfg, instances, groups)
+
+
+def _validate_placement(cfg, instances, groups):
     if len(groups) != 1:
         raise ValueError('placement group lookup is not exact')
     group = groups[0]
@@ -185,10 +220,18 @@ def validate_placement(cfg, instances, groups):
 
 
 def validate_build_identity(root, label):
+    return _validate_build_identity(root, label, historical=False)
+
+
+def historical_validate_build_identity(root, label):
+    return _validate_build_identity(root, label, historical=True)
+
+
+def _validate_build_identity(root, label, *, historical):
     import analyze_cloud as audit
     root = Path(root)
     cfg = audit.read_json(root / 'campaign-config.json')
-    validate_configuration(cfg)
+    (historical_validate_configuration if historical else validate_configuration)(cfg)
     identity = cfg['source_identities'][label]
     receipt = audit.read_json(root / f'cloud-build-{label}.json')
     if any(receipt.get(key) != value for key, value in identity.items() if key != 'protocol'):
@@ -207,7 +250,7 @@ def validate_build_identity(root, label):
         raise ValueError('archived manifest/source/provider differs from plan')
     with tarfile.open(root / f'source-{label}.tar.gz') as archive:
         protocol = archive.extractfile('tidehunter/src/distributed/tcp.rs').read().decode()
-    if re.findall(r'^const PROTOCOL: u32 = (\d+);$', protocol, re.M) != [str(PROTOCOLS[label])]:
+    if re.findall(r'^const PROTOCOL: u32 = (\d+);$', protocol, re.M) != [str(identity['protocol'])]:
         raise ValueError('archived source protocol differs')
     pair = audit.read_json(root / 'cloud-build-pair-verified.json')
     if pair['binary_sha256'][label] != receipt['binary_sha256']:
@@ -232,7 +275,17 @@ def validate_build_identity(root, label):
 
 
 def validate_node_policy(root, spec, text, partition):
-    transport_floor.validate_node_policy(root, spec | {'build': 'current'}, text, partition)
+    transport_floor.validate_node_policy(root, spec, text, partition)
+    launch = transport_floor.yaml_one(text)
+    if (launch['limits']['polling'] != spec['polling']
+            or launch['node']['read_resident_first'] is not spec['resident_first']):
+        raise ValueError('launched polling/resident policy differs')
+
+
+def historical_validate_node_policy(root, spec, text, partition):
+    if 'shard_cache' not in spec:
+        raise ValueError('historical node policy requires the retained schema')
+    return validate_node_policy(root, spec, text, partition)
 
 
 def read_cloud_case(root, name, spec, mode):
@@ -258,9 +311,19 @@ def read_floor_metrics(path, spec):
 
 
 def read_wal_metrics(path, spec, mode):
+    return _read_wal_metrics(path, spec, mode, historical=False)
+
+
+def historical_read_wal_metrics(path, spec, mode):
+    if 'shard_cache' not in spec:
+        raise ValueError('historical WAL profile requires the retained schema')
+    return _read_wal_metrics(path, spec, mode, historical=True)
+
+
+def _read_wal_metrics(path, spec, mode, *, historical):
     if spec['build'] == 'current':
         metadata = (Path(path) / 'campaign.txt').read_text()
-        required = dict(diagnostic_timing_schema='6', stage_times_are_nested_not_additive='true',
+        required = dict(diagnostic_timing_schema='6' if historical else '7', stage_times_are_nested_not_additive='true',
                         transport_io_time_includes_provider_work='true',
                         storage_persist_time_includes_file_lookup_and_sync='true')
         if any(re.findall(r'^' + key + r'=(.*)$', metadata, re.M) != [value] for key, value in required.items()):
@@ -273,7 +336,7 @@ def read_wal_metrics(path, spec, mode):
             'cache_evicted_get', 'cache_evicted_get_many', 'cache_evicted_get_window')}
     metrics = transport_floor.read_wal_metrics(path, spec, mode, expected_profiles=phases)
     if spec['build'] == 'current' and spec['diagnostics']:
-        validate_read_samples(path, spec, mode)
+        validate_read_samples(path, spec, mode, historical=historical)
         if mode == 'tcp':
             for record in transport_floor.yaml_documents((Path(path) / 'node_profiles.yaml').read_text()):
                 if record is None:
@@ -358,7 +421,7 @@ def validate_stages(profile, transport, enabled, writes=False):
         required |= {f'{owner}.{field}' for field in PROVIDER_FIELDS}
     missing = required - flat.keys()
     if missing:
-        raise ValueError('missing protocol-v6 stage evidence: ' + ','.join(sorted(missing)))
+        raise ValueError('missing current protocol stage evidence: ' + ','.join(sorted(missing)))
     if not enabled and any(flat[field] for field in required):
         raise ValueError('uninstrumented control recorded opt-in stage work')
     if profile['control_queue_samples'] != profile['control_execution_samples']:
@@ -412,27 +475,37 @@ def validate_stages(profile, transport, enabled, writes=False):
     return flat
 
 
-def validate_read_samples(path, spec, mode):
+def validate_read_samples(path, spec, mode, *, historical=False):
     filename = 'native_read_profiles.csv' if mode == 'native-sync' else 'remote_read_profiles.csv'
     records = cluster_ram.read_csv(Path(path) / filename)
     fields = (('index_ns', 'wal_and_decode_ns', 'whole_call_ns') if mode == 'native-sync' else
               ('index_ns', 'dispatch_ns', 'wait_ns', 'actor_queue_ns', 'actor_service_ns', 'actor_return_ns',
                'request_encode_ns', 'exchange_ns', 'response_decode_ns', 'record_verify_ns',
-               'server_handler_ns', 'server_inventory_wait_ns', 'server_authority_lookup_ns',
+               'server_handler_ns', 'server_authority_lookup_ns',
                'server_record_read_ns', 'whole_call_ns', 'inline_read_ns'))
+    if mode != 'native-sync':
+        fields += (('server_inventory_wait_ns', 'cache_hits', 'cache_misses') if historical else
+                   ('server_response_recheck_wait_ns', 'server_response_recheck_ns',
+                    'server_response_recheck_samples', 'wire_read_requests', 'cache_hits', 'cache_misses'))
     states = defaultdict(list)
     for row in records:
         if any(field not in row for field in fields):
             raise ValueError('missing sampled read stage field')
         for field in fields:
             cluster_ram.number(row[field])
+        if not historical and mode == 'native-sync':
+            if row.get('value_cache_hit') not in ('true', 'false'):
+                raise ValueError('native read profile cache-hit availability differs')
+        elif not historical and mode != 'native-sync' and (row.get('server_timing_available') not in ('true', 'false')
+              or (row['server_timing_available'] == 'true') != (int(row['server_response_recheck_samples']) > 0)):
+            raise ValueError('remote read profile timing availability differs from samples')
         states[row['state']].append(row)
     reopened = 'reopened-warm' if mode == 'native-sync' else 'reopened-cache-cleared'
     expected_states = {'warm', reopened} | ({'cache-evicted'} if spec['cold'] else set())
     if set(states) != expected_states:
         raise ValueError('missing/unplanned sampled read diagnostic states')
-    expected = min(spec['reads'], 256)
-    for rows in states.values():
+    for state, rows in states.items():
+        expected = min(spec['reads'], 256) if historical or state == 'cache-evicted' else spec['reads']
         if len(rows) != expected:
             raise ValueError('diagnostic sample count differs from planned bounded workload')
         if any(int(row['sample']) != sample for sample, row in enumerate(rows)):
@@ -456,7 +529,7 @@ def stage_denominators():
         'client.exchange_ns': 'client.requests',
     }
     for field in ('request_encode_ns', 'response_decode_ns', 'record_verify_ns', 'server_handler_ns',
-                  'server_inventory_wait_ns', 'server_authority_lookup_ns', 'server_record_read_ns'):
+                  'server_authority_lookup_ns', 'server_record_read_ns'):
         denominators['client.' + field] = 'client.requests'
     for owner in ('socket', 'client.socket'):
         for timer, count in (('read_ns', 'read_calls'), ('write_ns', 'write_calls'),
@@ -464,6 +537,8 @@ def stage_denominators():
             denominators[f'{owner}.{timer}'] = f'{owner}.{count}'
     denominators['polling.request_first_poll_gap_ns'] = 'polling.request_first_poll_samples'
     denominators['polling.idle_wait_ns'] = 'polling.idle_wait_calls'
+    denominators['polling.idle_sleep_ns'] = 'polling.idle_sleep_calls'
+    denominators['client.server_inventory_wait_ns'] = 'client.requests'
     for field in STORAGE_FIELDS:
         if field.endswith('_ns'):
             denominators['storage_write.' + field] = 'storage_write.' + ('append_calls' if field.startswith('append_') else 'persist_calls')
@@ -506,7 +581,7 @@ def summarize_stages(runs):
                     'not attributable per request under multiplexing' if kind == 'exchange_profile' else
                     'not measured for the RAM probe' if kind == 'floor_profile' and field in (
                         'handler_ns', 'client.record_verify_ns', 'client.server_handler_ns',
-                        'client.server_inventory_wait_ns', 'client.server_authority_lookup_ns',
+                        'client.server_authority_lookup_ns',
                         'client.server_record_read_ns') else None)
                 result.append(dict(case=name, kind=kind, phase=phase, field=metric,
                     ns_sum=summed, denominator_field=denominator, samples=count,
@@ -526,12 +601,16 @@ def compare_saved_spread(runs, root):
         raise ValueError('saved spread campaign is incomplete')
     if audit.read_json(root / 'campaign-config.json').get('campaign') != 'transport-floor':
         raise ValueError('saved spread control must be the historical transport-floor campaign')
-    transport_floor.validate_build_identity(root, 'current')
+    receipt = transport_floor.validate_build_identity(root, 'current')
+    if (receipt['source_tree_sha256'] != BASELINE_SOURCE_SHA256
+            or receipt['local_binary_sha256'] != BASELINE_BINARY_SHA256
+            or receipt.get('local_floor_binary_sha256') != BASELINE_FLOOR_BINARY_SHA256):
+        raise ValueError('saved spread source or binaries differ from stage baseline')
     result = []
     for spec in main_cases():
         if spec['build'] != 'baseline' or not spec.get('floor'):
             continue
-        previous = next(s for s in transport_floor.main_cases() if s.get('floor')
+        previous = next(s for s in transport_floor.historical_plan() if s.get('floor')
                         and s['transport'] == spec['transport'] and s['polling'] == spec['polling']
                         and not s['profile'] and s['idle_us'] == 0)
         for key in ('samples', 'floor_values', 'floor_repetitions', 'idle_us', 'profile'):

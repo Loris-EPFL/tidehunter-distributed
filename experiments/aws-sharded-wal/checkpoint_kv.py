@@ -14,7 +14,6 @@ import math
 import copy
 
 import transport_floor
-import raw_rma_floor
 
 from checkpoint_matrix import efa_snapshot, efa_proof, validate_efa_proof, validate_provider
 from checkpoint_matrix import fabric_local_log, fabric_local_archive_log
@@ -29,13 +28,11 @@ def validate_options(options):
         return
     if (not isinstance(options, dict)
             or not {'repetitions', 'diagnostics'} <= options.keys()
-            or options.keys() - {'repetitions', 'diagnostics', 'scope', 'resident_reads', 'bounded_hot_reads', 'cold_single_probes', 'cold_group_probes'}
+            or options.keys() - {'repetitions', 'diagnostics', 'scope', 'bounded_hot_reads', 'cold_single_probes', 'cold_group_probes'}
             or type(options['repetitions']) is not int or not 1 <= options['repetitions'] <= 3
             or type(options['diagnostics']) is not bool
-            or options.get('scope', 'full') not in ('full', 'targeted', 'hardware-populations')):
-        raise ValueError('kv_suite requires repetitions 1..3, boolean diagnostics, and full/targeted/hardware-populations scope')
-    if 'resident_reads' in options:
-        resident_read_config(options['resident_reads'])
+            or options.get('scope', 'full') not in ('full', 'targeted')):
+        raise ValueError('kv_suite requires repetitions 1..3, boolean diagnostics, and full/targeted scope')
     count = options.get('bounded_hot_reads')
     if count is not None and (type(count) is not int or not 32 <= count <= 131072):
         raise ValueError('bounded_hot_reads requires an integer 32..131072')
@@ -45,68 +42,15 @@ def validate_options(options):
     groups = options.get('cold_group_probes', 0)
     if type(groups) is not int or not 0 <= groups <= 4096:
         raise ValueError('cold_group_probes requires an integer 0..4096')
-    if options.get('scope') == 'hardware-populations':
-        profile = resident_read_config(options.get('resident_reads'))
-        if (count != 32768 or probes != 1024 or groups != 1024 or options['repetitions'] != 2 or not options['diagnostics']
-                or not profile['destination_slots'] or not profile['require_device_read']):
-            raise ValueError('hardware-populations requires 32768 hot samples, 1024 scalar and grouped physical cold probes, two clean repeats, diagnostics and device-qualified resident limits')
 
 
-def resident_plan(cases, options):
+def apply_workload_options(cases, options):
     if options.get('bounded_hot_reads') is not None:
-        cases = [case | dict(bounded_hot_reads=options['bounded_hot_reads']) for case in cases]
+        cases = [case | dict(bounded_hot_reads=options['bounded_hot_reads']) if not case['cold'] else case for case in cases]
     if options.get('cold_single_probes'):
         cases = [case | dict(cold_single_probes=options['cold_single_probes']) if case['cold'] else case for case in cases]
     if options.get('cold_group_probes'):
         cases = [case | dict(cold_group_probes=options['cold_group_probes']) if case['cold'] else case for case in cases]
-    if 'resident_reads' not in options:
-        return cases
-    config = resident_read_config(options['resident_reads'])
-    if config == resident_read_config():
-        return cases
-    native = ('efa-native', 'fabric-tcp-native')
-    if not any(case['transport'] in native for case in cases):
-        raise ValueError('resident_reads requires a trusted-native case; RPC controls remain unchanged')
-    # Preserve matrix size and the TCP/TLS RPC controls. Only explicit
-    # trusted-native cases acquire the distinct RMA-bound case identity.
-    return [case | dict(resident_reads=config)
-            if not case['cold'] and case['transport'] in native else case for case in cases]
-
-
-def hardware_population_plan(options, transports):
-    """Named populations, not a cache × shape × transport Cartesian product."""
-    if set(transports) != {'tcp', 'efa', 'efa-direct', 'efa-native'} or len(transports) != 4:
-        raise ValueError('hardware populations require all four remote transport controls')
-    profile = resident_read_config(options['resident_reads'])
-    shapes = [(256, 1, 1, 320), (8192, 1, 1, 320),
-              (8192, 32, 32, 320), (8192, 32, 32, 3200)]
-    def case(shape, transport, repeat, population, diagnostic=False):
-        value, batch, window, batches = shape
-        result = dict(shape=[value, batch, window], repetition=repeat, transport=transport,
-            cold=population == 'physical_io_interval', cached=population == 'coordinator_ram',
-            diagnostics=diagnostic, authority_resident_batches=None,
-            shard_cache_bytes=8 * 1024**2 if population == 'owner_encoded_ram' else 0,
-            preparation_chunk_batches=16, wal_layout='small', workload_batches=batches,
-            workload_reads=8192 if batch == 32 else 4096, transport_floor=False,
-            bounded_hot_reads=options['bounded_hot_reads'])
-        if result['cold']:
-            result['cold_single_probes'] = options['cold_single_probes']
-            result['cold_group_probes'] = options['cold_group_probes']
-        if population == 'registered_ram':
-            result['resident_reads'] = dict(profile)
-        return result
-    cases = []
-    for repeat in range(options['repetitions']):
-        for transport in transports if repeat % 2 == 0 else transports[::-1]:
-            cases.extend(case(shape, transport, repeat, 'pagecache_control') for shape in shapes)
-            if transport == 'efa-native':
-                cases.extend(case(shape, transport, repeat, 'registered_ram') for shape in shapes)
-            for population in ('coordinator_ram', 'owner_encoded_ram', 'physical_io_interval'):
-                cases.extend(case(shape, transport, repeat, population) for shape in shapes[:2])
-    # Clocks are fresh processes, not samples pooled with either clean repetition.
-    repeat = options['repetitions']
-    cases.extend(case(shapes[1], transport, repeat, 'pagecache_control', True) for transport in transports)
-    cases.append(case(shapes[1], 'efa-native', repeat, 'registered_ram', True))
     return cases
 
 
@@ -114,37 +58,32 @@ def plan(options, transports):
     validate_options(options)
     if options is None:
         return []
-    if options.get('scope') == 'hardware-populations':
-        return hardware_population_plan(options, transports)
     if options.get('scope', 'full') == 'targeted':
         cases = []
         for repeat in range(options['repetitions']):
             for transport in (transports if repeat % 2 == 0 else transports[::-1]):
-                for value, batch, window, cached, shard_cache, cold, chunk, layout in (
-                        (256, 1, 1, False, 0, False, 16, 'small'),
-                        (256, 1, 1, False, 8 * 1024**2, False, 16, 'small'),
-                        (256, 32, 32, False, 0, False, 16, 'small'),
-                        (8192, 1, 1, False, 0, False, 16, 'small'),
-                        (8192, 1, 1, False, 8 * 1024**2, False, 16, 'small'),
-                        (8192, 1, 1, True, 0, False, 16, 'small'),
-                        (8192, 32, 32, False, 0, False, 16, 'small'),
-                        (8192, 32, 32, False, 0, False, 32, 'small'),
-                        (8192, 32, 32, False, 8 * 1024**2, False, 16, 'small'),
-                        (8192, 32, 32, False, 0, True, 16, 'small'),
-                        (8192, 32, 32, False, 0, False, 32, 'sui')):
+                for value, batch, window, cached, cold, chunk, layout in (
+                        (256, 1, 1, False, False, 16, 'small'),
+                        (256, 32, 32, False, False, 16, 'small'),
+                        (8192, 1, 1, False, False, 16, 'small'),
+                        (8192, 1, 1, True, False, 16, 'small'),
+                        (8192, 32, 32, False, False, 16, 'small'),
+                        (8192, 32, 32, False, False, 32, 'small'),
+                        (8192, 32, 32, False, True, 16, 'small'),
+                        (8192, 32, 32, False, False, 32, 'sui')):
                     cases.append(dict(shape=[value, batch, window], repetition=repeat,
                         transport=transport, cold=cold, cached=cached,
                         diagnostics=False,
-                        authority_resident_batches=None, shard_cache_bytes=shard_cache,
+                        authority_resident_batches=None,
                         preparation_chunk_batches=chunk, wal_layout=layout,
                         workload_batches=3200 if batch == 32 else 320,
                         workload_reads=8192 if batch == 32 else 4096,
-                        transport_floor=bool(repeat == 0 and value == 256 and batch == 1 and not shard_cache)))
+                        transport_floor=bool(repeat == 0 and value == 256 and batch == 1)))
                 # Preserve the smaller historical working set as its own
                 # explicit case, never a denominator for the enlarged case.
                 cases.append(dict(shape=[8192, 32, 32], repetition=repeat,
                     transport=transport, cold=False, cached=False, diagnostics=False,
-                    authority_resident_batches=None, shard_cache_bytes=0,
+                    authority_resident_batches=None,
                     preparation_chunk_batches=16, wal_layout='small',
                     workload_batches=320, workload_reads=8192, transport_floor=False))
         if options['diagnostics']:
@@ -153,16 +92,16 @@ def plan(options, transports):
                 # ordinary no-cache control used for cache comparisons.
                 cases.append(dict(shape=[8192, 1, 1], repetition=options['repetitions'],
                     transport=transport, cold=False, cached=False, diagnostics=True,
-                    authority_resident_batches=None, shard_cache_bytes=0,
+                    authority_resident_batches=None,
                     preparation_chunk_batches=16, wal_layout='small',
                     workload_batches=320, workload_reads=4096, transport_floor=False))
                 for batches in (320, 3200):
                     cases.append(dict(shape=[8192, 32, 32], repetition=options['repetitions'],
                         transport=transport, cold=False, cached=False, diagnostics=True,
-                        authority_resident_batches=None, shard_cache_bytes=0,
+                        authority_resident_batches=None,
                         preparation_chunk_batches=16, wal_layout='small',
                         workload_batches=batches, workload_reads=8192, transport_floor=False))
-        return resident_plan(cases, options)
+        return apply_workload_options(cases, options)
     cases = []
     shapes = [(256, 1, 1), (256, 32, 32), (8192, 1, 1), (8192, 32, 32)]
     for repeat in range(options['repetitions']):
@@ -187,7 +126,7 @@ def plan(options, transports):
                                   workload_batches=3200 if shape == (8192, 32, 32) else None,
                                   authority_resident_batches=None))
     # Prioritize the same bounded diagnostic cases; preserve every clean case's order.
-    return resident_plan([case for case in cases if case['diagnostics']] + [
+    return apply_workload_options([case for case in cases if case['diagnostics']] + [
         case for case in cases if not case['diagnostics']], options)
 
 
@@ -205,7 +144,7 @@ def comparison_identity(directory, spec, mode, cfg):
     required = ('load_batches', 'mixed_batches', 'point_reads', 'read_query_algorithm',
                 'read_query_seed', 'read_query_order', 'read_prepared_state',
                 'wal_fragment_bytes', 'wal_file_bytes', 'wal_group_max_batches',
-                'wal_group_encoded_bytes', 'one_sided_wal_reads', 'rma_config',
+                'wal_group_encoded_bytes',
                 'target_os', 'target_arch', 'read_cpu_affinity', 'read_numa_affinity',
                 'read_placement_policy', 'build_features', 'topology')
     missing = [field for field in required if metadata.get(field) in (None, '', 'unavailable')]
@@ -221,9 +160,6 @@ def comparison_identity(directory, spec, mode, cfg):
             missing.append('bounded_hot_policy')
         if mode == 'native-sync' and metadata.get('native_read_cache_bytes') in (None, '', 'unavailable'):
             missing.append('native_read_cache_bytes')
-    if (mode == 'tcp' and resident_read_config(spec.get('resident_reads'))['destination_slots']
-            and not spec['cached'] and metadata.get('registered_hot_policy') in (None, '', 'unavailable')):
-        missing.append('registered_hot_policy')
     for field in ('region', 'availability_zone', 'instance_type', 'placement_group'):
         if not cfg.get(field):
             missing.append('environment.' + field)
@@ -310,7 +246,7 @@ def comparison_identity(directory, spec, mode, cfg):
                         missing.append('prepared_transport_hash_receipt_differs_from_artifacts')
             if observed_owner_transports != owner_transports:
                 missing.append('structured_owner_transport_binding')
-    identity = dict(schema=1, qualified=not missing, missing=missing,
+    identity = dict(schema=2, qualified=not missing, missing=missing,
         implementation=dict(binary_sha256=binary, source_archive_sha256=source),
         preparation=dict(owner_transports_sha256=owner_transport_sha256,
             requested_transport_sha256=requested_transport_sha256,
@@ -321,13 +257,10 @@ def comparison_identity(directory, spec, mode, cfg):
             'tls' if mode == 'tcp' else 'local',
             client=observed_client_transport,
             owner_transports=observed_owner_transports if mode == 'tcp' else [],
-            one_sided=metadata.get('one_sided_wal_reads'), build_features=metadata.get('build_features')),
+            build_features=metadata.get('build_features')),
         clocks=dict(detailed=spec['diagnostics']))
     if missing:
         return identity
-    observed_rma = resident_read_config(json.loads(metadata['rma_config']))
-    if observed_rma != (resident_read_config(spec.get('resident_reads')) if mode == 'tcp' else resident_read_config()):
-        raise ValueError('observed resident limits differ from admitted configuration')
     value, batch, window = spec['shape']
     batches = int(metadata['load_batches'])
     reads = int(metadata['point_reads'])
@@ -335,24 +268,6 @@ def comparison_identity(directory, spec, mode, cfg):
             or reads != int(commands[mode][commands[mode].index('--reads') + 1])
             or int(metadata['mixed_batches']) != 64):
         raise ValueError('observed workload cardinality differs from admitted command')
-    warm_policy = registered_hot_policy(reads, remote['read_lanes'],
-        mode == 'tcp' and observed_rma['destination_slots'] != 0 and remote['read_cache_bytes'] == 0,
-        spec.get('bounded_hot_reads'))
-    reported_warm_policy = metadata.get('registered_hot_policy')
-    if warm_policy['enabled']:
-        require_kv_policy(json.loads(reported_warm_policy), warm_policy)
-    elif reported_warm_policy not in (None, '', 'unavailable'):
-        inactive = json.loads(reported_warm_policy)
-        if not isinstance(inactive, dict) or inactive.get('enabled') is not False:
-            raise ValueError('inactive registered preparation contradicts effective configuration')
-    if not warm_policy['enabled']:
-        warm_policy = dict(enabled=False)
-    controls = registered_control_evidence(directory, [node['partition'] for node in cfg['nodes']])
-    if observed_rma == resident_read_config() and controls.get('available'):
-        raise ValueError('registered controls contradict the effective disabled resident configuration')
-    if warm_policy['enabled'] and not controls.get('qualified'):
-        identity['qualified'] = False
-        identity['missing'].append('registered_hot_preparation_or_population_not_qualified')
     common_policy = bounded_hot_policy(reads, remote['read_lanes'], expected_bounded, spec.get('bounded_hot_reads'))
     reported_common = metadata.get('bounded_hot_policy')
     if expected_bounded:
@@ -376,9 +291,6 @@ def comparison_identity(directory, spec, mode, cfg):
             raise ValueError('native bounded cache budget differs from its admitted command')
     elif common.get('available'):
         raise ValueError('bounded controls contradict the disabled source-bound command')
-    if warm_policy['enabled'] and controls.get('qualified'):
-        require_registered_probe(spec, mode, resident_read_evidence(
-            directory, [node['partition'] for node in cfg['nodes']]))
     with (directory / 'summary.csv').open() as stream:
         observed = list(csv.DictReader(stream))
     load = [row for row in observed if row['phase'] == 'load_write_window']
@@ -395,16 +307,13 @@ def comparison_identity(directory, spec, mode, cfg):
         read_order=metadata['read_query_order'], read_seed=metadata['read_query_seed'],
         read_algorithm=metadata['read_query_algorithm'], prepared_state=metadata['read_prepared_state'],
         hot_read_pass=not spec['cold'], advisory_eviction=spec['cold'],
-        read_window=32, get_many_widths=[4, 32],
-        hot_set_keys=256 if spec.get('shard_cache_bytes', 0) and not spec['cached'] else 0)
-    identity['workload']['requested_owner_cache_bytes'] = spec.get('shard_cache_bytes', 0)
+        read_window=32, get_many_widths=[4, 32], hot_set_keys=0)
     if spec.get('cold_single_probes') is not None:
         identity['workload']['cold_single_probes'] = spec['cold_single_probes']
     if spec.get('cold_group_probes') is not None:
         identity['workload']['cold_group_probes'] = spec['cold_group_probes']
     identity['policy'] = dict(
         coordinator_cache_bytes=remote['read_cache_bytes'],
-        shard_cache_bytes=spec.get('shard_cache_bytes', 0) if mode == 'tcp' else 0,
         coordinator_allowance=remote['read_memory_allowance_bytes'],
         shard_allowances=sorted(owner['node']['read_memory_allowance_bytes'] for owner in owners.values()) if mode == 'tcp' else [],
         read_lanes=remote['read_lanes'] if mode == 'tcp' else 0,
@@ -413,28 +322,15 @@ def comparison_identity(directory, spec, mode, cfg):
         member_read='async' if mode == 'tcp' else 'native-file-reader',
         resident_first=mode == 'tcp', polling='adaptive' if mode == 'tcp' else 'not_applicable',
         read_workers=2 if mode == 'tcp' else 1,
-        authority_resident_batches=remote['storage']['max_batches_per_partition'] if mode == 'tcp' else None,
-        registration_profile=observed_rma)
+        authority_resident_batches=remote['storage']['max_batches_per_partition'] if mode == 'tcp' else None)
     identity['preparation'] = dict(chunk_batches=spec.get('preparation_chunk_batches', 16),
         workers=remote['preparation_workers'], scan_prefetch_pages=remote['scan_prefetch_pages'],
         owner_transports_sha256=owner_transport_sha256,
-        layout={key: int(metadata[key]) for key in required[7:11]},
-        registered_hot_policy=warm_policy,
-        registered_hot_state=('qualified_all_lane_hit_only' if controls.get('qualified') else 'mixed_or_invalid')
-            if warm_policy['enabled'] else 'not_applicable')
+        layout={key: int(metadata[key]) for key in required[7:11]})
     identity['preparation']['bounded_hot_policy'] = common_policy if expected_bounded else dict(enabled=False)
     identity['preparation']['bounded_hot_state'] = (
         'verified_API_population' if common.get('qualified') else 'mixed_or_invalid') if expected_bounded else 'not_applicable'
     identity['bounded_hot'] = common
-    identity['preparation']['registered_hot_active_lanes'] = (
-        controls.get('preparation', {}).get('active_lanes', []) if warm_policy['enabled'] else [])
-    identity['preparation']['registered_hot_owner_elements'] = {
-        phase: {str(owner): sum(lane['counters']['rma_posts'] for lane in observation['lanes']
-                    if lane['owner'] == owner) for owner in sorted({lane['owner'] for lane in observation['lanes']})}
-        for phase, observation in controls.get('phases', {}).items()
-    } if warm_policy['enabled'] else {}
-    if warm_policy['enabled']:
-        identity['registered_control_observations'] = controls
     identity['environment'] = dict(
         region=cfg['region'], availability_zone=cfg['availability_zone'], instance_type=cfg['instance_type'],
         placement_strategy='cluster', topology=metadata['topology'],
@@ -457,7 +353,7 @@ def match_comparison(reference, candidate, *, compared=('implementation',)):
         raise ValueError('comparison axes must be implementation, transport, or clocks')
     required = dict(
         implementation={'binary_sha256', 'source_archive_sha256'},
-        transport={'name', 'security', 'one_sided', 'build_features'}, clocks={'detailed'},
+        transport={'name', 'security', 'build_features'}, clocks={'detailed'},
         environment={'region', 'availability_zone', 'instance_type', 'placement_strategy',
             'topology', 'target_os', 'target_arch', 'cpu_affinity', 'numa_affinity',
             'placement_policy', 'placement_scope'},
@@ -465,19 +361,23 @@ def match_comparison(reference, candidate, *, compared=('implementation',)):
             'loaded_payload_bytes', 'mixed_batches', 'read_count', 'read_order', 'read_seed',
             'read_algorithm', 'prepared_state', 'hot_read_pass', 'advisory_eviction',
             'read_window', 'get_many_widths', 'hot_set_keys'},
-        policy={'coordinator_cache_bytes', 'shard_cache_bytes', 'coordinator_allowance',
+        policy={'coordinator_cache_bytes', 'coordinator_allowance',
             'shard_allowances', 'read_lanes', 'max_pending_reads', 'max_pending_read_bytes',
             'member_read', 'resident_first', 'polling', 'read_workers',
-            'authority_resident_batches', 'registration_profile'},
+            'authority_resident_batches'},
         preparation={'chunk_batches', 'workers', 'scan_prefetch_pages', 'layout',
-                     'registered_hot_policy', 'registered_hot_state',
-                     'registered_hot_active_lanes', 'registered_hot_owner_elements',
                      'bounded_hot_policy', 'bounded_hot_state'})
+    historical = reference.get('schema') == candidate.get('schema') == 1
+    if historical:
+        required['transport'].add('one_sided')
+        required['policy'].update(('shard_cache_bytes', 'registration_profile'))
+        required['preparation'].update(('registered_hot_policy', 'registered_hot_state',
+                                        'registered_hot_active_lanes', 'registered_hot_owner_elements'))
     fields, missing = set(required), {}
     for label, row in (('reference', reference), ('candidate', candidate)):
         absent = list(row.get('missing', []))
         transport = row.get('transport') if isinstance(row.get('transport'), dict) else {}
-        if row.get('schema') != 1:
+        if row.get('schema') != (1 if historical else 2):
             absent.append('schema')
         for section, names in required.items():
             values = row.get(section)
@@ -489,10 +389,11 @@ def match_comparison(reference, candidate, *, compared=('implementation',)):
                                and name in ('max_pending_read_bytes', 'authority_resident_batches'))
                 if name not in values or (values[name] is None and not native_none) or values.get(name) == '':
                     absent.append(section + '.' + name)
-        for section, child, names in (
-                ('preparation', 'layout', {'wal_fragment_bytes', 'wal_file_bytes',
-                                         'wal_group_max_batches', 'wal_group_encoded_bytes'}),
-                ('policy', 'registration_profile', set(resident_read_config()))):
+        nested = [('preparation', 'layout', {'wal_fragment_bytes', 'wal_file_bytes',
+                                            'wal_group_max_batches', 'wal_group_encoded_bytes'})]
+        if historical:
+            nested.append(('policy', 'registration_profile', set(resident_read_config())))
+        for section, child, names in nested:
             parent = row.get(section) if isinstance(row.get(section), dict) else {}
             values = parent.get(child, {})
             if (not isinstance(values, dict) or not names <= set(values)
@@ -579,9 +480,10 @@ def _match_physical_population(reference, candidate, *, compared, evidence_field
         return dict(comparable=False, ratios_allowed=False, reason='unqualified_metadata')
     if any(not row.get(evidence_field, {}).get(qualification_field) for row in rows):
         return dict(comparable=False, ratios_allowed=False, reason='not_every_physical_probe_qualified')
-    if any(not row['workload']['advisory_eviction'] or row['policy']['registration_profile']['destination_slots']
+    if any(not row['workload']['advisory_eviction']
+           or (row.get('schema') == 1 and row['policy']['registration_profile']['destination_slots'])
            for row in rows):
-        return dict(comparable=False, ratios_allowed=False, reason='requires_RMA_off_physical_cold_controls')
+        return dict(comparable=False, ratios_allowed=False, reason='requires_physical_cold_controls')
     native = [row['transport']['name'] == 'native' for row in rows]
     if native[0] == native[1]:
         result = match_comparison(reference, candidate, compared=('transport',))
@@ -610,6 +512,8 @@ def match_registered_arm(reference, candidate, *, compared=()):
     if compared:
         raise ValueError('registered-arm comparison holds source, transport and clocks fixed')
     rows = (reference, candidate)
+    if any(row.get('schema') != 1 for row in rows):
+        return dict(comparable=False, ratios_allowed=False, reason='historical_registered_schema_required')
     if any(not match_comparison(row, row)['comparable'] for row in rows):
         return dict(comparable=False, ratios_allowed=False, reason='unqualified_metadata')
     if any(row['transport']['name'] != 'efa-native' for row in rows):
@@ -641,10 +545,15 @@ def classify_read_population(frontend, owners, physical_read_bytes, residency=No
     """Async submissions and advisory eviction never establish physical NVMe."""
     if frontend is None or owners is None:
         return dict(population='unqualified_missing_counters', hit_only=False, physical_nvme=False)
-    hits, misses = frontend.get('cache_hits', 0), frontend.get('cache_misses', 0)
-    shard_hits = sum(owner.get('cache_hits', 0) for owner in owners.values())
-    wal_reads = sum(owner.get('wal_reads', 0) for owner in owners.values())
-    resident = sum(owner.get('resident_read_successes', 0) for owner in owners.values())
+    hits = frontend.get('coordinator_cache_hits', frontend.get('cache_hits'))
+    misses = frontend.get('coordinator_cache_misses', frontend.get('cache_misses'))
+    if hits is None or misses is None:
+        return dict(population='unqualified_missing_counters', hit_only=False, physical_nvme=False)
+    resident = (sum(owner['resident_read_successes'] for owner in owners.values())
+                if all('resident_read_successes' in owner for owner in owners.values()) else None)
+    shard_hits = sum(owner['cache_hits'] for owner in owners.values()) if all(
+        'cache_hits' in owner for owner in owners.values()) else None
+    wal_reads = sum(owner['wal_reads'] for owner in owners.values())
     if hits and not misses:
         population = 'coordinator_cache_hit_only'
     elif hits:
@@ -678,15 +587,17 @@ def bounded_control_evidence(directory, mode, owner_partitions=range(5)):
     if not path.is_file() or not path.stat().st_size:
         return dict(available=False, qualified=False, reason='bounded hot control evidence unavailable')
     rows = [json.loads(line) for line in path.read_text().splitlines()]
-    phases, identities = {}, set()
+    phases, identities, scopes = {}, set(), set()
     for row in rows:
-        if (row.get('scope') != 'verified_API_values;RMA_counters_only_in_registered_controls'
+        if (row.get('scope') not in ('verified_API_values;cache_population_unclassified',
+                                     'verified_API_values;RMA_counters_only_in_registered_controls')
                 or row['phase'] in phases):
             raise ValueError('bounded control scope or phase population differs')
         phases[row['phase']] = row
+        scopes.add(row['scope'])
         identities.add(tuple(row[field] for field in
             ('backend', 'transport', 'value_bytes', 'batch_size', 'window', 'repetition')))
-    if (len(identities) != 1
+    if (len(identities) != 1 or len(scopes) != 1
             or set(phases) != {'bounded_hot_setup', 'cache_hot_get', 'cache_hot_get_many'}):
         raise ValueError('bounded control case/phase population differs')
     identity = next(iter(identities))
@@ -729,7 +640,6 @@ def bounded_control_evidence(directory, mode, owner_partitions=range(5)):
     metadata_path = directory / 'campaign.txt'
     metadata = dict(line.split('=', 1) for line in metadata_path.read_text().splitlines() if '=' in line) if metadata_path.is_file() else {}
     expected_owners = {0} if native else set(owner_partitions)
-    registered = None
     results, reasons = {}, []
     for phase, samples, elements in (
             ('cache_hot_get', policy['scalar_reads'], policy['scalar_reads']),
@@ -782,32 +692,30 @@ def bounded_control_evidence(directory, mode, owner_partitions=range(5)):
                             for row in physical.values())):
                 actual_population = 'native_buffered_hotset_zero_accounted_IO_with_residency'
                 service_qualified = True
-        elif population in ('registered_hit_only', 'mixed_or_invalid'):
-            if registered is None:
-                registered = registered_control_evidence(directory, expected_owners)
-            observation_rma = registered.get('phases', {}).get(phase, {})
-            if (registered.get('qualified') and observation_rma.get('qualified')
-                    and observation_rma.get('measurement_phase') == measured_phase
+        elif (scopes == {'verified_API_values;RMA_counters_only_in_registered_controls'}
+              and population in ('registered_hit_only', 'mixed_or_invalid')):
+            registered = registered_control_evidence(directory, expected_owners)
+            observed = registered.get('phases', {}).get(phase, {})
+            if (registered.get('qualified') and observed.get('qualified')
+                    and observed.get('measurement_phase') == measured_phase
                     and registered.get('identity') == list(identity)):
-                actual_population = 'registered_hit_only'
-                service_qualified = True
+                actual_population, service_qualified = 'registered_hit_only', True
         elif population != 'remote_API_hotset_unclassified' or measured_phase != phase:
             raise ValueError('unknown bounded service population')
         elif service is not None and charged == 0:
             classification = service['classification']['population']
             frontend = service['frontend'] or {}
             owners = list(service['owners'].values())
-            complete = frontend.get('cache_hits', 0) + frontend.get('cache_misses', 0) == elements
-            owner_hits = sum(owner['cache_hits'] for owner in owners)
+            hits = frontend.get('coordinator_cache_hits', frontend.get('cache_hits'))
+            misses = frontend.get('coordinator_cache_misses', frontend.get('cache_misses'))
+            complete = hits is not None and misses is not None and hits + misses == elements
             wal_reads = sum(owner['wal_reads'] for owner in owners)
             if (complete and classification == 'coordinator_cache_hit_only'
-                    and frontend.get('cache_hits') == elements and not owner_hits and not wal_reads):
-                actual_population, service_qualified = classification, True
-            elif (complete and classification == 'shard_cache_hit_only'
-                    and owner_hits == elements and not wal_reads):
+                    and hits == elements and not wal_reads):
                 actual_population, service_qualified = classification, True
             elif (complete and classification == 'page_cache_resident_observed'
-                    and not owner_hits and wal_reads == elements):
+                    and wal_reads == elements
+                    and sum(owner['resident_read_successes'] for owner in owners) == elements):
                 actual_population = 'remote_pagecache_service_observed_zero_accounted_IO'
                 service_qualified = True
         if not timing_matches:
@@ -1235,7 +1143,7 @@ def read_service_evidence(directory, mode, owner_partitions=range(5)):
             raise ValueError('duplicate or invalid read-service evidence boundary')
         pair[row['boundary']] = row
     phases = {}
-    fields = ('cache_hits', 'cache_misses', 'wal_reads', 'resident_read_successes', 'async_read_submissions')
+    fields = ('wal_reads', 'resident_read_successes', 'async_read_submissions')
     deferred_available = bool(rows) and 'resident_read_deferred' in rows[0]
     if deferred_available:
         fields += ('resident_read_deferred',)
@@ -1243,14 +1151,21 @@ def read_service_evidence(directory, mode, owner_partitions=range(5)):
         if set(pair) != {'before', 'after'}:
             raise ValueError('read-service evidence lacks complete interval')
         delta = {}
-        for field in fields:
-            before, after = int(pair['before'][field]), int(pair['after'][field])
+        source_fields = {field: field for field in fields} if role == 'storage' else {}
+        if role == 'frontend':
+            prefix = 'coordinator_' if 'coordinator_cache_hits' in pair['before'] else ''
+            source_fields.update({prefix + 'cache_hits': prefix + 'cache_hits',
+                                  prefix + 'cache_misses': prefix + 'cache_misses'})
+        elif role == 'storage' and 'cache_hits' in pair['before']:
+            source_fields.update(cache_hits='cache_hits', cache_misses='cache_misses')
+        for field, column in source_fields.items():
+            before, after = int(pair['before'][column]), int(pair['after'][column])
             if before < 0 or after < before:
                 raise ValueError('read-service counter reset or negative evidence')
             delta[field] = after - before
         delta['authority'] = None
         availability = tuple(pair[boundary].get('authority_available') for boundary in ('before', 'after'))
-        if any(value not in (None, 'true', 'false') for value in availability):
+        if any(value not in (None, '', 'true', 'false') for value in availability):
             raise ValueError('invalid authority-cache availability')
         if availability == ('true', 'true'):
             authority = {}
@@ -1385,11 +1300,10 @@ def validate_diagnostic_evidence(directory, spec, mode, owner_partitions):
     remote_fields = (
         'index_ns', 'dispatch_ns', 'wait_ns', 'actor_queue_ns', 'actor_service_ns',
         'actor_return_ns', 'request_encode_ns', 'exchange_ns', 'response_decode_ns',
-        'record_verify_ns', 'server_handler_ns', 'server_inventory_wait_ns',
+        'record_verify_ns', 'server_handler_ns',
         'server_authority_lookup_ns', 'server_record_read_ns', 'cache_hits', 'cache_misses',
         'whole_call_ns', 'inline_read_ns', 'server_response_recheck_wait_ns',
-        'server_response_recheck_ns', 'server_response_recheck_samples',
-        'server_response_recheck_deferrals', 'wire_read_requests')
+        'server_response_recheck_ns', 'server_response_recheck_samples', 'wire_read_requests')
     count = spec.get('workload_reads') or 4096
     reopened = 'reopened-warm' if native else 'reopened-cache-cleared'
     states = ['warm'] + (['cache-evicted'] if spec['cold'] else []) + [reopened]
@@ -1471,12 +1385,6 @@ def validate_diagnostic_evidence(directory, spec, mode, owner_partitions):
     if (len(records) != len(phases) or any(not isinstance(row, dict) for row in records)
             or [row.get('phase') for row in records] != phases):
         raise ValueError('diagnostic node profile phase population differs')
-    registered = resident_read_evidence(directory, owner_partitions)['phases'] if spec.get('resident_reads') else {}
-    registered_phases = {
-        'warm-profiled-read-diagnostics': 'point_get',
-        'warm-window-read-diagnostics': 'point_get_window',
-        'warm-batched-read-diagnostics': 'point_get_many',
-        'reopened-read-diagnostics': 'reopened_read_diagnostics'}
     for row in records:
         nodes = row.get('nodes')
         if (not same_case(row) or not isinstance(nodes, list) or len(nodes) != 5
@@ -1492,14 +1400,9 @@ def validate_diagnostic_evidence(directory, spec, mode, owner_partitions):
         # Bounded profiled reads can legitimately select only some batch owners.
         # Require every active owner's clocks, not merely a positive fleet sum.
         active = [profile for profile in counters if profile['client.requests'] > 0]
-        registered_hits = registered.get(registered_phases.get(row['phase']), {}).get('totals', {}).get('rma_hits', 0)
         if row['phase'] == 'load-write-diagnostics' and len(active) != len(counters):
             raise ValueError('diagnostic load did not exercise every owner')
         def positive(*keys):
-            if not active and registered_hits:
-                # FI_READ completion has no remote message handler. Keep those
-                # clocks not applicable rather than require a fictitious RPC.
-                return
             for key in keys:
                 if (any(key not in profile for profile in counters) or not active
                         or any(profile[key] <= 0 for profile in active)):
@@ -1887,7 +1790,6 @@ def operation_population_evidence(directory, spec, mode):
 def validate_auxiliary(root, state, cfg):
     """Fail closed on added controls; never relax the original paired-case count."""
     root = Path(root)
-    raw_rma_floor.validate_receipt(root, state, cfg)
     expected_plan = plan(cfg['kv_suite'], cfg['transports'])
     completed = state.get('completed_cases', [])
     floors = state.get('completed_floor_cases', [])
@@ -1907,12 +1809,8 @@ def validate_auxiliary(root, state, cfg):
             else:
                 require_clean_clocks(directory)
             validate_checkpoint_records(directory, spec, mode)
-            resident = resident_read_evidence(directory,
-                owner_partitions=[node['partition'] for node in cfg['nodes']])
-            registered_probe = require_registered_probe(spec, mode, resident)
             read_service.append(dict(case_id=case_id, mode=mode, diagnostic=spec['diagnostics'],
                 comparison_identity=comparison_identity(directory, spec, mode, cfg),
-                resident_reads=resident, registered_probe=registered_probe,
                 operations=operation_population_evidence(directory, spec, mode),
                 write_intervals=write_interval_evidence(directory, spec, mode,
                     [node['partition'] for node in cfg['nodes']]),
@@ -2078,13 +1976,12 @@ class CheckpointKvCampaign(Campaign):
                       cold=spec['cold'], diagnostics=spec['diagnostics'], transport=spec['transport'],
                       cached=spec['cached'], resource_evidence=True,
                       authority_resident_batches=spec['authority_resident_batches'],
-                      shard_cache_bytes=spec.get('shard_cache_bytes', 0),
                       transport_floor_probe=spec.get('transport_floor', False),
                       preparation_chunk_batches=spec.get('preparation_chunk_batches', 16),
                       workload_batches=spec.get('workload_batches'),
                       cache_hit_contention=spec.get('cache_hit_contention', False),
                       workload_reads=spec.get('workload_reads'), wal_layout=spec.get('wal_layout'),
-                      resident_reads=spec.get('resident_reads'), bounded_hot_reads=spec.get('bounded_hot_reads'),
+                      bounded_hot_reads=spec.get('bounded_hot_reads'),
                       cold_single_probes=spec.get('cold_single_probes'), cold_group_probes=spec.get('cold_group_probes'))
         completed = self.state['completed_cases'][completed_before:]
         case_id = completed_case_ids([spec], completed)[0]
@@ -2098,7 +1995,6 @@ class CheckpointKvCampaign(Campaign):
         try:
             write_json(self.results / 'plan.json', self.state)
             self.install()
-            raw_rma_floor.run_registered_floor(self)
             for ordinal, spec in enumerate(self.state['plan']):
                 self.run_planned_case(ordinal, spec)
             if len(self.state['completed_cases']) != 2 * len(self.state['plan']):
@@ -2134,13 +2030,11 @@ def planning_summary(cfg, *, sui_cell_seconds=155, fixed_seconds=600, kv_pair_se
     cases = plan(cfg['kv_suite'], cfg['transports'])
     cells = matrix_plan(cfg)
     work = cfg['ttl_seconds'] - cfg['export_reserve_seconds']
-    raw_reserve = 390 if raw_rma_floor.enabled(cfg) else 0
-    remaining = work - fixed_seconds - raw_reserve - len(cells) * sui_cell_seconds
+    remaining = work - fixed_seconds - len(cells) * sui_cell_seconds
     return dict(kv_pairs=len(cases), kv_processes=2 * len(cases),
         clean_kv_pairs=sum(not case['diagnostics'] for case in cases),
         diagnostic_kv_pairs=sum(case['diagnostics'] for case in cases),
         sui_cells=len(cells), sui_replays=2 * len(cells),
-        raw_rma_payloads=[256, 8192] if raw_reserve else [],
         bounded_hot_policy=bounded_hot_policy(8192, 2, True, cfg['kv_suite'].get('bounded_hot_reads')),
         physical_cold_probes_per_process=cfg['kv_suite'].get('cold_single_probes', 0),
         physical_cold_probes_total=2 * sum(case.get('cold_single_probes', 0) for case in cases),
@@ -2150,12 +2044,12 @@ def planning_summary(cfg, *, sui_cell_seconds=155, fixed_seconds=600, kv_pair_se
         ttl_seconds=cfg['ttl_seconds'], export_reserve_seconds=cfg['export_reserve_seconds'],
         measured_work_seconds=work, per_sui_replay_deadline_seconds=cfg['replay_deadline_seconds'],
         assumptions=dict(sui_cell_seconds=sui_cell_seconds, fixed_setup_seconds=fixed_seconds,
-                         raw_rma_reserve_seconds=raw_reserve, kv_pair_seconds=kv_pair_seconds),
+                         kv_pair_seconds=kv_pair_seconds),
         maximum_mean_kv_pair_seconds=remaining / len(cases) if cases else None,
-        estimated_work_seconds=(fixed_seconds + raw_reserve + len(cells) * sui_cell_seconds
+        estimated_work_seconds=(fixed_seconds + len(cells) * sui_cell_seconds
                                 + len(cases) * kv_pair_seconds) if kv_pair_seconds is not None else None,
         qualified=False,
-        scope='planning sensitivity only; 155s is observed local swapped Sui pair, setup/raw reserves are assumptions; new hot plus scalar/grouped physical-probe hardware timings unobserved; fixed absolute work/export deadlines remain authoritative')
+        scope='planning sensitivity only; 155s is observed local swapped Sui pair, setup reserve is assumed; new hot plus scalar/grouped physical-probe hardware timings unobserved; fixed absolute work/export deadlines remain authoritative')
 
 
 def main(argv=None):
@@ -2230,8 +2124,9 @@ def main(argv=None):
                                      json.loads(args.config.read_text()))
     elif args.action == 'evidence':
         result = dict(read_service=read_service_evidence(args.directory, args.mode),
-                      resident_reads=resident_read_evidence(args.directory),
                       bounded_hot=bounded_control_evidence(args.directory, args.mode))
+        if (args.directory / 'resident_reads.jsonl').is_file():
+            result['historical_registered_reads'] = resident_read_evidence(args.directory)
     else:
         match = (match_physical_cold_group if args.population == 'physical-cold-group' else
                  match_physical_cold if args.population == 'physical-cold' else

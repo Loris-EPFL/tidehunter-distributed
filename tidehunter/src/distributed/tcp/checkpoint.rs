@@ -194,7 +194,6 @@ impl Client {
         {
             return Err(TcpError::new("invalid retained WAL retirement decision"));
         }
-        self.revoke_resident_grants()?;
         match self.request(Request::RetireFiles {
             authority_epoch,
             epoch,

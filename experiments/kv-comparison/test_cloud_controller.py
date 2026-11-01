@@ -322,15 +322,14 @@ class OwnershipTests(unittest.TestCase):
 
 class CounterAdmissionTests(unittest.TestCase):
     def test_zero_hits_is_observation_not_fabricated_cache_success(self):
-        job = {"backend": "tidehunter_tcp", "coordinator_cache_bytes": 128 * 1024**2, "owner_read_cache_bytes": 0}
+        job = {"backend": "tidehunter_tcp", "coordinator_cache_bytes": 128 * 1024**2}
         evidence = {"schema_version": 1, "backend": "tidehunter_tcp",
             "coordinator": {"read_rpc_count": 42, "cache": {"budget_bytes": 128 * 1024**2, "hits": 0}},
-            "owner_read_configuration": [{"partition": i, "read_cache_bytes": 0, "read_resident_first": False,
-                "resident_reads": dict(controller.DISABLED_RESIDENT_READS)} for i in range(5)]}
+            "owner_read_configuration": [{"partition": i} for i in range(5)]}
         controller.verify_counter_evidence(job, evidence)
         for mutation in (lambda x: x["coordinator"]["cache"].update(budget_bytes=0),
                          lambda x: x.update(coordinator=None),
-                         lambda x: x["owner_read_configuration"][0].update(read_resident_first=True),
+                         lambda x: x["owner_read_configuration"][0].update(partition=1),
                          lambda x: x["owner_read_configuration"].pop()):
             broken = copy.deepcopy(evidence)
             mutation(broken)
@@ -338,26 +337,6 @@ class CounterAdmissionTests(unittest.TestCase):
                 controller.verify_counter_evidence(job, broken)
 
 
-    def test_registered_rma_policy_and_device_requirement_must_match_actual_owners(self):
-        resident = {**controller.DISABLED_RESIDENT_READS, "source_bytes": 2 * 1024**2,
-            "source_regions": 8, "destination_bytes": 2 * 1024**2, "destination_slots": 8,
-            "max_read_bytes": 65536, "max_handles": 8, "require_device_read": True}
-        job = {"backend": "tidehunter_efa_native", "coordinator_cache_bytes": 0,
-               "owner_read_cache_bytes": 0, "resident_reads": resident}
-        evidence = {"schema_version": 1, "backend": job["backend"],
-            "coordinator": {"read_rpc_count": 1, "cache": {"budget_bytes": 0}},
-            "owner_read_configuration": [{"partition": i, "read_cache_bytes": 0, "read_resident_first": True,
-                "resident_reads": dict(resident)} for i in range(5)]}
-        controller.verify_counter_evidence(job, evidence)
-        for value in (False, 1):
-            broken = copy.deepcopy(evidence)
-            broken["owner_read_configuration"][0]["resident_reads"]["require_device_read"] = value
-            with self.subTest(value=value), self.assertRaises(controller.SafetyError):
-                controller.verify_counter_evidence(job, broken)
-        broken = copy.deepcopy(evidence)
-        broken["owner_read_configuration"][2]["resident_reads"]["source_bytes"] = 0
-        with self.assertRaises(controller.SafetyError):
-            controller.verify_counter_evidence(job, broken)
 
 
 class BackendCleanupTests(unittest.TestCase):

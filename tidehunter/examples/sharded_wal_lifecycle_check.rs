@@ -1050,11 +1050,9 @@ fn controller(output: &Path, transport: &Transport) -> Result<()> {
             transport.clone(),
             2,
             WalMemberReadPolicy::Async,
-            0,
             128 * MIB,
             PollingPolicy::Adaptive,
             true,
-            tidehunter::distributed::tcp::ResidentReadConfig::default(),
         )?;
         let mut remote = owned.config.clone();
         cluster = Some(owned);

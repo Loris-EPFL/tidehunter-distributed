@@ -82,10 +82,6 @@ pub struct OperationalReadIoSnapshot {
     pub available: bool,
     pub failed_samples: u64,
     pub owners: Vec<(u32, super::tcp::ReadExecutorStats)>,
-    pub resident_available: bool,
-    pub residents: Vec<(u32, super::tcp::ResidentReadStats)>,
-    pub grants_available: bool,
-    pub grants: Vec<(u32, super::tcp::ResidentGrantStats)>,
 }
 struct OperationalReadIoState {
     snapshot: RwLock<OperationalReadIoSnapshot>,
@@ -173,14 +169,11 @@ impl OperationalReadIoSampler {
         Arc::downgrade(&self.lifecycle)
     }
 
-    fn activate(&self, reads: &Arc<ReadService>) {
-        Self::activate_lifecycle(&self.lifecycle, reads);
+    fn activate(&self) {
+        Self::activate_lifecycle(&self.lifecycle);
     }
 
-    pub(super) fn activate_lifecycle(
-        lifecycle: &Arc<Mutex<OperationalReadIoLifecycle>>,
-        reads: &Arc<ReadService>,
-    ) {
+    pub(super) fn activate_lifecycle(lifecycle: &Arc<Mutex<OperationalReadIoLifecycle>>) {
         let mut lifecycle = lifecycle.lock();
         if lifecycle.stopped || lifecycle.worker.is_some() {
             return;
@@ -190,7 +183,6 @@ impl OperationalReadIoSampler {
         };
         let state = lifecycle.state.clone();
         let thread_state = state.clone();
-        let reads = reads.clone();
         let (stop, stopped) = mpsc::sync_channel(1);
         let spawn_result = thread::Builder::new()
             .name("wal-operational-metrics".to_owned())
@@ -200,7 +192,6 @@ impl OperationalReadIoSampler {
                         pending.config,
                         pending.shape,
                         pending.tls_config,
-                        reads,
                         thread_state.clone(),
                         stopped,
                     )
@@ -249,11 +240,7 @@ impl OperationalReadIoSampler {
         }
         if let Some(mut snapshot) = state.snapshot.try_write() {
             snapshot.available = false;
-            snapshot.resident_available = false;
             snapshot.owners.clear();
-            snapshot.residents.clear();
-            snapshot.grants_available = false;
-            snapshot.grants.clear();
         }
     }
 }
@@ -268,10 +255,6 @@ fn mark_operational_sample_failed(state: &OperationalReadIoState) {
         snapshot.failed_samples = snapshot.failed_samples.saturating_add(1);
         snapshot.available = false;
         snapshot.owners.clear();
-        snapshot.resident_available = false;
-        snapshot.residents.clear();
-        snapshot.grants_available = false;
-        snapshot.grants.clear();
     }
 }
 
@@ -285,7 +268,6 @@ fn operational_sample_loop(
     config: RemoteDatabaseConfig,
     shape: KeyShape,
     tls_config: super::tcp::ClientTlsConfig,
-    reads: Arc<ReadService>,
     state: Arc<OperationalReadIoState>,
     stop: mpsc::Receiver<()>,
 ) {
@@ -297,8 +279,6 @@ fn operational_sample_loop(
         let attempt_started = Instant::now();
         let mut owners = Vec::with_capacity(config.endpoints.len());
         let mut available = true;
-        let mut grants = Vec::with_capacity(config.endpoints.len());
-        let mut grants_available = true;
         for (index, endpoint) in config.endpoints.iter().enumerate() {
             if stop.try_recv().is_ok() {
                 available = false;
@@ -307,7 +287,6 @@ fn operational_sample_loop(
             if clients[index].is_none() {
                 let mut tls = config.tls.clone();
                 tls.server_name = endpoint.server_name.clone();
-                tls.resident_reads = super::tcp::ResidentReadConfig::default();
                 clients[index] = Client::connect_operational_shared(
                     &endpoint.address,
                     &tls,
@@ -329,22 +308,7 @@ fn operational_sample_loop(
                     available = false;
                 }
             }
-            match clients[index].as_mut().map(Client::resident_grant_stats) {
-                Some(Ok(Some(stats))) => grants.push((endpoint.partition, stats)),
-                Some(Err(_)) => {
-                    clients[index] = None;
-                    grants_available = false;
-                }
-                Some(Ok(None)) | None => grants_available = false,
-            }
         }
-        let residents = reads.try_resident_read_stats().and_then(|samples| {
-            let mut rows = Vec::with_capacity(samples.len());
-            for (node, stats) in samples {
-                rows.push((config.endpoints.get(node as usize)?.partition, stats));
-            }
-            (rows.len() == config.endpoints.len()).then_some(rows)
-        });
         if !state.stopped.load(std::sync::atomic::Ordering::Acquire)
             && let Some(mut snapshot) = state.snapshot.try_write()
         {
@@ -359,14 +323,6 @@ fn operational_sample_loop(
             } else {
                 Vec::new()
             };
-            snapshot.resident_available = residents.is_some();
-            snapshot.residents = residents.unwrap_or_default();
-            snapshot.grants_available = grants_available && grants.len() == config.endpoints.len();
-            snapshot.grants = if snapshot.grants_available {
-                grants
-            } else {
-                Vec::new()
-            };
         }
         match stop.recv_timeout(OPERATIONAL_SAMPLE_INTERVAL) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -374,16 +330,7 @@ fn operational_sample_loop(
         }
     }
 }
-/// A sequential local snapshot of one instantiated read lane.
-/// Session presence is local state, not a fresh peer-health probe.
-pub struct ResidentReadLaneSnapshot {
-    pub partition: u32,
-    pub lane: usize,
-    pub session_present: Option<bool>,
-    pub stats: super::tcp::ResidentReadStats,
-}
-
-/// Explicit benchmark evidence handle; resident-lane reads may wait on a lane.
+/// Explicit benchmark evidence handle for owner read I/O.
 pub struct ReadEvidenceMonitor {
     clients: Vec<(u32, Arc<Mutex<Client>>)>,
     reads: Arc<ReadService>,
@@ -406,55 +353,6 @@ impl ReadEvidenceMonitor {
                     .map_err(LocalDbError::component)
             })
             .collect()
-    }
-    /// Sample node-cumulative grant decisions and source occupancy once per
-    /// owner outside the measured interval. Replies are not a global cut.
-    pub fn sample_owner_grants(
-        &self,
-    ) -> Result<Vec<(u32, super::tcp::ResidentGrantStats)>, LocalDbError> {
-        self.reads.ensure_idle()?;
-        self.clients
-            .iter()
-            .map(|(partition, client)| {
-                let stats = client
-                    .lock()
-                    .resident_grant_stats()
-                    .map_err(LocalDbError::component)?
-                    .ok_or_else(|| LocalDbError::new("owner grant statistics unavailable"))?;
-                Ok((*partition, stats))
-            })
-            .collect()
-    }
-
-    /// Per-partition client-side RMA counters; this does not make an RPC.
-    pub fn sample_resident_reads(
-        &self,
-    ) -> Result<Vec<(u32, super::tcp::ResidentReadStats)>, LocalDbError> {
-        let mut samples = self.reads.resident_read_stats();
-        for (node, _) in &mut samples {
-            *node = self.clients[*node as usize].0;
-        }
-        Ok(samples)
-    }
-    /// Per configured read lane, for proving warmed coverage before timing.
-    pub fn sample_resident_read_lanes(
-        &self,
-    ) -> Result<Vec<(u32, usize, super::tcp::ResidentReadStats)>, LocalDbError> {
-        let mut samples = self.reads.resident_read_lane_stats();
-        for (node, _, _) in &mut samples {
-            *node = self.clients[*node as usize].0;
-        }
-        Ok(samples)
-    }
-    /// Sample actual instantiated lanes after reads drain. A stopped service
-    /// returns an error rather than an apparently valid empty population.
-    pub fn sample_resident_read_lane_snapshots(
-        &self,
-    ) -> Result<Vec<ResidentReadLaneSnapshot>, LocalDbError> {
-        self.reads.ensure_idle()?;
-        self.reads.resident_read_lane_snapshots(|node| {
-            self.clients.get(node).map(|(partition, _)| *partition)
-        })
     }
 }
 
@@ -1329,7 +1227,7 @@ pub struct RemoteDatabase {
 }
 
 impl RemoteDatabase {
-    /// Install a verified sealed-WAL reader while all reads and grants are idle.
+    /// Install a verified sealed-WAL reader while all reads are idle.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn install_nvmeof_reader(
         &self,
@@ -1597,14 +1495,8 @@ impl RemoteDatabase {
             tls_config.clone(),
             retained_reads,
         )?;
-        let connected = transports::connect(
-            &config,
-            &shape,
-            tls_config.clone(),
-            1,
-            false,
-            retained_controls,
-        )?;
+        let connected =
+            transports::connect(&config, &shape, tls_config.clone(), 1, retained_controls)?;
         recovery_stats.connection_setup_ns = connected.elapsed_ns;
         recovery_stats.created_connections = (connected.clients.len() - connected.reused) as u64;
         recovery_stats.reused_connections = connected.reused as u64;
@@ -1913,7 +1805,7 @@ impl RemoteDatabase {
         }
     }
     pub fn operational_read_io_monitor(&self) -> OperationalReadIoMonitor {
-        self.operational_sampler.activate(&self.reads);
+        self.operational_sampler.activate();
         self.operational_sampler.monitor()
     }
 
@@ -3601,15 +3493,6 @@ impl RemoteDatabase {
             result = self.commit_checkpoint();
         }
         self.shutdown_stats.checkpoint_ns = elapsed(started);
-        let _resident_pause = match self.reads.pause_and_release_resident_grants() {
-            Ok(pause) => Some(pause),
-            Err(error) => {
-                if result.is_ok() {
-                    result = Err(error);
-                }
-                None
-            }
-        };
         let started = Instant::now();
         let read_clients = if result.is_ok() && self.transport_pool.is_some() {
             self.reads.stop_with_clients()

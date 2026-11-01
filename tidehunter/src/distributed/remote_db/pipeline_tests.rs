@@ -78,7 +78,6 @@ impl Fixture {
                 cert: certs.authority.certificate.clone(),
                 key: certs.authority.private_key.clone(),
                 server_name: String::new(),
-                resident_reads: super::super::tcp::ResidentReadConfig::default(),
             },
             // Five-node startup/replay shares disk and CPU with the full suite.
             // This is a bounded liveness guard, not a latency assertion.
@@ -111,12 +110,10 @@ impl Fixture {
                     read_workers: 2,
                     wal_member_read: Default::default(),
                     read_resident_first: false,
-                    read_cache_bytes: 0,
                     read_memory_allowance_bytes: 512 * 1024 * 1024,
                     read_max_inflight_requests: 32,
                     read_max_inflight_bytes: 64 * 1024 * 1024,
                     read_max_device_reads: 128,
-                    resident_reads: super::super::tcp::ResidentReadConfig::default(),
                 },
                 metrics(),
             )
@@ -133,7 +130,6 @@ impl Fixture {
                 cert: identity.certificate,
                 key: identity.private_key,
                 server_name: identity.server_name,
-                resident_reads: super::super::tcp::ResidentReadConfig::default(),
             };
             let serving = Arc::clone(&node);
             let stop = Arc::clone(&shutdown);

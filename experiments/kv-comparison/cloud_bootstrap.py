@@ -26,8 +26,8 @@ def validate_plan(plan):
                 "bundle_sha256", "bundle_bytes", "source_sha256", "binary_sha256",
                 "deadline_utc", "ttl_seconds", "instance_type"}
     if (not isinstance(plan, dict) or not required <= set(plan)
-            or set(plan) - required - {"read_tier_trace"}
-            or ("read_tier_trace" in plan and type(plan["read_tier_trace"]) is not bool)):
+            or set(plan) - required - {"read_tier_trace", "nvmeof"}
+            or any(type(plan[field]) is not bool for field in ("read_tier_trace", "nvmeof") if field in plan)):
         raise ValueError("exact bootstrap plan schema required")
     if plan["account"] != "354775971805" or not re.fullmatch(r"th-[a-f0-9]{16}", plan["run_id"]):
         raise ValueError("wrong account or run ID")
@@ -95,8 +95,11 @@ def activation_config(plan, value):
         raise ValueError("ready controller config differs from admitted run/source/binary/account/bucket")
     if config["fleet"]["run_id"] != plan["run_id"] or config["fleet"]["region"] != plan["region"]:
         raise ValueError("ready fleet differs from admitted run/region")
-    if plan.get("read_tier_trace", False) != (config["spec"].get("mode", "standard") in ("read-tier", "read-tier-focused")):
+    mode = config["spec"].get("mode", "standard")
+    if plan.get("read_tier_trace", False) != (mode in ("read-tier", "read-tier-focused", "nvmeof-focused")):
         raise ValueError("read-tier trace preparation differs from admitted campaign mode")
+    if plan.get("nvmeof", False) != (mode == "nvmeof-focused"):
+        raise ValueError("NVMe/TCP kernel preparation differs from admitted campaign mode")
     configured_deadline = datetime.fromisoformat(config["deadline_utc"].replace("Z", "+00:00"))
     planned_deadline = datetime.fromisoformat(plan["deadline_utc"].replace("Z", "+00:00"))
     if configured_deadline != planned_deadline:
@@ -130,6 +133,19 @@ def render_userdata(plan):
     trace_install = ("if ! timeout 180 apt-get install -y bpftrace; then "
                      "echo 'optional bpftrace unavailable; collector will report capability gap' >&2; fi"
                      if plan.get("read_tier_trace", False) else "")
+    nvme_install = ("""
+timeout 180 apt-get install -y nvme-cli
+if ! modprobe nvmet-tcp || ! modprobe nvme-tcp; then
+  timeout 600 apt-get install -y "linux-modules-extra-$(uname -r)"
+fi
+modprobe nvmet-tcp
+modprobe nvme-tcp
+mkdir -p /sys/kernel/config /sys/kernel/tracing
+mountpoint -q /sys/kernel/config || mount -t configfs none /sys/kernel/config
+mountpoint -q /sys/kernel/tracing || mount -t tracefs none /sys/kernel/tracing
+test -d /sys/kernel/config/nvmet
+test -d /sys/kernel/tracing/events/nvmet
+""" if plan.get("nvmeof", False) else "")
     capsule = base64.b85encode(lzma.compress(json.dumps({
         "bootstrap": (old / "bootstrap.py").read_text(),
         "install": Path(__file__).read_text(), "plan": plan}).encode())).decode()
@@ -150,6 +166,7 @@ export PYTHONDONTWRITEBYTECODE=1
 timeout 600 apt-get update -o Acquire::Retries=2
 timeout 900 apt-get install -y python3-boto3 python3-yaml docker.io binutils curl ca-certificates openssl pkg-config libclang-dev rdma-core
 {trace_install}
+{nvme_install}
 systemctl enable --now docker
 {efa}
 if systemctl cat snap.amazon-ssm-agent.amazon-ssm-agent.service >/dev/null 2>&1; then
@@ -317,8 +334,11 @@ def install(plan):
     # Pulls are bounded, digest-locked, and failures remain explicit evidence.
     monitor_images = cache_monitor_images(stage / "source", index, planned_deadline)
     (root / "monitor-image-proof.json").write_text(json.dumps(monitor_images, indent=2) + "\n")
+    uname = os.uname()
     ready = {"run_id": plan["run_id"], "instance_id": bootstrap["identity"]["instanceId"],
-        "source_sha256": plan["source_sha256"], "binary_sha256": plan["binary_sha256"], "deadline_utc": plan["deadline_utc"]}
+        "source_sha256": plan["source_sha256"], "binary_sha256": plan["binary_sha256"], "deadline_utc": plan["deadline_utc"],
+        "kernel": {"release": uname.release, "version": uname.version, "machine": uname.machine},
+        "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
     marker = root / "kv-bootstrap-ready.json"
     temporary = marker.with_suffix(".tmp")
     temporary.write_text(json.dumps(ready, indent=2) + "\n")

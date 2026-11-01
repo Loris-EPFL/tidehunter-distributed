@@ -185,6 +185,12 @@ impl KvBackend for NativeBackend {
         self.info()
     }
 
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    fn evict_mapped_wal_before_measurement(&self) -> BackendResult<serde_json::Value> {
+        let evidence = self.db.read_evidence_for_benchmark(true)?;
+        Ok(serde_json::json!({"backend":"native", "process":evidence}))
+    }
+
     async fn get(&self, key: &[u8]) -> BackendResult<Option<Bytes>> {
         self.db.get(self.keyspace, key).map_err(native_error)
     }

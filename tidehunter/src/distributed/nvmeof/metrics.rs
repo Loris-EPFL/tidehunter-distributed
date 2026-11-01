@@ -25,6 +25,9 @@ pub struct NvmeofStats {
     pub epoch: u64,
     pub partition: u32,
     pub export_uuid: [u8; 16],
+    /// Kernel-verified namespace transport; None for ordinary-file test fixtures.
+    #[serde(default)]
+    pub transport: Option<super::NvmeofTransport>,
     pub logical_requests: u64,
     pub logical_members: u64,
     pub eligible_hits: u64,

@@ -6,7 +6,6 @@ import time
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from resident_config import resident_read_config
 
 
 FABRIC_LOCAL_PREFIX = b'TIDEHUNTER_FABRIC_LOCAL_DIAGNOSTICS'
@@ -106,15 +105,12 @@ def fabric_local_archive_log(archive, name, *, required=False, forbidden=False):
     return validate_fabric_local_population(result, name, required, forbidden)
 
 
-def cell_resident_reads(cfg, transport, cell=None):
-    """Hardware campaigns retain an OFF baseline and a separately named ON arm."""
-    profile = resident_read_config((cfg.get('kv_suite') or {}).get('resident_reads'))
-    if (cfg.get('kv_suite') or {}).get('scope') == 'hardware-populations':
-        return profile if transport == 'efa-native' and cell and cell.get('resident_reads') == profile else resident_read_config()
-    return profile if transport == 'efa-native' else resident_read_config()
-
 
 def matrix_plan(cfg):
+    if {'shard_cache_mib', 'shard_cache_mib_by_repetition'} & cfg.keys():
+        raise ValueError('owner cache configuration is obsolete')
+    if 'resident_reads' in (cfg.get('kv_suite') or {}):
+        raise ValueError('registered value reads are obsolete')
     transports = cfg.get('transports')
     repetitions = cfg.get('repetitions')
     if ('transport' in cfg or not isinstance(transports, list) or not transports
@@ -139,13 +135,12 @@ def matrix_plan(cfg):
             or any(type(limit) is not int or not 0 <= limit <= 65536 for limit in native_limits)):
         raise ValueError('require native_write_profile_limits with one integer 0..65536 per repetition')
     cache_budgets = {}
-    for name, default in (('coordinator_cache_mib', 8), ('shard_cache_mib', 0)):
+    for name, default in (('coordinator_cache_mib', 8),):
         budgets = cfg.get(name + '_by_repetition', [cfg.get(name, default)] * repetitions)
         if (not isinstance(budgets, list) or len(budgets) != repetitions
                 or any(type(value) is not int or not 0 <= value <= 128 for value in budgets)):
             raise ValueError('cache schedules require one integer 0..128 MiB per repetition')
         cache_budgets[name] = budgets
-    resident = resident_read_config((cfg.get('kv_suite') or {}).get('resident_reads'))
     cells = [dict(cell_id=f'r{repeat + 1:02d}-{transport}', repetition=repeat + 1,
                   transport=transport, ordinal=ordinal, read_profile_limit=limits[repeat],
                   write_profile_limit=write_limits[repeat], native_write_profile_limit=native_limits[repeat],
@@ -153,13 +148,33 @@ def matrix_plan(cfg):
              for ordinal, (repeat, transport) in enumerate(
                  ( (repeat, transport) for repeat in range(repetitions)
                    for transport in (transports if repeat % 2 == 0 else transports[::-1]) ))]
+    return cells
+
+def historical_matrix_plan(cfg):
+    """Decode the retired owner-cache/grant schema of frozen campaigns only."""
+    from resident_config import resident_read_config
+
+    clean = {key: value for key, value in cfg.items()
+             if key not in ('shard_cache_mib', 'shard_cache_mib_by_repetition')}
+    clean['kv_suite'] = {key: value for key, value in (cfg.get('kv_suite') or {}).items()
+                         if key != 'resident_reads'}
+    cells = matrix_plan(clean)
+    repetitions = cfg['repetitions']
+    budgets = cfg.get('shard_cache_mib_by_repetition', [cfg.get('shard_cache_mib', 0)] * repetitions)
+    if (not isinstance(budgets, list) or len(budgets) != repetitions
+            or any(type(value) is not int or not 0 <= value <= 128 for value in budgets)):
+        raise ValueError('historical owner cache schedule is invalid')
+    resident = resident_read_config((cfg.get('kv_suite') or {}).get('resident_reads'))
+    for cell in cells:
+        cell['shard_cache_mib'] = budgets[cell['repetition'] - 1]
     if (cfg.get('kv_suite') or {}).get('scope') == 'hardware-populations':
+        limits = cfg['read_profile_limits']
         if (repetitions != 3 or limits[:2] != [0, 0] or limits[2] == 0
-                or write_limits != limits or native_limits != limits
-                or cache_budgets['coordinator_cache_mib'] != [0, 8, 0]
-                or cache_budgets['shard_cache_mib'] != [8, 8, 8]
-                or not resident['destination_slots'] or not resident['require_device_read']):
-            raise ValueError('hardware Sui requires two clean coor0/8MiB controls, owner8MiB and separate clocks')
+                or cfg.get('write_profile_limits', [0] * repetitions) != limits
+                or cfg.get('native_write_profile_limits', [0] * repetitions) != limits
+                or [cell['coordinator_cache_mib'] for cell in cells if cell['transport'] == cfg['transports'][0]] != [0, 8, 0]
+                or budgets != [8, 8, 8] or not resident['destination_slots'] or not resident['require_device_read']):
+            raise ValueError('historical hardware matrix policy differs')
         focused = []
         for cell in cells:
             if cell['repetition'] == 3 and cell['transport'] != 'efa-native':
@@ -262,24 +277,33 @@ def validate_efa_proof(proof, identity):
 
 
 def validate_matrix(cfg, cells):
-    plan = matrix_plan(cfg)
+    return _validate_matrix(cfg, cells, matrix_plan(cfg), historical=False)
+
+
+def validate_historical_matrix(cfg, cells):
+    """Validate retained historical reports without admitting old runtime controls."""
+    return _validate_matrix(cfg, cells, historical_matrix_plan(cfg), historical=True)
+
+
+def _validate_matrix(cfg, cells, plan, *, historical):
     if len(cells) != len(plan):
         raise ValueError('matrix misses requested cells')
     hashes, namespace_ids = set(), set()
     namespaces = None
     for planned, cell in zip(plan, cells):
+        if not historical and {'resident_reads', 'shard_cache_mib'} & cell.keys():
+            raise ValueError('matrix cell contains obsolete owner-cache or registered-read policy')
         if (type(cell.get('read_profile_limit')) is not int
                 or type(cell.get('write_profile_limit', 0)) is not int
                 or type(cell.get('native_write_profile_limit', 0)) is not int
-                or type(cell.get('coordinator_cache_mib')) is not int
-                or type(cell.get('shard_cache_mib')) is not int):
+                or type(cell.get('coordinator_cache_mib')) is not int):
             raise ValueError('matrix cell profile limits and cache budgets must be integers')
+        if historical and (type(cell.get('shard_cache_mib')) is not int
+                           or cell.get('resident_reads') != planned.get('resident_reads')):
+            raise ValueError('historical matrix owner-cache or registered-read policy differs')
         if any(cell.get(key, 0 if key in ('write_profile_limit', 'native_write_profile_limit') else None) != value
                for key, value in planned.items()) or cell.get('complete') is not True:
             raise ValueError('matrix cell missing, reordered, mismatched or incomplete')
-        if cell.get('resident_reads') != planned.get('resident_reads'):
-            raise ValueError('matrix cell registered-read policy differs from the canonical profile')
-        resident_read_config(cell.get('resident_reads'))
         if cell.get('build_manifest_sha256') != cfg['build_manifest_sha256'] or cell.get('binaries') != cfg['binaries']:
             raise ValueError('matrix cell source differs')
         for key in ('fixture_bundle', 'verification_bundle', 'source_archive_sha256', 'source_manifest_sha256'):

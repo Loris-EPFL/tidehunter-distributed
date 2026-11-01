@@ -545,8 +545,6 @@ class PreparedResidentPolicyTests(unittest.TestCase):
         campaign.deadline = campaign.cfg['deadline_utc']
         campaign.cfg.update(transports=[transport], repetitions=1, read_profile_limits=[0],
                             write_profile_limits=[0], native_write_profile_limits=[0])
-        if profile is not None:
-            campaign.cfg['kv_suite'] = dict(resident_reads=profile)
         campaign.cell = supervisor.matrix_plan(campaign.cfg)[0]
         campaign.root, campaign.cell_root = root, root / 'cell'
         campaign.cell_root.mkdir()
@@ -596,33 +594,27 @@ class PreparedResidentPolicyTests(unittest.TestCase):
             campaign.prepare()
         return campaign, commands, uploads
 
-    def test_cloud_prepare_passes_real_registered_profile_to_existing_producer(self):
+    def test_cloud_prepare_uses_current_transport_schema(self):
         import yaml
         with tempfile.TemporaryDirectory() as temporary:
-            profile = resident_profile()
-            campaign, commands, uploads = self.prepare_campaign(Path(temporary), profile)
-            command = commands[0]
-            policy = Path(command[command.index('--resident-reads') + 1])
-            self.assertEqual(policy, campaign.cell_root / 'resident-reads.json')
-            self.assertEqual(supervisor.read_json(policy), profile)
-            self.assertEqual(supervisor.read_json(campaign.results / 'resident-reads.json'), profile)
-            self.assertEqual(campaign.cell['resident_reads'], profile)
-            self.assertEqual(campaign.external['resident_reads'], profile)
+            campaign, commands, uploads = self.prepare_campaign(Path(temporary), None)
+            self.assertNotIn('--resident-reads', commands[0])
+            self.assertNotIn('--shard-cache-mib', commands[0])
+            self.assertNotIn('resident_reads', campaign.external)
+            self.assertNotIn('shard_cache_bytes', campaign.external)
             prepared = supervisor.read_json(campaign.deployment / 'config.json')
             for database in prepared['databases'].values():
                 self.assertEqual(database['tls']['transport'], transport_for_case(campaign.cell['transport']))
-            self.assertEqual(campaign.external['owner_transports'], select_transports(
-                transport_for_case(campaign.cell['transport']), None, 5))
+                self.assertNotIn('resident_reads', database['tls'])
             self.assertEqual(len(uploads), 5)
             for archive in uploads:
                 with tarfile.open(archive) as stream:
-                    launches = [member for member in stream.getmembers() if member.name.endswith('/launch.yaml')]
-                    self.assertEqual(len(launches), 1)
-                    with stream.extractfile(launches[0]) as source:
+                    launch_name = next(member for member in stream.getmembers() if member.name.endswith('/launch.yaml'))
+                    with stream.extractfile(launch_name) as source:
                         launch = yaml.safe_load(source)
-                    self.assertEqual(launch['tls']['transport'],
-                                     transport_for_case(campaign.cell['transport']))
-                    self.assertEqual(launch['tls']['cert'], '')
+                    self.assertNotIn('read_cache_bytes', launch['node'])
+                    self.assertNotIn('resident_reads', launch['node'])
+                    self.assertNotIn('resident_reads', launch['tls'])
 
     def test_tcp_storage_artifacts_contain_the_same_complete_source_bound_worker_runner(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -655,64 +647,18 @@ class PreparedResidentPolicyTests(unittest.TestCase):
                                           source_change=change, captured_uploads=uploads)
                 self.assertEqual(uploads, [])
 
-    def test_actual_coordinator_and_manifest_policy_cannot_be_silently_omitted_or_changed(self):
+    def test_retired_fields_in_prepared_policy_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
-            campaign, _, _ = self.prepare_campaign(Path(temporary), resident_profile())
+            campaign, _, _ = self.prepare_campaign(Path(temporary), None)
             prepared = supervisor.read_json(campaign.deployment / 'config.json')
             namespace = next(iter(prepared['databases']))
-            for field in ('coordinator-missing', 'coordinator-changed', 'manifest-missing',
-                          'manifest-changed', 'cell-missing'):
-                config, external, cell = copy.deepcopy((prepared, campaign.external, campaign.cell))
-                if field == 'coordinator-missing':
-                    config['databases'][namespace]['tls'].pop('resident_reads')
-                elif field == 'coordinator-changed':
-                    config['databases'][namespace]['tls']['resident_reads']['max_handles'] += 1
-                elif field == 'manifest-missing':
-                    external.pop('resident_reads')
-                elif field == 'manifest-changed':
-                    external['resident_reads']['max_handles'] += 1
-                else:
-                    cell.pop('resident_reads')
-                with self.subTest(field=field), self.assertRaises(ValueError):
-                    supervisor.validate_prepared_cell(campaign.cfg, cell, config, external)
-
-    def test_missing_and_disabled_native_profile_keep_rpc_deployment_and_old_metadata(self):
-        for profile in (None, supervisor.resident_read_config()):
-            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as temporary:
-                campaign, commands, _ = self.prepare_campaign(Path(temporary), profile)
-                self.assertNotIn('--resident-reads', commands[0])
-                self.assertFalse((campaign.cell_root / 'resident-reads.json').exists())
-                self.assertNotIn('resident_reads', campaign.cell)
-                prepared = supervisor.read_json(campaign.deployment / 'config.json')
-                self.assertTrue(all('resident_reads' not in database['tls']
-                                    for database in prepared['databases'].values()))
-                self.assertEqual(campaign.external['resident_reads'], supervisor.resident_read_config())
-
-    def test_enabled_profile_does_not_change_actual_tcp_tls_deployment(self):
-        import yaml
-        with tempfile.TemporaryDirectory() as temporary:
-            campaign, commands, uploads = self.prepare_campaign(Path(temporary), resident_profile(), 'tcp')
-            self.assertNotIn('--resident-reads', commands[0])
-            self.assertNotIn('resident_reads', campaign.cell)
-            prepared = supervisor.read_json(campaign.deployment / 'config.json')
-            database = next(iter(prepared['databases'].values()))
-            self.assertEqual(database['tls']['transport'], transport_for_case('tcp'))
-            self.assertNotIn('resident_reads', database['tls'])
-            self.assertTrue(all(database['tls'][name] for name in ('ca', 'cert', 'key')))
-            for archive in uploads:
-                with tarfile.open(archive) as stream:
-                    names = stream.getnames()
-                    self.assertIn('tls/ca.der', names)
-                    launch_name = next(name for name in names if name.endswith('/launch.yaml'))
-                    with stream.extractfile(launch_name) as source:
-                        launch = yaml.safe_load(source)
-                    self.assertNotIn('resident_reads', launch['node'])
-                    self.assertEqual(launch['tls']['transport'], transport_for_case('tcp'))
-            self.assertEqual(campaign.external['resident_reads'], supervisor.resident_read_config())
             changed = copy.deepcopy(prepared)
-            next(iter(changed['databases'].values()))['tls']['resident_reads'] = resident_profile()
+            changed['databases'][namespace]['tls']['resident_reads'] = {}
             with self.assertRaises(ValueError):
                 supervisor.validate_prepared_cell(campaign.cfg, campaign.cell, changed, campaign.external)
+            external = campaign.external | dict(shard_cache_bytes=0)
+            with self.assertRaises(ValueError):
+                supervisor.validate_prepared_cell(campaign.cfg, campaign.cell, prepared, external)
 
 
 class LifecycleTests(unittest.TestCase):

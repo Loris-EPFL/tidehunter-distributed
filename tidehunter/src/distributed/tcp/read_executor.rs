@@ -22,7 +22,6 @@ const RESIDENT_NOWAIT_MAX_BYTES: usize = 64 * 1024;
 const RESIDENT_NOWAIT_MAX_MEMBER_BYTES: usize = 16 * 1024;
 // At most 32 successful probes per request, spread over fair owner sweeps.
 const RESIDENT_NOWAIT_MAX_SWEEPS: usize = 8;
-mod cache;
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
 
@@ -30,7 +29,6 @@ mod tests;
 use super::super::storage::PartitionLog;
 use super::super::storage::{RecordReadPlan, StorageError};
 use super::super::types::ValueRecordReference;
-use super::ReadClass;
 #[cfg(target_os = "linux")]
 use io_uring::{IoUring, opcode, squeue, types};
 use minibytes::Bytes;
@@ -48,7 +46,6 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReadExecutorConfig {
-    pub(crate) cache_bytes: usize,
     pub(crate) memory_allowance_bytes: usize,
     pub(crate) max_requests: usize,
     pub(crate) max_bytes: usize,
@@ -58,7 +55,6 @@ pub(crate) struct ReadExecutorConfig {
 impl Default for ReadExecutorConfig {
     fn default() -> Self {
         Self {
-            cache_bytes: 0,
             memory_allowance_bytes: 512 * 1024 * 1024,
             max_requests: 32,
             max_bytes: 64 * 1024 * 1024,
@@ -68,56 +64,25 @@ impl Default for ReadExecutorConfig {
     }
 }
 impl ReadExecutorConfig {
-    pub(crate) fn cache_metadata_bytes(self) -> usize {
-        cache::Cache::metadata_bytes(self.cache_bytes)
-    }
     pub(crate) fn validate(self) -> Result<(), StorageError> {
         if self.memory_allowance_bytes == 0
-            || self
-                .cache_bytes
-                .checked_add(self.max_bytes)
-                .is_none_or(|bytes| bytes > self.memory_allowance_bytes)
+            || self.max_bytes > self.memory_allowance_bytes
             || !(1..=4096).contains(&self.max_requests)
             || !(1..=256 * 1024 * 1024).contains(&self.max_bytes)
             || !(1..=4096).contains(&self.max_device_reads)
         {
-            return Err(StorageError::Invalid(
-                "invalid asynchronous read/cache bounds",
-            ));
+            return Err(StorageError::Invalid("invalid asynchronous read bounds"));
         }
         Ok(())
     }
 }
 
-/// Node-wide counters. Bytes are requested retained allocation sizes, not RSS:
-/// cache includes fixed slots and exact payload/Arc owners; pending includes
-/// buffers, prepared Full-retry state and conservative request/member/map metadata.
-/// Idle reusable buffers share max_bytes with pending reservations, not an
-/// additional memory budget. Their bounded pointer table (at most
-/// min(max_device_reads, 128)) and reusable request tables/SQE scratch/kernel
-/// rings are metadata outside payload budgets. Allocator rounding is excluded.
-/// Leases retain credit through prepared retries and reply retirement. Cache
-/// and credit snapshots are sampled independently. Cache/response clones share
-/// storage; budgets remain conservative, not unique RSS.
+/// Node-wide counters. Pending bytes include buffers, prepared retry state and
+/// conservative request/member/map metadata. Idle reusable buffers share
+/// max_bytes with pending reservations; allocator rounding is excluded.
+/// Leases retain credit through prepared retries and reply retirement.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReadExecutorStats {
-    pub cache_hits: u64,
-    pub cache_misses: u64,
-    pub cache_inserts: u64,
-    pub cache_evictions: u64,
-    pub cache_oversized: u64,
-    pub cache_bypass_disabled: u64,
-    pub cache_bypass_eviction_limit: u64,
-    pub cache_bypass_scan: u64,
-    pub cache_bypass_generation: u64,
-    /// Charged exact member allocation bytes admitted; excludes fixed slots.
-    pub cache_admitted_bytes: u64,
-    /// Encoded member bytes served by hits, not currently caller-held bytes.
-    pub cache_served_bytes: u64,
-    pub cache_entries: usize,
-    pub cache_bytes: usize,
-    pub cache_metadata_bytes: usize,
-    pub cache_budget: usize,
     /// Shard authority-cache snapshot; `None` means unavailable, not zero.
     pub authority: Option<super::super::storage::AuthorityCacheStats>,
     /// Logical WAL member reads admitted, including synchronous diagnostics.
@@ -162,35 +127,17 @@ struct AdmissionState {
     devices: HashMap<u64, usize>,
     buffers: Vec<Box<[MaybeUninit<u8>]>>,
 }
-struct CacheState {
-    cache: cache::Cache,
-    stats: ReadExecutorStats,
-    generation: u64,
-}
-/// Shared by ALL node connection rings: cache and request/byte/device limits
-/// never multiply with connection count. No mutex is held during a syscall.
-/// Cache lookup/eviction never holds the admission mutex on entry. Final-owner
-/// recycling may take admission under cache; admission never takes cache.
-/// The admission lock makes cross-connection budgets and buffer recycling
-/// atomic; the cache lock protects CLOCK mutation, clones and clear generations.
-/// Neither is replaced by unprotected reclamation or held across submission.
+/// Shared by all node connection rings. The admission lock makes budgets and
+/// buffer recycling atomic and is never held across a syscall or submission.
 pub(crate) struct ReadAdmission {
     config: ReadExecutorConfig,
     state: Mutex<AdmissionState>,
-    cache: Mutex<CacheState>,
 }
 impl ReadAdmission {
     pub(crate) fn new(config: ReadExecutorConfig) -> Result<Self, StorageError> {
         config.validate()?;
-        let mut stats = ReadExecutorStats::default();
-        let cache = cache::Cache::new(config.cache_bytes, &mut stats);
         Ok(Self {
             config,
-            cache: Mutex::new(CacheState {
-                cache,
-                stats,
-                generation: 0,
-            }),
             state: Mutex::new(AdmissionState {
                 stats: ReadExecutorStats::default(),
                 devices: HashMap::new(),
@@ -199,39 +146,11 @@ impl ReadAdmission {
         })
     }
     pub(crate) fn stats(&self) -> ReadExecutorStats {
-        let cache = self.cache.lock().stats;
-        let mut stats = self.state.lock().stats;
-        stats.cache_inserts = cache.cache_inserts;
-        stats.cache_evictions = cache.cache_evictions;
-        stats.cache_oversized = cache.cache_oversized;
-        stats.cache_entries = cache.cache_entries;
-        stats.cache_bytes = cache.cache_bytes;
-        stats.cache_metadata_bytes = cache.cache_metadata_bytes;
-        stats.cache_budget = cache.cache_budget;
-        stats.cache_bypass_disabled = cache.cache_bypass_disabled;
-        stats.cache_bypass_eviction_limit = cache.cache_bypass_eviction_limit;
-        stats.cache_bypass_scan = cache.cache_bypass_scan;
-        stats.cache_bypass_generation = cache.cache_bypass_generation;
-        stats.cache_admitted_bytes = cache.cache_admitted_bytes;
-        stats
+        self.state.lock().stats
     }
     /// Nonblocking operational snapshot. Contention makes the whole sample unavailable.
     pub(crate) fn try_stats(&self) -> Option<ReadExecutorStats> {
-        let cache = self.cache.try_lock()?;
-        let mut stats = self.state.try_lock()?.stats;
-        stats.cache_inserts = cache.stats.cache_inserts;
-        stats.cache_evictions = cache.stats.cache_evictions;
-        stats.cache_oversized = cache.stats.cache_oversized;
-        stats.cache_entries = cache.stats.cache_entries;
-        stats.cache_bytes = cache.stats.cache_bytes;
-        stats.cache_metadata_bytes = cache.stats.cache_metadata_bytes;
-        stats.cache_budget = cache.stats.cache_budget;
-        stats.cache_bypass_disabled = cache.stats.cache_bypass_disabled;
-        stats.cache_bypass_eviction_limit = cache.stats.cache_bypass_eviction_limit;
-        stats.cache_bypass_scan = cache.stats.cache_bypass_scan;
-        stats.cache_bypass_generation = cache.stats.cache_bypass_generation;
-        stats.cache_admitted_bytes = cache.stats.cache_admitted_bytes;
-        Some(stats)
+        Some(self.state.try_lock()?.stats)
     }
     /// Diagnostic read admission, retained through response send retirement.
     /// Caller includes all retained work in `bytes`; this is not device credit.
@@ -274,32 +193,16 @@ impl ReadAdmission {
         }))
     }
     /// Diagnostic mapped/positional paths use the same evidence names, but do
-    /// not claim kernel asynchronous scheduling or populate the resident cache.
+    /// not claim kernel asynchronous scheduling.
     pub(crate) fn record_sync_read(&self, bytes: usize, success: bool) {
         let mut state = self.state.lock();
         state.stats.wal_reads += 1;
         state.stats.wal_read_bytes += bytes as u64;
-        state.stats.cache_misses += 1;
         if success {
             state.stats.completed_reads += 1;
         } else {
             state.stats.errors += 1;
         }
-    }
-    #[cfg(any(test, feature = "test-utils"))]
-    pub(crate) fn clear_cache(&self) {
-        let mut state = self.cache.lock();
-        let CacheState {
-            cache,
-            stats,
-            generation,
-        } = &mut *state;
-        cache.clear(stats);
-        // Clear and completion fills share only the cache lock, never credits.
-        // Exhaustion is fail-stop rather than permitting a generation ABA.
-        *generation = generation
-            .checked_add(1)
-            .expect("cache generation exhausted");
     }
     fn take_buffer(&self, len: usize) -> Box<[MaybeUninit<u8>]> {
         let mut state = self.state.lock();
@@ -404,8 +307,6 @@ struct PendingRequest {
     remaining: usize,
     lease: Option<ReadLease>,
     devices: Vec<(u64, usize)>,
-    generation: u64,
-    class: ReadClass,
     error: Option<StorageError>,
     cancelled: bool,
     profile: Option<super::WalReadProfile>,
@@ -421,20 +322,14 @@ struct PreparedRead {
     signature: Vec<(ValueRecordReference, u64, usize, u64)>,
     records: Vec<Option<Bytes>>,
     resident_buffers: Vec<Option<ResidentPrefix>>,
-    cache_hits: usize,
-    cache_misses: usize,
     wal_bytes: u64,
-    served_bytes: u64,
     resident_fallbacks: usize,
     resident_unsupported: usize,
     resident_partial: usize,
-    generation: u64,
-    class: ReadClass,
     warm_sweeps: usize,
 }
 
-/// The single final Bytes owner returns the allocation, never a CQ callback
-/// while a cache/response clone can still read it. Weak avoids a cache cycle.
+/// The final Bytes owner returns the allocation only after response clones retire.
 struct ReadBuffer {
     buffer: Option<Box<[MaybeUninit<u8>]>>,
     admission: Weak<ReadAdmission>,
@@ -442,7 +337,7 @@ struct ReadBuffer {
 impl AsRef<[u8]> for ReadBuffer {
     fn as_ref(&self) -> &[u8] {
         let buffer = self.buffer.as_ref().expect("owned read buffer");
-        // SAFETY: constructed only after an exact-length successful CQE.
+        // SAFETY: constructed only after a fully initialized NOWAIT read or CQE.
         unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast(), buffer.len()) }
     }
 }
@@ -457,7 +352,6 @@ impl Drop for ReadBuffer {
 struct Operation {
     request_id: u64,
     index: usize,
-    reference: ValueRecordReference,
     plan: RecordReadPlan,
     buffer: Box<[MaybeUninit<u8>]>,
     /// Initialized resident prefix; no Bytes is published until the suffix completes.
@@ -567,7 +461,8 @@ const MEMBER_METADATA_BYTES: usize = 4
         + size_of::<Option<Bytes>>()
         + size_of::<(ValueRecordReference, u64, usize, u64)>()
         + 4 * size_of::<u64>())
-    + cache::OWNER_BYTES;
+    + size_of::<ReadBuffer>()
+    + 2 * size_of::<usize>();
 // Wire clients reserve 4096 + sum(member.len + 4096) when chunking. Keep that
 // conservative contract valid if internal owner layouts change on any target.
 const _: () = assert!(REQUEST_METADATA_BYTES <= 4096 && MEMBER_METADATA_BYTES <= 4096);
@@ -649,7 +544,6 @@ impl ReadExecutor {
         &mut self,
         request_id: u64,
         members: Vec<(Arc<PartitionLog>, ValueRecordReference)>,
-        class: ReadClass,
     ) -> Result<SubmitOutcome, StorageError> {
         // Lower-level executor tests prepare real authority synchronously. The
         // serving reactor only calls submit_planned with already pinned plans.
@@ -660,7 +554,7 @@ impl ReadExecutor {
                     .map(|plan| (reference, plan))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        self.submit_planned(request_id, plans, class, &mut None)
+        self.submit_planned(request_id, plans, &mut None)
     }
 
     #[cfg(test)]
@@ -668,10 +562,9 @@ impl ReadExecutor {
         &mut self,
         request_id: u64,
         plans: Vec<PlannedRead>,
-        class: ReadClass,
         lease: &mut Option<ReadLease>,
     ) -> Result<SubmitOutcome, StorageError> {
-        self.submit_planned_profiled(request_id, plans, class, lease, None)
+        self.submit_planned_profiled(request_id, plans, lease, None)
     }
 
     /// Plans already own validated immutable authority and native file pins.
@@ -681,7 +574,6 @@ impl ReadExecutor {
         &mut self,
         request_id: u64,
         plans: Vec<PlannedRead>,
-        class: ReadClass,
         lease: &mut Option<ReadLease>,
         mut profile: Option<&mut super::WalReadProfile>,
     ) -> Result<SubmitOutcome, StorageError> {
@@ -706,8 +598,7 @@ impl ReadExecutor {
         if charge > self.config.max_bytes {
             return Err(StorageError::Capacity);
         }
-        // Reserve reply ownership before cloning a cache entry. Cache eviction
-        // can now run independently without leaving a detached clone uncharged.
+        // Reserve reply ownership before allocating retained read buffers.
         if lease.is_none() {
             *lease = self.admission.reserve_reply(charge)?;
         }
@@ -723,13 +614,9 @@ impl ReadExecutor {
         let resuming_prepared = prepared.is_some();
         let mut retained_signature = None;
         let (
-            generation,
             mut records,
             mut resident_buffers,
-            cache_hits,
-            initial_misses,
             wal_bytes,
-            served_bytes,
             mut resident_fallbacks,
             mut resident_unsupported,
             mut resident_partial,
@@ -743,7 +630,6 @@ impl ReadExecutor {
                     .any(|(saved, (reference, plan))| {
                         *saved != (*reference, plan.member.offset, plan.member.len, plan.device)
                     })
-                || prepared.class != class
             {
                 lease.as_mut().unwrap().prepared = Some(prepared);
                 return Err(StorageError::Invalid(
@@ -752,56 +638,23 @@ impl ReadExecutor {
             }
             retained_signature = Some(prepared.signature);
             (
-                prepared.generation,
                 prepared.records,
                 prepared.resident_buffers,
-                prepared.cache_hits,
-                prepared.cache_misses,
                 prepared.wal_bytes,
-                prepared.served_bytes,
                 prepared.resident_fallbacks,
                 prepared.resident_unsupported,
                 prepared.resident_partial,
                 prepared.warm_sweeps,
             )
         } else {
-            let cache_started = profile.as_ref().map(|_| Instant::now());
-            let mut cache = self.admission.cache.lock();
-            let generation = cache.generation;
-            let records = plans
-                .iter()
-                .map(|(reference, _)| cache.cache.get(reference))
-                .collect::<Vec<_>>();
-            let initial_misses = records.iter().filter(|record| record.is_none()).count();
-            let cache_hits = records.len() - initial_misses;
-            let (mut wal_bytes, mut served_bytes) = (0u64, 0u64);
-            for (record, (_, plan)) in records.iter().zip(&plans) {
-                if let Some(bytes) = record {
-                    served_bytes += bytes.len() as u64;
-                } else {
-                    wal_bytes += plan.member.len as u64;
-                }
-            }
-            drop(cache);
-            if let (Some(profile), Some(started)) = (profile.as_deref_mut(), cache_started) {
-                let ns = super::elapsed_ns(started);
-                profile.cache_resolution_ns += ns;
-                profile.cache_resolution_count += 1;
-                profile.cache_only_requests += u64::from(initial_misses == 0);
-                profile.cache_resolution_max_ns = profile.cache_resolution_max_ns.max(ns);
-            }
             (
-                generation,
-                records,
-                if self.config.resident_first && initial_misses != 0 {
+                (0..plans.len()).map(|_| None).collect(),
+                if self.config.resident_first {
                     (0..plans.len()).map(|_| None).collect()
                 } else {
                     Vec::new()
                 },
-                cache_hits,
-                initial_misses,
-                wal_bytes,
-                served_bytes,
+                plans.iter().map(|(_, plan)| plan.member.len as u64).sum(),
                 0,
                 0,
                 0,
@@ -814,11 +667,8 @@ impl ReadExecutor {
         let mut resident_attempts = 0usize;
         let mut resident_successes = 0usize;
         let mut resident_deferred = 0usize;
-        if self.config.resident_first
-            && (!resuming_prepared || warm_sweeps > 0)
-            && initial_misses != 0
-        {
-            for (index, (reference, plan)) in plans.iter().enumerate() {
+        if self.config.resident_first && (!resuming_prepared || warm_sweeps > 0) {
+            for (index, (_, plan)) in plans.iter().enumerate() {
                 if records[index].is_some() || resident_buffers[index].is_some() {
                     continue;
                 }
@@ -878,15 +728,6 @@ impl ReadExecutor {
                             admission: Arc::downgrade(&self.admission),
                         });
                         records[index] = Some(bytes);
-                        let mut cache = self.admission.cache.lock();
-                        if generation != cache.generation {
-                            cache.stats.cache_bypass_generation += 1;
-                        } else if class == ReadClass::ScanNoFill {
-                            cache.stats.cache_bypass_scan += 1;
-                        } else {
-                            let CacheState { cache, stats, .. } = &mut *cache;
-                            cache.insert(*reference, records[index].as_ref().unwrap(), stats);
-                        }
                         self.admission.state.lock().stats.completed_reads += 1;
                     }
                     Ok(read) => {
@@ -939,15 +780,10 @@ impl ReadExecutor {
                 signature: retained_signature.unwrap_or_else(|| read_plan_signature(&plans)),
                 records,
                 resident_buffers,
-                cache_hits,
-                cache_misses: initial_misses,
                 wal_bytes,
-                served_bytes,
                 resident_fallbacks,
                 resident_unsupported,
                 resident_partial,
-                generation,
-                class,
                 warm_sweeps: warm_sweeps + 1,
             });
             return Ok(SubmitOutcome::Deferred(plans));
@@ -961,11 +797,7 @@ impl ReadExecutor {
             state.stats.resident_read_attempts += resident_attempts as u64;
             state.stats.resident_read_successes += resident_successes as u64;
             state.stats.resident_read_deferred += resident_deferred as u64;
-            state.stats.cache_hits += cache_hits as u64;
-
-            state.stats.cache_misses += initial_misses as u64;
-            state.stats.cache_served_bytes += served_bytes;
-            state.stats.wal_reads += initial_misses as u64;
+            state.stats.wal_reads += plans.len() as u64;
             state.stats.wal_read_bytes += wal_bytes;
             drop(state);
             return Ok(SubmitOutcome::Ready {
@@ -1005,15 +837,10 @@ impl ReadExecutor {
                 signature: retained_signature.unwrap_or_else(|| read_plan_signature(&plans)),
                 records,
                 resident_buffers,
-                cache_hits,
-                cache_misses: initial_misses,
                 wal_bytes,
-                served_bytes,
                 resident_fallbacks,
                 resident_unsupported,
                 resident_partial,
-                generation,
-                class,
                 warm_sweeps: 0,
             });
             return Ok(SubmitOutcome::Full(plans));
@@ -1027,15 +854,10 @@ impl ReadExecutor {
                     signature: retained_signature.unwrap_or_else(|| read_plan_signature(&plans)),
                     records,
                     resident_buffers,
-                    cache_hits,
-                    cache_misses: initial_misses,
                     wal_bytes,
-                    served_bytes,
                     resident_fallbacks,
                     resident_unsupported,
                     resident_partial,
-                    generation,
-                    class,
                     warm_sweeps: 0,
                 });
                 return Ok(SubmitOutcome::Full(plans));
@@ -1063,8 +885,6 @@ impl ReadExecutor {
                 remaining: misses,
                 lease: lease.take(),
                 devices,
-                generation,
-                class,
                 error: None,
                 cancelled: false,
                 profile: profile.as_ref().map(|_| super::WalReadProfile::default()),
@@ -1072,7 +892,7 @@ impl ReadExecutor {
         );
         #[cfg(target_os = "linux")]
         self.entries.clear();
-        for (index, (reference, plan)) in plans.into_iter().enumerate() {
+        for (index, (_, plan)) in plans.into_iter().enumerate() {
             if self.requests[&request_id].records[index].is_some() {
                 continue;
             }
@@ -1091,7 +911,6 @@ impl ReadExecutor {
             let mut op = Operation {
                 request_id,
                 index,
-                reference,
                 buffer,
                 plan,
                 filled,
@@ -1119,10 +938,7 @@ impl ReadExecutor {
         }
         {
             let mut state = self.admission.state.lock();
-            state.stats.cache_hits += cache_hits as u64;
-            state.stats.cache_misses += initial_misses as u64;
-            state.stats.cache_served_bytes += served_bytes;
-            state.stats.wal_reads += initial_misses as u64;
+            state.stats.wal_reads += self.requests[&request_id].records.len() as u64;
             state.stats.wal_read_bytes += wal_bytes;
             state.stats.resident_read_fallbacks += resident_fallbacks as u64;
             state.stats.resident_read_unsupported += resident_unsupported as u64;
@@ -1218,17 +1034,6 @@ impl ReadExecutor {
                     admission: Arc::downgrade(&self.admission),
                 });
                 self.admission.state.lock().stats.completed_reads += 1;
-                if !request.cancelled {
-                    let mut state = self.admission.cache.lock();
-                    if request.generation != state.generation {
-                        state.stats.cache_bypass_generation += 1;
-                    } else if request.class == ReadClass::ScanNoFill {
-                        state.stats.cache_bypass_scan += 1;
-                    } else {
-                        let CacheState { cache, stats, .. } = &mut *state;
-                        cache.insert(op.reference, &bytes, stats);
-                    }
-                }
                 request.records[op.index] = Some(bytes);
             }
             request.remaining -= 1;

@@ -10,7 +10,7 @@ fallback fails the run.
 
 ## Portable transport selection
 
-The Sui replay's shared WAL/index and read-grant protocol is transport
+The Sui replay's shared WAL/index and record-read protocol is transport
 independent. TCP remains the default; opt-in OFI uses the same bounded engine
 transport and does not change storage locks, WAL acknowledgement, or
 durability. Configure a structured transport on each applicable endpoint:
@@ -31,7 +31,8 @@ against the returned address. Generic verbs supports provider-selected
 IB/RoCE/Falcon devices; these are not wire-interchangeable, and EFA SRD is
 separate. Explicit selection fails closed and does not downgrade to TCP.
 
-Resident FI_READ is a separate explicit choice. Setting
+Generic fabric FI_READ probes are separate from Sui record reads; the engine
+does not offer registered-value grants. In a fabric probe, setting
 `require_device_read: true` requires native reads plus provider-specific
 device evidence. For verbs this includes PCI metadata matched to canonical
 sysfs PCI BDF and rejects `rxe`, `rdma_rxe`, and `siw`; it does not establish
@@ -42,7 +43,7 @@ Hardware qualification remains pending until actual device evidence and
 parent-reviewed measurements are available. See the [fabric design](../../tidehunter-fabric/DESIGN.md#portable-transport-boundary-27-october-2026)
 for implementation symbols and primary OFI, Falcon, and native-paper sources.
 
-This structured-transport cutover uses wire protocol 11. The build plan records
+The current engine uses wire protocol 15. The build plan records
 it; external deployment and replay results copy the frozen build manifest's
 protocol rather than inventing a new value. Rebuild all participants and
 regenerate configurations together. Old string-transport deployments cannot
@@ -91,20 +92,14 @@ A fresh diagnostic twin replaces its scalar phase with profiled calls using the
 same complete random oracle, key order, cardinality and initial prepared state;
 it no longer samples a warmed sequential 256-key prefix. Diagnostic rows remain
 separate from clean latency. Grouped reads expose widths 4 and 32 independently.
-The targeted shard-cache-on cases explicitly fill a 256-key hot set with
-coordinator caching disabled. `cache_hot_before_scan` is hit-only only when its
-actual owner/frontend counter deltas prove it; enlarged uniform reads are not
-assumed resident or cache hits.
+Owners read through Linux page cache, with bounded NOWAIT attempts followed by
+asynchronous fallback; they no longer have an application value cache or
+registered-value grants. The coordinator value cache remains independently
+configurable. Neither an enlarged hot set nor a successful NOWAIT attempt
+establishes physical NVMe service time.
 
 Local software-provider controls use canonical transport selection, for
 example `{"kind":"ofi","fabric":{"backend":"software-tcp"},"security":"trusted"}`.
-Registered reads remain explicitly bounded by `resident_reads` and disabled
-with all-zero limits. Configure both owners and client before launch;
-existing external configurations reject CLI server-control overrides.
-`resident_reads.jsonl` retains actual grant acquisition, posts, successful CQ
-completions, verified hits, errors/fallback reasons and occupancy snapshots
-at each read boundary, with coordinator-local/per-owner-connection scope.
-It does not claim to sample remote source occupancy.
 
 For raw FI_READ measurement, provide a `FabricConfig` JSON and explicit device
 read policy:
@@ -123,112 +118,6 @@ host-specific `domain` and `source_address` selectors as needed. Hardware
 qualification remains pending until parent-reviewed results from actual
 devices.
 
-For an explicit trusted-native resident experiment, `kv_suite.resident_reads`
-accepts the complete limits object, without adding cases to either matrix:
-
-```json
-{
-  "source_bytes": 4194304,
-  "source_regions": 512,
-  "destination_bytes": 20971520,
-  "destination_slots": 640,
-  "max_read_bytes": 32768,
-  "max_handles": 4096,
-  "require_device_read": false
-}
-```
-
-This opt-in applies only to explicitly trusted-native cases. Existing
-historical TCP/EFA/EFA-direct/EFA-native matrix identities remain unchanged.
-Prepared owner and client YAML carry the exact limits, the case name binds
-their digest, and cold cases deliberately omit them. Hardware qualification
-must set `require_device_read: true` and retain actual provider/device evidence;
-software-provider success is not hardware proof.
-
-After the integrated source-bound build, run these paired loopback controls
-with the **new bundle's** executable, not an older `target/release` binary.
-Both use the same 32-key control before the legacy full-oracle workloads:
-
-```sh
-BUILD_ROOT=/path/to/new/source-bound/build
-"$BUILD_ROOT/binaries/storage-node" --output logs/resident-native --backend native-sync --transport fabric-tcp-native --values 8192 --batch-sizes 32 --windows 1 --batches 320 --mixed 64 --reads 512 --read-window 32 --tcp-read-lanes 4 --native-read-cache-bytes 0 --tcp-read-cache-bytes 0 --tcp-shard-cache-bytes 0 --hot-read-pass true --read-resource-evidence true --bounded-hot-pass true
-"$BUILD_ROOT/binaries/storage-node" --output logs/resident-local --backend tcp --transport fabric-tcp-native --values 8192 --batch-sizes 32 --windows 1 --batches 320 --mixed 64 --reads 512 --read-window 32 --tcp-read-lanes 4 --native-read-cache-bytes 0 --tcp-read-cache-bytes 0 --tcp-shard-cache-bytes 0 --hot-read-pass true --read-resource-evidence true --bounded-hot-pass true --rma-source-bytes 4194304 --rma-source-regions 512 --rma-destination-bytes 20971520 --rma-destination-slots 640 --rma-max-read-bytes 32768 --rma-max-handles 4096 --rma-require-device-read false
-python3 experiments/aws-sharded-wal/checkpoint_kv.py evidence logs/resident-native --mode native-sync
-python3 experiments/aws-sharded-wal/checkpoint_kv.py evidence logs/resident-local --mode tcp
-```
-
-`--bounded-hot-pass` is off by default and automatic when RMA is enabled.
-Native receives no RMA arguments and invents no RMA counters. Inspect
-`bounded_hot.service_qualified` on both sides and
-`resident_reads.registered_controls.qualified` on the remote side. Native
-qualification requires actual zero accounted reads/major faults with observed
-WAL residency and its value cache disabled. Software fabric proves correctness,
-not EFA latency. Replace `--batches 320` with `3200` on **both** sides for the
-larger working set; never combine the two denominators.
-
-Source-bound pipeline identities support an explicit bounded-only comparison:
-`compare NATIVE.identity.json REMOTE.identity.json --population bounded-hot
---compared implementation transport`. The ordinary matcher remains strict.
-Standalone CLI population evidence does not invent missing campaign provenance.
-
-The destination budget is a coordinator-wide total partitioned across read
-lanes, not multiplied per connection. At 32-KiB maximum reads, 640 slots and
-20 MiB permit a width-32 result group on each of up to 20 lanes. Smaller totals
-remain legitimate pressure controls but can force grouped-read RPC fallback;
-they must not be presented as a supported resident grouped-hit population.
-The 4,096-handle total also leaves room for session-scoped references across
-read lanes; a fitting value set alone does not prove that the handle cache fits.
-The control uses exactly the first 32 loaded keys, independent of the
-320/3200-batch oracle, immediately after load and before other read populations.
-The deterministic scalar sequence is `mix64(sample) % 32`, with
-`min(512, max(32, reads))` calls; each grouped call uses all 32 distinct keys,
-with `ceil(scalar_calls / 32)` calls. Native, RPC and RMA run the same
-`2 * read_lanes + 1` complete scalar-then-group warm passes. RMA additionally
-requires `read_lanes` consecutive fully registered-hit passes after every lane
-of each active hot-set owner has verified hits; it does not stop preparation
-early. `bounded_hot_setup` is the common CSV setup phase.
-`bounded_hot_controls.jsonl` retains the shared policy and verified populations;
-`registered_hot_setup` remains the RMA-specific preparation record inside
-`registered_controls.jsonl`. Acquisition and setup time are not hit latency.
-
-`registered_controls.jsonl` retains raw before/after lane snapshots, every
-preparation pass, the key/order/cardinality policy and both measured populations.
-For a registered experiment, only fully verified, prepared populations with
-zero Read/ReadProfiled messages, new grant acquisitions, fallbacks or errors
-may retain `cache_hot_get` / `cache_hot_get_many` rather than `*_mixed` labels.
-Accepted FI_READ posts and successful completions must equal **every** intended returned element;
-eligible reads and verified hits count complete owner groups, not elements.
-A 32-member group can therefore have one group hit and 32 posts/completions.
-Group hits must equal grouped calls times the actual hot-set owner count;
-scalar hits must equal scalar calls. Positive partial populations cannot pass.
-The consumer recomputes lane coverage and deltas, checks per-owner aggregates,
-and binds the CSV sample/operation counts. Mixed or invalid populations use
-`*_mixed` timing labels and cannot qualify the registered probe, even if some
-RMA hits occurred. Successful RPC fallback with all-zero RMA counters is not
-qualification. Inspect `resident_reads.registered_controls.qualified` in the
-`evidence` output; ordinary process success is insufficient.
-
-The original full-oracle `point_get` / `point_get_hot` and grouped populations
-retain their original counts/order. They are **not** relabeled registered-hit-only
-because the small control qualified. No server-handler clocks apply to a
-registered hit, and neither software-provider results nor these API timings
-establish hardware-only or physical-NVMe latency. Active RMA identities require
-the observed preparation policy and qualified raw controls. Older binaries
-without that policy remain unqualified unless their observed, source-bound
-all-zero resident configuration proves this preparation did not run; that
-inactive state is matched without inventing unused historical hot-set metadata.
-
-Use fresh output roots for each native/TCP/software-fabric/cache-off/cache-on
-control. Keep the same value shape, cardinality, read count/order and
-preparation controls for intentional comparisons; label the transport/RMA axis.
-The example requires Linux `test-utils` and `experimental-fabric`; use the same
-libfabric ABI as the build. Detailed clocks remain off unless explicitly enabled.
-
-`read_path_evidence.csv` additionally records nullable authority-cache counters:
-resident hits/misses, contention, history loads, entries/capacity and charged
-table bytes. Each owner retains its before/after observations; absent older
-fields or unavailable samples remain null. Authority-history loads can be
-served by page cache and never establish physical NVMe I/O.
 
 For a local replay select the canonical engine transport with `--transport-config JSON_FILE`.
 TCP is the default. Local hardware OFI is rejected; local runs permit TCP or
@@ -252,8 +141,8 @@ Sui summaries additionally retain `shard_read_by_owner`, parsed from
 binaries or failed `shard_sample_available` observations are unavailable,
 never zero. A foreground-only snapshot is cumulative, not an invented delta;
 the strict before/after consumer preserves each owner and rejects resets or
-population drift. Application-cache hits, resident/page-cache service, async
-submissions and positive process physical-I/O brackets remain distinct.
+population drift. Coordinator-cache hits, Linux NOWAIT attempts and successes,
+async submissions and positive process physical-I/O brackets remain distinct.
 Advisory eviction and async submission alone never prove physical NVMe reads,
 and process-I/O brackets never establish one device read per key.
 
@@ -266,7 +155,7 @@ Parent integration checks (not run by the implementation worker):
 
 Run the existing Rust example builds/checks and bounded native/TCP/software-
 fabric controls after integration. Require actual nonempty owner populations,
-separate registered acquisition/hit/fallback populations, successful value and
+Linux NOWAIT and asynchronous fallback observations, successful value and
 reopen audits, and counter-qualified cache/physical-I/O classifications.
 The existing deadline, export reserve, process ownership and unconditional
 cleanup/termination semantics are unchanged.
@@ -289,47 +178,18 @@ Typed-store `certified_checkpoints` histograms observe backend calls only, not
 sequence-cache hits. Fewer backend observations are not end-to-end sequence-lookup
 latency or an unchanged request population.
 
-The cloud supervisor accepts optional `coordinator_cache_mib_by_repetition` and
-`shard_cache_mib_by_repetition` arrays, with one integer 0..128 per repetition.
-Each effective budget is bound into the cell receipt, generated deployment and
-replay evidence. An omitted schedule uses the corresponding global budget.
-Keep clean repetitions separate from timing-profiled repetitions; compare cache
+The cloud supervisor accepts `coordinator_cache_mib_by_repetition`, with one
+integer 0..128 per repetition. The budget applies per logical database, shared
+across its CFs, and is recorded in the cell receipt and replay evidence.
+Keep clean repetitions separate from timing-profiled repetitions and compare
 variants within the same source, hardware and transport.
-The coordinator budget applies per logical database, shared across its CFs.
-The shard budget applies per database partition, not per storage host. In the
-three-DB/five-partition campaign, coordinator 8 MiB plus shard 16 MiB means
-24 MiB coordinator + 240 MiB storage value-cache capacity, excluding metadata,
-execution caches, in-flight buffers and OS page cache. It is not an RSS cap.
 
-Use `kv_suite: {"scope": "targeted", "repetitions": 1, "diagnostics": true}`
-for ten clean paired cases per requested transport: 256-byte and 8-KiB scalar reads
-with coordinator cache off and shard cache off/on, an 8-KiB coordinator-hit
-control, bulk preparation chunks of 16 versus 32, a bulk shard-cache pressure
-case, a cache-evicted bulk case, and a 32-batch preparation control with Sui-style
-WAL geometry. Bulk cases use 3,200 batches (100 full durable windows) and 8,192
-read keys, exceeding the five 8-MiB shard caches' aggregate payload allowance.
-The Sui-style control uses 16-MiB fragments, 256-MiB files and a 12-MiB group-byte
-limit, instead of 1-MiB fragments, 128-MiB files and a 1-MiB-minus-eight-byte group
-limit. It retains the raw benchmark's 32-batch group limit, not real Sui's 64;
-it is not a complete Sui configuration. The benchmark explicitly bounds load
-batches at 4,096 and checked value history at 1 GiB; defaults remain unchanged.
-Native durability windows still synchronize all registered Value WAL files,
-whereas owners synchronize the exact containing group file. Resource rows record
-the native registered-file count outside timed operations; larger histories can
-therefore expose extra conservative native barrier work. Do not call these
-identical persistence implementations.
-With diagnostics enabled, one additional fresh 8-KiB scalar pair per transport
-collects stage clocks. It must not be pooled with the ten clean pairs. The first
-256-byte clean case also runs the rebuilt authenticated
-RAM-response executable with 256-byte/8-KiB payloads and no WAL member reads
-during that measurement. Clean and profiled RAM processes are separate. This
-floor has no invented native-storage comparator and is not physical wire RTT.
-The default `full` scope retains the historical KV matrix.
+The 16 October targeted owner-cache cases described in the archived campaign
+are historical and cannot be rerun with the current engine.
 
 Cache hits are not durability acknowledgements. No experiment may remove exact
 reference checks, client integrity verification, valid-cut checks, durable-before-
-publication barriers, or buffer/file lifetime pins. Shard residency avoids file
-submission only after authoritative read planning; it is not one-sided RDMA.
+publication barriers, or buffer/file lifetime pins.
 RF1 remains unable to survive loss of an owner NVMe device.
 
 The **completed 16 October hardware campaign** and its correctness/security
@@ -461,7 +321,7 @@ python3 /absolute/owned/checkpoint-build/sources/tidehunter-sharded-wal/experime
   --build /absolute/owned/checkpoint-build \
   --fixture /absolute/repository/checkpoint-fixtures/sui-genesis-1775/fixture \
   --output /absolute/owned/checkpoint-run \
-  --deadline 900 --port 24000 --coordinator-cache-mib 8 --shard-cache-mib 0
+  --deadline 900 --port 24000 --coordinator-cache-mib 8
 
 python3 /absolute/owned/checkpoint-build/sources/tidehunter-sharded-wal/experiments/sui-checkpoint/analyze.py \
   /absolute/owned/checkpoint-run
@@ -597,7 +457,7 @@ python3 /absolute/owned/checkpoint-build/sources/tidehunter-sharded-wal/experime
   --db-root /absolute/owned/cloud-run/remote/full_node_db/94970e38de08 \
   --guest-root /absolute/owned/unique-storage-run \
   --hosts 10.0.1.10,10.0.1.11,10.0.1.12,10.0.1.13,10.0.1.14 \
-  --transport efa --coordinator-cache-mib 8 --shard-cache-mib 0
+  --transport-config /absolute/owned/efa-transport.json --coordinator-cache-mib 8
 ```
 
 `external-manifest.json` contains every launch argv, ready/stop path, binary,
@@ -880,14 +740,14 @@ exported before the exact-owned fleet termination attempt.
   from requests. Missing instrumentation is unavailable, not a fabricated zero.
   Native value/index/page-cache state differs from bounded remote cache tiers.
   `tidehunter_adapter{namespace,stat}` separates calls/keys/submitted read RPCs
-  from coordinator cache and authenticated cumulative shard cache/WAL-read
+  from coordinator cache and authenticated cumulative owner WAL-read
   samples. These diagnostic samples add control RPC work during scrapes.
   `shard_sample_available=0` means unavailable; diagnostics mask stale values to
   null, and qualification fails. WAL bytes and async submissions are not physical NVMe reads.
 * Every foreground sample records owned-PID RSS/high-water/swap and physical
   `/proc/PID/io` plus host swap/diskstats/meminfo. Host counters include desktop
   noise; OS read/write charges differ from logical WAL bytes and mapped reads.
-* Transport protocol is **9**, incompatible with prior endpoints. The current
+* Transport protocol is **15**, incompatible with prior endpoints. The current
   experimental member format is batch v3 with CRC32/IEEE; whole-batch BLAKE2b,
   sealed-file retirement and separate inventory-witness counters remain.
   Response recheck wait/work/deferrals and output queue/submit/retire spans are monotonic

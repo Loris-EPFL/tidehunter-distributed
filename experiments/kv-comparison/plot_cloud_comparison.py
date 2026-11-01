@@ -21,6 +21,7 @@ import textwrap
 STYLES = {
     "native": ("Native", "#333333", "o", "-"),
     "tidehunter_tcp": ("TH TCP", "#0072B2", "s", "-"),
+    "tidehunter_nvme_tcp": ("TH NVMe/TCP", "#E69F00", "X", "-"),
     "tidehunter_efa": ("TH EFA", "#56B4E9", "^", "--"),
     "tidehunter_efa_direct": ("TH EFA direct", "#009E73", "D", "-.") ,
     "tidehunter_efa_native": ("TH EFA native", "#D55E00", "v", "-"),
@@ -29,7 +30,8 @@ STYLES = {
     "foundationdb": ("FoundationDB", "#7854A3", "h", "-."),
     "valkey_tcp": ("Valkey TCP", "#C23B83", "*", "--"),
 }
-BACKENDS = tuple(STYLES)
+BACKENDS = tuple(name for name in STYLES if name != "tidehunter_nvme_tcp")
+PLANNABLE_BACKENDS = tuple(STYLES)
 OBSERVED_NAMES = {"tikv": "tikv_raw", "cassandra": "cassandra_cql_vendor_unverified"}
 TH = tuple(name for name in BACKENDS if name.startswith("tidehunter_"))
 SIZES = (64, 256, 1024, 8192, 65536)
@@ -156,9 +158,20 @@ class Dataset:
                 raise ValueError("job and observed backend differ")
             contract = {name: value for name, value in job.items()
                         if name not in ("backend", "case_id", "repeat")}
-            if isinstance(contract.get("read_tier"), dict):
-                contract["read_tier"] = {k: v for k, v in contract["read_tier"].items()
-                                         if k not in ("source_id", "data_id", "effective")}
+            for identity_field in ("read_tier", "sealed_dataset"):
+                if isinstance(contract.get(identity_field), dict):
+                    contract[identity_field] = {k: v for k, v in contract[identity_field].items()
+                                                if k not in ("source_id", "data_id", "effective")}
+            if job["cohort"] in ("sealed_read", "native_write_regression"):
+                # These are backend implementation/instrumentation settings, not
+                # workload shape. Keep the original settings in the appendix.
+                contract.pop("read_lanes", None)
+                contract.pop("diagnostics", None)
+                if job["cohort"] == "sealed_read":
+                    contract.pop("drop_os_caches", None)
+                if isinstance(contract.get("sealed_dataset"), dict):
+                    contract["sealed_dataset"].pop("target_cache", None)
+                    contract["sealed_dataset"].pop("page_cache_policy", None)
             cohort_cell = (job["cohort"], job["profile"], job["value_size"])
             if cohort_cell in contracts and contracts[cohort_cell] != contract:
                 raise ValueError("workload contract changed between repetitions or backends")
@@ -237,7 +250,8 @@ def aggregate_point(dataset, cell, repeats, metric, operation=None, outcome="suc
         value, samples = metric_value(case, metric, operation, outcome, percentile)
         if value is None:
             return None, f"{operation}/{outcome}/{metric} absent or untimed in repeat {repeat}; not zero"
-        observations.append({"repeat": repeat, "case_id": case["case_id"], "value": value,
+        identity = case_identity(case)
+        observations.append({"repeat": repeat, **identity, "value": value,
                              "timed_sample_count_or_denominator": samples})
     values = [item["value"] for item in observations]
     if len(values) < dataset.minimum_common_repeats:
@@ -249,6 +263,67 @@ def aggregate_point(dataset, cell, repeats, metric, operation=None, outcome="suc
             "observed_min": min(values), "observed_max": max(values),
             "repetition_mode": "single" if dataset.single_repetition else "multiple",
             "independent_repetitions": len(repeats), "run_to_run_errorbars": not dataset.single_repetition}, None
+
+
+def case_identity(case):
+    job = case["job"]
+    source = job.get("sealed_dataset") or job.get("read_tier") or {}
+    if not isinstance(source, dict):
+        source = {}
+    return {"case_id": case["case_id"], "backend": job["backend"],
+            "source_id": source.get("source_id"), "data_id": source.get("data_id")}
+
+
+def evidence_appendix(dataset):
+    """Keep each case's supplied evidence intact; missing is unknown, never zero."""
+    fields = ("dataset_source", "nvmeof_trace_evidence", "nvmeof_trace_raw_location", "trace_event_ratios",
+              "cold_device_evidence", "cold_device_raw_location",
+              "read_diagnostics", "write_diagnostics", "read_tier_qualification",
+              "read_path_qualification", "raw_samples", "samples",
+              "raw_artifacts", "artifacts_sha256")
+    return [{
+        **case_identity(case), "status": case["status"],
+        "cohort": case["job"]["cohort"], "profile": case["job"]["profile"], "job": case["job"],
+        "repeat": case["job"]["repeat"],
+        "evidence": {field: case.get(field) for field in fields},
+        "availability_note": "null means not supplied or unsupported, not a measured zero",
+    } for case in dataset.cases]
+
+
+def sealed_campaign_specs(cases):
+    """Use only planned cells and keep baseline and diagnostic populations separate."""
+    specs = []
+    for cohort in ("sealed_read", "native_write_regression"):
+        selected = [case for case in cases if case["job"]["cohort"] == cohort]
+        for profile in sorted({case["job"]["profile"] for case in selected}):
+            jobs = [case["job"] for case in selected if case["job"]["profile"] == profile]
+            operations = set()
+            for job in jobs:
+                mix = job.get("mix")
+                if not isinstance(mix, dict):
+                    raise ValueError(f"{cohort}/{profile}: workload mix unavailable")
+                active = [name for name, weight in mix.items() if weight]
+                if len(active) != 1 or active[0] not in ("read", "get_many", "put"):
+                    raise ValueError(f"{cohort}/{profile}: expected a pure read, get_many or put mix")
+                operations.add(active[0])
+            if len(operations) != 1:
+                raise ValueError(f"{cohort}/{profile}: incompatible operation mixes")
+            operation = operations.pop()
+            series = []
+            for backend in PLANNABLE_BACKENDS:
+                sizes = sorted({job["value_size"] for job in jobs if job["backend"] == backend})
+                if sizes:
+                    series.extend(size_series((backend,), cohort, profile, sizes))
+            specs.append(dict(name=cohort + "-" + profile, title=cohort + " — " + profile,
+                              series=series,
+                              panels=[panel("API p50", "api_ns", operation, "p50"),
+                                      panel("API p99", "api_ns", operation)] + goodput_panels(),
+                              columns=3, xkind="size", xticks=None,
+                              caption="Separate per-case populations; baseline and diagnostic cases are not pooled. "
+                              "Backend-specific lane, cache, cache-drop and diagnostic settings differ; see case jobs. "
+                              "Get-many latency is per call, not per key. Trace evidence is device or transport "
+                              "scoped, not per-API, NAND or pure wire latency. "))
+    return specs
 
 
 def panel(title, metric, operation=None, percentile="p99", outcome="success", **kwargs):
@@ -284,10 +359,13 @@ def figure_specs(backends=BACKENDS, cohorts=()):
                                    ("read-tier-c16-scalar-profiled", "read"),
                                    ("read-tier-c16-batch32-baseline", "get_many"),
                                    ("read-tier-c16-batch32-profiled", "get_many")):
-            add(cohort + "-" + profile, cohort + " — " + profile,
+            historical = cohort.startswith(("read_tier_owner_hit", "read_tier_registered",
+                                             "read_tier_first_touch_no_promotion"))
+            add(cohort + "-" + profile, ("Historical: " if historical else "") + cohort + " — " + profile,
                 size_series(backends, cohort, profile, (256, 1024, 8192, 65536)),
                 [panel("API p50", "api_ns", operation, "p50"), panel("API p99", "api_ns", operation)],
-                2, "Distinct per-case populations; configured tiers are not pure-path claims. "
+                2, ("Historical removed owner-cache/registered-value cohort. " if historical else "") +
+                "Distinct per-case populations; configured tiers are not pure-path claims. "
                 "Consult per-case qualification and cache/device evidence; no block timing is per-API NAND latency.")
 
     for profile, operation, title in (("read-concurrent", "read", "Pure reads"),
@@ -342,6 +420,8 @@ def figure_specs(backends=BACKENDS, cohorts=()):
             ("coordinator_cache_configured", "coordinator-cache", TH, "Coordinator cache"),
             ("owner_cache_configured", "owner-cache", TH, "Owner cache"),
             ("registered_ram_configured", "registered-ram", ("tidehunter_efa_native",), "Registered RAM")):
+        if cohort != "coordinator_cache_configured" and cohort not in cohorts:
+            continue
         cache_backends = tuple(name for name in cache_backends if name in backends)
         if not cache_backends:
             continue
@@ -353,9 +433,9 @@ def figure_specs(backends=BACKENDS, cohorts=()):
                                       quantile, cohort_filter=cohort))
     add("cache-cohorts", "Separate configured-cache cohorts — c1, 256 B and 8 KiB", cache_series,
         cache_panels, 3, "Every row is a distinct c1 cohort; no comparison against primary c16 pure reads. "
-        "Coordinator and owner cache budgets are 128 MiB where configured; Linux page cache also remains. "
-        "The owner-cache cohort includes cache misses/WAL fallbacks; it is not isolated owner-cache-hit latency. "
-        "Registered RAM is TH EFA native only and is mixed RMA plus message fallback, NOT isolated RDMA latency. "
+        "The coordinator cache is distinct from Linux page cache. Historical owner-cache cohorts include "
+        "misses/WAL fallbacks and are not isolated hits. Historical registered RAM is mixed RMA plus "
+        "message fallback, NOT isolated RDMA latency. "
         "Cumulative path counters include preload/warmup/qualification and are not timing fractions. ")
     read_modes = (("read-concurrent", "read", 1024, "1 KiB scalar"),
                   ("read-many32", "get_many", 8192, "8 KiB batch32"))
@@ -365,7 +445,7 @@ def figure_specs(backends=BACKENDS, cohorts=()):
                   "cells": [(backend, cohort, profile, size) for cohort in
                             ("read_stage_diagnostics", "resident_first_stage_diagnostics")],
                   "x": [0, 1]} for backend in TH if backend in backends]
-        add("read-modes-" + profile, label + " — matched sampled read modes, c16", modes,
+        add("read-modes-" + profile, "Historical: " + label + " — matched sampled read modes, c16", modes,
             [panel("API p50", "api_ns", operation, "p50"),
              panel("API p99", "api_ns", operation)] + goodput_panels(), 3,
             "Separate diagnostic cohorts, unchanged key count and measured call count, explicit caches zero. "
@@ -375,7 +455,7 @@ def figure_specs(backends=BACKENDS, cohorts=()):
     if "tidehunter_efa_native" in backends and "registered_ram_fullset_control" in cohorts:
         for profile, operation, size in (("registered-scalar", "read", 1024),
                                          ("registered-many32", "get_many", 8192)):
-            add("registered-fullset-" + profile, "Qualified registered full-set " + profile + " — c1",
+            add("registered-fullset-" + profile, "Historical qualified registered full-set " + profile + " — c1",
                 size_series(("tidehunter_efa_native",), "registered_ram_fullset_control", profile, (size,)),
                 [panel("API p50", "api_ns", operation, "p50"),
                  panel("API p99", "api_ns", operation)] + goodput_panels(), 3,
@@ -416,8 +496,10 @@ def build_figures(dataset):
     figures, omitted = [], []
     # Select from the frozen plan, never infer selection from successful cases.
     # Historical reports without explicit inventory retain their planned case rows.
-    backends = tuple(name for name in BACKENDS if name in dataset.planned_backends)
-    for spec in figure_specs(backends, {case["job"]["cohort"] for case in dataset.cases}):
+    backends = tuple(name for name in PLANNABLE_BACKENDS if name in dataset.planned_backends)
+    specs = figure_specs(backends, {case["job"]["cohort"] for case in dataset.cases})
+    specs.extend(sealed_campaign_specs(dataset.cases))
+    for spec in specs:
         unavailable = []
         if spec["name"] == "cold-os-cache":
             available = []
@@ -625,7 +707,7 @@ def render(figures, coverage_data, output):
 
 
 def export_data(figures, coverage_data, output):
-    fields = ["figure", "panel", "series", "backend", "cohort", "profile", "value_bytes", "x", "operation", "outcome",
+    fields = ["figure", "panel", "series", "backend", "source_id", "data_id", "cohort", "profile", "value_bytes", "x", "operation", "outcome",
               "metric", "percentile", "unit", "median", "observed_min", "observed_max", "repeat", "case_id", "value",
               "timed_sample_count_or_denominator", "repetition_mode", "independent_repetitions",
               "run_to_run_errorbars", "planned_repeats", "aggregation", "variation"]
@@ -674,11 +756,12 @@ def main():
                 **dataset.repetition_metadata(),
                 "units": "plot-data.csv retains exact source ns; latency figures convert ns / 1000 to µs; MiB = 2^20 bytes",
                 "figures": figures, "omitted_figures": omitted, "coverage": coverage_data,
+                "case_evidence": evidence_appendix(dataset),
                 "coverage_figure": {"files": ["coverage.png", "coverage.pdf"], "title": coverage_data["title"],
                                     "caption": coverage_data["caption"]},
                 "completed_cases_not_in_figures": [case["case_id"] for case in dataset.cases if case["status"] == "completed" and case["case_id"] not in used],
-                "limitations": ["Unmatched repetitions remain in the raw appendix and are not pooled into matched curves.",
-                                "No raw-sample verification or independence proof beyond exported case/repeat identity; source receipts remain authoritative.",
+                "limitations": ["Unmatched cases remain in case_evidence and are not pooled into matched curves.",
+                                "Source samples remain in their original artifacts; no raw-sample verification or independence proof beyond exported case/repeat identity; source receipts remain authoritative.",
                                 "No rejection API/scheduling latency: undispatched arrivals have no such clocks.",
                                 "No Sui checkpoint replay, isolated disk/RDMA microbenchmark, or confidence inference; rendering is offline."]}
     (args.output / "plots.json").write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n")

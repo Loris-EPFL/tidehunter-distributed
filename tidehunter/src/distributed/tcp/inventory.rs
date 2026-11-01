@@ -51,6 +51,91 @@ pub struct NodeInventory {
     lock: Arc<DbLock>,
 }
 
+/// Offline access to one explicitly sealed owner epoch, retaining the owner lock.
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+pub struct SealedOwnerExport {
+    log: Arc<PartitionLog>,
+    _lock: DbLock,
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+impl SealedOwnerExport {
+    pub fn open(config: &NodeConfig, epoch: u64, metrics: Arc<Metrics>) -> Result<Self, TcpError> {
+        config.partition.validate().map_err(TcpError::component)?;
+        if epoch == 0
+            || config.partition.inventory.epoch != 1
+            || config.partition.inventory.segment_generation != 1
+            || !(1..=1024).contains(&config.max_epochs)
+        {
+            return Err(TcpError::new("invalid owner export configuration"));
+        }
+        let root = config.root.canonicalize()?;
+        let lock = DbLock::acquire(&root, Duration::ZERO)?;
+        let path = root.join(MANIFEST);
+        if !fs::symlink_metadata(&path)?.file_type().is_file() {
+            return Err(TcpError::new("node manifest is not a regular file"));
+        }
+        let manifest: Manifest = read_metadata(&path).map_err(TcpError::component)?;
+        let shape = KeyShape::from_yaml(&config.shape_yaml).map_err(TcpError::component)?;
+        if manifest.format != 1
+            || manifest.partition != config.partition
+            || manifest.shape_yaml != shape.to_yaml().map_err(TcpError::component)?
+            || manifest.max_epochs != config.max_epochs
+            || manifest.epochs.len() > config.max_epochs
+            || manifest.epochs.iter().any(|e| e.epoch == 0)
+            || manifest.epochs.windows(2).any(|w| w[0].epoch >= w[1].epoch)
+            || !manifest
+                .epochs
+                .iter()
+                .any(|e| e.epoch == epoch && e.state == EpochState::Sealed)
+        {
+            return Err(TcpError::new(
+                "owner inventory does not contain the requested sealed epoch",
+            ));
+        }
+        let leases = super::super::nvmeof::lease::ExportLeaseRegistry::open(
+            &root,
+            1024,
+            super::super::nvmeof::MAX_EXPORT_MANIFEST_BYTES,
+        )
+        .map_err(TcpError::component)?;
+        if leases.has_live_or_quarantined() {
+            return Err(TcpError::new(
+                "owner export blocked by live or quarantined NVMe-oF leases",
+            ));
+        }
+        let path = epoch_path(&root, epoch);
+        directory(&path)?;
+        let log =
+            PartitionLog::recover_sealed(&path, &partition_at(&config.partition, epoch), metrics)
+                .map_err(TcpError::component)?;
+        if log.key_shape().to_yaml().map_err(TcpError::component)? != manifest.shape_yaml {
+            return Err(TcpError::new(
+                "owner export key shape differs from inventory",
+            ));
+        }
+        Ok(Self {
+            log: Arc::new(log),
+            _lock: lock,
+        })
+    }
+
+    pub fn log(&self) -> &PartitionLog {
+        &self.log
+    }
+
+    /// Export through the retained owner lock without exposing a clonable log handle.
+    pub fn export_sealed_readset(
+        &self,
+        directory: &Path,
+        references: &[ValueRecordReference],
+        config: &super::super::nvmeof::ExportConfig,
+    ) -> Result<super::super::nvmeof::ExportManifest, super::super::storage::StorageError> {
+        self.log
+            .export_sealed_readset(directory, references, config)
+    }
+}
+
 #[derive(Default)]
 pub(super) struct ReaderAuthority {
     generation: u64,
@@ -154,7 +239,6 @@ impl NodeInventory {
         Ok(evidence)
     }
     pub fn open(mut config: NodeConfig, metrics: Arc<Metrics>) -> Result<Self, TcpError> {
-        config.resident_reads.validate()?;
         config.partition.validate().map_err(TcpError::component)?;
         if config.partition.inventory.epoch != 1
             || config.partition.inventory.segment_generation != 1
@@ -239,8 +323,12 @@ impl NodeInventory {
         // recovered or sealed. Orphaned admissions stay quarantined.
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let nvmeof_leases = Arc::new(Mutex::new(
-            super::super::nvmeof::lease::ExportLeaseRegistry::open(&config.root, 1024, 1024 * 1024)
-                .map_err(TcpError::component)?,
+            super::super::nvmeof::lease::ExportLeaseRegistry::open(
+                &config.root,
+                1024,
+                super::super::nvmeof::MAX_EXPORT_MANIFEST_BYTES,
+            )
+            .map_err(TcpError::component)?,
         ));
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if nvmeof_leases.lock().has_live_or_quarantined() {
@@ -683,6 +771,57 @@ fn persist(root: &Path, manifest: &Manifest) -> Result<(), TcpError> {
 mod tests {
     use super::*;
     use crate::distributed::tcp::tests::{config, metrics};
+
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    #[test]
+    fn benchmark_eviction_includes_sealed_source_epochs() {
+        let temporary = tempdir::TempDir::new("node-evict-retained").unwrap();
+        let config = config(&temporary.path().join("node"));
+        let mut inventory = NodeInventory::open(config.clone(), metrics()).unwrap();
+        inventory.fence_to(1).unwrap();
+        let batch = crate::distributed::tcp::tests::batch(&config, 1, 0);
+        let source = inventory.active(1).unwrap();
+        let receipt = source
+            .append_complete_batch(RequestAuthority { epoch: 1 }, &batch)
+            .unwrap();
+        source.persist_through(receipt).unwrap();
+        drop(source);
+        inventory.seal(1).unwrap();
+        inventory.fence_to(2).unwrap();
+        let source_bytes = inventory.logs[&1]
+            .read_evidence_for_benchmark(false)
+            .unwrap()
+            .file_bytes;
+        let expected: u64 = inventory
+            .logs
+            .values()
+            .map(|log| log.read_evidence_for_benchmark(false).unwrap().file_bytes)
+            .sum();
+        assert!(source_bytes > 0);
+        let evidence = inventory.read_evidence_for_benchmark(2, true).unwrap();
+        assert_eq!(evidence.file_bytes, expected);
+        assert!(inventory.read_evidence_for_benchmark(1, true).is_err());
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    #[test]
+    fn offline_export_requires_sealed_epoch_and_retains_owner_lock() {
+        let temporary = tempdir::TempDir::new("node-sealed-export").unwrap();
+        let config = config(&temporary.path().join("node"));
+        let mut inventory = NodeInventory::open(config.clone(), metrics()).unwrap();
+        inventory.fence_to(1).unwrap();
+        assert!(SealedOwnerExport::open(&config, 1, metrics()).is_err());
+        drop(inventory);
+        assert!(SealedOwnerExport::open(&config, 1, metrics()).is_err());
+        let mut inventory = NodeInventory::open(config.clone(), metrics()).unwrap();
+        inventory.fence_to(2).unwrap();
+        inventory.seal(2).unwrap();
+        drop(inventory);
+        let export = SealedOwnerExport::open(&config, 2, metrics()).unwrap();
+        assert!(NodeInventory::open(config.clone(), metrics()).is_err());
+        drop(export);
+        assert!(NodeInventory::open(config, metrics()).is_ok());
+    }
     #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
     #[test]
     fn feature_disabled_reopen_rejects_unreleased_nvme_capability() {

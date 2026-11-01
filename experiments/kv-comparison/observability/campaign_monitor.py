@@ -42,6 +42,7 @@ QUERY_PAGE_SECONDS = 300
 QUERY_METRICS = ('kv_observer_snapshot_final', 'kv_observer_case_terminal', 'kv_observer_data_available', 'up',
                  'kv_case_success_calls_per_second', 'kv_case_api_quantile_seconds', 'kv_case_read_path_calls',
                  'kv_case_resource_interval_available', 'kv_case_resource_interval_elapsed_seconds',
+                 'kv_case_resource_interval_core_available', 'kv_case_resource_interval_io_available',
                  'kv_case_resource_interval_cpu_seconds', 'kv_case_resource_interval_cpu_throttled_seconds',
                  'kv_case_resource_interval_cpu_periods', 'kv_case_resource_interval_cpu_throttled_periods',
                  'kv_case_resource_interval_io_read_bytes', 'kv_case_resource_interval_io_write_bytes',

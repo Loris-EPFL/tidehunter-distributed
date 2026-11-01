@@ -1,4 +1,6 @@
 """Source-bound scalar/transport campaign; reuse the RAM workload/evidence parsers."""
+import hashlib
+import json
 from pathlib import Path
 import sys
 
@@ -10,7 +12,6 @@ import cluster_ram
 
 BASELINE_SOURCE_SHA256 = '1aff4260271bb116477a2ebda6ee2a761961266d7d0fce500bd61a6e10653a28'
 BASELINE_BINARY_SHA256 = '0a96d28ece36649fec0333ac3f427c3d4b3dab0c9f21fb430b420b5f1dc85d8e'
-CURRENT_SOURCE_SHA256 = '2e694cb0be9fe0738c217b75afb9fe0ba5d2eef170573bd95f092fa40e93dc57'
 SCOPES = ('full', 'core', 'recovery')
 FABRIC_VERSION = '2.6.0amzn1.0'
 # EFA uses OFI_VERSION_DEF_PROV, not the public FI_VERSION(major, minor) encoding.
@@ -56,6 +57,17 @@ def plan(scope='full'):
     return qualification_cases() + main_cases(scope) + (recovery_cases() if scope != 'core' else [])
 
 
+def historical_plan(scope='full'):
+    specs = plan(scope)
+    for spec in specs:
+        spec['shard_cache'] = 0
+        if not spec.get('recovery'):
+            old_family = spec['family']
+            spec['family'] = old_family.replace(f"-f{spec['cache']}-", f"-f{spec['cache']}-s0-", 1)
+            spec['case_id'] = spec['case_id'].replace(old_family, spec['family'], 1)
+    return specs
+
+
 def expected_cases(scope='full'):
     return {spec['case_id'] + '-' + mode:
             (spec['family'], spec['build'], spec['value'], spec['batch'], spec['window'], spec['rep'], mode, spec['case_id'])
@@ -64,23 +76,46 @@ def expected_cases(scope='full'):
 
 # Keep native controls, sampling and durable workload flags identical to RAM.
 flags = cluster_ram.flags
+historical_flags = cluster_ram.historical_flags
 
 
 def validate_build_identity(root, label):
+    return _validate_build_identity(root, label, historical=False)
+
+
+def historical_validate_build_identity(root, label):
+    return _validate_build_identity(root, label, historical=True)
+
+
+def _validate_build_identity(root, label, historical):
     import analyze_cloud as audit
     root = Path(root)
     if label not in ('baseline', 'current'):
         raise ValueError('unplanned scalar transport build')
     receipt = audit.read_json(root / f'cloud-build-{label}.json')
-    source = BASELINE_SOURCE_SHA256 if label == 'baseline' else CURRENT_SOURCE_SHA256
-    if (receipt.get('label') != label or receipt.get('source_tree_sha256') != source
+    source = receipt.get('source_tree_sha256')
+    historical_source = '2e694cb0be9fe0738c217b75afb9fe0ba5d2eef170573bd95f092fa40e93dc57'
+    if (not audit.is_sha256(source) or (label == 'baseline' and source != BASELINE_SOURCE_SHA256)
+            or (historical and label == 'current' and source != historical_source)
+            or receipt.get('label') != label
             or receipt.get('features') != 'experimental-fabric,test-utils'
             or receipt.get('libfabric_version') != FABRIC_VERSION
             or any(not audit.is_sha256(receipt.get(key)) for key in
-                   ('binary_sha256', 'local_binary_sha256', 'source_manifest_sha256', 'libfabric_sha256'))):
+                   ('binary_sha256', 'local_binary_sha256', 'source_manifest_sha256', 'libfabric_sha256'))
+            or (not historical and not audit.is_sha256(receipt.get('source_archive_sha256')))):
         raise ValueError('scalar transport source/binary/provider identity differs')
     if label == 'baseline' and receipt['local_binary_sha256'] != BASELINE_BINARY_SHA256:
         raise ValueError('baseline differs from the preserved October 11 executable')
+    if label == 'current' and not historical:
+        manifest_path = root / f'source-manifest-{label}.json'
+        manifest = audit.read_json(manifest_path)
+        files = manifest['source_sha256']
+        if (not isinstance(files, dict) or not files or any(not audit.is_sha256(v) for v in files.values())
+                or hashlib.sha256(manifest_path.read_bytes()).hexdigest() != receipt['source_manifest_sha256']
+                or hashlib.sha256(json.dumps(files, sort_keys=True, separators=(',', ':')).encode()).hexdigest() != source
+                or manifest['source_tree_sha256'] != source
+                or manifest['binary_sha256'] != receipt['local_binary_sha256']):
+            raise ValueError('scalar source manifest does not bind source and local binary')
     pair = audit.read_json(root / 'cloud-build-pair-verified.json')
     if pair.get('binary_sha256', {}).get(label) != receipt['binary_sha256']:
         raise ValueError('scalar transport executable differs from verified build pair')
@@ -146,10 +181,12 @@ def read_cloud_case(root, name, spec, mode):
     import analyze_cloud as audit
     root = Path(root)
     cfg = audit.read_json(root / 'campaign-config.json')
-    if (cfg.get('campaign') != 'scalar-transport' or spec not in plan(cfg.get('checkpoint_scope', 'full'))
+    historical = 'shard_cache' in spec
+    selected_plan = historical_plan if historical else plan
+    if (cfg.get('campaign') != 'scalar-transport' or spec not in selected_plan(cfg.get('checkpoint_scope', 'full'))
             or mode not in spec['modes'] or name != spec['case_id'] + '-' + mode):
         raise ValueError('unplanned scalar transport case or mode')
-    receipt = validate_build_identity(root, spec['build'])
+    receipt = (historical_validate_build_identity if historical else validate_build_identity)(root, spec['build'])
     preparation = audit.read_json(root / (spec['case_id'] + '-prepare.command.json'))
     if preparation.get('binary_sha256') != receipt['binary_sha256']:
         raise ValueError('preparation executable differs from source-bound build')
@@ -164,7 +201,7 @@ def read_cloud_case(root, name, spec, mode):
         raise ValueError('benchmark process executable differs from source-bound build')
     metrics = cluster_ram.read_cloud_case(root, name, spec, mode)
     expected_transport = (metadata_transport_label(spec['transport'])
-                          if spec['build'] == 'current' else spec['transport'])
+                          if spec['build'] == 'current' and not historical else spec['transport'])
     for row in cluster_ram.read_csv(root / name / 'summary.csv'):
         transport = row.get('transport', spec['transport'] if spec['build'] == 'baseline' else None)
         if row['durability'] != 'value_wal_file_and_directory_barrier' or transport != expected_transport:

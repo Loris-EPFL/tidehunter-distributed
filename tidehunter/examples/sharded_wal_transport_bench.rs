@@ -322,11 +322,9 @@ fn main() -> Result<()> {
             args.transport.clone(),
             2,
             WalMemberReadPolicy::Async,
-            0,
             128 * MIB,
             args.polling,
             false,
-            tidehunter::distributed::tcp::ResidentReadConfig::default(),
         )?;
         let config = owned.config.clone();
         cluster = Some(owned);

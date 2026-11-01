@@ -35,7 +35,47 @@ READ_RECHECK_TIMERS = ("server_response_recheck_wait_ns", "server_response_reche
 READ_RECHECK_SAMPLES = "server_response_recheck_samples"
 
 
-def expected_cases(profile="original", checkpoint_scope="full"):
+def selected_plan(root, profile, scope='full'):
+    """Select a frozen schema only from an exact recorded historical case."""
+    current = profile.plan(scope)
+    if not hasattr(profile, 'historical_plan'):
+        return current
+    historical = profile.historical_plan(scope)
+    for spec in historical:
+        path = Path(root) / (spec['case_id'] + '-plan.json')
+        if path.is_file() and read_json(path) == spec:
+            pinned = {checkpoint_async: cluster_ram.BASELINE_SOURCE_SHA256,
+                      cluster_ram: scalar_transport.BASELINE_SOURCE_SHA256,
+                      scalar_transport: transport_floor.BASELINE_SOURCE_SHA256,
+                      transport_floor: stage_timing.BASELINE_SOURCE_SHA256,
+                      stage_timing: stage_timing.HISTORICAL_CURRENT_SOURCE_SHA256}.get(profile)
+            if pinned is not None:
+                receipt = read_json(Path(root) / 'cloud-build-current.json')
+                if receipt.get('source_tree_sha256') != pinned:
+                    raise ValueError('historical case schema does not match frozen source')
+            return historical
+    return current
+
+
+def validate_profile_build(root, profile, label, historical):
+    if profile in (scalar_transport, stage_timing) and historical:
+        return profile.historical_validate_build_identity(root, label)
+    return profile.validate_build_identity(root, label)
+
+
+def plan_cases(specs):
+    return {spec['case_id'] + '-' + mode:
+            (spec['family'], spec['build'], spec['value'], spec['batch'], spec['window'],
+             spec['rep'], mode, spec['case_id'])
+            for spec in specs for mode in spec.get('modes', ('native-sync', 'tcp'))}
+
+
+def expected_cases(profile="original", checkpoint_scope="full", root=None):
+    profiles = {'stage-timing': stage_timing, 'transport-floor': transport_floor,
+                'scalar-transport': scalar_transport, 'cluster-ram': cluster_ram,
+                'checkpoint-async': checkpoint_async}
+    if root is not None and profile in profiles:
+        return plan_cases(selected_plan(root, profiles[profile], checkpoint_scope))
     if profile == 'stage-timing':
         return stage_timing.expected_cases(checkpoint_scope)
     if profile == 'transport-floor':
@@ -153,6 +193,18 @@ def validate_build_pair(root, receipts):
     archived here, so this does not independently rehash their contents.
     """
     errors, roots = {}, {}
+    cfg_path = root / 'campaign-config.json'
+    cfg = read_json(cfg_path) if cfg_path.is_file() else {}
+    profiles = {'checkpoint-async': checkpoint_async, 'cluster-ram': cluster_ram,
+                'scalar-transport': scalar_transport, 'transport-floor': transport_floor,
+                'stage-timing': stage_timing}
+    historical = False
+    if cfg.get('campaign') in profiles:
+        try:
+            specs = selected_plan(root, profiles[cfg['campaign']], cfg.get('checkpoint_scope', 'full'))
+            historical = 'shard_cache' in specs[0]
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            errors['cloud-build-schema'] = str(error)
     labels = ("baseline", "current")
     for label in labels:
         receipt = receipts.get("cloud-build-" + label, {})
@@ -187,8 +239,10 @@ def validate_build_pair(root, receipts):
             or any(pair.get(flag) is not True for flag in
                    ("distinct_sources", "distinct_binaries", "capability_checks"))):
         errors["cloud-build-pair-verified"] = "pair receipt must confirm both exact binary hashes, distinct sources/binaries and capabilities"
-    config_names = {"remote.yaml", "owner_transports.json"} | {f"node-{node}/launch.yaml" for node in range(5)}
-    if (root / 'campaign-config.json').is_file() and read_json(root / 'campaign-config.json').get('campaign') in ('transport-floor', 'stage-timing'):
+    config_names = {"remote.yaml"} | {f"node-{node}/launch.yaml" for node in range(5)}
+    if not historical:
+        config_names.add("owner_transports.json")
+    if cfg.get('campaign') in ('transport-floor', 'stage-timing'):
         config_names.add('shape.yaml')
     hashes = pair.get("prepared_configuration_sha256")
     if not isinstance(hashes, dict) or set(hashes) != config_names or any(not is_sha256(v) for v in hashes.values()):
@@ -201,7 +255,8 @@ def validate_build_pair(root, receipts):
                 raise ValueError("missing successful --help for the recorded build")
             help_text = (root / f"capability-{label}.stdout.log").read_text()
             if "--remote-config" not in help_text or (label == "current" and any(
-                    flag not in help_text for flag in ("--prepare-external-case", "--transport-config", "--owner-transports"))):
+                    flag not in help_text for flag in (("--prepare-external-case",) if historical else
+                    ("--prepare-external-case", "--transport-config", "--owner-transports")))):
                 raise ValueError("required cloud benchmark capabilities absent from help output")
         except (OSError, ValueError, KeyError, TypeError) as error:
             errors[f"cloud-build-capability-{label}"] = str(error)
@@ -218,29 +273,32 @@ def validate_build_pair(root, receipts):
             raise ValueError("duplicate preparation options")
         request_root = str(PurePosixPath(case_root).parent / 'requested-configs' / PurePosixPath(case_root).name)
         expected = {"--prepare-external-case": case_root, "--guest-case-root": case_root,
-                    "--transport-config": request_root + "/transport.json",
-                    "--owner-transports": request_root + "/owner-transports.json",
                     "--values": "1024", "--batch-sizes": "1", "--windows": "1", "--batches": "128",
                     "--mixed": "32", "--reads": "512", "--repetitions": "1"}
+        if not historical:
+            expected.update({"--transport-config": request_root + "/transport.json",
+                             "--owner-transports": request_root + "/owner-transports.json"})
         endpoints = options.get("--remote-endpoints", "").split(",")
         if (any(options.get(k) != v for k, v in expected.items()) or
                 set(options) != set(expected) | {"--remote-endpoints"} or
                 any(not endpoint.endswith(":7700") or len(endpoint) <= 5 for endpoint in endpoints)):
             raise ValueError("preparation did not use the expected six-config/five-endpoint smoke")
+        if historical and endpoints != [n['private_ip'] + ':7700' for n in sorted(cfg['nodes'], key=lambda n: n['partition'])]:
+            raise ValueError('historical smoke endpoints differ from owned nodes')
         recorded = read_json(root / ("cloud-build-preparation-check.command.json" if current_preflight else "cloud-build-preparation-smoke.command.json"))
         if recorded.get("exit_code") != 0 or recorded.get("command") != command:
             raise ValueError("successful preparation command does not match pair receipt")
-        cfg = read_json(root / 'campaign-config.json') if (root / 'campaign-config.json').is_file() else {}
-        requested_transport = root / 'cloud-build-requested-transport.json'
-        requested_owners = root / 'cloud-build-requested-owner-transports.json'
-        transport_label = (cfg.get('transports') or ['tcp'])[0]
-        expected_client = transport_for_case(transport_label)
-        expected_owners = select_transports(expected_client, None, len(cfg.get('nodes', [])))
-        if (json.loads(requested_transport.read_text()) != expected_client
-                or json.loads(requested_owners.read_text()) != expected_owners
-                or pair.get('requested_transport_sha256') != hashlib.sha256(requested_transport.read_bytes()).hexdigest()
-                or pair.get('requested_owner_transports_sha256') != hashlib.sha256(requested_owners.read_bytes()).hexdigest()):
-            raise ValueError('requested transport configs differ from hash-bound canonical selectors')
+        if not historical:
+            requested_transport = root / 'cloud-build-requested-transport.json'
+            requested_owners = root / 'cloud-build-requested-owner-transports.json'
+            transport_label = (cfg.get('transports') or ['tcp'])[0]
+            expected_client = transport_for_case(transport_label)
+            expected_owners = select_transports(expected_client, None, len(cfg.get('nodes', [])))
+            if (json.loads(requested_transport.read_text()) != expected_client
+                    or json.loads(requested_owners.read_text()) != expected_owners
+                    or pair.get('requested_transport_sha256') != hashlib.sha256(requested_transport.read_bytes()).hexdigest()
+                    or pair.get('requested_owner_transports_sha256') != hashlib.sha256(requested_owners.read_bytes()).hexdigest()):
+                raise ValueError('requested transport configs differ from hash-bound canonical selectors')
     except (OSError, ValueError, KeyError, TypeError) as error:
         errors["cloud-build-preparation-smoke"] = str(error)
     return errors
@@ -255,28 +313,33 @@ def read_case(root, name, info, campaign_profile="original"):
         profile = stage_timing if campaign_profile == 'stage-timing' else transport_floor
         cfg = read_json(root / 'campaign-config.json')
         scope = cfg.get('checkpoint_scope', 'full')
-        if profile.expected_cases(scope).get(name) != info:
+        specs = selected_plan(root, profile, scope)
+        if plan_cases(specs).get(name) != info:
             raise ValueError('unplanned source-bound case identity')
-        spec = next(c for c in profile.plan(scope) if c['case_id'] == info[-1])
+        spec = next(c for c in specs if c['case_id'] == info[-1])
         return profile.read_cloud_case(root, name, spec, mode)
     if campaign_profile == 'scalar-transport':
         cfg = read_json(root / 'campaign-config.json')
         scope = cfg.get('checkpoint_scope', 'full')
-        if scalar_transport.expected_cases(scope).get(name) != info:
+        specs = selected_plan(root, scalar_transport, scope)
+        if plan_cases(specs).get(name) != info:
             raise ValueError('unplanned scalar transport case identity')
-        spec = next(c for c in scalar_transport.plan(scope) if c['case_id'] == info[-1])
+        spec = next(c for c in specs if c['case_id'] == info[-1])
         return scalar_transport.read_cloud_case(root, name, spec, mode)
     if campaign_profile == 'cluster-ram':
-        spec = next(c for c in cluster_ram.plan() if c['case_id'] == info[-1])
+        scope = read_json(root / 'campaign-config.json').get('checkpoint_scope', 'full')
+        spec = next(c for c in selected_plan(root, cluster_ram, scope) if c['case_id'] == info[-1])
         if mode == 'recovery':
             return read_recovery_case(root, name, spec, cluster_ram)
         return cluster_ram.read_cloud_case(root, name, spec, mode)
     if campaign_profile == 'checkpoint-async' and mode == 'recovery':
-        return read_recovery_case(root, name, next(c for c in checkpoint_async.recovery_cases() if c['case_id'] == info[-1]))
+        scope = read_json(root / 'campaign-config.json').get('checkpoint_scope', 'full')
+        return read_recovery_case(root, name, next(c for c in selected_plan(root, checkpoint_async, scope) if c['case_id'] == info[-1]))
     progress_spec = None
     if campaign_profile in ('efa-progress', 'checkpoint-async'):
         profile = checkpoint_async if campaign_profile == 'checkpoint-async' else efa_progress
-        progress_spec = next(c for c in profile.plan() if c['case_id'] == info[-1])
+        specs = selected_plan(root, profile, read_json(root / 'campaign-config.json').get('checkpoint_scope', 'full')) if campaign_profile == 'checkpoint-async' else profile.plan()
+        progress_spec = next(c for c in specs if c['case_id'] == info[-1])
         family = ('diagnostic' if progress_spec['diagnostics'] else
                   'cold' if progress_spec['cold'] else 'cache' if progress_spec['cache'] else 'storage')
         if progress_spec['transport'] == 'efa':
@@ -530,13 +593,28 @@ def validate_prepared_transport(root, case, transport, nodes):
     return remote_docs[0]
 
 
+def validate_historical_remote(root, case, spec, cfg):
+    remote = transport_floor.yaml_one((root / (case + '-remote.yaml')).read_text())
+    expected_endpoints = sorted((n['partition'], n['private_ip'] + ':7700') for n in cfg['nodes'])
+    if (remote['tls']['transport'] != spec['transport']
+            or sorted((n['partition'], n['address']) for n in remote['endpoints']) != expected_endpoints
+            or remote['storage']['partitions'] != list(range(5))
+            or remote['read_lanes'] != spec['lanes']
+            or remote['read_cache_bytes'] != spec['cache']):
+        raise ValueError('historical remote transport or policy differs from case')
+
+
 def validate_progress_case(root, name, spec, mode, process, summaries, metrics):
-    checkpoint = 'shard_cache' in spec
+    cfg = read_json(root / 'campaign-config.json')
+    checkpoint = cfg.get('campaign') in ('checkpoint-async', 'cluster-ram', 'scalar-transport', 'transport-floor', 'stage-timing')
+    historical = checkpoint and 'shard_cache' in spec
+    structured_transport = spec['build'] == 'current' and not historical
     options = efa_progress.command_options(process['command'])
     case = spec['case_id']
     if read_json(root / (case + '-plan.json')) != spec:
         raise ValueError('archived case identity differs from deterministic plan')
-    cfg = read_json(root / 'campaign-config.json')
+    if checkpoint and not historical and {'shard_cache_bytes', 'resident_reads'} & spec.keys():
+        raise ValueError('obsolete owner cache or registered-value policy')
     build = read_json(root / ('cloud-build-' + spec['build'] + '.json'))
     binary = str(PurePosixPath(build['target_directory']).parent.parent /
                  'cloud-bin' / spec['build'] / 'sharded_wal_bench')
@@ -553,7 +631,7 @@ def validate_progress_case(root, name, spec, mode, process, summaries, metrics):
         expected['--transport-diagnostics'] = 'true'
     if mode == 'tcp':
         case_root = PurePosixPath(cfg['run_root']) / 'cases' / case
-        if spec['build'] == 'current':
+        if structured_transport:
             expected['--transport-config'] = str(case_root.parent / 'requested-configs' / case / 'transport.json')
         else:
             expected['--transport'] = spec['transport']
@@ -598,25 +676,27 @@ def validate_progress_case(root, name, spec, mode, process, summaries, metrics):
         ('--batches', 'batches'), ('--mixed', 'mixed'), ('--reads', 'reads'),
         ('--tcp-read-cache-bytes', 'cache')]}
     case_root = str(PurePosixPath(cfg['run_root']) / 'cases' / case)
-    if spec['build'] == 'current':
+    if structured_transport:
         prep_expected['--transport-config'] = str(PurePosixPath(cfg['run_root']) / 'cases' / 'requested-configs' / case / 'transport.json')
     else:
         prep_expected['--transport'] = str(spec['transport'])
     prep_expected.update({'--repetitions': '1', '--prepare-external-case': case_root,
                           '--guest-case-root': case_root, '--remote-endpoints': ','.join(
                               n['private_ip'] + ':7700' for n in sorted(cfg['nodes'], key=lambda n: n['partition']))})
-    if spec['build'] == 'current':
+    if structured_transport:
         prep_expected['--owner-transports'] = str(PurePosixPath(cfg['run_root']) / 'cases' / 'requested-configs' / case / 'owner-transports.json')
     if spec['build'] == 'current' or checkpoint:
         prep_expected.update({flag: str(spec[key]) for flag, key in [
             ('--tcp-read-lanes', 'lanes'), ('--tcp-server-read-workers', 'workers'),
             ('--tcp-wal-member-read', 'member')]})
-    if checkpoint and spec['build'] == 'current':
+    if historical and spec['build'] == 'current':
         prep_expected['--tcp-shard-cache-bytes'] = str(spec['shard_cache'])
     if prep != prep_expected:
         raise ValueError('prepared workload/endpoint/server policy differs from exact case')
-    if spec['build'] == 'current':
+    if structured_transport:
         validate_prepared_transport(root, case, spec['transport'], cfg['nodes'])
+    elif historical:
+        validate_historical_remote(root, case, spec, cfg)
     if spec['build'] == 'current' or checkpoint:
         remote = (root / (case + '-remote.yaml')).read_text()
         for key, value in [('read_lanes', spec['lanes']), ('read_cache_bytes', spec['cache'])]:
@@ -649,7 +729,8 @@ def validate_progress_case(root, name, spec, mode, process, summaries, metrics):
         thread_counters = checkpoint_async.validate_threads(read_json(root / (name + '-process.threads.json')), process['pid'])
         result.update({('threads', 'sampled_controller_lifetimes', key): value for key, value in thread_counters.items()})
         if spec['build'] == 'current' and mode == 'tcp':
-            result.update(checkpoint_async.read_path_metrics(root / name / 'read_path_evidence.csv', spec,
+            parser = checkpoint_async.historical_read_path_metrics if historical else checkpoint_async.read_path_metrics
+            result.update(parser(root / name / 'read_path_evidence.csv', spec,
                 'experimental_efa_authority' if spec['transport'] == 'efa' else BACKENDS['tcp']))
             for phase in ('open_recovery', 'reopen_recovery'):
                 for field in ('checkpoint_loaded', 'checkpoint_load_ns', 'proof_validation_ns', 'tail_replay_ns',
@@ -682,7 +763,10 @@ def validate_progress_inventory(root):
         raise ValueError('transport campaign requires its reviewed US East zone')
     reviewed_types = ('g6.16xlarge', 'c6id.32xlarge') if cfg.get('campaign') in ('transport-floor', 'stage-timing') else ('g6.16xlarge',)
     if cfg.get('campaign') == 'stage-timing':
-        stage_timing.validate_placement(cfg, instances, json.loads((root / 'placement-groups.json').read_text()))
+        specs = selected_plan(root, stage_timing, cfg.get('checkpoint_scope', 'full'))
+        validate = (stage_timing.historical_validate_placement if 'shard_cache' in specs[0]
+                    else stage_timing.validate_placement)
+        validate(cfg, instances, json.loads((root / 'placement-groups.json').read_text()))
     for instance in instances:
         actual = {t['Key']: t['Value'] for t in instance['Tags']}
         if (instance['InstanceType'] != cfg['instance_type'] or
@@ -711,7 +795,8 @@ def validate_qualification(root):
             profile = cluster_ram
         elif campaign_name in ('scalar-transport', 'transport-floor', 'stage-timing'):
             profile = stage_timing if campaign_name == 'stage-timing' else transport_floor if campaign_name == 'transport-floor' else scalar_transport
-            receipts = {f'cloud-build-{label}': profile.validate_build_identity(root, label)
+            historical = 'shard_cache' in selected_plan(root, profile)[0]
+            receipts = {f'cloud-build-{label}': validate_profile_build(root, profile, label, historical)
                         for label in ('baseline', 'current')}
             receipts['cloud-build-pair-verified'] = read_json(root / 'cloud-build-pair-verified.json')
             build_errors = validate_build_pair(root, receipts)
@@ -720,8 +805,10 @@ def validate_qualification(root):
         validate_progress_inventory(root)
     except (OSError, ValueError, KeyError, TypeError) as error:
         errors['inventory'] = str(error)
-    expected = profile.expected_cases()
-    for spec in profile.qualification_cases():
+    specs = selected_plan(root, profile) if profile is not efa_progress else profile.plan()
+    expected = plan_cases(specs)
+    qualification_specs = [s for s in specs if s['qualification']]
+    for spec in qualification_specs:
         for mode in spec.get('modes', ('native-sync', 'tcp')):
             name = spec['case_id'] + '-' + mode
             try:
@@ -730,8 +817,8 @@ def validate_qualification(root):
             except (OSError, ValueError, KeyError, TypeError, tarfile.TarError) as error:
                 errors[name] = str(error)
     return dict(schema=1, passed=not errors, case_ids=validated, errors=errors,
-                expected_api_cases=sum(len(c.get('modes', ('native-sync', 'tcp'))) for c in profile.qualification_cases()),
-                expected_node_archives=5 * len(profile.qualification_cases()),
+                expected_api_cases=sum(len(c.get('modes', ('native-sync', 'tcp'))) for c in qualification_specs),
+                expected_node_archives=5 * len(qualification_specs),
                 rss_limit_fraction=efa_progress.RSS_NUMERATOR / efa_progress.RSS_DENOMINATOR)
 
 
@@ -741,6 +828,8 @@ def read_recovery_case(root, name, spec, profile=checkpoint_async):
     case = spec['case_id']
     if read_json(root / (case + '-plan.json')) != spec:
         raise ValueError('recovery case differs from deterministic plan')
+    historical = 'shard_cache' in spec
+    structured_transport = spec['build'] == 'current' and not historical
     base = PurePosixPath(cfg['run_root'])
     binary = str(base / 'cloud-bin' / spec['build'] / 'sharded_wal_recovery_bench')
     preparation = read_json(root / (case + '-prepare.command.json'))
@@ -749,24 +838,27 @@ def read_recovery_case(root, name, spec, profile=checkpoint_async):
                      '--remote-endpoints': ','.join(n['private_ip'] + ':7700' for n in sorted(cfg['nodes'], key=lambda n: n['partition'])),
                      '--tcp-read-cache-bytes': '0',
                      **({'--transport-config': str(base / 'cases' / 'requested-configs' / case / 'transport.json')}
-                        if spec['build'] == 'current' else {'--transport': spec['transport']}),
+                        if structured_transport else {'--transport': spec['transport']}),
                      '--tcp-read-lanes': str(spec['lanes']), '--tcp-server-read-workers': str(spec['workers']),
                      '--tcp-wal-member-read': spec['member'], '--values': '8192', '--batch-sizes': '32',
                      '--windows': '32', '--batches': str(spec['batches']), '--mixed': str(spec['mixed']),
                      '--reads': '8192', '--repetitions': '1'}
-    if spec['build'] == 'current':
+    if spec['build'] == 'current' and 'shard_cache' in spec:
         expected_prep['--tcp-shard-cache-bytes'] = '0'
     if profile in (cluster_ram, scalar_transport, transport_floor, stage_timing):
-        transport_config = base / 'cases' / 'requested-configs' / case / 'transport.json' if spec['build'] == 'current' else None
+        transport_config = base / 'cases' / 'requested-configs' / case / 'transport.json' if structured_transport else None
+        flags = profile.historical_flags if historical else profile.flags
         expected_prep = efa_progress.command_options(['binary', '--prepare-external-case', str(base / 'cases' / case),
             '--guest-case-root', str(base / 'cases' / case), '--remote-endpoints',
             ','.join(n['private_ip'] + ':7700' for n in sorted(cfg['nodes'], key=lambda n: n['partition']))]
-            + profile.flags(spec, 'tcp', prepare=True, transport_config=transport_config))
-    if spec['build'] == 'current':
+            + flags(spec, 'tcp', prepare=True, transport_config=transport_config))
+    if structured_transport:
         expected_prep['--owner-transports'] = str(base / 'cases' / 'requested-configs' / case / 'owner-transports.json')
     if (preparation.get('exit_code') != 0 or preparation['command'][0] != str(base / 'cloud-bin' / spec['build'] / 'sharded_wal_bench')
             or efa_progress.command_options(preparation['command']) != expected_prep):
         raise ValueError('recovery preparation differs from source-bound server policy')
+    if historical:
+        validate_historical_remote(root, case, spec, cfg)
     before, after = [read_json(root / (name + '-' + stage + '.json')) for stage in ('before', 'after')]
     if any(e.get('instance_id') != cfg['coordinator_instance_id'] for e in (before, after)):
         raise ValueError('recovery controller identity differs')
@@ -827,7 +919,7 @@ def validate_checkpoint_campaign(root, receipts, recorded, qualification, profil
         raise ValueError('checkpoint campaign hardware/repetition/lifetime policy differs')
     if not qualification['passed'] or read_json(root / 'qualification-receipt.json') != qualification:
         raise ValueError('hardware qualification receipt/evidence mismatch')
-    selected = profile.plan(cfg.get('checkpoint_scope', 'full'))
+    selected = selected_plan(root, profile, cfg.get('checkpoint_scope', 'full'))
     ordered = []
     for spec in selected:
         modes = spec['modes'] if spec['rep'] % 2 == 0 else list(reversed(spec['modes']))
@@ -845,7 +937,7 @@ def validate_checkpoint_campaign(root, receipts, recorded, qualification, profil
         raise ValueError('baseline differs from the selected campaign source/binary pair')
     for label in ('baseline', 'current'):
         if profile is stage_timing:
-            profile.validate_build_identity(root, label)
+            validate_profile_build(root, profile, label, 'shard_cache' in selected[0])
             continue
         source = root / (f'sharded_wal_recovery_bench-{label}.rs'
                          if profile in (cluster_ram, scalar_transport, transport_floor, stage_timing) else 'sharded_wal_recovery_bench.rs')
@@ -871,11 +963,11 @@ def validate_checkpoint_campaign(root, receipts, recorded, qualification, profil
         if not receipt.get('compiler') or not is_sha256(receipt.get('libfabric_sha256')):
             raise ValueError('missing compiler/provider identity')
         if profile in (scalar_transport, transport_floor, stage_timing):
-            profile.validate_build_identity(root, label)
+            validate_profile_build(root, profile, label, 'shard_cache' in selected[0])
 
 
-def compare_checkpoint(runs, profile=checkpoint_async):
-    specs = {c['case_id']: c for c in profile.plan()}
+def compare_checkpoint(runs, profile=checkpoint_async, specs=None):
+    specs = {c['case_id']: c for c in (profile.plan() if specs is None else specs)}
     grouped = defaultdict(dict)
     for info, metrics in runs.values():
         family, build, value, batch, window, rep, mode, _ = info
@@ -888,12 +980,13 @@ def compare_checkpoint(runs, profile=checkpoint_async):
         oldfamily, oldbuild = family, 'baseline'
         pressure = family.startswith('pressure-') and profile is checkpoint_async
         if pressure:
-            oldfamily, oldbuild = f"core-f0-s0-{spec['transport']}", 'current'
+            oldfamily, oldbuild = (f"core-f0-s0-{spec['transport']}" if 'shard_cache' in spec
+                                   else f"core-f0-{spec['transport']}"), 'current'
         previous = grouped.get((oldfamily, oldbuild, value, batch, window, mode, kind, phase, metric), {}) if build == 'current' else {}
         common = sorted(repetitions.keys() & previous.keys())
         new = statistics.median(repetitions.values())
         old = statistics.median(previous.values()) if previous else None
-        native_family = f"core-f0-s0-{spec['transport']}" if pressure else family
+        native_family = oldfamily if pressure else family
         native = grouped.get((native_family, build, value, batch, window, 'native-sync', kind, phase, metric), {})
         native_old = grouped.get((oldfamily, oldbuild, value, batch, window, 'native-sync', kind, phase, metric), {})
         rows.append(dict(comparison='cache_capacity_not_equal_memory' if profile is cluster_ram and spec['workload'] in ('capacity', 'large-config', 'pressure') else 'finite_cache_pressure' if pressure else 'qualification' if spec['qualification'] else 'diagnostic_only' if profile is scalar_transport and spec['diagnostics'] else 'whole_implementation_and_config',
@@ -905,7 +998,7 @@ def compare_checkpoint(runs, profile=checkpoint_async):
             new_over_native_barrier=ratio(new, statistics.median(native.values())) if native and mode == 'tcp' and kind == 'summary' else None,
             repetition_values=repetitions, paired_deltas={r: repetitions[r] - previous[r] for r in common},
             paired_ratios={r: ratio(repetitions[r], previous[r]) for r in common},
-            transport=spec['transport'], frontend_cache_bytes=spec['cache'], per_shard_cache_bytes=spec['shard_cache'],
+            transport=spec['transport'], frontend_cache_bytes=spec['cache'], per_shard_cache_bytes=spec.get('shard_cache'),
             native_control_ids=[c['native_control_id'] for c in specs.values()
                                 if c['family'] == family and c['build'] == build and c['value'] == value],
             native_control_semantics='paired correlated transport controls; never pooled across transports'))
@@ -1062,6 +1155,26 @@ def io_delta(before, after):
     return delta
 
 
+def validate_owner_launch(launch, spec, historical=False):
+    for key, value in [('read_workers', spec['workers']), ('wal_member_read', spec['member'])]:
+        if re.findall(r'^\s*' + key + r':\s*(\S+)\s*$', launch, re.M) != [str(value)]:
+            raise ValueError('launched node policy differs from case')
+    if historical and spec['build'] == 'current':
+        if re.findall(r'^\s*read_cache_bytes:\s*(\S+)\s*$', launch, re.M) != [str(spec['shard_cache'])]:
+            raise ValueError('launched shard cache budget differs')
+    elif spec['build'] == 'current':
+        document = transport_floor.yaml_one(launch)
+        if (not isinstance(document, dict) or not isinstance(document.get('node'), dict)
+                or not isinstance(document.get('tls'), dict)):
+            raise ValueError('launch must contain node and tls mappings')
+        if ({'read_cache_bytes', 'read_cache_metadata_bytes', 'resident_reads'} & document['node'].keys()
+                or 'resident_reads' in document['tls']):
+            raise ValueError('obsolete owner cache or registered-value policy in launch')
+    if spec.get('workload') and spec['build'] == 'current':
+        if re.findall(r'^\s*read_memory_allowance_bytes:\s*(\S+)\s*$', launch, re.M) != [str(spec['shard_allowance'])]:
+            raise ValueError('launched shard read-memory allowance differs')
+
+
 def node_evidence(root, case, node):
     archive = root / "nodes" / case / f"node-{node}.tar.gz"
     receipt = read_json(archive.with_name(archive.name + ".receipt.json"))
@@ -1102,12 +1215,21 @@ def node_evidence(root, case, node):
             delta['efa_traffic_bytes'] = traffic
             delta['efa_counter_deltas'] = differences
         status = dict(line.split(":", 1) for line in text("process-status.txt").splitlines() if ":" in line)
-        spec = next((c for c in efa_progress.plan() + checkpoint_async.plan() + cluster_ram.plan() + scalar_transport.plan() + transport_floor.plan() + stage_timing.plan() if c['case_id'] == case), None)
-        cfg = read_json(root / 'campaign-config.json') if case.startswith(('transport-', 'floor-', 'stage-')) else None
+        config_path = root / 'campaign-config.json'
+        cfg = read_json(config_path) if config_path.is_file() else {}
+        profiles = {'checkpoint-async': checkpoint_async, 'cluster-ram': cluster_ram,
+                    'scalar-transport': scalar_transport, 'transport-floor': transport_floor,
+                    'stage-timing': stage_timing}
+        checkpoint = cfg.get('campaign') in profiles
+        specs = selected_plan(root, profiles[cfg['campaign']], cfg.get('checkpoint_scope', 'full')) if checkpoint else efa_progress.plan()
+        spec = next((c for c in specs if c['case_id'] == case), None)
+        historical = checkpoint and spec is not None and 'shard_cache' in spec
+        if checkpoint and spec is None:
+            raise ValueError('unplanned checkpoint node case')
         bound_profile = stage_timing if case.startswith('stage-') else transport_floor if case.startswith('floor-') else scalar_transport
         bound_campaign = 'stage-timing' if case.startswith('stage-') else 'transport-floor' if case.startswith('floor-') else 'scalar-transport'
-        if cfg is not None and (cfg.get('campaign') != bound_campaign
-                or spec not in bound_profile.plan(cfg.get('checkpoint_scope', 'full'))):
+        if case.startswith(('transport-', 'floor-', 'stage-')) and (cfg.get('campaign') != bound_campaign
+                or spec not in selected_plan(root, bound_profile, cfg.get('checkpoint_scope', 'full'))):
             raise ValueError('unplanned source-bound node case')
         if spec is not None:
             delta.update(efa_progress.hardware_interval(before, after, spec['transport'] == 'efa'))
@@ -1116,20 +1238,15 @@ def node_evidence(root, case, node):
                 raise ValueError('node instance/partition evidence differs')
             delta['instance_id'] = before['instance_id']
             delta['pid'] = int(status['Pid'])
-            if spec['build'] == 'current' or 'shard_cache' in spec:
+            if spec['build'] == 'current' or checkpoint:
                 launch = text('launch.yaml')
                 if case.startswith(('floor-', 'stage-')):
-                    bound_profile.validate_node_policy(root, spec, launch, node)
-                for key, value in [('read_workers', spec['workers']), ('wal_member_read', spec['member'])]:
-                    if re.findall(r'^\s*' + key + r':\s*(\S+)\s*$', launch, re.M) != [str(value)]:
-                        raise ValueError('launched node policy differs from case')
-                if 'shard_cache' in spec and spec['build'] == 'current':
-                    if re.findall(r'^\s*read_cache_bytes:\s*(\S+)\s*$', launch, re.M) != [str(spec['shard_cache'])]:
-                        raise ValueError('launched shard cache budget differs')
-                if spec.get('workload') and spec['build'] == 'current':
-                    if re.findall(r'^\s*read_memory_allowance_bytes:\s*(\S+)\s*$', launch, re.M) != [str(spec['shard_allowance'])]:
-                        raise ValueError('launched shard read-memory allowance differs')
-            if 'shard_cache' in spec:
+                    validator = (bound_profile.historical_validate_node_policy
+                                 if bound_profile is stage_timing and historical
+                                 else bound_profile.validate_node_policy)
+                    validator(root, spec, launch, node)
+                validate_owner_launch(launch, spec, historical)
+            if checkpoint:
                 counters = checkpoint_async.validate_threads(json.loads(text(f"threads-{delta['pid']}.json")), delta['pid'])
                 delta.update({'sampled_thread_' + key: value for key, value in counters.items()})
                 start = json.loads(text('start.json'))
@@ -1143,13 +1260,13 @@ def node_evidence(root, case, node):
                         raise ValueError('restart does not replace originally ready server')
                     delta['node_restart_ns'] = restart['node_restart_ns']
                     if cfg.get('campaign') in ('scalar-transport', 'transport-floor', 'stage-timing'):
-                        build = bound_profile.validate_build_identity(root, spec['build'])
+                        build = validate_profile_build(root, bound_profile, spec['build'], historical)
                         if restart.get('build') != spec['build'] or restart.get('binary_sha256') != build['binary_sha256']:
                             raise ValueError('restarted node executable differs from source-bound build')
                 elif start['pid'] != delta['pid'] or any(m.name == 'restart.json' for m in members):
                     raise ValueError('surviving shard process unexpectedly replaced')
                 if cfg.get('campaign') in ('scalar-transport', 'transport-floor', 'stage-timing'):
-                    build = bound_profile.validate_build_identity(root, spec['build'])
+                    build = validate_profile_build(root, bound_profile, spec['build'], historical)
                     if start.get('build') != spec['build'] or start.get('binary_sha256') != build['binary_sha256']:
                         raise ValueError('started node executable differs from source-bound build')
         for key in ("VmRSS", "VmHWM", "VmSwap"):
@@ -1239,7 +1356,7 @@ def main():
         parser.error('--spread-results is only supported by stage-timing')
     root = args.results.resolve()
     scope = read_json(root / 'campaign-config.json').get('checkpoint_scope', 'full') if args.profile in ('checkpoint-async', 'cluster-ram', 'scalar-transport', 'transport-floor', 'stage-timing') else 'full'
-    expected = expected_cases(args.profile, scope)
+    expected = expected_cases(args.profile, scope, root)
     output = args.output or root / "analysis"
     output.mkdir(parents=True, exist_ok=True)
     runs, invalid, nodes, node_errors = {}, {}, [], {}
@@ -1260,9 +1377,9 @@ def main():
             except (OSError, ValueError, KeyError, TypeError, tarfile.TarError) as error:
                 node_errors[f"{case}/node-{node}"] = str(error)
     rows = (stage_timing.compare(runs) if args.profile == 'stage-timing' else transport_floor.compare(runs) if args.profile == 'transport-floor' else
-            compare_checkpoint(runs, scalar_transport) if args.profile == 'scalar-transport' else
-            compare_checkpoint(runs, cluster_ram) if args.profile == 'cluster-ram' else
-            compare_checkpoint(runs) if args.profile == 'checkpoint-async' else
+            compare_checkpoint(runs, scalar_transport, selected_plan(root, scalar_transport, scope)) if args.profile == 'scalar-transport' else
+            compare_checkpoint(runs, cluster_ram, selected_plan(root, cluster_ram, scope)) if args.profile == 'cluster-ram' else
+            compare_checkpoint(runs, checkpoint_async, selected_plan(root, checkpoint_async, scope)) if args.profile == 'checkpoint-async' else
             compare_progress(runs) if args.profile == 'efa-progress' else compare(runs))
     fields = list(rows[0]) if rows else ["comparison", "family", "backend", "metric"]
     write_csv(output / "comparison.csv", rows, fields)
@@ -1386,10 +1503,10 @@ def main():
             swap_in_pages=sum(n["pswpin_pages"] for n in nodes) if nodes else None,
             swap_out_pages=sum(n["pswpout_pages"] for n in nodes) if nodes else None))
     if args.profile == 'stage-timing':
-        report.update(qualification=qualification, case_plan=stage_timing.plan(),
+        report.update(qualification=qualification, case_plan=selected_plan(root, stage_timing, scope),
                       stage_timing=detailed_stages, historical_spread_ram_controls=spread_comparison)
         report['methodology'] += [
-            'Stage-timing requires six C6id hosts in the exact owned cluster placement group/AZ. Source-bound baseline v5 and current v6 never mix peers.',
+            'Stage-timing requires six C6id hosts in the exact owned cluster placement group/AZ. Each source-bound revision runs its own matching servers.',
             'Stage counters are local monotonic nested/parallel sums with explicit call denominators, never additive wall slices, wire-only latency, or one-way delay.',
             'Baseline continuous RAM controls match the saved spread workload (1000 samples, 64 warmups, three repetitions, 1/8KiB, five shards). Cross-time spread/cluster comparison is observational, not causal placement isolation.']
     if args.profile == 'efa-progress':
@@ -1408,19 +1525,19 @@ def main():
             'Qualification and transport diagnostics are separate from headline timed comparisons. Cold evidence requires every process to have positive physical reads and no more than ten percent file residency before each eviction pass. Per-process peak RSS is bounded at eighty percent of that actual guest RAM.'
         ]
     if args.profile == 'checkpoint-async':
-        report.update(qualification=qualification, checkpoint_scope=scope, case_plan=checkpoint_async.plan(scope),
+        report.update(qualification=qualification, checkpoint_scope=scope, case_plan=selected_plan(root, checkpoint_async, scope),
                       recovery=[r for r in rows if r['kind'] == 'recovery'],
                       read_path_evidence=[r for r in rows if r['kind'] == 'read_path'])
         report['methodology'] += [
             'October 8 CURRENT engine is the immutable baseline. The identical hashed recovery-only overlay is compiled for both; checkpoint_recovery_stats is applied only to the current example, never its dependencies.',
             'Core is a whole implementation/configuration comparison: baseline mapped/4 lanes/1 worker versus current Async/1 lane/2 control workers; both native controls use 32 workers and window32. Five repetitions, alternating build order.',
             'Native controls remain paired to each transport. Equivalent copies share native_control_id and are not pooled as ten independent repetitions. Pressure runs have no native small-cache comparison; ratios reference cache-zero native.',
-            'Core includes warm and actual cache-evicted scalar/grouped/window phases. Pressure uses warm/hot phases and requires enabled-tier misses and evictions, finite retained budgets, and WAL reads; no cache-fitting hot phase is described as uncached.',
+            'Core includes warm and actual cache-evicted scalar/grouped/window phases. Pressure measures the finite coordinator cache and observed owner WAL reads; Linux page cache residency is not inferred from a workload label.',
             'Full-shard restart proves five replaced PIDs with fresh readiness and preserved data/absolute TTL. Surviving-shard reopen proves unchanged PIDs. OS cache is not claimed cold. Controller service restore includes SSM orchestration and verification and is not engine open latency.',
             'Thread CPU/context-switch evidence is sampled outside latency timers over observed thread lifetimes, not attributed to API phases. Each repetition retains raw samples and separate percentile/throughput metrics; paired deltas align exact repetition identities.'
         ]
     if args.profile == 'scalar-transport':
-        report.update(qualification=qualification, checkpoint_scope=scope, case_plan=scalar_transport.plan(scope),
+        report.update(qualification=qualification, checkpoint_scope=scope, case_plan=selected_plan(root, scalar_transport, scope),
                       recovery=[r for r in rows if r['kind'] == 'recovery'],
                       cold_reopen=[r for r in rows if r['phase'] in ('reopen', 'reopen_recovery')],
                       reused_transport_reopen=[r for r in rows if r['phase'] in
@@ -1436,7 +1553,7 @@ def main():
             'Unavailable baseline optional statistics/percentiles remain absent, never zero. Endpoint/setup worker sums overlap and cannot be added to cold/reused wall latency.'
         ]
     if args.profile == 'transport-floor':
-        report.update(qualification=qualification, checkpoint_scope=scope, case_plan=transport_floor.plan(scope),
+        report.update(qualification=qualification, checkpoint_scope=scope, case_plan=selected_plan(root, transport_floor, scope),
                       recovery=[r for r in rows if r['kind'] == 'recovery'],
                       transport_floor=[r for r in rows if r['kind'].startswith('floor')],
                       polling_and_resident_evidence=[r for r in rows if r['kind'] in ('read_path', 'node_profile')],

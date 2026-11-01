@@ -36,7 +36,7 @@ use tidehunter::distributed::local_inventory::LocalInventoryConfig;
 use tidehunter::distributed::remote_db::{
     RemoteDatabase, RemoteDatabaseConfig, RemoteTransportPool,
 };
-use tidehunter::distributed::tcp::{PollingPolicy, ResidentReadConfig, Transport};
+use tidehunter::distributed::tcp::{PollingPolicy, Transport};
 use tidehunter::distributed::worker::WorkerConfig;
 use tidehunter::key_shape::{KeyShape, KeySpace, KeySpaceConfig, KeyType};
 use tidehunter::metrics::Metrics;
@@ -183,8 +183,6 @@ struct Args {
     windows: Vec<usize>,
     kinds: Vec<Kind>,
     tcp_read_cache_bytes: Option<usize>,
-    tcp_shard_cache_bytes: Option<usize>,
-    rma: ResidentReadConfig,
     native_read_cache_bytes: usize,
     read_memory_allowance_bytes: usize,
     shard_read_memory_allowance_bytes: Option<usize>,
@@ -240,8 +238,6 @@ impl Args {
                 Kind::NativeAsync,
             ],
             tcp_read_cache_bytes: None,
-            tcp_shard_cache_bytes: None,
-            rma: ResidentReadConfig::default(),
             native_read_cache_bytes: 0,
             read_memory_allowance_bytes: 512 * MIB,
             shard_read_memory_allowance_bytes: None,
@@ -287,16 +283,13 @@ impl Args {
                     "WAL geometry: omitted means small locally/prepared; omitted with --remote-config uses supplied geometry. Explicit presets must match external config."
                 );
                 println!(
-                    "Read controls: --read-window 1..256 --tcp-read-lanes 1..8 --tcp-max-pending-reads 1..4096 --tcp-max-pending-read-bytes N --tcp-server-read-workers 1..8 --tcp-wal-member-read async|mapped|positional (default async) --tcp-shard-cache-bytes N (default 0; per-node retained bytes, including metadata; server controls apply only to local launch or --prepare-external-case)"
+                    "Read controls: --read-window 1..256 --tcp-read-lanes 1..8 --tcp-max-pending-reads 1..4096 --tcp-max-pending-read-bytes N --tcp-server-read-workers 1..8 --tcp-wal-member-read async|mapped|positional (default async; server controls apply only to local launch or --prepare-external-case)"
                 );
                 println!(
-                    "Resident RMA (trusted-native, explicit opt-in): --rma-source-bytes N --rma-source-regions N --rma-destination-bytes N --rma-destination-slots N --rma-max-read-bytes N --rma-max-handles N --rma-require-device-read true|false. Software fabric is correctness-only; all-zero defaults disable RMA."
+                    "Matched hot control: --bounded-hot-pass true|false or --bounded-hot-reads 32..131072. Same 32 keys, scalar mix and unique 32 groups; fixed 2*target-read-lanes+1 warm passes. Cache population is unclassified."
                 );
                 println!(
-                    "Matched hot control: --bounded-hot-pass true|false (default false; RMA implies true) or --bounded-hot-reads 32..131072 (explicit N also enables it; independent of --reads). Same32keys, scalar mix and unique32 groups; fixed2*target-read-lanes+1 warm passes. Explicit bounded reads may precede cold phases, which evict and measure separately. Native/RPC results are not registered-hit claims."
-                );
-                println!(
-                    "Memory controls: --read-memory-allowance-bytes N (coordinator/native; default 512 MiB) --shard-read-memory-allowance-bytes N (each storage node; default 512 MiB). Distributed allowances bound cache plus in-flight read bytes, not total RSS. Native cache bytes are nominal values only."
+                    "Memory controls: --read-memory-allowance-bytes N (coordinator/native; default 512 MiB) --shard-read-memory-allowance-bytes N (each storage node; default 512 MiB). Coordinator allowance includes its cache and in-flight bytes; owner allowance bounds in-flight read bytes. Neither is total RSS."
                 );
                 println!(
                     "Node progress: --tcp-polling adaptive|busy (default adaptive; applies to local launch or --prepare-external-case; busy consumes one CPU per open session)"
@@ -345,14 +338,6 @@ impl Args {
                 "--batch-sizes" => args.batch_sizes = number_list(&value)?,
                 "--windows" => args.windows = number_list(&value)?,
                 "--tcp-read-cache-bytes" => args.tcp_read_cache_bytes = Some(value.parse()?),
-                "--tcp-shard-cache-bytes" => args.tcp_shard_cache_bytes = Some(value.parse()?),
-                "--rma-source-bytes" => args.rma.source_bytes = value.parse()?,
-                "--rma-source-regions" => args.rma.source_regions = value.parse()?,
-                "--rma-destination-bytes" => args.rma.destination_bytes = value.parse()?,
-                "--rma-destination-slots" => args.rma.destination_slots = value.parse()?,
-                "--rma-max-read-bytes" => args.rma.max_read_bytes = value.parse()?,
-                "--rma-require-device-read" => args.rma.require_device_read = value.parse()?,
-                "--rma-max-handles" => args.rma.max_handles = value.parse()?,
                 "--native-read-cache-bytes" => args.native_read_cache_bytes = value.parse()?,
                 "--read-memory-allowance-bytes" => {
                     args.read_memory_allowance_bytes = value.parse()?
@@ -456,11 +441,7 @@ impl Args {
                 && (coordinator_cache
                     .checked_add(read_bytes)
                     .is_none_or(|bytes| bytes > args.read_memory_allowance_bytes)
-                    || args
-                        .tcp_shard_cache_bytes
-                        .unwrap_or(0)
-                        .checked_add(64 * MIB)
-                        .is_none_or(|bytes| bytes > shard_allowance)))
+                    || 64 * MIB > shard_allowance))
         {
             return Err(invalid(
                 "cache plus in-flight read bytes exceeds its explicit memory allowance",
@@ -470,37 +451,11 @@ impl Args {
         if args.remote_config.is_some()
             && (args.tcp_server_read_workers.is_some()
                 || args.tcp_wal_member_read.is_some()
-                || args.tcp_shard_cache_bytes.is_some()
-                || args.shard_read_memory_allowance_bytes.is_some()
-                || args.rma != ResidentReadConfig::default())
+                || args.shard_read_memory_allowance_bytes.is_some())
         {
             return Err(invalid("server read controls must be set in node YAML before launch, not with --remote-config").into());
         }
         args.transport.validate()?;
-        if args.rma != ResidentReadConfig::default()
-            && (!args.transport.is_native()
-                || args.kinds.iter().any(|kind| *kind != Kind::Tcp)
-                || args.rma.source_bytes == 0
-                || args.rma.source_regions == 0
-                || args.rma.destination_slots == 0
-                || args.rma.max_read_bytes == 0
-                || args.rma.max_read_bytes > args.rma.destination_bytes
-                || args.rma.max_handles == 0
-                || args
-                    .rma
-                    .source_bytes
-                    .checked_add(args.tcp_shard_cache_bytes.unwrap_or(0))
-                    .and_then(|bytes| bytes.checked_add(64 * MIB))
-                    .is_none_or(|bytes| bytes > shard_allowance)
-                || args
-                    .rma
-                    .destination_bytes
-                    .checked_add(coordinator_cache)
-                    .and_then(|bytes| bytes.checked_add(64 * MIB))
-                    .is_none_or(|bytes| bytes > args.read_memory_allowance_bytes))
-        {
-            return Err(invalid("resident RMA requires trusted-native tcp backend, nonzero bounded source/destination limits, and charged memory allowances").into());
-        }
         if !(1..=MAX_BENCH_BATCHES).contains(&args.batches)
             || args.mixed > args.batches
             || !(1..=8192).contains(&args.reads)
@@ -572,9 +527,7 @@ impl Args {
                 .iter()
                 .any(|k| !matches!(k, Kind::NativeBarrier | Kind::Tcp))
                 || args.tcp_read_cache_bytes.is_some_and(|n| n != 0)
-                || args.tcp_shard_cache_bytes.is_some_and(|n| n != 0)
                 || args.native_read_cache_bytes != 0
-                || args.rma.destination_slots != 0
             {
                 return Err(invalid(
                     "cold reads require native-sync or tcp and disabled application value caches",
@@ -1364,7 +1317,7 @@ fn profile_remote_reads(
         }
         writeln!(
             output.remote_read_profiles,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             case.label(),
             case.value_bytes,
             case.batch_size,
@@ -1383,7 +1336,6 @@ fn profile_remote_reads(
             profile.tcp.response_decode_ns,
             profile.tcp.record_verify_ns,
             profile.tcp.server_handler_ns,
-            profile.tcp.server_inventory_wait_ns,
             profile.tcp.server_authority_lookup_ns,
             profile.tcp.server_record_read_ns,
             profile.cache_hits,
@@ -1393,7 +1345,6 @@ fn profile_remote_reads(
             profile.tcp.server_response_recheck_wait_ns,
             profile.tcp.server_response_recheck_ns,
             profile.tcp.server_response_recheck_samples,
-            profile.tcp.server_response_recheck_deferrals,
             profile.tcp.requests,
             profile.tcp.server_response_recheck_samples != 0,
         )?;
@@ -1432,8 +1383,6 @@ struct Output {
     read_resources: Option<BufWriter<File>>,
     cache_contention: BufWriter<File>,
     checkpoint_diagnostics: BufWriter<File>,
-    resident_reads: BufWriter<File>,
-    registered_controls: BufWriter<File>,
     bounded_controls: BufWriter<File>,
 }
 impl Output {
@@ -1464,8 +1413,6 @@ impl Output {
             native_read_profiles: create("native_read_profiles.csv")?,
             cache_contention: create("cache_contention.jsonl")?,
             checkpoint_diagnostics: create("checkpoint_diagnostics.jsonl")?,
-            resident_reads: create("resident_reads.jsonl")?,
-            registered_controls: create("registered_controls.jsonl")?,
             bounded_controls: create("bounded_hot_controls.jsonl")?,
             read_resources: if resource_evidence {
                 Some(create("read_resources.csv")?)
@@ -1495,7 +1442,7 @@ impl Output {
         )?;
         writeln!(
             output.remote_read_profiles,
-            "backend,value_bytes,batch_size,window,repetition,state,sample,index_ns,dispatch_ns,wait_ns,actor_queue_ns,actor_service_ns,actor_return_ns,request_encode_ns,exchange_ns,response_decode_ns,record_verify_ns,server_handler_ns,server_inventory_wait_ns,server_authority_lookup_ns,server_record_read_ns,cache_hits,cache_misses,whole_call_ns,inline_read_ns,server_response_recheck_wait_ns,server_response_recheck_ns,server_response_recheck_samples,server_response_recheck_deferrals,wire_read_requests,server_timing_available"
+            "backend,value_bytes,batch_size,window,repetition,state,sample,index_ns,dispatch_ns,wait_ns,actor_queue_ns,actor_service_ns,actor_return_ns,request_encode_ns,exchange_ns,response_decode_ns,record_verify_ns,server_handler_ns,server_authority_lookup_ns,server_record_read_ns,cache_hits,cache_misses,whole_call_ns,inline_read_ns,server_response_recheck_wait_ns,server_response_recheck_ns,server_response_recheck_samples,wire_read_requests,server_timing_available"
         )?;
         writeln!(
             output.exchange_profiles,
@@ -1511,7 +1458,7 @@ impl Output {
         )?;
         writeln!(
             output.read_path_evidence,
-            "backend,value_bytes,batch_size,window,repetition,phase,boundary,role,partition,cache_budget_bytes,cache_retained_bytes,cache_metadata_bytes,cache_entries,cache_hits,cache_misses,cache_evictions,wal_reads,wal_read_bytes,inflight_requests,inflight_bytes,inflight_reads,peak_inflight_requests,peak_inflight_bytes,peak_inflight_reads,peak_device_reads,cache_bypass_disabled,cache_bypass_eviction_limit,cache_bypass_scan,cache_bypass_generation,cache_admitted_charge_bytes,cache_served_accounted_bytes,idle_buffer_bytes,idle_buffers,buffer_reuses,buffer_allocations,resident_read_attempts,resident_read_successes,resident_read_fallbacks,resident_read_unsupported,async_read_submissions,resident_read_partial,resident_read_deferred,authority_available,authority_resident_hits,authority_resident_misses,authority_contention,authority_history_loads,authority_entries,authority_capacity,authority_table_bytes"
+            "backend,value_bytes,batch_size,window,repetition,phase,boundary,role,partition,coordinator_cache_budget_bytes,coordinator_cache_retained_bytes,coordinator_cache_metadata_bytes,coordinator_cache_entries,coordinator_cache_hits,coordinator_cache_misses,coordinator_cache_evictions,wal_reads,wal_read_bytes,inflight_requests,inflight_bytes,inflight_reads,peak_inflight_requests,peak_inflight_bytes,peak_inflight_reads,peak_device_reads,coordinator_cache_bypass_disabled,coordinator_cache_bypass_eviction_limit,coordinator_cache_admitted_charge_bytes,coordinator_cache_served_accounted_bytes,idle_buffer_bytes,idle_buffers,buffer_reuses,buffer_allocations,resident_read_attempts,resident_read_successes,resident_read_fallbacks,resident_read_unsupported,async_read_submissions,resident_read_partial,resident_read_deferred,authority_available,authority_resident_hits,authority_resident_misses,authority_contention,authority_history_loads,authority_entries,authority_capacity,authority_table_bytes"
         )?;
         writeln!(
             output.native_read_profiles,
@@ -1712,117 +1659,84 @@ impl Output {
         let Backend::Tcp(db) = backend else {
             return Ok(());
         };
-        let cache = db.read_cache_stats();
-        write!(
-            self.read_path_evidence,
-            "{},{},{},{},{},{},{},frontend,,{},{},{},{},{},{},{},0,0,0,0,0,0,0,0,0",
-            case.label(),
-            case.value_bytes,
-            case.batch_size,
-            case.window,
-            case.repetition,
-            phase,
-            boundary,
-            cache.budget_bytes,
-            cache.retained_bytes,
-            cache.metadata_bytes,
-            cache.entries,
-            cache.hits,
-            cache.misses,
-            cache.evictions,
-        )?;
-        writeln!(
-            self.read_path_evidence,
-            ",{},{},0,0,{},{},0,0,0,0,0,0,0,0,0,0,0,false,,,,,,,",
-            cache.bypass_disabled,
-            cache.bypass_eviction_limit,
-            cache.admitted_bytes,
-            cache.served_bytes,
-        )?;
-        for (partition, stats) in db.read_io_stats()? {
-            write!(
-                self.read_path_evidence,
-                "{},{},{},{},{},{},{},storage,{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-                case.label(),
-                case.value_bytes,
-                case.batch_size,
-                case.window,
-                case.repetition,
-                phase,
-                boundary,
+        let prefix = |role: &str, partition: String| {
+            vec![
+                case.label().to_string(),
+                case.value_bytes.to_string(),
+                case.batch_size.to_string(),
+                case.window.to_string(),
+                case.repetition.to_string(),
+                phase.to_string(),
+                boundary.to_string(),
+                role.to_string(),
                 partition,
-                stats.cache_budget,
-                stats.cache_bytes,
-                stats.cache_metadata_bytes,
-                stats.cache_entries,
-                stats.cache_hits,
-                stats.cache_misses,
-                stats.cache_evictions,
-                stats.wal_reads,
-                stats.wal_read_bytes,
-                stats.inflight_requests,
-                stats.inflight_bytes,
-                stats.inflight_reads,
-                stats.peak_inflight_requests,
-                stats.peak_inflight_bytes,
-                stats.peak_inflight_reads,
-                stats.peak_device_reads,
-            )?;
-            write!(
-                self.read_path_evidence,
-                ",{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-                stats.cache_bypass_disabled,
-                stats.cache_bypass_eviction_limit,
-                stats.cache_bypass_scan,
-                stats.cache_bypass_generation,
-                stats.cache_admitted_bytes,
-                stats.cache_served_bytes,
-                stats.idle_buffer_bytes,
-                stats.idle_buffers,
-                stats.buffer_reuses,
-                stats.buffer_allocations,
-                stats.resident_read_attempts,
-                stats.resident_read_successes,
-                stats.resident_read_fallbacks,
-                stats.resident_read_unsupported,
-                stats.async_read_submissions,
-                stats.resident_read_partial,
-                stats.resident_read_deferred,
-            )?;
+            ]
+        };
+        let cache = db.read_cache_stats();
+        let mut row = prefix("frontend", String::new());
+        row.extend([
+            cache.budget_bytes.to_string(),
+            cache.retained_bytes.to_string(),
+            cache.metadata_bytes.to_string(),
+            cache.entries.to_string(),
+            cache.hits.to_string(),
+            cache.misses.to_string(),
+            cache.evictions.to_string(),
+        ]);
+        row.extend((0..9).map(|_| String::new()));
+        row.extend([
+            cache.bypass_disabled.to_string(),
+            cache.bypass_eviction_limit.to_string(),
+            cache.admitted_bytes.to_string(),
+            cache.served_bytes.to_string(),
+        ]);
+        row.extend((0..19).map(|_| String::new()));
+        writeln!(self.read_path_evidence, "{}", row.join(","))?;
+        for (partition, stats) in db.read_io_stats()? {
+            let mut row = prefix("storage", partition.to_string());
+            row.extend((0..7).map(|_| String::new()));
+            row.extend([
+                stats.wal_reads.to_string(),
+                stats.wal_read_bytes.to_string(),
+                stats.inflight_requests.to_string(),
+                stats.inflight_bytes.to_string(),
+                stats.inflight_reads.to_string(),
+                stats.peak_inflight_requests.to_string(),
+                stats.peak_inflight_bytes.to_string(),
+                stats.peak_inflight_reads.to_string(),
+                stats.peak_device_reads.to_string(),
+            ]);
+            row.extend((0..4).map(|_| String::new()));
+            row.extend([
+                stats.idle_buffer_bytes.to_string(),
+                stats.idle_buffers.to_string(),
+                stats.buffer_reuses.to_string(),
+                stats.buffer_allocations.to_string(),
+                stats.resident_read_attempts.to_string(),
+                stats.resident_read_successes.to_string(),
+                stats.resident_read_fallbacks.to_string(),
+                stats.resident_read_unsupported.to_string(),
+                stats.async_read_submissions.to_string(),
+                stats.resident_read_partial.to_string(),
+                stats.resident_read_deferred.to_string(),
+            ]);
             if let Some(authority) = &stats.authority {
-                writeln!(
-                    self.read_path_evidence,
-                    ",true,{},{},{},{},{},{},{}",
-                    authority.resident_hits,
-                    authority.resident_misses,
-                    authority.contention,
-                    authority.history_loads,
-                    authority.entries,
-                    authority.capacity,
-                    authority.table_bytes,
-                )?;
+                row.extend([
+                    "true".to_string(),
+                    authority.resident_hits.to_string(),
+                    authority.resident_misses.to_string(),
+                    authority.contention.to_string(),
+                    authority.history_loads.to_string(),
+                    authority.entries.to_string(),
+                    authority.capacity.to_string(),
+                    authority.table_bytes.to_string(),
+                ]);
             } else {
-                writeln!(self.read_path_evidence, ",false,,,,,,,")?;
+                row.push("false".to_string());
+                row.extend((0..7).map(|_| String::new()));
             }
+            writeln!(self.read_path_evidence, "{}", row.join(","))?;
         }
-        let snapshot = db.read_evidence_monitor().sample_resident_reads()?;
-        serde_json::to_writer(
-            &mut self.resident_reads,
-            &serde_json::json!({
-                "backend": case.label(),
-                "value_bytes": case.value_bytes,
-                "batch_size": case.batch_size,
-                "window": case.window,
-                "repetition": case.repetition,
-                "phase": phase,
-                "boundary": boundary,
-                "scope": "coordinator_local_per_owner_connection_counters",
-                "source_occupancy_available": false,
-                "owners": snapshot,
-            }),
-        )?;
-        writeln!(self.resident_reads)?;
-        self.resident_reads.flush()?;
         self.read_path_evidence.flush()?;
         Ok(())
     }
@@ -2328,11 +2242,9 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
                 args.tcp_server_read_workers.unwrap_or(2),
                 args.tcp_wal_member_read
                     .unwrap_or(tidehunter::distributed::storage::WalMemberReadPolicy::Async),
-                args.tcp_shard_cache_bytes.unwrap_or(0),
                 args.shard_read_memory_allowance_bytes.unwrap_or(512 * MIB),
                 args.tcp_polling,
                 args.tcp_resident_first,
-                args.rma,
             )?;
             parameters.remote = Some(owned.config.clone());
             cluster = Some(owned);
@@ -2340,12 +2252,6 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
         }
     }
     if let Some(remote) = &mut parameters.remote {
-        if args.cold_read_pass && remote.tls.resident_reads.destination_slots != 0 {
-            return Err(invalid(
-                "cold controls require resident RMA disabled in the external configuration",
-            )
-            .into());
-        }
         remote.read_memory_allowance_bytes = args.read_memory_allowance_bytes;
         remote.write_profile_limit = if args.transport_diagnostics { 128 } else { 0 };
         if remote.tls.transport != args.transport {
@@ -2386,15 +2292,6 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
     let mut backend = parameters.open()?;
     single(output, case, "open", ns(start), 1, 0)?;
     output.recovery_evidence(case, &backend, "open_recovery")?;
-    if args.cold_read_pass
-        && let Backend::Tcp(db) = &backend
-        && db
-            .read_io_stats()?
-            .iter()
-            .any(|(_, stats)| stats.cache_budget != 0)
-    {
-        return Err(invalid("cold reads require disabled shard application caches").into());
-    }
     // Start and acknowledge every worker before opened evidence or read timers.
     // One pool owns at most min(workers, window) requests across all phases.
     let mut native_workers = match &backend {
@@ -2463,16 +2360,7 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
         )?;
     }
     drop(load);
-    let registered = parameters.remote.as_ref().is_some_and(|remote| {
-        remote.tls.resident_reads.destination_slots != 0 && remote.read_cache_bytes == 0
-    });
-    if args.bounded_hot_pass
-        || args.bounded_hot_reads.is_some()
-        || parameters
-            .remote
-            .as_ref()
-            .is_some_and(|remote| remote.tls.resident_reads.destination_slots != 0)
-    {
+    if args.bounded_hot_pass || args.bounded_hot_reads.is_some() {
         let read_lanes = parameters
             .remote
             .as_ref()
@@ -2483,13 +2371,7 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
             output,
             ks,
             &oracle,
-            cache_workloads::registered_hot_policy(
-                args.reads,
-                args.bounded_hot_reads,
-                read_lanes,
-                true,
-            ),
-            registered,
+            cache_workloads::hot_policy(args.reads, args.bounded_hot_reads, read_lanes, true),
         )?;
     }
     if args.cache_probe_keys != 0 {
@@ -3098,11 +2980,9 @@ fn main() -> Result<()> {
             args.tcp_server_read_workers.unwrap_or(2),
             args.tcp_wal_member_read
                 .unwrap_or(tidehunter::distributed::storage::WalMemberReadPolicy::Async),
-            args.tcp_shard_cache_bytes.unwrap_or(0),
             args.shard_read_memory_allowance_bytes.unwrap_or(512 * MIB),
             args.tcp_polling,
             args.tcp_resident_first,
-            args.rma,
         )?;
         // Freeze the requested experimental controls into the generated remote
         // config as well as applying them when an existing config is executed.
@@ -3189,44 +3069,28 @@ fn main() -> Result<()> {
         args.cold_group_probes,
         args.transport_diagnostics
     )?;
-    let (effective_rma, default_read_lanes, default_read_cache_bytes) =
-        if let Some(path) = &args.remote_config {
-            let remote: RemoteDatabaseConfig = serde_yaml::from_slice(&fs::read(path)?)?;
-            (
-                remote.tls.resident_reads,
-                remote.read_lanes,
-                remote.read_cache_bytes,
-            )
-        } else {
-            (args.rma, 2, 8 * MIB)
-        };
-    let registered_policy = cache_workloads::registered_hot_policy(
+    let default_read_lanes = if let Some(path) = &args.remote_config {
+        let remote: RemoteDatabaseConfig = serde_yaml::from_slice(&fs::read(path)?)?;
+        remote.read_lanes
+    } else {
+        2
+    };
+    let bounded_enabled = args.bounded_hot_pass || args.bounded_hot_reads.is_some();
+    let bounded_policy = cache_workloads::hot_policy(
         args.reads,
         args.bounded_hot_reads,
         args.tcp_read_lanes.unwrap_or(default_read_lanes),
-        effective_rma.destination_slots != 0
-            && args
-                .tcp_read_cache_bytes
-                .unwrap_or(default_read_cache_bytes)
-                == 0,
+        bounded_enabled,
     );
-    let bounded_enabled = args.bounded_hot_pass
-        || args.bounded_hot_reads.is_some()
-        || (args.kinds.contains(&Kind::Tcp) && effective_rma.destination_slots != 0);
-    let mut bounded_policy = registered_policy;
-    bounded_policy.enabled = bounded_enabled;
     writeln!(
         metadata,
-        "diagnostic_timing_schema=7\nstage_times_are_nested_not_additive=true\ntransport_io_time_includes_provider_work=true\nstorage_persist_time_includes_file_lookup_and_sync=true\nresource_deltas_include_control_requests=true\nwarm_diagnostic_coordinator_cache_cleared=false\nread_query_algorithm=mix64-v1\nread_query_seed=0\nread_query_order=mix(sample)%loaded_keys\nread_prepared_state={}\nprofiled_scalar_population=full_clean_twin_order_and_cardinality\nrma_config={}\none_sided_wal_reads={}\nregistered_hot_policy={}",
+        "diagnostic_timing_schema=7\nstage_times_are_nested_not_additive=true\ntransport_io_time_includes_provider_work=true\nstorage_persist_time_includes_file_lookup_and_sync=true\nresource_deltas_include_control_requests=true\nwarm_diagnostic_coordinator_cache_cleared=false\nread_query_algorithm=mix64-v1\nread_query_seed=0\nread_query_order=mix(sample)%loaded_keys\nread_prepared_state={}\nprofiled_scalar_population=full_clean_twin_order_and_cardinality",
         match (bounded_enabled, args.cache_probe_keys != 0) {
             (true, true) => "post-load-after-bounded-hot32-controls-and-explicit-hotset-scan-probe",
             (true, false) => "post-load-after-bounded-hot32-controls",
             (false, true) => "post-load-after-explicit-hotset-and-scan-probe",
             (false, false) => "post-load-before-any-read",
         },
-        serde_json::to_string(&effective_rma)?,
-        effective_rma.destination_slots != 0,
-        serde_json::to_string(&registered_policy)?,
     )?;
     writeln!(
         metadata,
@@ -3277,8 +3141,8 @@ fn main() -> Result<()> {
     }
     writeln!(
         metadata,
-        "tcp_shard_cache_bytes_override={:?}\ntcp_wal_member_read_override={:?}\ncache_population=on_demand_only\nshard_placement=unchanged_batch_id_routing",
-        args.tcp_shard_cache_bytes, args.tcp_wal_member_read,
+        "tcp_wal_member_read_override={:?}\nshard_placement=unchanged_batch_id_routing",
+        args.tcp_wal_member_read,
     )?;
     writeln!(
         metadata,

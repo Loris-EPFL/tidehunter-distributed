@@ -82,7 +82,8 @@ resources. Local qualification is not a cloud cost or overhead measurement.
 
 ## What the campaign dashboard measures
 
-Dashboard UID: `kv-comparison-campaign`. It contains 29 panels. Select
+Dashboard UID: `kv-comparison-campaign`. It contains 35 panels: 34 data/query
+panels and one scope panel. Select
 **one run and one case**; do not pool different value sizes,
 durability contracts, cache cohorts, repeats or backends.
 
@@ -268,23 +269,16 @@ The resolution snapshot is exported independently when its measurement arm and
 drain are valid, even if a separate remote-flight profile reports an error.
 Invalid or incomplete resolution boundaries remain unavailable.
 
-Actual instantiated read lanes are sampled before and after measurement.
-Per-lane counter deltas and owner aggregates are separate views; lane session
-presence indicates locally usable constructed state, not fresh peer health.
-Missing or broken session state is unavailable, not a fabricated zero.
+Current measurement-boundary snapshots contain coordinator and owner-executor
+observations; owner value-cache and registered-value counters are no longer
+produced. Historical captures retain their original fields for comparison.
+Unavailable observations remain unavailable, not fabricated zeros.
 
-Measurement-boundary owner grant and response/output counters use sampled
-node-local populations. Missing fields remain unavailable. Their interval
-counts, sums and means are distinct from per-response profiles. A node-lifetime
-end maximum is explicitly labelled `scope=node_lifetime_end`; it cannot be
-subtracted into a measurement-interval maximum. Output retirement is local
-completion, not receipt by the peer. Provider registration calls are not proof
-of hardware pinning.
-
-The cache-policy table separates requested settings from effective receipts and
-coordinator/owner explicit caches from registered RAM and Linux page cache.
-Unavailable effective policy remains unavailable. Disabling an application
-cache or dropping page cache does not prove physical NVMe service.
+The cache-policy table separates requested settings from effective receipts.
+The coordinator application cache and Linux page cache are different tiers.
+The NVMe-oF target uses buffered file I/O; its verified target policy and actual
+TCP or RDMA transport are separate evidence. Warmup, a page-cache policy, and
+block-device activity do not establish cache-hit counts or NAND service.
 
 The terminal read table shows partition, clock domain, stage/population, metric,
 statistic and value. It preserves absent data and does not infer hardware

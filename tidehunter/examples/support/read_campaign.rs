@@ -628,7 +628,7 @@ pub(super) fn run(
             write_exchange_profile(output, case, "cache-evicted", sample, &p.tcp)?;
             writeln!(
                 output.remote_read_profiles,
-                "{},{},{},{},{},cache-evicted,{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},cache-evicted,{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 case.label(),
                 case.value_bytes,
                 case.batch_size,
@@ -646,7 +646,6 @@ pub(super) fn run(
                 p.tcp.response_decode_ns,
                 p.tcp.record_verify_ns,
                 p.tcp.server_handler_ns,
-                p.tcp.server_inventory_wait_ns,
                 p.tcp.server_authority_lookup_ns,
                 p.tcp.server_record_read_ns,
                 p.cache_hits,
@@ -656,7 +655,6 @@ pub(super) fn run(
                 p.tcp.server_response_recheck_wait_ns,
                 p.tcp.server_response_recheck_ns,
                 p.tcp.server_response_recheck_samples,
-                p.tcp.server_response_recheck_deferrals,
                 p.tcp.requests,
                 p.tcp.server_response_recheck_samples != 0,
             )?;

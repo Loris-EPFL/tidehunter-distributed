@@ -102,6 +102,10 @@ pub trait KvBackend: Send + Sync + 'static {
     fn read_observation(&self) -> serde_json::Value {
         serde_json::json!({"available": false, "error": "backend does not expose read observations"})
     }
+    /// Advisory mapped-WAL eviction outside timed operations, with evidence.
+    fn evict_mapped_wal_before_measurement(&self) -> BackendResult<serde_json::Value> {
+        Err(unsupported("pre-measurement mapped-WAL eviction"))
+    }
     /// Arm bounded engine-owned read diagnostics at the measurement boundary.
     fn arm_read_profile(&self, limit: usize) -> BackendResult<()> {
         if limit == 0 {

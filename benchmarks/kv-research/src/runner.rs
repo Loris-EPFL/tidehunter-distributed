@@ -151,7 +151,38 @@ pub async fn run<B: KvBackend>(
         && fatal_reason.is_none()
         && config.phases.measurement_operations > 0
     {
-        if let Some(gate) = &config.measurement_gate
+        if config.phases.evict_mapped_wal_before_measurement {
+            reporter.set_phase("mapped_wal_eviction");
+            let worker = Arc::clone(&backend);
+            let result =
+                tokio::task::spawn_blocking(move || worker.evict_mapped_wal_before_measurement())
+                    .await;
+            let result = match result {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(error) => Err(format!("eviction worker failed: {error}")),
+            };
+            let eviction = match result {
+                Ok(evidence) => serde_json::json!({
+                    "requested":true, "available":true, "scope":"after warmup and aging; before measurement gate",
+                    "semantics":"advisory initial mapped-WAL eviction; not proof of physical I/O or sustained coldness",
+                    "evidence":evidence
+                }),
+                Err(error) => {
+                    failed = true;
+                    fatal_reason = Some(format!(
+                        "pre-measurement mapped-WAL eviction failed: {error}"
+                    ));
+                    serde_json::json!({"requested":true,"available":false,"error":error})
+                }
+            };
+            std::fs::write(
+                output.join("pre-measurement-wal-eviction.json"),
+                serde_json::to_vec_pretty(&eviction)?,
+            )?;
+            reporter.snapshot()?;
+        }
+        if fatal_reason.is_none()
+            && let Some(gate) = &config.measurement_gate
             && let Err(error) = wait_for_measurement_gate(gate, deadline).await
         {
             failed = true;
@@ -442,110 +473,19 @@ fn partition_deltas(
     serde_json::json!({"available": true, "partitions": partitions})
 }
 
-fn lane_deltas(
+fn nvmeof_counter_delta(
     start: &serde_json::Value,
     end: &serde_json::Value,
     fields: &[&str],
 ) -> serde_json::Value {
-    if start["available"] != true || end["available"] != true {
-        return serde_json::json!({"available": false, "error": "lane snapshots unavailable at a boundary"});
-    }
-    let (Some(first), Some(last)) = (
-        start
-            .get("partitions")
-            .and_then(serde_json::Value::as_object),
-        end.get("partitions").and_then(serde_json::Value::as_object),
-    ) else {
-        return serde_json::json!({"available": false, "error": "lane partitions unavailable"});
-    };
-    let mut partitions = serde_json::Map::new();
-    for key in first.keys().chain(last.keys()) {
-        if partitions.contains_key(key) {
-            continue;
+    for field in fields {
+        if start.get(field).and_then(serde_json::Value::as_u64) == Some(u64::MAX)
+            || end.get(field).and_then(serde_json::Value::as_u64) == Some(u64::MAX)
+        {
+            return serde_json::json!({"available": false, "error": format!("saturated counter: {field}")});
         }
-        let delta = match (first.get(key), last.get(key)) {
-            (Some(a), Some(b)) => {
-                let snapshot = |row: &serde_json::Value| {
-                    let lanes = row.get("lanes").and_then(serde_json::Value::as_object);
-                    let counters: serde_json::Map<String, serde_json::Value> = lanes
-                        .into_iter()
-                        .flat_map(|lanes| lanes.iter())
-                        .map(|(lane, value)| {
-                            (
-                                lane.clone(),
-                                value.get("stats").cloned().unwrap_or_default(),
-                            )
-                        })
-                        .collect();
-                    serde_json::json!({"available": lanes.is_some(), "partitions": counters})
-                };
-                let delta = partition_deltas(&snapshot(a), &snapshot(b), fields);
-                serde_json::json!({"available": delta["available"], "lanes": delta["partitions"], "error": delta.get("error")})
-            }
-            _ => {
-                serde_json::json!({"available": false, "error": "partition missing at one boundary"})
-            }
-        };
-        partitions.insert(key.clone(), delta);
     }
-    serde_json::json!({"available": true, "partitions": partitions})
-}
-
-fn owner_response_deltas(start: &serde_json::Value, end: &serde_json::Value) -> serde_json::Value {
-    if start["available"] != true || end["available"] != true {
-        return serde_json::json!({"available": false, "error": "owner snapshots unavailable at a boundary"});
-    }
-    let (Some(first), Some(last)) = (
-        start
-            .get("partitions")
-            .and_then(serde_json::Value::as_object),
-        end.get("partitions").and_then(serde_json::Value::as_object),
-    ) else {
-        return serde_json::json!({"available": false, "error": "owner partitions unavailable"});
-    };
-    let mut partitions = serde_json::Map::new();
-    for key in first.keys().chain(last.keys()) {
-        if partitions.contains_key(key) {
-            continue;
-        }
-        let mut stages = serde_json::Map::new();
-        for (stage, parent, field) in [
-            ("read_response_encode", "", "read_response_encode"),
-            ("read_output_queue", "", "read_output_queue"),
-            ("read_output_submit", "", "read_output_submit"),
-            ("read_response_retire", "", "read_response_retire"),
-            ("read_grant_lookup", "read_grant", "lookup"),
-            ("read_grant_reservation", "read_grant", "reservation"),
-            ("read_grant_envelope", "read_grant", "envelope"),
-            ("read_grant_registration", "read_grant", "registration"),
-            (
-                "read_grant_recheck_publication",
-                "read_grant",
-                "recheck_publication",
-            ),
-        ] {
-            let value = match (first.get(key), last.get(key)) {
-                (Some(a), Some(b)) => {
-                    let (a, b) = if parent.is_empty() {
-                        (a, b)
-                    } else {
-                        (&a[parent], &b[parent])
-                    };
-                    counter_delta(&a[field], &b[field], &["ns", "count", "errors"])
-                }
-                _ => {
-                    serde_json::json!({"available": false, "error": "partition missing at one boundary"})
-                }
-            };
-            stages.insert(stage.to_owned(), value);
-        }
-        partitions.insert(key.clone(), serde_json::Value::Object(stages));
-    }
-    serde_json::json!({
-        "available": true, "partitions": partitions,
-        "population": "sampled owner grant attempts and response frames across node boundary snapshots; each stage has its own count, independent of completed coordinator flights",
-        "max_semantics": "lifetime maxima in raw start/end snapshots cannot be differenced into measurement maxima"
-    })
+    counter_delta(start, end, fields)
 }
 
 fn nvmeof_deltas(start: &serde_json::Value, end: &serde_json::Value) -> serde_json::Value {
@@ -573,13 +513,19 @@ fn nvmeof_deltas(start: &serde_json::Value, end: &serde_json::Value) -> serde_js
         if snapshot["available"] != true { return None; }
         let mut readers = std::collections::BTreeMap::new();
         for reader in snapshot["readers"].as_array()? {
-            let identity = serde_json::json!([
-                reader.get("database_uuid")?, reader.get("epoch")?,
-                reader.get("partition")?, reader.get("export_uuid")?
-            ]).to_string();
+            let bytes = |name: &str| {
+                let values = reader.get(name)?.as_array()?;
+                (values.len() == 16 && values.iter().all(|v| v.as_u64().is_some_and(|n| n <= 255))).then_some(values)
+            };
+            let database = bytes("database_uuid")?;
+            let export = bytes("export_uuid")?;
+            if export.iter().all(|v| v.as_u64() == Some(0)) { return None; }
+            let epoch = reader.get("epoch")?.as_u64().filter(|epoch| *epoch > 0)?;
+            let partition = u32::try_from(reader.get("partition")?.as_u64()?).ok()?;
+            let identity = serde_json::json!([database, epoch, partition, export]).to_string();
             if readers.insert(identity, reader.clone()).is_some() { return None; }
         }
-        Some(readers)
+        (!readers.is_empty()).then_some(readers)
     };
     let (Some(a), Some(b)) = (index(start), index(end)) else {
         return serde_json::json!({"available":false,"error":"NVMe-oF reader identity or boundary unavailable"});
@@ -588,29 +534,70 @@ fn nvmeof_deltas(start: &serde_json::Value, end: &serde_json::Value) -> serde_js
         return serde_json::json!({"available":false,"error":"NVMe-oF reader set changed during measurement"});
     }
     let mut readers = serde_json::Map::new();
+    let mut available = true;
     for (identity, first) in a {
         let last = &b[&identity];
+        let counters = nvmeof_counter_delta(&first, last, COUNTERS);
+        let mut reader_available =
+            counters["available"] == true && first.get("transport") == last.get("transport");
         let mut stages = serde_json::Map::new();
         for stage in STAGES {
+            let mut delta = nvmeof_counter_delta(&first[stage], &last[stage], &["count", "sum_ns"]);
+            let max = first[stage]
+                .get("max_ns")
+                .and_then(serde_json::Value::as_u64)
+                .zip(
+                    last[stage]
+                        .get("max_ns")
+                        .and_then(serde_json::Value::as_u64),
+                );
+            if max.is_none_or(|(a, b)| b < a || b == u64::MAX) {
+                delta = serde_json::json!({"available":false,"error":"missing, decreased or saturated lifetime maximum"});
+            }
+            let values = delta.get("counters");
+            let count = values
+                .and_then(|v| v.get("count"))
+                .and_then(serde_json::Value::as_u64);
+            let sum = values
+                .and_then(|v| v.get("sum_ns"))
+                .and_then(serde_json::Value::as_u64);
+            if count == Some(0) && sum.is_some_and(|n| n != 0) {
+                delta = serde_json::json!({"available":false,"error":"nonzero duration without observations"});
+            }
+            let mean = if delta["available"] == true {
+                count
+                    .zip(sum)
+                    .and_then(|(count, sum)| (count != 0).then_some(sum as f64 / count as f64))
+            } else {
+                None
+            };
+            reader_available &= delta["available"] == true;
             stages.insert(
                 (*stage).to_owned(),
                 serde_json::json!({
-                    "delta":counter_delta(&first[stage], &last[stage], &["count","sum_ns"]),
-                    "lifetime_max_ns_at_end":last[stage]["max_ns"]
+                    "delta": delta,
+                    "mean_ns": mean,
+                    "measurement_max_ns": null,
+                    "lifetime_max_ns_at_end": max.map(|(_, last)| last)
                 }),
             );
         }
+        available &= reader_available;
         readers.insert(
             identity,
             serde_json::json!({
-                "counters":counter_delta(&first,last,COUNTERS),"stages":stages
+                "available": reader_available, "identity": {
+                    "database_uuid":first["database_uuid"], "epoch":first["epoch"],
+                    "partition":first["partition"], "export_uuid":first["export_uuid"],
+                    "transport":first["transport"]
+                }, "counters":counters,"stages":stages
             }),
         );
     }
     serde_json::json!({
-        "available":true,"active_readers":readers.len(),"readers":readers,
+        "available":available,"active_readers":readers.len(),"readers":readers,
         "timing_scope":"submit_to_cq includes host kernel, transport, target and storage; overlapping physical reads cannot be added into API latency",
-        "cold_storage_limit":"O_DIRECT bypasses host/target page cache, not device cache; require target configuration and block-I/O evidence",
+        "cold_storage_limit":"O_DIRECT bypasses initiator page cache; buffered targets may serve Linux page-cache hits; device activity does not prove NAND access",
         "max_semantics":"lifetime maxima are not measurement-window maxima or percentile distributions"
     })
 }
@@ -636,17 +623,6 @@ fn measurement_read_evidence(
         "served_bytes",
     ];
     const OWNER: &[&str] = &[
-        "cache_hits",
-        "cache_misses",
-        "cache_inserts",
-        "cache_evictions",
-        "cache_oversized",
-        "cache_bypass_disabled",
-        "cache_bypass_eviction_limit",
-        "cache_bypass_scan",
-        "cache_bypass_generation",
-        "cache_admitted_bytes",
-        "cache_served_bytes",
         "wal_reads",
         "wal_read_bytes",
         "resident_read_attempts",
@@ -662,45 +638,10 @@ fn measurement_read_evidence(
         "buffer_reuses",
         "buffer_allocations",
     ];
-    const RESIDENT: &[&str] = &[
-        "message_read_requests",
-        "grants_issued",
-        "grant_candidates",
-        "grant_unavailable",
-        "grant_acquisitions",
-        "rma_completions",
-        "eligible_reads",
-        "rma_posts",
-        "rma_hits",
-        "rma_errors",
-        "fallback_missing",
-        "fallback_oversize",
-        "fallback_capacity",
-        "fallback_unsupported",
-        "fallback_stale",
-    ];
-    const OWNER_GRANTS: &[&str] = &[
-        "attempts",
-        "issued",
-        "reused",
-        "denied_request_limit",
-        "denied_oversize",
-        "denied_regions",
-        "denied_bytes",
-        "denied_admission",
-        "denied_source_unavailable",
-        "denied_owner_unavailable",
-        "denied_provider",
-    ];
     let deltas = if attempted && drained && start["available"] == true && end["available"] == true {
         serde_json::json!({
             "coordinator": counter_delta(&start["coordinator"], &end["coordinator"], COORDINATOR),
-            "owner_executor": partition_deltas(&start["owner_executor"], &end["owner_executor"], OWNER),
-            "client_resident": partition_deltas(&start["client_resident"], &end["client_resident"], RESIDENT),
-            "client_resident_lanes": lane_deltas(&start["client_resident_lanes"], &end["client_resident_lanes"], RESIDENT),
-            "owner_response": owner_response_deltas(&start["owner_grants"], &end["owner_grants"]),
-            "owner_output_abandoned": partition_deltas(&start["owner_grants"], &end["owner_grants"], &["read_output_abandoned"]),
-            "owner_grants": partition_deltas(&start["owner_grants"], &end["owner_grants"], OWNER_GRANTS)
+            "owner_executor": partition_deltas(&start["owner_executor"], &end["owner_executor"], OWNER)
         })
     } else {
         serde_json::json!({"available": false, "error": if !attempted { "measurement not attempted" }
@@ -718,7 +659,7 @@ fn measurement_read_evidence(
         "end_boundary": "after measurement run_phase and worker drain; before completion gate, profile finalization and postqualification",
         "measurement_attempted": attempted, "measurement_drained": drained,
         "snapshot_semantics": "sequential component and owner samples, not a globally atomic cut; raw snapshots include gauges and lifetime peaks",
-        "limitations": "logical WAL reads and async submissions are not physical IOPS; RMA counters do not establish hardware native FI_READ or per-operation hit fractions",
+        "limitations": "logical WAL reads, NOWAIT successes and async submissions are not physical IOPS or per-operation NAND evidence",
         "start": start, "end": end, "deltas": deltas, "nvmeof":nvmeof
     })
 }
@@ -2367,50 +2308,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn lane_deltas_preserve_missing_and_reset_lanes() {
-        let start = serde_json::json!({"available": true, "partitions": {"0": {"lanes": {
-            "0": {"session_present": true, "stats": {"hits": 3}},
-            "1": {"session_present": null, "stats": {"hits": 5}},
-            "2": {"session_present": true, "stats": {"hits": 1}}
-        }}}});
-        let end = serde_json::json!({"available": true, "partitions": {"0": {"lanes": {
-            "0": {"session_present": true, "stats": {"hits": 7}},
-            "1": {"session_present": null, "stats": {"hits": 1}}
-        }}}});
-        let delta = lane_deltas(&start, &end, &["hits"]);
-        assert_eq!(
-            delta["partitions"]["0"]["lanes"]["0"]["counters"]["hits"],
-            4
-        );
-        assert_eq!(delta["partitions"]["0"]["lanes"]["1"]["available"], false);
-        assert_eq!(delta["partitions"]["0"]["lanes"]["2"]["available"], false);
-    }
-
-    #[test]
-    fn owner_boundary_stages_keep_errors_missing_and_lifetime_max_separate() {
-        let start = serde_json::json!({"available": true, "partitions": {"0": {
-            "read_grant": {"registration": {"ns": 10, "count": 1, "errors": 0, "max_ns": 10}}
-        }}});
-        let end = serde_json::json!({"available": true, "partitions": {"0": {
-            "read_grant": {"registration": {"ns": 30, "count": 2, "errors": 1, "max_ns": 20}}
-        }}});
-        let delta = owner_response_deltas(&start, &end);
-        let registration = &delta["partitions"]["0"]["read_grant_registration"];
-        assert_eq!(registration["counters"]["ns"], 20);
-        assert_eq!(registration["counters"]["count"], 1);
-        assert_eq!(registration["counters"]["errors"], 1);
-        assert!(registration["counters"].get("max_ns").is_none());
-        assert_eq!(
-            delta["partitions"]["0"]["read_response_encode"]["available"],
-            false
-        );
-        assert_eq!(
-            owner_response_deltas(&start, &serde_json::json!({"available": false}))["available"],
-            false
-        );
-    }
-
     #[tokio::test]
     async fn read_evidence_excludes_warmup_and_postqualification() {
         let directory = result_directory("read-boundary");
@@ -2436,6 +2333,51 @@ mod tests {
         assert!(!output.join("read-diagnostics.json").exists());
         assert_eq!(evidence["deltas"]["owner_executor"]["available"], false);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    #[tokio::test]
+    async fn mapped_wal_eviction_precedes_measurement_and_failure_blocks_gate() {
+        for supported in [true, false] {
+            let directory = result_directory(if supported { "evict-ok" } else { "evict-fail" });
+            let output = directory.join("result");
+            let mut config = read_test_config();
+            config.backend.kind = "native".into();
+            config.phases.warmup_operations = 3;
+            config.phases.measurement_operations = 2;
+            config.phases.evict_mapped_wal_before_measurement = true;
+            if !supported {
+                config.measurement_gate = Some(crate::config::MeasurementGateConfig {
+                    ready_file: directory.join("ready"),
+                    release_file: directory.join("release"),
+                    timeout_seconds: 1,
+                });
+            }
+            let mut backend = MemoryBackend::new(false, false);
+            backend.eviction_supported = supported;
+            let result = run(backend, config, &output, prometheus::Registry::new()).await;
+            let eviction: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(output.join("pre-measurement-wal-eviction.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(eviction["available"], supported);
+            if supported {
+                result.unwrap();
+                let evidence: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(output.join("measurement-read-evidence.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    eviction["evidence"]["reads_before"],
+                    evidence["start"]["coordinator"]["hits"]
+                );
+                assert_eq!(measurement_outcomes(&output).len(), 2);
+            } else {
+                assert!(result.is_err());
+                assert!(!directory.join("ready").exists());
+            }
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -2581,6 +2523,7 @@ mod tests {
         read_count: AtomicUsize,
         profile_events: Option<Arc<Mutex<Vec<&'static str>>>>,
         profile_limit: AtomicUsize,
+        eviction_supported: bool,
     }
 
     impl MemoryBackend {
@@ -2594,6 +2537,7 @@ mod tests {
                 read_count: AtomicUsize::new(0),
                 profile_limit: AtomicUsize::new(0),
                 profile_events: None,
+                eviction_supported: false,
             }
         }
 
@@ -2643,6 +2587,12 @@ mod tests {
                 "admitted_bytes": 0, "served_bytes": 0},
                 "owner_executor": {"available": false, "error": "test unavailable"},
                 "client_resident": {"available": false, "error": "test unavailable"}})
+        }
+        fn evict_mapped_wal_before_measurement(&self) -> BackendResult<serde_json::Value> {
+            if !self.eviction_supported {
+                return Err(invalid("eviction unsupported"));
+            }
+            Ok(serde_json::json!({"reads_before":self.read_count.load(Ordering::Relaxed)}))
         }
         fn arm_read_profile(&self, limit: usize) -> BackendResult<()> {
             let events = self
@@ -3279,7 +3229,7 @@ mod tests {
     #[test]
     fn nvmeof_boundaries_reject_identity_changes_resets_and_missing_samples() {
         let mut reader = serde_json::json!({
-            "database_uuid":[1],"epoch":1,"partition":2,"export_uuid":[3],
+            "database_uuid":vec![1;16],"epoch":1,"partition":2,"export_uuid":vec![3;16],
             "logical_requests":0,"logical_members":0,"eligible_hits":0,
             "ineligible_fallbacks":0,"aligned_requested_bytes":0,"aligned_read_bytes":0,
             "io_submissions":0,"io_completions":0,"io_errors":0,"io_timeouts":0
@@ -3294,10 +3244,13 @@ mod tests {
         ] {
             reader[stage] = serde_json::json!({"count":1,"sum_ns":10,"max_ns":10});
         }
+        // A large pre-window verification population must not enter measured means.
+        reader["submit_to_cq"] = serde_json::json!({"count":65_536,"sum_ns":1_000_000,"max_ns":10});
         let start = serde_json::json!({"available":true,"readers":[reader]});
         let mut end = start.clone();
         end["readers"][0]["io_completions"] = serde_json::json!(2);
-        end["readers"][0]["submit_to_cq"] = serde_json::json!({"count":3,"sum_ns":40,"max_ns":20});
+        end["readers"][0]["submit_to_cq"] =
+            serde_json::json!({"count":65_538,"sum_ns":1_000_030,"max_ns":20});
         let delta = nvmeof_deltas(&start, &end);
         let row = delta["readers"]
             .as_object()
@@ -3311,6 +3264,9 @@ mod tests {
             30
         );
         assert_eq!(row["stages"]["submit_to_cq"]["lifetime_max_ns_at_end"], 20);
+        assert_eq!(row["stages"]["submit_to_cq"]["mean_ns"], 15.0);
+        assert!(row["stages"]["submit_to_cq"]["measurement_max_ns"].is_null());
+        assert!(row["stages"]["queue"]["mean_ns"].is_null());
         end["readers"][0]["submit_to_cq"]["count"] = serde_json::json!(0);
         let delta = nvmeof_deltas(&start, &end);
         let row = delta["readers"]
@@ -3320,7 +3276,8 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(row["stages"]["submit_to_cq"]["delta"]["available"], false);
-        end["readers"][0]["export_uuid"] = serde_json::json!([4]);
+        assert_eq!(delta["available"], false);
+        end["readers"][0]["export_uuid"] = serde_json::json!(vec![4; 16]);
         assert_eq!(nvmeof_deltas(&start, &end)["available"], false);
         assert_eq!(
             nvmeof_deltas(&start, &serde_json::json!({}))["available"],
@@ -3328,5 +3285,17 @@ mod tests {
         );
         let duplicate = serde_json::json!({"available":true,"readers":[start["readers"][0],start["readers"][0]]});
         assert_eq!(nvmeof_deltas(&duplicate, &duplicate)["available"], false);
+        let mut missing = start.clone();
+        missing["readers"][0]["alignment"]
+            .as_object_mut()
+            .unwrap()
+            .remove("sum_ns");
+        assert_eq!(nvmeof_deltas(&start, &missing)["available"], false);
+        let mut saturated = start.clone();
+        saturated["readers"][0]["io_completions"] = serde_json::json!(u64::MAX);
+        assert_eq!(nvmeof_deltas(&start, &saturated)["available"], false);
+        let mut invalid_identity = start.clone();
+        invalid_identity["readers"][0]["database_uuid"] = serde_json::json!([1]);
+        assert_eq!(nvmeof_deltas(&start, &invalid_identity)["available"], false);
     }
 }

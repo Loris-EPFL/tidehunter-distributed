@@ -23,7 +23,7 @@ BINDINGS = ('build_bundle', 'fixture_bundle', 'verification_bundle',
             'binaries', 'transports', 'repetitions', 'read_profile_limits', 'write_profile_limits',
             'native_write_profile_limits', 'kv_suite',
             'checkpoint_digest', 'checkpoint_limit')
-CACHE_BINDINGS = ('coordinator_cache_mib_by_repetition', 'shard_cache_mib_by_repetition')
+CACHE_BINDINGS = ('coordinator_cache_mib_by_repetition',)
 ROLES = {'controller', *(f'storage-{i}' for i in range(5))}
 
 
@@ -65,8 +65,9 @@ def launch_contract(plan):
     result['atomic_client_token'] = plan.get('atomic_client_token', plan['run_id'] + '-atomic')
     bindings = result['atomic_bindings']
     expected = set(BINDINGS) | (set(bindings) & set(CACHE_BINDINGS))
-    if (bindings.get('kv_suite') or {}).get('scope') == 'hardware-populations':
-        expected.update(CACHE_BINDINGS)
+    options = bindings.get('kv_suite') or {}
+    if options.get('scope') == 'hardware-populations' or 'resident_reads' in options:
+        raise ValueError('retired owner-cache and registered-read populations are not admitted')
     if (not re.fullmatch(r'th-[a-f0-9]{16}', result['run_id'])
             or not re.fullmatch(r'[0-9]{12}', result['account'])
             or result['prefix'] != result['run_id'] or result['placement_group'] != result['run_id']

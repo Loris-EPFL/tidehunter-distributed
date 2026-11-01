@@ -22,6 +22,10 @@ pub use reader::{
 };
 use serde::{Deserialize, Serialize};
 
+/// Maximum serialized manifest admitted by both publication and owner leases.
+/// Separate from the conservative in-memory catalog/queue admission budgets.
+pub const MAX_EXPORT_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
+
 /// One exact, owner-validated member and its original file-relative position.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -142,7 +146,7 @@ pub(crate) fn publish_export(
         catalog,
     };
     let encoded = serde_json::to_vec(&manifest).map_err(io::Error::other)?;
-    if encoded.len() > config.max_catalog_bytes {
+    if encoded.len() > config.max_catalog_bytes || encoded.len() > MAX_EXPORT_MANIFEST_BYTES {
         return Err(StorageError::Capacity);
     }
     let parent = directory

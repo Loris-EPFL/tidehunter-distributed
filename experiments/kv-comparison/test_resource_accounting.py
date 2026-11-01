@@ -89,15 +89,19 @@ class ResourceAccountingTests(unittest.TestCase):
         self.assertNotIn("io_read_bytes", row)
         self.assertNotIn("memory_peak_bytes", row)
 
-    def test_new_observed_io_device_starts_at_zero_but_disappearing_device_is_not_zero(self):
+    def test_changed_io_device_population_is_unavailable(self):
         before, after = self.pair()
-        after["processes"][0]["io_devices"]["259:2"] = {"rbytes": 1024, "wbytes": 2048}
-        row = resources.interval([before], [after])["processes"][0]
-        self.assertEqual(row["io_read_bytes"], 8192 + 1024)
-        after["processes"][0]["io_devices"].pop("259:1")
-        row = resources.interval([before], [after])["processes"][0]
-        self.assertFalse(row["available"])
-        self.assertNotIn("io_read_bytes", row)
+        added = copy.deepcopy(after)
+        added["processes"][0]["io_devices"]["259:2"] = {"rbytes": 1024, "wbytes": 2048}
+        removed = copy.deepcopy(after)
+        removed["processes"][0]["io_devices"].pop("259:1")
+        for boundary in (added, removed):
+            with self.subTest(devices=boundary["processes"][0]["io_devices"]):
+                row = resources.interval([before], [boundary])["processes"][0]
+                self.assertFalse(row["available"])
+                self.assertIn("device population changed", row["reason"])
+                self.assertNotIn("io_read_bytes", row)
+                self.assertNotIn("io_write_bytes", row)
 
     def test_foreign_root_traversal_symlink_and_duplicate_roles_are_rejected(self):
         for group in ("/", "relative", "/system.slice/../owned.service"):
@@ -117,6 +121,69 @@ class ResourceAccountingTests(unittest.TestCase):
             self.assertFalse(captured["processes"][0]["available"])
         with self.assertRaises(ValueError):
             resources.io_devices("259:1 rbytes=1 wbytes=2\n259:1 rbytes=3 wbytes=4\n")
+
+    def test_ambiguous_io_preserves_qualified_cpu_but_not_io(self):
+        for text in (
+            "(unknown) rbytes=0 wbytes=0 rios=5\n259:1 rbytes=10 wbytes=20\n",
+            "259:1 rbytes=1 wbytes=2\n259:1 rbytes=3 wbytes=4\n",
+            "259:1 rbytes=bad wbytes=2\n",
+        ):
+            with self.subTest(text=text):
+                (self.group / "io.stat").write_text(text)
+                before = self.capture(1_000_000_000)
+                self.write_counters(usage=800000, periods=13, throttled=3, throttle_us=6000,
+                                    read=12288, write=24588)
+                (self.group / "io.stat").write_text(text)
+                after = self.capture(3_000_000_000)
+                snapshot = before["processes"][0]
+                self.assertFalse(snapshot["available"])
+                self.assertTrue(snapshot["core_available"])
+                self.assertEqual(snapshot["io_diagnostic"], {"text_prefix": text, "truncated": False})
+                row = resources.interval([before], [after])["processes"][0]
+                self.assertFalse(row["available"])
+                self.assertTrue(row["core_available"])
+                self.assertEqual(row["cpu_seconds"], .7)
+                self.assertEqual(row["memory_current_bytes"], 1048576)
+                self.assertNotIn("io_read_bytes", row)
+                self.assertNotIn("io_write_bytes", row)
+                self.assertIn("IO counters unavailable", row["reason"])
+                self.write_counters(usage=100000, periods=3, throttled=1, throttle_us=1000,
+                                    read=4096, write=8192)
+
+    def test_ambiguous_io_never_relaxes_identity_or_cpu_validation(self):
+        (self.group / "io.stat").write_text("(unknown) rbytes=0 wbytes=0\n")
+        before = self.capture(1_000_000_000)
+        after = self.capture(3_000_000_000)
+        for mutate in (lambda f: f.update(boot_id="other"),
+                       lambda f: f["processes"][0].update(inode=0),
+                       lambda f: f["processes"][0].update(monotonic_ns=1_000_000_000),
+                       lambda f: f["processes"][0]["cpu"].update(usage_usec=0)):
+            broken = copy.deepcopy(after)
+            mutate(broken)
+            with self.subTest(mutator=mutate):
+                row = resources.interval([before], [broken])["processes"][0]
+                self.assertFalse(row["available"])
+                self.assertNotIn("cpu_seconds", row)
+                self.assertNotIn("memory_current_bytes", row)
+
+    def test_cgroup_replacement_during_capture_does_not_qualify_core(self):
+        def replace_group():
+            self.group.rename(self.group.with_name("retired.service"))
+            self.group.mkdir()
+            return 1
+        captured = resources.capture(-1, "boot-one", self.processes, cgroup_root=self.root, clock=replace_group)
+        row = captured["processes"][0]
+        self.assertFalse(row["available"])
+        self.assertNotIn("core_available", row)
+        self.assertIn("changed during accounting capture", row["reason"])
+
+    def test_io_diagnostic_is_bounded(self):
+        text = "(unknown) " + "x" * (resources.MAX_IO_DIAGNOSTIC_CHARS + 1)
+        (self.group / "io.stat").write_text(text)
+        row = self.capture(1)["processes"][0]
+        self.assertFalse(row["available"])
+        self.assertEqual(row["io_diagnostic"]["text_prefix"], text[:resources.MAX_IO_DIAGNOSTIC_CHARS])
+        self.assertTrue(row["io_diagnostic"]["truncated"])
 
 
 if __name__ == "__main__":

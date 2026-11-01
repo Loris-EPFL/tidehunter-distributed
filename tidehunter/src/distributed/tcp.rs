@@ -17,11 +17,6 @@ pub use fabric::{FabricBackend, FabricConfig, FabricSecurity, Transport, Transpo
 pub use tidehunter_fabric::ProviderInfo;
 mod control;
 mod inventory;
-mod resident;
-#[cfg(feature = "experimental-fabric")]
-use resident::encode_envelope;
-use resident::{RemoteRegion, ResidentGrant};
-pub use resident::{ResidentGrantStats, ResidentReadConfig, ResidentReadStats};
 mod payload;
 pub use diagnostics::{ConnectionProfile, PollingProfile, SocketProfile, WorkProfile};
 use payload::WireBytes;
@@ -57,16 +52,15 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 pub use inventory::NodeInventory;
-const PROTOCOL: u32 = 14;
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+pub use inventory::SealedOwnerExport;
+const PROTOCOL: u32 = 15;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
-static NEXT_RESIDENT_SESSION: AtomicU64 = AtomicU64::new(1);
-#[cfg(feature = "experimental-fabric")]
-static NEXT_RESIDENT_GRANT: AtomicU64 = AtomicU64::new(1);
 const MODE_MAGIC: [u8; 4] = *b"THDP";
 
 fn transport_mode_id(transport: &Transport) -> u8 {
@@ -108,6 +102,7 @@ fn read_transport_mode(stream: &mut impl Read, expected: &Transport) -> Result<(
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     pub root: PathBuf,
     /// Full static cluster inventory, this node's partition; template epoch = 1.
@@ -123,10 +118,7 @@ pub struct NodeConfig {
     /// Opt-in NOWAIT prefix reads; compare with forced-async on the target host.
     #[serde(default)]
     pub read_resident_first: bool,
-    /// Node-wide evictable encoded-member cache; clients still verify integrity.
-    #[serde(default)]
-    pub read_cache_bytes: usize,
-    /// Host memory reserved for this node's cache plus bounded inflight reads.
+    /// Host memory reserved for bounded inflight reads.
     /// Excludes index, application, transport/kernel and page-cache reserves.
     #[serde(default = "default_read_memory_allowance_bytes")]
     pub read_memory_allowance_bytes: usize,
@@ -136,20 +128,6 @@ pub struct NodeConfig {
     pub read_max_inflight_bytes: usize,
     #[serde(default = "default_device_reads")]
     pub read_max_device_reads: usize,
-    /// Process-wide source/destination registration budgets for resident RMA.
-    /// Disabled by default; ordinary RPC behavior is unchanged.
-    #[serde(default)]
-    pub resident_reads: ResidentReadConfig,
-}
-impl NodeConfig {
-    /// Requested fixed slot-table bytes before allocation; included in cache budget.
-    pub fn read_cache_metadata_bytes(&self) -> usize {
-        read_executor::ReadExecutorConfig {
-            cache_bytes: self.read_cache_bytes,
-            ..read_executor::ReadExecutorConfig::default()
-        }
-        .cache_metadata_bytes()
-    }
 }
 
 fn default_read_workers() -> usize {
@@ -173,6 +151,7 @@ pub(crate) fn default_read_memory_allowance_bytes() -> usize {
 /// TLS credentials and transport selection. Trusted OFI requires empty
 /// credential paths; mutual-TLS modes require a dedicated CA.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsFiles {
     #[serde(default)]
     pub transport: Transport,
@@ -185,9 +164,6 @@ pub struct TlsFiles {
     /// Expected server DNS name; ignored by the listener and trusted OFI modes.
     #[serde(default)]
     pub server_name: String,
-    /// Explicit opt-in for one-sided reads on this client/session transport.
-    #[serde(default)]
-    pub resident_reads: ResidentReadConfig,
 }
 
 /// Network-owner scheduling only, not a whole-system lock-free guarantee.
@@ -268,58 +244,6 @@ pub struct RecoveryPage {
     pub next: Option<usize>,
 }
 
-/// A sampled local elapsed interval. Counts describe this stage's own population.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
-pub struct ReadStageProfile {
-    pub ns: u64,
-    pub count: u64,
-    pub max_ns: u64,
-    pub errors: u64,
-}
-
-impl ReadStageProfile {
-    fn record(&mut self, began: Option<Instant>, error: bool) {
-        if let Some(began) = began {
-            self.record_ns(elapsed_ns(began), error);
-        }
-    }
-
-    fn record_ns(&mut self, ns: u64, error: bool) {
-        self.ns += ns;
-        self.count += 1;
-        self.max_ns = self.max_ns.max(ns);
-        self.errors += u64::from(error);
-    }
-
-    fn add(&mut self, other: Self) {
-        self.ns += other.ns;
-        self.count += other.count;
-        self.max_ns = self.max_ns.max(other.max_ns);
-        self.errors += other.errors;
-    }
-}
-
-/// Owner grant setup scopes, nested within sampled read handler residence.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
-pub struct GrantReadProfile {
-    pub lookup: ReadStageProfile,
-    pub reservation: ReadStageProfile,
-    pub envelope: ReadStageProfile,
-    /// Actual provider registration calls only, including failed calls.
-    pub registration: ReadStageProfile,
-    pub recheck_publication: ReadStageProfile,
-}
-
-impl GrantReadProfile {
-    fn add(&mut self, other: Self) {
-        self.lookup.add(other.lookup);
-        self.reservation.add(other.reservation);
-        self.envelope.add(other.envelope);
-        self.registration.add(other.registration);
-        self.recheck_publication.add(other.recheck_publication);
-    }
-}
-
 /// Explicit diagnostic timings; ordinary requests take no extra stage clocks.
 /// WAL-read exchange spans encoding through authenticated, verified completion
 /// (including interleaved progress), not wire-only RTT. Encode/decode/verification
@@ -351,13 +275,8 @@ pub struct TcpReadProfile {
     pub requests: u64,
     /// True when the response carried server handler clocks.
     pub server_handler_available: bool,
-    /// True when at least one sample used RMA and had no server handler.
-    pub server_handler_not_applicable: bool,
     /// Read-handler residence through completed records, excluding the final recheck.
     pub server_handler_ns: u64,
-    /// No append/control inventory wait; retained as a zero-valued compatibility
-    /// field after reader authority moved to its separate short-lived lock.
-    pub server_inventory_wait_ns: u64,
     /// Active-epoch validation and Arc log-handle pinning under the reader lock.
     pub server_authority_lookup_ns: u64,
     /// Exact member validation through completed range data/response construction,
@@ -370,12 +289,6 @@ pub struct TcpReadProfile {
     pub server_response_recheck_ns: u64,
     /// Profiled owner read replies carrying the above spans, including retained errors.
     pub server_response_recheck_samples: u64,
-    /// Retained as a zero-valued compatibility field; authority rechecks do not defer.
-    pub server_response_recheck_deferrals: u64,
-    pub server_grant: GrantReadProfile,
-    pub client_grant_install: ReadStageProfile,
-    /// Accepted FI_READ submission to locally observed completion, not wire time.
-    pub client_fi_read: ReadStageProfile,
     pub server_wal: WalReadProfile,
 }
 
@@ -384,17 +297,12 @@ pub struct TcpReadProfile {
 pub struct WalReadProfile {
     pub executor_requests: u64,
     pub sync_reader_requests: u64,
-    pub cache_only_requests: u64,
-    pub rma_not_applicable_requests: u64,
     pub planning_ns: u64,
     pub planning_count: u64,
     pub planning_max_ns: u64,
     pub executor_residence_ns: u64,
     pub executor_residence_count: u64,
     pub executor_residence_max_ns: u64,
-    pub cache_resolution_ns: u64,
-    pub cache_resolution_count: u64,
-    pub cache_resolution_max_ns: u64,
     pub nowait_ns: u64,
     pub nowait_count: u64,
     pub nowait_max_ns: u64,
@@ -416,14 +324,10 @@ impl WalReadProfile {
         sums!(
             executor_requests,
             sync_reader_requests,
-            cache_only_requests,
-            rma_not_applicable_requests,
             planning_ns,
             planning_count,
             executor_residence_ns,
             executor_residence_count,
-            cache_resolution_ns,
-            cache_resolution_count,
             nowait_ns,
             nowait_count,
             nowait_errors,
@@ -440,9 +344,6 @@ impl WalReadProfile {
         self.executor_residence_max_ns = self
             .executor_residence_max_ns
             .max(other.executor_residence_max_ns);
-        self.cache_resolution_max_ns = self
-            .cache_resolution_max_ns
-            .max(other.cache_resolution_max_ns);
         self.nowait_max_ns = self.nowait_max_ns.max(other.nowait_max_ns);
         self.async_max_ns = self.async_max_ns.max(other.async_max_ns);
         self.response_ready_max_ns = self.response_ready_max_ns.max(other.response_ready_max_ns);
@@ -468,18 +369,12 @@ impl TcpReadProfile {
         self.ram_payload_verified_bytes += next.ram_payload_verified_bytes;
         self.requests += next.requests;
         self.server_handler_available |= next.server_handler_available;
-        self.server_handler_not_applicable |= next.server_handler_not_applicable;
         self.server_handler_ns += next.server_handler_ns;
-        self.server_inventory_wait_ns += next.server_inventory_wait_ns;
         self.server_authority_lookup_ns += next.server_authority_lookup_ns;
         self.server_record_read_ns += next.server_record_read_ns;
         self.server_response_recheck_wait_ns += next.server_response_recheck_wait_ns;
         self.server_response_recheck_ns += next.server_response_recheck_ns;
         self.server_response_recheck_samples += next.server_response_recheck_samples;
-        self.server_response_recheck_deferrals += next.server_response_recheck_deferrals;
-        self.server_grant.add(next.server_grant);
-        self.client_grant_install.add(next.client_grant_install);
-        self.client_fi_read.add(next.client_fi_read);
         self.server_wal.add(next.server_wal);
     }
 }
@@ -487,18 +382,15 @@ impl TcpReadProfile {
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 struct ServerReadProfile {
     handler_ns: u64,
-    inventory_wait_ns: u64,
     authority_lookup_ns: u64,
     record_read_ns: u64,
     response_recheck_wait_ns: u64,
     response_recheck_ns: u64,
     response_recheck_samples: u64,
-    response_recheck_deferrals: u64,
-    grant: GrantReadProfile,
     wal: WalReadProfile,
 }
-// Fixed-integer bincode: eight legacy, twenty-seven WAL, twenty grant u64 values.
-const SERVER_READ_PROFILE_BYTES: usize = 55 * 8;
+// Fixed-integer bincode: six request and twenty-two WAL u64 values.
+const SERVER_READ_PROFILE_BYTES: usize = 28 * 8;
 
 #[derive(Debug)]
 pub struct TcpError {
@@ -528,13 +420,6 @@ impl From<io::Error> for TcpError {
     }
 }
 
-/// Advisory cache admission only; both classes validate and return identical data.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ReadClass {
-    Point,
-    ScanNoFill,
-}
-
 #[derive(Serialize, Deserialize)]
 enum Request {
     Checkpoint {
@@ -555,9 +440,6 @@ enum Request {
         files: Vec<u64>,
     },
     ReadIoStats,
-    RevokeGrants {
-        generations: Vec<u64>,
-    },
     Status {
         protocol: u32,
     },
@@ -571,9 +453,6 @@ enum Request {
     Read {
         epoch: u64,
         references: Vec<ValueRecordReference>,
-        class: ReadClass,
-        grant_limit: usize,
-        grant_max_bytes: usize,
     },
     Recover {
         epoch: u64,
@@ -587,9 +466,6 @@ enum Request {
     ReadProfiled {
         epoch: u64,
         references: Vec<ValueRecordReference>,
-        class: ReadClass,
-        grant_limit: usize,
-        grant_max_bytes: usize,
     },
     StatsDetailed,
     /// Connection-local diagnostics, explicit and disabled by default.
@@ -599,7 +475,6 @@ enum Request {
     },
     /// Nonblocking operational snapshot; not a durability barrier or evidence cut.
     OperationalReadIoStats,
-    ResidentGrantStats,
     #[cfg(all(target_os = "linux", feature = "test-utils"))]
     ReadEvidence {
         epoch: u64,
@@ -648,7 +523,6 @@ impl Request {
             | Self::StatsDetailed
             | Self::ReadIoStats
             | Self::OperationalReadIoStats
-            | Self::ResidentGrantStats
             | Self::ConnectionProfile { .. } => true,
             #[cfg(all(target_os = "linux", feature = "test-utils"))]
             Self::ReadEvidence { .. } => true,
@@ -688,21 +562,6 @@ enum Response {
     Status(NodeStatus),
     Appended(Vec<Receipt>),
     Records(Vec<WireBytes>),
-    ResidentRecords {
-        grants: Vec<Option<ResidentGrant>>,
-        records: Vec<WireBytes>,
-    },
-    ResidentRecordsProfiled {
-        grants: Vec<Option<ResidentGrant>>,
-        records: Vec<WireBytes>,
-        profile: ServerReadProfile,
-    },
-    GrantsRevoked(Vec<u64>),
-    ResidentPoison {
-        owner_boot: [u8; 16],
-        session_id: u64,
-        generations: Vec<u64>,
-    },
     Recovery {
         batches: Vec<(WireBytes, Receipt)>,
         next: Option<usize>,
@@ -731,7 +590,6 @@ enum Response {
     // Diagnostics must not enlarge every ordinary read/write response value.
     ConnectionProfile(Box<ConnectionProfile>),
     OperationalReadIoStats(Box<(PartitionConfig, Option<ReadExecutorStats>)>),
-    ResidentGrantStats(Box<(PartitionConfig, Option<ResidentGrantStats>)>),
     ReadErrorProfiled {
         message: String,
         profile: Box<ServerReadProfile>,
@@ -786,9 +644,6 @@ pub struct StorageNode {
     wal_member_read: super::storage::WalMemberReadPolicy,
     read_config: read_executor::ReadExecutorConfig,
     read_admission: Arc<read_executor::ReadAdmission>,
-    resident_grants: Arc<resident::GrantRegistry>,
-    owner_boot: [u8; 16],
-    resident_reads: ResidentReadConfig,
     terminal: Arc<AtomicBool>,
     #[cfg(any(test, feature = "test-utils"))]
     drop_append_response: AtomicBool,
@@ -802,14 +657,10 @@ impl StorageNode {
         if !(1..=8).contains(&config.read_workers) {
             return Err(TcpError::new("read_workers must be in 1..=8"));
         }
-        if (config.read_cache_bytes != 0
-            || config.read_resident_first
-            || config.resident_reads.source_enabled())
+        if config.read_resident_first
             && config.wal_member_read != super::storage::WalMemberReadPolicy::Async
         {
-            return Err(TcpError::new(
-                "resident grants, shard cache and resident-first reads require async reads",
-            ));
+            return Err(TcpError::new("resident-first reads require async reads"));
         }
         let read_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(config.read_workers)
@@ -818,7 +669,6 @@ impl StorageNode {
             .map_err(TcpError::component)?;
         let wal_member_read = config.wal_member_read;
         let read_config = read_executor::ReadExecutorConfig {
-            cache_bytes: config.read_cache_bytes,
             memory_allowance_bytes: config.read_memory_allowance_bytes,
             max_requests: config.read_max_inflight_requests,
             max_bytes: config.read_max_inflight_bytes,
@@ -827,7 +677,6 @@ impl StorageNode {
         };
         let read_admission =
             Arc::new(read_executor::ReadAdmission::new(read_config).map_err(TcpError::component)?);
-        let resident_reads = config.resident_reads;
         let inventory = NodeInventory::open(config, metrics)?;
         let readers = inventory.readers.clone();
         let terminal = inventory.terminal.clone();
@@ -838,21 +687,6 @@ impl StorageNode {
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let nvmeof_leases = inventory.nvmeof_leases.clone();
         let inventory = Arc::new(Mutex::new(inventory));
-        let resident_grants = Arc::new(resident::GrantRegistry::new(
-            resident_reads.source_bytes,
-            resident_reads.source_regions,
-        ));
-        let history_poison_registry = Arc::downgrade(&resident_grants);
-        inventory
-            .lock()
-            .set_history_failure_notifier(Arc::new(move || {
-                if let Some(registry) = history_poison_registry.upgrade() {
-                    // Request the existing notice/drain protocol. Terminal
-                    // authority must not advance before remote DMA is drained.
-                    registry.request_poison();
-                }
-            }));
-        let owner_boot = rand::random::<[u8; 16]>();
         #[cfg(test)]
         let panic_after_append = Arc::new(AtomicBool::new(false));
         let control_context = Arc::new(control::ControlContext {
@@ -860,18 +694,26 @@ impl StorageNode {
             inventory: inventory.clone(),
             readers: readers.clone(),
             terminal: terminal.clone(),
+            poison_pending: Arc::new(AtomicBool::new(false)),
             append_shape,
             append_batch_limits,
             append_group_limits,
             wal_member_read,
             read_config,
             read_admission: read_admission.clone(),
-            resident_grants: resident_grants.clone(),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             nvmeof_leases,
             #[cfg(test)]
             panic_after_append: panic_after_append.clone(),
         });
+        let history_context = Arc::downgrade(&control_context);
+        inventory
+            .lock()
+            .set_history_failure_notifier(Arc::new(move || {
+                if let Some(context) = history_context.upgrade() {
+                    context.poison_readers();
+                }
+            }));
         let control = control::ControlOwner::start(control_context.clone())?;
         Ok(Arc::new(Self {
             inventory,
@@ -889,12 +731,12 @@ impl StorageNode {
             panic_after_append,
             #[cfg(test)]
             read_hook: Mutex::new(None),
-            resident_reads,
-            resident_grants,
-            owner_boot,
         }))
     }
     pub fn status(&self) -> Result<NodeStatus, TcpError> {
+        if self.control_context.poison_pending.load(Ordering::Acquire) {
+            return Err(TcpError::new("reader authority is poison-pending"));
+        }
         self.inventory.lock().status()
     }
     /// Enable local maintenance diagnostics for current and later epochs.
@@ -915,7 +757,7 @@ impl StorageNode {
         epoch: u64,
         references: &[ValueRecordReference],
     ) -> Result<inventory::ReaderSnapshot, TcpError> {
-        if self.resident_grants.poison_requested() {
+        if self.control_context.poison_pending.load(Ordering::Acquire) {
             return Err(TcpError::new("reader authority is poison-pending"));
         }
         self.readers
@@ -953,13 +795,13 @@ impl StorageNode {
             &root,
             configfs,
             1024,
-            1024 * 1024,
+            super::nvmeof::MAX_EXPORT_MANIFEST_BYTES,
         )
         .map_err(TcpError::component)?;
         Ok(())
     }
     pub(super) fn reader_authority_valid(&self, epoch: u64, generation: Option<u64>) -> bool {
-        if self.resident_grants.poison_requested() {
+        if self.control_context.poison_pending.load(Ordering::Acquire) {
             return false;
         }
         let readers = self.readers.read();
@@ -968,9 +810,6 @@ impl StorageNode {
         } else {
             readers.active_valid(epoch, &self.terminal)
         }
-    }
-    pub(super) fn finish_poison_if_quiescent(&self) {
-        self.control_context.finish_poison_if_quiescent();
     }
     pub(super) fn poison_readers(&self) {
         self.control_context.poison_readers();
@@ -1054,13 +893,6 @@ impl StorageNode {
             })
             .map_err(TcpError::component)?;
         tls.transport.validate()?;
-        if self.inventory.lock().config.resident_reads.source_enabled()
-            && !tls.transport.is_native()
-        {
-            return Err(TcpError::new(
-                "resident source grants require explicitly trusted OFI security",
-            ));
-        }
         let transport = tls.transport.clone();
         let server = tls.server_config()?;
         listener.set_nonblocking(true)?;
@@ -1171,20 +1003,12 @@ impl StorageNode {
         shutdown: &AtomicBool,
         transport: &Transport,
     ) -> Result<(), TcpError> {
-        #[cfg(feature = "experimental-fabric")]
-        let source_resident_reads = {
-            self.inventory
-                .lock()
-                .config
-                .resident_reads
-                .source_per_connection(limits.max_connections)
-        };
         let mut io = DeadlineIo::new(socket, limits.io_timeout)?;
         if transport.is_native() {
             read_transport_mode(&mut io, transport)?;
             #[cfg(feature = "experimental-fabric")]
             {
-                let endpoint = fabric::bootstrap(&mut io, transport, source_resident_reads)?;
+                let endpoint = fabric::bootstrap(&mut io, transport)?;
                 io.fabric = Some(endpoint);
                 return reactor::serve_session(
                     self,
@@ -1217,7 +1041,7 @@ impl StorageNode {
         if transport.is_fabric() {
             #[cfg(feature = "experimental-fabric")]
             {
-                let endpoint = fabric::bootstrap(&mut stream, transport, source_resident_reads)?;
+                let endpoint = fabric::bootstrap(&mut stream, transport)?;
                 stream.sock.fabric = Some(endpoint);
             }
             #[cfg(not(feature = "experimental-fabric"))]
@@ -1411,7 +1235,6 @@ pub struct Client {
     reactor: reactor::ClientState,
     connected_status: Option<NodeStatus>,
     connect_profile: ClientConnectProfile,
-    resident_reads: ResidentReadConfig,
     reuse_verifier: Option<Arc<rustls::client::WebPkiServerVerifier>>,
     server_name: Option<ServerName<'static>>,
     polling: PollingPolicy,
@@ -1491,27 +1314,6 @@ impl Client {
             _ => self.wrong_response(),
         }
     }
-    /// Snapshot owner-side grant decisions and source occupancy.
-    pub fn resident_grant_stats(&mut self) -> Result<Option<ResidentGrantStats>, TcpError> {
-        match self.request(Request::ResidentGrantStats)? {
-            Response::ResidentGrantStats(snapshot) => {
-                let (partition, stats) = *snapshot;
-                if partition != self.expected {
-                    return self.wrong_response();
-                }
-                Ok(stats)
-            }
-            _ => self.wrong_response(),
-        }
-    }
-    /// Local cumulative grant/RMA counters for this partition connection.
-    /// Snapshot performs no RPC or provider progress.
-    #[must_use]
-    pub fn resident_read_stats(&self) -> ResidentReadStats {
-        let mut stats = self.reactor.resident_read_stats();
-        stats.destination_slots_live = self.resident_reads.destination_slots as u64;
-        stats
-    }
     pub fn connect(
         endpoint: &str,
         tls: &TlsFiles,
@@ -1575,7 +1377,6 @@ impl Client {
         let address: SocketAddr = endpoint.parse().map_err(|_| {
             TcpError::new("endpoint must be numeric IP:port; set TLS server_name separately")
         })?;
-        let destination_resident_reads = tls.resident_reads.destination_per_connection(1)?;
         let began = Instant::now();
         let socket = TcpStream::connect_timeout(&address, timeout)?;
         let connect_ns = elapsed_ns(began);
@@ -1588,8 +1389,7 @@ impl Client {
         {
             #[cfg(feature = "experimental-fabric")]
             {
-                let endpoint =
-                    fabric::bootstrap(&mut io, &tls.transport, destination_resident_reads)?;
+                let endpoint = fabric::bootstrap(&mut io, &tls.transport)?;
                 io.fabric = Some(endpoint);
                 let fabric_ns = Some(elapsed_ns(setup_started));
                 (reactor::Session::new_native(io)?, None, None, 0, fabric_ns)
@@ -1625,11 +1425,7 @@ impl Client {
             #[cfg(feature = "experimental-fabric")]
             let fabric_ns = if tls.transport.is_fabric() {
                 let began = Instant::now();
-                stream.sock.fabric = Some(fabric::bootstrap(
-                    &mut stream,
-                    &tls.transport,
-                    destination_resident_reads,
-                )?);
+                stream.sock.fabric = Some(fabric::bootstrap(&mut stream, &tls.transport)?);
                 Some(elapsed_ns(began))
             } else {
                 None
@@ -1656,7 +1452,6 @@ impl Client {
             max_read_bytes: 256 * 1024 * 1024,
             page_limit: 1024,
             diagnostics: None,
-            resident_reads: destination_resident_reads,
             reactor: reactor::ClientState::default(),
             connected_status: None,
             connect_profile: ClientConnectProfile {
@@ -1857,7 +1652,6 @@ impl Client {
         }
     }
     pub fn fence_to(&mut self, epoch: u64) -> Result<NodeStatus, TcpError> {
-        self.revoke_resident_grants()?;
         match self.request(Request::Fence { epoch })? {
             Response::Status(status) if status.active_epoch == Some(epoch) => {
                 self.check_status(status)
@@ -2078,7 +1872,7 @@ impl Client {
         references: &[ValueRecordReference],
         profile: Option<&mut TcpReadProfile>,
     ) -> Result<Vec<Mutation>, TcpError> {
-        self.read_records_correlated(epoch, references, ReadClass::Point, profile)
+        self.read_records_correlated(epoch, references, profile)
     }
     pub fn recovery_page(
         &mut self,
@@ -2125,7 +1919,6 @@ impl Client {
         }
     }
     pub fn seal(&mut self, epoch: u64) -> Result<(), TcpError> {
-        self.revoke_resident_grants()?;
         match self.request(Request::Seal { epoch })? {
             Response::Sealed => Ok(()),
             _ => self.wrong_response(),
@@ -2156,12 +1949,6 @@ impl Client {
 impl TlsFiles {
     fn trusted_mode(&self) -> Result<bool, TcpError> {
         self.transport.validate()?;
-        self.resident_reads.validate()?;
-        if self.resident_reads.enabled() && !self.transport.is_native() {
-            return Err(TcpError::new(
-                "one-sided reads require explicitly trusted OFI security",
-            ));
-        }
         let trusted = self.transport.is_native();
         if trusted
             && [&self.ca, &self.cert, &self.key]
