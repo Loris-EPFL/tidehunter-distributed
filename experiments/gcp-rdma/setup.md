@@ -185,3 +185,5 @@ any cloud allocation.
 Runner-dependent paths are initialized inside a step through `GITHUB_ENV`.
 GitHub does not permit the `runner` expression context in job-level `env`;
 ordinary YAML parsing cannot detect that workflow validation error.
+Compile TCP-only and NVMe-enabled configurations separately; an all-feature build
+does not detect feature-specific dead code.
