@@ -424,7 +424,7 @@ class CommandSafetyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             runtime.root = Path(tmp)
             with patch.object(controller, "read_s3_json") as read_receipt:
-                read_receipt.side_effect = lambda _client, _config, _key: {
+                read_receipt.side_effect = lambda _client, _config, _key, limit=controller.MAX_JSON_BYTES: {
                     "request": {"action": "snapshot", "index": 0},
                     "instance_id": runtime.ids[1], "status": "completed",
                     "result": {"snapshot": "exact-result"}}

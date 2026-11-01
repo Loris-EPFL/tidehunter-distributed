@@ -1,0 +1,283 @@
+name: GCP RDMA benchmark
+
+on:
+  pull_request:
+    paths:
+      - 'experiments/gcp-rdma/**'
+      - '.github/workflows/gcp-rdma-benchmarks.yaml'
+  push:
+    branches: [bench/gcp-rdma]
+  workflow_dispatch:
+    inputs:
+      operation:
+        type: choice
+        options: [preflight, launch]
+        default: preflight
+        required: true
+      suite:
+        type: choice
+        options: [kv, sui, both]
+        default: kv
+        required: true
+      backends:
+        description: 'Comma-separated IDs: native,tidehunter_tcp,tidehunter_nvme_tcp,tidehunter_nvme_rdma,tikv,cassandra,foundationdb,valkey_tcp'
+        type: string
+        default: 'native,tidehunter_tcp,tidehunter_nvme_tcp,tidehunter_nvme_rdma'
+        required: true
+      sui_transports:
+        description: 'Sui transports: tcp,tidehunter_verbs,tidehunter_verbs_native'
+        type: string
+        default: 'tcp'
+        required: true
+      mode:
+        type: choice
+        options: [standard, nvmeof-focused]
+        default: nvmeof-focused
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gcp-rdma-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  offline:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: |
+          python3 -m unittest discover -s experiments/gcp-rdma -p 'test_workflow_input.py'
+          python3 -m unittest discover -s experiments/gcp-rdma -p 'test_prepare.py'
+
+  prepare:
+    if: github.repository == 'Loris-EPFL/tidehunter-distributed' && github.ref == 'refs/heads/bench/gcp-rdma' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ${{ vars.GCP_BENCH_RUNNER || 'ubuntu-24.04' }}
+    environment: gcp-rdma-bench
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+      archive_sha256: ${{ steps.transfer.outputs.sha256 }}
+    env:
+      GCP_BENCH_ENABLED: ${{ vars.GCP_BENCH_ENABLED }}
+      SUI_TRANSPORTS: ${{ inputs.sui_transports || 'tcp' }}
+      OPERATION: ${{ inputs.operation || 'launch' }}
+      SUITE: ${{ inputs.suite || 'kv' }}
+      BACKENDS: ${{ inputs.backends || 'native,tidehunter_tcp,tidehunter_nvme_tcp,tidehunter_nvme_rdma' }}
+      MATRIX_MODE: ${{ inputs.mode || 'nvmeof-focused' }}
+      FIXTURE_KEY: ${{ vars.GCP_BENCH_FIXTURE_KEY }}
+      FIXTURE_GENERATION: ${{ vars.GCP_BENCH_FIXTURE_GENERATION }}
+      TIDEHUNTER_LIBFABRIC_PREFIX: ${{ runner.temp }}/gcp-libfabric-2.6.0
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: engine
+          persist-credentials: false
+      - name: Require explicit activation
+        id: gate
+        run: |
+          mkdir -p "$RUNNER_TEMP/gcp-results"
+          if [ "$GCP_BENCH_ENABLED" = true ]; then
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'GCP benchmark is disabled; no build, authentication, or allocation.' | tee "$RUNNER_TEMP/gcp-results/disarmed.txt"
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Select and validate suite
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          python3 engine/experiments/gcp-rdma/workflow_input.py spec --suite "$SUITE" --backends "$BACKENDS" --mode "$MATRIX_MODE" \
+            --sui-transports "$SUI_TRANSPORTS" --fixture-key "$FIXTURE_KEY" --fixture-generation "$FIXTURE_GENERATION" --output "$RUNNER_TEMP/gcp-results/spec.json"
+          python3 engine/experiments/gcp-rdma/workflow_input.py policy --config engine/experiments/gcp-rdma/config.json --budget engine/experiments/gcp-rdma/budget.json
+      - name: Checkout reviewed Sui source
+        if: steps.gate.outputs.enabled == 'true' && (env.SUITE == 'sui' || env.SUITE == 'both')
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Loris-EPFL/sui-tidehunter-distributed
+          ref: ef6701911cc07d9102f55e52f5a0632e5ddb0a86
+          path: sui
+          persist-credentials: false
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        if: steps.gate.outputs.enabled == 'true'
+        with:
+          workload_identity_provider: ${{ vars.GCP_BENCH_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_BENCH_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+        if: steps.gate.outputs.enabled == 'true'
+      - name: Retrieve generation-bound real fixture
+        if: steps.gate.outputs.enabled == 'true' && (env.SUITE == 'sui' || env.SUITE == 'both')
+        run: python3 engine/experiments/gcp-rdma/workflow_input.py fixture --config engine/experiments/gcp-rdma/config.json --spec "$RUNNER_TEMP/gcp-results/spec.json" --output "$RUNNER_TEMP/gcp-fixture.tar.gz"
+      - name: Prepare pinned build dependencies
+        if: steps.gate.outputs.enabled == 'true'
+        timeout-minutes: 40
+        run: |
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 install -y --no-install-recommends protobuf-compiler python3-venv
+          python3 -m venv --system-site-packages "$RUNNER_TEMP/gcp-tools"
+          "$RUNNER_TEMP/gcp-tools/bin/pip" install --disable-pip-version-check --retries 2 --timeout 30 PyYAML==6.0.2 matplotlib==3.11.2 cmake==3.31.6 ninja==1.11.1.4 protoc-wheel-0==29.3
+          echo "$RUNNER_TEMP/gcp-tools/bin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/gcp-tools/bin:$PATH"
+          TIDEHUNTER_SETUP_SKIP_AWS_SDK=1 bash engine/.github/scripts/setup.sh fabric
+      - name: Build and qualify exact KV release
+        if: steps.gate.outputs.enabled == 'true'
+        timeout-minutes: 185
+        run: python3 engine/experiments/gcp-rdma/prepare.py --engine "$GITHUB_WORKSPACE/engine" --revision "$GITHUB_SHA" --output "$RUNNER_TEMP/gcp-inputs" --fabric-prefix "$TIDEHUNTER_LIBFABRIC_PREFIX" --deadline 10800
+      - name: Build and audit exact Sui release against real checkpoint
+        if: steps.gate.outputs.enabled == 'true' && (env.SUITE == 'sui' || env.SUITE == 'both')
+        timeout-minutes: 185
+        env:
+          PKG_CONFIG_PATH: ${{ runner.temp }}/gcp-libfabric-2.6.0/lib/pkgconfig
+          LD_LIBRARY_PATH: ${{ runner.temp }}/gcp-libfabric-2.6.0/lib
+        run: python3 engine/experiments/gcp-rdma/prepare.py --output "$RUNNER_TEMP/gcp-inputs" --sui "$GITHUB_WORKSPACE/sui" --revision ef6701911cc07d9102f55e52f5a0632e5ddb0a86 --fixture "$RUNNER_TEMP/gcp-fixture.tar.gz" --target "$RUNNER_TEMP/gcp-sui-target" --deadline 10800
+      - name: Seal qualified inputs for separate campaign job
+        id: transfer
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/gcp-results/spec.json" "$RUNNER_TEMP/gcp-inputs/spec.json"
+          files=(package qualification package-receipt.json spec.json)
+          if [ "$SUITE" = sui ] || [ "$SUITE" = both ]; then
+            files+=(sui/sui-package.tar.gz sui/verification.tar.gz)
+          fi
+          tar -C "$RUNNER_TEMP/gcp-inputs" -czf "$RUNNER_TEMP/gcp-qualified.tar.gz" "${files[@]}"
+          echo "sha256=$(sha256sum "$RUNNER_TEMP/gcp-qualified.tar.gz" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - name: Transfer qualified current-source inputs
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gcp-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gcp-qualified.tar.gz
+          compression-level: 0
+          retention-days: 2
+          if-no-files-found: error
+      - name: Clean local owned databases
+        if: always() && steps.gate.outputs.enabled == 'true'
+        run: python3 engine/experiments/kv-comparison/cleanup.py --root "$RUNNER_TEMP/gcp-inputs"
+      - name: Retain preparation evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gcp-preparation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/gcp-results/
+            ${{ runner.temp }}/gcp-inputs/package-receipt.json
+            ${{ runner.temp }}/gcp-inputs/snapshot/
+            ${{ runner.temp }}/gcp-inputs/build/build.json
+            ${{ runner.temp }}/gcp-inputs/build/build.log
+            ${{ runner.temp }}/gcp-inputs/qualification/
+            ${{ runner.temp }}/gcp-inputs/sui/build/build-receipt.json
+            ${{ runner.temp }}/gcp-inputs/sui/build/build-manifest.json
+            ${{ runner.temp }}/gcp-inputs/sui/verification/
+          if-no-files-found: warn
+          retention-days: 30
+
+  campaign:
+    needs: prepare
+    if: needs.prepare.result == 'success' && needs.prepare.outputs.enabled == 'true'
+    runs-on: ubuntu-24.04
+    environment: gcp-rdma-bench
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GCP_BENCH_ENABLED: ${{ vars.GCP_BENCH_ENABLED }}
+      OPERATION: ${{ inputs.operation || 'launch' }}
+      ARCHIVE_SHA256: ${{ needs.prepare.outputs.archive_sha256 }}
+    steps:
+      - name: Require activation remains enabled
+        run: test "$GCP_BENCH_ENABLED" = true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: engine
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: gcp-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gcp-transfer
+      - name: Admit transferred package and same-binary local proof
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' "$ARCHIVE_SHA256" "$RUNNER_TEMP/gcp-transfer/gcp-qualified.tar.gz" | sha256sum --check
+          mkdir "$RUNNER_TEMP/gcp-inputs" "$RUNNER_TEMP/gcp-results"
+          tar --no-same-owner -xzf "$RUNNER_TEMP/gcp-transfer/gcp-qualified.tar.gz" -C "$RUNNER_TEMP/gcp-inputs"
+          python3 engine/experiments/gcp-rdma/prepare.py --admit-transfer --output "$RUNNER_TEMP/gcp-inputs" --revision "$GITHUB_SHA"
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_BENCH_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_BENCH_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+      - name: Create run identity and quoted deadline
+        run: |
+          python3 engine/experiments/gcp-rdma/workflow_input.py policy --config engine/experiments/gcp-rdma/config.json --budget engine/experiments/gcp-rdma/budget.json --deadline-output "$RUNNER_TEMP/gcp-results/deadline"
+          python3 -c 'import hashlib,os,pathlib; p=pathlib.Path(os.environ["RUNNER_TEMP"])/"gcp-results"; s=os.environ["GITHUB_RUN_ID"]+":"+os.environ["GITHUB_RUN_ATTEMPT"]; (p/"run-id").write_text("th-"+hashlib.sha256(s.encode()).hexdigest()[:16])'
+      - name: Preflight or launch admitted campaign
+        timeout-minutes: 250
+        run: |
+          set -euo pipefail
+          root=engine/experiments/gcp-rdma
+          results="$RUNNER_TEMP/gcp-results"
+          source_sha=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_sha256"])' "$RUNNER_TEMP/gcp-inputs/package-receipt.json")
+          args=(--config "$root/config.json" --budget "$root/budget.json" --run-id "$(cat "$results/run-id")" --source-sha "$source_sha" --package-receipt "$RUNNER_TEMP/gcp-inputs/package-receipt.json" --spec "$RUNNER_TEMP/gcp-inputs/spec.json" --deadline "$(cat "$results/deadline")" --state "$results/state.json" --output-dir "$results")
+          if [ "$OPERATION" = launch ] && { [ "$GITHUB_EVENT_NAME" = push ] || [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; }; then
+            python3 "$root/gcp_campaign.py" run "${args[@]}" --activate
+          elif [ "$OPERATION" = preflight ]; then
+            python3 "$root/gcp_campaign.py" preflight "${args[@]}"
+          else
+            echo 'Launch requires a trusted branch push or dispatch.' >&2; exit 1
+          fi
+      - name: Retain campaign results and identities
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gcp-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gcp-results/
+          if-no-files-found: warn
+          retention-days: 30
+
+  cleanup:
+    needs: [prepare, campaign]
+    if: always() && needs.prepare.outputs.enabled == 'true' && needs.campaign.result != 'skipped'
+    runs-on: ubuntu-24.04
+    environment: gcp-rdma-bench
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_BENCH_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_BENCH_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+      - name: Recover durable lifecycle state and delete exact-owned resources
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gcp-cleanup"
+          run_id=$(python3 -c 'import hashlib,os; s=os.environ["GITHUB_RUN_ID"]+":"+os.environ["GITHUB_RUN_ATTEMPT"]; print("th-"+hashlib.sha256(s.encode()).hexdigest()[:16])')
+          python3 experiments/gcp-rdma/gcp_campaign.py recover-cleanup --config experiments/gcp-rdma/config.json --run-id "$run_id" --output-dir "$RUNNER_TEMP/gcp-cleanup"
+      - name: Retain independent cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gcp-cleanup-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gcp-cleanup/
+          if-no-files-found: warn
+          retention-days: 30

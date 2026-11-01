@@ -113,7 +113,7 @@ def _upload(directory, config, clients, key_root, remaining):
                 raise ValueError('trace file changed while reading')
             digest = hashlib.sha256(raw).hexdigest()
             key = key_root + '/' + path.name
-            _s3_upload(config, key, raw, digest, remaining)
+            _upload_blob(config, key, raw, digest, remaining)
             files.append({'key': key, 'bytes': len(raw), 'sha256': digest})
         except Exception as exc:
             errors.append(path.name + ': ' + type(exc).__name__ + ': ' + str(exc))
@@ -279,23 +279,35 @@ def _upload_binding(root, config, clients, key_root, remaining):
             raw = json.dumps(owner._read_json(path), sort_keys=True).encode()
             digest = hashlib.sha256(raw).hexdigest()
             key = key_root + '/' + path.name
-            _s3_upload(config, key, raw, digest, remaining)
+            _upload_blob(config, key, raw, digest, remaining)
             records.append({'key': key, 'bytes': len(raw), 'sha256': digest})
         except Exception as exc:
             errors.append(path.name + ': ' + type(exc).__name__ + ': ' + str(exc))
     return records, errors
 
 
-def _s3_upload(config, key, raw, digest, remaining):
+def _upload_blob(config, key, raw, digest, remaining):
     """Run each SDK transaction in a killable process bounded by the action deadline."""
     args = {'bucket': config['bucket'], 'account': config['account'],
             'region': config['bucket_region'], 'key': key, 'sha256': digest, 'size': len(raw)}
+    if config.get('platform', {}).get('name') == 'gcp':
+        args['controller_config'] = config
     subprocess.run([sys.executable, '-B', __file__, '--upload-worker', json.dumps(args)],
                    input=raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                    timeout=remaining(), check=True)
 
 
 def _upload_worker(args):
+    raw = sys.stdin.buffer.read(MAX_FILE + 1)
+    if len(raw) != args['size'] or hashlib.sha256(raw).hexdigest() != args['sha256']:
+        raise ValueError('trace upload bytes differ from admitted digest')
+    if 'controller_config' in args:
+        from cloud_controller import make_clients, put_bytes, platform_module
+        config = args['controller_config']
+        if platform_module(config) is None:
+            raise ValueError('Google trace upload requires explicit GCP configuration')
+        put_bytes(make_clients(config, guest=True), config, args['key'], raw)
+        return
     # The guest only admits instance-profile credentials. Create a fresh client
     # in this process; inherited botocore clients are not process-safe.
     import boto3
@@ -306,9 +318,6 @@ def _upload_worker(args):
         raise ValueError('instance-profile credentials required')
     s3 = session.client('s3', config=Config(connect_timeout=4, read_timeout=15,
                                             retries={'total_max_attempts': 1, 'mode': 'standard'}))
-    raw = sys.stdin.buffer.read(MAX_FILE + 1)
-    if len(raw) != args['size'] or hashlib.sha256(raw).hexdigest() != args['sha256']:
-        raise ValueError('trace upload bytes differ from admitted digest')
     s3.put_object(Bucket=args['bucket'], Key=args['key'], Body=raw, ExpectedBucketOwner=args['account'],
                   ServerSideEncryption='AES256', Metadata={'sha256': args['sha256']})
     head = s3.head_object(Bucket=args['bucket'], Key=args['key'], ExpectedBucketOwner=args['account'])

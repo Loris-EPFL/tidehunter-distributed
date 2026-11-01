@@ -1,0 +1,66 @@
+{
+  "observed_utc": "2026-11-01T23:02:15.424727+00:00",
+  "method": "Google MCP read-only discovery plus Cloud Resource Manager testIamPermissions",
+  "project_id": "mysten-research",
+  "project_number": "514867804006",
+  "principal": "loris.tran@epfl.ch",
+  "granted_project_permissions": [
+    "compute.instances.create",
+    "compute.instances.delete",
+    "compute.instances.setMetadata",
+    "compute.instances.setServiceAccount",
+    "compute.resourcePolicies.create",
+    "compute.resourcePolicies.delete",
+    "iam.serviceAccounts.actAs"
+  ],
+  "not_granted_queried_project_permissions": [
+    "compute.networks.create",
+    "compute.subnetworks.create",
+    "iam.serviceAccounts.create",
+    "iam.serviceAccounts.setIamPolicy",
+    "iam.workloadIdentityPoolProviders.create",
+    "iam.workloadIdentityPools.create",
+    "iam.workloadIdentityPools.list",
+    "resourcemanager.projects.setIamPolicy",
+    "serviceusage.services.enable",
+    "serviceusage.services.use",
+    "storage.buckets.create"
+  ],
+  "project_iam_policy_read": "denied",
+  "wif_pool_list": "denied_not_proof_of_absence",
+  "visible_service_accounts": [
+    "514867804006-compute@developer.gserviceaccount.com",
+    "orchestrator@mysten-research.iam.gserviceaccount.com"
+  ],
+  "subnets_examined": 40,
+  "nondefault_subnets_in_examined_page": [],
+  "complete_subnet_inventory": false,
+  "iam_or_resource_mutations": false,
+  "guest_service_account_permissions_verified": false,
+  "real_new_rest_client_qualification": {
+    "project_permissions": [
+      "compute.instances.create",
+      "compute.instances.delete"
+    ],
+    "orchestrator@mysten-research.iam.gserviceaccount.com": [
+      "iam.serviceAccounts.actAs"
+    ],
+    "514867804006-compute@developer.gserviceaccount.com": [
+      "iam.serviceAccounts.actAs"
+    ]
+  },
+  "targeted_service_account_permissions": {
+    "orchestrator@mysten-research.iam.gserviceaccount.com": [
+      "iam.serviceAccounts.actAs"
+    ],
+    "514867804006-compute@developer.gserviceaccount.com": [
+      "iam.serviceAccounts.actAs"
+    ]
+  },
+  "filtered_nondefault_subnets": [],
+  "custom_project_images_in_bounded_query": [],
+  "artifact_bucket_listing": "denied_not_proof_of_absence",
+  "regional_generic_cpu_limit": 5000,
+  "regional_generic_cpu_usage": 4,
+  "z4m_specific_quota_verified": false
+}

@@ -209,7 +209,25 @@ def probe_trace_capability(script, wal_root, state, duration, env):
 
 
 
+def platform_module(config):
+    if not isinstance(config, dict):
+        raise SafetyError("runtime configuration must be an object")
+    platform = config.get("platform")
+    if platform is None:
+        return None
+    if not isinstance(platform, dict) or platform.get("name") != "gcp":
+        raise SafetyError("unsupported explicit cloud platform")
+    directory = str(Path(__file__).resolve().parents[1] / "gcp-rdma")
+    if directory not in sys.path:
+        sys.path.insert(0, directory)
+    import gcp_runtime
+    return gcp_runtime
+
+
 def validate_config(config):
+    platform = platform_module(config)
+    if platform:
+        return platform.validate_runtime(config)
     required = {"fleet", "bucket", "bucket_region", "prefix", "account", "source_revision",
                 "source_sha256", "binary_sha256", "binary_blake2b512", "repository_root",
                 "binary", "fdb_library_dir", "deadline_utc", "spec"}
@@ -264,6 +282,9 @@ def imds_identity():
 
 
 def verify_local_identity(config, index):
+    platform = platform_module(config)
+    if platform:
+        return platform.verify_local_identity(config, index)
     identity = imds_identity()
     host = config["fleet"]["coordinator"] if index == -1 else config["fleet"]["nodes"][index]
     if (identity.get("accountId") != config["account"] or identity.get("instanceId") != host["instance_id"]
@@ -279,7 +300,10 @@ def verify_package(config):
         if config[key] != str(stage / relative):
             raise SafetyError("configured runtime path differs from sealed package layout")
     try:
-        admission = cloud_package.verify_directory(stage, runtime=True)
+        options = {"runtime": True}
+        if platform_module(config):
+            options["provider"] = "gcp"
+        admission = cloud_package.verify_directory(stage, **options)
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         raise SafetyError("sealed source/runtime package admission failed: " + str(exc)) from exc
     inventory = json.loads((stage / "source.json").read_text())
@@ -299,6 +323,12 @@ def environment(config):
     result = dict(os.environ)
     for key in ("LD_PRELOAD", "LD_AUDIT"):
         result.pop(key, None)
+    if platform_module(config):
+        result.update(LD_LIBRARY_PATH=config["fdb_library_dir"],
+                      FDB_CLIENT_LIB_DIR=config["fdb_library_dir"],
+                      FDB_CLIENT_LIB_PATH=config["fdb_library_dir"])
+        result.pop("FI_EFA_USE_DEVICE_RDMA", None)
+        return result
     result.update(LD_LIBRARY_PATH=config["fdb_library_dir"] + ":/opt/amazon/efa/lib",
                   FDB_CLIENT_LIB_DIR=config["fdb_library_dir"], FDB_CLIENT_LIB_PATH=config["fdb_library_dir"],
                   FI_EFA_USE_DEVICE_RDMA="1")
@@ -313,6 +343,9 @@ def command(argv, *, timeout=60, env=None):
 
 
 def admit_fabrics(config, index, clients, root):
+    platform = platform_module(config)
+    if platform:
+        return platform.admit_fabrics(config, index, clients, root)
     # Pinned util/info.c maps -p to prov_name, -f to fabric name, and -c/-m
     # to caps/mode. efa-direct is a fabric of provider efa, not a provider:
     # https://github.com/ofiwg/libfabric/blob/3cc1095272b07ebeb5cc8f44851af6aa3eb75e41/util/info.c
@@ -346,7 +379,7 @@ def admit_fabrics(config, index, clients, root):
     key = config["prefix"] + ("/results/fabric-admission.json" if index == -1
                               else f"/results/cells/startup/storage/{index}/fabric-admission.json")
     try:
-        s3_json(clients["s3"], config, key, receipt)
+        persist_json(clients, config, key, receipt)
     except Exception as exc:
         if failure is not None:
             raise failure from exc
@@ -357,6 +390,9 @@ def admit_fabrics(config, index, clients, root):
 
 
 def make_clients(config, *, guest=False):
+    platform = platform_module(config)
+    if platform:
+        return platform.make_clients(config, guest=guest)
     # Delayed: offline plan/admission must not require boto3 or credentials.
     import boto3
     from botocore.config import Config
@@ -400,6 +436,106 @@ def read_s3_json(client, config, key, limit=MAX_JSON_BYTES):
     if len(raw) > limit:
         raise InfrastructureError("bounded guest result exceeded")
     return json.loads(raw)
+
+def object_key(config, key):
+    if not isinstance(key, str) or not key.startswith(config["prefix"] + "/") or ".." in key.split("/"):
+        raise SafetyError("object key escapes exact run prefix")
+    return key
+
+
+def object_head(clients, config, key):
+    object_key(config, key)
+    if "objects" in clients:
+        head = clients["objects"].head(key)
+        return {"bytes": int(head["size"]), "sha256": head.get("metadata", {}).get("sha256"),
+                "generation": head["generation"]}
+    head = clients["s3"].head_object(Bucket=config["bucket"], Key=key, ExpectedBucketOwner=config["account"])
+    return {"bytes": head["ContentLength"], "sha256": head.get("Metadata", {}).get("sha256")}
+
+
+def put_bytes(clients, config, key, raw, *, content_type="application/octet-stream", replace=False):
+    object_key(config, key)
+    checksum = hashlib.sha256(raw).hexdigest()
+    if "objects" in clients:
+        generation = 0
+        if replace:
+            try:
+                generation = clients["objects"].head(key)["generation"]
+            except Exception as exc:
+                if getattr(exc, "status", None) != 404:
+                    raise
+        try:
+            clients["objects"].put(key, raw, content_type=content_type,
+                                   metadata={"sha256": checksum}, if_generation_match=generation)
+        except Exception:
+            # A lost acknowledgement is reconciled by content, never a blind
+            # overwrite or a new mutation identity.
+            head = object_head(clients, config, key)
+            if head["bytes"] != len(raw) or head["sha256"] != checksum:
+                raise
+    else:
+        clients["s3"].put_object(Bucket=config["bucket"], Key=key, Body=raw,
+            ExpectedBucketOwner=config["account"], ServerSideEncryption="AES256",
+            Metadata={"sha256": checksum}, ContentType=content_type)
+    head = object_head(clients, config, key)
+    if head["bytes"] != len(raw) or head["sha256"] != checksum:
+        raise InfrastructureError("uploaded object identity not confirmed")
+    return {"key": key, "bytes": len(raw), "sha256": checksum,
+            **({"generation": head["generation"]} if "generation" in head else {})}
+
+
+def persist_json(clients, config, key, value, *, replace=False):
+    if "objects" not in clients:
+        return s3_json(clients["s3"], config, key, value)
+    raw = (json.dumps(value, sort_keys=True, separators=(",", ":"), default=str) + "\n").encode()
+    if len(raw) > MAX_JSON_BYTES:
+        raise SafetyError("JSON export exceeds bounded metadata budget")
+    return put_bytes(clients, config, key, raw, content_type="application/json", replace=replace)
+
+
+def read_json(clients, config, key, limit=MAX_JSON_BYTES):
+    object_key(config, key)
+    if "objects" not in clients:
+        return read_s3_json(clients["s3"], config, key, limit)
+    return json.loads(clients["objects"].get(key, max_bytes=limit))
+
+
+def upload_object(clients, config, key, path, *, deadline_check=None):
+    object_key(config, key)
+    checksum, size = digest(path), Path(path).stat().st_size
+    if deadline_check:
+        deadline_check()
+    if "objects" in clients:
+        clients["objects"].upload(key, path, metadata={"sha256": checksum}, if_generation_match=0)
+    else:
+        from boto3.s3.transfer import TransferConfig
+        options = {}
+        if deadline_check:
+            options["Callback"] = lambda count: deadline_check()
+        clients["s3"].upload_file(str(path), config["bucket"], key, ExtraArgs={
+            "ExpectedBucketOwner": config["account"], "ServerSideEncryption": "AES256",
+            "Metadata": {"sha256": checksum}},
+            Config=TransferConfig(multipart_threshold=16 << 20, multipart_chunksize=16 << 20,
+                                  max_concurrency=2, use_threads=True), **options)
+    head = object_head(clients, config, key)
+    if head["bytes"] != size or head["sha256"] != checksum:
+        raise InfrastructureError("uploaded file identity not confirmed")
+    if deadline_check:
+        deadline_check()
+    return head
+
+
+def download_object(clients, config, key, path):
+    object_key(config, key)
+    if "objects" in clients:
+        head = object_head(clients, config, key)
+        clients["objects"].download(key, path, generation=head["generation"])
+        if Path(path).stat().st_size != head["bytes"] or digest(path) != head["sha256"]:
+            raise InfrastructureError("downloaded generation differs from admitted object")
+    else:
+        clients["s3"].download_file(config["bucket"], key, str(path),
+                                   ExtraArgs={"ExpectedBucketOwner": config["account"]})
+
 
 
 def verify_instances(config, response, *, terminating=False, starting=False, now=None):
@@ -452,7 +588,7 @@ def systemd_argv(config, case, role, cpus, memory, seconds, executable):
             "--property=KillMode=control-group", "--property=RemainAfterExit=yes",
             "--property=CPUAccounting=yes", "--property=MemoryAccounting=yes", "--property=IOAccounting=yes",
             "--property=WorkingDirectory=" + config["repository_root"],
-            *["--setenv=" + key + "=" + env[key] for key in ("LD_LIBRARY_PATH", "FDB_CLIENT_LIB_DIR", "FDB_CLIENT_LIB_PATH", "FI_EFA_USE_DEVICE_RDMA")],
+            *["--setenv=" + key + "=" + env[key] for key in ("LD_LIBRARY_PATH", "FDB_CLIENT_LIB_DIR", "FDB_CLIENT_LIB_PATH", "FI_EFA_USE_DEVICE_RDMA") if key in env],
             "--", *map(str, executable)]
 
 
@@ -485,6 +621,9 @@ def monitoring_spec(config, results_root):
 
 def monitoring_access(config, proofs=()):
     """Describe private operator access without asserting human IAM grants."""
+    platform = platform_module(config)
+    if platform:
+        return platform.monitoring_access(config, proofs)
     spec = monitoring_spec(config, Path(config["fleet"]["data_root"]) / "results")
     target = config["fleet"]["coordinator"]["instance_id"]
     region = config["fleet"]["region"]
@@ -577,7 +716,8 @@ def owned_monitor_processes(config, index, job, owner_case=None):
 
 def snapshot(config, name=None, *, drop=False, completed=False):
     root = guarded(config["fleet"]["data_root"], Path("/mnt/tidehunter-kv-comparison"), must_exist=True)
-    nvme = cloud_layout.nvme_evidence(root, False)
+    nvme = (cloud_layout.nvme_evidence(root, False, provider="gcp") if platform_module(config)
+            else cloud_layout.nvme_evidence(root, False))
     if drop:
         command(["sync"], timeout=30)
         Path("/proc/sys/vm/drop_caches").write_text("3\n")
@@ -699,6 +839,8 @@ def guest_operation(config, request, clients):
     identity = verify_local_identity(config, index)
     root = guarded(config["fleet"]["data_root"], Path("/mnt/tidehunter-kv-comparison"), must_exist=True)
     action = request["action"]
+    if action == "bootstrap" and platform_module(config):
+        return platform_module(config).bootstrap_guest(config, index, clients)
     if action == "bootstrap":
         ready_path = guarded(Path("/mnt/tidehunter") / config["prefix"] / "kv-bootstrap-ready.json",
                              Path("/mnt/tidehunter"), must_exist=True)
@@ -805,7 +947,7 @@ def guest_operation(config, request, clients):
             expected = f"{config['prefix']}/results/cells/{request['case_id']}/storage/{index}/nvme-disconnect/{request['generation']}.json"
             if request.get("host_disconnected_key") != expected:
                 raise SafetyError("unexpected disconnect proof location")
-            request = {**request, "host_disconnected": read_s3_json(clients["s3"], config, expected)}
+            request = {**request, "host_disconnected": read_json(clients, config, expected)}
         import nvme_campaign_owner
         result = nvme_campaign_owner.execute(config, request, command=command,
             validate_launch=validate_launch, unit_status=unit_status, unit_name=unit_name)
@@ -820,12 +962,7 @@ def guest_operation(config, request, clients):
                 if not isinstance(ident, list) or len(ident) != 16 or any(type(b) is not int or not 0 <= b <= 255 for b in ident):
                     raise SafetyError("invalid export UUID")
                 key = f"{config['prefix']}/results/cells/{request['case_id']}/storage/{index}/nvme-manifests/{bytes(ident).hex()}.json"
-                clients["s3"].put_object(Bucket=config["bucket"], Key=key, Body=raw,
-                    ExpectedBucketOwner=config["account"], ServerSideEncryption="AES256",
-                    Metadata={"sha256": checksum}, ContentType="application/json")
-                head = clients["s3"].head_object(Bucket=config["bucket"], Key=key, ExpectedBucketOwner=config["account"])
-                if head.get("ContentLength") != len(raw) or head.get("Metadata", {}).get("sha256") != checksum:
-                    raise InfrastructureError("owner manifest upload identity unconfirmed")
+                put_bytes(clients, config, key, raw, content_type="application/json")
                 entry["manifest_key"] = key
                 entry["manifest_bytes"] = len(raw)
         return result
@@ -868,7 +1005,7 @@ def guest_operation(config, request, clients):
         if request["key"] != expected_key:
             raise SafetyError("unexpected capsule S3 path")
         archive = guarded(root / ("capsule-" + hashlib.sha256(case.encode()).hexdigest()[:16] + "-" + str(index) + ".tar.gz"), root)
-        clients["s3"].download_file(config["bucket"], expected_key, str(archive), ExtraArgs={"ExpectedBucketOwner": config["account"]})
+        download_object(clients, config, expected_key, archive)
         if digest(archive) != request["sha256"]:
             raise SafetyError("node capsule bytes differ from admission")
         safe_extract_capsule(archive, guest_root, request["files"])
@@ -931,7 +1068,13 @@ class Controller:
         self.config = validate_config(config)
         self.clients = clients
         self.clock = clock
-        seconds = (timestamp(config["deadline_utc"]) - utc()).total_seconds()
+        deadline = timestamp(config["deadline_utc"])
+        if platform_module(config):
+            campaign_deadline = timestamp(config["platform"]["runtime"]["campaign_deadline_utc"])
+            if campaign_deadline >= deadline:
+                raise SafetyError("campaign must leave time for retrieval before VM deletion")
+            deadline = campaign_deadline
+        seconds = (deadline - utc()).total_seconds()
         self.end = clock() + min(seconds, config["spec"]["hard_deadline_seconds"])
         self.work_end = self.end - config["spec"]["export_reserve_seconds"]
         self.root = guarded(Path(config["fleet"]["data_root"]) / "results", Path(config["fleet"]["data_root"]))
@@ -958,6 +1101,9 @@ class Controller:
         return remaining
 
     def guard(self, *, terminating=False, starting=False):
+        platform = platform_module(self.config)
+        if platform:
+            return platform.verify_fleet(self.config, self.clients, terminating=terminating, starting=starting)
         response = self.clients["ec2"].describe_instances(InstanceIds=self.ids)
         actual = verify_instances(self.config, response, terminating=terminating, starting=starting)
         tags = {item["Key"]: item["Value"] for item in actual[self.ids[0]]["Tags"]}
@@ -970,7 +1116,7 @@ class Controller:
 
     def persist(self, name, value):
         dump(self.root / name, value)
-        return s3_json(self.clients["s3"], self.config, self.config["prefix"] + "/results/" + name, value)
+        return persist_json(self.clients, self.config, self.config["prefix"] + "/results/" + name, value, replace=True)
 
     def request(self, index, request, *, case="startup", timeout=180, export=False):
         available = self.remaining(export=export)
@@ -982,6 +1128,9 @@ class Controller:
             request["operation_timeout"] = timeout
         if request.get("action") == "layout" and request.get("operation") == "probe":
             request["timeout"] = min(request["timeout"], timeout)
+        platform = platform_module(self.config)
+        if platform and index != -1:
+            return platform.request_remote(self, index, request, case=case, timeout=timeout, export=export)
         if index == -1:
             self.guard()
             return guest_operation(self.config, request, self.clients)
@@ -1012,7 +1161,7 @@ class Controller:
 
         def receipt_if_present():
             try:
-                result = read_s3_json(self.clients["s3"], self.config, key)
+                result = read_json(self.clients, self.config, key)
                 if not isinstance(result, dict):
                     raise SafetyError("guest response is not a control-operation receipt")
                 return result
@@ -1104,7 +1253,7 @@ class Controller:
                         raise SnapshotTimeout("read-only snapshot SSM invocation timed out")
                     if status != "Success" or invocation.get("ResponseCode") != 0:
                         raise InfrastructureError("SSM command failed/unknown terminal status: " + str(status))
-                    return admit(read_s3_json(self.clients["s3"], self.config, key), reconciled=False)
+                    return admit(read_json(self.clients, self.config, key), reconciled=False)
             time.sleep(min(0.5, max(0, deadline - self.clock())))
         record("deadline_exceeded", command_id=command_id)
         if read_only_snapshot(request):
@@ -1152,6 +1301,9 @@ class Controller:
         self.root.mkdir(parents=True, exist_ok=False)
         self.root_owned = True
         identity = verify_local_identity(self.config, -1)
+        platform = platform_module(self.config)
+        if platform:
+            return platform.bootstrap_controller(self)
         account = self.clients["sts"].get_caller_identity()
         if account.get("Account") != self.config["account"]:
             raise SafetyError("caller account differs from exact campaign account")
@@ -1422,8 +1574,7 @@ class Controller:
                 for name, source in files.items():
                     bundle.add(source, arcname=name, recursive=False)
             key = f"{self.config['prefix']}/deploy/cells/{case}/storage-{index}.tar.gz"
-            self.clients["s3"].upload_file(str(archive), self.config["bucket"], key, ExtraArgs={
-                "ExpectedBucketOwner": self.config["account"], "ServerSideEncryption": "AES256", "Metadata": {"sha256": digest(archive)}})
+            upload_object(self.clients, self.config, key, archive)
             # Mark before send; even an unknown response must be cleaned up.
             with self.sequence_lock:
                 self.active_tide[2].append(index)
@@ -1486,7 +1637,9 @@ class Controller:
         def execute(index):
             request = {"action": action, "case_id": case, "timeout": timeout, **fields}
             if action == "nvme_owner_target_setup":
-                request["address"] = self.config["fleet"]["nodes"][index]["address"]
+                host = self.config["fleet"]["nodes"][index]
+                field = "rdma_address" if platform_module(self.config) and fields.get("transport") == "rdma" else "address"
+                request["address"] = host[field]
             result = self.request(index, request, case=case, timeout=timeout, export=export)
             if result.get("complete") is not True:
                 raise InfrastructureError("owner lifecycle failed: " + json.dumps(result))
@@ -1519,15 +1672,13 @@ class Controller:
                         or not re.fullmatch(r"[a-f0-9]{64}", checksum)
                         or type(size) is not int or not 0 < size <= 64 * 1024**2):
                     raise SafetyError("manifest S3 identity or size differs from admission")
-                head = self.clients["s3"].head_object(Bucket=self.config["bucket"], Key=key,
-                                                       ExpectedBucketOwner=self.config["account"])
-                if head.get("ContentLength") != size or head.get("Metadata", {}).get("sha256") != checksum:
+                head = object_head(self.clients, self.config, key)
+                if head["bytes"] != size or head["sha256"] != checksum:
                     raise InfrastructureError("source manifest HEAD differs from owner receipt")
                 destination = mirror / original.relative_to(source)
                 guarded(destination, mirror)
                 destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                self.clients["s3"].download_file(self.config["bucket"], key, str(destination),
-                    ExtraArgs={"ExpectedBucketOwner": self.config["account"]})
+                download_object(self.clients, self.config, key, destination)
                 destination.chmod(0o600)
                 if destination.stat().st_size != size or digest(destination) != checksum:
                     raise SafetyError("downloaded source manifest differs from owner receipt")
@@ -1718,7 +1869,7 @@ class Controller:
             proof = json.loads(command([sys.executable, "-B", script, "host-disconnect",
                 "--state", host["state"], "--readers-drained"], timeout=timeout))
             key = f"{self.config['prefix']}/results/cells/{active['case']}/storage/{host['index']}/nvme-disconnect/{active['generation']}.json"
-            s3_json(self.clients["s3"], self.config, key, proof)
+            persist_json(self.clients, self.config, key, proof)
             timeout = self.cleanup_timeout(deadline, 60)
             result = self.request(host["index"], {"action": "nvme_owner_target_cleanup",
                 "case_id": active["case"], "timeout": timeout, "generation": active["generation"],
@@ -2146,7 +2297,7 @@ class Controller:
 
     def export(self, error):
         if not self.root_owned:
-            s3_json(self.clients["s3"], self.config, self.config["prefix"] + "/results/receipt.json",
+            persist_json(self.clients, self.config, self.config["prefix"] + "/results/receipt.json",
                     {"status": "incomplete", "error": error, "no_owned_result_directory": True})
             return {"complete": False}
         dump(self.root / "controller-outcome.json", {"error": error, "observed_utc": utc().isoformat()})
@@ -2184,19 +2335,12 @@ class Controller:
         records = archive_results(self.root, archive, deadline_check=lambda: self.remaining(export=True))
         checksum = digest(archive)
         size = archive.stat().st_size
-        from boto3.s3.transfer import TransferConfig
         key = self.config["prefix"] + "/results/controller.tar.gz"
-        self.clients["s3"].upload_file(str(archive), self.config["bucket"], key, ExtraArgs={
-            "ExpectedBucketOwner": self.config["account"], "ServerSideEncryption": "AES256", "Metadata": {"sha256": checksum}},
-            Config=TransferConfig(multipart_threshold=16 << 20, multipart_chunksize=16 << 20, max_concurrency=2, use_threads=True),
-            Callback=lambda count: self.remaining(export=True))
-        head = self.clients["s3"].head_object(Bucket=self.config["bucket"], Key=key, ExpectedBucketOwner=self.config["account"])
-        if head.get("ContentLength") != size or head.get("Metadata", {}).get("sha256") != checksum:
-            raise InfrastructureError("raw archive HEAD differs from exact uploaded bytes")
+        upload_object(self.clients, self.config, key, archive,
+                      deadline_check=lambda: self.remaining(export=True))
         # File inventories grow with the matrix. Keep bulk metadata out of the
         # launcher's independently bounded, frequently polled control receipt.
-        inventory = s3_json(self.clients["s3"], self.config,
-                            self.config["prefix"] + "/results/controller-inventory.json", records)
+        inventory = persist_json(self.clients, self.config, self.config["prefix"] + "/results/controller-inventory.json", records)
         self.persist("receipt.json", {"schema_version": 2,
             "status": "completed" if report["complete"] and not error else "incomplete",
             "error": error, "key": key, "bytes": size, "sha256": checksum, "inventory": inventory,
@@ -2205,6 +2349,9 @@ class Controller:
         return report
 
     def terminate(self):
+        platform = platform_module(self.config)
+        if platform:
+            return platform.terminate(self.config, self.clients)
         # This is intentionally independent of the workload/export deadline.
         # Never terminate a subset from a malformed or foreign response.
         current = self.guard(terminating=True)
@@ -2283,30 +2430,34 @@ class Controller:
                     if self.root_owned:
                         self.persist("receipt.json", value)
                     else:
-                        s3_json(self.clients["s3"], self.config, self.config["prefix"] + "/results/receipt.json", value)
+                        persist_json(self.clients, self.config, self.config["prefix"] + "/results/receipt.json", value)
                 except BaseException:
                     pass  # Original export failure is surfaced; termination is unconditional.
             finally:
                 termination = self.terminate()
                 # Local evidence may disappear when self termination takes effect.
                 if self.root_owned:
-                    dump(self.root / "termination-request.json", termination)
+                    name = "lifecycle-owner.json" if termination.get("external_lifecycle_owner") else "termination-request.json"
+                    dump(self.root / name, termination)
         if error or export_error or not report.get("complete"):
             raise InfrastructureError(json.dumps({"controller_error": error, "export_error": export_error,
                                                   "complete": report.get("complete", False)}))
         return report
 
 
-def validate_physical_proofs(proofs):
+def validate_physical_proofs(proofs, *, provider="aws"):
     if len(proofs) != 6:
         raise SafetyError("six physical host proofs required")
+    if provider not in ("aws", "gcp"):
+        raise SafetyError("unknown physical storage provider")
+    model = "local ssd" if provider == "gcp" else "instance storage"
     boot_ids, serials = set(), set()
     for proof in proofs:
         if proof.get("qualification_only") is not False or proof.get("independent_nvme_admitted") is not True:
             raise SafetyError("physical device proof was not admitted")
         boot = proof.get("host_identity", {}).get("boot_id")
         devices = proof.get("block_devices", {}).get("blockdevices", [])
-        selected = [x for x in devices if "instance storage" in str(x.get("model", "")).lower() and x.get("serial")]
+        selected = [x for x in devices if model in str(x.get("model", "")).lower() and x.get("serial")]
         if not boot or boot in boot_ids or not selected:
             raise SafetyError("physical independence not proven by unique boot IDs and instance NVMe serials")
         host_serials = {x["serial"] for x in selected}
@@ -2413,7 +2564,7 @@ def guest_main(config, payload):
         result["status"] = "completed"
     except Exception as exc:
         result.update(status="failed", error=type(exc).__name__ + ": " + str(exc))
-    exported = s3_json(clients["s3"], config, key, result)
+    exported = persist_json(clients, config, key, result)
     print(json.dumps(exported))
     # A successfully exported failure is a successful RPC transport. The caller
     # admits status separately; returning nonzero would hide its detailed proof.

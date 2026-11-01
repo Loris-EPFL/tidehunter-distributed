@@ -184,13 +184,8 @@ def execute(config, request, *, command, validate_launch, unit_status, unit_name
         return json.loads(call([sys.executable, '-B', script, 'status', '--state', path, '--kind', 'target']))
 
     def runtime_environment():
-        env = dict(os.environ)
-        env.pop('LD_PRELOAD', None)
-        env.pop('LD_AUDIT', None)
-        env.update(LD_LIBRARY_PATH=config['fdb_library_dir'] + ':/opt/amazon/efa/lib',
-                   FDB_CLIENT_LIB_DIR=config['fdb_library_dir'], FDB_CLIENT_LIB_PATH=config['fdb_library_dir'],
-                   FI_EFA_USE_DEVICE_RDMA='1')
-        return env
+        from cloud_controller import environment
+        return environment(config)
 
     def require_stopped():
         proof = _read_json(stop_proof)
@@ -250,9 +245,8 @@ def execute(config, request, *, command, validate_launch, unit_status, unit_name
                 marker.unlink(missing_ok=True)
             stop_proof.unlink()
             remaining()
-            env = {'LD_LIBRARY_PATH': config['fdb_library_dir'] + ':/opt/amazon/efa/lib',
-                   'FDB_CLIENT_LIB_DIR': config['fdb_library_dir'], 'FDB_CLIENT_LIB_PATH': config['fdb_library_dir'],
-                   'FI_EFA_USE_DEVICE_RDMA': '1'}
+            env = {key: value for key, value in runtime_environment().items()
+                   if key in ('LD_LIBRARY_PATH', 'FDB_CLIENT_LIB_DIR', 'FDB_CLIENT_LIB_PATH', 'FI_EFA_USE_DEVICE_RDMA')}
             argv = ['systemd-run', '--unit=' + name, '--service-type=exec',
                     '--property=CPUQuota=' + str(fleet['server_cpus'] * 100) + '%',
                     '--property=MemoryMax=' + str(int(fleet['server_memory_mib'])) + 'M',
@@ -303,8 +297,11 @@ def execute(config, request, *, command, validate_launch, unit_status, unit_name
             ready = _read_json(export / 'ready.json')
             if not isinstance(ready.get('exports'), list):
                 raise ValueError('target setup requires complete export readiness')
-            if request['address'] != fleet['nodes'][index]['address']:
-                raise ValueError('target address differs from owner')
+            host = fleet['nodes'][index]
+            address_field = ('rdma_address' if config.get('platform', {}).get('name') == 'gcp'
+                             and request['transport'] == 'rdma' else 'address')
+            if request['address'] != host[address_field]:
+                raise ValueError('target address differs from selected owner interface')
             transport = request['transport']
             if transport not in ('tcp', 'rdma'):
                 raise ValueError('explicit NVMe transport must be tcp or rdma')

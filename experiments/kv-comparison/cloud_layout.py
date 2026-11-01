@@ -211,6 +211,7 @@ def node_config(fleet, backend, index):
             "address": address, "instance_id": host["instance_id"], "directory": str(directory), "owner": owner,
             "labels": labels, "files": files, "containers": containers, "actions": actions,
             "qualification_only": fleet.get("qualification_only", False),
+            **({"provider": fleet["provider"]} if "provider" in fleet else {}),
             "budget": {"cpus": cpus, "memory_mib": memory},
             "client_budget": {"cpus": fleet["client_cpus"] - control_cpu,
                               "memory_mib": fleet["client_memory_mib"] - control_memory} if coordinator else None}
@@ -275,7 +276,7 @@ def save(path, value):
     temporary.replace(path)
 
 
-def nvme_evidence(directory, qualification):
+def nvme_evidence(directory, qualification, provider="aws"):
     existing = Path(directory)
     while not existing.exists():
         existing = existing.parent
@@ -294,8 +295,19 @@ def nvme_evidence(directory, qualification):
     device = re.sub(r"p[0-9]+$", "", source)
     blocks = json.loads(command(["lsblk", "--json", "--nodeps", "--paths", "--output", "NAME,TYPE,MODEL,SERIAL", device]))
     devices = blocks.get("blockdevices", [])
-    if len(devices) != 1 or "instance storage" not in (devices[0].get("model") or "").lower():
-        raise RuntimeError("NVMe is not identified as EC2 instance storage (EBS is not admitted)")
+    if len(devices) != 1:
+        raise RuntimeError("exactly one NVMe block device required")
+    if provider == "aws":
+        if "instance storage" not in (devices[0].get("model") or "").lower():
+            raise RuntimeError("NVMe is not identified as EC2 instance storage (EBS is not admitted)")
+    elif provider == "gcp":
+        local_ssd = Path("/dev/disk/by-id/google-local-nvme-ssd-0")
+        if (not local_ssd.is_symlink() or str(local_ssd.resolve(strict=True)) != device
+                or "local ssd" not in (devices[0].get("model") or "").lower()
+                or not devices[0].get("serial")):
+            raise RuntimeError("NVMe is not the identified Google local SSD")
+    else:
+        raise RuntimeError("unknown physical storage provider")
     if "rw" not in filesystems[0].get("options", "").split(","):
         raise RuntimeError("data mount is not writable")
     evidence.update({"block_devices": blocks, "independent_nvme_admitted": True})
@@ -324,13 +336,13 @@ def prepare(config):
     directory = guarded(config["directory"])
     if (directory / "owner.json").exists():
         require_state(config)
-        return {"reused": True, "nvme": nvme_evidence(directory, config["qualification_only"])}
+        return {"reused": True, "nvme": nvme_evidence(directory, config["qualification_only"], config.get("provider", "aws"))}
     if directory.exists() and any(directory.iterdir()):
         raise ValueError("refusing nonempty unowned directory")
     # Prove the requested address belongs to this host, without listening on a service port.
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.bind((config["address"], 0))
-    evidence = nvme_evidence(directory, config["qualification_only"])
+    evidence = nvme_evidence(directory, config["qualification_only"], config.get("provider", "aws"))
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "data").mkdir()
     if config["backend"] == "foundationdb":
@@ -382,7 +394,7 @@ def runtime_evidence(config):
 
 def start(config):
     directory = require_state(config)
-    nvme_evidence(directory, config["qualification_only"])
+    nvme_evidence(directory, config["qualification_only"], config.get("provider", "aws"))
     if config["backend"] == "foundationdb":
         # fdbserver opens trace files but does not create --logdir. Reset
         # deliberately empties data/, so recreate it on every fresh start.
@@ -594,7 +606,7 @@ def initialize(fleet, config):
 def probe_once(fleet, config, cluster=False):
     directory = require_state(config)
     proof = {"observed_at_unix": time.time(), "qualification_only": config["qualification_only"],
-             "nvme": nvme_evidence(directory, config["qualification_only"]), "runtime": runtime_evidence(config)}
+             "nvme": nvme_evidence(directory, config["qualification_only"], config.get("provider", "aws")), "runtime": runtime_evidence(config)}
     backend = config["backend"]
     if backend == "tikv":
         if config["index"] >= 0:
@@ -742,7 +754,7 @@ def reset_data(config):
         mount = Path(re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), field))
         if mount == data or data in mount.parents:
             raise RuntimeError("reset data contains a mountpoint; refusing deletion")
-    nvme = nvme_evidence(data, config["qualification_only"])
+    nvme = nvme_evidence(data, config["qualification_only"], config.get("provider", "aws"))
     # The pinned image's find handles files owned by container root/Cassandra.
     # The only writable host bind is this exact owned data path.
     ensure_image(local.IMAGES["cassandra"])

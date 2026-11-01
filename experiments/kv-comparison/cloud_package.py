@@ -39,7 +39,7 @@ EFA = {"installer_version": "1.50.0", "installer_sha256": "fa6dff8593d866866c13c
        "runtime_library_dir": "/opt/amazon/efa/lib", "required_environment": {"FI_EFA_USE_DEVICE_RDMA": "1"},
        "hardware_admission": "provider efa, RDM fabrics efa (MSG|DIRECTED_RECV) and efa-direct (MSG); registered-RAM additionally requires efa-direct RMA|READ|REMOTE_READ; Rust enforces geometry and native device reads; no TCP fallback"}
 NEW_ROOTS = ("benchmarks/kv-research/", "tidehunter/src/distributed/",
-             "experiments/kv-comparison/", "experiments/nvmeof/", "experiments/portable_transport.py")
+             "experiments/kv-comparison/", "experiments/gcp-rdma/", "experiments/nvmeof/", "experiments/portable_transport.py")
 SUFFIXES = {".rs", ".toml", ".lock", ".py", ".json", ".yaml", ".yml", ".sh", ".md", ".c", ".h", ".cpp", ".proto", ".html", ".css", ".js", ".txt"}
 EXCLUDED = {".git", "target", "checkpoint-work", "logs", "results", "artifacts", "data", "secrets", "credentials", ".state", "__pycache__", ".aws", ".ssh", "node_modules", ".venv"}
 REQUIRED = {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml", "benchmarks/kv-research/Cargo.toml",
@@ -467,7 +467,9 @@ def stage(repo, snapshot_dir, build_dir, fdb_prefix, output):
     return manifest
 
 
-def verify_directory(directory, runtime=False):
+def verify_directory(directory, runtime=False, provider="aws"):
+    if provider not in ("aws", "gcp"):
+        raise ValueError("unknown runtime provider")
     manifest = json.loads((directory / "manifest.json").read_text())
     files = manifest["files"]
     if (manifest.get("schema_version") != 1 or manifest.get("features") != FEATURES
@@ -515,16 +517,26 @@ def verify_directory(directory, runtime=False):
               "binary_blake2b512": manifest["binary_blake2b512"], "runtime_checked": runtime}
     if runtime:
         environment = clean_environment()
-        environment["LD_LIBRARY_PATH"] = f"{library.parent.resolve()}:{EFA['runtime_library_dir']}"
+        environment["LD_LIBRARY_PATH"] = (f"{library.parent.resolve()}:{EFA['runtime_library_dir']}"
+                                          if provider == "aws" else str(library.parent.resolve()))
         result["linkage"] = linked_libraries(binary, environment)
         if str(library.resolve()) not in result["linkage"]["resolved"]:
             raise ValueError("runtime linker selected a different FDB client")
-        fabric = Path(EFA["runtime_library_dir"]) / "libfabric.so.1"
-        if str(fabric.resolve(strict=True)) not in result["linkage"]["resolved"]:
-            raise ValueError("runtime linker selected a different EFA provider library")
-        result["fabric_version"] = command(["/opt/amazon/efa/bin/fi_info", "--version"], env=environment)
-        if EFA["libfabric_version"] not in result["fabric_version"]:
-            raise ValueError("runtime libfabric differs from pinned AWS installer")
+        if provider == "aws":
+            fabric = Path(EFA["runtime_library_dir"]) / "libfabric.so.1"
+            if str(fabric.resolve(strict=True)) not in result["linkage"]["resolved"]:
+                raise ValueError("runtime linker selected a different EFA provider library")
+            result["fabric_version"] = command(["/opt/amazon/efa/bin/fi_info", "--version"], env=environment)
+            if EFA["libfabric_version"] not in result["fabric_version"]:
+                raise ValueError("runtime libfabric differs from pinned AWS installer")
+        else:
+            libraries = [path for path in result["linkage"]["resolved"] if Path(path).name.startswith("libfabric.so")]
+            if len(libraries) != 1:
+                raise ValueError("GCP runtime requires exactly one linked system libfabric")
+            result["fabric_version"] = command(["fi_info", "--version"], env=environment)
+            if "2.6.0" not in result["fabric_version"]:
+                raise ValueError("GCP libfabric version differs from pinned build")
+            result["fabric_library"] = libraries[0]
         # Selecting API730 before the getter is mandatory; never initialize FDB
         # process-global state in the long-lived controller itself.
         result["fdb_client_version"] = fdb_client_version(library)

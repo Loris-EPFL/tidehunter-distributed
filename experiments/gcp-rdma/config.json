@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "project_id": "mysten-research",
+  "project_number": "514867804006",
+  "bucket": "",
+  "service_account": "",
+  "machine_type": "z4m-highmem-16",
+  "image": "",
+  "max_distance": 3,
+  "candidates": []
+}

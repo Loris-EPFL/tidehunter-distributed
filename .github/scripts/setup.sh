@@ -13,6 +13,7 @@ ${XDG_CACHE_HOME:-$HOME/.cache}/tidehunter/libfabric-2.6.0).
 An existing compatible prefix is reused without replacing its providers.
 TIDEHUNTER_SETUP_JOBS sets build concurrency (default: 2, maximum: 32).
 TIDEHUNTER_SETUP_SKIP_APT=1 skips apt when dependencies are already installed.
+TIDEHUNTER_SETUP_SKIP_AWS_SDK=1 skips boto3 for provider-independent builds.
 Run checks.py separately; setup does not run tests or claim hardware coverage.
 HELP
 }
@@ -39,7 +40,8 @@ if [[ ${TIDEHUNTER_SETUP_SKIP_APT:-0} != 1 ]]; then
     privileged=()
     if [[ $(id -u) != 0 ]]; then privileged=(sudo -n); fi
     packages=(build-essential pkg-config libfontconfig1-dev libssl-dev
-        python3 python3-pip python3-yaml python3-boto3 openssl ca-certificates curl bzip2)
+        python3 python3-pip python3-yaml openssl ca-certificates curl bzip2)
+    if [[ ${TIDEHUNTER_SETUP_SKIP_AWS_SDK:-0} != 1 ]]; then packages+=(python3-boto3); fi
     # Hosted runners also install tools outside apt; do not download duplicates.
     for tool in clang cmake; do
         if ! command -v "$tool" >/dev/null; then packages+=("$tool"); fi
@@ -78,15 +80,21 @@ fi
 # apt modules may not be visible to a hosted toolcache Python. Prepare the exact
 # interpreter used by checks.py; never change global Python packages or shell files.
 python3 -c 'import tomllib' || { echo 'Python 3.11 or newer is required' >&2; exit 1; }
-if ! python3 -c 'import yaml, boto3' >/dev/null 2>&1; then
+modules=(tomllib yaml)
+pip_packages=('PyYAML==6.0.2')
+if [[ ${TIDEHUNTER_SETUP_SKIP_AWS_SDK:-0} != 1 ]]; then
+    modules+=(boto3)
+    pip_packages+=('boto3==1.35.99')
+fi
+if ! python3 -c 'import importlib,sys; [importlib.import_module(name) for name in sys.argv[1:]]' "${modules[@]}" >/dev/null 2>&1; then
     pip_scope=()
     if python3 -c 'import sys; sys.exit(sys.prefix != sys.base_prefix)'; then
         pip_scope=(--user)
     fi
     timeout 300 python3 -m pip install "${pip_scope[@]}" --disable-pip-version-check \
-        --retries 2 --timeout 30 'PyYAML==6.0.2' 'boto3==1.35.99'
+        --retries 2 --timeout 30 "${pip_packages[@]}"
 fi
-python3 -c 'import tomllib, yaml, boto3'
+python3 -c 'import importlib,sys; [importlib.import_module(name) for name in sys.argv[1:]]' "${modules[@]}"
 # The Python runner reads this same project toolchain file.
 toolchain=$(python3 -c 'import pathlib,sys,tomllib; print(tomllib.loads(pathlib.Path(sys.argv[1]).read_text())["toolchain"]["channel"])' "$root/rust-toolchain.toml")
 timeout 900 rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy

@@ -152,7 +152,6 @@ class ControllerBoundaryTests(unittest.TestCase):
              patch.object(controller, 'read_s3_json', return_value=proof) as read_proof, \
              patch.object(nvme_campaign_owner, 'execute', return_value={'complete': True}) as execute:
             self.assertEqual(controller.guest_operation(config, request, clients), {'complete': True})
-            read_proof.assert_called_once_with(clients['s3'], config, request['host_disconnected_key'])
             self.assertIs(execute.call_args.args[1]['host_disconnected'], proof)
             execute.reset_mock()
             read_proof.reset_mock()

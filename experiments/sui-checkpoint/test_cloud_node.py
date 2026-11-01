@@ -97,6 +97,28 @@ class CloudNodeContract(unittest.TestCase):
         self.assertEqual(cfg['storage_binary_sha256'], cloud_node.sha256(self.binary))
         self.assertEqual(cfg['cell_id'], 'r04-tcp')
 
+    def test_verbs_transport_accepts_host_selector_and_rejects_fallback(self):
+        old_root = self.root
+        self.root = old_root.parent.parent / 'r04-tidehunter_verbs/storage'
+        self.root.parent.mkdir()
+        old_root.rename(self.root)
+        self.config_path = self.root / 'node-config.json'
+        self.binary = self.root / 'storage-node'
+        self.cfg = json.loads(json.dumps(self.cfg).replace(str(old_root), str(self.root)))
+        client = {'kind': 'ofi', 'fabric': {'backend': 'verbs', 'source_address': '10.0.0.1'}, 'security': 'mutual-tls'}
+        owner = {'kind': 'ofi', 'fabric': {'backend': 'verbs', 'source_address': '10.0.0.2'}, 'security': 'mutual-tls'}
+        self.cfg.update(cell_id='r04-tidehunter_verbs', transport='tidehunter_verbs',
+                        client_transport=client, owner_transport=owner)
+        launch = Path(self.cfg['commands'][0][2])
+        value = json.loads(launch.read_text().replace(str(old_root), str(self.root)))
+        value['tls']['transport'] = owner
+        launch.write_text(json.dumps(value))
+        self.assertEqual(self.validate()['owner_transport'], owner)
+        value['tls']['transport'] = {'kind': 'tcp'}
+        launch.write_text(json.dumps(value))
+        with self.assertRaisesRegex(ValueError, 'data-NIC selection'):
+            self.validate()
+
     def test_direct_identity_accepts_only_exact_direct_launch(self):
         old_root = self.root
         self.root = old_root.parent.parent / 'r04-efa-direct/storage'

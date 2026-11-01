@@ -72,13 +72,14 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def validate_config(config_path):
+def validate_config(config_path, owned_base=None):
     cfg = json.loads(bounded_text(config_path, 128 * 1024))
     if not isinstance(cfg, dict) or not re.fullmatch(r'th-[0-9a-f]{16}', cfg.get('run_id', '')):
         raise ValueError('invalid owned run ID')
-    owner = OWNED_BASE / cfg['run_id']
+    owner = (OWNED_BASE if owned_base is None else owned_base) / cfg['run_id']
     transport = cfg.get('transport')
-    if (transport not in ('tcp', 'efa', 'efa-direct', 'efa-native')
+    if (transport not in ('tcp', 'efa', 'efa-direct', 'efa-native',
+                          'tidehunter_verbs', 'tidehunter_verbs_native')
             or not isinstance(cfg.get('cell_id'), str)
             or not re.fullmatch(r'r0[1-4]-' + re.escape(transport) + (r'(?:-rma)?' if transport == 'efa-native' else ''), cfg['cell_id'])):
         raise ValueError('invalid matrix cell/transport identity')
@@ -531,10 +532,12 @@ class NodeOwner:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, required=True)
+    parser.add_argument('--owned-base', choices=('/mnt/tidehunter', '/mnt/tidehunter-kv-comparison'),
+                        default='/mnt/tidehunter')
     args = parser.parse_args()
     os.umask(0o077)
     try:
-        cfg = validate_config(args.config.absolute())
+        cfg = validate_config(args.config.absolute(), Path(args.owned_base))
     except Exception as error:
         # Parser errors may quote YAML/TLS content; never log untrusted text.
         print(json.dumps(dict(complete=False, failure='node config rejected', error=type(error).__name__)))
