@@ -181,3 +181,7 @@ not installed. No GitHub campaign, release-package build, GCP VM, kernel RDMA
 qualification or real GCP checkpoint replay was performed in this setup task.
 The workflow must still rebuild and qualify its exact release artifacts before
 any cloud allocation.
+
+Runner-dependent paths are initialized inside a step through `GITHUB_ENV`.
+GitHub does not permit the `runner` expression context in job-level `env`;
+ordinary YAML parsing cannot detect that workflow validation error.
