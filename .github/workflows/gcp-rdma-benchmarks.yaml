@@ -76,7 +76,6 @@ jobs:
       MATRIX_MODE: ${{ inputs.mode || 'nvmeof-focused' }}
       FIXTURE_KEY: ${{ vars.GCP_BENCH_FIXTURE_KEY }}
       FIXTURE_GENERATION: ${{ vars.GCP_BENCH_FIXTURE_GENERATION }}
-      TIDEHUNTER_LIBFABRIC_PREFIX: ${{ runner.temp }}/gcp-libfabric-2.6.0
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_RELEASE_DEBUG: '0'
     steps:
@@ -89,6 +88,7 @@ jobs:
         id: gate
         run: |
           mkdir -p "$RUNNER_TEMP/gcp-results"
+          echo "TIDEHUNTER_LIBFABRIC_PREFIX=$RUNNER_TEMP/gcp-libfabric-2.6.0" >> "$GITHUB_ENV"
           if [ "$GCP_BENCH_ENABLED" = true ]; then
             echo 'enabled=true' >> "$GITHUB_OUTPUT"
           else

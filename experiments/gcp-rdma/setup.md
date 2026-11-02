@@ -181,3 +181,12 @@ not installed. No GitHub campaign, release-package build, GCP VM, kernel RDMA
 qualification or real GCP checkpoint replay was performed in this setup task.
 The workflow must still rebuild and qualify its exact release artifacts before
 any cloud allocation.
+
+Runner-dependent paths are initialized inside a step through `GITHUB_ENV`.
+GitHub does not permit the `runner` expression context in job-level `env`;
+ordinary YAML parsing cannot detect that workflow validation error.
+Compile TCP-only and NVMe-enabled configurations separately; an all-feature build
+does not detect feature-specific dead code.
+The software-fabric profile runs retained message-path integration cases and
+transport-level RMA probes, not the deleted owner-value-cache grant cases. It
+does not establish hardware RDMA or kernel NVMe/RDMA performance.

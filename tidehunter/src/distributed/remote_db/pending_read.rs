@@ -778,7 +778,9 @@ impl Drop for Credit {
         self.state.admission_changed.notify_all();
     }
 }
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(super) struct AdmissionPause(Arc<State>);
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 impl Drop for AdmissionPause {
     fn drop(&mut self) {
         let _retained = self.0.retained.lock();
