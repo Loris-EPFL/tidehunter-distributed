@@ -1,6 +1,9 @@
 import unittest
 import subprocess
 from unittest.mock import patch
+import json
+from pathlib import Path
+import tempfile
 
 import valkey_service
 
@@ -53,3 +56,37 @@ class ValkeyServiceTests(unittest.TestCase):
                 patch.object(valkey_service, "command") as command:
             self.assertEqual(valkey_service.stop(config), [])
             command.assert_not_called()
+
+    def test_finite_soft_memlock_is_rejected_even_with_unlimited_hard_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime"
+            (runtime / "bin").mkdir(parents=True)
+            artifacts = {}
+            for name in ("valkey-server", "valkey-cli"):
+                binary = runtime / "bin" / name
+                binary.write_bytes(name.encode())
+                artifacts["src/" + name] = {"sha256": valkey_service.digest(binary)}
+            source = "fe8d406c0b5a64ec897f6455e4de684629883764"
+            (runtime / "valkey-rdma.json").write_text(json.dumps({"source_commit": source, "artifacts": artifacts}))
+            service = {"unit": "kvcloud-valkey-owned-0", "runtime": str(runtime),
+                       "source_commit": source, "server_sha256": artifacts["src/valkey-server"]["sha256"],
+                       "args": [str(runtime / "bin/valkey-server")], "cpus": 2, "memory_mib": 64}
+            proc = root / "proc" / "123"
+            proc.mkdir(parents=True)
+            (proc / "cmdline").write_bytes(b"valkey-server\0")
+            (proc / "exe").symlink_to(runtime / "bin/valkey-server")
+            (proc / "limits").write_text("Max locked memory         65536                unlimited            bytes\n")
+            group = "/system.slice/" + service["unit"] + ".service"
+            cgroup = root / "cgroup" / group.lstrip("/")
+            cgroup.mkdir(parents=True)
+            for name, value in (("memory.max", str(64 * 1024**2)), ("memory.swap.max", "0"), ("cpu.max", "200000 100000")):
+                (cgroup / name).write_text(value)
+            state = {"ActiveState": "active", "MainPID": "123", "ControlGroup": group}
+            def paths(value):
+                return {"/proc": root / "proc", "/sys/fs/cgroup": root / "cgroup"}.get(str(value), Path(value))
+            with patch.object(valkey_service, "Path", side_effect=paths), \
+                    patch.object(valkey_service, "status", return_value=state), \
+                    patch.object(valkey_service, "command", return_value="argv[]=" + service["args"][0] + " ;"), \
+                    self.assertRaisesRegex(RuntimeError, "memlock"):
+                valkey_service.evidence({"native_valkey": service})

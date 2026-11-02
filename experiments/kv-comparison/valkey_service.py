@@ -28,7 +28,7 @@ def identity(runtime):
 
 def status(unit):
     result = subprocess.run(["systemctl", "show", unit,
-        "--property=LoadState,ActiveState,MainPID,ControlGroup,CPUQuotaPerSecUSec,MemoryMax,LimitMEMLOCK"],
+        "--property=LoadState,ActiveState,MainPID,ControlGroup,CPUQuotaPerSecUSec,MemoryMax,LimitMEMLOCK,ExecStart"],
         capture_output=True, text=True, timeout=10)
     values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
     if result.returncode and values.get("LoadState") != "not-found":
@@ -73,18 +73,21 @@ def evidence(config):
         raise RuntimeError("Valkey process executable identity differs")
     admit_unit(service)
     cgroup = Path("/sys/fs/cgroup") / expected_cgroup.lstrip("/")
-    if int((cgroup / "memory.max").read_text().strip()) != service["memory_mib"] * 1024**2:
+    cgroup_files = {name: (cgroup / name).read_text().strip()
+                    for name in ("memory.max", "memory.swap.max", "cpu.max")}
+    if int(cgroup_files["memory.max"]) != service["memory_mib"] * 1024**2:
         raise RuntimeError("Valkey MemoryMax differs")
-    if (cgroup / "memory.swap.max").read_text().strip() != "0":
+    if cgroup_files["memory.swap.max"] != "0":
         raise RuntimeError("Valkey MemorySwapMax differs")
-    quota, period = (cgroup / "cpu.max").read_text().split()
+    quota, period = cgroup_files["cpu.max"].split()
     if quota == "max" or int(quota) != int(float(service["cpus"]) * int(period)):
         raise RuntimeError("Valkey CPUQuota differs")
     limits = (proc / "limits").read_text().splitlines()
-    if not any(line.startswith("Max locked memory") and "unlimited" in line for line in limits):
+    if not any(line.startswith("Max locked memory") and line.split()[3:5] == ["unlimited", "unlimited"] for line in limits):
         raise RuntimeError("Valkey memlock limit differs")
     return [{"unit": service["unit"], "pid": int(pid), "cgroup": expected_cgroup,
-             "systemd": state, "argv": actual, "source": service["source_commit"], "server_sha256": service["server_sha256"]}]
+             "systemd": state, "argv": actual, "source": service["source_commit"], "server_sha256": service["server_sha256"],
+             "cgroup_files": cgroup_files, "proc_limits": limits}]
 
 
 def start(config):

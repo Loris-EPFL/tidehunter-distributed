@@ -600,6 +600,12 @@ and executable, argument and cgroup checks. Process metrics feed the existing
 Prometheus/Grafana campaign pipeline. Functional RDMA PING/SET/GET/DEL and
 configuration/topology admission must pass before measurement. There is no
 CLI subprocess per measured operation.
+Native local exports use `services.json`, not Docker inspection files.
+`experiments/kv-comparison/analyze.py` checks both runtime snapshots against
+the owned launch, executable SHA, raw CPU/memory/swap cgroup files and both
+memlock limits. It normalizes libvalkey's node IDs and heartbeat times only
+after proving endpoint and complete slot ownership. TCP/RDMA and native/Docker
+contracts remain distinct; older native exports missing raw proof are rejected.
 
 RF1, AOF `appendfsync=always`, `no-appendfsync-on-rewrite=no` and `noeviction`
 are required on both arms. Valkey GET remains a RAM lookup, not a read from
