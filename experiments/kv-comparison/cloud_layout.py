@@ -15,8 +15,11 @@ import time
 import urllib.request
 
 import local
+import valkey_service
+import industry_service
+import binascii
 
-BACKENDS = ("tikv", "cassandra", "foundationdb", "valkey_tcp")
+BACKENDS = ("tikv", "cassandra", "foundationdb", "valkey_tcp", "valkey_rdma", "garnet", "kvrocks")
 RUN_LABEL = "io.tidehunter.kv-comparison.run"
 NODE_LABEL = "io.tidehunter.kv-comparison.node"
 BACKEND_LABEL = "io.tidehunter.kv-comparison.backend"
@@ -67,6 +70,15 @@ def validate_fleet(fleet):
             raise ValueError("memory MiB must be integral")
     return fleet
 
+def paired_valkey(fleet, backend):
+    return backend in ("valkey_tcp", "valkey_rdma") and fleet.get("valkey_rdma_package") is True
+
+
+def valkey_control_endpoints(fleet):
+    return [x["address"] + ":6379" for x in fleet["nodes"]]
+
+
+
 
 def backend_options(fleet, backend, root):
     validate_fleet(fleet)
@@ -78,9 +90,23 @@ def backend_options(fleet, backend, root):
         return {"nodes": [x["address"] + ":9042" for x in fleet["nodes"]], "keyspace": "kv_comparison",
                 "required_replication_factor": 1, "consistency": "quorum", "request_timeout_ms": 5000,
                 "get_many_concurrency": 16}
-    if backend == "valkey_tcp":
-        return {"nodes": [x["address"] + ":6379" for x in fleet["nodes"]], "cluster": True,
-                "required_replication_factor": 1, "required_primary_nodes": 5, "request_timeout_ms": 5000}
+    if backend in ("valkey_tcp", "valkey_rdma"):
+        paired = paired_valkey(fleet, backend)
+        if backend == "valkey_rdma" and not paired:
+            raise ValueError("Valkey RDMA requires the admitted matched package")
+        if paired:
+            addresses = [str(ipaddress.IPv4Address(x["rdma_address"])) for x in fleet["nodes"]]
+            if len(set(addresses)) != 5:
+                raise ValueError("five distinct RDMA addresses required")
+        nodes = ([x["rdma_address"] + ":6380" for x in fleet["nodes"]]
+                 if backend == "valkey_rdma" else valkey_control_endpoints(fleet))
+        options = {"nodes": nodes, "cluster": True, "required_replication_factor": 1,
+                   "required_primary_nodes": 5, "request_timeout_ms": 5000}
+        if paired and backend == "valkey_tcp":
+            options["client"] = "libvalkey"
+        return options
+    if backend in ("garnet", "kvrocks"):
+        return industry_service.options(backend, [x["address"] + ":6379" for x in fleet["nodes"]])
     if backend == "foundationdb":
         if not Path(root).is_absolute():
             raise ValueError("cluster file root must be absolute")
@@ -93,6 +119,8 @@ def node_config(fleet, backend, index):
     validate_fleet(fleet)
     if backend not in BACKENDS or type(index) is not int or index not in range(-1, 5):
         raise ValueError("unsupported backend or node index")
+    if backend == "valkey_rdma" and not paired_valkey(fleet, backend):
+        raise ValueError("Valkey RDMA requires the admitted matched package")
     if backend == "foundationdb" and fleet["client_memory_mib"] < 8192:
         raise ValueError("FoundationDB requires 6 GiB for control roles and at least 2 GiB for the client")
     coordinator = index == -1
@@ -105,7 +133,7 @@ def node_config(fleet, backend, index):
     files, containers = {}, []
     # Keep the 8-GiB host total; reserve memory for FDB's transaction/log roles.
     control_cpu, control_memory = {"tikv": (1, 1024), "cassandra": (0, 0), "foundationdb": (1, 6144),
-                                  "valkey_tcp": (0, 0)}[backend]
+                                  "valkey_tcp": (0, 0), "valkey_rdma": (0, 0), "garnet": (0, 0), "kvrocks": (0, 0)}[backend]
     cpus = control_cpu if coordinator else fleet["server_cpus"]
     memory = control_memory if coordinator else int(fleet["server_memory_mib"])
 
@@ -184,9 +212,20 @@ def node_config(fleet, backend, index):
                                  "-Dcassandra.logdir=/var/lib/cassandra/logs"}
         add(f"cassandra{index}", "cassandra", ["-ec", "cp /config/cassandra.yaml /etc/cassandra/cassandra.yaml; "
             "exec /usr/local/bin/docker-entrypoint.sh cassandra -f"], target="/var/lib/cassandra", entrypoint="/bin/bash", environment=env)
-    elif backend == "valkey_tcp" and not coordinator:
-        add(f"valkey{index}", "valkey_tcp",
-            local.valkey_server_args(address, 6379, 16379, True, memory * 3 // 4))
+    elif backend in ("valkey_tcp", "valkey_rdma") and not coordinator:
+        if not paired_valkey(fleet, backend):
+            add(f"valkey{index}", "valkey_tcp",
+                local.valkey_server_args(address, 6379, 16379, True, memory * 3 // 4))
+    elif backend in ("garnet", "kvrocks") and not coordinator:
+        if backend == "garnet":
+            add(f"garnet{index}", backend, industry_service.garnet_args(address, 6379, memory))
+        else:
+            files["kvrocks.conf"] = industry_service.kvrocks_config(address, 6379, memory)
+            add(f"kvrocks{index}", backend, ["-c", "/config/kvrocks.conf"], entrypoint="kvrocks")
+            # The image healthcheck hardcodes port 6666; lifecycle probes the configured 6379 via RESP.
+            containers[-1]["run_argv"][2:2] = ["--no-healthcheck"]
+        # The official images use unprivileged users; the owned NVMe bind is created root-owned.
+        containers[-1]["run_argv"][2:2] = ["--user", "0"]
     elif backend == "foundationdb":
         files["fdb.cluster"] = f"kvcomparison:{owner[:32]}@{pd}:4500\n"
         args = ["--cluster-file", "/config/fdb.cluster",
@@ -200,6 +239,20 @@ def node_config(fleet, backend, index):
             # Physical deployments retain FDB's default 5% floor.
             args += ["--knob-min_available_space_ratio", "0.01"]
         add("fdb-control" if coordinator else f"fdb{index}", "foundationdb", args, entrypoint="/usr/bin/fdbserver")
+    native_valkey = None
+    if paired_valkey(fleet, backend):
+        runtime = Path(__file__).resolve().parents[2].parent / "runtime"
+        metadata = valkey_service.identity(runtime)
+        if not coordinator:
+            data = str(directory / "data")
+            args = local.valkey_server_args(address, 6379, 16379, True, memory * 3 // 4)
+            args = [str(runtime / "bin/valkey-server") if x == "valkey-server" else
+                    x.replace("/data", data) for x in args]
+            args += ["--rdma-bind", str(ipaddress.IPv4Address(host["rdma_address"])), "--rdma-port", "6380"]
+            native_valkey = {"runtime": str(runtime), "unit": "kvcloud-valkey-" + owner[:20] + "-" + str(index),
+                             "args": args, "cpus": cpus, "memory_mib": memory,
+                             "source_commit": metadata["source_commit"],
+                             "server_sha256": metadata["artifacts"]["src/valkey-server"]["sha256"]}
     invocation = [sys.executable, str(Path(__file__).resolve())]
     arguments = ["--fleet-json", json.dumps(fleet, sort_keys=True, separators=(",", ":")),
                  "--backend", backend, "--node-index", str(index)]
@@ -210,6 +263,8 @@ def node_config(fleet, backend, index):
     return {"schema_version": 1, "run_id": fleet["run_id"], "backend": backend, "index": index,
             "address": address, "instance_id": host["instance_id"], "directory": str(directory), "owner": owner,
             "labels": labels, "files": files, "containers": containers, "actions": actions,
+            "native_valkey": native_valkey,
+            "paired_valkey": paired_valkey(fleet, backend),
             "qualification_only": fleet.get("qualification_only", False),
             **({"provider": fleet["provider"]} if "provider" in fleet else {}),
             "budget": {"cpus": cpus, "memory_mib": memory},
@@ -228,7 +283,10 @@ def build_plan(fleet, backend):
             "ack_policy": {"tikv": "RF1 raft-kv/Raft Engine, apply-unpersisted limit=0; v8.5.4 source synchronizes raft writes before persistence notification",
                            "cassandra": "commitlog_sync=batch, durable_writes=true, QUORUM at RF1",
                            "foundationdb": "single SSD, transaction log durable commit; serializable transaction semantics",
-                           "valkey_tcp": "RF1 AOF appendfsync always, no-appendfsync-on-rewrite no; noeviction; RAM-resident reads"}[backend]}
+                           "valkey_tcp": "RF1 AOF appendfsync always, no-appendfsync-on-rewrite no; noeviction; RAM-resident reads",
+                           "valkey_rdma": "RF1 AOF appendfsync always, no-appendfsync-on-rewrite no; noeviction; RAM-resident reads",
+                           "garnet": "RF1 hybrid-log storage tier; AOF commit per operation and commit-wait",
+                           "kvrocks": "RF1 RocksDB WAL enabled, write_options.sync=yes"}[backend]}
 
 
 def command(argv, timeout=30, include_stderr=False):
@@ -342,6 +400,11 @@ def prepare(config):
     # Prove the requested address belongs to this host, without listening on a service port.
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.bind((config["address"], 0))
+    if config.get("native_valkey"):
+        args = config["native_valkey"]["args"]
+        rdma_address = args[args.index("--rdma-bind") + 1]
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.bind((rdma_address, 0))
     evidence = nvme_evidence(directory, config["qualification_only"], config.get("provider", "aws"))
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "data").mkdir()
@@ -369,6 +432,8 @@ def inspect_container(config, container, required=True):
 
 
 def runtime_evidence(config):
+    if config.get("paired_valkey"):
+        return valkey_service.evidence(config)
     evidence = []
     for container in config["containers"]:
         item = inspect_container(config, container)
@@ -382,19 +447,38 @@ def runtime_evidence(config):
         bind = container["data_bind"]
         if not any(x.get("Type") == "bind" and x.get("Source") == bind["source"] and x.get("Destination") == bind["destination"] and x.get("RW") for x in mounts):
             raise RuntimeError("effective writable NVMe data bind mismatch")
+        if config["backend"] in ("garnet", "kvrocks"):
+            expected = container["run_argv"][container["run_argv"].index(container["image"]) + 1:]
+            if item["Config"].get("Cmd") != expected or item["Config"].get("Image") != container["image"]:
+                raise RuntimeError("industry live image or argv differs from admitted deployment")
+            if config["backend"] == "kvrocks":
+                source = str(Path(config["directory"]) / "kvrocks.conf")
+                if (not any(x.get("Type") == "bind" and x.get("Source") == source and
+                            x.get("Destination") == "/config/kvrocks.conf" and not x.get("RW") for x in mounts) or
+                        guarded(source).read_text() != config["files"]["kvrocks.conf"]):
+                    raise RuntimeError("Kvrocks effective configuration bind differs")
         image = json.loads(command(["docker", "image", "inspect", container["image"]]))[0]
         if item["Image"] != image["Id"]:
             raise RuntimeError("running image differs from digest-pinned image")
-        evidence.append({"id": item["Id"], "image_id": item["Image"], "repo_digests": image.get("RepoDigests"),
+        evidence.append({"id": item["Id"], "image_id": item["Image"], "image": item["Config"]["Image"],
+                         "cmd": item["Config"]["Cmd"], "entrypoint": item["Config"]["Entrypoint"],
+                         "service": container["service"], "name": item["Name"], "labels": item["Config"].get("Labels", {}),
+                         "repo_digests": image.get("RepoDigests"),
                          "state": item["State"], "cgroup_limits": host, "mounts": mounts,
                          "top": command(["docker", "top", item["Id"], "-eo", "pid,ppid,pcpu,rss,args"]),
                          "stats": command(["docker", "stats", "--no-stream", "--format", "{{json .}}", item["Id"]])})
+        if config["backend"] == "kvrocks":
+            evidence[-1]["config_text"] = guarded(Path(config["directory"]) / "kvrocks.conf").read_text()
+    if config["backend"] in ("garnet", "kvrocks") and config["index"] >= 0:
+        industry_service.admit_runtime(config["backend"], evidence, config)
     return evidence
 
 
 def start(config):
     directory = require_state(config)
     nvme_evidence(directory, config["qualification_only"], config.get("provider", "aws"))
+    if config.get("paired_valkey"):
+        return {"started": True, "runtime": valkey_service.start(config)}
     if config["backend"] == "foundationdb":
         # fdbserver opens trace files but does not create --logdir. Reset
         # deliberately empties data/, so recreate it on every fresh start.
@@ -456,6 +540,10 @@ def cql(fleet, config, query):
 
 
 def valkey_command(config, endpoint, *args):
+    if config.get("paired_valkey"):
+        runtime = Path(__file__).resolve().parents[2].parent / "runtime"
+        valkey_service.identity(runtime)
+        return command([runtime / "bin/valkey-cli", *args[1:]], timeout=30)
     if config["containers"]:
         return execute(config, *args)
     # Client-only coordinator: exact-owned, bounded CLI tool, never a server.
@@ -590,10 +678,13 @@ def initialize(fleet, config):
     elif backend == "cassandra":
         evidence["create_keyspace"] = cql(fleet, config, "CREATE KEYSPACE IF NOT EXISTS kv_comparison WITH replication = "
             "{'class':'SimpleStrategy','replication_factor':1} AND durable_writes = true;")
-    elif backend == "valkey_tcp":
+    elif backend in ("valkey_tcp", "valkey_rdma"):
         evidence["cluster_create"] = local.initialize_valkey(
             lambda endpoint, *args: valkey_command(config, endpoint, *args),
-            backend_options(fleet, backend, directory)["nodes"], directory, 30)
+            valkey_control_endpoints(fleet), directory, 30)
+    elif backend in ("garnet", "kvrocks"):
+        evidence["cluster_create"] = industry_service.initialize(backend,
+            backend_options(fleet, backend, directory)["nodes"], config["owner"], 30)
     else:
         evidence["configure"] = execute(config, "/usr/bin/fdbcli", "-C", "/config/fdb.cluster", "--timeout", "10", "--exec",
             "configure new single ssd logs=1 commit_proxies=1 grv_proxies=1 resolvers=1")
@@ -670,13 +761,61 @@ def probe_once(fleet, config, cluster=False):
             if len(rows) != 1 or rows[0].get("durable_writes") is not True or rows[0].get("replication", {}).get("replication_factor") != "1" or not rows[0]["replication"].get("class", "").endswith("SimpleStrategy"):
                 raise RuntimeError("Cassandra effective RF1/durable keyspace mismatch")
             proof.update({"peers": peers, "keyspace": rows[0], "storage_node_receipts_required": True})
-    elif backend == "valkey_tcp":
+    elif backend in ("valkey_tcp", "valkey_rdma"):
         complete = config["index"] == -1 or cluster
-        endpoints = backend_options(fleet, backend, directory)["nodes"] if complete else [config["address"] + ":6379"]
-        observed = local.valkey_evidence(lambda endpoint, *args: valkey_command(config, endpoint, *args), endpoints, True)
+        endpoints = valkey_control_endpoints(fleet) if complete else [config["address"] + ":6379"]
+        if backend == "valkey_rdma":
+            mapping = dict(zip(valkey_control_endpoints(fleet),
+                               backend_options(fleet, backend, directory)["nodes"]))
+            def rdma_command(endpoint, *args):
+                host, port = mapping[endpoint].rsplit(":", 1)
+                argv = list(args)
+                argv[argv.index("-h") + 1] = host
+                argv[argv.index("-p") + 1] = port
+                argv.insert(1, "--rdma")
+                return valkey_command(config, endpoint, *argv)
+            run = rdma_command
+        else:
+            run = lambda endpoint, *args: valkey_command(config, endpoint, *args)
+        observed = local.valkey_evidence(run, endpoints, True)
+        if config.get("paired_valkey"):
+            observed["image"] = None
+            observed["source_commit"] = "fe8d406c0b5a64ec897f6455e4de684629883764"
+            observed["transport"] = "RDMA-CM RC" if backend == "valkey_rdma" else "TCP"
+            observed["cluster_bus"] = "TCP control network"
         proof.update(observed)
         save(directory / "probe-attempt.json", proof)
-        proof["coverage"] = local.admit_valkey(observed["nodes"], endpoints, True, complete=complete)
+        data_dirs = ({x["address"] + ":6379": str(Path(fleet["data_root"]) / backend / f"node-{x['index']}" / "data")
+                      for x in fleet["nodes"]} if config.get("paired_valkey") else "/data")
+        proof["coverage"] = local.admit_valkey(observed["nodes"], endpoints, True, complete=complete, data_dir=data_dirs)
+        if backend == "valkey_rdma" and complete:
+            for node in observed["nodes"]:
+                endpoint = node["endpoint"]
+                if local.valkey_cli(run, endpoint, "PING").strip() != "PONG":
+                    raise RuntimeError("RDMA PING qualification failed")
+                own = next(line.split() for line in node["cluster_nodes"].splitlines()
+                           if "myself" in line.split()[2].split(","))
+                ranges = [tuple(map(int, token.split("-"))) if "-" in token else (int(token), int(token))
+                          for token in own[8:] if not token.startswith("[")]
+                key = next((f"kv-rdma-qualify-{config['owner'][:12]}-{i}" for i in range(200000)
+                            if any(a <= binascii.crc_hqx(f"kv-rdma-qualify-{config['owner'][:12]}-{i}".encode(), 0) % 16384 <= b
+                                   for a, b in ranges)), None)
+                if key is None:
+                    raise RuntimeError("no owned qualification key")
+                value = "rdma-qualified"
+                if (local.valkey_cli(run, endpoint, "SET", key, value).strip() != "OK" or
+                        local.valkey_cli(run, endpoint, "GET", key).strip() != value or
+                        local.valkey_cli(run, endpoint, "DEL", key).strip() != "1"):
+                    raise RuntimeError("RDMA SET/GET/DEL qualification failed")
+            proof["rdma_qualification"] = {"status": "passed", "operations": ["PING", "SET", "GET", "DEL"],
+                                           "endpoints": [mapping[x] for x in endpoints]}
+    elif backend in ("garnet", "kvrocks"):
+        complete = config["index"] == -1 or cluster
+        endpoints = (backend_options(fleet, backend, directory)["nodes"] if complete else [config["address"] + ":6379"])
+        observed = industry_service.evidence(backend, endpoints, complete=complete)
+        proof.update(observed)
+        save(directory / "probe-attempt.json", proof)
+        proof["coverage"] = industry_service.admit(backend, observed["nodes"], endpoints, complete=complete)
     else:
         status = json.loads(execute(config, "/usr/bin/fdbcli", "-C", "/config/fdb.cluster", "--timeout", "10", "--exec", "status json"))
         proof["status"] = status
@@ -708,7 +847,7 @@ def probe(fleet, config, timeout=120, initialize_cluster=False, cluster=False):
     while time.monotonic() < deadline:
         try:
             initialization = initialize(fleet, config) if initialize_cluster else None
-            proof = probe_once(fleet, config, cluster=cluster) if config["backend"] == "valkey_tcp" else probe_once(fleet, config)
+            proof = probe_once(fleet, config, cluster=cluster) if config["backend"] in ("valkey_tcp", "valkey_rdma", "garnet", "kvrocks") else probe_once(fleet, config)
             if cluster and config["backend"] == "cassandra" and config["index"] >= 0:
                 if (set(proof["ring_un"]) != {x["address"] for x in fleet["nodes"]} or len(proof["ring_un"]) != 5 or
                         len(proof["ring_members"]) != 5 or any(state != "UN" for state, _ in proof["ring_members"])):
@@ -733,6 +872,10 @@ def reset_container(config):
 def reset_data(config):
     """Empty one admitted data bind; caller must have stopped the entire fleet."""
     directory = require_state(config)
+    if config.get("native_valkey"):
+        state = valkey_service.status(config["native_valkey"]["unit"])
+        if state.get("LoadState") != "not-found" and state.get("ActiveState") not in ("inactive", "failed"):
+            raise RuntimeError("reset requires the owned Valkey service stopped")
     data = guarded(directory / "data")
     marker = guarded(directory / "initialization.json")
     if not data.is_dir() or (marker.exists() and not marker.is_file()):
@@ -789,6 +932,11 @@ def reset_data(config):
 
 def stop(config):
     require_state(config)
+    if config.get("paired_valkey"):
+        removed = valkey_service.stop(config)
+        result = {"removed_units": removed, "data_retained": True}
+        save(Path(config["directory"]) / "stop.json", result)
+        return result
     removed = []
     for container in config["containers"]:
         item = inspect_container(config, container, required=False)
@@ -821,6 +969,12 @@ def export(config):
     if any(x.is_symlink() for x in output.iterdir()):
         raise ValueError("symlink in evidence output refused")
     evidence = {"config": config, "exported_at_unix": time.time(), "containers": [], "receipts": {}}
+    if config.get("native_valkey"):
+        unit = config["native_valkey"]["unit"]
+        state = valkey_service.status(unit)
+        evidence["native_valkey"] = {"state": state,
+            "runtime": valkey_service.evidence(config) if state.get("ActiveState") == "active" else [],
+            "logs": command(["journalctl", "--no-pager", "--unit", unit, "--lines=1000"], timeout=30)}
     for name in ("nvme.json", "initialization-attempt.json", "initialization.json", "probe-attempt.json", "deployment.json", "stop.json", "reset.json"):
         path = guarded(directory / name)
         if path.exists():

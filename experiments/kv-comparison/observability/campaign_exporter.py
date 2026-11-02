@@ -2,11 +2,14 @@
 """Expose one explicit campaign selection; never discover processes or invent history."""
 import argparse
 from http.server import BaseHTTPRequestHandler
+import ipaddress
 import json
 import math
 import os
 from pathlib import Path
 import re
+import socket
+import time
 
 import exporter
 
@@ -1281,8 +1284,140 @@ def process_payload(root, process, labels):
         os.close(directory)
 
 
+# Field names and semantics are the pinned implementations, not Redis aliases:
+# https://github.com/microsoft/garnet/blob/v2.2.5/libs/server/Metrics/Info/GarnetInfoMetrics.cs
+# https://github.com/apache/kvrocks/blob/v2.17.0/src/server/server.cc
+INFO_COUNTERS = {
+    "garnet": {"total_connections_received", "total_connections_disposed", "rejected_connections",
+               "total_commands_processed", "total_net_input_bytes", "total_net_output_bytes",
+               "total_found", "total_notfound", "total_cluster_commands_processed",
+               "total_write_commands_processed", "total_read_commands_processed"},
+    "kvrocks": {"total_connections_received", "total_commands_processed", "total_net_input_bytes",
+                "total_net_output_bytes", "sync_full", "sync_partial_ok", "sync_partial_err",
+                "client_output_buffer_limit_disconnections", "keyspace_hits", "keyspace_misses",
+                "flush_count", "compaction_count", "block_cache_hit", "block_cache_miss",
+                "block_cache_index_hit", "block_cache_index_miss", "block_cache_filter_hit",
+                "block_cache_filter_miss", "block_cache_data_hit", "block_cache_data_miss"},
+}
+INFO_GAUGES = {
+    "garnet": {"proc_physical_memory_size", "proc_private_memory_size", "gc_heap_bytes",
+               "store_index_size", "store_mainlog_memory_size", "store_readcache_memory_size",
+               "total_main_store_size", "aof_memory_size", "total_connections_active",
+               "instantaneous_ops_per_sec", "CurrentVersion", "LastCheckpointedVersion",
+               "IndexBucketCount", "IndexBucketSizeBytes", "IndexMemorySizeBytes",
+               "IndexOverflowBucketCount", "IndexOverflowMemorySizeBytes", "IndexOverflowMaxMemorySizeBytes",
+               "IndexTotalMemorySizeBytes", "IndexMemoryBudgetBytes", "IndexMemoryChargedToLogBudgetBytes",
+               "Log.PageSizeBytes", "Log.MaxPageCount", "Log.AllocatedPageCount", "Log.MaxMemorySizeBytes",
+               "Log.CurrentMemorySizeBytes", "Log.CurrentHeapSizeBytes", "Log.BeginAddress",
+               "Log.HeadAddress", "Log.SafeReadOnlyAddress", "Log.FlushedUntilAddress", "Log.TailAddress",
+               "ReadCache.PageSizeBytes", "ReadCache.MaxPageCount", "ReadCache.AllocatedPageCount",
+               "ReadCache.MaxMemorySizeBytes", "ReadCache.CurrentMemorySizeBytes", "ReadCache.CurrentHeapSizeBytes",
+               "ReadCache.BeginAddress", "ReadCache.HeadAddress", "ReadCache.TailAddress",
+               "CommittedBeginAddress", "CommittedUntilAddress", "FlushedUntilAddress", "BeginAddress",
+               "TailAddress", "SafeAofAddress"},
+    "kvrocks": {"used_memory_rss", "used_memory_lua", "used_memory_startup",
+                "instantaneous_ops_per_sec", "pubsub_channels", "pubsub_patterns",
+                "loading", "bgsave_in_progress", "last_bgsave_time", "last_bgsave_time_sec",
+                "block_cache_usage", "all_mem_tables", "cur_mem_tables", "snapshots",
+                "num_immutable_tables", "num_running_flushes", "memtable_flush_pending",
+                "compaction_pending", "num_running_compactions", "num_live_versions", "num_super_version",
+                "num_background_errors", "put_per_sec", "get_per_sec", "seek_per_sec", "next_per_sec", "prev_per_sec"},
+}
+KVROCKS_CF_GAUGES = {"block_cache_pinned_usage", "estimate_keys", "index_and_filter_cache_usage",
+                     "estimate_pending_compaction_bytes"}
+KVROCKS_CF_COUNTERS = {"level0_file_limit_slowdown", "level0_file_limit_stop",
+                       "pending_compaction_bytes_slowdown", "pending_compaction_bytes_stop",
+                       "level0_file_limit_stop_with_ongoing_compaction",
+                       "level0_file_limit_slowdown_with_ongoing_compaction",
+                       "memtable_count_limit_slowdown", "memtable_count_limit_stop"}
+
+
+def info_section(address, port, section, deadline=None):
+    """Bound a complete RESP reply, including a peer that makes slow progress."""
+    deadline = min(deadline if deadline is not None else float("inf"), time.monotonic() + 0.15)
+    def remaining():
+        seconds = deadline - time.monotonic()
+        if seconds <= 0:
+            raise TimeoutError("INFO collection deadline")
+        return seconds
+    command = ("*2\r\n$4\r\nINFO\r\n$" + str(len(section)) + "\r\n" + section + "\r\n").encode()
+    with socket.create_connection((address, port), timeout=remaining()) as connection:
+        connection.settimeout(remaining())
+        connection.sendall(command)
+        def receive(size):
+            connection.settimeout(remaining())
+            data = connection.recv(size)
+            if not data:
+                raise ValueError("truncated INFO reply")
+            return data
+        header = bytearray()
+        for _ in range(128):
+            header.extend(receive(1))
+            if header.endswith(b"\r\n"):
+                break
+        if not re.fullmatch(rb"\$[0-9]+\r\n", header):
+            raise ValueError("INFO did not return a RESP bulk string")
+        size = int(header[1:-2])
+        if size > 256 * 1024:
+            raise ValueError("INFO reply exceeds bound")
+        data = bytearray()
+        while len(data) < size + 2:
+            data.extend(receive(min(65536, size + 2 - len(data))))
+        if data[-2:] != b"\r\n":
+            raise ValueError("truncated INFO reply")
+    fields = {}
+    for line in data[:-2].decode("utf-8").splitlines():
+        if not line or line.startswith("#"):
+            continue
+        key, separator, value = line.partition(":")
+        if not separator or key in fields:
+            raise ValueError("malformed or duplicate INFO field")
+        fields[key] = value
+    return fields
+
+
+def info_payload(target, job, labels):
+    if (not isinstance(target, dict) or set(target) != {"engine", "address", "port"}
+            or target["engine"] not in INFO_COUNTERS or not isinstance(job, dict)
+            or target["engine"] != job.get("backend") or target["port"] != 6379):
+        raise ValueError("invalid explicit INFO target")
+    address = str(ipaddress.IPv4Address(target["address"]))
+    if address != target["address"] or ipaddress.IPv4Address(address).is_unspecified:
+        raise ValueError("invalid INFO address")
+    engine = target["engine"]
+    result = ""
+    sections = {}
+    requested = ("server", "stats", "memory", "persistence",
+                 "store" if engine == "garnet" else "rocksdb")
+    # Leave headroom within the host Prometheus job's two-second scrape budget.
+    deadline = time.monotonic() + 0.75
+    for section in requested:
+        try:
+            sections[section] = info_section(address, target["port"], section, deadline)
+            result += sample("kv_observer_info_section_available", 1, labels | {"section": section})
+        except (OSError, ValueError, UnicodeError):
+            result += sample("kv_observer_info_section_available", 0, labels | {"section": section})
+    # Garnet explicitly returns zeroed stats when the sampling monitor is off.
+    # Missing server evidence is also insufficient to establish real counters.
+    if engine == "garnet" and sections.get("server", {}).get("monitor_task") != "enabled":
+        sections.pop("stats", None)
+    for section in requested[1:]:
+        for key, value in sections.get(section, {}).items():
+            if not value.isascii() or not value.isdigit():
+                continue
+            cf = re.fullmatch(r"([a-z0-9_]+)\[([A-Za-z0-9_.-]{1,64})\]", key) if engine == "kvrocks" and section == "rocksdb" else None
+            if key in INFO_COUNTERS[engine] or cf and cf.group(1) in KVROCKS_CF_COUNTERS:
+                metric = "kv_observer_info_counter_total"
+            elif key in INFO_GAUGES[engine] or cf and cf.group(1) in KVROCKS_CF_GAUGES:
+                metric = "kv_observer_info_gauge"
+            else:
+                continue
+            result += sample(metric, int(value), labels | {"field": key})
+    return result
+
+
 def host_payload(config, selection):
-    if set(selection) != {"job", "processes"}:
+    if set(selection) not in ({"job", "processes"}, {"job", "processes", "info"}):
         raise ValueError("unexpected host selection fields")
     labels = context(config["run_id"], selection["job"])
     processes = selection["processes"]
@@ -1294,6 +1429,8 @@ def host_payload(config, selection):
     result = sample("kv_observer_host_selection_available", 1, labels)
     for process in processes:
         result += process_payload(config["cgroup_root"], process, labels)
+    if "info" in selection:
+        result += info_payload(selection["info"], selection["job"], labels)
     return result.encode()
 
 
@@ -1303,7 +1440,7 @@ def metric_types(body):
         if not line or line.startswith("#"):
             continue
         matched = METRIC.match(line)
-        if matched and (matched.group().startswith(("kv_case_", "kv_observer_cgroup_"))
+        if matched and (matched.group().startswith(("kv_case_", "kv_observer_cgroup_", "kv_observer_info_"))
                         or matched.group() in ("kv_observer_host_selection_available",
                                                "kv_observer_case_terminal", "kv_observer_case_status",
                                                "kv_observer_write_profile_enabled",

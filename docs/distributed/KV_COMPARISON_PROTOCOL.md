@@ -65,12 +65,24 @@ Native Tidehunter ordinary writes return after mapped WAL/index work, not an fsy
 
 TiKV RawKV, Cassandra CQL and FoundationDB transactions expose different contracts. Record the effective server/client versions, replication, consistency, disk-acknowledgment policy, batch API, topology and relevant settings. A replica acknowledgment is not automatically an fsync, and QUORUM is not automatically linearizability. Experimental RF1 and normal replicated deployments belong to distinct cohorts. Unverified properties must be labeled unverified, not inferred from a requested configuration.
 
+Garnet and Apache Kvrocks are additional industry-oriented TCP comparators.
+Both deploy five real RF1 primaries with complete, agreed slot ownership.
+Garnet uses an SSD hybrid log and bounded read cache plus AOF commit frequency
+zero and commit-wait; Kvrocks enables the RocksDB WAL and synchronous writes.
+Retain effective CONFIG/INFO and live runtime/storage receipts. Garnet's tiering
+toggle requires the latter because CONFIG does not expose it. AOF commit waiting
+must not be silently equated with another engine's device-flush or transaction
+contract. Both support complete binary GET/SET/DEL and ordered native MGET via
+client cross-slot routing; neither declares cross-slot atomic write batches.
+Their APIs are not Sui integrations. See the
+[current pins and local qualification](../../experiments/kv-comparison/README.md#garnet-and-kvrocks-industry-comparisons).
+
 Use native Tidehunter and RocksDB/integrated BlobDB as embedded local references. Do not put their embedded latency in the same service-level ranking as a competitor's network client. An application-integrated comparison may colocate our coordinator with the application, but must charge its CPU/RAM and state the boundary. An external-client experiment must include each system's real front door; do not add an extra RPC only to one system. The archived middleware is not used.
 
 ## Workload and data contract
 
 - Logical keys are fixed 32-byte binary identities. Hash the entire identity, including the namespace and deterministic seed, rather than appending a constant run prefix to native hash-space keys. A constant high-bit prefix can concentrate native index cells.
-- Values have declared sizes and entropy. The core size cases are 256 B, 1 KiB and 8 KiB. Use complete-value replacement, not YCSB's default ten-field partial-update interpretation.
+- Values have declared sizes and entropy. The standard size cases are 64 B, 256 B, 1 KiB, 8 KiB and 64 KiB. Use complete-value replacement, not YCSB's default ten-field partial-update interpretation.
 - Preserve the generator version, logical seed/trace identity, actual namespace and key encoding. Equivalent logical traces can use separate owned namespaces without overwriting another run's data.
 - Uniform key-bit distribution and skewed access are different controls. State the Zipf exponent, key population, value size, hot-set behavior and every operation ratio.
 - The Zipf rejection-inversion generator has a fixed 1024-attempt bound. Exhaustion fails the run; it never silently substitutes a uniform distribution.
@@ -114,9 +126,10 @@ For each run retain configuration, seed/generator identity, backend guarantees/c
 Keep the ordinary unprofiled matrix intact. An explicit
 `diagnostics.write_profile_limit` adds separate native/Tidehunter write-diagnostic
 cohorts; it does not replace primary comparisons or make profiled API latency
-overhead-free. The default has 253 ordinary and five diagnostic cells per
-repetition. Zero disables the additions. Neither mode reduces any within-case
-phase, operation/sample count, backend, transport, size or correctness check.
+overhead-free. With all eleven currently selected AWS backend/transport IDs, the
+default has 293 ordinary, five write-diagnostic and twelve read-diagnostic cases.
+Zero disables only the corresponding diagnostic additions. Neither mode reduces
+within-case phases, operation/sample counts, values or correctness checks.
 
 Capture owned process counters at the pre-measurement gate and again while the
 completion gate holds the still-live client, before profile finalization,

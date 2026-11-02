@@ -55,7 +55,7 @@ class ControllerObjects(unittest.TestCase):
     def setUp(self):
         self.store = VersionedStore()
         self.clients = {'objects': self.store}
-        self.config = {'prefix': 'th-' + 'a' * 16, 'bucket': 'example-private-bucket'}
+        self.config = {'prefix': 'bench-' + 'a' * 16, 'bucket': 'example-private-bucket'}
         self.key = self.config['prefix'] + '/results/operation.json'
 
     def test_lost_ack_and_duplicate_do_not_overwrite_immutable_result(self):
@@ -104,6 +104,24 @@ class PhysicalFleet(unittest.TestCase):
                 controller.validate_physical_proofs(changed, provider='gcp')
         with self.assertRaises(controller.SafetyError):
             controller.validate_physical_proofs(proofs)
+
+    def test_backend_start_admits_google_storage_without_using_aws_model_rules(self):
+        campaign = object.__new__(controller.Controller)
+        campaign.config = {'platform': {'name': 'gcp'}}
+        campaign.sequence = 0
+        def layout(backend, operation, index, **kwargs):
+            return {'proof': {'nvme': {
+                'qualification_only': False, 'independent_nvme_admitted': True,
+                'host_identity': {'boot_id': 'boot-' + str(index)},
+                'block_devices': {'blockdevices': [
+                    {'model': 'Google Local SSD', 'serial': 'ssd-' + str(index)}]}}}}
+        campaign.layout = layout
+        with tempfile.TemporaryDirectory() as directory:
+            campaign.root = Path(directory)
+            campaign.start_backend('valkey_rdma')
+            evidence = json.loads((campaign.root / 'deployments/valkey_rdma-0/proofs.json').read_text())
+        self.assertEqual({item['proof']['nvme']['host_identity']['boot_id'] for item in evidence},
+                         {'boot-' + str(index) for index in range(-1, 5)})
 
 
 if __name__ == '__main__':

@@ -1,6 +1,7 @@
 """Generate a self-contained, source-bound GCE startup script."""
 import json
 import re
+import shlex
 
 import gcp_runtime
 
@@ -12,10 +13,12 @@ def startup_script(bucket, run_id, source_sha256, deadline_utc):
     gcp_runtime._sha(source_sha256)
     gcp_runtime._deadline(deadline_utc)
     constants = json.dumps({'bucket': bucket, 'run_id': run_id, 'source_sha256': source_sha256,
-                            'deadline_utc': deadline_utc}, sort_keys=True)
+                            'deadline_utc': deadline_utc, 'guest_python': gcp_runtime.GUEST_PYTHON,
+                            'guest_path': gcp_runtime.GUEST_PATH}, sort_keys=True)
     return '''#!/bin/bash
 set -euo pipefail
-exec /usr/bin/python3 - <<'TIDEHUNTER_BOOTSTRAP'
+export PATH=''' + shlex.quote(gcp_runtime.GUEST_PATH) + '''
+exec ''' + shlex.quote(gcp_runtime.GUEST_PYTHON) + ''' - <<'TIDEHUNTER_BOOTSTRAP'
 ''' + 'constants = ' + repr(constants) + '''
 import datetime, hashlib, json, os, pathlib, shutil, subprocess, tarfile, time, urllib.error, urllib.parse, urllib.request, zipfile
 c = json.loads(constants)
@@ -101,8 +104,13 @@ config_path = root / 'runtime.json'
 with config_path.open('x') as f: json.dump(runtime, f, sort_keys=True)
 os.chmod(config_path, 0o600)
 worker = target / 'source/experiments/gcp-rdma/gcp_worker.py'
+remaining = int(deadline - time.time())
+if remaining <= 0: raise TimeoutError('worker startup expired')
 subprocess.run(['/usr/bin/systemd-run', '--unit=tidehunter-worker-' + c['run_id'],
+                '--setenv=PATH=' + c['guest_path'],
                 '--property=Restart=on-failure', '--property=RestartSec=3', '--property=KillMode=control-group',
-                '/usr/bin/python3', str(worker), str(config_path)], check=True, timeout=30)
+                '--property=LimitMEMLOCK=infinity', '--property=RuntimeMaxSec=' + str(remaining),
+                '--property=TimeoutStopSec=1',
+                c['guest_python'], str(worker), str(config_path)], check=True, timeout=30)
 TIDEHUNTER_BOOTSTRAP
 '''

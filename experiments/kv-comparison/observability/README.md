@@ -109,6 +109,33 @@ durability contracts, cache cohorts, repeats or backends.
   preload or teardown; they are not exact per-case physical-I/O attribution.
   The access receipt preserves observed data-device mappings; unknown mappings
   remain unknown.
+- Garnet v2.2.5 and Kvrocks v2.17.0 host exporters request RESP `INFO server`,
+  `INFO stats`, `INFO memory`, `INFO persistence`, and respectively `INFO store`
+  or `INFO rocksdb` from port 6379 only on the selected
+  fleet host with its exact-owned, selected engine cgroup. Existing cgroup CPU,
+  memory and device I/O and host network collectors remain separate. These
+  requests add server work and count toward server statistics; they are not
+  measurement-boundary snapshots.
+  `kv_observer_info_counter_total{field="..."}` and
+  `kv_observer_info_gauge{field="..."}` retain the original INFO field names;
+  `kv_observer_info_section_available{section="..."}` reports whether each
+  bounded request returned a parseable section. Labels include the selected case,
+  and the host scrape supplies host identity. Missing, nonnumeric, negative or
+  unsupported fields are absent, not zero. Garnet stats are omitted unless
+  `INFO server` reports `monitor_task:enabled`, since disabled monitoring returns
+  synthetic zero stats. A returned section can still lack individual fields.
+  Server counters reset on restart; short cases need not yield a usable `rate`.
+  No equivalence between engines' differently named hit/miss or memory fields
+  is implied. The allowlists follow the pinned
+  [Garnet INFO implementation](https://github.com/microsoft/garnet/blob/v2.2.5/libs/server/Metrics/Info/GarnetInfoMetrics.cs)
+  and [Kvrocks INFO implementation](https://github.com/apache/kvrocks/blob/v2.17.0/src/server/server.cc).
+  Garnet store/log/cache sizes and addresses are gauges, not physical I/O or
+  durability acknowledgements. Kvrocks includes RocksDB cache ticker and
+  compaction/flush counters when emitted, plus cache and per-column-family
+  compaction properties. Kvrocks initializes several RocksDB property outputs to
+  zero and ignores the property's success return; those upstream zero values
+  cannot distinguish an unsupported property from an observed zero. The
+  exporter preserves them as reported rather than claiming independent proof.
 - Logical native WAL bytes are not physical device bytes. Page-cache/WAL
   submissions do not establish an NVMe fetch.
 - Available coordinator/owner/resident read-path counters are labeled

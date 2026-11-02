@@ -16,7 +16,7 @@ RUN rm -f /etc/apt/sources.list.d/ubuntu.sources && \
     timeout 180 apt-get -o Acquire::https::Verify-Peer=false --allow-downgrades install -y --no-install-recommends ca-certificates && \
     timeout 600 apt-get --allow-downgrades install -y --no-install-recommends \
       ca-certificates curl build-essential pkg-config libclang-dev clang cmake \
-      python3 libssl-dev liblzma-dev zlib1g-dev rdma-core libibverbs-dev libnuma-dev \
+      python3 libssl-dev liblzma-dev zlib1g-dev rdma-core libibverbs-dev librdmacm-dev libnuma-dev \
       autoconf automake libtool debhelper libnl-3-dev libnl-route-3-dev && \
     rm -rf /var/lib/apt/lists/*
 # Same installer as the EC2 bootstrap. Do not substitute upstream/system

@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "weekly_limit_cents": null,
-  "run_upper_bound_cents": null,
-  "max_duration_seconds": null,
-  "quote_description": ""
+  "weekly_limit_cents": 10000,
+  "run_upper_bound_cents": 9000,
+  "max_duration_seconds": 14400,
+  "quote_description": "USD conservative reservation for exactly six z4m-highmem-16 hosts in us-central1 for at most four hours: public on-demand VM/mandatory-Local-SSD rate $3.287109973 per host-hour, rounded compute base $78.90; $11.10 allowance for boot disks, object storage/requests and result transfer. Source: https://cloud.google.com/products/compute/pricing/storage-optimized . Estimate, not an invoice or project-wide hard spending cap; extra fleets, other machine types/regions and artifact retention beyond the campaign are not included. Weekly $100 applies to this CI ledger only; paid activation stays disabled until guest-image and artifact-volume admission are qualified."
 }

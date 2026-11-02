@@ -705,7 +705,7 @@ def select_host(spec, index, job, processes):
     started = time.monotonic()
     spec = validate_spec(spec)
     state, _ = state_for(spec)
-    host_for(spec, index)
+    host = host_for(spec, index)
     if job is not None:
         validate_job(job)
     if not isinstance(processes, list) or len(processes) > 8:
@@ -722,8 +722,14 @@ def select_host(spec, index, job, processes):
         if process['role'] in seen:
             raise ValueError('duplicate process role')
         seen.add(process['role'])
+    selection = {'job': job, 'processes': processes}
+    # Only the known, label-admitted owner container authorizes this host's
+    # fixed control endpoint; never discover or probe arbitrary services.
+    if (job is not None and index >= 0 and job['backend'] in ('garnet', 'kvrocks')
+            and any(process['role'] == job['backend'] + str(index) for process in processes)):
+        selection['info'] = {'engine': job['backend'], 'address': host['address'], 'port': 6379}
     import campaign_exporter
-    atomic_json(state / f'host-{index}/selection.json', {'job': job, 'processes': processes},
+    atomic_json(state / f'host-{index}/selection.json', selection,
                 0o444, max_bytes=campaign_exporter.MAX_SELECTION)
     return receipt(started, host_index=index, processes=processes,
                    availability='explicit' if processes else 'unavailable: no admitted cgroups')

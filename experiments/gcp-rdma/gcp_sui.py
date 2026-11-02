@@ -18,6 +18,8 @@ import sys
 import tarfile
 import time
 
+from gcp_runtime import GUEST_PYTHON
+
 TIP = 1775
 CHECKPOINT = 'EhUPyfwLGDEKH5Ssg3nFbVAHwi4XA87xNKvnFEo3ZJb6'
 BINARIES = {'sui-node-native', 'sui-node-remote', 'storage-node', 'state-audit', 'rocksdb-audit', 'transport-floor'}
@@ -36,7 +38,7 @@ def owner_deadline(fleet_deadline, now=None):
 
 
 def storage_root(run_id):
-    if not re.fullmatch(r'th-[0-9a-f]{16}', run_id):
+    if not re.fullmatch(r'bench-[0-9a-f]{16}', run_id):
         raise ValueError('invalid owned run ID')
     root = Path('/mnt/tidehunter-kv-comparison') / run_id
     device = Path('/dev/disk/by-id/google-local-nvme-ssd-0')
@@ -237,7 +239,7 @@ def node_action(args):
     import gcp_api
     store = gcp_api.GoogleApi(args.project, token_provider=gcp_api.metadata_token).objects(args.bucket)
     base = storage_root(args.run_id) / 'checkpoint-cells' / args.cell / 'storage'
-    if not re.fullmatch(r'th-[0-9a-f]{16}', args.run_id) or not re.fullmatch(r'r0[1-4]-(?:tcp|tidehunter_verbs(?:_native)?)', args.cell):
+    if not re.fullmatch(r'bench-[0-9a-f]{16}', args.run_id) or not re.fullmatch(r'r0[1-4]-(?:tcp|tidehunter_verbs(?:_native)?)', args.cell):
         raise ValueError('invalid run/cell identity')
     if args.action == 'start':
         archive = base.parent / 'payload.tar.gz'
@@ -361,7 +363,7 @@ def run_suite(config, mailbox, package, fixture, *, output_root):
         owner_completions = []
         cell_deadline = owner_deadline(config['deadline_utc'])
         def call(index, action, extra=(), timeout=180):
-            argv = ['/usr/bin/python3', str(helper), 'node', action, '--project', config['project_id'], '--bucket', config['bucket'], '--run-id', config['run_id'], '--cell', cell, '--index', str(index), *map(str, extra)]
+            argv = [GUEST_PYTHON, str(helper), 'node', action, '--project', config['project_id'], '--bucket', config['bucket'], '--run-id', config['run_id'], '--cell', cell, '--index', str(index), *map(str, extra)]
             return mailbox.submit(index, argv, operation_id=f'sui-{cell}-{action}-{index}', timeout_seconds=timeout)
         try:
             for index, host in enumerate(external['hosts'], 1):

@@ -12,6 +12,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'experiments/kv-comparison'))
@@ -27,8 +28,74 @@ def checkout(repo, revision):
     if actual != revision or dirty:
         raise ValueError(f'checkout {repo} must be clean and at the requested commit')
 
+def admit_selected_features(spec, manifest):
+    if spec.get('suite') == 'sui':
+        return
+    required = set(spec['backends']) & {'garnet', 'kvrocks'}
+    if not required <= set(manifest.get('features', [])):
+        raise ValueError('packaged binary lacks selected industry backend features')
 
-def prepare(engine, output, revision, fabric, deadline_seconds):
+def admit_rocky9_abi(abi):
+    for family, maximum in (('GLIBC', (2, 34)), ('GLIBCXX', (3, 4, 29))):
+        for version in abi['version_requirements'][family]:
+            if cloud_package.version_tuple(version) > maximum:
+                raise ValueError(f'Rocky 9 build requires unsupported {family}_{version}')
+
+def remove_build_container(name, owner):
+    inspected = subprocess.run(['docker', 'container', 'inspect', name],
+                               capture_output=True, text=True, timeout=30)
+    if inspected.returncode:
+        if any(f'No such {kind}: {name}' in inspected.stderr for kind in ('container', 'object')):
+            return
+        raise RuntimeError(f'cannot establish build container ownership: {inspected.stderr}')
+    containers = json.loads(inspected.stdout)
+    if len(containers) != 1:
+        raise ValueError('ambiguous build container identity')
+    container = containers[0]
+    if (container.get('Name') != '/' + name
+            or container.get('Config', {}).get('Labels', {}).get('io.tidehunter.gcp-build.owner') != owner
+            or not re.fullmatch(r'[0-9a-f]{64}', container.get('Id', ''))):
+        raise ValueError('refusing to remove an unowned build container')
+    removed = subprocess.run(['docker', 'container', 'rm', '--force', container['Id']],
+                             capture_output=True, text=True, timeout=30)
+    if removed.returncode and not any(f'No such {kind}: {container["Id"]}' in removed.stderr
+                                      for kind in ('container', 'object')):
+        raise RuntimeError(f'build container cleanup failed: {removed.stderr}')
+
+
+def container_build(engine, output, image_name, timeout, deadline, with_valkey):
+    image = cloud_package.command(['docker', 'image', 'inspect', '--format', '{{.Id}}', image_name])
+    if not re.fullmatch(r'sha256:[0-9a-f]{64}', image):
+        raise ValueError('Docker did not resolve the build image to an immutable image ID')
+    for path in (engine, output):
+        if ',' in str(path):
+            raise ValueError('Docker mount paths cannot contain commas')
+    owner = uuid.uuid4().hex
+    name = 'tidehunter-gcp-build-' + owner
+    expiry = int(time.time() + deadline - time.monotonic() - 1200)
+    cloud_package.dump(output / 'build-container-owner.json', {'name': name, 'owner': owner, 'deadline_epoch': expiry})
+    argv = ['docker', 'run', '--rm', '--name', name, '--label', 'io.tidehunter.gcp-build.owner=' + owner,
+            '--user', f'{os.getuid()}:{os.getgid()}',
+            '--mount', f'type=bind,src={engine},dst={engine},readonly',
+            '--mount', f'type=bind,src={output},dst={output}',
+            '--workdir', str(engine),
+            '--env', 'CARGO_BUILD_JOBS=2', '--env', 'CARGO_PROFILE_RELEASE_DEBUG=0',
+            '--env', f'CLOUD_PACKAGE_BUILDER_IMAGE={image}',
+            '--env', 'CLOUD_PACKAGE_BUILDER_RECIPE=experiments/gcp-rdma/Dockerfile.build',
+            '--env', f'TIDEHUNTER_GCP_BUILD_DEADLINE_EPOCH={expiry}',
+            '--env', 'TIDEHUNTER_GCP_BUILD_CHILD=0',
+            image, 'bash', str(engine / 'experiments/gcp-rdma/build-container.sh'),
+            str(engine), str(output), str(timeout), '1' if with_valkey else '0']
+    try:
+        ci_prepare.bounded(argv, deadline - 1200)
+    finally:
+        remove_build_container(name, owner)
+
+
+
+
+
+def prepare(engine, output, revision, fabric, deadline_seconds, spec_path=None, build_container=None):
     engine = Path(engine).resolve(strict=True)
     if engine != ROOT:
         raise ValueError('preparer must execute from the selected engine checkout')
@@ -38,7 +105,21 @@ def prepare(engine, output, revision, fabric, deadline_seconds):
     output = Path(output).absolute()
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
     deadline = time.monotonic() + deadline_seconds
-    fabric = Path(fabric).resolve(strict=True)
+    if build_container:
+        if fabric is not None:
+            raise ValueError('--fabric-prefix cannot be combined with --build-container')
+        fabric = output / 'fabric'
+    else:
+        fabric = Path(fabric).resolve(strict=True)
+    valkey_source = None
+    spec = None
+    if spec_path is not None:
+        spec = json.loads(Path(spec_path).read_text())
+        if spec.get('suite') != 'sui' and 'valkey_rdma' in spec['backends']:
+            valkey_source = output / 'valkey-source'
+            if not build_container:
+                ci_prepare.bounded([sys.executable, engine / 'experiments/kv-comparison/prepare_valkey_rdma.py',
+                                    '--output', valkey_source], deadline)
     fdb = output / 'fdb-client'
     ci_prepare.bounded([sys.executable, engine / 'experiments/kv-comparison/local.py', 'prepare-fdb', '--prefix', fdb], deadline)
     snapshot = output / 'snapshot'
@@ -47,9 +128,18 @@ def prepare(engine, output, revision, fabric, deadline_seconds):
     remaining = min(7200, int(deadline - time.monotonic()) - 1200)
     if remaining <= 0:
         raise TimeoutError('no build and qualification reserve remains')
-    cloud_package.build(snapshot, build, fdb, fabric, timeout=remaining)
+    if build_container:
+        container_build(engine, output, build_container, remaining, deadline, valkey_source is not None)
+    else:
+        cloud_package.build(snapshot, build, fdb, fabric, timeout=remaining, valkey_source=valkey_source)
+    if build_container:
+        built = json.loads((build / 'build.json').read_text())
+        admit_rocky9_abi(cloud_package.abi_requirements(
+            [built['binary'], built['fdb']['elf'], built['fabric_build']] +
+            ([built['valkey_rdma']['server_elf'], built['valkey_rdma']['cli_elf']]
+             if valkey_source else [])))
     package = output / 'package'
-    cloud_package.stage(engine, snapshot, build, fdb, package)
+    cloud_package.stage(engine, snapshot, build, fdb, package, valkey_source=valkey_source)
     if (package / 'bundle.tar.gz').stat().st_size > 512 << 20:
         raise ValueError('compressed KV runtime exceeds guest download limit')
     shutil.copy2((fabric / 'lib/libfabric.so.1').resolve(strict=True), fdb / 'lib/libfabric.so.1')
@@ -70,7 +160,14 @@ def prepare(engine, output, revision, fabric, deadline_seconds):
         (dest / 'result').mkdir()
         for name in ('manifest.json', 'summary.json', 'samples.csv', 'metrics.prom'):
             shutil.copy2(receipt.parent / 'result' / name, dest / 'result' / name)
+    if valkey_source is not None:
+        ci_prepare.bounded([sys.executable, engine / 'experiments/kv-comparison/qualify_valkey_tcp.py',
+                            '--runtime', package / 'runtime', '--binary', package / 'runtime/bin/kv-research',
+                            '--example', engine / 'benchmarks/kv-research/example.json',
+                            '--output', proof / 'valkey-libvalkey-tcp'], deadline, environment=env, cwd=engine)
     manifest = json.loads((package / 'manifest.json').read_text())
+    if spec is not None:
+        admit_selected_features(spec, manifest)
     diagnostic = ci_prepare.run_tcp_diagnostic(package / 'runtime/bin/kv-research', output / 'tcp-diagnostic-work',
                                                proof / 'tcp-diagnostic', revision, deadline, env)
     if diagnostic['binary_sha256'] != manifest['binary_sha256'] or diagnostic['binary_blake2b512'] != manifest['binary_blake2b512']:
@@ -87,7 +184,8 @@ def prepare(engine, output, revision, fabric, deadline_seconds):
     receipt = {'archive_path': str((package / 'bundle.tar.gz').resolve()),
                'sha256': ci_prepare.sha(package / 'bundle.tar.gz'), 'source_sha256': verified['source_sha256'],
                'source_revision': revision, 'binary_sha256': verified['binary_sha256'],
-               'binary_blake2b512': verified['binary_blake2b512'], 'qualification': ready}
+               'binary_blake2b512': verified['binary_blake2b512'], 'qualification': ready,
+               'manifest_sha256': verified['manifest_sha256'], 'abi': verified['abi']}
     cloud_package.dump(output / 'package-receipt.json', receipt)
     return receipt
 
@@ -110,6 +208,28 @@ def admit_sui_archives(bundle, verification):
         nested(bundle, 'build-bundle.tar.gz', root / 'build.tar.gz')
         nested(root / 'build.tar.gz', 'sources.tar.gz', root / 'sources.tar.gz')
         nested(verification, 'verification/evidence.tar.gz', root / 'evidence.tar.gz')
+        identities = []
+        with tarfile.open(root / 'build.tar.gz', 'r:gz') as archive:
+            member = archive.getmember('build-manifest.json')
+            if not member.isfile() or member.size > 1024 * 1024:
+                raise ValueError('invalid Sui build manifest')
+            manifest = json.loads(archive.extractfile(member).read())
+            binaries = manifest.get('binaries')
+            expected = {'sui-node-native', 'sui-node-remote', 'rocksdb-audit', 'storage-node', 'transport-floor', 'state-audit'}
+            if not isinstance(binaries, dict) or set(binaries) != expected:
+                raise ValueError('sealed Sui executable inventory differs')
+            for name, digest in sorted(binaries.items()):
+                member = archive.getmember('binaries/' + name)
+                if not member.isfile():
+                    raise ValueError('Sui executable must be a regular file')
+                target = root / name
+                with archive.extractfile(member) as source, target.open('xb') as destination:
+                    shutil.copyfileobj(source, destination)
+                if ci_prepare.sha(target) != digest:
+                    raise ValueError('sealed Sui executable SHA differs')
+                identities.append(cloud_package.elf_identity(target))
+                target.unlink()
+        return cloud_package.abi_requirements(identities)
 
 
 
@@ -157,11 +277,11 @@ def prepare_sui(output, sui, revision, fixture, target, deadline_seconds):
     verification_archive = work / 'verification.tar.gz'
     with tarfile.open(verification_archive, 'x:gz') as archive:
         archive.add(verification, arcname='verification')
-    admit_sui_archives(bundle, verification_archive)
+    sui_abi = admit_sui_archives(bundle, verification_archive)
     receipt = json.loads((output / 'package-receipt.json').read_text())
     receipt.update(sui_archive_path=str(bundle.resolve()), sui_sha256=ci_prepare.sha(bundle), sui_revision=revision,
                    verification_archive_path=str(verification_archive.resolve()),
-                   verification_sha256=ci_prepare.sha(verification_archive))
+                   verification_sha256=ci_prepare.sha(verification_archive), sui_abi=sui_abi)
     cloud_package.dump(output / 'package-receipt.json', receipt)
     return receipt
 
@@ -175,7 +295,7 @@ def admit_transfer(output, revision):
     source = cloud_package.admit_source(package)
     if (source['revision'] != revision or source['dirty'] or source['sha256'] != cloud_package.inventory(ROOT)
             or receipt.get('source_revision') != revision
-            or any(receipt.get(k) != verified[k] for k in ('source_sha256', 'binary_sha256', 'binary_blake2b512'))
+            or any(receipt.get(k) != verified[k] for k in ('source_sha256', 'binary_sha256', 'binary_blake2b512', 'manifest_sha256', 'abi'))
             or receipt.get('sha256') != ci_prepare.sha(package / 'bundle.tar.gz')):
         raise ValueError('transferred package does not match the current checkout and binary')
     archive = package / 'bundle.tar.gz'
@@ -187,6 +307,8 @@ def admit_transfer(output, revision):
     proof = receipt.get('qualification', {})
     if proof.get('engine_sha') != revision or proof.get('binary_sha256') != verified['binary_sha256'] or proof.get('binary_blake2b512') != verified['binary_blake2b512']:
         raise ValueError('qualification does not match transferred source and binary')
+    admit_selected_features(json.loads((output / 'spec.json').read_text()),
+                            json.loads((package / 'manifest.json').read_text()))
     ci_prepare.admit_qualification(output / 'qualification', proof)
     receipt['archive_path'] = str((package / 'bundle.tar.gz').resolve())
     if receipt.get('sui_sha256'):
@@ -199,7 +321,9 @@ def admit_transfer(output, revision):
             if ci_prepare.sha(path) != receipt.get(sha_key):
                 raise ValueError('transferred Sui archive digest differs')
             receipt[path_key] = str(path.resolve())
-        admit_sui_archives(Path(receipt['sui_archive_path']), Path(receipt['verification_archive_path']))
+        sui_abi = admit_sui_archives(Path(receipt['sui_archive_path']), Path(receipt['verification_archive_path']))
+        if receipt.get('sui_abi') != sui_abi:
+            raise ValueError('transferred Sui ABI requirements differ from sealed executables')
     cloud_package.dump(receipt_path, receipt)
     return receipt
 
@@ -210,7 +334,9 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--revision', required=True)
     parser.add_argument('--fabric-prefix', type=Path)
+    parser.add_argument('--build-container', help='local Rocky 9 build image; builds fabric and Valkey inside it')
     parser.add_argument('--deadline', type=int, default=10800)
+    parser.add_argument('--spec', type=Path)
     parser.add_argument('--sui', type=Path)
     parser.add_argument('--fixture', type=Path)
     parser.add_argument('--target', type=Path)
@@ -223,9 +349,10 @@ def main():
             parser.error('--sui requires --fixture and --target')
         result = prepare_sui(args.output, args.sui, args.revision, args.fixture, args.target, args.deadline)
     else:
-        if not args.fabric_prefix:
-            parser.error('--fabric-prefix is required for KV preparation')
-        result = prepare(args.engine, args.output, args.revision, args.fabric_prefix, args.deadline)
+        if bool(args.fabric_prefix) == bool(args.build_container):
+            parser.error('KV preparation requires exactly one of --fabric-prefix and --build-container')
+        result = prepare(args.engine, args.output, args.revision, args.fabric_prefix, args.deadline, args.spec,
+                         args.build_container)
     print(json.dumps(result, sort_keys=True))
 
 

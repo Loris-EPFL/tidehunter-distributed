@@ -233,6 +233,8 @@ def validate_config(config):
                 "binary", "fdb_library_dir", "deadline_utc", "spec"}
     if not isinstance(config, dict) or set(config) != required:
         raise SafetyError("runtime config requires its exact documented schema")
+    if set(config.get("spec", {}).get("backends", ())) & cloud_campaign.PORTABLE_BACKENDS:
+        raise SafetyError("AWS EFA does not admit portable verbs or Valkey RDMA backends")
     fleet = cloud_layout.validate_fleet(config["fleet"])
     if fleet.get("qualification_only", False):
         raise SafetyError("cloud controller refuses nonphysical qualification fleets")
@@ -703,6 +705,13 @@ def owned_monitor_processes(config, index, job, owner_case=None):
         processes.append({"role": role, "cgroup": "/system.slice/" + name})
     if job["backend"] in cloud_layout.BACKENDS:
         deployment = cloud_layout.node_config(config["fleet"], job["backend"], index)
+        if deployment.get("native_valkey"):
+            try:
+                identity = cloud_layout.valkey_service.evidence(deployment)[0]
+                processes.append({"role": "valkey" + str(index), "cgroup": identity["cgroup"]})
+                identities.append({"role": "valkey" + str(index), **identity})
+            except Exception as exc:
+                missing.append({"role": "valkey" + str(index), "reason": type(exc).__name__ + ": " + str(exc)})
         for container in deployment["containers"]:
             try:
                 item = cloud_layout.inspect_container(deployment, container)
@@ -1456,7 +1465,8 @@ class Controller:
         proofs.append(self.layout(backend, "probe", -1, timeout=180, initialize=True, cluster=True))
         for index in range(5):
             proofs.append(self.layout(backend, "probe", index, timeout=180, cluster=True))
-        validate_physical_proofs([x["proof"]["nvme"] for x in proofs])
+        validate_physical_proofs([x["proof"]["nvme"] for x in proofs],
+                                 provider="gcp" if platform_module(self.config) else "aws")
         dump(self.root / "deployments" / (backend + "-" + str(self.sequence)) / "proofs.json", proofs)
 
     def cleanup_deadline(self):
@@ -1535,6 +1545,8 @@ class Controller:
             prep["max_epochs"] = 40
         if "coordinator_read_memory_allowance_bytes" in job:
             prep["coordinator_read_memory_allowance_bytes"] = job["coordinator_read_memory_allowance_bytes"]
+        if platform_module(self.config):
+            prep = platform_module(self.config).prepare_transport(self.config, prep)
         dump(directory / "prepare-input.json", prep)
         prepared = directory / "prepared"
         command([self.config["binary"], "--prepare-external-case", directory / "prepare-input.json", "--output", prepared],

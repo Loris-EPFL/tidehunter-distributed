@@ -25,12 +25,23 @@ class CloudMatrixTests(unittest.TestCase):
         return {
             "schema_version": 1, "seed": 1775, "repeats": repeats,
             "value_sizes": [64, 256, 1024, 8192, 65536],
-            "backends": ["native", "tidehunter_tcp", "tidehunter_efa", "tidehunter_efa_direct",
-                         "tidehunter_efa_native", "tikv", "cassandra", "foundationdb", "valkey_tcp"],
-            "keys": 4096, "max_cases": 774, "offered_rates": [1000, 10000, 50000],
+            "backends": list(cloud.BACKENDS),
+            "keys": 4096, "max_cases": 924, "offered_rates": [1000, 10000, 50000],
             "offered_seconds": 8, "case_deadline_seconds": 180,
             "hard_deadline_seconds": 10800, "export_reserve_seconds": 600,
         }
+    def test_portable_backends_preserve_standard_common_workloads(self):
+        spec = self.spec(1)
+        selected = cloud.make_matrix(spec | {"backends": ["valkey_tcp", "valkey_rdma",
+                                                         "tidehunter_verbs", "tidehunter_verbs_native"]})
+        common = lambda backend: sorted(
+            cloud.analyze.canonical({k: v for k, v in job.items() if k not in ("backend", "case_id")})
+            for job in selected if job["backend"] == backend and job["cohort"] == "primary_rf1")
+        self.assertTrue(common("valkey_tcp"))
+        self.assertEqual(common("valkey_tcp"), common("valkey_rdma"))
+        self.assertEqual(common("valkey_tcp"), common("tidehunter_verbs"))
+        self.assertEqual(common("valkey_tcp"), common("tidehunter_verbs_native"))
+
 
     def nvmeof_spec(self):
         return self.spec(1) | {
@@ -216,7 +227,7 @@ class CloudMatrixTests(unittest.TestCase):
     def test_short_campaign_keeps_existing_cases_and_prioritizes_controls(self):
         spec = self.spec(1)
         jobs = cloud.make_matrix(spec | {"mode": "read-tier-focused"})
-        self.assertEqual(len(jobs), 135)
+        self.assertEqual(len(jobs), 141)
         self.assertEqual(len({j["case_id"] for j in jobs}), len(jobs))
         self.assertTrue(all(j["read_tier"]["name"] in
                             ("native_hot_wal_lru0_pagecache", "native_cold_os_lru0", "cold_device")
@@ -234,14 +245,14 @@ class CloudMatrixTests(unittest.TestCase):
         spec = self.spec(1) | {"mode": "read-tier-focused",
                               "diagnostics": {"write_profile_limit": 256, "read_profile_limit": 256}}
         jobs = cloud.make_matrix(spec)
-        self.assertEqual(len(jobs), 140)
+        self.assertEqual(len(jobs), 146)
         diagnostics = [j for j in jobs if j["cohort"] == "write_stage_diagnostics"]
         self.assertEqual({j["backend"] for j in diagnostics},
                          {"native"} | (set(spec["backends"]) & set(cloud.TRANSPORTS)))
         self.assertTrue(all(j["diagnostics"]["write_profile_limit"] == 256
                             and j["measurement_operations"] == 4096 for j in diagnostics))
         self.assertEqual(sum(j["cohort"] == "primary_rf1" and j["profile"] == "write-concurrent"
-                             for j in jobs), 9)
+                             for j in jobs), 11)
         selected = spec | {"backends": ["native", "tidehunter_tcp", "tidehunter_efa_native", "valkey_tcp"]}
         self.assertEqual(len(cloud.make_matrix(selected)), 71)
 
@@ -384,7 +395,7 @@ class CloudMatrixTests(unittest.TestCase):
     def test_one_repeat_preserves_every_first_repeat_job_and_run_configuration(self):
         single = cloud.make_matrix(self.spec(1))
         historical = cloud.make_matrix(self.spec(3))
-        self.assertEqual((len(single), len(historical)), (243, 729))
+        self.assertEqual((len(single), len(historical)), (293, 879))
         first = [job for job in historical if job["repeat"] == 0]
         self.assertEqual(single, first)
         for job, old_job in zip(single, first):
@@ -517,7 +528,7 @@ class CloudMatrixTests(unittest.TestCase):
                 self.assertEqual(config["limits"]["deadline_seconds"], 600 if cohort == "cold_os_cache" else 180)
 
     def test_exact_case_bound_admits_all_jobs_but_never_truncates(self):
-        for repeats, count in ((1, 243), (3, 729)):
+        for repeats, count in ((1, 293), (3, 879)):
             with self.subTest(repeats=repeats):
                 spec = self.spec(repeats) | {"max_cases": count}
                 self.assertEqual(len(cloud.make_matrix(spec)), count)
@@ -538,6 +549,12 @@ class CloudMatrixTests(unittest.TestCase):
             sorted((cloud.analyze.canonical({k: v for k, v in job.items() if k not in ignored}) for job in valkey)),
             sorted((cloud.analyze.canonical({k: v for k, v in job.items() if k not in ignored}) for job in common)))
         self.assertEqual(len(valkey), 25)
+        for name in ("garnet", "kvrocks"):
+            jobs = [job for job in full_jobs if job["backend"] == name]
+            self.assertEqual(len(jobs), 25)
+            self.assertEqual(
+                sorted(cloud.analyze.canonical({k: v for k, v in job.items() if k not in ignored}) for job in jobs),
+                sorted(cloud.analyze.canonical({k: v for k, v in job.items() if k not in ignored}) for job in valkey))
         expected = [job for job in full_jobs if job["backend"] == "valkey_tcp"]
         self.assertEqual(
             [cloud.analyze.canonical({k: v for k, v in job.items() if k != "case_id"}) for job in selected],
@@ -546,13 +563,13 @@ class CloudMatrixTests(unittest.TestCase):
             with self.subTest(backends=invalid), self.assertRaises(ValueError):
                 cloud.make_matrix(full | {"backends": invalid})
         self.assertEqual(len(cloud.make_matrix(self.spec(3) | {
-            'diagnostics': {'write_profile_limit': 256}})), 744)
+            'diagnostics': {'write_profile_limit': 256}})), 894)
 
     def test_historical_frozen_jobs_report_without_current_completeness(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             jobs = [job for job in cloud.make_matrix(self.spec(1))
-                    if job["backend"] != "valkey_tcp"]
+                    if job["backend"] in cloud.LEGACY_BACKENDS]
             jobs.append({**jobs[0], "case_id": "historical-registered-value",
                          "cohort": "registered_ram_fullset_control"})
             frozen = {"schema_version": 1, "spec": self.spec(1) | {

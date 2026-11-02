@@ -21,7 +21,10 @@ import tempfile
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
-FEATURES = ["tikv", "cassandra", "foundationdb", "valkey-tcp", "fabric", "nvmeof", "test-utils"]
+FEATURES = ["tikv", "cassandra", "foundationdb", "valkey-tcp", "garnet", "kvrocks", "fabric", "nvmeof", "test-utils"]
+VALKEY_COMMIT = "fe8d406c0b5a64ec897f6455e4de684629883764"
+VALKEY_ARTIFACTS = ("src/valkey-server", "src/valkey-cli",
+                    "deps/libvalkey/lib/libvalkey.a", "deps/libvalkey/lib/libvalkey_rdma.a")
 TARGET = "x86_64-unknown-linux-gnu"
 MAX_GLIBC = (2, 39)  # Ubuntu 24.04, not the build host's version.
 MAX_GLIBCXX = (3, 4, 33)  # Ubuntu 24.04 libstdc++6 (GCC 14).
@@ -49,6 +52,7 @@ REQUIRED = {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.to
             "experiments/kv-comparison/cloud_campaign.py", "experiments/kv-comparison/cloud_layout.py",
             "experiments/kv-comparison/cloud-campaign.json", "experiments/kv-comparison/local.py",
             "experiments/kv-comparison/resource_accounting.py",
+            "experiments/kv-comparison/industry_service.py",
             "experiments/kv-comparison/observability/campaign_monitor.py",
             "experiments/kv-comparison/observability/campaign_exporter.py",
             "experiments/kv-comparison/observability/exporter.py",
@@ -241,6 +245,12 @@ def elf_identity(path):
         if found and version_tuple(found[-1]) > maximum:
             raise ValueError(f"{path.name} requires {family}_{found[-1]}, newer than Ubuntu24; use the container build")
         requirements[family] = found
+    definitions = versions.split("Version definition section", 1)[-1].split("Version needs section", 1)[0] if "Version definition section" in versions else ""
+    exported = {family: sorted(set(re.findall(r"\b" + family + r"_(\d+(?:\.\d+)+)", definitions)), key=version_tuple)
+                for family in requirements}
+    sonames = re.findall(r"\(SONAME\).*\[(.*?)\]", dynamic)
+    if len(sonames) > 1:
+        raise ValueError("ambiguous ELF SONAME")
     rpaths = re.findall(r"\((?:RPATH|RUNPATH)\).*\[(.*?)\]", dynamic)
     if any(x not in {"$ORIGIN/../lib", "$ORIGIN"} for group in rpaths for x in group.split(":")):
         raise ValueError("absolute/unadmitted ELF rpath is not portable")
@@ -248,10 +258,19 @@ def elf_identity(path):
     supported = {"libc.so.6", "libm.so.6", "libpthread.so.0", "librt.so.1", "libdl.so.2", "ld-linux-x86-64.so.2",
                  "libgcc_s.so.1", "libstdc++.so.6", "liblzma.so.5", "libz.so.1", "libatomic.so.1",
                  "libssl.so.3", "libcrypto.so.3", "libfabric.so.1", "libfdb_c.so", "libnuma.so.1",
-                 "libibverbs.so.1", "libefa.so.1", "libnl-3.so.200", "libnl-route-3.so.200", "libuuid.so.1"}
+                 "libibverbs.so.1", "librdmacm.so.1", "libefa.so.1", "libnl-3.so.200", "libnl-route-3.so.200", "libuuid.so.1"}
     if set(needed) - supported:
         raise ValueError(f"unadmitted Ubuntu24 runtime SONAMEs: {sorted(set(needed) - supported)}")
-    return {"identity": identity(path), "needed": needed, "version_requirements": requirements, "rpaths": rpaths}
+    return {"identity": identity(path), "needed": needed, "version_requirements": requirements,
+            "version_definitions": exported, "soname": sonames[0] if sonames else None, "rpaths": rpaths}
+
+
+def abi_requirements(identities):
+    """Keep static requirements separate from source hashes and absolute paths."""
+    return {"needed": sorted({name for item in identities for name in item["needed"]}),
+            "version_requirements": {family: sorted({version for item in identities for version in item["version_requirements"][family]},
+                                                    key=version_tuple)
+                                     for family in ("GLIBC", "GLIBCXX", "CXXABI", "OPENSSL")}}
 
 
 def clean_environment():
@@ -342,7 +361,26 @@ def linked_libraries(path, environment):
     return {"ldd": text, "resolved": {str(Path(p).resolve(strict=True)): elf_identity(Path(p).resolve(strict=True)) for p in paths}}
 
 
-def build(snapshot_dir, output, fdb_prefix, fabric_prefix, timeout=5400):
+def valkey_source_identity(source):
+    source = source.resolve(strict=True)
+    if command(["git", "rev-parse", "HEAD"], cwd=source) != VALKEY_COMMIT:
+        raise ValueError("Valkey source is not the pinned commit")
+    if command(["git", "status", "--porcelain", "--untracked-files=no"], cwd=source):
+        raise ValueError("Valkey tracked source has local modifications")
+    settings = dict(line.split("=", 1) for line in (source / "src/.make-settings").read_text().splitlines()
+                    if "=" in line)
+    build_options = {name: settings.get(name) for name in ("BUILD_RDMA", "USE_SYSTEMD")}
+    if build_options != {"BUILD_RDMA": "yes", "USE_SYSTEMD": "no"}:
+        raise ValueError("Valkey server requires BUILD_RDMA=yes USE_SYSTEMD=no for the fixed runtime ABI")
+    artifacts = {name: identity(source / name) for name in VALKEY_ARTIFACTS}
+    if "--rdma" not in command([source / "src/valkey-cli", "--help"]):
+        raise ValueError("Valkey CLI lacks RDMA support")
+    return {"source_commit": VALKEY_COMMIT, "artifacts": artifacts, "server_build_options": build_options,
+            "server_elf": elf_identity(source / "src/valkey-server"),
+            "cli_elf": elf_identity(source / "src/valkey-cli")}
+
+
+def build(snapshot_dir, output, fdb_prefix, fabric_prefix, timeout=5400, valkey_source=None):
     if platform.machine() != "x86_64" or version_tuple(command(["getconf", "GNU_LIBC_VERSION"]).split()[-1]) > MAX_GLIBC:
         raise ValueError("build host must be x86_64 and glibc<=2.39; use Dockerfile.cloud-build")
     if not 1 <= timeout <= 7200:
@@ -353,11 +391,15 @@ def build(snapshot_dir, output, fdb_prefix, fabric_prefix, timeout=5400):
     source = output / "source"
     metadata = extract_source(snapshot_dir, source)
     fdb = fdb_identity(fdb_prefix)
+    valkey = valkey_source_identity(valkey_source) if valkey_source is not None else None
+    features = FEATURES + (["valkey-rdma"] if valkey else [])
     environment = clean_environment()
     environment.update({"PKG_CONFIG_PATH": str(fabric_prefix / "lib/pkgconfig"),
                         "FDB_CLIENT_LIB_DIR": str(fdb_prefix / "lib"), "FDB_CLIENT_LIB_PATH": str(fdb_prefix / "lib"),
                         "LIBRARY_PATH": str(fdb_prefix / "lib"), "LD_LIBRARY_PATH": f"{fdb_prefix}/lib:{fabric_prefix}/lib",
                         "CARGO_TARGET_DIR": str(output / "target"), "SOURCE_DATE_EPOCH": "0"})
+    if valkey:
+        environment["VALKEY_SOURCE_DIR"] = str(valkey_source.resolve(strict=True))
     fabric_version = command(["pkg-config", "--modversion", "libfabric"], env=environment)
     if fabric_version not in {"2.6.0", EFA["libfabric_version"]}:
         raise ValueError("build libfabric must match pinned 2.6.0 ABI, not a floating system provider")
@@ -371,7 +413,7 @@ def build(snapshot_dir, output, fdb_prefix, fabric_prefix, timeout=5400):
     argv = ["cargo", "--config", "build.rustflags=" + json.dumps(flags),
             "--config", f"target.{TARGET}.rustflags=" + json.dumps(flags), "build", "--release", "--frozen",
             "--target", TARGET, "-p", "kv-research", "--bin", "kv-research",
-            "--no-default-features", "--features", ",".join(FEATURES)]
+            "--no-default-features", "--features", ",".join(features)]
     rustc = command(["rustc", "-vV"], cwd=source, env=environment)
     if not rustc.startswith("rustc 1.90.0 "):
         raise ValueError("the source-pinned Rust1.90.0 toolchain is required")
@@ -383,6 +425,8 @@ def build(snapshot_dir, output, fdb_prefix, fabric_prefix, timeout=5400):
     admit_source(snapshot_dir, source)
     if fdb_identity(fdb_prefix) != fdb or elf_identity(fabric_library) != {k: v for k, v in fabric.items() if k not in {"version", "path"}}:
         raise ValueError("native build dependency changed during compilation")
+    if valkey and valkey_source_identity(valkey_source) != valkey:
+        raise ValueError("Valkey build dependency changed during compilation")
     shutil.copyfile(output / "target" / TARGET / "release/kv-research", output / "kv-research")
     (output / "kv-research").chmod(0o755)
     binary = elf_identity(output / "kv-research")
@@ -391,21 +435,25 @@ def build(snapshot_dir, output, fdb_prefix, fabric_prefix, timeout=5400):
     if str((fdb_prefix / "lib/libfdb_c.so").resolve()) not in resolved or str(fabric_library) not in resolved:
         raise ValueError("executable did not link the admitted FDB and libfabric libraries")
     receipt = {"schema_version": 1, "source_sha256": metadata["snapshot_sha256"], "source_tree_sha256": metadata["tree_sha256"],
-               "features": FEATURES, "target": TARGET, "cpu": "x86-64", "build_command": argv, "rustc": rustc,
+               "features": features, "valkey_rdma": valkey, "target": TARGET, "cpu": "x86-64", "build_command": argv, "rustc": rustc,
                "cargo": command(["cargo", "--version"], cwd=source, env=environment), "glibc": command(["getconf", "GNU_LIBC_VERSION"]),
                "binary": binary, "fdb": fdb, "fabric_build": fabric, "linkage": linkage,
                "build_log": identity(output / "build.log"), "runtime_efa": EFA,
                "builder_image": os.environ.get("CLOUD_PACKAGE_BUILDER_IMAGE"),
-               "builder_recipe_sha256": metadata["sha256"].get("experiments/kv-comparison/Dockerfile.cloud-build")}
+               "builder_recipe_sha256": metadata["sha256"].get(
+                   os.environ.get("CLOUD_PACKAGE_BUILDER_RECIPE", "experiments/kv-comparison/Dockerfile.cloud-build"))}
     dump(output / "build.json", receipt)
     return receipt
 
 
-def admit_build(snapshot_dir, build_dir, fdb_prefix):
+def admit_build(snapshot_dir, build_dir, fdb_prefix, valkey_source=None):
     source = admit_source(snapshot_dir)
     receipt = json.loads((build_dir / "build.json").read_text())
+    valkey = valkey_source_identity(valkey_source) if valkey_source is not None else None
+    features = FEATURES + (["valkey-rdma"] if valkey else [])
     if (receipt.get("schema_version") != 1 or receipt.get("source_sha256") != source["snapshot_sha256"]
-            or receipt.get("source_tree_sha256") != source["tree_sha256"] or receipt.get("features") != FEATURES
+            or receipt.get("source_tree_sha256") != source["tree_sha256"] or receipt.get("features") != features
+            or receipt.get("valkey_rdma") != valkey
             or receipt.get("target") != TARGET or receipt.get("cpu") != "x86-64" or receipt.get("runtime_efa") != EFA
             or receipt.get("binary") != elf_identity(build_dir / "kv-research") or receipt.get("fdb") != fdb_identity(fdb_prefix)
             or receipt.get("build_log") != identity(build_dir / "build.log")):
@@ -432,8 +480,8 @@ def deterministic_tar(output, paths):
                     archive.addfile(info, stream)
 
 
-def stage(repo, snapshot_dir, build_dir, fdb_prefix, output):
-    source, receipt = admit_build(snapshot_dir, build_dir, fdb_prefix)
+def stage(repo, snapshot_dir, build_dir, fdb_prefix, output, valkey_source=None):
+    source, receipt = admit_build(snapshot_dir, build_dir, fdb_prefix, valkey_source)
     if inventory(repo.resolve(strict=True)) != source["sha256"]:
         raise ValueError("checkout changed after source freeze; snapshot and rebuild latest sources")
     output.mkdir(parents=True, exist_ok=False)
@@ -448,11 +496,17 @@ def stage(repo, snapshot_dir, build_dir, fdb_prefix, output):
     (output / "runtime/bin/kv-research").chmod(0o755)
     shutil.copyfile(fdb_prefix / "lib/libfdb_c.so", output / "runtime/lib/libfdb_c.so")
     dump(output / "runtime/fdb-client.json", receipt["fdb"])
+    if valkey_source is not None:
+        for name in ("valkey-server", "valkey-cli"):
+            target = output / "runtime/bin" / name
+            shutil.copyfile(valkey_source / "src" / name, target)
+            target.chmod(0o755)
+        dump(output / "runtime/valkey-rdma.json", receipt["valkey_rdma"])
     files = {p.relative_to(output).as_posix(): p for p in output.rglob("*") if p.is_file()}
     manifest = {"schema_version": 1, "revision": source["revision"], "branch": source["branch"], "dirty": source["dirty"],
                 "source_sha256": source["snapshot_sha256"], "source_tree_sha256": source["tree_sha256"],
                 "binary_sha256": receipt["binary"]["identity"]["sha256"],
-                "binary_blake2b512": receipt["binary"]["identity"]["blake2b512"], "features": FEATURES,
+                "binary_blake2b512": receipt["binary"]["identity"]["blake2b512"], "features": receipt["features"],
                 "paths": {"repository_root": "source", "binary": "runtime/bin/kv-research", "fdb_library_dir": "runtime/lib"},
                 "runtime_efa": EFA, "files": {name: identity(path) for name, path in sorted(files.items())}}
     dump(output / "manifest.json", manifest)
@@ -472,13 +526,15 @@ def verify_directory(directory, runtime=False, provider="aws"):
         raise ValueError("unknown runtime provider")
     manifest = json.loads((directory / "manifest.json").read_text())
     files = manifest["files"]
-    if (manifest.get("schema_version") != 1 or manifest.get("features") != FEATURES
+    if (manifest.get("schema_version") != 1 or manifest.get("features") not in (FEATURES, FEATURES + ["valkey-rdma"])
             or manifest.get("runtime_efa") != EFA or len(files) > MAX_FILES):
         raise ValueError("runtime manifest schema/features/provider mismatch")
     if manifest.get("paths") != {"repository_root": "source", "binary": "runtime/bin/kv-research", "fdb_library_dir": "runtime/lib"}:
         raise ValueError("runtime manifest paths differ from package interface")
     required_files = {"source.zip", "source.json", "build.json", "build.log", "runtime/bin/kv-research",
                       "runtime/lib/libfdb_c.so", "runtime/fdb-client.json"}
+    if manifest["features"] == FEATURES + ["valkey-rdma"]:
+        required_files |= {"runtime/bin/valkey-server", "runtime/bin/valkey-cli", "runtime/valkey-rdma.json"}
     if required_files - files.keys():
         raise ValueError("runtime manifest omits mandatory artifact identities")
     if sum(x["bytes"] for x in files.values()) > MAX_BUNDLE:
@@ -498,7 +554,7 @@ def verify_directory(directory, runtime=False, provider="aws"):
     library = directory / "runtime/lib/libfdb_c.so"
     native = json.loads((directory / "runtime/fdb-client.json").read_text())
     if (manifest["source_sha256"] != source["snapshot_sha256"] or manifest["source_tree_sha256"] != source["tree_sha256"]
-            or build_receipt["source_sha256"] != manifest["source_sha256"] or build_receipt["features"] != FEATURES
+            or build_receipt["source_sha256"] != manifest["source_sha256"] or build_receipt["features"] != manifest["features"]
             or build_receipt["source_tree_sha256"] != manifest["source_tree_sha256"]
             or build_receipt.get("target") != TARGET or build_receipt.get("cpu") != "x86-64"
             or build_receipt.get("runtime_efa") != EFA or build_receipt.get("schema_version") != 1
@@ -508,18 +564,32 @@ def verify_directory(directory, runtime=False, provider="aws"):
             or identity(library)["sha256"] != FDB_SHA256 or identity(library)["blake2b512"] != FDB_BLAKE2B
             or native["sha256"] != FDB_SHA256 or native["blake2b512"] != FDB_BLAKE2B):
         raise ValueError("manifest source/binary/native-client binding mismatch")
+    roots = [elf_identity(binary), elf_identity(library)]
+    if "valkey-rdma" in manifest["features"]:
+        valkey = json.loads((directory / "runtime/valkey-rdma.json").read_text())
+        if valkey != build_receipt.get("valkey_rdma") or valkey.get("source_commit") != VALKEY_COMMIT:
+            raise ValueError("Valkey source/build identity differs")
+        for name in ("valkey-server", "valkey-cli"):
+            if identity(directory / "runtime/bin" / name) != valkey["artifacts"]["src/" + name]:
+                raise ValueError("Valkey runtime executable differs from build")
+            roots.append(elf_identity(directory / "runtime/bin" / name))
+    elif build_receipt.get("valkey_rdma") is not None:
+        raise ValueError("unexpected Valkey RDMA build identity")
     if not binary.stat().st_mode & 0o111:
         raise ValueError("comparison binary is not executable")
-    elf_identity(binary)
-    elf_identity(library)
     result = {"schema_version": 1, "manifest_sha256": identity(directory / "manifest.json")["sha256"],
               "source_sha256": manifest["source_sha256"], "binary_sha256": manifest["binary_sha256"],
-              "binary_blake2b512": manifest["binary_blake2b512"], "runtime_checked": runtime}
+              "binary_blake2b512": manifest["binary_blake2b512"], "runtime_checked": runtime,
+              "abi": abi_requirements(roots)}
     if runtime:
         environment = clean_environment()
         environment["LD_LIBRARY_PATH"] = (f"{library.parent.resolve()}:{EFA['runtime_library_dir']}"
                                           if provider == "aws" else str(library.parent.resolve()))
         result["linkage"] = linked_libraries(binary, environment)
+        if "valkey-rdma" in manifest["features"]:
+            result["valkey_runtime_linkage"] = {
+                name: linked_libraries(directory / "runtime/bin" / name, environment)
+                for name in ("valkey-server", "valkey-cli")}
         if str(library.resolve()) not in result["linkage"]["resolved"]:
             raise ValueError("runtime linker selected a different FDB client")
         if provider == "aws":
@@ -579,12 +649,14 @@ def main():
     compile_parser.add_argument("--fdb-prefix", type=Path, required=True)
     compile_parser.add_argument("--fabric-prefix", type=Path, required=True)
     compile_parser.add_argument("--timeout", type=int, default=5400)
+    compile_parser.add_argument("--valkey-source", type=Path)
     pack = sub.add_parser("stage")
     pack.add_argument("--repo", type=Path, default=ROOT)
     pack.add_argument("--snapshot", type=Path, required=True)
     pack.add_argument("--build", type=Path, required=True)
     pack.add_argument("--fdb-prefix", type=Path, required=True)
     pack.add_argument("--output", type=Path, required=True)
+    pack.add_argument("--valkey-source", type=Path)
     verify = sub.add_parser("verify")
     choice = verify.add_mutually_exclusive_group(required=True)
     choice.add_argument("--directory", type=Path)
@@ -597,9 +669,9 @@ def main():
         result = snapshot(args.repo, args.output)
         result = {k: v for k, v in result.items() if k != "sha256"}
     elif args.action == "build":
-        result = build(args.snapshot, args.output, args.fdb_prefix, args.fabric_prefix, args.timeout)
+        result = build(args.snapshot, args.output, args.fdb_prefix, args.fabric_prefix, args.timeout, args.valkey_source)
     elif args.action == "stage":
-        result = stage(args.repo, args.snapshot, args.build, args.fdb_prefix, args.output)
+        result = stage(args.repo, args.snapshot, args.build, args.fdb_prefix, args.output, args.valkey_source)
         result = {k: v for k, v in result.items() if k != "files"}
     else:
         if args.archive:

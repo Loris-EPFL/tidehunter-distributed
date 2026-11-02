@@ -149,6 +149,133 @@ class EvidenceAdmission(unittest.TestCase):
         self.assertNotEqual(analyze.stable_configuration(first, "valkey_tcp"),
                             analyze.stable_configuration(later, "valkey_tcp"))
 
+    def test_valkey_rdma_evidence_normalization_preserves_health_and_slots(self):
+        topology = {"primaries": [{"node_id": "one", "address": "10.0.0.1:6379", "slots": [[0, 10]]}]}
+        changed_id = {"primaries": [{**topology["primaries"][0], "node_id": "two"}]}
+        self.assertEqual(analyze.stable_topology("valkey_rdma", topology),
+                         analyze.stable_topology("valkey_rdma", changed_id))
+        first = {"persistence": [{"aof_enabled": "1", "aof_last_write_status": "ok", "aof_current_size": "1"}]}
+        second = copy.deepcopy(first)
+        second["persistence"][0]["aof_current_size"] = "2"
+        self.assertEqual(analyze.stable_configuration(first, "valkey_rdma"),
+                         analyze.stable_configuration(second, "valkey_rdma"))
+        second["persistence"][0]["aof_last_write_status"] = "err"
+        self.assertNotEqual(analyze.stable_configuration(first, "valkey_rdma"),
+                            analyze.stable_configuration(second, "valkey_rdma"))
+
+    def test_industry_signatures_keep_policies_but_exclude_info_counters(self):
+        for name, policy, changed in (
+            ("garnet", {"aof-commit-freq": "0", "aof-commit-wait": "yes"},
+             {"aof-commit-freq": "1", "aof-commit-wait": "yes"}),
+            ("kvrocks", {"rocksdb.write_options.disable_wal": "no", "rocksdb.write_options.sync": "yes",
+                         "rocksdb.block_cache_size": "1024"},
+             {"rocksdb.write_options.disable_wal": "no", "rocksdb.write_options.sync": "no",
+              "rocksdb.block_cache_size": "1024"}),
+        ):
+            first = {"node_config": [policy], "node_info": [{"used_memory": "1"}],
+                     "storage_tier_evidence": "lifecycle proof required"}
+            second = copy.deepcopy(first)
+            second["node_info"][0]["used_memory"] = "500"
+            self.assertEqual(analyze.stable_configuration(first, name),
+                             analyze.stable_configuration(second, name))
+            second["node_config"] = [changed]
+            self.assertNotEqual(analyze.stable_configuration(first, name),
+                                analyze.stable_configuration(second, name))
+            topology = {"primaries": [{"node_id": "old", "address": "host:1", "slots": [[0, 100]]}]}
+            later = {"primaries": [{**topology["primaries"][0], "node_id": "new"}]}
+            self.assertEqual(analyze.stable_topology(name, topology), analyze.stable_topology(name, later))
+            later["primaries"][0]["slots"] = [[0, 99]]
+            self.assertNotEqual(analyze.stable_topology(name, topology), analyze.stable_topology(name, later))
+
+    def industry_fixture(self, kind):
+        from test_industry_service import valid_nodes
+        nodes, endpoints = valid_nodes(kind)
+        slots = nodes[0]["cluster_slots"]
+        ids = [row[2][2] for row in slots]
+        coverage = {"required_primary_nodes": 5, "replication_factor": 1, "replica_count": 0,
+                    "primary_endpoints": endpoints, "slot_count": 16384,
+                    "primary_ids": dict(zip(endpoints, ids)),
+                    "durability": ("AOF commit per operation and commit-wait" if kind == "garnet"
+                                   else "RocksDB WAL enabled and write_options.sync=yes")}
+        primaries = [{"node_id": ids[i], "address": endpoints[i], "slots": slots[i][1] - slots[i][0] + 1,
+                      "slot_ranges": [[slots[i][0], slots[i][1]]]} for i in range(5)]
+        return ({"topology": {"nodes": 5}, "observed": {"nodes": nodes, "coverage": coverage}},
+                {"name": kind, "replication_factor": 1,
+                 "topology": {"cluster": True, "primary_count": 5, "slot_count": 16384, "primaries": primaries}})
+
+    def test_industry_offline_reconstruction_rejects_missing_or_conflicting_proof(self):
+        for kind in ("garnet", "kvrocks"):
+            deployment, backend = self.industry_fixture(kind)
+            self.assertEqual(analyze.admit_industry_observation(kind, deployment, backend),
+                             deployment["observed"]["coverage"])
+            cases = []
+            missing = copy.deepcopy(deployment)
+            del missing["observed"]["nodes"]
+            cases.append((missing, backend))
+            incomplete = copy.deepcopy(deployment)
+            incomplete["observed"]["nodes"][0]["cluster_slots"][0][1] -= 1
+            cases.append((incomplete, backend))
+            durability = copy.deepcopy(deployment)
+            key, value = (("aof-commit-wait", "no") if kind == "garnet"
+                          else ("rocksdb.write_options.sync", "no"))
+            durability["observed"]["nodes"][0]["effective_config"][key] = value
+            cases.append((durability, backend))
+            false_coverage = copy.deepcopy(deployment)
+            false_coverage["observed"]["coverage"]["replica_count"] = 1
+            cases.append((false_coverage, backend))
+            inconsistent = copy.deepcopy(backend)
+            inconsistent["topology"]["primaries"][0]["slot_ranges"][0][1] -= 1
+            cases.append((deployment, inconsistent))
+            for candidate, core in cases:
+                with self.subTest(kind=kind, candidate=candidate, core=core):
+                    with self.assertRaises(ValueError):
+                        analyze.admit_industry_observation(kind, candidate, core)
+
+    def test_industry_launch_proof_is_required_and_bound_to_containers(self):
+        import industry_service
+        import local
+
+        for kind in ("garnet", "kvrocks"):
+            state = {"backend": kind, "project": "owned", "owner": "run", "directory": "/tmp/owned"}
+            runtime = []
+            for i in range(5):
+                service = f"{kind}{i}"
+                address = f"127.0.0.{31+i}"
+                mounts = [{"Type": "volume", "Name": f"owned_{service}-data",
+                           "Destination": "/data", "RW": True}]
+                item = {"service": service, "id": str(i), "image_id": "sha256:image",
+                        "image": local.IMAGES[kind], "state": {"Running": True},
+                        "repo_digests": [local.IMAGES[kind]], "mounts": mounts,
+                        "memory_bytes": 1536 * 1024**2, "nano_cpus": 2_000_000_000,
+                        "memory_swap_bytes": 1536 * 1024**2,
+                        "volume_labels": {local.OWNER_LABEL: "run"},
+                        "entrypoint": ["/app/GarnetServer"] if kind == "garnet" else ["kvrocks"],
+                        "cmd": industry_service.garnet_args(address, 6379, 1536) if kind == "garnet"
+                               else ["-c", "/config/kvrocks.conf"]}
+                if kind == "kvrocks":
+                    mounts.append({"Type": "bind", "Source": f"/tmp/owned/{service}.conf",
+                                   "Destination": "/config/kvrocks.conf", "RW": False})
+                    item["config_text"] = industry_service.kvrocks_config(address, 6379, 1536)
+                runtime.append(item)
+            deployment = {"topology": state, "observed": {"runtime": runtime}}
+            containers = [{key: item[key] for key in ("service", "id", "image_id")} for item in runtime]
+            self.assertEqual(analyze.admit_industry_runtime(kind, deployment, containers)["containers"], 5)
+            missing = copy.deepcopy(deployment)
+            del missing["observed"]["runtime"]
+            with self.assertRaises(ValueError):
+                analyze.admit_industry_runtime(kind, missing, containers)
+            altered = copy.deepcopy(deployment)
+            if kind == "garnet":
+                altered["observed"]["runtime"][0]["cmd"].remove("--storage-tier")
+            else:
+                altered["observed"]["runtime"][0]["config_text"] = "rocksdb.write_options.sync no"
+            with self.assertRaises(ValueError):
+                analyze.admit_industry_runtime(kind, altered, containers)
+            foreign = copy.deepcopy(containers)
+            foreign[0]["id"] = "foreign"
+            with self.assertRaises(ValueError):
+                analyze.admit_industry_runtime(kind, deployment, foreign)
+
     def test_host_memory_and_swap_capacity_are_part_of_the_contract(self):
         small = analyze.host_capacity('MemTotal: 1024 kB\nMemFree: 12 kB\nSwapTotal: 0 kB\n')
         equally_sized = analyze.host_capacity('MemTotal: 1024 kB\nMemFree: 900 kB\nSwapTotal: 0 kB\n')

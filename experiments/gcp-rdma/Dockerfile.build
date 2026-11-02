@@ -1,0 +1,11 @@
+# Official Docker Hub rockylinux:9 amd64 manifest, resolved 2026-11-02.
+FROM rockylinux@sha256:d644d203142cd5b54ad2a83a203e1dee68af2229f8fe32f52a30c6e1d3c3a9e0
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+# Signed distribution packages only; no kernel or host driver changes.
+RUN dnf -y --enablerepo=crb install gcc gcc-c++ make git curl-minimal ca-certificates bzip2 tar \
+    pkgconf-pkg-config clang clang-devel cmake protobuf-compiler \
+    python3.11 python3.11-pip openssl-devel xz-devel zlib-devel \
+    rdma-core-devel libibverbs-devel librdmacm-devel numactl-devel \
+    autoconf automake libtool binutils findutils which diffutils perl patch && \
+    dnf clean all && ln -sf /usr/bin/python3.11 /usr/local/bin/python3
+ENV PYTHONDONTWRITEBYTECODE=1

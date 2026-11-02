@@ -32,6 +32,9 @@ tikv = ["dep:tikv-client", "dep:reqwest", "dep:tonic"]
 cassandra = ["dep:scylla", "dep:rustls", "dep:rustls-pemfile"]
 foundationdb = ["dep:foundationdb"]
 valkey-tcp = ["dep:redis"]
+garnet = ["dep:redis"]
+kvrocks = ["dep:redis"]
+valkey-rdma = []
 rocksdb = ["dep:rocksdb"]
 # Opt in to native OFI transports without tying selection to one provider.
 # Disabled builds reject OFI configuration rather than selecting TCP.

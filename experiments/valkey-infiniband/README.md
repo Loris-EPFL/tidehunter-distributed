@@ -1,11 +1,12 @@
 # Valkey over InfiniBand: preparation and bounded functional qualification
 
-This directory is **not a benchmark backend**. It is independent of
-`experiments/kv-comparison`, its Rust adapters, matrices, workflows and TCP
-lifecycle. No RDMA backend exists in that suite. Nothing here provisions a
-provider, downloads sources, installs packages/drivers, starts a server/container,
-or dispatches a workflow. Only the explicit `qualify` action connects to an
-already running, operator-supplied RDMA endpoint. **There is no TCP fallback.**
+This directory remains an independent **InfiniBand-only qualifier**, not a
+benchmark backend or a Falcon qualifier. The comparison suite now has a separate
+[`valkey_rdma` backend](../kv-comparison/README.md#valkey-tcp-and-matched-rdma-controls);
+that integration uses its own deployment and qualification gates. Nothing in
+this qualifier provisions a provider, downloads sources, installs packages or
+starts servers. Only explicit `qualify` connects to an operator-supplied
+endpoint. There is no TCP fallback.
 
 The supported release for this preparation is **Valkey 9.0.7**, official source
 commit **`fe8d406c0b5a64ec897f6455e4de684629883764`**. RDMA is upstream's
@@ -277,13 +278,13 @@ Do not relabel this JSON as that evidence.
   an NVMe value-WAL/cold-read workload. Compare a hot/cache-resident Tidehunter
   cohort separately from native NVMe retrieval; preserve this distinction in
   claims and graphs. Functional success cannot establish a 5 µs latency floor.
-- Tidehunter must first have an actual **compatible InfiniBand transport** and
-  its own end-to-end qualification on these hosts: a supported RC/verbs or
-  otherwise explicitly matched provider path, exact values, error/cancellation
-  semantics, progress/threading, memory registration, durability and recovery
-  contracts. Current EFA/SRD results do not supply this. Do not add an RDMA
-  alias/backend/matrix row, substitute TCP, or publish a Valkey-vs-Tidehunter RDMA
-  result before both real transports and their data-path semantics are proved.
+- Tidehunter and Valkey must each pass their own actual peer qualification on
+  the same fabric: compatible RC/verbs or explicitly matched provider paths,
+  exact values, errors/cancellation, progress/threading, registration, durability
+  and recovery contracts. The portable comparison adapters now exist, but
+  software-only checks and EFA/SRD results do not supply physical InfiniBand or
+  Falcon qualification. Do not publish a hardware comparison before both real
+  transports and their data-path semantics are proved.
 
 ## Primary-source mapping
 

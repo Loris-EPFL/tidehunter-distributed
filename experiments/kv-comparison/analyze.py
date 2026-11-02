@@ -157,7 +157,7 @@ def stable_topology(name, original):
         topology["endpoints"] = sorted(
             ({"partition": item["partition"]} for item in topology["endpoints"]),
             key=lambda item: item["partition"])
-    if name == "valkey_tcp" and isinstance(topology.get("primaries"), list):
+    if name in ("valkey_tcp", "valkey_rdma", "garnet", "kvrocks") and isinstance(topology.get("primaries"), list):
         topology["primaries"] = sorted(
             ({key: value for key, value in item.items() if key != "node_id"}
              for item in topology["primaries"]), key=canonical)
@@ -191,12 +191,16 @@ def stable_configuration(original, name=None):
     if isinstance(config.get("loaded_native_library"), dict):
         config["loaded_native_library"] = {
             key: value for key, value in config["loaded_native_library"].items() if key != "path"}
-    if name == "valkey_tcp" and isinstance(config.get("persistence"), list):
+    if name in ("valkey_tcp", "valkey_rdma") and isinstance(config.get("persistence"), list):
         # Retain health/guarantee evidence, not changing AOF sizes, timestamps,
         # rewrite progress or counters. Original artifacts retain every field.
         fields = ("aof_enabled", "loading", "async_loading", "aof_last_write_status", "aof_last_bgrewrite_status")
         config["persistence"] = [{key: item[key] for key in fields if key in item}
                                  for item in config["persistence"]]
+    if name in ("garnet", "kvrocks"):
+        # Raw INFO snapshots include changing counters, sizes and timestamps;
+        # effective CONFIG and the storage policy remain part of the contract.
+        config.pop("node_info", None)
     return config
 
 
@@ -213,6 +217,75 @@ def host_capacity(meminfo):
         raise ValueError("missing host RAM/swap capacity evidence")
     return values
 
+
+
+def admit_industry_observation(kind, deployment, backend):
+    """Reconstruct RF1 slot and durable-setting proof from the raw observations."""
+    import industry_service
+
+    topology = deployment.get("topology", {})
+    observed = deployment.get("observed", {})
+    if (topology.get("nodes") != 5 or backend.get("name") != kind
+            or backend.get("replication_factor") != 1):
+        raise ValueError("industry deployment must have five actual RF1 primaries")
+    nodes = observed.get("nodes")
+    coverage = observed.get("coverage")
+    if not isinstance(nodes, list) or not isinstance(coverage, dict):
+        raise ValueError("missing industry primary/slot observations")
+    endpoints = coverage.get("primary_endpoints")
+    if not isinstance(endpoints, list) or len(endpoints) != 5 or len(set(endpoints)) != 5:
+        raise ValueError("missing industry primary endpoint inventory")
+    try:
+        reconstructed = industry_service.admit(kind, nodes, endpoints)
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise ValueError(f"invalid industry primary/slot/durability evidence: {exc}") from exc
+    if reconstructed != coverage:
+        raise ValueError("industry recorded coverage disagrees with raw observations")
+    core = backend.get("topology", {})
+    primaries = core.get("primaries")
+    if (core.get("cluster") is not True or core.get("primary_count") != 5
+            or core.get("slot_count") != 16384 or not isinstance(primaries, list)
+            or len(primaries) != 5):
+        raise ValueError("missing industry backend primary/slot observation")
+    try:
+        core_slots = {}
+        for primary in primaries:
+            endpoint = primary["address"]
+            if reconstructed["primary_ids"].get(endpoint) != primary["node_id"]:
+                raise ValueError("industry backend primary identities disagree with deployment")
+            for start, end in primary["slot_ranges"]:
+                if type(start) is not int or type(end) is not int or not 0 <= start <= end < 16384:
+                    raise ValueError("invalid industry backend slot range")
+                for slot in range(start, end + 1):
+                    if slot in core_slots:
+                        raise ValueError("duplicate industry backend slot")
+                    core_slots[slot] = endpoint
+        actual_slots = {}
+        for start, end, primary in nodes[0]["cluster_slots"]:
+            endpoint = f"{primary[0]}:{primary[1]}"
+            actual_slots.update((slot, endpoint) for slot in range(start, end + 1))
+        if core_slots != actual_slots:
+            raise ValueError("industry backend slot ownership disagrees with deployment")
+    except (KeyError, TypeError, IndexError) as exc:
+        raise ValueError("missing industry backend slot observations") from exc
+    return reconstructed
+
+
+def admit_industry_runtime(kind, deployment, containers):
+    import industry_service
+
+    runtime = deployment.get("observed", {}).get("runtime")
+    if not isinstance(runtime, list) or not isinstance(containers, list):
+        raise ValueError("missing actual industry launch and storage-tier proof")
+    try:
+        proof = industry_service.admit_local_runtime(kind, runtime, deployment["topology"])
+        observed = {(item["service"], item["id"], item["image_id"]) for item in runtime}
+        exported = {(item["service"], item["id"], item["image_id"]) for item in containers}
+        if len(observed) != 5 or observed != exported:
+            raise ValueError("industry launch receipt disagrees with exported containers")
+        return proof
+    except (KeyError, TypeError, RuntimeError) as exc:
+        raise ValueError(f"invalid industry launch and storage-tier proof: {exc}") from exc
 
 
 def boundary(run):
@@ -239,11 +312,11 @@ def boundary(run):
         raise ValueError(f"{run}: manifest lacks observed effective BackendInfo")
     deployment_path = run / "deployment/deployment.json"
     deployment = json.loads(deployment_path.read_text()) if deployment_path.exists() else None
-    if config["backend"]["kind"] in ("tikv", "cassandra", "foundationdb", "valkey_tcp"):
+    if config["backend"]["kind"] in ("tikv", "cassandra", "foundationdb", "valkey_tcp", "valkey_rdma", "garnet", "kvrocks"):
         if not deployment:
             raise ValueError(f"{run}: missing actual external deployment/replication proof")
         observed, nodes = deployment["observed"], deployment["topology"]["nodes"]
-        expected_rf = (1 if config["backend"]["kind"] == "valkey_tcp" else
+        expected_rf = (1 if config["backend"]["kind"] in ("valkey_tcp", "valkey_rdma", "garnet", "kvrocks") else
                        (1 if nodes == 1 else 2) if config["backend"]["kind"] == "foundationdb" else nodes)
         if backend["replication_factor"] != expected_rf:
             raise ValueError(f"{run}: observed backend RF does not match admitted deployment")
@@ -254,7 +327,7 @@ def boundary(run):
         elif config["backend"]["kind"] == "foundationdb":
             if not observed["cluster"].get("full_replication") or not observed["cluster"].get("database_available"):
                 raise ValueError(f"{run}: missing available/full-replication FoundationDB observation")
-        elif config["backend"]["kind"] == "valkey_tcp":
+        elif config["backend"]["kind"] in ("valkey_tcp", "valkey_rdma"):
             expected_primaries = 1 if deployment["topology"]["layout"] == "qualification" else 5
             coverage = observed.get("coverage", {})
             if (nodes != expected_primaries or coverage.get("required_primary_nodes") != nodes
@@ -263,6 +336,8 @@ def boundary(run):
                     or len(set(coverage.get("primary_endpoints", []))) != nodes
                     or coverage.get("slot_count") != (0 if nodes == 1 else 16384)):
                 raise ValueError(f"{run}: incomplete Valkey RF1 primary/slot ownership proof")
+        elif config["backend"]["kind"] in ("garnet", "kvrocks"):
+            admit_industry_observation(config["backend"]["kind"], deployment, backend)
         elif len(observed["nodes"]) != nodes:
             raise ValueError(f"{run}: incomplete Cassandra member observations")
     # Dynamic per-run namespaces/storage roots are not compared. Retain raw originals and
@@ -274,6 +349,9 @@ def boundary(run):
             if key != "path"}
     guarantee["effective_configuration"] = stable_configuration(backend["configuration"], backend["name"])
     guarantee["observed_topology"] = stable_topology(backend["name"], backend["topology"])
+    if config["backend"]["kind"] in ("garnet", "kvrocks"):
+        guarantee["deployment_effective_configuration"] = sorted(
+            (node["effective_config"] for node in deployment["observed"]["nodes"]), key=canonical)
     hardware = receipt["hardware"]
     capacity = host_capacity(hardware["memory"])
     hardware = {key: hardware[key] for key in ("machine", "cpu", "kernel", "affinity", "block_devices")}
@@ -287,6 +365,8 @@ def boundary(run):
         compose = json.loads((run / "deployment/compose.json").read_text())
         actual = json.loads((run / "deployment/containers.json").read_text())
         resolved_images = {item["requested"]: item["image_id"] for item in json.loads((run / "deployment/images.json").read_text())}
+        if config["backend"]["kind"] in ("garnet", "kvrocks"):
+            admit_industry_runtime(config["backend"]["kind"], deployment, actual)
         if {item["service"] for item in actual} != set(compose["services"]):
             raise ValueError(f"{run}: actual role/container inventory differs from deployment")
         for item in actual:

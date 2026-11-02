@@ -24,6 +24,8 @@ IMAGES = {
     "cassandra": "library/cassandra:5.0.9@sha256:3ea9333712c5692f3fe91d6c4dcc262df9e36338c4fdd1bc00a5e53f1137a1a0",
     "foundationdb": "foundationdb/foundationdb:7.3.77@sha256:559b178a137bbe09272ad6e3752531aa04e2ddacab8ccfa4ffa86467db033bea",
     "valkey_tcp": "valkey/valkey:9.0.7@sha256:7e1deda01b64ece3167d370ab5be3452d29734feec22cbcbc69b3a64f6859d6d",
+    "garnet": "ghcr.io/microsoft/garnet:2.2.5@sha256:ef84a729cc054b048d8ed17113475890dc6389a8ea8725c34771efe785841137",
+    "kvrocks": "apache/kvrocks:2.17.0@sha256:a1e99b3653fb900d5a17b80a9487f74079edc6d5e9b70e3103c01cbfc0d5146a",
 }
 # TiKV 8.5.4 rejects the hosted runner's inherited 65,536-descriptor limit.
 TIKV_NOFILE = 1_048_576
@@ -59,8 +61,11 @@ def load(directory):
         raise ValueError("state owner/path mismatch; refusing lifecycle action")
     if state["project"] != "kv-" + state["owner"][:16] or state["compose_file"] != str(directory / "compose.json"):
         raise ValueError("state project/compose identity mismatch; refusing action")
-    if state["backend"] not in ("tikv", "cassandra", "foundationdb", "valkey_tcp") or state["layout"] not in ("distributed", "qualification"):
+    if state["backend"] not in ("tikv", "cassandra", "foundationdb", "valkey_tcp", "valkey_rdma", "garnet", "kvrocks") or state["layout"] not in ("distributed", "qualification"):
         raise ValueError("unsupported saved deployment contract")
+    if state["backend"] == "valkey_rdma" or (state["backend"] == "valkey_tcp" and state.get("paired_valkey") is True):
+        import local_valkey_rdma
+        local_valkey_rdma.validate_state(state)
     return state
 
 
@@ -118,7 +123,7 @@ def valkey_evidence(run, endpoints, cluster):
             "image": IMAGES["valkey_tcp"]}
 
 
-def admit_valkey(nodes, endpoints, cluster, complete=True):
+def admit_valkey(nodes, endpoints, cluster, complete=True, data_dir="/data"):
     expected = set(endpoints)
     if len(nodes) != len(expected) or len(expected) != (5 if cluster and complete else 1) or {x["endpoint"] for x in nodes} != expected:
         raise RuntimeError("Valkey requested primary endpoint inventory mismatch")
@@ -127,7 +132,9 @@ def admit_valkey(nodes, endpoints, cluster, complete=True):
         config, server = node["effective_config"], node["info_server"]
         persistence, replication = node["info_persistence"], node["info_replication"]
         required = {"appendonly": "yes", "appendfsync": "always", "no-appendfsync-on-rewrite": "no",
-                    "maxmemory-policy": "noeviction", "dir": "/data", "cluster-enabled": "yes" if cluster else "no"}
+                    "maxmemory-policy": "noeviction",
+                    "dir": data_dir[node["endpoint"]] if isinstance(data_dir, dict) else data_dir,
+                    "cluster-enabled": "yes" if cluster else "no"}
         if any(config.get(k) != v for k, v in required.items()):
             raise RuntimeError("Valkey effective durable/no-eviction/cluster configuration mismatch")
         for field in ("appenddirname", "appendfilename"):
@@ -228,7 +235,7 @@ def initialize_valkey(run, endpoints, directory, timeout):
 
 def topology(backend, layout, directory, owner):
     """Compose limits are hard cgroup budgets, not reserved physical resources."""
-    count = 1 if layout == "qualification" else (5 if backend == "valkey_tcp" else 3)
+    count = 5 if backend in ("garnet", "kvrocks") else (1 if layout == "qualification" else (5 if backend == "valkey_tcp" else 3))
     services, volumes = {}, {}
 
     def add(name, image, cpus, memory, args=None, **extra):
@@ -288,6 +295,19 @@ def topology(backend, layout, directory, owner):
         for i in range(count):
             add(f"valkey{i}", "valkey_tcp", 2.0, "1536m",
                 valkey_server_args(f"127.0.0.{21+i}", 6379+i, 16379+i, count > 1, 1024))
+    elif backend in ("garnet", "kvrocks"):
+        import industry_service
+        for i in range(count):
+            address = f"127.0.0.{31+i}"
+            if backend == "garnet":
+                add(f"garnet{i}", backend, 2.0, "1536m",
+                    industry_service.garnet_args(address, 6379, 1536), user="0")
+            else:
+                add(f"kvrocks{i}", backend, 2.0, "1536m",
+                    ["-c", "/config/kvrocks.conf"], entrypoint=["kvrocks"], user="0")
+                services[f"kvrocks{i}"]["healthcheck"] = {"disable": True}
+                services[f"kvrocks{i}"]["volumes"].append(str(directory / f"kvrocks{i}.conf") + ":/config/kvrocks.conf:ro")
+            services[f"{backend}{i}"]["memswap_limit"] = "1536m"
     else:
         raise ValueError("unknown backend")
     return {"services": services, "volumes": volumes}, count
@@ -322,10 +342,39 @@ def http(path):
 
 
 def probe(state):
+    if state["backend"] == "valkey_rdma" or (state["backend"] == "valkey_tcp" and state.get("paired_valkey") is True):
+        import local_valkey_rdma
+        return local_valkey_rdma.probe(state)
     backend, count = state["backend"], state["nodes"]
     items = inspect_owned(state)
     if len(items) != count + (backend == "tikv") or any(not x["State"]["Running"] for x in items):
         raise RuntimeError("not all requested containers are running")
+    if backend in ("garnet", "kvrocks"):
+        import industry_service
+        endpoints = state["backend_options"]["nodes"]
+        image = json.loads(command(["docker", "image", "inspect", IMAGES[backend]]))[0]
+        runtime = []
+        for item in items:
+            service = item["Config"]["Labels"]["com.docker.compose.service"]
+            volume = state["project"] + "_" + service + "-data"
+            volume_info = json.loads(command(["docker", "volume", "inspect", volume]))[0]
+            if item["Image"] != image["Id"]:
+                raise RuntimeError("industry container differs from pinned image")
+            row = {"id": item["Id"], "image_id": item["Image"], "image": item["Config"]["Image"],
+                   "cmd": item["Config"]["Cmd"], "entrypoint": item["Config"]["Entrypoint"],
+                   "state": item["State"], "repo_digests": image.get("RepoDigests", []),
+                   "memory_bytes": item["HostConfig"]["Memory"], "memory_swap_bytes": item["HostConfig"]["MemorySwap"],
+                   "nano_cpus": item["HostConfig"]["NanoCpus"],
+                   "mounts": item["Mounts"], "volume_labels": volume_info.get("Labels", {}), "service": service}
+            if backend == "kvrocks":
+                row["config_text"] = (Path(state["directory"]) / (service + ".conf")).read_text()
+            runtime.append(row)
+        industry_service.admit_local_runtime(backend, runtime, state)
+        proof = industry_service.evidence(backend, endpoints)
+        proof["runtime"] = runtime
+        dump(Path(state["directory"]) / "probe-attempt.json", proof)
+        proof["coverage"] = industry_service.admit(backend, proof["nodes"], endpoints)
+        return proof
     if backend == "tikv":
         stores = http("/pd/api/v1/stores")
         regions = http("/pd/api/v1/regions")
@@ -413,6 +462,9 @@ def runtime_configuration_hash(item):
 
 
 def export(state, output):
+    if state["backend"] == "valkey_rdma" or (state["backend"] == "valkey_tcp" and state.get("paired_valkey") is True):
+        import local_valkey_rdma
+        return local_valkey_rdma.export(state, output)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     items = inspect_owned(state)
@@ -431,6 +483,9 @@ def export(state, output):
 
 
 def stop(state):
+    if state["backend"] == "valkey_rdma" or (state["backend"] == "valkey_tcp" and state.get("paired_valkey") is True):
+        import local_valkey_rdma
+        return local_valkey_rdma.stop(state)
     inspect_owned(state)
     names = command(["docker", "volume", "ls", "-q", "--filter", "label=com.docker.compose.project=" + state["project"]]).split()
     if names:
@@ -442,6 +497,9 @@ def stop(state):
 
 
 def start(args):
+    if args.backend == "valkey_rdma" or (args.backend == "valkey_tcp" and getattr(args, "paired_valkey", False)):
+        import local_valkey_rdma
+        return local_valkey_rdma.start(args)
     if platform.system() != "Linux":
         raise RuntimeError("host-loopback topology requires Linux Docker Engine (not Docker Desktop)")
     directory = args.state.resolve()
@@ -465,6 +523,8 @@ def start(args):
         addresses += [("127.0.0.1", 7199+i) for i in range(count)]
     elif args.backend == "valkey_tcp":
         addresses = [(f"127.0.0.{21+i}", p) for i in range(count) for p in (6379+i, 16379+i)]
+    elif args.backend in ("garnet", "kvrocks"):
+        addresses = [(f"127.0.0.{31+i}", 6379) for i in range(count)]
     else:
         addresses = [("127.0.0.1", 4500+i) for i in range(count)]
     for address in addresses:
@@ -483,6 +543,13 @@ def start(args):
         state["backend_options"] = {"nodes": [f"127.0.0.{21+i}:{6379+i}" for i in range(count)],
                                     "cluster": count > 1, "required_replication_factor": 1,
                                     "required_primary_nodes": count, "request_timeout_ms": 5000}
+    if args.backend in ("garnet", "kvrocks"):
+        import industry_service
+        state["backend_options"] = industry_service.options(args.backend, [f"127.0.0.{31+i}:6379" for i in range(5)])
+        state["spec"] = spec
+        if args.backend == "kvrocks":
+            for i in range(5):
+                (directory / f"kvrocks{i}.conf").write_text(industry_service.kvrocks_config(f"127.0.0.{31+i}", 6379, 1536))
     dump(directory / "owner.json", state)
     dump(directory / "compose.json", spec)
     (directory / "pd.toml").write_text(f'[replication]\nmax-replicas = {count}\nlocation-labels = ["zone"]\n')
@@ -525,6 +592,9 @@ def start(args):
             initialize_valkey(
                 lambda endpoint, *argv: execute(state, f"valkey{state['backend_options']['nodes'].index(endpoint)}", *argv),
                 state["backend_options"]["nodes"], directory, args.timeout)
+        if args.backend in ("garnet", "kvrocks"):
+            dump(directory / "initialization.json", industry_service.initialize(
+                args.backend, state["backend_options"]["nodes"], owner, args.timeout))
         ready(state, args.timeout)
     except BaseException:
         export(state, directory / "failure")
@@ -571,7 +641,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
     launch = sub.add_parser("start")
-    launch.add_argument("--backend", required=True, choices=["tikv", "cassandra", "foundationdb", "valkey_tcp"])
+    launch.add_argument("--backend", required=True, choices=["tikv", "cassandra", "foundationdb", "valkey_tcp", "valkey_rdma", "garnet", "kvrocks"])
     launch.add_argument("--layout", choices=["distributed", "qualification"], default="distributed")
     launch.add_argument("--state", type=Path, required=True)
     launch.add_argument("--timeout", type=int, default=180)

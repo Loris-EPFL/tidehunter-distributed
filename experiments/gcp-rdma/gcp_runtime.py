@@ -1,4 +1,5 @@
 """GCP runtime identities and immutable, source-bound guest mailbox."""
+import copy
 import base64
 import hashlib
 import ipaddress
@@ -9,6 +10,13 @@ from datetime import datetime, timezone
 import sys
 from pathlib import Path
 from pathlib import PurePosixPath
+
+GUEST_PYTHON = '/opt/tidehunter-python/bin/python3'
+GUEST_PATH = '/opt/tidehunter-python/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+# Google automatically attaches these NVMe Local SSDs for the machine type.
+# https://docs.cloud.google.com/compute/docs/disks/local-ssd#performance
+LOCAL_SSD_COUNTS = {'z4m-highmem-16': 1, 'h4d-highmem-192-lssd': 10}
 
 
 class RuntimeSafetyError(RuntimeError):
@@ -90,10 +98,10 @@ def validate_runtime(config):
         raise RuntimeSafetyError('package source, revision or immutable object identity mismatch')
     _sha(package.get('sha256'))
     backends = config['spec'].get('backends', [])
-    if not isinstance(backends, list) or not set(backends) <= {'native', 'tidehunter_tcp', 'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma', 'tikv', 'cassandra', 'foundationdb', 'valkey_tcp'}:
+    if not isinstance(backends, list) or not set(backends) <= {'native', 'tidehunter_tcp', 'tidehunter_verbs', 'tidehunter_verbs_native', 'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma', 'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'valkey_rdma', 'garnet', 'kvrocks'}:
         raise RuntimeSafetyError('invalid GCP backend selection')
-    if not isinstance(config.get('machine_type'), str) or not config['machine_type']:
-        raise RuntimeSafetyError('machine type required')
+    if not isinstance(config.get('machine_type'), str) or config['machine_type'] not in LOCAL_SSD_COUNTS:
+        raise RuntimeSafetyError('machine type must have an admitted local SSD layout')
     if config.get('package_root') != '/mnt/tidehunter/' + config['run_id'] + '/package':
         raise RuntimeSafetyError('invalid installed package root')
     return config
@@ -236,8 +244,9 @@ def validate_controller_config(config):
     if (config.get('repository_root') != str(root / 'source') or config.get('binary') != str(root / 'runtime/bin/kv-research')
         or config.get('fdb_library_dir') != str(root / 'runtime/lib')):
         raise RuntimeSafetyError('package paths differ from sealed layout')
-    allowed = {'native', 'tidehunter_tcp', 'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma',
-               'tikv', 'cassandra', 'foundationdb', 'valkey_tcp'}
+    allowed = {'native', 'tidehunter_tcp', 'tidehunter_verbs', 'tidehunter_verbs_native',
+               'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma',
+               'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'valkey_rdma', 'garnet', 'kvrocks'}
     if not set(config['spec']['backends']) <= allowed:
         raise RuntimeSafetyError('unsupported GCP backend or AWS EFA selected')
     jobs = cloud_campaign.make_matrix(config['spec'])
@@ -265,13 +274,16 @@ def make_clients(config, *, guest=False, api=None):
 
 def verify_fleet(config, clients, *, terminating=False, starting=False):
     r = config['platform']['runtime']
+    if not isinstance(r.get('machine_type'), str) or r['machine_type'] not in LOCAL_SSD_COUNTS:
+        raise RuntimeSafetyError('machine type must have an admitted local SSD layout')
+    expected_ssds = LOCAL_SSD_COUNTS[r['machine_type']]
     observed = {}
     for host in r['fleet']:
         instance = clients['platform'].request('GET', f'beta/zones/{host["zone"]}/instances/{host["name"]}')
         meta = {item['key']: item.get('value') for item in instance.get('metadata', {}).get('items', [])}
         schedule = instance.get('scheduling', {})
         networks = instance.get('networkInterfaces', [])
-        scratch = [disk for disk in instance.get('disks', []) if disk.get('type') == 'SCRATCH' and disk.get('interface') == 'NVME']
+        scratch = [disk for disk in instance.get('disks', []) if disk.get('type') == 'SCRATCH']
         policy = r['run_id'] + '-placement'
         allowed = ('RUNNING', 'PROVISIONING', 'STAGING') if starting else ('RUNNING',)
         if terminating:
@@ -287,9 +299,12 @@ def verify_fleet(config, clients, *, terminating=False, starting=False):
             or len(networks) != 2 or networks[0].get('networkIP') != host['internal_ip']
             or networks[1].get('networkIP') != host['rdma_ip']
             or networks[0].get('nicType') != 'GVNIC' or networks[1].get('nicType') != 'IRDMA'
-            or len(scratch) != 1 or not any(item.split('/')[-1] == policy for item in instance.get('resourcePolicies', []))):
+            or len(scratch) != expected_ssds or any(disk.get('interface') != 'NVME' for disk in scratch)
+            or not any(item.split('/')[-1] == policy for item in instance.get('resourcePolicies', []))):
             raise RuntimeSafetyError('live GCE instance differs from admitted identity, network or expiry')
-        observed[host['name']] = {'status': instance['status'], 'id': str(instance['id']), 'name': host['name']}
+        observed[host['name']] = {'status': instance['status'], 'id': str(instance['id']), 'name': host['name'],
+                                  'local_ssd_count': expected_ssds, 'selected_local_ssd': 'google-local-nvme-ssd-0',
+                                  'unused_local_ssd_count': expected_ssds - 1}
     return observed
 
 
@@ -316,7 +331,7 @@ def request_remote(controller, index, request, *, case='startup', timeout=180, e
                'request': request, 'key': key}
     encode = lambda value: base64.b64encode(json.dumps(value).encode()).decode()
     script = Path(controller.config['repository_root']) / 'experiments/kv-comparison/cloud_controller.py'
-    argv = ['/usr/bin/python3', str(script), 'guest', '--config-base64', encode(controller.config), '--request-base64', encode(payload)]
+    argv = [GUEST_PYTHON, str(script), 'guest', '--config-base64', encode(controller.config), '--request-base64', encode(payload)]
     controller.guard()
     reference = controller.clients['mailbox'].submit(index + 1, argv, operation_id=op, timeout_seconds=timeout)
     receipt = controller.clients['mailbox'].wait(reference, timeout_seconds=timeout)
@@ -341,13 +356,38 @@ def monitoring_access(config, proofs=()):
             'hosts': [{'name': h['name'], 'address': h['internal_ip']} for h in config['platform']['runtime']['fleet']]}
 
 
+def prepare_transport(config, preparation):
+    """Bind generic verbs to each admitted host, not its management NIC."""
+    result = copy.deepcopy(preparation)
+    transport = result['transport']
+    if transport.get('fabric', {}).get('backend') == 'verbs':
+        fleet = config['fleet']
+        transport['fabric']['source_address'] = fleet['coordinator']['rdma_address']
+        result['owner_transports'] = []
+        for host in fleet['nodes']:
+            owner = copy.deepcopy(transport)
+            owner['fabric']['source_address'] = host['rdma_address']
+            result['owner_transports'].append(owner)
+    return result
+
+
 def admit_fabrics(config, index, clients, root):
     import subprocess
-    requested = 'tidehunter_nvme_rdma' in config['spec']['backends']
-    evidence = {'provider': 'gcp', 'nvme_rdma_requested': requested}
-    if requested:
+    backends = set(config['spec']['backends'])
+    nvme_requested = 'tidehunter_nvme_rdma' in backends
+    valkey_requested = 'valkey_rdma' in backends
+    requested = nvme_requested or valkey_requested or bool(
+        backends & {'tidehunter_verbs', 'tidehunter_verbs_native'})
+    evidence = {'provider': 'gcp', 'nvme_rdma_requested': nvme_requested,
+                'valkey_rdma_requested': valkey_requested, 'rdma_requested': requested}
+    if nvme_requested:
         for module in ('nvme-rdma', 'nvmet-rdma'):
             subprocess.run(['modprobe', module], check=True, timeout=30)
+    if requested:
+        if valkey_requested:
+            subprocess.run(['modprobe', 'rdma_cm'], check=True, timeout=30)
+            if not Path('/dev/infiniband/rdma_cm').is_char_device():
+                raise RuntimeSafetyError('Valkey RDMA requires the RDMA-CM character device')
         links = subprocess.check_output(['rdma', 'link', 'show'], text=True, timeout=10)
         host = config['platform']['runtime']['fleet'][index + 1]
         interfaces = json.loads(subprocess.check_output(['ip', '-j', 'address', 'show'], text=True, timeout=10))
@@ -362,9 +402,9 @@ def admit_fabrics(config, index, clients, root):
 def bootstrap_controller(controller):
     import cloud_controller
     identity = verify_local_identity(controller.config, -1)
-    controller.guard(starting=True)
+    fleet = controller.guard(starting=True)
     controller.persist('startup.json', {'status': 'starting', 'identity': identity,
-                                         'config': controller.config})
+                                         'config': controller.config, 'fleet_observations': fleet})
     controller.package = cloud_controller.verify_package(controller.config)
     end = controller.clock() + min(600, controller.remaining())
     while controller.clock() < end:
@@ -379,6 +419,7 @@ def bootstrap_controller(controller):
     cloud_controller.dump(controller.root / 'bootstrap-proofs.json', proofs)
     controller.persist('startup.json', {'status': 'admitted', 'identity': identity,
                                         'config': controller.config, 'package': controller.package,
+                                        'fleet_observations': current,
                                         'bootstrap_proofs_sha256': cloud_controller.digest(controller.root / 'bootstrap-proofs.json')})
     controller.start_monitoring()
     controller.observe('access_receipt', lambda: cloud_controller.dump(
@@ -392,7 +433,7 @@ def bootstrap_guest(config, index, clients):
     import cloud_bootstrap
     import subprocess
     identity = verify_local_identity(config, index)
-    verify_fleet(config, clients)
+    fleet = verify_fleet(config, clients)
     package = cloud_package.verify_directory(Path(config['platform']['runtime']['package_root']), runtime=True, provider='gcp')
     if package['source_sha256'] != config['source_sha256'] or package['binary_sha256'] != config['binary_sha256']:
         raise RuntimeSafetyError('package identity differs from controller')
@@ -402,9 +443,11 @@ def bootstrap_guest(config, index, clients):
               for name, image in local.IMAGES.items()}
     fabrics = admit_fabrics(config, index, clients, Path(config['fleet']['data_root']))
     monitor_images = cloud_bootstrap.cache_monitor_images(config['repository_root'], 5 if index == -1 else index,
-        datetime.fromtimestamp(_deadline(config['deadline_utc']), timezone.utc))
+        datetime.fromtimestamp(_deadline(config['deadline_utc']), timezone.utc), pull=False)
+    if not monitor_images['complete']:
+        raise RuntimeSafetyError('prepared guest lacks cached monitoring images: ' + repr(monitor_images['gaps']))
     return {'identity': identity, 'package': package, 'images': images, 'fabric_admission': fabrics,
-            'snapshot': cloud_controller.snapshot(config), 'monitor_images': monitor_images}
+            'fleet_observations': fleet, 'snapshot': cloud_controller.snapshot(config), 'monitor_images': monitor_images}
 
 
 def _controller_config(runtime):
@@ -413,6 +456,9 @@ def _controller_config(runtime):
     package = runtime['package']
     if manifest['source_sha256'] != runtime['source_sha256'] or manifest['revision'] != package['source_revision']:
         raise RuntimeSafetyError('runtime manifest source mismatch')
+    required_features = set(runtime['spec']['backends']) & {'garnet', 'kvrocks'}
+    if not required_features <= set(manifest.get('features', [])):
+        raise RuntimeSafetyError('packaged binary lacks selected industry backend features')
     raw_hosts = runtime['fleet']
     def host(item):
         return {'instance_id': item['name'], 'numeric_id': str(item['id']), 'address': item['internal_ip'],
@@ -423,6 +469,8 @@ def _controller_config(runtime):
              'qualification_only': False, 'data_root': '/mnt/tidehunter-kv-comparison/' + runtime['run_id'],
              'region': region, 'instance_type': runtime['machine_type'], 'coordinator': host(raw_hosts[0]), 'nodes': nodes,
              'server_cpus': 8, 'client_cpus': 8, 'server_memory_mib': 16384, 'client_memory_mib': 16384}
+    if 'valkey_rdma' in runtime['spec']['backends']:
+        fleet['valkey_rdma_package'] = True
     extra = {'suite', 'sui_fixture', 'sui_verification', 'sui_transports'}
     spec = {k: v for k, v in runtime['spec'].items() if k not in extra}
     return {'fleet': fleet, 'bucket': runtime['bucket'], 'bucket_region': region, 'prefix': runtime['run_id'],
@@ -458,11 +506,13 @@ def execute_campaign(runtime_config, *, api=None):
     if suite in ('sui', 'both'):
         import gcp_sui
         root = Path('/mnt/tidehunter') / runtime['run_id'] / 'sui-results'
+        fleet = verify_fleet({'platform': {'runtime': runtime}}, {'platform': api})
         try:
             sui_config = {**runtime, 'deadline_utc': runtime['campaign_deadline_utc']}
             results['sui'] = gcp_sui.run_suite(sui_config, mailbox, runtime['package'], runtime['spec']['sui_fixture'], output_root=root)
         finally:
             if root.exists():
+                (root / 'fleet-observations.json').write_text(json.dumps(fleet, sort_keys=True, indent=2) + '\n')
                 archive = root.parent / 'sui-results.tar.gz'
                 with tarfile.open(archive, 'x:gz') as out:
                     for path in sorted(root.iterdir()):

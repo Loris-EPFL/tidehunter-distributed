@@ -89,6 +89,8 @@ def load_config(path, env=None, backend_selection=None, mode="standard"):
     if mode == "nvmeof-focused":
         supported.update(cloud_campaign.NVME_BACKENDS)
     spec['backends'] = select_backends(backend_selection, spec.get('backends'), supported)
+    if set(spec['backends']) & cloud_campaign.PORTABLE_BACKENDS:
+        raise ValueError("AWS EFA campaign does not qualify RDMA-CM/verbs comparison backends")
     if "tidehunter_nvme_rdma" in spec['backends']:
         raise ValueError("AWS CI does not qualify an NVMe/RDMA provider; EFA/SRD is not NVMe/RDMA")
     spec['mode'] = mode
