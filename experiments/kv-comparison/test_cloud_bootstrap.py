@@ -203,6 +203,19 @@ class MonitoringImageAdmissionTests(unittest.TestCase):
         self.assertFalse(receipt["complete"])
         self.assertEqual(receipt["gaps"], ["library/python: TimeoutError", "prom/node-exporter: TimeoutError"])
 
+    def test_private_guest_uses_cache_without_contacting_registry_and_reports_missing_images(self):
+        future = datetime.now(timezone.utc) + timedelta(hours=1)
+        cached = json.dumps([{"Id": "sha256:" + "a" * 64, "RepoDigests": []}])
+        for missing in (False, True):
+            observations = [cached, subprocess.CalledProcessError(1, ["docker", "image", "inspect"])] if missing else [cached, cached]
+            with self.subTest(missing=missing), \
+                    patch.object(bootstrap.subprocess, "run", side_effect=AssertionError("registry contacted")), \
+                    patch.object(bootstrap.subprocess, "check_output", side_effect=observations):
+                receipt = bootstrap.cache_monitor_images(HERE.parents[1], 0, future, pull=False)
+            self.assertEqual(receipt["complete"], not missing)
+            self.assertEqual(set(receipt["images"]), {"library/python"} if missing else {"library/python", "prom/node-exporter"})
+            self.assertEqual(receipt["gaps"], ["prom/node-exporter: CalledProcessError"] if missing else [])
+
 
 if __name__ == "__main__":
     unittest.main()

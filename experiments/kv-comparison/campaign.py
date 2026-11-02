@@ -163,7 +163,7 @@ def matrix(spec):
     bounded_int(spec.get("client_memory_mib", 2048), 256, 65536, "client_memory_mib")
     if spec.get("layout") not in ("qualification", "distributed"):
         raise ValueError("layout must explicitly name qualification or distributed")
-    supported = {"native", "rocksdb", "blobdb", "tikv", "cassandra", "foundationdb", "valkey_tcp"} | set(CASE_TRANSPORTS)
+    supported = {"native", "rocksdb", "blobdb", "tikv", "cassandra", "foundationdb", "valkey_tcp", "valkey_rdma", "garnet", "kvrocks"} | set(CASE_TRANSPORTS)
     backends, profiles, rates = spec.get("backends", []), spec.get("profiles", []), spec.get("rates", [])
     if (not isinstance(backends, list) or not backends or any(not isinstance(x, str) for x in backends)
             or set(backends) - supported or len(backends) != len(set(backends))):
@@ -231,9 +231,23 @@ def backend_options(kind, state, output, transport=None):
                 "required_replication_factor": nodes, "consistency": "quorum"}
     if kind == "foundationdb":
         return {"cluster_file": str(Path(state["directory"]) / "fdb.cluster"), "required_replication_factor": 1 if nodes == 1 else 2}
+    if kind in ("garnet", "kvrocks"):
+        if state and "backend_options" in state:
+            return copy.deepcopy(state["backend_options"])
+        import industry_service
+        return industry_service.options(kind, industry_service.local_endpoints())
+    if kind == "valkey_rdma":
+        if state and "backend_options" in state:
+            return copy.deepcopy(state["backend_options"])
+        import local_valkey_rdma
+        return local_valkey_rdma.options(nodes)
     if kind == "valkey_tcp":
         if state and "backend_options" in state:
             return copy.deepcopy(state["backend_options"])
+        if state and state.get("paired_valkey"):
+            import local_valkey_rdma
+            rdma = local_valkey_rdma.options(nodes)
+            return local_valkey_rdma.options_for_backend(kind, nodes, rdma["nodes"])
         return {"nodes": [f"127.0.0.{21+i}:{6379+i}" for i in range(nodes)],
                 "cluster": nodes > 1, "required_replication_factor": 1,
                 "required_primary_nodes": nodes, "request_timeout_ms": 5000}
@@ -369,7 +383,7 @@ def run_one(args, spec, base, job, index):
     run_dir.mkdir()
     state_dir = args.reuse_state.resolve() if args.reuse_state else run_dir / "server"
     state = None
-    external = job["backend"] in ("tikv", "cassandra", "foundationdb", "valkey_tcp")
+    external = job["backend"] in ("tikv", "cassandra", "foundationdb", "valkey_tcp", "valkey_rdma", "garnet", "kvrocks")
     receipt = {"job": job, "status": "starting", "started_at_unix": time.time(),
                "physical_hosts": 1, "shared_ssd": True, "cloud_billing_estimate": None,
                "claim_boundary": "API qualification only" if args.qualification else "local shared-SSD timing; no HA or independent-NVMe claim",
@@ -382,11 +396,16 @@ def run_one(args, spec, base, job, index):
                             "block_devices": local.command(["lsblk", "-J", "-o", "NAME,TYPE,SIZE,ROTA,MODEL,MOUNTPOINTS"])}}
     local.dump(run_dir / "receipt.json", receipt)
     try:
-        prospective = {"nodes": (1 if spec["layout"] == "qualification" else
-                                 5 if job["backend"] == "valkey_tcp" else 3),
-                       "directory": str(state_dir)} if external else None
+        prospective = {"nodes": (5 if job["backend"] in ("garnet", "kvrocks") else
+                                 1 if spec["layout"] == "qualification" else
+                                 5 if job["backend"] in ("valkey_tcp", "valkey_rdma") else 3),
+                       "directory": str(state_dir),
+                       "paired_valkey": job["backend"] == "valkey_tcp" and "valkey_rdma" in spec["backends"]} if external else None
         if args.reuse_state:
             prospective = local.load(state_dir)
+            if (job["backend"] == "valkey_tcp" and "valkey_rdma" in spec["backends"]
+                    and prospective.get("paired_valkey") is not True):
+                raise ValueError("paired Valkey comparison cannot reuse the ordinary TCP deployment")
         config = build_config(base, job, prospective, run_dir, spec["seed"], args.qualification,
                               args.transport_config if job["backend"] in CASE_TRANSPORTS else None)
         config["source_revision"] = local.command(["git", "rev-parse", "HEAD"]).strip()
@@ -416,7 +435,8 @@ def run_one(args, spec, base, job, index):
                 state = local.load(state_dir)
                 local.ready(state, 180)
             else:
-                local.start(argparse.Namespace(state=state_dir, backend=job["backend"], layout=spec["layout"], timeout=180))
+                local.start(argparse.Namespace(state=state_dir, backend=job["backend"], layout=spec["layout"], timeout=180,
+                                               paired_valkey=job["backend"] == "valkey_tcp" and "valkey_rdma" in spec["backends"]))
                 state = local.load(state_dir)
         receipt["status"] = "running"
         local.dump(run_dir / "receipt.json", receipt)
@@ -486,7 +506,7 @@ def main():
     if args.output.exists():
         raise ValueError("output must be fresh; refusing to overwrite provenance")
     spec = json.loads(args.manifest.read_text())
-    supported = {"native", "rocksdb", "blobdb", "tikv", "cassandra", "foundationdb", "valkey_tcp"} | set(CASE_TRANSPORTS)
+    supported = {"native", "rocksdb", "blobdb", "tikv", "cassandra", "foundationdb", "valkey_tcp", "valkey_rdma", "garnet", "kvrocks"} | set(CASE_TRANSPORTS)
     spec["backends"] = select_backends(args.backends, spec.get("backends"), supported)
     jobs = matrix(spec)
     if args.transport_config:

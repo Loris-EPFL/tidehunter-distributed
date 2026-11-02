@@ -3,8 +3,10 @@
 import argparse
 import csv
 import hashlib
+import ipaddress
 import json
 import math
+import re
 from pathlib import Path
 import sys
 
@@ -149,6 +151,185 @@ def verify_binding(run, config, receipt, manifest, summary):
         raise ValueError(f"{run}: read diagnostics integrity binding differs")
 
 
+def valkey_view(text, identities, self_id):
+    """Reduce a validated cluster view to advertised endpoint and slot ownership."""
+    owners, seen, own = {}, set(), []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 9:
+            raise ValueError("malformed Valkey cluster view")
+        node_id, address, flags, master, _, _, _, link, *ranges = fields
+        flags = set(flags.split(","))
+        endpoint, _, bus = address.split(",")[0].partition("@")
+        if (node_id not in identities or node_id in seen or
+                endpoint != identities[node_id] or not bus.isdigit() or
+                int(bus) != int(endpoint.rsplit(":", 1)[1]) + 10000 or
+                flags - {"myself", "master"} or "master" not in flags or
+                master != "-" or link != "connected"):
+            raise ValueError("invalid Valkey cluster membership")
+        seen.add(node_id)
+        if "myself" in flags:
+            own.append(node_id)
+        for token in ranges:
+            if not re.fullmatch(r"\d+(?:-\d+)?", token):
+                raise ValueError("invalid Valkey slot range")
+            parts = token.split("-")
+            start, end = int(parts[0]), int(parts[-1])
+            if not 0 <= start <= end < 16384:
+                raise ValueError("invalid Valkey slot range")
+            for slot in range(start, end + 1):
+                if slot in owners:
+                    raise ValueError("duplicate Valkey slot")
+                owners[slot] = identities[node_id]
+    if seen != set(identities) or own != [self_id] or len(owners) != 16384:
+        raise ValueError("incomplete Valkey cluster view")
+    return [owners[i] for i in range(16384)]
+
+
+def admit_native_valkey(run, deployment, backend, config):
+    """Admit the local native exporter, including its independently captured proof."""
+    import local_valkey_rdma
+
+    state = deployment["topology"]
+    owner = json.loads((run / "deployment/owner.json").read_text())
+    services = json.loads((run / "deployment/services.json").read_text())
+    observed = deployment["observed"]
+    count = state["nodes"]
+    if owner != state or state.get("paired_valkey") is not True or state["backend"] != backend["name"]:
+        raise ValueError("native Valkey owner/deployment mismatch")
+    controls, rdma = state["control_endpoints"], state["rdma_endpoints"]
+    cluster = state["layout"] != "qualification"
+    if (count != (5 if cluster else 1) or len(controls) != count or len(rdma) != count or
+            len(set(controls)) != count or len(set(rdma)) != count or
+            len(state["services"]) != count or len(services) != count):
+        raise ValueError("native Valkey inventory mismatch")
+    options = local_valkey_rdma.options_for_backend(state["backend"], count, rdma)
+    if (state["backend_options"] != options or
+            config["backend"].get("options") != options or
+            controls != [f"127.0.0.{21+i}:{6379+i}" for i in range(count)]):
+        raise ValueError("native Valkey client endpoint contract differs")
+    address = rdma[0].rsplit(":", 1)[0]
+    if (ipaddress.IPv4Address(address).is_loopback or
+            rdma != [f"{address}:{6380+i}" for i in range(count)]):
+        raise ValueError("native Valkey RDMA endpoints differ")
+    source = "fe8d406c0b5a64ec897f6455e4de684629883764"
+    client = backend["configuration"]
+    expected_transport = ("upstream libvalkey VALKEY_CONN_RDMA, RDMA-CM RC"
+                          if state["backend"] == "valkey_rdma" else "upstream libvalkey VALKEY_CONN_TCP")
+    if (observed.get("source_commit") != source or
+            observed.get("transport") != ("RDMA-CM RC" if state["backend"] == "valkey_rdma" else "TCP") or
+            client.get("source_commit") != source or client.get("transport") != expected_transport or
+            "bundled libvalkey 0.2.1" not in backend.get("client_version", "") or
+            backend.get("server_version") != "9.0.7"):
+        raise ValueError("native Valkey source or transport differs")
+    qualification = observed.get("rdma_qualification" if state["backend"] == "valkey_rdma" else "tcp_qualification", {})
+    if qualification != {"status": "passed", "endpoints": options["nodes"], "operations": ["PING", "SET", "GET", "DEL"]}:
+        raise ValueError("native Valkey client qualification missing")
+    runtime = observed.get("runtime")
+    if not isinstance(runtime, list) or len(runtime) != count:
+        raise ValueError("native Valkey readiness runtime missing")
+    roles = []
+    for i, (service, exported, ready) in enumerate(zip(state["services"], services, runtime)):
+        data = str(Path(state["directory"]) / f"node-{i}" / "data")
+        argv = local.valkey_server_args(f"127.0.0.{21+i}", 6379+i, 16379+i, cluster, 1024)
+        argv = [str(Path(state["runtime"]) / "bin/valkey-server") if x == "valkey-server"
+                else x.replace("/data", data) for x in argv]
+        argv += ["--rdma-bind", address, "--rdma-port", str(6380+i)]
+        expected = {"runtime": state["runtime"], "unit": f"kvcloud-valkey-{state['owner'][:20]}-{i}",
+                    "args": argv, "cpus": 2, "memory_mib": 1536, "source_commit": source,
+                    "server_sha256": service.get("server_sha256")}
+        digest = service.get("server_sha256")
+        if service != expected or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("native Valkey service contract differs")
+        if not isinstance(exported, list) or len(exported) != 1:
+            raise ValueError("native Valkey exported runtime missing")
+        for record in (ready, exported[0]):
+            systemd = record.get("systemd", {})
+            unit = service["unit"]
+            cgroup = "/system.slice/" + unit + ".service"
+            files = record.get("cgroup_files")
+            limits = record.get("proc_limits")
+            if not isinstance(files, dict) or not isinstance(limits, list):
+                raise ValueError("native Valkey raw resource proof missing")
+            cpu = files.get("cpu.max")
+            match = re.fullmatch(r"([0-9]+) ([0-9]+)", cpu) if isinstance(cpu, str) else None
+            if (files.get("memory.max") != str(service["memory_mib"] * 1024**2) or
+                    files.get("memory.swap.max") != "0" or not match or int(match[2]) <= 0 or
+                    int(match[1]) != service["cpus"] * int(match[2]) or
+                    not any(isinstance(line, str) and line.startswith("Max locked memory") and
+                            line.split()[3:5] == ["unlimited", "unlimited"] for line in limits)):
+                raise ValueError("native Valkey cgroup or memlock proof differs")
+            if (record.get("unit") != unit or record.get("cgroup") != cgroup or
+                    type(record.get("pid")) is not int or record["pid"] <= 0 or
+                    record.get("source") != source or record.get("server_sha256") != digest or
+                    systemd.get("LoadState") != "loaded" or systemd.get("ActiveState") != "active" or
+                    systemd.get("MainPID") != str(record["pid"]) or systemd.get("ControlGroup") != cgroup or
+                    systemd.get("MemoryMax") != str(service["memory_mib"] * 1024**2) or
+                    systemd.get("LimitMEMLOCK") not in ("infinity", "18446744073709551615") or
+                    systemd.get("CPUQuotaPerSecUSec") not in ("2s", "2000000us", "2000000") or
+                    "argv[]=" + " ".join(service["args"]) + " ;" not in systemd.get("ExecStart", "") or
+                    not record.get("argv")):
+                raise ValueError("native Valkey systemd runtime proof differs")
+        if ready["pid"] != exported[0]["pid"] or ready["systemd"]["CPUQuotaPerSecUSec"] != exported[0]["systemd"]["CPUQuotaPerSecUSec"]:
+            raise ValueError("native Valkey runtime changed")
+        roles.append({"server_sha256": digest, "cpu_quota_cpus": service["cpus"],
+                      "memory_max_bytes": service["memory_mib"] * 1024**2,
+                      "memory_swap_max_bytes": 0, "memlock": "unlimited"})
+    dirs = {endpoint: str(Path(state["directory"]) / f"node-{i}" / "data") for i, endpoint in enumerate(controls)}
+    try:
+        coverage = local.admit_valkey(observed["nodes"], controls, cluster, data_dir=dirs)
+        if coverage != observed["coverage"]:
+            raise ValueError("native Valkey recorded coverage differs")
+        core_settings = client["node_config"]
+        if len(core_settings) != count:
+            raise ValueError("native Valkey client settings missing")
+        persistence = client["persistence"]
+        if len(persistence) != count or any(
+                item.get("loading") != "0" or item.get("aof_enabled") != "1" or
+                item.get("aof_last_write_status") != "ok" or item.get("aof_last_bgrewrite_status") != "ok"
+                for item in persistence):
+            raise ValueError("native Valkey client persistence health differs")
+        keys = ("appendonly", "appendfsync", "no-appendfsync-on-rewrite", "maxmemory-policy")
+        for node, settings in zip(observed["nodes"], core_settings):
+            if any(settings.get(key) != node["effective_config"].get(key) for key in keys):
+                raise ValueError("native Valkey client durability settings differ")
+            cluster_file = node["effective_config"].get("cluster-config-file")
+            if cluster and cluster_file != str(Path(dirs[node["endpoint"]]) / "nodes.conf"):
+                raise ValueError("native Valkey cluster configuration path differs")
+        topology = backend["topology"]
+        ids = topology["node_ids"]
+        views = topology["cluster_nodes_views"]
+        if (topology["cluster"] is not cluster or topology["primary_count"] != count or
+                topology["slot_count"] != (16384 if cluster else None) or topology["endpoints"] != options["nodes"]):
+            raise ValueError("native Valkey backend topology differs")
+        expected_slots = None
+        if cluster:
+            if (len(ids) != count or len(set(ids)) != count or len(views) != count or
+                    ids != [coverage["primary_ids"][endpoint] for endpoint in controls]):
+                raise ValueError("native Valkey backend identity differs")
+            identities = dict(zip(ids, controls))
+            expected_slots = valkey_view(observed["nodes"][0]["cluster_nodes"], identities, ids[0])
+            for i, view in enumerate(views):
+                if valkey_view(view, identities, ids[i]) != expected_slots:
+                    raise ValueError("native Valkey backend ownership differs")
+        elif ids != [] or views != []:
+            raise ValueError("standalone Valkey cluster proof differs")
+    except (KeyError, TypeError, IndexError, RuntimeError) as exc:
+        raise ValueError(f"invalid native Valkey evidence: {exc}") from exc
+    # Slots map to advertised control endpoints; selected client endpoints are retained separately.
+    stable = {key: value for key, value in topology.items() if key not in ("node_ids", "cluster_nodes_views")}
+    stable["slot_owners"] = expected_slots
+    settings = []
+    for node in observed["nodes"]:
+        omitted = ("dir", "cluster-config-file") if cluster else ("dir",)
+        settings.append({key: value for key, value in node["effective_config"].items() if key not in omitted})
+    return ({"kind": "native_systemd", "layout": state["layout"], "nodes": count,
+             "physical_hosts": state["physical_hosts"], "independent_disks": state["independent_disks"],
+             "roles": roles, "source_commit": source,
+             "resource_evidence": "observed systemd, cgroup files and process limits"},
+            stable, settings)
+
+
 def stable_topology(name, original):
     topology = dict(original)
     for field in ("path", "process_id", "cluster_file", "cluster_name", "coordinator_process_id", "owner_process_evidence", "owner_processes"):
@@ -157,7 +338,7 @@ def stable_topology(name, original):
         topology["endpoints"] = sorted(
             ({"partition": item["partition"]} for item in topology["endpoints"]),
             key=lambda item: item["partition"])
-    if name == "valkey_tcp" and isinstance(topology.get("primaries"), list):
+    if name in ("valkey_tcp", "valkey_rdma", "garnet", "kvrocks") and isinstance(topology.get("primaries"), list):
         topology["primaries"] = sorted(
             ({key: value for key, value in item.items() if key != "node_id"}
              for item in topology["primaries"]), key=canonical)
@@ -191,12 +372,16 @@ def stable_configuration(original, name=None):
     if isinstance(config.get("loaded_native_library"), dict):
         config["loaded_native_library"] = {
             key: value for key, value in config["loaded_native_library"].items() if key != "path"}
-    if name == "valkey_tcp" and isinstance(config.get("persistence"), list):
+    if name in ("valkey_tcp", "valkey_rdma") and isinstance(config.get("persistence"), list):
         # Retain health/guarantee evidence, not changing AOF sizes, timestamps,
         # rewrite progress or counters. Original artifacts retain every field.
         fields = ("aof_enabled", "loading", "async_loading", "aof_last_write_status", "aof_last_bgrewrite_status")
         config["persistence"] = [{key: item[key] for key in fields if key in item}
                                  for item in config["persistence"]]
+    if name in ("garnet", "kvrocks"):
+        # Raw INFO snapshots include changing counters, sizes and timestamps;
+        # effective CONFIG and the storage policy remain part of the contract.
+        config.pop("node_info", None)
     return config
 
 
@@ -213,6 +398,75 @@ def host_capacity(meminfo):
         raise ValueError("missing host RAM/swap capacity evidence")
     return values
 
+
+
+def admit_industry_observation(kind, deployment, backend):
+    """Reconstruct RF1 slot and durable-setting proof from the raw observations."""
+    import industry_service
+
+    topology = deployment.get("topology", {})
+    observed = deployment.get("observed", {})
+    if (topology.get("nodes") != 5 or backend.get("name") != kind
+            or backend.get("replication_factor") != 1):
+        raise ValueError("industry deployment must have five actual RF1 primaries")
+    nodes = observed.get("nodes")
+    coverage = observed.get("coverage")
+    if not isinstance(nodes, list) or not isinstance(coverage, dict):
+        raise ValueError("missing industry primary/slot observations")
+    endpoints = coverage.get("primary_endpoints")
+    if not isinstance(endpoints, list) or len(endpoints) != 5 or len(set(endpoints)) != 5:
+        raise ValueError("missing industry primary endpoint inventory")
+    try:
+        reconstructed = industry_service.admit(kind, nodes, endpoints)
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise ValueError(f"invalid industry primary/slot/durability evidence: {exc}") from exc
+    if reconstructed != coverage:
+        raise ValueError("industry recorded coverage disagrees with raw observations")
+    core = backend.get("topology", {})
+    primaries = core.get("primaries")
+    if (core.get("cluster") is not True or core.get("primary_count") != 5
+            or core.get("slot_count") != 16384 or not isinstance(primaries, list)
+            or len(primaries) != 5):
+        raise ValueError("missing industry backend primary/slot observation")
+    try:
+        core_slots = {}
+        for primary in primaries:
+            endpoint = primary["address"]
+            if reconstructed["primary_ids"].get(endpoint) != primary["node_id"]:
+                raise ValueError("industry backend primary identities disagree with deployment")
+            for start, end in primary["slot_ranges"]:
+                if type(start) is not int or type(end) is not int or not 0 <= start <= end < 16384:
+                    raise ValueError("invalid industry backend slot range")
+                for slot in range(start, end + 1):
+                    if slot in core_slots:
+                        raise ValueError("duplicate industry backend slot")
+                    core_slots[slot] = endpoint
+        actual_slots = {}
+        for start, end, primary in nodes[0]["cluster_slots"]:
+            endpoint = f"{primary[0]}:{primary[1]}"
+            actual_slots.update((slot, endpoint) for slot in range(start, end + 1))
+        if core_slots != actual_slots:
+            raise ValueError("industry backend slot ownership disagrees with deployment")
+    except (KeyError, TypeError, IndexError) as exc:
+        raise ValueError("missing industry backend slot observations") from exc
+    return reconstructed
+
+
+def admit_industry_runtime(kind, deployment, containers):
+    import industry_service
+
+    runtime = deployment.get("observed", {}).get("runtime")
+    if not isinstance(runtime, list) or not isinstance(containers, list):
+        raise ValueError("missing actual industry launch and storage-tier proof")
+    try:
+        proof = industry_service.admit_local_runtime(kind, runtime, deployment["topology"])
+        observed = {(item["service"], item["id"], item["image_id"]) for item in runtime}
+        exported = {(item["service"], item["id"], item["image_id"]) for item in containers}
+        if len(observed) != 5 or observed != exported:
+            raise ValueError("industry launch receipt disagrees with exported containers")
+        return proof
+    except (KeyError, TypeError, RuntimeError) as exc:
+        raise ValueError(f"invalid industry launch and storage-tier proof: {exc}") from exc
 
 
 def boundary(run):
@@ -239,11 +493,11 @@ def boundary(run):
         raise ValueError(f"{run}: manifest lacks observed effective BackendInfo")
     deployment_path = run / "deployment/deployment.json"
     deployment = json.loads(deployment_path.read_text()) if deployment_path.exists() else None
-    if config["backend"]["kind"] in ("tikv", "cassandra", "foundationdb", "valkey_tcp"):
+    if config["backend"]["kind"] in ("tikv", "cassandra", "foundationdb", "valkey_tcp", "valkey_rdma", "garnet", "kvrocks"):
         if not deployment:
             raise ValueError(f"{run}: missing actual external deployment/replication proof")
         observed, nodes = deployment["observed"], deployment["topology"]["nodes"]
-        expected_rf = (1 if config["backend"]["kind"] == "valkey_tcp" else
+        expected_rf = (1 if config["backend"]["kind"] in ("valkey_tcp", "valkey_rdma", "garnet", "kvrocks") else
                        (1 if nodes == 1 else 2) if config["backend"]["kind"] == "foundationdb" else nodes)
         if backend["replication_factor"] != expected_rf:
             raise ValueError(f"{run}: observed backend RF does not match admitted deployment")
@@ -254,7 +508,7 @@ def boundary(run):
         elif config["backend"]["kind"] == "foundationdb":
             if not observed["cluster"].get("full_replication") or not observed["cluster"].get("database_available"):
                 raise ValueError(f"{run}: missing available/full-replication FoundationDB observation")
-        elif config["backend"]["kind"] == "valkey_tcp":
+        elif config["backend"]["kind"] in ("valkey_tcp", "valkey_rdma"):
             expected_primaries = 1 if deployment["topology"]["layout"] == "qualification" else 5
             coverage = observed.get("coverage", {})
             if (nodes != expected_primaries or coverage.get("required_primary_nodes") != nodes
@@ -263,6 +517,8 @@ def boundary(run):
                     or len(set(coverage.get("primary_endpoints", []))) != nodes
                     or coverage.get("slot_count") != (0 if nodes == 1 else 16384)):
                 raise ValueError(f"{run}: incomplete Valkey RF1 primary/slot ownership proof")
+        elif config["backend"]["kind"] in ("garnet", "kvrocks"):
+            admit_industry_observation(config["backend"]["kind"], deployment, backend)
         elif len(observed["nodes"]) != nodes:
             raise ValueError(f"{run}: incomplete Cassandra member observations")
     # Dynamic per-run namespaces/storage roots are not compared. Retain raw originals and
@@ -273,7 +529,17 @@ def boundary(run):
             key: value for key, value in json.loads((run.parent / "fdb-client.json").read_text()).items()
             if key != "path"}
     guarantee["effective_configuration"] = stable_configuration(backend["configuration"], backend["name"])
-    guarantee["observed_topology"] = stable_topology(backend["name"], backend["topology"])
+    native = (deployment and config["backend"]["kind"] in ("valkey_tcp", "valkey_rdma")
+              and deployment["topology"].get("paired_valkey") is True)
+    if native:
+        deployment_budget, stable_valkey, valkey_settings = admit_native_valkey(run, deployment, backend, config)
+        guarantee["observed_topology"] = stable_valkey
+        guarantee["deployment_effective_configuration"] = valkey_settings
+    else:
+        guarantee["observed_topology"] = stable_topology(backend["name"], backend["topology"])
+    if config["backend"]["kind"] in ("garnet", "kvrocks"):
+        guarantee["deployment_effective_configuration"] = sorted(
+            (node["effective_config"] for node in deployment["observed"]["nodes"]), key=canonical)
     hardware = receipt["hardware"]
     capacity = host_capacity(hardware["memory"])
     hardware = {key: hardware[key] for key in ("machine", "cpu", "kernel", "affinity", "block_devices")}
@@ -281,12 +547,15 @@ def boundary(run):
     first_cpu = dict(line.split(":", 1) for line in hardware["cpu"].split("\n\n", 1)[0].splitlines() if ":" in line)
     hardware["cpu"] = {key.strip(): value.strip() for key, value in first_cpu.items()
                        if key.strip() in ("vendor_id", "cpu family", "model", "model name", "stepping", "flags", "CPU implementer", "CPU architecture", "CPU part")}
-    deployment_budget = None
-    if deployment:
+    if not native:
+        deployment_budget = None
+    if deployment and not native:
         topology = deployment["topology"]
         compose = json.loads((run / "deployment/compose.json").read_text())
         actual = json.loads((run / "deployment/containers.json").read_text())
         resolved_images = {item["requested"]: item["image_id"] for item in json.loads((run / "deployment/images.json").read_text())}
+        if config["backend"]["kind"] in ("garnet", "kvrocks"):
+            admit_industry_runtime(config["backend"]["kind"], deployment, actual)
         if {item["service"] for item in actual} != set(compose["services"]):
             raise ValueError(f"{run}: actual role/container inventory differs from deployment")
         for item in actual:

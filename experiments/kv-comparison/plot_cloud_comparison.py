@@ -16,21 +16,28 @@ from pathlib import Path
 import statistics
 import textwrap
 
+from cloud_campaign import BACKENDS
+
 
 # One style per backend, including when only a subset is present in a cohort.
 STYLES = {
     "native": ("Native", "#333333", "o", "-"),
     "tidehunter_tcp": ("TH TCP", "#0072B2", "s", "-"),
     "tidehunter_nvme_tcp": ("TH NVMe/TCP", "#E69F00", "X", "-"),
+    "tidehunter_nvme_rdma": ("TH NVMe/RDMA", "#009E73", "D", ":"),
     "tidehunter_efa": ("TH EFA", "#56B4E9", "^", "--"),
     "tidehunter_efa_direct": ("TH EFA direct", "#009E73", "D", "-.") ,
     "tidehunter_efa_native": ("TH EFA native", "#D55E00", "v", "-"),
+    "tidehunter_verbs": ("TH verbs TLS", "#5E3C99", "<", "--"),
+    "tidehunter_verbs_native": ("TH verbs native", "#B35806", ">", "-."),
     "tikv": ("TiKV", "#CC79A7", "P", "--"),
     "cassandra": ("Cassandra", "#8C6500", "X", ":"),
     "foundationdb": ("FoundationDB", "#7854A3", "h", "-."),
     "valkey_tcp": ("Valkey TCP", "#C23B83", "*", "--"),
+    "valkey_rdma": ("Valkey RDMA", "#008B8B", "P", ":"),
+    "garnet": ("Garnet", "#6F4E7C", "H", "--"),
+    "kvrocks": ("Kvrocks", "#4C956C", "d", "-."),
 }
-BACKENDS = tuple(name for name in STYLES if name != "tidehunter_nvme_tcp")
 PLANNABLE_BACKENDS = tuple(STYLES)
 OBSERVED_NAMES = {"tikv": "tikv_raw", "cassandra": "cassandra_cql_vendor_unverified"}
 TH = tuple(name for name in BACKENDS if name.startswith("tidehunter_"))
@@ -38,11 +45,15 @@ SIZES = (64, 256, 1024, 8192, 65536)
 TIMINGS = ("api_ns", "response_ns", "scheduling_ns")
 GOODPUT = ("success_calls_per_second", "success_logical_keys_per_second",
            "success_value_mib_per_second")
+# Storage semantics: https://github.com/microsoft/garnet/blob/v2.2.5/website/docs/getting-started/configuration.md
+# and https://github.com/apache/kvrocks/blob/v2.17.0/kvrocks.conf
 BASE_CAPTION = (
     "No pooled quantiles or confidence/significance claims. Successful latency is conditional on operation/outcome. "
     "RF1 does not equalize consistency, durability, security, or transaction semantics. "
     "Primary RF1 only: native uses value_wal_barrier and TH explicit caches are off; other cohorts use their stated settings. "
     "Valkey GET remains RAM-resident, including cold OS; appendfsync always acknowledges AOF writes, not value-WAL reads. "
+    "Garnet's SSD hybrid log is distinct from its AOF; Kvrocks uses RocksDB WAL and SST files with compaction. "
+    "Engine and OS caches and background work can affect reads and writes; no per-API disk incidence is implied. "
     "Warm OS is not guaranteed cache residency. Tail quantiles are descriptive, including small populations."
 )
 
@@ -345,6 +356,7 @@ def goodput_panels():
 
 def figure_specs(backends=BACKENDS, cohorts=()):
     specs = []
+    tidehunter_backends = tuple(name for name in backends if name.startswith("tidehunter_"))
 
     def add(name, title, series, panels, columns, caption, xkind="size", xticks=None):
         if not series:
@@ -417,8 +429,8 @@ def figure_specs(backends=BACKENDS, cohorts=()):
     cache_series, cache_panels = [], []
     # Separate panels, not a pooled cache-mode curve or an unmatched c16 baseline.
     for cohort, profile, cache_backends, label in (
-            ("coordinator_cache_configured", "coordinator-cache", TH, "Coordinator cache"),
-            ("owner_cache_configured", "owner-cache", TH, "Owner cache"),
+            ("coordinator_cache_configured", "coordinator-cache", tidehunter_backends, "Coordinator cache"),
+            ("owner_cache_configured", "owner-cache", tidehunter_backends, "Owner cache"),
             ("registered_ram_configured", "registered-ram", ("tidehunter_efa_native",), "Registered RAM")):
         if cohort != "coordinator_cache_configured" and cohort not in cohorts:
             continue
@@ -444,7 +456,7 @@ def figure_specs(backends=BACKENDS, cohorts=()):
         modes = [{"label": STYLES[backend][0], "backend": backend,
                   "cells": [(backend, cohort, profile, size) for cohort in
                             ("read_stage_diagnostics", "resident_first_stage_diagnostics")],
-                  "x": [0, 1]} for backend in TH if backend in backends]
+                  "x": [0, 1]} for backend in tidehunter_backends]
         add("read-modes-" + profile, "Historical: " + label + " — matched sampled read modes, c16", modes,
             [panel("API p50", "api_ns", operation, "p50"),
              panel("API p99", "api_ns", operation)] + goodput_panels(), 3,

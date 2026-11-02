@@ -4,7 +4,7 @@
 `cloud_layout.py` interface below prepares external servers on admitted physical
 hosts; it does not launch AWS resources or orchestrate a network deployment.
 The application boundary is the `kv-research` Rust binary and its real native/TCP, RocksDB/BlobDB,
-TiKV RawKV, Cassandra CQL, FoundationDB and Valkey Cluster TCP adapters. The common contract and native
+TiKV RawKV, Cassandra CQL, FoundationDB, Valkey Cluster TCP/RDMA, Garnet and Apache Kvrocks adapters. The common contract and native
 WAL restrictions are in [the comparison protocol](../../docs/distributed/KV_COMPARISON_PROTOCOL.md).
 Transport selection is explicit and provider-neutral. Tidehunter runtime kind
 is `tidehunter`; `Transport` defaults to TCP or accepts structured OFI
@@ -83,6 +83,10 @@ non-prerelease; 8.0.0/7.4.x were marked prerelease when selected, and
 security release for the TCP integration. Upgrade pins and clients together, then
 rerun qualification; never silently substitute another image.
 
+Garnet 2.2.5 and Apache Kvrocks 2.17.0 are also pinned by immutable image digest.
+Their current configuration, qualification evidence and comparison boundaries
+are in [the industry comparator section](#garnet-and-kvrocks-industry-comparisons).
+
 | Role | Distributed count | Hard per-process/container CPU / RAM cap | Effective policy |
 |---|---:|---|---|
 | TiKV PD controller | 1 | 1 CPU / 512 MiB | single PD controller, no PD HA claim |
@@ -90,6 +94,8 @@ rerun qualification; never silently substitute another image.
 | Cassandra storage+coordinator | 3 | 2 CPU / 1536 MiB | SimpleStrategy RF3, durable_writes=true, dc1, distinct logical racks; 512 MiB JVM heap, 256 MiB direct-memory cap and two GC/application processors |
 | FDB combined roles | 3 | 1 CPU / 768 MiB | double redundancy (RF2), three coordinators/zones; SSD engine; 512 MiB server memory and 128 MiB cache; actual recruited roles retained |
 | Valkey Cluster TCP primaries | 5 | 2 CPU / 1536 MiB | RF1, no replicas; 1024 MiB maxmemory per primary, noeviction; AOF appendfsync=always, no-appendfsync-on-rewrite=no; RAM-resident GET |
+| Garnet primaries | 5 | 2 CPU / 1536 MiB | RF1; SSD hybrid log, bounded read cache, AOF commit frequency 0 and commit-wait; recovery and background maintenance enabled |
+| Apache Kvrocks primaries | 5 | 2 CPU / 1536 MiB | RF1; RocksDB WAL enabled, synchronous writes; bounded block caches and memtables; automatic compaction enabled |
 | Rust workload/client (including native/TCP coordinator and owner descendants) | 1 owned process group | 2-CPU inherited affinity / 2048 MiB aggregate sampled RSS budget | independent wall deadline; per-process RSS/CPU sampled every 250 ms, **not** a hard memory cgroup |
 | Monitoring | campaign collector cohosted on controller; separate local mode optional | see [monitoring guide](observability/README.md) for hard caps | explicit observer placement; not off-host or proven overhead-neutral |
 
@@ -110,11 +116,13 @@ software/hardware performance result. See the
 [pinned source and local evidence](../../tidehunter-fabric/DESIGN.md#local-qualification-27-october-2026).
 
 TiKV total hard server caps: 7 CPU / 5 GiB; Cassandra: 6 CPU / 4.5 GiB;
-FDB: 3 CPU / 2.25 GiB; Valkey: 10 CPU / 7.5 GiB.
+FDB: 3 CPU / 2.25 GiB; Valkey, Garnet or Kvrocks: 10 CPU / 7.5 GiB each.
 Add client and optional monitoring, the Docker daemon,
 OS/page cache and image storage; CPU quotas are maxima, not dedicated reservations.
-External qualification uses one data node with the same per-role caps; Tidehunter/TCP
-still starts its five owned processes. Only one backend stack runs at a time.
+External qualification uses one data node with the same per-role caps, except
+Garnet and Kvrocks always exercise five actual primaries, even in qualification
+layout. Tidehunter/TCP still starts its five owned processes. Only one backend
+stack runs at a time.
 Tiny API data are appropriate for hosted CI, not saturation.
 The larger default working set is 65,536 keys, not a claim that it exceeds RAM.
 For a genuine memory-pressure profile explicitly increase keys within all admitted
@@ -461,7 +469,7 @@ match its provider/security; it changes only host-local selectors, not the
 case identity, report label, or transport cohort.
 
 
-### Valkey TCP and the separate future InfiniBand path
+### Valkey TCP and matched RDMA controls
 
 `valkey_tcp` is a real five-primary Valkey Cluster comparator in `distributed`
 layouts, not a standalone server relabeled distributed. The maintained
@@ -494,18 +502,53 @@ is not disabled. A memory-capacity failure under `noeviction` is a real failure,
 not a reason to silently evict or change persistence. Do not claim equivalent
 durability/security to other cohorts from common API shapes alone.
 
-[`../valkey-infiniband`](../valkey-infiniband/README.md) contains only independent
-offline planning, preflight and bounded functional qualification against an
-operator-supplied future InfiniBand endpoint. It is excluded from active
-manifests, package source bundles and CI backend choices. There is no Valkey
-RDMA suite backend, EFA substitution or TCP fallback. Hardware qualification and
-a matched TCP/RDMA comparison must precede any future suite integration.
+[`../valkey-infiniband`](../valkey-infiniband/README.md) provides independent
+InfiniBand-only qualification; it does not qualify Falcon or other generic RC
+fabrics. `prepare_valkey_rdma.py --output <new-directory>` builds the pinned
+upstream server and CLI with `BUILD_RDMA=yes USE_SYSTEMD=no`, then separately
+rebuilds bundled libvalkey with `USE_RDMA=1 static`. The services use systemd's
+`exec` protocol, not optional `sd_notify` integration. Pass that checkout as `--valkey-source` to
+both `cloud_package.py build` and `stage` to include the optional Rust feature
+and the same source-built server and CLI in the sealed runtime. The build needs
+RDMA-CM and verbs development libraries; execution also needs the compatible
+runtime libraries, provider, devices and an actual qualified RC fabric.
+Neither packaging nor a provider name proves GCP Falcon compatibility.
+
+`qualify_valkey_tcp.py` starts five owned, packaged Valkey primaries on local
+loopback addresses, initializes and admits the real cluster, and runs the paired
+libvalkey TCP adapter's functional qualification and short workload. Its
+`--standalone` option runs one primary instead. This is local TCP functionality
+evidence, not an RDMA fabric qualification or a performance comparison.
+
+With `fleet.valkey_rdma_package=true`, the cloud lifecycle uses the packaged
+server for both Valkey arms, a separate owned systemd service per primary and
+five explicit `rdma_address` values. The paired TCP arm uses the same libvalkey
+client pool as RDMA; ordinary TCP-only campaigns retain their existing image and
+client. Cluster initialization and bus traffic use control TCP; RDMA admission
+uses the RDMA listener for configuration, topology and functional SET/GET/DEL.
+EFA is not a substitute and there is no TCP fallback. Package admission and
+software tests do not establish compatibility with any specific NIC: a real
+five-primary preflight on the target fabric is required before measurement.
+
+The local `valkey_rdma` selection requires `VALKEY_RDMA_RUNTIME` to point to
+the sealed package's `runtime` directory and `VALKEY_RDMA_ADDRESS` to a
+non-loopback IPv4 address already configured on the intended RDMA fabric.
+It starts one primary for qualification or five local primaries on distinct
+RDMA ports for the distributed layout, using owned systemd services. These
+share one host and storage; they do not establish multi-host performance.
+RDMA PING and per-primary SET/GET/DEL must succeed before workload execution.
+When a local campaign selects both Valkey backends, its TCP arm uses the same
+packaged server and bounded libvalkey client as the RDMA arm. A TCP-only
+campaign retains the existing Docker image and redis-rs client.
+Both the local and cloud paths require an actual RC-capable device and system
+RDMA-CM/verbs libraries; EFA and loopback TCP are not substitutes.
 
 
 The default primary matrix includes `tidehunter_tcp`, TiKV, Cassandra,
-FoundationDB and Valkey Cluster TCP. Optional embedded controls stay in a **separate** copied manifest
-and output directory: set `backends` to `["native","rocksdb","blobdb"]` and
-`max_runs` to 135 for the same three-profile/three-rate/five-repeat design. Their
+FoundationDB, Valkey Cluster TCP, Garnet and Apache Kvrocks. Development manifests
+use one independent repetition. Optional embedded controls stay in a **separate**
+copied manifest and output directory: set `backends` to `["native","rocksdb","blobdb"]`
+and `max_runs` to 27 for the same three-profile/three-rate/one-repeat design. Their
 one-process API boundaries and acknowledgement policies are an embedded control
 tier, never a pretend distributed deployment.
 
@@ -782,14 +825,14 @@ override for the original `sui-transport` suite. It does not run both campaigns.
 Its KV compiler job is credential-free, `contents: read` only, and never checks
 out Sui or downloads a checkpoint fixture. The pinned Rust toolchain, locked
 Cargo sources, checksum-pinned libfabric 2.6.0 and digest/hash-pinned FDB client
-feed the maintained `cloud_package` release build. All five features
-`tikv,cassandra,foundationdb,fabric,valkey-tcp` remain mandatory.
+feed the maintained `cloud_package` release build. Its mandatory features include
+`tikv,cassandra,foundationdb,valkey-tcp,garnet,kvrocks,fabric,nvmeof,test-utils`.
 
 The protected cloud workflow accepts a `backends` comma-separated
 `workflow_dispatch` override. Blank leaves the tracked
 `experiments/kv-comparison/cloud-campaign.json` backend list in effect;
-push/default runs therefore retain all nine backend/transport IDs and the
-existing 258 one-repetition cells. A nonempty value selects an explicit
+push/default runs therefore select eleven backend/transport IDs and 310
+one-repetition cases. A nonempty value selects an explicit
 supported subset (for example `tidehunter_tcp,tidehunter_efa`); invalid,
 duplicate, or empty elements are rejected before cloud resource allocation.
 The selected IDs and expanded jobs are frozen into campaign artifacts.
@@ -1011,19 +1054,16 @@ covered without the native dependency.
 
 ## Development repetition policy
 
-Future development campaigns use **one independent repetition**, not fewer
-measurements within each case. All nine backend/transport variants retain
-**253 unprofiled cases**. The default adds five labelled write diagnostics,
-seventeen existing read diagnostics, twenty resident-first read diagnostics,
-and two full-working-set registered-read controls: **297 cases**. These are
-separate controls, not extra independent repetitions or replacements for
-primary results. Both diagnostic limits zero retain 253 cases; write-only
-diagnostics retain the historical 258-case layout. Three repetitions give
-891, 759 and 774 cases, respectively; `max_cases=900` admits that explicit
-publication/reproducibility setting. Multiple repetitions do not by themselves
-justify confidence or significance claims.
+Development campaigns use **one independent repetition**, not fewer measurements
+within each case. The eleven selected AWS backend/transport variants receive
+293 ordinary cases. The default adds five write diagnostics and twelve read
+diagnostics, for 310 cases. Both diagnostic limits zero retain 293 cases;
+write-only diagnostics retain 298. Three repetitions give 930, 879 and 894 cases,
+respectively; `max_cases=1200` admits an explicit publication/reproducibility
+setting. Multiple repetitions do not by themselves justify confidence or
+significance claims.
 
-The one-repetition default leaves all nine backends/transports, five sizes,
+The one-repetition default preserves the selected systems, five sizes,
 workloads, concurrency and offered-load levels, cache/registered-RAM/cold-storage
 cohorts, preload, warm-up, correctness checks and per-case operation/sample counts
 unchanged. The 10,800-second hard deadline and 600-second export reserve also stay
@@ -1118,6 +1158,10 @@ python3 experiments/kv-comparison/cloud_campaign.py plan \
   --backends native,tidehunter_tcp,tidehunter_efa,tidehunter_efa_direct,tidehunter_efa_native \
   --output /tmp/tidehunter-read-tier-matrix.json
 ```
+The following focused-mode counts and registered-owner-cache variants are
+historical configurations, not the current branch's generated plan. Use
+`cloud_campaign.py plan` with the selected mode/backends for current case counts.
+
 For a shorter one-repetition campaign use `--mode read-tier-focused` (and
 `kv_mode=read-tier-focused` in the workflow). With all nine tracked backends it
 selects 196 cases with the committed 256-sample write diagnostics enabled; with
@@ -1287,7 +1331,7 @@ The manual cloud path is separate from the existing local/CI campaign:
 
 | File | Responsibility |
 |---|---|
-| `cloud-campaign.json` | One development repetition, five value sizes, nine backends: 253 ordinary plus five diagnostic cases by default. Three repetitions give 774 cases, or 759 with diagnostics disabled. The 10,800-second absolute bound and 600-second export reserve are unchanged. |
+| `cloud-campaign.json` | One development repetition, five value sizes, eleven backends: 293 ordinary, five write diagnostics and twelve read diagnostics, totaling 310 cases. Three repetitions give 930 cases; the 1200-case admission cap allows them without changing the 10,800-second absolute bound or 600-second export reserve. |
 | `cloud_campaign.py` | Identical common profile order per repetition, typed configurations and JSON/CSV/Markdown raw-sample reports. |
 | `cloud_package.py` | Dirty-source snapshot, frozen generic-x86 release build, exact hashes and immutable runtime archive. |
 | `cloud_bootstrap.py` | Creation-only termination timer before installation, pinned EFA/runtime admission, ready markers and automatic controller startup. |
@@ -1676,4 +1720,91 @@ use synthetic fixture values, not measured Valkey performance. Single-repetition
 labels and the absence of between-run error bars remain unchanged. Evidence is
 under `checkpoint-work/portable-cloud-launch-20261027/plot-subset-check-193245Z/`.
 
+
+## Garnet and Kvrocks industry comparisons
+
+These are actual five-primary TCP deployments, not standalone stores labelled
+distributed. `garnet` and `kvrocks` are selectable in local campaigns, the AWS
+comparison workflow and the GCP workflow. Each receives the same 25 standard
+cases as the other external stores: five value sizes, point mixes, concurrent
+reads/writes, MGET32, offered-load sweeps, Zipf reads and the large cold-OS case.
+The default AWS plan now has 310 cases and the default standard GCP plan 273.
+Existing explicit subsets and historical raw results are not rewritten.
+
+| Store | Pinned image | Observed runtime version |
+|---|---|---|
+| Garnet | `ghcr.io/microsoft/garnet:2.2.5@sha256:ef84a729cc054b048d8ed17113475890dc6389a8ea8725c34771efe785841137` | `2.2.5` |
+| Kvrocks | `apache/kvrocks:2.17.0@sha256:a1e99b3653fb900d5a17b80a9487f74079edc6d5e9b70e3103c01cbfc0d5146a` | `2.17.0` |
+
+Kvrocks's image metadata carries `v2.17.0-rc2`; its pinned source revision
+`185d4221df20af8ed3416e4dec4de8917312a2e9` matches the upstream release tag.
+The actual executable reported `2.17.0` on every qualified primary. Garnet's
+source revision is `8d007138208ce030eb10a50c80e636b1678b83e4`.
+
+Both use the existing redis-rs 1.8.0 async cluster client. Full binary GET, SET,
+DEL and missing reads share the existing oracle. Ordered get-many uses native
+MGET through the client's cross-slot splitter and response combiner, with one
+overall request deadline. Cross-slot atomic PUT-batch is unsupported and rejected,
+not emulated by independent SETs.
+
+Garnet enables hybrid-log SSD tiering and a bounded read cache, plus a separate
+AOF with commit frequency zero and commit-wait. CONFIG proves the AOF controls;
+the live owned image, argv and writable storage receipt prove the tier setting,
+which its CONFIG interface does not expose. Recovery fails on recovery errors.
+Lookup compaction runs every 300 seconds and checkpoints every 600 seconds.
+Kvrocks uses the RocksDB WAL with `write_options.sync=yes`, bounded caches and
+memtables, and automatic compaction. These are recorded acknowledgment contracts,
+not a claim that every store has identical power-failure or transaction semantics.
+
+Implementation map:
+
+- `benchmarks/kv-research/src/backends/industry.rs`: store-specific admission and
+  the shared TCP data path; features `garnet` and `kvrocks` add no Rust dependency.
+- `industry_service.py`, `local.py`, `cloud_layout.py`: pinned commands, five-node
+  slot bootstrap, exact-owned lifecycle, effective settings and runtime receipts.
+- `campaign.py`, `cloud_campaign.py`, `cloud_package.py`, `ci_prepare.py`:
+  workload selection, current-source builds, package closure and CI admission.
+- `analyze.py`, `research_report.py`, `plot_cloud_comparison.py`: evidence
+  validation, separate storage/guarantee labels and figures.
+- `observability/campaign_{monitor,exporter}.py`: explicit owner INFO targets,
+  pinned engine counters and existing per-process/device metrics. INFO collection
+  has a 750-ms aggregate deadline and 150-ms per-response deadline, below the
+  two-second host scrape timeout. Missing fields remain unavailable.
+
+Build and exercise the local CI API path:
+
+```bash
+cargo build --locked -p kv-research --features garnet,kvrocks,valkey-tcp
+python3 experiments/kv-comparison/campaign.py \
+  --manifest experiments/kv-comparison/ci.json --backends garnet,kvrocks \
+  --binary target/debug/kv-research --qualification \
+  --output /tmp/industry-kv-api-new
+```
+
+For a five-repetition local publication copy, set `repeats=5` and `max_runs=315`.
+The tracked local development manifest uses one repetition and 63 cases; neither
+setting changes measurements within a case.
+
+Local evidence is under `checkpoint-work/industry-comparators-20261102/`.
+Both five-primary clusters passed API qualification and mixed workloads at
+64 B, 256 B, 1 KiB, 8 KiB and 64 KiB, with no wrong values or unknown mutations.
+Both survived SIGKILL of all five primaries and recovered all 64 seeded 1-KiB
+values before further reads. The integrated campaign and offline reconstruction
+also passed for each store. Live INFO capture returned all five requested
+sections per owner; Kvrocks HTTP/cgroup exposition passed `promtool check metrics`.
+All task-owned database containers, volumes and the temporary collector were
+removed after evidence export.
+
+These runs qualify functionality on one shared laptop SSD. They do not establish
+cloud performance, cold-device latency, HA, power-loss safety or superiority over
+another store. OS cache eviction does not clear engine caches. Compare actual
+device I/O, CPU, memory, network bytes, latency tails and maintenance activity;
+do not infer RAM/SSD hits from key-existence counters. Real Sui checkpoint replay
+still applies only to native and distributed Tidehunter, not these adapters.
+
+Primary sources: [Garnet configuration](https://microsoft.github.io/garnet/docs/getting-started/configuration),
+[Garnet cluster](https://microsoft.github.io/garnet/docs/cluster/overview),
+[Garnet pinned source](https://github.com/microsoft/garnet/tree/v2.2.5),
+[Kvrocks pinned configuration](https://github.com/apache/kvrocks/blob/v2.17.0/kvrocks.conf)
+and [Kvrocks cluster](https://kvrocks.apache.org/docs/cluster).
 

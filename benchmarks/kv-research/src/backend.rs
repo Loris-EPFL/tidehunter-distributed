@@ -35,7 +35,12 @@ pub(crate) fn native_error(
 #[derive(Debug)]
 pub(crate) struct BackendTransportError(Box<dyn std::error::Error + Send + Sync>);
 
-#[cfg(feature = "valkey-tcp")]
+#[cfg(any(
+    feature = "valkey-tcp",
+    feature = "valkey-rdma",
+    feature = "garnet",
+    feature = "kvrocks"
+))]
 impl BackendTransportError {
     pub(crate) fn new(error: Box<dyn std::error::Error + Send + Sync>) -> Self {
         Self(error)

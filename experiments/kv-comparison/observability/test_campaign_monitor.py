@@ -126,6 +126,23 @@ class CampaignMonitorBoundaries(unittest.TestCase):
         answer = monitor.select_host(self.spec, -1, self.job, [process])
         self.assertTrue(answer['complete'])
 
+    def test_industry_info_targets_require_selected_owned_node_role(self):
+        self.spec['hosts'] = [{'index': index, 'role': 'coordinator' if index == -1 else f'storage-{index}',
+                               'address': f'127.0.0.{index + 2}'} for index in range(-1, 5)]
+        state, _ = monitor.state_for(self.spec, create=True)
+        (state / 'host-0').mkdir()
+        for engine in ('garnet', 'kvrocks'):
+            job = self.job | {'backend': engine}
+            process = {'role': engine + '0', 'cgroup': '/system.slice/exact-owned.service'}
+            monitor.select_host(self.spec, 0, job, [process])
+            selected = monitor.load_json(state / 'host-0/selection.json')
+            self.assertEqual(selected['info'], {'engine': engine, 'address': '127.0.0.2', 'port': 6379})
+            monitor.select_host(self.spec, 0, job, [])
+            self.assertNotIn('info', monitor.load_json(state / 'host-0/selection.json'))
+        monitor.select_host(self.spec, 0, self.job | {'backend': 'valkey_rdma'},
+                            [{'role': 'valkey0', 'cgroup': '/system.slice/exact-owned.service'}])
+        self.assertNotIn('info', monitor.load_json(state / 'host-0/selection.json'))
+
     def test_terminal_barrier_requires_fresh_scrape_and_explicit_status(self):
         state, _, result = self.initialize_selection()
         monitor.select_case(self.spec, self.job, result)

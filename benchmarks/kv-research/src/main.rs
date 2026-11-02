@@ -71,7 +71,7 @@ fn entry() -> BackendResult<()> {
                 println!(
                     "Usage: kv-research --config FILE --output FRESH_DIR [--validate-config]\n\
                     External owner prep: kv-research --prepare-external-case INPUT.json --output FRESH_DIR\n\
-                    Backends: native, tidehunter (structured TCP/OFI transport), valkey_tcp (plain TCP, feature valkey-tcp), rocksdb, tikv, cassandra, foundationdb.\n\
+                    Backends: native, tidehunter (structured TCP/OFI transport), valkey_tcp (feature valkey-tcp), valkey_rdma (feature valkey-rdma), garnet, kvrocks, rocksdb, tikv, cassandra, foundationdb.\n\
                     OFI requires the fabric feature and never falls back to TCP."
                 );
                 return Ok(());
@@ -107,9 +107,51 @@ fn entry() -> BackendResult<()> {
             }
             #[cfg(feature = "valkey-tcp")]
             "valkey_tcp" => {
+                #[cfg(feature = "valkey-rdma")]
+                if config
+                    .backend
+                    .options
+                    .get("client")
+                    .and_then(|v| v.as_str())
+                    == Some("libvalkey")
+                {
+                    let backend = backends::valkey_rdma::ValkeyRdmaBackend::open_tcp(
+                        &config.backend.options,
+                        &registry,
+                    )
+                    .await?;
+                    return runner::run(backend, config, &output, registry).await;
+                }
                 let backend = backends::valkey_tcp::ValkeyTcpBackend::open(
                     &config.backend.options,
                     &registry,
+                )
+                .await?;
+                runner::run(backend, config, &output, registry).await
+            }
+            #[cfg(feature = "valkey-rdma")]
+            "valkey_rdma" => {
+                let backend = backends::valkey_rdma::ValkeyRdmaBackend::open(
+                    &config.backend.options,
+                    &registry,
+                )
+                .await?;
+                runner::run(backend, config, &output, registry).await
+            }
+            #[cfg(feature = "garnet")]
+            "garnet" => {
+                let backend = backends::industry::IndustryBackend::open(
+                    &config.backend.options,
+                    backends::industry::Store::Garnet,
+                )
+                .await?;
+                runner::run(backend, config, &output, registry).await
+            }
+            #[cfg(feature = "kvrocks")]
+            "kvrocks" => {
+                let backend = backends::industry::IndustryBackend::open(
+                    &config.backend.options,
+                    backends::industry::Store::Kvrocks,
                 )
                 .await?;
                 runner::run(backend, config, &output, registry).await

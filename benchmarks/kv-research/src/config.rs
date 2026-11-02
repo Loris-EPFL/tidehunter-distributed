@@ -286,8 +286,12 @@ impl RunConfig {
         if self.backend.kind.trim().is_empty() {
             return invalid("backend.kind must not be empty");
         }
-        if self.backend.kind == "valkey_tcp" && self.workload.mix.put_batch > 0 {
-            return invalid("valkey_tcp does not support atomic put_batch");
+        if matches!(
+            self.backend.kind.as_str(),
+            "valkey_tcp" | "valkey_rdma" | "garnet" | "kvrocks"
+        ) && self.workload.mix.put_batch > 0
+        {
+            return invalid("selected backend does not support atomic put_batch");
         }
         if self.dataset.keys == 0 || self.dataset.keys > self.limits.max_keys {
             return invalid("dataset.keys must be positive and within limits.max_keys");

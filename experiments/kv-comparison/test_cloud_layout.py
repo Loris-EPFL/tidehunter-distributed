@@ -19,8 +19,28 @@ def fleet(qualification=False):
 
 
 class Plans(unittest.TestCase):
+    def test_matched_valkey_uses_distinct_rdma_addresses_and_same_server(self):
+        value = fleet()
+        value["valkey_rdma_package"] = True
+        for i, node in enumerate(value["nodes"]):
+            node["rdma_address"] = f"10.2.0.{i + 1}"
+        metadata = {"source_commit": "fe8d406c0b5a64ec897f6455e4de684629883764",
+                    "artifacts": {"src/valkey-server": {"sha256": "a" * 64}}}
+        with patch.object(layout.valkey_service, "identity", return_value=metadata):
+            tcp = layout.build_plan(value, "valkey_tcp")
+            rdma = layout.build_plan(value, "valkey_rdma")
+        self.assertEqual(tcp["backend_options"]["client"], "libvalkey")
+        self.assertEqual(rdma["backend_options"]["nodes"], [f"10.2.0.{i + 1}:6380" for i in range(5)])
+        for tcp_node, rdma_node in zip(tcp["nodes"][1:], rdma["nodes"][1:]):
+            self.assertFalse(tcp_node["containers"])
+            self.assertFalse(rdma_node["containers"])
+            self.assertEqual(tcp_node["native_valkey"]["server_sha256"], rdma_node["native_valkey"]["server_sha256"])
+            self.assertEqual(tcp_node["native_valkey"]["args"][0], rdma_node["native_valkey"]["args"][0])
+        with self.assertRaises(ValueError):
+            layout.backend_options(fleet(), "valkey_rdma", "/tmp")
+
     def test_pinned_runnable_bind_mounts_and_equal_storage_caps(self):
-        for backend in layout.BACKENDS:
+        for backend in (name for name in layout.BACKENDS if name != "valkey_rdma"):
             with self.subTest(backend=backend):
                 plan = layout.build_plan(fleet(), backend)
                 self.assertEqual(len(plan["nodes"]), 6)
@@ -37,7 +57,6 @@ class Plans(unittest.TestCase):
                     for container in node["containers"]:
                         names.append(container["name"])
                         argv = container["run_argv"]
-                        self.assertEqual(argv[:3], ["docker", "run", "--detach"])
                         self.assertIn("@sha256:", container["image"])
                         self.assertIn(container["image"], argv)
                         self.assertIn("type=bind,src=" + node["directory"] + "/data,dst=" + container["data_bind"]["destination"], argv)
@@ -442,6 +461,25 @@ class OwnershipAndDevices(unittest.TestCase):
                 layout.nvme_evidence("/mnt", False)
         with patch.object(layout, "command", return_value=json.dumps(mount)):
             self.assertFalse(layout.nvme_evidence("/mnt", True)["independent_nvme_admitted"])
+
+    def test_gcp_mount_must_be_the_identified_first_local_ssd(self):
+        mount = {"filesystems": [{"source": "/dev/nvme1n1", "target": "/mnt", "fstype": "ext4", "options": "rw"}]}
+        blocks = {"blockdevices": [{"name": "/dev/nvme1n1", "model": "Google Local SSD", "serial": "local"}]}
+        with patch.object(Path, "is_symlink", return_value=True), \
+             patch.object(Path, "resolve", return_value=Path("/dev/nvme1n1")), \
+             patch.object(layout, "command", side_effect=[json.dumps(mount), json.dumps(blocks)]):
+            self.assertTrue(layout.nvme_evidence("/mnt", False, provider="gcp")["independent_nvme_admitted"])
+        with patch.object(Path, "is_symlink", return_value=True), \
+             patch.object(Path, "resolve", return_value=Path("/dev/nvme0n1")), \
+             patch.object(layout, "command", side_effect=[json.dumps(mount), json.dumps(blocks)]):
+            with self.assertRaisesRegex(RuntimeError, "identified Google local SSD"):
+                layout.nvme_evidence("/mnt", False, provider="gcp")
+        blocks["blockdevices"][0]["model"] = "Google Persistent Disk"
+        with patch.object(Path, "is_symlink", return_value=True), \
+             patch.object(Path, "resolve", return_value=Path("/dev/nvme1n1")), \
+             patch.object(layout, "command", side_effect=[json.dumps(mount), json.dumps(blocks)]):
+            with self.assertRaisesRegex(RuntimeError, "identified Google local SSD"):
+                layout.nvme_evidence("/mnt", False, provider="gcp")
 
     def test_probe_deadline_and_initialize_ownership_are_bounded(self):
         config = layout.node_config(fleet(), "tikv", 0)

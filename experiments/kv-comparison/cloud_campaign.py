@@ -17,10 +17,12 @@ import resource_accounting
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from portable_transport import runtime_backend, transport_for_case, validate_transport, protocol_key, select_backends
 
-BACKENDS = ("native", "tidehunter_tcp", "tidehunter_efa", "tidehunter_efa_direct",
-            "tidehunter_efa_native", "tikv", "cassandra", "foundationdb", "valkey_tcp")
-LEGACY_BACKENDS = BACKENDS[:-1]
-TRANSPORTS = {name: transport_for_case(name) for name in BACKENDS if name.startswith("tidehunter_")}
+LEGACY_BACKENDS = ("native", "tidehunter_tcp", "tidehunter_efa", "tidehunter_efa_direct",
+                   "tidehunter_efa_native", "tikv", "cassandra", "foundationdb")
+BACKENDS = (*LEGACY_BACKENDS, "valkey_tcp", "garnet", "kvrocks")
+PORTABLE_BACKENDS = {"tidehunter_verbs", "tidehunter_verbs_native", "valkey_rdma"}
+TRANSPORTS = {name: transport_for_case(name) for name in (*BACKENDS, *sorted(PORTABLE_BACKENDS))
+              if name.startswith("tidehunter_")}
 NVME_BACKENDS = {"tidehunter_nvme_tcp", "tidehunter_nvme_rdma"}
 for name in NVME_BACKENDS:
     TRANSPORTS[name] = transport_for_case("tidehunter_tcp")
@@ -51,7 +53,7 @@ def make_matrix(spec):
     sizes, backends, rates = spec["value_sizes"], spec["backends"], spec["offered_rates"]
     if set(sizes) != {64, 256, 1024, 8192, 65536} or len(sizes) != 5:
         raise ValueError("full campaign requires all five value sizes without duplicates")
-    supported = set(BACKENDS) | (NVME_BACKENDS if spec.get("mode") == "nvmeof-focused" else set())
+    supported = set(BACKENDS) | PORTABLE_BACKENDS | (NVME_BACKENDS if spec.get("mode") == "nvmeof-focused" else set())
     backends = select_backends(None, backends, supported)
     rates = spec["offered_rates"]
     if set(rates) != {1000, 10000, 50000} or len(rates) != 3 or any(type(rate) is not int for rate in rates):
@@ -1192,7 +1194,7 @@ def main():
             if args.read_profile_limit is not None:
                 diagnostics["read_profile_limit"] = args.read_profile_limit
             spec["diagnostics"] = diagnostics
-        supported = set(BACKENDS) | (NVME_BACKENDS if args.mode == "nvmeof-focused" else set())
+        supported = set(BACKENDS) | PORTABLE_BACKENDS | (NVME_BACKENDS if args.mode == "nvmeof-focused" else set())
         configured = select_backends(None, spec.get("backends"), supported)
         if args.mode == "nvmeof-focused" and args.backends is not None:
             # Local RDMA planning is explicit; AWS CI admits its own provider set.

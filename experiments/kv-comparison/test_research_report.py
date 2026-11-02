@@ -100,6 +100,46 @@ class CoverageEvidence(unittest.TestCase):
                 analyze.analyze([run, run])
 
 
+class IndustryComparatorReporting(unittest.TestCase):
+    def test_rows_keep_backend_contract_and_only_observed_populations(self):
+        cohorts = []
+        for backend in ("garnet", "kvrocks"):
+            cohorts.append({
+                "cohort": backend, "runs": ["run-1", "run-2"],
+                "boundary": {
+                    "backend": {"name": backend, "measurement_boundary": "client API",
+                                "acknowledgement": "configured", "consistency": "primary",
+                                "replication_factor": 1, "batch_atomicity": "none",
+                                "get_many_strategy": "per-key"},
+                    "workload": {"dataset": {"value_size": 64, "keys": 100},
+                                 "workload": {"distribution": "uniform", "mix": {"read": 1}},
+                                 "phases": {"aging_operations": 0},
+                                 "execution": {"mode": "closed_loop", "concurrency": 16}},
+                    "client_budget": {"cpus": 1}},
+                "uncertainty": {"throughput_mean_calls_per_second": {"estimate": 10, "interval": None}},
+                "statistics": {"success_fraction": 1, "populations": [
+                    {"operation": "read", "outcome": "success", "count": 7,
+                     "api_ns": {"p50": 100, "p99": 200},
+                     "response_ns": {"p50": 120, "p99": 220}}]},
+                "peak_sampled_aggregate_client_rss_bytes": None,
+            })
+        report = {"cohorts": cohorts, "coverage": [], "comparability": "separate", "limits": "finite"}
+        rows = list(research_report.rows(report))
+        self.assertEqual({row["backend"] for row in rows}, {"garnet", "kvrocks"})
+        self.assertTrue(all(row["tier"] == "Distributed application APIs" for row in rows))
+        self.assertTrue(all(row["samples"] == 7 and row["independent_runs"] == 2 for row in rows))
+        self.assertTrue(all(row["throughput_ci95_low"] is None for row in rows))
+        self.assertEqual({row["operation"] for row in rows}, {"read"})
+        text = research_report.markdown(report, rows)
+        self.assertIn("Garnet's SSD-tiered hybrid log", text)
+        self.assertIn("separate from its AOF", text)
+        self.assertIn("Kvrocks uses RocksDB WAL and SST", text)
+        self.assertIn("compaction", text)
+        self.assertIn("unknown, not zero", text)
+        self.assertIn("v2.2.5", text)
+        self.assertIn("v2.17.0", text)
+
+
 class RateSweepEvidence(unittest.TestCase):
     def cohort(self, rate, throughput, fraction=1.0, p99=50000, samples=10000, rf=1):
         return {

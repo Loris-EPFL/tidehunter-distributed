@@ -38,10 +38,15 @@ impl TestCertificates {
         let ca_pem = directory.join("ca.pem");
         let ca = directory.join("ca.der");
         let ca_key = directory.join("ca.key");
+        // Do not inherit host x509_extensions: OpenSSL 1.1 appends -addext to
+        // defaults, producing duplicate basicConstraints rejected by rustls.
+        let req_config = directory.join("ca-req.cnf");
+        fs::write(&req_config, "[req]\ndistinguished_name=dn\n[dn]\n")?;
         let mut command = Command::new("openssl");
         command
+            .args(["req", "-config"])
+            .arg(&req_config)
             .args([
-                "req",
                 "-x509",
                 "-newkey",
                 "ec",

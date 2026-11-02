@@ -82,10 +82,10 @@ jobs:
         run: python3 -m unittest discover -s experiments/kv-comparison -p 'test_*.py'
       - name: Build actual external adapters
         timeout-minutes: 25
-        run: cargo build --locked -p kv-research --features tikv,cassandra,foundationdb,valkey-tcp
+        run: cargo build --locked -p kv-research --features tikv,cassandra,foundationdb,valkey-tcp,garnet,kvrocks
       - name: Test the comparison crate with actual adapter features
         timeout-minutes: 10
-        run: cargo test --locked -p kv-research --features tikv,cassandra,foundationdb,valkey-tcp
+        run: cargo test --locked -p kv-research --features tikv,cassandra,foundationdb,valkey-tcp,garnet,kvrocks
       - name: Check monitoring freshness and metric semantics
         run: python3 -m unittest discover -s experiments/kv-comparison/observability -p 'test_*.py'
       - name: Validate sparse-series Prometheus query semantics

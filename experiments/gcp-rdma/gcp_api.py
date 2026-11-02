@@ -126,6 +126,9 @@ class ObjectStore:
     def head(self, key):
         return json.loads(self.api._request('GET', self._url(key)))
 
+    def delete(self, key, *, if_generation_match):
+        return self.api._request('DELETE', self._url(key, {'ifGenerationMatch': str(if_generation_match)}))
+
     def get(self, key, *, generation=None, max_bytes=256 * 1024 * 1024):
         meta = self.head(key) if generation is None else json.loads(self.api._request('GET', self._url(key, {'generation': generation})))
         if int(meta['size']) > max_bytes:

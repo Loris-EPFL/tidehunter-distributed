@@ -233,7 +233,7 @@ def monitor_image_plan(source, index):
     return result
 
 
-def cache_monitor_images(source, index, deadline):
+def cache_monitor_images(source, index, deadline, *, pull=True):
     started = time.monotonic()
     stop = min(started + 180, started + (deadline - datetime.now(timezone.utc)).total_seconds() - 30)
     evidence = {"complete": True, "images": {}, "gaps": []}
@@ -247,8 +247,9 @@ def cache_monitor_images(source, index, deadline):
             remaining = stop - time.monotonic()
             if remaining < 1:
                 raise TimeoutError("monitor image cache deadline")
-            subprocess.run(["docker", "pull", image], check=True, capture_output=True, text=True,
-                           timeout=min(60, remaining))
+            if pull:
+                subprocess.run(["docker", "pull", image], check=True, capture_output=True, text=True,
+                               timeout=min(60, remaining))
             remaining = stop - time.monotonic()
             if remaining < 1:
                 raise TimeoutError("monitor image inspection deadline")

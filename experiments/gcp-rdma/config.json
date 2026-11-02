@@ -2,10 +2,18 @@
   "version": 1,
   "project_id": "mysten-research",
   "project_number": "514867804006",
-  "bucket": "",
-  "service_account": "",
+  "bucket": "mysten-research-bench-artifacts",
+  "service_account": "bench-guest@mysten-research.iam.gserviceaccount.com",
   "machine_type": "z4m-highmem-16",
   "image": "",
+  "image_qualification": null,
   "max_distance": 3,
-  "candidates": []
+  "candidates": [
+    {
+      "zone": "us-central1-a",
+      "ordinary_subnet": "projects/mysten-research/regions/us-central1/subnetworks/default",
+      "rdma_subnet": "projects/mysten-research/regions/us-central1/subnetworks/falcon-rdma-us-central1-a",
+      "network_profile": "projects/mysten-research/global/networkProfiles/us-central1-a-vpc-falcon"
+    }
+  ]
 }

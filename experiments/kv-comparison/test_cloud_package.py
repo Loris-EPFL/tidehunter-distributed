@@ -36,6 +36,36 @@ class PackageTests(unittest.TestCase):
 
     def git(self, *argv):
         return subprocess.check_output(["git", *argv], cwd=self.repo, text=True)
+    def test_valkey_source_admission_requires_pinned_clean_rdma_artifacts(self):
+        source = self.root / "valkey"
+        source.mkdir()
+        for name in package.VALKEY_ARTIFACTS:
+            path = source / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(name.encode())
+        settings = source / "src/.make-settings"
+        settings.write_text("BUILD_RDMA=yes\nUSE_SYSTEMD=no\n")
+
+        def command(argv, **kwargs):
+            if argv[1:3] == ["rev-parse", "HEAD"]:
+                return package.VALKEY_COMMIT
+            if argv[1:3] == ["status", "--porcelain"]:
+                return ""
+            return "--rdma"
+
+        with patch.object(package, "command", side_effect=command), \
+                patch.object(package, "elf_identity", return_value={"elf": True}):
+            settings.write_text("BUILD_RDMA=yes\nUSE_SYSTEMD=yes\n")
+            with self.assertRaisesRegex(ValueError, "fixed runtime ABI"):
+                package.valkey_source_identity(source)
+            settings.write_text("BUILD_RDMA=yes\nUSE_SYSTEMD=no\n")
+            (source / package.VALKEY_ARTIFACTS[-1]).unlink()
+            with self.assertRaises(FileNotFoundError):
+                package.valkey_source_identity(source)
+        with patch.object(package, "command", return_value="different"):
+            with self.assertRaisesRegex(ValueError, "pinned commit"):
+                package.valkey_source_identity(source)
+
 
     def test_dirty_and_new_framework_bytes_not_unrelated_notes_or_credentials(self):
         dirty = "benchmarks/kv-research/src/main.rs"

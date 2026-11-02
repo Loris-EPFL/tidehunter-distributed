@@ -59,7 +59,7 @@ class ConfigTests(unittest.TestCase):
     def test_full_single_and_three_repeat_matrices_are_admitted(self):
         spec = ci.core.read_json(ci.HERE / 'cloud-campaign.json')
         for limit in (0, 256):
-            for repeats, ordinary_cases in ((1, 243), (3, 729)):
+            for repeats, ordinary_cases in ((1, 293), (3, 879)):
                 with self.subTest(repeats=repeats, write_profile_limit=limit):
                     cfg = self.config(matrix=spec | {
                         'repeats': repeats, 'diagnostics': {'write_profile_limit': limit}})
@@ -75,7 +75,7 @@ class ConfigTests(unittest.TestCase):
         for repeats in (1, 3):
             cfg = self.config(matrix=spec | {'repeats': repeats})
             jobs = ci.cloud_campaign.make_matrix(cfg['spec'])
-            self.assertEqual(len(jobs), 260 * repeats)
+            self.assertEqual(len(jobs), 310 * repeats)
             self.assertEqual(sum(job['cohort'] == 'read_stage_diagnostics' for job in jobs),
                              12 * repeats)
             self.assertEqual(sum(job['cohort'] == 'write_stage_diagnostics' for job in jobs),

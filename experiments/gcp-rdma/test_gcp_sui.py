@@ -42,7 +42,7 @@ class SuiAdmissionTests(unittest.TestCase):
                 gcp_sui.extract(archive, root / 'unpack')
 
     def test_local_ssd_mount_is_required(self):
-        run_id = 'th-0123456789abcdef'
+        run_id = 'bench-0123456789abcdef'
         with patch.object(Path, 'is_symlink', return_value=True), \
              patch.object(Path, 'resolve', return_value=Path('/dev/nvme0n1')), \
              patch.object(gcp_sui.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='/dev/nvme0n1')) as findmnt:

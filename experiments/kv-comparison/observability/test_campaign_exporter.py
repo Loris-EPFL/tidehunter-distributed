@@ -1,8 +1,10 @@
 """Consumer-visible identity, clock, counter and missing-data regressions."""
+import io
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import campaign_exporter as campaign
 
@@ -709,6 +711,106 @@ class ExplicitCgroupTests(unittest.TestCase):
         text = campaign.process_payload(self.root, self.process, {})
         self.assertIn('kv_observer_cgroup_available{process_role="client"} 0', text)
         self.assertNotIn('cpu_seconds_total', text)
+
+
+class IndustryInfoTests(unittest.TestCase):
+    def test_resp_info_request_and_bounded_reply(self):
+        from unittest.mock import MagicMock
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        stream = io.BytesIO(b'$18\r\nused_memory_rss:42\r\n')
+        connection.recv.side_effect = stream.read
+        with patch.object(campaign.socket, "create_connection", return_value=connection):
+            self.assertEqual(campaign.info_section("127.0.0.2", 6379, "memory"), {"used_memory_rss": "42"})
+        connection.recv.side_effect = io.BytesIO(b'$262145\r\n').read
+        with patch.object(campaign.socket, "create_connection", return_value=connection), self.assertRaises(ValueError):
+            campaign.info_section("127.0.0.2", 6379, "memory")
+
+    def test_slow_progress_cannot_extend_info_deadline(self):
+        from unittest.mock import MagicMock
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        clock = [0.0]
+        data = io.BytesIO(b'$18\r\nused_memory_rss:42\r\n')
+        def receive(size):
+            clock[0] += 0.04
+            return data.read(size)
+        connection.recv.side_effect = receive
+        with patch.object(campaign.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(campaign.socket, "create_connection", return_value=connection):
+            with self.assertRaises(TimeoutError):
+                campaign.info_section("127.0.0.2", 6379, "memory")
+
+    def target(self, engine):
+        return {"engine": engine, "address": "127.0.0.2", "port": 6379}
+
+    def test_fields_remain_engine_specific_and_unavailable_fields_are_absent(self):
+        replies = {
+            "server": {"monitor_task": "enabled"},
+            "stats": {"total_commands_processed": "17", "total_found": "4",
+                      "keyspace_hits": "3", "invented_counter": "99"},
+            "memory": {"proc_physical_memory_size": "123", "used_memory_rss": "456"},
+        }
+        for engine, expected, absent in (("garnet", "total_found", "keyspace_hits"),
+                                         ("kvrocks", "keyspace_hits", "total_found")):
+            with self.subTest(engine=engine), patch.object(campaign, "info_section",
+                    side_effect=lambda address, port, section, deadline: replies.get(section, {})):
+                body = campaign.info_payload(self.target(engine), {"backend": engine}, {})
+                self.assertIn('field="' + expected + '"', body)
+                self.assertNotIn('field="' + absent + '"', body)
+                self.assertNotIn("invented_counter", body)
+                self.assertIn("kv_observer_info_counter_total", body)
+                self.assertIn("kv_observer_info_gauge", body)
+                self.assertIn("# TYPE kv_observer_info_counter_total counter", campaign.metric_types(body.encode()).decode())
+
+    def test_disabled_or_unavailable_garnet_monitor_never_exports_zeroed_stats(self):
+        for server in ({"monitor_task": "disabled"}, {}):
+            with self.subTest(server=server), patch.object(campaign, "info_section",
+                    side_effect=lambda address, port, section, deadline: {
+                        "server": server, "stats": {"total_commands_processed": "0"},
+                        "memory": {"store_index_size": "0"}}.get(section, {})):
+                body = campaign.info_payload(self.target("garnet"), {"backend": "garnet"}, {})
+                self.assertNotIn("kv_observer_info_counter_total", body)
+                self.assertIn('field="store_index_size"} 0', body)
+
+    def test_failed_section_is_not_zero_filled_and_other_sections_survive(self):
+        def fetch(address, port, section, deadline):
+            if section == "stats":
+                raise TimeoutError("unavailable")
+            return {"used_memory_rss": "42"} if section == "memory" else {}
+        with patch.object(campaign, "info_section", side_effect=fetch):
+            body = campaign.info_payload(self.target("kvrocks"), {"backend": "kvrocks"}, {})
+        self.assertIn('section="stats"} 0', body)
+        self.assertIn('field="used_memory_rss"} 42', body)
+        self.assertNotIn("kv_observer_info_counter_total", body)
+
+    def test_engine_storage_and_persistence_sections_use_pinned_fields(self):
+        replies = {"server": {"monitor_task": "enabled"},
+                   "store": {"Log.TailAddress": "109", "ReadCache.CurrentMemorySizeBytes": "N/A"},
+                   "persistence": {"CommittedUntilAddress": "88", "bgsave_in_progress": "1"},
+                   "rocksdb": {"compaction_count": "3", "block_cache_hit": "12",
+                               "block_cache_usage": "4096", "estimate_pending_compaction_bytes[metadata]": "34",
+                               "pending_compaction_bytes_stop[metadata]": "2", "unknown[metadata]": "9"}}
+        for engine in ("garnet", "kvrocks"):
+            with self.subTest(engine=engine), patch.object(campaign, "info_section",
+                    side_effect=lambda address, port, section, deadline: replies.get(section, {})):
+                body = campaign.info_payload(self.target(engine), {"backend": engine}, {})
+                if engine == "garnet":
+                    self.assertIn('field="Log.TailAddress"} 109', body)
+                    self.assertIn('field="CommittedUntilAddress"} 88', body)
+                    self.assertNotIn('field="ReadCache.CurrentMemorySizeBytes"', body)
+                    self.assertNotIn("compaction_count", body)
+                else:
+                    self.assertIn('field="bgsave_in_progress"} 1', body)
+                    self.assertIn('field="block_cache_hit"} 12', body)
+                    self.assertIn('field="compaction_count"} 3', body)
+                    self.assertIn('field="estimate_pending_compaction_bytes[metadata]"} 34', body)
+                    self.assertIn('field="pending_compaction_bytes_stop[metadata]"} 2', body)
+                    self.assertNotIn("unknown[metadata]", body)
+
+    def test_info_target_must_match_selected_engine(self):
+        with self.assertRaises(ValueError):
+            campaign.info_payload(self.target("garnet"), {"backend": "kvrocks"}, {})
 
 
 if __name__ == '__main__':

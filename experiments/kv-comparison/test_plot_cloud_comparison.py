@@ -7,6 +7,7 @@ import unittest
 import xml.etree.ElementTree as ET
 
 import plot_cloud_comparison as plots
+from cloud_campaign import LEGACY_BACKENDS
 
 
 def population(operation="read", outcome="success", count=10, p50=100, p99=900):
@@ -81,6 +82,42 @@ def full_matrix_cases(repeats=(0,)):
     return result
 
 
+class IndustryComparatorEvidence(unittest.TestCase):
+    def test_cold_figures_keep_comparator_labels_repeats_and_caveats(self):
+        items = []
+        for backend in ("garnet", "kvrocks"):
+            for repeat in (0, 1):
+                item = case(backend, repeat, populations=[population(p99=900 + 100 * repeat)])
+                identity = f"{backend}-cold-{repeat}"
+                item["case_id"] = identity
+                item["job"].update(case_id=identity, cohort="cold_os_cache",
+                                   profile="cold-os-large", value_size=65536)
+                items.append(item)
+        data = dataset(items, ("garnet", "kvrocks"))
+        figures, _ = plots.build_figures(data)
+        cold = next(figure for figure in figures if figure["name"] == "cold-os-cache")
+        self.assertEqual(cold["repeats"], [0, 1])
+        series = cold["panels"][1]["series"]
+        self.assertEqual({row["label"] for row in series}, {"Garnet", "Kvrocks"})
+        for row in series:
+            self.assertEqual(row["points"][0]["median"], 950)
+            self.assertEqual(row["points"][0]["independent_repetitions"], 2)
+        self.assertIn("SSD hybrid log", cold["caption"])
+        self.assertIn("distinct from its AOF", cold["caption"])
+        self.assertIn("RocksDB WAL and SST", cold["caption"])
+        self.assertIn("compaction", cold["caption"])
+        self.assertIn("no per-API disk incidence", cold["caption"])
+
+    def test_missing_comparator_operation_is_not_a_zero_point(self):
+        for backend in ("garnet", "kvrocks"):
+            data = dataset([case(backend, repeat) for repeat in (0, 1)])
+            cell = (backend, "primary_rf1", "read-concurrent", 64)
+            point, reason = plots.aggregate_point(data, cell, [0, 1], "api_ns", "put")
+            self.assertIsNone(point)
+            self.assertIn("not zero", reason)
+            self.assertIsNone(plots.evidence_appendix(data)[0]["evidence"]["read_diagnostics"])
+
+
 class SingleRepeatPolicy(unittest.TestCase):
     def test_focused_read_tier_figures_keep_profiled_and_baseline_separate(self):
         specs = plots.figure_specs(("tidehunter_tcp",), {"read_tier_remote"})
@@ -103,7 +140,8 @@ class SingleRepeatPolicy(unittest.TestCase):
         self.assertIn("Historical registered RAM", cache["caption"])
 
     def test_historical_eight_system_report_keeps_coverage_and_single_repeat_policy(self):
-        original = [row for row in full_matrix_cases() if row["job"]["backend"] != "valkey_tcp"]
+        original = [row for row in full_matrix_cases()
+                    if row["job"]["backend"] in LEGACY_BACKENDS]
         frozen = copy.deepcopy(original)
         data = dataset(original)
         figures, omitted = plots.build_figures(data)
