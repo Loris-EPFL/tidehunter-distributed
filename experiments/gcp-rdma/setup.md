@@ -14,6 +14,10 @@ targeting `bench/gcp-rdma` runs the complete offline GCP safety suite without a
 protected environment, OIDC permission, or cloud credentials. Cancellation is
 not proof of fleet cleanup; absolute server-side DELETE expiry is mandatory.
 
+Correctness jobs check out the immutable event SHA unless a manual
+`tidehunter_repo_ref` override is supplied. Queued PR jobs must not depend on
+`refs/pull/N/merge`, which can disappear when the pull request is merged.
+
 ## Repository administration
 
 1. Create the GitHub environment **gcp-rdma-bench** under Settings →
