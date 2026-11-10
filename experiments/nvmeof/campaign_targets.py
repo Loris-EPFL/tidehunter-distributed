@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Orchestrate explicitly owned, buffered TCP or RDMA NVMe-oF exports.
+"""Orchestrate explicitly owned, sealed read-only TCP or RDMA NVMe-oF exports.
 
 All paths are absolute and rooted in trusted, root-owned directories. JSON output
 is a receipt; retain it for the other machine. State directories are never reused.
@@ -135,11 +135,15 @@ def receipt(state):
     result = dict(state)
     if state['kind'] == 'campaign-host' and state['phase'] == 'connected':
         result['bindings'] = [{'export_uuid': e['export_uuid'], 'namespace_path': e['device'],
-                               'transport': state['transport']} for e in state['exports']]
+                               'transport': state['transport'], 'target': e.get('target', 'kernel')}
+                              for e in state['exports']]
     return result
 
 
 def setup(a):
+    target = getattr(a, 'target_kind', 'kernel')
+    if target not in ('kernel', 'kernel_direct'):
+        raise ValueError('kernel target kind required')
     address = private_address(a.address)
     exports = load_exports(a.ready, a.export_root)
     if not 1 <= a.base_port_id <= 65535 or not 1 <= a.base_service <= 65535 or \
@@ -150,16 +154,18 @@ def setup(a):
     for i, e in enumerate(exports):
         e.update(address=address, port_id=a.base_port_id + i, service=a.base_service + i,
                  hostnqn=host_identity(campaign, e['uuid'])[0], status='pending',
-                 state=str(state_path / ('export-%03d' % i)))
+                 state=str(state_path / ('export-%03d' % i)), target=target)
         e['hostid'] = host_identity(campaign, e['uuid'])[1]
     s = {'version': 1, 'kind': 'campaign-target', 'phase': 'creating', 'campaign_id': campaign,
-         'transport': a.transport, 'export_root': str(absolute(a.export_root)), 'exports': exports}
+         'transport': a.transport, 'target_implementation': target,
+         'export_root': str(absolute(a.export_root)), 'exports': exports}
     directory = new_campaign_state(state_path, s)
     try:
         for e in exports:
             e['status'] = 'attempted'; manage.save(directory, s)
             result = manage.target_setup(SimpleNamespace(manifest=e['manifest'], state=e['state'], transport=a.transport,
-                address=address, service=e['service'], port_id=e['port_id'], hostnqn=e['hostnqn']))
+                address=address, service=e['service'], port_id=e['port_id'], hostnqn=e['hostnqn'],
+                target_kind=target))
             e['target_receipt'] = result; e['status'] = 'published'; manage.save(directory, s)
         s['phase'] = 'published'; manage.save(directory, s)
         return receipt(s)
@@ -193,9 +199,13 @@ def connect(a):
             raise ValueError('invalid target service')
         e.update(address=addr, service=r['service'], hostnqn=hostnqn, hostid=hostid,
                  target_status=r['status'], status='pending', state=str(state_path / ('export-%03d' % i)))
+        e['target'] = manage.export_target(r.get('target', 'kernel'))
         entries.append(e)
+    # Default 4x128 unless both overrides are given; validated before any connection.
+    requested = manage.queue_geometry_request(a)
+    want = {'nr_io_queues': requested[0], 'queue_size': requested[1]}
     s = {'version': 1, 'kind': 'campaign-host', 'phase': 'connecting', 'campaign_id': campaign,
-         'transport': transport, 'exports': entries}
+         'transport': transport, 'exports': entries, 'queue_geometry_requested': want}
     directory = new_campaign_state(state_path, s)
     try:
         for e in entries:
@@ -203,7 +213,12 @@ def connect(a):
                 continue
             e['status'] = 'attempted'; manage.save(directory, s)
             result = manage.host_connect(SimpleNamespace(manifest=e['manifest'], state=e['state'], transport=transport,
-                address=e['address'], service=e['service'], hostnqn=e['hostnqn']))
+                address=e['address'], service=e['service'], hostnqn=e['hostnqn'], export_target=e['target'],
+                nr_io_queues=requested[0], queue_size=requested[1]))
+            geometry = result.get('queue_geometry')
+            if (not isinstance(geometry, dict) or geometry.get('requested') != want or
+                    geometry.get('observed') != {'queue_count': requested[0] + 1, 'sqsize': requested[1] - 1}):
+                raise ValueError('controller queue geometry mismatch')
             if result['hostid'] != e['hostid'] or result['phase'] != 'protected':
                 raise ValueError('host protection or identity mismatch')
             e['host_receipt'] = result; e['device'] = result['device']; e['status'] = 'connected'; manage.save(directory, s)
@@ -299,8 +314,13 @@ def main():
             c.add_argument('--transport', choices=('tcp', 'rdma'), default='tcp')
             c.add_argument('--base-port-id', type=int, required=True)
             c.add_argument('--base-service', type=int, required=True)
+            c.add_argument('--target-kind', choices=('kernel', 'kernel_direct'), default='kernel')
         else:
             c.add_argument('--targets', required=True)
+            c.add_argument('--nr-io-queues', type=int, default=None,
+                           help='I/O queue count (default 4; set together with --queue-size); sysfs readback must match')
+            c.add_argument('--queue-size', type=int, default=None,
+                           help='I/O queue depth (default 128; set together with --nr-io-queues); sysfs readback must match')
     for name in ('host-disconnect', 'target-cleanup'):
         c = sub.add_parser(name); c.add_argument('--state', required=True)
         c.add_argument('--readers-drained', action='store_true', required=True)

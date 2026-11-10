@@ -1,0 +1,14 @@
+--- a/drivers/nvme/target/io-cmd-file.c
++++ b/drivers/nvme/target/io-cmd-file.c
+@@ -173,6 +173,11 @@ static bool nvmet_file_execute_io(struct nvmet_req *req, int ki_flags)
+ 
+ 	ret = nvmet_file_submit_bvec(req, pos, bv_cnt, total_len, ki_flags);
+ 
++	/* Retry a short NOWAIT read in the blocking workqueue. */
++	if ((ki_flags & IOCB_NOWAIT) && req->cmd->rw.opcode == nvme_cmd_read &&
++	    ret > 0 && ret < total_len)
++		return false;
++
+ 	switch (ret) {
+ 	case -EIOCBQUEUED:
+ 		return true;

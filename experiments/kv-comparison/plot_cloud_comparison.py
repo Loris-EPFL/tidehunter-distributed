@@ -16,20 +16,22 @@ from pathlib import Path
 import statistics
 import textwrap
 
-from cloud_campaign import BACKENDS
+from cloud_campaign import BACKENDS, comparison_backend
 
 
 # One style per backend, including when only a subset is present in a cohort.
 STYLES = {
     "native": ("Native", "#333333", "o", "-"),
-    "tidehunter_tcp": ("TH TCP", "#0072B2", "s", "-"),
+    "tidehunter_tcp": ("TH RPC TCP/TLS", "#0072B2", "s", "-"),
     "tidehunter_nvme_tcp": ("TH NVMe/TCP", "#E69F00", "X", "-"),
     "tidehunter_nvme_rdma": ("TH NVMe/RDMA", "#009E73", "D", ":"),
+    "tidehunter_spdk_rdma": ("TH SPDK NVMe/RDMA (direct file)", "#660099", "p", "--"),
+    "tidehunter_spdk_live_rdma": ("TH live SPDK NVMe/RDMA (direct file)", "#AA4499", "P", "-."),
     "tidehunter_efa": ("TH EFA", "#56B4E9", "^", "--"),
     "tidehunter_efa_direct": ("TH EFA direct", "#009E73", "D", "-.") ,
     "tidehunter_efa_native": ("TH EFA native", "#D55E00", "v", "-"),
-    "tidehunter_verbs": ("TH verbs TLS", "#5E3C99", "<", "--"),
-    "tidehunter_verbs_native": ("TH verbs native", "#B35806", ">", "-."),
+    "tidehunter_verbs": ("TH RPC verbs/TLS", "#5E3C99", "<", "--"),
+    "tidehunter_verbs_native": ("TH RPC verbs (trusted)", "#B35806", ">", "-."),
     "tikv": ("TiKV", "#CC79A7", "P", "--"),
     "cassandra": ("Cassandra", "#8C6500", "X", ":"),
     "foundationdb": ("FoundationDB", "#7854A3", "h", "-."),
@@ -54,6 +56,7 @@ BASE_CAPTION = (
     "Valkey GET remains RAM-resident, including cold OS; appendfsync always acknowledges AOF writes, not value-WAL reads. "
     "Garnet's SSD hybrid log is distinct from its AOF; Kvrocks uses RocksDB WAL and SST files with compaction. "
     "Engine and OS caches and background work can affect reads and writes; no per-API disk incidence is implied. "
+    "Live SPDK target file I/O bypasses the target OS page cache; device/controller caches remain. "
     "Warm OS is not guaranteed cache residency. Tail quantiles are descriptive, including small populations."
 )
 
@@ -141,13 +144,22 @@ class Dataset:
             raise ValueError("planned_cases does not match case coverage")
         self.index = {}
         planned_repeats = set()
-        ids, contracts = set(), {}
+        ids, contracts, implementation_contracts = set(), {}, {}
+        logical_data_contracts = {}
+        tiers = self.durability_tiers = {}
         for case in self.cases:
             job = case["job"]
             case_id = case["case_id"]
-            backend = job["backend"]
+            runtime_backend = job["backend"]
+            backend = comparison_backend(job)
             if backend not in STYLES:
                 raise ValueError(f"unknown backend {backend}; add an explicit style")
+            route = job.get("nvmeof_route")
+            if route is not None:
+                if runtime_backend not in ("tidehunter_nvme_tcp", "tidehunter_nvme_rdma") or route not in ("live", "sealed_read"):
+                    raise ValueError("invalid requested NVMe-oF route")
+                if (route == "sealed_read") != (job["cohort"] == "sealed_read"):
+                    raise ValueError("NVMe-oF route and workload population disagree")
             integer(job["repeat"], "repeat")
             planned_repeats.add(job["repeat"])
             integer(job["value_size"], "value_size", 1)
@@ -165,10 +177,42 @@ class Dataset:
                 if case["status"] == "not_run" and case.get("metrics") is not None:
                     raise ValueError("not-run case must not carry performance metrics")
                 continue
-            if case.get("backend", {}).get("name") != OBSERVED_NAMES.get(backend, backend):
+            expected_backend = OBSERVED_NAMES.get(runtime_backend, runtime_backend)
+            if route == "sealed_read":
+                expected_backend += "_sealed_read"
+            elif route == "live":
+                expected_backend = "tidehunter_live_nvmeof"
+            if case.get("backend", {}).get("name") != expected_backend:
                 raise ValueError("job and observed backend differ")
+            implementation = {name: job[name] for name in
+                              ("native_wal_geometry", "owner_read_resident_first", "durability_tier") if name in job}
+            if "nvmeof_route" in job:
+                implementation["nvmeof_route"] = job["nvmeof_route"]
+            if backend == "native":
+                implementation["native_config_preset"] = (
+                    case.get("backend", {}).get("configuration", {}).get("native_config_preset"))
+            if job["cohort"] == "sealed_read":
+                logical_cell = (job["cohort"], job["profile"], job["value_size"], job["repeat"])
+                logical_id = job.get("sealed_dataset", {}).get("data_id")
+                if logical_cell in logical_data_contracts and logical_data_contracts[logical_cell] != logical_id:
+                    raise ValueError("logical dataset contract changed between backends")
+                logical_data_contracts[logical_cell] = logical_id
+                implementation["mapped_eviction"] = job.get("evict_mapped_wal_before_measurement")
+                implementation["sealed_io"] = {
+                    key: job.get("sealed_dataset", {}).get(key) for key in
+                    ("directness", "mapped_wal_eviction", "target_cache", "page_cache_policy")}
+            if job["cohort"] == "native_write_regression":
+                implementation["write_path"] = job.get("write_path")
+            implementation_cell = (backend, job["cohort"], job["profile"], job["value_size"])
+            if implementation_cell in implementation_contracts and implementation_contracts[implementation_cell] != implementation:
+                raise ValueError("backend implementation contract changed between repetitions")
+            implementation_contracts[implementation_cell] = implementation
+            # One backend, one acknowledgement tier: a series never joins points of two tiers.
+            if tiers.setdefault(backend, job.get("durability_tier")) != job.get("durability_tier"):
+                raise ValueError(f"{backend}: durability tier changes within one dataset; "
+                                 "plot each tier from its own comparison document")
             contract = {name: value for name, value in job.items()
-                        if name not in ("backend", "case_id", "repeat")}
+                        if name not in ("backend", "case_id", "repeat", "native_wal_geometry", "owner_read_resident_first", "nvmeof_route", "nvmeof_target", "durability_tier")}
             for identity_field in ("read_tier", "sealed_dataset"):
                 if isinstance(contract.get(identity_field), dict):
                     contract[identity_field] = {k: v for k, v in contract[identity_field].items()
@@ -178,11 +222,16 @@ class Dataset:
                 # workload shape. Keep the original settings in the appendix.
                 contract.pop("read_lanes", None)
                 contract.pop("diagnostics", None)
+                contract.pop("write_path", None)
                 if job["cohort"] == "sealed_read":
                     contract.pop("drop_os_caches", None)
+                    contract.pop("evict_mapped_wal_before_measurement", None)
                 if isinstance(contract.get("sealed_dataset"), dict):
                     contract["sealed_dataset"].pop("target_cache", None)
                     contract["sealed_dataset"].pop("page_cache_policy", None)
+                    contract["sealed_dataset"].pop("mapped_wal_eviction", None)
+                    contract["sealed_dataset"].pop("directness", None)
+                    contract["sealed_dataset"].pop("cold_claim", None)
             cohort_cell = (job["cohort"], job["profile"], job["value_size"])
             if cohort_cell in contracts and contracts[cohort_cell] != contract:
                 raise ValueError("workload contract changed between repetitions or backends")
@@ -194,7 +243,7 @@ class Dataset:
         self.planned_repeats = sorted(planned_repeats)
         self.single_repetition = len(self.planned_repeats) == 1
         self.minimum_common_repeats = 1 if self.single_repetition else 2
-        observed_backends = {case["job"]["backend"] for case in self.cases}
+        observed_backends = {comparison_backend(case["job"]) for case in self.cases}
         selected = document.get("planned_backends", sorted(observed_backends))
         if (not isinstance(selected, list) or not selected
                 or any(not isinstance(name, str) or name not in STYLES for name in selected)
@@ -281,17 +330,21 @@ def case_identity(case):
     source = job.get("sealed_dataset") or job.get("read_tier") or {}
     if not isinstance(source, dict):
         source = {}
-    return {"case_id": case["case_id"], "backend": job["backend"],
+    return {"case_id": case["case_id"], "backend": comparison_backend(job),
+            "runtime_backend": job["backend"], "durability_tier": job.get("durability_tier"),
+            "requested_nvmeof_route": job.get("nvmeof_route"),
+            "requested_nvmeof_target": job.get("nvmeof_target"),
             "source_id": source.get("source_id"), "data_id": source.get("data_id")}
 
 
 def evidence_appendix(dataset):
     """Keep each case's supplied evidence intact; missing is unknown, never zero."""
     fields = ("dataset_source", "nvmeof_trace_evidence", "nvmeof_trace_raw_location", "trace_event_ratios",
+              "nvmeof_measurement_qualification", "nvmeof_target_evidence", "measurement_read_evidence",
               "cold_device_evidence", "cold_device_raw_location",
               "read_diagnostics", "write_diagnostics", "read_tier_qualification",
               "read_path_qualification", "raw_samples", "samples",
-              "raw_artifacts", "artifacts_sha256")
+              "spdk_target_measurement", "spdk_target_io", "raw_artifacts", "artifacts_sha256")
     return [{
         **case_identity(case), "status": case["status"],
         "cohort": case["job"]["cohort"], "profile": case["job"]["profile"], "job": case["job"],
@@ -314,15 +367,15 @@ def sealed_campaign_specs(cases):
                 if not isinstance(mix, dict):
                     raise ValueError(f"{cohort}/{profile}: workload mix unavailable")
                 active = [name for name, weight in mix.items() if weight]
-                if len(active) != 1 or active[0] not in ("read", "get_many", "put"):
-                    raise ValueError(f"{cohort}/{profile}: expected a pure read, get_many or put mix")
+                if len(active) != 1 or active[0] not in ("read", "get_many", "put", "put_batch"):
+                    raise ValueError(f"{cohort}/{profile}: expected a pure read, get_many, put or put_batch mix")
                 operations.add(active[0])
             if len(operations) != 1:
                 raise ValueError(f"{cohort}/{profile}: incompatible operation mixes")
             operation = operations.pop()
             series = []
             for backend in PLANNABLE_BACKENDS:
-                sizes = sorted({job["value_size"] for job in jobs if job["backend"] == backend})
+                sizes = sorted({job["value_size"] for job in jobs if comparison_backend(job) == backend})
                 if sizes:
                     series.extend(size_series((backend,), cohort, profile, sizes))
             specs.append(dict(name=cohort + "-" + profile, title=cohort + " — " + profile,
@@ -332,6 +385,9 @@ def sealed_campaign_specs(cases):
                               columns=3, xkind="size", xticks=None,
                               caption="Separate per-case populations; baseline and diagnostic cases are not pooled. "
                               "Backend-specific lane, cache, cache-drop and diagnostic settings differ; see case jobs. "
+                              "NVMe arms read pinned sealed exports, not a new live-WAL write path. Logical data match, "
+                              "but original WAL and export image have independent page caches and physical source identities. "
+                              "SPDK file AIO bypasses the target OS page cache; repeat-read is not a RAM-cache-hit claim. "
                               "Get-many latency is per call, not per key. Trace evidence is device or transport "
                               "scoped, not per-API, NAND or pure wire latency. "))
     return specs
@@ -343,8 +399,8 @@ def panel(title, metric, operation=None, percentile="p99", outcome="success", **
 
 
 def size_series(backends, cohort, profile, sizes=SIZES, suffix=""):
-    return [{"label": STYLES[backend][0] + suffix, "backend": backend,
-             "cells": [(backend, cohort, profile, size) for size in sizes], "x": list(sizes)}
+    return [{"label": STYLES[backend][0] + (" / sealed export" if cohort == "sealed_read" and backend.startswith("tidehunter_nvme_") else "") + suffix,
+             "backend": backend, "cells": [(backend, cohort, profile, size) for size in sizes], "x": list(sizes)}
             for backend in backends]
 
 
@@ -501,6 +557,18 @@ def figure_specs(backends=BACKENDS, cohorts=()):
     add("native-pagecache-goodput", "Native durability extras — whole-workload goodput", native,
         goodput_panels(), 3, "Four labeled series: mixed c1 and read-many32 c16, each with barrier/pagecache durability. "
         "Do not interpret different profiles/concurrency as a durability-only speedup. ")
+    if "native_async_write" in cohorts:
+        writes = []
+        for cohort, suffix in (("primary_rf1", " / WAL barrier"),
+                               ("native_async_write", " / foreground without barrier")):
+            rows = size_series(("native",), cohort, "write-concurrent", suffix=suffix)
+            rows[0]["variant"] = len(writes)
+            writes.extend(rows)
+        add("native-write-boundaries", "Native pure writes — distinct acknowledgement boundaries",
+            writes, [panel("API p50", "api_ns", "put", "p50"),
+                     panel("API p99", "api_ns", "put")] + goodput_panels(), 3,
+            "Closed-loop c16, identical planned workload; foreground completion does not wait for the "
+            "per-put Value-WAL barrier. These are distinct durability populations, not equivalent acknowledgements.")
     return specs
 
 
@@ -508,7 +576,8 @@ def build_figures(dataset):
     figures, omitted = [], []
     # Select from the frozen plan, never infer selection from successful cases.
     # Historical reports without explicit inventory retain their planned case rows.
-    backends = tuple(name for name in PLANNABLE_BACKENDS if name in dataset.planned_backends)
+    backends = tuple(name for name in PLANNABLE_BACKENDS
+                     if name != "tidehunter_spdk_rdma" and name in dataset.planned_backends)
     specs = figure_specs(backends, {case["job"]["cohort"] for case in dataset.cases})
     specs.extend(sealed_campaign_specs(dataset.cases))
     for spec in specs:
@@ -719,7 +788,8 @@ def render(figures, coverage_data, output):
 
 
 def export_data(figures, coverage_data, output):
-    fields = ["figure", "panel", "series", "backend", "source_id", "data_id", "cohort", "profile", "value_bytes", "x", "operation", "outcome",
+    fields = ["figure", "panel", "series", "backend", "runtime_backend", "durability_tier", "requested_nvmeof_route", "requested_nvmeof_target",
+              "source_id", "data_id", "cohort", "profile", "value_bytes", "x", "operation", "outcome",
               "metric", "percentile", "unit", "median", "observed_min", "observed_max", "repeat", "case_id", "value",
               "timed_sample_count_or_denominator", "repetition_mode", "independent_repetitions",
               "run_to_run_errorbars", "planned_repeats", "aggregation", "variation"]
@@ -765,7 +835,7 @@ def main():
     export_data(figures, coverage_data, args.output)
     used = set().union(*(set(figure["case_ids"]) for figure in figures))
     manifest = {"schema_version": 1, "input": str(args.input), "input_sha256": hashlib.sha256(raw).hexdigest(),
-                **dataset.repetition_metadata(),
+                **dataset.repetition_metadata(), "durability_tier_by_backend": dataset.durability_tiers,
                 "units": "plot-data.csv retains exact source ns; latency figures convert ns / 1000 to µs; MiB = 2^20 bytes",
                 "figures": figures, "omitted_figures": omitted, "coverage": coverage_data,
                 "case_evidence": evidence_appendix(dataset),

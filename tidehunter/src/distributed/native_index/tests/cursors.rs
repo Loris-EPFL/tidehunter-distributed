@@ -14,12 +14,13 @@ fn paused_scan_and_retained_history_cursors_survive_unload_and_base_replacement(
         batch(2, vec![delete(A), put(0, &future, b"future")]),
     ];
     let receipts = durable(&log, &batches);
-    let mut index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
-    install(&mut index, &log, &batches[0], receipts[0]);
+    let index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
+    install(&index, &log, &batches[0], receipts[0]);
     index
+        .writer()
         .flush_and_unload(&temp.path().join("base.index"), IndexReadCut::Latest)
         .unwrap();
-    install(&mut index, &log, &batches[1], receipts[1]);
+    install(&index, &log, &batches[1], receipts[1]);
     let cut = index.latest_cut();
     let pin = index.pin_cut(cut.clone()).unwrap();
     let expected = index
@@ -45,11 +46,14 @@ fn paused_scan_and_retained_history_cursors_survive_unload_and_base_replacement(
     // Physical positions will change when captured overlay keys are merged into
     // the new base. The history cursor protects its *whole* supported history.
     let prepared = index
+        .writer()
         .prepare_compacted_image(cut.clone(), cut.clone())
         .unwrap();
-    install(&mut index, &log, &batches[2], receipts[2]);
+    install(&index, &log, &batches[2], receipts[2]);
     let root = temp.path().join("replacement.index");
-    index.install_image(prepared.persist(&root).unwrap());
+    index
+        .writer()
+        .install_image(prepared.persist(&root).unwrap());
     assert_eq!(index.retention_floor(), IndexReadCut::BeforeAll);
     while let Some(row) = forward.next(&index) {
         forward_rows.push(row);
@@ -77,9 +81,10 @@ fn paused_scan_and_retained_history_cursors_survive_unload_and_base_replacement(
     drop(pin);
     // Once history ownership is released, a later compaction can advance.
     let compacted = index
+        .writer()
         .prepare_compacted_image(IndexReadCut::Latest, cut.clone())
         .unwrap();
-    index.install_image(
+    index.writer().install_image(
         compacted
             .persist(&temp.path().join("compacted.index"))
             .unwrap(),

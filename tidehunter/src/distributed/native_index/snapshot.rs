@@ -31,7 +31,7 @@ fn cell_digest(bytes: &[u8]) -> [u8; 32] {
 pub(super) struct FrozenCell {
     pub identity: (KeySpace, CellId),
     pub base: Option<SortedBlock>,
-    pub overlay: Overlay<ValueRecordReference>,
+    pub overlay: std::sync::Arc<Overlay<ValueRecordReference>>,
 }
 
 pub(crate) struct PreparedIndexImage {
@@ -77,15 +77,11 @@ impl PreparedIndexImage {
         }
     }
 
-    /// One candidate container for rewritten nonempty cells, never the root.
-    /// Reservation precedes the background worker; no per-cell paths are owned.
-    pub(crate) fn new_files(&self, path: &Path) -> Result<Vec<String>, NativeIndexError> {
-        let (parent, name) = output_parts(path)?;
-        Ok(if self.needs_container(parent) {
-            vec![format!("{name}.cells")]
-        } else {
-            Vec::new()
-        })
+    /// Reserve the generation-specific container even if persistence later
+    /// reuses every existing base. The root is reserved by the authority.
+    pub(crate) fn reserved_files(&self, path: &Path) -> Result<Vec<String>, NativeIndexError> {
+        let (_, name) = output_parts(path)?;
+        Ok(vec![format!("{name}.cells")])
     }
 
     fn needs_container(&self, parent: &Path) -> bool {
@@ -106,6 +102,13 @@ impl PreparedIndexImage {
         path: &Path,
         after_create: impl FnOnce(),
     ) -> Result<PersistedIndexImage, NativeIndexError> {
+        self.cells.sort_by(|a, b| {
+            a.identity
+                .0
+                .0
+                .cmp(&b.identity.0.0)
+                .then_with(|| a.identity.1.cmp(&b.identity.1))
+        });
         let (parent, root_name) = output_parts(path)?;
         match std::fs::symlink_metadata(path) {
             Ok(_) => {
@@ -274,14 +277,19 @@ impl PreparedIndexImage {
 }
 
 fn reusable(cell: &FrozenCell, parent: &Path, cut: IndexReadCut, floor: IndexReadCut) -> bool {
-    cell.overlay.is_empty()
-        && cell.base.as_ref().is_some_and(|base| {
-            retention::position(&base.cut) <= retention::position(&cut)
-                && base.file.as_ref().is_some_and(|file| {
-                    file.path.parent() == Some(parent)
-                        && retention::position(&file.floor) >= retention::position(&floor)
-                })
-        })
+    // Captures retain the complete sealed generation. A cell is still clean
+    // for this prefix when all its overlay references are newer than the cut.
+    cell.overlay.values().all(|values| {
+        values
+            .first()
+            .is_none_or(|reference| !cut.contains(reference))
+    }) && cell.base.as_ref().is_some_and(|base| {
+        retention::position(&base.cut) <= retention::position(&cut)
+            && base.file.as_ref().is_some_and(|file| {
+                file.path.parent() == Some(parent)
+                    && retention::position(&file.floor) >= retention::position(&floor)
+            })
+    })
 }
 
 pub(super) fn container_names<'a>(files: impl Iterator<Item = &'a CellFile>) -> Vec<String> {
@@ -396,6 +404,7 @@ pub(super) fn open(
     shape: &KeyShape,
     database: [u8; 16],
     max_metadata_bytes: usize,
+    shards: usize,
 ) -> Result<NativeIndex, NativeIndexError> {
     let mapped = map_file(&File::open(path)?, Some(MAX_IMAGE_BYTES as u64))?;
     let payload = frame_payload(&mapped)?;
@@ -423,13 +432,13 @@ pub(super) fn open(
     let parent = path
         .parent()
         .ok_or(NativeIndexError::Invalid("image has no parent"))?;
-    let mut index = NativeIndex::new(shape, database, max_metadata_bytes)?;
+    let mut index = NativeIndex::with_shards(shape, database, max_metadata_bytes, shards)?;
     let mut containers: HashMap<String, Container> = HashMap::new();
     for _ in 0..count {
         let keyspace = KeySpace(cursor.u8()?);
         let cell_id = decode_cell(&mut cursor)?;
         index.check_capacity(cell_directory_charge(&cell_id))?;
-        index.resident_directory_bytes += cell_directory_charge(&cell_id);
+        super::shards::add(&index.accounting.directory, cell_directory_charge(&cell_id));
         let name_length = cursor.u16()? as usize;
         let name = std::str::from_utf8(cursor.take(name_length)?)
             .map_err(|_| NativeIndexError::Invalid("cell file name encoding"))?;
@@ -477,14 +486,22 @@ pub(super) fn open(
         for n in 0..block.count {
             let (_, versions) = block.entry(n);
             let reference = decode_reference(&versions[versions.len() - REFERENCE_BYTES..])?;
-            index.latest = Some(index.latest.map_or(reference.mutation_version(), |old| {
+            let writer = index.writer.get_mut();
+            writer.latest = Some(writer.latest.map_or(reference.mutation_version(), |old| {
                 old.max(reference.mutation_version())
             }));
         }
-        if index
-            .cells
+        index
+            .writer
+            .get_mut()
+            .cell_order
+            .push((keyspace, cell_id.clone()));
+        let identity = (keyspace, cell_id);
+        let shard = index.shard_index(identity.0, &identity.1);
+        if index.shards[shard]
+            .get_mut()
             .insert(
-                (keyspace, cell_id),
+                identity,
                 CellIndex {
                     base: Some(block),
                     ..Default::default()
@@ -498,8 +515,12 @@ pub(super) fn open(
     if cursor.remaining() != 0 {
         return Err(NativeIndexError::Invalid("trailing payload"));
     }
-    index.retention.lock().floor = floor;
+    index.retention.set_floor(floor);
     index.recount_retained();
+    let latest = index.writer.get_mut().latest;
+    index.published.store(std::sync::Arc::new(
+        latest.map_or(IndexReadCut::BeforeAll, IndexReadCut::At),
+    ));
     Ok(index)
 }
 

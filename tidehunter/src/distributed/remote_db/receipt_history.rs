@@ -66,6 +66,16 @@ pub(super) struct ReceiptHistory {
     pub(super) counts: BTreeMap<(u32, u64), usize>,
     pub(super) chains: BTreeMap<(u32, u64), [u8; 32]>,
     pub(super) io_stats: HistoryIoStats,
+    // Clones retain their own evidence: syncing a frozen root must not clear
+    // the live root's obligations. Handles are retained only until a barrier.
+    dirty_nodes: bool,
+    dirty_streams: BTreeMap<(u32, u64), Arc<File>>,
+    dirty_namespace: bool,
+    // Reopen cannot infer durability from existence, including abandoned tails.
+    // The first barrier covers every restored nonempty stream and namespace.
+    reopened: bool,
+    #[cfg(test)]
+    fail_sync_after: Option<usize>,
 }
 
 fn encode_slot(value: &impl Serialize) -> Result<[u8; SLOT_BYTES], LocalDbError> {
@@ -104,12 +114,7 @@ impl ReceiptHistory {
     pub(super) fn open(path: &Path, database: [u8; 16]) -> Result<Self, LocalDbError> {
         let path = path.join("receipt-history-v2");
         match fs::create_dir(&path) {
-            Ok(()) => File::open(
-                path.parent()
-                    .ok_or_else(|| LocalDbError::new("receipt history parent absent"))?,
-            )
-            .and_then(|parent| parent.sync_all())
-            .map_err(LocalDbError::component)?,
+            Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 if !fs::symlink_metadata(&path)
                     .map_err(LocalDbError::component)?
@@ -123,6 +128,14 @@ impl ReceiptHistory {
             }
             Err(error) => return Err(LocalDbError::component(error)),
         }
+        // A previous creator may have failed its parent barrier after mkdir.
+        // Existence alone does not prove that the directory name is durable.
+        File::open(
+            path.parent()
+                .ok_or_else(|| LocalDbError::new("receipt history parent absent"))?,
+        )
+        .and_then(|parent| parent.sync_all())
+        .map_err(LocalDbError::component)?;
         let nodes = OpenOptions::new()
             .read(true)
             .write(true)
@@ -148,6 +161,12 @@ impl ReceiptHistory {
             cache: Arc::new(Mutex::new(NodeCache::new(capacity))),
             counts: BTreeMap::new(),
             chains: BTreeMap::new(),
+            dirty_nodes: false,
+            dirty_streams: BTreeMap::new(),
+            dirty_namespace: false,
+            reopened: true,
+            #[cfg(test)]
+            fail_sync_after: None,
             io_stats: HistoryIoStats::default(),
         })
     }
@@ -194,6 +213,8 @@ impl ReceiptHistory {
         self.append_offset = offset
             .checked_add(SLOT_BYTES as u64)
             .ok_or_else(|| LocalDbError::new("retained authority offset exhausted"))?;
+        // Mark before the syscall: write_all_at can fail after a partial write.
+        self.dirty_nodes = true;
         self.nodes
             .write_all_at(&slot, offset)
             .map_err(LocalDbError::component)?;
@@ -382,16 +403,64 @@ impl ReceiptHistory {
             return Ok(());
         };
         let stream = (first.address.partition, first.version.epoch);
+        let root = self.root;
+        let count = self.counts.get(&stream).copied();
+        let chain = self.chains.get(&stream).copied();
+        let result = self.append_stream_inner(receipts);
+        if result.is_err() {
+            // Unreachable node pages and receipt tails may remain. A retry
+            // overwrites the latter from the original ordinal; never publish
+            // in-memory authority for a partially written buffer.
+            self.root = root;
+            match count {
+                Some(value) => {
+                    self.counts.insert(stream, value);
+                }
+                None => {
+                    self.counts.remove(&stream);
+                }
+            }
+            match chain {
+                Some(value) => {
+                    self.chains.insert(stream, value);
+                }
+                None => {
+                    self.chains.remove(&stream);
+                }
+            }
+        }
+        result
+    }
+
+    fn append_stream_inner(&mut self, receipts: &[CheckpointReceipt]) -> Result<(), LocalDbError> {
+        let Some(first) = receipts.first() else {
+            return Ok(());
+        };
+        let stream = (first.address.partition, first.version.epoch);
         let mut ordinal = self.counts.get(&stream).copied().unwrap_or(0);
         let mut state = self.state(stream.0, stream.1)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.stream_path(stream.0, stream.1))
-            .map_err(LocalDbError::component)?;
-        self.io_stats.stream_opens += 1;
+        // An uncommitted file may already exist without a durable name, e.g.
+        // after a failed frozen checkpoint. Treat every zero-count stream as
+        // requiring a directory barrier, even when open finds an existing file.
+        if ordinal == 0 {
+            self.dirty_namespace = true;
+        }
+        let file = if let Some(file) = self.dirty_streams.get(&stream) {
+            Arc::clone(file)
+        } else {
+            let file = Arc::new(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(self.stream_path(stream.0, stream.1))
+                    .map_err(LocalDbError::component)?,
+            );
+            self.io_stats.stream_opens += 1;
+            self.dirty_streams.insert(stream, Arc::clone(&file));
+            file
+        };
         if ordinal != 0 {
             self.io_stats.previous_slot_reads += 1;
             let previous = Self::read_receipt(&file, ordinal - 1)?;
@@ -463,21 +532,71 @@ impl ReceiptHistory {
     }
 
     pub(super) fn sync(&mut self) -> Result<(), LocalDbError> {
-        self.nodes.sync_all().map_err(LocalDbError::component)?;
-        self.io_stats.sync_operations += 1;
-        for (&(partition, epoch), &count) in &self.counts {
-            if count != 0 {
-                self.io_stats.stream_opens += 1;
-                File::open(self.stream_path(partition, epoch))
-                    .and_then(|file| file.sync_all())
-                    .map_err(LocalDbError::component)?;
-                self.io_stats.sync_operations += 1;
+        // Like the distributed native WAL's data barrier, sync_data includes
+        // file-size metadata needed to retrieve appended bytes; namespace
+        // durability remains a separate directory sync. Native Index WAL's
+        // dirty row maintenance writes a common append log (large_table.rs);
+        // a consolidated metadata log could reduce barriers further when many
+        // streams change, but requires new ordinal-to-offset indexing, replay,
+        // root reachability, retention and crash-safe migration. It also trades
+        // fixed-slot direct reads for indirection and shared-log contention.
+        // Existing append-only Patricia pages and fixed ordinal streams already
+        // permit this smaller optimization without another value WAL or format
+        // change. Valkey 9.1.3 beforeSleep/flushAppendOnlyFile orders its
+        // AOF_FSYNC_ALWAYS barrier before replies; unchanged-file elimination
+        // similarly leaves the required data and namespace barriers intact.
+        if self.reopened || self.dirty_nodes {
+            #[cfg(test)]
+            Self::sync_step(&mut self.fail_sync_after)?;
+            self.nodes.sync_data().map_err(LocalDbError::component)?;
+            self.io_stats.sync_operations += 1;
+        }
+        if self.reopened {
+            for (&stream, &count) in &self.counts {
+                if count != 0 && !self.dirty_streams.contains_key(&stream) {
+                    // Retained after a failed barrier and reused by append.
+                    let file = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(self.stream_path(stream.0, stream.1))
+                        .map_err(LocalDbError::component)?;
+                    self.io_stats.stream_opens += 1;
+                    self.dirty_streams.insert(stream, Arc::new(file));
+                }
             }
         }
-        File::open(&self.path)
-            .and_then(|directory| directory.sync_all())
-            .map_err(LocalDbError::component)?;
-        self.io_stats.sync_operations += 1;
+        for file in self.dirty_streams.values() {
+            #[cfg(test)]
+            Self::sync_step(&mut self.fail_sync_after)?;
+            file.sync_data().map_err(LocalDbError::component)?;
+            self.io_stats.sync_operations += 1;
+        }
+        if self.reopened || self.dirty_namespace {
+            #[cfg(test)]
+            Self::sync_step(&mut self.fail_sync_after)?;
+            File::open(&self.path)
+                .and_then(|directory| directory.sync_all())
+                .map_err(LocalDbError::component)?;
+            self.io_stats.sync_operations += 1;
+        }
+        // Preserve the entire set on any failure, including files already
+        // synchronized, so retry cannot lose an outstanding obligation.
+        self.dirty_nodes = false;
+        self.dirty_streams.clear();
+        self.dirty_namespace = false;
+        self.reopened = false;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn sync_step(fail_sync_after: &mut Option<usize>) -> Result<(), LocalDbError> {
+        if let Some(remaining) = fail_sync_after {
+            if *remaining == 0 {
+                *fail_sync_after = None;
+                return Err(LocalDbError::new("injected receipt history sync failure"));
+            }
+            *remaining -= 1;
+        }
         Ok(())
     }
 
@@ -536,6 +655,10 @@ impl ReceiptHistory {
             .write(true)
             .open(self.stream_path(stream.0, stream.1))
             .map_err(LocalDbError::component)?;
+        self.dirty_streams.insert(
+            stream,
+            Arc::new(file.try_clone().map_err(LocalDbError::component)?),
+        );
         file.write_all_at(&encode_slot(&entry)?, 0)
             .map_err(LocalDbError::component)?;
         self.root = Some(self.write_node(&Node::Leaf(entry))?);
@@ -568,6 +691,163 @@ mod tests {
                 offset: sequence * 256,
                 len: 128,
             },
+        }
+    }
+
+    #[test]
+    fn sync_only_changed_streams_and_reopen_covers_restored_roots() {
+        let temporary = tempdir::TempDir::new("receipt-dirty-streams").unwrap();
+        let mut history = ReceiptHistory::open(temporary.path(), [9; 16]).unwrap();
+        let first = receipt(0);
+        let mut other = receipt(1);
+        other.address.partition = 3;
+        history.append_stream(&[first]).unwrap();
+        history.append_stream(&[other]).unwrap();
+        history.sync().unwrap();
+        let old_root = history.clone();
+        history.reset_io_stats();
+        history.append_stream(&[receipt(2)]).unwrap();
+        // A missing unchanged stream would make the old sync loop fail on open.
+        // Its already-open file is not held after the successful barrier either.
+        let unchanged = history.stream_path(3, 1);
+        let parked = unchanged.with_extension("parked");
+        fs::rename(&unchanged, &parked).unwrap();
+        history.sync().unwrap();
+        assert_eq!(history.io_stats.stream_opens, 1); // append only
+        assert_eq!(history.io_stats.sync_operations, 2); // nodes and changed stream
+        fs::rename(&parked, &unchanged).unwrap();
+        assert_eq!(old_root.lookup(receipt(2).id).unwrap(), None);
+
+        let mut reopened = ReceiptHistory::open(temporary.path(), [9; 16]).unwrap();
+        reopened.root = history.root;
+        reopened.counts = history.counts.clone();
+        reopened.chains = history.chains.clone();
+        reopened.sync().unwrap();
+        assert_eq!(reopened.io_stats.sync_operations, 4); // nodes, two streams, directory
+        assert_eq!(
+            reopened.lookup(receipt(2).id).unwrap(),
+            Some(receipt(2).authenticated())
+        );
+        assert_eq!(
+            reopened.receipt(3, 1, 0).unwrap().authenticated(),
+            other.authenticated()
+        );
+        assert_eq!(
+            reopened.prefix(2, 1, 2).unwrap(),
+            history.prefix(2, 1, 2).unwrap()
+        );
+        reopened.reset_io_stats();
+        reopened.sync().unwrap();
+        assert_eq!(reopened.io_stats.sync_operations, 0);
+    }
+
+    #[test]
+    fn partial_barrier_failure_retains_every_obligation_for_retry_and_clones() {
+        let temporary = tempdir::TempDir::new("receipt-sync-retry").unwrap();
+        let mut history = ReceiptHistory::open(temporary.path(), [9; 16]).unwrap();
+        history.sync().unwrap();
+        history.append_stream(&[receipt(0)]).unwrap();
+        let mut other = receipt(1);
+        other.address.partition = 3;
+        history.append_stream(&[other]).unwrap();
+        let mut frozen = history.clone();
+        // Real node and first stream barriers complete; the second fails before
+        // its syscall. Retry must perform the complete set, including directory.
+        history.fail_sync_after = Some(2);
+        history.reset_io_stats();
+        assert!(history.sync().is_err());
+        assert_eq!(history.io_stats.sync_operations, 2);
+        history.reset_io_stats();
+        history.sync().unwrap();
+        assert_eq!(history.io_stats.sync_operations, 4);
+        frozen.reset_io_stats();
+        frozen.sync().unwrap();
+        assert_eq!(frozen.io_stats.sync_operations, 4);
+        let mut reopened = ReceiptHistory::open(temporary.path(), [9; 16]).unwrap();
+        reopened.root = history.root;
+        reopened.counts = history.counts.clone();
+        reopened.chains = history.chains.clone();
+        assert_eq!(
+            reopened.receipt(3, 1, 0).unwrap().authenticated(),
+            other.authenticated()
+        );
+        assert_eq!(
+            reopened.lookup(receipt(0).id).unwrap(),
+            Some(receipt(0).authenticated())
+        );
+        reopened.sync().unwrap();
+    }
+
+    #[test]
+    fn reopened_stream_remains_appendable_after_partial_sync_failure() {
+        let temporary = tempdir::TempDir::new("receipt-reopen-sync-retry").unwrap();
+        let mut original = ReceiptHistory::open(temporary.path(), [9; 16]).unwrap();
+        original.append_stream(&[receipt(0)]).unwrap();
+        original.sync().unwrap();
+        let mut reopened = ReceiptHistory::open(temporary.path(), [9; 16]).unwrap();
+        reopened.root = original.root;
+        reopened.counts = original.counts.clone();
+        reopened.chains = original.chains.clone();
+        // The node and stream barriers execute; failure leaves the restored
+        // stream handle retained for a later append and complete barrier retry.
+        reopened.fail_sync_after = Some(2);
+        assert!(reopened.sync().is_err());
+        reopened.append_stream(&[receipt(1)]).unwrap();
+        reopened.sync().unwrap();
+        let mut restored = ReceiptHistory::open(temporary.path(), [9; 16]).unwrap();
+        restored.root = reopened.root;
+        restored.counts = reopened.counts.clone();
+        restored.chains = reopened.chains.clone();
+        assert_eq!(
+            restored.receipt(2, 1, 1).unwrap().authenticated(),
+            receipt(1).authenticated()
+        );
+        assert_eq!(
+            restored.lookup(receipt(1).id).unwrap(),
+            Some(receipt(1).authenticated())
+        );
+        assert_eq!(
+            restored.prefix(2, 1, 2).unwrap(),
+            reopened.prefix(2, 1, 2).unwrap()
+        );
+    }
+
+    #[test]
+    fn failed_append_leaves_uncommitted_tail_and_retry_restores_exact_prefix() {
+        let temporary = tempdir::TempDir::new("receipt-append-retry").unwrap();
+        let mut history = ReceiptHistory::open(temporary.path(), [9; 16]).unwrap();
+        history.append_stream(&[receipt(0)]).unwrap();
+        history.sync().unwrap();
+        let saved = history.clone();
+        let mut entries: Vec<_> = (1..18).map(receipt).collect();
+        entries[16].address.partition = 3;
+        assert!(history.append_stream(&entries).is_err());
+        assert_eq!(history.counts, saved.counts);
+        assert_eq!(history.root, saved.root);
+        assert_eq!(history.lookup(receipt(1).id).unwrap(), None);
+        entries[16].address.partition = 2;
+        history.append_stream(&entries).unwrap();
+        history.sync().unwrap();
+        let mut reopened = ReceiptHistory::open(temporary.path(), [9; 16]).unwrap();
+        reopened.root = history.root;
+        reopened.counts = history.counts.clone();
+        reopened.chains = history.chains.clone();
+        assert_eq!(
+            reopened.prefix(2, 1, 18).unwrap(),
+            history.prefix(2, 1, 18).unwrap()
+        );
+        for entry in entries {
+            assert_eq!(
+                reopened
+                    .receipt(2, 1, entry.version.sequence as usize)
+                    .unwrap()
+                    .authenticated(),
+                entry.authenticated()
+            );
+            assert_eq!(
+                reopened.lookup(entry.id).unwrap(),
+                Some(entry.authenticated())
+            );
         }
     }
 

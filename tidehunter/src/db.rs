@@ -98,9 +98,34 @@ impl Db {
         config: Arc<Config>,
         metrics: Arc<Metrics>,
     ) -> DbResult<Arc<Self>> {
+        Self::open_inner(path, key_shape, config, metrics, false)
+    }
+
+    /// Open a benchmark database only when its persisted WAL geometry matches.
+    /// A path without a config witness must be empty apart from the lock file.
+    #[cfg(feature = "experimental-distributed")]
+    pub fn open_for_benchmark(
+        path: &Path,
+        key_shape: KeyShape,
+        config: Arc<Config>,
+        metrics: Arc<Metrics>,
+    ) -> DbResult<Arc<Self>> {
+        Self::open_inner(path, key_shape, config, metrics, true)
+    }
+
+    fn open_inner(
+        path: &Path,
+        key_shape: KeyShape,
+        config: Arc<Config>,
+        metrics: Arc<Metrics>,
+        check_benchmark_geometry: bool,
+    ) -> DbResult<Arc<Self>> {
         config.validate();
         let path = path.canonicalize()?;
         let lock = DbLock::acquire(&path, config.open_lock_retry_timeout)?;
+        if check_benchmark_geometry {
+            Self::check_benchmark_wal_geometry(&path, &config)?;
+        }
         let (key_shape, keyspaces, registry_dirty) = Self::reconcile_key_shape(&path, key_shape)?;
         Self::maybe_create_config_file(&path, &config)?;
         let wal = Wal::open(&path, config.wal_layout(WalKind::Replay), metrics.clone())?;
@@ -352,7 +377,37 @@ impl Db {
         path.join("config.yaml")
     }
 
-    /// Create config file if it doesn't exist
+    /// Check the benchmark's persisted layout under the database lock.
+    fn check_benchmark_wal_geometry(path: &Path, config: &Config) -> DbResult<()> {
+        if Self::config_file_path(path).exists() {
+            let stored = Self::load_config(path)?;
+            if stored.frag_size != config.frag_size || stored.wal_file_size != config.wal_file_size
+            {
+                return Err(DbError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "WAL geometry mismatch: stored fragment/file sizes {}/{}, requested {}/{}",
+                        stored.frag_size,
+                        stored.wal_file_size,
+                        config.frag_size,
+                        config.wal_file_size
+                    ),
+                )));
+            }
+        } else {
+            for entry in std::fs::read_dir(path)? {
+                if entry?.file_name() != "LOCK" {
+                    return Err(DbError::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "benchmark database has no WAL geometry witness and is not empty",
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Create config file if it doesn't exist.
     fn maybe_create_config_file(path: &Path, config: &Config) -> DbResult<()> {
         let config_file_path = Self::config_file_path(path);
         if !config_file_path.exists() {
@@ -1385,6 +1440,13 @@ impl Db {
     #[cfg(feature = "experimental-distributed")]
     pub fn registered_value_wal_files_for_benchmark(&self) -> usize {
         self.wal.registered_file_count()
+    }
+
+    /// Observe the registered Value-WAL file count and total logical file length
+    /// at a benchmark boundary, without reading or faulting WAL contents.
+    #[cfg(feature = "experimental-distributed")]
+    pub fn value_wal_inventory_for_benchmark(&self) -> std::io::Result<(usize, u64)> {
+        self.wal.registered_file_inventory()
     }
 
     /// Sample the native benchmark barrier's file and namespace persistence.

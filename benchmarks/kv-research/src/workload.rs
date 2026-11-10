@@ -2,9 +2,11 @@ use blake2::{Blake2b512, Digest};
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
 use std::io::Read;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tidehunter::minibytes::Bytes;
 
-use crate::config::{KeyDistribution, OperationMix};
+use crate::config::{KeyDistribution, OperationMix, PutKeyPolicy};
 
 pub const KEY_BYTES: usize = 32;
 
@@ -84,6 +86,8 @@ pub struct WorkloadGenerator {
     mix: OperationMix,
     batch_size: usize,
     distribution: KeyDistribution,
+    put_key_policy: PutKeyPolicy,
+    next_put_index: Arc<AtomicU64>,
 }
 
 impl WorkloadGenerator {
@@ -94,6 +98,8 @@ impl WorkloadGenerator {
         mix: OperationMix,
         batch_size: usize,
         distribution: KeyDistribution,
+        put_key_policy: PutKeyPolicy,
+        next_put_index: Arc<AtomicU64>,
     ) -> Self {
         Self {
             rng: StdRng::seed_from_u64(seed),
@@ -101,8 +107,30 @@ impl WorkloadGenerator {
             mix,
             batch_size,
             distribution,
+            put_key_policy,
+            next_put_index,
         }
     }
+    /// Reads stay in the prepared range. Each put uses a new logical id above that range.
+    pub(crate) fn interference_item(
+        &mut self,
+        put_index: Option<u64>,
+    ) -> crate::backend::BackendResult<WorkItem> {
+        let (operation, key) = if let Some(index) = put_index {
+            let key = self
+                .key_count
+                .checked_add(index)
+                .ok_or_else(|| std::io::Error::other("interference put key range overflow"))?;
+            (OperationKind::Put, key)
+        } else {
+            (OperationKind::Read, self.next_key()?)
+        };
+        Ok(WorkItem {
+            operation,
+            keys: vec![key],
+        })
+    }
+
     /// Advance the normal RNG while visiting logical keys in cursor order.
     /// The caller validates a read-only mix; measurement sweeps also bound calls to avoid wrap.
     pub(crate) fn next_sweep_item(
@@ -160,11 +188,29 @@ impl WorkloadGenerator {
         for _ in 0..count {
             keys.push(if operation == OperationKind::MissingRead {
                 self.key_count + self.rng.gen_range(0..self.key_count.max(1))
+            } else if self.put_key_policy == PutKeyPolicy::New
+                && matches!(operation, OperationKind::Put | OperationKind::PutBatch)
+            {
+                self.next_put_key()?
             } else {
                 self.next_key()?
             });
         }
         Ok(WorkItem { operation, keys })
+    }
+
+    fn next_put_key(&self) -> crate::backend::BackendResult<u64> {
+        // Relaxed reserves unique ids only; it does not publish any other shared state.
+        let index = self
+            .next_put_index
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |index| {
+                self.key_count.checked_add(index)?;
+                index.checked_add(1)
+            })
+            .map_err(|_| std::io::Error::other("new put key range overflow"))?;
+        self.key_count
+            .checked_add(index)
+            .ok_or_else(|| std::io::Error::other("new put key range overflow").into())
     }
 
     fn next_key(&mut self) -> crate::backend::BackendResult<u64> {
@@ -230,6 +276,159 @@ mod tests {
     use super::*;
 
     #[test]
+    fn new_put_keys_share_one_exact_range_across_threads_and_phases() {
+        for distribution in [
+            KeyDistribution::Uniform,
+            KeyDistribution::Zipf { exponent: 1.2 },
+        ] {
+            let counter = Arc::new(AtomicU64::new(0));
+            let mut keys = Vec::new();
+            for _ in 0..2 {
+                let barrier = std::sync::Barrier::new(4);
+                std::thread::scope(|scope| {
+                    let mut workers = Vec::new();
+                    for worker in 0..4 {
+                        let mut generator = WorkloadGenerator::new(
+                            worker,
+                            100,
+                            OperationMix {
+                                put: u32::from(worker % 2 == 0),
+                                put_batch: u32::from(worker % 2 != 0),
+                                ..OperationMix::default()
+                            },
+                            4,
+                            distribution.clone(),
+                            PutKeyPolicy::New,
+                            Arc::clone(&counter),
+                        );
+                        let barrier = &barrier;
+                        workers.push(scope.spawn(move || {
+                            barrier.wait();
+                            (0..64)
+                                .flat_map(|_| generator.next_item().unwrap().keys)
+                                .collect::<Vec<_>>()
+                        }));
+                    }
+                    for worker in workers {
+                        keys.extend(worker.join().unwrap());
+                    }
+                });
+            }
+            keys.sort_unstable();
+            assert_eq!(keys, (100..1380).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn new_put_key_overflow_is_an_error_and_never_wraps() {
+        for batch in [false, true] {
+            let mut generator = WorkloadGenerator::new(
+                7,
+                u64::MAX - 1,
+                OperationMix {
+                    put: u32::from(!batch),
+                    put_batch: u32::from(batch),
+                    ..OperationMix::default()
+                },
+                2,
+                KeyDistribution::Uniform,
+                PutKeyPolicy::New,
+                Arc::new(AtomicU64::new(0)),
+            );
+            if batch {
+                assert_eq!(
+                    generator.next_item().unwrap().keys,
+                    [u64::MAX - 1, u64::MAX]
+                );
+            } else {
+                assert_eq!(generator.next_item().unwrap().keys, [u64::MAX - 1]);
+                assert_eq!(generator.next_item().unwrap().keys, [u64::MAX]);
+            }
+            for _ in 0..2 {
+                assert_eq!(
+                    generator.next_item().unwrap_err().to_string(),
+                    "new put key range overflow"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn overwrite_preserves_recorded_seeded_operation_and_key_sequence() {
+        // Recorded from the old selection path: rand 0.8 StdRng, seed 7, six equal
+        // weights, 100 prepared keys and three members per grouped operation.
+        let expected = [
+            (OperationKind::Read, vec![30]),
+            (OperationKind::MissingRead, vec![127]),
+            (OperationKind::PutBatch, vec![17, 25, 12]),
+            (OperationKind::GetMany, vec![2, 8, 37]),
+            (OperationKind::PutBatch, vec![56, 50, 64]),
+            (OperationKind::Delete, vec![78]),
+            (OperationKind::Put, vec![92]),
+            (OperationKind::Delete, vec![46]),
+            (OperationKind::PutBatch, vec![56, 1, 67]),
+            (OperationKind::MissingRead, vec![128]),
+            (OperationKind::Put, vec![66]),
+            (OperationKind::Put, vec![40]),
+        ];
+        let mut generator = WorkloadGenerator::new(
+            7,
+            100,
+            OperationMix {
+                read: 1,
+                put: 1,
+                delete: 1,
+                missing_read: 1,
+                get_many: 1,
+                put_batch: 1,
+            },
+            3,
+            KeyDistribution::Uniform,
+            PutKeyPolicy::Overwrite,
+            Arc::new(AtomicU64::new(0)),
+        );
+        for (operation, keys) in expected {
+            let item = generator.next_item().unwrap();
+            assert_eq!(item.operation, operation);
+            assert_eq!(item.keys, keys);
+        }
+    }
+
+    #[test]
+    fn interference_keys_are_disjoint_and_put_keys_are_new() {
+        for distribution in [
+            KeyDistribution::Uniform,
+            KeyDistribution::Zipf { exponent: 1.2 },
+        ] {
+            let mut generator = WorkloadGenerator::new(
+                7,
+                8,
+                OperationMix {
+                    read: 1,
+                    ..OperationMix::default()
+                },
+                2,
+                distribution,
+                PutKeyPolicy::Overwrite,
+                Arc::new(AtomicU64::new(0)),
+            );
+            for index in 0..1000 {
+                let read = generator.interference_item(None).unwrap();
+                let put = generator.interference_item(Some(index)).unwrap();
+                assert_eq!(read.operation, OperationKind::Read);
+                assert!(read.keys[0] < 8);
+                assert_eq!(put.operation, OperationKind::Put);
+                assert_eq!(put.keys, [8 + index]);
+                assert_ne!(
+                    key_bytes(&[0; 16], 7, read.keys[0]),
+                    key_bytes(&[0; 16], 7, put.keys[0])
+                );
+            }
+            assert!(generator.interference_item(Some(u64::MAX)).is_err());
+        }
+    }
+
+    #[test]
     fn deterministic_data_is_namespaced_and_uniform_key_width() {
         let ns = [9; 16];
         assert_eq!(key_bytes(&ns, 7, 42), key_bytes(&ns, 7, 42));
@@ -268,8 +467,24 @@ mod tests {
             get_many: 1,
             ..OperationMix::default()
         };
-        let mut a = WorkloadGenerator::new(4, 100, mix.clone(), 32, KeyDistribution::Uniform);
-        let mut b = WorkloadGenerator::new(4, 100, mix, 32, KeyDistribution::Uniform);
+        let mut a = WorkloadGenerator::new(
+            4,
+            100,
+            mix.clone(),
+            32,
+            KeyDistribution::Uniform,
+            PutKeyPolicy::Overwrite,
+            Arc::new(AtomicU64::new(0)),
+        );
+        let mut b = WorkloadGenerator::new(
+            4,
+            100,
+            mix,
+            32,
+            KeyDistribution::Uniform,
+            PutKeyPolicy::Overwrite,
+            Arc::new(AtomicU64::new(0)),
+        );
         let left = a.next_item().unwrap();
         let right = b.next_item().unwrap();
         assert_eq!(left.operation, OperationKind::GetMany);
@@ -283,7 +498,15 @@ mod tests {
             get_many: 1,
             ..OperationMix::default()
         };
-        let mut generator = WorkloadGenerator::new(7, 8, mix, 2, KeyDistribution::Uniform);
+        let mut generator = WorkloadGenerator::new(
+            7,
+            8,
+            mix,
+            2,
+            KeyDistribution::Uniform,
+            PutKeyPolicy::Overwrite,
+            Arc::new(AtomicU64::new(0)),
+        );
         let mut cursor = 0;
         let keys: Vec<_> = (0..4)
             .flat_map(|_| generator.next_sweep_item(&mut cursor).unwrap().keys)
@@ -297,8 +520,24 @@ mod tests {
             get_many: 1,
             ..OperationMix::default()
         };
-        let mut sweep = WorkloadGenerator::new(4, 7, mix.clone(), 3, KeyDistribution::Uniform);
-        let mut random = WorkloadGenerator::new(4, 7, mix, 3, KeyDistribution::Uniform);
+        let mut sweep = WorkloadGenerator::new(
+            4,
+            7,
+            mix.clone(),
+            3,
+            KeyDistribution::Uniform,
+            PutKeyPolicy::Overwrite,
+            Arc::new(AtomicU64::new(0)),
+        );
+        let mut random = WorkloadGenerator::new(
+            4,
+            7,
+            mix,
+            3,
+            KeyDistribution::Uniform,
+            PutKeyPolicy::Overwrite,
+            Arc::new(AtomicU64::new(0)),
+        );
         let mut cursor = 0;
         let mut keys = Vec::new();
         for _ in 0..3 {

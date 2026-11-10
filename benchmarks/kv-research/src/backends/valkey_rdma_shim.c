@@ -11,6 +11,58 @@
 #include <string.h>
 #include <time.h>
 
+/* Called only by the optional, pinned-source diagnostic hook.  The pointer is
+ * thread-local because a context is used by one blocking worker at a time. */
+struct kv_cq_sample {
+    uint64_t poll_wait_ns, poll_calls, cq_poll_ns, cq_poll_calls;
+    uint64_t wake_to_cq_ns, wake_to_cq_samples, completions, clock_failures;
+};
+static _Thread_local struct kv_cq_sample *kv_cq_current;
+static _Thread_local uint64_t kv_poll_start, kv_cq_start, kv_cq_wake;
+static uint64_t kv_clock_ns(void) {
+    struct timespec ts;
+    int saved_errno = errno;
+    int result = clock_gettime(CLOCK_MONOTONIC, &ts);
+    errno = saved_errno;
+    if (result != 0) {
+        if (kv_cq_current) kv_cq_current->clock_failures++;
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+void kv_cq_sample_begin(struct kv_cq_sample *sample) {
+    kv_cq_current = sample;
+    kv_poll_start = kv_cq_start = kv_cq_wake = 0;
+}
+void kv_cq_sample_end(void) { kv_cq_current = NULL; }
+void kv_diag_poll_begin(void) {
+    if (kv_cq_current) kv_poll_start = kv_clock_ns();
+}
+void kv_diag_poll_end(int cq_ready) {
+    if (!kv_cq_current) return;
+    uint64_t now = kv_clock_ns();
+    if (now && kv_poll_start) kv_cq_current->poll_wait_ns += now - kv_poll_start;
+    kv_cq_current->poll_calls++;
+    kv_cq_wake = cq_ready ? now : 0;
+}
+void kv_diag_cq_poll_begin(void) {
+    if (!kv_cq_current) return;
+    uint64_t now = kv_clock_ns();
+    if (kv_cq_wake && now) {
+        kv_cq_current->wake_to_cq_ns += now - kv_cq_wake;
+        kv_cq_current->wake_to_cq_samples++;
+        kv_cq_wake = 0;
+    }
+    kv_cq_start = now;
+}
+void kv_diag_cq_poll_end(int result) {
+    if (!kv_cq_current) return;
+    uint64_t now = kv_clock_ns();
+    if (now && kv_cq_start) kv_cq_current->cq_poll_ns += now - kv_cq_start;
+    kv_cq_current->cq_poll_calls++;
+    if (result > 0) kv_cq_current->completions += (uint64_t)result;
+}
+
 /* Capture errno before Rust or another library call can overwrite it. The two
  * RDMA IO strings are emitted specifically on upstream poll/deadline expiry. */
 static int kv_timed_out(const valkeyContext *c, int rdma, int saved_errno) {

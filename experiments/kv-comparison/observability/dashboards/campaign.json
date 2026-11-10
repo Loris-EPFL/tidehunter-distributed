@@ -1989,10 +1989,10 @@
       "title": "TERMINAL boundary accounting availability and elapsed seconds",
       "type": "table",
       "datasource": {"type": "prometheus", "uid": "kv-campaign-prometheus"},
-      "description": "Controller-validated same-boot, same-cgroup-inode before/end accounting. The host-local monotonic interval includes driver/oracle, background work and gate/control-plane overlap; NOT pure operation CPU or measurement-only stage time. Availability 0 means rejected/unavailable; absent means no evidence. Elapsed seconds are observed boundary separation, NOT benchmark API exposure or a live rate interval. resource_host_index identifies the measured host, not exporter placement. Sampling and observer overhead remain uncalibrated.",
+      "description": "Controller-validated same-boot, same-cgroup-inode before/end accounting. available=1 denotes a fully available row; available=0 with core_available=1 and io_available=0 denotes validated CPU/memory but unknown IO, while available=0 without those qualifiers denotes unavailable core. Qualifier gauges are emitted for partial rows only; absent evidence is not zero. The host-local monotonic interval includes driver/oracle, background work and gate/control-plane overlap; NOT pure operation CPU or measurement-only stage time. Elapsed seconds are observed boundary separation, NOT benchmark API exposure or a live rate interval. resource_host_index identifies the measured host, not exporter placement. Sampling and observer overhead remain uncalibrated.",
       "gridPos": {"x": 0, "y": 96, "w": 12, "h": 8},
       "targets": [
-        {"refId": "A", "expr": "label_replace(last_over_time({__name__=~\"kv_case_resource_interval_(available|elapsed_seconds)\",job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",scope=\"measurement_boundary_interval\",resource_host_index=~\"$host_index\"}[$__range]), \"metric\", \"$1\", \"__name__\", \"kv_case_resource_interval_(.*)\")", "format": "table", "instant": true, "range": false}
+        {"refId": "A", "expr": "label_replace(last_over_time({__name__=~\"kv_case_resource_interval_(available|core_available|io_available|elapsed_seconds)\",job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",scope=\"measurement_boundary_interval\",resource_host_index=~\"$host_index\"}[$__range]), \"metric\", \"$1\", \"__name__\", \"kv_case_resource_interval_(.*)\")", "format": "table", "instant": true, "range": false}
       ],
       "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "__name__": true, "job": true, "instance": true, "host_index": true, "host_role": true, "run_id": true, "case_id": true}}}],
       "fieldConfig": {"defaults": {"unit": "none", "noValue": "No data"}, "overrides": []},
@@ -2031,10 +2031,10 @@
       "title": "TERMINAL write stage totals — distinct scoped populations",
       "type": "table",
       "datasource": {"type": "prometheus", "uid": "kv-campaign-prometheus"},
-      "description": "Real schema-1 write-diagnostics.json only. TWO INDEPENDENT POPULATIONS: scope=sampled_prefix is bounded owner/transport/native write samples; scope=measurement_boundary_cumulative_delta is the coordinator's FULL measurement-boundary counter window, including coordinator preparation/admission, storage wait, publication, checkpoints and prefix-blocked time. The coordinator window is not restricted to the sampled prefix, and its availability does not require owner samples. Never combine their counts or normalize one population by the other's samples. Accumulated ns clocks become seconds, NOT per-operation percentiles, pure network time or additive latency fractions. Nested/overlapping stages MUST NOT be added or drawn as a percentage pie. Prefix selection is not proven representative; clock/collection overhead is NOT zero. Absent/reset/unavailable intervals remain No data, with explicit availability=0 only when a recorded interval error exists. Inspect each population's clock_scope and the artifact's overlap_semantics.",
+      "description": "Independent populations: sampled_prefix is bounded append/native samples; sampled_checkpoint_control reports separate checkpoint availability; measurement_nvme_io_cumulative_delta is a full live NVMe client-side I/O counter window, not first-N samples; coordinator_arm_through_pre_completion_gate and measurement_boundary_cumulative_delta are separate coordinator windows. Never combine counts or normalize one population by another. Clocks overlap, are not additive, and do not establish pure wire, device or CPU time or stage percentiles. Missing values are unavailable, not zero.",
       "gridPos": {"x": 0, "y": 112, "w": 24, "h": 12},
       "targets": [
-        {"refId": "A", "expr": "label_replace(label_replace(label_replace(label_replace(last_over_time({__name__=~\"kv_case_write_diagnostic_(available|operations|stage_seconds|stage_count)\",job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",phase=\"measurement\",scope=~\"sampled_prefix|measurement_boundary_cumulative_delta\"}[$__range]), \"metric\", \"$1\", \"__name__\", \"kv_case_write_diagnostic_(.*)\"), \"detail\", \"$1\", \"stage\", \"(.+)\"), \"detail\", \"$1\", \"counter\", \"(.+)\"), \"detail\", \"$1\", \"population\", \"(.+)\")", "format": "table", "instant": true, "range": false}
+        {"refId": "A", "expr": "label_replace(label_replace(label_replace(label_replace(last_over_time({__name__=~\"kv_case_write_diagnostic_(available|operations|stage_seconds|stage_count)\",job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",phase=\"measurement\",scope=~\"sampled_prefix|sampled_checkpoint_control|measurement_nvme_io_cumulative_delta|coordinator_arm_through_pre_completion_gate|measurement_boundary_cumulative_delta\"}[$__range]), \"metric\", \"$1\", \"__name__\", \"kv_case_write_diagnostic_(.*)\"), \"detail\", \"$1\", \"stage\", \"(.+)\"), \"detail\", \"$1\", \"counter\", \"(.+)\"), \"detail\", \"$1\", \"population\", \"(.+)\")", "format": "table", "instant": true, "range": false}
       ],
       "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "__name__": true, "job": true, "instance": true, "host_index": true, "host_role": true, "run_id": true, "case_id": true, "phase": true, "diagnostic_backend": true, "stage": true, "counter": true, "population": true}, "indexByName": {"scope": 0, "component": 1, "detail": 2, "metric": 3, "Value": 4}}}],
       "fieldConfig": {"defaults": {"unit": "none", "decimals": 9, "noValue": "No data"}, "overrides": [{"matcher": {"id": "byName", "options": "detail"}, "properties": [{"id": "custom.width", "value": 460}]}]},
@@ -2119,6 +2119,52 @@
       "gridPos": {"x": 0, "y": 182, "w": 24, "h": 12},
       "targets": [{"refId": "A", "expr": "last_over_time({__name__=~\"kv_case_block_(trace|interval)_(available|qualified|truncated|count|counter_available|timestamp_available|timestamp_seconds|seconds)\",job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",scope=\"collector_window_block_device_wide\",resource_host_index=~\"$host_index\"}[$__range])", "format": "table", "instant": true, "range": false}],
       "fieldConfig": {"defaults": {"unit": "none", "decimals": 9, "noValue": "No data"}, "overrides": []},
+      "options": {"showHeader": true, "cellHeight": "sm"}
+    },
+    {
+      "id": 36,
+      "title": "TERMINAL correlated diagnostic stage sums and samples",
+      "type": "table",
+      "datasource": {"type": "prometheus", "uid": "kv-campaign-prometheus"},
+      "description": "Sampled diagnostic cohorts, not all operations. Each scope, population and stage has its own observed sum and denominator; clocks can overlap and populations differ. Do not add nested stages or pool population means. Client CQ poll-wait and wake-to-CQ are local polling/wakeup intervals, not wire or device time. Missing endpoints and unavailable evidence remain No data; inspect raw records for correlations and tails.",
+      "gridPos": {"x": 0, "y": 194, "w": 24, "h": 10},
+      "targets": [{"refId": "A", "expr": "label_replace(last_over_time({__name__=~\"kv_case_correlated_stage_(seconds_sum|samples)\",job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",phase=\"measurement\"}[$__range]), \"metric\", \"$1\", \"__name__\", \"kv_case_correlated_stage_(.*)\")", "format": "table", "instant": true, "range": false}],
+      "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "__name__": true, "job": true, "instance": true, "run_id": true, "exported_run_id": true, "case_id": true, "exported_case_id": true, "cohort": true, "host_index": true, "host_role": true, "phase": true, "profile": true, "repeat": true, "requested_backend": true, "value_bytes": true}, "indexByName": {"diagnostic_backend": 0, "scope": 1, "population": 2, "stage": 3, "metric": 4, "Value": 5}}}],
+      "fieldConfig": {"defaults": {"unit": "none", "decimals": 9, "noValue": "No data"}, "overrides": []},
+      "options": {"showHeader": true, "cellHeight": "sm"}
+    },
+    {
+      "id": 37,
+      "title": "TERMINAL Valkey CQ availability and partial records",
+      "type": "table",
+      "datasource": {"type": "prometheus", "uid": "kv-campaign-prometheus"},
+      "description": "Availability status distinguishes available, unavailable and profile_unavailable. Partial-record populations count unfinished workers, missing CQ records and clock failures; these are distinct populations. CQ timings exclude records with clock failures and may be incomplete. Missing evidence is unknown, not zero.",
+      "gridPos": {"x": 0, "y": 204, "w": 24, "h": 8},
+      "targets": [{"refId": "A", "expr": "label_replace(last_over_time({__name__=~\"kv_case_valkey_(cq_availability|diagnostic_observations)\",job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range]), \"metric\", \"$1\", \"__name__\", \"kv_case_valkey_(.*)\")", "format": "table", "instant": true, "range": false}],
+      "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "__name__": true, "job": true, "instance": true, "run_id": true, "exported_run_id": true, "case_id": true, "exported_case_id": true, "cohort": true, "host_index": true, "host_role": true, "phase": true, "profile": true, "repeat": true, "requested_backend": true, "value_bytes": true}, "indexByName": {"diagnostic_backend": 0, "metric": 1, "status": 2, "population": 3, "Value": 4}}}],
+      "fieldConfig": {"defaults": {"unit": "none", "noValue": "No data"}, "overrides": []},
+      "options": {"showHeader": true, "cellHeight": "sm"}
+    },
+    {
+      "id": 38,
+      "title": "TERMINAL live SPDK owner bdev completions",
+      "description": "Live read/write counts, bytes and mean completions are distinct from sealed SPDK. Partial owners and missing I/O error counters are explicitly unavailable, not zero; bdev rotation prevents attribution. Timing is not API, wire or NAND latency.",
+      "type": "table",
+      "datasource": {"type": "prometheus", "uid": "kv-campaign-prometheus"},
+      "gridPos": {"x": 0, "y": 212, "w": 24, "h": 8},
+      "targets": [{"refId": "A", "expr": "last_over_time({__name__=~\"kv_spdk_live_target_(evidence_available|owner_available|io_error_available|io_errors|ops|bytes|completion_seconds)\",job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\"}[$__range])", "format": "table", "instant": true, "range": false}],
+      "fieldConfig": {"defaults": {"unit": "none", "noValue": "No data"}, "overrides": []},
+      "options": {"showHeader": true, "cellHeight": "sm"}
+    },
+    {
+      "id": 39,
+      "title": "Value WAL inventory at measurement boundaries",
+      "description": "Observed registered file count and logical file lengths at start and end. These gauges are not physical disk usage, write bytes, or I/O operations; missing inventory remains unavailable.",
+      "type": "table",
+      "datasource": {"type": "prometheus", "uid": "kv-campaign-prometheus"},
+      "gridPos": {"x": 0, "y": 220, "w": 24, "h": 8},
+      "targets": [{"refId": "A", "expr": "last_over_time({__name__=~\"kv_case_native_wal_(inventory_available|registered_files|logical_file_length_bytes)\",job=\"campaign-benchmark\",run_id=\"$run_id\",case_id=\"$case_id\",scope=\"measurement_boundary\"}[$__range])", "format": "table", "instant": true, "range": false}],
+      "fieldConfig": {"defaults": {"unit": "none", "noValue": "No data"}, "overrides": []},
       "options": {"showHeader": true, "cellHeight": "sm"}
     }
   ],

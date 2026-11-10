@@ -20,9 +20,19 @@ impl Fixture {
         Self::with_value_len(count, 64)
     }
     fn with_value_len(count: usize, value_len: usize) -> Self {
+        Self::build(count, value_len, false)
+    }
+    fn batch(count: usize) -> Self {
+        Self::build(count, 64, true)
+    }
+    fn build(count: usize, value_len: usize, combined: bool) -> Self {
         let temp = tempdir::TempDir::new("uring-member-test").unwrap();
         let shape = KeyShape::new_single(4, 1, KeyType::uniform(1));
-        let max_encoded_bytes = value_len + 512;
+        let max_encoded_bytes = if combined {
+            count * (value_len + 32) + 512
+        } else {
+            value_len + 512
+        };
         let max_group_bytes = max_encoded_bytes + 512;
         let fragment_bytes = ((max_group_bytes as u64 + 15) / 8) * 8;
         let config = PartitionConfig {
@@ -56,9 +66,14 @@ impl Fixture {
             .unwrap(),
         );
         let mut references = Vec::new();
-        for n in 0..count {
+        for n in 0..if combined { 1 } else { count } {
             let mut operation = [0; 16];
             operation[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            let mutations = if combined {
+                (0..count).map(|i| Self::mutation(i, value_len)).collect()
+            } else {
+                vec![Self::mutation(n, value_len)]
+            };
             let batch = CompleteBatch::new(
                 &shape,
                 BatchId {
@@ -69,7 +84,7 @@ impl Fixture {
                     epoch: 5,
                     sequence: n as u64,
                 },
-                vec![Self::mutation(n, value_len)],
+                mutations,
                 config.batch_limits,
             )
             .unwrap();
@@ -77,7 +92,9 @@ impl Fixture {
                 .append_complete_batch(RequestAuthority { epoch: 5 }, &batch)
                 .unwrap();
             log.persist_through(receipt).unwrap();
-            references.push(log.record_reference(receipt, 0).unwrap());
+            for member in 0..if combined { count } else { 1 } {
+                references.push(log.record_reference(receipt, member as u32).unwrap());
+            }
         }
         log.seal_epoch(RequestAuthority { epoch: 5 }).unwrap();
         Self {
@@ -136,6 +153,164 @@ fn read(executor: &mut ReadExecutor, fixture: &Fixture, n: usize, id: u64) -> By
         SubmitOutcome::Deferred(_) => panic!("scalar request unexpectedly deferred"),
         SubmitOutcome::Full(_) => panic!("unexpected admission pressure"),
     }
+}
+
+#[test]
+fn scalar_output_keeps_file_and_log_pinned_until_last_consumer() {
+    for resident in [false, true] {
+        let fixture = Fixture::new(1);
+        let plan = fixture
+            .log
+            .plan_record_read(&fixture.references[0])
+            .unwrap();
+        let file = Arc::downgrade(&plan.member.file);
+        let log = Arc::downgrade(&plan._log);
+        drop(plan);
+        let (_, mut executor) = executor(ReadExecutorConfig {
+            resident_first: resident,
+            ..ReadExecutorConfig::default()
+        });
+        if resident {
+            executor
+                .resident_test_results
+                .push_back(ResidentTestResult::Complete);
+        }
+        let (record, lease) = match executor.submit(1, fixture.member(0)).unwrap() {
+            SubmitOutcome::Ready { mut records, lease } => (records.remove(0), Some(lease)),
+            SubmitOutcome::Pending => {
+                let mut completion = finish(&mut executor, 1).remove(0);
+                (
+                    completion.result.unwrap().remove(0),
+                    completion.lease.take(),
+                )
+            }
+            _ => panic!("scalar read was not admitted"),
+        };
+        fixture.assert_value(0, record.clone());
+        drop(lease);
+        drop(fixture);
+        assert!(file.upgrade().is_some());
+        assert!(log.upgrade().is_some());
+        drop(record);
+        assert!(file.upgrade().is_none());
+        assert!(log.upgrade().is_none());
+    }
+}
+
+#[test]
+fn contiguous_authorized_members_share_one_read_and_scatter_in_order() {
+    let fixture = Fixture::batch(3);
+    let (admission, mut executor) = executor(ReadExecutorConfig::default());
+    let members = [0, 1, 1, 2]
+        .into_iter()
+        .map(|n| (fixture.log.clone(), fixture.references[n]))
+        .collect();
+    assert!(matches!(
+        executor.submit(1, members).unwrap(),
+        SubmitOutcome::Pending
+    ));
+    assert_eq!(admission.stats().inflight_reads, 1);
+    let operation = executor.operations.values().next().unwrap();
+    assert_eq!(operation.siblings.len(), 3);
+    let weak_log = Arc::downgrade(&operation.plan._log);
+    let mut completion = finish(&mut executor, 1).remove(0);
+    let records = completion.result.as_mut().unwrap();
+    for (n, bytes) in [0, 1, 1, 2].into_iter().zip(records.iter().cloned()) {
+        fixture.assert_value(n, bytes);
+    }
+    assert_eq!(admission.stats().async_read_submissions, 1);
+    assert_eq!(admission.stats().completed_reads, 4);
+    let retained = records[0].clone();
+    drop(completion);
+    drop(fixture);
+    assert!(weak_log.upgrade().is_some());
+    drop(retained);
+    assert!(weak_log.upgrade().is_none());
+}
+
+#[test]
+fn nonadjacent_and_different_log_ranges_never_share_reads() {
+    let a = Fixture::batch(3);
+    let b = Fixture::batch(1);
+    let (admission, mut executor) = executor(ReadExecutorConfig::default());
+    let members = vec![
+        (a.log.clone(), a.references[0]),
+        (a.log.clone(), a.references[2]),
+        (b.log.clone(), b.references[0]),
+    ];
+    assert!(matches!(
+        executor.submit(1, members).unwrap(),
+        SubmitOutcome::Pending
+    ));
+    assert_eq!(admission.stats().inflight_reads, 3);
+    let mut records = finish(&mut executor, 1).remove(0).result.unwrap();
+    a.assert_value(0, records.remove(0));
+    a.assert_value(2, records.remove(0));
+    b.assert_value(0, records.remove(0));
+}
+
+#[test]
+fn resident_fallbacks_coalesce_but_partial_prefix_remains_independent() {
+    for partial in [false, true] {
+        let fixture = Fixture::batch(3);
+        let (admission, mut executor) = executor(ReadExecutorConfig {
+            resident_first: true,
+            ..ReadExecutorConfig::default()
+        });
+        executor.resident_test_results.push_back(if partial {
+            ResidentTestResult::Partial(7)
+        } else {
+            ResidentTestResult::WouldBlock
+        });
+        executor
+            .resident_test_results
+            .push_back(ResidentTestResult::Unsupported);
+        executor
+            .resident_test_results
+            .push_back(ResidentTestResult::WouldBlock);
+        let members = (0..3)
+            .map(|n| (fixture.log.clone(), fixture.references[n]))
+            .collect();
+        assert!(matches!(
+            executor.submit(1, members).unwrap(),
+            SubmitOutcome::Pending
+        ));
+        assert_eq!(
+            admission.stats().inflight_reads,
+            if partial { 2 } else { 1 }
+        );
+        let records = finish(&mut executor, 1).remove(0).result.unwrap();
+        for (n, bytes) in records.into_iter().enumerate() {
+            fixture.assert_value(n, bytes);
+        }
+        let stats = admission.stats();
+        assert_eq!(stats.resident_read_fallbacks, 3);
+        assert_eq!(stats.resident_read_partial, u64::from(partial));
+        assert_eq!(stats.resident_read_unsupported, 1);
+    }
+}
+
+#[test]
+fn cancelled_coalesced_read_retains_pins_and_credits_until_late_completion() {
+    let fixture = Fixture::batch(2);
+    let (admission, mut executor) = executor(ReadExecutorConfig::default());
+    let members = (0..2)
+        .map(|n| (fixture.log.clone(), fixture.references[n]))
+        .collect();
+    assert!(matches!(
+        executor.submit(1, members).unwrap(),
+        SubmitOutcome::Pending
+    ));
+    let op = executor.operations.values().next().unwrap();
+    let log = Arc::downgrade(&op.plan._log);
+    executor.cancel(1);
+    drop(fixture);
+    assert!(log.upgrade().is_some());
+    assert!(admission.stats().inflight_bytes > 0);
+    executor.wait_for_ready_completion().unwrap();
+    assert!(executor.poll_completed().unwrap().is_empty());
+    assert_eq!(admission.stats().inflight_bytes, 0);
+    assert!(log.upgrade().is_none());
 }
 
 #[test]
@@ -571,7 +746,7 @@ fn repeated_async_misses_reuse_exact_storage_after_last_clone_only() {
 }
 
 #[test]
-fn cancelled_buffers_stay_owned_until_cq_then_reuse_across_connection_rings() {
+fn cancelled_buffers_stay_owned_until_cq_then_return_to_their_own_session_pool() {
     let fixture = Fixture::new(2);
     let (admission, mut first) = executor(ReadExecutorConfig::default());
     let mut second = ReadExecutor::new(admission.config, admission.clone()).unwrap();
@@ -588,10 +763,102 @@ fn cancelled_buffers_stay_owned_until_cq_then_reuse_across_connection_rings() {
         std::thread::yield_now();
     }
     assert_eq!(admission.stats().idle_buffers, 1);
+    // Share nothing: the other session cannot take the returned buffer, so it
+    // allocates; the owning session reuses it.
     fixture.assert_value(0, read(&mut second, &fixture, 0, 3));
-    fixture.assert_value(1, live);
+    assert_eq!(admission.stats().buffer_reuses, 0);
+    assert_eq!(admission.stats().buffer_allocations, 3);
+    fixture.assert_value(0, read(&mut first, &fixture, 0, 4));
     assert_eq!(admission.stats().buffer_reuses, 1);
+    fixture.assert_value(1, live);
     assert_eq!(admission.stats().inflight_bytes, 0);
+}
+
+#[test]
+fn closed_session_keeps_its_counters_and_releases_idle_bytes() {
+    let fixture = Fixture::new(2);
+    let (admission, mut executor) = executor(ReadExecutorConfig::default());
+    fixture.assert_value(0, read(&mut executor, &fixture, 0, 1));
+    let before = admission.stats();
+    assert_eq!(before.wal_reads, 1);
+    assert_eq!(before.idle_buffers, 1);
+    drop(executor);
+    let after = admission.stats();
+    assert_eq!(after.wal_reads, 1);
+    assert_eq!(after.completed_reads, before.completed_reads);
+    assert_eq!(after.buffer_allocations, 1);
+    assert_eq!(after.idle_buffers, 0);
+    assert_eq!(after.idle_buffer_bytes, 0);
+}
+
+#[test]
+fn concurrent_reservations_never_exceed_the_node_budget() {
+    let config = ReadExecutorConfig {
+        max_requests: 4,
+        max_bytes: 4096,
+        ..ReadExecutorConfig::default()
+    };
+    let admission = Arc::new(ReadAdmission::new(config).unwrap());
+    std::thread::scope(|scope| {
+        for seed in 0..8usize {
+            let admission = admission.clone();
+            scope.spawn(move || {
+                for step in 0..2000usize {
+                    let bytes = 256 * (1 + (seed + step) % 8);
+                    if let Some(lease) = admission.reserve_reply(bytes).unwrap() {
+                        if step % 16 == 0 {
+                            let stats = admission.stats();
+                            assert!(stats.inflight_bytes <= 4096, "{stats:?}");
+                            assert!(stats.inflight_requests <= 4, "{stats:?}");
+                        }
+                        drop(lease);
+                    }
+                }
+            });
+        }
+    });
+    let stats = admission.stats();
+    assert_eq!((stats.inflight_bytes, stats.inflight_requests), (0, 0));
+    assert!(stats.peak_inflight_bytes <= 4096 && stats.peak_inflight_requests <= 4);
+    assert!(stats.peak_inflight_requests > 0);
+}
+
+#[test]
+fn contended_device_credit_lock_reports_wait_and_hold_time() {
+    let admission = Arc::new(ReadAdmission::new(ReadExecutorConfig::default()).unwrap());
+    let held = admission.devices.shard(7).lock();
+    let hold = Duration::from_millis(50);
+    std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| admission.reserve_device_reads(&[(7, 1)], 1));
+        std::thread::sleep(hold);
+        drop(held);
+        assert!(waiter.join().unwrap());
+    });
+    let lock = admission.stats().device_credit_lock;
+    assert_eq!(lock.acquisitions, 1);
+    assert_eq!(lock.contended, 1);
+    assert!(lock.wait_ns >= 30_000_000, "{lock:?}");
+    admission.release_reads(7, 1);
+    let lock = admission.stats().device_credit_lock;
+    assert_eq!((lock.acquisitions, lock.contended), (2, 1));
+    assert!(lock.hold_ns > 0);
+}
+
+#[test]
+fn device_credits_are_all_or_nothing_across_shards() {
+    let config = ReadExecutorConfig {
+        max_device_reads: 2,
+        ..ReadExecutorConfig::default()
+    };
+    let admission = Arc::new(ReadAdmission::new(config).unwrap());
+    assert!(admission.reserve_device_reads(&[(1, 2)], 2));
+    // Device 2 has room but device 1 is full: nothing may stay reserved.
+    assert!(!admission.reserve_device_reads(&[(2, 1), (1, 1)], 2));
+    assert_eq!(admission.stats().inflight_reads, 2);
+    assert!(admission.reserve_device_reads(&[(2, 2)], 2));
+    admission.release_reads(1, 2);
+    admission.release_reads(2, 2);
+    assert_eq!(admission.stats().inflight_reads, 0);
 }
 
 #[test]
@@ -602,23 +869,30 @@ fn buffer_pool_uses_exact_sizes_and_existing_node_budget() {
         ..ReadExecutorConfig::default()
     };
     let admission = Arc::new(ReadAdmission::new(config).unwrap());
-    admission.return_buffer(Box::<[u8]>::new_uninit_slice(512));
-    admission.return_buffer(Box::<[u8]>::new_uninit_slice(1024));
-    admission.return_buffer(Box::<[u8]>::new_uninit_slice(2048));
+    let first = admission.session_pool();
+    let second = admission.session_pool();
+    first.return_buffer(Box::<[u8]>::new_uninit_slice(512));
+    first.return_buffer(Box::<[u8]>::new_uninit_slice(1024));
+    first.return_buffer(Box::<[u8]>::new_uninit_slice(2048));
     assert_eq!(admission.stats().idle_buffers, 2);
-    let exact = admission.take_buffer(512);
+    let exact = first.take_buffer(512);
     assert_eq!(exact.len(), 512);
     assert_eq!(admission.stats().buffer_reuses, 1);
-    let different = admission.take_buffer(513);
+    let different = first.take_buffer(513);
     assert_eq!(different.len(), 513);
     assert_eq!(admission.stats().buffer_allocations, 1);
     drop((exact, different));
+    second.return_buffer(Box::<[u8]>::new_uninit_slice(2048));
+    assert_eq!(admission.stats().idle_buffer_bytes, 1024 + 2048);
+    // The reservation needs the whole allowance: idle buffers of every session
+    // are evicted for it.
     let lease = admission.reserve_reply(4096).unwrap().unwrap();
     assert_eq!(admission.stats().idle_buffer_bytes, 0);
-    admission.return_buffer(Box::<[u8]>::new_uninit_slice(512));
+    assert_eq!(admission.stats().idle_buffer_evictions, 2);
+    first.return_buffer(Box::<[u8]>::new_uninit_slice(512));
     assert_eq!(admission.stats().idle_buffers, 0);
     drop(lease);
-    admission.return_buffer(Box::<[u8]>::new_uninit_slice(512));
+    first.return_buffer(Box::<[u8]>::new_uninit_slice(512));
     assert_eq!(admission.stats().idle_buffer_bytes, 512);
 }
 

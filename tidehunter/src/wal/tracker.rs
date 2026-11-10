@@ -43,6 +43,24 @@ pub struct WalGuardMaker {
     shared_guard: Rc<ArcMutexGuard<RawMutex, ()>>,
 }
 
+/// A cross-thread external allocation pin. Only validated adoption may release
+/// it. Dropping it without release stops the tracker rather than advancing its
+/// processed frontier across an uncertain WAL hole.
+#[cfg(feature = "experimental-nvmeof")]
+pub(crate) struct ExternalWalGuard {
+    release: Option<mpsc::Sender<()>>,
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+impl ExternalWalGuard {
+    pub(crate) fn release(mut self) -> Result<(), std::sync::mpsc::SendError<()>> {
+        self.release
+            .take()
+            .expect("external guard released once")
+            .send(())
+    }
+}
+
 /// A latch pins the externally observed `last_processed` position.
 ///
 /// While at least one latch is held, the value returned by
@@ -115,6 +133,11 @@ enum WalTrackerMessage {
         mutex: Arc<Mutex<()>>,
         result: AllocationResult,
     },
+    #[cfg(feature = "experimental-nvmeof")]
+    ExternalAllocation {
+        release: mpsc::Receiver<()>,
+        result: AllocationResult,
+    },
     /// Request a new latch. The tracker assigns an id, captures the current
     /// received frontier as the latch position, stores the latch, and replies
     /// with the [`WalTrackerLatch`]. The reply is deferred until every position
@@ -184,6 +207,35 @@ impl WalTracker {
         WalGuardMaker {
             shared_guard: Rc::new(guard),
         }
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    pub(crate) fn allocated_external(
+        &self,
+        result: AllocationResult,
+    ) -> Result<ExternalWalGuard, std::io::Error> {
+        let (release, receiver) = mpsc::channel();
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("WAL tracker stopped"))?;
+        sender
+            .send(WalTrackerMessage::ExternalAllocation {
+                release: receiver,
+                result,
+            })
+            .map_err(|_| std::io::Error::other("WAL tracker stopped"))?;
+        Ok(ExternalWalGuard {
+            release: Some(release),
+        })
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    pub(crate) fn ensure_external_file(
+        &self,
+        id: super::position::WalFileId,
+    ) -> std::io::Result<()> {
+        self.mapper.ensure_external_file(id)
     }
 
     pub fn last_processed(&self) -> LastProcessed {
@@ -331,6 +383,28 @@ impl WalTrackerThread {
                     });
                     // Only an allocation that advances last_processed can
                     // change the external value or satisfy a deferred request.
+                    if advanced.is_some() {
+                        if !self.pending_requests.is_empty() {
+                            self.fulfill_pending_requests();
+                        }
+                        self.publish();
+                    }
+                }
+                #[cfg(feature = "experimental-nvmeof")]
+                WalTrackerMessage::ExternalAllocation { release, result } => {
+                    // Disconnect means the external write is unknown. Never
+                    // advance or finalize a fragment across that allocation.
+                    if release.recv().is_err() {
+                        return;
+                    }
+                    let advanced = self.state.add_processed(result, |processed| {
+                        if let Some(frag) =
+                            self.layout.is_first_in_frag(processed.allocated_position())
+                            && let Some(prev_frag) = frag.prev_map()
+                        {
+                            self.mapper.map_finalized(prev_frag);
+                        }
+                    });
                     if advanced.is_some() {
                         if !self.pending_requests.is_empty() {
                             self.fulfill_pending_requests();

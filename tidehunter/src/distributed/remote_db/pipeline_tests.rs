@@ -45,7 +45,36 @@ impl Fixture {
         Self::new_with_config(max_batches, shape, group_max_batches, |_| {})
     }
 
+    /// Opt one test into the synchronous tier: for tests whose assertions need
+    /// persistence to stay pending (prior durability, paused syncs) or receipts
+    /// that are already durable. Call before the first write.
+    pub(super) fn synchronous(self) -> Self {
+        for node in &self.nodes {
+            node.set_durability(crate::distributed::durability::DurabilityConfig::with_tier(
+                crate::distributed::durability::DurabilityTier::Synchronous,
+            ))
+            .unwrap();
+        }
+        self
+    }
+
     fn new_with_config(
+        max_batches: usize,
+        shape: KeyShape,
+        group_max_batches: u32,
+        configure: impl FnOnce(&mut RemoteDatabaseConfig),
+    ) -> Self {
+        Self::new_with_tier(
+            crate::distributed::durability::DurabilityTier::Native,
+            max_batches,
+            shape,
+            group_max_batches,
+            configure,
+        )
+    }
+
+    fn new_with_tier(
+        tier: crate::distributed::durability::DurabilityTier,
         max_batches: usize,
         shape: KeyShape,
         group_max_batches: u32,
@@ -86,8 +115,11 @@ impl Fixture {
             max_index_bytes: 1024 * 1024,
             max_pending_batches: 64,
             max_pending_bytes: 1024 * 1024,
+            replay_limits: Default::default(),
+            owner_append_occupancy: DEFAULT_OWNER_APPEND_OCCUPANCY,
             pipelined_writes: true,
             read_cache_bytes: 64 * 1024,
+            index_shards: super::super::native_index::DEFAULT_INDEX_SHARDS,
             read_memory_allowance_bytes: 512 * 1024 * 1024,
             preparation_workers: 2,
             scan_prefetch_pages: 2,
@@ -95,6 +127,7 @@ impl Fixture {
             max_pending_reads: 256,
             max_pending_read_bytes: 64 * 1024 * 1024,
             write_profile_limit: 0,
+            live_nvme: None,
         };
         configure(&mut config);
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -114,9 +147,14 @@ impl Fixture {
                     read_max_inflight_requests: 32,
                     read_max_inflight_bytes: 64 * 1024 * 1024,
                     read_max_device_reads: 128,
+                    live_target: None,
                 },
                 metrics(),
             )
+            .unwrap();
+            node.set_durability(crate::distributed::durability::DurabilityConfig::with_tier(
+                tier,
+            ))
             .unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             config.endpoints.push(RemoteEndpoint {
@@ -334,7 +372,7 @@ fn exhausted_publication_view_budget_rejects_before_admission_and_allows_retry()
     let max_excluded = db.config.max_pending_batches - 1;
     let mut reservations = Vec::new();
     loop {
-        match db.index.read().reserve_publication_view(max_excluded) {
+        match db.index.reserve_publication_view(max_excluded) {
             Ok(reservation) => reservations.push(reservation),
             Err(super::super::native_index::NativeIndexError::Capacity) => break,
             Err(error) => panic!("unexpected reservation failure: {error}"),
@@ -345,7 +383,7 @@ fn exhausted_publication_view_budget_rejects_before_admission_and_allows_retry()
     // reservation may leave enough slack for the smaller next-window charges.
     let mut small_reservations = Vec::new();
     loop {
-        match db.index.read().reserve_publication_view(1) {
+        match db.index.reserve_publication_view(1) {
             Ok(reservation) => small_reservations.push(reservation),
             Err(super::super::native_index::NativeIndexError::Capacity) => break,
             Err(error) => panic!("unexpected reservation failure: {error}"),
@@ -440,16 +478,20 @@ fn active_checkpoint_capture_and_sparse_publication_have_separate_budgets() {
     let max_excluded = db.config.max_pending_batches - 1;
     let mut reservations = Vec::new();
     loop {
-        match db.index.read().reserve_publication_view(max_excluded) {
+        match db.index.reserve_publication_view(max_excluded) {
             Ok(reservation) => reservations.push(reservation),
             Err(super::super::native_index::NativeIndexError::Capacity) => break,
             Err(error) => panic!("unexpected reservation failure: {error}"),
         }
     }
     assert!(reservations.len() >= 3);
-    let before_capture = db.index.read().stats().transient_metadata_bytes;
-    let capture = db.index.read().prepare_image(IndexReadCut::Latest).unwrap();
-    assert!(db.index.read().stats().transient_metadata_bytes > before_capture);
+    let before_capture = db.index.stats().transient_metadata_bytes;
+    let capture = db
+        .index
+        .writer()
+        .prepare_image(IndexReadCut::Latest)
+        .unwrap();
+    assert!(db.index.stats().transient_metadata_bytes > before_capture);
     for _ in 0..3 {
         drop(reservations.pop().unwrap());
     }
@@ -465,6 +507,7 @@ fn active_checkpoint_capture_and_sparse_publication_have_separate_budgets() {
     db.submit(fixture.operation(1, 53), vec![put(53, 53)])
         .unwrap();
     let group = db.inflight[1].pop_front().unwrap();
+    db.inflight_bytes[1] -= group.charge;
     let receipts = group
         .reply
         .recv_timeout(Duration::from_secs(5))
@@ -485,6 +528,7 @@ fn active_checkpoint_capture_and_sparse_publication_have_separate_budgets() {
     db.drain().unwrap();
     assert_eq!(value(&mut db, 51), Some(vec![51; 32]));
     drop(capture);
+    assert!(db.index.writer().cleanup_failed_capture_step(32).unwrap());
     db.shutdown().unwrap();
 }
 
@@ -535,6 +579,7 @@ fn nonempty_dependency_tables_shrink_while_a_prefix_holds_window_credit() {
         let Some(group) = db.inflight[1].pop_front() else {
             continue;
         };
+        db.inflight_bytes[1] -= group.charge;
         let receipts = group
             .reply
             .recv_timeout(Duration::from_secs(5))
@@ -592,6 +637,7 @@ fn sparse_publication_retains_bounded_window_until_earlier_prefix_publishes() {
     // Observe the later group's real durable reply, deliberately leaving node 0
     // blocked. No sleep or assumed persistence timing determines this ordering.
     let later = db.inflight[1].pop_front().unwrap();
+    db.inflight_bytes[1] -= later.charge;
     let receipts = later
         .reply
         .recv_timeout(Duration::from_secs(5))
@@ -671,6 +717,7 @@ fn conflicting_and_transitive_batches_wait_for_their_whole_predecessors() {
             .unwrap();
         for node in [1usize, 2] {
             let group = db.inflight[node].pop_front().unwrap();
+            db.inflight_bytes[node] -= group.charge;
             let receipts = group
                 .reply
                 .recv_timeout(Duration::from_secs(5))
@@ -737,6 +784,7 @@ fn distinct_keys_with_same_native_reduction_cannot_publish_out_of_order() {
     db.submit(fixture.operation(1, 22), vec![mutation(other_key, 3)])
         .unwrap();
     let group = db.inflight[1].pop_front().unwrap();
+    db.inflight_bytes[1] -= group.charge;
     let receipts = group
         .reply
         .recv_timeout(Duration::from_secs(5))
@@ -1181,7 +1229,7 @@ fn preparation_services_previous_groups_without_admitting_invalid_next_chunk() {
 
 #[test]
 fn same_shard_window_appends_successor_before_prefix_is_durable() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().synchronous();
     let mut db = fixture.open();
     let (entered, release) = fixture.nodes[0].pause_next_persist(1).unwrap();
     let operations: Vec<_> = (0..4u64).map(|seed| fixture.operation(0, seed)).collect();
@@ -1232,7 +1280,6 @@ fn same_shard_window_appends_successor_before_prefix_is_durable() {
     );
     assert!((0..4u32).all(|key| {
         db.index
-            .read()
             .get(KeySpace(0), &key.to_be_bytes(), IndexReadCut::Latest)
             .unwrap()
             .is_none()
@@ -1246,6 +1293,104 @@ fn same_shard_window_appends_successor_before_prefix_is_durable() {
     for key in 0..4u32 {
         assert_eq!(value(&mut db, key), Some(vec![key as u8; 32]));
     }
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn tail_flush_dispatches_third_group_before_prior_durability() {
+    let shape = KeyShape::new_single(4, 1, KeyType::uniform(1));
+    let fixture = Fixture::new_with_shape_and_group(128, shape, 1).synchronous();
+    let mut db = fixture.open();
+    let (entered, release) = fixture.nodes[0].pause_next_persist(1).unwrap();
+    let operations: Vec<_> = (0..3u64)
+        .map(|seed| fixture.operation(0, 800 + seed))
+        .collect();
+    db.submit(operations[0], vec![put(800, 0)]).unwrap();
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    db.submit(operations[1], vec![put(801, 1)]).unwrap();
+    db.submit(operations[2], vec![put(802, 2)]).unwrap();
+    db.progress_pipeline(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let reached_owner = loop {
+        if fixture.nodes[0]
+            .contains_batch(
+                1,
+                BatchId {
+                    database: fixture.config.storage.database,
+                    operation: operations[2],
+                },
+            )
+            .unwrap()
+        {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        thread::yield_now();
+    };
+    let in_flight = db.inflight[0].len();
+    let acknowledgements_held = db.inflight[0]
+        .iter()
+        .all(|pending| matches!(pending.reply.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    let published = db.publication.published_prefix().next_sequence();
+    release.send(()).unwrap();
+    assert!(
+        reached_owner,
+        "third group must reach the real owner while persistence is paused"
+    );
+    assert_eq!(in_flight, 3);
+    assert!(acknowledgements_held);
+    assert_eq!(published, 0);
+    db.drain().unwrap();
+    for key in 800..803u32 {
+        assert_eq!(value(&mut db, key), Some(vec![(key - 800) as u8; 32]));
+    }
+    db.shutdown().unwrap();
+    drop(db);
+    let mut reopened = fixture.open();
+    for key in 800..803u32 {
+        assert_eq!(value(&mut reopened, key), Some(vec![(key - 800) as u8; 32]));
+    }
+    reopened.shutdown().unwrap();
+}
+
+#[test]
+fn tail_flush_respects_bounded_owner_command_window() {
+    let shape = KeyShape::new_single(4, 1, KeyType::uniform(1));
+    let mut fixture = Fixture::new_with_shape_and_group(128, shape, 1).synchronous();
+    fixture.config.owner_append_occupancy = super::super::tcp::APPEND_COMMAND_WINDOW;
+    let mut db = fixture.open();
+    let (entered, release) = fixture.nodes[0].pause_next_persist(1).unwrap();
+    let count = super::super::tcp::APPEND_COMMAND_WINDOW + 4;
+    db.submit(fixture.operation(0, 900), vec![put(900, 0)])
+        .unwrap();
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    for key in 1..count {
+        db.submit(
+            fixture.operation(0, 900 + key as u64),
+            vec![put(900 + key as u32, key as u8)],
+        )
+        .unwrap();
+    }
+    db.progress_pipeline(true).unwrap();
+    let in_flight = db.inflight[0].len();
+    let staged = db.staged[0].len();
+    let (checkpoint_reply, checkpoint_result) = mpsc::sync_channel(1);
+    db.clients[0]
+        .send(Command::Checkpoint(db.epoch, db.epoch, 0, checkpoint_reply))
+        .unwrap();
+    let checkpoint_held = matches!(checkpoint_result.try_recv(), Err(mpsc::TryRecvError::Empty));
+    release.send(()).unwrap();
+    assert_eq!(in_flight, super::super::tcp::APPEND_COMMAND_WINDOW);
+    assert!(checkpoint_held);
+    let proof = checkpoint_result
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    assert_eq!(proof.prefix, 0);
+    assert_eq!(staged, count - super::super::tcp::APPEND_COMMAND_WINDOW);
+    db.drain().unwrap();
     db.shutdown().unwrap();
 }
 
@@ -1372,6 +1517,7 @@ fn busy_owner_coalesces_staged_whole_batches_and_other_owner_progresses() {
         );
     }
     let other = db.inflight[1].pop_front().unwrap();
+    db.inflight_bytes[1] -= other.charge;
     let receipts = other
         .reply
         .recv_timeout(Duration::from_secs(5))
@@ -1405,7 +1551,7 @@ fn busy_owner_coalesces_staged_whole_batches_and_other_owner_progresses() {
         let _ = db.completion_wake.recv_timeout(Duration::from_millis(100));
     }
     assert!(db.staged[0].is_empty());
-    assert!(db.inflight[0].len() <= OWNER_APPEND_PIPELINE_GROUPS);
+    assert!(db.inflight[0].len() <= db.config.owner_append_occupancy);
     assert_eq!(db.pipeline_stats.append_requests, 4);
     // Either correlated durable reply can arrive first. Every already
     // published batch must expose both distinct keys; its whole successors
@@ -1452,6 +1598,33 @@ fn busy_owner_coalesces_staged_whole_batches_and_other_owner_progresses() {
         assert_eq!(value(&mut reopened, 200 + key), Some(vec![key as u8; 32]));
     }
     reopened.shutdown().unwrap();
+}
+
+#[test]
+fn checkpoint_diagnostic_cursor_survives_profile_rearming() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    db.arm_write_profile(1).unwrap();
+    db.write_batch(fixture.operation(0, 301), vec![put(301, 1)])
+        .unwrap();
+    db.flush_index().unwrap();
+    let first = db.checkpoint_diagnostics_since(0);
+    assert!(!first.records.is_empty());
+    let cursor = first.next_cursor;
+    db.arm_write_profile(0).unwrap();
+    let disabled = db.checkpoint_diagnostics_since(0);
+    assert!(disabled.records.is_empty());
+    assert_eq!(disabled.next_cursor, cursor);
+    db.arm_write_profile(1).unwrap();
+    assert!(db.checkpoint_diagnostics_since(0).records.is_empty());
+    db.write_batch(fixture.operation(1, 302), vec![put(302, 2)])
+        .unwrap();
+    db.flush_index().unwrap();
+    let second = db.checkpoint_diagnostics_since(cursor);
+    assert!(!second.records.is_empty());
+    assert!(second.records.iter().all(|record| record.cursor >= cursor));
+    assert!(second.next_cursor > cursor);
+    db.shutdown().unwrap();
 }
 
 #[test]

@@ -4,6 +4,7 @@
 #[allow(clippy::wildcard_imports)]
 // Private read delegate shares its parent's bounded transport types.
 use super::*;
+use crate::distributed::sui::kv_capture;
 
 // Keep misses inline; boxing would allocate on every uncached scalar read.
 #[allow(clippy::large_enum_variant)]
@@ -28,6 +29,7 @@ impl ConcurrentRemoteDatabase {
             .remaining
             .store(limit, Ordering::Relaxed);
         self.reads.state.coordinator_diagnostics.arm(limit);
+        self.reads.state.trace.arm(limit);
     }
     pub(crate) fn read_profile_enabled(&self) -> bool {
         self.reads.state.diagnostics.limit.load(Ordering::Relaxed) != 0
@@ -37,6 +39,27 @@ impl ConcurrentRemoteDatabase {
             state: self.reads.state.clone(),
             fabric: self.config.tls.transport.is_fabric(),
         }
+    }
+    pub fn read_trace_snapshot(&self) -> ReadTraceSnapshot {
+        self.reads.state.trace.snapshot()
+    }
+
+    pub fn traced_get(
+        &self,
+        ks: KeySpace,
+        key: &[u8],
+        caller_id: u64,
+    ) -> Result<Option<Bytes>, LocalDbError> {
+        let trace = self.reads.state.trace.begin(caller_id, 1);
+        if let Some(trace) = &trace {
+            trace.event("api_started");
+        }
+        let result = self.get_inner(ks, key, trace.as_ref());
+        if let Some(trace) = trace {
+            trace.event("api_finished");
+            trace.finish(result.is_ok());
+        }
+        result
     }
     pub fn read_rpc_count(&self) -> u64 {
         self.reads.state.read_rpcs.load(Ordering::Relaxed)
@@ -48,20 +71,59 @@ impl ConcurrentRemoteDatabase {
     /// # Errors
     /// Returns key, admission, authority, transport, or value-integrity errors.
     pub fn get(&self, ks: KeySpace, key: &[u8]) -> Result<Option<Bytes>, LocalDbError> {
+        self.get_inner(ks, key, None)
+    }
+
+    fn get_inner(
+        &self,
+        ks: KeySpace,
+        key: &[u8],
+        trace: Option<&ReadTraceCallGuard>,
+    ) -> Result<Option<Bytes>, LocalDbError> {
+        if let Some(trace) = trace {
+            trace.event("index_resolution_started");
+        }
         let (resolution, node) = self.resolve_concurrent_get(ks, key, IndexReadCut::Latest)?;
+        if let Some(trace) = trace {
+            trace.event("index_resolution_finished");
+        }
         let (reference, pin) = match resolution {
             GetResolution::Ready(value) => return Ok(value),
             GetResolution::Miss { reference, pin } => (reference, pin),
         };
         let node = node.expect("a miss has a route");
         let deadline = Instant::now() + self.config.timeout;
+        // The member is planned once; a retry after backpressure reuses the
+        // plan unless the reader set changed.
+        let mut plan = None;
         loop {
             let generation = self.read_admission_generation();
-            match self.prepare_concurrent_miss(ks, key, reference, node, true, pin.clone()) {
+            let child = trace.and_then(|trace| trace.child(node, vec![0]));
+            let planned = self.reads.cached_plan(&mut plan, &reference)?;
+            match self.prepare_concurrent_miss(
+                ks,
+                key,
+                reference,
+                node,
+                true,
+                pin.clone(),
+                child,
+                Some(planned),
+            ) {
                 Ok(pending) => return self.finish_ready_get(pending.wait()),
                 Err(error) if RemoteDatabase::read_backpressured(&error) => {
+                    if let Some(trace) = trace {
+                        trace.event("admission_wait_started");
+                    }
                     self.wait_read_admission(generation, deadline)?;
-                    if let Some(value) = self.cache.lock().get_point(&reference, ks, key) {
+                    if let Some(trace) = trace {
+                        trace.event("admission_wait_finished");
+                    }
+                    // A disabled cache can never answer the recheck, and probing
+                    // it would only count a miss for a read that is still pending.
+                    if self.cache.is_enabled()
+                        && let Some(value) = self.cache.get_point(&reference, ks, key)
+                    {
                         self.ensure_healthy()?;
                         return Ok(Some(value));
                     }
@@ -96,6 +158,43 @@ impl ConcurrentRemoteDatabase {
         keys: &[K],
         cut: IndexReadCut,
     ) -> Result<Vec<Result<Option<Bytes>, LocalDbError>>, LocalDbError> {
+        self.get_many_cut_inner(ks, keys, cut, None, 0)
+    }
+
+    pub(crate) fn begin_read_trace(
+        &self,
+        caller_id: u64,
+        members: usize,
+    ) -> Option<ReadTraceCallGuard> {
+        let trace = self.reads.state.trace.begin(caller_id, members);
+        if let Some(trace) = &trace {
+            trace.event("api_started");
+        }
+        trace
+    }
+
+    pub(crate) fn traced_get_many_cut<K: AsRef<[u8]>>(
+        &self,
+        ks: KeySpace,
+        keys: &[K],
+        cut: IndexReadCut,
+        trace: Option<&ReadTraceCallGuard>,
+        offset: usize,
+    ) -> Result<Vec<Result<Option<Bytes>, LocalDbError>>, LocalDbError> {
+        self.get_many_cut_inner(ks, keys, cut, trace, offset)
+    }
+
+    fn get_many_cut_inner<K: AsRef<[u8]>>(
+        &self,
+        ks: KeySpace,
+        keys: &[K],
+        cut: IndexReadCut,
+        trace: Option<&ReadTraceCallGuard>,
+        offset: usize,
+    ) -> Result<Vec<Result<Option<Bytes>, LocalDbError>>, LocalDbError> {
+        if let Some(trace) = trace {
+            trace.event("index_resolution_started");
+        }
         let mut sample = self
             .reads
             .state
@@ -110,13 +209,12 @@ impl ConcurrentRemoteDatabase {
         let mut missing = Vec::new();
         let mut groups = vec![Vec::new(); self.partition_indexes.len()];
         let (references, pin) = {
+            // Resolve the cut once and use it for validation, every lookup and
+            // the pin; no lock or guard is held across the batch.
+            let cut = self.index.resolve_cut(cut);
             let clock = ResolutionSample::start(&sample);
-            let index = self.index.read();
-            if let Some(sample) = &sample {
-                sample.stage(ResolutionStage::IndexLockWait, clock);
-            }
-            let clock = ResolutionSample::start(&sample);
-            let validation = index
+            let validation = self
+                .index
                 .validate_cut(cut.clone())
                 .map_err(LocalDbError::component);
             if let Some(sample) = &sample {
@@ -127,7 +225,8 @@ impl ConcurrentRemoteDatabase {
                 .iter()
                 .map(|key| {
                     let clock = ResolutionSample::start(&sample);
-                    let result = index
+                    let result = self
+                        .index
                         .get(ks, key.as_ref(), cut.clone())
                         .map_err(LocalDbError::component);
                     if let Some(sample) = &sample {
@@ -136,29 +235,19 @@ impl ConcurrentRemoteDatabase {
                     result
                 })
                 .collect::<Vec<_>>();
-            // Bound cache ownership independently of the 256-key outer window.
-            // Keep lookup order, including duplicate references, and perform
-            // routing and allocation only after releasing the cache guard.
+            // Keep lookup order, including duplicate references, and route and
+            // allocate per 32-member chunk.
             for (chunk_index, chunk) in references.chunks(32).enumerate() {
                 let base = chunk_index * 32;
-                if chunk
-                    .iter()
-                    .any(|reference| matches!(reference, Ok(Some(_))))
-                {
+                for (offset, reference) in chunk.iter().enumerate() {
+                    let Ok(Some(reference)) = reference else {
+                        continue;
+                    };
+                    kv_capture::reference(11, reference, Some(keys[base + offset].as_ref()), 1, 0);
                     let clock = ResolutionSample::start(&sample);
-                    let mut cache = self.cache.lock();
+                    values[base + offset] = self.cache.get(reference);
                     if let Some(sample) = &sample {
-                        sample.stage(ResolutionStage::CacheLockWait, clock);
-                    }
-                    for (offset, reference) in chunk.iter().enumerate() {
-                        let Ok(Some(reference)) = reference else {
-                            continue;
-                        };
-                        let clock = ResolutionSample::start(&sample);
-                        values[base + offset] = cache.get(reference);
-                        if let Some(sample) = &sample {
-                            sample.stage(ResolutionStage::CacheLookup, clock);
-                        }
+                        sample.stage(ResolutionStage::CacheLookup, clock);
                     }
                 }
                 for (offset, reference) in chunk.iter().enumerate() {
@@ -209,7 +298,7 @@ impl ConcurrentRemoteDatabase {
                 None
             } else {
                 let clock = ResolutionSample::start(&sample);
-                let pin = index.pin_cut(cut).map_err(LocalDbError::component);
+                let pin = self.index.pin_cut(cut).map_err(LocalDbError::component);
                 if let Some(sample) = &sample {
                     sample.stage(ResolutionStage::PinPreparation, clock);
                 }
@@ -217,6 +306,9 @@ impl ConcurrentRemoteDatabase {
             };
             (references, pin)
         };
+        if let Some(trace) = trace {
+            trace.event("index_resolution_finished");
+        }
         let clock = ResolutionSample::start(&sample);
         let batch = ReadBatch::new(&self.reads, values, groups);
         if let Some(sample) = &sample {
@@ -231,12 +323,19 @@ impl ConcurrentRemoteDatabase {
             sample.success();
         }
         batch.pin = pin;
+        let clock = ResolutionSample::start(&sample);
         while !batch.complete() {
             self.ensure_healthy()?;
             let generation = self.read_admission_generation();
-            batch.dispatch(&self.reads)?;
+            batch.dispatch_traced(&self.reads, trace, offset)?;
             if batch.reads.is_empty() {
+                if let Some(trace) = trace {
+                    trace.event("admission_wait_started");
+                }
                 self.wait_read_admission(generation, batch.deadline)?;
+                if let Some(trace) = trace {
+                    trace.event("admission_wait_finished");
+                }
             } else {
                 let started = Instant::now();
                 let result = batch.finish_one();
@@ -245,7 +344,11 @@ impl ConcurrentRemoteDatabase {
                 result.inspect_err(|_| self.poison())?;
             }
         }
+        if let Some(sample) = &sample {
+            sample.stage(ResolutionStage::BatchWait, clock);
+        }
         self.ensure_healthy()?;
+        let clock = ResolutionSample::start(&sample);
         for slot in missing {
             let Ok(Some(reference)) = &references[slot] else {
                 unreachable!("only live references were submitted");
@@ -253,14 +356,13 @@ impl ConcurrentRemoteDatabase {
             let mutation = batch.values[slot]
                 .as_ref()
                 .expect("every admitted member completed");
-            let prepared = ReadCache::prepare_verified(
-                &self.cache,
-                self.config.read_cache_bytes,
-                *reference,
-                mutation,
-            );
-            self.cache.lock().insert_prepared(prepared);
+            let prepared = self.cache.prepare_verified(*reference, mutation);
+            self.cache.insert_prepared(prepared);
         }
+        if let Some(sample) = &sample {
+            sample.stage(ResolutionStage::PostreadCacheFill, clock);
+        }
+        let clock = ResolutionSample::start(&sample);
         let result = references
             .into_iter()
             .zip(batch.values)
@@ -276,7 +378,13 @@ impl ConcurrentRemoteDatabase {
                 .inspect_err(|_| self.poison()),
             })
             .collect();
+        if let Some(sample) = &sample {
+            sample.stage(ResolutionStage::ResultMaterialization, clock);
+        }
         self.ensure_healthy()?;
+        if let Some(trace) = trace {
+            trace.event("result_validation_finished");
+        }
         Ok(result)
     }
 
@@ -291,7 +399,6 @@ impl ConcurrentRemoteDatabase {
         self.ensure_healthy()?;
         let rows = self
             .index
-            .read()
             .scan_reduced(ks, after_reduced, reverse, limit, cut)
             .map_err(LocalDbError::component)?;
         self.ensure_healthy()?;
@@ -307,13 +414,12 @@ impl ConcurrentRemoteDatabase {
         self.ensure_healthy()?;
         let started = self.read_profile_enabled().then(Instant::now);
         let resolution = {
+            // Resolve the cut once: the lookup and a miss's pin must see the
+            // same cut. No lock or guard is held past each call.
+            let cut = self.index.resolve_cut(cut);
             let clock = ResolutionSample::start(&sample);
-            let index = self.index.read();
-            if let Some(sample) = &sample {
-                sample.stage(ResolutionStage::IndexLockWait, clock);
-            }
-            let clock = ResolutionSample::start(&sample);
-            let reference = index
+            let reference = self
+                .index
                 .get(ks, key, cut.clone())
                 .map_err(LocalDbError::component);
             if let Some(sample) = &sample {
@@ -333,17 +439,12 @@ impl ConcurrentRemoteDatabase {
                     GetResolution::Ready(None)
                 }
                 Ok(Some(reference)) => {
+                    kv_capture::reference(11, &reference, Some(key), 1, 0);
                     let clock = ResolutionSample::start(&sample);
-                    let mut cache = self.cache.lock();
-                    if let Some(sample) = &sample {
-                        sample.stage(ResolutionStage::CacheLockWait, clock);
-                    }
-                    let clock = ResolutionSample::start(&sample);
-                    let cached = cache.get_point(&reference, ks, key);
+                    let cached = self.cache.get_point(&reference, ks, key);
                     if let Some(sample) = &sample {
                         sample.stage(ResolutionStage::CacheLookup, clock);
                     }
-                    drop(cache);
                     if let Some(value) = cached {
                         if let Some(sample) = &sample {
                             sample.member(MemberOutcome::CacheHit);
@@ -354,7 +455,7 @@ impl ConcurrentRemoteDatabase {
                             sample.member(MemberOutcome::RemoteMiss);
                         }
                         let clock = ResolutionSample::start(&sample);
-                        let pin = index.pin_cut(cut).map_err(LocalDbError::component);
+                        let pin = self.index.pin_cut(cut).map_err(LocalDbError::component);
                         if let Some(sample) = &sample {
                             sample.stage(ResolutionStage::PinPreparation, clock);
                         }
@@ -411,10 +512,14 @@ impl ConcurrentRemoteDatabase {
                 node.expect("a miss has a route"),
                 inline,
                 pin,
+                None,
+                None,
             ),
         }
     }
 
+    // Preserve the existing key/routing/pin contract when adding optional diagnostics.
+    #[allow(clippy::too_many_arguments)]
     fn prepare_concurrent_miss(
         &self,
         ks: KeySpace,
@@ -423,29 +528,52 @@ impl ConcurrentRemoteDatabase {
         node: usize,
         inline: bool,
         pin: IndexReadPin,
+        trace: Option<ReadTraceChild>,
+        planned: Option<PlannedMembers<'_>>,
     ) -> Result<PendingGet, LocalDbError> {
         self.ensure_healthy()?;
         let started = Instant::now();
+        if let Some(trace) = &trace {
+            trace.event("inline_lane_attempt");
+        }
         let immediate = if inline {
-            self.reads.read_inline(
+            self.reads.read_inline_traced(
                 node,
                 self.epoch,
                 &reference,
                 key.len(),
                 None,
                 Some(pin.clone()),
+                trace.as_ref(),
             )?
         } else {
             None
         };
+        if let Some(trace) = &trace {
+            trace.event(if immediate.is_some() {
+                "inline_read_completed"
+            } else {
+                "inline_lane_unavailable"
+            });
+        }
         let state = if let Some(values) = immediate {
             self.value_read_ns
                 .fetch_add(elapsed(started), Ordering::Relaxed);
             GetState::Ready(self.complete_concurrent_get(reference, ks, key, values)?)
         } else {
-            let read = self
-                .reads
-                .submit(node, vec![reference], key.len(), false, Some(pin))?;
+            let read = self.reads.submit_until_owned(
+                node,
+                vec![reference],
+                key.len(),
+                false,
+                ReadContext {
+                    deadline: Instant::now() + self.reads.timeout,
+                    pin: Some(pin),
+                    trace,
+                },
+                None,
+                planned,
+            )?;
             GetState::Pending {
                 read,
                 reference,
@@ -504,13 +632,8 @@ impl ConcurrentRemoteDatabase {
             ));
         }
         let mutation = values.pop().unwrap();
-        let prepared = ReadCache::prepare_verified(
-            &self.cache,
-            self.config.read_cache_bytes,
-            reference,
-            &mutation,
-        );
-        self.cache.lock().insert_prepared(prepared);
+        let prepared = self.cache.prepare_verified(reference, &mutation);
+        self.cache.insert_prepared(prepared);
         let result = RemoteDatabase::point_value(ks, key, mutation);
         self.ensure_healthy()?;
         result
@@ -535,7 +658,7 @@ impl ConcurrentRemoteDatabase {
         pin: IndexReadPin,
     ) -> Result<PendingRecord, LocalDbError> {
         self.ensure_healthy()?;
-        let ready = self.cache.lock().get_scan(&reference);
+        let ready = self.cache.get_scan(&reference);
         let read = if ready.is_none() {
             let node = *self
                 .partition_indexes
@@ -549,6 +672,7 @@ impl ConcurrentRemoteDatabase {
                 ReadContext {
                     deadline: Instant::now() + self.config.timeout,
                     pin: Some(pin),
+                    trace: None,
                 },
             )?)
         } else {

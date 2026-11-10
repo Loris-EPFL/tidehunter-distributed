@@ -126,7 +126,7 @@ impl ConcurrentRemoteDatabase {
         let mut values = vec![None; rows.len()];
         let mut groups = vec![Vec::new(); self.partition_indexes.len()];
         for (slot, (_, reference)) in rows.iter().enumerate() {
-            if let Some(value) = self.cache.lock().get_scan(reference) {
+            if let Some(value) = self.cache.get_scan(reference) {
                 values[slot] = Some(value);
             } else {
                 let node = *self
@@ -238,14 +238,14 @@ impl RemoteDatabase {
     /// only additional prefetch storage has the two-page bound.
     pub fn scan(&mut self, ks: KeySpace) -> Result<Vec<(Bytes, Bytes)>, LocalDbError> {
         self.ensure_healthy()?;
-        let cut = self.index.read().latest_cut();
+        let cut = self.index.latest_cut();
         // Reject unsupported/invalid keyspace scans before issuing any RPC or
         // poisoning a serving authority for a caller's invalid request.
         let resolve_started = Instant::now();
         let (mut cursor, pin) = {
-            let index = self.index.read();
-            let pin = index.pin_cut(cut).map_err(LocalDbError::component)?;
-            let cursor = index
+            let pin = self.index.pin_cut(cut).map_err(LocalDbError::component)?;
+            let cursor = self
+                .index
                 .scan_cursor(ks, None, false, pin.cut())
                 .map_err(LocalDbError::component)?;
             (cursor, pin)
@@ -271,7 +271,7 @@ impl RemoteDatabase {
         cursor: &mut NativeIndexScan,
     ) -> Result<Option<ScanPage>, LocalDbError> {
         let started = Instant::now();
-        let page = ScanPage::next(cursor, &self.index.read());
+        let page = ScanPage::next(cursor, &self.index);
         self.stats.read_resolve_ns += elapsed(started);
         page
     }
@@ -336,7 +336,7 @@ impl RemoteDatabase {
         let mut values = vec![None; page.rows.len()];
         let mut groups = vec![Vec::new(); self.clients.len()];
         for (slot, (_, reference)) in page.rows.iter().enumerate() {
-            if let Some(value) = self.read_cache.lock().get_scan(reference) {
+            if let Some(value) = self.read_cache.get_scan(reference) {
                 values[slot] = Some(value);
             } else {
                 let node = *self

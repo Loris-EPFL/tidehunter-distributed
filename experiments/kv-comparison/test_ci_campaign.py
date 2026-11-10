@@ -59,7 +59,7 @@ class ConfigTests(unittest.TestCase):
     def test_full_single_and_three_repeat_matrices_are_admitted(self):
         spec = ci.core.read_json(ci.HERE / 'cloud-campaign.json')
         for limit in (0, 256):
-            for repeats, ordinary_cases in ((1, 293), (3, 879)):
+            for repeats, ordinary_cases in ((1, 298), (3, 894)):
                 with self.subTest(repeats=repeats, write_profile_limit=limit):
                     cfg = self.config(matrix=spec | {
                         'repeats': repeats, 'diagnostics': {'write_profile_limit': limit}})
@@ -75,12 +75,37 @@ class ConfigTests(unittest.TestCase):
         for repeats in (1, 3):
             cfg = self.config(matrix=spec | {'repeats': repeats})
             jobs = ci.cloud_campaign.make_matrix(cfg['spec'])
-            self.assertEqual(len(jobs), 310 * repeats)
+            self.assertEqual(len(jobs), 315 * repeats)
             self.assertEqual(sum(job['cohort'] == 'read_stage_diagnostics' for job in jobs),
                              12 * repeats)
             self.assertEqual(sum(job['cohort'] == 'write_stage_diagnostics' for job in jobs),
                              5 * repeats)
             self.assertFalse(any('resident_reads' in job or 'owner_read_cache_bytes' in job for job in jobs))
+
+    def test_every_tidehunter_job_carries_a_tier_defaulting_to_synchronous(self):
+        spec = ci.core.read_json(ci.HERE / 'cloud-nvmeof-campaign.json')
+        spec['mode'] = 'nvmeof-focused'
+        spec['backends'] = ['native', 'tidehunter_tcp', 'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma']
+        jobs = ci.cloud_campaign.make_matrix(spec)
+        tidehunter = [job for job in jobs if job['backend'] in ci.cloud_campaign.TRANSPORTS]
+        self.assertTrue(tidehunter)
+        self.assertTrue(all(job['durability_tier'] == 'synchronous' for job in tidehunter))
+        # Comparators and native have their own durability contract and get no owner tier.
+        self.assertTrue(all('durability_tier' not in job for job in jobs if job not in tidehunter))
+
+    def test_run_config_records_the_planned_tier_and_rejects_a_conflicting_option(self):
+        job = {'backend': 'tidehunter_tcp', 'case_id': 'c', 'repeat': 0, 'keys': 1024, 'value_size': 256,
+               'mix': ci.cloud_campaign.mix(read=100), 'concurrency': 1, 'measurement_operations': 8,
+               'warmup_operations': 0, 'offered_ops_per_second': None, 'distribution': 'uniform',
+               'durability_tier': 'native'}
+        config = ci.cloud_campaign.make_run_config(job, Path('/tmp/tier-case'), {}, 'source')
+        self.assertEqual(config['backend']['options']['durability_tier'], 'native')
+        with self.assertRaisesRegex(ValueError, 'durability_tier differs'):
+            ci.cloud_campaign.make_run_config(
+                job, Path('/tmp/tier-case'), {'durability_tier': 'synchronous'}, 'source')
+        with self.assertRaisesRegex(ValueError, 'invalid durability_tier'):
+            ci.cloud_campaign.make_run_config(
+                {**job, 'durability_tier': 'sync'}, Path('/tmp/tier-case'), {}, 'source')
 
     def test_nvme_rdma_planner_keeps_control_and_target_transports_distinct(self):
         spec = ci.core.read_json(ci.HERE / 'cloud-nvmeof-campaign.json')
@@ -95,6 +120,22 @@ class ConfigTests(unittest.TestCase):
         config = ci.cloud_campaign.make_run_config(rdma[0], Path('/tmp/rdma-case'), {}, 'source')
         self.assertEqual(config['backend']['kind'], 'tidehunter')
         self.assertEqual(config['backend']['options']['transport'], {'kind': 'tcp'})
+
+    def test_live_spdk_ci_plan_preserves_runtime_and_workload(self):
+        spec = ci.core.read_json(ci.HERE / 'cloud-nvmeof-campaign.json')
+        spec.update(mode='standard-with-live-nvmeof', spdk_comparison=True, max_cases=2000,
+                    backends=['native', 'tidehunter_tcp', 'tidehunter_nvme_rdma'])
+        jobs = ci.cloud_campaign.make_matrix(spec)
+        live = [job for job in jobs if job.get('nvmeof_route') == 'live'
+                and job['backend'] == 'tidehunter_nvme_rdma']
+        kernel = [job for job in live if job.get('nvmeof_target', 'kernel') == 'kernel']
+        spdk = [job for job in live if job.get('nvmeof_target') == 'spdk']
+        self.assertTrue(spdk)
+        self.assertEqual(len(kernel), len(spdk))
+        for source, twin in zip(kernel, spdk):
+            self.assertEqual({k: v for k, v in source.items() if k != 'case_id'},
+                             {k: v for k, v in twin.items() if k not in ('case_id', 'nvmeof_target')})
+            self.assertEqual(ci.cloud_campaign.comparison_backend(twin), 'tidehunter_spdk_live_rdma')
 
     def test_local_cli_plans_explicit_nvme_rdma_backend(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -154,7 +195,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_rejects_short_raw_bound_and_underreserved_s3_storage(self):
         with self.assertRaisesRegex(ValueError, 'raw export bound'):
-            self.config(lambda cfg: cfg.update(raw_export_max_gib=8))
+            self.config(lambda cfg: cfg.update(raw_export_max_gib=32))
         with self.assertRaisesRegex(ValueError, 'shared cost reservation'):
             self.config(lambda cfg: cfg['cost_assumptions'].update(result_gib=8))
 

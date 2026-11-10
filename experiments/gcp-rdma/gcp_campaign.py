@@ -5,8 +5,11 @@ import datetime as dt
 import hashlib
 import json
 import os
+import random
 import re
 import sys
+import subprocess
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -31,6 +34,32 @@ def parse_time(value):
     if result.tzinfo is None:
         raise ValueError('deadline must include UTC offset')
     return result.astimezone(dt.timezone.utc)
+
+
+def validate_spec(spec):
+    """Reject unsupported selections before any fleet allocation."""
+    import workflow_input
+    if not isinstance(spec, dict) or spec.get('suite') not in {'kv', 'sui', 'both'}:
+        raise ValueError('invalid campaign suite')
+    backends = spec.get('backends')
+    if (not isinstance(backends, list) or not backends
+            or any(not isinstance(item, str) or item not in workflow_input.BACKENDS for item in backends)
+            or len(backends) != len(set(backends))):
+        raise ValueError('invalid GCP backend selection; EFA is unavailable')
+    if spec.get('mode') not in {'standard', 'nvmeof-focused', 'standard-with-nvmeof', 'standard-with-live-nvmeof', 'focused'}:
+        raise ValueError('invalid campaign mode')
+    if spec['mode'] == 'focused':
+        import manual_campaign
+        manual_campaign._reviewed_jobs(spec)
+        return
+    if spec['mode'] == 'standard' and set(backends) & {'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma'}:
+        raise ValueError('NVMe backends require an NVMe-oF mode')
+    if spec['suite'] in {'kv', 'both'}:
+        extras = {'suite', 'sui_fixture', 'sui_verification', 'sui_transports'}
+        workflow_input.cloud_campaign.make_matrix({key: value for key, value in spec.items() if key not in extras})
+    if spec['suite'] in {'sui', 'both'}:
+        import gcp_sui
+        gcp_sui.selected_transports(spec)
 
 
 def validate(config, budget, run_id, source, deadline):
@@ -94,18 +123,30 @@ class StateFile:
 
     def persist(self, state):
         data = json_bytes(state)
-        try:
-            meta = self.store.put(self.key, data, content_type='application/json', if_generation_match=self.generation)
-        except ApiError as exc:
-            if exc.status is not None and exc.status < 500:
-                raise
+        deadline = time.monotonic() + 60
+        for attempt in range(8):
             try:
-                meta = self.store.head(self.key)
-                observed = self.store.get(self.key, generation=meta['generation'])
-            except Exception:
-                raise exc
-            if observed != data:
-                raise exc
+                meta = self.store.put(self.key, data, content_type='application/json',
+                                      if_generation_match=self.generation)
+                break
+            except ApiError as exc:
+                if exc.status is None or exc.status >= 500:
+                    try:
+                        meta = self.store.head(self.key)
+                        observed = self.store.get(self.key, generation=meta['generation'])
+                    except Exception:
+                        observed = None
+                    if observed == data:
+                        break
+                if exc.status not in (429, 500, 502, 503, 504) or attempt == 7:
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                delay = min(2 ** attempt, 12) * random.uniform(0.75, 1.0)
+                time.sleep(min(delay, remaining))
+                if time.monotonic() >= deadline:
+                    raise
         self.generation = meta['generation']
         save(self.path, state)
 
@@ -213,6 +254,38 @@ def admit_permissions(api, config):
     require_permissions('guest bucket', storage, guest.bucket_permissions(config['bucket'], storage))
 
 
+def admit_sealed_observer(receipt, run_id, deadline):
+    """Check the sealed renderer and validator before allocation, not host readiness."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'kv-comparison'))
+    import cloud_package
+    with tempfile.TemporaryDirectory(prefix='gcp-observer-preflight-') as temporary:
+        package = Path(temporary) / 'package'
+        admitted = cloud_package.verify_archive(Path(receipt['archive_path']), receipt['sha256'], destination=package)
+        if (admitted['source_sha256'] != receipt['source_sha256']
+                or admitted['binary_sha256'] != receipt['binary_sha256']):
+            raise ValueError('observer preflight archive differs from sealed source or binary')
+        source = package / 'source' / 'experiments' / 'kv-comparison'
+        # Addresses are representative because GCE assigns them after allocation.
+        # The actual rendered spec is validated again against the admitted fleet.
+        program = """
+import json, sys
+from pathlib import Path
+sys.dont_write_bytecode = True
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root))
+sys.path.insert(0, str(root / 'observability'))
+import cloud_controller, campaign_monitor
+run_id, deadline = sys.argv[2:]
+hosts = [{'address': '10.0.0.' + str(i)} for i in range(1, 7)]
+config = {'prefix': run_id, 'deadline_utc': deadline,
+          'fleet': {'coordinator': hosts[0], 'nodes': hosts[1:]}}
+spec = cloud_controller.monitoring_spec(config, Path('/mnt/tidehunter-kv-comparison') / run_id / 'results')
+campaign_monitor.validate_spec(spec)
+"""
+        subprocess.run([sys.executable, '-B', '-c', program, str(source), run_id, deadline],
+                       check=True, timeout=60, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
+
+
 def preflight(api, config, receipt, spec):
     admit_permissions(api, config)
     image = config['image'].split('/')
@@ -228,6 +301,9 @@ def preflight(api, config, receipt, spec):
     if not isinstance(size, str) or not size.isascii() or not size.isdecimal() or not 0 < int(size) <= BOOT_DISK_GIB:
         raise ValueError('image diskSizeGb must be positive and no larger than 80 GiB')
     qualification = gcp_image.admit_image(api, config, image_info)
+    gcp_image.admit_nvme_transports(qualification, spec.get('backends', []),
+                                    live=spec.get('mode') == 'standard-with-live-nvmeof')
+    gcp_image.admit_spdk(qualification, spec)
     gcp_image.admit_abi(qualification, receipt.get('abi'))
     if spec.get('suite') in ('sui', 'both'):
         gcp_image.admit_abi(qualification, receipt.get('sui_abi'))
@@ -442,6 +518,9 @@ def upload_file(store, path, digest, key):
 
 
 def launch(api, config, budget, state, state_path, receipt, spec, output):
+    if (spec.get('mode') == 'standard-with-live-nvmeof'
+            and set(spec.get('backends', ())) & {'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma'}):
+        raise ValueError('direct launcher has no two-host live qualification; physical route/counter evidence must be established before fleet allocation')
     from gcp_bootstrap import startup_script
     from gcp_runtime import build_runtime_config, RemoteMailbox
     store = api.objects(config['bucket'])
@@ -520,7 +599,7 @@ def launch(api, config, budget, state, state_path, receipt, spec, output):
 # A full 273-case campaign can produce many individual owner RPC receipts.
 # Allow over 360 objects per case as well as the suite-level archives.
 MAX_RESULT_OBJECTS = 100_000
-MAX_RESULT_OBJECT_BYTES = 32 * 1024**3
+MAX_RESULT_OBJECT_BYTES = 34 * 1024**3
 MAX_RESULT_TOTAL_BYTES = 256 * 1024**3
 
 
@@ -670,6 +749,7 @@ def main(argv=None):
     validate(config, budget, args.run_id, args.source_sha, args.deadline)
     receipt = json.loads(Path(args.package_receipt).read_text())
     spec = json.loads(Path(args.spec).read_text())
+    validate_spec(spec)
     if receipt.get('source_sha256') != args.source_sha:
         raise ValueError('source identity differs from package receipt')
     plan = {'project_id': config['project_id'], 'run_id': args.run_id, 'source_sha256': args.source_sha, 'deadline': args.deadline, 'hosts': 6, 'machine_type': config['machine_type'], 'candidates': config['candidates'], 'upper_bound_cents': budget['run_upper_bound_cents'], 'estimate_note': budget['quote_description']}
@@ -677,6 +757,7 @@ def main(argv=None):
     if args.command == 'plan':
         return
     api = GoogleApi(config['project_id'])
+    admit_sealed_observer(receipt, args.run_id, args.deadline)
     preflight(api, config, receipt, spec)
     if args.command == 'preflight':
         return

@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tidehunter_fabric::{
-    Endpoint, FabricBackend, FabricConfig, PeerDrainToken, RemoteReadRegion, RmaConfig,
+    Endpoint, FabricBackend, FabricConfig, MAX_SLOTS, PeerDrainToken, RemoteReadRegion, RmaConfig,
 };
 
 fn software_config(domain: Option<&str>) -> FabricConfig {
@@ -15,6 +15,7 @@ fn software_config(domain: Option<&str>) -> FabricConfig {
         backend: FabricBackend::SoftwareTcp,
         domain: domain.map(str::to_owned),
         source_address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
+        slots: None,
     }
 }
 
@@ -38,6 +39,7 @@ fn regular_efa_rma_is_rejected_instead_of_promoted_to_direct() {
         backend: FabricBackend::Efa,
         domain: None,
         source_address: None,
+        slots: None,
     };
     let rma = RmaConfig {
         source_bytes: 4096,
@@ -477,6 +479,7 @@ fn efa_direct_opens_only_the_negotiated_hardware_fabric() -> io::Result<()> {
         backend: FabricBackend::EfaDirect,
         domain: None,
         source_address: None,
+        slots: None,
     };
     let endpoint = Endpoint::open(&config, None)?;
     let profile = endpoint.open_profile();
@@ -931,5 +934,82 @@ fn software_provider_buffered_receive_disables_idle_cq_wait() -> io::Result<()> 
     })?;
     a.flush(deadline)?;
     b.flush(deadline)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm and local network permission"]
+fn software_provider_records_effective_geometry_and_rxm_parameters() -> io::Result<()> {
+    let endpoint = Endpoint::open(&software_config(Some("lo")), None)?;
+    let geometry = &endpoint.provider_info().geometry;
+    assert!(geometry.libfabric_api_version.contains('.'));
+    assert!(geometry.provider_version.contains('.'));
+    assert_eq!(geometry.slots, 4);
+    assert_eq!(geometry.data_progress, "manual");
+    assert!(geometry.tx_size >= 4 && geometry.rx_size >= 4);
+    assert!(geometry.max_msg_size >= 65_536);
+    assert_eq!(geometry.mr_mode == 0, geometry.mr_mode_flags.is_empty());
+    assert!(
+        geometry.cq_wait.starts_with("unspec"),
+        "software provider reports its bounded CQ wait: {}",
+        geometry.cq_wait
+    );
+    // The RxM parameter list is what explains eager/SAR/rendezvous thresholds.
+    let configured = |name: &str| {
+        geometry
+            .rxm_parameters
+            .iter()
+            .find(|param| param.name == name)
+            .unwrap_or_else(|| panic!("missing {name}: {:?}", geometry.rxm_parameters))
+            .configured_or_default
+            .clone()
+    };
+    if std::env::var_os("FI_OFI_RXM_BUFFER_SIZE").is_none() {
+        assert_eq!(
+            configured("FI_OFI_RXM_BUFFER_SIZE").as_deref(),
+            Some("16384")
+        );
+    }
+    if std::env::var_os("FI_OFI_RXM_SAR_LIMIT").is_none() {
+        assert_eq!(
+            configured("FI_OFI_RXM_SAR_LIMIT").as_deref(),
+            Some("131072")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm and local network permission"]
+fn software_provider_transfers_with_a_larger_slot_count() -> io::Result<()> {
+    let mut config = software_config(Some("lo"));
+    config.slots = Some(MAX_SLOTS);
+    let mut a = Endpoint::open(&config, None)?;
+    let mut b = Endpoint::open(&config, None)?;
+    assert_eq!(a.provider_info().geometry.slots, MAX_SLOTS);
+    let (a_addr, b_addr) = (a.address()?, b.address()?);
+    a.set_peer(&b_addr)?;
+    b.set_peer(&a_addr)?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    // More chunks than the default four-slot ring so the larger ring wraps.
+    let payload: Vec<u8> = (0..70 * 65_536 + 13)
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect();
+    let expected = payload.clone();
+    let sender = thread::spawn(move || -> io::Result<Endpoint> {
+        let mut offset = 0;
+        while offset < payload.len() {
+            offset += a.queue_send(&payload[offset..], deadline)?;
+        }
+        a.flush(deadline)?;
+        Ok(a)
+    });
+    let mut received = vec![0; expected.len()];
+    let mut offset = 0;
+    while offset < received.len() {
+        offset += b.receive(&mut received[offset..], deadline)?;
+    }
+    assert_eq!(received, expected);
+    sender.join().unwrap()?;
     Ok(())
 }

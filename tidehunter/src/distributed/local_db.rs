@@ -238,6 +238,7 @@ impl LocalDatabase {
                     receipt.version().sequence
                 ));
                 index
+                    .writer()
                     .flush_and_unload(&name, index.latest_cut())
                     .map_err(LocalDbError::component)?;
             }
@@ -247,11 +248,16 @@ impl LocalDatabase {
             let durable = log
                 .persist_through(receipt)
                 .map_err(LocalDbError::component)?;
+            let mut writer = index.writer();
             PreparedNativePublication::prepare(log, &batch, durable)
                 .map_err(LocalDbError::component)?
-                .publish(&mut index)
+                .publish(&mut writer)
                 .map_err(LocalDbError::component)?;
-            index.promote_committed().map_err(LocalDbError::component)?;
+            writer
+                .promote_committed()
+                .map_err(LocalDbError::component)?;
+            writer.publish_latest();
+            drop(writer);
             last_version = Some(receipt.version());
             latest = batch.mutation_version(batch.mutations().len() - 1);
             *ordinal += 1;
@@ -530,7 +536,7 @@ impl LocalDatabase {
             }
         }
         let started = Instant::now();
-        let index = &mut self.index;
+        let index = &self.index;
         let submissions = &mut self.submissions;
         let active_identities = &mut self.active_identities;
         let latest = &mut self.latest;
@@ -544,11 +550,15 @@ impl LocalDatabase {
                 let entry =
                     &mut submissions[(receipt.version().sequence - submission_base) as usize];
                 let batch = entry.batch.as_ref().unwrap();
+                let mut writer = index.writer();
                 PreparedNativePublication::prepare(&partitions[entry.partition], batch, durable)
                     .map_err(LocalDbError::component)?
-                    .publish(index)
+                    .publish(&mut writer)
                     .map_err(LocalDbError::component)?;
-                index.promote_committed().map_err(LocalDbError::component)?;
+                writer
+                    .promote_committed()
+                    .map_err(LocalDbError::component)?;
+                writer.publish_latest();
                 *latest = batch.mutation_version(batch.mutations().len() - 1);
                 active_identities.remove(&receipt.id());
                 *reserved -= entry.metadata_bytes;
@@ -835,6 +845,8 @@ impl LocalDatabase {
             result.persistence_barriers += stats.persistence_barriers;
             result.namespace_syncs += stats.namespace_syncs;
             result.inventory_witnesses += stats.inventory_witnesses;
+            result.live_frontier_file_syncs += stats.live_frontier_file_syncs;
+            result.live_frontier_namespace_syncs += stats.live_frontier_namespace_syncs;
             result.registered_records += stats.registered_records;
             result.reference_metadata_bytes += stats.reference_metadata_bytes;
         }

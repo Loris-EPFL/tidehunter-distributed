@@ -57,6 +57,8 @@ pub struct Wal {
 #[cfg(feature = "experimental-distributed")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ValueWalPersistenceProfile {
+    /// Number of files in the registry snapshot used by this profiled barrier.
+    pub registered_files: u64,
     pub file_calls: u64,
     pub file_successes: u64,
     pub file_ns: u64,
@@ -96,7 +98,59 @@ pub enum WalRandomRead {
     File(FileRange),
 }
 
+/// Native allocation pin for an externally written final frame. The tracker
+/// cannot advance over it until validated adoption explicitly releases it.
+#[cfg(feature = "experimental-nvmeof")]
+pub(crate) struct ExternalWalAllocation {
+    pub(crate) position: WalPosition,
+    pub(crate) file: Arc<File>,
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) guard: tracker::ExternalWalGuard,
+}
+
 impl WalWriter {
+    #[cfg(feature = "experimental-nvmeof")]
+    pub(crate) fn reserve_external(&self, frame_len: u32) -> io::Result<ExternalWalAllocation> {
+        let len = u64::from(frame_len);
+        if len == 0
+            || len >= (1 << 30)
+            || len > self.wal.layout.frag_size
+            || !len.is_multiple_of(4096)
+            || !self.position().is_multiple_of(4096)
+            || !self.wal.layout.frag_size.is_multiple_of(4096)
+            || !self.wal.layout.wal_file_size.is_multiple_of(4096)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid external WAL geometry",
+            ));
+        }
+        let allocation = self.allocator.allocate(len);
+        if let Some(skip) = allocation.need_skip_marker() {
+            self.write_skip_marker(skip);
+        }
+        let position = allocation.allocated_position();
+        // Wait until the mapper has registered the final backing inode.
+        let _ = self.get_writeable_map(position);
+        let files = self.wal.files.load_full();
+        let file_id = self.wal.layout.locate_file(position);
+        // The mapper owns all file growth. Preallocate there before enqueueing
+        // the tracker hold, so no stale fragment extension can shrink the file.
+        self.wal_tracker.ensure_external_file(file_id)?;
+        let file = files
+            .get_checked(file_id)
+            .cloned()
+            .ok_or_else(|| io::Error::other("allocated WAL file missing"))?;
+        let path = self.wal.layout.wal_file_name(&files.base_path, file_id);
+        let guard = self.wal_tracker.allocated_external(allocation)?;
+        Ok(ExternalWalAllocation {
+            position: WalPosition::new(position, frame_len),
+            file,
+            path,
+            guard,
+        })
+    }
+
     pub fn write(&self, w: &PreparedWalWrite) -> Result<WalGuard, WalError> {
         Ok(self
             .multi_write(std::iter::once(w))?
@@ -273,6 +327,7 @@ pub enum WalMemberReadPolicy {
 /// after submission. Distributed readers additionally retain their PartitionLog
 /// authority/segment lifetime until the completion is retired.
 #[cfg(feature = "experimental-distributed")]
+#[derive(Clone)]
 pub(crate) struct WalMemberReadPlan {
     pub(crate) file: Arc<File>,
     pub(crate) offset: u64,
@@ -743,6 +798,20 @@ impl Wal {
         self.files.load().files.len()
     }
 
+    /// Observe registered file lengths at a diagnostic boundary. Lengths include
+    /// preallocated space and do not represent dirty or physically written bytes.
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn registered_file_inventory(&self) -> io::Result<(usize, u64)> {
+        let files = self.files.load_full();
+        let mut bytes = 0_u64;
+        for file in files.files.values() {
+            bytes = bytes.checked_add(file.metadata()?.len()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "WAL file length sum overflow")
+            })?;
+        }
+        Ok((files.files.len(), bytes))
+    }
+
     /// Persist every file currently registered and its directory entry.
     ///
     /// The experimental partition service serializes append/persist and invokes
@@ -767,6 +836,7 @@ impl Wal {
         profile: &mut ValueWalPersistenceProfile,
     ) -> io::Result<()> {
         let files = self.files.load_full();
+        profile.registered_files = files.files.len() as u64;
         for file in files.files.values() {
             let began = std::time::Instant::now();
             let result = file.sync_all();

@@ -31,7 +31,7 @@ import build
 CHECKPOINT_DIAGNOSTIC_PHASES = (
     'pressure_wait', 'drain', 'existing_capture_wait', 'new_capture_wait',
     'staging_manifest', 'receipt_history', 'receipt_history_sync', 'node_prefix_wait',
-    'index_prepare', 'index_persist', 'metadata_install', 'owner_adoption', 'obsolete_cleanup')
+    'index_prepare', 'index_persist', 'metadata_install', 'root_adoption', 'owner_adoption', 'obsolete_cleanup')
 CHECKPOINT_HISTORY_COUNTERS = (
     'history_stream_opens', 'history_previous_slot_reads', 'history_receipt_write_ops',
     'history_receipt_write_bytes', 'history_buffer_flushes', 'history_node_write_ops',

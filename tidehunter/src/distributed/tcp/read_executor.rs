@@ -20,6 +20,10 @@
 const RESIDENT_NOWAIT_MAX_CALLS: usize = 4;
 const RESIDENT_NOWAIT_MAX_BYTES: usize = 64 * 1024;
 const RESIDENT_NOWAIT_MAX_MEMBER_BYTES: usize = 16 * 1024;
+// Coalesce only ranges whose union contains no unauthorized gaps. Bounded
+// original-order runs avoid sorting and keep scalar/nonadjacent reads cheap.
+const COALESCED_MAX_MEMBERS: usize = 32;
+const COALESCED_MAX_BYTES: usize = 64 * 1024;
 // At most 32 successful probes per request, spread over fair owner sweeps.
 const RESIDENT_NOWAIT_MAX_SWEEPS: usize = 8;
 #[cfg(all(test, target_os = "linux"))]
@@ -41,6 +45,7 @@ use std::mem::{MaybeUninit, size_of};
 use std::os::fd::AsRawFd;
 #[cfg(all(test, target_os = "linux"))]
 use std::os::unix::fs::FileExt;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -121,36 +126,310 @@ pub struct ReadExecutorStats {
     pub idle_buffers: usize,
     pub buffer_reuses: u64,
     pub buffer_allocations: u64,
+    /// Idle buffers dropped so a new reply fits the shared byte allowance.
+    pub idle_buffer_evictions: u64,
+    /// Per-device read-credit shard locks: the only lock on a read's async path.
+    pub device_credit_lock: LockProfileStats,
+    /// Session-pool registry: touched at session open/close, eviction, snapshots.
+    pub pool_registry_lock: LockProfileStats,
+    /// Send-path counters summed across all sessions of this owner, including
+    /// closed ones. Zero without an OFI transport.
+    pub transport: super::OwnerTransportStats,
 }
-struct AdmissionState {
-    stats: ReadExecutorStats,
-    devices: HashMap<u64, usize>,
-    buffers: Vec<Box<[MaybeUninit<u8>]>>,
+
+/// Evidence for one remaining lock. Wait time is measured only for acquisitions
+/// that found the lock held; hold time covers every acquisition.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LockProfileStats {
+    pub acquisitions: u64,
+    pub contended: u64,
+    pub wait_ns: u64,
+    pub hold_ns: u64,
 }
-/// Shared by all node connection rings. The admission lock makes budgets and
-/// buffer recycling atomic and is never held across a syscall or submission.
+
+/// Counters for one lock. Relaxed ordering: they are independent statistics
+/// and publish no data.
+#[derive(Default)]
+struct LockProfile {
+    acquisitions: AtomicU64,
+    contended: AtomicU64,
+    wait_ns: AtomicU64,
+    hold_ns: AtomicU64,
+}
+impl LockProfile {
+    /// Runs `work` under `mutex`. A parking_lot guard is never returned, so no
+    /// lock outlives this call and none is held across a syscall.
+    fn run<T, R>(&self, mutex: &Mutex<T>, work: impl FnOnce(&mut T) -> R) -> R {
+        let (mut guard, waited) = if let Some(guard) = mutex.try_lock() {
+            (guard, 0)
+        } else {
+            let began = Instant::now();
+            let guard = mutex.lock();
+            self.contended.fetch_add(1, Ordering::Relaxed);
+            (guard, super::elapsed_ns(began))
+        };
+        let held = Instant::now();
+        let result = work(&mut *guard);
+        drop(guard);
+        self.acquisitions.fetch_add(1, Ordering::Relaxed);
+        self.wait_ns.fetch_add(waited, Ordering::Relaxed);
+        self.hold_ns
+            .fetch_add(super::elapsed_ns(held), Ordering::Relaxed);
+        result
+    }
+    fn snapshot(&self) -> LockProfileStats {
+        LockProfileStats {
+            acquisitions: self.acquisitions.load(Ordering::Relaxed),
+            contended: self.contended.load(Ordering::Relaxed),
+            wait_ns: self.wait_ns.load(Ordering::Relaxed),
+            hold_ns: self.hold_ns.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Event counters. A session's executor increments its own set; the node sums
+/// them in `stats()`. Relaxed ordering: independent statistics, no data hand-off.
+#[derive(Default)]
+struct Counters {
+    wal_reads: AtomicU64,
+    wal_read_bytes: AtomicU64,
+    resident_read_attempts: AtomicU64,
+    resident_read_successes: AtomicU64,
+    resident_read_fallbacks: AtomicU64,
+    resident_read_unsupported: AtomicU64,
+    resident_read_partial: AtomicU64,
+    resident_read_deferred: AtomicU64,
+    async_read_submissions: AtomicU64,
+    completed_reads: AtomicU64,
+    errors: AtomicU64,
+    buffer_reuses: AtomicU64,
+    buffer_allocations: AtomicU64,
+}
+fn bump(counter: &AtomicU64, amount: u64) {
+    counter.fetch_add(amount, Ordering::Relaxed);
+}
+impl Counters {
+    fn add_to(&self, stats: &mut ReadExecutorStats) {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        stats.wal_reads += load(&self.wal_reads);
+        stats.wal_read_bytes += load(&self.wal_read_bytes);
+        stats.resident_read_attempts += load(&self.resident_read_attempts);
+        stats.resident_read_successes += load(&self.resident_read_successes);
+        stats.resident_read_fallbacks += load(&self.resident_read_fallbacks);
+        stats.resident_read_unsupported += load(&self.resident_read_unsupported);
+        stats.resident_read_partial += load(&self.resident_read_partial);
+        stats.resident_read_deferred += load(&self.resident_read_deferred);
+        stats.async_read_submissions += load(&self.async_read_submissions);
+        stats.completed_reads += load(&self.completed_reads);
+        stats.errors += load(&self.errors);
+        stats.buffer_reuses += load(&self.buffer_reuses);
+        stats.buffer_allocations += load(&self.buffer_allocations);
+    }
+    /// Moves a closing session's totals into the node's retired set.
+    fn fold_into(&self, retired: &Counters) {
+        macro_rules! fold {
+            ($($field:ident),* $(,)?) => {$(
+                bump(&retired.$field, self.$field.load(Ordering::Relaxed));
+            )*};
+        }
+        fold!(
+            wal_reads,
+            wal_read_bytes,
+            resident_read_attempts,
+            resident_read_successes,
+            resident_read_fallbacks,
+            resident_read_unsupported,
+            resident_read_partial,
+            resident_read_deferred,
+            async_read_submissions,
+            completed_reads,
+            errors,
+            buffer_reuses,
+            buffer_allocations,
+        );
+    }
+}
+
+/// Bounded retries for every compare-exchange loop below. Exhaustion reports
+/// "no room right now" (`None`/`false`); callers already retry on Full.
+const CAS_ATTEMPTS: usize = 64;
+const DEVICE_SHARDS: usize = 16;
+
+/// Node-wide per-device in-flight read credits, sharded by device so reads on
+/// different devices never share a lock. Lock order: a thread holds at most one
+/// shard lock at a time (multi-device requests lock shards one after another and
+/// roll back on failure), so no ordering between shards is needed.
+struct DeviceCredits {
+    shards: [Mutex<HashMap<u64, usize>>; DEVICE_SHARDS],
+    lock: LockProfile,
+}
+impl DeviceCredits {
+    fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            lock: LockProfile::default(),
+        }
+    }
+    fn shard(&self, device: u64) -> &Mutex<HashMap<u64, usize>> {
+        // Fibonacci hashing: device ids are inode/dev numbers, often sequential.
+        let index = (device.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 60) as usize;
+        &self.shards[index % DEVICE_SHARDS]
+    }
+    /// All-or-nothing: credits taken for earlier devices are returned when a
+    /// later device is at `limit`. Reports the highest per-device depth reached.
+    fn try_reserve(&self, devices: &[(u64, usize)], limit: usize, peak: &AtomicUsize) -> bool {
+        for (taken, (device, count)) in devices.iter().enumerate() {
+            let depth = self.lock.run(self.shard(*device), |shard| {
+                let current = shard.entry(*device).or_default();
+                if *current + count > limit {
+                    if *current == 0 {
+                        shard.remove(device);
+                    }
+                    return None;
+                }
+                *current += count;
+                Some(*current)
+            });
+            let Some(depth) = depth else {
+                for (device, count) in &devices[..taken] {
+                    self.release(*device, *count);
+                }
+                return false;
+            };
+            peak.fetch_max(depth, Ordering::Relaxed);
+        }
+        true
+    }
+    fn release(&self, device: u64, count: usize) {
+        self.lock.run(self.shard(device), |shard| {
+            let current = shard.get_mut(&device).expect("reserved device");
+            *current -= count;
+            if *current == 0 {
+                shard.remove(&device);
+            }
+        });
+    }
+}
+
+/// Reserved reply bytes (high half) and idle pooled-buffer bytes (low half) in
+/// one word, so admission, eviction and recycling each decide and update both
+/// in a single compare-exchange. `max_bytes <= 256 MiB` fits 32 bits.
+const IDLE_MASK: u64 = u32::MAX as u64;
+
+/// Node-wide admission. Reply requests and bytes are atomics; nothing here
+/// serializes unrelated sessions. Buffer reuse and event counters belong to each
+/// session's `SessionPool`. The only remaining locks are the per-device credit
+/// shards (one device's reads) and the pool registry (cold: session open/close,
+/// idle eviction under byte pressure, stats snapshots); both report
+/// acquisition, contention, wait and hold time in `ReadExecutorStats`.
+/// Lock order: registry, then one pool's buffer lock via `try_lock` only; a
+/// device shard lock is never held together with either.
 pub(crate) struct ReadAdmission {
     config: ReadExecutorConfig,
-    state: Mutex<AdmissionState>,
+    /// Acquire/Release: a thread that wins the byte CAS owns that room.
+    bytes: AtomicU64,
+    inflight_requests: AtomicUsize,
+    idle_buffers: AtomicUsize,
+    inflight_reads: AtomicUsize,
+    peak_inflight_requests: AtomicUsize,
+    peak_inflight_bytes: AtomicUsize,
+    peak_inflight_reads: AtomicUsize,
+    peak_device_reads: AtomicUsize,
+    cancellations: AtomicU64,
+    idle_evictions: AtomicU64,
+    /// Diagnostic synchronous reads have no session; their counters live here.
+    node_counters: Counters,
+    /// Totals of closed sessions, so a snapshot never loses history.
+    retired: Counters,
+    devices: DeviceCredits,
+    pools: Mutex<Vec<Weak<SessionPool>>>,
+    /// Send-path counters of every session, flushed by the session threads.
+    pub(super) transport: Arc<super::OwnerTransportCounters>,
+    pools_lock: LockProfile,
 }
 impl ReadAdmission {
     pub(crate) fn new(config: ReadExecutorConfig) -> Result<Self, StorageError> {
         config.validate()?;
         Ok(Self {
             config,
-            state: Mutex::new(AdmissionState {
-                stats: ReadExecutorStats::default(),
-                devices: HashMap::new(),
-                buffers: Vec::with_capacity(config.max_device_reads.min(128)),
-            }),
+            bytes: AtomicU64::new(0),
+            inflight_requests: AtomicUsize::new(0),
+            idle_buffers: AtomicUsize::new(0),
+            inflight_reads: AtomicUsize::new(0),
+            peak_inflight_requests: AtomicUsize::new(0),
+            peak_inflight_bytes: AtomicUsize::new(0),
+            peak_inflight_reads: AtomicUsize::new(0),
+            peak_device_reads: AtomicUsize::new(0),
+            cancellations: AtomicU64::new(0),
+            idle_evictions: AtomicU64::new(0),
+            node_counters: Counters::default(),
+            retired: Counters::default(),
+            transport: Arc::default(),
+            devices: DeviceCredits::new(),
+            pools: Mutex::new(Vec::new()),
+            pools_lock: LockProfile::default(),
         })
     }
-    pub(crate) fn stats(&self) -> ReadExecutorStats {
-        self.state.lock().stats
+    /// A new session-owned buffer pool and counter set, registered for stats.
+    pub(crate) fn session_pool(self: &Arc<Self>) -> Arc<SessionPool> {
+        let pool = Arc::new(SessionPool {
+            admission: self.clone(),
+            counters: Counters::default(),
+            buffers: Mutex::new(Vec::with_capacity(self.pool_capacity())),
+        });
+        self.pools_lock.run(&self.pools, |pools| {
+            pools.retain(|pool| pool.strong_count() > 0);
+            pools.push(Arc::downgrade(&pool));
+        });
+        pool
     }
-    /// Nonblocking operational snapshot. Contention makes the whole sample unavailable.
+    fn pool_capacity(&self) -> usize {
+        self.config.max_device_reads.min(128)
+    }
+    pub(crate) fn stats(&self) -> ReadExecutorStats {
+        // A monitor read is not part of the contention evidence it reports, so
+        // this acquisition is deliberately not counted in `pools_lock`.
+        let pools = {
+            let mut pools = self.pools.lock();
+            pools.retain(|pool| pool.strong_count() > 0);
+            pools.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
+        };
+        self.snapshot(&pools)
+    }
+    /// Nonblocking operational snapshot. Contention on the registry makes the
+    /// whole sample unavailable. Not transactional across sessions.
     pub(crate) fn try_stats(&self) -> Option<ReadExecutorStats> {
-        Some(self.state.try_lock()?.stats)
+        let pools = self
+            .pools
+            .try_lock()?
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        Some(self.snapshot(&pools))
+    }
+    fn snapshot(&self, pools: &[Arc<SessionPool>]) -> ReadExecutorStats {
+        let mut stats = ReadExecutorStats::default();
+        self.node_counters.add_to(&mut stats);
+        self.retired.add_to(&mut stats);
+        for pool in pools {
+            pool.counters.add_to(&mut stats);
+        }
+        let word = self.bytes.load(Ordering::Acquire);
+        stats.inflight_bytes = (word >> 32) as usize;
+        stats.idle_buffer_bytes = (word & IDLE_MASK) as usize;
+        stats.idle_buffers = self.idle_buffers.load(Ordering::Relaxed);
+        stats.inflight_requests = self.inflight_requests.load(Ordering::Acquire);
+        stats.inflight_reads = self.inflight_reads.load(Ordering::Acquire);
+        stats.peak_inflight_requests = self.peak_inflight_requests.load(Ordering::Relaxed);
+        stats.peak_inflight_bytes = self.peak_inflight_bytes.load(Ordering::Relaxed);
+        stats.peak_inflight_reads = self.peak_inflight_reads.load(Ordering::Relaxed);
+        stats.peak_device_reads = self.peak_device_reads.load(Ordering::Relaxed);
+        stats.cancellations = self.cancellations.load(Ordering::Relaxed);
+        stats.idle_buffer_evictions = self.idle_evictions.load(Ordering::Relaxed);
+        stats.device_credit_lock = self.devices.lock.snapshot();
+        stats.pool_registry_lock = self.pools_lock.snapshot();
+        stats.transport = self.transport.snapshot();
+        stats
     }
     /// Diagnostic read admission, retained through response send retirement.
     /// Caller includes all retained work in `bytes`; this is not device credit.
@@ -161,87 +440,209 @@ impl ReadAdmission {
         if bytes == 0 || bytes > self.config.max_bytes {
             return Err(StorageError::Capacity);
         }
-        let mut state = self.state.lock();
-        if state.stats.inflight_requests >= self.config.max_requests
-            || bytes > self.config.max_bytes - state.stats.inflight_bytes
-        {
+        if !self.acquire_request() {
             return Ok(None);
         }
-        // Idle storage shares the existing byte allowance, not a second pool
-        // budget. Evict before admission; active CQ/response owners never move.
-        while bytes
-            > self.config.max_bytes - state.stats.inflight_bytes - state.stats.idle_buffer_bytes
-        {
-            let buffer = state.buffers.pop().expect("idle buffer accounting");
-            state.stats.idle_buffer_bytes -= buffer.len();
-            state.stats.idle_buffers -= 1;
+        if !self.acquire_bytes(bytes) {
+            // Release: nothing else was published for this request.
+            self.inflight_requests.fetch_sub(1, Ordering::Release);
+            return Ok(None);
         }
-        state.stats.inflight_requests += 1;
-        state.stats.inflight_bytes += bytes;
-        state.stats.peak_inflight_requests = state
-            .stats
-            .peak_inflight_requests
-            .max(state.stats.inflight_requests);
-        state.stats.peak_inflight_bytes = state
-            .stats
-            .peak_inflight_bytes
-            .max(state.stats.inflight_bytes);
         Ok(Some(ReadLease {
             admission: self.clone(),
             charge: bytes,
             prepared: None,
         }))
     }
+    fn acquire_request(&self) -> bool {
+        let mut current = self.inflight_requests.load(Ordering::Relaxed);
+        for _ in 0..CAS_ATTEMPTS {
+            if current >= self.config.max_requests {
+                return false;
+            }
+            match self.inflight_requests.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.peak_inflight_requests
+                        .fetch_max(current + 1, Ordering::Relaxed);
+                    return true;
+                }
+                Err(seen) => current = seen,
+            }
+        }
+        false
+    }
+    /// Reserves `bytes` of reply credit. Idle pooled buffers share the byte
+    /// allowance: when only they stand in the way they are evicted first, so
+    /// reserved plus idle bytes never exceed `max_bytes`.
+    fn acquire_bytes(&self, bytes: usize) -> bool {
+        let max = self.config.max_bytes as u64;
+        let need = bytes as u64;
+        let mut word = self.bytes.load(Ordering::Acquire);
+        for _ in 0..CAS_ATTEMPTS {
+            let reserved = word >> 32;
+            let idle = word & IDLE_MASK;
+            if need > max.saturating_sub(reserved) {
+                return false;
+            }
+            let excess = (reserved + need + idle).saturating_sub(max);
+            if excess > 0 {
+                if self.evict_idle(excess as usize) == 0 {
+                    return false;
+                }
+                word = self.bytes.load(Ordering::Acquire);
+                continue;
+            }
+            match self.bytes.compare_exchange_weak(
+                word,
+                word + (need << 32),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.peak_inflight_bytes
+                        .fetch_max((reserved + need) as usize, Ordering::Relaxed);
+                    return true;
+                }
+                Err(seen) => word = seen,
+            }
+        }
+        false
+    }
+    /// Drops idle buffers from session pools until `want` bytes are freed.
+    /// A pool whose owner is mid-operation is skipped, never waited for.
+    fn evict_idle(&self, want: usize) -> usize {
+        let pools = self.pools_lock.run(&self.pools, |pools| {
+            pools.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
+        });
+        let mut freed = 0;
+        for pool in pools {
+            let Some(mut buffers) = pool.buffers.try_lock() else {
+                continue;
+            };
+            while freed < want {
+                let Some(buffer) = buffers.pop() else { break };
+                self.remove_idle(buffer.len());
+                self.idle_evictions.fetch_add(1, Ordering::Relaxed);
+                freed += buffer.len();
+            }
+            if freed >= want {
+                break;
+            }
+        }
+        freed
+    }
+    /// Takes `len` idle bytes out of the shared allowance (buffer leaves a pool).
+    fn remove_idle(&self, len: usize) {
+        self.bytes.fetch_sub(len as u64, Ordering::AcqRel);
+        self.idle_buffers.fetch_sub(1, Ordering::Relaxed);
+    }
+    /// Adds `len` idle bytes if reserved plus idle bytes still fit `max_bytes`.
+    fn try_add_idle(&self, len: usize) -> bool {
+        let max = self.config.max_bytes as u64;
+        let mut word = self.bytes.load(Ordering::Acquire);
+        for _ in 0..CAS_ATTEMPTS {
+            let used = (word >> 32) + (word & IDLE_MASK);
+            if len as u64 > max.saturating_sub(used) {
+                return false;
+            }
+            match self.bytes.compare_exchange_weak(
+                word,
+                word + len as u64,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.idle_buffers.fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
+                Err(seen) => word = seen,
+            }
+        }
+        false
+    }
     /// Diagnostic mapped/positional paths use the same evidence names, but do
     /// not claim kernel asynchronous scheduling.
     pub(crate) fn record_sync_read(&self, bytes: usize, success: bool) {
-        let mut state = self.state.lock();
-        state.stats.wal_reads += 1;
-        state.stats.wal_read_bytes += bytes as u64;
-        if success {
-            state.stats.completed_reads += 1;
-        } else {
-            state.stats.errors += 1;
-        }
+        bump(&self.node_counters.wal_reads, 1);
+        bump(&self.node_counters.wal_read_bytes, bytes as u64);
+        bump(
+            if success {
+                &self.node_counters.completed_reads
+            } else {
+                &self.node_counters.errors
+            },
+            1,
+        );
     }
+    /// Node-wide per-device and total in-flight read credits for `io_count`
+    /// kernel reads; all-or-nothing.
+    fn reserve_device_reads(&self, devices: &[(u64, usize)], io_count: usize) -> bool {
+        if !self.devices.try_reserve(
+            devices,
+            self.config.max_device_reads,
+            &self.peak_device_reads,
+        ) {
+            return false;
+        }
+        let reads = self.inflight_reads.fetch_add(io_count, Ordering::AcqRel) + io_count;
+        self.peak_inflight_reads.fetch_max(reads, Ordering::Relaxed);
+        true
+    }
+    fn release_reads(&self, device: u64, count: usize) {
+        self.devices.release(device, count);
+        self.inflight_reads.fetch_sub(count, Ordering::AcqRel);
+    }
+}
+
+/// One session's reusable read buffers and event counters (share nothing: only
+/// this session's executor and its outstanding response owners touch them). The
+/// buffer lock is therefore uncontended; byte accounting stays node-wide so the
+/// shared allowance still bounds idle plus reserved memory.
+/// Lock order: the buffer lock is a leaf; eviction only `try_lock`s it.
+pub(crate) struct SessionPool {
+    admission: Arc<ReadAdmission>,
+    counters: Counters,
+    buffers: Mutex<Vec<Box<[MaybeUninit<u8>]>>>,
+}
+impl SessionPool {
     fn take_buffer(&self, len: usize) -> Box<[MaybeUninit<u8>]> {
-        let mut state = self.state.lock();
         // Exact-size classes avoid padding the wire client's retained-byte
-        // reservation. The scan is bounded by max_device_reads (and 128).
-        if let Some(index) = state.buffers.iter().position(|buffer| buffer.len() == len) {
-            let buffer = state.buffers.swap_remove(index);
-            state.stats.idle_buffer_bytes -= len;
-            state.stats.idle_buffers -= 1;
-            state.stats.buffer_reuses += 1;
+        // reservation. The scan is bounded by the pool capacity (<= 128).
+        let reused = {
+            let mut buffers = self.buffers.lock();
+            buffers
+                .iter()
+                .position(|buffer| buffer.len() == len)
+                .map(|index| buffers.swap_remove(index))
+        };
+        if let Some(buffer) = reused {
+            self.admission.remove_idle(len);
+            bump(&self.counters.buffer_reuses, 1);
             return buffer;
         }
-        state.stats.buffer_allocations += 1;
-        drop(state);
+        bump(&self.counters.buffer_allocations, 1);
         Box::<[u8]>::new_uninit_slice(len)
     }
     fn return_buffer(&self, buffer: Box<[MaybeUninit<u8>]>) {
-        let mut state = self.state.lock();
-        if state.buffers.len() < self.config.max_device_reads.min(128)
-            && buffer.len()
-                <= self.config.max_bytes
-                    - state.stats.inflight_bytes
-                    - state.stats.idle_buffer_bytes
+        let mut buffers = self.buffers.lock();
+        if buffers.len() < self.admission.pool_capacity()
+            && self.admission.try_add_idle(buffer.len())
         {
-            state.stats.idle_buffer_bytes += buffer.len();
-            state.stats.idle_buffers += 1;
-            state.buffers.push(buffer);
+            buffers.push(buffer);
         }
     }
-    fn release_reads(&self, device: u64, count: usize) {
-        let mut state = self.state.lock();
-        state.stats.inflight_reads -= count;
-        let current = state.devices.get_mut(&device).expect("reserved device");
-        *current -= count;
-        if *current == 0 {
-            state.devices.remove(&device);
+}
+impl Drop for SessionPool {
+    fn drop(&mut self) {
+        self.counters.fold_into(&self.admission.retired);
+        for buffer in self.buffers.get_mut().drain(..) {
+            self.admission.remove_idle(buffer.len());
         }
-        // Keep the bounded high-water table: the next scalar read would
-        // otherwise allocate it again after every last completion.
     }
 }
 
@@ -258,23 +659,28 @@ impl Drop for ReadLease {
         let cancelled = prepared.is_some();
         if let Some(mut prepared) = prepared {
             // Retire payload owners before releasing their lease charge. Bytes
-            // owners may recycle through admission, so none are dropped under
-            // its mutex.
+            // owners may recycle through their pool, so none are dropped under
+            // a lock.
             drop(std::mem::take(&mut prepared.records));
             for buffer in prepared
                 .resident_buffers
                 .iter_mut()
                 .filter_map(Option::take)
             {
-                self.admission.return_buffer(buffer.bytes);
+                prepared.pool.return_buffer(buffer.bytes);
             }
             drop(prepared);
         }
-        let mut state = self.admission.state.lock();
-        state.stats.inflight_requests -= 1;
-        state.stats.inflight_bytes -= self.charge;
+        // Release: the freed room must be visible before another reservation
+        // can observe it.
+        self.admission
+            .bytes
+            .fetch_sub((self.charge as u64) << 32, Ordering::Release);
+        self.admission
+            .inflight_requests
+            .fetch_sub(1, Ordering::Release);
         if cancelled {
-            state.stats.cancellations += 1;
+            bump(&self.admission.cancellations, 1);
         }
     }
 }
@@ -327,12 +733,17 @@ struct PreparedRead {
     resident_unsupported: usize,
     resident_partial: usize,
     warm_sweeps: usize,
+    /// Pool that owns the buffers in `resident_buffers`.
+    pool: Arc<SessionPool>,
 }
 
 /// The final Bytes owner returns the allocation only after response clones retire.
 struct ReadBuffer {
     buffer: Option<Box<[MaybeUninit<u8>]>>,
-    admission: Weak<ReadAdmission>,
+    pool: Arc<SessionPool>,
+    // Every response owner keeps its exact authority and native file pins.
+    _first_plan: RecordReadPlan,
+    _coalesced_rest: Vec<(usize, RecordReadPlan)>,
 }
 impl AsRef<[u8]> for ReadBuffer {
     fn as_ref(&self) -> &[u8] {
@@ -344,19 +755,72 @@ impl AsRef<[u8]> for ReadBuffer {
 impl minibytes::BytesOwner for ReadBuffer {}
 impl Drop for ReadBuffer {
     fn drop(&mut self) {
-        if let Some(admission) = self.admission.upgrade() {
-            admission.return_buffer(self.buffer.take().expect("owned read buffer"));
-        }
+        self.pool
+            .return_buffer(self.buffer.take().expect("owned read buffer"));
     }
 }
 struct Operation {
     request_id: u64,
     index: usize,
     plan: RecordReadPlan,
+    /// Additional independently authorized members sharing this buffer.
+    siblings: Vec<(usize, RecordReadPlan)>,
     buffer: Box<[MaybeUninit<u8>]>,
     /// Initialized resident prefix; no Bytes is published until the suffix completes.
     filled: usize,
     queued_at: Option<Instant>,
+}
+
+// Return the exclusive end of an original-order, gap-free run. Arc identity
+// pins both the native file and the epoch/log authority; equal offsets or
+// device numbers alone are never sufficient. A partial resident prefix keeps
+// its existing suffix-only operation rather than being read again.
+fn read_run_end(
+    plans: &[PlannedRead],
+    records: &[Option<Bytes>],
+    resident: &[Option<ResidentPrefix>],
+    start: usize,
+) -> (usize, usize) {
+    let first = &plans[start].1;
+    let mut end = start + 1;
+    let mut range_end = match first.member.offset.checked_add(first.member.len as u64) {
+        Some(end) => end,
+        None => return (end, first.member.len),
+    };
+    if resident
+        .get(start)
+        .and_then(Option::as_ref)
+        .is_some_and(|p| p.filled != 0)
+        || first.member.len > COALESCED_MAX_BYTES
+    {
+        return (end, first.member.len);
+    }
+    while end < plans.len() && end - start < COALESCED_MAX_MEMBERS {
+        let next = &plans[end].1;
+        if records[end].is_some()
+            || resident
+                .get(end)
+                .and_then(Option::as_ref)
+                .is_some_and(|p| p.filled != 0)
+            || !Arc::ptr_eq(&first._log, &next._log)
+            || !Arc::ptr_eq(&first.member.file, &next.member.file)
+            || first.device != next.device
+            || next.member.offset < first.member.offset
+            || next.member.offset > range_end
+        {
+            break;
+        }
+        let Some(next_end) = next.member.offset.checked_add(next.member.len as u64) else {
+            break;
+        };
+        let combined_end = range_end.max(next_end);
+        if combined_end - first.member.offset > COALESCED_MAX_BYTES as u64 {
+            break;
+        }
+        range_end = combined_end;
+        end += 1;
+    }
+    (end, (range_end - first.member.offset) as usize)
 }
 
 #[cfg(target_os = "linux")]
@@ -365,7 +829,7 @@ impl Operation {
         let read = opcode::Read::new(
             types::Fd(self.plan.member.file.as_raw_fd()),
             self.buffer.as_mut_ptr().wrapping_add(self.filled).cast(),
-            (self.plan.member.len - self.filled) as u32,
+            (self.buffer.len() - self.filled) as u32,
         )
         .offset(self.plan.member.offset + self.filled as u64);
         read.build().flags(squeue::Flags::ASYNC).user_data(token)
@@ -415,6 +879,7 @@ fn resident_test_preadv2(
     *attempted = true;
     match result {
         ResidentTestResult::Unsupported => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+        ResidentTestResult::WouldBlock => Err(io::Error::from_raw_os_error(libc::EAGAIN)),
         ResidentTestResult::Complete => {
             let mut bytes = vec![0; buffer.len()];
             plan.member
@@ -470,6 +935,7 @@ const _: () = assert!(REQUEST_METADATA_BYTES <= 4096 && MEMBER_METADATA_BYTES <=
 #[cfg(all(test, target_os = "linux"))]
 enum ResidentTestResult {
     Unsupported,
+    WouldBlock,
     Complete,
     Partial(usize),
 }
@@ -484,6 +950,8 @@ pub(crate) struct ReadExecutor {
     #[cfg(all(test, target_os = "linux"))]
     submit_errors: std::collections::VecDeque<i32>,
     admission: Arc<ReadAdmission>,
+    /// This session's reusable buffers and counters (share nothing).
+    pool: Arc<SessionPool>,
     config: ReadExecutorConfig,
     requests: HashMap<u64, PendingRequest>,
     operations: HashMap<u64, Operation>,
@@ -519,6 +987,7 @@ impl ReadExecutor {
                 resident_test_results: std::collections::VecDeque::new(),
                 #[cfg(all(test, target_os = "linux"))]
                 submit_errors: std::collections::VecDeque::new(),
+                pool: admission.session_pool(),
                 admission,
                 config,
                 requests: HashMap::with_capacity(config.max_requests),
@@ -682,7 +1151,7 @@ impl ReadExecutor {
                     // the same member on each continuation.
                     continue;
                 }
-                let mut buffer = self.admission.take_buffer(len);
+                let mut buffer = self.pool.take_buffer(len);
 
                 let mut syscall_attempted = false;
                 let nowait_started = profile.as_ref().map(|_| Instant::now());
@@ -725,10 +1194,12 @@ impl ReadExecutor {
                         resident_successes += 1;
                         let bytes = Bytes::from_owner(ReadBuffer {
                             buffer: Some(buffer),
-                            admission: Arc::downgrade(&self.admission),
+                            pool: self.pool.clone(),
+                            _first_plan: plan.clone(),
+                            _coalesced_rest: Vec::new(),
                         });
                         records[index] = Some(bytes);
-                        self.admission.state.lock().stats.completed_reads += 1;
+                        bump(&self.pool.counters.completed_reads, 1);
                     }
                     Ok(read) => {
                         resident_fallbacks += 1;
@@ -753,12 +1224,12 @@ impl ReadExecutor {
                         });
                     }
                     Err(error) => {
-                        self.admission.return_buffer(buffer);
-                        let mut state = self.admission.state.lock();
-                        state.stats.resident_read_attempts += resident_attempts as u64;
-                        state.stats.resident_read_successes += resident_successes as u64;
-                        state.stats.resident_read_deferred += resident_deferred as u64;
-                        state.stats.errors += 1;
+                        self.pool.return_buffer(buffer);
+                        let counters = &self.pool.counters;
+                        bump(&counters.resident_read_attempts, resident_attempts as u64);
+                        bump(&counters.resident_read_successes, resident_successes as u64);
+                        bump(&counters.resident_read_deferred, resident_deferred as u64);
+                        bump(&counters.errors, 1);
                         return Err(error.into());
                     }
                 }
@@ -772,10 +1243,9 @@ impl ReadExecutor {
                 records[index].is_some() || plan.member.len <= RESIDENT_NOWAIT_MAX_MEMBER_BYTES
             });
         if can_continue {
-            let mut state = self.admission.state.lock();
-            state.stats.resident_read_attempts += resident_attempts as u64;
-            state.stats.resident_read_successes += resident_successes as u64;
-            drop(state);
+            let counters = &self.pool.counters;
+            bump(&counters.resident_read_attempts, resident_attempts as u64);
+            bump(&counters.resident_read_successes, resident_successes as u64);
             lease.as_mut().unwrap().prepared = Some(PreparedRead {
                 signature: retained_signature.unwrap_or_else(|| read_plan_signature(&plans)),
                 records,
@@ -785,6 +1255,7 @@ impl ReadExecutor {
                 resident_unsupported,
                 resident_partial,
                 warm_sweeps: warm_sweeps + 1,
+                pool: self.pool.clone(),
             });
             return Ok(SubmitOutcome::Deferred(plans));
         }
@@ -793,46 +1264,62 @@ impl ReadExecutor {
         }
         let misses = records.iter().filter(|record| record.is_none()).count();
         if misses == 0 {
-            let mut state = self.admission.state.lock();
-            state.stats.resident_read_attempts += resident_attempts as u64;
-            state.stats.resident_read_successes += resident_successes as u64;
-            state.stats.resident_read_deferred += resident_deferred as u64;
-            state.stats.wal_reads += plans.len() as u64;
-            state.stats.wal_read_bytes += wal_bytes;
-            drop(state);
+            let counters = &self.pool.counters;
+            bump(&counters.resident_read_attempts, resident_attempts as u64);
+            bump(&counters.resident_read_successes, resident_successes as u64);
+            bump(&counters.resident_read_deferred, resident_deferred as u64);
+            bump(&counters.wal_reads, plans.len() as u64);
+            bump(&counters.wal_read_bytes, wal_bytes);
             return Ok(SubmitOutcome::Ready {
                 records: records.into_iter().map(Option::unwrap).collect(),
                 lease: lease.take().expect("reserved read reply"),
             });
         }
         let mut devices = Vec::<(u64, usize)>::new();
-        for (index, (_, plan)) in plans.iter().enumerate() {
-            if records[index].is_none() {
-                if let Some((_, count)) = devices.iter_mut().find(|(id, _)| *id == plan.device) {
-                    *count += 1;
-                } else {
-                    devices.push((plan.device, 1));
-                }
+        let mut io_count = 0;
+        let mut index = 0;
+        while index < plans.len() {
+            if records[index].is_some() {
+                index += 1;
+                continue;
             }
+            let plan = &plans[index].1;
+            let (end, _) = read_run_end(&plans, &records, &resident_buffers, index);
+            io_count += 1;
+            if let Some((_, count)) = devices.iter_mut().find(|(id, _)| *id == plan.device) {
+                *count += 1;
+            } else {
+                devices.push((plan.device, 1));
+            }
+            index = end;
         }
-        let mut state = self.admission.state.lock();
-        state.stats.resident_read_attempts += resident_attempts as u64;
-        state.stats.resident_read_successes += resident_successes as u64;
-        state.stats.resident_read_deferred += resident_deferred as u64;
+        let counters = &self.pool.counters;
+        bump(&counters.resident_read_attempts, resident_attempts as u64);
+        bump(&counters.resident_read_successes, resident_successes as u64);
+        bump(&counters.resident_read_deferred, resident_deferred as u64);
         if devices
             .iter()
             .any(|(_, count)| *count > self.config.max_device_reads)
-            || misses > self.config.max_device_reads
+            || io_count > self.config.max_device_reads
         {
             return Err(StorageError::Capacity);
         }
-        if self.requests.len() >= self.config.max_requests
-            || self.operations.len() + misses > self.config.max_device_reads
-            || devices.iter().any(|(id, count)| {
-                state.devices.get(id).copied().unwrap_or(0) + count > self.config.max_device_reads
-            })
-        {
-            drop(state);
+        let mut full = self.requests.len() >= self.config.max_requests
+            || self.operations.len() + io_count > self.config.max_device_reads;
+        #[cfg(target_os = "linux")]
+        if !full {
+            let sq = self.ring.submission();
+            full = sq.capacity() - sq.len() < io_count;
+        }
+        if !full {
+            self.next_token
+                .checked_add(io_count as u64)
+                .ok_or(StorageError::Capacity)?;
+            // Node-wide per-device credits come last: all-or-nothing, so a
+            // failure leaves no credit taken and the request stays prepared.
+            full = !self.admission.reserve_device_reads(&devices, io_count);
+        }
+        if full {
             lease.as_mut().unwrap().prepared = Some(PreparedRead {
                 signature: retained_signature.unwrap_or_else(|| read_plan_signature(&plans)),
                 records,
@@ -842,47 +1329,15 @@ impl ReadExecutor {
                 resident_unsupported,
                 resident_partial,
                 warm_sweeps: 0,
+                pool: self.pool.clone(),
             });
             return Ok(SubmitOutcome::Full(plans));
         }
-        #[cfg(target_os = "linux")]
-        {
-            let sq = self.ring.submission();
-            if sq.capacity() - sq.len() < misses {
-                drop(state);
-                lease.as_mut().unwrap().prepared = Some(PreparedRead {
-                    signature: retained_signature.unwrap_or_else(|| read_plan_signature(&plans)),
-                    records,
-                    resident_buffers,
-                    wal_bytes,
-                    resident_fallbacks,
-                    resident_unsupported,
-                    resident_partial,
-                    warm_sweeps: 0,
-                });
-                return Ok(SubmitOutcome::Full(plans));
-            }
-        }
-        self.next_token
-            .checked_add(misses as u64)
-            .ok_or(StorageError::Capacity)?;
-        state.stats.inflight_reads += misses;
-        state.stats.peak_inflight_reads = state
-            .stats
-            .peak_inflight_reads
-            .max(state.stats.inflight_reads);
-        for (id, count) in &devices {
-            let current = state.devices.entry(*id).or_default();
-            *current += count;
-            let current = *current;
-            state.stats.peak_device_reads = state.stats.peak_device_reads.max(current);
-        }
-        drop(state);
         self.requests.insert(
             request_id,
             PendingRequest {
                 records,
-                remaining: misses,
+                remaining: io_count,
                 lease: lease.take(),
                 devices,
                 error: None,
@@ -892,33 +1347,61 @@ impl ReadExecutor {
         );
         #[cfg(target_os = "linux")]
         self.entries.clear();
-        for (index, (_, plan)) in plans.into_iter().enumerate() {
+        let mut plans = plans.into_iter();
+        let mut index = 0;
+        while !plans.as_slice().is_empty() {
             if self.requests[&request_id].records[index].is_some() {
+                plans.next();
+                index += 1;
                 continue;
             }
+            let (run_len, len) = read_run_end(
+                plans.as_slice(),
+                &self.requests[&request_id].records[index..],
+                resident_buffers.get(index..).unwrap_or(&[]),
+                0,
+            );
+            let (_, plan) = plans.next().expect("nonempty planned run");
             let token = self.next_token;
             self.next_token += 1;
-            let ResidentPrefix {
-                bytes: buffer,
-                filled,
-            } = resident_buffers
-                .get_mut(index)
-                .and_then(Option::take)
-                .unwrap_or_else(|| ResidentPrefix {
-                    bytes: self.admission.take_buffer(plan.member.len),
-                    filled: 0,
-                });
+            let mut siblings = Vec::new();
+            let (buffer, filled) = if run_len == 1 {
+                let prefix = resident_buffers
+                    .get_mut(index)
+                    .and_then(Option::take)
+                    .unwrap_or_else(|| ResidentPrefix {
+                        bytes: self.pool.take_buffer(len),
+                        filled: 0,
+                    });
+                (prefix.bytes, prefix.filled)
+            } else {
+                // Zero-byte NOWAIT fallbacks have no useful prefix. Retire
+                // their allocations before allocating the gap-free union.
+                for slot in index..index + run_len {
+                    if let Some(prefix) = resident_buffers.get_mut(slot).and_then(Option::take) {
+                        self.pool.return_buffer(prefix.bytes);
+                    }
+                }
+                siblings.reserve_exact(run_len - 1);
+                for slot in index + 1..index + run_len {
+                    let (_, sibling) = plans.next().expect("complete planned run");
+                    siblings.push((slot, sibling));
+                }
+                (self.pool.take_buffer(len), 0)
+            };
             let mut op = Operation {
                 request_id,
                 index,
                 buffer,
                 plan,
+                siblings,
                 filled,
                 queued_at: profile.as_ref().map(|_| Instant::now()),
             };
             #[cfg(target_os = "linux")]
             self.entries.push(op.entry(token));
             self.operations.insert(token, op);
+            index += run_len;
         }
         #[cfg(target_os = "linux")]
         {
@@ -936,15 +1419,19 @@ impl ReadExecutor {
                 ));
             }
         }
-        {
-            let mut state = self.admission.state.lock();
-            state.stats.wal_reads += self.requests[&request_id].records.len() as u64;
-            state.stats.wal_read_bytes += wal_bytes;
-            state.stats.resident_read_fallbacks += resident_fallbacks as u64;
-            state.stats.resident_read_unsupported += resident_unsupported as u64;
-            state.stats.resident_read_partial += resident_partial as u64;
-            state.stats.async_read_submissions += misses as u64;
-        }
+        let counters = &self.pool.counters;
+        bump(
+            &counters.wal_reads,
+            self.requests[&request_id].records.len() as u64,
+        );
+        bump(&counters.wal_read_bytes, wal_bytes);
+        bump(&counters.resident_read_fallbacks, resident_fallbacks as u64);
+        bump(
+            &counters.resident_read_unsupported,
+            resident_unsupported as u64,
+        );
+        bump(&counters.resident_read_partial, resident_partial as u64);
+        bump(&counters.async_read_submissions, io_count as u64);
         self.flush()?;
         Ok(SubmitOutcome::Pending)
     }
@@ -970,7 +1457,7 @@ impl ReadExecutor {
                     ) || e.raw_os_error() == Some(libc::EBUSY) => {}
                 Err(e) => {
                     self.failed = true;
-                    self.admission.state.lock().stats.errors += 1;
+                    bump(&self.pool.counters.errors, 1);
                     return Err(e.into());
                 }
             }
@@ -999,6 +1486,7 @@ impl ReadExecutor {
                 return Err(StorageError::Invalid("unknown read completion token"));
             };
             let result = cqe.result();
+            let device = op.plan.device;
             let request = self
                 .requests
                 .get_mut(&op.request_id)
@@ -1009,12 +1497,12 @@ impl ReadExecutor {
                 profile.async_count += 1;
                 profile.async_max_ns = profile.async_max_ns.max(ns);
                 profile.async_errors +=
-                    u64::from(result < 0 || result as usize != op.plan.member.len - op.filled);
+                    u64::from(result < 0 || result as usize != op.buffer.len() - op.filled);
                 profile.async_partial +=
-                    u64::from(result >= 0 && result as usize != op.plan.member.len - op.filled);
+                    u64::from(result >= 0 && result as usize != op.buffer.len() - op.filled);
             }
-            if result < 0 || result as usize != op.plan.member.len - op.filled {
-                self.admission.state.lock().stats.errors += 1;
+            if result < 0 || result as usize != op.buffer.len() - op.filled {
+                bump(&self.pool.counters.errors, 1);
                 if request.error.is_none() {
                     request.error = Some(StorageError::Io(if result < 0 {
                         io::Error::from_raw_os_error(-result)
@@ -1025,19 +1513,40 @@ impl ReadExecutor {
                         )
                     }));
                 }
-                self.admission.return_buffer(op.buffer);
+                self.pool.return_buffer(op.buffer);
             } else {
                 // The CQE retires kernel ownership, but all Bytes clones must
                 // retire too before this allocation can back another SQE.
+                let first_len = op.plan.member.len;
+                let first_offset = op.plan.member.offset;
+                let scatter = op
+                    .siblings
+                    .iter()
+                    .map(|(index, plan)| {
+                        let start = (plan.member.offset - first_offset) as usize;
+                        (*index, start, start + plan.member.len)
+                    })
+                    .collect::<smallvec::SmallVec<[_; COALESCED_MAX_MEMBERS]>>();
+                let member_count = 1 + scatter.len();
+                let coalesced = !op.siblings.is_empty();
                 let bytes = Bytes::from_owner(ReadBuffer {
                     buffer: Some(op.buffer),
-                    admission: Arc::downgrade(&self.admission),
+                    pool: self.pool.clone(),
+                    _first_plan: op.plan,
+                    _coalesced_rest: op.siblings,
                 });
-                self.admission.state.lock().stats.completed_reads += 1;
-                request.records[op.index] = Some(bytes);
+                bump(&self.pool.counters.completed_reads, member_count as u64);
+                if coalesced {
+                    request.records[op.index] = Some(bytes.slice(..first_len));
+                    for (index, start, end) in scatter {
+                        request.records[index] = Some(bytes.slice(start..end));
+                    }
+                } else {
+                    request.records[op.index] = Some(bytes);
+                }
             }
             request.remaining -= 1;
-            self.admission.release_reads(op.plan.device, 1);
+            self.admission.release_reads(device, 1);
             if request.remaining == 0 {
                 let mut request = self.requests.remove(&op.request_id).unwrap();
                 // Suppress cancelled successes, never a late storage failure.
@@ -1065,7 +1574,7 @@ impl ReadExecutor {
             && !request.cancelled
         {
             request.cancelled = true;
-            self.admission.state.lock().stats.cancellations += 1;
+            bump(&self.admission.cancellations, 1);
         }
     }
     /// Only shutdown waits, for at most 30 seconds. All operation owners survive

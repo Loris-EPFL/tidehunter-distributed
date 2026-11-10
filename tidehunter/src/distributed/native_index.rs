@@ -7,11 +7,19 @@
 //! complete publication, logical checkpoint cuts and reconstructible indexes.
 //!
 //! Immutable shared cell containers retain pageable history independently of the bounded
-//! resident dirty overlay. A snapshot is not authority to delete any Value WAL.
+//! resident dirty overlay. Capture seals a publication generation per cell;
+//! later publications use a fresh overlay without cloning the sealed history.
+//! A snapshot is not authority to delete any Value WAL.
+//!
+//! The index is sharded: cells route by a stable hash to independent shards,
+//! each behind its own lock, so unrelated key ranges never synchronize (paper
+//! §4.1). Readers take one shard read lock per lookup and filter by a read cut.
+//! A single publication watermark, advanced after every shard apply, makes a
+//! batch visible atomically. See `shards` for the model and its argument.
 
 use super::codec::CompleteBatch;
 use super::index_reference::LogicalValueId;
-use super::native_publication::NativePendingSink;
+use super::shard_lock::ShardRwLock;
 use super::types::{
     BatchId, BatchVersion, MemberChecksum, MutationVersion, PayloadDigest, PhysicalValueAddress,
     RecordDescriptor, RecordKind, ValueRecordReference,
@@ -21,9 +29,11 @@ use crate::crc::{CrcFrame, IntoBytesFixed};
 use crate::index::pending_table::PendingTable;
 use crate::index::versioned_overlay::{Overlay, insert_unique_by, lower_bound_by, matching_prefix};
 use crate::key_shape::{KeyIndexing, KeyShape, KeySpace, KeySpaceDesc, KeyType};
+use arc_swap::ArcSwap;
 use blake2::{Blake2b, Digest};
 use bytes::BytesMut;
 use minibytes::Bytes;
+use parking_lot::Mutex;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -34,12 +44,20 @@ use std::path::Path;
 use typenum::U32;
 
 mod retention;
+mod shards;
 mod snapshot;
+mod writer;
 pub use retention::IndexReadPin;
 pub(crate) use retention::PublicationViewReservation;
-use retention::{CaptureLease, Retention};
-use snapshot::FrozenCell;
+use retention::{CaptureLease, RetentionState, position, view_charge};
+use shards::{Accounting, Cells, PublicationHistogram};
+pub use shards::{
+    DEFAULT_INDEX_SHARDS, IndexShardLoad, IndexShardStats, MAX_INDEX_SHARDS,
+    PUBLICATION_HISTOGRAM_BUCKETS,
+};
 pub(crate) use snapshot::{PersistedIndexImage, PreparedIndexImage};
+pub use writer::IndexWriter;
+use writer::WriterState;
 
 const MAGIC: &[u8; 8] = b"THINDEX1";
 const FORMAT: u16 = 4;
@@ -49,7 +67,8 @@ const VERSION_CHARGE: usize = std::mem::size_of::<ValueRecordReference>() + 32;
 const CELL_CHARGE: usize = std::mem::size_of::<CellIndex>() + 256;
 
 fn cell_directory_charge(cell: &CellId) -> usize {
-    CELL_CHARGE + cell.len()
+    // The append-only capture directory owns a second cell identity.
+    CELL_CHARGE + 2 * cell.len()
 }
 
 /// `At` includes that exact mutation. `BeforeAll` is the empty checkpoint;
@@ -69,7 +88,7 @@ pub struct SparseIndexView {
     upper: MutationVersion,
     floor: Option<MutationVersion>,
     excluded: Vec<BatchVersion>,
-    retention: std::sync::Arc<parking_lot::Mutex<Retention>>,
+    retention: std::sync::Arc<RetentionState>,
     charge: usize,
 }
 
@@ -85,7 +104,7 @@ impl Eq for SparseIndexView {}
 
 impl Drop for SparseIndexView {
     fn drop(&mut self) {
-        self.retention.lock().release_view(self.floor, self.charge);
+        self.retention.release_view(self.floor, self.charge);
     }
 }
 
@@ -118,6 +137,8 @@ pub enum NativeIndexError {
     ConflictingVersion,
     PendingPublication,
     ExpiredCut,
+    /// An explicit cut reaches a batch that is not published (applied or not).
+    UnpublishedCut,
     RetentionInProgress,
     CheckpointInProgress,
     Io(std::io::Error),
@@ -132,6 +153,7 @@ impl fmt::Display for NativeIndexError {
             }
             Self::PendingPublication => f.write_str("index has pending publication entries"),
             Self::ExpiredCut => f.write_str("read cut is below the persisted retention floor"),
+            Self::UnpublishedCut => f.write_str("read cut includes an unpublished batch"),
             Self::RetentionInProgress => {
                 f.write_str("read cut conflicts with retention in progress")
             }
@@ -160,30 +182,47 @@ pub struct NativeIndexStats {
     pub transient_metadata_bytes: usize,
 }
 
+impl NativeIndexStats {
+    fn add_cells(&mut self, cells: &Cells) {
+        self.cells += cells.len();
+        self.unloaded_cells += cells
+            .values()
+            .filter(|cell| cell.base.as_ref().is_some_and(|block| block.mapped))
+            .count();
+        self.pending_operations += cells.values().map(|cell| cell.pending.len()).sum::<usize>();
+    }
+}
+
 #[derive(Default)]
 struct CellIndex {
     pending: PendingTable<ValueRecordReference>,
     overlay: Overlay<ValueRecordReference>,
+    sealed: Option<std::sync::Arc<Overlay<ValueRecordReference>>>,
+    generation: u64,
     base: Option<SortedBlock>,
 }
 
 /// One database's native-routed cells with typed logical versions and locations.
-/// The owner serializes publication; get/scan use immutable references. This is a
-/// real reference index, not a map storing a second copy of application values.
+/// Cells live in independently locked shards; get/scan lock one shard at a time
+/// and filter by a read cut. Publication and maintenance go through
+/// [`NativeIndex::writer`]. This is a real reference index, not a map storing a
+/// second copy of application values.
 pub struct NativeIndex {
     shape: KeyShape,
     database: [u8; 16],
     max_metadata_bytes: usize,
-    cells: HashMap<(KeySpace, CellId), CellIndex>,
-    touched: HashSet<(KeySpace, CellId)>,
-    retained_bytes: usize,
-    retained_versions: usize,
-    latest: Option<MutationVersion>,
-    live_view: Option<IndexReadCut>,
-    resident_overlay_bytes: usize,
-    resident_directory_bytes: usize,
-    resident_loaded_bytes: usize,
-    retention: std::sync::Arc<parking_lot::Mutex<Retention>>,
+    /// Cells by stable hash of `(keyspace, cell)`; `shard_mask` is `len - 1`.
+    /// Never persisted.
+    shards: Box<[ShardRwLock<Cells>]>,
+    shard_mask: usize,
+    /// Serializes publication and capture/installation. Readers never take it.
+    writer: Mutex<WriterState>,
+    /// The publication watermark: the cut `Latest` resolves to. Replaced only by
+    /// the writer, after the entries it exposes are applied to their shards.
+    published: ArcSwap<IndexReadCut>,
+    accounting: Accounting,
+    publication_shards: PublicationHistogram,
+    retention: std::sync::Arc<RetentionState>,
 }
 
 /// Digest of the exact durable CRC-framed image, usable by its manifest owner.
@@ -219,10 +258,13 @@ pub(crate) struct NativeIndexHistory {
 impl NativeIndexHistory {
     pub(crate) fn next(&mut self, index: &NativeIndex) -> Option<(Bytes, ValueRecordReference)> {
         loop {
-            let identity = self.cells.last()?;
-            let cell = &index.cells[identity];
-            if let Some((key, reference)) = cell.next_history(self.after.as_ref(), self.cut.clone())
-            {
+            let last = self.cells.len().checked_sub(1)?;
+            let next = {
+                // One shard read lock per row; no lock is held between rows.
+                let shard = index.shard_for(&self.cells[last]).read();
+                shard[&self.cells[last]].next_history(self.after.as_ref(), self.cut.clone())
+            };
+            if let Some((key, reference)) = next {
                 self.after = Some((key.clone(), reference.mutation_version()));
                 return Some((key, reference));
             }
@@ -320,7 +362,7 @@ impl CellScan {
                 self.base_position += 1;
                 position
             };
-            if let Some(reference) = block.selected(position, cut.clone()) {
+            if let Some(reference) = block.selected(position, &cut) {
                 self.base = Some((
                     block.bytes.slice_to_bytes(block.entry(position).0),
                     reference,
@@ -336,7 +378,10 @@ impl CellScan {
         reverse: bool,
         cut: IndexReadCut,
     ) -> Option<(Bytes, ValueRecordReference)> {
-        let source = &index.cells[&self.identity];
+        // One shard read lock per step; none is held between steps, so a scan
+        // never blocks publication of its shard across pages.
+        let shard = index.shard_for(&self.identity).read();
+        let source = &shard[&self.identity];
         let replaced = match (&self.base_owner, &source.base) {
             (None, None) => false,
             (Some(owner), Some(block)) => {
@@ -390,6 +435,21 @@ impl NativeIndex {
         database: [u8; 16],
         max_metadata_bytes: usize,
     ) -> Result<Self, NativeIndexError> {
+        Self::with_shards(shape, database, max_metadata_bytes, DEFAULT_INDEX_SHARDS)
+    }
+
+    /// Build an index of `shards` independent shards. `shards` must be a power
+    /// of two in `1..=MAX_INDEX_SHARDS`. The shard count and hash are never
+    /// persisted, so any count can open any snapshot.
+    pub fn with_shards(
+        shape: &KeyShape,
+        database: [u8; 16],
+        max_metadata_bytes: usize,
+        shards: usize,
+    ) -> Result<Self, NativeIndexError> {
+        let shard_mask = shards::checked_mask(shards).ok_or(NativeIndexError::Invalid(
+            "index shard count must be a power of two in 1..=4096",
+        ))?;
         if max_metadata_bytes == 0 || max_metadata_bytes > MAX_IMAGE_BYTES / 2 {
             return Err(NativeIndexError::Invalid(
                 "metadata budget must be in 1..=512 MiB",
@@ -405,16 +465,13 @@ impl NativeIndex {
             shape,
             database,
             max_metadata_bytes,
-            cells: HashMap::new(),
-            touched: HashSet::new(),
-            retained_bytes: 0,
-            retained_versions: 0,
-            latest: None,
-            resident_overlay_bytes: 0,
-            resident_directory_bytes: 0,
-            resident_loaded_bytes: 0,
-            retention: Default::default(),
-            live_view: None,
+            shards: shards::new_shards(shards),
+            shard_mask,
+            writer: Mutex::new(WriterState::default()),
+            published: ArcSwap::from_pointee(IndexReadCut::BeforeAll),
+            accounting: Accounting::default(),
+            publication_shards: PublicationHistogram::default(),
+            retention: RetentionState::new(),
         })
     }
 
@@ -440,10 +497,7 @@ impl NativeIndex {
             .iter()
             .try_fold(0usize, |total, mutation| {
                 let (_, reduced, cell) = self.route(mutation.keyspace(), mutation.key())?;
-                let cell_charge = if self
-                    .cells
-                    .contains_key(&(mutation.keyspace(), cell.clone()))
-                {
+                let cell_charge = if self.contains_cell(mutation.keyspace(), &cell) {
                     0
                 } else {
                     cell_directory_charge(&cell)
@@ -465,10 +519,7 @@ impl NativeIndex {
                 .checked_add(
                     VERSION_CHARGE
                         + operation.reduced_key().len()
-                        + if self
-                            .cells
-                            .contains_key(&(operation.ks(), operation.cell_id().clone()))
-                        {
+                        + if self.contains_cell(operation.ks(), operation.cell_id()) {
                             0
                         } else {
                             cell_directory_charge(operation.cell_id())
@@ -479,118 +530,93 @@ impl NativeIndex {
     }
 
     pub fn retained_metadata_bytes(&self) -> usize {
-        self.retained_bytes
+        self.accounting.retained_bytes()
+    }
+
+    /// Resident charge used by checkpoint admission, without directory scans.
+    pub(crate) fn charged_metadata_bytes(&self) -> usize {
+        self.resident_bytes()
     }
 
     fn resident_bytes(&self) -> usize {
-        self.resident_overlay_bytes + self.resident_directory_bytes + self.resident_loaded_bytes
+        self.accounting.resident()
     }
 
-    fn resolve_cut(&self, cut: IndexReadCut) -> IndexReadCut {
-        if cut == IndexReadCut::Latest {
+    /// Resolve `Latest` to the current publication watermark; any other cut
+    /// passes through. Resolve once per read or batch, then use the explicit
+    /// cut for every lookup and for the pin, so they all see the same cut.
+    pub fn resolve_cut(&self, cut: IndexReadCut) -> IndexReadCut {
+        if matches!(cut, IndexReadCut::Latest) {
             self.latest_cut()
         } else {
             cut
         }
     }
 
+    /// Totals and per-cell counts. Locks each shard in turn for reading; never
+    /// holds two.
     pub fn stats(&self) -> NativeIndexStats {
+        let mut stats = self.base_stats();
+        for shard in self.shards.iter() {
+            stats.add_cells(&shard.read());
+        }
+        stats
+    }
+
+    /// Like [`Self::stats`], but returns `None` instead of waiting when a
+    /// publication holds a shard.
+    pub fn try_stats(&self) -> Option<NativeIndexStats> {
+        let mut stats = self.base_stats();
+        for shard in self.shards.iter() {
+            let cells = shard.try_read()?;
+            stats.add_cells(&cells);
+        }
+        Some(stats)
+    }
+
+    fn base_stats(&self) -> NativeIndexStats {
         NativeIndexStats {
-            cells: self.cells.len(),
-            unloaded_cells: self
-                .cells
-                .values()
-                .filter(|cell| cell.base.as_ref().is_some_and(|block| block.mapped))
-                .count(),
-            retained_versions: self.retained_versions,
-            pending_operations: self.cells.values().map(|cell| cell.pending.len()).sum(),
+            retained_versions: self.accounting.retained_versions(),
             charged_metadata_bytes: self.resident_bytes(),
             transient_metadata_bytes: self.transient_bytes(),
+            ..NativeIndexStats::default()
         }
     }
 
+    /// The publication watermark: the newest cut that is entirely applied.
     pub fn latest_cut(&self) -> IndexReadCut {
-        self.live_view.clone().unwrap_or_else(|| {
-            self.latest
-                .map_or(IndexReadCut::BeforeAll, IndexReadCut::At)
-        })
+        IndexReadCut::clone(&**self.published.load())
     }
 
-    /// Promote committed native pending entries while retaining every logical
-    /// version. Invoke inside the authority's atomic publication callback. Errors
-    /// can follow partial promotion and therefore require authority recovery.
-    pub fn promote_committed(&mut self) -> Result<usize, NativeIndexError> {
-        let touched = std::mem::take(&mut self.touched);
-        let mut promoted = 0;
-        let mut resident = self.resident_bytes();
-        for (keyspace, cell_id) in touched {
-            let cell = self
-                .cells
-                .get_mut(&(keyspace, cell_id.clone()))
-                .expect("touched cell exists");
-            let (changes, _) = cell.pending.take_committed();
-            if cell.pending.len() != 0 {
-                self.touched.insert((keyspace, cell_id));
-            }
-            for change in changes {
-                let reference = change.value;
-                if reference.batch_id.database != self.database
-                    || reference.descriptor.keyspace != keyspace.0
-                    || change.is_modified != (reference.descriptor.kind == RecordKind::Put)
-                {
-                    return Err(NativeIndexError::Invalid(
-                        "pending reference domain or operation kind",
-                    ));
-                }
-                if let Some(existing) = cell.exact(&change.key, reference.mutation_version()) {
-                    if existing != reference {
-                        return Err(NativeIndexError::ConflictingVersion);
-                    }
-                    continue;
-                }
-                let charge = VERSION_CHARGE + change.key.len();
-                let total = self
-                    .retained_bytes
-                    .checked_add(charge)
-                    .ok_or(NativeIndexError::Capacity)?;
-                resident = resident
-                    .checked_add(charge)
-                    .ok_or(NativeIndexError::Capacity)?;
-                if resident > self.max_metadata_bytes {
-                    return Err(NativeIndexError::Capacity);
-                }
-                let key = change.key.into_owned();
-                let values = cell.overlay.entry(key).or_default();
-                if let Some(old) = insert_unique_by(values, reference, |a, b| {
-                    a.mutation_version().cmp(&b.mutation_version())
-                }) && old != reference
-                {
-                    return Err(NativeIndexError::ConflictingVersion);
-                }
-                self.retained_bytes = total;
-                self.resident_overlay_bytes += charge;
-                self.retained_versions += 1;
-                self.latest = Some(self.latest.map_or(reference.mutation_version(), |v| {
-                    v.max(reference.mutation_version())
-                }));
-                promoted += 1;
-            }
-        }
-        Ok(promoted)
-    }
-
+    /// Resolve `Latest` inside the shard lock so the lookup uses the newest
+    /// watermark that is already applied to this shard, then validate and look
+    /// the key up. Only this key's shard is locked.
     pub fn get(
         &self,
         keyspace: KeySpace,
         full_key: &[u8],
         cut: IndexReadCut,
     ) -> Result<Option<ValueRecordReference>, NativeIndexError> {
-        let cut = self.resolve_cut(cut);
-        self.validate_cut(cut.clone())?;
+        let latest = matches!(cut, IndexReadCut::Latest);
+        if !latest {
+            // Preserve error precedence: an expired cut beats a bad key.
+            self.validate_resolved(&cut)?;
+        }
         let (_, reduced, cell) = self.route(keyspace, full_key)?;
-        Ok(self
-            .cells
-            .get(&(keyspace, cell))
+        let identity = (keyspace, cell);
+        let shard = self.shard_for(&identity).read();
+        let watermark;
+        let cut = if latest {
+            // Acquire load under the shard lock: every entry this watermark
+            // exposes was applied before it was stored.
+            watermark = self.published.load();
+            &**watermark
+        } else {
+            &cut
+        };
+        self.validate_resolved(cut)?;
+        Ok(shard
+            .get(&identity)
             .and_then(|cell| cell.get(&reduced, cut))
             .filter(|reference| reference.descriptor.kind == RecordKind::Put))
     }
@@ -606,7 +632,10 @@ impl NativeIndex {
         limit: usize,
         cut: IndexReadCut,
     ) -> Result<Vec<(Bytes, ValueRecordReference)>, NativeIndexError> {
-        let mut cursor = self.scan_cursor(keyspace, after_reduced, reverse, cut)?;
+        // The pin holds the cut for the whole traversal: a checkpoint installed
+        // meanwhile cannot advance the retention floor past it.
+        let pin = self.pin_cut(cut)?;
+        let mut cursor = self.scan_cursor(keyspace, after_reduced, reverse, pin.cut())?;
         let mut output = Vec::with_capacity(limit.min(4096));
         while output.len() < limit {
             let Some(row) = cursor.next(self) else {
@@ -637,7 +666,9 @@ impl NativeIndex {
         limit: usize,
         cut: IndexReadCut,
     ) -> Result<Vec<(Bytes, ValueRecordReference)>, NativeIndexError> {
-        let mut cursor = self.scan_cursor_impl(keyspace, after, reverse, cut, true)?;
+        // See `scan`: hold the cut pinned until the traversal ends.
+        let pin = self.pin_cut(cut)?;
+        let mut cursor = self.scan_cursor_impl(keyspace, after, reverse, pin.cut(), true)?;
         let mut rows = Vec::with_capacity(limit.min(256));
         while rows.len() < limit.min(256) {
             match cursor.next(self) {
@@ -654,21 +685,23 @@ impl NativeIndex {
         cut: IndexReadCut,
     ) -> Result<NativeIndexHistory, NativeIndexError> {
         self.descriptor(keyspace)?;
-        self.validate_cut(cut.clone())?;
+        let cut = self.resolve_cut(cut);
+        self.validate_resolved(&cut)?;
+        let mut cells = Vec::new();
+        for shard in self.shards.iter() {
+            cells.extend(
+                shard
+                    .read()
+                    .keys()
+                    .filter(|(ks, _)| *ks == keyspace)
+                    .cloned(),
+            );
+        }
         Ok(NativeIndexHistory {
-            cells: self
-                .cells
-                .keys()
-                .filter(|(ks, _)| *ks == keyspace)
-                .cloned()
-                .collect(),
+            cells,
             after: None,
             _pin: self.pin_cut(self.retention_floor())?,
-            cut: if cut == IndexReadCut::Latest {
-                self.latest_cut()
-            } else {
-                cut
-            },
+            cut,
         })
     }
 
@@ -681,35 +714,35 @@ impl NativeIndex {
         allow_hash: bool,
     ) -> Result<NativeIndexScan, NativeIndexError> {
         let descriptor = self.descriptor(keyspace)?;
-        self.validate_cut(cut.clone())?;
+        let cut = self.resolve_cut(cut);
+        self.validate_resolved(&cut)?;
         if !allow_hash && matches!(descriptor.key_indexing(), KeyIndexing::Hash) {
             return Err(NativeIndexError::Invalid(
                 "ordered scan is unsupported for hashed keys",
             ));
         }
-        let cut = if cut == IndexReadCut::Latest {
-            self.latest_cut()
-        } else {
-            cut
-        };
         let after_reduced = after_reduced.map(Bytes::copy_from_slice);
-        let cells = if cut == IndexReadCut::BeforeAll {
-            Vec::new()
-        } else {
-            self.cells
-                .iter()
-                .filter(|(identity, _)| identity.0 == keyspace)
-                .map(|(identity, source)| {
-                    CellScan::new(
-                        identity.clone(),
-                        source,
-                        after_reduced.as_ref(),
-                        reverse,
-                        cut.clone(),
-                    )
-                })
-                .collect()
-        };
+        let mut cells = Vec::new();
+        if !matches!(cut, IndexReadCut::BeforeAll) {
+            // Ascending shard order, one read lock at a time.
+            for shard in self.shards.iter() {
+                let guard = shard.read();
+                cells.extend(
+                    guard
+                        .iter()
+                        .filter(|(identity, _)| identity.0 == keyspace)
+                        .map(|(identity, source)| {
+                            CellScan::new(
+                                identity.clone(),
+                                source,
+                                after_reduced.as_ref(),
+                                reverse,
+                                cut.clone(),
+                            )
+                        }),
+                );
+            }
+        }
         let mut cursor = NativeIndexScan {
             cells,
             heads: BinaryHeap::new(),
@@ -722,150 +755,51 @@ impl NativeIndex {
         Ok(cursor)
     }
 
-    /// Write a new immutable, metadata-only image, sync it and its directory,
-    /// then unload eligible history into file-backed compact blocks. Existing
-    /// files are never overwritten; a root manifest may name the image only
-    /// after success. Post-cut versions remain in the live overlay.
-    pub fn flush_and_unload(
-        &mut self,
-        path: &Path,
-        cut: IndexReadCut,
-    ) -> Result<IndexImageMetadata, NativeIndexError> {
-        let image = self.prepare_image(cut)?.persist(path)?;
-        let metadata = image.metadata;
-        self.install_image(image);
-        Ok(metadata)
-    }
-
-    pub(crate) fn prepare_image(
-        &self,
-        cut: IndexReadCut,
-    ) -> Result<PreparedIndexImage, NativeIndexError> {
-        self.prepare_compacted_image(cut, self.retention_floor())
-    }
-
-    /// Reserve a supported-history floor, atomically clamped to the oldest pin.
-    /// `floor` is the requested maximum; the installed durable floor can lag it.
-    /// The authority must durably adopt the root before installing this image.
-    pub(crate) fn prepare_compacted_image(
-        &self,
-        cut: IndexReadCut,
-        floor: IndexReadCut,
-    ) -> Result<PreparedIndexImage, NativeIndexError> {
-        if self.cells.values().any(|cell| cell.pending.len() != 0) {
-            return Err(NativeIndexError::PendingPublication);
-        }
-        let cut = self.resolve_cut(cut);
-        let lease = self.capture_lease(cut.clone(), floor)?;
-        let mut cells = Vec::with_capacity(self.cells.len());
-        for (identity, cell) in &self.cells {
-            let overlay = cell
-                .overlay
-                .iter()
-                .filter_map(|(key, values)| {
-                    let selected = matching_prefix(values, |reference| cut.contains(reference));
-                    (!selected.is_empty())
-                        .then(|| (key.clone(), selected.iter().copied().collect()))
-                })
-                .collect();
-            cells.push(FrozenCell {
-                identity: identity.clone(),
-                base: cell.base.clone(),
-                overlay,
-            });
-        }
-        cells.sort_by(|a, b| {
-            a.identity
-                .0
-                .0
-                .cmp(&b.identity.0.0)
-                .then_with(|| a.identity.1.cmp(&b.identity.1))
-        });
-        Ok(PreparedIndexImage::new(
-            self.database,
-            schema_digest(&self.shape)?,
-            cells,
-            cut,
-            lease,
-        ))
-    }
-
-    /// Native LargeTable's unmerge rule: remove exactly the captured references,
-    /// never replace the current overlay with an earlier view of post-cut writes.
-    pub(crate) fn install_image(&mut self, persisted: PersistedIndexImage) {
-        for captured in persisted.cells {
-            let Some(cell) = self.cells.get_mut(&captured.identity) else {
-                continue;
-            };
-            // A caller may persist an older exact cut for export. Installing it
-            // must not discard newer history that has already been unloaded.
-            if cell.base.as_ref().is_some_and(|base| {
-                retention::position(&base.cut) > retention::position(&persisted.cut)
-            }) {
-                continue;
-            }
-            cell.overlay.retain(|key, values| {
-                if let Some(flushed) = captured.overlay.get(key) {
-                    values.retain(|reference| {
-                        let remove = flushed
-                            .binary_search_by_key(&reference.mutation_version(), |value| {
-                                value.mutation_version()
-                            })
-                            .is_ok_and(|at| flushed[at] == *reference);
-                        if remove {
-                            self.resident_overlay_bytes -= VERSION_CHARGE + key.len();
-                        }
-                        !remove
-                    });
-                }
-                !values.is_empty()
-            });
-            cell.base = captured.base;
-        }
-        persisted.lease.install();
-        // Compaction changes durable history, not just the residency of rows.
-        self.recount_retained();
-    }
-
+    /// Recompute every derived total from the cells. Exclusive access: used only
+    /// while an index is being opened.
     fn recount_retained(&mut self) {
-        self.resident_directory_bytes = self
-            .cells
-            .keys()
-            .map(|(_, cell)| cell_directory_charge(cell))
-            .sum();
-        self.resident_loaded_bytes = self
-            .cells
-            .values()
-            .filter_map(|cell| cell.base.as_ref())
-            .filter(|block| !block.mapped)
-            .map(|block| block.bytes.len())
-            .sum();
-        self.retained_bytes = self.resident_overlay_bytes;
-        self.retained_versions = self
-            .cells
-            .values()
-            .map(|cell| {
-                cell.overlay
+        let mut directory = 0;
+        let mut loaded = 0;
+        let mut versions = 0;
+        let mut retained = self.accounting.overlay();
+        for shard in self.shards.iter_mut() {
+            for ((_, cell_id), cell) in shard.get_mut().iter() {
+                directory += cell_directory_charge(cell_id);
+                versions += cell
+                    .overlay
                     .values()
                     .map(|values| values.len())
                     .sum::<usize>()
-            })
-            .sum();
-        for block in self.cells.values().filter_map(|cell| cell.base.as_ref()) {
-            self.retained_bytes += block.retained_bytes;
-            self.retained_versions += block.retained_versions;
+                    + cell.sealed.as_ref().map_or(0, |sealed| {
+                        sealed.values().map(|values| values.len()).sum::<usize>()
+                    });
+                if let Some(block) = &cell.base {
+                    if !block.mapped {
+                        loaded += block.bytes.len();
+                    }
+                    retained += block.retained_bytes;
+                    versions += block.retained_versions;
+                }
+            }
         }
+        self.accounting
+            .set_recounted(directory, loaded, versions, retained);
     }
 
     /// Unique immutable containers reachable from the installed index. The
     /// authority must union these with every retained/protected checkpoint root.
     pub(crate) fn reachable_files(&self) -> Vec<String> {
-        snapshot::container_names(
-            self.cells
-                .values()
-                .filter_map(|cell| cell.base.as_ref())
-                .filter_map(|block| block.file.as_ref()),
-        )
+        let mut names = std::collections::BTreeSet::new();
+        for shard in self.shards.iter() {
+            let cells = shard.read();
+            names.extend(snapshot::container_names(
+                cells
+                    .values()
+                    .filter_map(|cell| cell.base.as_ref())
+                    .filter_map(|block| block.file.as_ref()),
+            ));
+        }
+        names.into_iter().collect()
     }
 
     /// Conservative payload reachability for one physical WAL file. Walk the
@@ -890,19 +824,25 @@ impl NativeIndex {
                     .checked_add(u64::from(address.len))
                     .is_none_or(|record_end| record_end > start)
         };
-        self.cells.values().any(|cell| {
-            cell.overlay
-                .values()
-                .any(|values| values.iter().any(&references))
-                || cell.base.as_ref().is_some_and(|block| {
-                    (0..block.count).any(|n| {
-                        block.entry(n).1.chunks_exact(REFERENCE_BYTES).any(|bytes| {
-                            references(
-                                &decode_reference(bytes).expect("validated immutable reference"),
-                            )
+        self.shards.iter().any(|shard| {
+            shard.read().values().any(|cell| {
+                cell.overlay
+                    .values()
+                    .any(|values| values.iter().any(&references))
+                    || cell.sealed.as_ref().is_some_and(|sealed| {
+                        sealed.values().any(|values| values.iter().any(&references))
+                    })
+                    || cell.base.as_ref().is_some_and(|block| {
+                        (0..block.count).any(|n| {
+                            block.entry(n).1.chunks_exact(REFERENCE_BYTES).any(|bytes| {
+                                references(
+                                    &decode_reference(bytes)
+                                        .expect("validated immutable reference"),
+                                )
+                            })
                         })
                     })
-                })
+            })
         })
     }
 
@@ -912,30 +852,25 @@ impl NativeIndex {
         database: [u8; 16],
         max_metadata_bytes: usize,
     ) -> Result<Self, NativeIndexError> {
-        snapshot::open(path, shape, database, max_metadata_bytes)
+        Self::open_snapshot_with_shards(
+            path,
+            shape,
+            database,
+            max_metadata_bytes,
+            DEFAULT_INDEX_SHARDS,
+        )
     }
 
-    /// Materialize compact cell metadata in heap buffers. User values remain in
-    /// their partition WAL; this does not expand blocks into per-key heap maps.
-    pub fn reload(&mut self) -> Result<(), NativeIndexError> {
-        let additional: usize = self
-            .cells
-            .values()
-            .filter_map(|cell| cell.base.as_ref())
-            .filter(|block| block.mapped)
-            .map(|block| block.bytes.len())
-            .sum();
-        self.check_capacity(additional)?;
-        for cell in self.cells.values_mut() {
-            if let Some(block) = &mut cell.base
-                && block.mapped
-            {
-                block.bytes = block.bytes.as_ref().to_vec().into();
-                block.mapped = false;
-            }
-        }
-        self.resident_loaded_bytes += additional;
-        Ok(())
+    /// Open a snapshot into `shards` shards. The snapshot records no shard map:
+    /// cells are placed by hash while loading.
+    pub fn open_snapshot_with_shards(
+        path: &Path,
+        shape: &KeyShape,
+        database: [u8; 16],
+        max_metadata_bytes: usize,
+        shards: usize,
+    ) -> Result<Self, NativeIndexError> {
+        snapshot::open(path, shape, database, max_metadata_bytes, shards)
     }
 
     fn descriptor(&self, keyspace: KeySpace) -> Result<&KeySpaceDesc, NativeIndexError> {
@@ -1007,58 +942,72 @@ impl Ord for ScanHead {
     }
 }
 
-impl NativePendingSink for NativeIndex {
-    type Error = NativeIndexError;
-    fn with_pending_table(
-        &mut self,
-        keyspace: KeySpace,
-        cell: &CellId,
-        apply: impl FnOnce(&mut PendingTable<ValueRecordReference>),
-    ) -> Result<(), Self::Error> {
-        let descriptor = self.descriptor(keyspace)?;
-        match (descriptor.key_type(), cell) {
-            (KeyType::Uniform(config), CellId::Integer(id))
-                if config
-                    .cells_per_mutex()
-                    .checked_mul(descriptor.num_mutexes())
-                    .and_then(|count| u32::try_from(count).ok())
-                    .is_some_and(|count| (*id as u128) < u128::from(count)) => {}
-            (KeyType::PrefixedUniform(_), CellId::Bytes(prefix))
-                if matches!(descriptor.first_cell(), CellId::Bytes(first) if first.len() == prefix.len())
-                    && descriptor.cell_id(prefix) == *cell => {}
-            _ => {
-                return Err(NativeIndexError::Invalid(
-                    "cell does not belong to keyspace",
-                ));
+impl CellIndex {
+    fn rotate(&mut self, generation: u64) -> bool {
+        if self.generation == generation {
+            return false;
+        }
+        assert!(self.sealed.is_none(), "previous capture must be cleaned");
+        self.sealed = Some(std::sync::Arc::new(std::mem::take(&mut self.overlay)));
+        self.generation = generation;
+        true
+    }
+
+    fn merge_overlay(&mut self, overlay: Overlay<ValueRecordReference>) {
+        for (key, values) in overlay {
+            match self.overlay.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(values);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let active = entry.get_mut();
+                    let mut left = active.len();
+                    let mut right = values.len();
+                    active.reserve(right);
+                    active.extend_from_slice(&values);
+                    let mut destination = left + right;
+                    while left != 0 && right != 0 {
+                        let old = active[left - 1];
+                        let sealed = values[right - 1];
+                        let order = old.mutation_version().cmp(&sealed.mutation_version());
+                        assert_ne!(
+                            order,
+                            Ordering::Equal,
+                            "distinct generations have unique versions"
+                        );
+                        destination -= 1;
+                        if order == Ordering::Greater {
+                            active[destination] = old;
+                            left -= 1;
+                        } else {
+                            active[destination] = sealed;
+                            right -= 1;
+                        }
+                    }
+                    active[..right].copy_from_slice(&values[..right]);
+                }
             }
         }
-        let identity = (keyspace, cell.clone());
-        if !self.cells.contains_key(&identity) {
-            self.check_capacity(cell_directory_charge(&identity.1))?;
-            self.resident_directory_bytes += cell_directory_charge(&identity.1);
-        }
-        self.touched.insert(identity.clone());
-        apply(&mut self.cells.entry(identity).or_default().pending);
-        Ok(())
     }
-}
 
-impl CellIndex {
     fn exact(&self, key: &[u8], version: MutationVersion) -> Option<ValueRecordReference> {
-        let selected = self.get(key, IndexReadCut::At(version));
+        let selected = self.get(key, &IndexReadCut::At(version));
         selected.filter(|reference| reference.mutation_version() == version)
     }
-    fn get(&self, key: &[u8], cut: IndexReadCut) -> Option<ValueRecordReference> {
-        let overlay = self
-            .overlay
-            .get(key)
-            .and_then(|values| {
+    fn get(&self, key: &[u8], cut: &IndexReadCut) -> Option<ValueRecordReference> {
+        let selected = |overlay: &Overlay<ValueRecordReference>| {
+            overlay.get(key).and_then(|values| {
                 matching_prefix(values, |value| cut.within_upper(value))
                     .iter()
                     .rev()
                     .find(|value| cut.contains(value))
+                    .copied()
             })
-            .copied();
+        };
+        let overlay = newest(
+            selected(&self.overlay),
+            self.sealed.as_deref().and_then(selected),
+        );
         let base = self.base.as_ref().and_then(|block| block.get(key, cut));
         newest(overlay, base)
     }
@@ -1068,28 +1017,43 @@ impl CellIndex {
         reverse: bool,
         cut: IndexReadCut,
     ) -> Option<(Bytes, ValueRecordReference)> {
-        let start = previous.map_or(Bound::Unbounded, Bound::Excluded);
-        if reverse {
-            self.overlay
-                .range::<[u8], _>((Bound::Unbounded, start))
-                .rev()
-                .find_map(|(key, values)| {
-                    matching_prefix(values, |v| cut.within_upper(v))
-                        .iter()
-                        .rev()
-                        .find(|v| cut.contains(v))
-                        .map(|reference| (key.clone(), *reference))
+        let next = |overlay: &Overlay<ValueRecordReference>| {
+            let start = previous.map_or(Bound::Unbounded, Bound::Excluded);
+            let select = |(key, values): (
+                &Bytes,
+                &crate::index::versioned_overlay::Versions<ValueRecordReference>,
+            )| {
+                matching_prefix(values, |v| cut.within_upper(v))
+                    .iter()
+                    .rev()
+                    .find(|v| cut.contains(v))
+                    .map(|reference| (key.clone(), *reference))
+            };
+            if reverse {
+                overlay
+                    .range::<[u8], _>((Bound::Unbounded, start))
+                    .rev()
+                    .find_map(select)
+            } else {
+                overlay
+                    .range::<[u8], _>((start, Bound::Unbounded))
+                    .find_map(select)
+            }
+        };
+        match (next(&self.overlay), self.sealed.as_deref().and_then(next)) {
+            (None, other) | (other, None) => other,
+            (Some(a), Some(b)) => {
+                let order = if reverse {
+                    b.0.cmp(&a.0)
+                } else {
+                    a.0.cmp(&b.0)
+                };
+                Some(match order {
+                    Ordering::Less => a,
+                    Ordering::Greater => b,
+                    Ordering::Equal => (a.0, newest(Some(a.1), Some(b.1)).expect("overlay heads")),
                 })
-        } else {
-            self.overlay
-                .range::<[u8], _>((start, Bound::Unbounded))
-                .find_map(|(key, values)| {
-                    matching_prefix(values, |v| cut.within_upper(v))
-                        .iter()
-                        .rev()
-                        .find(|v| cut.contains(v))
-                        .map(|reference| (key.clone(), *reference))
-                })
+            }
         }
     }
 
@@ -1125,37 +1089,48 @@ impl CellIndex {
             }
             None
         });
-        let lower = after.map_or(Bound::Unbounded, |(key, _)| Bound::Included(key.as_ref()));
-        let overlay = self
-            .overlay
-            .range::<[u8], _>((lower, Bound::Unbounded))
-            .find_map(|(key, versions)| {
-                let previous = after
-                    .filter(|(prior, _)| prior == key)
-                    .map(|(_, version)| *version);
-                let first = versions.partition_point(|value| {
-                    previous.is_some_and(|previous| value.mutation_version() <= previous)
-                });
-                versions[first..]
-                    .iter()
-                    .take_while(|value| cut.within_upper(value))
-                    .find(|value| cut.contains(value) && value.descriptor.kind == RecordKind::Put)
-                    .map(|reference| (key.clone(), *reference))
-            });
-        match (base, overlay) {
-            (None, other) | (other, None) => other,
-            (Some(a), Some(b)) => Some(
-                if a.0
-                    .cmp(&b.0)
-                    .then_with(|| a.1.mutation_version().cmp(&b.1.mutation_version()))
-                    != Ordering::Greater
-                {
-                    a
-                } else {
-                    b
-                },
-            ),
-        }
+        let next = |overlay: &Overlay<ValueRecordReference>| {
+            let lower = after.map_or(Bound::Unbounded, |(key, _)| Bound::Included(key.as_ref()));
+            overlay
+                .range::<[u8], _>((lower, Bound::Unbounded))
+                .find_map(|(key, versions)| {
+                    let previous = after
+                        .filter(|(prior, _)| prior == key)
+                        .map(|(_, version)| *version);
+                    let first = versions.partition_point(|value| {
+                        previous.is_some_and(|previous| value.mutation_version() <= previous)
+                    });
+                    versions[first..]
+                        .iter()
+                        .take_while(|value| cut.within_upper(value))
+                        .find(|value| {
+                            cut.contains(value) && value.descriptor.kind == RecordKind::Put
+                        })
+                        .map(|reference| (key.clone(), *reference))
+                })
+        };
+        let overlay = earliest_history(next(&self.overlay), self.sealed.as_deref().and_then(next));
+        earliest_history(base, overlay)
+    }
+}
+
+fn earliest_history(
+    a: Option<(Bytes, ValueRecordReference)>,
+    b: Option<(Bytes, ValueRecordReference)>,
+) -> Option<(Bytes, ValueRecordReference)> {
+    match (a, b) {
+        (None, other) | (other, None) => other,
+        (Some(a), Some(b)) => Some(
+            if a.0
+                .cmp(&b.0)
+                .then_with(|| a.1.mutation_version().cmp(&b.1.mutation_version()))
+                != Ordering::Greater
+            {
+                a
+            } else {
+                b
+            },
+        ),
     }
 }
 
@@ -1273,7 +1248,7 @@ impl SortedBlock {
             &self.bytes[count_at + 4..count_at + 4 + count * REFERENCE_BYTES],
         )
     }
-    fn selected(&self, index: usize, cut: IndexReadCut) -> Option<ValueRecordReference> {
+    fn selected(&self, index: usize, cut: &IndexReadCut) -> Option<ValueRecordReference> {
         let (_, values) = self.entry(index);
         let count = lower_bound_by(values.len() / REFERENCE_BYTES, |n| {
             cut.within_upper(
@@ -1288,7 +1263,7 @@ impl SortedBlock {
             cut.contains(&reference).then_some(reference)
         })
     }
-    fn get(&self, key: &[u8], cut: IndexReadCut) -> Option<ValueRecordReference> {
+    fn get(&self, key: &[u8], cut: &IndexReadCut) -> Option<ValueRecordReference> {
         let at = lower_bound_by(self.count, |n| self.entry(n).0 < key);
         if at == self.count || self.entry(at).0 != key {
             return None;
@@ -1501,6 +1476,7 @@ mod tests {
     mod cursors;
     mod lifecycle;
     mod owners;
+    mod sharding;
     mod sparse;
 
     const DATABASE: [u8; 16] = [7; 16];
@@ -1625,16 +1601,18 @@ mod tests {
             .collect()
     }
     fn install(
-        index: &mut NativeIndex,
+        index: &NativeIndex,
         log: &PartitionLog,
         batch: &CompleteBatch,
         durable: DurableBatch,
     ) {
+        let mut writer = index.writer();
         PreparedNativePublication::prepare(log, batch, durable)
             .unwrap()
-            .publish(index)
+            .publish(&mut writer)
             .unwrap();
-        index.promote_committed().unwrap();
+        writer.promote_committed().unwrap();
+        writer.publish_latest();
     }
     fn value(
         index: &NativeIndex,
@@ -1674,11 +1652,11 @@ mod tests {
         let first = batch(0, vec![put(1, &first_key, b"first")]);
         let second = batch(1, vec![put(1, &second_key, b"second")]);
         let receipts = durable(&log, &[first.clone(), second.clone()]);
-        let mut index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
+        let index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
 
         // A late lower logical version must not replace the newer reduced-key head.
-        install(&mut index, &log, &second, receipts[1]);
-        install(&mut index, &log, &first, receipts[0]);
+        install(&index, &log, &second, receipts[1]);
+        install(&index, &log, &first, receipts[0]);
         let first_lookup = index
             .get(KeySpace(1), &first_key, IndexReadCut::Latest)
             .unwrap();
@@ -1708,17 +1686,24 @@ mod tests {
         );
         let second = batch(1, vec![delete(A), put(0, C, b"third")]);
         let receipts = durable(&log, &[first.clone(), second.clone()]);
-        let mut index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
+        let index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
         let prepared = PreparedNativePublication::prepare(&log, &first, receipts[0]).unwrap();
-        prepared.publish(&mut index).unwrap();
+        prepared.publish(&mut index.writer()).unwrap();
         // Committed pending entries do not leak into the serving index before the
         // owning authority's single publication callback promotes every cell.
         assert_eq!(
             index.get(KeySpace(0), A, IndexReadCut::Latest).unwrap(),
             None
         );
-        assert_eq!(index.promote_committed().unwrap(), 8);
-        assert_eq!(index.promote_committed().unwrap(), 0);
+        assert_eq!(index.writer().promote_committed().unwrap(), 8);
+        assert_eq!(index.writer().promote_committed().unwrap(), 0);
+        // Promotion applies entries to shards but changes nothing a reader sees
+        // until the publication watermark advances.
+        assert_eq!(
+            index.get(KeySpace(0), A, IndexReadCut::Latest).unwrap(),
+            None
+        );
+        index.writer().publish_latest();
         assert_eq!(
             value(&index, &log, A, cut(0, 0)).as_deref(),
             Some(b"first".as_slice())
@@ -1733,7 +1718,7 @@ mod tests {
             keys(&index, false, IndexReadCut::Latest),
             [A.to_vec(), B.to_vec()]
         );
-        install(&mut index, &log, &second, receipts[1]);
+        install(&index, &log, &second, receipts[1]);
         assert_eq!(
             keys(&index, false, IndexReadCut::Latest),
             [B.to_vec(), C.to_vec()]
@@ -1816,9 +1801,158 @@ mod tests {
         );
         assert_eq!(index.stats().retained_versions, 10);
         // Exact replay duplicates do not charge a second retained version.
-        install(&mut index, &log, &first, receipts[0]);
+        install(&index, &log, &first, receipts[0]);
         assert_eq!(index.stats().retained_versions, 10);
         assert_eq!(value(&index, &log, A, IndexReadCut::Latest), None);
+    }
+
+    #[test]
+    fn generation_capture_excludes_late_older_publication_and_new_cells() {
+        let temp = tempdir::TempDir::new("native-index-generation").unwrap();
+        let log = log(&temp.path().join("wal"));
+        let early = batch(0, vec![put(0, C, b"late-old"), put(2, b"new-cell", b"new")]);
+        let later = batch(1, vec![put(0, A, b"a"), put(0, B, b"b")]);
+        let receipts = durable(&log, &[early.clone(), later.clone()]);
+        let index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
+        install(&index, &log, &later, receipts[1]);
+        let pin = index.pin_cut(cut(1, u32::MAX)).unwrap();
+        index.writer().begin_capture(cut(1, u32::MAX)).unwrap();
+        assert!(index.writer().capture_step(1).is_none());
+        let versions = index.stats().retained_versions;
+        install(&index, &log, &later, receipts[1]);
+        assert_eq!(index.stats().retained_versions, versions);
+        install(&index, &log, &early, receipts[0]);
+        let prepared = index.writer().capture_step(1).unwrap();
+        let root = temp.path().join("captured.index");
+        let persisted = prepared.persist(&root).unwrap();
+        let recovered = NativeIndex::open_snapshot(&root, &shape(), DATABASE, BUDGET).unwrap();
+        assert_eq!(value(&recovered, &log, C, IndexReadCut::Latest), None);
+        assert_eq!(
+            value(&index, &log, C, pin.cut()).as_deref(),
+            Some(b"late-old".as_slice())
+        );
+        index.writer().begin_install_image(persisted);
+        assert!(!index.writer().install_image_step(1));
+        assert_eq!(
+            value(&index, &log, C, pin.cut()).as_deref(),
+            Some(b"late-old".as_slice())
+        );
+        assert!(index.writer().install_image_step(1));
+        assert_eq!(
+            value(&index, &log, C, IndexReadCut::Latest).as_deref(),
+            Some(b"late-old".as_slice())
+        );
+        assert!(
+            index
+                .get(KeySpace(2), b"new-cell", IndexReadCut::Latest)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn abandoned_generation_is_readable_and_cleaned_before_retry() {
+        let temp = tempdir::TempDir::new("native-index-abandoned-generation").unwrap();
+        let log = log(&temp.path().join("wal"));
+        let first = batch(0, vec![put(0, A, b"old-a"), put(0, B, b"old-b")]);
+        let second = batch(1, vec![put(0, A, b"new-a"), delete(B)]);
+        let receipts = durable(&log, &[first.clone(), second.clone()]);
+        let index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
+        install(&index, &log, &first, receipts[0]);
+        index.writer().begin_capture(cut(0, u32::MAX)).unwrap();
+        assert!(index.writer().capture_step(1).is_none());
+        install(&index, &log, &second, receipts[1]);
+        index.writer().abort_capture();
+        assert!(matches!(
+            index.writer().begin_capture(IndexReadCut::Latest),
+            Err(NativeIndexError::CheckpointInProgress)
+        ));
+        assert_eq!(
+            value(&index, &log, A, cut(0, u32::MAX)).as_deref(),
+            Some(b"old-a".as_slice())
+        );
+        assert_eq!(value(&index, &log, B, IndexReadCut::Latest), None);
+        assert!(!index.writer().cleanup_failed_capture_step(1).unwrap());
+        assert!(index.writer().cleanup_failed_capture_step(1).unwrap());
+        let path = temp.path().join("retry.index");
+        let prepared = index.writer().prepare_image(IndexReadCut::Latest).unwrap();
+        index
+            .writer()
+            .install_image(prepared.persist(&path).unwrap());
+        assert_eq!(
+            value(&index, &log, A, IndexReadCut::Latest).as_deref(),
+            Some(b"new-a".as_slice())
+        );
+        assert_eq!(value(&index, &log, B, IndexReadCut::Latest), None);
+    }
+
+    #[test]
+    fn installation_accounting_matches_full_recount_with_later_updates() {
+        let temp = tempdir::TempDir::new("native-index-install-accounting").unwrap();
+        let log = log(&temp.path().join("wal"));
+        let first = batch(0, vec![put(0, A, b"old"), put(0, B, b"other")]);
+        let later = batch(1, vec![delete(A), put(0, C, b"new")]);
+        let receipts = durable(&log, &[first.clone(), later.clone()]);
+        let mut index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
+        install(&index, &log, &first, receipts[0]);
+        index
+            .writer()
+            .flush_and_unload(&temp.path().join("first.index"), cut(0, u32::MAX))
+            .unwrap();
+        index.writer().reload().unwrap();
+        let pin = index.pin_cut(cut(0, 1)).unwrap();
+        let prepared = index
+            .writer()
+            .prepare_compacted_image(cut(0, u32::MAX), cut(0, 1))
+            .unwrap();
+        let persisted = prepared.persist(&temp.path().join("second.index")).unwrap();
+        index.writer().begin_install_image(persisted);
+        assert!(!index.writer().install_image_step(1));
+        assert_eq!(index.retention_floor(), IndexReadCut::BeforeAll);
+        install(&index, &log, &later, receipts[1]);
+        assert_eq!(
+            value(&index, &log, A, pin.cut()).as_deref(),
+            Some(b"old".as_slice())
+        );
+        assert_eq!(value(&index, &log, A, IndexReadCut::Latest), None);
+        assert!(index.writer().install_image_step(1));
+        assert_eq!(index.retention_floor(), cut(0, 1));
+        let before = index.stats();
+        let retained = index.retained_metadata_bytes();
+        index.recount_retained();
+        let after = index.stats();
+        assert_eq!(before.retained_versions, after.retained_versions);
+        assert_eq!(before.charged_metadata_bytes, after.charged_metadata_bytes);
+        assert_eq!(retained, index.retained_metadata_bytes());
+        assert_eq!(value(&index, &log, A, IndexReadCut::Latest), None);
+        assert_eq!(
+            value(&index, &log, C, IndexReadCut::Latest).as_deref(),
+            Some(b"new".as_slice())
+        );
+        let floor = index.retention_floor();
+        assert!(
+            index
+                .writer()
+                .prepare_image(IndexReadCut::Latest)
+                .unwrap()
+                .persist(&temp.path().join("second.index"))
+                .is_err()
+        );
+        assert_eq!(index.retention_floor(), floor);
+        assert_eq!(value(&index, &log, A, IndexReadCut::Latest), None);
+        assert!(!index.writer().cleanup_failed_capture_step(1).unwrap());
+        let mut cleaned = false;
+        for _ in 1..index.stats().cells {
+            if index.writer().cleanup_failed_capture_step(1).unwrap() {
+                cleaned = true;
+                break;
+            }
+        }
+        assert!(cleaned);
+        assert_eq!(
+            value(&index, &log, C, IndexReadCut::Latest).as_deref(),
+            Some(b"new".as_slice())
+        );
     }
 
     #[test]
@@ -1836,14 +1970,17 @@ mod tests {
         );
         let second = batch(1, vec![delete(A), put(0, C, b"new")]);
         let receipts = durable(&log, &[first.clone(), second.clone()]);
-        let mut index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
+        let index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
         // Publication arriving in reverse physical/completion order still obeys
         // the explicit logical version, never the address or insertion order.
-        install(&mut index, &log, &second, receipts[1]);
-        install(&mut index, &log, &first, receipts[0]);
+        install(&index, &log, &second, receipts[1]);
+        install(&index, &log, &first, receipts[0]);
         let old = temp.path().join("old.index");
         let expected_bytes = index.retained_metadata_bytes();
-        let metadata = index.flush_and_unload(&old, cut(0, u32::MAX)).unwrap();
+        let metadata = index
+            .writer()
+            .flush_and_unload(&old, cut(0, u32::MAX))
+            .unwrap();
         let image = std::fs::read(&old).unwrap();
         assert_eq!(metadata.bytes, image.len() as u64);
         assert_eq!(
@@ -1851,10 +1988,20 @@ mod tests {
             <[u8; 32]>::from(Blake2b::<U32>::digest(&image))
         );
         let repeated = temp.path().join("same-cut.index");
-        let repeated_metadata = index.flush_and_unload(&repeated, cut(0, u32::MAX)).unwrap();
-        assert_eq!(std::fs::read(repeated).unwrap(), image);
-        assert_eq!(repeated_metadata.bytes, metadata.bytes);
-        assert_eq!(repeated_metadata.digest, metadata.digest);
+        index
+            .writer()
+            .flush_and_unload(&repeated, cut(0, u32::MAX))
+            .unwrap();
+        let repeated_reader =
+            NativeIndex::open_snapshot(&repeated, &shape(), DATABASE, BUDGET).unwrap();
+        assert_eq!(
+            value(&repeated_reader, &log, A, IndexReadCut::Latest).as_deref(),
+            Some(b"old".as_slice())
+        );
+        assert_eq!(
+            keys(&repeated_reader, false, IndexReadCut::Latest),
+            [A.to_vec(), B.to_vec()]
+        );
         assert!(index.stats().unloaded_cells > 0);
         assert_eq!(index.retained_metadata_bytes(), expected_bytes);
         assert_eq!(value(&index, &log, A, IndexReadCut::Latest), None);
@@ -1872,7 +2019,7 @@ mod tests {
             Some(b"old".as_slice())
         );
         assert_eq!(value(&old_reopened, &log, C, IndexReadCut::Latest), None);
-        index.reload().unwrap();
+        index.writer().reload().unwrap();
         assert_eq!(index.stats().unloaded_cells, 0);
         assert_eq!(
             keys(&index, true, cut(0, u32::MAX)),
@@ -1880,22 +2027,26 @@ mod tests {
         );
         let third = batch(2, vec![put(0, A, b"recreated")]);
         let receipt = durable(&log, std::slice::from_ref(&third))[0];
-        install(&mut index, &log, &third, receipt);
+        install(&index, &log, &third, receipt);
         let latest = temp.path().join("latest.index");
         index
+            .writer()
             .flush_and_unload(&latest, IndexReadCut::Latest)
             .unwrap();
-        // Every cell is now a compact immutable base. A repeated image reuses
-        // the exact same container ranges without rewriting their histories.
+        // A repeated image preserves the same visible and historical rows.
         let repeated_latest = temp.path().join("same-latest.index");
         index
+            .writer()
             .flush_and_unload(&repeated_latest, IndexReadCut::Latest)
             .unwrap();
+        let repeated_reader =
+            NativeIndex::open_snapshot(&repeated_latest, &shape(), DATABASE, BUDGET).unwrap();
         assert_eq!(
-            std::fs::read(&repeated_latest).unwrap(),
-            std::fs::read(&latest).unwrap()
+            value(&repeated_reader, &log, A, IndexReadCut::Latest).as_deref(),
+            Some(b"recreated".as_slice())
         );
-        let mut reopened = NativeIndex::open_snapshot(&latest, &shape(), DATABASE, BUDGET).unwrap();
+        assert_eq!(value(&repeated_reader, &log, A, cut(1, u32::MAX)), None);
+        let reopened = NativeIndex::open_snapshot(&latest, &shape(), DATABASE, BUDGET).unwrap();
         assert_eq!(reopened.stats().retained_versions, 7);
         assert_eq!(
             value(&reopened, &log, A, IndexReadCut::Latest).as_deref(),
@@ -1914,13 +2065,14 @@ mod tests {
             keys(&reopened, true, cut(1, u32::MAX)),
             [C.to_vec(), B.to_vec()]
         );
-        reopened.reload().unwrap();
+        reopened.writer().reload().unwrap();
         assert_eq!(
             value(&reopened, &log, A, IndexReadCut::Latest).as_deref(),
             Some(b"recreated".as_slice())
         );
         assert!(
             index
+                .writer()
                 .flush_and_unload(&latest, IndexReadCut::Latest)
                 .is_err()
         );
@@ -1929,6 +2081,7 @@ mod tests {
         let empty = temp.path().join("empty.index");
         let unloaded_before_export = index.stats().unloaded_cells;
         index
+            .writer()
             .flush_and_unload(&empty, IndexReadCut::BeforeAll)
             .unwrap();
         assert_eq!(index.stats().unloaded_cells, unloaded_before_export);
@@ -2013,13 +2166,14 @@ mod tests {
             .into_iter()
             .map(|receipt| log.persist_through(receipt).unwrap())
             .collect();
-        let mut index = NativeIndex::new(&shape, DATABASE, BUDGET).unwrap();
-        install(&mut index, &log, &batches[0], receipts[0]);
+        let index = NativeIndex::new(&shape, DATABASE, BUDGET).unwrap();
+        install(&index, &log, &batches[0], receipts[0]);
         index
+            .writer()
             .flush_and_unload(&temp.path().join("prefix.index"), cut(0, u32::MAX))
             .unwrap();
-        install(&mut index, &log, &batches[1], receipts[1]);
-        install(&mut index, &log, &batches[2], receipts[2]);
+        install(&index, &log, &batches[1], receipts[1]);
+        install(&index, &log, &batches[2], receipts[2]);
         assert_eq!(index.stats().cells, 64);
         for read_cut in [cut(0, u32::MAX), cut(1, u32::MAX), IndexReadCut::Latest] {
             for reverse in [false, true] {
@@ -2068,6 +2222,7 @@ mod tests {
             }
         }
         index
+            .writer()
             .flush_and_unload(&temp.path().join("all.index"), IndexReadCut::Latest)
             .unwrap();
         assert_eq!(index.stats().unloaded_cells, 64);
@@ -2093,17 +2248,20 @@ mod tests {
         let log = log(&temp.path().join("wal"));
         let batch = batch(0, vec![put(0, A, b"value kept only in WAL")]);
         let receipt = durable(&log, std::slice::from_ref(&batch))[0];
-        let mut index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
+        let index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
         let estimate = index.estimated_batch_bytes(&batch).unwrap();
         let small = NativeIndex::new(&shape(), DATABASE, estimate - 1).unwrap();
         assert!(matches!(
             small.check_capacity(estimate),
             Err(NativeIndexError::Capacity)
         ));
-        install(&mut index, &log, &batch, receipt);
+        install(&index, &log, &batch, receipt);
         assert_eq!(index.retained_metadata_bytes(), VERSION_CHARGE + A.len());
         let path = temp.path().join("valid.index");
-        index.flush_and_unload(&path, IndexReadCut::Latest).unwrap();
+        index
+            .writer()
+            .flush_and_unload(&path, IndexReadCut::Latest)
+            .unwrap();
         let image = std::fs::read(&path).unwrap();
         assert!(
             !image

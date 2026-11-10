@@ -1,6 +1,10 @@
 """Consumer-visible identity, clock, counter and missing-data regressions."""
+import copy
+import hashlib
 import io
+import importlib.util
 import json
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -46,6 +50,23 @@ def write_diagnostics():
                         "value_wal_persistence": {"status": "sampled", "profiled_barriers": 3,
                                                   "file_calls": 3, "file_successes": 2,
                                                   "file_ns": 1000000000}}}
+
+def live_write_diagnostics():
+    value = write_diagnostics()
+    value.update(backend="tidehunter_live_nvmeof", runtime_observation_mode="live_nvmeof_phase_counters")
+    value["measurement_drained"] = True
+    value["selection"].update(requested_limit=2, observed_samples=3,
+                              selection_policy="completed I/O in armed measurement window")
+    value["profile"] = {
+        "runtime_observation_mode": "live_nvmeof_phase_counters",
+        "scope": "measurement_nvme_io_cumulative_delta", "requested_limit": 2, "selected_operations": 3,
+        "stages": {"live_nvmeof": {
+            "completed_write_ops": 3, "completed_write_bytes": 12288,
+            "completed_read_ops": 0, "metadata_requests": 4, "payload_rpc_requests": 0,
+            "unknown_writes": 0, "errors": 0, "queue_ns": 3000000000, "queue_samples": 3,
+            "cq_ns": 0, "cq_samples": 0}},
+        "finalization_error": None}
+    return value
 
 
 def read_diagnostics():
@@ -163,6 +184,153 @@ class CaseIdentityTests(unittest.TestCase):
         del owner["partitions"]["0"]["counters"]["async_read_submissions"]
         self.assertNotIn("async_read_submissions", campaign.measurement_read_metrics(evidence, {}))
 
+    def test_requested_route_labels_do_not_invent_live_measurements(self):
+        selected = job() | {"backend": "tidehunter_nvme_tcp", "nvmeof_route": "live"}
+        labels = campaign.context("run", selected)
+        self.assertEqual(labels["requested_nvmeof_route"], "live")
+        text = campaign.terminal_metrics({"status": "failed"}, labels)
+        self.assertIn('requested_nvmeof_route="live"', text)
+        self.assertNotIn("kv_nvmeof_reader_count", text)
+        with self.assertRaisesRegex(ValueError, "invalid requested"):
+            campaign.context("run", selected | {"nvmeof_route": "other"})
+
+    def test_spdk_routes_have_distinct_labels_and_reject_invalid_combinations(self):
+        live = job() | {"backend": "tidehunter_nvme_rdma", "nvmeof_route": "live",
+                        "nvmeof_target": "spdk"}
+        labels = campaign.context("run", live)
+        self.assertEqual(labels["requested_backend"], "tidehunter_spdk_live_rdma")
+        self.assertEqual(labels["requested_nvmeof_route"], "live")
+        self.assertEqual(labels["requested_nvmeof_target"], "spdk")
+        sealed = live | {"nvmeof_route": "sealed_read", "cohort": "sealed_read"}
+        self.assertEqual(campaign.context("run", sealed)["requested_backend"], "tidehunter_spdk_rdma")
+        for invalid in (live | {"backend": "tidehunter_nvme_tcp"},
+                        live | {"backend": "native"},
+                        live | {"nvmeof_route": None},
+                        live | {"nvmeof_route": "other"},
+                        live | {"cohort": "sealed_read"},
+                        sealed | {"cohort": "primary_rf1"},
+                        live | {"nvmeof_target": None},
+                        live | {"nvmeof_target": "other"}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                campaign.context("run", invalid)
+
+    def test_hybrid_put_route_is_admitted_without_weakening_other_jobs(self):
+        hybrid = job() | {"backend": "tidehunter_nvme_rdma", "nvmeof_route": "sealed_read",
+                          "cohort": "primary_rf1", "case_kind": "hybrid_put", "nvmeof_target": "kernel"}
+        self.assertEqual(campaign.context("run", hybrid)["requested_nvmeof_route"], "sealed_read")
+        for invalid in (hybrid | {"nvmeof_route": "live"},
+                        hybrid | {"nvmeof_route": None, "nvmeof_target": None},
+                        hybrid | {"cohort": "sealed_read"},
+                        hybrid | {"backend": "tidehunter_nvme_tcp"},
+                        hybrid | {"case_kind": "remote_put"}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                campaign.context("run", invalid)
+
+    def test_live_measurement_deltas_are_scoped_and_missing_is_not_zero(self):
+        fields = ("completed_read_ops", "completed_read_bytes", "completed_write_ops",
+                  "completed_write_bytes", "recovery_read_ops", "recovery_read_bytes",
+                  "metadata_requests", "namespace_connects", "payload_rpc_requests",
+                  "unknown_writes", "errors", "route_evidence_dropped", "fence_evidence_dropped")
+        counters = {field: index for index, field in enumerate(fields)}
+        for stage in ("queue", "submit", "cq", "control", "validation", "allocation",
+                      "publication", "namespace_setup", "read_io", "persistence", "owner_completion",
+                      "wal_persistence", "wal_namespace", "frontier_file", "frontier_namespace"):
+            counters[stage + "_ns"] = 0
+            counters[stage + "_samples"] = 0
+        counters["queue_ns"], counters["queue_samples"] = 100, 2
+        counters["owner_completion_ns"], counters["owner_completion_samples"] = 250, 1
+        evidence = {"scope": "measurement_boundary", "deltas": {"available": False},
+                    "live_nvmeof": {"available": True, "counters": counters}}
+        labels = campaign.context("run", job() | {"backend": "tidehunter_nvme_tcp", "nvmeof_route": "live"})
+        text = campaign.measurement_read_metrics(evidence, labels)
+        self.assertIn('scope="measurement_boundary",counter="completed_read_ops"} 0', text)
+        self.assertIn('scope="measurement_boundary",counter="completed_read_bytes"} 1', text)
+        self.assertIn("kv_live_nvmeof_bytes", text)
+        self.assertIn("kv_live_nvmeof_events", text)
+        self.assertIn('stage="queue",statistic="sum"} 1e-07', text)
+        self.assertIn('stage="cq"} 0', text)
+        self.assertNotIn('stage="cq",statistic="sum"', text)
+        self.assertIn('stage="owner_completion",statistic="sum"} 2.5e-07', text)
+        self.assertIn('stage="frontier_file"} 0', text)
+        self.assertNotIn('stage="frontier_file",statistic="sum"', text)
+        evidence["live_nvmeof"] = {"available": False}
+        text = campaign.measurement_read_metrics(evidence, labels)
+        self.assertIn('scope="measurement_boundary"} 0', text)
+        self.assertNotIn("kv_live_nvmeof_events", text)
+        evidence["live_nvmeof"] = {"available": True, "counters": {"errors": 0}}
+        with self.assertRaisesRegex(ValueError, "incomplete live"):
+            campaign.measurement_read_metrics(evidence, labels)
+
+    def test_new_live_deltas_peaks_and_pool_keep_distinct_scopes(self):
+        counters = {field: 0 for field in (
+            "completed_read_ops", "completed_read_bytes", "completed_write_ops", "completed_write_bytes",
+            "recovery_read_ops", "recovery_read_bytes", "metadata_requests", "namespace_connects",
+            "payload_rpc_requests", "unknown_writes", "errors", "route_evidence_dropped", "fence_evidence_dropped")}
+        for stage in ("queue", "submit", "cq", "control", "validation", "allocation", "publication",
+                      "namespace_setup", "read_io", "persistence", "owner_completion", "wal_persistence",
+                      "wal_namespace", "frontier_file", "frontier_namespace"):
+            counters.update({stage + "_ns": 0, stage + "_samples": 0})
+        counters.update(lane_inflight_samples=2, lane_inflight_request_sum=3, grant_hits=4,
+                        copy_bytes_avoided=4096, delivery_ns=200, delivery_samples=2)
+        evidence = {"scope": "measurement_boundary", "deltas": {"available": False},
+                    "live_nvmeof": {"available": True, "counters": counters},
+                    "live_nvmeof_peaks": {"lane_inflight_request_max": {"at_start": 2, "at_end": 5},
+                                           "lane_inflight_op_max": {"at_start": None, "at_end": None}},
+                    "client_pool": {"available": True, "counters": {"connections_replaced": 1}}}
+        text = campaign.measurement_read_metrics(evidence, {})
+        self.assertIn('counter="grant_hits"} 4', text)
+        self.assertIn('kv_live_nvmeof_bytes{scope="measurement_boundary",counter="copy_bytes_avoided"} 4096', text)
+        self.assertIn('stage="delivery",statistic="sum"} 2e-07', text)
+        self.assertIn('scope="node_lifetime",boundary="end",peak="lane_inflight_request_max"} 5', text)
+        self.assertNotIn('peak="lane_inflight_op_max"', text)
+        self.assertIn('counter="connections_replaced"} 1', text)
+        del counters["delivery_samples"]
+        with self.assertRaisesRegex(ValueError, "incomplete live"):
+            campaign.measurement_read_metrics(evidence, {})
+
+    def test_new_transport_observations_do_not_require_cq_timing(self):
+        evidence = read_diagnostics()
+        counters = evidence["profile"]["counters"]
+        counters.update(read_profile_transport_progress_available=1,
+                        read_profile_transport_send_size_le_4k=7,
+                        read_profile_transport_send_post_eagain=2,
+                        read_profile_transport_send_post_retries=1,
+                        read_profile_transport_cq_idle_waits=4,
+                        read_profile_admission_retry_credit=3)
+        text = campaign.read_diagnostic_metrics(evidence, {})
+        for field, value in (("send_size_le_4k", 7), ("send_post_eagain", 2),
+                             ("send_post_retries", 1), ("cq_idle_waits", 4)):
+            self.assertIn(f'counter="{field}"}} {value}', text)
+        self.assertIn('counter="read_profile_admission_retry_credit"} 3', text)
+        counters["read_profile_transport_progress_available"] = 0
+        self.assertNotIn('counter="send_post_eagain"', campaign.read_diagnostic_metrics(evidence, {}))
+
+    def test_sealed_reader_new_fields_are_lifetime_snapshots(self):
+        reader = {"partition": 1, "admitted_sqes": 8, "merged_members": 3,
+                  "pool_hits": 4, "lock_wait": {"count": 0, "sum_ns": 0, "max_ns": 0},
+                  "lock_hold": {"count": 2, "sum_ns": 100, "max_ns": 60}}
+        evidence = {"scope": "measurement_boundary", "deltas": {"available": False},
+                    "end": {"nvmeof": {"available": True, "readers": [reader]}}}
+        text = campaign.measurement_read_metrics(evidence, {})
+        self.assertIn('scope="node_lifetime",boundary="end",reader="0",partition="1",counter="merged_members"} 3', text)
+        self.assertIn('stage="lock_hold",statistic="max"} 6e-08', text)
+        self.assertNotIn('stage="lock_wait",statistic="sum"', text)
+        self.assertNotIn('counter="pool_misses"', text)
+        reader["lock_wait"]["sum_ns"] = 1
+        with self.assertRaisesRegex(ValueError, "without samples"):
+            campaign.measurement_read_metrics(evidence, {})
+
+    def test_live_write_new_counters_are_exported_without_inventing_clocks(self):
+        evidence = live_write_diagnostics()
+        counters = evidence["profile"]["stages"]["live_nvmeof"]
+        counters.update(grant_hits=2, copy_bytes_avoided=128, controller_connect_ns=0,
+                        controller_connect_samples=0, delivery_ns=9, delivery_samples=1)
+        text = campaign.write_diagnostic_metrics(evidence, {})
+        self.assertIn('counter="grant_hits"} 2', text)
+        self.assertIn('counter="copy_bytes_avoided"} 128', text)
+        self.assertIn('stage="delivery_ns"} 9e-09', text)
+        self.assertNotIn('stage="controller_connect_ns"', text)
+
     def test_nvme_reader_exports_transport_and_unavailable_stages(self):
         row = {"available": True, "identity": {"partition": 0, "transport": "rdma"},
                "counters": {"available": True, "counters": {"aligned_read_bytes": 4096}},
@@ -240,6 +408,21 @@ class CaseIdentityTests(unittest.TestCase):
             del broken[missing]
             with self.subTest(missing=missing), self.assertRaises(ValueError):
                 campaign.resource_interval_metrics(evidence | {"processes": [broken]}, {})
+
+    def test_captured_device_change_exports_qualified_core_only(self):
+        directory = Path(__file__).resolve().parent.parent
+        spec = importlib.util.spec_from_file_location("resource_accounting", directory / "resource_accounting.py")
+        accounting = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(accounting)
+        before, after = json.loads((directory / "resource-client-boundaries-0024.json").read_text())
+        evidence = accounting.interval([before], [after])
+        text = campaign.resource_interval_metrics(evidence, {})
+        self.assertIn("kv_case_resource_interval_core_available", text)
+        self.assertIn("kv_case_resource_interval_io_available", text)
+        self.assertIn("0.670104", text)
+        self.assertIn("19963904", text)
+        self.assertNotIn("io_read_bytes", text)
+        self.assertNotIn("io_write_bytes", text)
 
     def test_resource_rejects_reset_impossible_or_unavailable_counter_claims(self):
         valid = {"host_index": -1, "process_role": "client", "available": True, "elapsed_seconds": 1,
@@ -429,6 +612,20 @@ class CaseIdentityTests(unittest.TestCase):
         self.assertIn('stage="index_lookup",statistic="max"} 7e-08', text)
         self.assertIn('stage="cache_lookup"} 0', text)
         self.assertNotIn('stage="cache_lookup",statistic=', text)
+        self.assertNotIn('stage="batch_wait"', text)
+        stages = evidence["profile"]["coordinator_resolution"]["stages"]
+        stages.update(batch_wait={"available": True, "sum_ns": 500, "count": 1,
+                                  "max_ns": 500, "unavailable_reason": None},
+                      postread_cache_fill=absent, result_materialization=absent)
+        text = campaign.read_diagnostic_metrics(evidence, {})
+        self.assertIn('stage="batch_wait",statistic="mean"} 5e-07', text)
+        self.assertIn('stage="postread_cache_fill"} 0', text)
+        self.assertNotIn('stage="postread_cache_fill",statistic=', text)
+        self.assertNotIn('stage="result_materialization",statistic=', text)
+        stages["unbounded_stage_name"] = observed
+        with self.assertRaisesRegex(ValueError, "resolution profile"):
+            campaign.read_diagnostic_metrics(evidence, {})
+        del stages["unbounded_stage_name"]
         evidence["error"] = "one selected remote flight failed"
         evidence["profile"]["coordinator_resolution_valid"] = True
         evidence["profile"]["coordinator_resolution"]["errors"] = 1
@@ -566,6 +763,168 @@ class CaseIdentityTests(unittest.TestCase):
         self.assertIn('stage="write_profile_client_exchange_ns"} 0.7', text)
         self.assertIn('counter="write_profile_storage_append_calls"} 3', text)
 
+    def test_live_nvme_write_window_is_distinct_and_preserves_actual_counters(self):
+        value = live_write_diagnostics()
+        value["pre_completion_gate"] = {
+            "available": True, "scope": "coordinator_arm_through_pre_completion_gate",
+            "clock_scope": "independent", "stages": {"write_storage_wait_ns": 12}}
+        text = campaign.write_diagnostic_metrics(value, {})
+        self.assertIn('scope="measurement_nvme_io_cumulative_delta"', text)
+        self.assertIn('population="completed_write_ops"} 3', text)
+        self.assertIn('counter="completed_write_bytes"} 12288', text)
+        self.assertIn('counter="queue_samples"} 3', text)
+        self.assertIn('counter="unknown_writes"} 0', text)
+        self.assertIn('stage="queue_ns"} 3.0', text)
+        self.assertIn('scope="coordinator_arm_through_pre_completion_gate"', text)
+        self.assertNotIn('scope="sampled_prefix"', text)
+        self.assertNotIn('stage="cq_ns"', text)
+        self.assertNotIn('counter="completed_read_bytes"', text)
+        self.assertNotIn("quantile", text)
+
+    def test_live_nvme_write_window_rejects_inconsistent_evidence(self):
+        def cases():
+            value = live_write_diagnostics()
+            value["profile"]["selected_operations"] = 2
+            yield value
+            value = live_write_diagnostics()
+            value["profile"]["stages"]["live_nvmeof"]["completed_write_ops"] = 2
+            yield value
+            for key, replacement in (("errors", 1), ("unknown_writes", 1), ("queue_ns", -1),
+                                     ("completed_write_ops", None), ("errors", None)):
+                value = live_write_diagnostics()
+                value["profile"]["stages"]["live_nvmeof"][key] = replacement
+                yield value
+            value = live_write_diagnostics()
+            del value["profile"]["stages"]["live_nvmeof"]["queue_samples"]
+            yield value
+            for key, replacement in (("scope", "sampled_prefix"), ("requested_limit", 7),
+                                     ("runtime_observation_mode", "other"),
+                                     ("finalization_error", "counter reset")):
+                value = live_write_diagnostics()
+                value["profile"][key] = replacement
+                yield value
+            value = live_write_diagnostics()
+            value["backend"] = "native"
+            yield value
+            value = live_write_diagnostics()
+            value["runtime_observation_mode"] = "other"
+            yield value
+            for remove in ("neither", "scope", "stages"):
+                value = live_write_diagnostics()
+                value["backend"] = "native"
+                value["runtime_observation_mode"] = "other"
+                value["profile"]["runtime_observation_mode"] = "other"
+                if remove == "scope":
+                    value["profile"]["scope"] = "sampled_prefix"
+                elif remove == "stages":
+                    value["profile"]["stages"] = {"wal_append_ns": 1}
+                yield value
+        for value in cases():
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                campaign.write_diagnostic_metrics(value, {})
+
+    def test_write_dashboard_selects_independent_write_populations(self):
+        dashboard = json.loads((Path(__file__).parent / "dashboards/campaign.json").read_text())
+        expressions = [target.get("expr", "") for panel in dashboard["panels"]
+                       for target in panel.get("targets", [])]
+        expression = next(expr for expr in expressions if "kv_case_write_diagnostic_(available|operations" in expr)
+        pattern = re.search(r'scope=~"([^"]+)"', expression).group(1)
+        for scope in ("sampled_prefix", "measurement_nvme_io_cumulative_delta",
+                      "coordinator_arm_through_pre_completion_gate", "measurement_boundary_cumulative_delta"):
+            self.assertRegex(scope, "^(?:" + pattern + ")$")
+
+    def test_write_pre_gate_snapshot_exports_only_available_observations(self):
+        evidence = write_diagnostics()
+        evidence["pre_completion_gate"] = {
+            "available": True, "scope": "coordinator_arm_through_pre_completion_gate",
+            "clock_scope": "independent completion-charged counters",
+            "stages": {"write_foreground_checkpoint_ns": 2000000000,
+                       "write_foreground_checkpoint_count": 2,
+                       "write_checkpoint_diagnostic_root_adoption_ns": 50}}
+        text = campaign.write_diagnostic_metrics(evidence, {})
+        self.assertIn('scope="coordinator_arm_through_pre_completion_gate"', text)
+        self.assertIn('stage="write_foreground_checkpoint_ns"} 2.0', text)
+        self.assertNotIn('stage="write_checkpoint_diagnostic_root_adoption_ns"', text)
+        evidence["pre_completion_gate"] = {"available": False, "reason": "missing"}
+        text = campaign.write_diagnostic_metrics(evidence, {})
+        self.assertIn('scope="coordinator_arm_through_pre_completion_gate",diagnostic_backend=', text)
+        self.assertNotIn('stage="write_foreground_checkpoint_ns"', text)
+
+    def test_incomplete_measurement_does_not_export_boundary_counters(self):
+        evidence = write_diagnostics()
+        evidence["pre_completion_gate"] = {
+            "available": True, "scope": "coordinator_arm_through_pre_completion_gate",
+            "clock_scope": "independent clocks", "stages": {
+                "write_foreground_checkpoint_ns": 2000000000,
+                "write_foreground_checkpoint_count": 2}}
+        evidence["measurement_drained"] = False
+        text = campaign.write_diagnostic_metrics(evidence, {})
+        self.assertIn('scope="coordinator_arm_through_pre_completion_gate",diagnostic_backend="native"} 0', text)
+        self.assertNotIn('stage="write_foreground_checkpoint_ns"', text)
+        del evidence["measurement_drained"]
+        self.assertIn('stage="write_foreground_checkpoint_ns"} 2.0',
+                      campaign.write_diagnostic_metrics(evidence, {}))
+        evidence["error"] = "finalization failed"
+        text = campaign.write_diagnostic_metrics(evidence, {})
+        self.assertIn('stage="write_foreground_checkpoint_ns"} 2.0', text)
+
+    def test_checkpoint_control_metrics_require_explicit_availability(self):
+        evidence = write_diagnostics()
+        evidence["profile"]["stages"] = {
+            "write_profile_checkpoint_available": 1,
+            "write_profile_checkpoint_requests": 2,
+            "write_profile_checkpoint_completed": 1,
+            "write_profile_checkpoint_wait_ns": 1000000000,
+            "write_profile_checkpoint_append_completions": 3,
+            "write_profile_checkpoint_admission_stalls": 4}
+        text = campaign.write_diagnostic_metrics(evidence, {})
+        self.assertIn('stage="write_profile_checkpoint_wait_ns"} 1.0', text)
+        self.assertIn('counter="write_profile_checkpoint_append_completions"} 3', text)
+        self.assertIn('counter="write_profile_checkpoint_admission_stalls"} 4', text)
+        del evidence["profile"]["stages"]["write_profile_checkpoint_available"]
+        text = campaign.write_diagnostic_metrics(evidence, {})
+        self.assertNotIn('stage="write_profile_checkpoint_wait_ns"', text)
+        self.assertNotIn('counter="write_profile_checkpoint_admission_stalls"', text)
+
+    def test_transport_pressure_requires_observed_poll_denominator(self):
+        evidence = read_diagnostics()
+        counters = evidence["profile"]["counters"]
+        counters.update(read_profile_transport_tx_all_slots_pending_polls=3,
+                        read_profile_transport_rx_unread_slots_polls=1)
+        self.assertNotIn("kv_case_read_transport_observations", campaign.read_diagnostic_metrics(evidence, {}))
+        counters["read_profile_transport_cq_timed_calls"] = 10
+        text = campaign.read_diagnostic_metrics(evidence, {})
+        self.assertIn('counter="cq_timed_calls"} 10', text)
+        self.assertIn('counter="tx_all_slots_pending_polls"} 3', text)
+        self.assertNotIn('counter="rx_no_posted_slots_polls"', text)
+        counters["read_profile_transport_cq_timed_calls"] = 0
+        self.assertNotIn("kv_case_read_transport_observations", campaign.read_diagnostic_metrics(evidence, {}))
+        write = write_diagnostics()
+        write["profile"]["stages"] = {"write_profile_client_transport_cq_timed_calls": 10,
+                                      "write_profile_client_transport_tx_all_slots_pending_polls": 3,
+                                      "write_profile_transport_receive_post_would_block": 2}
+        text = campaign.write_diagnostic_metrics(write, {})
+        self.assertIn('counter="write_profile_client_transport_tx_all_slots_pending_polls"} 3', text)
+        self.assertIn('counter="write_profile_transport_receive_post_would_block"} 2', text)
+
+    def test_native_inventory_is_boundary_evidence_not_zero_filled_io(self):
+        evidence = write_diagnostics()
+        evidence["profile"]["value_wal_persistence"].update(
+            sampled_registered_files_min=None, sampled_registered_files_max=None)
+        evidence["profile"]["value_wal_inventory"] = {
+            "start": None, "end": {"available": True, "registered_files": 80, "logical_file_length_bytes": 335544320}}
+        text = campaign.write_diagnostic_metrics(evidence, {})
+        self.assertIn('scope="measurement_boundary"', text)
+        self.assertIn('kv_case_native_wal_registered_files{phase="measurement",scope="measurement_boundary",diagnostic_backend="native",boundary="end"} 80', text)
+        self.assertNotIn('boundary="start"', text)
+        self.assertNotIn('counter="sampled_registered_files_min"', text)
+        evidence["profile"]["value_wal_inventory"]["end"] = {"available": False, "error": "stat failed"}
+        text = campaign.write_diagnostic_metrics(evidence, {})
+        self.assertNotIn('kv_case_native_wal_registered_files{', text)
+        evidence["profile"]["value_wal_inventory"]["end"]["registered_files"] = 0
+        with self.assertRaisesRegex(ValueError, "unavailable"):
+            campaign.write_diagnostic_metrics(evidence, {})
+
     def test_write_diagnostics_absence_and_unavailable_stages_are_not_zeros(self):
         self.assertEqual(campaign.write_diagnostic_metrics(None, {}), "")
         value = write_diagnostics()
@@ -638,6 +997,22 @@ class CaseIdentityTests(unittest.TestCase):
         self.assertNotIn('component="stages"', text)
         self.assertIn('scope="sampled_prefix",diagnostic_backend="native"} 0', text)
         self.assertIn('scope="measurement_boundary_cumulative_delta",diagnostic_backend="native"} 1', text)
+
+    def test_unavailable_checkpoint_phases_do_not_export_stale_clocks(self):
+        value = write_diagnostics()
+        value["profile"]["coordinator_interval"] = {
+            "scope": "measurement_boundary_cumulative_delta",
+            "clock_scope": "completed checkpoint phases",
+            "stages": {"write_checkpoint_diagnostic_root_adoption_ns": 3000000,
+                       "write_checkpoint_diagnostic_root_adoption_count": 2}}
+        for available in (None, False, True):
+            value["profile"]["coordinator_checkpoint_diagnostics_available"] = available
+            text = campaign.write_diagnostic_metrics(value, {})
+            with self.subTest(available=available):
+                self.assertEqual('stage="write_checkpoint_diagnostic_root_adoption_ns"' in text,
+                                 available is True)
+                self.assertEqual('counter="write_checkpoint_diagnostic_root_adoption_count"' in text,
+                                 available is True)
 
     def test_coordinator_interval_absence_or_counter_reset_does_not_invent_zero(self):
         value = write_diagnostics()
@@ -811,6 +1186,164 @@ class IndustryInfoTests(unittest.TestCase):
     def test_info_target_must_match_selected_engine(self):
         with self.assertRaises(ValueError):
             campaign.info_payload(self.target("garnet"), {"backend": "kvrocks"}, {})
+
+
+class CorrelatedTimingTests(unittest.TestCase):
+    def test_valkey_pipeline_and_cq_keep_independent_observed_populations(self):
+        cq = {"poll_wait_ns": 100, "poll_calls": 2, "cq_poll_ns": 8,
+              "cq_poll_calls": 4, "wake_to_cq_ns": 0, "wake_to_cq_samples": 0,
+              "clock_failures": 0}
+        record = {"operation": "get_many", "pipeline_outcome": "ok",
+                  "mutex_wait_ns": 0, "command_encode_ns": 30, "cq": cq, "worker_finished": True}
+        artifact = {"profile": {"cq_available": True, "records": [
+            record, record | {"pipeline_outcome": "cancelled", "command_encode_ns": None, "cq": None, "worker_finished": False}]}}
+        summary = campaign.summarize_correlated_timings("valkey", artifact, "valkey_rdma")
+        text = campaign.terminal_metrics({"status": "failed", "correlation_summaries": [summary]}, {})
+        self.assertIn('scope="client_pipeline",population="get_many_ok",stage="command_encode"} 3e-08', text)
+        self.assertIn('scope="client_cq",population="get_many_ok",stage="poll_wait"} 2', text)
+        self.assertIn('scope="client_pipeline",population="get_many_cancelled",stage="mutex_wait"} 0.0', text)
+        self.assertNotIn('stage="wake_to_cq"', text)
+        self.assertNotIn('stage="reply_decode"', text)
+        self.assertNotIn("caller_sample_id", text)
+        artifact["profile"]["records"][0]["cq"]["clock_failures"] = 1
+        partial = campaign.summarize_correlated_timings("valkey", artifact, "valkey_rdma")
+        self.assertEqual(partial["availability"]["cq_clock_failure_records"], 1)
+        self.assertEqual(partial["availability"]["cq_clock_failures"], 1)
+        self.assertEqual(partial["availability"]["unfinished_workers"], 1)
+        self.assertEqual(partial["availability"]["cq_missing_records"], 1)
+        text = campaign.correlated_timing_metrics([partial], {})
+        self.assertNotIn("client_cq", text)
+        self.assertIn('population="cq_clock_failures"} 1', text)
+        unavailable = campaign.summarize_correlated_timings("valkey",
+            {"profile": {"cq_available": False, "records": []}}, "valkey_tcp")
+        self.assertIn('status="unavailable"} 1', campaign.correlated_timing_metrics([unavailable], {}))
+
+    def test_read_pairs_are_local_and_nvme_io_uses_queue_and_token(self):
+        def event(name, timestamp, queue=None, token=None):
+            return {"name": name, "elapsed_ns": timestamp, "io_queue_id": queue, "io_token": token}
+        group = {"membership_classified": True, "events": [
+            event("live_io_sqe_submitted", 10, 1, 7),
+            event("live_io_sqe_submitted", 11, 2, 7),
+            event("live_io_cqe_observed", 20, 2, 7),
+            event("live_io_cqe_observed", 30, 1, 7),
+            event("live_resolve_started", 40)]}
+        call = {"status": "complete", "events": [event("api_started", 1), event("api_finished", 101)],
+                "groups": [group, group | {"membership_classified": False}]}
+        artifact = {"profile": {"caller_correlation": {"trace": {"calls": [call]}}}}
+        summary = campaign.summarize_correlated_timings("read", artifact, "tidehunter_live_nvmeof")
+        stages = {(s["scope"], s["stage"]): s for s in summary["stages"]}
+        self.assertEqual((stages["read_group", "live_io"]["sum_ns"],
+                          stages["read_group", "live_io"]["count"]), (29, 2))
+        self.assertNotIn(("read_group", "live_resolve"), stages)
+        text = campaign.correlated_timing_metrics([summary], {})
+        self.assertIn('population="complete",stage="api"} 1e-07', text)
+        self.assertNotIn("io_token", text)
+
+    def test_write_group_not_multiplied_by_callers_and_partial_endpoints_omitted(self):
+        def event(stage, timestamp, owner=None):
+            return {"stage": stage, "elapsed_ns": timestamp, "owner": owner, "envelope_id": None}
+        record = {"completed": True, "error": None, "events": [
+            event("caller_start", 10), event("caller_finished", 100),
+            event("live_reserve_started", 20, 0), event("live_reserve_completed", 50, 0),
+            event("live_io_started", 60, 0)]}
+        persistence = {"persist_total_ns": 80, "persist_calls": 1,
+                       "persist_wal_file_ns": 0, "file_persist_calls": 0}
+        artifact = {"timeline": {"records": [record, record],
+            "owner_records": [{"success": True, "append_validation_ns": 35},
+                              {"success": False, "append_validation_ns": None}],
+            "live_groups": [{"owner_validation_ns": 25, "owner_persistence": persistence},
+                            {"owner_validation_ns": None, "owner_persistence": None}]}}
+        summary = campaign.summarize_correlated_timings("write", artifact, "tidehunter_live_nvmeof")
+        stages = {(s["scope"], s["stage"]): s for s in summary["stages"]}
+        self.assertEqual(stages["write_call", "live_reserve"]["count"], 2)
+        self.assertEqual(stages["live_owner_group", "owner_validation"]["count"], 1)
+        self.assertEqual(stages["write_owner_envelope", "append_validation"]["count"], 1)
+        self.assertNotIn(("write_call", "live_io"), stages)
+        self.assertNotIn(("live_owner_persistence", "persist_wal_file"), stages)
+        self.assertEqual(stages["live_owner_persistence", "persist_total"]["sum_ns"], 80)
+
+    def test_invalid_summaries_and_absence(self):
+        self.assertEqual(campaign.correlated_timing_metrics(None, {}), "")
+        self.assertEqual(campaign.summarize_correlated_timings("valkey", {"profile": None},
+                                                              "valkey_tcp")["stages"], [])
+        bad = {"schema_version": 1, "kind": "read", "backend": "tidehunter_tcp",
+               "stages": [{"scope": "read_call", "population": "complete", "stage": "api",
+                           "sum_ns": 0, "count": 0}]}
+        with self.assertRaises(ValueError):
+            campaign.correlated_timing_metrics([bad], {})
+        bad["stages"][0]["count"] = 1
+        with self.assertRaises(ValueError):
+            campaign.correlated_timing_metrics([bad, bad], {})
+        bad["stages"][0]["stage"] = "caller_123"
+        with self.assertRaises(ValueError):
+            campaign.correlated_timing_metrics([bad], {})
+
+
+class LiveSpdkExporterTests(unittest.TestCase):
+    def test_live_read_and_write_selections_render_admitted_intervals(self):
+        path = Path(__file__).resolve().parents[2] / "nvmeof" / "spdk_measurement.py"
+        spec = importlib.util.spec_from_file_location("spdk_measurement", path)
+        measurement = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(measurement)
+        for profile in ("read-concurrent", "write-concurrent"):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as directory:
+                selected = job() | {"backend": "tidehunter_nvme_rdma", "nvmeof_route": "live",
+                                    "nvmeof_target": "spdk", "profile": profile, "value_size": 65536}
+                start = []
+                for index in range(5):
+                    daemon = {"pid": 100 + index, "process_start_ticks": 10, "executable": "/bin/nvmf_tgt",
+                              "executable_device": 1, "executable_inode": 2, "binary_sha256": "a" * 64,
+                              "rpc_socket": "/run/rpc", "rpc_device": 3, "rpc_inode": 4}
+                    start.append({"case_id": selected["case_id"], "index": index, "target": {
+                        "daemon": daemon, "bdevs": [{"name": "wal"}], "subsystems": [],
+                        "iostat": {"ticks": 100, "tick_rate": 1000000, "bdevs": [
+                            {"name": "wal", "bytes_read": 4096, "num_read_ops": 1,
+                             "bytes_written": 4096, "num_write_ops": 1,
+                             "read_latency_ticks": 10, "write_latency_ticks": 20}]}}})
+                end = copy.deepcopy(start)
+                for row in end:
+                    stats = row["target"]["iostat"]
+                    stats["ticks"] += 1000000
+                    stats["bdevs"][0].update(bytes_read=12288, num_read_ops=3, read_latency_ticks=50,
+                                              bytes_written=8192, num_write_ops=2, write_latency_ticks=50)
+                binding = {}
+                for boundary, rows in (("start", start), ("end", end)):
+                    name = "spdk-target-" + boundary + ".json"
+                    raw = json.dumps(rows).encode()
+                    (Path(directory) / name).write_bytes(raw)
+                    binding[boundary] = {"path": name, "sha256": hashlib.sha256(raw).hexdigest()}
+                evidence = measurement.admit_live(directory, binding)
+                selection = {"job": selected, "results": str(Path(directory) / selected["case_id"] / "result"),
+                             "terminal": {"status": "completed", "spdk_target_io": evidence}}
+                text = campaign.benchmark_payload({"run_id": "run", "stale_seconds": 30}, selection).decode()
+                self.assertIn('requested_backend="tidehunter_spdk_live_rdma"', text)
+                self.assertIn('requested_nvmeof_route="live",requested_nvmeof_target="spdk"', text)
+                self.assertIn('target_owner="all",direction="read"} 10', text)
+                self.assertIn('target_owner="all",direction="write"} 5', text)
+                self.assertIn('target_owner="all",direction="read"} 40960', text)
+                self.assertIn('target_owner="all",direction="write"} 20480', text)
+                self.assertIn('target_owner="all",direction="read",statistic="mean"} 2e-05', text)
+                self.assertIn('target_owner="all",direction="write",statistic="mean"} 3e-05', text)
+                self.assertIn('target_owner="all"} 0', text)
+                self.assertNotIn("kv_spdk_live_target_io_errors", text)
+                self.assertNotIn("kv_spdk_target_read_ops", text)
+
+    def test_partial_owner_metrics_do_not_invent_aggregate_or_error_counts(self):
+        owners = [{"index": i, "available": True, "io_error_available": False,
+                   "read_ops": 2, "read_bytes": 8192, "mean_read_completion_us": 20,
+                   "write_ops": 1, "write_bytes": 4096, "mean_write_completion_us": 30}
+                  for i in range(5)]
+        owners[2] = {"index": 2, "available": False, "reason": "rotated"}
+        text = campaign.spdk_target_metrics({"kind": "live", "available": False, "owners": owners}, {})
+        availability = re.search(
+            r'(?m)^kv_spdk_live_target_evidence_available(?:\{\})? (\S+)$', text)
+        self.assertIsNotNone(availability)
+        self.assertEqual(float(availability.group(1)), 0)
+        self.assertIn('target_owner="2"', text)
+        self.assertIn('kv_spdk_live_target_io_error_available', text)
+        self.assertNotIn('kv_spdk_live_target_io_errors', text)
+        self.assertNotIn('target_owner="all"', text)
+        self.assertNotIn('kv_spdk_target_read_ops', text)
 
 
 if __name__ == '__main__':

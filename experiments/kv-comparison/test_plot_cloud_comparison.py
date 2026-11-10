@@ -1,13 +1,14 @@
 """Behavioral data-integrity and offline rendering tests; no benchmark execution."""
 import copy
 import csv
+import json
 from pathlib import Path
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 
 import plot_cloud_comparison as plots
-from cloud_campaign import LEGACY_BACKENDS
+from cloud_campaign import LEGACY_BACKENDS, make_matrix
 
 
 def population(operation="read", outcome="success", count=10, p50=100, p99=900):
@@ -80,6 +81,76 @@ def full_matrix_cases(repeats=(0,)):
             item["metrics"]["success_value_mib_per_second"] = 50 * size / 1024**2
             result.append(item)
     return result
+
+
+class NativeWriteBoundaries(unittest.TestCase):
+    def test_reference_is_plotted_separately_without_changing_primary(self):
+        items = []
+        for size in plots.SIZES:
+            for cohort, value in (("primary_rf1", 100), ("native_async_write", 25)):
+                item = case("native", populations=[population("put", p50=value, p99=value)])
+                identity = f"native-{cohort}-{size}"
+                item["case_id"] = identity
+                item["job"].update(case_id=identity, cohort=cohort,
+                                   profile="write-concurrent", value_size=size)
+                items.append(item)
+        figures, _ = plots.build_figures(dataset(items, ("native",)))
+        figure = next(row for row in figures if row["name"] == "native-write-boundaries")
+        series = figure["panels"][0]["series"]
+        self.assertEqual({row["points"][0]["median"] for row in series}, {25, 100})
+
+    def test_generated_backend_settings_do_not_change_workload_matching(self):
+        spec = json.loads(Path(__file__).with_name("cloud-campaign.json").read_text())
+        backends = ["native", "tidehunter_tcp", "tikv"]
+        spec.update(backends=backends, repeats=2)
+        items = []
+        for job in make_matrix(spec):
+            if (job["cohort"], job["profile"], job["value_size"]) != (
+                    "primary_rf1", "write-concurrent", 1024):
+                continue
+            item = case(job["backend"], job["repeat"],
+                        populations=[population("put", count=job["measurement_operations"])])
+            item.update(case_id=job["case_id"], job=job)
+            items.append(item)
+        cells = [(backend, "primary_rf1", "write-concurrent", 1024) for backend in backends]
+        self.assertEqual(dataset(items).matched_repeats(cells), [0, 1])
+        for field, value in (("native_wal_geometry", "small"), ("concurrency", 1)):
+            changed = copy.deepcopy(items)
+            next(row["job"] for row in changed
+                 if row["job"]["backend"] == "native" and row["job"]["repeat"] == 1)[field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                dataset(changed)
+
+    def test_native_preset_cannot_change_between_repetitions(self):
+        items = [case("native", repeat) for repeat in (0, 1)]
+        for item in items:
+            item["backend"]["configuration"] = {"native_config_preset": "default"}
+        cell = ("native", "primary_rf1", "read-concurrent", 64)
+        self.assertEqual(dataset(items).matched_repeats([cell]), [0, 1])
+        items[1]["backend"]["configuration"]["native_config_preset"] = "small"
+        with self.assertRaisesRegex(ValueError, "backend implementation contract changed"):
+            dataset(items)
+        del items[1]["backend"]["configuration"]["native_config_preset"]
+        with self.assertRaisesRegex(ValueError, "backend implementation contract changed"):
+            dataset(items)
+
+    def test_one_backend_cannot_join_two_durability_tiers_and_the_tier_is_exported(self):
+        items = [case("tidehunter_tcp", repeat) for repeat in (0, 1)]
+        for item in items:
+            item["job"]["durability_tier"] = "synchronous"
+        data = dataset(items)
+        self.assertEqual(data.durability_tiers, {"tidehunter_tcp": "synchronous"})
+        self.assertEqual(plots.evidence_appendix(data)[0]["durability_tier"], "synchronous")
+        # A second tier for the same backend, even at another size, is refused.
+        other = case("tidehunter_tcp", 2)
+        other["job"].update(durability_tier="native", value_size=256)
+        other["case_id"] = other["job"]["case_id"] = "tidehunter_tcp-read-concurrent-256-r2"
+        with self.assertRaisesRegex(ValueError, "durability tier changes within one dataset"):
+            dataset(items + [other])
+        # A pre-tier case does not silently join a tiered series either.
+        legacy = case("tidehunter_tcp", 2)
+        with self.assertRaisesRegex(ValueError, "implementation contract changed|durability tier changes"):
+            dataset(items + [legacy])
 
 
 class IndustryComparatorEvidence(unittest.TestCase):
@@ -538,6 +609,26 @@ class DuplicateIdentityIntegrity(unittest.TestCase):
 
 
 class NvmeTcpEvidenceReporting(unittest.TestCase):
+    def test_live_route_is_distinct_from_sealed_and_evidence_preserved(self):
+        live = case("tidehunter_nvme_tcp")
+        live["job"]["nvmeof_route"] = "live"
+        live["backend"]["name"] = "tidehunter_live_nvmeof"
+        live["measurement_read_evidence"] = {"observed": {"nvmeof": {"available": False}}}
+        live["nvmeof_measurement_qualification"] = {"qualified": False}
+        data = dataset([case("native"), live])
+        appendix = plots.evidence_appendix(data)[1]
+        self.assertEqual(appendix["requested_nvmeof_route"], "live")
+        self.assertEqual(appendix["evidence"]["measurement_read_evidence"], live["measurement_read_evidence"])
+        self.assertEqual(appendix["evidence"]["nvmeof_measurement_qualification"], live["nvmeof_measurement_qualification"])
+        sealed = self.sealed_case("tidehunter_nvme_tcp")
+        sealed["job"]["nvmeof_route"] = "sealed_read"
+        sealed["backend"]["name"] += "_sealed_read"
+        sealed_data = dataset([sealed])
+        self.assertEqual(plots.evidence_appendix(sealed_data)[0]["requested_nvmeof_route"], "sealed_read")
+        live["job"]["nvmeof_route"] = "sealed_read"
+        with self.assertRaisesRegex(ValueError, "population disagree"):
+            dataset([live])
+
     def sealed_case(self, backend, profile="baseline", repeat=0, status="completed"):
         item = case(backend, repeat, status)
         identity = f"{backend}-{profile}-r{repeat}"
@@ -550,6 +641,106 @@ class NvmeTcpEvidenceReporting(unittest.TestCase):
         if profile == "diagnostic" and backend != "native":
             item["job"]["diagnostics"] = {"read_profile_limit": 256}
         return item
+
+    def test_spdk_and_kernel_targets_keep_distinct_latency_populations(self):
+        kernel = self.sealed_case("tidehunter_nvme_rdma")
+        kernel["job"]["nvmeof_route"] = "sealed_read"
+        kernel["backend"]["name"] += "_sealed_read"
+        spdk = copy.deepcopy(kernel)
+        spdk["case_id"] = spdk["job"]["case_id"] = spdk["case_id"] + "-spdk"
+        spdk["job"]["nvmeof_target"] = "spdk"
+        spdk["job"]["sealed_dataset"].update(
+            target_cache="direct_file_bdev_no_OS_pagecache", directness="target_O_DIRECT",
+            cold_claim="OS cache bypass is not a NAND latency claim")
+        spdk["metrics"]["populations"][0]["api_ns"]["p50"] = 200
+        data = dataset([kernel, spdk], ["tidehunter_nvme_rdma", "tidehunter_spdk_rdma"])
+        figures, _ = plots.build_figures(data)
+        figure = next(row for row in figures if row["name"] == "sealed_read-baseline")
+        observed = {series["backend"]: series["points"][0]["median"]
+                    for series in figure["panels"][0]["series"]}
+        self.assertEqual(observed, {"tidehunter_nvme_rdma": 100, "tidehunter_spdk_rdma": 200})
+
+    def test_live_spdk_and_kernel_plot_as_distinct_matched_series(self):
+        items = []
+        for size in plots.SIZES:
+            kernel = case("tidehunter_nvme_rdma")
+            kernel["case_id"] = kernel["job"]["case_id"] = f"kernel-{size}"
+            kernel["job"].update(value_size=size, nvmeof_route="live")
+            kernel["backend"]["name"] = "tidehunter_live_nvmeof"
+            spdk = copy.deepcopy(kernel)
+            spdk["case_id"] = spdk["job"]["case_id"] = f"spdk-{size}"
+            spdk["job"]["nvmeof_target"] = "spdk"
+            spdk["metrics"]["populations"][0]["api_ns"]["p50"] = 200
+            items.extend((kernel, spdk))
+        data = dataset(items, ["tidehunter_nvme_rdma", "tidehunter_spdk_live_rdma"])
+        figures, _ = plots.build_figures(data)
+        figure = next(row for row in figures if row["name"] == "primary-read-concurrent")
+        observed = {series["backend"]: series["points"][0]["median"]
+                    for series in figure["panels"][0]["series"]}
+        self.assertEqual(observed, {"tidehunter_nvme_rdma": 100, "tidehunter_spdk_live_rdma": 200})
+        self.assertEqual(plots.evidence_appendix(data)[1]["requested_nvmeof_target"], "spdk")
+
+    def test_generated_tcp_verbs_nvme_rdma_plan_keeps_distinct_series_and_contracts(self):
+        spec = {
+            "schema_version": 1, "mode": "nvmeof-focused", "seed": 1775, "repeats": 1,
+            "value_sizes": list(plots.SIZES),
+            "backends": ["native", "tidehunter_tcp", "tidehunter_verbs_native", "tidehunter_nvme_rdma"],
+            "keys": 4096, "max_cases": 2000, "offered_rates": [1000, 10000, 50000],
+            "offered_seconds": 8, "case_deadline_seconds": 600,
+            "hard_deadline_seconds": 10800, "export_reserve_seconds": 600,
+        }
+        jobs = make_matrix(spec)
+        items = []
+        expected = {}
+        for job in jobs:
+            operation = next(name for name, weight in job["mix"].items() if weight)
+            value = 100 + 10 * len(items)
+            item = case(job["backend"], populations=[
+                population(operation, count=job["measurement_operations"], p50=value, p99=value * 10)])
+            item["case_id"], item["job"] = job["case_id"], copy.deepcopy(job)
+            if job.get("nvmeof_route") == "sealed_read":
+                item["backend"]["name"] = job["backend"] + "_sealed_read"
+            logical_keys = job["measurement_operations"] * (32 if operation in ("get_many", "put_batch") else 1)
+            item["metrics"]["populations"][0]["logical_keys"] = logical_keys
+            item["metrics"]["success_logical_keys_per_second"] = logical_keys
+            item["metrics"]["success_value_mib_per_second"] = (
+                logical_keys * job["value_size"] / 1024**2)
+            items.append(item)
+            if job["value_size"] == 1024 and job["profile"] == "first_touch-scalar-c1-baseline":
+                expected[job["backend"]] = value
+        data = dataset(items)
+        figures, _ = plots.build_figures(data)
+        reads = next(row for row in figures if row["name"] == "sealed_read-first_touch-scalar-c1-baseline")
+        actual = {series["backend"]: next(point["median"] for point in series["points"]
+                                         if point["value_bytes"] == 1024)
+                  for series in reads["panels"][0]["series"]}
+        self.assertEqual(actual, expected)
+        writes = next(row for row in figures if row["name"] == "native_write_regression-write-c16-baseline")
+        self.assertEqual({series["backend"] for series in writes["panels"][0]["series"]},
+                         set(spec["backends"]) - {"tidehunter_nvme_rdma"})
+        originals = [item for item in items if item["job"]["cohort"] == "sealed_read"
+                     and item["job"]["value_size"] == 1024
+                     and item["job"]["profile"] == "first_touch-scalar-c1-baseline"]
+        mislabeled = copy.deepcopy(next(item for item in originals
+                                         if item["job"]["backend"] == "tidehunter_nvme_rdma"))
+        mislabeled["backend"]["name"] = "tidehunter_nvme_rdma"
+        with self.assertRaisesRegex(ValueError, "job and observed backend differ"):
+            dataset([mislabeled])
+        repeated = copy.deepcopy(next(item for item in originals
+                                     if item["job"]["backend"] == "tidehunter_nvme_rdma"))
+        repeated["case_id"] = repeated["job"]["case_id"] = repeated["case_id"] + "-r1"
+        repeated["job"]["repeat"] = 1
+        repeated["job"]["sealed_dataset"]["directness"] = "changed"
+        with self.assertRaisesRegex(ValueError, "implementation contract changed"):
+            dataset(originals + [repeated])
+        changed = copy.deepcopy(originals)
+        changed[-1]["job"]["concurrency"] = 2
+        with self.assertRaisesRegex(ValueError, "workload contract changed"):
+            dataset(changed)
+        changed = copy.deepcopy(originals)
+        changed[-1]["job"]["sealed_dataset"]["data_id"] = "different-logical-data"
+        with self.assertRaisesRegex(ValueError, "logical dataset contract changed"):
+            dataset(changed)
 
     def test_sealed_observations_retain_backend_source_and_case_identity(self):
         native = self.sealed_case("native")

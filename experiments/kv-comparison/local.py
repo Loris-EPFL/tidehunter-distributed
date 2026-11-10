@@ -30,6 +30,48 @@ IMAGES = {
 # TiKV 8.5.4 rejects the hosted runner's inherited 65,536-descriptor limit.
 TIKV_NOFILE = 1_048_576
 
+# PD reports sampled state, not a guarantee that future scheduling will stop.
+TIKV_STABLE_SECONDS = 5
+
+
+class TikvSteadyAdmission:
+    def __init__(self):
+        self.first = None
+        self.signature = None
+
+    def reset(self):
+        self.first = None
+        self.signature = None
+
+    def observe(self, regions, running, waiting, now):
+        if not isinstance(running, list) or not isinstance(waiting, list):
+            raise RuntimeError("PD operator response is not a list")
+        if running or waiting:
+            self.reset()
+            raise RuntimeError("PD has running or waiting operators")
+        rows = regions.get("regions")
+        if not isinstance(rows, list) or not rows or regions.get("count") != len(rows):
+            raise RuntimeError("PD region listing is incomplete")
+        selected = []
+        for row in rows:
+            if not all(key in row for key in ("id", "start_key", "end_key", "epoch", "peers", "leader")):
+                raise RuntimeError("PD region routing metadata is incomplete")
+            if not isinstance(row["epoch"], dict) or not all(key in row["epoch"] for key in ("conf_ver", "version")):
+                raise RuntimeError("PD region epoch is incomplete")
+            selected.append({key: row[key] for key in ("id", "start_key", "end_key", "epoch", "peers", "leader")})
+        selected.sort(key=lambda row: row["id"])
+        signature = json.dumps(selected, sort_keys=True, separators=(",", ":"))
+        sample = {"observed_at_unix": time.time(), "regions": regions, "running_operators": running,
+                  "waiting_operators": waiting}
+        if signature != self.signature:
+            self.signature, self.first = signature, (now, sample)
+            return None
+        if now - self.first[0] < TIKV_STABLE_SECONDS:
+            return None
+        return {"minimum_stable_seconds": TIKV_STABLE_SECONDS,
+                "observed_stable_seconds": now - self.first[0],
+                "first": self.first[1], "last": sample}
+
 
 def dump(path, value):
     path = Path(path)
@@ -439,13 +481,30 @@ def probe(state):
 def ready(state, timeout):
     deadline = time.monotonic() + timeout
     error = None
+    steady = TikvSteadyAdmission() if state["backend"] == "tikv" else None
     while time.monotonic() < deadline:
         try:
             proof = probe(state)
+            if steady is not None:
+                running = http("/pd/api/v1/operators?object=true")
+                waiting = http("/pd/api/v1/operators?kind=waiting&object=true")
+                dump(Path(state["directory"]) / "probe-attempt.json",
+                     {"regions": proof["regions"], "running_operators": running, "waiting_operators": waiting,
+                      "observed_at_unix": time.time()})
+                observation = steady.observe(proof["regions"], running, waiting, time.monotonic())
+                if observation is None:
+                    error = "PD region topology has not remained stable for five seconds"
+                    time.sleep(min(1, max(0, deadline - time.monotonic())))
+                    continue
+                proof["steady_admission"] = observation
+            if steady is not None and time.monotonic() >= deadline:
+                raise RuntimeError("readiness deadline reached during probe")
             dump(Path(state["directory"]) / "deployment.json", {"observed_at_unix": time.time(), "topology": state, "observed": proof})
             return proof
         except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as exc:
             error = str(exc)
+            if steady is not None:
+                steady.reset()
             time.sleep(min(1, max(0, deadline - time.monotonic())))
     raise RuntimeError(f"requested {state['backend']} readiness failed: {error}")
 

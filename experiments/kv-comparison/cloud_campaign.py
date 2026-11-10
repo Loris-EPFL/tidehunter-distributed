@@ -4,10 +4,13 @@ import argparse
 import csv
 import copy
 import hashlib
+import ipaddress
 import json
 from pathlib import Path
 import random
 import statistics
+import re
+import uuid
 import sys
 
 import analyze
@@ -16,6 +19,7 @@ import resource_accounting
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from portable_transport import runtime_backend, transport_for_case, validate_transport, protocol_key, select_backends
+from nvmeof import spdk_measurement
 
 LEGACY_BACKENDS = ("native", "tidehunter_tcp", "tidehunter_efa", "tidehunter_efa_direct",
                    "tidehunter_efa_native", "tikv", "cassandra", "foundationdb")
@@ -27,24 +31,138 @@ NVME_BACKENDS = {"tidehunter_nvme_tcp", "tidehunter_nvme_rdma"}
 for name in NVME_BACKENDS:
     TRANSPORTS[name] = transport_for_case("tidehunter_tcp")
 MIX_FIELDS = ("read", "put", "delete", "missing_read", "get_many", "put_batch")
+# Owner acknowledgement tier of every Tidehunter case. `synchronous` waits for the covering WAL
+# barrier and matches native `value_wal_barrier` and Valkey `appendfsync always`; `native` acks after
+# the page-cache write and matches only native `page_cache`. Tiers are never mixed in a comparison.
+DURABILITY_TIERS = ("native", "synchronous")
+# Tier given to jobs of a newly generated matrix. A job record without a tier predates tiers and
+# ran the engine default, which is native.
+DEFAULT_DURABILITY_TIER = "synchronous"
+ONE_OWNER_CASE_KINDS = frozenset({"remote_put"})
+
+
+
+def durability_tier(job):
+    """Planned tier of a Tidehunter case; other backends have no owner tier."""
+    if job["backend"] not in TRANSPORTS:
+        return None
+    tier = job.get("durability_tier", "native")
+    if tier not in DURABILITY_TIERS:
+        raise ValueError("invalid durability_tier")
+    return tier
+
+def active_owner_count(job):
+    count = job.get("owner_count", 5)
+    if type(count) is not int or count not in (1, 5):
+        raise ValueError("owner_count must be 1 or 5")
+    if count == 1 and (job.get("case_kind") not in ONE_OWNER_CASE_KINDS
+                       or job.get("backend") not in ("tidehunter_verbs_native", "tidehunter_tcp")
+                       or job.get("durability_tier") != "synchronous"
+                       or "sealed_dataset" in job or "nvmeof_route" in job):
+        raise ValueError("one owner is restricted to synchronous ordinary owner RPC cases")
+    return count
+
+
+def active_partitions(job):
+    return {str(index) for index in range(active_owner_count(job))}
+
+
+OWNER_RECEIPT_FIELDS = frozenset((
+    "partition", "database", "address", "launch_nonce", "pid", "boot_id", "started_unix_ns",
+    "durability"))
+
+
+def owner_receipt_path(launch):
+    """The receipt an owner process publishes next to its ready marker, before the marker."""
+    ready = Path(launch["ready_file"])
+    if ready.suffix:
+        raise ValueError("owner ready marker must have no extension")
+    return ready.with_name(ready.name + ".durability.json")
+
+
+def validate_owner_receipt(receipt, launch):
+    """The receipt must name this exact owner and launch and carry an explicit tier."""
+    durability = receipt.get("durability") if isinstance(receipt, dict) else None
+    launched = (launch.get("durability") or {}).get("tier", "native")
+    partition = launch["node"]["partition"]["partition"]
+    if (set(receipt) != OWNER_RECEIPT_FIELDS or not isinstance(durability, dict)
+            or durability.get("tier") not in DURABILITY_TIERS or durability["tier"] != launched
+            or receipt["partition"] != partition
+            or receipt["database"] != launch["node"]["partition"]["inventory"]["database"]
+            or receipt["address"] != launch["listen"]
+            or not launch.get("launch_nonce") or receipt["launch_nonce"] != launch["launch_nonce"]
+            or not isinstance(receipt["pid"], int) or not receipt["boot_id"]
+            or not isinstance(receipt["started_unix_ns"], int)):
+        raise ValueError("owner receipt does not match its owner, launch or tier")
+    return receipt
+
+
+def read_owner_receipt(launch):
+    path = owner_receipt_path(launch)
+    if not path.is_file():
+        raise FileNotFoundError("owner did not publish its receipt")
+    return validate_owner_receipt(json.loads(path.read_text()), launch)
+
+
+def owner_receipt_is_fresh(previous, receipt):
+    """Same owner and launch, but a later start by a different process incarnation."""
+    identity = ("partition", "database", "address", "launch_nonce")
+    process = ("pid", "boot_id", "started_unix_ns")
+    return (isinstance(receipt, dict) and set(receipt) == OWNER_RECEIPT_FIELDS
+            and all(receipt[name] == previous[name] for name in identity)
+            and receipt["durability"] == previous["durability"]
+            and [receipt[name] for name in process] != [previous[name] for name in process]
+            and receipt["started_unix_ns"] > previous["started_unix_ns"])
+
+
+def admit_durability_tier(job, options, manifest_path):
+    """The executed tier must be the planned one, with explicit evidence for planned tiers.
+
+    A missing executed option is the pre-tier engine default, native; it never inherits the plan,
+    so a synchronous case cannot be admitted without evidence that it executed. A job record with
+    no tier predates tiers and needs no receipt confirmation.
+    """
+    if job["backend"] not in TRANSPORTS:
+        return
+    planned = durability_tier(job)
+    if options.get("durability_tier", "native") != planned:
+        raise ValueError("Tidehunter durability_tier differs from the planned case")
+    if "durability_tier" in job:
+        executed = json.loads(Path(manifest_path).read_text()).get("durability") or {}
+        if executed.get("confirmed_by_backend_receipt") != planned:
+            raise ValueError("owner receipts did not confirm the planned durability_tier")
 
 
 def mix(**values):
     return {name: values.get(name, 0) for name in MIX_FIELDS}
 
 
-def make_matrix(spec):
+def make_matrix(spec, *, _allow_live_nvme=False):
+    """Every Tidehunter job carries its tier; jobs planned without one default to synchronous."""
+    if spec.get("mode") == "focused":
+        if spec.get("direct_control_arm") is not True:
+            raise ValueError("focused campaign requires the reviewed direct control arm")
+        return make_focused_matrix(spec.get("selection"))
+    jobs = _make_matrix(spec, _allow_live_nvme=_allow_live_nvme)
+    for job in jobs:
+        if job["backend"] in TRANSPORTS:
+            job["durability_tier"] = job.get("durability_tier", DEFAULT_DURABILITY_TIER)
+            durability_tier(job)
+    return jobs
+
+
+def _make_matrix(spec, *, _allow_live_nvme=False):
     """Block by backend to amortize server deployment; shuffle within each repeat."""
     required = {"schema_version", "seed", "repeats", "value_sizes", "backends",
                 "keys", "max_cases", "offered_rates", "offered_seconds",
                 "case_deadline_seconds", "hard_deadline_seconds", "export_reserve_seconds"}
-    if not required <= set(spec) or set(spec) - required - {"diagnostics", "mode"}:
+    if not required <= set(spec) or set(spec) - required - {"diagnostics", "mode", "spdk_comparison", "valkey_reproduction_profiles", "native_durability_cohort"}:
         raise ValueError("cloud matrix requires its explicit schema")
     if spec["schema_version"] != 1 or isinstance(spec["seed"], bool) or not isinstance(spec["seed"], int):
         raise ValueError("invalid cloud schema/seed")
     for name, lower, upper in (("repeats", 1, 10), ("keys", 1024, 65536), ("max_cases", 1, 2000),
                               ("offered_seconds", 2, 60), ("case_deadline_seconds", 60, 600),
-                              ("hard_deadline_seconds", 3600, 10800), ("export_reserve_seconds", 300, 1800)):
+                              ("hard_deadline_seconds", 3600, 21600), ("export_reserve_seconds", 300, 1800)):
         value = spec[name]
         if isinstance(value, bool) or not isinstance(value, int) or not lower <= value <= upper:
             raise ValueError(f"invalid {name}")
@@ -53,20 +171,97 @@ def make_matrix(spec):
     sizes, backends, rates = spec["value_sizes"], spec["backends"], spec["offered_rates"]
     if set(sizes) != {64, 256, 1024, 8192, 65536} or len(sizes) != 5:
         raise ValueError("full campaign requires all five value sizes without duplicates")
-    supported = set(BACKENDS) | PORTABLE_BACKENDS | (NVME_BACKENDS if spec.get("mode") == "nvmeof-focused" else set())
+    if type(spec.get("spdk_comparison", False)) is not bool:
+        raise ValueError("spdk_comparison must be a boolean")
+    if type(spec.get("native_durability_cohort", False)) is not bool:
+        raise ValueError("native_durability_cohort must be a boolean")
+    if spec.get("native_durability_cohort") and spec.get("mode") != "standard-with-live-nvmeof":
+        raise ValueError("native durability cohort requires the matched live and sealed campaign")
+    if spec.get("spdk_comparison") and (spec.get("mode") != "standard-with-live-nvmeof"
+                                      or "tidehunter_nvme_rdma" not in backends):
+        raise ValueError("SPDK comparison requires the matched live/ sealed RDMA campaign")
+    profiles = spec.get("valkey_reproduction_profiles", [])
+    if (not isinstance(profiles, list) or any(not isinstance(name, str) for name in profiles)
+            or len(profiles) != len(set(profiles))
+            or set(profiles) - {"published-as-written", "matched-ram"}
+            or profiles and not {"valkey_tcp", "valkey_rdma"} <= set(backends)):
+        raise ValueError("native Valkey profiles require both TCP and RDMA")
+    supported = set(BACKENDS) | PORTABLE_BACKENDS | (NVME_BACKENDS if _allow_live_nvme or spec.get("mode") in ("nvmeof-focused", "standard-with-nvmeof", "standard-with-live-nvmeof") else set())
     backends = select_backends(None, backends, supported)
     rates = spec["offered_rates"]
     if set(rates) != {1000, 10000, 50000} or len(rates) != 3 or any(type(rate) is not int for rate in rates):
         raise ValueError("full campaign requires all three offered rates without duplicates")
     diagnostics = spec.get("diagnostics", {})
     if (not isinstance(diagnostics, dict)
-            or set(diagnostics) - {"write_profile_limit", "read_profile_limit"}
+            or set(diagnostics) - {"write_profile_limit", "read_profile_limit", "write_timeline_limit", "valkey_profile_limit"}
             or ("diagnostics" in spec and not diagnostics)
             or any(type(value) is not int or not 0 <= value <= 65536
                    for value in diagnostics.values())):
         raise ValueError("diagnostics limits must be integers between 0 and 65536")
     diagnostics = {"write_profile_limit": diagnostics.get("write_profile_limit", 0),
-                   "read_profile_limit": diagnostics.get("read_profile_limit", 0)}
+                   "read_profile_limit": diagnostics.get("read_profile_limit", 0),
+                   "write_timeline_limit": diagnostics.get("write_timeline_limit", 0),
+                   "valkey_profile_limit": diagnostics.get("valkey_profile_limit", 0)}
+    if spec.get("mode") in ("standard-with-nvmeof", "standard-with-live-nvmeof"):
+        live = spec["mode"] == "standard-with-live-nvmeof"
+        standard_backends = backends if live else [backend for backend in backends if backend not in NVME_BACKENDS]
+        matched_backends = [backend for backend in backends if backend in
+                            ({"native", "tidehunter_tcp", "tidehunter_verbs", "tidehunter_verbs_native",
+                              "tidehunter_efa", "tidehunter_efa_direct", "tidehunter_efa_native"} | NVME_BACKENDS)]
+        expanded = {**spec, "max_cases": 2000}
+        jobs = make_matrix({**expanded, "mode": "standard", "backends": standard_backends,
+                            "spdk_comparison": False, "native_durability_cohort": False}, _allow_live_nvme=live)
+        valkey_jobs = [job for job in jobs if job["cohort"] == "valkey_client_diagnostics"]
+        jobs = [job for job in jobs if job["cohort"] != "valkey_client_diagnostics"]
+        matched = make_nvmeof_matrix(expanded, matched_backends, diagnostics)
+        for number, job in enumerate(matched, start=len(jobs)):
+            job["case_id"] = f"{number:04d}-{comparison_backend(job)}-{job['value_size']}-{job['profile']}"
+        jobs.extend(matched)
+        for number, job in enumerate(valkey_jobs, start=len(jobs)):
+            job["case_id"] = (f"{number:04d}-{job['backend']}-{job['value_size']}-"
+                              f"{job['profile']}-{job['cohort']}-r{job['repeat']}")
+        jobs.extend(valkey_jobs)
+        if spec.get("spdk_comparison"):
+            paired = []
+            for job in jobs:
+                paired.append(job)
+                if job["backend"] == "tidehunter_nvme_rdma" and job.get("nvmeof_route") == "live":
+                    twin = copy.deepcopy(job)
+                    twin["nvmeof_target"] = "spdk"
+                    paired.append(twin)
+            jobs = paired
+            # Admit every storage target early, before spending the fleet on
+            # unrelated write/load controls. Keep each immutable source block intact.
+            jobs = ([job for job in jobs if job["cohort"] == "sealed_read"]
+                    + [job for job in jobs if job["cohort"] != "sealed_read"])
+            for number, job in enumerate(jobs):
+                job["case_id"] = (f"{number:04d}-{comparison_backend(job)}-{job['value_size']}-"
+                                  f"{job['profile']}-{job['cohort']}-r{job['repeat']}")
+        if spec.get("native_durability_cohort"):
+            sealed_native, standard_native = [], []
+            for job in jobs:
+                if job["backend"] not in TRANSPORTS:
+                    continue
+                sealed = (job["cohort"] == "sealed_read"
+                          and "-scalar-" in job["profile"]
+                          and job["profile"].endswith("-baseline"))
+                standard = (job["cohort"] == "primary_rf1"
+                            and job["profile"] in ("point-mixed", "read-many32", "write-concurrent"))
+                if not (sealed or standard):
+                    continue
+                twin = copy.deepcopy(job)
+                twin["durability_tier"] = "native"
+                twin["case_id"] += "-durability-native"
+                if sealed:
+                    twin["sealed_dataset"]["source_id"] += "-durability-native"
+                    sealed_native.append(twin)
+                else:
+                    standard_native.append(twin)
+            split = next((i for i, job in enumerate(jobs) if job["cohort"] != "sealed_read"), len(jobs))
+            jobs = jobs[:split] + sealed_native + jobs[split:] + standard_native
+        if len(jobs) > spec["max_cases"]:
+            raise ValueError(f"matrix contains {len(jobs)} cases, exceeding explicit max_cases")
+        return jobs
     if spec.get("mode") == "nvmeof-focused":
         return make_nvmeof_matrix(spec, backends, diagnostics)
     if spec.get("mode", "standard") == "read-tier-focused":
@@ -89,7 +284,12 @@ def make_matrix(spec):
                            (1024, "read-concurrent"), (8192, "read-many32"))]
         comparisons += [job for job in standard_jobs if job["cohort"] == "write_stage_diagnostics"
                         and job["value_size"] == 1024 and job["profile"] == "write-concurrent"]
+        comparisons += [job for job in standard_jobs if job["cohort"] == "write_timeline_diagnostics"
+                        and job["value_size"] == 1024 and job["profile"] == "write-concurrent"]
+        comparisons += [job for job in standard_jobs if job["cohort"] == "native_async_write"
+                        and job["value_size"] == 1024]
         jobs = early + comparisons + later
+        jobs.extend(job for job in standard_jobs if job["cohort"] == "valkey_client_diagnostics")
         if len(jobs) > spec["max_cases"]:
             raise ValueError(f"matrix contains {len(jobs)} cases, exceeding explicit max_cases")
         return jobs
@@ -103,7 +303,7 @@ def make_matrix(spec):
         ("write-concurrent", mix(put=100), 16, 4096),
         ("read-many32", mix(get_many=100), 16, 2048),
     ]
-    jobs, read_jobs, fast_read_jobs = [], [], []
+    jobs, read_jobs, fast_read_jobs, async_write_jobs = [], [], [], []
     for repeat in range(spec["repeats"]):
         order = list(backends)
         random.Random(spec["seed"] + repeat).shuffle(order)
@@ -111,16 +311,26 @@ def make_matrix(spec):
             block = []
             def add(label, size, operation_mix, concurrency, count, *, cohort="primary_rf1",
                     rate=None, distribution="uniform", keys=None, cache=0, warmup=512):
-                block.append({"backend": backend, "repeat": repeat, "profile": label,
+                job = {"backend": backend, "repeat": repeat, "profile": label,
                     "cohort": cohort, "value_size": size, "keys": keys or spec["keys"],
                     "mix": operation_mix, "concurrency": concurrency, "measurement_operations": count,
                     "warmup_operations": warmup, "offered_ops_per_second": rate,
                     "distribution": distribution, "coordinator_cache_bytes": cache,
                     "drop_os_caches": cohort == "cold_os_cache",
-                    "native_durability": "page_cache" if cohort == "native_pagecache" else "value_wal_barrier"})
+                    "native_durability": "page_cache" if cohort == "native_pagecache" else "value_wal_barrier"}
+                if backend == "native":
+                    job["native_wal_geometry"] = "native_default"
+                if backend in NVME_BACKENDS:
+                    job["nvmeof_route"] = "live"
+                if backend in TRANSPORTS:
+                    job["owner_read_resident_first"] = cohort != "cold_os_cache"
+                block.append(job)
             for size in sizes:
                 for label, operation_mix, concurrency, count in profiles:
                     add(label, size, operation_mix, concurrency, count)
+                # External comparators lacking atomic batches cannot join this cohort.
+                if _allow_live_nvme and (backend == "native" or backend in TRANSPORTS):
+                    add("write-batch32", size, mix(put_batch=100), 16, 2048)
             for rate in rates:
                 add(f"offered-{rate}", 1024, mix(read=70, put=30), 32,
                     rate * spec["offered_seconds"], rate=rate)
@@ -137,6 +347,10 @@ def make_matrix(spec):
                 for size in sizes:
                     for label, operation_mix, concurrency, count in (profiles[0], profiles[3]):
                         add(label, size, operation_mix, concurrency, count, cohort="native_pagecache")
+                for job in block:
+                    if job["cohort"] == "primary_rf1" and job["profile"] == "write-concurrent":
+                        async_write_jobs.append(job | {"cohort": "native_async_write",
+                                                       "native_durability": "page_cache"})
             primary = [job for job in block if job["cohort"] == "primary_rf1"]
             extra = [job for job in block if job["cohort"] not in ("primary_rf1", "cold_os_cache")]
             cold = [job for job in block if job["cohort"] == "cold_os_cache"]
@@ -162,23 +376,41 @@ def make_matrix(spec):
     # Keep every pre-existing case ID and its derived namespace stable.
     jobs.extend(read_jobs)
     jobs.extend(fast_read_jobs)
+    jobs.extend(async_write_jobs)
+    if diagnostics["write_timeline_limit"]:
+        jobs.extend(job | {"cohort": "write_timeline_diagnostics",
+                           "diagnostics": {"write_profile_limit": 0,
+                                           "write_timeline_limit": diagnostics["write_timeline_limit"]}}
+                    for job in list(jobs) if job["backend"] in TRANSPORTS
+                    and job["cohort"] == "primary_rf1"
+                    and job["value_size"] == 1024 and job["profile"] == "write-concurrent")
+    if diagnostics["valkey_profile_limit"]:
+        jobs.extend(job | {"cohort": "valkey_client_diagnostics",
+                           "diagnostic_source_cohort": job["cohort"],
+                           "diagnostics": {"valkey_profile_limit": diagnostics["valkey_profile_limit"]}}
+                    for job in list(jobs) if job["backend"] in ("valkey_tcp", "valkey_rdma")
+                    and job["cohort"] == "primary_rf1"
+                    and job["value_size"] in (1024, 8192)
+                    and job["profile"] in ("read-concurrent", "write-concurrent", "read-many32"))
     if len(jobs) > spec["max_cases"]:
         raise ValueError(f"matrix contains {len(jobs)} cases, exceeding explicit max_cases")
     for number, job in enumerate(jobs):
-        job["case_id"] = f"{number:04d}-{job['backend']}-{job['value_size']}-{job['profile']}-{job['cohort']}-r{job['repeat']}"
+        route = "-live-nvmeof" if job.get("nvmeof_route") == "live" else ""
+        job["case_id"] = f"{number:04d}-{job['backend']}-{job['value_size']}-{job['profile']}-{job['cohort']}-r{job['repeat']}{route}"
     return jobs
 
 
 def make_nvmeof_matrix(spec, backends, diagnostics):
     """Matched sealed-source read cohorts; profiled twins are independent runs."""
     if spec["repeats"] != 1:
-        raise ValueError("NVMe/TCP comparison requires one repetition")
-    required = {"native", "tidehunter_tcp", "tidehunter_nvme_tcp"}
-    if not required <= set(backends):
-        raise ValueError("NVMe/TCP comparison requires native, RPC TCP and NVMe/TCP")
-    allowed = required | NVME_BACKENDS | {"tidehunter_efa", "tidehunter_efa_direct", "tidehunter_efa_native"}
+        raise ValueError("NVMe-oF comparison requires one repetition")
+    required = {"native", "tidehunter_tcp"}
+    if not required <= set(backends) or not (set(backends) & NVME_BACKENDS):
+        raise ValueError("NVMe-oF comparison requires native, RPC TCP and at least one NVMe-oF backend")
+    allowed = required | NVME_BACKENDS | {"tidehunter_efa", "tidehunter_efa_direct", "tidehunter_efa_native",
+                                          "tidehunter_verbs", "tidehunter_verbs_native"}
     if set(backends) - allowed:
-        raise ValueError("NVMe/TCP comparison excludes unrelated KV backends")
+        raise ValueError("NVMe-oF comparison excludes unrelated KV backends")
     # These two readers must share one physical source block. A native or
     # different transport case ends that block; its evidence directory remains
     # immutable and cannot be recreated later in the same matrix.
@@ -193,6 +425,8 @@ def make_nvmeof_matrix(spec, backends, diagnostics):
         source = f"sealed-v2-seed{spec['seed']}-size{size}-keys{keys}"
         shapes = (("scalar", 1), ("scalar", 16), ("batch32", 1), ("batch32", 16)) if size in (1024, 8192) else (("scalar", 1),)
         for backend in backends:
+            physical = ("tcp" if backend in tcp_readers else
+                        "native" if backend == "native" else backend)
             for shape, concurrency in shapes:
                 for tier in ("first_touch", "repeat_read"):
                     for profiled in ((False, True) if backend != "native" and
@@ -212,16 +446,29 @@ def make_nvmeof_matrix(spec, backends, diagnostics):
                                "native_durability": "value_wal_barrier",
                                "measurement_key_sweep": tier == "first_touch",
                                "evict_mapped_wal_before_measurement": mapped_eviction,
-                               "sealed_dataset": {"source_id": source, "data_id": source, "seed": spec["seed"], "profiled": profiled,
+                               "sealed_dataset": {"source_id": f"{source}-{physical}", "data_id": source, "seed": spec["seed"], "profiled": profiled,
                                                   "tier": tier, "instrumentation": "read_profile" if profiled and backend != "native" else "none",
                                                   "page_cache_policy": "drop_at_measurement_gate" if drop else "not_dropped",
                                                   "mapped_wal_eviction": "before_measurement_gate" if mapped_eviction else "not_requested",
                                                   "directness": "initiator_O_DIRECT_target_buffered" if backend in NVME_BACKENDS else "buffered_WAL_pagecache_or_device",
                                                   "cold_claim": "distinct keys after OS cache drop do not prove per-call device reads; shared pages, readahead and device caches remain",
                                                   "target_cache": "buffered_file_page_cache" if backend in NVME_BACKENDS else "not_applicable"}}
+                        if backend in NVME_BACKENDS:
+                            job["nvmeof_route"] = "sealed_read"
+                        if backend == "native":
+                            job["native_wal_geometry"] = "native_default"
                         if profiled and backend != "native":
                             job["diagnostics"] = {"read_profile_limit": diagnostics["read_profile_limit"] or 256}
                         jobs.append(job)
+                        if spec.get("spdk_comparison") and backend == "tidehunter_nvme_rdma":
+                            spdk = copy.deepcopy(job)
+                            spdk["nvmeof_target"] = "spdk"
+                            spdk["sealed_dataset"]["directness"] = "initiator_O_DIRECT_target_file_O_DIRECT"
+                            spdk["sealed_dataset"]["target_cache"] = "direct_file_bdev_no_OS_pagecache"
+                            spdk["sealed_dataset"]["cold_claim"] = (
+                                "SPDK file direct I/O bypasses OS cache; device/controller caches remain. "
+                                "Compare actual device evidence, not first-touch keys alone.")
+                            jobs.append(spdk)
         for backend in (name for name in backends if name not in NVME_BACKENDS):
             for profiled in ((False, True) if backend != "native" and size in (1024, 8192) else (False,)):
                 job = {"backend": backend, "repeat": 0, "profile": "write-c16-" + ("diagnostic" if profiled else "baseline"),
@@ -232,6 +479,8 @@ def make_nvmeof_matrix(spec, backends, diagnostics):
                        "offered_ops_per_second": None, "distribution": "uniform",
                        "coordinator_cache_bytes": 0,
                        "drop_os_caches": False, "native_durability": "value_wal_barrier"}
+                if backend == "native":
+                    job["native_wal_geometry"] = "native_default"
                 if profiled and backend != "native":
                     job["diagnostics"] = {"write_profile_limit": diagnostics["write_profile_limit"] or 256}
                 writes.append(job)
@@ -242,10 +491,18 @@ def make_nvmeof_matrix(spec, backends, diagnostics):
                     batch["measurement_operations"] = 2048
                     writes.append(batch)
     jobs.extend(writes)
+    if diagnostics["write_timeline_limit"]:
+        jobs.extend(job | {"cohort": "write_timeline_diagnostics",
+                           "profile": job["profile"].replace("-baseline", "-timeline"),
+                           "diagnostics": {"write_profile_limit": 0,
+                                           "write_timeline_limit": diagnostics["write_timeline_limit"]}}
+                    for job in writes if job["backend"] in TRANSPORTS
+                    and ((job["value_size"] == 1024 and job["profile"] == "write-c16-baseline")
+                         or (job["value_size"] == 8192 and job["profile"] == "write-batch32-c16-baseline")))
     if len(jobs) > spec["max_cases"]:
         raise ValueError(f"matrix contains {len(jobs)} cases, exceeding explicit max_cases")
     for number, job in enumerate(jobs):
-        job["case_id"] = f"{number:04d}-{job['backend']}-{job['value_size']}-{job['profile']}"
+        job["case_id"] = f"{number:04d}-{comparison_backend(job)}-{job['value_size']}-{job['profile']}"
     return jobs
 
 
@@ -304,6 +561,7 @@ def make_read_tier_matrix(spec, backends, diagnostics):
                             job["read_tier"]["requested"]["coordinator_read_memory_allowance_bytes"] = coordinator_allowance
                             job["read_tier"]["requested"]["owner_read_memory_allowance_bytes"] = owner_allowance
                         if backend == "native":
+                            job["native_wal_geometry"] = "native_default"
                             job["read_tier"]["requested"]["native_value_lru_bytes"] = 0
                             job["read_tier"]["requested"]["native_value_lru_source"] = "KeyShape::new_single default"
                         if profiled:
@@ -345,14 +603,602 @@ def make_read_tier_matrix(spec, backends, diagnostics):
     return jobs
 
 
+FOCUSED_SELECTIONS = ("recommended", "full", "device", "floors", "stages", "unified",
+                      "append_floors", "fair_native", "parity")
+FOCUSED_COUNTS = {"recommended": 279, "full": 333, "device": 120, "floors": 69,
+                  "stages": 183, "ssd_write": 18, "unified": 270, "append_floors": 48,
+                  "fair_native": 168, "parity": 216}
+_FOCUSED_GROUP_COUNTS = {
+    "recommended": {"G1": 81, "G2": 24, "G3": 6, "G4": 12, "G5": 150, "anchors": 6},
+    "full": {"G1": 81, "G2": 24, "G3": 6, "G4": 12, "G5": 150,
+             "anchors": 6, "G7": 48, "G9": 6},
+    # The device-only follow-up holds only the cases appended after the full selection.
+    "device": {"G10R": 60, "G10W": 60},
+    "floors": {"G11N": 45, "G11S": 24},
+    "stages": {"G12N": 52, "G12W": 60, "G12H": 12, "G12K": 12, "G12D": 43, "G12S": 4},
+    "unified": {"G12N": 52, "G12W": 60, "G12H": 12, "G12K": 12, "G12D": 43,
+                "G12S": 4, "G11N": 45, "G11S": 24, "G11W": 18},
+    "append_floors": {"G13W": 48},
+    "fair_native": {"G14N": 54, "G14S": 36, "G14O1": 36, "G14O5": 36, "G14P": 6},
+    "parity": {"G13W": 48, "G14N": 54, "G14S": 36, "G14O1": 36, "G14O5": 36, "G14P": 6},
+}
+
+
+def focused_group_counts(selection):
+    if selection not in FOCUSED_SELECTIONS:
+        raise ValueError("unknown focused selection")
+    groups = dict(_FOCUSED_GROUP_COUNTS[selection])
+    if selection in ("stages", "unified", "append_floors", "fair_native", "parity"):
+        jobs = make_focused_matrix(selection)
+        for kind in {job["case_kind"] for job in jobs}:
+            groups[kind] = sum(job["case_kind"] == kind for job in jobs)
+        return groups
+    kinds = {"G1": "media_read", "G2": "fio_floor", "G3": "block_trace",
+             "G4": "interference", "G5": "sealed_knee", "anchors": "native_anchor",
+             "G7": "high_concurrency", "G9": "write_wait_diagnostic",
+             "G10R": "media_read", "G10W": "remote_put",
+             "G11N": "net_floor", "G11S": "ssd_floor"}
+    return {**groups, **{kinds[group]: count for group, count in groups.items()}}
+
+
+def _focused_jobs():
+    """Build the frozen matrix without consulting mutable external specifications."""
+    jobs = []
+    routes = (("tidehunter_verbs_native", None), ("tidehunter_tcp", None),
+              ("tidehunter_nvme_rdma", "kernel"), ("tidehunter_nvme_rdma", "spdk"))
+    def add(group, kind, repeat, backend, target=None, *, size=1024, concurrency=1,
+            operation="read", tier="repeat_read", media=None, extra=None):
+        profile = f"{group}-{operation}-c{concurrency}-{tier}"
+        if kind == "native_anchor":
+            profile = "read-concurrent" if operation == "read" else "write-concurrent"
+        job = {"case_kind": kind,
+               "selection": ("fair_native" if group.startswith("G14")
+                             else "append_floors" if group == "G13W"
+                             else "unified" if group == "G11W"
+                             else "stages" if group.startswith("G12")
+                             else "floors" if group in ("G11N", "G11S")
+                             else "device" if group in ("G10R", "G10W")
+                             else "full" if group in ("G7", "G9") else "recommended"),
+               "group": group, "backend": backend, "repeat": repeat,
+               "profile": profile, "cohort": "sealed_read" if operation == "read" or kind == "interference" else "primary_rf1",
+               "value_size": size, "keys": 4096, "mix": mix(**{operation: 100}),
+               "concurrency": concurrency, "read_lanes": 0 if backend == "native" else (4 if concurrency >= 16 else 1),
+               "measurement_operations": (400000 if kind == "interference" else
+                                          4096 if tier == "first_touch" or operation == "put" else 8192),
+               "warmup_operations": 0 if operation == "read" else 512,
+               "offered_ops_per_second": None, "distribution": "uniform",
+               "coordinator_cache_bytes": 0, "drop_os_caches": tier == "first_touch",
+               "native_durability": "value_wal_barrier",
+               "durability_tier": "value_wal_barrier" if backend == "native" else "synchronous",
+               "target_io": "not_applicable" if target is None else ("buffered" if target == "kernel" else "spdk_direct"),
+               "execution": {"queue_capacity": max(128, concurrency)}}
+        if backend == "native":
+            job["native_wal_geometry"] = "native_default"
+        if target:
+            job.update(nvmeof_route="sealed_read", nvmeof_target=target)
+        if media is not None:
+            job["media"] = media
+            if media["history"] == "prewarm":
+                job["drop_os_caches"] = False
+                job["evict_mapped_wal_before_measurement"] = True
+            elif media["wal_eviction"] == "selective":
+                # Device-only owner arms: evict the mapped WAL, then drop the page cache at the gate.
+                job["evict_mapped_wal_before_measurement"] = True
+            if media["expected"] == "memory" or media["history"] == "prewarm":
+                job["warmup_operations"] = job["keys"]
+                job["warmup_key_sweep"] = True
+        if extra:
+            job.update(extra)
+        # Every physical source is a single contiguous block, isolated by repeat,
+        # transport, target, tier and complete case dimensions.
+        identity = hashlib.sha256(json.dumps(job, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:20]
+        job["case_id"] = f"{group}-r{repeat}-{identity}"
+        if operation == "read" or kind in ("interference", "hybrid_put"):
+            physical = backend + ("-" + target if target else "")
+            dataset_size = 1024 if kind == "hybrid_put" else size
+            job["sealed_dataset"] = {
+                "source_id": f"focused-r{repeat}-{physical}-s{dataset_size}-seed1775-{tier}-{identity}",
+                "data_id": f"focused-r{repeat}-s{dataset_size}-seed1775",
+                "seed": 1775, "tier": tier, "profiled": False, "instrumentation": "none",
+                "page_cache_policy": ("evict_mapped_wal_then_drop_at_measurement_gate"
+                                      if job.get("evict_mapped_wal_before_measurement") and job["drop_os_caches"]
+                                      else "selective_wal_eviction" if job.get("evict_mapped_wal_before_measurement")
+                                      else "drop_at_measurement_gate" if tier == "first_touch" else "not_dropped"),
+                "mapped_wal_eviction": ("before_measurement_gate" if job.get("evict_mapped_wal_before_measurement")
+                                        else "not_requested"),
+                "directness": ("initiator_O_DIRECT_target_kernel_buffered_io_0" if job["target_io"] == "direct" else
+                               "initiator_O_DIRECT_target_file_O_DIRECT" if target == "spdk" else
+                               "initiator_O_DIRECT_target_buffered" if target else "buffered_WAL_pagecache_or_device"),
+                "cold_claim": "first touch does not establish per-call device reads",
+                "target_cache": ("direct_kernel_buffered_io_0_no_target_pagecache" if job["target_io"] == "direct" else
+                                 "direct_file_bdev_no_OS_pagecache" if target == "spdk" else
+                                 "buffered_file_page_cache" if target else "not_applicable")}
+            job["measurement_key_sweep"] = tier == "first_touch" and job.get("key_order") != "random_with_replacement"
+        jobs.append(job)
+
+    for repeat in range(3):
+        for size in (1024, 8192, 65536):
+            for backend, target in routes:
+                add("G1", "media_read", repeat, backend, target, size=size, tier="first_touch",
+                    media={"expected": "cold", "history": "normal", "wal_eviction": "none"})
+            add("G1", "media_read", repeat, "tidehunter_verbs_native", size=size, tier="first_touch",
+                media={"expected": "cold", "history": "prewarm", "wal_eviction": "selective"})
+            for backend, target in routes[:3]:
+                add("G1", "media_read", repeat, backend, target, size=size,
+                    media={"expected": "memory", "history": "normal", "wal_eviction": "none"})
+        # Append direct controls after the existing G1 cases for this repeat.
+        for size in (1024, 8192, 65536):
+            add("G1", "media_read", repeat, "tidehunter_nvme_rdma", "kernel", size=size,
+                tier="first_touch", media={"expected": "cold", "history": "normal", "wal_eviction": "none"},
+                extra={"target_io": "direct"})
+        for location in ("local_file", "nvmeof_namespace"):
+            for block in (4096, 65536):
+                for depth in (1, 16):
+                    add("G2", "fio_floor", repeat, "tidehunter_nvme_rdma" if location == "nvmeof_namespace" else "tidehunter_verbs_native",
+                        "kernel" if location == "nvmeof_namespace" else None, size=65536,
+                        extra={"fio": {"location": location, "block_bytes": block, "queue_depth": depth,
+                                       "runtime_seconds": 10, "direct": True, "pattern": "randread"}})
+        for scope, operation in (("cold_owner_read", "read"), ("owner_put", "put")):
+            add("G3", "block_trace", repeat, "tidehunter_verbs_native", operation=operation,
+                tier="first_touch" if operation == "read" else "repeat_read",
+                extra={"trace": {"scope": scope, "require_file_attribution": True}})
+        for backend, target in routes:
+            add("G4", "interference", repeat, backend, target, concurrency=16,
+                extra={"interference": {"read_offered_per_second": 1000, "read_queue_capacity": 4096,
+                       "put_concurrency": 16, "duration_seconds": 20, "key_policy": "disjoint_read_put"}})
+        for backend, target in (("native", None), *routes):
+            for tier in ("first_touch", "repeat_read"):
+                for concurrency in (1, 2, 4, 8, 16):
+                    add("G5", "sealed_knee", repeat, backend, target, concurrency=concurrency, tier=tier)
+        for operation in ("read", "put"):
+            add("anchors", "native_anchor", repeat, "native", concurrency=16, operation=operation)
+    for repeat in range(3):
+        for operation in ("read", "put"):
+            for backend, target in (("native", None), *routes):
+                if operation == "put" and target:
+                    continue
+                for concurrency in (64, 256):
+                    add("G7", "high_concurrency", repeat, backend, target, concurrency=concurrency, operation=operation)
+        for enabled in (False, True):
+            limit = 256 if enabled else 0
+            add("G9", "write_wait_diagnostic", repeat, "tidehunter_verbs_native", concurrency=16,
+                operation="put", extra={"write_wait_diagnostics": {"enabled": enabled, "timeline_limit": limit},
+                                        "diagnostics": {"write_timeline_limit": limit}})
+    # G10, the device-only follow-up: cold reads on spread datasets with random keys, and plain puts.
+    # A 4,096-key sweep reads each owner's WAL in order, so kernel readahead serves most calls.
+    # Random keys over a large dataset make each call a first touch; device counters qualify it.
+    first_device = len(jobs)
+    # The sealed preparer admits at most 65,536 keys, and a hybrid reader charges 4 KiB per catalog entry
+    # against a 448 MiB allowance. With 65,536 keys, 4,096 random reads of 8 or 64 KiB values first-touch
+    # about 0.97 of their keys. At 1 KiB about four values share a 4 KiB page, so 2,048 reads keep the
+    # first-touch share near 0.94 (4,096 reads would give about 0.88, below the 0.9 cold test).
+    device_routes = (("tidehunter_verbs_native", None), ("tidehunter_tcp", None),
+                     ("tidehunter_nvme_rdma", "kernel"), ("tidehunter_nvme_rdma", "spdk"))
+    for repeat in range(3):
+        for backend, target in device_routes:
+            for size, concurrency in ((1024, 1), (8192, 1), (65536, 1), (1024, 16), (65536, 16)):
+                extra = {"keys": 65536, "key_order": "random_with_replacement"}
+                if size == 1024:
+                    extra["measurement_operations"] = 2048
+                if target == "kernel":
+                    extra["target_io"] = "direct"
+                add("G10R", "media_read", repeat, backend, target, size=size, concurrency=concurrency,
+                    tier="first_touch", extra=extra,
+                    media={"expected": "cold", "history": "normal",
+                           "wal_eviction": "selective" if target is None else "none"})
+        for backend in ("tidehunter_verbs_native", "tidehunter_tcp"):
+            for owner_tier in ("synchronous", "native"):
+                for size in (1024, 65536):
+                    for concurrency in (1, 16):
+                        add("G10W", "remote_put", repeat, backend, size=size, concurrency=concurrency,
+                            operation="put", extra={"durability_tier": owner_tier})
+                add("G10W", "remote_put", repeat, backend, size=1024, concurrency=16, operation="put",
+                    extra={"durability_tier": owner_tier, "measurement_operations": 200000})
+    device = jobs[first_device:]
+
+    def canary(group, backend, size, concurrency, detail=None, operations=None):
+        for job in device:
+            if (job["repeat"] == 0 and job["group"] == group and job["backend"] == backend
+                    and job["value_size"] == size and job["concurrency"] == concurrency
+                    and detail in (None, job.get("nvmeof_target"), job["durability_tier"])
+                    and operations in (None, job["measurement_operations"])):
+                return job
+        raise ValueError("device canary case missing")
+
+    # One case of every new flow first, so a failed cold gate or put flow shows within minutes.
+    canaries = [canary("G10R", "tidehunter_verbs_native", 65536, 1),
+                canary("G10R", "tidehunter_tcp", 1024, 1),
+                canary("G10R", "tidehunter_nvme_rdma", 1024, 1, "spdk"),
+                canary("G10R", "tidehunter_nvme_rdma", 8192, 1, "kernel"),
+                canary("G10W", "tidehunter_verbs_native", 1024, 1, "synchronous", 4096),
+                canary("G10W", "tidehunter_verbs_native", 1024, 1, "native", 4096),
+                canary("G10W", "tidehunter_verbs_native", 1024, 16, "synchronous", 200000)]
+    chosen = {job["case_id"] for job in canaries}
+    jobs[first_device:] = canaries + [job for job in device if job["case_id"] not in chosen]
+    first_floors = len(jobs)
+    sizes = [8, 1024, 4096, 65536]
+    for repeat in range(3):
+        for tool in ("ib_send_lat", "ib_write_lat", "ib_read_lat"):
+            for mode in ("polled", "event"):
+                add("G11N", "net_floor", repeat, "tidehunter_verbs_native", size=65536,
+                    extra={"net": {"tool": tool, "mode": mode, "interface": "rdma0",
+                                   "provider": None, "endpoint": None, "sizes": sizes,
+                                   "iterations": 5000, "warmup": 0}})
+        for provider, endpoint, interface in (("verbs;ofi_rxm", "rdm", "rdma0"),
+                                               ("verbs", "msg", "rdma0"),
+                                               ("tcp;ofi_rxm", "rdm", "eth0")):
+            add("G11N", "net_floor", repeat, "tidehunter_verbs_native", size=65536,
+                extra={"net": {"tool": "fi_pingpong", "mode": None, "interface": interface,
+                               "provider": provider, "endpoint": endpoint, "sizes": sizes,
+                               "iterations": 5000, "warmup": 0}})
+        for interface in ("eth0", "rdma0"):
+            for mode in ("block", "spin", "busy_poll"):
+                add("G11N", "net_floor", repeat, "tidehunter_verbs_native", size=65536,
+                    extra={"net": {"tool": "tcp_rtt", "mode": mode, "interface": interface,
+                                   "provider": None, "endpoint": None, "sizes": sizes,
+                                   "iterations": 20000, "warmup": 2000}})
+        for block in (4096, 65536):
+            for region in (67108864, 2147483648):
+                for state, age in (("fresh", 0), ("aged", 60)):
+                    add("G11S", "ssd_floor", repeat, "tidehunter_verbs_native", size=65536,
+                        extra={"ssd": {"block_bytes": block, "region_bytes": region,
+                                       "state": state, "age_seconds": age, "runtime_seconds": 6,
+                                       "queue_depth": 1, "pattern": "randread", "direct": True}})
+    floors = jobs[first_floors:]
+    canaries = [
+        next(job for job in floors if job["repeat"] == 0 and job.get("net", {}).get("tool") == "ib_send_lat"
+             and job["net"]["mode"] == "polled"),
+        next(job for job in floors if job["repeat"] == 0 and job.get("net", {}).get("provider") == "verbs;ofi_rxm"),
+        next(job for job in floors if job["repeat"] == 0 and job.get("net", {}).get("tool") == "tcp_rtt"
+             and job["net"]["interface"] == "eth0" and job["net"]["mode"] == "block"),
+        *[next(job for job in floors if job["repeat"] == 0 and job.get("ssd", {}).get("state") == state
+               and job["ssd"]["block_bytes"] == 4096 and job["ssd"]["region_bytes"] == 67108864)
+          for state in ("fresh", "aged")],
+    ]
+    chosen = {job["case_id"] for job in canaries}
+    jobs[first_floors:] = canaries + [job for job in floors if job["case_id"] not in chosen]
+    first_stages = len(jobs)
+
+    def write_case(group, kind, repeat, backend, operation, size, concurrency, durability,
+                   target=None, extra=None):
+        fields = {"measurement_operations": 1024 if operation == "put_batch" else 4096,
+                  "durability_tier": durability}
+        if backend == "native":
+            fields["native_durability"] = durability
+        if target == "kernel":
+            fields["target_io"] = "direct"
+        if kind == "hybrid_put":
+            fields["read_lanes"] = 4
+        fields.update(extra or {})
+        add(group, kind, repeat, backend, target, size=size, concurrency=concurrency,
+            operation=operation, extra=fields)
+
+    for repeat in range(2):
+        for operation, sizes in (("put", (1024, 8192, 65536)), ("put_batch", (1024, 8192)),
+                                 ("delete", (1024,))):
+            if repeat and operation != "put":
+                continue
+            for size in sizes:
+                for concurrency in (1, 16):
+                    for durability in ("page_cache", "value_wal_barrier"):
+                        write_case("G12N", "native_op", repeat, "native", operation, size, concurrency, durability)
+        for size in (8192, 65536):
+            for concurrency in (1, 16):
+                add("G12N", "native_op", repeat, "native", size=size, concurrency=concurrency)
+        for size in (1024, 8192, 65536):
+            for concurrency in (1, 16):
+                if concurrency == 16 and (repeat or size == 8192):
+                    continue
+                add("G12N", "native_media_read", repeat, "native", size=size, concurrency=concurrency,
+                    tier="first_touch", media={"expected": "cold", "history": "normal", "wal_eviction": "selective"},
+                    extra={"keys": 65536, "key_order": "random_with_replacement",
+                           "measurement_operations": 2048 if size == 1024 else 4096})
+        for operation, sizes in (("put", (1024, 8192, 65536)), ("put_batch", (1024, 8192)),
+                                 ("delete", (1024,))):
+            if repeat and operation != "put":
+                continue
+            for size in sizes:
+                for concurrency in (1, 16):
+                    for tier in ("synchronous", "native"):
+                        write_case("G12W", "remote_put", repeat, "tidehunter_verbs_native",
+                                   operation, size, concurrency, tier)
+        for backend, tiers in (("tidehunter_tcp", ("synchronous", "native")),
+                               ("tidehunter_verbs", ("synchronous",))):
+            for size in (1024, 65536):
+                for concurrency in (1, 16):
+                    for tier in tiers:
+                        write_case("G12W", "remote_put", repeat, backend, "put", size, concurrency, tier)
+        for target in ("kernel", "spdk"):
+            for size, concurrency in ((1024, 1), (1024, 16), (65536, 16)):
+                write_case("G12H", "hybrid_put", repeat, "tidehunter_nvme_rdma",
+                           "put", size, concurrency, "synchronous", target)
+        for backend, kind, tier in (("native", "native_op", "value_wal_barrier"),
+                                     ("tidehunter_verbs_native", "remote_put", "synchronous")):
+            for size, concurrency in ((1024, 1), (1024, 16), (65536, 16)):
+                write_case("G12K", kind, repeat, backend, "put", size, concurrency, tier,
+                           extra={"put_key_policy": "new"})
+
+    def diagnostic_copy(source, field, limit, group="G12D", extra=None):
+        job = copy.deepcopy(source)
+        job["group"] = group
+        job["diagnostics"] = {field: limit}
+        job.update(extra or {})
+        job.pop("case_id")
+        identity = hashlib.sha256(json.dumps(job, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:20]
+        job["case_id"] = f"{group}-r0-{identity}"
+        if "sealed_dataset" in job:
+            job["sealed_dataset"]["source_id"] += "-" + identity
+            if field == "read_profile_limit":
+                job["sealed_dataset"]["profiled"] = True
+                job["sealed_dataset"]["instrumentation"] = "read_profile"
+        jobs.append(job)
+
+    base = jobs[first_stages:]
+    def find(group, backend, operation, size, concurrency, tier, target=None):
+        return next(j for j in base if j["repeat"] == 0 and j["group"] == group and j["backend"] == backend
+                    and j["mix"][operation] == 100 and j["value_size"] == size
+                    and j["concurrency"] == concurrency and j["durability_tier"] == tier
+                    and (target is None or j.get("nvmeof_target") == target))
+
+    for backend, operation, size, concurrency, tier, target in (
+            ("tidehunter_verbs_native", "put", 1024, 1, "synchronous", None),
+            ("tidehunter_verbs_native", "put", 65536, 1, "synchronous", None),
+            ("tidehunter_verbs_native", "put", 1024, 16, "synchronous", None),
+            ("tidehunter_verbs_native", "put_batch", 8192, 1, "synchronous", None),
+            ("tidehunter_verbs_native", "delete", 1024, 1, "synchronous", None),
+            ("tidehunter_verbs_native", "put", 1024, 1, "native", None),
+            ("tidehunter_tcp", "put", 1024, 1, "synchronous", None),
+            ("tidehunter_tcp", "put", 1024, 16, "synchronous", None),
+            ("tidehunter_nvme_rdma", "put", 1024, 1, "synchronous", "kernel"),
+            ("tidehunter_nvme_rdma", "put", 1024, 1, "synchronous", "spdk")):
+        diagnostic_copy(find("G12H" if target else "G12W", backend, operation, size, concurrency, tier, target),
+                        "write_timeline_limit", 4096)
+    for backend, operation, size, concurrency, tier in (
+            ("native", "put", 1024, 1, "value_wal_barrier"), ("native", "put", 1024, 1, "page_cache"),
+            ("native", "put", 65536, 1, "value_wal_barrier"), ("native", "put", 1024, 16, "value_wal_barrier"),
+            ("native", "delete", 1024, 1, "value_wal_barrier"),
+            ("tidehunter_verbs_native", "put", 1024, 1, "synchronous"),
+            ("tidehunter_verbs_native", "put", 1024, 16, "synchronous")):
+        diagnostic_copy(find("G12N" if backend == "native" else "G12W", backend, operation, size, concurrency, tier),
+                        "write_profile_limit", 4096)
+    for backend, target, states in (("tidehunter_verbs_native", None, ("memory", "cold")),
+                                     ("tidehunter_tcp", None, ("memory", "cold")),
+                                     ("tidehunter_nvme_rdma", "kernel", ("memory", "cold")),
+                                     ("tidehunter_nvme_rdma", "spdk", ("cold",))):
+        for state in states:
+            for size in (1024, 65536):
+                cold = state == "cold"
+                extra = {"diagnostics": {"read_profile_limit": 4096}, "measurement_operations": 4096}
+                if cold:
+                    extra.update(keys=65536, key_order="random_with_replacement",
+                                 measurement_operations=2048 if size == 1024 else 4096)
+                    if target == "kernel":
+                        extra["target_io"] = "direct"
+                add("G12D", "media_read", 0, backend, target, size=size,
+                    tier="first_touch" if cold else "repeat_read",
+                    media={"expected": state, "history": "normal",
+                           "wal_eviction": "selective" if cold and target is None else "none"},
+                    extra=extra)
+                jobs[-1]["sealed_dataset"]["profiled"] = True
+                jobs[-1]["sealed_dataset"]["instrumentation"] = "read_profile"
+    for backend, target, states, concurrency in (
+            ("tidehunter_verbs_native", None, ("memory", "cold"), 16),
+            ("tidehunter_tcp", None, ("memory", "cold"), 16),
+            ("tidehunter_nvme_rdma", "kernel", ("cold",), 16),
+            ("tidehunter_nvme_rdma", "spdk", ("cold",), 16),
+            ("tidehunter_verbs", None, ("memory", "cold"), 1)):
+        for state in states:
+            cold = state == "cold"
+            extra = {"diagnostics": {"read_profile_limit": 4096}, "measurement_operations": 4096}
+            if cold:
+                extra.update(keys=65536, key_order="random_with_replacement", measurement_operations=2048)
+                if target == "kernel":
+                    extra["target_io"] = "direct"
+            add("G12D", "media_read", 0, backend, target, size=1024, concurrency=concurrency,
+                tier="first_touch" if cold else "repeat_read",
+                media={"expected": state, "history": "normal",
+                       "wal_eviction": "selective" if cold and target is None else "none"},
+                extra=extra)
+            jobs[-1]["sealed_dataset"]["profiled"] = True
+            jobs[-1]["sealed_dataset"]["instrumentation"] = "read_profile"
+    diagnostic_copy(find("G12W", "tidehunter_verbs", "put", 1024, 1, "synchronous"),
+                    "write_timeline_limit", 4096)
+    for operation, size in (("put", 65536), ("put_batch", 8192), ("delete", 1024)):
+        write_case("G12D", "remote_put", 0, "tidehunter_tcp", operation, size, 1, "synchronous",
+                   extra={"diagnostics": {"write_timeline_limit": 4096}})
+    for policy in ("overwrite", "new"):
+        for field, limit in (("write_timeline_limit", 65536), ("write_profile_limit", 4096)):
+            source = find("G12W", "tidehunter_verbs_native", "put", 1024, 16, "synchronous")
+            extra = {"measurement_operations": 200000}
+            if policy == "new":
+                extra["put_key_policy"] = "new"
+            diagnostic_copy(source, field, limit, "G12S", extra)
+    stages = jobs[first_stages:]
+    canaries = [
+        find("G12N", "native", "put", 1024, 1, "value_wal_barrier"),
+        next(j for j in stages if j["case_kind"] == "native_media_read" and j["repeat"] == 0
+             and j["value_size"] == 1024 and j["concurrency"] == 1),
+        find("G12W", "tidehunter_verbs_native", "put", 1024, 1, "synchronous"),
+        find("G12W", "tidehunter_verbs_native", "put_batch", 8192, 1, "synchronous"),
+        find("G12W", "tidehunter_verbs_native", "delete", 1024, 1, "synchronous"),
+        find("G12H", "tidehunter_nvme_rdma", "put", 1024, 1, "synchronous", "kernel"),
+        find("G12H", "tidehunter_nvme_rdma", "put", 1024, 1, "synchronous", "spdk"),
+        find("G12K", "tidehunter_verbs_native", "put", 1024, 1, "synchronous"),
+        next(j for j in stages if j["group"] == "G12D" and "write_timeline_limit" in j["diagnostics"]),
+        next(j for j in stages if j["group"] == "G12D" and "read_profile_limit" in j["diagnostics"]),
+        next(j for j in stages if j["group"] == "G12D" and "write_profile_limit" in j["diagnostics"]),
+    ]
+    chosen = {j["case_id"] for j in canaries}
+    remaining = [j for j in stages if j["case_id"] not in chosen]
+    remaining.sort(key=lambda j: (j["repeat"], j["group"]))
+    jobs[first_stages:] = canaries + remaining
+    first_ssd_write = len(jobs)
+    for repeat in range(2):
+        for mode in ("buffered", "fdatasync", "direct"):
+            for block in (1024, 8192, 65536):
+                add("G11W", "ssd_write_floor", repeat, "tidehunter_verbs_native", size=65536,
+                    extra={"ssd_write": {"mode": mode, "block_bytes": block, "region_bytes": 536870912,
+                                         "runtime_seconds": 6, "queue_depth": 1, "location": "local_file",
+                                         "preheat": True}})
+    ssd_write = jobs[first_ssd_write:]
+    canary = next(job for job in ssd_write if job["repeat"] == 0
+                  and job["ssd_write"]["mode"] == "fdatasync" and job["ssd_write"]["block_bytes"] == 1024)
+    jobs[first_ssd_write:] = [canary] + [job for job in ssd_write if job["case_id"] != canary["case_id"]]
+    first_append = len(jobs)
+    for block in (1024, 8192, 65536):
+        for mode in ("fdatasync", "append_pwrite", "append_mmap", "append_mmap_fsync"):
+            for repeat in (0, 1):
+                for host in (("client", "owner0") if repeat == 0 else ("owner0", "client")):
+                    spec = {"mode": mode, "block_bytes": block, "region_bytes": 536870912,
+                            "queue_depth": 1, "location": "local_file", "host": host}
+                    if mode == "fdatasync":
+                        spec.update(runtime_seconds=6, preheat=True)
+                    else:
+                        spec.update(operations=4096, warmup_operations=512)
+                    add("G13W", "ssd_write_floor", repeat, "tidehunter_verbs_native",
+                        size=65536, extra={"ssd_write": spec})
+    append = jobs[first_append:]
+    canary = next(job for job in append if job["repeat"] == 0
+                  and job["ssd_write"]["mode"] == "append_mmap"
+                  and job["ssd_write"]["block_bytes"] == 1024
+                  and job["ssd_write"]["host"] == "client")
+    jobs[first_append:] = [canary] + [job for job in append if job["case_id"] != canary["case_id"]]
+    first_fair = len(jobs)
+    for repeat in (0, 1):
+        for shards, group, concurrencies in ((1, "G14N", (1, 5, 16)),
+                                             (5, "G14S", (5, 16))):
+            for durability in ("page_cache", "value_wal_barrier", "value_wal_group_barrier"):
+                for size in (1024, 8192, 65536):
+                    for concurrency in concurrencies:
+                        write_case(group, "native_op", repeat, "native", "put", size,
+                                   concurrency, durability,
+                                   extra={"profile": "write-concurrent", "native_shards": shards})
+        for owners, group in ((1, "G14O1"), (5, "G14O5")):
+            for backend in ("tidehunter_verbs_native", "tidehunter_tcp"):
+                for size in (1024, 8192, 65536):
+                    for concurrency in (1, 5, 16):
+                        write_case(group, "remote_put", repeat, backend, "put", size,
+                                   concurrency, "synchronous",
+                                   extra={"profile": "write-concurrent", "owner_count": owners})
+    fair = jobs[first_fair:]
+    for backend, concurrency, tier, owners, shards in (
+            ("tidehunter_verbs_native", 1, "synchronous", 5, None),
+            ("tidehunter_tcp", 1, "synchronous", 5, None),
+            ("tidehunter_verbs_native", 16, "synchronous", 5, None),
+            ("tidehunter_verbs_native", 16, "synchronous", 1, None),
+            ("native", 16, "value_wal_barrier", None, 1),
+            ("native", 1, "value_wal_barrier", None, 1)):
+        source = next(j for j in fair if j["repeat"] == 0 and j["backend"] == backend
+                      and j["value_size"] == 65536 and j["concurrency"] == concurrency
+                      and j["durability_tier"] == tier and j.get("owner_count") == owners
+                      and j.get("native_shards") == shards)
+        diagnostic_copy(source, "write_profile_limit", 4096, "G14P")
+    fair = jobs[first_fair:]
+    canary = next(j for j in fair if j["group"] == "G14N" and j["repeat"] == 0
+                  and j["value_size"] == 1024 and j["concurrency"] == 1
+                  and j["native_durability"] == "value_wal_group_barrier")
+    jobs[first_fair:] = [canary] + [j for j in fair if j["case_id"] != canary["case_id"]]
+    return jobs
+
+
+def make_focused_matrix(selection):
+    if selection not in FOCUSED_SELECTIONS:
+        raise ValueError("unknown focused selection")
+    jobs = _focused_jobs()
+    ids = [job["case_id"] for job in jobs]
+    if len(ids) != len(set(ids)):
+        raise ValueError("duplicate focused case ID")
+    if len(jobs) != sum(FOCUSED_COUNTS[name] for name in ("full", "device", "floors", "stages", "ssd_write", "append_floors", "fair_native")):
+        raise ValueError("focused matrix size differs from its reviewed counts")
+    if selection == "recommended":
+        return jobs[:FOCUSED_COUNTS["recommended"]]
+    if selection == "full":
+        return jobs[:FOCUSED_COUNTS["full"]]
+    device_end = FOCUSED_COUNTS["full"] + FOCUSED_COUNTS["device"]
+    if selection == "device":
+        return jobs[FOCUSED_COUNTS["full"]:device_end]
+    floors_end = device_end + FOCUSED_COUNTS["floors"]
+    if selection == "floors":
+        return jobs[device_end:floors_end]
+    stages_end = floors_end + FOCUSED_COUNTS["stages"]
+    if selection == "stages":
+        return jobs[floors_end:stages_end]
+    write_end = stages_end + FOCUSED_COUNTS["ssd_write"]
+    append_end = write_end + FOCUSED_COUNTS["append_floors"]
+    if selection == "append_floors":
+        return jobs[write_end:append_end]
+    if selection == "fair_native":
+        return jobs[append_end:]
+    if selection == "parity":
+        return jobs[append_end:append_end + 1] + jobs[write_end:append_end] + jobs[append_end + 1:]
+    return jobs[floors_end:stages_end] + jobs[device_end:floors_end] + jobs[stages_end:write_end]
+
+
+def _focused_exact(actual, expected):
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(_focused_exact(actual[k], v) for k, v in expected.items())
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(_focused_exact(a, b) for a, b in zip(actual, expected))
+    return actual == expected
+
+
+def validate_focused_job(job):
+    """Validate an exact case; selection is its minimum included campaign selection.
+
+    Recommended cases also belong to full; only the appended cases require full.
+    """
+    if not isinstance(job, dict):
+        raise ValueError("focused job must be an object")
+    active_owner_count(job)
+    if job.get("case_kind") == "sui_trace_replay":
+        raise ValueError("Sui trace replay is reserved and not admitted")
+    case_id = job.get("case_id")
+    if not isinstance(case_id, str):
+        raise ValueError("focused case_id is required")
+    expected = next ( (item for item in _focused_jobs() if item["case_id"] == case_id), None)
+    if expected is None or not _focused_exact(job, expected):
+        raise ValueError("focused job differs from the exact reviewed case")
+    return job
+
+
 def make_run_config(job, case_root, options, source_revision, deadline_seconds=180):
+    active_owner_count(job)
+    if "case_kind" in job:
+        validate_focused_job(job)
     case_root = Path(case_root)
     if not case_root.is_absolute():
         raise ValueError("absolute case root required")
     maximum = job["keys"] + job["warmup_operations"] + job["measurement_operations"] + 4096
     options = dict(options)
+    if job.get("diagnostics", {}).get("valkey_profile_limit"):
+        if job["backend"] not in ("valkey_tcp", "valkey_rdma"):
+            raise ValueError("Valkey client diagnostics require a Valkey backend")
+        if job["backend"] == "valkey_tcp":
+            if options.get("client", "libvalkey") != "libvalkey":
+                raise ValueError("Valkey client diagnostics require libvalkey")
+            options["client"] = "libvalkey"
+    if job["backend"] == "native":
+        for option, value in (("durability", job["native_durability"]),
+                              ("native_wal_geometry", job.get("native_wal_geometry", "native_default"))):
+            if option in options and options[option] != value:
+                raise ValueError(f"native {option} differs from the planned case")
+            options[option] = value
+        if "native_shards" in job:
+            shards = job["native_shards"]
+            if "native_shards" in options and (type(options["native_shards"]) is not int
+                                                or options["native_shards"] != shards):
+                raise ValueError("native_shards differs from the planned case")
+            options["native_shards"] = shards
     if job["backend"] in TRANSPORTS:
-        expected = TRANSPORTS[job["backend"]]
+        tier = durability_tier(job)
+        if options.get("durability_tier", tier) != tier:
+            raise ValueError("durability_tier differs from the planned case")
+        options["durability_tier"] = tier
+        expected = (transport_for_case("tidehunter_verbs_native")
+                    if job.get("case_kind") and job["backend"] == "tidehunter_nvme_rdma"
+                    else TRANSPORTS[job["backend"]])
         selected = validate_transport(options.get("transport", expected))
         if protocol_key(selected) != protocol_key(expected):
             raise ValueError("runtime transport differs from research case provider/security")
@@ -363,7 +1209,7 @@ def make_run_config(job, case_root, options, source_revision, deadline_seconds=1
         "dataset": {"keys": job["keys"], "value_size": job["value_size"], "entropy": 1.0},
         "workload": {"distribution": job["distribution"], "mix": job["mix"], "batch_size": 32},
         "execution": {"mode": "open_loop" if job["offered_ops_per_second"] else "closed_loop",
-            "concurrency": job["concurrency"], "queue_capacity": 128,
+            "concurrency": job["concurrency"], "queue_capacity": job.get("execution", {}).get("queue_capacity", 128),
             "request_timeout_ms": 10000, "offered_ops_per_second": job["offered_ops_per_second"]},
         "phases": {"preload": True, "warmup_operations": job["warmup_operations"],
             "aging_operations": 0, "measurement_operations": job["measurement_operations"]},
@@ -375,10 +1221,20 @@ def make_run_config(job, case_root, options, source_revision, deadline_seconds=1
         "limits": {"max_keys": max(job["keys"], 1000000), "max_bytes": 16 * 1024**3,
             "max_operations": maximum, "deadline_seconds": max(deadline_seconds, 600 if job["keys"] > 65536 else deadline_seconds),
             "shutdown_grace_seconds": 20}}
+    if "put_key_policy" in job:
+        config["workload"]["put_key_policy"] = job["put_key_policy"]
+    if "case_kind" in job:
+        config["case_id"] = job["case_id"]
+    if job.get("case_kind") == "interference":
+        config["execution"]["mode"] = "interference"
+        config["interference"] = dict(job["interference"])
     if "sealed_dataset" in job:
         config["phases"]["preload"] = False
         config["phases"]["verify_existing_dataset"] = True
         config["phases"]["evict_mapped_wal_before_measurement"] = job.get("evict_mapped_wal_before_measurement", False)
+    if job.get("case_kind") == "hybrid_put":
+        config["phases"]["preload"] = True
+        config["phases"]["verify_existing_dataset"] = False
     if "diagnostics" in job:
         config["diagnostics"] = job["diagnostics"]
     if job.get("warmup_key_sweep"):
@@ -439,6 +1295,185 @@ def admit_measurement_read_evidence(directory):
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "observed": data}
 
 
+LIVE_NVME_COUNTERS = ("completed_read_ops", "completed_read_bytes", "completed_write_ops",
+                      "completed_write_bytes", "recovery_read_ops", "recovery_read_bytes",
+                      "metadata_requests", "namespace_connects", "payload_rpc_requests",
+                      "unknown_writes", "errors", "queue_ns", "queue_samples",
+                      "submit_ns", "submit_samples", "cq_ns", "cq_samples",
+                      "control_ns", "control_samples", "validation_ns", "validation_samples",
+                      "allocation_ns", "allocation_samples", "publication_ns", "publication_samples",
+                      "namespace_setup_ns", "namespace_setup_samples", "read_io_ns", "read_io_samples",
+                      "persistence_ns", "persistence_samples",
+                      "owner_completion_ns", "owner_completion_samples",
+                      "wal_persistence_ns", "wal_persistence_samples",
+                      "wal_namespace_ns", "wal_namespace_samples",
+                      "frontier_file_ns", "frontier_file_samples",
+                      "frontier_namespace_ns", "frontier_namespace_samples",
+                      "route_evidence_dropped", "fence_evidence_dropped")
+
+
+def qualify_live_nvme_measurement(evidence, job):
+    """Validate deltas against raw boundaries; a requested route alone is not proof."""
+    reasons = []
+    data = evidence if isinstance(evidence, dict) else {}
+    start = data.get("start") or {}
+    end = data.get("end") or {}
+    start = start.get("live_nvmeof") if isinstance(start, dict) else None
+    end = end.get("live_nvmeof") if isinstance(end, dict) else None
+    delta = data.get("live_nvmeof")
+    counters = delta.get("counters") if isinstance(delta, dict) else None
+    if (data.get("measurement_attempted") is not True or data.get("measurement_drained") is not True
+            or not isinstance(delta, dict) or delta.get("available") is not True
+            or not isinstance(start, dict) or not isinstance(end, dict) or not isinstance(counters, dict)):
+        return {"qualified": False, "reasons": ["live NVMe boundary counters unavailable"]}
+    for name in LIVE_NVME_COUNTERS:
+        a, b, value = start.get(name), end.get(name), counters.get(name)
+        if (type(a) is not int or type(b) is not int or type(value) is not int
+                or a < 0 or b < a or b >= 2**64 - 1 or value != b - a):
+            reasons.append(f"invalid live NVMe counter {name}")
+    if reasons:
+        return {"qualified": False, "reasons": reasons}
+    if counters["payload_rpc_requests"]:
+        reasons.append("payload RPC observed on live NVMe route")
+    if counters["errors"] or counters["unknown_writes"]:
+        reasons.append("live NVMe errors or unknown writes observed")
+    if counters["route_evidence_dropped"] or counters["fence_evidence_dropped"]:
+        reasons.append("live NVMe route or fence evidence was dropped")
+    mix = job.get("mix", {})
+    if any(mix.get(name, 0) for name in ("put", "put_batch", "delete")):
+        if counters["completed_write_ops"] <= 0 or counters["completed_write_bytes"] <= 0:
+            reasons.append("no completed live NVMe writes observed")
+    if any(mix.get(name, 0) for name in ("read", "get_many")):
+        if counters["completed_read_ops"] <= 0 or counters["completed_read_bytes"] <= 0:
+            if not job.get("coordinator_cache_bytes"):
+                reasons.append("no completed live NVMe reads observed")
+            else:
+                first = (data.get("start") or {}).get("coordinator") or {}
+                last = (data.get("end") or {}).get("coordinator") or {}
+                hits = (data.get("deltas") or {}).get("coordinator") or {}
+                values = hits.get("counters") if isinstance(hits, dict) else None
+                values = values if isinstance(values, dict) else {}
+                a = first.get("hits") if isinstance(first, dict) else None
+                b = last.get("hits") if isinstance(last, dict) else None
+                count = values.get("hits")
+                if (not isinstance(hits, dict) or hits.get("available") is not True
+                        or type(a) is not int or type(b) is not int or type(count) is not int
+                        or a < 0 or b < a or count != b - a
+                        or count < job.get("measurement_operations", 0)):
+                    reasons.append("cache hits do not account for the measured read calls")
+    return {"qualified": not reasons, "reasons": reasons}
+
+
+def qualify_live_nvme_route(evidence, job, expected):
+    """Bind verified initiator namespaces and target implementations to the fleet."""
+    result = qualify_live_nvme_measurement(evidence, job)
+    reasons = result["reasons"]
+    transport = "rdma" if job["backend"] == "tidehunter_nvme_rdma" else "tcp"
+    if not isinstance(expected, dict) or expected.get("transport") != transport:
+        reasons.append("live NVMe expected transport unavailable or mismatched")
+        return {"qualified": False, "reasons": reasons}
+    addresses = expected.get("addresses")
+    host_id = expected.get("host_id")
+    host_nqn = expected.get("host_nqn")
+    service = expected.get("service")
+    try:
+        if (not isinstance(addresses, list) or not addresses
+                or len(set(addresses)) != len(addresses)
+                or any(ipaddress.ip_address(address).is_loopback for address in addresses)
+                or type(service) is not int or not 1 <= service <= 65535
+                or not isinstance(host_id, list) or len(host_id) != 16
+                or any(type(value) is not int or not 0 <= value <= 255 for value in host_id)
+                or not any(host_id)):
+            raise ValueError("invalid fleet identity")
+        identity = uuid.UUID(bytes=bytes(host_id))
+        if host_nqn != "nqn.2014-08.org.nvmexpress:uuid:" + str(identity):
+            raise ValueError("host identity mismatch")
+    except (ValueError, TypeError):
+        reasons.append("invalid admitted live NVMe fleet identity")
+        return {"qualified": False, "reasons": reasons}
+    end = evidence.get("end") if isinstance(evidence, dict) else None
+    stats = end.get("live_nvmeof") if isinstance(end, dict) else None
+    routes = stats.get("routes") if isinstance(stats, dict) else None
+    if not isinstance(routes, list) or not routes:
+        reasons.append("no verified kernel live NVMe namespace route")
+    else:
+        for route in routes:
+            ns = route.get("namespace_identity") if isinstance(route, dict) else None
+            if (not isinstance(route, dict) or route.get("transport") != transport
+                    or route.get("address") not in addresses or route.get("service") != service
+                    or route.get("host_nqn") != host_nqn or route.get("host_id") != host_id
+                    or not isinstance(ns, dict)
+                    or not isinstance(ns.get("namespace_path"), str)
+                    or not re.fullmatch(r"/dev/nvme[0-9]+n[0-9]+", ns["namespace_path"])
+                    or type(ns.get("controller_instance")) is not int or ns["controller_instance"] < 0
+                    or not isinstance(ns.get("nqn"), str) or not ns["nqn"].startswith("nqn.")
+                    or not isinstance(ns.get("uuid"), list) or len(ns["uuid"]) != 16
+                    or any(type(value) is not int or not 0 <= value <= 255 for value in ns["uuid"])
+                    or not any(ns["uuid"])
+                    or type(ns.get("nsid")) is not int or ns["nsid"] <= 0
+                    or type(ns.get("bytes")) is not int or ns["bytes"] <= 0
+                    or type(ns.get("block_size")) is not int or ns["block_size"] <= 0
+                    or ns["bytes"] % ns["block_size"]):
+                reasons.append("observed live NVMe route differs from admitted kernel namespace")
+                break
+            target = job.get("nvmeof_target", "kernel")
+            if (target not in ("kernel", "spdk")
+                    or route.get("target_implementation", "kernel") != target
+                    or ns.get("target_implementation", "kernel") != target):
+                reasons.append("live NVMe target implementation differs from the selected target")
+                break
+            if target == "spdk":
+                binding = route.get("spdk")
+                writer = route.get("writer")
+                file = writer.get("file_identity") if isinstance(writer, dict) else None
+                if (not isinstance(binding, dict)
+                        or not all(isinstance(binding.get(key), str) and Path(binding[key]).is_absolute()
+                                   for key in ("rpc_socket", "image_path"))
+                        or not isinstance(binding.get("bdev_name"), str) or not binding["bdev_name"]
+                        or any(type(binding.get(key)) is not int or binding[key] <= 0
+                               for key in ("pid", "process_start_ticks"))
+                        or writer is not None and (not isinstance(file, dict)
+                            or file.get("path") != binding["image_path"]
+                            or type(file.get("device")) is not int or file["device"] < 0
+                            or type(file.get("inode")) is not int or file["inode"] <= 0
+                            or file.get("bytes") != ns["bytes"]
+                            or file.get("block_size") != ns["block_size"])):
+                    reasons.append("live SPDK route lacks a valid authenticated owner binding")
+                    break
+    return {"qualified": not reasons, "reasons": reasons}
+
+
+def comparison_backend(job):
+    """Keep target implementations distinct without inventing an engine backend."""
+    target = job.get("nvmeof_target", "kernel")
+    if target not in ("kernel", "spdk") or ("nvmeof_target" in job and job["backend"] not in NVME_BACKENDS):
+        raise ValueError("invalid NVMe target implementation")
+    if target == "spdk":
+        if job["backend"] != "tidehunter_nvme_rdma" or job.get("nvmeof_route") not in ("sealed_read", "live"):
+            raise ValueError("SPDK requires a sealed or live RDMA route")
+        return "tidehunter_spdk_live_rdma" if job["nvmeof_route"] == "live" else "tidehunter_spdk_rdma"
+    return job["backend"]
+
+
+def diagnostic_backend(job):
+    """Runtime evidence uses a distinct identity for the immutable reader."""
+    backend = job["backend"]
+    if backend in NVME_BACKENDS and job.get("nvmeof_route") == "live":
+        return "tidehunter_live_nvmeof"
+    if backend in NVME_BACKENDS and job.get("nvmeof_route") == "sealed_read":
+        return backend + "_sealed_read"
+    return backend
+
+
+def admit_write_timeline(directory, job, config, *, completed):
+    requested = job.get("diagnostics", {}).get("write_timeline_limit", 0)
+    configured = config.get("diagnostics", {}).get("write_timeline_limit", 0)
+    if type(requested) is not int or requested != configured:
+        raise ValueError("write timeline job and executed configuration limits differ")
+    return analyze.admit_write_timeline(directory, config, completed=completed,
+                                        expected_backend=diagnostic_backend(job))
+
+
 def admit_write_diagnostics(directory, job, *, completed):
     path = Path(directory) / "result/write-diagnostics.json"
     requested = job.get("diagnostics", {}).get("write_profile_limit", 0)
@@ -453,14 +1488,21 @@ def admit_write_diagnostics(directory, job, *, completed):
         raise ValueError("write-stage diagnostics require object and selection evidence")
     selection = data.get("selection", {})
     if (type(data.get("schema_version")) is not int or data["schema_version"] != 1
-            or data.get("backend") != job["backend"] or data.get("phase") != "measurement"
-            or selection.get("requested_limit") != requested
+            or data.get("backend") != diagnostic_backend(job) or data.get("phase") != "measurement"
+            or type(requested) is not int or type(selection.get("requested_limit")) is not int
+            or selection["requested_limit"] != requested
             or type(data.get("phase_attempted")) is not bool or type(data.get("runtime_enabled")) is not bool
             or type(selection.get("observed_samples")) is not int or selection["observed_samples"] < 0):
         raise ValueError("write-stage diagnostics schema, backend, phase or requested limit differs")
     if completed and requested and (not data["phase_attempted"] or not data["runtime_enabled"]
-            or selection["observed_samples"] == 0 or not isinstance(data.get("profile"), dict) or data.get("error")):
+            or data.get("measurement_drained") is False or selection["observed_samples"] == 0
+            or not isinstance(data.get("profile"), dict) or data.get("error")):
         raise ValueError("requested write-stage diagnostics did not observe real measurement samples")
+    if completed and requested and data["backend"] == "tidehunter_live_nvmeof":
+        if data.get("runtime_observation_mode") != "live_nvmeof_phase_counters":
+            raise ValueError("requested live NVMe write diagnostics have an unrecognized observation mode")
+        if data.get("measurement_drained") is not True:
+            raise ValueError("live NVMe write diagnostics require a drained measurement")
     observer_path = str(Path(__file__).resolve().parent / "observability")
     if observer_path not in sys.path:
         sys.path.insert(0, observer_path)
@@ -469,6 +1511,214 @@ def admit_write_diagnostics(directory, job, *, completed):
     return {"path": "result/write-diagnostics.json", "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             "observed": data}
 
+def _diagnostic_raw_rows(directory):
+    path = Path(directory) / "result/samples.csv"
+    if not path.is_file():
+        return None
+    rows = {}
+    for row in analyze.read_samples(path):
+        sample_id = row["caller_sample_id"]
+        if sample_id is not None:
+            if sample_id in rows:
+                raise ValueError("duplicate diagnostic caller identity")
+            rows[sample_id] = row
+    return rows
+
+
+def _uint(value):
+    return type(value) is int and 0 <= value <= 2**64 - 1
+
+
+def admit_valkey_diagnostics(directory, job, config=None, *, completed):
+    """Bind client pipeline records to measurement API calls, not to API success."""
+    requested = job.get("diagnostics", {}).get("valkey_profile_limit", 0)
+    if type(requested) is not int or not 0 <= requested <= 65536:
+        raise ValueError("invalid Valkey profile limit")
+    if config is not None and config.get("diagnostics", {}).get("valkey_profile_limit", 0) != requested:
+        raise ValueError("Valkey job and executed configuration limits differ")
+    path = Path(directory) / "result/valkey-timings.json"
+    if not path.is_file():
+        if completed and requested:
+            raise ValueError("requested Valkey diagnostics artifact is missing")
+        return None
+    if not requested or job.get("backend") not in ("valkey_tcp", "valkey_rdma"):
+        raise ValueError("unexpected Valkey diagnostics")
+    if config is not None:
+        backend = config.get("backend", {})
+        if backend.get("kind") != job["backend"] or (job["backend"] == "valkey_tcp"
+                and backend.get("options", {}).get("client") != "libvalkey"):
+            raise ValueError("Valkey diagnostics require the configured libvalkey backend")
+    if path.stat().st_size > 64 * 1024 * 1024:
+        raise ValueError("Valkey diagnostics exceed bounded artifact size")
+    raw = path.read_bytes()
+    data = json.loads(raw)
+    if (not isinstance(data, dict) or type(data.get("schema_version")) is not int
+            or data["schema_version"] != 1 or data.get("requested_limit") != requested
+            or type(data.get("requested_limit")) is not int
+            or any(type(data.get(name)) is not bool for name in
+                   ("measurement_attempted", "measurement_drained", "available"))
+            or not isinstance(data.get("error"), (str, type(None)))):
+        raise ValueError("invalid Valkey diagnostics wrapper")
+    profile = data.get("profile")
+    if data["available"]:
+        if not isinstance(profile, dict) or profile.get("available") is not True:
+            raise ValueError("available Valkey diagnostics lack a profile")
+        if profile.get("source_commit") != "fe8d406c0b5a64ec897f6455e4de684629883764":
+            raise ValueError("Valkey profile source commit differs")
+        for name in ("rdma_source_sha256", "rdma_archive_sha256", "client_archive_sha256"):
+            if not isinstance(profile.get(name), str) or not re.fullmatch(r"[0-9a-f]{64}", profile[name]):
+                raise ValueError("invalid Valkey artifact provenance digest")
+        for name in ("snapshot", "clock", "poll_wait_scope", "wake_to_cq_scope", "transport_scope"):
+            if not isinstance(profile.get(name), str) or not profile[name]:
+                raise ValueError("Valkey profile lacks clock or population scope")
+        cq_available = profile.get("cq_available")
+        reason = profile.get("cq_unavailable_reason")
+        if (type(cq_available) is not bool or (cq_available and reason is not None)
+                or (not cq_available and (not isinstance(reason, str) or not reason))
+                or (job["backend"] == "valkey_tcp" and cq_available)):
+            raise ValueError("invalid Valkey CQ availability")
+        records = profile.get("records")
+        if not isinstance(records, list) or len(records) > requested:
+            raise ValueError("invalid bounded Valkey pipeline population")
+        rows = _diagnostic_raw_rows(directory)
+        seen = set()
+        for record in records:
+            if not isinstance(record, dict):
+                raise ValueError("invalid Valkey pipeline record")
+            ident, operation = record.get("caller_sample_id"), record.get("operation")
+            owner, connection = record.get("owner"), record.get("connection")
+            if (not all(_uint(value) for value in (ident, owner, connection))
+                    or operation not in ("get", "get_many", "put", "delete")
+                    or type(record.get("worker_finished")) is not bool
+                    or "pipeline_outcome" not in record or "cq" not in record
+                    or record.get("pipeline_outcome") not in (None, "ok", "error", "cancelled")):
+                raise ValueError("invalid Valkey pipeline identity or outcome")
+            key = (ident, owner, connection)
+            if key in seen:
+                raise ValueError("duplicate Valkey caller/owner/connection pipeline")
+            seen.add(key)
+            for name in ("mutex_wait_ns", "blocking_enqueue_to_start_ns", "blocking_return_to_wake_ns",
+                         "command_encode_ns", "transport_and_parser_ns", "reply_decode_ns"):
+                if name not in record or (record[name] is not None and not _uint(record[name])):
+                    raise ValueError("invalid nullable Valkey duration")
+            cq = record.get("cq")
+            if cq is not None:
+                if not cq_available or not isinstance(cq, dict) or any(not _uint(cq.get(name)) for name in
+                        ("poll_wait_ns", "poll_calls", "cq_poll_ns", "cq_poll_calls", "wake_to_cq_ns",
+                         "wake_to_cq_samples", "completions", "clock_failures")):
+                    raise ValueError("invalid Valkey CQ observations")
+            if rows is None:
+                if completed:
+                    raise ValueError("Valkey diagnostics lack raw measurement samples")
+            elif ident not in rows:
+                raise ValueError("Valkey pipeline references a foreign caller")
+            else:
+                row = rows[ident]
+                expected = {"get": ("read", "missing_read"), "get_many": ("get_many",),
+                            "put": ("put",), "delete": ("delete",)}[operation]
+                if row["operation"] not in expected or row["dispatch_observed"] != "true":
+                    raise ValueError("Valkey pipeline does not match raw API operation")
+        # Multiple owner pipelines can represent one MGET; their outcomes do not
+        # prove that the enclosing API succeeded or that every owner was sampled.
+    elif profile is not None and (not isinstance(profile, dict) or profile.get("available") is not False):
+        raise ValueError("unavailable Valkey profile has inconsistent availability")
+    if completed and (not data["measurement_attempted"] or not data["measurement_drained"]
+                      or not data["available"] or data["error"]):
+        raise ValueError("requested Valkey diagnostics did not complete")
+    coverage = None
+    if data["available"]:
+        unfinished = sum(not record["worker_finished"] for record in records)
+        missing_cq = sum(record["cq"] is None for record in records) if cq_available else 0
+        clock_failures = sum(record["cq"]["clock_failures"] for record in records if record["cq"] is not None)
+        failed_clocks = sum(record["cq"] is not None and record["cq"]["clock_failures"] > 0 for record in records)
+        coverage = {"pipeline_records": len(records), "unfinished_workers": unfinished,
+                    "cq_available": cq_available, "cq_unavailable_reason": reason,
+                    "cq_missing_records": missing_cq, "cq_clock_failure_records": failed_clocks,
+                    "cq_clock_failures": clock_failures,
+                    "partial": bool(unfinished or missing_cq or clock_failures)}
+    return {"path": "result/valkey-timings.json", "sha256": hashlib.sha256(raw).hexdigest(),
+            "coverage": coverage, "observed": data}
+
+
+def _validate_read_correlation(directory, correlation, requested, completed):
+    if not isinstance(correlation, dict) or type(correlation.get("available")) is not bool:
+        raise ValueError("invalid read correlation availability")
+    for name in ("clock_scope", "granularity", "limitations"):
+        if not isinstance(correlation.get(name), str) or not correlation[name]:
+            raise ValueError("read correlation requires clock and granularity scopes")
+    trace = correlation.get("trace")
+    if not correlation["available"]:
+        if trace is not None:
+            raise ValueError("unavailable read correlation contains a trace")
+        return
+    if not isinstance(trace, dict) or trace.get("limit") != requested or type(trace.get("limit")) is not int:
+        raise ValueError("invalid read trace limit")
+    calls = trace.get("calls")
+    if not isinstance(calls, list) or len(calls) > requested:
+        raise ValueError("invalid read trace population")
+    if any(not _uint(trace.get(name)) for name in ("dropped_calls", "contention_drops", "budget_drops")):
+        raise ValueError("invalid read trace drop counts")
+    rows = _diagnostic_raw_rows(directory)
+    ids = set()
+    budget = 512 * len(calls)
+    for call in calls:
+        if not isinstance(call, dict):
+            raise ValueError("invalid read trace call")
+        ident, members = call.get("caller_id"), call.get("members")
+        if (not _uint(ident) or ident in ids or not _uint(members) or not members
+                or call.get("status") not in ("complete", "error", "cancelled_or_incomplete", "incomplete")
+                or any(not _uint(call.get(name)) for name in ("dropped_children", "dropped_events"))):
+            raise ValueError("invalid read trace identity or status")
+        ids.add(ident)
+        if rows is None:
+            if completed:
+                raise ValueError("read trace lacks raw measurement samples")
+        elif ident not in rows:
+            raise ValueError("read trace references foreign caller")
+        else:
+            row = rows[ident]
+            if (row["operation"] not in ("read", "missing_read", "get_many")
+                    or row["dispatch_observed"] != "true" or row["logical_keys"] != members):
+                raise ValueError("read trace does not match raw API identity")
+        groups = call.get("groups")
+        if not isinstance(groups, list) or len(groups) > 256:
+            raise ValueError("invalid read trace group population")
+        def events(items):
+            if not isinstance(items, list) or len(items) > 512:
+                raise ValueError("invalid read trace event population")
+            for event in items:
+                if (not isinstance(event, dict) or not isinstance(event.get("name"), str)
+                        or not event["name"] or not _uint(event.get("elapsed_ns"))):
+                    raise ValueError("invalid read trace event")
+                queue, token = event.get("io_queue_id"), event.get("io_token")
+                if (queue is None) != (token is None) or (queue is not None and
+                        (not _uint(queue) or not _uint(token))):
+                    raise ValueError("invalid read IO identity")
+        events(call.get("events"))
+        budget += 256 * len(call["events"])
+        for group in groups:
+            if (not isinstance(group, dict) or not _uint(group.get("owner"))
+                    or type(group.get("membership_classified")) is not bool
+                    or not _uint(group.get("dropped_events"))):
+                raise ValueError("invalid read trace group")
+            indices = group.get("members")
+            coalesced = group.get("coalesced_members")
+            if (not isinstance(indices, list) or not indices or len(indices) > members
+                    or any(not _uint(index) or index >= members for index in indices)
+                    or len(set(indices)) != len(indices)
+                    or not isinstance(coalesced, list)
+                    or any(not _uint(index) or index not in indices for index in coalesced)
+                    or len(set(coalesced)) != len(coalesced)):
+                raise ValueError("invalid read trace member identities")
+            if any(group.get(name) is not None and not _uint(group[name])
+                   for name in ("lane", "flight_slot")):
+                raise ValueError("invalid read trace lane or flight")
+            events(group.get("events"))
+            budget += 512 + 64 * len(indices) + 256 * len(group["events"])
+    if budget > 4 * 1024 * 1024:
+        raise ValueError("read trace exceeds producer budget")
+
+
 def admit_read_diagnostics(directory, job, *, completed):
     path = Path(directory) / "result/read-diagnostics.json"
     requested = job.get("diagnostics", {}).get("read_profile_limit", 0)
@@ -476,14 +1726,14 @@ def admit_read_diagnostics(directory, job, *, completed):
         if completed and requested:
             raise ValueError("requested read-stage diagnostics artifact is missing")
         return None
-    if path.stat().st_size > 256 * 1024:
+    if path.stat().st_size > 32 * 1024 * 1024:
         raise ValueError("read-stage diagnostics exceed the bounded artifact size")
     data = json.loads(path.read_text())
     if not isinstance(data, dict) or not isinstance(data.get("selection"), dict):
         raise ValueError("read-stage diagnostics require object and selection evidence")
     selection = data["selection"]
     if (type(data.get("schema_version")) is not int or data["schema_version"] != 1
-            or data.get("backend") != job["backend"] or data.get("phase") != "measurement"
+            or data.get("backend") != diagnostic_backend(job) or data.get("phase") != "measurement"
             or type(selection.get("requested_limit")) is not int or selection["requested_limit"] != requested
             or type(data.get("phase_attempted")) is not bool or type(data.get("runtime_enabled")) is not bool):
         raise ValueError("read-stage diagnostics schema, backend, phase or requested limit differs")
@@ -494,16 +1744,28 @@ def admit_read_diagnostics(directory, job, *, completed):
     if observer_path not in sys.path:
         sys.path.insert(0, observer_path)
     import campaign_exporter
-    campaign_exporter.read_diagnostic_metrics(data, {})
+    correlation = (data.get("profile") or {}).get("caller_correlation")
+    export_data = data
+    if correlation is not None:
+        _validate_read_correlation(directory, correlation, requested, completed)
+        # The independent aggregate validator does not consume the bounded trace.
+        export_data = dict(data)
+        export_data["profile"] = dict(data["profile"])
+        export_data["profile"].pop("caller_correlation")
+    campaign_exporter.read_diagnostic_metrics(export_data, {})
     return {"path": "result/read-diagnostics.json", "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             "observed": data}
 
 
-def qualify_nvme_measurement(evidence, expected_readers, expected_transport, targets):
+def qualify_nvme_measurement(evidence, expected_readers, expected_transport, targets, expected_target="kernel"):
     """Require actual interval activity, not startup verification or lifetime counters."""
     reasons = []
     if expected_transport not in ("tcp", "rdma"):
         reasons.append("expected NVMe transport is invalid")
+    cache_policy = {"kernel": "buffered_file_page_cache", "kernel_direct": "direct_file_no_OS_pagecache",
+                    "spdk": "direct_file_bdev_no_OS_pagecache"}.get(expected_target)
+    if cache_policy is None or expected_target == "spdk" and expected_transport != "rdma":
+        reasons.append("expected NVMe target implementation is invalid")
     exports = []
     if isinstance(targets, list):
         for owner in targets:
@@ -519,13 +1781,21 @@ def qualify_nvme_measurement(evidence, expected_readers, expected_transport, tar
     for entry in exports:
         policy = entry.get("target_receipt") if isinstance(entry, dict) else None
         target_policies.append({key: policy.get(key) if isinstance(policy, dict) else None
-                                for key in ("target_cache", "target_cache_verified", "selected_transport")})
+                                for key in ("target_implementation", "target_cache", "target_cache_verified",
+                                            "selected_transport", "direct_io_verified", "read_only_verified")})
         if (not isinstance(policy, dict)
-                or policy.get("target_cache") != "buffered_file_page_cache"
+                or policy.get("target_cache") != cache_policy
                 or policy.get("target_cache_verified") is not True
                 or policy.get("selected_transport") != expected_transport):
-            reasons.append("target buffered cache or selected transport is unverified")
+            reasons.append("target cache/open-mode or selected transport is unverified")
             continue
+        if expected_target == "spdk" and (
+                policy.get("target_implementation") != "spdk"
+                or policy.get("direct_io_verified") is not True
+                or policy.get("read_only_verified") is not True):
+            reasons.append("SPDK direct-I/O/read-only target identity is unverified")
+        if expected_target == "kernel_direct" and policy.get("target_implementation") != "kernel_direct":
+            reasons.append("direct kernel target identity is unverified")
     nvme = evidence.get("nvmeof") if isinstance(evidence, dict) else None
     readers = nvme.get("readers") if isinstance(nvme, dict) else None
     if not isinstance(readers, dict) or not readers or len(readers) != expected_readers or nvme.get("available") is not True:
@@ -566,10 +1836,42 @@ def qualify_nvme_measurement(evidence, expected_readers, expected_transport, tar
         reasons.append("measurement used owner record RPC or coordinator cache")
     return {"qualified": not reasons, "reasons": reasons, "nvmeof_totals": totals,
             "expected_transport": expected_transport, "reader_transports": reader_transports,
+            "expected_target": expected_target,
             "target_policies": target_policies,
             "coordinator_read_rpc_count": values.get("read_rpc_count") if values is not None else None,
             "coordinator_cache_hits": values.get("hits") if values is not None else None,
             "scope": "drained measurement interval; excludes full-key dataset verification; not NAND or wire timing"}
+
+
+def admit_spdk_target_measurement(directory, job, receipt, *, completed):
+    if job.get("nvmeof_target") != "spdk":
+        if "spdk_target_measurement" in receipt or "spdk_target_io" in receipt:
+            raise ValueError("SPDK evidence is attached to another target")
+        return None
+    binding = receipt.get("spdk_target_measurement")
+    if not completed and (not isinstance(binding, dict) or "end" not in binding):
+        return None
+    observed = (spdk_measurement.admit_live(directory, binding)
+                if job.get("nvmeof_route") == "live" else spdk_measurement.admit(
+                    directory, binding, allow_zero_reads=job.get("case_kind") == "hybrid_put"))
+    recorded = receipt.get("spdk_target_io")
+    if recorded is not None and recorded != observed:
+        # Python 3.12 changed float sum to compensated summation. Accept the
+        # older left-to-right result only for the two derived live means.
+        normalized = dict(recorded) if isinstance(recorded, dict) else {}
+        if job.get("nvmeof_route") == "live" and observed.get("available"):
+            for direction in ("read", "write"):
+                key = "mean_" + direction + "_completion_us"
+                ops = observed[direction + "_ops"]
+                total = 0.0
+                for owner in observed["owners"]:
+                    total += (owner[key] or 0) * owner[direction + "_ops"]
+                legacy = total / ops if ops else None
+                if key in normalized and normalized[key] == legacy:
+                    normalized[key] = observed[key]
+        if normalized != observed:
+            raise ValueError("SPDK interval accounting differs from its bound raw evidence")
+    return observed
 
 
 def qualify_fullset_read_path(job, evidence):
@@ -582,7 +1884,7 @@ def qualify_fullset_read_path(job, evidence):
         group = deltas.get(component, {})
         rows = group.get("partitions")
         if (group.get("available") is not True or not isinstance(rows, dict)
-                or set(rows) != {str(index) for index in range(5)}):
+                or set(rows) != active_partitions(job)):
             return None
         values = []
         for row in rows.values():
@@ -626,7 +1928,7 @@ def qualify_fullset_read_path(job, evidence):
             "not a hardware-only RTT or physical NVMe measurement"}
 
 
-def qualify_read_tier(job, evidence, receipt):
+def qualify_read_tier(job, evidence, receipt, *, local_mode=False):
     """Use complete boundary counters; unknown never means zero."""
     tier = job.get("read_tier", {}).get("name")
     if tier is None:
@@ -640,7 +1942,7 @@ def qualify_read_tier(job, evidence, receipt):
             values = [group.get("counters", {}).get(field)]
         else:
             rows = group.get("partitions")
-            if not isinstance(rows, dict) or set(rows) != {str(i) for i in range(5)}:
+            if not isinstance(rows, dict) or set(rows) != active_partitions(job):
                 return None
             if any(row.get("available") is not True for row in rows.values()):
                 return None
@@ -661,9 +1963,11 @@ def qualify_read_tier(job, evidence, receipt):
     # Authority counters are cumulative in raw boundary snapshots, not in
     # owner_executor deltas. Never interpret a missing/reset counter as zero.
     authority_loads = []
-    for partition in map(str, range(5)):
+    for partition in sorted(active_partitions(job)):
         try:
-            if any(evidence[side]["owner_executor"].get("available") is not True for side in ("start", "end")):
+            if any(evidence[side]["owner_executor"].get("available") is not True
+                   or set(evidence[side]["owner_executor"]["partitions"]) != active_partitions(job)
+                   for side in ("start", "end")):
                 raise ValueError("authority boundary unavailable")
             start = evidence["start"]["owner_executor"]["partitions"][partition]["authority"]["history_loads"]
             end = evidence["end"]["owner_executor"]["partitions"][partition]["authority"]["history_loads"]
@@ -673,7 +1977,8 @@ def qualify_read_tier(job, evidence, receipt):
         except (TypeError, KeyError, ValueError):
             authority_loads = []
             break
-    observed["authority_history_loads"] = sum(authority_loads) if len(authority_loads) == 5 else None
+    observed["authority_history_loads"] = (sum(authority_loads)
+                                             if len(authority_loads) == active_owner_count(job) else None)
     observed["owner_grants"] = observed_owner_grants
     reasons = []
     if receipt.get("status") != "completed" or not isinstance(evidence, dict) or evidence.get("measurement_drained") is not True:
@@ -687,6 +1992,15 @@ def qualify_read_tier(job, evidence, receipt):
                      "coordinator_read_memory_allowance_bytes", "owner_read_memory_allowance_bytes",
                      "page_cache_policy", "warmup_operations", "warmup_key_sweep",
                      "measurement_key_sweep", "read_lanes", "concurrency"):
+            if (local_mode and name == "page_cache_policy"
+                    and requested.get(name) == "drop_at_measurement_gate"
+                    and effective.get(name) == "scoped_file_eviction"):
+                evictions = receipt.get("measurement_evidence", {}).get("scoped_file_eviction")
+                if (isinstance(evictions, list) and len(evictions) == 6
+                        and all(isinstance(row, dict) and row.get("method") == "scoped_file_eviction"
+                                for row in evictions)
+                        and any(row.get("files") for row in evictions)):
+                    continue
             if effective.get(name) != requested.get(name):
                 reasons.append(name + " effective configuration differs or is unavailable")
     def expect(name, predicate, description):
@@ -716,7 +2030,7 @@ def qualify_read_tier(job, evidence, receipt):
     elif tier == "registered_acquire":
         start = (evidence.get("start") or {}).get("client_resident_lanes", {}) if isinstance(evidence, dict) else {}
         partitions = start.get("partitions", {}) if isinstance(start, dict) else {}
-        if start.get("available") is not True or set(partitions) != {str(i) for i in range(5)}:
+        if start.get("available") is not True or set(partitions) != active_partitions(job):
             reasons.append("premeasurement read-lane sessions unavailable")
         else:
             for row in partitions.values():
@@ -745,7 +2059,7 @@ def qualify_read_tier(job, evidence, receipt):
         if not isinstance(hosts, list) or len(hosts) != 6:
             reasons.append("owned-device traces unavailable")
         else:
-            owners = hosts[1:]
+            owners = hosts[1:1 + active_owner_count(job)]
             if not all(isinstance(x, dict) and x.get("available") is True for x in owners):
                 reasons.append("one or more owner traces unavailable")
             if not any(isinstance(x, dict) and x.get("available") is True
@@ -766,13 +2080,52 @@ def qualify_read_tier(job, evidence, receipt):
         "claim_boundary": "Device-wide collector-window events include gate overlap, background and metadata I/O; they do not establish measurement-scoped or per-API device time, NAND latency, or pure wire latency."}
 
 
-def summarize_case(directory):
+def summarize_case(directory, *, local_mode=False):
     directory = Path(directory)
     receipt = json.loads((directory / "receipt.json").read_text())
     job = receipt["job"]
     value = {"case_id": job["case_id"], "job": job, "status": receipt.get("status"),
              "error": receipt.get("error"), "measurement_evidence": receipt.get("measurement_evidence"),
              "counter_evidence": receipt.get("counter_evidence")}
+    if "case_kind" in job:
+        validate_focused_job(job)
+        focused = analyze.admit_focused_artifacts(
+            directory, job, receipt, completed=receipt.get("status") == "completed")
+        value["focused_evidence"] = focused
+    owner_bindings = receipt.get("owner_durability_receipts")
+    if ("owner_count" in job and receipt.get("status") == "completed"
+            and owner_bindings is None):
+        raise ValueError("completed case lacks owner durability receipts")
+    if owner_bindings is not None:
+        if (not isinstance(owner_bindings, list) or len(owner_bindings) > active_owner_count(job)
+                or ("owner_count" in job and receipt.get("status") == "completed"
+                    and len(owner_bindings) != active_owner_count(job))):
+            raise ValueError("invalid owner durability receipt bindings")
+        owners = []
+        for index, binding in enumerate(owner_bindings):
+            expected = f"owner-durability/node-{index}.durability.json"
+            if not isinstance(binding, dict) or binding.get("path") != expected:
+                raise ValueError("invalid owner durability receipt path")
+            path = directory / expected
+            data = path.read_bytes()
+            if hashlib.sha256(data).hexdigest() != binding.get("sha256"):
+                raise ValueError("owner durability receipt differs from its integrity binding")
+            owner = json.loads(data)
+            if "owner_count" in job and (type(owner.get("partition")) is not int
+                                           or owner["partition"] != index):
+                raise ValueError("owner durability receipt partition differs from its binding")
+            owners.append(owner)
+        value["owner_durability_receipts"] = owners
+    facts = receipt.get("owner_provider_facts")
+    if isinstance(facts, dict) and facts.get("path") == "owner-provider-facts.json":
+        data = (directory / facts["path"]).read_bytes()
+        if hashlib.sha256(data).hexdigest() != facts.get("sha256"):
+            raise ValueError("owner provider facts differ from their integrity binding")
+        value["owner_provider_facts"] = json.loads(data)
+    elif facts is not None:
+        value["owner_provider_facts"] = facts
+    if job.get("case_kind") in ("fio_floor", "block_trace", "net_floor", "ssd_floor", "ssd_write_floor"):
+        return {**value, "metrics_unavailable": "standalone evidence; no KV samples"}
     if "sealed_dataset" in job:
         value["nvmeof_trace_evidence"] = receipt.get("nvmeof_trace_evidence")
         value["nvmeof_trace_raw_location"] = receipt.get("nvmeof_trace_raw_location")
@@ -781,7 +2134,31 @@ def summarize_case(directory):
         value["cold_device_raw_location"] = receipt.get("cold_device_raw_location")
         value["nvmeof_measurement_qualification"] = receipt.get("nvmeof_measurement_qualification")
         value["dataset_source"] = receipt.get("dataset_source")
+    if job.get("nvmeof_target") == "spdk":
+        value["spdk_target_measurement"] = receipt.get("spdk_target_measurement")
+        if receipt.get("status") == "completed" or receipt.get("raw_artifacts_validated"):
+            observed_spdk = admit_spdk_target_measurement(
+                directory, job, receipt, completed=receipt.get("status") == "completed")
+            if observed_spdk is not None:
+                value["spdk_target_io"] = observed_spdk
     if receipt.get("status") != "completed" and not receipt.get("raw_artifacts_validated"):
+        binding = receipt.get("write_timeline")
+        path = directory / "result/write-timeline.json"
+        if binding is not None or path.exists():
+            normalized = json.loads((directory / "normalized-config.json").read_text())
+            timeline = admit_write_timeline(directory, job, normalized, completed=False)
+            if timeline != binding:
+                raise ValueError("partial write timeline differs from its receipt integrity binding")
+            value["write_timeline"] = timeline
+        for key, filename, admit in (
+                ("read_diagnostics", "read-diagnostics.json", admit_read_diagnostics),
+                ("valkey_diagnostics", "valkey-timings.json", admit_valkey_diagnostics)):
+            binding = receipt.get(key)
+            if binding is not None or (directory / "result" / filename).exists():
+                observed = admit(directory, job, completed=False)
+                if observed != binding:
+                    raise ValueError(f"partial {key} differs from its receipt integrity binding")
+                value[key] = observed
         return {**value, "metrics_unavailable": "failed before trustworthy raw artifact admission"}
     read_interval = admit_measurement_read_evidence(directory)
     if read_interval is not None:
@@ -810,7 +2187,7 @@ def summarize_case(directory):
         value["cold_device_evidence"] = receipt.get("cold_device_evidence")
         value["cold_device_raw_location"] = receipt.get("cold_device_raw_location")
         value["read_tier_qualification"] = qualify_read_tier(
-            job, read_interval["observed"] if read_interval else None, receipt)
+            job, read_interval["observed"] if read_interval else None, receipt, local_mode=local_mode)
     eviction = admit_wal_eviction_evidence(directory, job, completed=receipt.get("status") == "completed")
     if eviction is not None:
         if eviction != receipt.get("wal_eviction_evidence"):
@@ -845,6 +2222,11 @@ def summarize_case(directory):
             frames.append([host["resource_accounting"] for host in json.loads(path.read_text())["hosts"]])
         if resource_accounting.interval(*frames) != resources:
             raise ValueError("resource interval cannot be reproduced from owned boundary counters")
+        if "core_complete" in resource_binding or "io_complete" in resource_binding:
+            coverage = resource_accounting.coverage(resources)
+            if any(type(resource_binding.get(key)) is not bool or resource_binding[key] != value
+                   for key, value in coverage.items()):
+                raise ValueError("resource coverage differs from reproduced boundary counters")
         value["resource_evidence"] = resource_binding
     diagnostics = admit_write_diagnostics(directory, job, completed=receipt.get("status") == "completed")
     if diagnostics is not None:
@@ -865,7 +2247,46 @@ def summarize_case(directory):
     config = json.loads((directory / "config.json").read_text())
     normalized = json.loads((directory / "normalized-config.json").read_text())
     analyze.verify_normalization(config, normalized)
-    if job["backend"] in NVME_BACKENDS:
+    valkey = admit_valkey_diagnostics(directory, job, normalized, completed=receipt.get("status") == "completed")
+    if valkey != receipt.get("valkey_diagnostics"):
+        raise ValueError("Valkey diagnostics differ from their receipt integrity binding")
+    if valkey is not None:
+        value["valkey_diagnostics"] = valkey
+    timeline = admit_write_timeline(directory, job, normalized, completed=receipt.get("status") == "completed")
+    if timeline != receipt.get("write_timeline"):
+        raise ValueError("write timeline differs from its receipt integrity binding")
+    if timeline is not None:
+        value["write_timeline"] = timeline
+    if job["backend"] == "native":
+        options = normalized["backend"]["options"]
+        for planned, option in (("native_durability", "durability"),
+                                ("native_wal_geometry", "native_wal_geometry"),
+                                ("native_shards", "native_shards")):
+            if planned in job and options.get(option) != job[planned]:
+                raise ValueError(f"native {option} differs from the planned case")
+    admit_durability_tier(job, normalized["backend"]["options"], result / "manifest.json")
+    if job["backend"] in NVME_BACKENDS and job.get("nvmeof_route") == "live":
+        binding = receipt.get("live_nvme_expected")
+        admitted = receipt.get("live_nvme_measurement_qualification")
+        expected = None
+        if binding is not None:
+            if not isinstance(binding, dict) or binding.get("path") != "live-nvme-expected.json":
+                raise ValueError("invalid live NVMe expectation binding")
+            artifact = directory / binding["path"]
+            if hashlib.sha256(artifact.read_bytes()).hexdigest() != binding.get("sha256"):
+                raise ValueError("live NVMe expectation differs from its integrity binding")
+            expected = json.loads(artifact.read_text())
+            live = config["backend"]["options"].get("external_remote_config", {}).get("live_nvme")
+            if not isinstance(live, dict) or any(expected.get(k) != live.get(k) for k in ("host_id", "host_nqn")):
+                raise ValueError("live NVMe identity differs from executed configuration")
+        qualification = qualify_live_nvme_route(read_interval["observed"] if read_interval else None, job, expected)
+        value["live_nvme_measurement_qualification"] = qualification
+        if admitted is not None and qualification != admitted:
+            raise ValueError("live NVMe qualification differs from measurement evidence")
+        if receipt.get("status") == "completed" and (binding is None or admitted is None or not qualification["qualified"]):
+            raise ValueError("completed live NVMe result lacks qualified physical route evidence")
+    if (job["backend"] in NVME_BACKENDS and job.get("nvmeof_route") != "live"
+            and job.get("case_kind") != "hybrid_put"):
         expected = len(config["backend"]["options"]["nvmeof_readers"])
         transport = "rdma" if job["backend"] == "tidehunter_nvme_rdma" else "tcp"
         binding = receipt.get("nvmeof_target_evidence")
@@ -881,7 +2302,9 @@ def summarize_case(directory):
                 raise ValueError("NVMe target evidence differs from its integrity binding")
             targets = json.loads(artifact.read_text())
         qualification = qualify_nvme_measurement(
-            read_interval["observed"] if read_interval else None, expected, transport, targets)
+            read_interval["observed"] if read_interval else None, expected, transport, targets,
+            expected_target=("kernel_direct" if job.get("target_io") == "direct"
+                             else job.get("nvmeof_target", "kernel")))
         if admitted_qualification is None:
             qualification["qualified"] = False
             qualification["reasons"].append("measurement qualification receipt unavailable")
@@ -889,8 +2312,22 @@ def summarize_case(directory):
         if binding is not None and admitted_qualification is not None:
             if qualification != admitted_qualification:
                 raise ValueError("NVMe path qualification differs from measurement evidence")
+        if job.get("case_kind") and job.get("nvmeof_target") == "kernel":
+            target_io = analyze.qualify_target_buffered_io(job, targets, expected)
+            value["target_io_qualification"] = target_io
         if receipt.get("status") == "completed" and not qualification["qualified"]:
-            raise ValueError("completed NVMe result lacks qualified measurement path")
+            target_io = value.get("target_io_qualification") or {}
+            policies = qualification.get("target_policies") or []
+            expected_cache = ("direct_file_no_OS_pagecache" if job.get("target_io") == "direct"
+                              else "buffered_file_page_cache")
+            only_readback = (target_io.get("qualified") is False and policies
+                             and set(qualification["reasons"]) == {"target cache/open-mode or selected transport is unverified"}
+                             and all(p.get("target_cache") == expected_cache
+                                     and p.get("selected_transport") == transport
+                                     and (job.get("target_io") != "direct"
+                                          or p.get("target_implementation") == "kernel_direct") for p in policies))
+            if not only_readback:
+                raise ValueError("completed NVMe result lacks qualified measurement path")
     manifest = json.loads((result / "manifest.json").read_text())
     summary = json.loads((result / "summary.json").read_text())
     if manifest.get("status") not in ("completed", "failed") or summary.get("status") != manifest.get("status"):
@@ -903,14 +2340,80 @@ def summarize_case(directory):
         raise ValueError("actual executable differs from admitted release binary")
     if manifest.get("backend_info") != summary.get("backend"):
         raise ValueError("manifest and summary disagree about the executed backend")
+    if receipt.get("status") == "completed" and job.get("case_kind") in ("interference", "write_wait_diagnostic"):
+        marker_name = ("interference" if job["case_kind"] == "interference"
+                       else "write_wait_metrics" if job["write_wait_diagnostics"]["enabled"] else None)
+        if marker_name is not None:
+            marker = manifest["run"].get(marker_name)
+            artifact_name = "interference_result.json" if marker_name == "interference" else "write_wait_metrics.json"
+            if (not isinstance(marker, dict) or type(marker.get("schema_version")) is not int
+                    or marker["schema_version"] != 1 or marker.get("path") != artifact_name):
+                raise ValueError("focused benchmark artifact manifest marker unavailable")
     for name in names:
         if hashlib.sha256((result / name).read_bytes()).hexdigest() != receipt["artifacts_sha256"][name]:
             raise ValueError("raw result checksum differs from its original admission")
+    if "durability" in manifest and "durability" in summary and manifest["durability"] != summary["durability"]:
+        raise ValueError("manifest and summary disagree about durability")
+    value["harness_evidence"] = {
+        "manifest": {key: manifest[key] for key in
+                     ("durability", "sample_writer_admission", "worker_release") if key in manifest},
+        "summary": {key: summary[key] for key in ("durability", "distributions") if key in summary},
+    }
     samples = list(analyze.read_samples(result / "samples.csv"))
+    if job.get("case_kind") == "hybrid_put":
+        binding = receipt.get("nvmeof_target_evidence")
+        targets = None
+        if binding is not None:
+            if not isinstance(binding, dict) or binding.get("path") != "nvme-targets.json":
+                raise ValueError("invalid NVMe target evidence binding")
+            artifact = directory / binding["path"]
+            if hashlib.sha256(artifact.read_bytes()).hexdigest() != binding.get("sha256"):
+                raise ValueError("NVMe target evidence differs from its integrity binding")
+            targets = json.loads(artifact.read_text())
+        qualification = analyze.qualify_hybrid_put(
+            job, summary["backend"], read_interval["observed"] if read_interval else None,
+            targets, config["backend"]["options"].get("nvmeof_readers"), samples,
+            receipt.get("status") == "completed"
+            and receipt.get("measurement_evidence", {}).get("completion_gate_observed") is True,
+            normalized, value.get("spdk_target_io"))
+        value["hybrid_put_qualification"] = qualification
+        if receipt.get("hybrid_put_qualification") is not None and qualification != receipt["hybrid_put_qualification"]:
+            raise ValueError("hybrid put qualification differs from measurement evidence")
+        if receipt.get("status") == "completed" and receipt.get("hybrid_put_qualification") is None:
+            raise ValueError("completed hybrid put lacks measurement qualification")
     if not samples:
+        if job.get("case_kind") in ("interference", "media_read", "native_media_read") and receipt.get("status") == "completed":
+            raise ValueError("completed focused case lacks measurement samples")
         return {**value, "backend": summary["backend"],
                 "metrics_unavailable": "validated execution has no observed measurement calls"}
+    if job.get("case_kind") in ("media_read", "native_media_read"):
+        media = value["focused_evidence"].get("media_evidence")
+        if media is None:
+            raise ValueError("media evidence unavailable")
+        successful_reads = sum(row["operation"] == "read" and row["outcome"] in ("ok", "success")
+                               for row in samples)
+        if media["successful_reads"] != successful_reads:
+            raise ValueError("media successful reads differ from raw samples")
     totals = analyze.aggregate(samples)
+    if (job.get("case_kind") in ("media_read", "sealed_knee")
+            and job.get("backend") == "tidehunter_nvme_rdma"):
+        successful_reads = sum(row["operation"] == "read" and row["outcome"] in ("ok", "success")
+                               for row in samples)
+        value["sealed_read_accounting"] = analyze.qualify_sealed_read_accounting(
+            value.get("nvmeof_measurement_qualification"), successful_reads)
+    if job.get("case_kind") == "interference":
+        interference = value["focused_evidence"].get("interference_result")
+        if interference is None:
+            raise ValueError("interference stream evidence unavailable")
+        totals["populations"] = analyze.reconcile_interference_samples(samples, interference)
+        route = analyze.qualify_interference_route(
+            job, summary["backend"], manifest,
+            read_interval["observed"] if read_interval else None,
+            value.get("nvmeof_measurement_qualification"), interference)
+        value["interference_route_qualification"] = route
+        interference["qualification"]["qualified"] &= route["qualified"]
+        interference["qualification"]["reasons"].extend(route["reasons"])
+        interference["qualification"]["notes"] = route["notes"]
     elapsed = (max(row["completed_ns"] for row in samples) - min(row["scheduled_ns"] for row in samples)) / 1e9
     if elapsed <= 0:
         raise ValueError("measurement exposure must be positive")
@@ -921,6 +2424,11 @@ def summarize_case(directory):
         "success_calls_per_second": len(good) / elapsed,
         "success_logical_keys_per_second": sum(row["logical_keys"] for row in good) / elapsed,
         "success_value_mib_per_second": sum(row["bytes"] for row in good) / elapsed / 1024**2})
+    if job.get("case_kind") == "interference":
+        totals["planned_measurement_calls"] = None
+        totals["measurement_rows_complete"] = interference["measurement_drained"]
+        totals["measurement_operation_ceiling"] = config["phases"]["measurement_operations"]
+    totals["measurement_timeline"] = analyze.measurement_timeline(samples)
     traces = value.get("nvmeof_trace_evidence")
     if isinstance(traces, list):
         ratios = []
@@ -963,21 +2471,82 @@ def summarize_case(directory):
                 "scope": "device-wide collector window versus API calls; overlapping gates and background I/O prevent per-call attribution"})
     for population in totals["populations"]:
         selected = [row for row in samples if row["operation"] == population["operation"]
-                    and row["outcome"] == population["outcome"]]
+                    and row["outcome"] == population["outcome"]
+                    and ("stream" not in population or row.get("stream") == population["stream"])]
         for kind in ("api", "response", "scheduling"):
             values = [row[kind + "_ns"] for row in selected if row[kind + "_ns"] is not None]
             population[kind + "_mean_ns"] = statistics.mean(values) if values else None
             population[kind + "_min_ns"] = min(values) if values else None
             population[kind + "_stddev_ns"] = statistics.pstdev(values) if values else None
         population["tail_warning"] = "p99 descriptive below 10000 calls; p999 descriptive below 100000 calls"
+    if job.get("case_kind") in ("media_read", "native_media_read"):
+        media = value["focused_evidence"]["media_evidence"]
+        value["media_qualification"] = analyze.qualify_media_target(media, value.get("target_io_qualification"))
     return {**value, "backend": summary["backend"], "metrics": totals}
 
+
+
+def qualify_history_prewarm(row, baseline, root):
+    """Compare one admitted prewarm case with its matched cold baseline."""
+    media = row.get("focused_evidence", {}).get("media_evidence")
+    base_media = baseline.get("focused_evidence", {}).get("media_evidence") if baseline else None
+    reasons = []
+    def add(reason):
+        if reason not in reasons:
+            reasons.append(reason)
+    def delta(evidence):
+        if not isinstance(evidence, dict):
+            return None
+        before, after = evidence.get("history_loads_before"), evidence.get("history_loads_after")
+        if type(before) is not int or type(after) is not int or not 0 <= before <= after < 2**64:
+            return None
+        return after - before
+    if baseline is None or baseline.get("status") != "completed" or not isinstance(base_media, dict):
+        add("history_baseline_missing")
+    elif base_media.get("status") != "qualified" or base_media.get("measurement_drained") is not True:
+        add("history_baseline_unqualified")
+    warm_delta, baseline_delta = delta(media), delta(base_media)
+    if warm_delta is None or (isinstance(base_media, dict) and baseline_delta is None):
+        add("history_counter_unavailable")
+    ratio = warm_delta / baseline_delta if warm_delta is not None and baseline_delta else None
+    if baseline_delta == 0:
+        add("history_baseline_zero")
+    elif ratio is not None and warm_delta * 10 > baseline_delta:
+        add("history_delta_above_threshold")
+    if row.get("status") != "completed" or not isinstance(media, dict):
+        add("cold_evidence_unavailable")
+    else:
+        for reason in media.get("reason_codes", []):
+            if reason not in ("history_baseline_compared_in_report", "history_counter_unavailable",
+                              "cold_read_ratio_below_threshold"):
+                add(reason)
+        cold = media.get("read_ops_per_success")
+        if type(cold) not in (int, float) or not cold >= 0.9:
+            add("cold_ratio_below_threshold")
+        gate = row.get("measurement_evidence") or {}
+        if (media.get("measurement_drained") is not True
+                or gate.get("gate_released") is not True
+                or gate.get("completion_gate_observed") is not True):
+            add("cold_evidence_unavailable")
+        devices = media.get("owner_devices")
+        if not isinstance(devices, list) or not devices:
+            add("cold_evidence_unavailable")
+        try:
+            analyze._verify_media_snapshots(
+                Path(root).resolve() / "cases" / row["case_id"],
+                {"measurement_evidence": gate}, media)
+        except (OSError, ValueError, KeyError, TypeError):
+            add("cold_evidence_unavailable")
+    return {"status": "qualified" if not reasons else "unqualified", "reason_codes": reasons,
+            "baseline_case_id": baseline.get("case_id") if baseline else None,
+            "prewarm_history_load_delta": warm_delta, "baseline_history_load_delta": baseline_delta,
+            "history_delta_ratio": ratio, "history_ratio_max": 0.10}
 
 
 def write_csv_report(root, results):
     planned_repeats = sorted({row["job"]["repeat"] for row in results})
     repetition_mode = "single" if len(planned_repeats) == 1 else "multiple"
-    fields = ["case_id", "status", "backend", "cohort", "profile", "repeat",
+    fields = ["case_id", "status", "backend", "durability_tier", "native_durability", "nvmeof_target", "requested_target_cache", "cohort", "profile", "repeat",
               "planned_independent_repetitions", "repetition_mode", "timing_stddev_scope", "value_bytes", "keys",
               "concurrency", "offered_ops_per_second", "observed_calls", "planned_calls",
               "measurement_rows_complete", "successful_calls", "unsuccessful_calls", "elapsed_seconds",
@@ -986,6 +2555,11 @@ def write_csv_report(root, results):
               "acknowledgement", "consistency", "replication_factor", "measurement_boundary",
               "get_many_strategy", "batch_atomicity", "observed_topology", "effective_configuration",
               "resource_evidence", "read_path_qualification"]
+    fields += ["case_kind", "stream", "media_status", "media_read_ops_per_success", "media_reason_codes",
+               "focused_evidence", "interference_route_qualification", "history_baseline_case_id",
+               "prewarm_history_load_delta", "baseline_history_load_delta", "history_delta_ratio", "history_ratio_max",
+               "target_io", "target_io_qualification", "nvme_completions", "successful_reads",
+               "accounting_gap", "read_rpc_count", "sealed_accounting_notes"]
     fields += [f"{kind}_{stat}_us" for kind in ("api", "response", "scheduling")
                for stat in ("mean", "min", "stddev")]
     fields += [f"{kind}_{stat}_us" for kind in ("api", "response", "scheduling")
@@ -997,8 +2571,39 @@ def write_csv_report(root, results):
         for result in results:
             job, metrics = result["job"], result.get("metrics", {})
             row = {key: job.get(key) for key in ("backend", "cohort", "profile", "repeat", "keys", "concurrency", "offered_ops_per_second")}
+            row["durability_tier"] = durability_tier(job)
+            row["native_durability"] = job.get("native_durability") if job["backend"] == "native" else None
+            row["backend"] = comparison_backend(job)
+            row["nvmeof_target"] = job.get("nvmeof_target", "kernel" if job["backend"] in NVME_BACKENDS else None)
+            row["requested_target_cache"] = (
+                "direct_kernel_buffered_io_0_no_target_pagecache" if job.get("target_io") == "direct" else
+                "direct_file_bdev_no_OS_pagecache" if row["nvmeof_target"] == "spdk" else
+                "buffered_file_page_cache" if row["nvmeof_target"] == "kernel" else None)
             row.update(case_id=result["case_id"], status=result["status"], value_bytes=job["value_size"],
                        error=result.get("error"), metrics_unavailable=result.get("metrics_unavailable"))
+            evidence = result.get("focused_evidence", {})
+            media = evidence.get("media_evidence", {})
+            row.update(case_kind=job.get("case_kind"), media_status=media.get("status"),
+                       media_read_ops_per_success=media.get("read_ops_per_success"),
+                       media_reason_codes=analyze.canonical(media.get("reason_codes")))
+            verdict = result.get("media_qualification")
+            if verdict is not None:
+                row.update(media_status=verdict["status"], media_reason_codes=analyze.canonical(verdict["reason_codes"]))
+            row["target_io"] = job.get("target_io")
+            row["target_io_qualification"] = analyze.canonical(result.get("target_io_qualification"))
+            history = result.get("history_prewarm_qualification")
+            if history is not None:
+                row.update(media_status=history["status"], media_reason_codes=analyze.canonical(history["reason_codes"]),
+                           history_baseline_case_id=history["baseline_case_id"],
+                           prewarm_history_load_delta=history["prewarm_history_load_delta"],
+                           baseline_history_load_delta=history["baseline_history_load_delta"],
+                           history_delta_ratio=history["history_delta_ratio"], history_ratio_max=history["history_ratio_max"])
+            row["focused_evidence"] = analyze.canonical(evidence) if evidence else None
+            row["interference_route_qualification"] = analyze.canonical(result.get("interference_route_qualification"))
+            accounting = result.get("sealed_read_accounting") or result.get("interference_route_qualification") or {}
+            for key in ("nvme_completions", "successful_reads", "accounting_gap", "read_rpc_count"):
+                row[key] = accounting.get(key)
+            row["sealed_accounting_notes"] = analyze.canonical(accounting.get("notes")) if accounting else None
             row.update(planned_independent_repetitions=len(planned_repeats), repetition_mode=repetition_mode,
                        timing_stddev_scope="within_case_population")
             if "read_path_qualification" in result:
@@ -1020,6 +2625,7 @@ def write_csv_report(root, results):
                 flat = dict(row)
                 if population is not None:
                     flat.update(operation=population["operation"], outcome=population["outcome"],
+                                stream=population.get("stream"),
                                 population_calls=population["count"], population_logical_keys=population["logical_keys"])
                     for kind in ("api", "response", "scheduling"):
                         for stat in ("mean", "min", "stddev"):
@@ -1067,16 +2673,147 @@ def read_diagnostic_report(rows):
     return lines
 
 
+def write_diagnostic_summary(row):
+    """Keep each observed sum with its own denominator; never infer tail/wire time."""
+    evidence = (row.get("write_diagnostics") or {}).get("observed") or {}
+    profile = evidence.get("profile") or {}
+    observed = (evidence.get("selection") or {}).get("observed_samples")
+    boundary_eligible = (evidence.get("phase_attempted") is True
+                         and evidence.get("measurement_drained") is not False)
+    eligible = (boundary_eligible
+                and evidence.get("runtime_enabled") is True and evidence.get("error") is None
+                and type(observed) is int and observed > 0)
+    pairs = (
+        ("client_exchange", "client_requests", "mixed_connection"),
+        ("connection_control_queue", "connection_control_queue_samples", "mixed_connection"),
+        ("connection_control_execution", "connection_control_execution_samples", "mixed_connection"),
+        ("storage_append_wal", "storage_append_calls", "sampled_append_invocations"),
+        ("storage_persist_wal_file", "storage_file_persist_calls", "sampled_file_syncs"),
+    )
+    clocks = []
+    def observe(stage, values, clock, denominator, scope, available):
+        if clock not in values and denominator not in values:
+            return
+        total, count = values.get(clock), values.get(denominator)
+        available = (available and type(total) is int and total >= 0
+                     and type(count) is int and count > 0)
+        clocks.append({"stage": stage, "scope": scope, "available": available,
+                       "sum_ns": total, "count": count,
+                       "mean_ns": total / count if available else None})
+    stages = profile.get("stages") or {}
+    for stage, count, scope in pairs:
+        observe(stage, stages, "write_profile_" + stage + "_ns",
+                "write_profile_" + count, scope, eligible)
+    if (evidence.get("backend") == "tidehunter_live_nvmeof"
+            and evidence.get("runtime_observation_mode") == "live_nvmeof_phase_counters"
+            and profile.get("scope") == "measurement_nvme_io_cumulative_delta"):
+        nvme = stages.get("live_nvmeof") or {}
+        for field in sorted(nvme):
+            if field.endswith("_ns"):
+                observe(field[:-3], nvme, field, field[:-3] + "_samples",
+                        "measurement_nvme_io_cumulative_delta",
+                        eligible and evidence.get("measurement_drained") is True)
+    observe("checkpoint_wait", stages, "write_profile_checkpoint_wait_ns",
+            "write_profile_checkpoint_completed", "sampled_checkpoint_submit_to_retire_post_gate_capture",
+            boundary_eligible and evidence.get("error") is None
+            and stages.get("write_profile_checkpoint_available") == 1)
+    pre = evidence.get("pre_completion_gate") or {}
+    if pre.get("available") is True:
+        coordinator = pre.get("stages") or {}
+        interval_scope = "coordinator_arm_through_pre_completion_gate"
+    else:
+        coordinator = (profile.get("coordinator_interval") or {}).get("stages") or {}
+        interval_scope = "coordinator_arm_through_post_gate"
+    wait = coordinator.get("write_storage_wait_ns")
+    if wait is not None:
+        valid_wait = boundary_eligible and type(wait) is int and wait >= 0
+        clocks.append({"stage": "write_completion_wait", "scope": interval_scope,
+                       "available": valid_wait, "sum_ns": wait, "count": None, "mean_ns": None})
+    observe("foreground_admission_pressure", coordinator, "write_foreground_checkpoint_ns",
+            "write_foreground_checkpoint_count", interval_scope,
+            boundary_eligible)
+    for phase in ("root_adoption", "owner_adoption", "obsolete_cleanup", "index_prepare"):
+        prefix = "write_checkpoint_diagnostic_" + phase
+        observe(phase, coordinator, prefix + "_ns", prefix + "_count",
+                interval_scope + "_completion_charged_checkpoint",
+                boundary_eligible
+                and profile.get("coordinator_checkpoint_diagnostics_available") is True)
+    return clocks
+
+
+def write_diagnostic_report(rows):
+    lines = ["", "## Write-stage diagnostics", "",
+             "Independent diagnostic runs, not the primary API populations. Each mean uses its own "
+             "observed sum/count. Mixed connection requests include checkpoint controls, not only appends; "
+             "pre-gate snapshots exclude completion-gate background progress; post-gate "
+             "snapshots and sampled checkpoint controls can include it. Completion-charged "
+             "counters may straddle measurement boundaries; consult measurement_drained for failures. "
+             "Scopes overlap; do not add rows, subtract them from API p99, or infer network RTT. "
+             "Missing or unavailable clocks are not zero. Stage p99 is unavailable.", "",
+             "These sampled runs are perturbative: reaching an append sample cap can block later "
+             "appends while in-flight appends drain and any pending checkpoint control finishes "
+             "before synchronous profile stop. Limit-zero primary runs do not use this gate; "
+             "profiled API latencies are not primary comparison latencies.", "",
+             "Live NVMe phase-window clocks cover completed client-side I/O events, not a first-N "
+             "append sample: requested_limit enables the window and does not cap its population. "
+             "Their clocks overlap and do not isolate wire, device or CPU time.", "",
+             "The selected prefix may exclude later slow calls; there is no API-to-owner request join. "
+             "cq_poll_gap_max_ns includes idle gaps; cq_max_poll_gap_ns covers pending TX only, "
+             "not the whole outstanding RPC or receive wait.", "",
+             "| Case | Scope | Stage | Count | Sum ns | Mean µs |",
+             "|---|---|---|---:|---:|---:|"]
+    for row in rows:
+        for clock in write_diagnostic_summary(row):
+            count = clock["count"] if clock["count"] is not None else "—"
+            total = clock["sum_ns"] if clock["available"] else "—"
+            mean = f"{clock['mean_ns'] / 1000:.3f}" if clock["mean_ns"] is not None else "—"
+            lines.append(f"| {row['case_id']} | {clock['scope']} | {clock['stage']} | {count} | {total} | {mean} |")
+    return lines
+
+
 def report(root):
     root = Path(root)
     planned = json.loads((root / "matrix.json").read_text())
     results = []
+    focused_ids = set()
+    for job in planned["jobs"]:
+        if "case_kind" in job:
+            validate_focused_job(job)
+            if job["case_id"] in focused_ids:
+                raise ValueError("duplicate focused case ID")
+            focused_ids.add(job["case_id"])
     for job in planned["jobs"]:
         directory = root / "cases" / job["case_id"]
         if (directory / "receipt.json").exists():
-            results.append(summarize_case(directory))
+            try:
+                row = summarize_case(directory)
+                if "case_kind" in job and row["job"] != job:
+                    raise ValueError("focused receipt job differs from planned job")
+                results.append(row)
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError) as exc:
+                receipt = json.loads((directory / "receipt.json").read_text())
+                if receipt.get("status") == "completed":
+                    raise
+                results.append({"case_id": job["case_id"], "job": job, "status": "failed",
+                                "error": str(receipt.get("error") or "case failed") +
+                                         "; report admission: " + type(exc).__name__ + ": " + str(exc)})
         else:
             results.append({"case_id": job["case_id"], "job": job, "status": "not_run"})
+    baselines = {}
+    for row in results:
+        job = row["job"]
+        media = job.get("media", {})
+        if (job.get("group") == "G1" and job.get("case_kind") == "media_read" and job.get("backend") == "tidehunter_verbs_native"
+                and media.get("expected") == "cold" and media.get("history") == "normal"):
+            key = (job["repeat"], job["value_size"])
+            if key in baselines:
+                raise ValueError("duplicate history comparison baseline")
+            baselines[key] = row
+    for row in results:
+        job = row["job"]
+        if job.get("case_kind") == "media_read" and job.get("media", {}).get("history") == "prewarm":
+            row["history_prewarm_qualification"] = qualify_history_prewarm(
+                row, baselines.get((job["repeat"], job["value_size"])), root)
     planned_repeats = sorted({job["repeat"] for job in planned["jobs"]})
     repetition_mode = "single" if len(planned_repeats) == 1 else "multiple"
     repetition_note = ("One planned independent repetition; no run-to-run variability estimate or confidence/significance claim."
@@ -1087,13 +2824,20 @@ def report(root):
         "cases": results,
         "planned_repeats": planned_repeats, "planned_independent_repetitions": len(planned_repeats),
         "repetition_mode": repetition_mode,
-        "planned_backends": sorted({job["backend"] for job in planned["jobs"]}),
+        "planned_backends": sorted({comparison_backend(job) for job in planned["jobs"]}),
         "current_backend_coverage": set(BACKENDS) <= {job["backend"] for job in planned["jobs"]},
         "interpretation": ["Common RF1 API experiment, not equivalent HA/transaction/security guarantees.",
             "API-call latency for get_many is the complete ordered group, not latency per key.",
             "OS-cache eviction does not evict engine caches; qualified device intervals, when available, are retained separately.",
+            "Live SPDK target direct-file I/O bypasses the target OS page cache; device and controller caches may remain.",
+            "TideHunter native owner acknowledgement is a page-cache write with background fsync; compare only to matching native page-cache cases, not synchronous Valkey writes.",
             "Valkey GET is memory-resident even after OS-cache eviction; AOF always is write acknowledgment, not a value-WAL-backed read.",
             "No Sui checkpoint/application or sustainable infinite-aging claim."]}
+    if focused_ids:
+        value["focused_coverage"] = {
+            field: {name: sum(job.get(field) == name for job in planned["jobs"])
+                    for name in sorted({job[field] for job in planned["jobs"] if field in job})}
+            for field in ("group", "case_kind")}
     if planned.get("spec", {}).get("mode") in ("read-tier", "read-tier-focused"):
         capability = root / "trace-capability.json"
         value["trace_capability"] = (json.loads(capability.read_text()) if capability.is_file() else
@@ -1110,14 +2854,56 @@ def report(root):
                       "Capability is not evidence of block I/O or qualified device latency; consult trace-capability.json for host gaps.", ""]
     for row in results:
         if "metrics" not in row:
-            lines.append(f"| {row['case_id']} | {row['job']['backend']} | {row['job']['value_size']} | {row['job']['cohort']} | {row['status']} | — | — | — | — | — | — | — |")
+            lines.append(f"| {row['case_id']} | {comparison_backend(row['job'])} | {row['job']['value_size']} | {row['job']['cohort']} | {row['status']} | — | — | — | — | — | — | — |")
             continue
         for population in row["metrics"]["populations"]:
             def us(value):
                 return f"{value / 1000:.3f}" if value is not None else "—"
-            lines.append(f"| {row['case_id']} ({row['status']}) | {row['job']['backend']} | {row['job']['value_size']} | {row['job']['cohort']} | {population['operation']}/{population['outcome']} | {population['count']} | {row['metrics']['success_calls_per_second']:.2f} | {us(population['api_mean_ns'])} | {us(population['api_ns']['p50'])} | {us(population['api_ns']['p95'])} | {us(population['api_ns']['p99'])} | {us(population['response_ns']['p99'])} |")
+            lines.append(f"| {row['case_id']} ({row['status']}) | {comparison_backend(row['job'])} | {row['job']['value_size']} | {row['job']['cohort']} | {population['operation']}/{population['outcome']} | {population['count']} | {row['metrics']['success_calls_per_second']:.2f} | {us(population['api_mean_ns'])} | {us(population['api_ns']['p50'])} | {us(population['api_ns']['p95'])} | {us(population['api_ns']['p99'])} | {us(population['response_ns']['p99'])} |")
+    if any(row["job"].get("case_kind") for row in results):
+        lines.extend(["", "## Focused evidence",
+                      "Media verdicts and reason codes are retained per case in comparison.csv and comparison.json.",
+                      "NVMe-oF fio measures the buffered target path, not the SSD floor.",
+                      "Interference write routing is configured-route evidence, not an independent append counter.",
+                      "Each stream and repetition remains a separate population.", ""])
+        lines.extend(["| Media case | Repeat | Value bytes | Target I/O | Verdict |",
+                      "|---|---:|---:|---|---|"])
+        for row in results:
+            if row["job"].get("case_kind") == "media_read":
+                verdict = row.get("history_prewarm_qualification") or row.get("media_qualification") or {}
+                lines.append(f"| {row['case_id']} | {row['job']['repeat']} | {row['job']['value_size']} | "
+                             f"{row['job']['target_io']} | {verdict.get('status', 'unavailable')} |")
+        lines.append("")
+        lines.extend(["### Warm-history comparison", "",
+                      "The reviewed maximum history-load delta ratio is 0.10; this is not a measurement.", "",
+                      "| Case | Repeat | Value bytes | Baseline | Prewarm delta | Baseline delta | Ratio | Verdict | Reasons |",
+                      "|---|---:|---:|---|---:|---:|---:|---|---|"])
+        for row in results:
+            comparison = row.get("history_prewarm_qualification")
+            if comparison is None:
+                continue
+            def shown(value):
+                return "—" if value is None else str(value)
+            lines.append(f"| {row['case_id']} | {row['job']['repeat']} | {row['job']['value_size']} | "
+                         f"{shown(comparison['baseline_case_id'])} | {shown(comparison['prewarm_history_load_delta'])} | "
+                         f"{shown(comparison['baseline_history_load_delta'])} | {shown(comparison['history_delta_ratio'])} | "
+                         f"{comparison['status']} | {'; '.join(comparison['reason_codes']) or '—'} |")
+        lines.append("")
     lines.extend(["", "Quantiles are exact nearest-rank raw-sample quantiles, not histogram bucket bounds. Tail precision depends on population size. Compare only matching size/workload/cohort/acknowledgement; consult comparison.json for full configuration, per-repeat logical-key throughput, bandwidth, errors and additional quantiles.", ""])
+    lines.extend(["", "## Observed write transport and acknowledgement", "",
+                  "Compare transport timings only after checking security and acknowledgement; missing metadata is unknown, not matched.", "",
+                  "| Case | Transport | Security | Acknowledgement |", "|---|---|---|---|"])
+    for row in results:
+        if row["job"].get("cohort") != "write_stage_diagnostics":
+            continue
+        backend = row.get("backend") or {}
+        configuration = backend.get("configuration") or {}
+        def shown(value):
+            return str(value).replace("|", "\\|").replace("\n", " ") if value is not None else "—"
+        lines.append(f"| {row['case_id']} | {shown(configuration.get('transport'))} | "
+                     f"{shown(configuration.get('transport_security'))} | {shown(backend.get('acknowledgement'))} |")
     lines.extend(read_diagnostic_report(results))
+    lines.extend(write_diagnostic_report(results))
     controls = [row for row in results if "read_path_qualification" in row]
     if controls:
         lines.extend(["", "## Full-working-set registered-read controls", "",
@@ -1176,29 +2962,50 @@ def main():
     plan.add_argument("--spec", type=Path, default=Path(__file__).with_name("cloud-campaign.json"))
     plan.add_argument("--output", type=Path, required=True)
     plan.add_argument("--backends", help="comma-separated nonempty subset of tracked backend IDs")
-    plan.add_argument("--mode", choices=("standard", "read-tier", "read-tier-focused", "nvmeof-focused"), default="standard")
+    plan.add_argument("--mode", choices=("standard", "read-tier", "read-tier-focused", "nvmeof-focused", "standard-with-nvmeof", "standard-with-live-nvmeof", "focused"), default="standard")
+    plan.add_argument("--selection", choices=FOCUSED_SELECTIONS, default="recommended")
     plan.add_argument("--write-profile-limit", type=int,
                       help="diagnostic-only 1KiB write cohort for native/Tidehunter; leaves normal plans unprofiled")
     plan.add_argument("--read-profile-limit", type=int,
                       help="diagnostic-only representative read cohorts for distributed Tidehunter")
+    plan.add_argument("--write-timeline-limit", type=int,
+                      help="independent Tidehunter write timeline cohorts; legacy profiler disabled")
+    plan.add_argument("--valkey-profile-limit", type=int,
+                      help="independent libvalkey scalar and batch diagnostic cohorts")
     summary = commands.add_parser("report")
     summary.add_argument("--root", type=Path, required=True)
     args = parser.parse_args()
     if args.action == "plan":
+        if args.mode == "focused":
+            if args.backends is not None or any(value is not None for value in
+                    (args.write_profile_limit, args.read_profile_limit, args.write_timeline_limit, args.valkey_profile_limit)):
+                parser.error("focused mode does not admit backend or diagnostic overrides")
+            jobs = make_focused_matrix(args.selection)
+            value = {"schema_version": 1, "spec": {"mode": "focused", "selection": args.selection,
+                                                     "direct_control_arm": True}, "jobs": jobs}
+            local.dump(args.output, value)
+            print(json.dumps({"planned_cases": len(jobs), "groups": focused_group_counts(args.selection),
+                              "job_selection_semantics": "minimum campaign selection containing the job"}))
+            return 0
         spec = json.loads(args.spec.read_text())
         spec["mode"] = args.mode
-        if args.write_profile_limit is not None or args.read_profile_limit is not None:
+        if any(value is not None for value in (args.write_profile_limit, args.read_profile_limit,
+                                                args.write_timeline_limit, args.valkey_profile_limit)):
             diagnostics = dict(spec.get("diagnostics", {}))
             if args.write_profile_limit is not None:
                 diagnostics["write_profile_limit"] = args.write_profile_limit
             if args.read_profile_limit is not None:
                 diagnostics["read_profile_limit"] = args.read_profile_limit
+            if args.write_timeline_limit is not None:
+                diagnostics["write_timeline_limit"] = args.write_timeline_limit
+            if args.valkey_profile_limit is not None:
+                diagnostics["valkey_profile_limit"] = args.valkey_profile_limit
             spec["diagnostics"] = diagnostics
-        supported = set(BACKENDS) | PORTABLE_BACKENDS | (NVME_BACKENDS if args.mode == "nvmeof-focused" else set())
+        supported = set(BACKENDS) | PORTABLE_BACKENDS | (NVME_BACKENDS if args.mode in ("nvmeof-focused", "standard-with-nvmeof", "standard-with-live-nvmeof") else set())
         configured = select_backends(None, spec.get("backends"), supported)
-        if args.mode == "nvmeof-focused" and args.backends is not None:
-            # Local RDMA planning is explicit; AWS CI admits its own provider set.
-            configured += sorted(NVME_BACKENDS.difference(configured))
+        if args.mode in ("nvmeof-focused", "standard-with-nvmeof", "standard-with-live-nvmeof") and args.backends is not None:
+            # Provider-specific workflow admission remains separate.
+            configured += sorted((NVME_BACKENDS | {"tidehunter_verbs", "tidehunter_verbs_native"}).difference(configured))
         spec["backends"] = select_backends(args.backends, configured, supported)
         value = {"schema_version": 1, "spec": spec, "jobs": make_matrix(spec)}
         local.dump(args.output, value)

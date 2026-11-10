@@ -124,17 +124,45 @@ impl PrefixDigest {
 }
 
 impl Client {
-    pub fn checkpoint(
+    pub(crate) fn checkpoint_deadline(&self) -> Instant {
+        Instant::now() + self.timeout
+    }
+
+    pub(crate) fn submit_checkpoint(
         &mut self,
         authority_epoch: u64,
         epoch: u64,
         prefix: usize,
+        deadline: Instant,
+    ) -> Result<bool, TcpError> {
+        self.submit_control(
+            &Request::Checkpoint {
+                authority_epoch,
+                epoch,
+                prefix,
+            },
+            deadline,
+        )
+    }
+
+    pub(crate) fn take_checkpoint(
+        &mut self,
+        epoch: u64,
+        prefix: usize,
+    ) -> Option<Result<CheckpointProof, TcpError>> {
+        self.take_control().map(|response| {
+            let response = response?;
+            self.validate_checkpoint_response(response, epoch, prefix)
+        })
+    }
+
+    fn validate_checkpoint_response(
+        &mut self,
+        response: Response,
+        epoch: u64,
+        prefix: usize,
     ) -> Result<CheckpointProof, TcpError> {
-        match self.request(Request::Checkpoint {
-            authority_epoch,
-            epoch,
-            prefix,
-        })? {
+        match response {
             Response::Checkpoint(proof)
                 if proof.database == self.expected.inventory.database
                     && proof.partition == self.expected.partition
@@ -146,6 +174,20 @@ impl Client {
             }
             _ => self.wrong_response(),
         }
+    }
+
+    pub fn checkpoint(
+        &mut self,
+        authority_epoch: u64,
+        epoch: u64,
+        prefix: usize,
+    ) -> Result<CheckpointProof, TcpError> {
+        let response = self.request(Request::Checkpoint {
+            authority_epoch,
+            epoch,
+            prefix,
+        })?;
+        self.validate_checkpoint_response(response, epoch, prefix)
     }
 
     pub fn retirement_files(

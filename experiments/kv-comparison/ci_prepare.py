@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import secrets
 import socket
 import subprocess
 import sys
@@ -146,7 +147,10 @@ def admit_tcp_diagnostic(directory, ready):
     return receipt
 
 
-def admit_qualification(directory, ready):
+def admit_qualification(directory, ready, *, focused=False):
+    if type(focused) is not bool:
+        raise ValueError('invalid qualification profile')
+    required_backends = {'native', 'tidehunter_tcp'} if focused else BACKENDS
     if proof_inventory(directory) != ready.get('qualification_files'):
         raise ValueError('same-build qualification evidence inventory differs')
     receipts = sorted(Path(directory).glob('*/receipt.json'))
@@ -154,7 +158,7 @@ def admit_qualification(directory, ready):
     for path in receipts:
         receipt = json.loads(path.read_text())
         backend = receipt.get('job', {}).get('backend')
-        if (backend not in BACKENDS or backend in found or receipt.get('status') != 'completed'
+        if (backend not in required_backends or backend in found or receipt.get('status') != 'completed'
                 or receipt.get('cleanup_errors') or receipt.get('binary_sha256') != ready['binary_sha256']
                 or receipt.get('claim_boundary') != 'API qualification only'):
             raise ValueError('complete same-binary real API qualification required for every software backend')
@@ -167,7 +171,7 @@ def admit_qualification(directory, ready):
                 raise ValueError('qualification raw artifact differs')
         if set(receipt.get('artifacts_sha256', {})) != {'manifest.json', 'summary.json', 'samples.csv', 'metrics.prom'}:
             raise ValueError('qualification raw artifacts incomplete')
-    if found != BACKENDS:
+    if found != required_backends:
         raise ValueError('qualification must cover every software-admissible adapter; RDMA hardware remains separate')
     admit_tcp_diagnostic(Path(directory) / 'tcp-diagnostic', ready)
 
@@ -209,7 +213,8 @@ def bounded(command, deadline, *, environment=None, cwd=None):
                    cwd=cwd, env=environment)
 
 
-def run_tcp_diagnostic(binary, work, proof, source_revision, deadline, environment):
+def run_tcp_diagnostic(binary, work, proof, source_revision, deadline, environment,
+                       durability_tier=cloud_campaign.DEFAULT_DURABILITY_TIER):
     """Exercise the built binary against five real local TCP owner processes."""
     binary = Path(binary).resolve(strict=True)
     work, proof = Path(work).absolute(), Path(proof).absolute()
@@ -228,7 +233,9 @@ def run_tcp_diagnostic(binary, work, proof, source_revision, deadline, environme
             'max_batches_per_partition': 16384, 'max_admitted_batches': 16384,
             'max_index_bytes': 128 * 1024**2, 'coordinator_cache_bytes': 0,
             'owner_read_workers': 2, 'owner_wal_member_read': 'async',
-            'owner_read_memory_allowance_bytes': 512 * 1024**2, 'polling': 'adaptive'}
+            'owner_read_resident_first': True,
+            'owner_read_memory_allowance_bytes': 512 * 1024**2, 'polling': 'adaptive',
+            'durability_tier': durability_tier}
         cloud_package.dump(work / 'prepare.json', preparation)
         prepared = work / 'prepared'
         bounded([binary, '--prepare-external-case', work / 'prepare.json', '--output', prepared],
@@ -242,12 +249,17 @@ def run_tcp_diagnostic(binary, work, proof, source_revision, deadline, environme
         options = {'path': str(work / 'database'), 'evidence': str(work / 'read-evidence'),
                    'owners': 5, 'key_count': 1048576, 'max_batches_per_partition': 16384,
                    'coordinator_read_cache_bytes': 0, 'external_remote_config': remote,
-                   'external_owner_read_config': owner_configs}
+                   'owner_read_resident_first': preparation['owner_read_resident_first'],
+                   'external_owner_read_config': owner_configs,
+                   'durability_tier': preparation['durability_tier'],
+                   # Each owner publishes this file next to its ready marker before readiness.
+                   'external_owner_durability_receipts': [
+                       str(guest / f'node-{index}' / 'ready.durability.json') for index in range(5)]}
         job = {'backend': 'tidehunter_tcp', 'case_id': 'local-tcp-diagnostic', 'repeat': 0,
                'keys': 256, 'value_size': 256, 'mix': cloud_campaign.mix(read=100),
                'concurrency': 1, 'measurement_operations': 64, 'warmup_operations': 0,
                'offered_ops_per_second': None, 'distribution': 'uniform',
-               'diagnostics': {'read_profile_limit': 32}}
+               'diagnostics': {'read_profile_limit': 32}, 'durability_tier': durability_tier}
         config = cloud_campaign.make_run_config(job, work, options, source_revision, 180)
         config['key_namespace_hex'] = '00112233445566778899aabbccddeeff'
         config['measurement_gate'] = None
@@ -257,6 +269,13 @@ def run_tcp_diagnostic(binary, work, proof, source_revision, deadline, environme
         if remaining <= 0:
             raise TimeoutError('TCP diagnostic admission deadline exhausted')
         campaign.admit_config(binary, work / 'config.json', work, environment, timeout=min(30, remaining))
+        import yaml
+        for index in range(5):
+            # The receipt must echo this launch's nonce; an empty nonce is never accepted.
+            launch_path = prepared / f'node-{index}' / 'launch.yaml'
+            launch = yaml.safe_load(launch_path.read_text())
+            launch['launch_nonce'] = secrets.token_hex(16)
+            launch_path.write_text(yaml.safe_dump(launch, sort_keys=False))
         for index, listener in enumerate(sockets):
             listener.close()
             log = (work / f'owner-{index}.log').open('wb')

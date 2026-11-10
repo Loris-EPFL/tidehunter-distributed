@@ -17,6 +17,8 @@ pub(crate) enum WalMapperMessage {
     MapFinalized(MapId),
     MinWalPositionUpdated(u64, mpsc::SyncSender<()>),
     DeleteFiles(Vec<WalFileId>, mpsc::SyncSender<()>),
+    #[cfg(feature = "experimental-nvmeof")]
+    EnsureExternalFile(WalFileId, mpsc::SyncSender<std::io::Result<()>>),
 }
 
 pub(crate) struct WalMapper {
@@ -33,6 +35,8 @@ struct WalMapperThread {
     syncer: WalSyncer,
     metrics: Arc<Metrics>,
     unlinker: UnlinkWorker,
+    #[cfg(feature = "experimental-nvmeof")]
+    external_preallocated: Option<WalFileId>,
 }
 /// Number of fragments past the writer's current one that the mapper keeps
 /// mmapped ahead of time so the writer never waits for a map to appear.
@@ -179,6 +183,8 @@ impl WalMapper {
             metrics,
             syncer,
             unlinker,
+            #[cfg(feature = "experimental-nvmeof")]
+            external_preallocated: None,
         };
         let jh = thread::Builder::new()
             .name("wal-mapper".to_string())
@@ -251,6 +257,18 @@ impl WalMapper {
             .ok();
         rx.recv().ok();
     }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    pub(crate) fn ensure_external_file(&self, id: WalFileId) -> std::io::Result<()> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.sender
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("WAL mapper stopped"))?
+            .send(WalMapperMessage::EnsureExternalFile(id, tx))
+            .map_err(|_| std::io::Error::other("WAL mapper stopped"))?;
+        rx.recv()
+            .map_err(|_| std::io::Error::other("WAL mapper stopped"))?
+    }
 }
 
 impl Drop for WalMapper {
@@ -312,7 +330,51 @@ impl WalMapperThread {
                     self.delete_files(&to_delete);
                     // dropping _cb to release receiver
                 }
+                #[cfg(feature = "experimental-nvmeof")]
+                WalMapperMessage::EnsureExternalFile(id, reply) => {
+                    let result = self.ensure_external_file(id);
+                    let _ = reply.send(result);
+                }
             }
+        }
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    fn ensure_external_file(&mut self, id: WalFileId) -> std::io::Result<()> {
+        if self.external_preallocated == Some(id) {
+            return Ok(());
+        }
+        let files = self.files.load();
+        let file = files
+            .get_checked(id)
+            .ok_or_else(|| std::io::Error::other("WAL file missing"))?;
+        let len = self.layout.wal_file_size;
+        if len == 0 || len > i64::MAX as u64 || file.metadata()?.len() > len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid external WAL file size",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: file owns a valid descriptor for the duration of the call;
+            // the checked nonnegative range fits off_t. The mapper serializes
+            // this operation with its own fragment extension and file removal.
+            let result = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len as libc::off_t) };
+            if result != 0 {
+                return Err(std::io::Error::from_raw_os_error(result));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "live NVMe-oF requires Linux",
+        ));
+        #[cfg(target_os = "linux")]
+        {
+            self.external_preallocated = Some(id);
+            Ok(())
         }
     }
 

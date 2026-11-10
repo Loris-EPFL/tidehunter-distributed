@@ -10,11 +10,16 @@
 //! man/fi_efa.7.md Progress: normal `efa` RDM requires manual CQ progress;
 //! it does not require a TCP syscall per CQ poll.
 //! Adaptive TCP parks only a drained owner on socket readability, never on a
-//! periodic sleep. Adaptive fabric keeps manual progress even with no RPCs.
+//! periodic sleep. An adaptive fabric owner with no RPC pending parks on the
+//! provider CQ wait object when the endpoint has one (software RxM, or `verbs`
+//! through a wait fd, see `tidehunter_fabric::Endpoint::open_idle_parking`) and
+//! otherwise keeps bounded manual progress; busy polling continues while any
+//! request is outstanding.
 //! eRPC §3.2 / ReFlex §§3.1, 4.1 motivate keeping completion and reply
 //! submission inline while cold I/O remains asynchronous, not weakening sync
 //! durability. Inventory try-locks for admission and response epoch validation
-//! and node-wide read admission locks remain; no storage lock is removed.
+//! remain; node read admission is atomic with per-session buffer pools and a
+//! sharded per-device credit lock; no storage lock is removed.
 //! https://www.usenix.org/system/files/nsdi19-kalia.pdf
 //! ReFlex source: papers/parsed/ReFlex-2017.md, §§3.1 and 4.1.
 use super::*;
@@ -27,12 +32,15 @@ use std::sync::mpsc;
 #[path = "reactor_output_tests.rs"]
 mod output_tests;
 #[cfg(test)]
+#[path = "reactor_plain_tests.rs"]
+mod plain_tests;
+#[cfg(test)]
 #[path = "reactor_session_tests.rs"]
 mod session_tests;
 
 pub(super) const TLS_BUFFER_BYTES: usize = 256 * 1024;
-const SESSION_REQUESTS: usize = 32;
-const SESSION_BYTES: usize = 256 * 1024 * 1024;
+pub(super) const SESSION_REQUESTS: usize = 32;
+pub(super) const SESSION_BYTES: usize = 256 * 1024 * 1024;
 const PROGRESS_BYTES: usize = 64 * 1024;
 
 #[cfg(feature = "experimental-fabric")]
@@ -292,13 +300,21 @@ pub(super) struct Session {
     control_peer: ControlPeerHealth,
     #[cfg(feature = "experimental-fabric")]
     direct_diagnostic: Option<DirectDiagnosticWindow>,
+    /// Server sessions publish their send-path counters to the owner-wide
+    /// aggregate; client sessions have none.
+    #[cfg(feature = "experimental-fabric")]
+    owner_transport: Option<super::owner_transport::OwnerTransportSink>,
 }
 impl Session {
-    pub(super) fn new(mut conn: rustls::Connection, sock: DeadlineIo) -> Result<Self, TcpError> {
-        sock.socket.set_nonblocking(true)?;
-        let tls_state = conn.process_new_packets().map_err(TcpError::component)?;
-        Ok(Self {
-            conn: Some(conn),
+    /// One owner for every constructor so the transports cannot drift apart.
+    fn from_parts(
+        conn: Option<rustls::Connection>,
+        sock: DeadlineIo,
+        plaintext_pending: usize,
+        peer_closed: bool,
+    ) -> Self {
+        Self {
+            conn,
             sock,
             output: VecDeque::new(),
             submitted: 0,
@@ -318,15 +334,27 @@ impl Session {
             input_used: 0,
             input_len: 0,
             input_started: None,
-            plaintext_pending: tls_state.plaintext_bytes_to_read(),
-            peer_closed: tls_state.peer_has_closed(),
+            plaintext_pending,
+            peer_closed,
             spare_output: Vec::new(),
             control_peer: ControlPeerHealth {
                 next_check: Instant::now(),
             },
             #[cfg(feature = "experimental-fabric")]
             direct_diagnostic: None,
-        })
+            #[cfg(feature = "experimental-fabric")]
+            owner_transport: None,
+        }
+    }
+    pub(super) fn new(mut conn: rustls::Connection, sock: DeadlineIo) -> Result<Self, TcpError> {
+        sock.socket.set_nonblocking(true)?;
+        let tls_state = conn.process_new_packets().map_err(TcpError::component)?;
+        Ok(Self::from_parts(
+            Some(conn),
+            sock,
+            tls_state.plaintext_bytes_to_read(),
+            tls_state.peer_has_closed(),
+        ))
     }
     #[cfg(feature = "experimental-fabric")]
     pub(super) fn new_native(sock: DeadlineIo) -> Result<Self, TcpError> {
@@ -334,35 +362,19 @@ impl Session {
             return Err(TcpError::new("native session requires a fabric endpoint"));
         }
         sock.socket.set_nonblocking(true)?;
-        Ok(Self {
-            conn: None,
-            sock,
-            output: VecDeque::new(),
-            submitted: 0,
-            output_budget: OutputBudget {
-                plaintext: PROGRESS_BYTES,
-                tls_writes: OUTPUT_TLS_WRITE_BUDGET,
-                frames: OUTPUT_FRAME_BUDGET,
-                frame_gate_observed: false,
-            },
-            closed: false,
-            stats: TransportProgressStats::default(),
-            time_work: false,
-            output_bytes: 0,
-            header: [0; 4],
-            header_used: 0,
-            input: Vec::new(),
-            input_used: 0,
-            input_len: 0,
-            input_started: None,
-            plaintext_pending: 0,
-            peer_closed: false,
-            spare_output: Vec::new(),
-            control_peer: ControlPeerHealth {
-                next_check: Instant::now(),
-            },
-            direct_diagnostic: None,
-        })
+        Ok(Self::from_parts(None, sock, 0, false))
+    }
+    /// Trusted-network TCP: frames cross the socket with no TLS, exactly as the
+    /// trusted OFI session carries them with no TLS over the fabric.
+    pub(super) fn new_plain(sock: DeadlineIo) -> Result<Self, TcpError> {
+        #[cfg(feature = "experimental-fabric")]
+        if sock.fabric.is_some() {
+            return Err(TcpError::new(
+                "plain TCP session cannot own a fabric endpoint",
+            ));
+        }
+        sock.socket.set_nonblocking(true)?;
+        Ok(Self::from_parts(None, sock, 0, false))
     }
     fn queue<T: Serialize>(&mut self, id: u64, body: &T, limit: usize) -> Result<(), TcpError> {
         let began = self.time_work.then(Instant::now);
@@ -381,7 +393,7 @@ impl Session {
         limit: usize,
     ) -> Result<(), TcpError> {
         #[cfg(feature = "experimental-fabric")]
-        if self.conn.is_none() {
+        if self.conn.is_none() && self.is_fabric() {
             let began = self.time_work.then(Instant::now);
             let result = match response {
                 Response::Records(records) => self.queue_native_records(id, records, None, limit),
@@ -498,9 +510,7 @@ impl Session {
         let retained_bytes = total_len
             .checked_add(metadata_bytes)
             .ok_or_else(|| TcpError::new("record response length overflow"))?;
-        if self.output.len() == SESSION_REQUESTS
-            || retained_bytes > SESSION_BYTES.saturating_sub(self.output_bytes)
-        {
+        if self.output.len() == SESSION_REQUESTS || !self.output_fits(retained_bytes) {
             return Err(TcpError::new("session output credit exceeded"));
         }
 
@@ -544,7 +554,7 @@ impl Session {
             .checked_add(metadata_slack)
             .and_then(|bytes| bytes.checked_add(segment_slack))
             .ok_or_else(|| TcpError::new("record response metadata overflow"))?;
-        if retained_bytes > SESSION_BYTES.saturating_sub(self.output_bytes) {
+        if !self.output_fits(retained_bytes) {
             return Err(TcpError::new("session output credit exceeded"));
         }
         self.output_bytes += retained_bytes;
@@ -581,10 +591,15 @@ impl Session {
         }
         Ok(size)
     }
+    /// Whether `retained` more bytes of frame allocation fit the session budget.
+    /// Every admission uses this one rule, against allocation capacity and never
+    /// against logical length, so `output_bytes` cannot pass `SESSION_BYTES`.
+    fn output_fits(&self, retained: usize) -> bool {
+        retained <= SESSION_BYTES.saturating_sub(self.output_bytes)
+    }
     fn can_queue(&self, size: usize) -> bool {
         self.output.len() < SESSION_REQUESTS
-            && self.spare_output.capacity().max(size.saturating_add(4))
-                <= SESSION_BYTES.saturating_sub(self.output_bytes)
+            && self.output_fits(self.spare_output.capacity().max(size.saturating_add(4)))
     }
     fn queue_inner<T: Serialize>(
         &mut self,
@@ -607,15 +622,19 @@ impl Session {
             return Err(TcpError::new("frame length exceeds limit"));
         }
         let retained = self.spare_output.capacity().max(size + 4);
-        if self.output.len() == SESSION_REQUESTS
-            || retained > SESSION_BYTES.saturating_sub(self.output_bytes)
-        {
+        if self.output.len() == SESSION_REQUESTS || !self.output_fits(retained) {
             return Err(TcpError::new("session output credit exceeded"));
         }
         let mut bytes = std::mem::take(&mut self.spare_output);
         encode_sized_frame_into(&message, limit, size, &mut bytes)?;
         let len = bytes.len();
+        // The allocator may return more than the exact request that the check
+        // above assumed. Charge, and re-check, the capacity actually retained;
+        // an over-allocation is dropped here, before it joins the queue.
         let retained = bytes.capacity();
+        if !self.output_fits(retained) {
+            return Err(TcpError::new("session output credit exceeded"));
+        }
         self.output_bytes += retained;
         self.output.push_back(Output {
             id,
@@ -638,6 +657,8 @@ impl Session {
     fn abort(&mut self) {
         #[cfg(feature = "experimental-fabric")]
         self.finish_direct_diagnostic("session-abort");
+        #[cfg(feature = "experimental-fabric")]
+        self.flush_owner_transport();
         self.stats = self.transport_stats();
         self.closed = true;
         let _ = self.sock.socket.shutdown(Shutdown::Both);
@@ -700,11 +721,9 @@ impl Session {
         }
     }
     fn write_plaintext(&mut self, budget: usize) -> Result<usize, TcpError> {
-        if self.conn.is_none() {
-            #[cfg(feature = "experimental-fabric")]
+        #[cfg(feature = "experimental-fabric")]
+        if self.conn.is_none() && self.is_fabric() {
             return self.write_native(budget);
-            #[cfg(not(feature = "experimental-fabric"))]
-            return Err(TcpError::new("native session requires experimental-fabric"));
         }
         if budget == 0 {
             return Ok(0);
@@ -722,11 +741,13 @@ impl Session {
                 .min(output.offset + PROGRESS_BYTES),
         );
         let began = self.time_work.then(Instant::now);
-        let conn = self
-            .conn
-            .as_mut()
-            .ok_or_else(|| TcpError::new("TLS session lost its rustls connection"))?;
-        let result = conn.writer().write(&output.bytes[output.offset..end]);
+        let chunk = &output.bytes[output.offset..end];
+        // TLS sessions encrypt into rustls; a trusted-network TCP session has no
+        // connection and hands the same plaintext frame bytes to the socket.
+        let result = match self.conn.as_mut() {
+            Some(conn) => conn.writer().write(chunk),
+            None => NonblockingIo(&mut self.sock).write(chunk),
+        };
         self.stats.plaintext_write.record(began, &result);
         match result {
             Ok(n) => {
@@ -1043,6 +1064,25 @@ impl Session {
         }
         stats
     }
+    /// Server sessions only: registers this session's provider counters with
+    /// the owner-wide aggregate.
+    #[cfg(feature = "experimental-fabric")]
+    pub(super) fn attach_owner_transport(
+        &mut self,
+        counters: &std::sync::Arc<super::OwnerTransportCounters>,
+    ) {
+        self.owner_transport = Some(counters.attach());
+    }
+    /// Publishes counter growth since the last flush. Call before the endpoint
+    /// counters are reset or the endpoint is dropped.
+    #[cfg(feature = "experimental-fabric")]
+    pub(super) fn flush_owner_transport(&mut self) {
+        if let (Some(sink), Some(endpoint)) = (&mut self.owner_transport, &self.sock.fabric) {
+            sink.flush(super::OwnerTransportStats::from_progress(
+                &endpoint.progress_stats(),
+            ));
+        }
+    }
     pub(super) fn configure_transport_stats(&mut self, enabled: bool, reset: bool) {
         #[cfg(feature = "experimental-fabric")]
         if reset || !enabled {
@@ -1060,9 +1100,18 @@ impl Session {
                 output.stage_started = None;
             }
         }
+        // Publish what the endpoint counted before its counters restart at zero.
+        #[cfg(feature = "experimental-fabric")]
+        if reset {
+            self.flush_owner_transport();
+        }
         #[cfg(feature = "experimental-fabric")]
         if let Some(endpoint) = &mut self.sock.fabric {
             endpoint.configure_progress_stats(enabled, reset);
+        }
+        #[cfg(feature = "experimental-fabric")]
+        if reset && let Some(sink) = &mut self.owner_transport {
+            sink.rebase();
         }
         if reset {
             self.stats = TransportProgressStats {
@@ -1151,19 +1200,11 @@ impl Session {
             return conn.reader().read(bytes);
         }
         #[cfg(feature = "experimental-fabric")]
-        {
-            sock.fabric
-                .as_mut()
-                .ok_or_else(|| io::Error::other("native session lost its fabric endpoint"))?
-                .try_receive_no_poll(bytes)
+        if let Some(endpoint) = sock.fabric.as_mut() {
+            return endpoint.try_receive_no_poll(bytes);
         }
-        #[cfg(not(feature = "experimental-fabric"))]
-        {
-            let _ = sock;
-            Err(io::Error::other(
-                "native session requires experimental-fabric",
-            ))
-        }
+        // Trusted-network TCP: the nonblocking socket is the plaintext transport.
+        NonblockingIo(sock).read(bytes)
     }
     fn recycle_input(&mut self, bytes: Vec<u8>) {
         if bytes.capacity() <= 1024 * 1024 {
@@ -1570,6 +1611,10 @@ impl Client {
             || !self.reactor.append_ready.is_empty()
             || self.reactor.control.is_some()
     }
+    #[cfg(test)]
+    pub(crate) fn checkpoint_control_pending(&self) -> bool {
+        self.reactor.control.is_some()
+    }
     fn data_request_count(&self) -> usize {
         self.reactor.reads.len()
             + self.reactor.ready.len()
@@ -1646,6 +1691,12 @@ impl Client {
         deadline: Instant,
         profiled: bool,
     ) -> Result<Option<u64>, TcpError> {
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if self.live_config.is_some() {
+            return Err(TcpError::new(
+                "live NVMe read route unavailable; refusing payload RPC",
+            ));
+        }
         if !self.read_admission(&references, profiled)? {
             return Ok(None);
         }
@@ -1736,6 +1787,12 @@ impl Client {
         batches: &[CompleteBatch],
         charge: usize,
     ) -> Result<Option<u64>, TcpError> {
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if self.live_config.is_some() {
+            return Err(TcpError::new(
+                "live NVMe write route unavailable; refusing payload RPC",
+            ));
+        }
         self.ensure_connection()?;
         if charge > SESSION_BYTES {
             return Err(TcpError::new("append exceeds session byte limit"));
@@ -2132,6 +2189,50 @@ impl Client {
             );
         }
     }
+    pub(super) fn submit_control(
+        &mut self,
+        request: &Request,
+        deadline: Instant,
+    ) -> Result<bool, TcpError> {
+        self.ensure_connection()?;
+        if self.reactor.control.is_some() {
+            return Ok(false);
+        }
+        let id = self
+            .reactor
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| TcpError::new("request ID space exhausted"))?;
+        let size = self.stream.queue_size(id, request, self.frame_limit)?;
+        if Instant::now() >= deadline {
+            return Err(TcpError::new("control output admission deadline expired"));
+        }
+        if !self.stream.can_queue(size) {
+            return Ok(false);
+        }
+        let id = self.reactor.allocate_id()?;
+        self.stream.queue(id, request, self.frame_limit)?;
+        self.reactor.control = Some((id, deadline));
+        self.reactor.control_decode_ns = 0;
+        self.reactor.control_profiled = false;
+        Ok(true)
+    }
+
+    pub(super) fn take_control(&mut self) -> Option<Result<Response, TcpError>> {
+        let (id, _) = self.reactor.control?;
+        if self.reactor.control_result.is_none() || self.stream.output_pending(id) {
+            return None;
+        }
+        let response = self.reactor.control_result.take()?;
+        self.reactor.control = None;
+        self.reactor.control_profiled = false;
+        self.reactor.control_decode_ns = 0;
+        Some(match response {
+            Response::Error(message) => Err(TcpError::new(message)),
+            response => Ok(response),
+        })
+    }
+
     pub(super) fn exchange_correlated(
         &mut self,
         request: &Request,
@@ -2223,6 +2324,8 @@ struct ServerPending {
     async_handler_ns: u64,
     control_queued: Option<Instant>,
     is_append: bool,
+    owner_trace: bool,
+    owner_trace_shape: Option<(u64, usize, usize)>,
 }
 
 pub(super) struct WorkCompletion {
@@ -2230,6 +2333,14 @@ pub(super) struct WorkCompletion {
     pub(super) response: Result<Response, TcpError>,
     pub(super) profile: ConnectionProfile,
     pub(super) is_control: bool,
+}
+
+struct OwnerTimeline {
+    limit: usize,
+    active: bool,
+    selected: usize,
+    dropped: u64,
+    records: Vec<super::super::write_timeline::OwnerTimelineRecord>,
 }
 struct DeferredRead {
     id: u64,
@@ -2360,10 +2471,13 @@ pub(super) fn serve_session(
     let mut diagnostic_only = false;
     let mut last_id = 0;
     let mut diagnostics = None::<ConnectionProfile>;
+    let mut owner_timeline = None::<OwnerTimeline>;
     let mut idle_since = Instant::now();
     let mut polling = ActivePoll::default();
     let mut previous_sweep = None::<Instant>;
     let mut fabric_idle_deadline = None;
+    #[cfg(feature = "experimental-fabric")]
+    stream.attach_owner_transport(&node.read_admission.transport);
     #[cfg(feature = "test-utils")]
     let mut ram_probe = None::<minibytes::Bytes>;
     let result = (|| {
@@ -2428,6 +2542,82 @@ pub(super) fn serve_session(
                     } else {
                         barrier_active = false;
                     }
+                }
+                if let Some(request) = pending.get(&completion.id)
+                    && request.owner_trace
+                    && let Some(timeline) = owner_timeline.as_mut()
+                {
+                    let profile = completion.profile;
+                    let storage = profile.storage_write;
+                    let phase = |ns| {
+                        (storage.append_calls != 0
+                            && ((storage.append_errors == 0 && storage.append_retries == 0)
+                                || ns != 0))
+                            .then_some(ns)
+                    };
+                    let mut error_truncated = false;
+                    let error = completion.response.as_ref().err().map(|error| {
+                        let mut message = error.to_string();
+                        if message.len() > 128 {
+                            let mut end = 128;
+                            while !message.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            message.truncate(end);
+                            error_truncated = true;
+                        }
+                        message
+                    });
+                    timeline
+                        .records
+                        .push(super::super::write_timeline::OwnerTimelineRecord {
+                            owner: 0,
+                            envelope_id: completion.id,
+                            epoch: request.owner_trace_shape.map(|shape| shape.0),
+                            success: completion.response.is_ok(),
+                            error,
+                            error_truncated,
+                            control_queue_ns: (profile.control_queue_samples != 0)
+                                .then_some(profile.control_queue_ns),
+                            session_admission_wait_ns: (profile.control_queue_samples != 0)
+                                .then_some(profile.session_admission_wait_ns),
+                            appender_queue_ns: (profile.control_queue_samples != 0)
+                                .then_some(profile.appender_queue_ns),
+                            flusher_queue_ns: (storage.persist_calls != 0)
+                                .then_some(profile.flusher_queue_ns),
+                            append_barrier_wait_ns: (storage.append_calls != 0)
+                                .then_some(profile.append_barrier_wait_ns),
+                            append_wal_ns: (storage.append_calls != 0)
+                                .then_some(profile.append_wal_ns),
+                            append_validation_ns: (storage.append_calls != 0)
+                                .then_some(storage.append_validation_ns),
+                            append_basic_validation_ns: phase(storage.append_basic_validation_ns),
+                            append_conflict_lookup_ns: phase(storage.append_conflict_lookup_ns),
+                            append_geometry_capacity_ns: phase(storage.append_geometry_capacity_ns),
+                            append_metadata_reservation_ns: phase(
+                                storage.append_metadata_reservation_ns,
+                            ),
+                            append_descriptor_preparation_ns: phase(
+                                storage.append_descriptor_preparation_ns,
+                            ),
+                            append_errors: storage.append_errors,
+                            append_retries: storage.append_retries,
+                            append_persist_ns: (storage.persist_calls != 0)
+                                .then_some(profile.append_persist_ns),
+                            wal_file_persist_ns: (storage.file_persist_calls != 0)
+                                .then_some(storage.persist_wal_file_ns),
+                            handler_ns: Some(profile.handler_ns),
+                            response_ready_ns: request.control_queued.map(elapsed_ns),
+                            namespace_persist_ns: (storage.namespace_persist_calls != 0)
+                                .then_some(storage.persist_namespace_ns),
+                            file_persist_calls: storage.file_persist_calls,
+                            namespace_persist_calls: storage.namespace_persist_calls,
+                            appended_groups: storage.appended_groups,
+                            batch_count: request.owner_trace_shape.map(|shape| shape.1),
+                            encoded_bytes: request.owner_trace_shape.map(|shape| shape.2),
+                            persistence_capture: storage.persistence_capture,
+                            ready_append_prefix: profile.ready_append_prefix,
+                        });
                 }
                 if let Some(profile) = diagnostics.as_mut() {
                     profile.add(completion.profile);
@@ -2539,6 +2729,10 @@ pub(super) fn serve_session(
                     | Request::ReadProfiled {
                         epoch, references, ..
                     } => {
+                        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                        if node.live_nvme_selected {
+                            return Err(TcpError::new("live NVMe owner rejects payload read RPC"));
+                        }
                         if references.is_empty()
                             || references.len() > node.effective_max_reads(limits)
                         {
@@ -2597,7 +2791,42 @@ pub(super) fn serve_session(
                 last_id = envelope.id;
                 initialized = true;
                 retained_bytes += charge;
-                let measured = diagnostics.is_some() && !envelope.body.is_measurement_control();
+                let owner_trace = if matches!(&envelope.body, Request::Append { .. }) {
+                    if let Some(timeline) =
+                        owner_timeline.as_mut().filter(|timeline| timeline.active)
+                    {
+                        if timeline.selected < timeline.limit {
+                            timeline.selected += 1;
+                            true
+                        } else {
+                            timeline.dropped += 1;
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                let owner_trace_shape = if owner_timeline
+                    .as_ref()
+                    .is_some_and(|timeline| timeline.active)
+                    || diagnostics.is_some()
+                {
+                    if let Request::Append { epoch, batches } = &envelope.body {
+                        Some((
+                            *epoch,
+                            batches.len(),
+                            batches.iter().map(|batch| batch.as_slice().len()).sum(),
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let measured = (diagnostics.is_some() && !envelope.body.is_measurement_control())
+                    || owner_trace;
                 if let Some(profile) = diagnostics.as_mut() {
                     profile.requests += u64::from(measured);
                 }
@@ -2623,6 +2852,8 @@ pub(super) fn serve_session(
                         ready_response: None,
                         response_ready_at: None,
                         measured,
+                        owner_trace,
+                        owner_trace_shape,
                         is_append: matches!(&envelope.body, Request::Append { .. }),
                         control_queued: measured.then(Instant::now),
                         output_started: None,
@@ -2891,7 +3122,72 @@ pub(super) fn serve_session(
                         }
                     }
                 }
-                if let Request::ConnectionProfile { enabled, reset } = request {
+                if let Request::OwnerTimelineArm { limit } = request {
+                    let response = if limit > 65_536 {
+                        Response::Error("owner timeline limit exceeds 65536".into())
+                    } else {
+                        owner_timeline = (limit != 0).then(|| OwnerTimeline {
+                            limit,
+                            selected: 0,
+                            dropped: 0,
+                            active: true,
+                            records: Vec::with_capacity(limit),
+                        });
+                        Response::OwnerTimelineArmed
+                    };
+                    queue_response(&mut pending, id, response)?;
+                } else if let Request::OwnerTimelineFetch { offset } = request {
+                    let response = if let Some(timeline) = owner_timeline.as_mut() {
+                        timeline.active = false;
+                        if offset > timeline.records.len() {
+                            Response::Error("invalid owner timeline offset".into())
+                        } else {
+                            let empty = Envelope {
+                                protocol: PROTOCOL,
+                                id,
+                                body: Response::OwnerTimelinePage {
+                                    records: Vec::new(),
+                                    dropped: timeline.dropped,
+                                    incomplete: timeline
+                                        .selected
+                                        .saturating_sub(timeline.records.len())
+                                        as u64,
+                                    more: true,
+                                },
+                            };
+                            let mut bytes = wire_codec(HARD_FRAME_LIMIT)
+                                .serialized_size(&empty)
+                                .map_err(TcpError::component)?;
+                            let mut end = offset;
+                            for record in timeline.records[offset..].iter().take(512) {
+                                let size = wire_codec(HARD_FRAME_LIMIT)
+                                    .serialized_size(record)
+                                    .map_err(TcpError::component)?;
+                                if bytes.saturating_add(size) > limits.max_frame_bytes as u64 {
+                                    break;
+                                }
+                                bytes += size;
+                                end += 1;
+                            }
+                            if end == offset && offset < timeline.records.len() {
+                                Response::Error("owner timeline record exceeds frame bound".into())
+                            } else {
+                                Response::OwnerTimelinePage {
+                                    records: timeline.records[offset..end].to_vec(),
+                                    dropped: timeline.dropped,
+                                    incomplete: timeline
+                                        .selected
+                                        .saturating_sub(timeline.records.len())
+                                        as u64,
+                                    more: end < timeline.records.len(),
+                                }
+                            }
+                        }
+                    } else {
+                        Response::Error("owner timeline is not armed".into())
+                    };
+                    queue_response(&mut pending, id, response)?;
+                } else if let Request::ConnectionProfile { enabled, reset } = request {
                     let mut previous = diagnostics.unwrap_or_default();
                     previous.socket = stream.sock.profile.take().unwrap_or_default();
                     previous.transport = stream.transport_stats();
@@ -2924,7 +3220,9 @@ pub(super) fn serve_session(
                         request,
                         limits,
                         measured: pending[&id].measured,
+                        trace_shape: pending[&id].owner_trace_shape,
                         queued: pending[&id].control_queued,
+                        submitted: pending[&id].measured.then(Instant::now),
                         charge: pending[&id].charge,
                         completed: completed.clone(),
                     };
@@ -2984,6 +3282,9 @@ pub(super) fn serve_session(
                 progressed = true;
             }
             progressed |= stream.finish_fabric_sweep()?;
+            // Every send of this sweep has been posted; publish its counters.
+            #[cfg(feature = "experimental-fabric")]
+            stream.flush_owner_transport();
             if progressed {
                 idle_since = Instant::now();
             }

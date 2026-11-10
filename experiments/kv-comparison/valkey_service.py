@@ -98,11 +98,15 @@ def start(config):
     state = status(service["unit"])
     if state.get("LoadState") != "not-found":
         return evidence(config)
+    lifetime = service.get("runtime_seconds")
+    if lifetime is not None and (type(lifetime) is not int or not 1 <= lifetime <= 7200):
+        raise ValueError("Valkey service lifetime must be bounded")
+    expiry = [] if lifetime is None else ["--property=RuntimeMaxSec=" + str(lifetime)]
     command(["systemd-run", "--unit=" + service["unit"], "--service-type=exec",
              "--property=CPUQuota=" + str(service["cpus"] * 100) + "%",
              "--property=MemoryMax=" + str(service["memory_mib"]) + "M",
              "--property=MemorySwapMax=0", "--property=LimitMEMLOCK=infinity",
-             "--property=TimeoutStopSec=25", *service["args"]], timeout=60)
+             "--property=TimeoutStopSec=25", *expiry, *service["args"]], timeout=60)
     return evidence(config)
 
 

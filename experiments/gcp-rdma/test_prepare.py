@@ -23,14 +23,32 @@ class CheckoutAdmissionTest(unittest.TestCase):
                 with patch.object(prepare.cloud_package, 'command', side_effect=[actual, status]), self.assertRaises(ValueError):
                     prepare.checkout(Path(directory), revision)
 
+    def test_dirty_requires_explicit_manual_opt_in_and_exact_revision(self):
+        revision = 'a' * 40
+        with patch.object(prepare.cloud_package, 'command', side_effect=[revision, ' M Cargo.lock']):
+            prepare.checkout(Path('.'), revision, allow_dirty=True)
+        with patch.object(prepare.cloud_package, 'command', side_effect=['b' * 40, ' M Cargo.lock']):
+            with self.assertRaises(ValueError):
+                prepare.checkout(Path('.'), revision, allow_dirty=True)
+
+    def test_manual_dirty_preparation_rejects_unreviewed_spec(self):
+        with tempfile.TemporaryDirectory() as directory:
+            spec = Path(directory) / 'spec.json'
+            spec.write_text('{}')
+            with patch.object(prepare, 'checkout'), patch.object(prepare.cloud_package, 'inventory', return_value={}):
+                with self.assertRaisesRegex(ValueError, 'exact reviewed manual spec'):
+                    prepare.prepare(prepare.ROOT, Path(directory) / 'out', 'a' * 40, None, 1800,
+                                    spec, manual_allow_dirty=True)
+
     def test_revision_must_be_full_commit(self):
         with self.assertRaises(ValueError):
             prepare.checkout(Path('.'), 'abc')
 
     def test_selected_industry_features_are_required(self):
-        spec = {'suite': 'kv', 'backends': ['garnet', 'kvrocks']}
-        prepare.admit_selected_features(spec, {'features': ['garnet', 'kvrocks']})
-        for features in ([], ['garnet'], ['kvrocks']):
+        backends = ['tikv', 'cassandra', 'foundationdb', 'garnet', 'kvrocks']
+        spec = {'suite': 'kv', 'backends': backends}
+        prepare.admit_selected_features(spec, {'features': backends})
+        for features in ([], *([name for name in backends if name != missing] for missing in backends)):
             with self.subTest(features=features), self.assertRaisesRegex(ValueError, 'lacks selected'):
                 prepare.admit_selected_features(spec, {'features': features})
         prepare.admit_selected_features({'suite': 'kv', 'backends': ['native']}, {'features': []})

@@ -127,10 +127,7 @@ fn multi_page_scan_matches_serial_cut_updates_deletes_and_reopen() {
     }
     db.drain().unwrap();
     let checkpoint = db.checkpoint().unwrap();
-    let pin = {
-        let index = db.index.read();
-        index.pin_cut(index.latest_cut()).unwrap()
-    };
+    let pin = db.index.pin_cut(db.index.latest_cut()).unwrap();
     let captured_rows: Vec<_> = expected
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
@@ -178,7 +175,6 @@ fn multi_page_scan_matches_serial_cut_updates_deletes_and_reopen() {
     };
     let mut cursor = db
         .index
-        .read()
         .scan_cursor(KeySpace(0), None, false, pin.cut())
         .unwrap();
     let first = db.next_scan_page(&mut cursor).unwrap().unwrap();
@@ -242,13 +238,12 @@ fn later_page_node_completes_while_first_node_is_explicitly_stalled() {
     let mut db = fixture.open();
     let rows = db
         .index
-        .read()
         .scan(KeySpace(0), None, false, 2, IndexReadCut::Latest)
         .unwrap();
     let first_node = db.partition_indexes[&rows[0].1.batch_address.partition];
     let second_node = db.partition_indexes[&rows[1].1.batch_address.partition];
     assert_ne!(first_node, second_node);
-    let pin = db.index.read().pin_cut(IndexReadCut::Latest).unwrap();
+    let pin = db.index.pin_cut(IndexReadCut::Latest).unwrap();
     let connection = db.reads.lane_client(first_node, 0);
     let held = connection.lock();
     let first = db

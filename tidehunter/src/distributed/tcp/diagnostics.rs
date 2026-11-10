@@ -143,6 +143,13 @@ pub struct ConnectionProfile {
     pub storage_write: crate::distributed::storage::StorageWriteProfile,
     /// Per-request control/pool, flusher and barrier queue waits, summed once.
     pub control_queue_ns: u64,
+    /// Components of control_queue_ns, measured separately for append requests.
+    pub session_admission_wait_ns: u64,
+    pub appender_queue_ns: u64,
+    pub flusher_queue_ns: u64,
+    pub append_barrier_wait_ns: u64,
+    /// One append's already-ready queue prefix; aggregation discards this snapshot.
+    pub ready_append_prefix: Option<super::super::write_timeline::ReadyAppendPrefix>,
     pub control_queue_samples: u64,
     /// Appender and persistence service, nested in handler_ns; excludes queue waits.
     pub control_execution_ns: u64,
@@ -175,6 +182,11 @@ impl ConnectionProfile {
         self.append_persist_ns += other.append_persist_ns;
         self.storage_write.add(other.storage_write);
         self.control_queue_ns += other.control_queue_ns;
+        self.session_admission_wait_ns += other.session_admission_wait_ns;
+        self.appender_queue_ns += other.appender_queue_ns;
+        self.flusher_queue_ns += other.flusher_queue_ns;
+        self.append_barrier_wait_ns += other.append_barrier_wait_ns;
+        self.ready_append_prefix = None;
         self.control_queue_samples += other.control_queue_samples;
         self.control_execution_ns += other.control_execution_ns;
         self.control_execution_samples += other.control_execution_samples;

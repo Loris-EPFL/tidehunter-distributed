@@ -39,10 +39,10 @@ class GoogleApi:
 
     def _request(self, method, url, body=None, headers=None, read_retries=3):
         headers = dict(headers or {})
-        headers['Authorization'] = 'Bearer ' + self.token_provider()
-        req = urllib.request.Request(url, data=body, headers=headers, method=method)
         attempts = read_retries if method == 'GET' else 1
         for n in range(attempts):
+            headers['Authorization'] = 'Bearer ' + self.token_provider()
+            req = urllib.request.Request(url, data=body, headers=headers, method=method)
             try:
                 with self.opener(req, timeout=30) as response:
                     return response.read()
@@ -139,12 +139,14 @@ class ObjectStore:
             raise ValueError('GCS object integrity mismatch')
         return data
 
-    def upload(self, key, path, *, content_type='application/octet-stream', if_generation_match=None, metadata=None):
+    def upload(self, key, path, *, content_type='application/octet-stream', if_generation_match=None, metadata=None, deadline_check=None):
         path = Path(path)
         size = path.stat().st_size
         digest = hashlib.sha256()
         with path.open('rb') as source:
             for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                if deadline_check:
+                    deadline_check()
                 digest.update(chunk)
         attrs = dict(metadata or {})
         attrs['sha256'] = digest.hexdigest()
@@ -159,6 +161,8 @@ class ObjectStore:
             yield prefix
             with path.open('rb') as source:
                 for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                    if deadline_check:
+                        deadline_check()
                     sent += len(chunk)
                     if sent > size:
                         raise ValueError('file changed during upload')
@@ -174,6 +178,8 @@ class ObjectStore:
         headers = {'Authorization': 'Bearer ' + self.api.token_provider(),
                    'Content-Type': 'multipart/related; boundary=' + boundary,
                    'Content-Length': str(len(prefix) + size + len(suffix))}
+        if deadline_check:
+            deadline_check()
         request = urllib.request.Request(url, data=chunks(), headers=headers, method='POST')
         try:
             with self.api.opener(request, timeout=300) as response:
@@ -186,7 +192,9 @@ class ObjectStore:
             raise ValueError('GCS upload receipt mismatch')
         return result
 
-    def download(self, key, path, *, generation=None, max_bytes=256 * 1024 * 1024):
+    def download(self, key, path, *, generation=None, max_bytes=256 * 1024 * 1024, deadline_check=None):
+        if deadline_check:
+            deadline_check()
         meta = self.head(key) if generation is None else json.loads(self.api._request('GET', self._url(key, {'generation': generation})))
         size = int(meta['size'])
         if size > max_bytes:
@@ -200,7 +208,10 @@ class ObjectStore:
         try:
             with self.api.opener(request, timeout=300) as response, temporary.open('xb') as output:
                 while True:
-                    chunk = response.read(1024 * 1024)
+                    if deadline_check:
+                        deadline_check()
+                    read = getattr(response, 'read1', response.read) if deadline_check else response.read
+                    chunk = read(1024 * 1024)
                     if not chunk:
                         break
                     count += len(chunk)
@@ -208,6 +219,8 @@ class ObjectStore:
                         raise ValueError('GCS object exceeds declared size')
                     digest.update(chunk)
                     output.write(chunk)
+            if deadline_check:
+                deadline_check()
             if count != size or (meta.get('metadata', {}).get('sha256') and digest.hexdigest() != meta['metadata']['sha256']):
                 raise ValueError('GCS object integrity mismatch')
             temporary.replace(target)

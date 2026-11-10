@@ -30,6 +30,9 @@ pub struct CoordinatorResolutionSnapshot {
     pub route_preparation: CoordinatorResolutionStage,
     pub pin_preparation: CoordinatorResolutionStage,
     pub batch_preparation: CoordinatorResolutionStage,
+    pub batch_wait: CoordinatorResolutionStage,
+    pub postread_cache_fill: CoordinatorResolutionStage,
+    pub result_materialization: CoordinatorResolutionStage,
 }
 
 #[derive(Default)]
@@ -79,6 +82,9 @@ pub(super) struct CoordinatorResolutionDiagnostics {
     route_preparation: Stage,
     pin_preparation: Stage,
     batch_preparation: Stage,
+    batch_wait: Stage,
+    postread_cache_fill: Stage,
+    result_materialization: Stage,
 }
 impl CoordinatorResolutionDiagnostics {
     pub(super) fn enabled(&self) -> bool {
@@ -109,6 +115,9 @@ impl CoordinatorResolutionDiagnostics {
                 &self.route_preparation,
                 &self.pin_preparation,
                 &self.batch_preparation,
+                &self.batch_wait,
+                &self.postread_cache_fill,
+                &self.result_materialization,
             ] {
                 stage.reset();
             }
@@ -156,20 +165,24 @@ impl CoordinatorResolutionDiagnostics {
             route_preparation: self.route_preparation.snapshot(),
             pin_preparation: self.pin_preparation.snapshot(),
             batch_preparation: self.batch_preparation.snapshot(),
+            batch_wait: self.batch_wait.snapshot(),
+            postread_cache_fill: self.postread_cache_fill.snapshot(),
+            result_materialization: self.result_materialization.snapshot(),
         }
     }
 }
 
 pub(super) enum ResolutionStage {
-    IndexLockWait,
     IndexLookup,
-    CacheLockWait,
     CacheLookup,
     CutValidation,
     CutCapture,
     RoutePreparation,
     PinPreparation,
     BatchPreparation,
+    BatchWait,
+    PostreadCacheFill,
+    ResultMaterialization,
 }
 pub(super) enum MemberOutcome {
     CacheHit,
@@ -189,15 +202,16 @@ impl ResolutionSample<'_> {
         if let Some(started) = started {
             let ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             match stage {
-                ResolutionStage::IndexLockWait => &self.diagnostics.index_lock_wait,
                 ResolutionStage::IndexLookup => &self.diagnostics.index_lookup,
-                ResolutionStage::CacheLockWait => &self.diagnostics.cache_lock_wait,
                 ResolutionStage::CacheLookup => &self.diagnostics.cache_lookup,
                 ResolutionStage::CutValidation => &self.diagnostics.cut_validation,
                 ResolutionStage::CutCapture => &self.diagnostics.cut_capture,
                 ResolutionStage::RoutePreparation => &self.diagnostics.route_preparation,
                 ResolutionStage::PinPreparation => &self.diagnostics.pin_preparation,
                 ResolutionStage::BatchPreparation => &self.diagnostics.batch_preparation,
+                ResolutionStage::BatchWait => &self.diagnostics.batch_wait,
+                ResolutionStage::PostreadCacheFill => &self.diagnostics.postread_cache_fill,
+                ResolutionStage::ResultMaterialization => &self.diagnostics.result_materialization,
             }
             .add(ns);
         }

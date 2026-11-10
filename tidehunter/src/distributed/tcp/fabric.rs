@@ -47,6 +47,10 @@ pub struct TransportProgressStats {
     /// Opt-in maximum inter-poll interval while a local send is outstanding.
     /// Scheduler/manual-progress gap, not CQ completion latency or network RTT.
     pub cq_max_poll_gap_ns: u64,
+    /// Opt-in poll-weighted application slot samples, not hardware WQE counts.
+    pub tx_all_slots_pending_polls: u64,
+    pub rx_no_posted_slots_polls: u64,
+    pub rx_unread_slots_polls: u64,
     /// Actual TCP health probes on fabric lanes, gated independently of CQ/data
     /// polls at one millisecond (forced once before idle-lane reuse). Zero on TCP.
     pub control_peer_checks: u64,
@@ -104,6 +108,20 @@ pub struct TransportProgressStats {
     pub cq_poll_gap_ns: u64,
     pub cq_poll_gap_samples: u64,
     pub cq_poll_gap_max_ns: u64,
+    /// Successful provider sends by posted message length (always on, no clock):
+    /// at most 4 KiB, 16 KiB, 64 KiB, and above. Together with the provider
+    /// geometry in `ProviderInfo` these locate eager/SAR/rendezvous boundaries.
+    pub send_size_le_4k: u64,
+    pub send_size_le_16k: u64,
+    pub send_size_le_64k: u64,
+    pub send_size_gt_64k: u64,
+    /// Provider sends that returned EAGAIN, and posts that reused the filled
+    /// slot of an earlier EAGAIN without copying the bytes again.
+    pub send_post_eagain: u64,
+    pub send_post_retries: u64,
+    /// Idle sweeps that parked on the provider CQ wait object instead of
+    /// busy polling. Zero when no wait object exists (see `ProviderInfo`).
+    pub cq_idle_waits: u64,
 }
 
 impl TransportProgressStats {
@@ -125,6 +143,9 @@ impl TransportProgressStats {
             cq_polls,
             cq_empty_polls,
             cq_completions,
+            tx_all_slots_pending_polls,
+            rx_no_posted_slots_polls,
+            rx_unread_slots_polls,
             control_peer_checks,
             output_queue_ns,
             output_queue_samples,
@@ -157,6 +178,13 @@ impl TransportProgressStats {
             cq_dispatch_errors,
             cq_poll_gap_ns,
             cq_poll_gap_samples,
+            send_size_le_4k,
+            send_size_le_16k,
+            send_size_le_64k,
+            send_size_gt_64k,
+            send_post_eagain,
+            send_post_retries,
+            cq_idle_waits,
         );
         // Aggregated peaks are maxima of individual connections, not a sampled
         // simultaneous cluster occupancy. Current gauges above are summed.
@@ -187,6 +215,9 @@ impl TransportProgressStats {
             cq_empty_polls,
             cq_completions,
             cq_max_poll_gap_ns,
+            tx_all_slots_pending_polls,
+            rx_no_posted_slots_polls,
+            rx_unread_slots_polls,
             send_copy_ns,
             send_copy_calls,
             send_copy_bytes,
@@ -213,14 +244,36 @@ impl TransportProgressStats {
             cq_poll_gap_ns,
             cq_poll_gap_samples,
             cq_poll_gap_max_ns,
+            send_size_le_4k,
+            send_size_le_16k,
+            send_size_le_64k,
+            send_size_gt_64k,
+            send_post_eagain,
+            send_post_retries,
+            cq_idle_waits,
         );
     }
 }
 /// Transport selection is explicit: a selected fabric is never replaced with TCP.
+///
+/// Security is part of the selection and is never inferred or downgraded:
+/// `Tcp` and `Ofi { security: MutualTls }` authenticate and encrypt with mutual
+/// TLS; `TcpTrusted` and `Ofi { security: Trusted }` are the explicit
+/// trusted-network/no-TLS modes. A no-TLS mode has no confidentiality or
+/// cryptographic peer authentication and is only for an isolated network;
+/// WAL integrity, fencing and durability checks remain.
+///
+/// Fair-comparison partners: `Tcp` against `Ofi { MutualTls }` (both mutual
+/// TLS, `security_label()` = `mutual_tls`), and `TcpTrusted` against
+/// `Ofi { Trusted }` (both `trusted_network_no_tls`). Never compare across the
+/// two security classes as an isolated network effect.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Transport {
     Tcp,
+    /// Explicit opt-in: plain TCP with the trust semantics of trusted OFI. It
+    /// requires empty TLS credential paths and is never a default or fallback.
+    TcpTrusted,
     Ofi {
         fabric: FabricConfig,
         #[serde(default)]
@@ -243,6 +296,7 @@ impl Transport {
                 backend,
                 domain: None,
                 source_address: None,
+                slots: None,
             },
             security,
         }
@@ -263,20 +317,35 @@ impl Transport {
         matches!(self, Self::Ofi { .. })
     }
 
+    /// True for the explicit trusted-network/no-TLS modes (`TcpTrusted` and
+    /// `Ofi { Trusted }`): no TLS configuration, certificate or ALPN exists.
     #[must_use]
     pub fn is_native(&self) -> bool {
         matches!(
             self,
-            Self::Ofi {
-                security: FabricSecurity::Trusted,
-                ..
-            }
+            Self::TcpTrusted
+                | Self::Ofi {
+                    security: FabricSecurity::Trusted,
+                    ..
+                }
         )
+    }
+
+    /// Receipt label for the transport's security class: `mutual_tls` or
+    /// `trusted_network_no_tls`. Experiments must record it beside `label()`.
+    #[must_use]
+    pub fn security_label(&self) -> &'static str {
+        if self.is_native() {
+            "trusted_network_no_tls"
+        } else {
+            "mutual_tls"
+        }
     }
 
     pub fn label(&self) -> &'static str {
         match self {
             Self::Tcp => "tcp",
+            Self::TcpTrusted => "tcp-trusted",
             Self::Ofi { fabric, security } => match (&fabric.backend, security) {
                 (FabricBackend::Efa, FabricSecurity::MutualTls) => "ofi-efa-mutual-tls",
                 (FabricBackend::Efa, FabricSecurity::Trusted) => "ofi-efa-trusted",
@@ -297,7 +366,7 @@ impl Transport {
     #[must_use]
     pub fn same_protocol(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Tcp, Self::Tcp) => true,
+            (Self::Tcp, Self::Tcp) | (Self::TcpTrusted, Self::TcpTrusted) => true,
             (
                 Self::Ofi {
                     fabric: left,
@@ -321,12 +390,33 @@ impl Transport {
     }
 
     #[cfg(feature = "experimental-fabric")]
-    fn open(&self) -> io::Result<tidehunter_fabric::Endpoint> {
+    fn open(&self, park_idle: bool) -> io::Result<tidehunter_fabric::Endpoint> {
         let Self::Ofi { fabric, .. } = self else {
             return Err(io::Error::other("TCP needs no fabric endpoint"));
         };
-        tidehunter_fabric::Endpoint::open(fabric, None)
+        if park_idle {
+            tidehunter_fabric::Endpoint::open_idle_parking(fabric, None)
+        } else {
+            tidehunter_fabric::Endpoint::open(fabric, None)
+        }
     }
+}
+
+/// Owner-side provider facts, once per accepted session. The client reads its own
+/// through `Client::provider_info`; an owner has no response field for them, so
+/// they use the local-observer line protocol on stderr (never a wire field).
+/// Observer IO must not fail a session.
+#[cfg(feature = "experimental-fabric")]
+pub(super) fn report_owner_provider(endpoint: &tidehunter_fabric::Endpoint) {
+    let record = serde_json::json!({
+        "schema": 1,
+        "role": "owner",
+        "provider": endpoint.provider_info(),
+    });
+    let _ = writeln!(
+        io::stderr().lock(),
+        "TIDEHUNTER_FABRIC_PROVIDER_FACTS {record}"
+    );
 }
 
 // Exchange bounded endpoint addresses over the selected control stream; only
@@ -336,7 +426,28 @@ pub(super) fn bootstrap(
     stream: &mut (impl Read + Write),
     transport: &Transport,
 ) -> Result<tidehunter_fabric::Endpoint, TcpError> {
-    let mut endpoint = transport.open()?;
+    bootstrap_with(stream, transport, false)
+}
+
+/// Owner-side bootstrap: the endpoint may park on the provider CQ wait object
+/// while no request is pending, instead of spinning (`verbs` gets a wait fd).
+#[cfg(feature = "experimental-fabric")]
+pub(super) fn bootstrap_idle_parking(
+    stream: &mut (impl Read + Write),
+    transport: &Transport,
+) -> Result<tidehunter_fabric::Endpoint, TcpError> {
+    let endpoint = bootstrap_with(stream, transport, true)?;
+    report_owner_provider(&endpoint);
+    Ok(endpoint)
+}
+
+#[cfg(feature = "experimental-fabric")]
+fn bootstrap_with(
+    stream: &mut (impl Read + Write),
+    transport: &Transport,
+    park_idle: bool,
+) -> Result<tidehunter_fabric::Endpoint, TcpError> {
+    let mut endpoint = transport.open(park_idle)?;
     let address = endpoint.address()?;
     let len = u16::try_from(address.len()).map_err(TcpError::component)?;
     stream.write_all(&len.to_be_bytes())?;

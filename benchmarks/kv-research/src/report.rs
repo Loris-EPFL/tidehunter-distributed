@@ -6,12 +6,20 @@ use std::borrow::Cow;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, SyncSender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 
 use crate::backend::{BackendInfo, BackendResult};
 use crate::duration_ns;
+/// Raw sample queue: owner is the single `kv-research-sample-writer` thread; producers are the
+/// scheduling task (completions, rejections) and snapshot flush requests.
+/// Capacity: 4096 messages (about 0.5 MiB of `Sample`), above the at most 65536 admitted
+/// in-flight requests per phase draining at one row each, so a stall is a measured exception.
+/// Full-queue policy: old single streams wait and count the stall. Interference rows use
+/// `try_send`; saturation fails the case and marks raw samples incomplete. Admission never
+/// waits for telemetry in interference. Flush requests use `try_send` and are skipped when full.
+/// Shutdown: `finish` drops the sender, the writer drains every queued row, flushes and syncs.
 const RAW_SAMPLE_QUEUE_CAPACITY: usize = 4096;
 
 const LATENCY_BUCKETS_SECONDS: &[f64] = &[
@@ -20,11 +28,56 @@ const LATENCY_BUCKETS_SECONDS: &[f64] = &[
     30.0,
 ];
 
+/// Independent measurement populations. Old single-stream rows leave this column empty.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Stream {
+    Read,
+    Put,
+}
+
+impl Stream {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Put => "put",
+        }
+    }
+}
+
+#[derive(Default, Debug, Serialize)]
+pub struct StreamCounts {
+    pub offered: u64,
+    pub admitted: u64,
+    pub completed: u64,
+    pub successful: u64,
+    pub rejected: u64,
+    /// Accepted calls without a terminal worker response at the drain boundary.
+    pub failed: u64,
+    pub first_dispatch_ns: Option<u64>,
+    pub last_completion_ns: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub struct InterferenceResult {
+    pub schema_version: u32,
+    pub case_id: String,
+    pub read: StreamCounts,
+    pub put: StreamCounts,
+    pub measurement_drained: bool,
+    pub read_offered_per_second: u64,
+    pub measurement_elapsed_ns: u64,
+    pub window_start_ns: u64,
+    pub window_end_ns: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Sample {
+    pub stream: Option<Stream>,
     pub phase: &'static str,
     pub operation: &'static str,
     pub outcome: &'static str,
+    pub caller_sample_id: Option<u64>,
     pub scheduled_ns: u64,
     pub dispatched_ns: u64,
     pub dispatch_observed: bool,
@@ -32,6 +85,9 @@ pub struct Sample {
     pub api_ns: u64,
     pub response_ns: u64,
     pub scheduling_ns: u64,
+    /// Benchmark worker release: end of oracle verification, on the same origin clock as
+    /// `completed_ns`. `completed_ns` stays the API boundary; the difference is oracle cost.
+    pub released_ns: u64,
     pub logical_keys: u64,
     pub bytes: u64,
     pub error_kind: Cow<'static, str>,
@@ -119,6 +175,8 @@ impl LatencyAccumulator {
 #[derive(Serialize)]
 pub struct RunSummary {
     pub status: String,
+    /// Durability contract and matched comparison cohort; tiers are never mixed in a comparison.
+    pub durability: serde_json::Value,
     pub started_unix_seconds: f64,
     pub finished_unix_seconds: f64,
     pub backend: BackendInfo,
@@ -127,9 +185,45 @@ pub struct RunSummary {
     pub limitations: Vec<String>,
 }
 
+/// Raw rows and flush requests share one bounded queue so the writer needs no timer.
+enum WriterMessage {
+    Row(Sample),
+    Flush,
+}
+
+/// Result of one bounded admission. `stalled_ns` is `Some` when the queue was full and the
+/// sender had to wait for capacity.
+struct Admission {
+    stalled_ns: Option<u64>,
+    delivered: bool,
+}
+
+/// Never blocks the calling thread: a full queue suspends only this task until the writer
+/// frees capacity. A message is never dropped; a stopped writer is reported as not delivered.
+async fn send_bounded(sender: &mpsc::Sender<WriterMessage>, message: WriterMessage) -> Admission {
+    match sender.try_send(message) {
+        Ok(()) => Admission {
+            stalled_ns: None,
+            delivered: true,
+        },
+        Err(mpsc::error::TrySendError::Full(message)) => {
+            let started = Instant::now();
+            let delivered = sender.send(message).await.is_ok();
+            Admission {
+                stalled_ns: Some(duration_ns(started.elapsed())),
+                delivered,
+            }
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => Admission {
+            stalled_ns: None,
+            delivered: false,
+        },
+    }
+}
+
 pub struct Reporter {
     output: PathBuf,
-    samples: Option<SyncSender<Sample>>,
+    samples: Option<mpsc::Sender<WriterMessage>>,
     sample_writer: Option<JoinHandle<std::io::Result<()>>>,
     registry: Registry,
     pub backend_label: String,
@@ -160,8 +254,17 @@ pub struct Reporter {
     sample_backpressure_ns: u64,
     sample_backpressure_events: u64,
     sample_submit_errors: u64,
+    release_samples: u64,
+    release_oracle_ns_sum: u64,
+    release_oracle_ns_max: u64,
     distributions: std::collections::BTreeMap<
-        (&'static str, &'static str, &'static str, &'static str),
+        (
+            &'static str,
+            &'static str,
+            &'static str,
+            &'static str,
+            &'static str,
+        ),
         LatencyAccumulator,
     >,
 }
@@ -183,17 +286,17 @@ impl Reporter {
             .write(true)
             .create_new(true)
             .open(samples_path)?;
-        let (sample_sender, sample_receiver) =
-            mpsc::sync_channel::<Sample>(RAW_SAMPLE_QUEUE_CAPACITY);
+        let (sample_sender, mut sample_receiver) =
+            mpsc::channel::<WriterMessage>(RAW_SAMPLE_QUEUE_CAPACITY);
         let sample_writer = thread::Builder::new().name("kv-research-sample-writer".to_owned()).spawn(move || {
             let mut samples = BufWriter::new(samples_file);
-            writeln!(samples, "phase,operation,outcome,scheduled_ns,dispatched_ns,dispatch_observed,completed_ns,api_ns,response_ns,scheduling_ns,logical_keys,bytes,error_kind")?;
+            writeln!(samples, "phase,operation,outcome,scheduled_ns,dispatched_ns,dispatch_observed,completed_ns,api_ns,response_ns,scheduling_ns,logical_keys,bytes,error_kind,caller_sample_id,released_ns,stream")?;
             let mut next_flush = Instant::now() + Duration::from_secs(1);
-            loop {
-                match sample_receiver.recv_timeout(next_flush.saturating_duration_since(Instant::now())) {
-                    Ok(sample) => write_sample_row(&mut samples, &sample)?,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {},
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            // This dedicated OS thread owns the receiver; blocking here never touches a runtime thread.
+            while let Some(message) = sample_receiver.blocking_recv() {
+                match message {
+                    WriterMessage::Row(sample) => write_sample_row(&mut samples, &sample)?,
+                    WriterMessage::Flush => samples.flush()?,
                 }
                 if Instant::now() >= next_flush {
                     samples.flush()?;
@@ -351,6 +454,9 @@ impl Reporter {
             sample_backpressure_ns: 0,
             sample_backpressure_events: 0,
             sample_submit_errors: 0,
+            release_samples: 0,
+            release_oracle_ns_sum: 0,
+            release_oracle_ns_max: 0,
             distributions: std::collections::BTreeMap::default(),
         })
     }
@@ -367,6 +473,17 @@ impl Reporter {
         });
     }
 
+    #[cfg(test)]
+    pub(crate) fn stall_sample_writer_for_test(&mut self) -> impl Send + use<> {
+        self.samples.take();
+        if let Some(writer) = self.sample_writer.take() {
+            writer.join().unwrap().unwrap();
+        }
+        let (sender, receiver) = mpsc::channel::<WriterMessage>(1);
+        self.samples = Some(sender);
+        receiver
+    }
+
     pub fn offered(&mut self, phase: &str, operation: &str, logical_keys: u64) {
         let labels = [self.backend_label.as_str(), operation, "scheduled", phase];
         self.offered.with_label_values(&labels).inc();
@@ -377,7 +494,7 @@ impl Reporter {
         self.keys_offered_total += logical_keys;
     }
 
-    pub fn rejected(&mut self, sample: Sample) -> BackendResult<()> {
+    pub async fn rejected(&mut self, sample: Sample) -> BackendResult<()> {
         let labels = [
             self.backend_label.as_str(),
             sample.operation,
@@ -394,13 +511,19 @@ impl Reporter {
             .with_label_values(&labels)
             .observe(Duration::from_nanos(sample.response_ns).as_secs_f64());
         self.distributions
-            .entry((sample.phase, sample.operation, "response", "rejected"))
+            .entry((
+                sample.phase,
+                sample.stream.map_or("", Stream::as_str),
+                sample.operation,
+                "response",
+                "rejected",
+            ))
             .or_default()
             .observe(sample.response_ns);
-        self.write_sample(sample)
+        self.write_sample(sample).await
     }
 
-    pub fn record(&mut self, sample: Sample) -> BackendResult<()> {
+    pub async fn record(&mut self, sample: Sample) -> BackendResult<()> {
         let labels = [
             self.backend_label.as_str(),
             sample.operation,
@@ -432,7 +555,13 @@ impl Reporter {
             .with_label_values(&labels)
             .observe(Duration::from_nanos(sample.response_ns).as_secs_f64());
         self.distributions
-            .entry((sample.phase, sample.operation, "response", sample.outcome))
+            .entry((
+                sample.phase,
+                sample.stream.map_or("", Stream::as_str),
+                sample.operation,
+                "response",
+                sample.outcome,
+            ))
             .or_default()
             .observe(sample.response_ns);
         if sample.dispatch_observed {
@@ -443,56 +572,88 @@ impl Reporter {
                 .with_label_values(&labels)
                 .observe(Duration::from_nanos(sample.scheduling_ns).as_secs_f64());
             self.distributions
-                .entry((sample.phase, sample.operation, "api", sample.outcome))
+                .entry((
+                    sample.phase,
+                    sample.stream.map_or("", Stream::as_str),
+                    sample.operation,
+                    "api",
+                    sample.outcome,
+                ))
                 .or_default()
                 .observe(sample.api_ns);
             self.distributions
-                .entry((sample.phase, sample.operation, "scheduling", sample.outcome))
+                .entry((
+                    sample.phase,
+                    sample.stream.map_or("", Stream::as_str),
+                    sample.operation,
+                    "scheduling",
+                    sample.outcome,
+                ))
                 .or_default()
                 .observe(sample.scheduling_ns);
         }
-        self.write_sample(sample)
+        let oracle_ns = sample.released_ns.saturating_sub(sample.completed_ns);
+        self.release_samples = self.release_samples.saturating_add(1);
+        self.release_oracle_ns_sum = self.release_oracle_ns_sum.saturating_add(oracle_ns);
+        self.release_oracle_ns_max = self.release_oracle_ns_max.max(oracle_ns);
+        if sample.dispatch_observed {
+            self.distributions
+                .entry((
+                    sample.phase,
+                    sample.stream.map_or("", Stream::as_str),
+                    sample.operation,
+                    "oracle",
+                    sample.outcome,
+                ))
+                .or_default()
+                .observe(oracle_ns);
+        }
+        self.write_sample(sample).await
     }
 
-    fn write_sample(&mut self, sample: Sample) -> BackendResult<()> {
+    async fn write_sample(&mut self, sample: Sample) -> BackendResult<()> {
         let sender = self.samples.as_ref().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "sample writer already stopped",
             )
         })?;
-        match sender.try_send(sample) {
-            Ok(()) => Ok(()),
-            Err(mpsc::TrySendError::Full(sample)) => {
-                self.sample_backpressure_events = self.sample_backpressure_events.saturating_add(1);
-                let started = Instant::now();
-                let result = sender.send(sample);
-                self.sample_backpressure_ns = self
-                    .sample_backpressure_ns
-                    .saturating_add(duration_ns(started.elapsed()));
-                if result.is_err() {
+        // The arrival clock must not wait for telemetry. A full writer queue invalidates
+        // interference instead of delaying admission or losing a row without an error.
+        if sample.stream.is_some() {
+            return match sender.try_send(WriterMessage::Row(sample)) {
+                Ok(()) => Ok(()),
+                Err(error) => {
                     self.sample_submit_errors = self.sample_submit_errors.saturating_add(1);
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "raw sample writer stopped; current sample was not persisted",
-                    )
+                    Err(std::io::Error::other(format!(
+                        "interference telemetry admission failed: {error}"
+                    ))
                     .into())
-                } else {
-                    Ok(())
                 }
-            }
-            Err(mpsc::TrySendError::Disconnected(_sample)) => {
-                self.sample_submit_errors = self.sample_submit_errors.saturating_add(1);
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "raw sample writer stopped; current sample was not persisted",
-                )
-                .into())
-            }
+            };
+        }
+        let admission = send_bounded(sender, WriterMessage::Row(sample)).await;
+        if let Some(stalled_ns) = admission.stalled_ns {
+            self.sample_backpressure_events = self.sample_backpressure_events.saturating_add(1);
+            self.sample_backpressure_ns = self.sample_backpressure_ns.saturating_add(stalled_ns);
+        }
+        if admission.delivered {
+            Ok(())
+        } else {
+            self.sample_submit_errors = self.sample_submit_errors.saturating_add(1);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "raw sample writer stopped; current sample was not persisted",
+            )
+            .into())
         }
     }
 
     pub fn snapshot(&mut self) -> BackendResult<()> {
+        // A full queue means rows are flowing and the writer flushes by elapsed time.
+        if let Some(sender) = &self.samples {
+            let _ = sender.try_send(WriterMessage::Flush);
+        }
         self.snapshot_timestamp.set(unix_seconds());
         let mut encoded = Vec::new();
         TextEncoder::new().encode(&self.registry.gather(), &mut encoded)?;
@@ -555,6 +716,7 @@ impl Reporter {
             "live_metrics": "live.prom",
             "status": if failed { "failed" } else { "completed" },
             "backend_info": summary.backend,
+            "durability": summary.durability,
             "offered_operations": self.offered_total,
             "completed_operations": self.completed_total,
             "succeeded_operations": self.succeeded_total,
@@ -569,6 +731,23 @@ impl Reporter {
             "raw_sample_writer_error": sample_writer_error,
             "sample_writer_backpressure_ns": self.sample_backpressure_ns,
             "sample_writer_backpressure_events": self.sample_backpressure_events,
+            "sample_writer_admission": {
+                "mode": if manifest_extra.get("interference").is_some() {
+                    "interference rows use bounded try_send; saturation fails the case and marks raw samples incomplete; other rows wait"
+                } else {
+                    "tokio bounded mpsc; a full queue suspends only the sending task, no runtime thread blocks, no sample is dropped"
+                },
+                "queue_capacity": RAW_SAMPLE_QUEUE_CAPACITY,
+                "stall_total_ns": self.sample_backpressure_ns,
+                "stall_events": self.sample_backpressure_events,
+                "submit_errors": self.sample_submit_errors,
+            },
+            "worker_release": {
+                "clock": "released_ns column: benchmark worker release after oracle verification; completed_ns stays the API response boundary",
+                "samples": self.release_samples,
+                "oracle_ns_sum": self.release_oracle_ns_sum,
+                "oracle_ns_max": self.release_oracle_ns_max,
+            },
             "run": manifest_extra,
         });
         atomic_write(
@@ -603,9 +782,13 @@ impl Reporter {
         serde_json::Value::Object(
             self.distributions
                 .iter()
-                .map(|((phase, operation, metric, outcome), values)| {
+                .map(|((phase, stream, operation, metric, outcome), values)| {
                     (
-                        format!("{phase}.{operation}.{metric}.{outcome}"),
+                        if stream.is_empty() {
+                            format!("{phase}.{operation}.{metric}.{outcome}")
+                        } else {
+                            format!("{phase}.{stream}.{operation}.{metric}.{outcome}")
+                        },
                         serde_json::json!(values.summary()),
                     )
                 })
@@ -616,7 +799,7 @@ impl Reporter {
 fn write_sample_row<W: Write>(samples: &mut W, sample: &Sample) -> std::io::Result<()> {
     writeln!(
         samples,
-        "{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         csv(sample.phase),
         csv(sample.operation),
         csv(sample.outcome),
@@ -629,7 +812,12 @@ fn write_sample_row<W: Write>(samples: &mut W, sample: &Sample) -> std::io::Resu
         sample.scheduling_ns,
         sample.logical_keys,
         sample.bytes,
-        csv(sample.error_kind.as_ref())
+        csv(sample.error_kind.as_ref()),
+        sample
+            .caller_sample_id
+            .map_or_else(String::new, |id| id.to_string()),
+        sample.released_ns,
+        sample.stream.map_or("", Stream::as_str)
     )
 }
 
@@ -685,10 +873,138 @@ mod tests {
         assert_eq!(exact.quantile_upper_bound(99, 100), Some(3));
     }
 
+    #[tokio::test]
+    async fn stream_tails_and_outcomes_are_not_pooled_and_rejections_have_no_api_tail() {
+        let path = std::env::temp_dir().join(format!(
+            "kv-research-tail-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut reporter = Reporter::create(&path, Registry::new(), "test".into()).unwrap();
+        for (stream, operation, outcome, latency) in [
+            (Stream::Read, "read", "success", 3),
+            (Stream::Put, "put", "success", 255),
+            (Stream::Read, "read", "timeout", 1023),
+        ] {
+            let WriterMessage::Row(mut sample) = row(outcome) else {
+                unreachable!()
+            };
+            sample.stream = Some(stream);
+            sample.operation = operation;
+            sample.api_ns = latency;
+            sample.completed_ns = sample.dispatched_ns + latency;
+            sample.response_ns = sample.completed_ns;
+            sample.released_ns = sample.completed_ns;
+            reporter.offered("measurement", operation, 1);
+            reporter.record(sample).await.unwrap();
+        }
+        let WriterMessage::Row(mut rejected) = row("rejected") else {
+            unreachable!()
+        };
+        rejected.stream = Some(Stream::Read);
+        rejected.dispatch_observed = false;
+        rejected.dispatched_ns = 0;
+        rejected.api_ns = 0;
+        rejected.scheduling_ns = 0;
+        reporter.offered("measurement", "read", 1);
+        reporter.rejected(rejected).await.unwrap();
+        let summary = reporter.distribution_summaries();
+        for (key, expected) in [
+            ("measurement.read.read.api.success", 3),
+            ("measurement.put.put.api.success", 255),
+            ("measurement.read.read.api.timeout", 1023),
+        ] {
+            assert_eq!(summary[key]["count"], 1);
+            assert_eq!(summary[key]["p99_upper_bound_ns"], expected);
+            assert_eq!(summary[key]["p999_upper_bound_ns"], expected);
+        }
+        assert!(summary.get("measurement.read.read.api.rejected").is_none());
+        assert!(summary.get("measurement.read.api.success").is_none());
+        // Finish the writer here so no queue or thread outlives the fixture.
+        reporter.samples.take();
+        reporter
+            .sample_writer
+            .take()
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     #[test]
     fn csv_fields_escape_commas_and_quotes() {
         assert_eq!(csv("a,\"b"), "\"a,\"\"b\"");
         assert_eq!(csv("plain"), "plain");
         assert_eq!(csv("a\rb"), "\"a\rb\"");
+    }
+
+    fn row(outcome: &'static str) -> WriterMessage {
+        WriterMessage::Row(Sample {
+            stream: None,
+            phase: "measurement",
+            operation: "read",
+            outcome,
+            caller_sample_id: None,
+            scheduled_ns: 0,
+            dispatched_ns: 1,
+            dispatch_observed: true,
+            completed_ns: 5,
+            api_ns: 4,
+            response_ns: 5,
+            scheduling_ns: 1,
+            released_ns: 9,
+            logical_keys: 1,
+            bytes: 0,
+            error_kind: Cow::Borrowed(""),
+        })
+    }
+
+    // The runtime has one thread. A blocking send would park it, the drain task below could
+    // never run, and this test would hang; an awaiting send lets the drain task free capacity.
+    #[tokio::test(flavor = "current_thread")]
+    async fn full_queue_suspends_only_the_sender_and_loses_no_sample() {
+        let (sender, mut receiver) = mpsc::channel::<WriterMessage>(1);
+        assert!(send_bounded(&sender, row("first")).await.delivered);
+        let drain = async {
+            tokio::task::yield_now().await;
+            let mut outcomes = Vec::new();
+            for _ in 0..2 {
+                match receiver.recv().await {
+                    Some(WriterMessage::Row(sample)) => outcomes.push(sample.outcome),
+                    _ => break,
+                }
+            }
+            outcomes
+        };
+        let (admission, outcomes) = tokio::join!(send_bounded(&sender, row("second")), drain);
+        assert!(admission.delivered);
+        assert!(admission.stalled_ns.is_some());
+        assert_eq!(outcomes, ["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn stopped_writer_is_reported_not_delivered() {
+        let (sender, receiver) = mpsc::channel::<WriterMessage>(1);
+        drop(receiver);
+        let admission = send_bounded(&sender, row("lost")).await;
+        assert!(!admission.delivered);
+        assert!(admission.stalled_ns.is_none());
+    }
+
+    #[test]
+    fn sample_row_ends_with_worker_release_clock() {
+        let WriterMessage::Row(sample) = row("success") else {
+            unreachable!("row builds a sample message");
+        };
+        let mut line = Vec::new();
+        write_sample_row(&mut line, &sample).unwrap();
+        assert_eq!(
+            String::from_utf8(line).unwrap(),
+            "measurement,read,success,0,1,true,5,4,5,1,1,0,,,9,\n"
+        );
     }
 }

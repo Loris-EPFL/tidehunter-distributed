@@ -1,18 +1,217 @@
-//! Bounded coordinator-owned reads, driven by one nonblocking connection owner.
+//! Bounded coordinator-owned reads use one actor per owner endpoint. Each lane
+//! has one progress owner at a time: its actor or an idle caller. Owner-local
+//! progress follows eRPC's per-core ownership principle, not its wire protocol.
 //! Exact-reference fill sharing adapts native DecompressCache::FillCell and
 //! CacheLib's fill-context waiters, not its mutable-key tombstone protocol:
 //! <https://github.com/facebook/CacheLib/blob/a24370092f0bd6fa7145b2f01c3e50e63edd6a6e/cachelib/allocator/nvmcache/NvmCache.h#L767-L848>.
-//! A fixed weak registry is reserved from the pending byte allowance. Every
-//! caller owns bounded result/slot credits; only new storage work owns a request
-//! credit. Pins and authenticated completion checks survive delivery cancellation.
+//! Fixed weak slots and an exact-reference index are reserved from the pending
+//! byte allowance. Every caller owns bounded result/slot credits; only new
+//! storage work owns a request credit. Pins and authenticated completion checks
+//! survive delivery cancellation.
 use super::*;
 use crate::distributed::native_index::IndexReadPin;
 use smallvec::SmallVec;
+use std::hash::BuildHasher;
 use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+/// A batch member with the plan computed once at batch creation.
+struct PlannedMember {
+    slot: usize,
+    reference: ValueRecordReference,
+    plan: MemberPlan,
+}
+#[cfg(test)]
+mod kv_capture_tests;
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+mod live_lane;
+mod read_trace;
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+mod sealed;
+
+/// One member's admission facts, computed once per request or batch: pending
+/// bytes to charge (including its aligned NVMe-oF buffer) and, when a sealed
+/// reader serves it, that reader and the member's aligned range.
+#[derive(Clone, Copy)]
+struct MemberPlan {
+    charge: usize,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    sealed: Option<sealed::SealedMember>,
+}
+impl MemberPlan {
+    /// Index of the serving sealed reader in the routing snapshot.
+    fn route(&self) -> Option<usize> {
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        {
+            self.sealed.map(|member| member.route)
+        }
+        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+        {
+            None
+        }
+    }
+}
+/// Plans made against one reader-set snapshot. Valid only while that
+/// snapshot is current.
+#[derive(Clone, Copy)]
+struct PlannedMembers<'a> {
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    generation: u64,
+    members: &'a [MemberPlan],
+}
+/// One member's plan with the reader-set generation it was made against.
+struct CachedPlan {
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    generation: u64,
+    member: [MemberPlan; 1],
+}
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+type RoutingView = arc_swap::Guard<Arc<sealed::NvmeRouting>>;
+#[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+struct NoRouting;
+#[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+type RoutingView = NoRouting;
+use crate::distributed::sui::kv_capture;
+use read_trace::ReadTrace;
+pub use read_trace::ReadTraceSnapshot;
+pub(crate) use read_trace::{ReadTraceCallGuard, ReadTraceChild};
+
+const NO_INDEX: usize = usize::MAX;
+
+struct FlightIndexEntry {
+    node: usize,
+    reference: ValueRecordReference,
+    slot: usize,
+    member: usize,
+    bucket_next: usize,
+    slot_next: usize,
+}
+
+// Fixed-capacity separate chaining avoids hash-table growth and retains no
+// uncharged allocations when the last consumer drops a flight. Stale entries
+// are removed when their slot is reused or when index capacity is needed.
+struct FlightRegistry {
+    slots: Box<[Weak<ReadFlight>]>,
+    slot_heads: Box<[usize]>,
+    buckets: Box<[usize]>,
+    entries: Box<[Option<FlightIndexEntry>]>,
+    free: Vec<usize>,
+    next_slot: usize,
+    hasher: std::collections::hash_map::RandomState,
+}
+
+impl FlightRegistry {
+    const ENTRY_BYTES: usize =
+        std::mem::size_of::<Option<FlightIndexEntry>>() + 3 * std::mem::size_of::<usize>(); // free stack and two buckets
+
+    fn new(slots: usize, capacity: usize) -> Self {
+        Self {
+            slots: (0..slots).map(|_| Weak::new()).collect(),
+            slot_heads: vec![NO_INDEX; slots].into_boxed_slice(),
+            buckets: vec![NO_INDEX; capacity * 2].into_boxed_slice(),
+            entries: std::iter::repeat_with(|| None).take(capacity).collect(),
+            free: (0..capacity).rev().collect(),
+            next_slot: 0,
+            hasher: std::collections::hash_map::RandomState::new(),
+        }
+    }
+
+    fn available_slot(&mut self, ready: &[FlightSignal]) -> Option<usize> {
+        for offset in 0..self.slots.len() {
+            let slot = (self.next_slot + offset) % self.slots.len();
+            if self.slots[slot].strong_count() == 0 && ready[slot].is_ready() {
+                self.next_slot = (slot + 1) % self.slots.len();
+                return Some(slot);
+            }
+        }
+        None
+    }
+
+    fn bucket(&self, node: usize, reference: &ValueRecordReference) -> usize {
+        (self.hasher.hash_one((node, reference)) as usize) % self.buckets.len()
+    }
+
+    fn find(
+        &self,
+        node: usize,
+        reference: &ValueRecordReference,
+    ) -> Option<(Arc<ReadFlight>, usize)> {
+        let mut index = self.buckets[self.bucket(node, reference)];
+        while index != NO_INDEX {
+            let entry = self.entries[index].as_ref().unwrap();
+            if entry.node == node
+                && entry.reference == *reference
+                && let Some(flight) = self.slots[entry.slot].upgrade()
+            {
+                return Some((flight, entry.member));
+            }
+            index = entry.bucket_next;
+        }
+        None
+    }
+
+    fn clear_slot(&mut self, slot: usize) {
+        let mut index = std::mem::replace(&mut self.slot_heads[slot], NO_INDEX);
+        while index != NO_INDEX {
+            let entry = self.entries[index].take().unwrap();
+            let bucket = self.bucket(entry.node, &entry.reference);
+            let mut current = self.buckets[bucket];
+            let mut previous = NO_INDEX;
+            while current != index {
+                previous = current;
+                current = self.entries[current].as_ref().unwrap().bucket_next;
+            }
+            if previous == NO_INDEX {
+                self.buckets[bucket] = entry.bucket_next;
+            } else {
+                self.entries[previous].as_mut().unwrap().bucket_next = entry.bucket_next;
+            }
+            self.free.push(index);
+            index = entry.slot_next;
+        }
+        self.slots[slot] = Weak::new();
+    }
+
+    fn reserve_entries(&mut self, count: usize, ready: &[FlightSignal]) -> bool {
+        if self.free.len() < count {
+            for (slot, signal) in ready.iter().enumerate() {
+                if self.slots[slot].strong_count() == 0 && signal.is_ready() {
+                    self.clear_slot(slot);
+                    if self.free.len() >= count {
+                        break;
+                    }
+                }
+            }
+        }
+        self.free.len() >= count
+    }
+
+    fn insert(&mut self, flight: &Arc<ReadFlight>) {
+        let slot = flight.slot;
+        self.clear_slot(slot);
+        self.slots[slot] = Arc::downgrade(flight);
+        for (member, reference) in flight.references.iter().enumerate() {
+            let bucket = self.bucket(flight.node, reference);
+            let index = self.free.pop().expect("flight index capacity reserved");
+            self.entries[index] = Some(FlightIndexEntry {
+                node: flight.node,
+                reference: *reference,
+                slot,
+                member,
+                bucket_next: self.buckets[bucket],
+                slot_next: self.slot_heads[slot],
+            });
+            self.buckets[bucket] = index;
+            self.slot_heads[slot] = index;
+        }
+    }
+}
 
 const BACKPRESSURE: &str = "remote read admission is full";
 const BYTE_BUDGET: &str = "request exceeds pending read byte budget";
+const MIN_MEMBER_BYTES: usize = 3 * 256
+    + 3 * std::mem::size_of::<ValueRecordReference>()
+    + 64
+    + 3 * (std::mem::size_of::<(ValueRecordReference, usize)>() + 1);
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ReadClass {
@@ -25,7 +224,16 @@ fn member_charge(reference: &ValueRecordReference) -> Result<usize, LocalDbError
         .checked_add(256)
         .filter(|n| *n <= super::super::tcp::HARD_FRAME_LIMIT - 32)
         .ok_or_else(|| LocalDbError::new("record exceeds read frame bound"))?;
-    Ok(wire * 3 + 3 * std::mem::size_of::<ValueRecordReference>() + 64)
+    // Three buckets per member cover HashMap's power-of-two growth and
+    // control bytes even immediately after a resize.
+    Ok(wire * 3
+        + 3 * std::mem::size_of::<ValueRecordReference>()
+        + 64
+        + 3 * (std::mem::size_of::<(ValueRecordReference, usize)>() + 1)
+        // Cover geometric growth and the minimum allocation of both vectors.
+        + 4 * (std::mem::size_of::<Weak<BatchSignal>>() + std::mem::size_of::<usize>())
+        // Every admitted batch has at least one member; this covers its Arc.
+        + std::mem::size_of::<BatchSignal>() + 2 * std::mem::size_of::<usize>())
 }
 
 pub(super) fn admission_error(error: &LocalDbError) -> bool {
@@ -35,6 +243,7 @@ pub(super) fn admission_error(error: &LocalDbError) -> bool {
 struct ReadContext {
     deadline: Instant,
     pin: Option<IndexReadPin>,
+    trace: Option<ReadTraceChild>,
 }
 
 /// A caller-bounded collection, submitted as the largest fitting shard groups.
@@ -46,9 +255,13 @@ pub(super) struct ReadBatch {
     pub(super) deadline: Instant,
     class: ReadClass,
     pub(super) pin: Option<IndexReadPin>,
-    groups: VecDeque<(usize, VecDeque<(usize, ValueRecordReference)>)>,
+    groups: VecDeque<(usize, VecDeque<PlannedMember>)>,
+    /// Reader-set generation the member plans in `groups` were made against.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    planned_generation: u64,
     owned_lanes: Vec<OwnedLane>,
     state: Arc<State>,
+    signal: Option<Arc<BatchSignal>>,
     epoch: u64,
 }
 
@@ -67,11 +280,28 @@ impl ReadBatch {
         values: Vec<Option<Mutation>>,
         groups: Vec<Vec<(usize, ValueRecordReference)>>,
     ) -> Result<Self, LocalDbError> {
-        // Reject an impossible member before issuing any of this batch's RPCs.
-        for (_, reference) in groups.iter().flatten() {
-            if service.member_charge(reference)? > service.max_bytes.saturating_sub(512) {
-                return Err(LocalDbError::new(BYTE_BUDGET));
+        // Plan every member once: one authority lookup and one alignment each.
+        // Dispatch and every admission retry reuse these plans.
+        let routing = service.routing();
+        let mut planned = VecDeque::with_capacity(groups.len());
+        for (node, group) in groups.into_iter().enumerate() {
+            if group.is_empty() {
+                continue;
             }
+            let mut members = VecDeque::with_capacity(group.len());
+            for (slot, reference) in group {
+                let plan = service.plan_member(&routing, &reference)?;
+                // Reject an impossible member before issuing any of this batch's RPCs.
+                if plan.charge > service.max_bytes.saturating_sub(512) {
+                    return Err(LocalDbError::new(BYTE_BUDGET));
+                }
+                members.push_back(PlannedMember {
+                    slot,
+                    reference,
+                    plan,
+                });
+            }
+            planned.push_back((node, members));
         }
         Ok(Self {
             values,
@@ -81,13 +311,11 @@ impl ReadBatch {
             deadline: Instant::now() + service.timeout,
             owned_lanes: Vec::new(),
             state: service.state.clone(),
+            signal: None,
             epoch: service.epoch,
-            groups: groups
-                .into_iter()
-                .enumerate()
-                .filter(|(_, group)| !group.is_empty())
-                .map(|(node, group)| (node, group.into()))
-                .collect(),
+            groups: planned,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            planned_generation: routing.generation,
         })
     }
 
@@ -100,6 +328,32 @@ impl ReadBatch {
     }
 
     pub(super) fn dispatch(&mut self, service: &ReadService) -> Result<(), LocalDbError> {
+        self.dispatch_traced(service, None, 0)
+    }
+
+    fn dispatch_traced(
+        &mut self,
+        service: &ReadService,
+        trace: Option<&ReadTraceCallGuard>,
+        offset: usize,
+    ) -> Result<(), LocalDbError> {
+        // One snapshot for planning checks and route lookups: plan indexes
+        // are valid only for the snapshot they were made against.
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        let routing = service.routing();
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if routing.generation != self.planned_generation {
+            // The reader set changed since planning: plan again once, not
+            // once per admission retry.
+            for (_, group) in &mut self.groups {
+                for member in group.iter_mut() {
+                    member.plan = service.plan_member(&routing, &member.reference)?;
+                }
+            }
+            self.planned_generation = routing.generation;
+        }
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        let planned_generation = self.planned_generation;
         let mut skipped = 0;
         while skipped < self.groups.len() {
             let (node, group) = self.groups.front_mut().expect("nonempty groups");
@@ -107,19 +361,19 @@ impl ReadBatch {
             let available = service.max_bytes - retained.1;
             let mut bytes = 512usize;
             let mut count = 0;
-            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            let first_eligible = service.nvmeof_eligible(&group.front().unwrap().1)?;
+            let first_route = group.front().and_then(|member| member.plan.route());
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             let mut nvme_bytes = 0usize;
-            for (_, reference) in group.iter().take(256) {
-                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                if service.nvmeof_eligible(reference)? != first_eligible {
+            for member in group.iter().take(256) {
+                if member.plan.route() != first_route {
                     break;
                 }
                 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-                if let Some(index) = first_eligible {
-                    let (member_bytes, max_bytes, max_members) =
-                        service.nvmeof_limits(index, reference)?;
+                if let Some(sealed) = member.plan.sealed {
+                    let catalog = &routing.routes[sealed.route].catalog;
+                    let member_bytes = sealed.range.charge();
+                    let (max_bytes, max_members) =
+                        (catalog.max_request_bytes(), catalog.max_request_members());
                     if member_bytes > max_bytes || max_members == 0 {
                         return Err(LocalDbError::new("record exceeds NVMe-oF reader capacity"));
                     }
@@ -128,7 +382,7 @@ impl ReadBatch {
                     }
                     nvme_bytes += member_bytes;
                 }
-                let charge = service.member_charge(reference)?;
+                let charge = member.plan.charge;
                 if charge > available.saturating_sub(bytes) {
                     break;
                 }
@@ -142,8 +396,18 @@ impl ReadBatch {
             }
             // Other callers can reserve credits after the snapshot above.
             // Retain every source slot until this request is actually admitted.
-            let (slots, references) = group.iter().take(count).copied().unzip();
-            let request = match service.submit_until_owned(
+            let mut slots = Vec::with_capacity(count);
+            let mut references = Vec::with_capacity(count);
+            let mut plans = SmallVec::<[MemberPlan; 32]>::new();
+            for member in group.iter().take(count) {
+                slots.push(member.slot);
+                references.push(member.reference);
+                plans.push(member.plan);
+            }
+            let child = trace.and_then(|trace| {
+                trace.child(*node, slots.iter().map(|slot| slot + offset).collect())
+            });
+            let mut request = match service.submit_until_owned(
                 *node,
                 references,
                 0,
@@ -151,17 +415,35 @@ impl ReadBatch {
                 ReadContext {
                     deadline: self.deadline,
                     pin: self.pin.clone(),
+                    trace: child.clone(),
                 },
                 (self.class == ReadClass::Point).then_some(&mut self.owned_lanes),
+                Some(PlannedMembers {
+                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                    generation: planned_generation,
+                    members: &plans,
+                }),
             ) {
                 Ok(request) => request,
                 Err(error) if RemoteDatabase::read_backpressured(&error) => {
+                    if let Some(trace) = &child {
+                        trace.event("admission_backpressured");
+                    }
                     self.groups.rotate_left(1);
                     skipped += 1;
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if let Some(trace) = &child {
+                        trace.event("admission_error");
+                    }
+                    return Err(error);
+                }
             };
+            let signal = self
+                .signal
+                .get_or_insert_with(|| Arc::new(BatchSignal::new()));
+            request.subscribe(signal);
             drop(group.drain(..count));
             skipped = 0;
             self.reads.push_back((slots, request));
@@ -181,11 +463,15 @@ impl ReadBatch {
             .credit
             .state
             .clone();
-        // The same generation/condition variable used for admission also
-        // advances after flight readiness is published. Hold its mutex while
-        // checking all flights to avoid sleeping through a completion.
+        let signal = self.signal.as_ref().expect("admitted batch has a signal");
+        // Check only readiness atomics while holding this batch's predicate
+        // mutex; producers take the same mutex before notifying.
         let mut empty_sweeps = 0u8;
         let ready = loop {
+            // Only the caller can release its reservation. A joined request
+            // asks it to hand progress to the actor without stealing the guard.
+            self.owned_lanes
+                .retain(|owned| !owned.lane.scheduling.lock().grouped_handoff_requested);
             let mut progressed = false;
             for owned in &self.owned_lanes {
                 if let Some(mut driver) = owned.lane.driver.try_lock() {
@@ -204,7 +490,7 @@ impl ReadBatch {
             }
             self.owned_lanes
                 .retain(|owned| owned.lane.outstanding.load(Ordering::Acquire) != 0);
-            let mut retained = state.retained.lock();
+            let mut wait_guard = signal.wait_lock.lock();
             if let Some(index) = self.reads.iter().position(|(_, request)| {
                 request
                     .parts
@@ -217,30 +503,43 @@ impl ReadBatch {
                 return Err(LocalDbError::new("read authority is poisoned or closed"));
             }
             if Instant::now() >= self.deadline {
-                drop(retained);
+                drop(wait_guard);
                 state.poison();
                 return Err(LocalDbError::new(
                     "remote read deadline expired or worker stopped",
                 ));
             }
             if self.owned_lanes.is_empty() {
-                state
-                    .admission_changed
-                    .wait_until(&mut retained, self.deadline);
+                #[cfg(test)]
+                signal.waiters.fetch_add(1, Ordering::Release);
+                signal.changed.wait_until(&mut wait_guard, self.deadline);
+                #[cfg(test)]
+                signal.waiters.fetch_sub(1, Ordering::Release);
             } else {
-                drop(retained);
+                drop(wait_guard);
                 thread::yield_now();
             }
         };
         self.owned_lanes
             .retain(|owned| owned.lane.outstanding.load(Ordering::Acquire) != 0);
         let (slots, request) = self.reads.remove(ready).expect("ready request exists");
+        if self.reads.is_empty() {
+            // The removed request still owns its subscription and credit until
+            // finish returns; no idle batch retains an uncharged signal.
+            self.signal = None;
+        }
         let (values, _) = request.finish()?;
         if slots.len() != values.len() {
             return Err(LocalDbError::new("remote read count mismatch"));
         }
         for (slot, value) in slots.into_iter().zip(values) {
             self.values[slot] = Some(value);
+        }
+        if self.reads.is_empty() {
+            // A joined request may still occupy this lane and its credits.
+            // This batch can now wait for admission of a later wave, so the
+            // actor must own progress for those unrelated accepted requests.
+            self.owned_lanes.clear();
         }
         Ok(())
     }
@@ -269,8 +568,17 @@ macro_rules! read_diagnostics {
                 set("read_profile_server_nowait_available", u64::from(self.server_nowait_count.load(Ordering::Relaxed) != 0));
                 set("read_profile_server_async_available", u64::from(self.server_async_count.load(Ordering::Relaxed) != 0));
                 set("read_profile_server_response_ready_available", u64::from(self.server_response_ready_count.load(Ordering::Relaxed) != 0));
-                $(set(concat!("read_profile_", stringify!($name)),
-                    self.$name.load(Ordering::Relaxed));)+
+                $(if !matches!(stringify!($name),
+                    "transport_tx_all_slots_pending_polls"
+                    | "transport_rx_no_posted_slots_polls"
+                    | "transport_rx_unread_slots_polls"
+                    | "transport_send_post_would_block"
+                    | "transport_receive_post_would_block")
+                    || self.transport_cq_timed_calls.load(Ordering::Relaxed) != 0
+                {
+                    set(concat!("read_profile_", stringify!($name)),
+                        self.$name.load(Ordering::Relaxed));
+                })+
             }
         }
     };
@@ -346,6 +654,32 @@ read_diagnostics!(
     transport_cq_completions,
     transport_cq_call_ns,
     transport_cq_timed_calls,
+    transport_tx_all_slots_pending_polls,
+    transport_rx_no_posted_slots_polls,
+    transport_rx_unread_slots_polls,
+    transport_send_post_would_block,
+    transport_receive_post_would_block,
+    transport_send_size_le_4k,
+    transport_send_size_le_16k,
+    transport_send_size_le_64k,
+    transport_send_size_gt_64k,
+    transport_send_post_eagain,
+    transport_send_post_retries,
+    transport_cq_idle_waits,
+    // Why admission returned backpressure; credit shortage is real load, the
+    // others are structural or a reader-set change.
+    admission_retry_credit,
+    admission_retry_flight,
+    admission_retry_lane,
+    admission_retry_paused,
+    admission_retry_config,
+    admission_retry_mixed,
+    // Live lane inbox pressure: inbox-full events, deepest inbox, deepest
+    // actor-side overflow queue, and time requests spent in that queue.
+    live_lane_full,
+    live_lane_depth_max,
+    live_lane_pending_max,
+    live_pending_wait_ns,
 );
 impl ReadDiagnostics {
     fn add_wal(&self, wal: super::super::tcp::WalReadProfile) {
@@ -459,6 +793,21 @@ impl ReadDiagnostics {
             (transport_cq_completions, cq_completions),
             (transport_cq_call_ns, cq_call_ns),
             (transport_cq_timed_calls, cq_timed_calls),
+            (
+                transport_tx_all_slots_pending_polls,
+                tx_all_slots_pending_polls
+            ),
+            (transport_rx_no_posted_slots_polls, rx_no_posted_slots_polls),
+            (transport_rx_unread_slots_polls, rx_unread_slots_polls),
+            (transport_send_post_would_block, send_post_would_block),
+            (transport_receive_post_would_block, receive_post_would_block),
+            (transport_send_size_le_4k, send_size_le_4k),
+            (transport_send_size_le_16k, send_size_le_16k),
+            (transport_send_size_le_64k, send_size_le_64k),
+            (transport_send_size_gt_64k, send_size_gt_64k),
+            (transport_send_post_eagain, send_post_eagain),
+            (transport_send_post_retries, send_post_retries),
+            (transport_cq_idle_waits, cq_idle_waits),
         );
     }
     fn select(&self) -> bool {
@@ -628,6 +977,7 @@ impl ReadProfileMonitor {
         for (partition, diagnostics) in self.state.owner_diagnostics.iter() {
             diagnostics.visit(&mut |name, value| {
                 if name.starts_with("read_profile_server_")
+                    || name.starts_with("read_profile_live_")
                     || matches!(
                         name,
                         "read_profile_completed"
@@ -646,21 +996,52 @@ impl ReadProfileMonitor {
         }
     }
 }
-struct FlightSignal {
-    ready: AtomicBool,
+struct BatchSignal {
     wait_lock: Mutex<()>,
     changed: parking_lot::Condvar,
     #[cfg(test)]
     waiters: AtomicUsize,
+    #[cfg(test)]
+    notifications: AtomicUsize,
+}
+impl BatchSignal {
+    fn new() -> Self {
+        Self {
+            wait_lock: Mutex::new(()),
+            changed: parking_lot::Condvar::new(),
+            #[cfg(test)]
+            waiters: AtomicUsize::new(0),
+            #[cfg(test)]
+            notifications: AtomicUsize::new(0),
+        }
+    }
+    fn notify(&self) {
+        let _guard = self.wait_lock.lock();
+        #[cfg(test)]
+        self.notifications.fetch_add(1, Ordering::Relaxed);
+        self.changed.notify_all();
+    }
+}
+
+struct FlightSignal {
+    ready: AtomicBool,
+    wait_lock: Mutex<SmallVec<[Weak<BatchSignal>; 1]>>,
+    changed: parking_lot::Condvar,
+    #[cfg(test)]
+    waiters: AtomicUsize,
+    #[cfg(test)]
+    retiring: AtomicUsize,
 }
 impl FlightSignal {
     fn new() -> Self {
         Self {
             ready: AtomicBool::new(true),
-            wait_lock: Mutex::new(()),
+            wait_lock: Mutex::new(SmallVec::new()),
             changed: parking_lot::Condvar::new(),
             #[cfg(test)]
             waiters: AtomicUsize::new(0),
+            #[cfg(test)]
+            retiring: AtomicUsize::new(0),
         }
     }
     fn begin(&self) {
@@ -670,9 +1051,21 @@ impl FlightSignal {
         self.ready.load(Ordering::Acquire)
     }
     fn retire(&self) {
+        // Publish retirement only while holding the subscription lock. A
+        // reused slot may begin immediately after ready becomes visible, but
+        // its subscriber cannot enter this generation's drain.
+        #[cfg(test)]
+        self.retiring.fetch_add(1, Ordering::Release);
+        let mut subscribers = self.wait_lock.lock();
+        #[cfg(test)]
+        self.retiring.fetch_sub(1, Ordering::Release);
         self.ready.store(true, Ordering::Release);
-        let _wait_lock = self.wait_lock.lock();
         self.changed.notify_all();
+        for subscriber in std::mem::take(&mut *subscribers) {
+            if let Some(signal) = subscriber.upgrade() {
+                signal.notify();
+            }
+        }
     }
     fn wait_until(&self, deadline: Instant) -> bool {
         let mut wait_lock = self.wait_lock.lock();
@@ -688,31 +1081,78 @@ impl FlightSignal {
         }
         true
     }
+    fn subscribe(&self, signal: &Arc<BatchSignal>) -> bool {
+        let mut subscribers = self.wait_lock.lock();
+        if self.is_ready() {
+            return false;
+        }
+        subscribers.push(Arc::downgrade(signal));
+        true
+    }
+    fn unsubscribe(&self, signal: &Arc<BatchSignal>) {
+        let mut subscribers = self.wait_lock.lock();
+        if let Some(index) = subscribers
+            .iter()
+            .position(|entry| entry.as_ptr() == Arc::as_ptr(signal))
+        {
+            subscribers.swap_remove(index);
+            if subscribers.is_empty() {
+                *subscribers = SmallVec::new();
+            } else if subscribers.capacity() > 2 * subscribers.len() {
+                subscribers.shrink_to_fit();
+            }
+        }
+    }
+    fn notify_batches(&self) {
+        let subscribers = self.wait_lock.lock();
+        for subscriber in subscribers.iter() {
+            if let Some(signal) = subscriber.upgrade() {
+                signal.notify();
+            }
+        }
+    }
 }
+
+#[cfg(test)]
+type ReactorPause = Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>;
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+type UnreleasedLiveGrant = (Arc<Mutex<Client>>, u64, Vec<[u8; 16]>);
 
 struct State {
     failed: AtomicBool,
+    first_failure: Arc<std::sync::OnceLock<String>>,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    live_reads: bool,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    live_unreleased: Mutex<Vec<UnreleasedLiveGrant>>,
     stopped: AtomicBool,
     retained: Mutex<(usize, usize)>,
     admission_paused: AtomicBool,
     admission_generation: AtomicU64,
     admission_changed: parking_lot::Condvar,
-    wake_pending: AtomicBool,
-    // Fixed flight signals and weak slots are reserved from pending bytes.
+    wake_pending: Box<[AtomicBool]>,
+    // Fixed flight signals, weak slots and exact-reference index are reserved from pending bytes.
     flight_ready: Box<[FlightSignal]>,
     read_rpcs: AtomicU64,
     diagnostics: ReadDiagnostics,
+    trace: Arc<ReadTrace>,
     coordinator_diagnostics: CoordinatorResolutionDiagnostics,
     owner_diagnostics: Box<[(u32, ReadDiagnostics)]>,
-    flights: Mutex<Box<[Weak<ReadFlight>]>>,
+    flights: Mutex<FlightRegistry>,
     coalesced_members: AtomicU64,
     flight_metadata_bytes: usize,
+    /// Installed sealed readers. Replaced only by install and release, never
+    /// by credit changes; each reader has its own mutex (see `sealed`).
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    nvmeof: Mutex<Vec<NvmeDispatch>>,
+    nvme_routing: arc_swap::ArcSwap<sealed::NvmeRouting>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     nvmeof_metrics: Mutex<Vec<super::super::nvmeof::NvmeofMetrics>>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     nvmeof_enabled: AtomicBool,
+    /// Endpoints whose reactor has drained and closed its readers.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    nvme_shutdown_ready: AtomicUsize,
     #[cfg(test)]
     peak_connection_reads: AtomicUsize,
     #[cfg(test)]
@@ -722,20 +1162,13 @@ struct State {
     #[cfg(test)]
     completion_pause: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
     #[cfg(test)]
-    reactor_pause: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
+    reactor_pause: Box<[ReactorPause]>,
+    #[cfg(test)]
+    reactor_enqueue_entered: Box<[Mutex<Option<mpsc::SyncSender<()>>>]>,
 }
 
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-struct NvmeDispatch {
-    reader: super::super::nvmeof::NvmeofReader,
-    lease_client: Arc<Mutex<Client>>,
-    lease_epoch: u64,
-    lease_token: [u8; 16],
-    shape: Arc<KeyShape>,
-    metadata_budget: usize,
-    next: u64,
-    active: HashMap<u64, Request>,
-}
+use sealed::NvmeDispatch;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 struct NvmeEpochPin {
     client: Arc<Mutex<Client>>,
@@ -746,7 +1179,13 @@ struct NvmeEpochPin {
 impl State {
     fn poison(&self) {
         self.failed.store(true, Ordering::Release);
+        self.notify_batches();
         self.notify_admission();
+    }
+    fn notify_batches(&self) {
+        for flight in &self.flight_ready {
+            flight.notify_batches();
+        }
     }
     fn notify_admission(&self) {
         let _retained = self.retained.lock();
@@ -759,6 +1198,33 @@ impl Drop for PoisonOnPanic {
     fn drop(&mut self) {
         if thread::panicking() {
             self.0.poison();
+        }
+    }
+}
+/// Closes the sealed readers of one endpoint when its reactor has drained. A
+/// reader serves only its own endpoint's requests, so no other reactor's
+/// state matters here.
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+struct NvmeActorBarrier {
+    state: Arc<State>,
+    node: usize,
+    ready: bool,
+}
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+impl NvmeActorBarrier {
+    fn arrive(&mut self) {
+        self.state.begin_nvme_shutdown(self.node);
+        self.ready = true;
+        self.state
+            .nvme_shutdown_ready
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+impl Drop for NvmeActorBarrier {
+    fn drop(&mut self) {
+        if !self.ready && thread::panicking() {
+            self.state.begin_nvme_shutdown(self.node);
         }
     }
 }
@@ -794,11 +1260,18 @@ impl Drop for AdmissionPause {
 
 struct LaneScheduling {
     inline_reserved: bool,
+    // A grouped owner drives the shared reactor; a scalar owner uses the
+    // synchronous client and must remain exclusive of queued requests.
+    grouped_reserved: bool,
+    grouped_handoff_requested: bool,
 }
 struct InlineLaneReservation(Arc<Mutex<LaneScheduling>>);
 impl Drop for InlineLaneReservation {
     fn drop(&mut self) {
-        self.0.lock().inline_reserved = false;
+        let mut scheduling = self.0.lock();
+        scheduling.inline_reserved = false;
+        scheduling.grouped_reserved = false;
+        scheduling.grouped_handoff_requested = false;
     }
 }
 
@@ -816,13 +1289,25 @@ struct Request {
     deadline: Instant,
     submitted: Option<Instant>,
     sampled: bool,
+    trace: Option<ReadTraceChild>,
     flight: Arc<ReadFlight>,
     _credit: Arc<Credit>,
+    /// Sealed reader SQE layout built once at admission; `None` for owner RPC.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    sealed: Option<Box<super::super::nvmeof::ReadPlan>>,
     _lane_credit: LaneCredit,
 }
 enum ReadCommand {
     Request(Request),
     Wake,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    DrainLive(mpsc::SyncSender<Result<(), String>>),
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+enum LiveLaneCommand {
+    Request(Request),
+    Drain(mpsc::SyncSender<Result<(), String>>),
 }
 
 struct OwnedLane {
@@ -830,16 +1315,17 @@ struct OwnedLane {
     reservation: Option<InlineLaneReservation>,
     sender: mpsc::SyncSender<ReadCommand>,
     state: Arc<State>,
+    node: usize,
 }
 impl Drop for OwnedLane {
     fn drop(&mut self) {
         drop(self.reservation.take());
         // At most one control wake occupies the channel independently of
         // request credits. Accepted work remains in the shared driver.
-        if !self.state.wake_pending.swap(true, Ordering::AcqRel)
+        if !self.state.wake_pending[self.node].swap(true, Ordering::AcqRel)
             && self.sender.try_send(ReadCommand::Wake).is_err()
         {
-            self.state.wake_pending.store(false, Ordering::Release);
+            self.state.wake_pending[self.node].store(false, Ordering::Release);
         }
     }
 }
@@ -878,9 +1364,23 @@ impl Request {
         failed_profile: Option<super::super::tcp::TcpReadProfile>,
         record_profile: bool,
     ) {
+        kv_capture::routes(
+            &self.flight.references,
+            !record_profile,
+            self.flight.slot as u64,
+        );
+        if let Some(trace) = &self.trace {
+            trace.event(if result.is_err() {
+                "flight_error"
+            } else {
+                "flight_completed"
+            });
+        }
         if self.sampled && record_profile {
             let diagnostics = &self._credit.state.diagnostics;
             let owner = &self._credit.state.owner_diagnostics[self.flight.node].1;
+            // This class records admission origin, not the executing thread:
+            // a grouped caller can hand its accepted flight to the actor.
             if self.flight.grouped_inline.load(Ordering::Acquire) {
                 let profile = result
                     .as_ref()
@@ -901,7 +1401,19 @@ impl Request {
                 owner.complete(&result, failed_profile);
             }
         }
-        if result.is_err() {
+        if let Err(error) = &result {
+            let partition = self
+                .flight
+                .references
+                .first()
+                .map(|reference| reference.batch_address.partition);
+            super::record_first_failure(
+                &self._credit.state.first_failure,
+                partition,
+                None,
+                "read_completion",
+                error,
+            );
             self._credit.state.poison();
         }
         // Transport has relinquished this request's application buffers. The
@@ -982,37 +1494,69 @@ struct InflightRead {
 }
 struct ReactorLane {
     client: Arc<Mutex<Client>>,
+    /// Endpoint whose reactor drives this lane. It selects the only sealed
+    /// readers this lane may submit to: those of the same endpoint.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    node: usize,
     queued: VecDeque<Request>,
     active: HashMap<u64, InflightRead>,
     profiling: bool,
 }
+/// Harvest completions of `node`'s sealed readers. Each reader has its own
+/// mutex, held only across its ring submit and CQ harvest; record verification
+/// and request completion run with no lock held.
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-fn progress_nvmeof(state: &Arc<State>) -> bool {
-    let mut guard = state.nvmeof.lock();
+fn progress_nvmeof(state: &Arc<State>, node: usize) -> bool {
     let mut ready = Vec::new();
-    for (index, dispatch) in guard.iter_mut().enumerate() {
-        if dispatch.active.is_empty() {
-            continue;
-        }
-        let completions = match dispatch.reader.progress() {
-            Ok(completions) => completions,
-            Err(_) => {
-                // Retain requests, credits and pins while the queue owns DMA.
-                state.poison();
+    {
+        let routing = state.nvme_routing.load();
+        for route in routing.routes.iter().filter(|route| route.node == node) {
+            // Only this reactor raises the count, so zero means no CQE is owed.
+            if route.cell.in_flight.load(Ordering::Relaxed) == 0 {
                 continue;
             }
-        };
-        for completion in completions {
-            if let Some(request) = dispatch.active.remove(&completion.id) {
-                ready.push((index, dispatch.shape.clone(), request, completion.result));
-            } else {
-                state.poison();
+            let mut guard = route.lock();
+            let Some(dispatch) = guard.dispatch() else {
+                continue;
+            };
+            let completions = match dispatch.reader.progress() {
+                Ok(completions) => completions,
+                Err(error) => {
+                    super::record_first_failure(
+                        &state.first_failure,
+                        Some(dispatch.reader.manifest().partition),
+                        None,
+                        "nvme_progress",
+                        &error,
+                    );
+                    // Retain requests, credits and pins while the queue owns DMA.
+                    state.poison();
+                    continue;
+                }
+            };
+            for completion in completions {
+                if let Some(request) = dispatch.active.remove(&completion.id) {
+                    route.cell.in_flight.fetch_sub(1, Ordering::Relaxed);
+                    if let Some(trace) = &request.trace {
+                        trace.event_io("sealed_nvme_completion_observed", 0, completion.id);
+                    }
+                    ready.push((
+                        route.catalog.clone(),
+                        dispatch.shape.clone(),
+                        request,
+                        completion.result,
+                    ));
+                } else {
+                    state.poison();
+                }
             }
         }
     }
-    drop(guard);
     let progressed = !ready.is_empty();
-    for (index, shape, request, result) in ready {
+    for (catalog, shape, request, result) in ready {
+        if let Some(trace) = &request.trace {
+            trace.event("sealed_nvme_validation_started");
+        }
         let verifying = result
             .as_ref()
             .is_ok_and(|members| members.len() == request.flight.references.len());
@@ -1036,10 +1580,11 @@ fn progress_nvmeof(state: &Arc<State>) -> bool {
             }
             Ok((values, None))
         });
-        if verifying && let Some(dispatch) = state.nvmeof.lock().get(index) {
-            dispatch
-                .reader
-                .record_verification(verification_started.elapsed());
+        if let Some(trace) = &request.trace {
+            trace.event("sealed_nvme_validation_finished");
+        }
+        if verifying {
+            catalog.record_verification(verification_started.elapsed());
         }
         request.complete_nvme(result);
     }
@@ -1047,60 +1592,56 @@ fn progress_nvmeof(state: &Arc<State>) -> bool {
 }
 
 // Returns whether the head belongs to NVMe-oF and whether it made progress.
+// Admission already chose the reader and built the SQE layout, so this takes
+// only that reader's mutex and repeats no alignment or eligibility work.
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 fn submit_nvmeof(state: &Arc<State>, lane: &mut ReactorLane) -> (bool, bool) {
-    let mut guard = state.nvmeof.lock();
     let Some(request) = lane.queued.front() else {
         return (false, false);
     };
-    let mut selected = None;
-    for reference in &request.references {
-        let mut member = None;
-        for (index, dispatch) in guard.iter().enumerate() {
-            match dispatch.reader.eligibility(reference) {
-                Ok(super::super::nvmeof::Eligibility::Eligible) => member = Some(index),
-                Ok(super::super::nvmeof::Eligibility::Ineligible) => {}
-                Err(error) => {
-                    let request = lane.queued.pop_front().unwrap();
-                    drop(guard);
-                    request.complete(Err(LocalDbError::component(error)));
-                    return (true, true);
-                }
-            }
-        }
-        if let Some(previous) = selected {
-            if previous != member {
-                let request = lane.queued.pop_front().unwrap();
-                drop(guard);
-                request.complete(Err(LocalDbError::new(
-                    "mixed NVMe-oF request was not partitioned",
-                )));
-                return (true, true);
-            }
-        } else {
-            selected = Some(member);
-        }
-    }
-    let Some(Some(index)) = selected else {
+    let Some(plan) = request.sealed.as_deref() else {
         return (false, false);
     };
-    let dispatch = &mut guard[index];
+    let routing = state.nvme_routing.load();
+    let Some(route) = routing
+        .routes
+        .iter()
+        .find(|route| route.node == lane.node && route.catalog.id() == plan.reader_id())
+    else {
+        // Admission holds the request credit, which blocks any reader-set
+        // change, so a missing reader is an internal error.
+        if let Some(request) = lane.queued.pop_front() {
+            request.complete(Err(LocalDbError::new("sealed read plan has no reader")));
+        }
+        return (true, true);
+    };
+    let mut guard = route.lock();
+    let Some(dispatch) = guard.dispatch() else {
+        drop(guard);
+        if let Some(request) = lane.queued.pop_front() {
+            request.complete(Err(LocalDbError::new("sealed reader was released")));
+        }
+        return (true, true);
+    };
     let id = dispatch.next;
     dispatch.next = dispatch.next.wrapping_add(1);
-    match dispatch
-        .reader
-        .submit(id, request.references.clone(), request.deadline)
-    {
+    match dispatch.reader.submit_planned(id, plan, request.deadline) {
         Ok(super::super::nvmeof::SubmitOutcome::Submitted) => {
-            let request = lane.queued.pop_front().unwrap();
-            dispatch.active.insert(id, request);
+            if let Some(request) = lane.queued.pop_front() {
+                if let Some(trace) = &request.trace {
+                    trace.event_io("sealed_nvme_request_submitted", 0, id);
+                }
+                dispatch.active.insert(id, request);
+                route.cell.in_flight.fetch_add(1, Ordering::Relaxed);
+            }
             (true, true)
         }
         Ok(super::super::nvmeof::SubmitOutcome::Full) => (true, false),
         Err(error) => {
-            let request = lane.queued.pop_front().unwrap();
             drop(guard);
-            request.complete(Err(LocalDbError::component(error)));
+            if let Some(request) = lane.queued.pop_front() {
+                request.complete(Err(LocalDbError::component(error)));
+            }
             (true, true)
         }
     }
@@ -1128,12 +1669,16 @@ fn progress_read_lane(state: &Arc<State>, lane: &mut ReactorLane, epoch: u64) ->
     }
     // Diagnostics and the deterministic test hook may own a mutex.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    let nvme_head = loop {
-        let (handled, made_progress) = submit_nvmeof(state, lane);
-        progressed |= made_progress;
-        if !handled || !made_progress {
-            break handled;
+    let nvme_head = if state.nvmeof_enabled.load(Ordering::Acquire) {
+        loop {
+            let (handled, made_progress) = submit_nvmeof(state, lane);
+            progressed |= made_progress;
+            if !handled || !made_progress {
+                break handled;
+            }
         }
+    } else {
+        false
     };
     #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
     let nvme_head = false;
@@ -1191,6 +1736,9 @@ fn progress_read_lane(state: &Arc<State>, lane: &mut ReactorLane, epoch: u64) ->
             request.submitted.is_some(),
         ) {
             Ok(Some(id)) => {
+                if let Some(trace) = &request.trace {
+                    trace.event_io("transport_request_submitted", 0, id);
+                }
                 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                 if state.nvmeof_enabled.load(Ordering::Acquire) {
                     fallback = Some((
@@ -1259,13 +1807,14 @@ fn progress_read_lane(state: &Arc<State>, lane: &mut ReactorLane, epoch: u64) ->
     drop(client);
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     if let Some((partition, count)) = fallback
-        && let Some(dispatch) = state
-            .nvmeof
-            .lock()
+        && let Some(route) = state
+            .nvme_routing
+            .load()
+            .routes
             .iter()
-            .find(|dispatch| dispatch.reader.manifest().partition == partition)
+            .find(|route| route.catalog.manifest().partition == partition)
     {
-        dispatch.reader.record_ineligible_fallbacks(count);
+        route.catalog.record_ineligible_fallbacks(count);
     }
     match completions {
         Ok(completions) => {
@@ -1316,6 +1865,13 @@ fn progress_read_lane(state: &Arc<State>, lane: &mut ReactorLane, epoch: u64) ->
             }
         }
         Err(error) => {
+            super::record_first_failure(
+                &state.first_failure,
+                None,
+                None,
+                "read_transport_progress",
+                &error,
+            );
             state.poison();
             // Client's fail-stop path relinquishes every request buffer
             // before returning; endpoint-owned DMA slots are separate.
@@ -1329,30 +1885,267 @@ fn progress_read_lane(state: &Arc<State>, lane: &mut ReactorLane, epoch: u64) ->
     progressed
 }
 
+// Live control and CQ waits must not occupy the shared multi-lane reactor.
+// Global flight credits bound all channel entries, including these lane queues.
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+fn drive_live_reads(
+    state: Arc<State>,
+    receiver: mpsc::Receiver<ReadCommand>,
+    lanes: Vec<Lane>,
+    node: usize,
+    base: usize,
+    epoch: u64,
+    max_requests: usize,
+) {
+    /// A lane's inbox as seen by the actor. `pending` holds requests the full
+    /// inbox did not accept; it is bounded by `max_requests` because every
+    /// request holds a global flight credit. Depth counts inbox entries.
+    struct LiveLane {
+        sender: mpsc::SyncSender<LiveLaneCommand>,
+        depth: Arc<AtomicUsize>,
+        waker: live_lane::LaneWaker,
+        pending: VecDeque<(Instant, Request)>,
+    }
+    /// Hand `request` to the lane without blocking; false if the inbox is full.
+    fn offer(lane: &mut LiveLane, request: Request, state: &State, node: usize) -> Option<Request> {
+        // Count before sending so the worker's decrement cannot underflow.
+        let depth = lane.depth.fetch_add(1, Ordering::Relaxed) + 1;
+        match lane.sender.try_send(LiveLaneCommand::Request(request)) {
+            Ok(()) => {
+                // Interrupt a worker sleeping on its CQ so it admits this at once.
+                if let Some(waker) = lane.waker.get()
+                    && let Err(error) = waker.wake()
+                {
+                    // A lost wake could strand this request behind a sleeping
+                    // worker: fail closed instead of waiting for its timeout.
+                    super::record_first_failure(
+                        &state.first_failure,
+                        None,
+                        None,
+                        "live_lane_wake",
+                        &error,
+                    );
+                    state.poison();
+                }
+                state
+                    .diagnostics
+                    .live_lane_depth_max
+                    .fetch_max(depth as u64, Ordering::Relaxed);
+                state.owner_diagnostics[node]
+                    .1
+                    .live_lane_depth_max
+                    .fetch_max(depth as u64, Ordering::Relaxed);
+                None
+            }
+            Err(mpsc::TrySendError::Full(LiveLaneCommand::Request(request))) => {
+                lane.depth.fetch_sub(1, Ordering::Relaxed);
+                state
+                    .diagnostics
+                    .live_lane_full
+                    .fetch_add(1, Ordering::Relaxed);
+                state.owner_diagnostics[node]
+                    .1
+                    .live_lane_full
+                    .fetch_add(1, Ordering::Relaxed);
+                Some(request)
+            }
+            Err(mpsc::TrySendError::Disconnected(LiveLaneCommand::Request(request))) => {
+                lane.depth.fetch_sub(1, Ordering::Relaxed);
+                request.complete_nvme(Err(LocalDbError::new("live read worker stopped")));
+                None
+            }
+            Err(_) => None,
+        }
+    }
+    /// Move pending requests into their inboxes, oldest first, until one is full.
+    fn flush(lanes: &mut [LiveLane], state: &State, node: usize) {
+        for lane in lanes {
+            while let Some((queued, request)) = lane.pending.pop_front() {
+                if Instant::now() >= request.deadline {
+                    // Never reached a worker: fail it like an expired admission.
+                    state.poison();
+                    request.complete_nvme(Err(LocalDbError::new(
+                        "remote read admission deadline expired",
+                    )));
+                    continue;
+                }
+                match offer(lane, request, state, node) {
+                    None => {
+                        let waited = elapsed(queued);
+                        state
+                            .diagnostics
+                            .live_pending_wait_ns
+                            .fetch_add(waited, Ordering::Relaxed);
+                        state.owner_diagnostics[node]
+                            .1
+                            .live_pending_wait_ns
+                            .fetch_add(waited, Ordering::Relaxed);
+                    }
+                    Some(request) => {
+                        lane.pending.push_front((queued, request));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let _poison = PoisonOnPanic(state.clone());
+    let mut inboxes = Vec::with_capacity(lanes.len());
+    let mut workers = Vec::with_capacity(lanes.len());
+    for lane in lanes {
+        let (sender, lane_receiver) = mpsc::sync_channel::<LiveLaneCommand>(max_requests);
+        let depth = Arc::new(AtomicUsize::new(0));
+        let waker = live_lane::LaneWaker::default();
+        let worker_state = state.clone();
+        let worker_depth = depth.clone();
+        let worker_waker = waker.clone();
+        let worker = thread::Builder::new()
+            .name(format!("wal-live-read-{}", lane.index))
+            .spawn(move || {
+                live_lane::run(
+                    worker_state,
+                    lane,
+                    lane_receiver,
+                    worker_depth,
+                    worker_waker,
+                    epoch,
+                    max_requests,
+                );
+            });
+        match worker {
+            Ok(worker) => {
+                inboxes.push(LiveLane {
+                    sender,
+                    depth,
+                    waker,
+                    pending: VecDeque::new(),
+                });
+                workers.push(worker);
+            }
+            Err(_) => {
+                state.poison();
+                drop(sender);
+                break;
+            }
+        }
+    }
+    let mut disconnected = false;
+    loop {
+        flush(&mut inboxes, &state, node);
+        let queued = inboxes.iter().map(|lane| lane.pending.len()).sum::<usize>();
+        if queued != 0 {
+            let queued = queued as u64;
+            state
+                .diagnostics
+                .live_lane_pending_max
+                .fetch_max(queued, Ordering::Relaxed);
+            state.owner_diagnostics[node]
+                .1
+                .live_lane_pending_max
+                .fetch_max(queued, Ordering::Relaxed);
+        }
+        let command = if disconnected {
+            if queued == 0 {
+                break;
+            }
+            // Closing: only the pending requests remain; wait for lane room.
+            thread::sleep(Duration::from_micros(100));
+            continue;
+        } else if queued == 0 {
+            // Nothing to retry: block until the next command.
+            match receiver.recv() {
+                Ok(command) => command,
+                Err(_) => {
+                    disconnected = true;
+                    continue;
+                }
+            }
+        } else {
+            match receiver.recv_timeout(Duration::from_micros(100)) {
+                Ok(command) => command,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    disconnected = true;
+                    continue;
+                }
+            }
+        };
+        match command {
+            ReadCommand::Request(request) => {
+                if let Some(trace) = &request.trace {
+                    trace.event("actor_dequeued");
+                }
+                let index = request.lane.checked_sub(base);
+                let Some(lane) = index.and_then(|index| inboxes.get_mut(index)) else {
+                    request.complete_nvme(Err(LocalDbError::new("live read worker unavailable")));
+                    continue;
+                };
+                // Keep lane FIFO: never pass requests already waiting.
+                if lane.pending.is_empty() {
+                    if let Some(request) = offer(lane, request, &state, node) {
+                        lane.pending.push_back((Instant::now(), request));
+                    }
+                } else {
+                    lane.pending.push_back((Instant::now(), request));
+                }
+            }
+            ReadCommand::Wake => state.wake_pending[node].store(false, Ordering::Release),
+            ReadCommand::DrainLive(reply) => {
+                for lane in &inboxes {
+                    if lane
+                        .sender
+                        .try_send(LiveLaneCommand::Drain(reply.clone()))
+                        .is_err()
+                    {
+                        let _ = reply.send(Err("live read lane drain admission failed".into()));
+                    }
+                }
+            }
+        }
+    }
+    drop(inboxes);
+    for worker in workers {
+        if worker.join().is_err() {
+            state.poison();
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // The actor takes explicit ownership, admission and polling inputs once.
 fn drive_reads(
     state: Arc<State>,
     receiver: mpsc::Receiver<ReadCommand>,
     lanes: Vec<Lane>,
+    node: usize,
+    base: usize,
     epoch: u64,
     max_requests: usize,
     fabric: bool,
     busy: bool,
 ) {
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    if state.live_reads {
+        drive_live_reads(state, receiver, lanes, node, base, epoch, max_requests);
+        return;
+    }
     let _poison = PoisonOnPanic(state.clone());
     let mut disconnected = false;
     let mut first_lane = 0;
     let mut empty_polls = 0u8;
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    let mut nvme_shutdown_started = false;
+    let mut nvme_barrier = NvmeActorBarrier {
+        state: state.clone(),
+        node,
+        ready: false,
+    };
     loop {
         let mut progressed = false;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        {
-            progressed |= progress_nvmeof(&state);
+        if state.nvmeof_enabled.load(Ordering::Acquire) {
+            progressed |= progress_nvmeof(&state, node);
         }
         #[cfg(test)]
-        if let Some((entered, resume)) = state.reactor_pause.lock().take() {
+        if let Some((entered, resume)) = state.reactor_pause[node].lock().take() {
             entered.send(()).unwrap();
             resume.recv().unwrap();
         }
@@ -1361,11 +2154,24 @@ fn drive_reads(
         for _ in 0..max_requests {
             match receiver.try_recv() {
                 Ok(ReadCommand::Request(request)) => {
-                    lanes[request.lane].driver.lock().queued.push_back(request);
+                    #[cfg(test)]
+                    if let Some(entered) = state.reactor_enqueue_entered[node].lock().take() {
+                        entered.send(()).unwrap();
+                    }
+                    lanes[request.lane - base]
+                        .driver
+                        .lock()
+                        .queued
+                        .push_back(request);
                     progressed = true;
                 }
                 Ok(ReadCommand::Wake) => {
-                    state.wake_pending.store(false, Ordering::Release);
+                    state.wake_pending[node].store(false, Ordering::Release);
+                    progressed = true;
+                }
+                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                Ok(ReadCommand::DrainLive(reply)) => {
+                    let _ = reply.send(Err("not a live read worker".into()));
                     progressed = true;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -1387,12 +2193,12 @@ fn drive_reads(
                 progressed |= progress_read_lane(&state, &mut driver, epoch);
             }
         }
-        // Sender disconnection proves no producer can enqueue another accepted
-        // request. Preserve existing drain semantics by submitting every queued
-        // request before closing reader admission, then keep polling terminal CQEs.
+        // Every owner must drain its channel and submit or fail queued reads
+        // before the last owner closes shared NVMe-oF reader admission.
+        // Terminal CQEs remain driven after begin_shutdown.
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if disconnected
-            && !nvme_shutdown_started
+            && !nvme_barrier.ready
             && lanes.iter().all(|lane| {
                 !lane.scheduling.lock().inline_reserved
                     && lane
@@ -1401,13 +2207,14 @@ fn drive_reads(
                         .is_some_and(|driver| driver.queued.is_empty())
             })
         {
-            let mut readers = state.nvmeof.lock();
-            for dispatch in readers.iter_mut() {
-                dispatch.reader.begin_shutdown();
-            }
-            nvme_shutdown_started = true;
+            nvme_barrier.arrive();
         }
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        let may_exit = nvme_barrier.ready;
+        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+        let may_exit = true;
         if disconnected
+            && may_exit
             && lanes.iter().all(|lane| {
                 !lane.scheduling.lock().inline_reserved
                     && lane.outstanding.load(Ordering::Acquire) == 0
@@ -1440,10 +2247,22 @@ fn drive_reads(
                 // periodically sleeping through the next scalar request.
                 match receiver.recv_timeout(Duration::from_millis(50)) {
                     Ok(ReadCommand::Request(request)) => {
-                        lanes[request.lane].driver.lock().queued.push_back(request)
+                        #[cfg(test)]
+                        if let Some(entered) = state.reactor_enqueue_entered[node].lock().take() {
+                            entered.send(()).unwrap();
+                        }
+                        lanes[request.lane - base]
+                            .driver
+                            .lock()
+                            .queued
+                            .push_back(request)
                     }
                     Ok(ReadCommand::Wake) => {
-                        state.wake_pending.store(false, Ordering::Release);
+                        state.wake_pending[node].store(false, Ordering::Release);
+                    }
+                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                    Ok(ReadCommand::DrainLive(reply)) => {
+                        let _ = reply.send(Err("not a live read worker".into()));
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => disconnected = true,
@@ -1458,14 +2277,14 @@ fn drive_reads(
 pub(super) struct ReadService {
     state: Arc<State>,
     lanes: RwLock<Vec<Vec<Lane>>>,
-    sender: Mutex<Option<mpsc::SyncSender<ReadCommand>>>,
+    sender: Mutex<Vec<mpsc::SyncSender<ReadCommand>>>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     nvmeof_maintenance: Mutex<()>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     nvmeof_epoch_pins: Mutex<Vec<NvmeEpochPin>>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     nvmeof_pin_uncertain: AtomicBool,
-    thread: Mutex<Option<JoinHandle<()>>>,
+    thread: Mutex<Vec<JoinHandle<()>>>,
     next: Vec<AtomicUsize>,
     max_requests: usize,
     max_bytes: usize,
@@ -1483,14 +2302,38 @@ impl ReadService {
             })
     }
 }
+struct BatchSubscription {
+    signal: Arc<BatchSignal>,
+    slots: SmallVec<[usize; 1]>,
+}
 pub(super) struct ReadRequest {
     parts: SmallVec<[(Arc<ReadFlight>, usize); 1]>,
     credit: Arc<Credit>,
     deadline: Instant,
     sampled: bool,
+    trace: Option<ReadTraceChild>,
     profile: Option<Arc<ReadFlight>>,
+    subscription: Option<BatchSubscription>,
 }
 impl ReadRequest {
+    fn subscribe(&mut self, signal: &Arc<BatchSignal>) {
+        let mut slots = SmallVec::new();
+        for (index, (flight, _)) in self.parts.iter().enumerate() {
+            if self.parts[..index]
+                .iter()
+                .any(|(previous, _)| previous.slot == flight.slot)
+            {
+                continue;
+            }
+            if self.credit.state.flight_ready[flight.slot].subscribe(signal) {
+                slots.push(flight.slot);
+            }
+        }
+        self.subscription = Some(BatchSubscription {
+            signal: signal.clone(),
+            slots,
+        });
+    }
     fn failure(&self, message: &str) -> LocalDbError {
         self.credit.state.poison();
         LocalDbError::new(message)
@@ -1539,6 +2382,9 @@ impl ReadRequest {
         let result = self
             .try_result()?
             .ok_or_else(|| self.failure("remote read did not complete"))?;
+        if let Some(trace) = &self.trace {
+            trace.event("request_result_delivered");
+        }
         if self.sampled
             && !self
                 .profile
@@ -1555,6 +2401,17 @@ impl ReadRequest {
         Ok(result)
     }
 }
+impl Drop for ReadRequest {
+    fn drop(&mut self) {
+        // All flight Arcs in parts remain live until this Drop returns, so
+        // slots cannot be reused before their subscriptions are removed.
+        if let Some(subscription) = self.subscription.take() {
+            for slot in subscription.slots {
+                self.credit.state.flight_ready[slot].unsubscribe(&subscription.signal);
+            }
+        }
+    }
+}
 impl ReadService {
     fn nvmeof_enabled(&self) -> bool {
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -1567,105 +2424,147 @@ impl ReadService {
         }
     }
 
-    fn member_charge(&self, reference: &ValueRecordReference) -> Result<usize, LocalDbError> {
-        let charge = member_charge(reference)?;
+    fn routing(&self) -> RoutingView {
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        for dispatch in self.state.nvmeof.lock().iter() {
-            if dispatch.reader.eligibility(reference).map_err(|error| {
-                self.state.poison();
-                LocalDbError::component(error)
-            })? == super::super::nvmeof::Eligibility::Eligible
-            {
-                let aligned = dispatch
-                    .reader
-                    .aligned_charge(reference)
-                    .map_err(LocalDbError::component)?;
-                if aligned > dispatch.reader.max_request_bytes()
-                    || dispatch.reader.max_request_members() == 0
-                {
-                    return Err(LocalDbError::new("record exceeds NVMe-oF reader capacity"));
-                }
-                return charge
-                    .checked_add(aligned)
-                    .ok_or_else(|| LocalDbError::new("read budget overflow"));
-            }
+        {
+            self.state.nvme_routing.load()
         }
-        Ok(charge)
+        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+        {
+            NoRouting
+        }
     }
 
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    fn nvmeof_eligible(
+    /// Charge and, for a sealed member, the aligned range of one member. One
+    /// authority lookup and one alignment computation; callers keep the result.
+    fn plan_member(
         &self,
+        routing: &RoutingView,
         reference: &ValueRecordReference,
-    ) -> Result<Option<usize>, LocalDbError> {
-        let mut selected = None;
-        for (index, dispatch) in self.state.nvmeof.lock().iter().enumerate() {
-            if dispatch.reader.eligibility(reference).map_err(|error| {
-                self.state.poison();
-                LocalDbError::component(error)
-            })? == super::super::nvmeof::Eligibility::Eligible
-            {
-                selected = Some(index);
-            }
+    ) -> Result<MemberPlan, LocalDbError> {
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        {
+            self.plan_sealed_member(routing, reference)
         }
-        Ok(selected)
+        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+        {
+            let NoRouting = routing;
+            Ok(MemberPlan {
+                charge: member_charge(reference)?,
+            })
+        }
     }
-    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    fn nvmeof_limits(
+
+    #[cfg(test)]
+    fn member_charge(&self, reference: &ValueRecordReference) -> Result<usize, LocalDbError> {
+        self.plan_member(&self.routing(), reference)
+            .map(|plan| plan.charge)
+    }
+
+    /// Backpressure error that records why admission was refused.
+    fn backpressure(&self, cause: &AtomicU64) -> LocalDbError {
+        cause.fetch_add(1, Ordering::Relaxed);
+        LocalDbError::new(BACKPRESSURE)
+    }
+
+    /// Plan of one member kept across admission retries of a blocking caller.
+    /// It is recomputed only when the reader set changed, never because
+    /// credit was released.
+    fn cached_plan<'a>(
         &self,
-        index: usize,
+        cached: &'a mut Option<CachedPlan>,
         reference: &ValueRecordReference,
-    ) -> Result<(usize, usize, usize), LocalDbError> {
-        let guard = self.state.nvmeof.lock();
-        let reader = &guard
-            .get(index)
-            .ok_or_else(|| LocalDbError::new(BACKPRESSURE))?
-            .reader;
-        Ok((
-            reader
-                .aligned_charge(reference)
-                .map_err(LocalDbError::component)?,
-            reader.max_request_bytes(),
-            reader.max_request_members(),
-        ))
+    ) -> Result<PlannedMembers<'a>, LocalDbError> {
+        let routing = self.routing();
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        let generation = routing.generation;
+        let plan = match cached.take() {
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            Some(plan) if plan.generation == generation => plan,
+            #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+            Some(plan) => plan,
+            _ => CachedPlan {
+                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                generation,
+                member: [self.plan_member(&routing, reference)?],
+            },
+        };
+        let plan = cached.insert(plan);
+        Ok(PlannedMembers {
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            generation: plan.generation,
+            members: &plan.member,
+        })
     }
 
     const FLIGHT_SLOT_BYTES: usize = std::mem::size_of::<Weak<ReadFlight>>()
         + std::mem::size_of::<ReadFlight>()
         + std::mem::size_of::<FlightCompletion>()
         + std::mem::size_of::<FlightSignal>()
-        + 2 * std::mem::size_of::<usize>();
-    pub(super) const MIN_FLIGHT_BYTES: usize = Self::FLIGHT_SLOT_BYTES + 512;
+        + 3 * std::mem::size_of::<usize>();
+    // Leave room for a small real encoded member, not merely an empty reference.
+    pub(super) const MIN_FLIGHT_BYTES: usize = std::mem::size_of::<FlightRegistry>()
+        + Self::FLIGHT_SLOT_BYTES
+        + 2 * FlightRegistry::ENTRY_BYTES
+        + 512
+        + MIN_MEMBER_BYTES
+        + 3 * 256;
 
     pub(super) fn from_clients(
         config: &RemoteDatabaseConfig,
         epoch: u64,
         clients: Vec<Client>,
         recovery_stats: &mut RecoveryStats,
+        first_failure: Arc<std::sync::OnceLock<String>>,
     ) -> Result<Self, LocalDbError> {
         // Resolve immutable node policy before handing clients to the reactor;
         // startup must not contend with an otherwise idle scalar caller.
         let busy = clients
             .iter()
             .any(|client| client.polling_policy() == super::super::tcp::PollingPolicy::Busy);
-        let flight_slots = config
-            .max_pending_reads
-            .min(config.max_pending_read_bytes / Self::MIN_FLIGHT_BYTES);
-        let flight_metadata_bytes = flight_slots * Self::FLIGHT_SLOT_BYTES;
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        let live_reads = clients.iter().any(Client::live_nvme_configured);
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if live_reads && clients.iter().any(|client| !client.live_nvme_configured()) {
+            return Err(LocalDbError::new("mixed live and message read lanes"));
+        }
+        let index_capacity = (config.max_pending_read_bytes
+            - std::mem::size_of::<FlightRegistry>()
+            - Self::FLIGHT_SLOT_BYTES
+            - 512)
+            .div_ceil(MIN_MEMBER_BYTES + FlightRegistry::ENTRY_BYTES)
+            .min(config.max_pending_reads.saturating_mul(256))
+            .max(1);
+        let index_bytes =
+            std::mem::size_of::<FlightRegistry>() + index_capacity * FlightRegistry::ENTRY_BYTES;
+        let flight_slots = config.max_pending_reads.min(
+            (config.max_pending_read_bytes - index_bytes - MIN_MEMBER_BYTES - 3 * 256)
+                / (Self::FLIGHT_SLOT_BYTES + 512),
+        );
+        let flight_metadata_bytes = flight_slots * Self::FLIGHT_SLOT_BYTES + index_bytes;
         let state = Arc::new(State {
             failed: AtomicBool::new(false),
+            first_failure,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            live_reads,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            live_unreleased: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
             retained: Mutex::new((0, 0)),
             admission_paused: AtomicBool::new(false),
             admission_generation: AtomicU64::new(0),
             admission_changed: parking_lot::Condvar::new(),
-            wake_pending: AtomicBool::new(false),
+            wake_pending: (0..config.endpoints.len())
+                .map(|_| AtomicBool::new(false))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             flight_ready: (0..flight_slots)
                 .map(|_| FlightSignal::new())
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             read_rpcs: AtomicU64::new(0),
             diagnostics: ReadDiagnostics::default(),
+            trace: Arc::new(ReadTrace::default()),
             coordinator_diagnostics: CoordinatorResolutionDiagnostics::default(),
             owner_diagnostics: config
                 .endpoints
@@ -1673,15 +2572,17 @@ impl ReadService {
                 .map(|endpoint| (endpoint.partition, ReadDiagnostics::default()))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
-            flights: Mutex::new((0..flight_slots).map(|_| Weak::new()).collect()),
+            flights: Mutex::new(FlightRegistry::new(flight_slots, index_capacity)),
             coalesced_members: AtomicU64::new(0),
             flight_metadata_bytes,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            nvmeof: Mutex::new(Vec::new()),
+            nvme_routing: arc_swap::ArcSwap::from_pointee(sealed::NvmeRouting::empty()),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             nvmeof_metrics: Mutex::new(Vec::new()),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             nvmeof_enabled: AtomicBool::new(false),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            nvme_shutdown_ready: AtomicUsize::new(0),
             #[cfg(test)]
             peak_connection_reads: AtomicUsize::new(0),
             #[cfg(test)]
@@ -1691,19 +2592,27 @@ impl ReadService {
             #[cfg(test)]
             completion_pause: Mutex::new(None),
             #[cfg(test)]
-            reactor_pause: Mutex::new(None),
+            reactor_pause: (0..config.endpoints.len())
+                .map(|_| Mutex::new(None))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            #[cfg(test)]
+            reactor_enqueue_entered: (0..config.endpoints.len())
+                .map(|_| Mutex::new(None))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
         });
         let mut service = Self {
             state,
             lanes: RwLock::new(Vec::new()),
-            sender: Mutex::new(None),
+            sender: Mutex::new(Vec::new()),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             nvmeof_maintenance: Mutex::new(()),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             nvmeof_epoch_pins: Mutex::new(Vec::new()),
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             nvmeof_pin_uncertain: AtomicBool::new(false),
-            thread: Mutex::new(None),
+            thread: Mutex::new(Vec::new()),
             next: (0..config.endpoints.len())
                 .map(|_| AtomicUsize::new(0))
                 .collect(),
@@ -1714,20 +2623,24 @@ impl ReadService {
             timeout: config.timeout,
             epoch,
         };
-        let mut reactor_lanes = Vec::new();
         let mut clients = clients.into_iter();
-        for _ in &config.endpoints {
+        for node in 0..config.endpoints.len() {
+            let base = node * config.read_lanes;
             let mut lanes = Vec::with_capacity(config.read_lanes);
             for _ in 0..config.read_lanes {
                 let client = clients.next().unwrap();
                 recovery_stats.add_connection(client.connect_profile());
                 let client = Arc::new(Mutex::new(client));
-                let index = reactor_lanes.len();
+                let index = base + lanes.len();
                 let scheduling = Arc::new(Mutex::new(LaneScheduling {
                     inline_reserved: false,
+                    grouped_reserved: false,
+                    grouped_handoff_requested: false,
                 }));
                 let driver = Arc::new(Mutex::new(ReactorLane {
                     client: client.clone(),
+                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                    node,
                     queued: VecDeque::new(),
                     active: HashMap::new(),
                     profiling: false,
@@ -1739,32 +2652,38 @@ impl ReadService {
                     scheduling,
                     driver,
                 };
-                reactor_lanes.push(lane.clone());
                 lanes.push(lane);
             }
-            service.lanes.get_mut().push(lanes);
-        }
-        // Up to flight_slots charged requests plus one coalesced control wake.
-        let (sender, receiver) = mpsc::sync_channel(flight_slots + 1);
-        let state = service.state.clone();
-        let fabric = config.tls.transport.is_fabric();
-        *service.thread.get_mut() = Some(
-            thread::Builder::new()
-                .name("wal-read-reactor".to_owned())
+            service.lanes.get_mut().push(lanes.clone());
+            // At most endpoints * (flight_slots + 1) fixed channel slots.
+            // Global flight credits bound aggregate request occupancy; each
+            // owner can still use the full global allowance.
+            let (sender, receiver) = mpsc::sync_channel(flight_slots + 1);
+            let state = service.state.clone();
+            let fabric = config.tls.transport.is_fabric();
+            let thread = thread::Builder::new()
+                .name(format!("wal-read-reactor-{node}"))
                 .spawn(move || {
                     drive_reads(
                         state,
                         receiver,
-                        reactor_lanes,
+                        lanes,
+                        node,
+                        base,
                         epoch,
                         flight_slots,
                         fabric,
                         busy,
                     )
-                })
-                .map_err(LocalDbError::component)?,
-        );
-        *service.sender.get_mut() = Some(sender);
+                });
+            match thread {
+                Ok(thread) => {
+                    service.thread.get_mut().push(thread);
+                    service.sender.get_mut().push(sender);
+                }
+                Err(error) => return Err(LocalDbError::component(error)),
+            }
+        }
         Ok(service)
     }
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -1784,6 +2703,64 @@ impl ReadService {
         let pause = AdmissionPause(self.state.clone());
         drop(retained);
         Ok(pause)
+    }
+
+    /// Pause new admissions and retire every lane's cached live file grants.
+    /// Outstanding callers receive an explicit retryable error instead of
+    /// relinquishing their read/cut pins on their behalf.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(super) fn pause_live_for_retirement(&self) -> Result<Option<AdmissionPause>, LocalDbError> {
+        if !self.state.live_reads {
+            return Ok(None);
+        }
+        let pause = self.pause_idle_nvmeof(false)?;
+        let lanes = self.lanes.read().iter().map(Vec::len).sum::<usize>();
+        let senders = self.sender.lock().clone();
+        if lanes == 0 || senders.is_empty() {
+            return Err(LocalDbError::new(
+                "live read lanes unavailable for retirement",
+            ));
+        }
+        let (reply, responses) = mpsc::sync_channel(lanes);
+        for sender in senders {
+            match sender.try_send(ReadCommand::DrainLive(reply.clone())) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(_)) => {
+                    return Err(LocalDbError::new(
+                        "live read grant drain is busy; retry retirement",
+                    ));
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    self.state.poison();
+                    return Err(LocalDbError::new(
+                        "live read reactor stopped during grant drain",
+                    ));
+                }
+            }
+        }
+        drop(reply);
+        let deadline = Instant::now() + self.timeout;
+        for _ in 0..lanes {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(LocalDbError::new(
+                    "live read grant drain timed out; retry retirement",
+                ));
+            }
+            match responses.recv_timeout(remaining) {
+                Ok(result) => result.map_err(LocalDbError::new)?,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(LocalDbError::new(
+                        "live read grant drain timed out; retry retirement",
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.state.poison();
+                    return Err(LocalDbError::new("live read grant drain lost a lane"));
+                }
+            }
+        }
+        Ok(Some(pause))
     }
 
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -1861,16 +2838,23 @@ impl ReadService {
     // namespace FD before acknowledging any owner lease release.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn release_nvmeof_readers(&self) -> Result<(), LocalDbError> {
-        let mut guard = self.state.nvmeof.lock();
-        if guard.iter().any(|dispatch| !dispatch.active.is_empty()) {
+        let routing = self.state.nvme_routing.load_full();
+        // Cold path: lock every reader in routing order, then check that none
+        // has an accepted request before any of them is closed.
+        let mut guards: Vec<_> = routing.routes.iter().map(sealed::NvmeRoute::lock).collect();
+        if guards.iter_mut().any(|guard| {
+            guard
+                .dispatch()
+                .is_some_and(|dispatch| !dispatch.active.is_empty())
+        }) {
             return Err(LocalDbError::new("NVMe-oF requests have not drained"));
         }
         self.state.nvmeof_enabled.store(false, Ordering::Release);
-        let readers = std::mem::take(&mut *guard);
-        for metrics in self.state.nvmeof_metrics.lock().iter() {
-            metrics.replace_sources(&[]);
+        if !routing.routes.is_empty() {
+            self.publish_routing(Vec::new());
         }
-        drop(guard);
+        let readers: Vec<_> = guards.iter_mut().filter_map(|guard| guard.take()).collect();
+        drop(guards);
         let mut releases = Vec::with_capacity(readers.len());
         for dispatch in readers {
             let NvmeDispatch {
@@ -1902,10 +2886,11 @@ impl ReadService {
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub(super) fn nvmeof_stats(&self) -> Vec<super::super::nvmeof::NvmeofStats> {
         self.state
-            .nvmeof
-            .lock()
+            .nvme_routing
+            .load()
+            .routes
             .iter()
-            .map(|dispatch| dispatch.reader.snapshot())
+            .map(|route| route.catalog.snapshot())
             .collect()
     }
 
@@ -1914,11 +2899,19 @@ impl ReadService {
         &self,
         registry: &prometheus::Registry,
     ) -> Result<(), LocalDbError> {
-        let guard = self.state.nvmeof.lock();
+        // Serialize with install and release so no reader-set change is missed.
+        let _maintenance = self.nvmeof_maintenance.lock();
         let metrics = super::super::nvmeof::NvmeofMetrics::register(registry)
             .map_err(LocalDbError::component)?;
-        let readers: Vec<_> = guard.iter().map(|dispatch| &dispatch.reader).collect();
-        metrics.replace_sources(&readers);
+        metrics.replace_sources(
+            self.state
+                .nvme_routing
+                .load()
+                .routes
+                .iter()
+                .map(|route| route.catalog.stats().clone())
+                .collect(),
+        );
         self.state.nvmeof_metrics.lock().push(metrics);
         Ok(())
     }
@@ -1983,11 +2976,12 @@ impl ReadService {
             .saturating_sub(database.max_pending_read_bytes);
         let reserved = self
             .state
-            .nvmeof
-            .lock()
+            .nvme_routing
+            .load()
+            .routes
             .iter()
-            .try_fold(0usize, |total, reader| {
-                total.checked_add(reader.metadata_budget)
+            .try_fold(0usize, |total, route| {
+                total.checked_add(route.metadata_budget)
             })
             .ok_or_else(|| LocalDbError::new("NVMe-oF metadata budget overflow"))?;
         if metadata_budget > allowance.saturating_sub(reserved) {
@@ -2008,20 +3002,17 @@ impl ReadService {
         {
             return Err(LocalDbError::new("NVMe-oF manifest authority mismatch"));
         }
-        {
-            let readers = self.state.nvmeof.lock();
-            for entry in &manifest.catalog {
-                for existing in readers.iter() {
-                    match existing
-                        .reader
-                        .eligibility(&entry.reference)
-                        .map_err(LocalDbError::component)?
-                    {
-                        super::super::nvmeof::Eligibility::Eligible => {
-                            return Err(LocalDbError::new("overlapping NVMe-oF catalogs"));
-                        }
-                        super::super::nvmeof::Eligibility::Ineligible => {}
+        for entry in &manifest.catalog {
+            for existing in &self.state.nvme_routing.load().routes {
+                match existing
+                    .catalog
+                    .eligibility(&entry.reference)
+                    .map_err(LocalDbError::component)?
+                {
+                    super::super::nvmeof::Eligibility::Eligible => {
+                        return Err(LocalDbError::new("overlapping NVMe-oF catalogs"));
                     }
+                    super::super::nvmeof::Eligibility::Ineligible => {}
                 }
             }
         }
@@ -2068,7 +3059,8 @@ impl ReadService {
         let first_reader = self.acquire_nvmeof_epoch_pins()?;
         // Admission is serialized with the owner's authority transitions. A
         // lost reply is uncertain and therefore poisons this coordinator.
-        let binding = super::super::nvmeof::lease::ExportBinding::from(manifest);
+        let mut binding = super::super::nvmeof::lease::ExportBinding::from(manifest);
+        binding.target.clone_from(&config.binding.target);
         let token = client
             .lock()
             .register_nvmeof_export(self.epoch, binding, manifest.catalog[0].reference)
@@ -2105,21 +3097,23 @@ impl ReadService {
                 return Err(error);
             }
         };
-        let mut readers = self.state.nvmeof.lock();
-        readers.push(NvmeDispatch {
-            reader,
-            lease_client: client,
-            lease_epoch: self.epoch,
-            lease_token: token,
-            shape: Arc::new(shape.clone()),
-            next: 0,
-            active: HashMap::new(),
+        let route = sealed::NvmeRoute {
+            catalog: reader.catalog().clone(),
+            node,
             metadata_budget,
-        });
-        let sources: Vec<_> = readers.iter().map(|dispatch| &dispatch.reader).collect();
-        for metrics in self.state.nvmeof_metrics.lock().iter() {
-            metrics.replace_sources(&sources);
-        }
+            cell: Arc::new(sealed::NvmeDispatchCell::new(NvmeDispatch {
+                reader,
+                lease_client: client,
+                lease_epoch: self.epoch,
+                lease_token: token,
+                shape: Arc::new(shape.clone()),
+                next: 0,
+                active: HashMap::new(),
+            })),
+        };
+        let mut routes = self.state.nvme_routing.load().routes.clone();
+        routes.push(route);
+        self.publish_routing(routes);
         self.state.nvmeof_enabled.store(true, Ordering::Release);
         Ok(())
     }
@@ -2178,16 +3172,17 @@ impl ReadService {
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         let _maintenance = self.nvmeof_maintenance.lock();
         self.state.stopped.store(true, Ordering::Release);
+        self.state.notify_batches();
         self.notify_admission();
-        self.sender.lock().take();
+        self.sender.lock().clear();
         // Serialize all shutdown callers through join and lease release. A
         // second caller must not release an owner token while the first one is
         // still waiting for the reactor's terminal completions.
         let mut thread_guard = self.thread.lock();
-        if let Some(thread) = thread_guard.take()
-            && thread.join().is_err()
-        {
-            self.poison();
+        for thread in thread_guard.drain(..) {
+            if thread.join().is_err() {
+                self.poison();
+            }
         }
         // Join any caller-owned lane before the authority directory lock drops.
         for lane in self.lanes.read().iter().flatten() {
@@ -2246,10 +3241,29 @@ impl ReadService {
         profile: Option<&mut super::super::tcp::TcpReadProfile>,
         pin: Option<IndexReadPin>,
     ) -> Result<Option<Vec<Mutation>>, LocalDbError> {
+        self.read_inline_traced(node, epoch, reference, extra_bytes, profile, pin, None)
+    }
+
+    // Keep routing, pin ownership and the optional borrowed trace explicit.
+    #[allow(clippy::too_many_arguments)]
+    fn read_inline_traced(
+        &self,
+        node: usize,
+        epoch: u64,
+        reference: &ValueRecordReference,
+        extra_bytes: usize,
+        profile: Option<&mut super::super::tcp::TcpReadProfile>,
+        pin: Option<IndexReadPin>,
+        trace: Option<&ReadTraceChild>,
+    ) -> Result<Option<Vec<Mutation>>, LocalDbError> {
         if self.failed() || self.state.stopped.load(Ordering::Acquire) {
             return Err(LocalDbError::new("read authority is poisoned or closed"));
         }
         if self.nvmeof_enabled() {
+            return Ok(None);
+        }
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if self.state.live_reads {
             return Ok(None);
         }
         let bytes = member_charge(reference)?
@@ -2260,20 +3274,15 @@ impl ReadService {
             return Err(LocalDbError::new(BYTE_BUDGET));
         }
         let mut flights = self.state.flights.lock();
-        if flights
-            .iter()
-            .filter_map(Weak::upgrade)
-            .any(|flight| flight.node == node && flight.references.contains(reference))
-        {
+        if flights.find(node, reference).is_some() {
             return Ok(None);
         }
         let flight_slot = flights
-            .iter()
-            .enumerate()
-            .position(|(slot, flight)| {
-                flight.strong_count() == 0 && self.state.flight_ready[slot].is_ready()
-            })
+            .available_slot(&self.state.flight_ready)
             .ok_or_else(|| LocalDbError::new(BACKPRESSURE))?;
+        if !flights.reserve_entries(1, &self.state.flight_ready) {
+            return Err(LocalDbError::new(BACKPRESSURE));
+        }
         let (lane, reservation) = {
             let mut retained = self.state.retained.lock();
             if self.failed() {
@@ -2326,6 +3335,11 @@ impl ReadService {
         let Some(mut client) = lane.client.try_lock() else {
             return Ok(None);
         };
+        if let Some(trace) = trace {
+            trace.classify_members(std::iter::empty());
+            trace.lane(lane.index, flight_slot);
+            trace.event("inline_lane_acquired");
+        }
         self.state.flight_ready[flight_slot].begin();
         let flight = Arc::new(ReadFlight {
             node,
@@ -2336,7 +3350,7 @@ impl ReadService {
             _pin: pin,
             _credit: credit,
         });
-        flights[flight_slot] = Arc::downgrade(&flight);
+        flights.insert(&flight);
         drop(flights);
         #[cfg(test)]
         if let Some((entered, resume)) = self.state.inline_pause.lock().take() {
@@ -2379,6 +3393,7 @@ impl ReadService {
         } else {
             client.read_records(epoch, std::slice::from_ref(reference))
         };
+        kv_capture::reference(15, reference, None, 1, flight_slot as u64);
         if client.message_read_requests() != message_requests {
             self.state.read_rpcs.fetch_add(1, Ordering::Relaxed);
         }
@@ -2428,6 +3443,7 @@ impl ReadService {
             ReadContext {
                 deadline: Instant::now() + self.timeout,
                 pin,
+                trace: None,
             },
         )
     }
@@ -2439,8 +3455,11 @@ impl ReadService {
         profiled: bool,
         context: ReadContext,
     ) -> Result<ReadRequest, LocalDbError> {
-        self.submit_until_owned(node, references, extra_bytes, profiled, context, None)
+        self.submit_until_owned(node, references, extra_bytes, profiled, context, None, None)
     }
+    // Admission takes its context, optional lane ownership and optional
+    // precomputed member plans explicitly; each belongs to a distinct concern.
+    #[allow(clippy::too_many_arguments)]
     fn submit_until_owned(
         &self,
         node: usize,
@@ -2449,84 +3468,131 @@ impl ReadService {
         profiled: bool,
         context: ReadContext,
         mut owned_lanes: Option<&mut Vec<OwnedLane>>,
+        planned: Option<PlannedMembers<'_>>,
     ) -> Result<ReadRequest, LocalDbError> {
-        let ReadContext { deadline, pin } = context;
+        let ReadContext {
+            deadline,
+            pin,
+            trace,
+        } = context;
+        if let Some(trace) = &trace {
+            trace.event("admission_started");
+        }
         if self.failed() || self.state.stopped.load(Ordering::Acquire) {
             return Err(LocalDbError::new("read authority is poisoned or closed"));
         }
         if references.is_empty() || references.len() > 256 {
             return Err(LocalDbError::new("read request count exceeds bound"));
         }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        let generation = self.state.admission_generation.load(Ordering::Acquire);
-        let bytes = references
-            .iter()
-            .try_fold(extra_bytes + 512, |bytes, reference| {
-                bytes
-                    .checked_add(self.member_charge(reference)?)
-                    .ok_or_else(|| LocalDbError::new("read budget overflow"))
-            })?;
+        let routing = self.routing();
+        // Each member's authority lookup, alignment and charge are computed
+        // once here, or by the batch that owns the plans, and reused by the
+        // charge sum, the reader plan and every retry of this request.
+        let mut computed = SmallVec::<[MemberPlan; 32]>::new();
+        let plans: &[MemberPlan] = if let Some(planned) = planned {
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            if planned.generation != routing.generation {
+                return Err(self.backpressure(&self.state.diagnostics.admission_retry_config));
+            }
+            planned.members
+        } else {
+            for reference in &references {
+                computed.push(self.plan_member(&routing, reference)?);
+            }
+            &computed
+        };
+        if plans.len() != references.len() {
+            return Err(LocalDbError::new("read plan does not match request"));
+        }
+        let bytes = plans.iter().try_fold(extra_bytes + 512, |bytes, plan| {
+            bytes
+                .checked_add(plan.charge)
+                .ok_or_else(|| LocalDbError::new("read budget overflow"))
+        })?;
         if bytes > self.max_bytes {
             return Err(LocalDbError::new(BYTE_BUDGET));
         }
         let mut flights = self.state.flights.lock();
         let mut missing = Vec::new();
+        let mut missing_plans = SmallVec::<[MemberPlan; 32]>::new();
         let mut parts: SmallVec<[(Option<Arc<ReadFlight>>, usize); 1]> =
             SmallVec::with_capacity(references.len());
-        for reference in &references {
-            let existing = flights.iter().filter_map(Weak::upgrade).find_map(|flight| {
-                if flight.node != node {
-                    return None;
-                }
-                flight
-                    .references
-                    .iter()
-                    .position(|member| member == reference)
-                    .map(|slot| (flight, slot))
-            });
+        let mut missing_index = (references.len() > 1).then(HashMap::new);
+        for (position, reference) in references.iter().enumerate() {
+            let existing = flights.find(node, reference);
             if let Some((flight, slot)) = existing {
+                if let Some(trace) = &trace {
+                    trace.event_io("coalesced_flight_slot", 0, flight.slot as u64);
+                }
                 parts.push((Some(flight), slot));
             } else {
-                let slot = match missing.iter().position(|member| member == reference) {
-                    Some(slot) => slot,
-                    None => {
+                let slot = if let Some(index) = missing_index.as_mut() {
+                    *index.entry(*reference).or_insert_with(|| {
                         missing.push(*reference);
+                        missing_plans.push(plans[position]);
                         missing.len() - 1
-                    }
+                    })
+                } else {
+                    missing.push(*reference);
+                    missing_plans.push(plans[position]);
+                    0
                 };
                 parts.push((None, slot));
             }
         }
-        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        if let Some(first) = missing.first() {
-            let eligible = self.nvmeof_eligible(first)?;
-            for reference in &missing[1..] {
-                if self.nvmeof_eligible(reference)? != eligible {
-                    return Err(LocalDbError::new(BACKPRESSURE));
-                }
-            }
+        if let Some(trace) = &trace {
+            trace.classify_members(
+                parts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, (flight, _))| flight.as_ref().map(|_| position)),
+            );
         }
+        // One request goes to one reader or to none. A mixed request is
+        // split by the batch dispatcher, so this is a routing change, not load.
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        let sealed = {
+            let route = missing_plans
+                .first()
+                .and_then(|plan| plan.sealed)
+                .map(|member| member.route);
+            if missing_plans
+                .iter()
+                .any(|plan| plan.sealed.map(|member| member.route) != route)
+            {
+                return Err(self.backpressure(&self.state.diagnostics.admission_retry_mixed));
+            }
+            let members: SmallVec<[sealed::SealedMember; 32]> = missing_plans
+                .iter()
+                .filter_map(|plan| plan.sealed)
+                .collect();
+            routing.sealed_plan(&members)?
+        };
         let coalesced_members = references.len() - missing.len();
         let new_request = usize::from(!missing.is_empty());
         let flight_slot = if new_request != 0 {
             Some(
                 flights
-                    .iter()
-                    .enumerate()
-                    .position(|(slot, flight)| {
-                        flight.strong_count() == 0 && self.state.flight_ready[slot].is_ready()
-                    })
-                    .ok_or_else(|| LocalDbError::new(BACKPRESSURE))?,
+                    .available_slot(&self.state.flight_ready)
+                    .ok_or_else(|| {
+                        self.backpressure(&self.state.diagnostics.admission_retry_flight)
+                    })?,
             )
         } else {
             None
         };
+        if !flights.reserve_entries(missing.len(), &self.state.flight_ready) {
+            return Err(self.backpressure(&self.state.diagnostics.admission_retry_flight));
+        }
         let mut reserved = false;
         let (credit, lane) = {
             let mut retained = self.state.retained.lock();
+            // The reader set may change only while admission is paused, so a
+            // changed snapshot means the plans above are stale. Credit
+            // releases never advance this generation.
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-            if self.state.admission_generation.load(Ordering::Acquire) != generation {
-                return Err(LocalDbError::new(BACKPRESSURE));
+            if self.state.nvme_routing.load().generation != routing.generation {
+                return Err(self.backpressure(&self.state.diagnostics.admission_retry_config));
             }
             if self.failed() {
                 return Err(LocalDbError::new("read authority is poisoned"));
@@ -2535,20 +3601,21 @@ impl ReadService {
                 return Err(LocalDbError::new("read authority is closed"));
             }
             if self.state.admission_paused.load(Ordering::Acquire) {
-                return Err(LocalDbError::new(BACKPRESSURE));
+                return Err(self.backpressure(&self.state.diagnostics.admission_retry_paused));
             }
             if (new_request != 0 && retained.0 == self.max_requests)
                 || bytes > self.max_bytes - retained.1
             {
-                return Err(LocalDbError::new(BACKPRESSURE));
+                // Real shortage: the request or byte credit is exhausted now,
+                // checked under the same mutex that reserves it.
+                return Err(self.backpressure(&self.state.diagnostics.admission_retry_credit));
             }
             let lane_guard = self.lanes.read();
             let lanes = lane_guard
                 .get(node)
                 .ok_or_else(|| LocalDbError::new("read reactor stopped"))?;
-            // Prefer an idle lane so work can progress independently instead
-            // of queueing behind an unrelated slow or stalled request. If all
-            // lanes are occupied, fall back to a non-inline-reserved lane.
+            // Prefer an idle lane. Busy grouped reservations accept joined
+            // work but ask their caller to hand progress back to the actor.
             let next = self.next[node].fetch_add(1, Ordering::Relaxed);
             let lane = if new_request == 0 {
                 None
@@ -2560,20 +3627,41 @@ impl ReadService {
                             (0..lanes.len()).find_map(|offset| {
                                 let lane = &lanes[next.wrapping_add(offset) % lanes.len()];
                                 let mut scheduling = lane.scheduling.lock();
-                                if scheduling.inline_reserved
+                                if (scheduling.inline_reserved
+                                    && (idle_only || !scheduling.grouped_reserved))
                                     || (idle_only && lane.outstanding.load(Ordering::Acquire) != 0)
                                 {
                                     return None;
                                 }
-                                if idle_only && owned_lanes.is_some() && !self.nvmeof_enabled() {
+                                if idle_only && owned_lanes.is_some() && !self.nvmeof_enabled() && {
+                                    #[cfg(all(
+                                        feature = "experimental-nvmeof",
+                                        target_os = "linux"
+                                    ))]
+                                    {
+                                        !self.state.live_reads
+                                    }
+                                    #[cfg(not(all(
+                                        feature = "experimental-nvmeof",
+                                        target_os = "linux"
+                                    )))]
+                                    {
+                                        true
+                                    }
+                                } {
                                     scheduling.inline_reserved = true;
+                                    scheduling.grouped_reserved = true;
                                     reserved = true;
+                                } else if scheduling.grouped_reserved {
+                                    scheduling.grouped_handoff_requested = true;
                                 }
                                 lane.outstanding.fetch_add(1, Ordering::AcqRel);
                                 Some(lane.clone())
                             })
                         })
-                        .ok_or_else(|| LocalDbError::new(BACKPRESSURE))?,
+                        .ok_or_else(|| {
+                            self.backpressure(&self.state.diagnostics.admission_retry_lane)
+                        })?,
                 )
             };
             retained.0 += new_request;
@@ -2585,6 +3673,14 @@ impl ReadService {
             });
             (credit, lane)
         };
+        if let Some(trace) = &trace {
+            if let Some(lane) = &lane {
+                trace.lane(lane.index, flight_slot.unwrap());
+                trace.event("admitted");
+            } else {
+                trace.event("coalesced_existing_flight");
+            }
+        }
         let sampled = new_request != 0 && self.state.diagnostics.select();
         let flight = if let Some(lane) = lane {
             let slot = flight_slot.expect("a new request reserves a flight slot");
@@ -2598,21 +3694,24 @@ impl ReadService {
                 _pin: pin,
                 _credit: credit.clone(),
             });
-            flights[slot] = Arc::downgrade(&flight);
+            flights.insert(&flight);
             let request = Request {
                 lane: lane.index,
                 references: missing,
                 deadline,
                 submitted: (profiled || sampled).then(Instant::now),
                 sampled,
+                trace: trace.clone(),
                 flight: flight.clone(),
                 _credit: credit.clone(),
+                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                sealed,
                 _lane_credit: LaneCredit {
                     outstanding: lane.outstanding.clone(),
                 },
             };
             let sender_guard = self.sender.lock();
-            let Some(sender) = sender_guard.as_ref() else {
+            let Some(sender) = sender_guard.get(node) else {
                 if reserved {
                     drop(InlineLaneReservation(lane.scheduling.clone()));
                 }
@@ -2639,6 +3738,7 @@ impl ReadService {
                             reservation: Some(reservation),
                             sender,
                             state: self.state.clone(),
+                            node,
                         });
                     drop(flights);
                     self.state
@@ -2653,7 +3753,9 @@ impl ReadService {
                         credit,
                         deadline,
                         sampled,
+                        trace,
                         profile: Some(flight),
+                        subscription: None,
                     });
                 }
                 drop(reservation);
@@ -2677,7 +3779,10 @@ impl ReadService {
                 let (error, disconnected) = match error {
                     mpsc::TrySendError::Full(request) => {
                         drop(request);
-                        (LocalDbError::new(BACKPRESSURE), false)
+                        (
+                            self.backpressure(&self.state.diagnostics.admission_retry_lane),
+                            false,
+                        )
                     }
                     mpsc::TrySendError::Disconnected(request) => {
                         drop(request);
@@ -2712,7 +3817,9 @@ impl ReadService {
             credit,
             deadline,
             sampled,
+            trace,
             profile: flight,
+            subscription: None,
         })
     }
 }
@@ -2862,13 +3969,12 @@ impl RemoteDatabase {
         self.ensure_healthy()?;
         let pin = self
             .index
-            .read()
             .pin_cut(IndexReadCut::At(MutationVersion {
                 batch: reference.batch_version,
                 operation_index: reference.descriptor.operation_index,
             }))
             .map_err(LocalDbError::component)?;
-        let ready = self.read_cache.lock().get_scan(&reference);
+        let ready = self.read_cache.get_scan(&reference);
         let read = if ready.is_none() {
             let node = *self
                 .partition_indexes
@@ -2882,6 +3988,7 @@ impl RemoteDatabase {
                 ReadContext {
                     deadline: Instant::now() + self.config.timeout,
                     pin: Some(pin),
+                    trace: None,
                 },
             )?)
         } else {
@@ -2967,13 +4074,12 @@ impl RemoteDatabase {
         self.ensure_healthy()?;
         let index_started = Instant::now();
         let (reference, pin, cached) = {
+            // Resolve the cut once; the lookup and a miss's pin must see the
+            // same cut. No lock or guard is held past each call.
+            let cut = self.index.resolve_cut(cut);
             let clock = ResolutionSample::start(&sample);
-            let index = self.index.read();
-            if let Some(sample) = &sample {
-                sample.stage(ResolutionStage::IndexLockWait, clock);
-            }
-            let clock = ResolutionSample::start(&sample);
-            let reference = index
+            let reference = self
+                .index
                 .get(ks, key, cut.clone())
                 .map_err(LocalDbError::component);
             if let Some(sample) = &sample {
@@ -2990,12 +4096,7 @@ impl RemoteDatabase {
             };
             let cached = if let Some(reference) = reference {
                 let clock = ResolutionSample::start(&sample);
-                let mut cache = self.read_cache.lock();
-                if let Some(sample) = &sample {
-                    sample.stage(ResolutionStage::CacheLockWait, clock);
-                }
-                let clock = ResolutionSample::start(&sample);
-                let cached = cache.get_point(&reference, ks, key);
+                let cached = self.read_cache.get_point(&reference, ks, key);
                 if let Some(sample) = &sample {
                     sample.stage(ResolutionStage::CacheLookup, clock);
                 }
@@ -3005,7 +4106,7 @@ impl RemoteDatabase {
             };
             let pin = if reference.is_some() && cached.is_none() {
                 let clock = ResolutionSample::start(&sample);
-                let pin = index.pin_cut(cut).map_err(LocalDbError::component);
+                let pin = self.index.pin_cut(cut).map_err(LocalDbError::component);
                 if let Some(sample) = &sample {
                     sample.stage(ResolutionStage::PinPreparation, clock);
                 }
@@ -3163,13 +4264,8 @@ impl RemoteDatabase {
                 "live index reference resolves to tombstone",
             ));
         }
-        let prepared = ReadCache::prepare_verified(
-            &self.read_cache,
-            self.config.read_cache_bytes,
-            reference,
-            &mutation,
-        );
-        self.read_cache.lock().insert_prepared(prepared);
+        let prepared = self.read_cache.prepare_verified(reference, &mutation);
+        self.read_cache.insert_prepared(prepared);
         Self::point_value(ks, key, mutation)
     }
     /// `None` means pending; `Some(None)` is a completed absence. A completion
@@ -3261,3 +4357,233 @@ mod tests;
 
 #[cfg(test)]
 mod locality_tests;
+
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+mod live_worker_tests {
+    use super::*;
+    use crate::distributed::remote_db::pipeline_tests::Fixture;
+
+    #[test]
+    fn live_grant_barrier_waits_for_lane_owner() {
+        let mut fixture = Fixture::new();
+        fixture.config.read_lanes = 1;
+        let mut db = fixture.open();
+        let lanes = db.reads.lanes.read()[0].clone();
+        let client = lanes[0].client.clone();
+        let base = lanes[0].index;
+        let (sender, receiver) = mpsc::sync_channel(db.reads.max_requests + 1);
+        let state = db.reads.state.clone();
+        let epoch = db.reads.epoch;
+        let max_requests = db.reads.max_requests;
+        let held = client.lock();
+        let worker = thread::spawn(move || {
+            drive_live_reads(state, receiver, lanes, 0, base, epoch, max_requests)
+        });
+        let (reply, response) = mpsc::sync_channel(1);
+        assert!(sender.send(ReadCommand::DrainLive(reply)).is_ok());
+        assert!(matches!(
+            response.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(held);
+        assert!(
+            response
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .is_ok()
+        );
+        drop(sender);
+        worker.join().unwrap();
+        assert!(!db.reads.failed());
+        db.shutdown().unwrap();
+    }
+
+    #[test]
+    fn retirement_pause_preserves_outstanding_read_and_can_retry() {
+        let mut fixture = Fixture::new();
+        fixture.config.read_cache_bytes = 0;
+        fixture.config.read_lanes = 1;
+        let mut db = fixture.open();
+        db.write_batch(fixture.operation(0, 0), vec![super::tests::put(0, 7)])
+            .unwrap();
+        let reference = db
+            .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
+            .unwrap()
+            .unwrap();
+        let node = db.partition_indexes[&reference.batch_address.partition];
+        let lane = db.reads.lane_client(node, 0);
+        let held = lane.lock();
+        let request = db
+            .reads
+            .submit(node, vec![reference], 0, false, None)
+            .unwrap();
+        assert!(db.reads.pause_idle_nvmeof(false).is_err());
+        assert!(!db.reads.failed());
+        drop(held);
+        let (values, _) = request.finish().unwrap();
+        assert_eq!(values, vec![super::tests::put(0, 7)]);
+        drop(db.reads.pause_idle_nvmeof(false).unwrap());
+        db.shutdown().unwrap();
+    }
+
+    #[test]
+    fn live_worker_propagates_real_client_configuration_failure_and_retires_credit() {
+        // A normal authenticated TCP connection is deliberately not configured
+        // as live. This exercises the real worker failure, not a fake device.
+        let mut fixture = Fixture::new();
+        fixture.config.read_lanes = 1;
+        fixture.config.read_cache_bytes = 0;
+        let mut db = fixture.open();
+        db.write_batch(fixture.operation(0, 0), vec![super::tests::put(0, 7)])
+            .unwrap();
+        let reference = db
+            .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
+            .unwrap()
+            .unwrap();
+        let node = db.partition_indexes[&reference.batch_address.partition];
+        let lanes = db.reads.lanes.read()[node].clone();
+        let base = lanes[0].index;
+        let (sender, receiver) = mpsc::sync_channel(db.reads.max_requests + 1);
+        let state = db.reads.state.clone();
+        let epoch = db.reads.epoch;
+        let max_requests = db.reads.max_requests;
+        let worker = thread::spawn(move || {
+            drive_live_reads(state, receiver, lanes, node, base, epoch, max_requests)
+        });
+        db.reads.sender.lock()[node] = sender;
+        let request = db
+            .reads
+            .submit(node, vec![reference], 0, false, None)
+            .unwrap();
+        let error = match request.finish() {
+            Err(error) => error,
+            Ok(_) => panic!("unconfigured live worker unexpectedly succeeded"),
+        };
+        assert!(error.to_string().contains("live NVMe is not configured"));
+        assert!(db.reads.failed());
+        assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+        db.reads.sender.lock().clear();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn missing_and_before_all_cut_do_not_send_live_payload_work() {
+        let mut fixture = Fixture::new();
+        fixture.config.read_lanes = 1;
+        fixture.config.read_cache_bytes = 0;
+        let mut original = fixture.open();
+        original
+            .write_batch(fixture.operation(0, 0), vec![super::tests::put(0, 7)])
+            .unwrap();
+        let db = ConcurrentRemoteDatabase::new(original).unwrap();
+        let mut workers = Vec::new();
+        for (node, lanes) in db.reads.lanes.read().iter().enumerate() {
+            let lanes = lanes.clone();
+            let base = lanes[0].index;
+            let (sender, receiver) = mpsc::sync_channel(db.reads.max_requests + 1);
+            let state = db.reads.state.clone();
+            let epoch = db.reads.epoch;
+            let max_requests = db.reads.max_requests;
+            workers.push(thread::spawn(move || {
+                drive_live_reads(state, receiver, lanes, node, base, epoch, max_requests)
+            }));
+            db.reads.sender.lock()[node] = sender;
+        }
+        // The workers have real but intentionally unconfigured clients: any
+        // accidentally submitted payload read would fail rather than succeed.
+        let keys = [0u32.to_be_bytes(), 2u32.to_be_bytes(), 0u32.to_be_bytes()];
+        let before = db
+            .get_many_cut(KeySpace(0), &keys, IndexReadCut::BeforeAll)
+            .unwrap();
+        assert!(before.into_iter().all(|result| matches!(result, Ok(None))));
+        let missing = db
+            .get_many_cut(KeySpace(0), &[2u32.to_be_bytes()], IndexReadCut::Latest)
+            .unwrap();
+        assert!(missing.into_iter().all(|result| matches!(result, Ok(None))));
+        assert!(!db.reads.failed());
+        assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+        db.reads.sender.lock().clear();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        db.shutdown().unwrap();
+    }
+
+    #[test]
+    fn full_lane_inbox_never_blocks_the_actor() {
+        let mut fixture = Fixture::new();
+        fixture.config.read_lanes = 1;
+        fixture.config.read_cache_bytes = 0;
+        let mut db = fixture.open();
+        // A batch holds at most four operations; two batches put eight members
+        // on one owner.
+        for batch in 0u32..2 {
+            let writes: Vec<_> = (batch * 4..batch * 4 + 4)
+                .map(|key| super::tests::put(key, 7))
+                .collect();
+            db.write_batch(fixture.operation(0, u64::from(batch)), writes)
+                .unwrap();
+        }
+        let references: Vec<_> = (0u32..8)
+            .map(|key| {
+                db.index_reference(KeySpace(0), &key.to_be_bytes(), IndexReadCut::Latest)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        let node = db.partition_indexes[&references[0].batch_address.partition];
+        let same_owner: Vec<_> = references
+            .into_iter()
+            .filter(|reference| db.partition_indexes[&reference.batch_address.partition] == node)
+            .take(6)
+            .collect();
+        assert!(same_owner.len() >= 5, "need distinct flights on one lane");
+        let lanes = db.reads.lanes.read()[node].clone();
+        let base = lanes[0].index;
+        let client = lanes[0].client.clone();
+        let (sender, receiver) = mpsc::sync_channel(db.reads.max_requests + 1);
+        let state = db.reads.state.clone();
+        let epoch = db.reads.epoch;
+        // A lane inbox of two entries, and a worker stuck behind the client lock.
+        let held = client.lock();
+        let actor =
+            thread::spawn(move || drive_live_reads(state, receiver, lanes, node, base, epoch, 2));
+        db.reads.sender.lock()[node] = sender.clone();
+        let pending: Vec<_> = same_owner
+            .iter()
+            .map(|reference| {
+                db.reads
+                    .submit(node, vec![*reference], 0, false, None)
+                    .unwrap()
+            })
+            .collect();
+        let diagnostics = &db.reads.state.diagnostics;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while diagnostics.live_lane_full.load(Ordering::Relaxed) == 0 {
+            assert!(Instant::now() < deadline, "the lane inbox never filled");
+            thread::yield_now();
+        }
+        // The actor still serves its own channel while one lane is full.
+        db.reads.state.wake_pending[node].store(true, Ordering::Release);
+        assert!(sender.try_send(ReadCommand::Wake).is_ok());
+        while db.reads.state.wake_pending[node].load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "the actor blocked on a full lane"
+            );
+            thread::yield_now();
+        }
+        assert!(diagnostics.live_lane_pending_max.load(Ordering::Relaxed) >= 1);
+        assert!(diagnostics.live_lane_depth_max.load(Ordering::Relaxed) <= 2);
+        drop(held);
+        // Unconfigured live clients fail every request; none may be lost.
+        for request in pending {
+            assert!(request.finish().is_err());
+        }
+        assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+        drop(sender);
+        db.reads.sender.lock().clear();
+        actor.join().unwrap();
+        drop(db);
+    }
+}

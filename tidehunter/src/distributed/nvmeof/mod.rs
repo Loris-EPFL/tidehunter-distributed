@@ -1,26 +1,126 @@
-//! Sealed native WAL exports for Linux NVMe-oF readers.
+//! Live native WAL data paths and sealed readsets over Linux NVMe-oF.
 //!
 //! A manifest describes an owner-authorized bounded readset; its serialization
 //! is not authentication. The management plane must protect its distribution.
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 mod namespace;
-#[cfg(target_os = "linux")]
-pub use namespace::{NamespaceBinding, NvmeofTransport};
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+pub use namespace::NamespaceBinding;
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub mod lease;
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+pub mod live_connect;
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+pub mod live_io;
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+pub mod live_metrics;
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+pub mod live_namespace;
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+pub mod live_pool;
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+pub(crate) mod live_prometheus;
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+pub mod live_storage;
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+pub mod live_target;
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 mod metrics;
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+mod spdk;
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub use metrics::{NvmeofMetrics, NvmeofStats, StageStats};
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 mod reader;
 use super::types::ValueRecordReference;
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub use reader::{
-    Completion, Eligibility, NvmeofError, NvmeofReader, NvmeofReaderConfig, SubmitOutcome,
+    Completion, Eligibility, MemberRange, NvmeofCatalog, NvmeofError, NvmeofReader,
+    NvmeofReaderConfig, ReadPlan, SubmitOutcome,
 };
 use serde::{Deserialize, Serialize};
+
+/// Explicit target protection policy. A failed kernel check never selects SPDK.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportTarget {
+    #[default]
+    Kernel,
+    Spdk(SpdkTarget),
+    /// Kernel nvmet with `buffered_io=0`, for sealed read-only image controls.
+    /// This measurement control is never the default or a live WAL target.
+    KernelDirect,
+}
+
+/// Owner-verified identity of the root-owned SPDK export process and AIO bdev.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpdkTarget {
+    pub rpc_socket: std::path::PathBuf,
+    pub pid: u32,
+    pub process_start_ticks: u64,
+    pub bdev_name: String,
+    pub image_path: std::path::PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NvmeofTransport {
+    Tcp,
+    Rdma,
+}
+
+/// Externally managed SPDK daemon used for live WAL namespaces.
+///
+/// The caller must provision and admit the patched executable whose namespace
+/// removal RPC reports pause and resume failures. Stock SPDK does not provide
+/// the fence guarantee required by live WAL recovery. Campaign admission must
+/// verify its source patch, build proof and binary identity before launch.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveSpdkConfig {
+    pub rpc_socket: std::path::PathBuf,
+    pub executable: std::path::PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveTargetConfig {
+    pub address: String,
+    pub service: u16,
+    pub transport: NvmeofTransport,
+    pub host_nqn: String,
+    pub port_id: u16,
+    pub state_dir: std::path::PathBuf,
+    pub commissioning_port_id: u16,
+    pub commissioning_service: u16,
+    #[serde(default)]
+    pub spdk: Option<LiveSpdkConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveTargetImplementation {
+    #[default]
+    Kernel,
+    Spdk,
+}
+
+/// Per-process target evidence. Fixture events are not kernel qualifications.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LiveTargetStats {
+    pub fixture_only: bool,
+    #[serde(default)]
+    pub target_implementation: LiveTargetImplementation,
+    pub namespaces_exposed: u64,
+    pub disable_drain_successes: u64,
+    pub readonly_commission_successes: u64,
+    pub errors: u64,
+    pub owned_namespace_count: u64,
+    pub fence_count: u64,
+    pub disable_drain_time_ns: u64,
+}
 
 /// Maximum serialized manifest admitted by both publication and owner leases.
 /// Separate from the conservative in-memory catalog/queue admission budgets.
@@ -69,6 +169,7 @@ pub struct ExportConfig {
 
 /// Publish only after both files and their containing directory are durable.
 /// The plans retain the actual source descriptors and their storage authority.
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(crate) fn publish_export(
     directory: &std::path::Path,
     config: &ExportConfig,

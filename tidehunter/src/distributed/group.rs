@@ -26,6 +26,9 @@ use std::fmt;
 
 const MAGIC: &[u8; 8] = b"THGROUP2";
 const FORMAT_VERSION: u16 = 2;
+const LIVE_FORMAT_VERSION: u16 = 3;
+pub const LIVE_BLOCK_SIZE: usize = 4096;
+const LIVE_BLOCK_SHIFT: u16 = 12;
 /// Magic, format version, zero reserved field and member count.
 pub const GROUP_HEADER_LEN: usize = 16;
 const FRAME_HEADER_LEN: usize = CrcFrame::CRC_HEADER_LENGTH;
@@ -36,6 +39,7 @@ pub struct GroupLimits {
     pub max_batches: u32,
     /// Group payload, excluding its outer native CRC header. Each contained
     /// batch contributes its native CRC header and 0..7 alignment bytes.
+    /// Live v3's bounded physical tail is excluded from this logical limit.
     pub max_encoded_bytes: usize,
 }
 
@@ -73,7 +77,10 @@ impl CompleteGroup {
         limits.validate()?;
         batch_limits.validate()?;
         check_count(self.batches.len(), limits)?;
-        if self.encoded.len() > limits.max_encoded_bytes {
+        if self.encoded.len() > limits.max_encoded_bytes
+            && (self.encoded[9] != LIVE_FORMAT_VERSION as u8
+                || Self::encoded_len_for_batches(&self.batches)? > limits.max_encoded_bytes)
+        {
             return Err(GroupError::TooLarge);
         }
         for batch in &self.batches {
@@ -128,6 +135,46 @@ impl CompleteGroup {
         })
     }
 
+    /// Construct a distributed live frame whose outer CRC frame is block aligned.
+    /// Padding is part of the CRC payload, so the native iterator needs no
+    /// special treatment and cannot interpret padding as another frame.
+    pub fn new_live(
+        shape: &KeyShape,
+        batches: Vec<CompleteBatch>,
+        batch_limits: BatchLimits,
+        limits: GroupLimits,
+    ) -> Result<Self, GroupError> {
+        let mut group = Self::new(shape, batches, batch_limits, limits)?;
+        let frame_len = group
+            .encoded
+            .len()
+            .checked_add(FRAME_HEADER_LEN)
+            .and_then(|n| n.checked_add(LIVE_BLOCK_SIZE - 1))
+            .map(|n| n & !(LIVE_BLOCK_SIZE - 1))
+            .ok_or(GroupError::TooLarge)?;
+        let payload_len = frame_len - FRAME_HEADER_LEN;
+        if frame_len >= NATIVE_FRAME_MAX_EXCLUSIVE {
+            return Err(GroupError::TooLarge);
+        }
+        let mut encoded = BytesMut::with_capacity(payload_len);
+        encoded.put_slice(&group.encoded);
+        encoded[8..10].copy_from_slice(&LIVE_FORMAT_VERSION.to_be_bytes());
+        encoded[10..12].copy_from_slice(&LIVE_BLOCK_SHIFT.to_be_bytes());
+        encoded.resize(payload_len, 0);
+        group.encoded = encoded.freeze().into();
+        Ok(group)
+    }
+
+    /// Return the exact native outer CRC frame for a live group.
+    pub fn live_frame(&self) -> Result<Vec<u8>, GroupError> {
+        if self.encoded.len() < GROUP_HEADER_LEN
+            || u16::from_be_bytes([self.encoded[8], self.encoded[9]]) != LIVE_FORMAT_VERSION
+        {
+            return Err(GroupError::InvalidFormat);
+        }
+        Ok(CrcFrame::new(self).as_ref().to_vec())
+    }
+
     /// Decode an outer-CRC-validated group payload. This method checks shape,
     /// length, count, inner CRCs, batch digests, padding and identity uniqueness.
     /// Storage must verify the OUTER CRC before treating any result as authority.
@@ -139,7 +186,7 @@ impl CompleteGroup {
     ) -> Result<Self, GroupError> {
         limits.validate()?;
         batch_limits.validate()?;
-        if encoded.len() > limits.max_encoded_bytes {
+        if encoded.len() > limits.max_encoded_bytes.saturating_add(LIVE_BLOCK_SIZE - 1) {
             return Err(GroupError::TooLarge);
         }
         if encoded.len() < GROUP_HEADER_LEN {
@@ -148,9 +195,13 @@ impl CompleteGroup {
         // CRC/member validation below must describe bytes that cannot change
         // after decode. Arbitrary input may be a mutable file-backed mapping.
         let encoded: Bytes = encoded.as_ref().to_vec().into_boxed_slice().into();
+        let version = u16::from_be_bytes(encoded[8..10].try_into().unwrap());
+        let flags = u16::from_be_bytes(encoded[10..12].try_into().unwrap());
         if &encoded[..8] != MAGIC
-            || u16::from_be_bytes(encoded[8..10].try_into().unwrap()) != FORMAT_VERSION
-            || encoded[10..12] != [0, 0]
+            || !matches!(
+                (version, flags),
+                (FORMAT_VERSION, 0) | (LIVE_FORMAT_VERSION, LIVE_BLOCK_SHIFT)
+            )
         {
             return Err(GroupError::InvalidFormat);
         }
@@ -180,8 +231,25 @@ impl CompleteGroup {
             batches.push(CompleteBatch::decode(shape, batch_bytes, batch_limits)?);
             offset = next;
         }
-        if offset != encoded.len() {
-            return Err(GroupError::TrailingBytes);
+        if offset > limits.max_encoded_bytes {
+            return Err(GroupError::TooLarge);
+        }
+        if version == FORMAT_VERSION {
+            if offset != encoded.len() {
+                return Err(GroupError::TrailingBytes);
+            }
+        } else {
+            let canonical_len = offset
+                .checked_add(FRAME_HEADER_LEN)
+                .and_then(|n| n.checked_add(LIVE_BLOCK_SIZE - 1))
+                .map(|n| (n & !(LIVE_BLOCK_SIZE - 1)) - FRAME_HEADER_LEN)
+                .ok_or(GroupError::TooLarge)?;
+            if encoded.len() != canonical_len {
+                return Err(GroupError::TrailingBytes);
+            }
+            if encoded[offset..].iter().any(|byte| *byte != 0) {
+                return Err(GroupError::InvalidPadding);
+            }
         }
         check_members(&batches)?;
         Ok(Self {
@@ -354,6 +422,49 @@ mod tests {
             limits().0,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn live_group_is_canonical_and_crc_covers_padding() {
+        let (bl, gl) = limits();
+        let batches = vec![batch(3, 2), batch(4, 1)];
+        let ordinary = CompleteGroup::new(&shape(), batches.clone(), bl, gl).unwrap();
+        let live = CompleteGroup::new_live(&shape(), batches, bl, gl).unwrap();
+        assert_eq!(ordinary.batch_offsets(), live.batch_offsets());
+        let frame = live.live_frame().unwrap();
+        assert_eq!(frame.len() % LIVE_BLOCK_SIZE, 0);
+        let payload = CrcFrame::read_from_slice(&frame, 0).unwrap();
+        let recovered = CompleteGroup::decode(&shape(), payload.to_vec().into(), bl, gl).unwrap();
+        assert_eq!(recovered.batch_offsets(), live.batch_offsets());
+        let mut bad = payload.to_vec();
+        *bad.last_mut().unwrap() = 1;
+        assert_eq!(
+            CompleteGroup::decode(&shape(), bad.into(), bl, gl).unwrap_err(),
+            GroupError::InvalidPadding
+        );
+        let mut bad = payload.to_vec();
+        bad[11] = 13;
+        assert_eq!(
+            CompleteGroup::decode(&shape(), bad.into(), bl, gl).unwrap_err(),
+            GroupError::InvalidFormat
+        );
+        let mut bad = payload.to_vec();
+        bad.extend_from_slice(&[0; LIVE_BLOCK_SIZE]);
+        assert_eq!(
+            CompleteGroup::decode(&shape(), bad.into(), bl, gl).unwrap_err(),
+            GroupError::TrailingBytes
+        );
+        let mut torn = frame;
+        *torn.last_mut().unwrap() = 1;
+        assert!(CrcFrame::read_from_slice(&torn, 0).is_err());
+        assert!(ordinary.live_frame().is_err());
+        let small = GroupLimits {
+            max_encoded_bytes: 1024,
+            ..gl
+        };
+        let small_live = CompleteGroup::new_live(&shape(), vec![batch(3, 2)], bl, small).unwrap();
+        assert!(small_live.encoded().len() > small.max_encoded_bytes);
+        CompleteGroup::decode(&shape(), small_live.encoded().clone(), bl, small).unwrap();
     }
 
     #[test]

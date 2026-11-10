@@ -28,6 +28,7 @@ on:
         default: 'tcp'
         required: true
       mode:
+        description: 'NVMe arms require nvmeof-focused. For portable RDMA compare native,tidehunter_tcp,tidehunter_verbs_native,tidehunter_nvme_rdma; NVMe/TCP optional.'
         type: choice
         options: [standard, nvmeof-focused]
         default: standard
@@ -61,6 +62,8 @@ jobs:
         run: |
           set -euo pipefail
           python -m unittest discover -s experiments/gcp-rdma -p 'test_*.py'
+          python -m unittest discover -s experiments/kv-comparison -p 'test_cloud_controller.py'
+          python -m unittest discover -s experiments/kv-comparison/observability -p 'test_*.py'
           python experiments/gcp-rdma/workflow_input.py spec --suite kv \
             --backends native,tidehunter_tcp,tidehunter_verbs_native,tikv,cassandra,foundationdb,valkey_tcp,valkey_rdma,garnet,kvrocks \
             --mode standard --output "$RUNNER_TEMP/gcp-spec.json"

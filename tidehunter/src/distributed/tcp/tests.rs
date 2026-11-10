@@ -15,6 +15,7 @@ fn structured_transport_identity_ignores_local_selectors_only() {
             backend: FabricBackend::Verbs,
             domain: Some("mlx5_0".to_owned()),
             source_address: Some("10.1.0.1".parse().unwrap()),
+            slots: None,
         },
         security: FabricSecurity::MutualTls,
     };
@@ -22,6 +23,7 @@ fn structured_transport_identity_ignores_local_selectors_only() {
         backend: FabricBackend::Verbs,
         domain: Some("mlx5_1".to_owned()),
         source_address: Some("10.1.0.2".parse().unwrap()),
+        slots: Some(8),
     };
     let right = Transport::Ofi {
         fabric: right_fabric.clone(),
@@ -36,6 +38,8 @@ fn structured_transport_identity_ignores_local_selectors_only() {
         fabric: right_fabric.clone(),
         security: FabricSecurity::Trusted,
     }));
+    assert!(!Transport::Tcp.same_protocol(&Transport::TcpTrusted));
+    assert!(Transport::TcpTrusted.same_protocol(&Transport::TcpTrusted));
     assert_eq!(Transport::default(), Transport::Tcp);
     assert_eq!(
         serde_json::to_value(Transport::Tcp).unwrap(),
@@ -82,7 +86,42 @@ pub(super) fn config(root: &Path) -> NodeConfig {
         read_max_inflight_requests: default_read_requests(),
         read_max_inflight_bytes: default_read_bytes(),
         read_max_device_reads: default_device_reads(),
+        live_target: None,
     }
+}
+
+#[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+#[test]
+fn unsupported_live_target_is_rejected_before_node_creation() {
+    let temp = tempdir::TempDir::new("unsupported-live-target").unwrap();
+    let mut config = config(&temp.path().join("node"));
+    config.live_target = Some(crate::distributed::nvmeof::LiveTargetConfig {
+        address: "127.0.0.1".into(),
+        service: 4420,
+        transport: crate::distributed::nvmeof::NvmeofTransport::Tcp,
+        host_nqn: "nqn.2026-01.test:host".into(),
+        port_id: 42,
+        state_dir: temp.path().join("target"),
+        commissioning_port_id: 43,
+        commissioning_service: 4421,
+        spdk: None,
+    });
+    let serialized = serde_yaml::to_string(&config).unwrap();
+    let parsed: NodeConfig = serde_yaml::from_str(&serialized).unwrap();
+    assert_eq!(parsed.live_target, config.live_target);
+    let error = match StorageNode::open(parsed, metrics()) {
+        Ok(_) => panic!("unsupported target was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("requires experimental-nvmeof"));
+    assert!(!config.root.exists());
+}
+
+#[test]
+fn native_node_has_no_live_target_shutdown_evidence() {
+    let temp = tempdir::TempDir::new("native-node-final").unwrap();
+    let node = StorageNode::open(config(&temp.path().join("node")), metrics()).unwrap();
+    assert!(node.finish_live_target_shutdown().unwrap().is_none());
 }
 pub(super) fn batch(config: &NodeConfig, epoch: u64, sequence: u64) -> CompleteBatch {
     let id = (sequence * 1024..)
@@ -689,6 +728,93 @@ pub(super) fn certificates(root: &Path) -> TlsFiles {
 }
 
 #[test]
+fn pending_checkpoint_does_not_hide_prior_durable_append_completion() {
+    let temp = tempdir::TempDir::new("tcp-checkpoint-append-progress").unwrap();
+    let tls = certificates(temp.path());
+    let config = config(&temp.path().join("node"));
+    let node = StorageNode::open(config.clone(), metrics()).unwrap();
+    node.set_durability(crate::distributed::durability::DurabilityConfig::with_tier(
+        crate::distributed::durability::DurabilityTier::Synchronous,
+    ))
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = listener.local_addr().unwrap().to_string();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server = node.clone();
+    let stop = shutdown.clone();
+    let server_tls = tls.clone();
+    let limits = TcpLimits::default();
+    let timeout = limits.io_timeout;
+    let server_thread =
+        thread::spawn(move || server.serve(listener, server_tls, limits, stop).unwrap());
+    let mut client =
+        Client::connect(&endpoint, &tls, timeout, config.partition.clone(), &shape()).unwrap();
+    client.fence_to(1).unwrap();
+    let log = node.inventory.lock().active(1).unwrap();
+    let (entered, release) = log.pause_next_persist();
+    let item = batch(&config, 1, 0);
+    let id = client
+        .submit_append_many(1, std::slice::from_ref(&item))
+        .unwrap()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while entered.try_recv().is_err() && Instant::now() < deadline {
+        client.progress_appends().unwrap();
+        thread::yield_now();
+    }
+    assert!(
+        Instant::now() < deadline,
+        "append did not enter persistence"
+    );
+    // This blocks only checkpoint proof lookup, not the already accepted
+    // append's flusher. Its barrier remains in the normal FIFO order.
+    let inventory = node.inventory.lock();
+    let control_deadline = client.checkpoint_deadline();
+    assert!(client.submit_checkpoint(1, 1, 1, control_deadline).unwrap());
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut completion = None;
+    while completion.is_none() && Instant::now() < deadline {
+        for done in client.progress_appends().unwrap() {
+            if done.id == id {
+                completion = Some(done.result);
+            }
+        }
+        thread::yield_now();
+    }
+    let proof_still_pending = client.take_checkpoint(1, 1).is_none();
+    drop(inventory);
+    let completion = completion
+        .expect("durable append reply was blocked behind checkpoint")
+        .unwrap();
+    assert_eq!(completion.len(), 1);
+    assert!(proof_still_pending);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let proof = loop {
+        client.progress_appends().unwrap();
+        if let Some(proof) = client.take_checkpoint(1, 1) {
+            break proof.unwrap();
+        }
+        assert!(Instant::now() < deadline, "checkpoint did not finish");
+        thread::yield_now();
+    };
+    assert_eq!(proof.prefix, 1);
+    assert!(proof.retained >= 1);
+    assert_eq!(
+        proof.digest,
+        checkpoint::prefix_digest(
+            proof.database,
+            proof.partition,
+            1,
+            std::iter::once(completion[0].appended().into()),
+        )
+    );
+    drop(client);
+    shutdown.store(true, Ordering::Release);
+    server_thread.join().unwrap();
+}
+
+#[test]
 fn mtls_roundtrip_authentication_lost_response_and_recovery() {
     authenticated_roundtrip(Transport::Tcp);
 }
@@ -709,6 +835,10 @@ fn authenticated_roundtrip(transport: Transport) {
     tls.transport = transport.clone();
     let config = config(&temp.path().join("node"));
     let node = StorageNode::open(config.clone(), metrics()).unwrap();
+    node.set_durability(crate::distributed::durability::DurabilityConfig::with_tier(
+        crate::distributed::durability::DurabilityTier::Synchronous,
+    ))
+    .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = listener.local_addr().unwrap().to_string();
     let shutdown = Arc::new(AtomicBool::new(false));

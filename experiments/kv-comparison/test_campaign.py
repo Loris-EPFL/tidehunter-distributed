@@ -73,6 +73,17 @@ class AdmissionTests(unittest.TestCase):
         base["phases"]["measurement_operations"] = 1_000_000
         with self.assertRaisesRegex(ValueError, "exceeds supported"):
             campaign.build_config(base, job, None, Path("/tmp/unused"), 17, False)
+    def test_native_local_geometry_and_acknowledgement_are_explicit(self):
+        base = {"dataset": {}, "phases": {"preload": True, "warmup_operations": 10,
+                "aging_operations": 0, "measurement_operations": 100}, "execution": {}, "limits": {}}
+        job = {"backend": "native", "profile": {"keys": 64, "aging_operations": 0}, "rate": 100}
+        measured = campaign.build_config(base, job, None, Path("/tmp/unused"), 17, False)
+        qualified = campaign.build_config(base, job, None, Path("/tmp/unused"), 17, True)
+        self.assertEqual(measured["backend"]["options"]["native_wal_geometry"], "native_default")
+        self.assertEqual(qualified["backend"]["options"]["native_wal_geometry"], "small")
+        self.assertEqual(measured["backend"]["options"]["durability"], "page_cache")
+        self.assertEqual(qualified["backend"]["options"]["durability"], "page_cache")
+
     def test_explicit_portable_transport_cannot_masquerade_as_another_case(self):
         base = {"dataset": {"keys": 1}, "phases": {"preload": False, "warmup_operations": 0,
                 "aging_operations": 0, "measurement_operations": 1}, "execution": {}, "limits": {}}

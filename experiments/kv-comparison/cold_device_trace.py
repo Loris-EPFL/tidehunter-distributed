@@ -19,14 +19,16 @@ import subprocess
 import sys
 import time
 
+import wal_extent_evidence
+
 TRACE_ROOT = Path('/sys/kernel/tracing')
 SYS_BLOCK = Path('/sys/dev/block')
 MAX_DURATION = 3600
 MAX_CPUS = 256
 BUFFER_KB = 64  # per CPU, at most 16 MiB across MAX_CPUS
 MAX_STARTUP_RING_BYTES = 512 * 1024 * 1024
-MAX_BYTES = 8 * 1024 * 1024
-MAX_EVENTS = 20000
+MAX_BYTES = 32 * 1024 * 1024
+MAX_EVENTS = 300000  # Includes I/S/C records; bounded diagnostic-only capture.
 MAX_OUTSTANDING = 2048
 EVENT = re.compile(r'\s(\d+)\.(\d+):\s+block_rq_(issue|complete|requeue):\s+(\d+),(\d+)\s+(\S+)\s+(?:\d+\s+)?(?:\([^)]*\)\s+)?(\d+)\s+\+\s+(\d+)(?:\s|$)')
 
@@ -290,6 +292,7 @@ rawtracepoint:block_rq_issue {
       $r->q->disk->major == MAJOR && $r->q->disk->first_minor == MINOR &&
       ($r->cmd_flags & 255) == 0) {
     $t = nsecs(monotonic); @events = count(); printf("I %llu\n", $t);
+    @events = count(); printf("S %llu %llu %llu\n", $t, (uint64)$r->__sector, (uint64)$r->__data_len);
     if (@pending[$r]) {
       @events = count(); printf("D %llu\n", $t); delete(@pending[$r]);
     } else {
@@ -328,6 +331,22 @@ END { clear(@pending); }
 '''.replace('MAJOR', str(major)).replace('MINOR', str(minor))
 
 
+def interval_distribution(intervals):
+    intervals = sorted(intervals)
+    n = len(intervals)
+    total = sum(intervals)
+    mean = total / n if n else None
+    dist = {'count': n, 'sum': total, 'max': intervals[-1] if n else None,
+            'mean': mean, 'population_stddev': math.sqrt(sum((x - mean) ** 2 for x in intervals) / n) if n else None,
+            'tail_warnings': []}
+    for name, numerator, minimum in (('p50', 50, 2), ('p95', 95, 20), ('p99', 99, 100), ('p999', 999, 1000)):
+        denominator = 1000 if name == 'p999' else 100
+        dist[name] = intervals[(numerator * n + denominator - 1) // denominator - 1] if n else None
+        if n < minimum:
+            dist['tail_warnings'].append(f'{name}: fewer than {minimum} observations')
+    return dist
+
+
 def parse_identity(lines, started, stopped, *, truncated=False, diagnostics=''):
     issues = completions = partials = requeues = misses = errors = overflows = duplicates = 0
     intervals, raw = [], []
@@ -344,17 +363,20 @@ def parse_identity(lines, started, stopped, *, truncated=False, diagnostics=''):
         if not line:
             continue
         parts = line.split()
-        if not parts or parts[0] not in ('I', 'C', 'P', 'R', 'M', 'E', 'O', 'D'):
+        if not parts or parts[0] not in ('I', 'S', 'C', 'P', 'R', 'M', 'E', 'O', 'D'):
             malformed += 1
             continue
         emitted += 1
-        if len(parts) != (3 if parts[0] == 'C' else 2) or not all(x.isdigit() for x in parts[1:]):
+        if len(parts) != (3 if parts[0] == 'C' else 4 if parts[0] == 'S' else 2) or not all(x.isdigit() for x in parts[1:]):
             malformed += 1
             continue
-        kind, end = parts[0], int(parts[-1])
+        kind = parts[0]
+        end = int(parts[1] if kind == 'S' else parts[-1])
         if not started <= end <= stopped:
             continue
         raw.append(line)
+        if kind == 'S':
+            continue
         if kind == 'I':
             issues += 1
         elif kind == 'C':
@@ -387,16 +409,7 @@ def parse_identity(lines, started, stopped, *, truncated=False, diagnostics=''):
     intervals.sort()
     n = len(intervals)
     unmatched_issues = max(0, issues - n)
-    total = sum(intervals)
-    mean = total / n if n else None
-    dist = {'count': n, 'sum': total, 'max': intervals[-1] if n else None,
-            'mean': mean, 'population_stddev': math.sqrt(sum((x - mean) ** 2 for x in intervals) / n) if n else None,
-            'tail_warnings': []}
-    for name, numerator, minimum in (('p50', 50, 2), ('p95', 95, 20), ('p99', 99, 100), ('p999', 999, 1000)):
-        denominator = 1000 if name == 'p999' else 100
-        dist[name] = intervals[(numerator * n + denominator - 1) // denominator - 1] if n else None
-        if n < minimum:
-            dist['tail_warnings'].append(f'{name}: fewer than {minimum} observations')
+    dist = interval_distribution(intervals)
     qualified = bool(issues and completions and n and lost == 0 and not truncated and
                      not (malformed or requeues or misses or errors or overflows or duplicates or unmatched_issues))
     return {'backend': 'bpftrace-request-identity', 'read_issues': issues, 'read_completions': completions,
@@ -420,7 +433,7 @@ def identity_unavailable(state, reason, **details):
     return None
 
 
-def identity_capture(state, mapping, deadline, stop_requested):
+def identity_capture(state, mapping, deadline, stop_requested, wal_path):
     binary = shutil.which('bpftrace')
     if not binary or not Path('/sys/kernel/btf/vmlinux').is_file():
         return identity_unavailable(state, 'bpftrace binary or kernel BTF unavailable')
@@ -435,6 +448,8 @@ def identity_capture(state, mapping, deadline, stop_requested):
     def child_death_signal():
         if ctypes.CDLL(None).prctl(1, signal.SIGKILL, 0, 0, 0) != 0 or os.getppid() != parent_pid:
             os._exit(127)
+    extents_before = wal_extent_evidence.snapshot(wal_path, mapping)
+    save(state / 'wal-extents-before.json', extents_before)
     try:
         process = subprocess.Popen([binary, '-q', '-k', '-B', 'line', '-e', identity_program(mapping['device'])],
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -443,6 +458,7 @@ def identity_capture(state, mapping, deadline, stop_requested):
         return identity_unavailable(state, 'bpftrace could not start', error=str(error)[:500])
     selector = selectors.DefaultSelector()
     data, errors = bytearray(), bytearray()
+    stdout_lines = 0
     started = stopped = None
     truncated = False
     shutdown_deadline = None
@@ -470,7 +486,9 @@ def identity_capture(state, mapping, deadline, stop_requested):
                 target, limit = (data, MAX_BYTES) if key.fileobj is process.stdout else (errors, 256 * 1024)
                 remaining = limit - len(target)
                 target.extend(chunk[:max(0, remaining)])
-                if len(chunk) > remaining or data.count(b'\n') > MAX_EVENTS + 8:
+                if key.fileobj is process.stdout:
+                    stdout_lines += chunk[:max(0, remaining)].count(b'\n')
+                if len(chunk) > remaining or stdout_lines > MAX_EVENTS + 8:
                     truncated = True
                 if started is None and attachment_marker_seen(data, errors) and not truncated and stopped is None:
                     started = time.monotonic_ns()
@@ -490,10 +508,16 @@ def identity_capture(state, mapping, deadline, stop_requested):
         diagnostics = bytes(errors).replace(marker, b'').strip()
         parsed = parse_identity(bytes(data).replace(marker, b'').decode('utf-8', errors='replace').splitlines(),
                                 started, stopped, truncated=truncated, diagnostics=diagnostics)
+        extents_after = wal_extent_evidence.snapshot(wal_path, mapping)
+        save(state / 'wal-extents-after.json', extents_after)
+        owned_io = wal_extent_evidence.classify(parsed, extents_before, extents_after)
+        if owned_io.get('available'):
+            owned_io['intervals_ns'] = interval_distribution(owned_io.pop('raw_intervals_ns'))
         return {'available': True, 'state_dir': str(state), 'device': mapping,
                 'started_monotonic_ns': started, 'stopped_monotonic_ns': stopped,
                 'scope': 'device-wide request-identity block issue-to-completion; not application or NAND service',
-                'possible_cpus': cpus, 'perf_ring_pages_per_cpu': 8, **parsed}
+                'possible_cpus': cpus, 'perf_ring_pages_per_cpu': 8,
+                'event_budget': MAX_EVENTS, 'byte_budget': MAX_BYTES, 'owned_wal_io': owned_io, **parsed}
     finally:
         selector.close()
         if process.poll() is None:
@@ -518,7 +542,7 @@ def worker(state, wal_path, duration, instance_name):
         if not re.fullmatch(r'tidehunter-[0-9a-f]{32}', instance_name):
             raise ValueError('invalid owned instance name')
         mapping = resolve_device(wal_path)
-        identity = identity_capture(state, mapping, deadline, lambda: terminated)
+        identity = identity_capture(state, mapping, deadline, lambda: terminated, wal_path)
         if identity is not None:
             result = identity
             return

@@ -12,6 +12,7 @@ engine=$1
 output=$2
 build_timeout=$3
 with_valkey=$4
+focused=${5:-0}
 export HOME="$output/container-home"
 export CARGO_HOME="$HOME/cargo" RUSTUP_HOME="$HOME/rustup"
 export PATH="$CARGO_HOME/bin:$PATH"
@@ -21,8 +22,14 @@ mkdir -p "$HOME"
 bash "$engine/.github/scripts/setup.sh" fabric
 args=()
 if [[ $with_valkey == 1 ]]; then
-    python3 "$engine/experiments/kv-comparison/prepare_valkey_rdma.py" --output "$output/valkey-source"
+    python3 "$engine/experiments/kv-comparison/prepare_valkey_rdma.py" --output "$output/valkey-source" --cq-diagnostics
     args+=(--valkey-source "$output/valkey-source")
+fi
+if [[ $focused == 1 ]]; then
+    exec python3 "$engine/experiments/kv-comparison/cloud_package.py" build \
+        --snapshot "$output/snapshot" --output "$output/build" \
+        --fabric-prefix "$output/fabric" --focused \
+        --timeout "$build_timeout" "${args[@]}"
 fi
 exec python3 "$engine/experiments/kv-comparison/cloud_package.py" build \
     --snapshot "$output/snapshot" --output "$output/build" \

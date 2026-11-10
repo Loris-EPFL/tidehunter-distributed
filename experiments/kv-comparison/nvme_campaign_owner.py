@@ -13,7 +13,8 @@ import yaml
 
 
 ACTIONS = {"nvme_owner_stop", "nvme_owner_restart", "nvme_owner_export",
-           "nvme_owner_target_setup", "nvme_owner_target_cleanup", "nvme_owner_cleanup_export"}
+           "nvme_owner_target_setup", "nvme_owner_target_cleanup", "nvme_owner_cleanup_export",
+           "nvme_owner_target_snapshot"}
 MAX_JSON = 64 * 1024 * 1024
 
 
@@ -123,7 +124,56 @@ def read_export_manifest(config, case, index, manifest_path, *, validate_launch)
     return _read_export_entry(export, manifest)
 
 
-def execute(config, request, *, command, validate_launch, unit_status, unit_name):
+def capture_live_owner_identity(node, launch_path, status):
+    """Persist the exact systemd process identity while the owner is alive."""
+    _trusted_dir(node)
+    raw_pid = status.get('MainPID')
+    if not isinstance(raw_pid, str) or not raw_pid.isdigit() or int(raw_pid) <= 0:
+        raise ValueError('live owner has no active process identity')
+    pid = int(raw_pid)
+    raw = Path('/proc').joinpath(str(pid), 'stat').read_text()
+    fields = raw.rsplit(')', 1)
+    if len(fields) != 2:
+        raise ValueError('invalid owner process stat')
+    ticks = int(fields[1].split()[19])
+    if ticks <= 0:
+        raise ValueError('invalid owner process start time')
+    identity = {'process_id': pid, 'process_start_ticks': ticks,
+                'launch_blake2b512': hashlib.blake2b(_read_bytes(launch_path)).hexdigest()}
+    _write_new(Path(node) / 'live-owner-identity.json', identity)
+    return identity
+
+
+def admit_live_shutdown(node, launch_path, launch, index, graceful_status):
+    """Admit only a shutdown proof from the exact previously observed owner."""
+    _trusted_dir(node)
+    if not _stopped(graceful_status):
+        raise ValueError('live owner did not exit gracefully')
+    identity = _read_json(Path(node) / 'live-owner-identity.json')
+    proof = _read_json(Path(launch_path).with_suffix('.live-target-shutdown.json'))
+    owner = launch['node']
+    expected = {'database': owner['partition']['inventory']['database'],
+                'partition': owner['partition']['partition'], 'root': owner['root']}
+    target = proof.get('target')
+    expected_scope = ('spdk_live_target_shutdown' if (owner.get('live_target') or {}).get('spdk') is not None
+                      else 'kernel_live_target_shutdown')
+    if (expected['partition'] != index or proof.get('schema_version') != 1
+            or proof.get('scope') != expected_scope or proof.get('complete') is not True
+            or proof.get('owner') != expected or proof.get('serve_error') is not None
+            or proof.get('cleanup_error') is not None
+            or proof.get('launch_blake2b512') != hashlib.blake2b(_read_bytes(launch_path)).hexdigest()
+            or any(proof.get(k) != identity.get(k) for k in
+                   ('process_id', 'process_start_ticks', 'launch_blake2b512'))
+            or type(identity.get('process_id')) is not int or identity['process_id'] <= 0
+            or type(identity.get('process_start_ticks')) is not int or identity['process_start_ticks'] <= 0
+            or not isinstance(target, dict) or target.get('fixture_only') is not False
+            or type(target.get('errors')) is not int or target['errors'] != 0
+            or type(target.get('owned_namespace_count')) is not int or target['owned_namespace_count'] != 0):
+        raise ValueError('live target shutdown proof differs from exact owner or is incomplete')
+    return proof
+
+
+def execute(config, request, *, command, validate_launch, unit_status, unit_name, local_qualification=False):
     """Execute one action. Failure receipts retain any attempted target state for recovery."""
     action = request['action']
     case, index = request['case_id'], request['index']
@@ -135,8 +185,14 @@ def execute(config, request, *, command, validate_launch, unit_status, unit_name
     if (generation is not None and
             (not isinstance(generation, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', generation))):
         raise ValueError('safe target generation required')
-    if action in ('nvme_owner_target_setup', 'nvme_owner_target_cleanup') and generation is None:
+    if action in ('nvme_owner_target_setup', 'nvme_owner_target_cleanup', 'nvme_owner_target_snapshot') and generation is None:
         raise ValueError('safe target generation required')
+    implementation = request.get('target_implementation', 'kernel')
+    if implementation not in ('kernel', 'kernel_direct', 'spdk'):
+        raise ValueError('unsupported target implementation')
+    if implementation == 'spdk' and (config['spec'].get('spdk_comparison') is not True
+                                     or request.get('transport', 'rdma') != 'rdma'):
+        raise ValueError('SPDK requires its explicit read-only RDMA comparison')
     timeout = request['timeout']
     if type(timeout) not in (int, float) or not 0 < timeout <= 86400:
         raise ValueError('bounded positive timeout required')
@@ -170,18 +226,26 @@ def execute(config, request, *, command, validate_launch, unit_status, unit_name
         raise ValueError('owner work directory must be private')
     name = unit_name(config, case, 'storage-' + str(index))
     state = (work / ('target-state-' + generation)
-             if action in ('nvme_owner_target_setup', 'nvme_owner_target_cleanup') else None)
+             if action in ('nvme_owner_target_setup', 'nvme_owner_target_cleanup', 'nvme_owner_target_snapshot') else None)
     export = work / 'export'
     stop_proof = work / 'stopped.json'
-    script = Path(config['repository_root']) / 'experiments/nvmeof/campaign_targets.py'
+    scripts = Path(config['repository_root']) / 'experiments/nvmeof'
+    script = scripts / ('spdk_targets.py' if implementation == 'spdk' else 'campaign_targets.py')
     receipt = {'action': action, 'case_id': case, 'index': index, 'unit_name': name,
                'work_dir': str(work), 'complete': False}
 
     def call(argv):
         return command(argv, timeout=remaining())
 
+    def target_script(path):
+        saved = _read_json(Path(path) / 'state.json')
+        selected = saved.get('target_implementation', 'kernel')
+        if selected not in ('kernel', 'kernel_direct', 'spdk'):
+            raise ValueError('unknown persisted target implementation')
+        return scripts / ('spdk_targets.py' if selected == 'spdk' else 'campaign_targets.py')
+
     def target_status(path):
-        return json.loads(call([sys.executable, '-B', script, 'status', '--state', path, '--kind', 'target']))
+        return json.loads(call([sys.executable, '-B', target_script(path), 'status', '--state', path, '--kind', 'target']))
 
     def runtime_environment():
         from cloud_controller import environment
@@ -239,7 +303,7 @@ def execute(config, request, *, command, validate_launch, unit_status, unit_name
                 status = unit_status(name)
                 if status.get('LoadState') != 'not-found' and status.get('ActiveState') == 'failed':
                     call(['systemctl', 'reset-failed', name])
-            for marker in (node / 'stop', node / 'ready'):
+            for marker in (node / 'stop', node / 'ready', node / 'ready.durability.json'):
                 if marker.is_symlink():
                     raise ValueError('unsafe marker')
                 marker.unlink(missing_ok=True)
@@ -247,6 +311,12 @@ def execute(config, request, *, command, validate_launch, unit_status, unit_name
             remaining()
             env = {key: value for key, value in runtime_environment().items()
                    if key in ('LD_LIBRARY_PATH', 'FDB_CLIENT_LIB_DIR', 'FDB_CLIENT_LIB_PATH', 'FI_EFA_USE_DEVICE_RDMA')}
+            if local_qualification:
+                # Restarted cohosted owners need the same RXE CQ bound as initial units.
+                env['FI_UNIVERSE_SIZE'] = '6'
+                level = os.environ.get('FI_LOG_LEVEL')
+                if level in ('info', 'debug'):
+                    env['FI_LOG_LEVEL'] = level
             argv = ['systemd-run', '--unit=' + name, '--service-type=exec',
                     '--property=CPUQuota=' + str(fleet['server_cpus'] * 100) + '%',
                     '--property=MemoryMax=' + str(int(fleet['server_memory_mib'])) + 'M',
@@ -269,6 +339,8 @@ def execute(config, request, *, command, validate_launch, unit_status, unit_name
                     if ready.read_text().strip() != launch['listen']:
                         raise ValueError('owner readiness endpoint mismatch')
                     receipt['ready'] = launch['listen']
+                    import cloud_campaign
+                    receipt['durability_receipt'] = cloud_campaign.read_owner_receipt(launch)
                     break
                 time.sleep(min(0.2, remaining()))
         elif action == 'nvme_owner_export':
@@ -306,10 +378,30 @@ def execute(config, request, *, command, validate_launch, unit_status, unit_name
             if transport not in ('tcp', 'rdma'):
                 raise ValueError('explicit NVMe transport must be tcp or rdma')
             receipt['target_setup_attempted'] = True
-            receipt['target'] = json.loads(call([sys.executable, '-B', script, 'target-setup',
-                '--ready', export / 'ready.json', '--export-root', export, '--state', state,
-                '--address', request['address'], '--base-port-id', str(request['base_port_id']),
-                '--base-service', str(request['base_service']), '--transport', transport]))
+            argv = [sys.executable, '-B', script, 'target-setup',
+                    '--ready', export / 'ready.json', '--export-root', export, '--state', state,
+                    '--address', request['address'], '--base-port-id', str(request['base_port_id']),
+                    '--base-service', str(request['base_service']), '--transport', transport]
+            if implementation != 'spdk':
+                argv += ['--target-kind', implementation]
+            if implementation == 'spdk':
+                target_end = datetime.fromisoformat(request['target_deadline_utc'].replace('Z', '+00:00'))
+                fleet_end = datetime.fromisoformat(config['deadline_utc'].replace('Z', '+00:00'))
+                if target_end.tzinfo is None or not datetime.now(timezone.utc) < target_end <= fleet_end:
+                    raise ValueError('SPDK target deadline must be future and bounded by fleet deletion')
+                argv += ['--spdk-prefix', Path(config['binary']).parent.parent / 'spdk',
+                         '--deadline-epoch', str(target_end.timestamp())]
+                if local_qualification:
+                    cores = sorted(os.sched_getaffinity(0))[2 * index:2 * index + 2]
+                    if len(cores) != 2:
+                        raise ValueError('local SPDK requires two distinct CPUs per owner')
+                    argv = ['taskset', '--cpu-list', ','.join(map(str, cores)), *argv]
+            receipt['target'] = json.loads(call(argv))
+        elif action == 'nvme_owner_target_snapshot':
+            if implementation != 'spdk':
+                raise ValueError('SPDK target counters require an admitted SPDK target')
+            receipt['target'] = json.loads(call([sys.executable, '-B', target_script(state),
+                                                'stats', '--state', state]))
         elif action == 'nvme_owner_cleanup_export':
             status = unit_status(name)
             if status.get('ActiveState') != 'active' or status.get('MainPID') in (None, '0'):
@@ -369,6 +461,7 @@ def execute(config, request, *, command, validate_launch, unit_status, unit_name
                 raise ValueError('explicit reader drain and host disconnect proof required')
             proof_path = work / ('host-disconnected-' + generation + '.json')
             _write_matching(proof_path, request['host_disconnected'])
+            script = target_script(state)
             receipt['target_cleanup_attempted'] = True
             receipt['target'] = json.loads(call([sys.executable, '-B', script, 'target-cleanup',
                 '--state', state, '--readers-drained', '--host-disconnected', proof_path]))

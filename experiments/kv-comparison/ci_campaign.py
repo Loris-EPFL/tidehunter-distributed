@@ -69,8 +69,8 @@ def load_config(path, env=None, backend_selection=None, mode="standard"):
         if type(cfg.get('cost_assumptions', {}).get(name)) is not int or cfg['cost_assumptions'][name] <= 0:
             raise ValueError('positive reviewed cost_assumptions.' + name + ' required')
     raw_bound = cfg.get('raw_export_max_gib')
-    if type(raw_bound) is not int or raw_bound < 32 or cfg['cost_assumptions']['result_gib'] < raw_bound:
-        raise ValueError('explicit raw export bound >=32GiB must be covered by the shared cost reservation')
+    if type(raw_bound) is not int or raw_bound < 33 or cfg['cost_assumptions']['result_gib'] < raw_bound:
+        raise ValueError('explicit raw export bound >=33GiB must be covered by the shared cost reservation')
     resources = cfg.get('fleet', {})
     if set(resources) != {'server_cpus', 'server_memory_mib', 'client_cpus', 'client_memory_mib'}:
         raise ValueError('explicit equal owner/coordinator resource caps required')

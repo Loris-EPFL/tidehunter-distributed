@@ -1,0 +1,31 @@
+diff --git a/lib/nvmf/nvmf_rpc.c b/lib/nvmf/nvmf_rpc.c
+index d3b1e36..d4dc139 100644
+--- a/lib/nvmf/nvmf_rpc.c
++++ b/lib/nvmf/nvmf_rpc.c
+@@ -1755,6 +1755,12 @@ nvmf_rpc_remove_ns_resumed(struct spdk_nvmf_subsystem *subsystem,
+ 		return;
+ 	}
+ 
++	if (status != 0) {
++		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
++						    "Namespace removal resume failed: %d", status);
++		return;
++	}
++
+ 	spdk_jsonrpc_send_bool_response(request, true);
+ }
+ 
+@@ -1765,6 +1771,13 @@ nvmf_rpc_remove_ns_paused(struct spdk_nvmf_subsystem *subsystem,
+ 	struct nvmf_rpc_remove_ns_ctx *ctx = cb_arg;
+ 	int ret;
+ 
++	if (status != 0) {
++		spdk_jsonrpc_send_error_response_fmt(ctx->request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
++						    "Namespace removal pause failed: %d", status);
++		nvmf_rpc_remove_ns_ctx_free(ctx);
++		return;
++	}
++
+ 	ret = spdk_nvmf_subsystem_remove_ns(subsystem, ctx->nsid);
+ 	if (ret < 0) {
+ 		SPDK_ERRLOG("Unable to remove namespace ID %u\n", ctx->nsid);

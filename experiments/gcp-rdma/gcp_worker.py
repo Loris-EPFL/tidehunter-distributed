@@ -17,10 +17,12 @@ from pathlib import Path
 
 import gcp_api
 import gcp_runtime
+import gcp_poweroff
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'kv-comparison'))
 from control_execution import execute_at_most_once
 import cloud_package
+import physical_storage
 
 MAX_OUTPUT = 1024 * 1024
 MAX_ACTIVE = 16
@@ -138,8 +140,10 @@ def admit_scratch(config, host, api):
             any(not re.fullmatch(r'[0-9]+/', e) for e in entries)):
         raise gcp_runtime.RuntimeSafetyError('invalid metadata disk listing')
     guest_types = [metadata('instance/disks/' + entry + 'type') for entry in entries]
-    if guest_types.count('SCRATCH') != expected:
-        raise gcp_runtime.RuntimeSafetyError('scratch metadata mismatch')
+    # Compute uses SCRATCH for attachments; metadata exposes LOCAL-SSD media.
+    if guest_types.count('LOCAL-SSD') != expected:
+        raise gcp_runtime.RuntimeSafetyError(
+            f'scratch metadata mismatch: expected {expected} LOCAL-SSD entries, got {guest_types}')
     links = sorted((p for p in Path('/dev/disk/by-id').glob('google-local-nvme-ssd-*')
                     if re.fullmatch(r'google-local-nvme-ssd-[0-9]+', p.name)),
                    key=lambda p: p.name)
@@ -174,9 +178,8 @@ def admit_scratch(config, host, api):
         if len(rows) != 1:
             raise gcp_runtime.RuntimeSafetyError('local SSD device unavailable')
         disk = rows[0]
-        model = (disk.get('model') or '').lower()
         if (disk.get('path') != path or disk.get('type') != 'disk' or
-                not (model.strip() == 'nvme_card0' or 'local ssd' in model or 'titanium' in model) or
+                not physical_storage.admitted_model('gcp', disk.get('model')) or
                 not isinstance(disk.get('serial'), str) or not disk['serial'].strip() or
                 type(disk.get('size')) is not int or disk['size'] <= 0):
             raise gcp_runtime.RuntimeSafetyError('local SSD model or serial not admitted')
@@ -280,7 +283,7 @@ def run_request(config, host, store, key, generation, gate_root):
         if remaining <= 0:
             raise gcp_runtime.RuntimeSafetyError('command expired before start')
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-            process = subprocess.Popen(argv, cwd=cwd, env={**os.environ, **env, 'PYTHONDONTWRITEBYTECODE': '1'}, stdout=stdout,
+            process = subprocess.Popen(argv, cwd=cwd, env={**os.environ, **env, 'PATH': gcp_runtime.GUEST_PATH, 'PYTHONDONTWRITEBYTECODE': '1'}, stdout=stdout,
                                        stderr=stderr, start_new_session=True)
             try:
                 code = process.wait(timeout=remaining)
@@ -303,6 +306,10 @@ def run_request(config, host, store, key, generation, gate_root):
     result = execute_at_most_once(gate_root, key, request, execute, deadline_epoch=deadline)
     response_key = key.replace('/requests/', '/responses/')
     gcp_runtime._put_once(store, response_key, gcp_runtime._encode(result))
+    if (op == 'campaign' and host['index'] == 0
+            and argv == [gcp_runtime.GUEST_PYTHON, config['package_root'] + '/source/experiments/gcp-rdma/gcp_runtime.py',
+                         'execute', '/mnt/tidehunter/' + config['run_id'] + '/runtime.json']):
+        gcp_poweroff.publish_terminal(config, host, store, result, response_key)
     return result
 
 
@@ -314,6 +321,15 @@ def serve(config, *, api=None, poll_seconds=1):
         raise gcp_runtime.RuntimeSafetyError('sealed source identity mismatch')
     api = api or gcp_api.GoogleApi(config['project_id'], token_provider=gcp_api.metadata_token)
     gcp_runtime.verify_fleet({'platform': {'runtime': config}}, {'platform': api})
+    nvmet_fix = gcp_runtime.admit_nvmet_fix(config, host, admission)
+    # Sui-only runs do not start the KV controller, so admit their selected
+    # physical verbs interface before this worker can accept replay requests.
+    if (config['spec'].get('suite') in ('sui', 'both')
+            and set(config['spec'].get('sui_transports', []))
+            & {'tidehunter_verbs', 'tidehunter_verbs_native'}):
+        gcp_runtime.admit_fabrics(
+            {'spec': {'backends': []}, 'platform': {'runtime': config}},
+            config['fleet'].index(host) - 1, {}, None)
     prepare_storage(config, host, api)
     store = api.objects(config['bucket'])
     gate_root = Path('/var/lib/tidehunter-gcp-control') / config['run_id']
@@ -323,7 +339,16 @@ def serve(config, *, api=None, poll_seconds=1):
     state = WorkerState(gate_root, prefix)
     deadline = gcp_runtime._deadline(config['deadline_utc'])
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_ACTIVE)
+    next_poweroff_check = 0
     try:
+        ready = {'run_id': config['run_id'], 'source_sha256': config['source_sha256'],
+                 'manifest_sha256': admission['manifest_sha256'], 'deadline_utc': config['deadline_utc'],
+                 'instance_name': host['name'], 'instance_id': str(host['id']), 'complete': True}
+        if nvmet_fix is not None:
+            ready['nvmet_fix'] = nvmet_fix
+        gcp_runtime._put_once(
+            store, f'runs/{config["run_id"]}/qualification/{host["name"]}/worker-ready.json',
+            gcp_runtime._encode(ready))
         while time.time() < deadline:
             for key, future in list(active.items()):
                 if future.done():
@@ -370,6 +395,18 @@ def serve(config, *, api=None, poll_seconds=1):
                     record['retry_after'] = time.time() + min(2 ** (record['attempts'] - 1), 8)
                     state.save(key)
                     active[key] = pool.submit(run_request, config, host, store, key, record['generation'], gate_root)
+            if time.monotonic() >= next_poweroff_check:
+                next_poweroff_check = time.monotonic() + gcp_poweroff.POLL_SECONDS
+                try:
+                    outcome = gcp_poweroff.evaluate(config, host, store, active=bool(active))
+                    if outcome in ('poweroff_no_acknowledgement', 'poweroff_hard_cap'):
+                        subprocess.run(['/usr/bin/systemctl', 'poweroff'], check=True, timeout=30)
+                except Exception as exc:
+                    print(f'poweroff deferred: {type(exc).__name__}: {exc}', file=sys.stderr, flush=True)
+                    try:
+                        gcp_poweroff.log_decision(config, host, store, time.time(), 'unknown')
+                    except Exception as log_error:
+                        print(f'poweroff decision log failed: {log_error}', file=sys.stderr, flush=True)
             time.sleep(min(poll_seconds, max(0, deadline - time.time())))
     finally:
         # Running I/O may still block; the systemd expiry and RuntimeMaxSec

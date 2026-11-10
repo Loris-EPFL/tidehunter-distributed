@@ -18,3 +18,12 @@ class PrepareValkeyTests(unittest.TestCase):
                 prepare.prepare(Path(root) / "valkey")
         self.assertFalse(any(call[0] == "make" for call in calls))
 
+    def test_hook_rejects_missing_or_duplicate_anchor(self):
+        source = "\n".join(old for old, _ in prepare.HOOKS)
+        patched = prepare.hooked_source(source)
+        self.assertIn("kv_diag_cq_poll_begin();", patched)
+        with self.assertRaisesRegex(ValueError, "does not match exactly"):
+            prepare.hooked_source(source + "\n" + prepare.HOOKS[1][0])
+        with self.assertRaisesRegex(ValueError, "does not match exactly"):
+            prepare.hooked_source(source.replace(prepare.HOOKS[2][0], "changed"))
+

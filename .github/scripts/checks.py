@@ -46,6 +46,7 @@ SOFTWARE_ENGINE_TESTS = (
     "fabric_tcp_native_large_partial_frames_bypass_tls",
     "fabric_tcp_native_disconnect_retains_owned_reply_credits_until_retirement",
     "software_provider_operational_session_binds_identity_and_cannot_admit_data",
+    "software_fabric_owner_transport_aggregate_sums_sessions_and_keeps_closed_ones",
 )
 
 

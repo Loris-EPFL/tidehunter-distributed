@@ -26,6 +26,212 @@ pub(super) fn value(byte: u8) -> Option<Bytes> {
     Some(vec![byte; 32].into())
 }
 
+#[test]
+fn batch_signal_registers_only_pending_flights_and_notifies_target() {
+    let first = FlightSignal::new();
+    let second = FlightSignal::new();
+    let a = Arc::new(BatchSignal::new());
+    let b = Arc::new(BatchSignal::new());
+    first.begin();
+    second.begin();
+    assert!(first.subscribe(&a));
+    assert!(second.subscribe(&b));
+    first.retire();
+    assert_eq!(a.notifications.load(Ordering::Relaxed), 1);
+    assert_eq!(b.notifications.load(Ordering::Relaxed), 0);
+    assert!(
+        !first.subscribe(&b),
+        "a retired flight needs no subscription"
+    );
+    second.retire();
+    assert_eq!(b.notifications.load(Ordering::Relaxed), 1);
+    assert!(first.wait_lock.lock().is_empty());
+    assert!(second.wait_lock.lock().is_empty());
+}
+
+#[test]
+fn flight_retirement_cannot_publish_reusable_slot_before_subscription_drain() {
+    let flight = Arc::new(FlightSignal::new());
+    let old = Arc::new(BatchSignal::new());
+    flight.begin();
+    assert!(flight.subscribe(&old));
+    let held = flight.wait_lock.lock();
+    let retiring = flight.clone();
+    let worker = thread::spawn(move || retiring.retire());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while flight.retiring.load(Ordering::Acquire) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "retirement did not reach the held lock"
+        );
+        thread::yield_now();
+    }
+    assert!(
+        !flight.is_ready(),
+        "the old generation became reusable before its drain"
+    );
+    drop(held);
+    worker.join().unwrap();
+    assert_eq!(old.notifications.load(Ordering::Relaxed), 1);
+    flight.begin();
+    let next = Arc::new(BatchSignal::new());
+    assert!(flight.subscribe(&next));
+    flight.retire();
+    assert_eq!(next.notifications.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn cancelled_coalesced_batch_subscriptions_do_not_accumulate() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_lanes = 1;
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
+        .unwrap();
+    let reference = db
+        .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let node = db.partition_indexes[&reference.batch_address.partition];
+    let lane = db.reads.lane_client(node, 0);
+    let client = lane.lock();
+    let mut groups = vec![Vec::new(); db.partition_indexes.len()];
+    groups[node].push((0, reference));
+    let mut original = ReadBatch::new(&db.reads, vec![None], groups).unwrap();
+    original.dispatch(&db.reads).unwrap();
+    let slot = original.reads[0].1.parts[0].0.slot;
+    for _ in 0..128 {
+        let mut groups = vec![Vec::new(); db.partition_indexes.len()];
+        groups[node].extend([(0, reference), (1, reference)]);
+        let mut joined = ReadBatch::new(&db.reads, vec![None; 2], groups).unwrap();
+        joined.dispatch(&db.reads).unwrap();
+        assert_eq!(db.reads.state.flight_ready[slot].wait_lock.lock().len(), 2);
+        drop(joined);
+        let subscribers = db.reads.state.flight_ready[slot].wait_lock.lock();
+        assert_eq!(subscribers.len(), 1);
+        assert!(subscribers.capacity() <= 4);
+    }
+    drop(client);
+    original.finish_one().unwrap();
+    assert_eq!(original.values, vec![Some(put(0, 7))]);
+    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn unrelated_flight_completion_does_not_notify_waiting_batch() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_lanes = 1;
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
+        .unwrap();
+    db.write_batch(fixture.operation(1, 1), vec![put(1, 8)])
+        .unwrap();
+    let first = db
+        .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let second = db
+        .index_reference(KeySpace(0), &1u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let first_node = db.partition_indexes[&first.batch_address.partition];
+    let second_node = db.partition_indexes[&second.batch_address.partition];
+    assert_ne!(first_node, second_node);
+    let lane = db.reads.lane_client(first_node, 0);
+    let client = lane.lock();
+    let mut groups = vec![Vec::new(); db.partition_indexes.len()];
+    groups[first_node].push((0, first));
+    let mut batch = ReadBatch::new(&db.reads, vec![None], groups).unwrap();
+    batch.dispatch(&db.reads).unwrap();
+    let signal = batch.signal.as_ref().unwrap().clone();
+    let (done, result) = mpsc::sync_channel(1);
+    let waiter = thread::spawn(move || {
+        batch.finish_one().unwrap();
+        done.send(batch.values).unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while signal.waiters.load(Ordering::Acquire) == 0 {
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    let other = db
+        .reads
+        .submit(second_node, vec![second], 0, false, None)
+        .unwrap();
+    assert_eq!(other.finish().unwrap().0, vec![put(1, 8)]);
+    assert_eq!(signal.notifications.load(Ordering::Relaxed), 0);
+    assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    drop(client);
+    assert_eq!(
+        result.recv_timeout(Duration::from_secs(5)).unwrap(),
+        vec![Some(put(0, 7))]
+    );
+    waiter.join().unwrap();
+    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn poison_and_stop_wake_waiting_batch_without_forging_readiness() {
+    for stop in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.config.read_lanes = 1;
+        fixture.config.read_cache_bytes = 0;
+        let mut db = fixture.open();
+        db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
+            .unwrap();
+        let reference = db
+            .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
+            .unwrap()
+            .unwrap();
+        let node = db.partition_indexes[&reference.batch_address.partition];
+        let lane = db.reads.lane_client(node, 0);
+        let client = lane.lock();
+        let mut groups = vec![Vec::new(); db.partition_indexes.len()];
+        groups[node].push((0, reference));
+        let mut batch = ReadBatch::new(&db.reads, vec![None], groups).unwrap();
+        batch.dispatch(&db.reads).unwrap();
+        let signal = batch.signal.as_ref().unwrap().clone();
+        let slot = batch.reads[0].1.parts[0].0.slot;
+        let (done, result) = mpsc::sync_channel(1);
+        let waiter = thread::spawn(move || done.send(batch.finish_one()).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while signal.waiters.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let stopper = if stop {
+            let reads = db.reads.clone();
+            Some(thread::spawn(move || reads.stop()))
+        } else {
+            db.reads.state.poison();
+            None
+        };
+        assert!(
+            result
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .is_err()
+        );
+        waiter.join().unwrap();
+        if stop {
+            assert!(!db.reads.state.flight_ready[slot].is_ready());
+        }
+        drop(client);
+        if let Some(stopper) = stopper {
+            stopper.join().unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while *db.reads.state.retained.lock() != (0, 0) {
+            assert!(Instant::now() < deadline, "accepted work did not retire");
+            thread::yield_now();
+        }
+        let _ = db.shutdown();
+    }
+}
+
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[test]
 fn nvme_profile_counts_completion_without_inventing_owner_timing() {
@@ -66,11 +272,42 @@ fn nonconcurrent_bulk_records_pin_lock_separately() {
         .unwrap();
     assert_eq!(values[0], value(7));
     let snapshot = monitor.coordinator_resolution_snapshot();
-    // One acquisition for cut capture, one for member lookup, one for pinning.
-    assert_eq!(snapshot.index_lock_wait.count, 3);
+    // The index has no single lock to wait for: cut capture, member lookup and
+    // pinning are separate calls and none holds anything across the others.
+    assert_eq!(snapshot.index_lock_wait.count, 0);
     assert_eq!(snapshot.index_lookup.count, 1);
     assert_eq!(snapshot.cut_capture.count, 1);
     assert_eq!(snapshot.pin_preparation.count, 1);
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn concurrent_batch_disabled_cache_counts_each_member_and_profiles_completed_stages() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_cache_bytes = 0;
+    let mut original = fixture.open();
+    original
+        .write_batch(fixture.operation(0, 0), vec![put(0, 7), put(1, 8)])
+        .unwrap();
+    let db = ConcurrentRemoteDatabase::new(original).unwrap();
+    let before = db.read_cache_stats().bypass_disabled;
+    db.set_read_profile_limit(1);
+    let monitor = db.read_profile_monitor();
+    let keys: Vec<_> = (0u32..70).map(|i| (i % 2).to_be_bytes()).collect();
+    let values = db
+        .get_many_cut(KeySpace(0), &keys, IndexReadCut::Latest)
+        .unwrap();
+    for (i, value) in values.iter().enumerate() {
+        assert_eq!(
+            value.as_ref().unwrap().as_deref(),
+            Some([if i % 2 == 0 { 7 } else { 8 }; 32].as_slice())
+        );
+    }
+    assert_eq!(db.read_cache_stats().bypass_disabled - before, 70);
+    let snapshot = monitor.coordinator_resolution_snapshot();
+    assert_eq!(snapshot.batch_wait.count, 1);
+    assert_eq!(snapshot.postread_cache_fill.count, 1);
+    assert_eq!(snapshot.result_materialization.count, 1);
     db.shutdown().unwrap();
 }
 
@@ -227,6 +464,46 @@ fn sampled_owner_profiles_are_attributed_to_configured_partitions() {
             global[name]
         );
     }
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn traced_bulk_call_preserves_owner_and_member_identity() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_cache_bytes = 0;
+    let mut original = fixture.open();
+    original
+        .write_batch(fixture.operation(0, 0), vec![put(0, 7)])
+        .unwrap();
+    original
+        .write_batch(fixture.operation(1, 1), vec![put(1, 8)])
+        .unwrap();
+    let original = reopen_cold(&fixture, original);
+    let db = ConcurrentRemoteDatabase::new(original).unwrap();
+    db.set_read_profile_limit(1);
+    let trace = db.begin_read_trace(123, 3).unwrap();
+    let keys = [0u32.to_be_bytes(), 1u32.to_be_bytes(), 0u32.to_be_bytes()];
+    let values = db
+        .traced_get_many_cut(KeySpace(0), &keys, IndexReadCut::Latest, Some(&trace), 0)
+        .unwrap();
+    assert!(values.iter().all(|value| value.as_ref().unwrap().is_some()));
+    trace.finish(true);
+    let snapshot = db.read_trace_snapshot();
+    assert_eq!(snapshot.calls.len(), 1);
+    let call = &snapshot.calls[0];
+    assert_eq!(
+        (call.caller_id, call.members, call.status),
+        (123, 3, "complete")
+    );
+    assert!(call.groups.iter().any(|group| group.members == [0, 2]));
+    assert!(call.groups.iter().any(|group| group.members == [1]));
+    assert_ne!(call.groups[0].owner, call.groups[1].owner);
+    assert!(call.groups.iter().all(|group| {
+        group
+            .events
+            .iter()
+            .any(|event| event.name == "request_result_delivered")
+    }));
     db.shutdown().unwrap();
 }
 
@@ -484,7 +761,7 @@ fn queued_lane_wake_does_not_consume_read_admission() {
     let node = db.partition_indexes[&reference.batch_address.partition];
     let (entered, waiting) = mpsc::sync_channel(1);
     let (release, resumed) = mpsc::sync_channel(1);
-    *db.reads.state.reactor_pause.lock() = Some((entered, resumed));
+    *db.reads.state.reactor_pause[node].lock() = Some((entered, resumed));
     waiting.recv_timeout(Duration::from_secs(5)).unwrap();
 
     let mut groups = vec![Vec::new(); db.partition_indexes.len()];
@@ -504,7 +781,7 @@ fn queued_lane_wake_does_not_consume_read_admission() {
         panic!("caller-owned read did not complete");
     }
     let completed = batch.finish_one();
-    let wake_queued = db.reads.state.wake_pending.load(Ordering::Acquire);
+    let wake_queued = db.reads.state.wake_pending[node].load(Ordering::Acquire);
     let next = db.submit_get(KeySpace(0), &1u32.to_be_bytes());
     release.send(()).unwrap();
 
@@ -519,7 +796,7 @@ fn queued_lane_wake_does_not_consume_read_admission() {
 fn byte_bounded_reads_accept_request_limits_above_channel_capacity() {
     let mut fixture = Fixture::new();
     fixture.config.max_pending_reads = usize::MAX;
-    fixture.config.max_pending_read_bytes = 4096;
+    fixture.config.max_pending_read_bytes = ReadService::MIN_FLIGHT_BYTES + 4096;
     fixture.config.read_cache_bytes = 0;
     let mut db = fixture.open();
     for batch in 0u32..2 {
@@ -548,15 +825,26 @@ fn oversized_scalar_read_does_not_poison_write_authority() {
     let mut fixture = Fixture::new();
     fixture.config.max_pending_read_bytes = ReadService::MIN_FLIGHT_BYTES;
     let mut db = fixture.open();
-    db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
-        .unwrap();
+    db.write_batch(
+        fixture.operation(0, 0),
+        vec![
+            put(0, 7),
+            Mutation::Put {
+                keyspace: KeySpace(0),
+                key: 1u32.to_be_bytes().to_vec().into(),
+                value: vec![8; 1024].into(),
+            },
+        ],
+    )
+    .unwrap();
     let mut db = reopen_cold(&fixture, db);
+    assert_eq!(db.get(KeySpace(0), &0u32.to_be_bytes()).unwrap(), value(7));
     assert!(admission_error(
-        &db.get(KeySpace(0), &0u32.to_be_bytes()).unwrap_err()
+        &db.get(KeySpace(0), &1u32.to_be_bytes()).unwrap_err()
     ));
-    db.write_batch(fixture.operation(1, 1), vec![put(1, 8)])
+    db.write_batch(fixture.operation(1, 1), vec![put(2, 8)])
         .unwrap();
-    assert!(db.exists(KeySpace(0), &1u32.to_be_bytes()).unwrap());
+    assert!(db.exists(KeySpace(0), &2u32.to_be_bytes()).unwrap());
     db.shutdown().unwrap();
 }
 
@@ -603,15 +891,77 @@ fn cancelled_batch_keeps_accepted_flight_until_completion() {
     let mut groups = vec![Vec::new(); db.partition_indexes.len()];
     groups[node].extend([(0, reference), (1, reference)]);
     let mut batch = ReadBatch::new(&db.reads, vec![None; 2], groups).unwrap();
-    batch.dispatch(&db.reads).unwrap();
+    db.reads.state.trace.arm(2);
+    let trace = db.reads.state.trace.begin(91, 2).unwrap();
+    batch.dispatch_traced(&db.reads, Some(&trace), 0).unwrap();
     let slot = batch.reads[0].1.parts[0].0.slot;
     drop(batch);
+    drop(trace);
     assert_eq!(db.reads.state.retained.lock().0, 1);
     drop(held);
     assert!(db.reads.state.flight_ready[slot].wait_until(Instant::now() + Duration::from_secs(5)));
     assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    let snapshot = db.reads.state.trace.snapshot();
+    let call = &snapshot.calls[0];
+    assert_eq!(
+        (call.caller_id, call.status),
+        (91, "cancelled_or_incomplete")
+    );
+    assert!(
+        call.groups[0]
+            .events
+            .iter()
+            .any(|event| event.name == "flight_completed")
+    );
+    assert_eq!(call.groups[0].members, [0, 1]);
     assert_eq!(db.get(KeySpace(0), &0u32.to_be_bytes()).unwrap(), value(7));
     db.shutdown().unwrap();
+}
+
+#[test]
+fn traced_fenced_read_records_failure_and_retires_transport() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_lanes = 1;
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
+        .unwrap();
+    let reference = db
+        .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let node = db.partition_indexes[&reference.batch_address.partition];
+    let lane = db.reads.lane_client(node, 0);
+    let held = lane.lock();
+    db.reads.state.trace.arm(1);
+    let trace = db.reads.state.trace.begin(92, 1).unwrap();
+    let mut groups = vec![Vec::new(); db.partition_indexes.len()];
+    groups[node].push((0, reference));
+    let mut batch = ReadBatch::new(&db.reads, vec![None], groups).unwrap();
+    batch.dispatch_traced(&db.reads, Some(&trace), 0).unwrap();
+    let slot = batch.reads[0].1.parts[0].0.slot;
+    db.clients[node]
+        .client
+        .lock()
+        .fence_to(db.epoch + 1)
+        .unwrap();
+    drop(held);
+    assert!(db.reads.state.flight_ready[slot].wait_until(Instant::now() + Duration::from_secs(5)));
+    assert!(batch.finish_one().is_err());
+    drop(batch);
+    trace.finish(false);
+    db.reads.stop();
+    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    let snapshot = db.reads.state.trace.snapshot();
+    let call = &snapshot.calls[0];
+    assert_eq!((call.caller_id, call.status), (92, "error"));
+    assert!(
+        call.groups[0]
+            .events
+            .iter()
+            .any(|event| event.name == "flight_error")
+    );
+    assert!(db.shutdown().is_err());
 }
 
 #[test]
@@ -666,6 +1016,397 @@ fn cancelled_owned_batch_hands_accepted_transport_work_back_to_actor() {
     assert!(db.reads.state.flight_ready[slot].wait_until(Instant::now() + Duration::from_secs(5)));
     assert_eq!(*db.reads.state.retained.lock(), (0, 0));
     assert_eq!(db.get(KeySpace(0), &0u32.to_be_bytes()).unwrap(), value(7));
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn completed_wave_releases_owner_for_credit_blocking_foreign_read() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_lanes = 1;
+    fixture.config.max_pending_reads = 4;
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    let large = Mutation::Put {
+        keyspace: KeySpace(0),
+        key: 2u32.to_be_bytes().to_vec().into(),
+        value: vec![9; 1600].into(),
+    };
+    db.write_batch(
+        fixture.operation(0, 0),
+        vec![put(0, 7), put(1, 8), large.clone()],
+    )
+    .unwrap();
+    let reference = |key: u32| {
+        db.index_reference(KeySpace(0), &key.to_be_bytes(), IndexReadCut::Latest)
+            .unwrap()
+            .unwrap()
+    };
+    let first = reference(0);
+    let foreign = reference(1);
+    let last = reference(2);
+    let node = db.partition_indexes[&first.batch_address.partition];
+    let limit = 512 + db.reads.member_charge(&last).unwrap();
+    assert!(
+        1024 + db.reads.member_charge(&first).unwrap()
+            + 2 * db.reads.member_charge(&foreign).unwrap()
+            <= limit
+    );
+    Arc::get_mut(&mut db.reads).unwrap().max_bytes = limit;
+
+    let mut groups = vec![Vec::new(); db.partition_indexes.len()];
+    groups[node].extend([(0, first), (1, last)]);
+    let mut owner = ReadBatch::new(&db.reads, vec![None; 2], groups).unwrap();
+    owner.dispatch(&db.reads).unwrap();
+    assert!(owner.has_unsubmitted());
+    assert_eq!(owner.reads.len(), 1);
+    let lane = owner.owned_lanes[0].lane.clone();
+    let slot = owner.reads[0].1.parts[0].0.slot;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !db.reads.state.flight_ready[slot].is_ready() {
+        progress_read_lane(&db.reads.state, &mut lane.driver.lock(), db.epoch);
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    let client = lane.client.lock();
+    let mut groups = vec![Vec::new(); db.partition_indexes.len()];
+    groups[node].extend([(0, foreign), (1, foreign)]);
+    let mut joined = ReadBatch::new(&db.reads, vec![None; 2], groups).unwrap();
+    joined.dispatch(&db.reads).unwrap();
+    assert_eq!(joined.reads.len(), 1);
+    assert!(joined.owned_lanes.is_empty());
+    owner.finish_one().unwrap();
+    assert_eq!(owner.values[0], Some(put(0, 7)));
+
+    let reads = db.reads.clone();
+    let (blocked_send, blocked_recv) = mpsc::sync_channel(1);
+    let (done_send, done_recv) = mpsc::sync_channel(2);
+    let owner_done = done_send.clone();
+    let owner_thread = thread::spawn(move || {
+        let generation = reads.admission_generation();
+        owner.dispatch(&reads).unwrap();
+        assert!(owner.reads.is_empty() && owner.has_unsubmitted());
+        blocked_send.send(()).unwrap();
+        reads.wait_admission(generation, owner.deadline).unwrap();
+        while !owner.complete() {
+            let generation = reads.admission_generation();
+            owner.dispatch(&reads).unwrap();
+            if owner.reads.is_empty() {
+                reads.wait_admission(generation, owner.deadline).unwrap();
+            } else {
+                owner.finish_one().unwrap();
+            }
+        }
+        owner_done.send(owner.values).unwrap();
+    });
+    blocked_recv.recv_timeout(Duration::from_secs(5)).unwrap();
+    let joined_thread = thread::spawn(move || {
+        joined.finish_one().unwrap();
+        done_send.send(joined.values).unwrap();
+    });
+    drop(client);
+    let a = done_recv.recv_timeout(Duration::from_secs(5)).unwrap();
+    let b = done_recv.recv_timeout(Duration::from_secs(5)).unwrap();
+    owner_thread.join().unwrap();
+    joined_thread.join().unwrap();
+    assert!(
+        a == vec![Some(put(0, 7)), Some(large.clone())]
+            && b == vec![Some(put(1, 8)), Some(put(1, 8))]
+            || b == vec![Some(put(0, 7)), Some(large)]
+                && a == vec![Some(put(1, 8)), Some(put(1, 8))]
+    );
+    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn grouped_owner_accepts_other_requests_without_losing_order_or_credits() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_lanes = 1;
+    fixture.config.max_pending_reads = 2;
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(
+        fixture.operation(0, 0),
+        vec![put(0, 7), put(1, 8), put(2, 9)],
+    )
+    .unwrap();
+    let first = db
+        .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let second = db
+        .index_reference(KeySpace(0), &1u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let third = db
+        .index_reference(KeySpace(0), &2u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let node = db.partition_indexes[&first.batch_address.partition];
+    let mut first_groups = vec![Vec::new(); db.partition_indexes.len()];
+    first_groups[node].push((0, first));
+    let mut owner = ReadBatch::new(&db.reads, vec![None], first_groups).unwrap();
+    owner.dispatch(&db.reads).unwrap();
+    assert_eq!(owner.owned_lanes.len(), 1);
+    let lane = owner.owned_lanes[0].lane.clone();
+    let client = lane.client.lock();
+
+    let mut second_groups = vec![Vec::new(); db.partition_indexes.len()];
+    second_groups[node].extend([(0, second), (1, second)]);
+    let mut joined = ReadBatch::new(&db.reads, vec![None; 2], second_groups).unwrap();
+    joined.dispatch(&db.reads).unwrap();
+    assert_eq!(joined.reads.len(), 1);
+    assert!(joined.owned_lanes.is_empty());
+    assert_eq!(db.reads.state.retained.lock().0, 2);
+    let mut third_groups = vec![Vec::new(); db.partition_indexes.len()];
+    third_groups[node].push((0, third));
+    let mut waiting = ReadBatch::new(&db.reads, vec![None], third_groups).unwrap();
+    waiting.dispatch(&db.reads).unwrap();
+    assert!(waiting.reads.is_empty());
+    assert!(waiting.has_unsubmitted());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while lane.driver.lock().queued.len() != 2 {
+        assert!(
+            Instant::now() < deadline,
+            "actor did not enqueue the joined request"
+        );
+        thread::yield_now();
+    }
+    drop(client);
+    owner.finish_one().unwrap();
+    assert_eq!(owner.values, vec![Some(put(0, 7))]);
+    drop(owner);
+    joined.finish_one().unwrap();
+    assert_eq!(joined.values, vec![Some(put(1, 8)), Some(put(1, 8))]);
+    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    waiting.dispatch(&db.reads).unwrap();
+    waiting.finish_one().unwrap();
+    assert_eq!(waiting.values, vec![Some(put(2, 9))]);
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn joined_lane_is_handed_back_before_another_ready_owner_returns() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_lanes = 1;
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7), put(2, 9)])
+        .unwrap();
+    db.write_batch(fixture.operation(1, 1), vec![put(1, 8)])
+        .unwrap();
+    let reference = |key: u32| {
+        db.index_reference(KeySpace(0), &key.to_be_bytes(), IndexReadCut::Latest)
+            .unwrap()
+            .unwrap()
+    };
+    let first = reference(0);
+    let second = reference(1);
+    let foreign = reference(2);
+    let first_node = db.partition_indexes[&first.batch_address.partition];
+    let second_node = db.partition_indexes[&second.batch_address.partition];
+    assert_ne!(first_node, second_node);
+    let mut resume = Vec::new();
+    for node in [first_node, second_node] {
+        let (entered, waiting) = mpsc::sync_channel(1);
+        let (release, resumed) = mpsc::sync_channel(1);
+        *db.reads.state.reactor_pause[node].lock() = Some((entered, resumed));
+        db.reads.sender.lock()[node]
+            .send(ReadCommand::Wake)
+            .unwrap();
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        resume.push(release);
+    }
+    let mut groups = vec![Vec::new(); db.partition_indexes.len()];
+    groups[first_node].push((0, first));
+    groups[second_node].push((1, second));
+    let mut owner = ReadBatch::new(&db.reads, vec![None; 2], groups).unwrap();
+    owner.dispatch(&db.reads).unwrap();
+    let first_lane = db.reads.lanes.read()[first_node][0].clone();
+    let second_lane = db.reads.lanes.read()[second_node][0].clone();
+    {
+        let scheduling = first_lane.scheduling.lock();
+        assert!(scheduling.inline_reserved && scheduling.grouped_reserved);
+    }
+    let held = first_lane.client.lock();
+    let second_slot = owner
+        .reads
+        .iter()
+        .find(|(slots, _)| slots.as_slice() == [1])
+        .unwrap()
+        .1
+        .parts[0]
+        .0
+        .slot;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !db.reads.state.flight_ready[second_slot].is_ready() {
+        progress_read_lane(&db.reads.state, &mut second_lane.driver.lock(), db.epoch);
+        assert!(Instant::now() < deadline, "second owner did not complete");
+        thread::yield_now();
+    }
+    let mut groups = vec![Vec::new(); db.partition_indexes.len()];
+    groups[first_node].extend([(0, foreign), (1, foreign)]);
+    let mut joined = ReadBatch::new(&db.reads, vec![None; 2], groups).unwrap();
+    joined.dispatch(&db.reads).unwrap();
+    assert_eq!(joined.reads.len(), 1);
+    assert!(first_lane.scheduling.lock().grouped_handoff_requested);
+    owner.finish_one().unwrap();
+    assert_eq!(owner.values, vec![None, Some(put(1, 8))]);
+    assert!(
+        !first_lane.scheduling.lock().inline_reserved,
+        "busy joined lane must be handed back before returning another ready read"
+    );
+    for release in resume {
+        release.send(()).unwrap();
+    }
+    drop(held);
+    joined.finish_one().unwrap();
+    owner.finish_one().unwrap();
+    assert_eq!(joined.values, vec![Some(put(2, 9)), Some(put(2, 9))]);
+    assert_eq!(owner.values, vec![Some(put(0, 7)), Some(put(1, 8))]);
+    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn joined_grouped_read_hands_progress_to_actor_before_owner_completes() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_lanes = 1;
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7), put(1, 8)])
+        .unwrap();
+    let first = db
+        .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let second = db
+        .index_reference(KeySpace(0), &1u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let node = db.partition_indexes[&first.batch_address.partition];
+    let mut groups = vec![Vec::new(); db.partition_indexes.len()];
+    groups[node].extend([(0, first), (1, first)]);
+    let mut owner = ReadBatch::new(&db.reads, vec![None; 2], groups).unwrap();
+    owner.dispatch(&db.reads).unwrap();
+    let lane = owner.owned_lanes[0].lane.clone();
+    let client = lane.client.lock();
+    let mut groups = vec![Vec::new(); db.partition_indexes.len()];
+    groups[node].extend([(0, second), (1, second)]);
+    let mut joined = ReadBatch::new(&db.reads, vec![None; 2], groups).unwrap();
+    joined.dispatch(&db.reads).unwrap();
+    assert_eq!(joined.reads.len(), 1);
+    let (done, result) = mpsc::sync_channel(1);
+    let waiter = thread::spawn(move || {
+        owner.finish_one().unwrap();
+        done.send(owner.values).unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while lane.scheduling.lock().inline_reserved {
+        assert!(
+            Instant::now() < deadline,
+            "joined request did not hand back progress"
+        );
+        thread::yield_now();
+    }
+    assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    assert_eq!(db.reads.state.retained.lock().0, 2);
+    drop(client);
+    joined.finish_one().unwrap();
+    assert_eq!(joined.values, vec![Some(put(1, 8)), Some(put(1, 8))]);
+    assert_eq!(
+        result.recv_timeout(Duration::from_secs(5)).unwrap(),
+        vec![Some(put(0, 7)), Some(put(0, 7))]
+    );
+    waiter.join().unwrap();
+    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn busy_scalar_reservation_remains_exclusive() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_lanes = 1;
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7), put(1, 8)])
+        .unwrap();
+    let first = db
+        .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let second = db
+        .index_reference(KeySpace(0), &1u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let node = db.partition_indexes[&first.batch_address.partition];
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (release, resume) = mpsc::sync_channel(1);
+    *db.reads.state.inline_pause.lock() = Some((entered, resume));
+    let reads = db.reads.clone();
+    let epoch = db.epoch;
+    let scalar = thread::spawn(move || reads.read_inline(node, epoch, &first, 0, None, None));
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    let admitted = db.reads.submit(node, vec![second], 0, false, None);
+    release.send(()).unwrap();
+    assert!(admitted.is_err());
+    assert_eq!(scalar.join().unwrap().unwrap(), Some(vec![put(0, 7)]));
+    assert_eq!(
+        db.reads
+            .submit(node, vec![second], 0, false, None)
+            .unwrap()
+            .finish()
+            .unwrap()
+            .0,
+        vec![put(1, 8)]
+    );
+    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn cancelled_grouped_owner_hands_joined_request_to_actor() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_lanes = 1;
+    fixture.config.max_pending_reads = 2;
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7), put(1, 8)])
+        .unwrap();
+    let first = db
+        .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let second = db
+        .index_reference(KeySpace(0), &1u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let node = db.partition_indexes[&first.batch_address.partition];
+    let mut groups = vec![Vec::new(); db.partition_indexes.len()];
+    groups[node].push((0, first));
+    let mut owner = ReadBatch::new(&db.reads, vec![None], groups).unwrap();
+    owner.dispatch(&db.reads).unwrap();
+    assert_eq!(owner.owned_lanes.len(), 1);
+    let lane = owner.owned_lanes[0].lane.clone();
+    let client = lane.client.lock();
+    let mut groups = vec![Vec::new(); db.partition_indexes.len()];
+    groups[node].push((0, second));
+    let mut joined = ReadBatch::new(&db.reads, vec![None], groups).unwrap();
+    joined.dispatch(&db.reads).unwrap();
+    assert_eq!(joined.reads.len(), 1);
+    drop(owner);
+    drop(client);
+    joined.finish_one().unwrap();
+    assert_eq!(joined.values, vec![Some(put(1, 8))]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while *db.reads.state.retained.lock() != (0, 0) {
+        assert!(
+            Instant::now() < deadline,
+            "cancelled request did not retire"
+        );
+        thread::yield_now();
+    }
     db.shutdown().unwrap();
 }
 
@@ -897,6 +1638,55 @@ fn batch_retires_ready_owner_before_blocked_owner_and_preserves_duplicates() {
             1
         );
     }
+    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn blocked_owner_driver_does_not_block_another_owners_read() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_lanes = 1;
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
+        .unwrap();
+    db.write_batch(fixture.operation(1, 1), vec![put(1, 8)])
+        .unwrap();
+    let first = db
+        .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let second = db
+        .index_reference(KeySpace(0), &1u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let first_node = db.partition_indexes[&first.batch_address.partition];
+    let second_node = db.partition_indexes[&second.batch_address.partition];
+    assert_ne!(first_node, second_node);
+    let lane = db.reads.lanes.read()[first_node][0].clone();
+    let held = lane.driver.lock();
+    let (entered, waiting) = mpsc::sync_channel(1);
+    *db.reads.state.reactor_enqueue_entered[first_node].lock() = Some(entered);
+    let first_read = db
+        .reads
+        .submit(first_node, vec![first], 0, false, None)
+        .unwrap();
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    let second_read = db
+        .reads
+        .submit(second_node, vec![second], 0, false, None)
+        .unwrap();
+    let (finished, result) = mpsc::sync_channel(1);
+    let waiter = thread::spawn(move || finished.send(second_read.finish()).unwrap());
+    let independent = result.recv_timeout(Duration::from_secs(5));
+    drop(held);
+    let second_values = independent
+        .expect("other owner stalled behind blocked driver")
+        .unwrap()
+        .0;
+    waiter.join().unwrap();
+    assert_eq!(second_values, vec![put(1, 8)]);
+    assert_eq!(first_read.finish().unwrap().0, vec![put(0, 7)]);
     assert_eq!(*db.reads.state.retained.lock(), (0, 0));
     db.shutdown().unwrap();
 }
@@ -1210,10 +2000,12 @@ fn published_result_stays_unavailable_until_credit_retirement() {
     let mut parts = SmallVec::new();
     parts.push((flight, 0));
     let read = ReadRequest {
+        subscription: None,
         parts,
         credit: credit.clone(),
         deadline: Instant::now() + Duration::from_secs(5),
         sampled: false,
+        trace: None,
         profile: None,
     };
     drop(credit);
@@ -1280,6 +2072,147 @@ fn subset_joiner_keeps_cancelled_initiators_full_result_credit() {
 }
 
 #[test]
+fn exact_flight_index_shares_cancellation_and_reuses_retired_slot() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_cache_bytes = 0;
+    fixture.config.read_lanes = 1;
+    fixture.config.max_pending_reads = 1;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7), put(1, 8)])
+        .unwrap();
+    let first = db
+        .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let second = db
+        .index_reference(KeySpace(0), &1u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let node = db.partition_indexes[&first.batch_address.partition];
+    let lane = db.reads.lane_client(node, 0);
+    let held = lane.lock();
+    let producer = db
+        .reads
+        .submit(node, vec![first, second, first], 0, false, None)
+        .unwrap();
+    let joiner = db
+        .reads
+        .submit(node, vec![second, first, second], 0, false, None)
+        .unwrap();
+    let slot = producer.parts[0].0.slot;
+    assert!(Arc::ptr_eq(&producer.parts[0].0, &joiner.parts[0].0));
+    assert_eq!(
+        (joiner.parts[0].1, joiner.parts[1].1, joiner.parts[2].1),
+        (1, 0, 1)
+    );
+    {
+        let registry = db.reads.state.flights.lock();
+        let mut changed = first;
+        changed.batch_version.epoch ^= 1;
+        assert!(registry.find(node, &changed).is_none());
+        changed = first;
+        changed.batch_address.offset ^= 1;
+        assert!(registry.find(node, &changed).is_none());
+        changed = first;
+        changed.batch_address.segment_generation ^= 1;
+        assert!(registry.find(node, &changed).is_none());
+        changed = first;
+        changed.batch_digest.0[0] ^= 1;
+        assert!(registry.find(node, &changed).is_none());
+        assert!(registry.find(node.wrapping_add(1), &first).is_none());
+    }
+    drop(producer);
+    let mut different = first;
+    different.descriptor.offset ^= 1;
+    assert!(admission_error(
+        &db.reads
+            .submit(node, vec![different], 0, false, None)
+            .err()
+            .unwrap()
+    ));
+    drop(held);
+    assert_eq!(
+        joiner.finish().unwrap().0,
+        vec![put(1, 8), put(0, 7), put(1, 8)]
+    );
+    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    assert!(db.reads.state.flights.lock().find(node, &first).is_none());
+
+    let next = db.reads.submit(node, vec![second], 0, false, None).unwrap();
+    assert_eq!(next.parts[0].0.slot, slot);
+    {
+        let registry = db.reads.state.flights.lock();
+        assert!(registry.find(node, &first).is_none());
+        assert!(registry.find(node, &second).is_some());
+    }
+    assert_eq!(next.finish().unwrap().0, vec![put(1, 8)]);
+    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn duplicate_map_resize_is_charged_at_group_budget_boundaries() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    for first in (0u32..29).step_by(4) {
+        db.write_batch(
+            fixture.operation(0, u64::from(first)),
+            (first..(first + 4).min(29))
+                .map(|key| put(key, key as u8))
+                .collect(),
+        )
+        .unwrap();
+    }
+    let references: Vec<_> = (0u32..29)
+        .map(|key| {
+            db.index_reference(KeySpace(0), &key.to_be_bytes(), IndexReadCut::Latest)
+                .unwrap()
+                .unwrap()
+        })
+        .collect();
+    let node = db.partition_indexes[&references[0].batch_address.partition];
+    for count in [15, 29] {
+        let members = &references[..count];
+        let mut map = HashMap::new();
+        for (index, reference) in members.iter().copied().enumerate() {
+            map.insert(reference, index);
+        }
+        // HashMap's current 7/8 load factor exposes 28 and 56 usable entries
+        // for these resize boundaries, backed by 32 and 64 buckets.
+        let buckets = map.capacity() + map.capacity() / 7;
+        let bucket_bytes = std::mem::size_of::<(ValueRecordReference, usize)>() + 1;
+        assert!(3 * count * bucket_bytes + 512 >= buckets * bucket_bytes + 16);
+        let charge = 512
+            + members
+                .iter()
+                .map(|r| member_charge(r).unwrap())
+                .sum::<usize>();
+        Arc::get_mut(&mut db.reads).unwrap().max_bytes = charge;
+        let read = db
+            .reads
+            .submit(node, members.to_vec(), 0, false, None)
+            .unwrap();
+        assert_eq!(db.reads.state.retained.lock().1, charge);
+        assert_eq!(
+            read.finish().unwrap().0,
+            (0..count)
+                .map(|key| put(key as u32, key as u8))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+        Arc::get_mut(&mut db.reads).unwrap().max_bytes = charge - 1;
+        assert!(admission_error(
+            &db.reads
+                .submit(node, members.to_vec(), 0, false, None)
+                .err()
+                .unwrap()
+        ));
+    }
+    db.shutdown().unwrap();
+}
+
+#[test]
 fn dropped_failed_read_poison_cannot_be_hidden_by_a_cached_hit() {
     let mut fixture = Fixture::new();
     fixture.config.read_lanes = 1;
@@ -1305,6 +2238,18 @@ fn dropped_failed_read_poison_cannot_be_hidden_by_a_cached_hit() {
     drop(held);
     db.reads.stop(); // deterministic completion barrier, including discarded replies
     assert!(db.reads.failed());
+    let cause = db
+        .first_failure
+        .get()
+        .expect("read failure is retained")
+        .clone();
+    assert!(cause.contains("stage=read_completion"), "{cause}");
+    assert!(!cause.contains("stage=owner_health"), "{cause}");
+    let batch_error = db
+        .get_many(KeySpace(0), &[0u32.to_be_bytes().to_vec()])
+        .unwrap_err()
+        .to_string();
+    assert!(batch_error.contains(&cause), "{batch_error}");
     assert_eq!(*db.reads.state.retained.lock(), (0, 0));
     let mut counts = std::collections::BTreeMap::new();
     profile.visit(&mut |name, value| {

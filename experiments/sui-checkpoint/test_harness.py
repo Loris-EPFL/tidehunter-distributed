@@ -79,11 +79,14 @@ class CheckpointDiagnosticContract(unittest.TestCase):
             write_checkpoint_diagnostic_pressure_wait_ns=20000,
             write_checkpoint_diagnostic_pressure_wait_count=2,
             write_checkpoint_diagnostic_owner_adoption_ns=5000,
-            write_checkpoint_diagnostic_owner_adoption_count=1)
+            write_checkpoint_diagnostic_owner_adoption_count=1,
+            write_checkpoint_diagnostic_root_adoption_ns=30000,
+            write_checkpoint_diagnostic_root_adoption_count=2)
         run.validate_checkpoint_diagnostics({'db': measured}, 128)
         means = analyze.adapter_means(measured)
         self.assertEqual(means['write_checkpoint_diagnostic_pressure_wait']['mean_us'], 10)
         self.assertEqual(means['write_checkpoint_diagnostic_owner_adoption']['mean_us'], 5)
+        self.assertEqual(means['write_checkpoint_diagnostic_root_adoption']['mean_us'], 15)
         with self.assertRaises(ValueError):
             run.validate_checkpoint_diagnostics({'db': measured}, 0)
         with self.assertRaises(ValueError):
@@ -327,6 +330,20 @@ class DeploymentContract(unittest.TestCase):
 class CheckpointSourceBoundaries(unittest.TestCase):
     support_relative = 'experiments/sui-checkpoint/checkpoint_support.py'
 
+    def test_staged_wire_protocol_tracks_frozen_engine_and_rejects_ambiguous_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = Path(tmp)
+            source = engine / 'tidehunter/src/distributed/tcp.rs'
+            source.parent.mkdir(parents=True)
+            for version in (19, 37):
+                source.write_text(f'const PROTOCOL: u32 = {version};\n')
+                self.assertEqual(build.staged_protocol(engine), version)
+            for text in ('', 'const PROTOCOL: u32 = 65536;\n',
+                         'const PROTOCOL: u32 = 1;\nconst PROTOCOL: u32 = 2;\n'):
+                source.write_text(text)
+                with self.assertRaises(ValueError):
+                    build.staged_protocol(engine)
+
     def source_tree(self, root):
         identities = {}
         for owner in ('sui', 'tidehunter-sharded-wal'):
@@ -384,6 +401,9 @@ class CheckpointSourceBoundaries(unittest.TestCase):
                     '[features]\nexperimental-distributed = []\ntest-utils = []\n'
                     'experimental-fabric = ["dep:tidehunter-fabric"]\n')
             (crate / 'Cargo.toml').write_text(manifest)
+        protocol = engine / 'tidehunter/src/distributed/tcp.rs'
+        protocol.parent.mkdir()
+        protocol.write_text('const PROTOCOL: u32 = 37;\n')
         audit = engine / 'experiments/sui-checkpoint/audit'
         (audit / 'src').mkdir()
         (audit / 'src/lib.rs').write_text('')
@@ -447,6 +467,7 @@ class CheckpointSourceBoundaries(unittest.TestCase):
                 before = {owner: build.source_files(sources / owner) for owner in ('sui', 'tidehunter-sharded-wal')}
                 output = root / 'prepared'
                 build.prepare(SimpleNamespace(sui=sui, engine=engine, output=output, jobs=2, fabric=fabric))
+                self.assertEqual(run.read_json(output / 'plan.json')['protocol'], 37)
                 self.assertEqual(before, {owner: build.source_files(sources / owner) for owner in before})
                 manifest = run.read_json(output / 'source-manifest.json')
                 self.assertEqual(set(manifest), {'sui', 'tidehunter-sharded-wal'})

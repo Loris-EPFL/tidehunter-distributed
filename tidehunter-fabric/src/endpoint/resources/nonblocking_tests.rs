@@ -29,6 +29,24 @@ struct Provider {
     auto_complete: bool,
     closed_byte: Option<u8>,
     close_result: i32,
+    trywaits: usize,
+    trywait_result: i32,
+}
+
+/// Scripted `fi_trywait`: records the call and returns the configured status.
+/// Same fixture ownership as `read_cq`; the fabric fid carries the `Provider`.
+unsafe extern "C" fn trywait(
+    fabric: *mut ffi::fid_fabric,
+    fids: *mut *mut ffi::fid,
+    count: i32,
+) -> i32 {
+    // SAFETY: The fixture installs this callback only on a fabric whose fid
+    // context points to the live Provider; calls are serialized.
+    let state = unsafe { &mut *(*fabric).fid.context.cast::<Provider>() };
+    assert_eq!(count, 1, "only the completion queue may be waited on");
+    assert!(!fids.is_null());
+    state.trywaits += 1;
+    state.trywait_result
 }
 
 // SAFETY: Only the fixture invokes these callbacks through generated libfabric
@@ -824,6 +842,35 @@ fn eagain_failure_and_ordinal_exhaustion_never_accept_a_fence() {
 }
 
 #[test]
+fn diagnostic_poll_samples_distinguish_tx_and_rx_slot_pressure() {
+    let mut fixture = Fixture::new();
+    fixture.endpoint().configure_progress_stats(true, true);
+    let resources = fixture.endpoint().inner();
+    resources.tx_pending.fill(true);
+    resources.rx_pending.fill(false);
+    resources.rx_len[0] = 1;
+    assert!(!resources.poll().unwrap());
+    let stats = resources.progress_stats();
+    assert_eq!(stats.tx_all_slots_pending_polls, 1);
+    assert_eq!(stats.rx_no_posted_slots_polls, 1);
+    assert_eq!(stats.rx_unread_slots_polls, 1);
+    resources.rx_pending[1] = true;
+    resources.rx_len[0] = 0;
+    resources.tx_pending[0] = false;
+    assert!(!resources.poll().unwrap());
+    let stats = resources.progress_stats();
+    assert_eq!(stats.tx_all_slots_pending_polls, 1);
+    assert_eq!(stats.rx_no_posted_slots_polls, 1);
+    assert_eq!(stats.rx_unread_slots_polls, 1);
+    resources.configure_progress_stats(false, true);
+    assert!(!resources.poll().unwrap());
+    let stats = resources.progress_stats();
+    assert_eq!(stats.tx_all_slots_pending_polls, 0);
+    assert_eq!(stats.rx_no_posted_slots_polls, 0);
+    assert_eq!(stats.rx_unread_slots_polls, 0);
+}
+
+#[test]
 fn cq_statistics_count_real_polls_and_reset_without_changing_fences() {
     let mut fixture = Fixture::new();
     fixture.endpoint().configure_progress_stats(true, true);
@@ -1062,7 +1109,7 @@ fn no_poll_partial_receive_keeps_unread_bytes_until_repost() {
     let mut fixture = Fixture::new();
     let state = fixture.endpoint().inner();
     // Start with a full ring, as after initial peer setup.
-    state.rx_pending = [true; SLOTS];
+    state.rx_pending.fill(true);
     // SAFETY: Scripted provider has no concurrent DMA and writes before CQE.
     unsafe { ptr::copy_nonoverlapping(b"abcd".as_ptr(), state.memory.rx(0), 4) };
     let context = state.memory.rx_context(0);
@@ -1152,4 +1199,384 @@ fn open_profile_snapshot_never_polls_and_first_progress_is_not_retimed() {
     assert_eq!(fixture.endpoint().open_profile().first_progress_ns, 37);
     assert_eq!(fixture.endpoint().progress_stats().cq_polls, 1);
     assert_eq!(fixture.state().polls, 2);
+}
+
+#[test]
+fn eagain_keeps_the_filled_slot_and_retries_without_copying_again() {
+    let mut fixture = Fixture::new();
+    fixture.endpoint().configure_progress_stats(true, true);
+    fixture.state().send_result = -isize::try_from(ffi::FI_EAGAIN).unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            fixture
+                .endpoint()
+                .try_send_vectored_no_poll(&[IoSlice::new(b"pay"), IoSlice::new(b"load")])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+    let stats = fixture.endpoint().progress_stats();
+    assert_eq!(stats.send_copy_calls, 1, "only the first attempt may copy");
+    assert_eq!(stats.send_copy_bytes, 7);
+    assert_eq!(stats.send_post_eagain, 3);
+    assert_eq!(stats.send_post_retries, 2);
+    assert_eq!(fixture.endpoint().accepted_send_fence().unwrap(), 0);
+    assert!(!fixture.endpoint().sends_pending());
+
+    fixture.state().send_result = 0;
+    assert_eq!(
+        fixture
+            .endpoint()
+            .try_send_vectored_no_poll(&[IoSlice::new(b"pay"), IoSlice::new(b"load")])
+            .unwrap(),
+        7
+    );
+    let stats = fixture.endpoint().progress_stats();
+    assert_eq!(
+        stats.send_copy_calls, 1,
+        "the successful retry must not copy"
+    );
+    assert_eq!(stats.send_post_retries, 3);
+    assert_eq!(stats.send_size_le_4k, 1);
+    assert_eq!(stats.send_post_bytes, 7);
+    assert_eq!(fixture.endpoint().accepted_send_fence().unwrap(), 1);
+    // SAFETY: The successful post owns these seven initialized TX bytes.
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(fixture.state().sent, 7) },
+        b"payload"
+    );
+}
+
+#[test]
+fn changed_bytes_after_eagain_are_copied_fresh_never_posted_stale() {
+    let mut fixture = Fixture::new();
+    fixture.endpoint().configure_progress_stats(true, true);
+    fixture.state().send_result = -isize::try_from(ffi::FI_EAGAIN).unwrap();
+    fixture.endpoint().try_send(b"first").unwrap_err();
+    fixture.state().send_result = 0;
+    // Same length, different content, then different length: both need a copy.
+    assert_eq!(fixture.endpoint().try_send(b"other").unwrap(), 5);
+    // SAFETY: The successful post owns these five initialized TX bytes.
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(fixture.state().sent, 5) },
+        b"other"
+    );
+    fixture.state().send_result = -isize::try_from(ffi::FI_EAGAIN).unwrap();
+    fixture.endpoint().try_send(b"abc").unwrap_err();
+    fixture.state().send_result = 0;
+    assert_eq!(fixture.endpoint().try_send(b"abcdef").unwrap(), 6);
+    // SAFETY: As above for the six posted bytes.
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(fixture.state().sent, 6) },
+        b"abcdef"
+    );
+    let stats = fixture.endpoint().progress_stats();
+    assert_eq!(stats.send_copy_calls, 4);
+    assert_eq!(stats.send_post_retries, 0);
+}
+
+#[test]
+fn staged_slot_is_not_a_provider_owned_slot() {
+    // A kept EAGAIN copy owns no ordinal; filling every other slot and then
+    // completing the ring must leave fences exact and reuse the staged slot.
+    let mut fixture = Fixture::new();
+    fixture.state().send_result = -isize::try_from(ffi::FI_EAGAIN).unwrap();
+    fixture
+        .endpoint()
+        .try_send_vectored_no_poll(&[IoSlice::new(b"kept")])
+        .unwrap_err();
+    assert_eq!(fixture.endpoint().inner().free_send_slot(), Some(0));
+    fixture.state().send_result = 0;
+    for byte in 0..SLOTS {
+        fixture
+            .endpoint()
+            .try_send_vectored_no_poll(&[IoSlice::new(&[u8::try_from(byte).unwrap()])])
+            .unwrap();
+    }
+    assert_eq!(
+        fixture.endpoint().accepted_send_fence().unwrap(),
+        SLOTS as u64
+    );
+    assert_eq!(fixture.endpoint().inner().free_send_slot(), None);
+}
+
+#[test]
+fn send_buckets_follow_posted_message_length() {
+    let mut fixture = Fixture::new();
+    for (len, bucket) in [
+        (1, 0),
+        (4096, 0),
+        (4097, 1),
+        (16_384, 1),
+        (16_385, 2),
+        (CHUNK, 2),
+    ] {
+        let state = fixture.endpoint().inner();
+        let before = state.progress_stats();
+        state.record_send_bucket(len);
+        let after = state.progress_stats();
+        let delta = [
+            after.send_size_le_4k - before.send_size_le_4k,
+            after.send_size_le_16k - before.send_size_le_16k,
+            after.send_size_le_64k - before.send_size_le_64k,
+            after.send_size_gt_64k - before.send_size_gt_64k,
+        ];
+        let mut expected = [0; 4];
+        expected[bucket] = 1;
+        assert_eq!(delta, expected, "length {len}");
+    }
+    fixture.endpoint().inner().record_send_bucket(CHUNK + 1);
+    assert_eq!(fixture.endpoint().progress_stats().send_size_gt_64k, 1);
+}
+
+#[test]
+fn configured_slot_count_sizes_every_per_slot_structure() {
+    for slots in [1, 2, 8, crate::MAX_SLOTS] {
+        let mut resources = Resources::default();
+        resources.set_slots(slots);
+        assert_eq!(resources.slots(), slots);
+        assert_eq!(resources.tx_pending.len(), slots);
+        assert_eq!(resources.tx_ordinal.len(), slots);
+        assert_eq!(resources.rx_pending.len(), slots);
+        assert_eq!(resources.rx_len.len(), slots);
+        // Every slot's buffer and context is distinct, in bounds and maps back
+        // to exactly its own index; a neighbor's pointer never aliases it.
+        for slot in 0..slots {
+            assert_eq!(
+                resources
+                    .memory
+                    .tx_context_slot(resources.memory.tx_context(slot)),
+                Some(slot)
+            );
+            assert_eq!(
+                resources
+                    .memory
+                    .rx_context_slot(resources.memory.rx_context(slot)),
+                Some(slot)
+            );
+            assert_eq!(
+                resources
+                    .memory
+                    .tx_context_slot(resources.memory.rx_context(slot)),
+                None
+            );
+        }
+        // SAFETY: Both writes target in-bounds bytes of the last slot's buffers,
+        // which no provider references in this unit test.
+        unsafe {
+            resources.memory.tx(slots - 1).add(CHUNK - 1).write(7);
+            resources.memory.rx(slots - 1).add(CHUNK - 1).write(9);
+        }
+        let past = resources.memory.tx_context(slots - 1);
+        // One byte past a context is not a context.
+        assert_eq!(
+            resources.memory.tx_context_slot(past.wrapping_byte_add(1)),
+            None
+        );
+    }
+}
+
+#[test]
+fn full_ring_of_configured_size_requires_exact_completions() {
+    let mut resources = Resources::default();
+    resources.set_slots(8);
+    resources.peer = Some(0);
+    for slot in 0..8 {
+        resources.tx_pending[slot] = true;
+        resources.tx_ordinal[slot] = slot as u64 + 1;
+    }
+    resources.accepted_send = 8;
+    assert_eq!(resources.free_send_slot(), None);
+    // Out-of-order completion of slot 5 frees only slot 5.
+    resources
+        .complete(resources.memory.tx_context(5), || unreachable!())
+        .unwrap();
+    assert_eq!(resources.free_send_slot(), Some(5));
+    assert_eq!(resources.send_fences(), (8, 0));
+    for slot in [0, 1, 2, 3, 4, 6, 7] {
+        resources
+            .complete(resources.memory.tx_context(slot), || unreachable!())
+            .unwrap();
+    }
+    assert_eq!(resources.send_fences(), (8, 8));
+}
+
+/// A pipe stands in for the provider's CQ wait fd: its read end is never
+/// readable, so `poll(2)` runs for the full bounded timeout.
+struct WaitPipe([libc::c_int; 2]);
+
+impl WaitPipe {
+    fn new() -> Self {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` is a writable two-element array, as pipe(2) requires.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        Self(fds)
+    }
+}
+
+impl Drop for WaitPipe {
+    fn drop(&mut self) {
+        // SAFETY: Both descriptors were opened by `new` and are closed once.
+        unsafe {
+            libc::close(self.0[0]);
+            libc::close(self.0[1]);
+        }
+    }
+}
+
+/// Installs a scripted `fi_trywait` fabric on a fixture's resources and returns
+/// the heap boxes that must outlive the endpoint.
+fn install_wait_fabric(
+    fixture: &mut Fixture,
+    wait_fd: libc::c_int,
+) -> (
+    Box<ffi::fi_ops>,
+    Box<ffi::fi_ops_fabric>,
+    Box<ffi::fid_fabric>,
+) {
+    let context = fixture.state.get().cast::<c_void>();
+    let mut ops = Box::new(ffi::fi_ops {
+        close: Some(close),
+        ..ffi::fi_ops::default()
+    });
+    let mut fabric_ops = Box::new(ffi::fi_ops_fabric {
+        trywait: Some(trywait),
+        ..ffi::fi_ops_fabric::default()
+    });
+    let mut fabric = Box::new(ffi::fid_fabric {
+        fid: ffi::fid {
+            context,
+            ops: &raw mut *ops,
+            ..ffi::fid::default()
+        },
+        ops: &raw mut *fabric_ops,
+        ..ffi::fid_fabric::default()
+    });
+    let state = fixture.endpoint().inner();
+    state.fabric = &raw mut *fabric;
+    state.cq_wait_mode = CqWaitMode::FdTryWait(wait_fd);
+    state.rx_pending.fill(true);
+    (ops, fabric_ops, fabric)
+}
+
+#[test]
+fn idle_sweep_parks_on_the_wait_fd_only_after_trywait_allows_it() {
+    let pipe = WaitPipe::new();
+    let mut fixture = Fixture::new();
+    let keep = install_wait_fabric(&mut fixture, pipe.0[0]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+
+    // fi_trywait == 0: the CQ is quiescent, so this sweep blocks on the fd.
+    let started = Instant::now();
+    assert_eq!(
+        fixture
+            .endpoint()
+            .try_progress_for_sweep(Some(deadline))
+            .unwrap(),
+        (false, true)
+    );
+    assert!(started.elapsed() >= Duration::from_micros(500));
+    assert_eq!(fixture.state().trywaits, 1);
+    assert_eq!(
+        fixture.state().polls,
+        1,
+        "one nonblocking CQ read after waking"
+    );
+    assert_eq!(fixture.endpoint().progress_stats().cq_idle_waits, 1);
+
+    // -FI_EAGAIN: completions are pending inside the provider; never block.
+    fixture.state().trywait_result = -i32::try_from(ffi::FI_EAGAIN).unwrap();
+    let started = Instant::now();
+    assert_eq!(
+        fixture
+            .endpoint()
+            .try_progress_for_sweep(Some(deadline))
+            .unwrap(),
+        (false, false)
+    );
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert_eq!(fixture.state().trywaits, 2);
+    assert_eq!(fixture.endpoint().progress_stats().cq_idle_waits, 1);
+    drop(fixture.endpoint.take());
+    drop(keep);
+}
+
+#[test]
+fn outstanding_requests_keep_busy_polling_instead_of_parking() {
+    let pipe = WaitPipe::new();
+    let mut fixture = Fixture::new();
+    let keep = install_wait_fabric(&mut fixture, pipe.0[0]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    // An accepted send awaiting its local completion forbids parking.
+    fixture
+        .endpoint()
+        .try_send_vectored_no_poll(&[IoSlice::new(b"x")])
+        .unwrap();
+    assert!(fixture.endpoint().sends_pending());
+    fixture
+        .endpoint()
+        .try_progress_for_sweep(Some(deadline))
+        .unwrap();
+    assert_eq!(fixture.state().trywaits, 0);
+    // An unread received slot forbids parking as well.
+    let completion = fixture.state().sent_context;
+    fixture.state().completion = Some(ffi::fi_cq_msg_entry {
+        op_context: completion,
+        ..ffi::fi_cq_msg_entry::default()
+    });
+    fixture.endpoint().try_progress().unwrap();
+    assert!(!fixture.endpoint().sends_pending());
+    fixture.endpoint().inner().rx_len[0] = 1;
+    fixture
+        .endpoint()
+        .try_progress_for_sweep(Some(deadline))
+        .unwrap();
+    assert_eq!(fixture.state().trywaits, 0);
+    assert_eq!(fixture.endpoint().progress_stats().cq_idle_waits, 0);
+    fixture.endpoint().inner().rx_len[0] = 0;
+    drop(fixture.endpoint.take());
+    drop(keep);
+}
+
+#[test]
+fn help_defaults_parse_the_forms_libfabric_prints() {
+    assert_eq!(
+        help_default("size (default 16384)."),
+        Some("16384".to_owned())
+    );
+    assert_eq!(help_default("(default: 10000)."), Some("10000".to_owned()));
+    assert_eq!(
+        help_default("(default: 128, 4096 with srx"),
+        Some("128".to_owned())
+    );
+    assert_eq!(
+        help_default("(default: false/no)."),
+        Some("false/no".to_owned())
+    );
+    assert_eq!(help_default("no stated value"), None);
+    assert_eq!(help_default("(default)"), None);
+}
+
+#[test]
+fn only_owners_that_park_request_a_verbs_wait_fd() {
+    use FabricBackend::{Efa, EfaDirect, SoftwareTcp, Verbs};
+    // (backend, park_idle, direct, rma) -> requested wait object
+    for ((backend, park_idle, direct, rma), expected) in [
+        ((Verbs, true, false, false), WaitRequest::Fd),
+        // A polling client never pays for a wait object.
+        ((Verbs, false, false, false), WaitRequest::None),
+        ((Verbs, true, false, true), WaitRequest::None),
+        ((SoftwareTcp, false, false, false), WaitRequest::Software),
+        ((SoftwareTcp, true, false, true), WaitRequest::None),
+        // EFA has no CQ wait object: its idle owner keeps bounded polling.
+        ((Efa, true, false, false), WaitRequest::None),
+        ((EfaDirect, true, true, false), WaitRequest::None),
+    ] {
+        assert_eq!(
+            WaitRequest::select(backend, park_idle, direct, rma),
+            expected,
+            "{backend:?} park={park_idle} direct={direct} rma={rma}"
+        );
+    }
 }

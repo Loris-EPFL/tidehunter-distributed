@@ -10,12 +10,13 @@ fn sparse_view_survives_hole_closure_pages_history_and_compaction() {
         batch(2, vec![put(0, B, b"new-b"), put(0, C, b"new-c")]),
     ];
     let receipts = durable(&log, &batches);
-    let mut index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
-    install(&mut index, &log, &batches[0], receipts[0]);
+    let index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
+    install(&index, &log, &batches[0], receipts[0]);
     index
+        .writer()
         .flush_and_unload(&temp.path().join("base.index"), IndexReadCut::Latest)
         .unwrap();
-    install(&mut index, &log, &batches[2], receipts[2]);
+    install(&index, &log, &batches[2], receipts[2]);
     let upper = match cut(2, 1) {
         IndexReadCut::At(v) => v,
         _ => unreachable!(),
@@ -25,12 +26,13 @@ fn sparse_view_survives_hole_closure_pages_history_and_compaction() {
         sequence: 1,
     };
     index
+        .writer()
         .install_live_view(upper, cut(0, 1), vec![hole])
         .unwrap();
     let frozen = index.latest_cut();
     let pin = index.pin_cut(frozen.clone()).unwrap();
     assert!(matches!(
-        index.prepare_image(frozen.clone()),
+        index.writer().prepare_image(frozen.clone()),
         Err(NativeIndexError::Invalid(_))
     ));
     let foreign = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
@@ -49,11 +51,30 @@ fn sparse_view_survives_hole_closure_pages_history_and_compaction() {
     // Capture only the genuinely published prefix while the sparse view is
     // live. The missing batch must remain in the overlay when this capture is
     // persisted and installed after that batch publishes.
-    let prefix_capture = index.prepare_compacted_image(cut(0, 1), cut(0, 1)).unwrap();
-    install(&mut index, &log, &batches[1], receipts[1]);
-    index.install_live_view(upper, cut(0, 1), vec![]).unwrap();
+    let prefix_capture = index
+        .writer()
+        .prepare_compacted_image(cut(0, 1), cut(0, 1))
+        .unwrap();
+    install(&index, &log, &batches[1], receipts[1]);
+    index
+        .writer()
+        .install_live_view(upper, cut(0, 1), vec![])
+        .unwrap();
     let prefix_path = temp.path().join("prefix-during-hole.index");
-    index.install_image(prefix_capture.persist(&prefix_path).unwrap());
+    index
+        .writer()
+        .begin_install_image(prefix_capture.persist(&prefix_path).unwrap());
+    assert!(!index.writer().install_image_step(1));
+    assert_eq!(
+        value(&index, &log, A, frozen.clone()).as_deref(),
+        Some(b"old-a".as_slice())
+    );
+    assert_eq!(
+        value(&index, &log, B, frozen.clone()).as_deref(),
+        Some(b"new-b".as_slice())
+    );
+    assert_eq!(value(&index, &log, A, IndexReadCut::Latest), None);
+    assert!(index.writer().install_image_step(1));
     let recovered = NativeIndex::open_snapshot(&prefix_path, &shape(), DATABASE, BUDGET).unwrap();
     assert_eq!(
         value(&recovered, &log, A, IndexReadCut::Latest).as_deref(),
@@ -141,8 +162,13 @@ fn sparse_view_survives_hole_closure_pages_history_and_compaction() {
     }
     assert!(seen_newer, "history must not stop at an excluded version");
     drop(history);
-    let capture = index.prepare_compacted_image(cut(2, 1), cut(2, 1)).unwrap();
-    index.install_image(capture.persist(&temp.path().join("held.index")).unwrap());
+    let capture = index
+        .writer()
+        .prepare_compacted_image(cut(2, 1), cut(2, 1))
+        .unwrap();
+    index
+        .writer()
+        .install_image(capture.persist(&temp.path().join("held.index")).unwrap());
     assert_eq!(index.retention_floor(), cut(0, 1));
     assert_eq!(
         value(&index, &log, A, frozen.clone()).as_deref(),
@@ -150,8 +176,11 @@ fn sparse_view_survives_hole_closure_pages_history_and_compaction() {
     );
     drop(pin);
     drop(frozen);
-    let capture = index.prepare_compacted_image(cut(2, 1), cut(2, 1)).unwrap();
-    index.install_image(
+    let capture = index
+        .writer()
+        .prepare_compacted_image(cut(2, 1), cut(2, 1))
+        .unwrap();
+    index.writer().install_image(
         capture
             .persist(&temp.path().join("released.index"))
             .unwrap(),
@@ -168,9 +197,9 @@ fn sparse_view_metadata_is_bounded_and_failed_install_preserves_live_view() {
         batch(2, vec![put(0, B, b"new")]),
     ];
     let receipts = durable(&log, &batches);
-    let mut index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
-    install(&mut index, &log, &batches[0], receipts[0]);
-    install(&mut index, &log, &batches[1], receipts[1]);
+    let index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
+    install(&index, &log, &batches[0], receipts[0]);
+    install(&index, &log, &batches[1], receipts[1]);
     let upper = match cut(2, 0) {
         IndexReadCut::At(v) => v,
         _ => unreachable!(),
@@ -180,6 +209,7 @@ fn sparse_view_metadata_is_bounded_and_failed_install_preserves_live_view() {
         sequence: 1,
     };
     index
+        .writer()
         .install_live_view(upper, cut(0, 0), vec![hole])
         .unwrap();
     let old = index.latest_cut();
@@ -188,17 +218,27 @@ fn sparse_view_metadata_is_bounded_and_failed_install_preserves_live_view() {
     let mut oversized = Vec::with_capacity(BUDGET / std::mem::size_of::<BatchVersion>() + 1);
     oversized.push(hole);
     assert!(matches!(
-        index.install_live_view(upper, cut(0, 0), oversized),
+        index
+            .writer()
+            .install_live_view(upper, cut(0, 0), oversized),
         Err(NativeIndexError::Capacity)
     ));
     assert_eq!(index.latest_cut(), old);
-    let capture = index.prepare_compacted_image(cut(2, 0), cut(2, 0)).unwrap();
+    let capture = index
+        .writer()
+        .prepare_compacted_image(cut(0, u32::MAX), cut(0, 0))
+        .unwrap();
     assert!(matches!(
-        index.install_live_view(upper, IndexReadCut::BeforeAll, vec![hole]),
+        index
+            .writer()
+            .install_live_view(upper, IndexReadCut::BeforeAll, vec![hole]),
         Err(NativeIndexError::RetentionInProgress)
     ));
     drop(capture);
-    index.install_live_view(upper, cut(0, 0), vec![]).unwrap();
+    index
+        .writer()
+        .install_live_view(upper, cut(0, 0), vec![])
+        .unwrap();
     assert_eq!(index.stats().transient_metadata_bytes, charged);
     drop(old);
     assert_eq!(index.stats().transient_metadata_bytes, 0);
@@ -272,12 +312,12 @@ fn publication_reservation_growth_is_preflighted_and_never_shrinks() {
 
 #[test]
 fn reserved_view_conversion_keeps_frozen_clones_charged_until_last_drop() {
-    let mut index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
+    let index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
     let upper = match cut(2, 0) {
         IndexReadCut::At(version) => version,
         _ => unreachable!(),
     };
-    index.latest = Some(upper);
+    index.writer.lock().latest = Some(upper);
     let hole = BatchVersion {
         epoch: EPOCH,
         sequence: 1,
@@ -285,6 +325,7 @@ fn reserved_view_conversion_keeps_frozen_clones_charged_until_last_drop() {
     let reservation = index.reserve_publication_view(2).unwrap();
     let reserved = index.stats().transient_metadata_bytes;
     index
+        .writer()
         .install_reserved_live_view(upper, IndexReadCut::BeforeAll, vec![hole], reservation)
         .unwrap();
     let charged = index.stats().transient_metadata_bytes;
@@ -294,6 +335,7 @@ fn reserved_view_conversion_keeps_frozen_clones_charged_until_last_drop() {
     // Replacing the last live owner takes the same retention lock in Drop.
     // This must finish without holding that lock, even for an empty view.
     index
+        .writer()
         .install_live_view(upper, IndexReadCut::BeforeAll, vec![])
         .unwrap();
     assert_eq!(index.stats().transient_metadata_bytes, charged);
@@ -302,13 +344,16 @@ fn reserved_view_conversion_keeps_frozen_clones_charged_until_last_drop() {
     drop(clone);
     assert_eq!(index.stats().transient_metadata_bytes, 0);
     index
+        .writer()
         .install_live_view(upper, IndexReadCut::BeforeAll, vec![hole])
         .unwrap();
     index
+        .writer()
         .install_live_view(upper, IndexReadCut::BeforeAll, vec![hole])
         .unwrap();
     let reservation = index.reserve_publication_view(1).unwrap();
     index
+        .writer()
         .install_reserved_live_view(upper, IndexReadCut::BeforeAll, vec![], reservation)
         .unwrap();
     assert_eq!(index.stats().transient_metadata_bytes, 0);
@@ -324,10 +369,13 @@ fn active_full_capture_has_independent_view_allowance() {
     ];
     let receipts = durable(&log, &batches);
     let mut index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
-    install(&mut index, &log, &batches[0], receipts[0]);
-    install(&mut index, &log, &batches[1], receipts[1]);
+    install(&index, &log, &batches[0], receipts[0]);
+    install(&index, &log, &batches[1], receipts[1]);
     index.max_metadata_bytes = index.resident_bytes();
-    let capture = index.prepare_compacted_image(cut(0, 0), cut(0, 0)).unwrap();
+    let capture = index
+        .writer()
+        .prepare_compacted_image(cut(0, 0), cut(0, 0))
+        .unwrap();
     assert_eq!(
         index.stats().transient_metadata_bytes,
         index.max_metadata_bytes
@@ -339,6 +387,7 @@ fn active_full_capture_has_independent_view_allowance() {
         _ => unreachable!(),
     };
     index
+        .writer()
         .install_reserved_live_view(
             upper,
             cut(0, 0),
@@ -356,20 +405,26 @@ fn active_full_capture_has_independent_view_allowance() {
 
 #[test]
 fn foreign_and_undersized_reservations_reject_without_changing_view() {
-    let mut index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
+    let index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
     let foreign = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
     let upper = match cut(2, 0) {
         IndexReadCut::At(version) => version,
         _ => unreachable!(),
     };
-    index.latest = Some(upper);
+    index.writer.lock().latest = Some(upper);
+    index.writer().publish_latest();
     let hole = BatchVersion {
         epoch: EPOCH,
         sequence: 1,
     };
     let token = foreign.reserve_publication_view(1).unwrap();
     assert!(matches!(
-        index.install_reserved_live_view(upper, IndexReadCut::BeforeAll, vec![hole], token),
+        index.writer().install_reserved_live_view(
+            upper,
+            IndexReadCut::BeforeAll,
+            vec![hole],
+            token
+        ),
         Err(NativeIndexError::Invalid(_))
     ));
     assert_eq!(foreign.stats().transient_metadata_bytes, 0);
@@ -378,9 +433,92 @@ fn foreign_and_undersized_reservations_reject_without_changing_view() {
     let mut exclusions = Vec::with_capacity(2);
     exclusions.push(hole);
     assert!(matches!(
-        index.install_reserved_live_view(upper, IndexReadCut::BeforeAll, exclusions, token),
+        index.writer().install_reserved_live_view(
+            upper,
+            IndexReadCut::BeforeAll,
+            exclusions,
+            token
+        ),
         Err(NativeIndexError::Invalid(_))
     ));
     assert_eq!(index.latest_cut(), IndexReadCut::At(upper));
     assert_eq!(index.stats().transient_metadata_bytes, 0);
+}
+
+#[test]
+fn sparse_gap_generations_merge_for_install_and_abandoned_capture() {
+    let temp = tempdir::TempDir::new("sparse-generation-merge").unwrap();
+    let log = log(&temp.path().join("wal"));
+    let batches: Vec<_> = (0..10)
+        .map(|sequence| {
+            let value = format!("v{sequence}");
+            let mut mutations = vec![put(0, A, value.as_bytes())];
+            if sequence == 0 {
+                mutations.push(put(0, B, b"other"));
+            }
+            batch(sequence, mutations)
+        })
+        .collect();
+    let mut receipts = Vec::new();
+    for group in batches.chunks(4) {
+        receipts.extend(durable(&log, group));
+    }
+    let upper = match cut(8, 0) {
+        IndexReadCut::At(version) => version,
+        _ => unreachable!(),
+    };
+    for install_image in [true, false] {
+        let index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
+        for n in [0, 2, 4, 6, 8] {
+            install(&index, &log, &batches[n], receipts[n]);
+        }
+        let excluded = [1, 3, 5, 7]
+            .into_iter()
+            .map(|sequence| BatchVersion {
+                epoch: EPOCH,
+                sequence,
+            })
+            .collect();
+        index
+            .writer()
+            .install_live_view(upper, cut(0, 0), excluded)
+            .unwrap();
+        let frozen = index.latest_cut();
+        let _pin = index.pin_cut(frozen.clone()).unwrap();
+        index
+            .writer()
+            .begin_compacted_capture(cut(0, 1), cut(0, 0))
+            .unwrap();
+        assert!(index.writer().capture_step(1).is_none());
+        for n in [1, 3, 5, 7, 9] {
+            install(&index, &log, &batches[n], receipts[n]);
+        }
+        let captured = index.writer().capture_step(1).unwrap();
+        if install_image {
+            let persisted = captured.persist(&temp.path().join("merged.index")).unwrap();
+            index.writer().begin_install_image(persisted);
+            assert!(!index.writer().install_image_step(1));
+            assert_eq!(
+                value(&index, &log, A, frozen.clone()).as_deref(),
+                Some(b"v8".as_slice())
+            );
+            assert!(index.writer().install_image_step(1));
+        } else {
+            drop(captured);
+            assert!(!index.writer().cleanup_failed_capture_step(1).unwrap());
+            assert!(index.writer().cleanup_failed_capture_step(1).unwrap());
+        }
+        assert_eq!(
+            value(&index, &log, A, frozen.clone()).as_deref(),
+            Some(b"v8".as_slice())
+        );
+        for sequence in 0..10 {
+            let expected = format!("v{sequence}");
+            assert_eq!(
+                value(&index, &log, A, cut(sequence, u32::MAX)).as_deref(),
+                Some(expected.as_bytes())
+            );
+        }
+        assert_eq!(keys(&index, false, frozen), [A.to_vec(), B.to_vec()]);
+    }
 }

@@ -17,6 +17,7 @@ import urllib.request
 import local
 import valkey_service
 import industry_service
+import physical_storage
 import binascii
 
 BACKENDS = ("tikv", "cassandra", "foundationdb", "valkey_tcp", "valkey_rdma", "garnet", "kvrocks")
@@ -334,6 +335,19 @@ def save(path, value):
     temporary.replace(path)
 
 
+def gcp_instance_id():
+    request = urllib.request.Request("http://metadata.google.internal/computeMetadata/v1/instance/id",
+                                     headers={"Metadata-Flavor": "Google"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=5) as response:
+        if response.headers.get("Metadata-Flavor") != "Google":
+            raise RuntimeError("untrusted Google metadata response")
+        instance_id = response.read(4096).decode().strip()
+    if not re.fullmatch(r"[1-9][0-9]*", instance_id):
+        raise RuntimeError("invalid Google numeric instance ID")
+    return instance_id
+
+
 def nvme_evidence(directory, qualification, provider="aws"):
     existing = Path(directory)
     while not existing.exists():
@@ -356,14 +370,15 @@ def nvme_evidence(directory, qualification, provider="aws"):
     if len(devices) != 1:
         raise RuntimeError("exactly one NVMe block device required")
     if provider == "aws":
-        if "instance storage" not in (devices[0].get("model") or "").lower():
+        if not physical_storage.admitted_model(provider, devices[0].get("model")):
             raise RuntimeError("NVMe is not identified as EC2 instance storage (EBS is not admitted)")
     elif provider == "gcp":
         local_ssd = Path("/dev/disk/by-id/google-local-nvme-ssd-0")
         if (not local_ssd.is_symlink() or str(local_ssd.resolve(strict=True)) != device
-                or "local ssd" not in (devices[0].get("model") or "").lower()
-                or not devices[0].get("serial")):
+                or not physical_storage.admitted_model(provider, devices[0].get("model"))
+                or not isinstance(devices[0].get("serial"), str) or not devices[0]["serial"].strip()):
             raise RuntimeError("NVMe is not the identified Google local SSD")
+        evidence["host_identity"]["instance_id"] = gcp_instance_id()
     else:
         raise RuntimeError("unknown physical storage provider")
     if "rw" not in filesystems[0].get("options", "").split(","):
@@ -844,10 +859,25 @@ def probe(fleet, config, timeout=120, initialize_cluster=False, cluster=False):
     if type(timeout) is not int or not 1 <= timeout <= 900:
         raise ValueError("probe timeout must be 1..900 seconds")
     deadline, error = time.monotonic() + timeout, None
+    steady = local.TikvSteadyAdmission() if config["backend"] == "tikv" and config["index"] == -1 else None
     while time.monotonic() < deadline:
         try:
             initialization = initialize(fleet, config) if initialize_cluster else None
             proof = probe_once(fleet, config, cluster=cluster) if config["backend"] in ("valkey_tcp", "valkey_rdma", "garnet", "kvrocks") else probe_once(fleet, config)
+            if steady is not None:
+                running = http(fleet, "/operators?object=true")
+                waiting = http(fleet, "/operators?kind=waiting&object=true")
+                proof["operator_observation"] = {"observed_at_unix": time.time(),
+                                                 "running": running, "waiting": waiting}
+                save(Path(config["directory"]) / "probe-attempt.json", proof)
+                observation = steady.observe(proof["regions"], running, waiting, time.monotonic())
+                if observation is None:
+                    error = "PD region topology has not remained stable for five seconds"
+                    time.sleep(min(1, max(0, deadline - time.monotonic())))
+                    continue
+                proof["steady_admission"] = observation
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("readiness deadline reached during TiKV probe")
             if cluster and config["backend"] == "cassandra" and config["index"] >= 0:
                 if (set(proof["ring_un"]) != {x["address"] for x in fleet["nodes"]} or len(proof["ring_un"]) != 5 or
                         len(proof["ring_members"]) != 5 or any(state != "UN" for state, _ in proof["ring_members"])):
@@ -860,6 +890,8 @@ def probe(fleet, config, timeout=120, initialize_cluster=False, cluster=False):
             return {"status": "ready", "proof": proof}
         except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as exc:
             error = str(exc)
+            if steady is not None:
+                steady.reset()
             time.sleep(min(1, max(0, deadline - time.monotonic())))
     raise RuntimeError(f"readiness deadline exceeded: {error}")
 

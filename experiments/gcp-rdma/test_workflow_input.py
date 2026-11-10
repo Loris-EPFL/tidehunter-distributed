@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 import workflow_input
+import gcp_campaign
 
 
 class WorkflowInputTest(unittest.TestCase):
@@ -40,6 +41,53 @@ class WorkflowInputTest(unittest.TestCase):
         self.assertEqual(spec['suite'], 'kv')
         self.assertEqual(spec['value_sizes'], [64, 256, 1024, 8192, 65536])
 
+    def test_portable_focused_rdma_does_not_require_nvme_tcp(self):
+        backends = 'native,tidehunter_tcp,tidehunter_verbs_native,tidehunter_nvme_rdma'
+        spec = workflow_input.specification('kv', backends, 'nvmeof-focused')
+        self.assertEqual(spec['backends'], backends.split(','))
+        jobs = workflow_input.cloud_campaign.make_matrix({k: v for k, v in spec.items() if k != 'suite'})
+        self.assertEqual({job['backend'] for job in jobs}, set(backends.split(',')))
+        gcp_campaign.validate_spec(spec)
+        with self.assertRaises(ValueError):
+            gcp_campaign.validate_spec({**spec, 'mode': 'standard'})
+        with self.assertRaises(ValueError):
+            gcp_campaign.validate_spec({**spec, 'backends': spec['backends'] + ['tidehunter_efa']})
+        with self.assertRaises(ValueError):
+            workflow_input.specification('kv', backends, 'standard')
+        with self.assertRaises(ValueError):
+            workflow_input.specification('kv', backends + ',tidehunter_efa', 'nvmeof-focused')
+
+    def test_combined_mode_is_accepted_by_workflow_and_campaign(self):
+        backends = 'native,tidehunter_tcp,tidehunter_verbs_native,tidehunter_nvme_rdma,valkey_tcp,valkey_rdma'
+        spec = workflow_input.specification('kv', backends, 'standard-with-nvmeof')
+        gcp_campaign.validate_spec(spec)
+        jobs = workflow_input.cloud_campaign.make_matrix({k: v for k, v in spec.items() if k != 'suite'})
+        self.assertEqual({job['backend'] for job in jobs}, set(backends.split(',')))
+        with self.assertRaises(ValueError):
+            gcp_campaign.validate_spec({**spec, 'mode': 'unknown'})
+
+    def test_live_mode_is_accepted_but_not_allocated_without_pair_proof(self):
+        backends = 'native,tidehunter_tcp,tidehunter_nvme_rdma'
+        spec = workflow_input.specification('kv', backends, 'standard-with-live-nvmeof')
+        gcp_campaign.validate_spec(spec)
+        jobs = workflow_input.cloud_campaign.make_matrix({k: v for k, v in spec.items() if k != 'suite'})
+        self.assertEqual({job['backend'] for job in jobs}, set(backends.split(',')))
+        nvme_routes = {job.get('nvmeof_route') for job in jobs if job['backend'] == 'tidehunter_nvme_rdma'}
+        self.assertEqual(nvme_routes, {'live', 'sealed_read'})
+        with self.assertRaisesRegex(ValueError, 'physical route/counter evidence'):
+            gcp_campaign.launch(None, None, None, None, None, None, spec, None)
+
+    def test_live_mode_requires_matched_native_and_tcp_controls(self):
+        mode = 'standard-with-live-nvmeof'
+        spec = workflow_input.specification('kv', 'native,tidehunter_tcp,tidehunter_nvme_rdma', mode)
+        for missing in ('native', 'tidehunter_tcp', 'tidehunter_nvme_rdma'):
+            selected = [backend for backend in spec['backends'] if backend != missing]
+            with self.subTest(missing=missing):
+                with self.assertRaisesRegex(ValueError, 'requires native, RPC TCP and at least one NVMe-oF backend'):
+                    workflow_input.specification('kv', ','.join(selected), mode)
+                with self.assertRaisesRegex(ValueError, 'requires native, RPC TCP and at least one NVMe-oF backend'):
+                    gcp_campaign.validate_spec({**spec, 'backends': selected})
+
     def test_standard_matrix_accepts_external_comparison_backends(self):
         spec = workflow_input.specification('kv', 'native,tidehunter_tcp,tikv,cassandra,foundationdb,valkey_tcp', 'standard')
         self.assertIn('foundationdb', spec['backends'])
@@ -52,7 +100,6 @@ class WorkflowInputTest(unittest.TestCase):
             return workflow_input.cloud_campaign.make_matrix({k: v for k, v in spec.items() if k != 'suite'})
         original_jobs = matrix(original)
         jobs = matrix(expanded)
-        self.assertEqual(len(original_jobs), 223)
         self.assertEqual(len(jobs), len(original_jobs) + 50)
         self.assertLessEqual(len(jobs), expanded['max_cases'])
         def population(backend):

@@ -464,11 +464,14 @@ class OwnershipAndDevices(unittest.TestCase):
 
     def test_gcp_mount_must_be_the_identified_first_local_ssd(self):
         mount = {"filesystems": [{"source": "/dev/nvme1n1", "target": "/mnt", "fstype": "ext4", "options": "rw"}]}
-        blocks = {"blockdevices": [{"name": "/dev/nvme1n1", "model": "Google Local SSD", "serial": "local"}]}
+        blocks = {"blockdevices": [{"name": "/dev/nvme1n1", "model": "nvme_card0", "serial": "local"}]}
         with patch.object(Path, "is_symlink", return_value=True), \
              patch.object(Path, "resolve", return_value=Path("/dev/nvme1n1")), \
+             patch.object(layout, "gcp_instance_id", return_value="123456"), \
              patch.object(layout, "command", side_effect=[json.dumps(mount), json.dumps(blocks)]):
-            self.assertTrue(layout.nvme_evidence("/mnt", False, provider="gcp")["independent_nvme_admitted"])
+            proof = layout.nvme_evidence("/mnt", False, provider="gcp")
+            self.assertTrue(proof["independent_nvme_admitted"])
+            self.assertEqual(proof["host_identity"]["instance_id"], "123456")
         with patch.object(Path, "is_symlink", return_value=True), \
              patch.object(Path, "resolve", return_value=Path("/dev/nvme0n1")), \
              patch.object(layout, "command", side_effect=[json.dumps(mount), json.dumps(blocks)]):
@@ -480,6 +483,21 @@ class OwnershipAndDevices(unittest.TestCase):
              patch.object(layout, "command", side_effect=[json.dumps(mount), json.dumps(blocks)]):
             with self.assertRaisesRegex(RuntimeError, "identified Google local SSD"):
                 layout.nvme_evidence("/mnt", False, provider="gcp")
+
+    def test_gcp_instance_id_requires_trusted_metadata(self):
+        with patch.object(layout.urllib.request, "build_opener") as build:
+            response = build.return_value.open.return_value.__enter__.return_value
+            response.headers = {"Metadata-Flavor": "Google"}
+            response.read.return_value = b"123456\n"
+            self.assertEqual(layout.gcp_instance_id(), "123456")
+            self.assertEqual(build.return_value.open.call_args.kwargs["timeout"], 5)
+            response.headers = {}
+            with self.assertRaisesRegex(RuntimeError, "untrusted"):
+                layout.gcp_instance_id()
+            response.headers = {"Metadata-Flavor": "Google"}
+            response.read.return_value = b"not-an-id"
+            with self.assertRaisesRegex(RuntimeError, "numeric"):
+                layout.gcp_instance_id()
 
     def test_probe_deadline_and_initialize_ownership_are_bounded(self):
         config = layout.node_config(fleet(), "tikv", 0)

@@ -10,6 +10,7 @@ from unittest import mock
 import gcp_bootstrap
 import gcp_worker as worker
 import gcp_runtime
+import workflow_input
 
 
 class FakePath:
@@ -58,7 +59,7 @@ class StorageTests(unittest.TestCase):
         self.api.request.return_value = self.instance
         self.meta = {'instance/disks/': '0/\n1/',
                      'instance/disks/0/type': 'PERSISTENT',
-                     'instance/disks/1/type': 'SCRATCH'}
+                     'instance/disks/1/type': 'LOCAL-SSD'}
         self.disk = {'path': '/dev/nvme7n1', 'type': 'disk', 'model': 'nvme_card0',
                      'serial': 'serial', 'size': 4096, 'mountpoints': [None]}
         self.commands = []
@@ -103,7 +104,7 @@ class StorageTests(unittest.TestCase):
             {'type': 'SCRATCH', 'interface': 'NVME'} for _ in range(10)]
         self.meta = {'instance/disks/': '\n'.join(f'{i}/' for i in range(11)),
                      'instance/disks/0/type': 'PERSISTENT',
-                     **{f'instance/disks/{i}/type': 'SCRATCH' for i in range(1, 11)}}
+                     **{f'instance/disks/{i}/type': 'LOCAL-SSD' for i in range(1, 11)}}
         links = {'/dev/disk/by-id/google-boot': '/dev/nvme0n1',
                  **{f'/dev/disk/by-id/google-local-nvme-ssd-{i}': f'/dev/nvme{i + 10}n1'
                     for i in range(10)}}
@@ -177,8 +178,9 @@ class WorkerQueueTests(unittest.TestCase):
         api = mock.Mock()
         api.objects.return_value = store
         config = {'run_id': 'run', 'source_sha256': 'a' * 64, 'package_root': '/package',
-                  'project_id': 'project', 'bucket': 'bucket', 'deadline_utc': 'deadline'}
-        host = {'id': '42'}
+                  'project_id': 'project', 'bucket': 'bucket', 'deadline_utc': 'deadline',
+                  'spec': workflow_input.specification('kv', 'native', 'standard')}
+        host = {'id': '42', 'name': 'vm'}
         def sleep(seconds):
             clock[0] += seconds
         with mock.patch.object(worker, 'Path', FakePath), \
@@ -188,7 +190,7 @@ class WorkerQueueTests(unittest.TestCase):
              mock.patch.object(worker.gcp_runtime, 'validate_runtime'), \
              mock.patch.object(worker.gcp_runtime, 'verify_fleet'), \
              mock.patch.object(worker.gcp_runtime, '_deadline', return_value=3), \
-             mock.patch.object(worker.cloud_package, 'verify_directory', return_value={'source_sha256': 'a' * 64}), \
+             mock.patch.object(worker.cloud_package, 'verify_directory', return_value={'source_sha256': 'a' * 64, 'manifest_sha256': 'b' * 64}), \
              mock.patch.object(worker.concurrent.futures, 'ThreadPoolExecutor', Pool), \
              mock.patch.object(worker.time, 'time', side_effect=lambda: clock[0]), \
              mock.patch.object(worker.time, 'sleep', side_effect=sleep), \
@@ -235,15 +237,16 @@ class WorkerQueueTests(unittest.TestCase):
                 api = mock.Mock()
                 api.objects.return_value = store
                 config = {'run_id': 'run', 'source_sha256': 'a' * 64, 'package_root': '/package',
-                          'project_id': 'project', 'bucket': 'bucket', 'deadline_utc': 'deadline'}
+                          'project_id': 'project', 'bucket': 'bucket', 'deadline_utc': 'deadline',
+                          'spec': workflow_input.specification('kv', 'native', 'standard')}
                 with mock.patch.object(worker, 'Path', FakePath), \
                      mock.patch.object(worker, 'WorkerState', MemoryState), \
-                     mock.patch.object(worker, 'identify', return_value={'id': '42'}), \
+                     mock.patch.object(worker, 'identify', return_value={'id': '42', 'name': 'vm'}), \
                      mock.patch.object(worker, 'prepare_storage'), \
                      mock.patch.object(worker.gcp_runtime, 'validate_runtime'), \
                      mock.patch.object(worker.gcp_runtime, 'verify_fleet'), \
                      mock.patch.object(worker.gcp_runtime, '_deadline', return_value=8), \
-                     mock.patch.object(worker.cloud_package, 'verify_directory', return_value={'source_sha256': 'a' * 64}), \
+                     mock.patch.object(worker.cloud_package, 'verify_directory', return_value={'source_sha256': 'a' * 64, 'manifest_sha256': 'b' * 64}), \
                      mock.patch.object(worker.concurrent.futures, 'ThreadPoolExecutor', Pool), \
                      mock.patch.object(worker.time, 'time', side_effect=lambda: clock[0]), \
                      mock.patch.object(worker.time, 'sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
@@ -296,16 +299,17 @@ class WorkerQueueTests(unittest.TestCase):
         store = api.objects.return_value
         store.list.return_value = [{'name': key, 'generation': '7'}]
         config = {'run_id': 'run', 'source_sha256': 'a' * 64, 'package_root': '/package',
-                  'project_id': 'project', 'bucket': 'bucket', 'deadline_utc': 'deadline'}
+                  'project_id': 'project', 'bucket': 'bucket', 'deadline_utc': 'deadline',
+                  'spec': workflow_input.specification('kv', 'native', 'standard')}
         with tempfile.TemporaryDirectory() as root, \
              mock.patch.object(worker, 'Path', FakePath), \
              mock.patch.object(worker, 'WorkerState', side_effect=lambda ignored, prefix: original_state(root, prefix)), \
-             mock.patch.object(worker, 'identify', return_value={'id': '42'}), \
+             mock.patch.object(worker, 'identify', return_value={'id': '42', 'name': 'vm'}), \
              mock.patch.object(worker, 'prepare_storage'), \
              mock.patch.object(worker.gcp_runtime, 'validate_runtime'), \
              mock.patch.object(worker.gcp_runtime, 'verify_fleet'), \
              mock.patch.object(worker.gcp_runtime, '_deadline', side_effect=lambda value: end[0]), \
-             mock.patch.object(worker.cloud_package, 'verify_directory', return_value={'source_sha256': 'a' * 64}), \
+             mock.patch.object(worker.cloud_package, 'verify_directory', return_value={'source_sha256': 'a' * 64, 'manifest_sha256': 'b' * 64}), \
              mock.patch.object(worker.concurrent.futures, 'ThreadPoolExecutor', Pool), \
              mock.patch.object(worker, 'MAX_REQUESTS', 1), \
              mock.patch.object(worker.time, 'time', side_effect=lambda: clock[0]), \
@@ -366,15 +370,16 @@ class WorkerQueueTests(unittest.TestCase):
             {'name': 'runs/run/mailbox/42/requests/op.json', 'generation': '1'}]
         pool = mock.Mock()
         config = {'run_id': 'run', 'source_sha256': 'a' * 64, 'package_root': '/package',
-                  'project_id': 'project', 'bucket': 'bucket', 'deadline_utc': 'deadline'}
+                  'project_id': 'project', 'bucket': 'bucket', 'deadline_utc': 'deadline',
+                  'spec': workflow_input.specification('kv', 'native', 'standard')}
         with mock.patch.object(worker, 'Path', FakePath), \
              mock.patch.object(worker, 'WorkerState', return_value=state), \
-             mock.patch.object(worker, 'identify', return_value={'id': '42'}), \
+             mock.patch.object(worker, 'identify', return_value={'id': '42', 'name': 'vm'}), \
              mock.patch.object(worker, 'prepare_storage'), \
              mock.patch.object(worker.gcp_runtime, 'validate_runtime'), \
              mock.patch.object(worker.gcp_runtime, 'verify_fleet'), \
              mock.patch.object(worker.gcp_runtime, '_deadline', return_value=3), \
-             mock.patch.object(worker.cloud_package, 'verify_directory', return_value={'source_sha256': 'a' * 64}), \
+             mock.patch.object(worker.cloud_package, 'verify_directory', return_value={'source_sha256': 'a' * 64, 'manifest_sha256': 'b' * 64}), \
              mock.patch.object(worker.concurrent.futures, 'ThreadPoolExecutor', return_value=pool), \
              mock.patch.object(worker.time, 'time', return_value=0):
             with self.assertRaisesRegex(OSError, 'disk full'):
@@ -388,7 +393,8 @@ class WorkerQueueTests(unittest.TestCase):
         api.objects.return_value.list.return_value = [
             {'name': 'runs/run/mailbox/42/requests/op.json', 'generation': '1'}]
         config = {'run_id': 'run', 'source_sha256': 'a' * 64, 'package_root': '/package',
-                  'project_id': 'project', 'bucket': 'bucket', 'deadline_utc': 'deadline'}
+                  'project_id': 'project', 'bucket': 'bucket', 'deadline_utc': 'deadline',
+                  'spec': workflow_input.specification('kv', 'native', 'standard')}
         def blocked(*args):
             started.set()
             release.wait(5)
@@ -400,13 +406,13 @@ class WorkerQueueTests(unittest.TestCase):
         try:
             with mock.patch.object(worker, 'Path', FakePath), \
                  mock.patch.object(worker, 'WorkerState', MemoryState), \
-                 mock.patch.object(worker, 'identify', return_value={'id': '42'}), \
+                 mock.patch.object(worker, 'identify', return_value={'id': '42', 'name': 'vm'}), \
                  mock.patch.object(worker, 'prepare_storage'), \
                  mock.patch.object(worker, 'run_request', side_effect=blocked), \
                  mock.patch.object(worker.gcp_runtime, 'validate_runtime'), \
                  mock.patch.object(worker.gcp_runtime, 'verify_fleet'), \
                  mock.patch.object(worker.gcp_runtime, '_deadline', return_value=3), \
-                 mock.patch.object(worker.cloud_package, 'verify_directory', return_value={'source_sha256': 'a' * 64}), \
+                 mock.patch.object(worker.cloud_package, 'verify_directory', return_value={'source_sha256': 'a' * 64, 'manifest_sha256': 'b' * 64}), \
                  mock.patch.object(worker.time, 'time', side_effect=lambda: clock[0]), \
                  mock.patch.object(worker.time, 'sleep', side_effect=expire):
                 worker.serve(config, api=api)

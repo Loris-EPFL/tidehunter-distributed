@@ -412,6 +412,8 @@ fn stalled_fences_bound_output_and_keep_actual_reply_leases() {
                 async_handler_ns: 0,
                 control_queued: None,
                 is_append: false,
+                owner_trace: false,
+                owner_trace_shape: None,
             },
         );
         retained += charge;
@@ -807,6 +809,8 @@ fn completed_read(measured: bool, profiled: bool) -> HashMap<u64, ServerPending>
             async_handler_ns: 0,
             control_queued: None,
             is_append: false,
+            owner_trace: false,
+            owner_trace_shape: None,
         },
     )])
 }
@@ -1097,4 +1101,63 @@ fn submitted_ready_cqes_share_rechecks_deadlines_and_reply_retirement() {
         assert_eq!(retained, 0);
         assert_eq!(node.read_admission.stats().inflight_requests, 0);
     }
+}
+
+#[test]
+fn owner_timeline_maximal_record_fits_minimum_wire_frame() {
+    use crate::distributed::write_timeline::OwnerTimelineRecord;
+    use bincode::Options;
+    let record = OwnerTimelineRecord {
+        owner: u32::MAX,
+        envelope_id: u64::MAX,
+        epoch: Some(u64::MAX),
+        success: false,
+        error: Some("\u{1}".repeat(128)),
+        error_truncated: true,
+        control_queue_ns: Some(u64::MAX),
+        session_admission_wait_ns: Some(u64::MAX),
+        appender_queue_ns: Some(u64::MAX),
+        flusher_queue_ns: Some(u64::MAX),
+        append_barrier_wait_ns: Some(u64::MAX),
+        append_wal_ns: Some(u64::MAX),
+        append_validation_ns: Some(u64::MAX),
+        append_basic_validation_ns: Some(u64::MAX),
+        append_conflict_lookup_ns: Some(u64::MAX),
+        append_geometry_capacity_ns: Some(u64::MAX),
+        append_metadata_reservation_ns: Some(u64::MAX),
+        append_descriptor_preparation_ns: Some(u64::MAX),
+        append_errors: u64::MAX,
+        append_retries: u64::MAX,
+        append_persist_ns: Some(u64::MAX),
+        wal_file_persist_ns: Some(u64::MAX),
+        handler_ns: Some(u64::MAX),
+        response_ready_ns: Some(u64::MAX),
+        namespace_persist_ns: Some(u64::MAX),
+        file_persist_calls: u64::MAX,
+        namespace_persist_calls: u64::MAX,
+        appended_groups: u64::MAX,
+        batch_count: Some(usize::MAX),
+        encoded_bytes: Some(usize::MAX),
+        persistence_capture: Some(crate::distributed::storage::PersistenceCapture {
+            durable_end: u64::MAX,
+            captured_appended_end: u64::MAX,
+            cumulative_appended_groups: u64::MAX,
+        }),
+        ready_append_prefix: Some(crate::distributed::write_timeline::ReadyAppendPrefix {
+            commands: usize::MAX,
+            batches: usize::MAX,
+            encoded_bytes: usize::MAX,
+        }),
+    };
+    let minimum_frame = Envelope {
+        protocol: PROTOCOL,
+        id: u64::MAX,
+        body: Response::OwnerTimelinePage {
+            records: vec![record.clone()],
+            dropped: u64::MAX,
+            incomplete: u64::MAX,
+            more: true,
+        },
+    };
+    assert!(wire_codec(1024).serialized_size(&minimum_frame).unwrap() <= 1024);
 }

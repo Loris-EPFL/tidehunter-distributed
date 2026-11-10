@@ -7,6 +7,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import yaml
+
 import nvme_campaign_owner as owner
 
 
@@ -17,7 +19,11 @@ class OwnerLifecycleTests(unittest.TestCase):
         self.base = Path(self.tmp.name)
         self.node = self.base / 'mnt/tidehunter-kv-comparison/run/cells/case/node-0'
         (self.node / 'storage').mkdir(parents=True)
-        (self.node / 'launch.yaml').write_text('listen: 10.0.0.1:9400\n')
+        self.launch = {
+            'listen': '10.0.0.1:9400', 'ready_file': str(self.node / 'ready'),
+            'launch_nonce': 'nonce-0', 'durability': {'tier': 'synchronous'},
+            'node': {'partition': {'partition': 0, 'inventory': {'database': [7] * 16}}}}
+        (self.node / 'launch.yaml').write_text(yaml.safe_dump(self.launch))
         (self.node / 'launch.yaml').chmod(0o600)
         self.config = {'prefix': 'run', 'repository_root': '/repository', 'binary': '/binary',
                        'deadline_utc': '2099-01-01T00:00:00Z', 'fdb_library_dir': '/lib/fdb', 'fleet': {
@@ -46,6 +52,14 @@ class OwnerLifecycleTests(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
 
+
+    def publish_receipt(self, **changes):
+        receipt = {'partition': 0, 'database': [7] * 16, 'address': '10.0.0.1:9400',
+                   'launch_nonce': 'nonce-0', 'pid': 456, 'boot_id': 'boot', 'started_unix_ns': 2,
+                   'durability': {'tier': 'synchronous', 'max_unsynced_age_ms': None,
+                                  'max_pending_completions': 8}} | changes
+        (self.node / 'ready.durability.json').write_text(json.dumps(receipt))
+
     def command(self, argv, *, timeout):
         self.calls.append(([str(x) for x in argv], timeout))
         return '{}'
@@ -62,6 +76,45 @@ class OwnerLifecycleTests(unittest.TestCase):
         (work / 'stopped.json').write_text(json.dumps({'unit': 'owned-unit', 'status': self.stopped}))
         (work / 'stopped.json').chmod(0o600)
         self.status = self.stopped
+    def test_live_shutdown_requires_bound_graceful_owner_and_kernel_drain(self):
+        launch_path = self.node / 'launch.yaml'
+        launch = {'node': {'root': str(self.node / 'storage'), 'partition': {
+            'partition': 0, 'inventory': {'database': [1] * 16}}}}
+        identity = {'process_id': 123, 'process_start_ticks': 456,
+                    'launch_blake2b512': hashlib.blake2b(launch_path.read_bytes()).hexdigest()}
+        proof = {'schema_version': 1, 'scope': 'kernel_live_target_shutdown', 'complete': True,
+                 'owner': {'database': [1] * 16, 'partition': 0, 'root': launch['node']['root']},
+                 **identity, 'target': {'fixture_only': False, 'errors': 0, 'owned_namespace_count': 0},
+                 'serve_error': None, 'cleanup_error': None}
+        identity_path = self.node / 'live-owner-identity.json'
+        proof_path = self.node / 'launch.live-target-shutdown.json'
+        identity_path.write_text(json.dumps(identity))
+        identity_path.chmod(0o600)
+        proof_path.write_text(json.dumps(proof))
+        proof_path.chmod(0o600)
+        self.assertEqual(owner.admit_live_shutdown(self.node, launch_path, launch, 0, self.stopped), proof)
+        with self.assertRaises(ValueError):
+            owner.admit_live_shutdown(self.node, launch_path, launch, 0, self.status)
+        for field, value in (('process_id', 124), ('process_start_ticks', 457),
+                             ('launch_blake2b512', '0' * 128), ('complete', False),
+                             ('target', {'fixture_only': True, 'errors': 0, 'owned_namespace_count': 0}),
+                             ('target', {'fixture_only': False, 'errors': 1, 'owned_namespace_count': 0}),
+                             ('target', {'fixture_only': False, 'errors': 0, 'owned_namespace_count': 1})):
+            changed = dict(proof, **{field: value})
+            proof_path.write_text(json.dumps(changed))
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                owner.admit_live_shutdown(self.node, launch_path, launch, 0, self.stopped)
+        launch['node']['live_target'] = {'spdk': {'rpc_socket': '/run/owned/rpc.sock', 'executable': '/opt/spdk/bin/nvmf_tgt'}}
+        proof_path.write_text(json.dumps(proof))
+        with self.assertRaises(ValueError):
+            owner.admit_live_shutdown(self.node, launch_path, launch, 0, self.stopped)
+        proof['scope'] = 'spdk_live_target_shutdown'
+        proof_path.write_text(json.dumps(proof))
+        self.assertEqual(owner.admit_live_shutdown(self.node, launch_path, launch, 0, self.stopped), proof)
+        del launch['node']['live_target']
+        with self.assertRaises(ValueError):
+            owner.admit_live_shutdown(self.node, launch_path, launch, 0, self.stopped)
+
 
     def test_graceful_stop_preserves_database_without_forced_stop(self):
         statuses = iter([self.status, self.stopped])
@@ -137,6 +190,9 @@ class OwnerLifecycleTests(unittest.TestCase):
         target = {'version': 1, 'kind': 'campaign-target', 'phase': phase, 'readers_drained': True,
                   'campaign_id': 'campaign', 'export_root': str(export),
                   'exports': [dict(identity, status='cleaned')]}
+        target_path = work / 'target-state-g1/state.json'
+        target_path.write_text(json.dumps(target))
+        target_path.chmod(0o600)
         proof = {'version': 1, 'kind': 'campaign-host', 'phase': 'disconnected', 'readers_drained': True,
                  'campaign_id': 'campaign', 'exports': [dict(identity, status='disconnected')]}
         (work / 'host-disconnected-g1.json').write_text(json.dumps(proof))
@@ -187,6 +243,7 @@ class OwnerLifecycleTests(unittest.TestCase):
 
     def test_cleanup_empty_export_requires_explicit_no_target_attestation(self):
         export, work = self.cleanup_export_fixture()
+        (work / 'target-state-g1/state.json').unlink()
         (work / 'target-state-g1').rmdir()
         (export / 'ready.json').write_text('{\"exports\":[]}')
         with patch.object(owner, '_remove_export') as remove:
@@ -207,6 +264,7 @@ class OwnerLifecycleTests(unittest.TestCase):
 
     def test_export_cleanup_retries_after_ready_removed(self):
         export, work = self.cleanup_export_fixture()
+        (work / 'target-state-g1/state.json').unlink()
         (work / 'target-state-g1').rmdir()
         (export / 'z-image').write_text('image')
         (export / 'z-image').chmod(0o600)
@@ -263,6 +321,43 @@ class OwnerLifecycleTests(unittest.TestCase):
             self.assertTrue(second['complete'])
             self.assertFalse(export.exists())
 
+
+    def test_kernel_target_kind_reaches_setup_and_readback_receipt(self):
+        self.prove_stop()
+        self.status = {'ActiveState': 'active', 'SubState': 'running', 'MainPID': '123'}
+        export = self.node / 'nvmeof/export'
+        export.mkdir()
+        (export / 'ready.json').write_text('{"exports":[]}')
+        (export / 'ready.json').chmod(0o600)
+        for kind, expected in (('kernel', 1), ('kernel_direct', 0)):
+            with self.subTest(kind=kind):
+                def setup(argv, *, timeout):
+                    args = [str(x) for x in argv]
+                    self.assertTrue(args[2].endswith('/campaign_targets.py'))
+                    self.assertEqual(args[args.index('--target-kind') + 1], kind)
+                    return json.dumps({'exports': [{'target': kind,
+                        'target_receipt': {'buffered_io': expected}}]})
+                self.command = setup
+                result = self.run_action('nvme_owner_target_setup', generation=kind, address='10.0.0.1',
+                    base_port_id=1, base_service=4420, transport='rdma', target_implementation=kind)
+                self.assertTrue(result['complete'])
+                self.assertEqual(result['target']['exports'][0]['target_receipt']['buffered_io'], expected)
+
+    def test_direct_target_restart_status_uses_kernel_cleanup_tool(self):
+        work = self.node / 'nvmeof'
+        work.mkdir(mode=0o700)
+        state = work / 'target-state-direct'
+        state.mkdir(mode=0o700)
+        (state / 'state.json').write_text('{"target_implementation":"kernel_direct"}')
+        (state / 'state.json').chmod(0o600)
+        def status(argv, **kwargs):
+            self.assertTrue(str(argv[2]).endswith('/campaign_targets.py'))
+            return json.dumps({'phase': 'published'})
+        self.command = status
+        result = self.run_action('nvme_owner_restart', runtime_seconds=3600)
+        self.assertFalse(result['complete'])
+        self.assertIn('target', result['error'])
+
     def test_partial_target_setup_is_reported_not_cleaned(self):
         self.prove_stop()
         self.status = {'ActiveState': 'active', 'SubState': 'running', 'MainPID': '123'}
@@ -274,6 +369,9 @@ class OwnerLifecycleTests(unittest.TestCase):
             self.calls.append(([str(x) for x in argv], timeout))
             if 'target-setup' in argv:
                 (self.node / 'nvmeof/target-state-case1').mkdir()
+                state_path = self.node / 'nvmeof/target-state-case1/state.json'
+                state_path.write_text('{"target_implementation":"kernel"}')
+                state_path.chmod(0o600)
                 raise RuntimeError('setup failed after first export')
             return json.dumps({'phase': 'creating', 'exports': [{'status': 'published'}]})
         self.command = setup
@@ -287,10 +385,12 @@ class OwnerLifecycleTests(unittest.TestCase):
     def test_restart_refuses_live_target(self):
         self.prove_stop()
         (self.node / 'nvmeof/target-state-case1').mkdir()
+        state_path = self.node / 'nvmeof/target-state-case1/state.json'
+        state_path.write_text('{"target_implementation":"kernel"}')
+        state_path.chmod(0o600)
         self.command = lambda argv, *, timeout: json.dumps({'phase': 'published'})
         result = self.run_action('nvme_owner_restart', runtime_seconds=3600)
         self.assertFalse(result['complete'])
-        self.assertIn('readers drain', result['error'])
         self.assertTrue((self.node / 'nvmeof/stopped.json').exists())
 
     def test_restart_uses_runtime_not_action_timeout(self):
@@ -301,6 +401,7 @@ class OwnerLifecycleTests(unittest.TestCase):
             if argv[0] == 'systemd-run':
                 self.status = {'ActiveState': 'active', 'SubState': 'running', 'MainPID': '456'}
                 (self.node / 'ready').write_text('10.0.0.1:9400')
+                self.publish_receipt()
             return ''
         self.command = start
         result = self.run_action('nvme_owner_restart', runtime_seconds=3600)
@@ -308,6 +409,52 @@ class OwnerLifecycleTests(unittest.TestCase):
         args = self.calls[-1][0]
         self.assertIn('--property=RuntimeMaxSec=3600', args)
         self.assertFalse((self.node / 'stop').exists())
+
+    def test_local_restart_preserves_soft_roce_environment(self):
+        self.prove_stop()
+        def start(argv, *, timeout):
+            self.calls.append(([str(x) for x in argv], timeout))
+            if argv[0] == 'systemd-run':
+                self.status = {'ActiveState': 'active', 'SubState': 'running', 'MainPID': '456'}
+                (self.node / 'ready').write_text('10.0.0.1:9400')
+                self.publish_receipt()
+            return ''
+        with patch.dict(os.environ, {'FI_LOG_LEVEL': 'info'}):
+            result = owner.execute(
+                self.config, {'action': 'nvme_owner_restart', 'case_id': 'case', 'index': 0,
+                              'timeout': 10, 'runtime_seconds': 3600},
+                command=start, validate_launch=lambda *args: None,
+                unit_status=lambda name: self.status, unit_name=lambda *args: 'owned-unit',
+                local_qualification=True)
+        self.assertTrue(result['complete'])
+        args = self.calls[-1][0]
+        self.assertIn('--setenv=FI_UNIVERSE_SIZE=6', args)
+        self.assertIn('--setenv=FI_LOG_LEVEL=info', args)
+
+    def test_restart_returns_the_new_process_receipt_and_never_a_stale_or_foreign_one(self):
+        def restart(publish):
+            self.prove_stop()
+            self.publish_receipt(pid=1, started_unix_ns=1)  # left by the process before the restart
+            def start(argv, *, timeout):
+                self.calls.append(([str(x) for x in argv], timeout))
+                if argv[0] == 'systemd-run':
+                    self.status = {'ActiveState': 'active', 'SubState': 'running', 'MainPID': '456'}
+                    (self.node / 'ready').write_text('10.0.0.1:9400')
+                    publish()
+                return ''
+            self.command = start
+            return self.run_action('nvme_owner_restart', runtime_seconds=3600)
+        fresh = restart(lambda: self.publish_receipt(pid=456, started_unix_ns=2))
+        self.assertTrue(fresh['complete'])
+        self.assertEqual(fresh['durability_receipt']['pid'], 456)
+        # No new receipt: the old file was removed, so the restart cannot succeed on it.
+        stale = restart(lambda: None)
+        self.assertFalse(stale['complete'])
+        self.assertNotIn('durability_receipt', stale)
+        # A receipt for another partition or launch is rejected.
+        for changes in ({'partition': 4}, {'launch_nonce': 'other'}, {'address': '10.9.9.9:9400'}):
+            foreign = restart(lambda changes=changes: self.publish_receipt(**changes))
+            self.assertFalse(foreign['complete'], changes)
 
     def test_restart_after_stopped_transient_unit_is_unloaded(self):
         self.prove_stop()
@@ -318,6 +465,7 @@ class OwnerLifecycleTests(unittest.TestCase):
             elif argv[0] == 'systemd-run':
                 self.status = {'ActiveState': 'active', 'SubState': 'running', 'MainPID': '456'}
                 (self.node / 'ready').write_text('10.0.0.1:9400')
+                self.publish_receipt()
             return ''
         self.command = start
         result = self.run_action('nvme_owner_restart', runtime_seconds=3600)

@@ -8,23 +8,25 @@
 
 pub mod codec;
 pub mod completion;
+pub mod durability;
 pub mod group;
 pub mod index_reference;
 pub mod local_db;
 pub mod local_inventory;
 pub mod native_index;
 pub mod native_publication;
-#[cfg(feature = "experimental-nvmeof")]
 pub mod nvmeof;
 pub mod publication;
 pub mod reference_directory;
 pub mod remote_db;
 pub mod sequence;
+pub mod shard_lock;
 pub mod storage;
 pub mod sui;
 pub mod tcp;
 pub mod types;
 pub mod worker;
+pub mod write_timeline;
 
 #[cfg(test)]
 mod group_model;

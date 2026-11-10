@@ -69,6 +69,7 @@ fn nvme_fixture(
         binding: NamespaceBinding {
             namespace_path: path.clone(),
             transport: NvmeofTransport::Tcp,
+            target: Default::default(),
         },
         manifest,
         max_inflight_requests: 32,
@@ -341,25 +342,25 @@ fn nvmeof_shutdown_drains_an_already_admitted_read() {
         .index_reference(KeySpace(0), &4u32.to_be_bytes(), IndexReadCut::Latest)
         .unwrap()
         .unwrap();
+    let node = db.partition_indexes[&reference.batch_address.partition];
     let (config, path) = nvme_fixture(&fixture, 0, &[reference], "nvme-shutdown");
     db.reads
         .install_nvmeof_file_fixture(config, &db.config, &db.shape, &path)
         .unwrap();
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = mpsc::sync_channel(1);
-    *db.reads.state.reactor_pause.lock() = Some((entered_tx, resume_rx));
+    *db.reads.state.reactor_pause[node].lock() = Some((entered_tx, resume_rx));
     assert!(
         db.reads
             .sender
             .lock()
-            .as_ref()
+            .get(node)
             .unwrap()
             .send(ReadCommand::Wake)
             .is_ok()
     );
     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let pin = db.pin_cut(IndexReadCut::Latest).unwrap();
-    let node = db.partition_indexes[&reference.batch_address.partition];
     let pending = db
         .reads
         .submit(node, vec![reference], 0, false, Some(pin))
@@ -372,7 +373,17 @@ fn nvmeof_shutdown_drains_an_already_admitted_read() {
         assert!(Instant::now() < deadline, "shutdown did not begin");
         thread::yield_now();
     }
+    // All other actors can drain, but they must not close shared readers
+    // while this owner's accepted request is still in its channel.
+    let expected = fixture.config.endpoints.len() - 1;
+    while stopped.nvme_shutdown_ready.load(Ordering::Acquire) < expected
+        && Instant::now() < deadline
+    {
+        thread::yield_now();
+    }
+    let ready = stopped.nvme_shutdown_ready.load(Ordering::Acquire);
     resume_tx.send(()).unwrap();
+    assert_eq!(ready, expected);
     stop.join().unwrap();
     assert_eq!(pending.finish().unwrap().0, vec![put(4, 11)]);
     assert!(!db.reads.failed());
@@ -478,7 +489,7 @@ fn overlapping_groups_share_members_and_preserve_each_callers_slot_order() {
         vec![put(0, 7), put(1, 8), put(2, 9)],
     )
     .unwrap();
-    let pin = db.index.read().pin_cut(IndexReadCut::Latest).unwrap();
+    let pin = db.index.pin_cut(IndexReadCut::Latest).unwrap();
     let references: Vec<_> = (0u32..3)
         .map(|key| {
             db.index_reference(KeySpace(0), &key.to_be_bytes(), pin.cut())
@@ -503,6 +514,7 @@ fn overlapping_groups_share_members_and_preserve_each_callers_slot_order() {
             ReadContext {
                 deadline: Instant::now() + db.config.timeout,
                 pin: Some(pin),
+                trace: None,
             },
         )
         .unwrap();
@@ -731,4 +743,178 @@ fn sui_reseek_and_checkpoint_pins_preserve_old_cut_until_final_drop() {
     );
     assert!(db.get(ks, &2u32.to_be_bytes()).unwrap().is_none());
     db.wait_for_background_threads_to_finish().unwrap();
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+fn sealed_fixture(name: &str) -> (Fixture, RemoteDatabase, ValueRecordReference) {
+    let mut fixture = Fixture::new();
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 0), vec![put(0, 7), put(1, 8)])
+        .unwrap();
+    let db = reopen_cold(&fixture, db);
+    let references: Vec<_> = (0u32..2)
+        .map(|key| {
+            db.index_reference(KeySpace(0), &key.to_be_bytes(), IndexReadCut::Latest)
+                .unwrap()
+                .unwrap()
+        })
+        .collect();
+    let (config, path) = nvme_fixture(&fixture, 0, &references, name);
+    db.reads
+        .install_nvmeof_file_fixture(config, &db.config, &db.shape, &path)
+        .unwrap();
+    (fixture, db, references[0])
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+fn retry_counts(reads: &ReadService) -> [u64; 6] {
+    let d = &reads.state.diagnostics;
+    [
+        &d.admission_retry_credit,
+        &d.admission_retry_flight,
+        &d.admission_retry_lane,
+        &d.admission_retry_paused,
+        &d.admission_retry_config,
+        &d.admission_retry_mixed,
+    ]
+    .map(|counter| counter.load(Ordering::Relaxed))
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+#[test]
+fn only_reader_set_changes_advance_the_routing_generation() {
+    let (_fixture, mut db, _) = sealed_fixture("nvme-generation");
+    let routing = db.reads.routing().generation;
+    let wakeups = db.reads.admission_generation();
+    assert_eq!(db.get(KeySpace(0), &0u32.to_be_bytes()).unwrap(), value(7));
+    wait_read_retirement(&db.reads);
+    // The credit release woke waiters but did not touch the reader set.
+    assert!(db.reads.admission_generation() > wakeups);
+    assert_eq!(db.reads.routing().generation, routing);
+    db.clear_nvmeof_reader().unwrap();
+    assert!(db.reads.routing().generation > routing);
+    db.shutdown().unwrap();
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+#[test]
+fn stale_plans_are_the_only_sealed_admission_retry() {
+    let (_fixture, mut db, reference) = sealed_fixture("nvme-stale-plan");
+    let node = db.partition_indexes[&reference.batch_address.partition];
+    let routing = db.reads.routing();
+    let plans = [db.reads.plan_member(&routing, &reference).unwrap()];
+    let generation = routing.generation;
+    drop(routing);
+    // Credit churn between planning and admission is not a retry cause.
+    assert_eq!(db.get(KeySpace(0), &0u32.to_be_bytes()).unwrap(), value(7));
+    wait_read_retirement(&db.reads);
+    let context = || ReadContext {
+        deadline: Instant::now() + db.config.timeout,
+        pin: None,
+        trace: None,
+    };
+    let admitted = db
+        .reads
+        .submit_until_owned(
+            node,
+            vec![reference],
+            0,
+            false,
+            context(),
+            None,
+            Some(PlannedMembers {
+                generation,
+                members: &plans,
+            }),
+        )
+        .unwrap();
+    assert_eq!(admitted.finish().unwrap().0, vec![put(0, 7)]);
+    wait_read_retirement(&db.reads);
+    assert_eq!(retry_counts(&db.reads), [0; 6]);
+    // A reader-set change makes the same plans stale: one counted retry, no
+    // credit left behind.
+    db.clear_nvmeof_reader().unwrap();
+    let error = db
+        .reads
+        .submit_until_owned(
+            node,
+            vec![reference],
+            0,
+            false,
+            context(),
+            None,
+            Some(PlannedMembers {
+                generation,
+                members: &plans,
+            }),
+        )
+        .err()
+        .unwrap();
+    assert!(RemoteDatabase::read_backpressured(&error));
+    assert_eq!(retry_counts(&db.reads), [0, 0, 0, 0, 1, 0]);
+    assert_eq!(*db.reads.state.retained.lock(), (0, 0));
+    db.shutdown().unwrap();
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+#[test]
+fn concurrent_sealed_reads_neither_retry_admission_nor_repeat_alignment() {
+    let (_fixture, db, _) = sealed_fixture("nvme-churn");
+    let db = Arc::new(ConcurrentRemoteDatabase::new(db).unwrap());
+    let wakeups = db.reads.admission_generation();
+    let threads: Vec<_> = (0..4u32)
+        .map(|thread| {
+            let db = db.clone();
+            thread::spawn(move || {
+                for index in 0..100u32 {
+                    let key = (index + thread) % 2;
+                    // Every completion releases credit while other threads admit.
+                    assert_eq!(
+                        db.get(KeySpace(0), &key.to_be_bytes()).unwrap(),
+                        value(7 + key as u8)
+                    );
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    wait_read_retirement(&db.reads);
+    assert!(db.reads.admission_generation() >= wakeups + 400);
+    // Plenty of credit and lanes: no admission was refused for any reason.
+    assert_eq!(retry_counts(&db.reads), [0; 6]);
+    let stats = db.nvmeof_stats();
+    // Identical concurrent misses share one flight, so a call is either a
+    // reader member or coalesced; every call is aligned exactly once.
+    let coalesced = db.reads.state.coalesced_members.load(Ordering::Relaxed);
+    assert_eq!(stats[0].logical_members + coalesced, 400);
+    assert_eq!(stats[0].alignment.count, 400);
+    // Each reader's mutex is the only lock on its path; uncontended here.
+    assert_eq!(stats[0].lock_wait.count, 0);
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+#[test]
+fn batch_members_are_aligned_once_across_admission_retries() {
+    let (_fixture, db, _) = sealed_fixture("nvme-batch-plan");
+    let db = ConcurrentRemoteDatabase::new(db).unwrap();
+    let keys = [0u32.to_be_bytes(), 1u32.to_be_bytes()];
+    for _ in 0..3 {
+        let values = db
+            .get_many_cut(KeySpace(0), &keys, IndexReadCut::Latest)
+            .unwrap();
+        assert_eq!(
+            values.into_iter().map(Result::unwrap).collect::<Vec<_>>(),
+            vec![value(7), value(8)]
+        );
+    }
+    wait_read_retirement(&db.reads);
+    let stats = db.nvmeof_stats();
+    assert_eq!(stats[0].logical_members, 6);
+    assert_eq!(stats[0].alignment.count, 6);
+    // Both members are in one block of the export image: one SQE per call.
+    assert_eq!(stats[0].admitted_sqes, 3);
+    assert_eq!(stats[0].merged_members, 3);
 }

@@ -64,6 +64,8 @@ struct Binding {
     export_uuid: [u8; 16],
     namespace_path: PathBuf,
     transport: String,
+    #[serde(default)]
+    target: tidehunter::distributed::nvmeof::ExportTarget,
 }
 #[derive(Serialize)]
 struct Sample {
@@ -374,6 +376,7 @@ fn main() -> Result<()> {
             binding: NamespaceBinding {
                 namespace_path: binding.namespace_path,
                 transport,
+                target: binding.target,
             },
             manifest,
             max_inflight_requests: 32,
@@ -588,7 +591,14 @@ fn main() -> Result<()> {
         if transport != reader.binding.transport {
             return Err(fail("rebound transport differs from initial binding").into());
         }
+        if std::mem::discriminant(&binding.target) != std::mem::discriminant(&reader.binding.target)
+        {
+            return Err(
+                fail("rebound target protection policy differs from initial binding").into(),
+            );
+        }
         reader.binding.namespace_path = binding.namespace_path;
+        reader.binding.target = binding.target;
     }
     if !rebound_by_uuid.is_empty() {
         return Err(fail("unexpected rebound namespace binding").into());

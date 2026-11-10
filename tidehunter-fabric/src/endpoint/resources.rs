@@ -7,11 +7,12 @@ mod efa;
 mod efa_direct;
 
 use super::{
-    CHUNK, OpenProfile, PeerDrainToken, ProgressStats, ProviderInfo, RMA_CANCELLED, ReadBuffer,
-    ReadBufferStorage, ReadOperation, RegisteredReadRegion, RemoteReadRegion, RmaAddressMode,
-    RmaCapabilities, RmaConfig, RmaReadMode, SLOTS,
+    CHUNK, OpenProfile, PeerDrainToken, ProgressStats, ProviderGeometry, ProviderInfo,
+    ProviderParameter, RMA_CANCELLED, ReadBuffer, ReadBufferStorage, ReadOperation,
+    RegisteredReadRegion, RemoteReadRegion, RmaAddressMode, RmaCapabilities, RmaConfig,
+    RmaReadMode, SLOTS,
 };
-use crate::{FabricBackend, FabricConfig};
+use crate::{FabricBackend, FabricConfig, MAX_SLOTS};
 use ofi_libfabric_sys::bindgen as ffi;
 use std::{
     any::Any,
@@ -31,85 +32,199 @@ use std::{
 
 pub(super) const ADDRESS: usize = 512;
 
-struct Buffers {
-    tx: UnsafeCell<[[u8; CHUNK]; SLOTS]>,
-    rx: UnsafeCell<[[u8; CHUNK]; SLOTS]>,
-    tx_context: UnsafeCell<[ffi::fi_context2; SLOTS]>,
-    rx_context: UnsafeCell<[ffi::fi_context2; SLOTS]>,
+/// Provider-visible TX/RX chunk and completion-context storage for one endpoint.
+/// Each array is one zeroed heap allocation addressed only through raw pointers:
+/// no Rust reference or `Box` to this memory exists while the provider can access
+/// it, so moving `Resources` cannot retag registered buffers.
+struct Memory {
+    slots: usize,
+    tx: NonNull<UnsafeCell<[u8; CHUNK]>>,
+    rx: NonNull<UnsafeCell<[u8; CHUNK]>>,
+    tx_context: NonNull<UnsafeCell<ffi::fi_context2>>,
+    rx_context: NonNull<UnsafeCell<ffi::fi_context2>>,
 }
 
-/// This allocation has no Rust references while the provider can access it.
-/// Metadata borrows cannot retag the independently allocated buffers/contexts.
-struct Memory(NonNull<Buffers>);
+/// Allocates `len` zeroed elements directly on the heap (a TX array can be 4 MiB,
+/// so no stack temporary) and returns a raw owner released by `release_array`
+/// with the same `len`.
+///
+/// # Safety
+/// All-zero bytes must be a valid `T`.
+unsafe fn zeroed_array<T>(len: usize) -> NonNull<T> {
+    let mut array = Box::<[T]>::new_uninit_slice(len);
+    // SAFETY: the allocation holds exactly `len` elements and zero is valid by
+    // this function's contract.
+    let array = unsafe {
+        array.as_mut_ptr().write_bytes(0, len);
+        array.assume_init()
+    };
+    // SAFETY: Box::into_raw never returns null.
+    unsafe { NonNull::new_unchecked(Box::into_raw(array).cast()) }
+}
 
-impl Default for Memory {
-    fn default() -> Self {
-        let mut buffers = Box::<Buffers>::new_uninit();
-        // SAFETY: Buffers contains only byte arrays and fi_context2 raw-pointer
-        // arrays inside UnsafeCell. All-zero is valid for every field. Initialize
-        // on the heap to avoid a 512 KiB temporary on a connection thread stack.
-        let buffers = unsafe {
-            buffers.as_mut_ptr().write_bytes(0, 1);
-            buffers.assume_init()
-        };
-        Self(NonNull::new(Box::into_raw(buffers)).expect("Box allocation is non-null"))
-    }
+/// Frees an allocation produced by `zeroed_array::<T>(len)`.
+///
+/// # Safety
+/// `ptr` and `len` must be exactly a prior `zeroed_array` result, released once,
+/// with no live provider access to the memory.
+unsafe fn release_array<T>(ptr: NonNull<T>, len: usize) {
+    let slice = ptr::slice_from_raw_parts_mut(ptr.as_ptr(), len);
+    // SAFETY: by contract `slice` is exactly the leaked boxed slice, released once.
+    drop(unsafe { Box::from_raw(slice) });
 }
 
 impl Memory {
+    fn new(slots: usize) -> Self {
+        debug_assert!((1..=MAX_SLOTS).contains(&slots));
+        // SAFETY: byte arrays and fi_context2 (raw-pointer fields) are valid all-zero.
+        unsafe {
+            Self {
+                slots,
+                tx: zeroed_array(slots),
+                rx: zeroed_array(slots),
+                tx_context: zeroed_array(slots),
+                rx_context: zeroed_array(slots),
+            }
+        }
+    }
+
     fn tx(&self, slot: usize) -> *mut u8 {
-        debug_assert!(slot < SLOTS);
-        // SAFETY: The allocation is live until successful resource teardown.
-        // Only an UnsafeCell shared reference is formed, never a buffer slice.
-        unsafe { (*self.0.as_ptr()).tx.get().cast::<u8>().add(slot * CHUNK) }
+        debug_assert!(slot < self.slots);
+        // SAFETY: slot is in bounds of the live allocation, which lives until
+        // successful resource teardown. Only a raw cell pointer is formed.
+        unsafe { UnsafeCell::raw_get(self.tx.as_ptr().add(slot)).cast::<u8>() }
     }
 
     fn rx(&self, slot: usize) -> *mut u8 {
-        debug_assert!(slot < SLOTS);
+        debug_assert!(slot < self.slots);
         // SAFETY: As above; provider writes are permitted inside UnsafeCell.
-        unsafe { (*self.0.as_ptr()).rx.get().cast::<u8>().add(slot * CHUNK) }
+        unsafe { UnsafeCell::raw_get(self.rx.as_ptr().add(slot)).cast::<u8>() }
     }
 
     fn tx_context(&self, slot: usize) -> *mut c_void {
-        debug_assert!(slot < SLOTS);
+        debug_assert!(slot < self.slots);
         // SAFETY: The context has the same lifetime and stable allocation.
-        unsafe {
-            (*self.0.as_ptr())
-                .tx_context
-                .get()
-                .cast::<ffi::fi_context2>()
-                .add(slot)
-                .cast()
-        }
+        unsafe { UnsafeCell::raw_get(self.tx_context.as_ptr().add(slot)).cast() }
     }
 
     fn rx_context(&self, slot: usize) -> *mut c_void {
-        debug_assert!(slot < SLOTS);
+        debug_assert!(slot < self.slots);
         // SAFETY: The context has the same lifetime and stable allocation.
-        unsafe {
-            (*self.0.as_ptr())
-                .rx_context
-                .get()
-                .cast::<ffi::fi_context2>()
-                .add(slot)
-                .cast()
-        }
+        unsafe { UnsafeCell::raw_get(self.rx_context.as_ptr().add(slot)).cast() }
+    }
+
+    /// Slot whose TX completion context is exactly `context`, if any.
+    fn tx_context_slot(&self, context: *mut c_void) -> Option<usize> {
+        context_slot(self.tx_context, self.slots, context)
+    }
+
+    /// Slot whose RX completion context is exactly `context`, if any.
+    fn rx_context_slot(&self, context: *mut c_void) -> Option<usize> {
+        context_slot(self.rx_context, self.slots, context)
+    }
+}
+
+/// Maps a CQ context pointer back to an element index of the context array at
+/// `base`, rejecting any address that is not exactly an element start. Address
+/// arithmetic only: the pointer is never dereferenced.
+fn context_slot(
+    base: NonNull<UnsafeCell<ffi::fi_context2>>,
+    slots: usize,
+    context: *mut c_void,
+) -> Option<usize> {
+    let size = mem::size_of::<UnsafeCell<ffi::fi_context2>>();
+    let offset = (context as usize).checked_sub(base.as_ptr() as usize)?;
+    (offset % size == 0 && offset / size < slots).then_some(offset / size)
+}
+
+impl Default for Memory {
+    fn default() -> Self {
+        Self::new(SLOTS)
     }
 }
 
 impl Drop for Memory {
     fn drop(&mut self) {
         // SAFETY: Endpoint frees Resources only after close() succeeds for all
-        // handles. Failed close leaks Resources, including this unique owner.
-        unsafe { drop(Box::from_raw(self.0.as_ptr())) };
+        // handles. Failed close leaks Resources, including these unique owners.
+        unsafe {
+            release_array(self.tx, self.slots);
+            release_array(self.rx, self.slots);
+            release_array(self.tx_context, self.slots);
+            release_array(self.rx_context, self.slots);
+        }
     }
 }
 
-#[derive(Default)]
+/// Per-slot bookkeeping sized to the endpoint's slot count (default `SLOTS`).
+struct PerSlot<T>(Vec<T>);
+
+impl<T: Clone + Default> PerSlot<T> {
+    fn new(slots: usize) -> Self {
+        Self(vec![T::default(); slots])
+    }
+}
+
+impl<T: Clone + Default> Default for PerSlot<T> {
+    fn default() -> Self {
+        Self::new(SLOTS)
+    }
+}
+
+impl<T> std::ops::Deref for PerSlot<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for PerSlot<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        &mut self.0
+    }
+}
+
+/// How an idle owner may park on the completion queue.
+#[derive(Clone, Copy, Default)]
 enum CqWaitMode {
     #[default]
     Polling,
+    /// Software `RxM`: bounded `fi_cq_sread`.
     SoftwareBounded,
+    /// Provider wait file descriptor: `fi_trywait` then `poll(2)` on the fd.
+    FdTryWait(libc::c_int),
+}
+
+/// Which CQ wait object an open requests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WaitRequest {
+    None,
+    /// `FI_WAIT_UNSPEC` for the software provider's bounded `fi_cq_sread`.
+    Software,
+    /// `FI_WAIT_FD` for `fi_trywait` plus `poll(2)`.
+    Fd,
+}
+
+impl WaitRequest {
+    /// Software `RxM` always parks in bounded `fi_cq_sread`. `verbs` requests a
+    /// wait fd only when the owner parks while idle (`park_idle`): the wait
+    /// object adds signalling work to every completion, which a polling client
+    /// never needs. EFA has no CQ wait object, and RMA endpoints keep polling.
+    fn select(backend: FabricBackend, park_idle: bool, direct: bool, rma: bool) -> Self {
+        match backend {
+            FabricBackend::SoftwareTcp if !direct && !rma => Self::Software,
+            FabricBackend::Verbs if park_idle && !rma => Self::Fd,
+            _ => Self::None,
+        }
+    }
+}
+
+/// A filled, unposted TX slot kept after an EAGAIN. It owns no ordinal, no
+/// credit and no provider resource, so it remains an ordinary free slot.
+#[derive(Clone, Copy)]
+struct StagedSend {
+    slot: usize,
+    len: usize,
 }
 
 #[derive(Default)]
@@ -125,8 +240,9 @@ pub(super) struct Resources {
     peer: Option<ffi::fi_addr_t>,
     addr_format: u32,
     address: Vec<u8>,
-    tx_pending: [bool; SLOTS],
-    tx_ordinal: [u64; SLOTS],
+    tx_pending: PerSlot<bool>,
+    tx_ordinal: PerSlot<u64>,
+    staged_send: Option<StagedSend>,
     accepted_send: u64,
     completed_send: u64,
     progress_stats: ProgressStats,
@@ -137,8 +253,10 @@ pub(super) struct Resources {
     last_poll: Option<Instant>,
     last_any_poll: Option<Instant>,
     cq_wait_mode: CqWaitMode,
-    rx_pending: [bool; SLOTS],
-    rx_len: [usize; SLOTS],
+    /// Human-readable outcome of the CQ wait request, for provider evidence.
+    cq_wait_note: String,
+    rx_pending: PerSlot<bool>,
+    rx_len: PerSlot<usize>,
     rx_offset: usize,
     rx_read: usize,
     rx_post: usize,
@@ -694,7 +812,178 @@ fn is_registered_rdma_pci_device(bus_address: &str) -> bool {
             .is_some_and(|name| name == bus_address)
     })
 }
+fn format_version(version: u32) -> String {
+    format!("{}.{}", version >> 16, version & 0xffff)
+}
+
+fn mr_mode_flags(mode: i32) -> Vec<String> {
+    const FLAGS: [(u32, &str); 10] = [
+        (ffi::FI_MR_LOCAL, "local"),
+        (ffi::FI_MR_RAW, "raw"),
+        (ffi::FI_MR_VIRT_ADDR, "virt-addr"),
+        (ffi::FI_MR_ALLOCATED, "allocated"),
+        (ffi::FI_MR_PROV_KEY, "prov-key"),
+        (ffi::FI_MR_MMU_NOTIFY, "mmu-notify"),
+        (ffi::FI_MR_RMA_EVENT, "rma-event"),
+        (ffi::FI_MR_ENDPOINT, "endpoint"),
+        (ffi::FI_MR_HMEM, "hmem"),
+        (ffi::FI_MR_COLLECTIVE, "collective"),
+    ];
+    let mode = u32::try_from(mode).unwrap_or(0);
+    FLAGS
+        .iter()
+        .filter(|(bit, _)| mode & bit != 0)
+        .map(|(_, name)| (*name).to_owned())
+        .collect()
+}
+
+fn progress_name(progress: ffi::fi_progress) -> &'static str {
+    match progress {
+        ffi::fi_progress_FI_PROGRESS_AUTO => "auto",
+        ffi::fi_progress_FI_PROGRESS_MANUAL => "manual",
+        ffi::fi_progress_FI_PROGRESS_CONTROL_UNIFIED => "control-unified",
+        ffi::fi_progress_FI_PROGRESS_UNSPEC => "unspec",
+        _ => "unknown",
+    }
+}
+
+fn threading_name(threading: ffi::fi_threading) -> &'static str {
+    match threading {
+        ffi::fi_threading_FI_THREAD_SAFE => "safe",
+        ffi::fi_threading_FI_THREAD_FID => "fid",
+        ffi::fi_threading_FI_THREAD_DOMAIN => "domain",
+        ffi::fi_threading_FI_THREAD_COMPLETION => "completion",
+        ffi::fi_threading_FI_THREAD_ENDPOINT => "endpoint",
+        ffi::fi_threading_FI_THREAD_UNSPEC => "unspec",
+        _ => "unknown",
+    }
+}
+
+/// Upper bound on libfabric parameter entries inspected; the library defines
+/// a few hundred, so this only bounds a corrupted count.
+const MAX_PARAMETERS: usize = 4096;
+/// The default a libfabric help string states, as in "(default 16384)" or
+/// "(default: 10000)." Only the first value is taken ("128, 4096 with srx").
+fn help_default(help: &str) -> Option<String> {
+    let after = &help[help.find("(default")? + "(default".len()..];
+    let value = after
+        .trim_start_matches([':', ' '])
+        .split([')', ','])
+        .next()?
+        .trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+/// `RxM` parameters (`FI_OFI_RXM_*`): configured override and provider help text.
+/// Returns an empty list when libfabric reports none.
+fn rxm_parameters() -> Vec<ProviderParameter> {
+    let mut params = ptr::null_mut();
+    let mut count = 0;
+    // SAFETY: fi_getparams stores an array of `count` entries that libfabric owns
+    // until fi_freeparams; both out-pointers are live locals.
+    if unsafe { ffi::fi_getparams(&raw mut params, &raw mut count) } != 0 || params.is_null() {
+        return Vec::new();
+    }
+    let len = usize::try_from(count).unwrap_or(0).min(MAX_PARAMETERS);
+    // SAFETY: `params` points to at least `len` initialized entries until the
+    // fi_freeparams call below; the strings are copied out before then.
+    let entries = unsafe { std::slice::from_raw_parts(params, len) };
+    let mut found = Vec::new();
+    for entry in entries {
+        let Some(name) = optional_c_string(entry.name) else {
+            continue;
+        };
+        // libfabric names parameters "<provider>_<name>" in lower case; the
+        // environment variable is that name, upper-cased, with an FI_ prefix.
+        let name = name.to_ascii_uppercase();
+        if !name.contains("OFI_RXM_") {
+            continue;
+        }
+        let name = if name.starts_with("FI_") {
+            name
+        } else {
+            format!("FI_{name}")
+        };
+        // libfabric reads provider parameters from the environment only.
+        let value = optional_c_string(entry.value).or_else(|| std::env::var(&name).ok());
+        let help = optional_c_string(entry.help_string).unwrap_or_default();
+        found.push(ProviderParameter {
+            configured_or_default: value.clone().or_else(|| help_default(&help)),
+            name,
+            value,
+            help,
+        });
+    }
+    // SAFETY: `params` came from fi_getparams and is released exactly once.
+    unsafe { ffi::fi_freeparams(params) };
+    found.sort_by(|left, right| left.name.cmp(&right.name));
+    found
+}
+
+/// Copies the selected provider/domain/endpoint attributes into plain data.
+///
+/// # Safety
+/// `selected` must be a successful `fi_getinfo` result whose fabric, domain,
+/// endpoint, TX and RX attribute pointers are non-null.
+unsafe fn capture_geometry(
+    selected: &ffi::fi_info,
+    requested_api: u32,
+    slots: usize,
+    cq_wait: &str,
+) -> ProviderGeometry {
+    // SAFETY: by this function's contract all attribute pointers are valid.
+    let (fabric, domain, ep, tx, rx) = unsafe {
+        (
+            &*selected.fabric_attr,
+            &*selected.domain_attr,
+            &*selected.ep_attr,
+            &*selected.tx_attr,
+            &*selected.rx_attr,
+        )
+    };
+    let rxm = optional_c_string(fabric.prov_name).is_some_and(|name| name.contains("ofi_rxm"));
+    ProviderGeometry {
+        // SAFETY: fi_version has no arguments and no preconditions.
+        libfabric_api_version: format_version(unsafe { ffi::fi_version() }),
+        requested_api_version: format_version(requested_api),
+        provider_version: format_version(fabric.prov_version),
+        protocol: ep.protocol,
+        protocol_version: ep.protocol_version,
+        tx_inject_size: tx.inject_size,
+        tx_size: tx.size,
+        rx_size: rx.size,
+        tx_iov_limit: tx.iov_limit,
+        rx_iov_limit: rx.iov_limit,
+        max_msg_size: ep.max_msg_size,
+        mr_mode: domain.mr_mode,
+        mr_mode_flags: mr_mode_flags(domain.mr_mode),
+        // SAFETY: data_progress and progress are the same fi_progress union field.
+        data_progress: progress_name(unsafe { domain.__bindgen_anon_1.data_progress }).to_owned(),
+        control_progress: progress_name(domain.control_progress).to_owned(),
+        threading: threading_name(domain.threading).to_owned(),
+        slots,
+        cq_wait: cq_wait.to_owned(),
+        rxm_parameters: if rxm { rxm_parameters() } else { Vec::new() },
+    }
+}
+
 impl Resources {
+    fn slots(&self) -> usize {
+        self.memory.slots
+    }
+
+    /// Resizes the TX/RX storage before any registration or provider handle
+    /// can reference it. Only called from `open_mode`.
+    fn set_slots(&mut self, slots: usize) {
+        if slots != self.slots() {
+            self.memory = Memory::new(slots);
+            self.tx_pending = PerSlot::new(slots);
+            self.tx_ordinal = PerSlot::new(slots);
+            self.rx_pending = PerSlot::new(slots);
+            self.rx_len = PerSlot::new(slots);
+        }
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "Keep validated provider info and partial resource ownership in one ordered setup path"
@@ -703,6 +992,7 @@ impl Resources {
         &mut self,
         config: &FabricConfig,
         rma: Option<RmaConfig>,
+        park_idle: bool,
     ) -> io::Result<()> {
         config.validate()?;
         let discovery = Instant::now();
@@ -720,8 +1010,13 @@ impl Resources {
             ));
         }
         self.direct = direct_fabric;
-        let software_wait_candidate =
-            config.backend == FabricBackend::SoftwareTcp && !direct_fabric && rma.is_none();
+        let slots = config.effective_slots();
+        self.set_slots(slots);
+        // Software RxM parks in bounded fi_cq_sread. Verbs parks on a provider
+        // wait fd only when the owner asks (`park_idle`): the wait object adds
+        // signalling work to every completion, which a polling client never needs.
+        let wait_request =
+            WaitRequest::select(config.backend, park_idle, direct_fabric, rma.is_some());
         if let Some(config) = rma {
             RmaState::validate_config(config)?;
         }
@@ -933,8 +1228,8 @@ impl Resources {
                     (*selected.domain_attr).threading,
                     ffi::fi_threading_FI_THREAD_SAFE | ffi::fi_threading_FI_THREAD_DOMAIN
                 )
-                || (*selected.tx_attr).size < SLOTS
-                || (*selected.rx_attr).size < SLOTS
+                || (*selected.tx_attr).size < slots
+                || (*selected.rx_attr).size < slots
                 || mr_mode & !i32::try_from(supported_mr_modes).unwrap() != 0
                 || (direct_fabric && mr_mode & i32::try_from(ffi::FI_MR_LOCAL).unwrap() == 0)
                 || (direct_fabric
@@ -1021,7 +1316,7 @@ impl Resources {
             self.open_endpoint(
                 info.0,
                 active_rma.map_or(0, |config| config.destination_slots),
-                software_wait_candidate,
+                wait_request,
             )?;
             let stage = Instant::now();
             if let (Some(rma_config), Some(mut capabilities)) =
@@ -1116,7 +1411,7 @@ impl Resources {
                     ffi::fi_mr_reg(
                         self.domain,
                         self.memory.tx(0).cast(),
-                        CHUNK * SLOTS,
+                        CHUNK * slots,
                         u64::from(ffi::FI_SEND),
                         0,
                         1,
@@ -1130,7 +1425,7 @@ impl Resources {
                     ffi::fi_mr_reg(
                         self.domain,
                         self.memory.rx(0).cast(),
-                        CHUNK * SLOTS,
+                        CHUNK * slots,
                         u64::from(ffi::FI_RECV),
                         0,
                         2,
@@ -1216,6 +1511,7 @@ impl Resources {
                 bus_address,
                 rma_capabilities,
                 capability_evidence,
+                geometry: capture_geometry(selected, api, slots, &self.cq_wait_note),
             });
         }
         Ok(())
@@ -1225,18 +1521,18 @@ impl Resources {
         &mut self,
         info: *mut ffi::fi_info,
         rma_slots: usize,
-        allow_wait: bool,
+        wait_request: WaitRequest,
     ) -> io::Result<()> {
-        let cq_size = (2 * SLOTS)
+        let cq_size = (2 * self.slots())
             .checked_add(rma_slots)
             .ok_or_else(|| invalid("RMA completion queue size overflow"))?;
         let mut cq = ffi::fi_cq_attr {
             size: cq_size,
             format: ffi::fi_cq_format_FI_CQ_FORMAT_MSG,
-            wait_obj: if allow_wait {
-                ffi::fi_wait_obj_FI_WAIT_UNSPEC
-            } else {
-                ffi::fi_wait_obj_FI_WAIT_NONE
+            wait_obj: match wait_request {
+                WaitRequest::None => ffi::fi_wait_obj_FI_WAIT_NONE,
+                WaitRequest::Software => ffi::fi_wait_obj_FI_WAIT_UNSPEC,
+                WaitRequest::Fd => ffi::fi_wait_obj_FI_WAIT_FD,
             },
             ..ffi::fi_cq_attr::default()
         };
@@ -1251,15 +1547,44 @@ impl Resources {
             let stage = Instant::now();
             let mut code =
                 ffi::fi_cq_open(self.domain, &raw mut cq, &raw mut self.cq, ptr::null_mut());
-            if allow_wait
-                && (code == -i32::try_from(ffi::FI_ENOSYS).unwrap()
-                    || code == -i32::try_from(ffi::FI_EOPNOTSUPP).unwrap())
-            {
+            self.cq_wait_note = match wait_request {
+                WaitRequest::None => "none: not requested".to_owned(),
+                WaitRequest::Software => "unspec: bounded fi_cq_sread".to_owned(),
+                WaitRequest::Fd => "fd: FI_WAIT_FD with fi_trywait and poll".to_owned(),
+            };
+            let refused = [ffi::FI_ENOSYS, ffi::FI_EOPNOTSUPP, ffi::FI_EINVAL]
+                .into_iter()
+                .any(|refusal| code == -i32::try_from(refusal).unwrap());
+            if wait_request != WaitRequest::None && refused {
+                // Keep the polling behavior: a provider without a wait object is
+                // reported in evidence, never papered over with a different one.
+                self.cq_wait_note = format!(
+                    "none: provider rejected the CQ wait object ({}); busy polling retained",
+                    error("open completion queue wait", code.unsigned_abs())
+                );
                 cq.wait_obj = ffi::fi_wait_obj_FI_WAIT_NONE;
                 self.cq = ptr::null_mut();
                 code = ffi::fi_cq_open(self.domain, &raw mut cq, &raw mut self.cq, ptr::null_mut());
-            } else if code == 0 && allow_wait {
-                self.cq_wait_mode = CqWaitMode::SoftwareBounded;
+            } else if code == 0 {
+                match wait_request {
+                    WaitRequest::None => {}
+                    WaitRequest::Software => self.cq_wait_mode = CqWaitMode::SoftwareBounded,
+                    WaitRequest::Fd => {
+                        let mut fd: libc::c_int = -1;
+                        let status = ffi::fi_control(
+                            &raw mut (*self.cq).fid,
+                            i32::try_from(ffi::FI_GETWAIT).unwrap(),
+                            (&raw mut fd).cast(),
+                        );
+                        if status == 0 && fd >= 0 {
+                            self.cq_wait_mode = CqWaitMode::FdTryWait(fd);
+                        } else {
+                            self.cq_wait_note = format!(
+                                "none: FI_GETWAIT returned no fd (status {status}); busy polling retained"
+                            );
+                        }
+                    }
+                }
             }
             check("open completion queue", code)?;
             self.open_profile.cq_ns = elapsed_ns(stage);
@@ -1754,7 +2079,8 @@ impl Resources {
 
     pub(super) fn free_send_slot(&self) -> Option<usize> {
         if self.direct {
-            self.tx_pending[..SLOTS - 1]
+            let data_slots = self.slots() - 1;
+            self.tx_pending[..data_slots]
                 .iter()
                 .position(|pending| !pending)
         } else {
@@ -1770,7 +2096,7 @@ impl Resources {
     }
 
     pub(super) fn supports_idle_wait(&self) -> bool {
-        matches!(self.cq_wait_mode, CqWaitMode::SoftwareBounded)
+        !matches!(self.cq_wait_mode, CqWaitMode::Polling)
     }
 
     pub(super) fn progress_stats(&self) -> ProgressStats {
@@ -1810,7 +2136,7 @@ impl Resources {
 
     pub(super) fn free_control_slot(&self) -> Option<usize> {
         self.direct
-            .then_some(SLOTS - 1)
+            .then(|| self.slots() - 1)
             .filter(|&slot| !self.tx_pending[slot])
     }
 
@@ -1831,13 +2157,15 @@ impl Resources {
     /// The returned bytes must remain unchanged after a successful post until
     /// the corresponding CQ completion retires this physical slot.
     fn send_buffer(&mut self, slot: usize) -> &mut [u8] {
-        assert!(slot < SLOTS && !self.tx_pending[slot]);
+        assert!(slot < self.slots() && !self.tx_pending[slot]);
+        self.forget_staged(slot);
         // SAFETY: The slot is not provider-owned or otherwise borrowed; the
         // mutable Resources borrow prevents another safe accessor from aliasing it.
         unsafe { std::slice::from_raw_parts_mut(self.memory.tx(slot), CHUNK) }
     }
     pub(super) fn copy_send(&mut self, slot: usize, bytes: &[IoSlice<'_>]) -> usize {
-        assert!(slot < SLOTS && !self.tx_pending[slot]);
+        assert!(slot < self.slots() && !self.tx_pending[slot]);
+        self.forget_staged(slot);
         let began = self.time_progress.then(Instant::now);
         let mut offset = 0;
         for source in bytes {
@@ -1854,6 +2182,67 @@ impl Resources {
         }
         self.record_send_copy(began, offset);
         offset
+    }
+
+    /// A write into `slot` ends any kept copy there.
+    fn forget_staged(&mut self, slot: usize) {
+        if self.staged_send.is_some_and(|staged| staged.slot == slot) {
+            self.staged_send = None;
+        }
+    }
+
+    /// Whether the kept EAGAIN copy is byte-identical to what `copy_send` would
+    /// now produce for `bytes`: same length (so the post accepts exactly the
+    /// bytes a fresh copy would) and same content. Compares, never copies.
+    fn staged_matches(&self, staged: StagedSend, bytes: &[IoSlice<'_>]) -> bool {
+        let total = bytes
+            .iter()
+            .fold(0_usize, |sum, slice| sum.saturating_add(slice.len()));
+        if total.min(CHUNK) != staged.len {
+            return false;
+        }
+        // SAFETY: The staged slot is not provider-owned (tx_pending is false by
+        // the caller's check) and holds `staged.len <= CHUNK` initialized bytes.
+        let kept = unsafe { std::slice::from_raw_parts(self.memory.tx(staged.slot), staged.len) };
+        let mut offset = 0;
+        for source in bytes {
+            let len = source.len().min(staged.len - offset);
+            if kept[offset..offset + len] != source[..len] {
+                return false;
+            }
+            offset += len;
+            if offset == staged.len {
+                break;
+            }
+        }
+        true
+    }
+
+    /// Copies `bytes` into a free slot once and posts it. On EAGAIN the filled
+    /// slot is kept unposted, owning no ordinal, so a later call with the same
+    /// bytes posts it again without another copy; different bytes are copied
+    /// fresh into any free slot. Returns `WouldBlock` for EAGAIN or no free slot.
+    pub(super) fn send_copied(&mut self, bytes: &[IoSlice<'_>]) -> io::Result<usize> {
+        let reusable = self
+            .staged_send
+            .take()
+            .filter(|staged| !self.tx_pending[staged.slot] && self.staged_matches(*staged, bytes));
+        let staged = if let Some(staged) = reusable {
+            self.progress_stats.send_post_retries =
+                self.progress_stats.send_post_retries.saturating_add(1);
+            staged
+        } else {
+            let slot = self.free_send_slot().ok_or(io::ErrorKind::WouldBlock)?;
+            StagedSend {
+                slot,
+                len: self.copy_send(slot, bytes),
+            }
+        };
+        if !self.post_send(staged.slot, staged.len)? {
+            self.staged_send = Some(staged);
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        Ok(staged.len)
     }
 
     fn record_send_copy(&mut self, began: Option<Instant>, len: usize) {
@@ -1908,13 +2297,13 @@ impl Resources {
         if self.rx_offset == self.rx_len[slot] {
             self.rx_len[slot] = 0;
             self.rx_offset = 0;
-            self.rx_read = (slot + 1) % SLOTS;
+            self.rx_read = (slot + 1) % self.slots();
         }
         Some(len)
     }
 
     pub(super) fn post_send(&mut self, slot: usize, len: usize) -> io::Result<bool> {
-        assert!(slot < SLOTS && !self.tx_pending[slot] && len <= CHUNK);
+        assert!(slot < self.slots() && !self.tx_pending[slot] && len <= CHUNK);
         let peer = self.peer.ok_or_else(|| invalid("missing fabric peer"))?;
         // Reserve the ordinal before posting: an overflow must accept no bytes.
         let ordinal = self
@@ -1954,6 +2343,12 @@ impl Resources {
                 stats.send_post_errors = stats.send_post_errors.saturating_add(1);
             }
         }
+        if code == 0 {
+            self.record_send_bucket(len);
+        } else if code == -isize::try_from(ffi::FI_EAGAIN).unwrap() {
+            self.progress_stats.send_post_eagain =
+                self.progress_stats.send_post_eagain.saturating_add(1);
+        }
         self.tx_pending[slot] = posted("post fabric send", code)?;
         if self.tx_pending[slot] {
             if self.time_progress && self.accepted_send == self.completed_send {
@@ -1965,8 +2360,20 @@ impl Resources {
         Ok(self.tx_pending[slot])
     }
 
+    /// Always-on posted-length histogram; never reads a clock.
+    fn record_send_bucket(&mut self, len: usize) {
+        let stats = &mut self.progress_stats;
+        let bucket = match len {
+            0..=4096 => &mut stats.send_size_le_4k,
+            4097..=16_384 => &mut stats.send_size_le_16k,
+            16_385..=65_536 => &mut stats.send_size_le_64k,
+            _ => &mut stats.send_size_gt_64k,
+        };
+        *bucket = bucket.saturating_add(1);
+    }
+
     pub(super) fn fill_receives(&mut self) -> io::Result<()> {
-        for _ in 0..SLOTS {
+        for _ in 0..self.slots() {
             match self.try_post_receive() {
                 Ok(true) => {}
                 Ok(false) => break,
@@ -1988,7 +2395,7 @@ impl Resources {
         if !self.post_receive(slot)? {
             return Err(io::ErrorKind::WouldBlock.into());
         }
-        self.rx_post = (slot + 1) % SLOTS;
+        self.rx_post = (slot + 1) % self.slots();
         Ok(true)
     }
 
@@ -2089,8 +2496,45 @@ impl Resources {
         {
             return self.poll().map(|progress| (progress, false));
         }
-        self.poll_with_timeout::<true>(1)
-            .map(|progress| (progress, true))
+        match self.cq_wait_mode {
+            CqWaitMode::FdTryWait(fd) => self.park_on_wait_fd(fd),
+            CqWaitMode::SoftwareBounded | CqWaitMode::Polling => self
+                .poll_with_timeout::<true>(1)
+                .map(|progress| (progress, true)),
+        }
+    }
+
+    /// Blocks for at most one millisecond on the provider's CQ wait fd, only
+    /// after `fi_trywait` proves no completion is already queued. A nonzero
+    /// `fi_trywait` (EAGAIN: provider has work to progress) polls normally
+    /// instead. Returns `(progress, parked)`.
+    fn park_on_wait_fd(&mut self, fd: libc::c_int) -> io::Result<(bool, bool)> {
+        // SAFETY: `fabric` and `cq` are the live handles this Resources owns and
+        // this &mut self is the only user (FI_THREAD_DOMAIN); `fids` points to one
+        // initialized element for the call's duration.
+        let code = unsafe {
+            let mut fid = &raw mut (*self.cq).fid;
+            ffi::fi_trywait(self.fabric, &raw mut fid, 1)
+        };
+        if code != 0 {
+            return self.poll().map(|progress| (progress, false));
+        }
+        let mut descriptor = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialized stack pollfd is writable for this call; poll
+        // retains neither the pointer nor the descriptor, which the CQ keeps open.
+        let ready = unsafe { libc::poll(&raw mut descriptor, 1, 1) };
+        if ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return Err(io::Error::last_os_error());
+        }
+        if descriptor.revents & libc::POLLNVAL != 0 {
+            return Err(invalid("fabric CQ wait descriptor is invalid"));
+        }
+        self.progress_stats.cq_idle_waits = self.progress_stats.cq_idle_waits.saturating_add(1);
+        self.poll().map(|progress| (progress, true))
     }
 
     #[allow(
@@ -2099,6 +2543,18 @@ impl Resources {
     )]
     fn poll_with_timeout<const WAIT: bool>(&mut self, timeout_ms: i32) -> io::Result<bool> {
         if self.time_progress {
+            self.progress_stats.tx_all_slots_pending_polls = self
+                .progress_stats
+                .tx_all_slots_pending_polls
+                .saturating_add(u64::from(self.tx_pending.iter().all(|pending| *pending)));
+            self.progress_stats.rx_no_posted_slots_polls = self
+                .progress_stats
+                .rx_no_posted_slots_polls
+                .saturating_add(u64::from(self.rx_pending.iter().all(|pending| !*pending)));
+            self.progress_stats.rx_unread_slots_polls = self
+                .progress_stats
+                .rx_unread_slots_polls
+                .saturating_add(u64::from(self.rx_len.iter().any(|&len| len != 0)));
             let now = Instant::now();
             if let Some(previous) = self.last_any_poll.replace(now) {
                 let gap =
@@ -2121,22 +2577,25 @@ impl Resources {
         self.progress_stats.cq_polls = self.progress_stats.cq_polls.saturating_add(1);
         // Empty polls need no initialization. MSG len is receive-only: read
         // fields individually instead of assuming a complete Rust struct exists.
-        let mut entries = [MaybeUninit::<ffi::fi_cq_msg_entry>::uninit(); 2 * SLOTS];
+        let mut entries = [MaybeUninit::<ffi::fi_cq_msg_entry>::uninit(); 2 * MAX_SLOTS];
+        // At most one CQE per TX slot and per RX slot can be outstanding.
+        let capacity = 2 * self.slots();
         let initial_progress = (!self.initial_progress_recorded).then(Instant::now);
         let began = self.time_progress.then(Instant::now);
-        // SAFETY: Our CQ uses MSG format and may initialize at most entries.len()
-        // entries; no Rust references to this storage cross the synchronous call.
+        // SAFETY: Our CQ uses MSG format and may initialize at most `capacity <=
+        // entries.len()` entries; no Rust references to this storage cross the
+        // synchronous call.
         let count = unsafe {
             if WAIT {
                 ffi::fi_cq_sread(
                     self.cq,
                     entries.as_mut_ptr().cast(),
-                    entries.len(),
+                    capacity,
                     ptr::null(),
                     timeout_ms,
                 )
             } else {
-                ffi::fi_cq_read(self.cq, entries.as_mut_ptr().cast(), entries.len())
+                ffi::fi_cq_read(self.cq, entries.as_mut_ptr().cast(), capacity)
             }
         };
         if let Some(began) = began {
@@ -2196,7 +2655,7 @@ impl Resources {
                 u32::try_from(count.unsigned_abs()).unwrap_or(ffi::FI_EIO),
             )
         })?;
-        if count > entries.len() {
+        if count > capacity {
             return Err(invalid("invalid fabric completion count"));
         }
         for entry in &entries[..count] {
@@ -2240,31 +2699,33 @@ impl Resources {
         {
             return Ok(());
         }
-        for slot in 0..SLOTS {
-            if context == self.memory.tx_context(slot) && self.tx_pending[slot] {
-                self.tx_pending[slot] = false;
-                // Every accepted ordinal not in a pending slot has completed.
-                // Taking the oldest live ordinal handles arbitrary CQ order and
-                // slot reuse with fixed O(SLOTS) state, even if one send stalls.
-                self.completed_send = self
-                    .tx_pending
-                    .iter()
-                    .zip(self.tx_ordinal)
-                    .filter(|(pending, _)| **pending)
-                    .map(|(_, ordinal)| ordinal - 1)
-                    .min()
-                    .unwrap_or(self.accepted_send);
-                return Ok(());
+        if let Some(slot) = self.memory.tx_context_slot(context)
+            && self.tx_pending[slot]
+        {
+            self.tx_pending[slot] = false;
+            // Every accepted ordinal not in a pending slot has completed.
+            // Taking the oldest live ordinal handles arbitrary CQ order and
+            // slot reuse with fixed O(slots) state, even if one send stalls.
+            self.completed_send = self
+                .tx_pending
+                .iter()
+                .zip(self.tx_ordinal.iter())
+                .filter(|(pending, _)| **pending)
+                .map(|(_, ordinal)| ordinal - 1)
+                .min()
+                .unwrap_or(self.accepted_send);
+            return Ok(());
+        }
+        if let Some(slot) = self.memory.rx_context_slot(context)
+            && self.rx_pending[slot]
+        {
+            let len = receive_len();
+            if len == 0 || len > CHUNK {
+                return Err(invalid("invalid fabric receive length"));
             }
-            if context == self.memory.rx_context(slot) && self.rx_pending[slot] {
-                let len = receive_len();
-                if len == 0 || len > CHUNK {
-                    return Err(invalid("invalid fabric receive length"));
-                }
-                self.rx_pending[slot] = false;
-                self.rx_len[slot] = len;
-                return Ok(());
-            }
+            self.rx_pending[slot] = false;
+            self.rx_len[slot] = len;
+            return Ok(());
         }
         Err(invalid("unexpected fabric completion"))
     }
@@ -2503,7 +2964,7 @@ mod tests {
             assert_eq!(rx.msg_order, u64::from(ffi::FI_ORDER_SAS));
         }
         let mut state = Resources {
-            tx_pending: [true; SLOTS],
+            tx_pending: PerSlot(vec![true; SLOTS]),
             ..Resources::default()
         };
         assert_eq!(state.free_send_slot(), None);
@@ -2530,8 +2991,10 @@ mod tests {
                         backend: FabricBackend::SoftwareTcp,
                         domain: Some("lo".to_owned()),
                         source_address: Some(std::net::Ipv4Addr::LOCALHOST.into()),
+                        slots: None,
                     },
                     Some(config),
+                    false,
                 )
                 .is_err()
         );
@@ -2540,7 +3003,7 @@ mod tests {
     #[test]
     fn receive_delivery_follows_posting_order_not_completion_order() {
         let mut state = Resources {
-            rx_pending: [true; SLOTS],
+            rx_pending: PerSlot(vec![true; SLOTS]),
             ..Resources::default()
         };
         for slot in 0..SLOTS {
@@ -2568,8 +3031,8 @@ mod tests {
     #[test]
     fn transmit_slots_remain_unavailable_until_their_own_completion() {
         let mut state = Resources {
-            tx_pending: [true; SLOTS],
-            tx_ordinal: [1, 2, 3, 4],
+            tx_pending: PerSlot(vec![true; SLOTS]),
+            tx_ordinal: PerSlot(vec![1, 2, 3, 4]),
             accepted_send: 4,
             ..Resources::default()
         };
@@ -2680,8 +3143,8 @@ mod tests {
     #[test]
     fn direct_local_cqe_releases_physical_slot_without_remote_credit() {
         let mut state = Resources {
-            tx_pending: [true; SLOTS],
-            tx_ordinal: [1, 2, 3, 4],
+            tx_pending: PerSlot(vec![true; SLOTS]),
+            tx_ordinal: PerSlot(vec![1, 2, 3, 4]),
             accepted_send: 4,
             direct: true,
             ..Resources::default()

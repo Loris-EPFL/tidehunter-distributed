@@ -39,22 +39,46 @@ def _identity(config):
             "dataset": copy.deepcopy(config["dataset"])}
 
 
+class PreparationTimeout(RuntimeError):
+    """Preparation exceeded its local budget after confirmed process termination."""
+
+
+class PreparationCleanupUnconfirmed(OSError):
+    """The preparation process may still own the dataset."""
+
+
+def _stop(process):
+    try:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=10)
+        import floors
+        deadline = time.monotonic() + 2
+        while floors.process_group_alive(process.pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if floors.process_group_alive(process.pid):
+            raise PreparationCleanupUnconfirmed("native preparation process group remains alive")
+    except Exception as exc:
+        raise PreparationCleanupUnconfirmed("native preparation process stop unconfirmed") from exc
+
+
 def _run(argv, log, deadline, environment=None):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise TimeoutError("native preparation deadline expired")
+        raise PreparationTimeout("native preparation deadline expired before launch")
     with log.open("wb") as output, log.with_suffix(".stderr.log").open("wb") as errors:
         process = subprocess.Popen([str(x) for x in argv], stdout=output,
                                    stderr=errors, start_new_session=True, env=environment)
         try:
             code = process.wait(timeout=remaining)
         except subprocess.TimeoutExpired as exc:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
-            raise TimeoutError("native preparation subprocess exceeded deadline") from exc
+            _stop(process)
+            raise PreparationTimeout("native preparation subprocess exceeded deadline") from exc
+        except BaseException:
+            _stop(process)
+            raise
     if code:
         raise RuntimeError(f"native preparation subprocess exited {code}; see {log}")
 
@@ -86,6 +110,7 @@ def prepare_native(binary, config, output_dir, timeout_seconds, environment=None
                           "measurement_operations": 1}
     prepared["workload"]["mix"] = {"read": 100, "put": 0, "put_batch": 0,
                                    "delete": 0, "missing_read": 0, "get_many": 0}
+    prepared["workload"].pop("put_key_policy", None)
     prepared["qualification_only"] = False
     prepared["measurement_gate"] = None
     prepared["measurement_completion_gate"] = None
@@ -98,6 +123,7 @@ def prepare_native(binary, config, output_dir, timeout_seconds, environment=None
                "database_path": str(root / "database"), "config": prepared,
                "binary_sha256": _digest(binary), "binary_blake2b512": _digest(binary, "blake2b"),
                "raw_result": str(root / "result")}
+    cleanup_unconfirmed = False
     try:
         _run([binary, "--config", config_path, "--validate-config"], root / "admission.log", deadline, environment)
         envelope = json.loads((root / "admission.log").read_text())
@@ -119,10 +145,15 @@ def prepare_native(binary, config, output_dir, timeout_seconds, environment=None
         receipt["status"] = "completed"
         return receipt
     except Exception as exc:
+        cleanup_unconfirmed = isinstance(exc, PreparationCleanupUnconfirmed)
         receipt["error"] = f"{type(exc).__name__}: {exc}"
         raise
     finally:
-        _dump(root / "receipt.json", receipt)
+        try:
+            _dump(root / "receipt.json", receipt)
+        except Exception:
+            if not cleanup_unconfirmed:
+                raise
 
 
 def read_config(receipt, config):

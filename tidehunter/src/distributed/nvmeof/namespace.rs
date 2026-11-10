@@ -1,19 +1,12 @@
 //! Kernel namespace identity and read-only verification. Management and connect
 //! operations are intentionally not available through this data-plane module.
 
-use super::ExportManifest;
+use super::{ExportManifest, ExportTarget, NvmeofTransport};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NvmeofTransport {
-    Tcp,
-    Rdma,
-}
 
 /// Production input accepts only a kernel block namespace, never a regular file.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -21,6 +14,8 @@ pub enum NvmeofTransport {
 pub struct NamespaceBinding {
     pub namespace_path: PathBuf,
     pub transport: NvmeofTransport,
+    #[serde(default)]
+    pub target: ExportTarget,
 }
 
 #[repr(C)]
@@ -153,9 +148,9 @@ fn verify_transport_at(
     Ok(())
 }
 
-/// Opens an actual read-only, direct-I/O NVMe namespace and verifies kernel
-/// identity plus the target's identify-namespace write-protection bit. The
-/// caller must separately authenticate the manifest's catalog with the owner.
+/// Opens a read-only direct-I/O block namespace with exact kernel identity.
+/// Kernel targets also require the identify write-protection bit. SPDK's
+/// distinct RO-bdev proof must already be admitted by the authenticated owner.
 pub(crate) fn open_namespace(
     binding: &NamespaceBinding,
     manifest: &ExportManifest,
@@ -230,16 +225,33 @@ pub(crate) fn open_namespace(
     if result < 0 {
         return Err(io::Error::last_os_error());
     }
-    if result != 0 || identify[99] & 1 == 0 {
+    verify_write_protection(&binding.target, result, identify[99])?;
+    Ok(file)
+}
+
+fn verify_write_protection(target: &ExportTarget, result: i32, attributes: u8) -> io::Result<()> {
+    if result != 0
+        || (matches!(target, ExportTarget::Kernel | ExportTarget::KernelDirect)
+            && attributes & 1 == 0)
+    {
         return Err(invalid("target namespace is not write protected"));
     }
-    Ok(file)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn both_kernel_policies_require_namespace_write_protection() {
+        for target in [ExportTarget::Kernel, ExportTarget::KernelDirect] {
+            assert!(verify_write_protection(&target, 0, 0).is_err());
+            assert!(verify_write_protection(&target, 0, 1).is_ok());
+            assert!(verify_write_protection(&target, 1, 1).is_err());
+        }
+    }
 
     #[test]
     fn subsystem_head_requires_one_matching_live_controller() {

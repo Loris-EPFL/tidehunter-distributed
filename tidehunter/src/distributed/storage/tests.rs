@@ -76,6 +76,585 @@ fn metrics() -> Arc<Metrics> {
     Metrics::new_in_enabled(&prometheus::Registry::new(), false)
 }
 
+#[cfg(feature = "experimental-nvmeof")]
+fn live_config() -> PartitionConfig {
+    let mut config = config(vec![3], 3);
+    config.group_limits.max_encoded_bytes = 4088;
+    config.fragment_bytes = 4096;
+    config.wal_file_bytes = 8192;
+    config
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+fn append_live_fixture(log: &PartitionLog, config: &PartitionConfig, n: u64) -> AppendedBatch {
+    use crate::distributed::nvmeof::live_storage::{LiveGroupDescriptor, LiveReserveResult};
+    let group = CompleteGroup::new_live(
+        &shape(),
+        vec![batch(config, n)],
+        config.batch_limits,
+        config.group_limits,
+    )
+    .unwrap();
+    let (descriptor, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+    let reservation = match log
+        .reserve_live_group(authority(config), descriptor)
+        .unwrap()
+    {
+        LiveReserveResult::Reserved(reservation) => reservation,
+        _ => panic!("expected new live reservation"),
+    };
+    let file = OpenOptions::new()
+        .write(true)
+        .open(&reservation.segment.path)
+        .unwrap();
+    file.write_all_at(&frame, reservation.frame_offset % reservation.segment.bytes)
+        .unwrap();
+    log.complete_live_group(authority(config), reservation.token)
+        .unwrap()[0]
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn live_final_frames_persist_retry_and_recover_across_rollover() {
+    use crate::distributed::nvmeof::live_storage::{LiveGroupDescriptor, LiveReserveResult};
+    let temp = tempdir::TempDir::new("live-final-wal").unwrap();
+    let config = live_config();
+    let path = temp.path().join("stream");
+    let log = PartitionLog::create_live(&path, config.clone(), &shape(), metrics()).unwrap();
+    let mut receipts = Vec::new();
+    for n in 0..5 {
+        let group = CompleteGroup::new_live(
+            &shape(),
+            vec![batch(&config, n)],
+            config.batch_limits,
+            config.group_limits,
+        )
+        .unwrap();
+        let (descriptor, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+        let reservation = match log
+            .reserve_live_group(authority(&config), descriptor.clone())
+            .unwrap()
+        {
+            LiveReserveResult::Reserved(reservation) => reservation,
+            _ => panic!("new group must reserve"),
+        };
+        assert_eq!(reservation.frame_offset, n * 4096);
+        assert_eq!(reservation.segment.file_index, n / 2);
+        assert!(
+            !log.can_release_live_segment(reservation.segment.file_index)
+                .unwrap()
+        );
+        if n == 2 {
+            assert!(log.can_release_live_segment(0).unwrap());
+        }
+        if n == 4 {
+            assert!(log.can_release_live_segment(1).unwrap());
+        }
+        assert!(matches!(
+            log.append_group(authority(&config), &group),
+            Err(StorageError::Invalid(_))
+        ));
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&reservation.segment.path)
+            .unwrap();
+        file.write_all_at(&frame, reservation.frame_offset % reservation.segment.bytes)
+            .unwrap();
+        let (appended, _validation_ns, samples) = log
+            .complete_live_group_profiled(authority(&config), reservation.token)
+            .unwrap();
+        assert_eq!(samples, 1);
+        log.persist_many(&appended).unwrap();
+        if n == 1 {
+            assert!(log.can_release_live_segment(0).unwrap());
+        }
+        let (retried, validation_ns, samples) = log
+            .complete_live_group_profiled(authority(&config), reservation.token)
+            .unwrap();
+        assert_eq!(retried, appended);
+        assert_eq!((validation_ns, samples), (0, 0));
+        assert_eq!(
+            log.read_batch(appended[0]).unwrap().id(),
+            batch(&config, n).id()
+        );
+        let mut conflict = descriptor.clone();
+        conflict.batches[0].digest.0[0] ^= 1;
+        assert!(matches!(
+            log.reserve_live_group(authority(&config), conflict),
+            Err(StorageError::IdentityConflict)
+        ));
+        let mut conflict = descriptor.clone();
+        conflict.frame_crc ^= 1;
+        assert!(matches!(
+            log.reserve_live_group(authority(&config), conflict),
+            Err(StorageError::IdentityConflict)
+        ));
+        assert!(matches!(
+            log.reserve_live_group(authority(&config), descriptor).unwrap(),
+            LiveReserveResult::Existing(found) if found == appended
+        ));
+        receipts.extend(appended);
+    }
+    drop(log);
+    assert!(PartitionLog::recover_sealed(&path, &config, metrics()).is_err());
+    // This test created no target namespace, so there is nothing to revoke.
+    let recovered =
+        Arc::new(PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).unwrap());
+    let reference = recovered.record_reference(receipts[0], 0).unwrap();
+    let member = recovered.resolve_live_record(&reference).unwrap();
+    let frame = recovered.resolve_live_batch(receipts[0]).unwrap();
+    assert_eq!(
+        frame.offset,
+        receipts[0].address().offset % config.wal_file_bytes
+    );
+    assert_eq!(frame.len, receipts[0].address().len);
+    assert_eq!(member.segment.inode, frame.segment.inode);
+    assert!(matches!(
+        recovered.retire_files(recovered.receipt_count(), &[0]),
+        Err(StorageError::Invalid(_))
+    ));
+    drop(member);
+    drop(frame);
+    for receipt in receipts {
+        assert_eq!(recovered.read_batch(receipt).unwrap().id(), receipt.id());
+    }
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn live_skip_marker_stays_in_unused_block_and_recovery_crosses_fragment() {
+    use crate::distributed::nvmeof::live_storage::{LiveGroupDescriptor, LiveReserveResult};
+    let temp = tempdir::TempDir::new("live-fragment-skip").unwrap();
+    let mut config = live_config();
+    config.batch_limits.max_encoded_bytes = 6000;
+    config.group_limits.max_encoded_bytes = 8184;
+    config.fragment_bytes = 8192;
+    config.wal_file_bytes = 16384;
+    let path = temp.path().join("stream");
+    let log = PartitionLog::create_live(&path, config.clone(), &shape(), metrics()).unwrap();
+    let large = CompleteBatch::new(
+        &shape(),
+        id_for(&config, 1),
+        BatchVersion {
+            epoch: config.inventory.epoch,
+            sequence: 1,
+        },
+        vec![Mutation::Put {
+            keyspace: KeySpace(0),
+            key: b"key3"[..].into(),
+            value: vec![9; 5000].into(),
+        }],
+        config.batch_limits,
+    )
+    .unwrap();
+    let mut receipts = Vec::new();
+    for (item, expected_offset) in [(batch(&config, 0), 0), (large, 8192)] {
+        let group = CompleteGroup::new_live(
+            &shape(),
+            vec![item],
+            config.batch_limits,
+            config.group_limits,
+        )
+        .unwrap();
+        let (descriptor, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+        let reservation = match log
+            .reserve_live_group(authority(&config), descriptor)
+            .unwrap()
+        {
+            LiveReserveResult::Reserved(reservation) => reservation,
+            _ => panic!("new group must reserve"),
+        };
+        assert_eq!(reservation.frame_offset, expected_offset);
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&reservation.segment.path)
+            .unwrap();
+        file.write_all_at(&frame, reservation.frame_offset % reservation.segment.bytes)
+            .unwrap();
+        let appended = log
+            .complete_live_group(authority(&config), reservation.token)
+            .unwrap();
+        log.persist_many(&appended).unwrap();
+        receipts.extend(appended);
+    }
+    drop(log);
+    let recovered =
+        PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).unwrap();
+    for receipt in receipts {
+        assert_eq!(recovered.read_batch(receipt).unwrap().id(), receipt.id());
+    }
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn torn_live_frame_is_unknown_and_blocks_later_allocation() {
+    use crate::distributed::nvmeof::live_storage::{LiveGroupDescriptor, LiveReserveResult};
+    let temp = tempdir::TempDir::new("live-torn-wal").unwrap();
+    let config = live_config();
+    let path = temp.path().join("stream");
+    let log = PartitionLog::create_live(&path, config.clone(), &shape(), metrics()).unwrap();
+    let make = |n| {
+        CompleteGroup::new_live(
+            &shape(),
+            vec![batch(&config, n)],
+            config.batch_limits,
+            config.group_limits,
+        )
+        .unwrap()
+    };
+    let (first, frame) = LiveGroupDescriptor::from_group(&make(0)).unwrap();
+    let (later, _) = LiveGroupDescriptor::from_group(&make(1)).unwrap();
+    let reservation = match log
+        .reserve_live_group(authority(&config), first.clone())
+        .unwrap()
+    {
+        LiveReserveResult::Reserved(reservation) => reservation,
+        _ => panic!("new group must reserve"),
+    };
+    let mut conflict = first.clone();
+    conflict.batches[0].digest.0[0] ^= 1;
+    assert!(matches!(
+        log.reserve_live_group(authority(&config), conflict),
+        Err(StorageError::Invalid(_))
+    ));
+    let mut foreign = reservation.token;
+    foreign[0] ^= 1;
+    assert!(matches!(
+        log.complete_live_group(authority(&config), foreign),
+        Err(StorageError::Invalid(_))
+    ));
+    assert!(matches!(
+        log.reserve_live_group(authority(&config), later.clone()),
+        Err(StorageError::Invalid(_))
+    ));
+    assert!(matches!(
+        log.reserve_live_group(authority(&config), first).unwrap(),
+        LiveReserveResult::Reserved(retry) if retry == reservation
+    ));
+    let file = OpenOptions::new()
+        .write(true)
+        .open(&reservation.segment.path)
+        .unwrap();
+    file.write_all_at(
+        &frame[..32],
+        reservation.frame_offset % reservation.segment.bytes,
+    )
+    .unwrap();
+    assert!(matches!(
+        log.complete_live_group(authority(&config), reservation.token),
+        Err(StorageError::IncompleteLiveFrame)
+    ));
+    assert!(matches!(
+        log.reserve_live_group(authority(&config), later),
+        Err(StorageError::Poisoned)
+    ));
+    drop(log);
+    // No target namespace exists in this local positional-write test.
+    let recovered =
+        PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).unwrap();
+    assert_eq!(recovered.receipt_count(), 0);
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn live_multi_batch_mixed_and_delete_only_recover_together() {
+    use crate::distributed::nvmeof::live_storage::{LiveGroupDescriptor, LiveReserveResult};
+    let temp = tempdir::TempDir::new("live-mixed-group").unwrap();
+    let config = live_config();
+    let path = temp.path().join("stream");
+    let log = PartitionLog::create_live(&path, config.clone(), &shape(), metrics()).unwrap();
+    let delete = CompleteBatch::new(
+        &shape(),
+        id_for(&config, 1),
+        BatchVersion {
+            epoch: config.inventory.epoch,
+            sequence: 1,
+        },
+        vec![Mutation::Delete {
+            keyspace: KeySpace(0),
+            key: b"key3"[..].into(),
+        }],
+        config.batch_limits,
+    )
+    .unwrap();
+    let group = CompleteGroup::new_live(
+        &shape(),
+        vec![batch(&config, 0), delete],
+        config.batch_limits,
+        config.group_limits,
+    )
+    .unwrap();
+    let (descriptor, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+    let reservation = match log
+        .reserve_live_group(authority(&config), descriptor)
+        .unwrap()
+    {
+        LiveReserveResult::Reserved(reservation) => reservation,
+        _ => panic!("expected reservation"),
+    };
+    let file = OpenOptions::new()
+        .write(true)
+        .open(&reservation.segment.path)
+        .unwrap();
+    file.write_all_at(&frame, reservation.frame_offset % reservation.segment.bytes)
+        .unwrap();
+    let receipts = log
+        .complete_live_group(authority(&config), reservation.token)
+        .unwrap();
+    assert_eq!(receipts.len(), 2);
+    log.persist_many(&receipts).unwrap();
+    drop(log);
+    let recovered =
+        PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).unwrap();
+    assert_eq!(recovered.receipt_count(), 2);
+    for receipt in receipts {
+        let recovered_batch = recovered.read_batch(receipt).unwrap();
+        assert_eq!(recovered_batch.id(), receipt.id());
+    }
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn live_recovery_discards_valid_unacknowledged_tail() {
+    use crate::distributed::nvmeof::live_storage::{LiveGroupDescriptor, LiveReserveResult};
+    let temp = tempdir::TempDir::new("live-frontier-tail").unwrap();
+    let config = live_config();
+    let path = temp.path().join("stream");
+    let log = PartitionLog::create_live(&path, config.clone(), &shape(), metrics()).unwrap();
+    let mut saved = Vec::new();
+    for n in 0..2 {
+        let group = CompleteGroup::new_live(
+            &shape(),
+            vec![batch(&config, n)],
+            config.batch_limits,
+            config.group_limits,
+        )
+        .unwrap();
+        let (descriptor, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+        let reservation = match log
+            .reserve_live_group(authority(&config), descriptor)
+            .unwrap()
+        {
+            LiveReserveResult::Reserved(reservation) => reservation,
+            _ => panic!("expected reservation"),
+        };
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&reservation.segment.path)
+            .unwrap();
+        file.write_all_at(&frame, reservation.frame_offset % reservation.segment.bytes)
+            .unwrap();
+        let receipts = log
+            .complete_live_group(authority(&config), reservation.token)
+            .unwrap();
+        if n == 0 {
+            log.persist_many(&receipts).unwrap();
+        }
+        saved.push(receipts[0]);
+    }
+    drop(log);
+    let recovered =
+        PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).unwrap();
+    assert_eq!(recovered.lookup(saved[0].id()).unwrap(), Some(saved[0]));
+    // A complete valid frame beyond the root is adopted, not discarded.
+    assert_eq!(recovered.lookup(saved[1].id()).unwrap(), Some(saved[1]));
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn live_fence_drop_reopens_after_torn_pending_reservation() {
+    use crate::distributed::nvmeof::live_storage::{LiveGroupDescriptor, LiveReserveResult};
+    let temp = tempdir::TempDir::new("live-fence-torn").unwrap();
+    let config = live_config();
+    let path = temp.path().join("stream");
+    let log = PartitionLog::create_live(&path, config.clone(), &shape(), metrics()).unwrap();
+    let reserve = |n| {
+        let group = CompleteGroup::new_live(
+            &shape(),
+            vec![batch(&config, n)],
+            config.batch_limits,
+            config.group_limits,
+        )
+        .unwrap();
+        let (descriptor, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+        let reservation = match log
+            .reserve_live_group(authority(&config), descriptor)
+            .unwrap()
+        {
+            LiveReserveResult::Reserved(reservation) => reservation,
+            _ => panic!("expected reservation"),
+        };
+        (reservation, frame)
+    };
+    let (first, first_frame) = reserve(0);
+    let file = OpenOptions::new()
+        .write(true)
+        .open(&first.segment.path)
+        .unwrap();
+    file.write_all_at(&first_frame, first.frame_offset % first.segment.bytes)
+        .unwrap();
+    let acknowledged = log
+        .complete_live_group(authority(&config), first.token)
+        .unwrap();
+    log.persist_many(&acknowledged).unwrap();
+    let (pending, pending_frame) = reserve(1);
+    file.write_all_at(
+        &pending_frame[..32],
+        pending.frame_offset % pending.segment.bytes,
+    )
+    .unwrap();
+    // No target namespace exists in this positional-write test. Dropping the
+    // old handle releases its unknown pin before joining the native writer.
+    drop(log);
+    let recovered =
+        PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).unwrap();
+    assert_eq!(
+        recovered.lookup(acknowledged[0].id()).unwrap(),
+        Some(acknowledged[0])
+    );
+    assert_eq!(recovered.lookup(batch(&config, 1).id()).unwrap(), None);
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn live_recovery_fails_on_acknowledged_corruption_even_skip_header() {
+    use crate::distributed::nvmeof::live_storage::{LiveGroupDescriptor, LiveReserveResult};
+    for skip_header in [false, true] {
+        let temp = tempdir::TempDir::new("live-frontier-corruption").unwrap();
+        let config = live_config();
+        let path = temp.path().join("stream");
+        let log = PartitionLog::create_live(&path, config.clone(), &shape(), metrics()).unwrap();
+        let group = CompleteGroup::new_live(
+            &shape(),
+            vec![batch(&config, 0)],
+            config.batch_limits,
+            config.group_limits,
+        )
+        .unwrap();
+        let (descriptor, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+        let reservation = match log
+            .reserve_live_group(authority(&config), descriptor)
+            .unwrap()
+        {
+            LiveReserveResult::Reserved(reservation) => reservation,
+            _ => panic!("expected reservation"),
+        };
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&reservation.segment.path)
+            .unwrap();
+        file.write_all_at(&frame, 0).unwrap();
+        let receipts = log
+            .complete_live_group(authority(&config), reservation.token)
+            .unwrap();
+        log.persist_many(&receipts).unwrap();
+        drop(log);
+        if skip_header {
+            file.write_all_at(&[0xff; 8], 0).unwrap();
+        } else {
+            file.write_all_at(&[0x55], 32).unwrap();
+        }
+        file.sync_all().unwrap();
+        assert!(PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).is_err());
+    }
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn live_corrupt_frontier_is_not_treated_as_empty() {
+    let temp = tempdir::TempDir::new("live-frontier-root").unwrap();
+    let config = live_config();
+    let path = temp.path().join("stream");
+    let log = PartitionLog::create_live(&path, config.clone(), &shape(), metrics()).unwrap();
+    drop(log);
+    let file = OpenOptions::new()
+        .write(true)
+        .open(path.join(LIVE_FRONTIER))
+        .unwrap();
+    file.write_all_at(&[0xff], 0).unwrap();
+    file.sync_all().unwrap();
+    assert!(PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).is_err());
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn live_frontier_commit_failures_preserve_prior_ack_and_return_unknown() {
+    for phase in 1..=3 {
+        let temp = tempdir::TempDir::new("live-frontier-phase-failure").unwrap();
+        let config = live_config();
+        let path = temp.path().join("stream");
+        let log = PartitionLog::create_live(&path, config.clone(), &shape(), metrics()).unwrap();
+        let acknowledged = append_live_fixture(&log, &config, 0);
+        log.persist_through(acknowledged).unwrap();
+        let unacknowledged = append_live_fixture(&log, &config, 1);
+        log.fail_live_frontier.store(phase, Ordering::Release);
+        let mut profile = StorageWriteProfile::default();
+        assert!(matches!(
+            log.persist_many_profiled(&[unacknowledged], &mut profile),
+            Err(StorageError::Unknown(_))
+        ));
+        assert_eq!(profile.persist_errors, 1);
+        assert_eq!(profile.live_frontier_file_calls, 1);
+        assert_eq!(profile.live_frontier_file_successes, u64::from(phase != 1));
+        assert_eq!(profile.live_frontier_namespace_calls, u64::from(phase == 3));
+        assert_eq!(profile.live_frontier_namespace_successes, 0);
+        assert!(matches!(
+            log.validate_durable_receipt(DurableBatch(unacknowledged)),
+            Err(StorageError::Poisoned)
+        ));
+        let frontier: LiveFrontier = read_metadata(&path.join(LIVE_FRONTIER)).unwrap();
+        assert_eq!(frontier.end, if phase == 3 { 8192 } else { 4096 });
+        drop(log);
+        // No target namespace exists in this positional-write test.
+        let recovered =
+            PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).unwrap();
+        assert_eq!(
+            recovered.lookup(acknowledged.id()).unwrap(),
+            Some(acknowledged)
+        );
+        // The frame is complete and valid, so recovery adopts it whether or not
+        // the failed frontier publication left the new root visible.
+        assert_eq!(
+            recovered.lookup(unacknowledged.id()).unwrap(),
+            Some(unacknowledged)
+        );
+    }
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn live_frontier_commit_uses_capture_not_later_completed_append() {
+    let temp = tempdir::TempDir::new("live-frontier-capture").unwrap();
+    let config = live_config();
+    let path = temp.path().join("stream");
+    let log =
+        Arc::new(PartitionLog::create_live(&path, config.clone(), &shape(), metrics()).unwrap());
+    let first = append_live_fixture(&log, &config, 0);
+    let (entered, resume) = log.pause_next_persist();
+    let writer_log = Arc::clone(&log);
+    let writer = std::thread::spawn(move || writer_log.persist_through(first));
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let later = append_live_fixture(&log, &config, 1);
+    resume.send(()).unwrap();
+    let durable = writer.join().unwrap().unwrap();
+    assert_eq!(durable.appended(), first);
+    let frontier: LiveFrontier = read_metadata(&path.join(LIVE_FRONTIER)).unwrap();
+    assert_eq!(frontier.end, 4096);
+    assert_eq!(frontier.tail.unwrap().id, first.id());
+    assert!(matches!(
+        log.validate_durable_receipt(DurableBatch(later)),
+        Err(StorageError::NeedsPersistence)
+    ));
+    drop(log);
+    // No target namespace exists in this positional-write test.
+    let recovered =
+        PartitionLog::recover_live_sealed(&path, &config, metrics(), || Ok(())).unwrap();
+    assert_eq!(recovered.lookup(first.id()).unwrap(), Some(first));
+    // The completed, valid frame beyond the captured frontier is adopted: it was
+    // appended (and, under the native tier, acknowledged) before the crash.
+    assert_eq!(recovered.lookup(later.id()).unwrap(), Some(later));
+}
+
 #[test]
 fn direct_append_panic_after_native_allocation_requires_recovery() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -1070,6 +1649,15 @@ fn concurrent_duplicate_requests_share_one_authority_frame() {
 }
 
 fn assert_profile_stage_bounds(profile: StorageWriteProfile) {
+    assert_eq!(
+        profile.append_validation_ns,
+        profile
+            .append_basic_validation_ns
+            .saturating_add(profile.append_conflict_lookup_ns)
+            .saturating_add(profile.append_geometry_capacity_ns)
+            .saturating_add(profile.append_metadata_reservation_ns)
+            .saturating_add(profile.append_descriptor_preparation_ns)
+    );
     assert!(
         profile.append_state_lock_wait_ns
             + profile.append_validation_ns
@@ -1089,6 +1677,54 @@ fn assert_profile_stage_bounds(profile: StorageWriteProfile) {
             + profile.persist_publication_ns
             <= profile.persist_total_ns
     );
+}
+
+#[test]
+fn append_validation_timing_closes_on_unwind_and_aggregates() {
+    let mut profile = StorageWriteProfile::default();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut timing = WriteTiming::new(Some(&mut profile), true);
+        // Make the artificial stage intervals subsets of the artificial total.
+        timing.started = Some(Instant::now() - Duration::from_secs(1));
+        timing.stage(Some(WriteStage::AppendBasicValidation));
+        timing.stage_started = Some(Instant::now() - Duration::from_millis(1));
+        timing.stage(Some(WriteStage::AppendConflictLookup));
+        timing.stage_started = Some(Instant::now() - Duration::from_millis(1));
+        timing.stage(Some(WriteStage::AppendBasicValidation));
+        timing.stage_started = Some(Instant::now() - Duration::from_millis(1));
+        timing.stage(Some(WriteStage::AppendGeometryCapacity));
+        timing.stage_started = Some(Instant::now() - Duration::from_millis(1));
+        timing.stage(Some(WriteStage::AppendMetadataReservation));
+        timing.stage_started = Some(Instant::now() - Duration::from_millis(1));
+        timing.stage(Some(WriteStage::AppendDescriptorPreparation));
+        timing.stage_started = Some(Instant::now() - Duration::from_millis(1));
+        panic!("test unwind");
+    }));
+    assert!(result.is_err());
+    assert_eq!(profile.append_calls, 1);
+    assert_eq!(profile.append_errors, 1);
+    assert_eq!(profile.append_wal_ns, 0);
+    assert!(profile.append_basic_validation_ns >= 2_000_000);
+    assert!(profile.append_conflict_lookup_ns >= 1_000_000);
+    assert!(profile.append_geometry_capacity_ns >= 1_000_000);
+    assert!(profile.append_metadata_reservation_ns >= 1_000_000);
+    assert!(profile.append_descriptor_preparation_ns >= 1_000_000);
+    assert_profile_stage_bounds(profile);
+
+    let mut aggregate = StorageWriteProfile::default();
+    aggregate.add(profile);
+    aggregate.add(profile);
+    assert_eq!(aggregate.append_calls, 2);
+    assert_eq!(
+        aggregate.append_descriptor_preparation_ns,
+        profile.append_descriptor_preparation_ns.saturating_mul(2)
+    );
+    assert_profile_stage_bounds(aggregate);
+
+    let mut disabled = WriteTiming::new(None, true);
+    disabled.stage(Some(WriteStage::AppendBasicValidation));
+    assert!(disabled.started.is_none());
+    assert!(disabled.stage_started.is_none());
 }
 
 #[test]
@@ -1114,6 +1750,11 @@ fn profiled_writes_preserve_retries_admission_and_durability_frontiers() {
     assert_eq!(append.appended_receipts, 2);
     assert_eq!(append.append_retries, 0);
     assert_eq!(append.persist_total_ns, 0);
+    assert!(append.append_basic_validation_ns > 0);
+    assert!(append.append_conflict_lookup_ns > 0);
+    assert!(append.append_geometry_capacity_ns > 0);
+    assert!(append.append_metadata_reservation_ns > 0);
+    assert!(append.append_descriptor_preparation_ns > 0);
     assert_profile_stage_bounds(append);
     assert_eq!(log.stats().persistence_barriers, 0);
     assert_eq!(log.state.lock().durable_end, 0);
@@ -1128,9 +1769,52 @@ fn profiled_writes_preserve_retries_admission_and_durability_frontiers() {
     assert_eq!(retry.append_retries, 1);
     assert_eq!(retry.appended_groups, 0);
     assert_eq!(retry.appended_receipts, 2);
+    assert!(retry.append_basic_validation_ns > 0);
+    assert!(retry.append_conflict_lookup_ns > 0);
+    assert_eq!(retry.append_geometry_capacity_ns, 0);
+    assert_eq!(retry.append_metadata_reservation_ns, 0);
+    assert_eq!(retry.append_descriptor_preparation_ns, 0);
     assert_eq!(retry.append_wal_ns, 0);
     assert_eq!(retry.append_publication_ns, 0);
     assert_profile_stage_bounds(retry);
+
+    let mut fenced_authority = authority(&config);
+    fenced_authority.epoch += 1;
+    let mut fenced = StorageWriteProfile::default();
+    assert!(matches!(
+        log.append_group_profiled(fenced_authority, &group, &mut fenced),
+        Err(StorageError::Fenced)
+    ));
+    assert_eq!(fenced.append_calls, 1);
+    assert_eq!(fenced.append_errors, 1);
+    assert!(fenced.append_basic_validation_ns > 0);
+    assert_eq!(fenced.append_state_lock_wait_ns, 0);
+    assert_eq!(fenced.append_conflict_lookup_ns, 0);
+    assert_eq!(fenced.append_geometry_capacity_ns, 0);
+    assert_eq!(fenced.append_metadata_reservation_ns, 0);
+    assert_eq!(fenced.append_descriptor_preparation_ns, 0);
+    assert_profile_stage_bounds(fenced);
+
+    let mixed = CompleteGroup::new(
+        &shape(),
+        vec![batch(&config, 0), batch(&config, 2)],
+        config.batch_limits,
+        config.group_limits,
+    )
+    .unwrap();
+    let mut rejected = StorageWriteProfile::default();
+    assert!(matches!(
+        log.append_group_profiled(authority(&config), &mixed, &mut rejected),
+        Err(StorageError::MixedRetry)
+    ));
+    assert_eq!(rejected.append_errors, 1);
+    assert_eq!(rejected.append_retries, 0);
+    assert!(rejected.append_basic_validation_ns > 0);
+    assert!(rejected.append_conflict_lookup_ns > 0);
+    assert_eq!(rejected.append_geometry_capacity_ns, 0);
+    assert_eq!(rejected.append_metadata_reservation_ns, 0);
+    assert_eq!(rejected.append_descriptor_preparation_ns, 0);
+    assert_profile_stage_bounds(rejected);
 
     let next = CompleteGroup::new(
         &shape(),
@@ -1168,6 +1852,7 @@ fn profiled_writes_preserve_retries_admission_and_durability_frontiers() {
     assert_eq!(invalid.file_persist_calls, 0);
     assert_eq!(invalid.namespace_persist_calls, 0);
     assert_eq!(invalid.durable_publications, 0);
+    assert!(invalid.persistence_capture.is_none());
     assert_profile_stage_bounds(invalid);
 
     let mut persist = StorageWriteProfile::default();
@@ -1188,7 +1873,12 @@ fn profiled_writes_preserve_retries_admission_and_durability_frontiers() {
     assert_eq!(persist.namespace_persist_calls, 1);
     assert_eq!(persist.namespace_persist_successes, 1);
     assert_eq!(persist.durable_publications, 1);
+    let capture = persist.persistence_capture.unwrap();
+    assert!(capture.captured_appended_end > capture.durable_end);
+    assert_eq!(capture.cumulative_appended_groups, 2);
     assert_profile_stage_bounds(persist);
+    log.persist_many_profiled(&[], &mut persist).unwrap();
+    assert!(persist.persistence_capture.is_none());
     for receipt in &receipts {
         assert!(
             pending_persistence(&log.state.lock(), *receipt)
@@ -1202,6 +1892,7 @@ fn profiled_writes_preserve_retries_admission_and_durability_frontiers() {
     log.persist_many_profiled(&[], &mut noops).unwrap();
     assert_eq!(noops.persist_calls, 2);
     assert_eq!(noops.persist_noops, 2);
+    assert!(noops.persistence_capture.is_none());
     assert_eq!(noops.persist_errors, 0);
     assert_eq!(noops.persisted_receipts, 3);
     assert_eq!(noops.persist_serialization_lock_wait_ns, 0);
@@ -1235,7 +1926,6 @@ fn profiled_writes_preserve_retries_admission_and_durability_frontiers() {
             .is_some()
     );
     log.persist_many_profiled(&later, &mut persist).unwrap();
-    assert_eq!(persist.persist_calls, 2);
     assert_eq!(persist.persisted_receipts, 4);
     assert_eq!(persist.file_persist_calls, 2);
     assert_eq!(persist.file_persist_successes, 2);
@@ -1424,12 +2114,13 @@ fn sealed_export_async_reads_keep_duplicate_order_and_enforce_bounds() {
         binding: NamespaceBinding {
             namespace_path: path.join("image.wal"),
             transport: NvmeofTransport::Tcp,
+            target: Default::default(),
         },
         manifest,
         max_inflight_requests: 1,
-        max_inflight_members: 4,
-        max_inflight_bytes: 65536,
-        max_catalog_bytes: 65536,
+        max_inflight_members: 32,
+        max_inflight_bytes: 1024 * 1024,
+        max_catalog_bytes: 1024 * 1024,
     };
     // Production never treats an ordinary file as a qualified namespace.
     assert!(NvmeofReader::open_verified(reader_config.clone()).is_err());
@@ -1443,13 +2134,19 @@ fn sealed_export_async_reads_keep_duplicate_order_and_enforce_bounds() {
     underfunded.max_catalog_bytes = 8192;
     assert!(NvmeofReader::open_verified_file(underfunded, &path.join("image.wal")).is_err());
     let mut reader =
-        NvmeofReader::open_verified_file(reader_config, &path.join("image.wal")).unwrap();
+        NvmeofReader::open_verified_file(reader_config.clone(), &path.join("image.wal")).unwrap();
     assert_eq!(reader.eligibility(&first).unwrap(), Eligibility::Eligible);
     let mut forged = first;
     forged.descriptor.checksum.0 ^= 1;
     assert!(reader.eligibility(&forged).is_err());
     let deadline = Instant::now() + Duration::from_secs(10);
-    assert!(reader.submit(4, vec![first; 5], deadline).is_err());
+    assert!(reader.submit(4, vec![first; 33], deadline).is_err());
+    assert!(matches!(
+        reader.submit(4, vec![forged], deadline),
+        Err(crate::distributed::nvmeof::NvmeofError::Invalid(
+            "reference conflicts with owner authority"
+        ))
+    ));
     assert_eq!(
         reader
             .submit(1, vec![second, first, second], deadline)
@@ -1477,9 +2174,88 @@ fn sealed_export_async_reads_keep_duplicate_order_and_enforce_bounds() {
         );
     }
     let stats = reader.snapshot();
-    assert_eq!(stats.io_submissions, 3);
-    assert_eq!(stats.io_completions, 3);
+    assert_eq!(stats.io_submissions, 1);
+    assert_eq!(stats.io_completions, 1);
+    assert_eq!(
+        (
+            stats.logical_members,
+            stats.admitted_sqes,
+            stats.merged_members
+        ),
+        (3, 1, 2)
+    );
     assert!(stats.aligned_read_bytes >= stats.aligned_requested_bytes);
+    let references: Vec<_> = (0..32)
+        .map(|index| if index % 2 == 0 { first } else { second })
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    assert_eq!(
+        reader.submit(7, references.clone(), deadline).unwrap(),
+        SubmitOutcome::Submitted
+    );
+    let completion = loop {
+        if let Some(done) = reader.progress().unwrap().pop() {
+            break done;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    };
+    assert_eq!(completion.id, 7);
+    let records = completion.result.unwrap();
+    assert_eq!(records.len(), references.len());
+    for (reference, bytes) in references.iter().zip(records) {
+        assert_eq!(
+            CompleteBatch::decode_record(&shape(), reference, bytes).unwrap(),
+            batch(&config, 0).mutations()[reference.descriptor.operation_index as usize]
+        );
+    }
+    let stats = reader.snapshot();
+    // Both members lie in one 512-byte block, so each request is one SQE.
+    assert_eq!(stats.io_submissions, 2);
+    assert_eq!(stats.io_completions, 2);
+    assert_eq!(stats.queue.count, 2);
+    assert_eq!(stats.submit_to_cq.count, 2);
+    assert_eq!(stats.extraction.count, 2);
+    assert_eq!((stats.admitted_sqes, stats.merged_members), (2, 33));
+    // Three admitted members, one full retry, then 32 admitted members; each
+    // member is aligned once, even when its request was refused as full.
+    assert_eq!(stats.alignment.count, 36);
+    // A reference of another file generation is never admitted, so it can
+    // neither be read nor merged into this reader's SQEs.
+    let mut other_generation = first;
+    other_generation.batch_address.segment_generation += 1;
+    assert_eq!(
+        reader.eligibility(&other_generation).unwrap(),
+        Eligibility::Ineligible
+    );
+    assert!(matches!(
+        reader.catalog().plan_references(&[first, other_generation]),
+        Err(crate::distributed::nvmeof::NvmeofError::Invalid(
+            "reference not admitted"
+        ))
+    ));
+    // Members of one aligned block share one read.
+    let plan = reader
+        .catalog()
+        .plan_references(&[second, first, second])
+        .unwrap();
+    assert_eq!((plan.members(), plan.reads()), (3, 1));
+    // A range planned by another reader's catalog was never authorised by this
+    // one: a single foreign range and a mixed-origin batch are both refused.
+    let other =
+        NvmeofReader::open_verified_file(reader_config.clone(), &path.join("image.wal")).unwrap();
+    let own_range = reader.catalog().plan_member(&first).unwrap();
+    let foreign_range = other.catalog().plan_member(&first).unwrap();
+    assert!(reader.catalog().plan_request(&[own_range]).is_ok());
+    for ranges in [vec![foreign_range], vec![own_range, foreign_range]] {
+        assert!(matches!(
+            reader.catalog().plan_request(&ranges),
+            Err(crate::distributed::nvmeof::NvmeofError::Invalid(
+                "member range belongs to another reader"
+            ))
+        ));
+    }
+    drop(other);
     assert_eq!(
         reader
             .submit(3, vec![first], Instant::now() + Duration::from_secs(10))
@@ -1521,4 +2297,53 @@ fn sealed_export_async_reads_keep_duplicate_order_and_enforce_bounds() {
     ));
 }
 
+#[test]
+fn failed_seal_cannot_be_acknowledged_by_a_retry() {
+    let temp = tempdir::TempDir::new("failed-seal-retry").unwrap();
+    let config = config(vec![3], 3);
+    let path = temp.path().join("stream");
+    let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+    let appended = log
+        .append_complete_batch(authority(&config), &batch(&config, 1))
+        .unwrap();
+    log.persist_through(appended).unwrap();
+    fs::create_dir(path.join(SEAL)).unwrap();
+    assert!(log.seal_epoch(authority(&config)).is_err());
+    assert!(matches!(
+        log.seal_epoch(authority(&config)),
+        Err(StorageError::Poisoned)
+    ));
+    fs::remove_dir(path.join(SEAL)).unwrap();
+    drop(log);
+    let recovered = PartitionLog::recover_sealed(&path, &config, metrics()).unwrap();
+    assert_eq!(
+        recovered.read_batch(appended).unwrap().id(),
+        batch(&config, 1).id()
+    );
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+#[test]
+fn missing_live_registration_cannot_downgrade_frontier_recovery() {
+    let temp = tempdir::TempDir::new("missing-live-registration").unwrap();
+    let config = live_config();
+    let path = temp.path().join("stream");
+    let log = PartitionLog::create_live(&path, config.clone(), &shape(), metrics()).unwrap();
+    let appended = append_live_fixture(&log, &config, 1);
+    log.persist_through(appended).unwrap();
+    drop(log);
+    fs::remove_file(path.join(LIVE_REGISTRATION)).unwrap();
+    assert!(matches!(
+        PartitionLog::is_live_path(&path),
+        Err(StorageError::Invalid(_))
+    ));
+    assert!(matches!(
+        PartitionLog::recover_sealed(&path, &config, metrics()),
+        Err(StorageError::Invalid(_))
+    ));
+}
+
+mod conflict_index;
 mod history;
+#[cfg(feature = "experimental-nvmeof")]
+mod live_native;

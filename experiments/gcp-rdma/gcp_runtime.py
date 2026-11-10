@@ -5,11 +5,14 @@ import hashlib
 import ipaddress
 import json
 import re
+import resource
 import time
 from datetime import datetime, timezone
 import sys
 from pathlib import Path
 from pathlib import PurePosixPath
+
+from gcp_manual_storage import CredentialUnavailable
 
 GUEST_PYTHON = '/opt/tidehunter-python/bin/python3'
 GUEST_PATH = '/opt/tidehunter-python/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
@@ -21,6 +24,23 @@ LOCAL_SSD_COUNTS = {'z4m-highmem-16': 1, 'h4d-highmem-192-lssd': 10}
 
 class RuntimeSafetyError(RuntimeError):
     pass
+
+
+def admit_guest_runtime():
+    """Admit the interpreter and inherited hard limit used by guest operations."""
+    if sys.executable != GUEST_PYTHON or sys.version_info < (3, 11):
+        raise RuntimeSafetyError('guest orchestration requires ' + GUEST_PYTHON + ' (Python >= 3.11)')
+    try:
+        import yaml
+        if yaml.__version__ != '6.0.2' or yaml.safe_load('x: 1') != {'x': 1}:
+            raise ValueError('incorrect PyYAML version or behavior')
+    except (ImportError, AttributeError, ValueError) as exc:
+        raise RuntimeSafetyError('guest Python requires functional PyYAML 6.0.2') from exc
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard != resource.RLIM_INFINITY and hard < 524288:
+        raise RuntimeSafetyError('guest hard RLIMIT_NOFILE must permit 524288 descriptors')
+    return {'executable': sys.executable, 'python': sys.version, 'yaml': yaml.__version__,
+            'nofile_soft': soft, 'nofile_hard': hard}
 
 
 def _deadline(value):
@@ -90,6 +110,11 @@ def validate_runtime(config):
         raise RuntimeSafetyError('numeric project number required')
     if not isinstance(config.get('package'), dict) or not isinstance(config.get('spec'), dict):
         raise RuntimeSafetyError('package and spec required')
+    grace = config.get('poweroff_grace_seconds', 600)
+    hard_cap = config.get('poweroff_hard_cap_seconds', 3600)
+    if (type(grace) is not int or type(hard_cap) is not int or grace < 0
+            or hard_cap < grace or hard_cap > 21600):
+        raise RuntimeSafetyError('invalid guest poweroff timing')
     package = config['package']
     if (package.get('source_sha256') != config['source_sha256']
         or package.get('object_key') != 'runs/' + config['run_id'] + '/package.tar'
@@ -100,8 +125,57 @@ def validate_runtime(config):
     backends = config['spec'].get('backends', [])
     if not isinstance(backends, list) or not set(backends) <= {'native', 'tidehunter_tcp', 'tidehunter_verbs', 'tidehunter_verbs_native', 'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma', 'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'valkey_rdma', 'garnet', 'kvrocks'}:
         raise RuntimeSafetyError('invalid GCP backend selection')
+    mode = config['spec'].get('mode', 'standard')
+    if mode not in {'standard', 'nvmeof-focused', 'standard-with-nvmeof', 'standard-with-live-nvmeof', 'focused'}:
+        raise RuntimeSafetyError('invalid matrix mode')
+    if mode == 'focused':
+        import manual_campaign
+        manual_campaign._reviewed_jobs(config['spec'])
+    if mode == 'standard' and set(backends) & {'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma'}:
+        raise RuntimeSafetyError('NVMe backends require an NVMe-oF mode')
+    if mode == 'standard-with-live-nvmeof' and set(backends) & {'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma'}:
+        live = config.get('live_qualification')
+        if not isinstance(live, dict) or set(live) != {'image', 'image_qualification', 'pair_hosts', 'rdma_device', 'service_account'}:
+            raise RuntimeSafetyError('generation-pinned live pair qualification is required')
+        reference = live['image_qualification']
+        if (not isinstance(reference, dict) or set(reference) != {'bucket', 'object', 'generation', 'sha256'}
+                or reference.get('bucket') != config['bucket']
+                or not re.fullmatch(r'runs/bench-[0-9a-f]{16}/qualification/image-receipt\.json', str(reference.get('object', '')))
+                or not re.fullmatch(r'[1-9][0-9]*', str(reference.get('generation', '')))):
+            raise RuntimeSafetyError('invalid live pair receipt reference')
+        _sha(reference.get('sha256'))
+        if (not re.fullmatch(r'projects/' + re.escape(config['project_id']) + r'/global/images/[a-z0-9-]+', str(live['image']))
+                or not re.fullmatch(r'[A-Za-z0-9_]+', str(live['rdma_device']))
+                or not isinstance(live['service_account'], str) or not live['service_account']):
+            raise RuntimeSafetyError('invalid live qualification image or device identity')
+        pair = live['pair_hosts']
+        if not isinstance(pair, list) or len(pair) != 2:
+            raise RuntimeSafetyError('live qualification requires two distinct guests')
+        for host in pair:
+            if (not isinstance(host, dict) or set(host) != {'name', 'id', 'zone', 'internal_ip', 'rdma_ip'}
+                    or not re.fullmatch(r'[a-z][a-z0-9-]{0,62}', str(host['name']))
+                    or not re.fullmatch(r'[1-9][0-9]*', str(host['id']))
+                    or not re.fullmatch(r'[a-z]+(?:-[a-z0-9]+)+-[a-z]', str(host['zone']))):
+                raise RuntimeSafetyError('invalid live pair guest identity')
+            try:
+                addresses = [ipaddress.IPv4Address(host[key]) for key in ('internal_ip', 'rdma_ip')]
+            except (ValueError, TypeError) as exc:
+                raise RuntimeSafetyError('invalid live pair addresses') from exc
+            if any(ip.is_loopback or ip.is_multicast or ip.is_unspecified for ip in addresses):
+                raise RuntimeSafetyError('invalid live pair addresses')
+        pair_run = reference['object'].split('/')[1]
+        if ({host['name'] for host in pair} != {pair_run + '-0', pair_run + '-1'}
+                or str(pair[0]['id']) == str(pair[1]['id'])
+                or pair[0]['zone'] != pair[1]['zone'] or pair[0]['zone'] != config['fleet'][0]['zone']
+                or len({host[key] for host in pair for key in ('internal_ip', 'rdma_ip')}) != 4):
+            raise RuntimeSafetyError('live pair guests and addresses must be distinct, bound to the receipt and zonal')
     if not isinstance(config.get('machine_type'), str) or config['machine_type'] not in LOCAL_SSD_COUNTS:
         raise RuntimeSafetyError('machine type must have an admitted local SSD layout')
+    policy = config.get('placement_policy')
+    if policy is not None and (not isinstance(policy, dict)
+            or not re.fullmatch(r'[a-z][a-z0-9-]{0,62}', str(policy.get('name', '')))
+            or not re.fullmatch(r'[1-9][0-9]*', str(policy.get('id', '')))):
+        raise RuntimeSafetyError('exact placement policy name and numeric ID required')
     if config.get('package_root') != '/mnt/tidehunter/' + config['run_id'] + '/package':
         raise RuntimeSafetyError('invalid installed package root')
     return config
@@ -111,6 +185,7 @@ def build_runtime_config(launch_config, fleet, package_receipt, spec, deadline_u
     run_id = optional.pop('run_id', launch_config.get('run_id'))
     source_sha256 = package_receipt.get('source_sha256')
     campaign_deadline = optional.pop('campaign_deadline_utc', None)
+    policy = optional.pop('placement_policy', None)
     if campaign_deadline is None:
         campaign_deadline = datetime.fromtimestamp(_deadline(deadline_utc) - 120, timezone.utc).isoformat()
     if optional:
@@ -121,7 +196,46 @@ def build_runtime_config(launch_config, fleet, package_receipt, spec, deadline_u
               'deadline_utc': deadline_utc, 'campaign_deadline_utc': campaign_deadline,
               'package': package_receipt, 'spec': spec,
               'package_root': '/mnt/tidehunter/' + str(run_id) + '/package'}
+    for key in ('poweroff_grace_seconds', 'poweroff_hard_cap_seconds'):
+        if key in launch_config:
+            config[key] = launch_config[key]
+    if 'live_qualification' in launch_config:
+        config['live_qualification'] = launch_config['live_qualification']
+    if policy is not None:
+        config['placement_policy'] = dict(policy)
     return validate_runtime(config)
+
+
+def admit_live_qualification(runtime):
+    """Revalidate the immutable pair proof on the guest before live owner setup."""
+    import gcp_api
+    import gcp_image
+    import manual_campaign
+    validate_runtime(runtime)
+    spec = runtime['spec']
+    if (spec.get('mode') != 'standard-with-live-nvmeof'
+            or not set(spec['backends']) & {'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma'}):
+        raise RuntimeSafetyError('live qualification requested for a non-live campaign')
+    binding = runtime['live_qualification']
+    api = gcp_api.GoogleApi(runtime['project_id'], token_provider=gcp_api.metadata_token)
+    image = api.request('GET', 'global/images/' + binding['image'].rsplit('/', 1)[-1])
+    image_config = {'project_id': runtime['project_id'], 'bucket': runtime['bucket'],
+                    'image': binding['image'], 'image_qualification': binding['image_qualification'],
+                    'service_account': binding['service_account']}
+    qualification = gcp_image.admit_image(api, image_config, image)
+    if qualification.get('runtime_sha256') != runtime['package'].get('manifest_sha256'):
+        raise RuntimeSafetyError('live pair qualification does not bind this package manifest')
+    gcp_image.admit_nvme_transports(qualification, spec['backends'], live=True)
+    gcp_image.admit_spdk(qualification, spec)
+    records, hosts = qualification['_records'], binding['pair_hosts']
+    for index, record in enumerate(records):
+        if (record.get('instance_id') != str(hosts[index]['id'])
+                or record.get('peer_instance_id') != str(hosts[1 - index]['id'])
+                or record.get('local_rdma') != hosts[index]['rdma_ip']
+                or record.get('peer') != hosts[1 - index]['rdma_ip']):
+            raise RuntimeSafetyError('live pair qualification host identity mismatch')
+    pair_run_id = binding['image_qualification']['object'].split('/')[1]
+    manual_campaign._admit_live_pair(records, hosts, spec, binding['rdma_device'], pair_run_id)
 
 
 def _encode(value):
@@ -193,15 +307,26 @@ class RemoteMailbox:
         expected = f'runs/{self.run_id}/mailbox/{reference["instance_id"]}/requests/{op}.json'
         if reference.get('key') != expected:
             raise RuntimeSafetyError('reference key mismatch')
-        request = _object_get(self.store, expected, generation=reference['generation'])
-        if hashlib.sha256(request).hexdigest() != reference.get('request_sha256'):
-            raise RuntimeSafetyError('request generation identity mismatch')
         key = expected.replace('/requests/', '/responses/')
         end = min(self.deadline, time.time() + timeout_seconds)
+        request_verified = False
+        failures = 0
+        backoff = 5
         while time.time() < end:
             try:
+                if not request_verified:
+                    request = _object_get(self.store, expected, generation=reference['generation'])
+                    if hashlib.sha256(request).hexdigest() != reference.get('request_sha256'):
+                        raise RuntimeSafetyError('request generation identity mismatch')
+                    request_verified = True
                 meta = self.store.head(key)
                 receipt = json.loads(_object_get(self.store, key, generation=meta['generation']))
+            except CredentialUnavailable:
+                failures += 1
+                print(f'credential attempt {failures} failed; re-authenticate gcloud', file=sys.stderr)
+                time.sleep(min(backoff, max(0, end - time.time())))
+                backoff = min(backoff * 2, 60)
+                continue
             except Exception as exc:
                 if getattr(exc, 'status', None) != 404:
                     raise
@@ -249,7 +374,14 @@ def validate_controller_config(config):
                'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'valkey_rdma', 'garnet', 'kvrocks'}
     if not set(config['spec']['backends']) <= allowed:
         raise RuntimeSafetyError('unsupported GCP backend or AWS EFA selected')
-    jobs = cloud_campaign.make_matrix(config['spec'])
+    if runtime['spec'].get('mode') == 'focused':
+        expected = {k: v for k, v in runtime['spec'].items()
+                    if k not in {'suite', 'sui_fixture', 'sui_verification', 'sui_transports'}}
+        if json.dumps(config['spec'], sort_keys=True) != json.dumps(expected, sort_keys=True):
+            raise RuntimeSafetyError('focused controller spec differs from reviewed runtime')
+        jobs = cloud_campaign.make_focused_matrix(runtime['spec']['selection'])
+    else:
+        jobs = cloud_campaign.make_matrix(config['spec'])
     cloud_controller.validate_read_tier_memory(jobs, config['fleet'])
     return config
 
@@ -277,6 +409,15 @@ def verify_fleet(config, clients, *, terminating=False, starting=False):
     if not isinstance(r.get('machine_type'), str) or r['machine_type'] not in LOCAL_SSD_COUNTS:
         raise RuntimeSafetyError('machine type must have an admitted local SSD layout')
     expected_ssds = LOCAL_SSD_COUNTS[r['machine_type']]
+    placement = r.get('placement_policy')
+    if placement is not None:
+        region = r['fleet'][0]['zone'].rsplit('-', 1)[0]
+        observed_policy = clients['platform'].request('GET', f'beta/regions/{region}/resourcePolicies/{placement["name"]}')
+        group = observed_policy.get('groupPlacementPolicy', {})
+        if (str(observed_policy.get('id')) != str(placement['id'])
+                or group.get('collocation') != 'COLLOCATED'
+                or group.get('maxDistance') not in (1, 2, 3)):
+            raise RuntimeSafetyError('live compact placement policy differs from admitted identity')
     observed = {}
     for host in r['fleet']:
         instance = clients['platform'].request('GET', f'beta/zones/{host["zone"]}/instances/{host["name"]}')
@@ -284,7 +425,7 @@ def verify_fleet(config, clients, *, terminating=False, starting=False):
         schedule = instance.get('scheduling', {})
         networks = instance.get('networkInterfaces', [])
         scratch = [disk for disk in instance.get('disks', []) if disk.get('type') == 'SCRATCH']
-        policy = r['run_id'] + '-placement'
+        policy = placement['name'] if placement is not None else r['run_id'] + '-placement'
         allowed = ('RUNNING', 'PROVISIONING', 'STAGING') if starting else ('RUNNING',)
         if terminating:
             allowed = ('RUNNING', 'PROVISIONING', 'STAGING', 'STOPPING', 'TERMINATED')
@@ -306,6 +447,28 @@ def verify_fleet(config, clients, *, terminating=False, starting=False):
                                   'local_ssd_count': expected_ssds, 'selected_local_ssd': 'google-local-nvme-ssd-0',
                                   'unused_local_ssd_count': expected_ssds - 1}
     return observed
+
+
+def admit_nvmet_fix(runtime, host, package):
+    """Load the selected sealed candidate only after local and fleet admission."""
+    candidate = package.get('nvmet_fix')
+    if candidate is None:
+        return None
+    if package.get('manifest_sha256') != runtime['package']['manifest_sha256']:
+        raise RuntimeSafetyError('nvmet fix manifest differs from selected package')
+    import cloud_package
+    root = Path(runtime['package_root'])
+    loaded = cloud_package.nvmet_fix_module(root / 'source').install(root / 'nvmet-fix')
+    guest = loaded.get('guest', {})
+    if (any(loaded.get(key) != value for key, value in candidate.items())
+            or guest.get('instance_name') != host['name']
+            or guest.get('instance_id') != str(host['id'])
+            or guest.get('run_id') != runtime['run_id']
+            or loaded.get('loaded_nvmet') != {'srcversion': candidate['candidate_srcversion'],
+                                              'build_id': candidate['candidate_build_id']}):
+        raise RuntimeSafetyError('loaded nvmet identity differs from selected candidate or guest')
+    return {'candidate': candidate, 'loaded': loaded}
+
 
 
 def request_remote(controller, index, request, *, case='startup', timeout=180, export=False):
@@ -364,7 +527,7 @@ def prepare_transport(config, preparation):
         fleet = config['fleet']
         transport['fabric']['source_address'] = fleet['coordinator']['rdma_address']
         result['owner_transports'] = []
-        for host in fleet['nodes']:
+        for host in fleet['nodes'][:len(result.get('addresses', fleet['nodes']))]:
             owner = copy.deepcopy(transport)
             owner['fabric']['source_address'] = host['rdma_address']
             result['owner_transports'].append(owner)
@@ -372,29 +535,58 @@ def prepare_transport(config, preparation):
 
 
 def admit_fabrics(config, index, clients, root):
+    import shutil
     import subprocess
     backends = set(config['spec']['backends'])
     nvme_requested = 'tidehunter_nvme_rdma' in backends
+    nvme_tcp_requested = 'tidehunter_nvme_tcp' in backends
+    nvme_live = (config['spec'].get('mode') == 'standard-with-live-nvmeof'
+                 and (nvme_requested or nvme_tcp_requested))
     valkey_requested = 'valkey_rdma' in backends
-    requested = nvme_requested or valkey_requested or bool(
+    runtime_spec = config.get('platform', {}).get('runtime', {}).get('spec', {})
+    sui_verbs = (runtime_spec.get('suite') in ('sui', 'both')
+                 and bool(set(runtime_spec.get('sui_transports', []))
+                          & {'tidehunter_verbs', 'tidehunter_verbs_native'}))
+    requested = nvme_requested or valkey_requested or sui_verbs or bool(
         backends & {'tidehunter_verbs', 'tidehunter_verbs_native'})
     evidence = {'provider': 'gcp', 'nvme_rdma_requested': nvme_requested,
+                'nvme_tcp_requested': nvme_tcp_requested,
                 'valkey_rdma_requested': valkey_requested, 'rdma_requested': requested}
-    if nvme_requested:
-        for module in ('nvme-rdma', 'nvmet-rdma'):
+    if nvme_requested or nvme_tcp_requested:
+        if not shutil.which('nvme'):
+            raise RuntimeSafetyError('NVMe-oF requires nvme-cli')
+        modules = ['nvmet', 'nvme_fabrics']
+        if nvme_requested:
+            modules += ['rdma_cm', 'nvme_rdma', 'nvmet_rdma']
+        if nvme_tcp_requested or nvme_live:
+            modules += ['nvme_tcp', 'nvmet_tcp']
+        for module in modules:
             subprocess.run(['modprobe', module], check=True, timeout=30)
+        mounted = subprocess.run(['findmnt', '-rn', '-M', '/sys/kernel/config', '-o', 'FSTYPE'],
+                                 capture_output=True, text=True, timeout=10)
+        if mounted.returncode == 1:
+            subprocess.run(['mount', '-t', 'configfs', 'configfs', '/sys/kernel/config'], check=True, timeout=30)
+        elif mounted.returncode:
+            raise RuntimeSafetyError('unable to inspect configfs mount')
+        elif mounted.stdout.strip() != 'configfs':
+            raise RuntimeSafetyError('NVMe target requires configfs at /sys/kernel/config')
+        if not Path('/sys/kernel/config/nvmet').is_dir() or not Path('/dev/nvme-fabrics').is_char_device():
+            raise RuntimeSafetyError('NVMe-oF target configfs or initiator device is unavailable')
     if requested:
-        if valkey_requested:
+        if valkey_requested or nvme_requested:
             subprocess.run(['modprobe', 'rdma_cm'], check=True, timeout=30)
             if not Path('/dev/infiniband/rdma_cm').is_char_device():
-                raise RuntimeSafetyError('Valkey RDMA requires the RDMA-CM character device')
+                raise RuntimeSafetyError('RDMA requires the RDMA-CM character device')
         links = subprocess.check_output(['rdma', 'link', 'show'], text=True, timeout=10)
         host = config['platform']['runtime']['fleet'][index + 1]
         interfaces = json.loads(subprocess.check_output(['ip', '-j', 'address', 'show'], text=True, timeout=10))
         names = [item.get('ifname') for item in interfaces
                  if any(address.get('local') == host['rdma_ip'] for address in item.get('addr_info', []))]
-        if len(names) != 1 or not isinstance(names[0], str) or not re.search(r'\bnetdev\s+' + re.escape(names[0]) + r'\b', links):
-            raise RuntimeSafetyError('RDMA device is not bound to the admitted IRDMA address')
+        if (len(names) != 1 or not isinstance(names[0], str)
+                or not any(re.search(r'\bstate\s+ACTIVE\b', line)
+                           and re.search(r'\bnetdev\s+' + re.escape(names[0]) + r'\b', line)
+                           for line in links.splitlines())):
+            raise RuntimeSafetyError('active RDMA device is not bound to the admitted IRDMA address')
         evidence.update(rdma_links=links, network_interface=names[0], address=host['rdma_ip'])
     return evidence
 
@@ -415,7 +607,9 @@ def bootstrap_controller(controller):
     else:
         raise RuntimeSafetyError('exact fleet did not reach running state')
     proofs = controller.all_hosts({'action': 'bootstrap'}, timeout=300)
-    cloud_controller.validate_physical_proofs([proof['snapshot']['nvme'] for proof in proofs], provider='gcp')
+    cloud_controller.validate_physical_proofs(
+        [proof['snapshot']['nvme'] for proof in proofs], provider='gcp',
+        expected_instance_ids=[str(host['id']) for host in controller.config['platform']['runtime']['fleet']])
     cloud_controller.dump(controller.root / 'bootstrap-proofs.json', proofs)
     controller.persist('startup.json', {'status': 'admitted', 'identity': identity,
                                         'config': controller.config, 'package': controller.package,
@@ -426,6 +620,54 @@ def bootstrap_controller(controller):
         controller.root / 'observability/access.json', monitoring_access(controller.config, proofs)), retain_receipt=False)
 
 
+def admit_guest_unit(config, index):
+    """Exercise the actual benchmark transient-unit constructor before any case."""
+    import cloud_controller
+    import subprocess
+    import tempfile
+    role = 'client' if index == -1 else 'storage-' + str(index)
+    case = 'startup-runtime-admission'
+    name = cloud_controller.unit_name(config, case, role)
+    script = (
+        "import json,resource,sys,yaml; "
+        "print(json.dumps({'executable':sys.executable,'yaml':yaml.__version__,"
+        "'yaml_check':yaml.safe_load('x: 1'),"
+        "'nofile':list(resource.getrlimit(resource.RLIMIT_NOFILE))}))"
+    )
+    fleet = config['fleet']
+    argv = cloud_controller.systemd_argv(
+        config, case, role, fleet['client_cpus'] if index == -1 else fleet['server_cpus'],
+        fleet['client_memory_mib'] if index == -1 else fleet['server_memory_mib'], 30,
+        [GUEST_PYTHON, '-c', script])
+    with tempfile.TemporaryDirectory(prefix='.runtime-admission-', dir=fleet['data_root']) as temporary:
+        proof_path = Path(temporary) / 'guest-runtime.json'
+        argv[1:1] = ['--property=StandardOutput=file:' + str(proof_path)]
+        try:
+            subprocess.run(argv, check=True, capture_output=True, text=True, timeout=15)
+            deadline = time.monotonic() + 30
+            while True:
+                status = cloud_controller.unit_status(name)
+                if status.get('ActiveState') == 'active' and status.get('SubState') == 'exited':
+                    break
+                if status.get('ActiveState') == 'failed' or status.get('Result') not in (None, '', 'success'):
+                    raise RuntimeSafetyError('transient unit runtime admission failed: ' + repr(status))
+                if time.monotonic() >= deadline:
+                    raise RuntimeSafetyError('transient unit runtime admission timed out: ' + repr(status))
+                time.sleep(0.1)
+            if (status.get('ExecMainStatus') != '0' or status.get('LimitNOFILE') != '524288'
+                    or status.get('LimitNOFILESoft') != '524288'):
+                raise RuntimeSafetyError('transient unit exit or NOFILE properties do not match admission')
+            if not proof_path.is_file() or proof_path.is_symlink() or proof_path.stat().st_size > 16384:
+                raise RuntimeSafetyError('transient unit runtime proof is missing or invalid')
+            proof = json.loads(proof_path.read_text())
+            if (proof.get('executable') != GUEST_PYTHON or proof.get('yaml') != '6.0.2'
+                    or proof.get('yaml_check') != {'x': 1} or proof.get('nofile') != [524288, 524288]):
+                raise RuntimeSafetyError('transient unit guest Python or effective NOFILE admission failed')
+            return {'process': proof, 'unit': status}
+        finally:
+            subprocess.run(['systemctl', 'stop', name], check=True, capture_output=True, timeout=10)
+
+
 def bootstrap_guest(config, index, clients):
     import cloud_controller
     import cloud_package
@@ -433,21 +675,33 @@ def bootstrap_guest(config, index, clients):
     import cloud_bootstrap
     import subprocess
     identity = verify_local_identity(config, index)
+    runtime_admission = admit_guest_runtime()
     fleet = verify_fleet(config, clients)
     package = cloud_package.verify_directory(Path(config['platform']['runtime']['package_root']), runtime=True, provider='gcp')
     if package['source_sha256'] != config['source_sha256'] or package['binary_sha256'] != config['binary_sha256']:
         raise RuntimeSafetyError('package identity differs from controller')
+    focused = config['spec'].get('mode') == 'focused'
+    if (package.get('build_profile') == 'focused') is not focused:
+        raise RuntimeSafetyError('package build profile differs from campaign')
+    nvmet_fix = admit_nvmet_fix(config['platform']['runtime'],
+                                {'name': identity['name'], 'id': identity['instance_id']}, package)
+    unit_admission = admit_guest_unit(config, index)
     unit = 'tidehunter-expire-' + config['prefix'] + '.timer'
     subprocess.run(['systemctl', 'is-active', '--quiet', unit], check=True, timeout=10)
-    images = {name: json.loads(subprocess.check_output(['docker', 'image', 'inspect', image], text=True, timeout=30))
-              for name, image in local.IMAGES.items()}
+    images = ({} if config['spec'].get('mode') == 'focused' else
+              {name: json.loads(subprocess.check_output(['docker', 'image', 'inspect', image], text=True, timeout=30))
+               for name, image in local.IMAGES.items()})
     fabrics = admit_fabrics(config, index, clients, Path(config['fleet']['data_root']))
     monitor_images = cloud_bootstrap.cache_monitor_images(config['repository_root'], 5 if index == -1 else index,
         datetime.fromtimestamp(_deadline(config['deadline_utc']), timezone.utc), pull=False)
     if not monitor_images['complete']:
         raise RuntimeSafetyError('prepared guest lacks cached monitoring images: ' + repr(monitor_images['gaps']))
-    return {'identity': identity, 'package': package, 'images': images, 'fabric_admission': fabrics,
-            'fleet_observations': fleet, 'snapshot': cloud_controller.snapshot(config), 'monitor_images': monitor_images}
+    result = {'identity': identity, 'package': package, 'images': images, 'fabric_admission': fabrics,
+              'guest_runtime': runtime_admission, 'guest_unit': unit_admission,
+              'fleet_observations': fleet, 'snapshot': cloud_controller.snapshot(config), 'monitor_images': monitor_images}
+    if nvmet_fix is not None:
+        result['nvmet_fix'] = nvmet_fix
+    return result
 
 
 def _controller_config(runtime):
@@ -456,9 +710,29 @@ def _controller_config(runtime):
     package = runtime['package']
     if manifest['source_sha256'] != runtime['source_sha256'] or manifest['revision'] != package['source_revision']:
         raise RuntimeSafetyError('runtime manifest source mismatch')
-    required_features = set(runtime['spec']['backends']) & {'garnet', 'kvrocks'}
+    if runtime['spec'].get('mode') == 'focused':
+        import cloud_package
+        if manifest.get('build_profile') != 'focused' or manifest.get('features') != cloud_package.FOCUSED_FEATURES:
+            raise RuntimeSafetyError('focused campaign requires exact TideHunter build features')
+    required_features = set(runtime['spec']['backends']) & {'tikv', 'cassandra', 'foundationdb', 'garnet', 'kvrocks'}
     if not required_features <= set(manifest.get('features', [])):
         raise RuntimeSafetyError('packaged binary lacks selected industry backend features')
+    required_artifacts = set()
+    if runtime['spec'].get('spdk_comparison'):
+        required_artifacts |= {'runtime/spdk/spdk.json', 'runtime/spdk/bin/nvmf_tgt',
+                               'source/experiments/nvmeof/spdk_targets.py',
+                               'source/experiments/nvmeof/spdk_artifacts.py',
+                               'source/experiments/nvmeof/spdk_measurement.py'}
+        if runtime['spec'].get('mode') == 'standard-with-live-nvmeof':
+            required_artifacts |= {'source/experiments/nvmeof/live_spdk_daemon.py',
+                                   'source/experiments/kv-comparison/nvme_campaign_owner.py'}
+    if runtime['spec'].get('valkey_reproduction_profiles'):
+        required_artifacts |= {'runtime/bin/valkey-benchmark', 'runtime/valkey-rdma.json',
+                               'source/experiments/kv-comparison/valkey_cloud.py',
+                               'source/experiments/kv-comparison/valkey_reproduction.py',
+                               'source/experiments/kv-comparison/valkey-public-reproduction.json'}
+    if not required_artifacts <= set(manifest.get('files', {})):
+        raise RuntimeSafetyError('runtime omits selected SPDK or native Valkey artifacts')
     raw_hosts = runtime['fleet']
     def host(item):
         return {'instance_id': item['name'], 'numeric_id': str(item['id']), 'address': item['internal_ip'],
@@ -498,12 +772,18 @@ def execute_campaign(runtime_config, *, api=None):
         raise RuntimeSafetyError('unknown suite')
     results = {}
     if suite in ('kv', 'both'):
+        _put_once(api.objects(runtime['bucket']), 'runs/' + runtime['run_id'] + '/poweroff/kv-started.json',
+                  _encode({'run_id': runtime['run_id'], 'source_sha256': runtime['source_sha256'], 'suite': 'kv'}))
         import cloud_controller
         config = _controller_config(runtime)
         clients = make_clients(config, guest=True, api=api)
         report = cloud_controller.Controller(config, clients).run()
         results['kv'] = {key: report[key] for key in ('complete', 'planned_cases', 'completed_cases')}
+        if runtime['spec'].get('valkey_reproduction_profiles'):
+            results['kv']['native_valkey_reproduction'] = report['native_valkey_reproduction']
     if suite in ('sui', 'both'):
+        _put_once(api.objects(runtime['bucket']), 'runs/' + runtime['run_id'] + '/poweroff/sui-started.json',
+                  _encode({'run_id': runtime['run_id'], 'source_sha256': runtime['source_sha256'], 'suite': 'sui'}))
         import gcp_sui
         root = Path('/mnt/tidehunter') / runtime['run_id'] / 'sui-results'
         fleet = verify_fleet({'platform': {'runtime': runtime}}, {'platform': api})

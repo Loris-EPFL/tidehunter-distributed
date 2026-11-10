@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 
@@ -55,7 +56,87 @@ def deadline():
     return (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
 
 
+class SelectedBackendRuntimeTests(unittest.TestCase):
+    def test_controller_rejects_each_missing_selected_store_feature(self):
+        backends = ['tikv', 'cassandra', 'foundationdb', 'garnet', 'kvrocks']
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = {'package_root': directory, 'source_sha256': 'a' * 64,
+                      'package': {'source_revision': 'b' * 40},
+                      'spec': {'backends': backends}}
+            for missing in backends:
+                manifest = {'source_sha256': config['source_sha256'], 'revision': 'b' * 40,
+                            'features': [name for name in backends if name != missing]}
+                (root / 'manifest.json').write_text(json.dumps(manifest))
+                with self.subTest(missing=missing), self.assertRaisesRegex(
+                        runtime.RuntimeSafetyError, 'lacks selected industry'):
+                    runtime._controller_config(config)
+
+
+class NvmetFixRuntimeTests(unittest.TestCase):
+    def test_selected_candidate_requires_matching_manifest_guest_and_loaded_identity(self):
+        import cloud_package
+        candidate = {'candidate_srcversion': 'ABC', 'candidate_build_id': '123', 'module_sha256': 'a' * 64}
+        loaded = {**candidate, 'guest': {'instance_name': 'run-1', 'instance_id': '101', 'run_id': 'run'},
+                  'loaded_nvmet': {'srcversion': 'ABC', 'build_id': '123'}}
+        helper = SimpleNamespace(install=lambda prefix: loaded)
+        config = {'run_id': 'run', 'package_root': '/package', 'package': {'manifest_sha256': 'b' * 64}}
+        admission = {'manifest_sha256': 'b' * 64, 'nvmet_fix': candidate}
+        host = {'name': 'run-1', 'id': '101'}
+        with patch.object(cloud_package, 'nvmet_fix_module', return_value=helper):
+            self.assertEqual(runtime.admit_nvmet_fix(config, host, admission)['loaded'], loaded)
+            with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'manifest'):
+                runtime.admit_nvmet_fix(config, host, {**admission, 'manifest_sha256': 'c' * 64})
+            loaded['loaded_nvmet']['srcversion'] = 'stock'
+            with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'loaded nvmet identity'):
+                runtime.admit_nvmet_fix(config, host, admission)
+        self.assertIsNone(runtime.admit_nvmet_fix(config, host, {}))
+
+
 class MailboxTests(unittest.TestCase):
+    def test_wait_retries_credentials_then_receives_terminal(self):
+        api = Api()
+        mailbox = runtime.RemoteMailbox(api, 'bucket', 'run', fleet(), 'a' * 64, deadline())
+        ref = mailbox.submit(0, [runtime.GUEST_PYTHON, '/source/a.py'], operation_id='id', timeout_seconds=1)
+        key = ref['key'].replace('/requests/', '/responses/')
+        api.store.put(key, json.dumps({'request_sha256': ref['request_sha256'], 'instance_id': ref['instance_id'],
+                                      'operation_id': 'id', 'source_sha256': 'a' * 64, 'exit_code': 0,
+                                      'stdout': '', 'stderr': ''}).encode())
+        clock, sleeps = [0], []
+        original = api.store.get
+        failures = [2]
+        def get(*args, **kwargs):
+            if failures[0]:
+                failures[0] -= 1
+                raise runtime.CredentialUnavailable('secret')
+            return original(*args, **kwargs)
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock[0] += seconds
+        with patch.object(api.store, 'get', side_effect=get), \
+                patch.object(runtime.time, 'time', side_effect=lambda: clock[0]), \
+                patch.object(runtime.time, 'sleep', side_effect=sleep), \
+                patch('sys.stderr') as stderr:
+            self.assertEqual(mailbox.wait(ref, timeout_seconds=100)['exit_code'], 0)
+        self.assertEqual(sleeps, [5, 10])
+        self.assertNotIn('secret', str(stderr.write.call_args_list))
+
+    def test_wait_credentials_stop_at_deadline_with_capped_backoff(self):
+        api = Api()
+        mailbox = runtime.RemoteMailbox(api, 'bucket', 'run', fleet(), 'a' * 64, deadline())
+        ref = mailbox.submit(0, [runtime.GUEST_PYTHON, '/source/a.py'], operation_id='id', timeout_seconds=1)
+        clock, sleeps = [0], []
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock[0] += seconds
+        with patch.object(api.store, 'get', side_effect=runtime.CredentialUnavailable('secret')), \
+                patch.object(runtime.time, 'time', side_effect=lambda: clock[0]), \
+                patch.object(runtime.time, 'sleep', side_effect=sleep), patch('sys.stderr'):
+            with self.assertRaisesRegex(TimeoutError, 'terminal response missing before deadline'):
+                mailbox.wait(ref, timeout_seconds=220)
+        self.assertEqual(clock[0], 220)
+        self.assertEqual(sleeps, [5, 10, 20, 40, 60, 60, 25])
+
     def test_real_subprocess_round_trip_and_replay_gate(self):
         api = Api()
         expires = deadline()
@@ -153,6 +234,23 @@ class MailboxTests(unittest.TestCase):
         rows['run-1']['id'] = '999'
         with self.assertRaises(runtime.RuntimeSafetyError):
             runtime.verify_fleet(config, clients)
+        rows['run-1']['id'] = '101'
+        for row in rows.values():
+            row['resourcePolicies'] = ['regions/us-central1/resourcePolicies/reused-placement']
+        config['platform']['runtime']['placement_policy'] = {'name': 'reused-placement', 'id': '123'}
+        policy = {'id': '123', 'groupPlacementPolicy': {'collocation': 'COLLOCATED', 'maxDistance': 2}}
+        class ReusedCompute:
+            def request(self, method, path):
+                if '/resourcePolicies/' in path:
+                    self.path = path
+                    return policy
+                return rows[path.rsplit('/', 1)[-1]]
+        compute = ReusedCompute()
+        self.assertEqual(len(runtime.verify_fleet(config, {'platform': compute})), 6)
+        self.assertEqual(compute.path, 'beta/regions/us-central1/resourcePolicies/reused-placement')
+        policy['id'] = '124'
+        with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'placement policy'):
+            runtime.verify_fleet(config, {'platform': compute})
 
     def test_h4d_fleet_requires_all_ten_nvme_scratch_disks(self):
         expires = deadline()
@@ -201,12 +299,56 @@ class MailboxTests(unittest.TestCase):
         config = {'spec': {'backends': ['tidehunter_nvme_rdma']},
                   'platform': {'runtime': {'fleet': fleet()}}}
         addresses = json.dumps([{'ifname': 'eth1', 'addr_info': [{'local': '10.1.0.2'}]}])
-        with patch('subprocess.run'), patch('subprocess.check_output', side_effect=['link rdma0/1 netdev eth1', addresses]):
+        with patch('shutil.which', return_value='/usr/bin/nvme'), \
+             patch.object(Path, 'is_dir', return_value=True), \
+             patch.object(Path, 'is_char_device', return_value=True), \
+             patch('subprocess.run', return_value=SimpleNamespace(returncode=0, stdout='configfs')), \
+             patch('subprocess.check_output', side_effect=['link rdma0/1 state ACTIVE netdev eth1', addresses]):
             proof = runtime.admit_fabrics(config, 0, {}, '/tmp')
         self.assertEqual(proof['network_interface'], 'eth1')
-        with patch('subprocess.run'), patch('subprocess.check_output', side_effect=['link rdma0/1 netdev eth0', addresses]):
+        with patch('shutil.which', return_value='/usr/bin/nvme'), \
+             patch.object(Path, 'is_dir', return_value=True), \
+             patch.object(Path, 'is_char_device', return_value=True), \
+             patch('subprocess.run', return_value=SimpleNamespace(returncode=0, stdout='configfs')), \
+             patch('subprocess.check_output', side_effect=['link rdma0/1 state ACTIVE netdev eth0', addresses]):
             with self.assertRaises(runtime.RuntimeSafetyError):
                 runtime.admit_fabrics(config, 0, {}, '/tmp')
+        with patch('shutil.which', return_value='/usr/bin/nvme'), \
+             patch.object(Path, 'is_dir', return_value=True), \
+             patch.object(Path, 'is_char_device', return_value=True), \
+             patch('subprocess.run', return_value=SimpleNamespace(returncode=0, stdout='configfs')), \
+             patch('subprocess.check_output', side_effect=['link rdma0/1 state DOWN netdev eth1', addresses]):
+            with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'active RDMA'):
+                runtime.admit_fabrics(config, 0, {}, '/tmp')
+
+    def test_live_rdma_also_loads_tcp_for_private_commissioning(self):
+        config = {'spec': {'mode': 'standard-with-live-nvmeof',
+                           'backends': ['tidehunter_nvme_rdma']},
+                  'platform': {'runtime': {'fleet': fleet()}}}
+        addresses = json.dumps([{'ifname': 'eth1', 'addr_info': [{'local': '10.1.0.2'}]}])
+        with patch('shutil.which', return_value='/usr/bin/nvme'), \
+             patch.object(Path, 'is_dir', return_value=True), \
+             patch.object(Path, 'is_char_device', return_value=True), \
+             patch('subprocess.run', return_value=SimpleNamespace(returncode=0, stdout='configfs')) as run, \
+             patch('subprocess.check_output', side_effect=['link rdma0/1 state ACTIVE netdev eth1', addresses]):
+            runtime.admit_fabrics(config, 0, {}, '/tmp')
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(['modprobe', 'nvme_tcp'], commands)
+        self.assertIn(['modprobe', 'nvmet_tcp'], commands)
+
+    def test_nvme_prerequisites_fail_closed(self):
+        config = {'spec': {'backends': ['tidehunter_nvme_tcp']}}
+        with patch('shutil.which', return_value=None), self.assertRaisesRegex(runtime.RuntimeSafetyError, 'nvme-cli'):
+            runtime.admit_fabrics(config, 0, {}, '/tmp')
+        with patch('shutil.which', return_value='/usr/bin/nvme'), \
+             patch('subprocess.run', return_value=SimpleNamespace(returncode=0, stdout='tmpfs')), \
+             self.assertRaisesRegex(runtime.RuntimeSafetyError, 'configfs'):
+            runtime.admit_fabrics(config, 0, {}, '/tmp')
+        with patch('shutil.which', return_value='/usr/bin/nvme'), \
+             patch('subprocess.run', return_value=SimpleNamespace(returncode=0, stdout='configfs')), \
+             patch.object(Path, 'is_dir', return_value=False), \
+             self.assertRaisesRegex(runtime.RuntimeSafetyError, 'configfs or initiator'):
+            runtime.admit_fabrics(config, 0, {}, '/tmp')
 
     def test_verbs_binds_each_host_without_mutating_case_defaults(self):
         transport = {'kind': 'ofi', 'fabric': {'backend': 'verbs'}, 'security': 'trusted'}
@@ -216,9 +358,26 @@ class MailboxTests(unittest.TestCase):
         self.assertEqual(prepared['transport']['fabric']['source_address'], '10.1.0.1')
         self.assertEqual([value['fabric']['source_address'] for value in prepared['owner_transports']],
                          [f'10.1.0.{i+2}' for i in range(5)])
+        single = runtime.prepare_transport(config, {'transport': transport, 'addresses': ['10.0.0.2:9400']})
+        self.assertEqual([value['fabric']['source_address'] for value in single['owner_transports']],
+                         ['10.1.0.2'])
         self.assertEqual(transport, {'kind': 'ofi', 'fabric': {'backend': 'verbs'}, 'security': 'trusted'})
         self.assertEqual(runtime.prepare_transport(config, {'transport': {'kind': 'tcp'}}),
                          {'transport': {'kind': 'tcp'}})
+
+    def test_sui_only_verbs_admits_the_active_rdma_interface(self):
+        config = {'spec': {'backends': ['native']},
+                  'platform': {'runtime': {'fleet': fleet(),
+                              'spec': {'suite': 'sui', 'backends': ['native'],
+                                       'sui_transports': ['tidehunter_verbs_native']}}}}
+        addresses = json.dumps([{'ifname': 'eth1', 'addr_info': [{'local': '10.1.0.2'}]}])
+        with patch('subprocess.check_output',
+                   side_effect=['link rdma0/1 state ACTIVE netdev eth1', addresses]):
+            self.assertTrue(runtime.admit_fabrics(config, 0, {}, '/tmp')['rdma_requested'])
+        with patch('subprocess.check_output',
+                   side_effect=['link rdma0/1 state DOWN netdev eth1', addresses]):
+            with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'active RDMA'):
+                runtime.admit_fabrics(config, 0, {}, '/tmp')
 
     def test_valkey_rdma_requires_cm_and_its_admitted_nic(self):
         config = {'spec': {'backends': ['valkey_tcp', 'valkey_rdma']},
@@ -228,7 +387,7 @@ class MailboxTests(unittest.TestCase):
             with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'RDMA-CM'):
                 runtime.admit_fabrics(config, 0, {}, '/tmp')
         with patch('subprocess.run'), patch.object(Path, 'is_char_device', return_value=True), \
-             patch('subprocess.check_output', side_effect=['link rdma0/1 netdev eth1', addresses]):
+             patch('subprocess.check_output', side_effect=['link rdma0/1 state ACTIVE netdev eth1', addresses]):
             proof = runtime.admit_fabrics(config, 0, {}, '/tmp')
         self.assertTrue(proof['valkey_rdma_requested'])
         self.assertFalse(proof['nvme_rdma_requested'])
@@ -250,6 +409,49 @@ class MailboxTests(unittest.TestCase):
         config['spec']['backends'].append('tidehunter_efa')
         with self.assertRaises(runtime.RuntimeSafetyError):
             runtime.validate_runtime(config)
+        config['spec'] = {'backends': ['native', 'tidehunter_nvme_rdma'], 'mode': 'standard'}
+        with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'NVMe-oF mode'):
+            runtime.validate_runtime(config)
+        config['spec']['mode'] = 'nvmeof-focused'
+        self.assertIs(runtime.validate_runtime(config), config)
+        config['spec']['mode'] = 'standard-with-nvmeof'
+        self.assertIs(runtime.validate_runtime(config), config)
+        config['spec']['mode'] = 'standard-with-live-nvmeof'
+        with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'live pair qualification'):
+            runtime.validate_runtime(config)
+        config['live_qualification'] = {
+            'image': 'projects/project/global/images/qualified',
+            'image_qualification': {'bucket': 'bucket',
+                'object': 'runs/bench-aaaaaaaaaaaaaaaa/qualification/image-receipt.json',
+                'generation': '1', 'sha256': 'd' * 64},
+            'pair_hosts': [
+                {'name': 'bench-aaaaaaaaaaaaaaaa-0', 'id': '200', 'zone': 'us-central1-a',
+                 'internal_ip': '10.2.0.1', 'rdma_ip': '10.3.0.1'},
+                {'name': 'bench-aaaaaaaaaaaaaaaa-1', 'id': '201', 'zone': 'us-central1-a',
+                 'internal_ip': '10.2.0.2', 'rdma_ip': '10.3.0.2'}],
+            'rdma_device': 'irdma0', 'service_account': 'guest@example.test'}
+        self.assertIs(runtime.validate_runtime(config), config)
+        config['package']['manifest_sha256'] = 'e' * 64
+        hosts = config['live_qualification']['pair_hosts']
+        records = [{'instance_id': host['id'], 'peer_instance_id': hosts[1-i]['id'],
+                    'local_rdma': host['rdma_ip'], 'peer': hosts[1-i]['rdma_ip']}
+                   for i, host in enumerate(hosts)]
+        import gcp_api
+        import gcp_image
+        import manual_campaign
+        api = SimpleNamespace(request=lambda *args: {'id': '1'})
+        qualified = {'runtime_sha256': 'e' * 64, '_records': records}
+        with patch.object(gcp_api, 'GoogleApi', return_value=api), \
+             patch.object(gcp_image, 'admit_image', return_value=qualified), \
+             patch.object(gcp_image, 'admit_nvme_transports'), \
+             patch.object(manual_campaign, '_admit_live_pair'):
+            runtime.admit_live_qualification(config)
+            records[0]['peer_instance_id'] = '999'
+            with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'host identity mismatch'):
+                runtime.admit_live_qualification(config)
+        config['spec']['mode'] = 'unexpected'
+        with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'invalid matrix mode'):
+            runtime.validate_runtime(config)
 
     def test_industry_stores_do_not_request_rdma(self):
         config = {'spec': {'backends': ['garnet', 'kvrocks']}}
@@ -260,6 +462,65 @@ class MailboxTests(unittest.TestCase):
         self.assertFalse(proof['nvme_rdma_requested'])
         run.assert_not_called()
         output.assert_not_called()
+
+    def test_focused_guest_bootstrap_skips_external_store_image_inspection(self):
+        import cloud_bootstrap
+        import cloud_controller
+        import cloud_package
+        import local
+        config = {'spec': {'mode': 'focused'}, 'platform': {'runtime': {'package_root': '/package'}},
+                  'source_sha256': 'a' * 64, 'binary_sha256': 'b' * 64,
+                  'fleet': {'data_root': '/tmp'}, 'prefix': 'run', 'repository_root': '/source',
+                  'deadline_utc': deadline()}
+        package = {'source_sha256': 'a' * 64, 'binary_sha256': 'b' * 64, 'build_profile': 'focused'}
+        with patch.object(runtime, 'verify_local_identity', return_value={'name': 'host', 'instance_id': '1'}), \
+                patch.object(runtime, 'admit_guest_runtime', return_value={}), \
+                patch.object(runtime, 'verify_fleet', return_value=[]), \
+                patch.object(runtime, 'admit_nvmet_fix', return_value=None), \
+                patch.object(runtime, 'admit_guest_unit', return_value={}), \
+                patch.object(runtime, 'admit_fabrics', return_value={}), \
+                patch.object(cloud_package, 'verify_directory', return_value=package), \
+                patch.object(cloud_controller, 'snapshot', return_value={}), \
+                patch.object(cloud_bootstrap, 'cache_monitor_images', return_value={'complete': True}), \
+                patch('subprocess.run'), patch('subprocess.check_output', return_value='[]') as inspect:
+            focused = runtime.bootstrap_guest(config, 0, {})
+            self.assertEqual(focused['images'], {})
+            inspect.assert_not_called()
+            config['spec']['mode'] = 'standard-with-live-nvmeof'
+            package.pop('build_profile')
+            full = runtime.bootstrap_guest(config, 0, {})
+            self.assertEqual(set(full['images']), set(local.IMAGES))
+            self.assertEqual(inspect.call_count, len(local.IMAGES))
+
+    def test_guest_unit_rejects_unsafe_process_limits_and_identity(self):
+        import cloud_controller
+        config = {'prefix': 'bench-0123456789abcdef',
+                  'repository_root': '/tmp/source',
+                  'fleet': {'client_cpus': 1, 'server_cpus': 1,
+                            'client_memory_mib': 512, 'server_memory_mib': 512}}
+        valid = {'executable': runtime.GUEST_PYTHON, 'yaml': '6.0.2',
+                 'yaml_check': {'x': 1}, 'nofile': [524288, 524288]}
+        status = {'LimitNOFILE': '524288', 'LimitNOFILESoft': '524288',
+                  'ActiveState': 'active', 'SubState': 'exited', 'ExecMainStatus': '0', 'Result': 'success'}
+        def execute(argv, **kwargs):
+            if argv[0] == 'systemd-run':
+                output = next(arg.split('file:', 1)[1] for arg in argv if arg.startswith('--property=StandardOutput=file:'))
+                Path(output).write_text(json.dumps(valid))
+            return unittest.mock.Mock()
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(cloud_controller, 'environment', return_value={}), \
+             patch.object(cloud_controller, 'unit_status', return_value=status), \
+             patch('subprocess.run', side_effect=execute) as run:
+            config['fleet']['data_root'] = directory
+            for field, value, error in (('nofile', [1024, 524288], 'effective NOFILE'),
+                                        ('executable', '/usr/bin/python3', 'guest Python')):
+                invalid = dict(valid)
+                invalid[field] = value
+                with self.subTest(field=field), patch.object(Path, 'read_text', return_value=json.dumps(invalid)):
+                    with self.assertRaisesRegex(runtime.RuntimeSafetyError, error):
+                        runtime.admit_guest_unit(config, -1)
+                self.assertEqual(run.call_args.args[0], ['systemctl', 'stop',
+                    cloud_controller.unit_name(config, 'startup-runtime-admission', 'client')])
 
 
 if __name__ == '__main__':

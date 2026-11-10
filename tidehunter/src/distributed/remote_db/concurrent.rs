@@ -32,6 +32,7 @@ struct Admission {
     changed: Condvar,
     max_requests: usize,
     max_bytes: usize,
+    first_failure: Arc<std::sync::OnceLock<String>>,
 }
 struct WriteCredit {
     admission: Arc<Admission>,
@@ -61,11 +62,16 @@ impl WriteReply {
 impl Drop for WriteReply {
     fn drop(&mut self) {
         if let Some(sender) = self.sender.take() {
+            let message = failure_context(
+                &self._credit.admission.first_failure,
+                match self.version {
+                    Some(_) => "write authority stopped before acknowledgement",
+                    None => "write authority stopped before admission",
+                },
+            );
             let error = match self.version {
-                Some(version) => {
-                    LocalDbError::unknown(version, "write authority stopped before acknowledgement")
-                }
-                None => LocalDbError::new("write authority stopped before admission"),
+                Some(version) => LocalDbError::unknown(version, message),
+                None => LocalDbError::new(message),
             };
             let _ = sender.send(Err(error));
         }
@@ -90,6 +96,14 @@ enum OwnerCommand {
     },
 }
 
+struct DeferredWrite {
+    prepared: PreparedAdmission,
+    reply: WriteReply,
+    since: Option<Instant>,
+    drained_generation: Option<u64>,
+    fresh_generation: Option<u64>,
+}
+
 #[derive(Clone, Copy, Default)]
 struct Snapshot {
     stats: LocalDbStats,
@@ -97,6 +111,24 @@ struct Snapshot {
     authority: AuthorityWriteStats,
     metadata_history_bytes: usize,
     checkpoint_diagnostics: CheckpointDiagnosticSummary,
+}
+
+/// Setup evidence from one owner-monitor connection.
+#[cfg(feature = "experimental-fabric")]
+pub struct FabricProviderEvidence {
+    pub partition: u32,
+    pub provider: Option<tidehunter_fabric::ProviderInfo>,
+    pub open_profile: Option<tidehunter_fabric::OpenProfile>,
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+type LiveTargetReports = Vec<(u32, super::super::nvmeof::LiveTargetStats)>;
+
+/// Evidence collected only after the final sealed authority and initiator drain.
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+pub struct LiveFinalShutdownEvidence {
+    pub metrics: super::super::nvmeof::live_metrics::LiveNvmeStats,
+    pub targets: LiveTargetReports,
 }
 
 /// Consumes one opened authority. Reads never borrow or lock its write owner.
@@ -109,24 +141,209 @@ pub struct ConcurrentRemoteDatabase {
     admission: Arc<Admission>,
     snapshot: Arc<Mutex<Snapshot>>,
     pub(super) failure: Arc<AtomicBool>,
-    pub(super) index: Arc<RwLock<NativeIndex>>,
+    first_failure: Arc<std::sync::OnceLock<String>>,
+    pub(super) index: Arc<NativeIndex>,
     pub(super) reads: Arc<ReadService>,
-    pub(super) cache: Arc<Mutex<ReadCache>>,
+    pub(super) cache: Arc<ReadCache>,
     write_profile: Arc<Mutex<WriteProfileSnapshot>>,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    live_metrics: Option<Arc<super::super::nvmeof::live_metrics::LiveNvmeMetrics>>,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    live_final_requested: Arc<AtomicBool>,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    live_final_targets: Arc<Mutex<Option<LiveTargetReports>>>,
+    pub(crate) write_timeline: Arc<WriteTimeline>,
     pub(super) shape: KeyShape,
     pub(super) config: RemoteDatabaseConfig,
     pub(super) epoch: u64,
     pub(super) partition_indexes: HashMap<u32, usize>,
     pub(super) read_resolve_ns: AtomicU64,
     pub(super) value_read_ns: AtomicU64,
-    io_clients: Vec<(u32, Arc<Mutex<Client>>)>,
+    io_clients: Vec<(u32, ControlHandle)>,
     operational_monitor: OperationalReadIoMonitor,
     operational_lifecycle: std::sync::Weak<Mutex<OperationalReadIoLifecycle>>,
     #[cfg(test)]
     progress: Arc<Mutex<Option<mpsc::SyncSender<PipelineStats>>>>,
 }
 
+fn owner_timeline_error(
+    owner: u32,
+    phase: &'static str,
+    error: LocalDbError,
+) -> super::super::write_timeline::OwnerTimelineError {
+    let mut message = error.to_string();
+    let truncated = message.len() > 128;
+    if truncated {
+        let mut end = 128;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+    }
+    super::super::write_timeline::OwnerTimelineError {
+        owner,
+        phase,
+        message,
+        truncated,
+    }
+}
+
 impl ConcurrentRemoteDatabase {
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub fn live_nvmeof_stats(&self) -> Option<super::super::nvmeof::live_metrics::LiveNvmeStats> {
+        self.live_metrics.as_ref().map(|metrics| metrics.snapshot())
+    }
+
+    pub(crate) fn arm_write_timeline(&self, limit: usize) -> Result<(), LocalDbError> {
+        self.write_timeline.arm(limit).map_err(LocalDbError::new)?;
+        if limit == 0 {
+            return Ok(());
+        }
+        for (_, client) in &self.io_clients {
+            if let Err(error) = client.control(move |client| client.owner_timeline_arm(limit)) {
+                let mut failures = Vec::new();
+                for (partition, client) in &self.io_clients {
+                    if let Err(cleanup) = client.control(|client| client.owner_timeline_arm(0)) {
+                        failures.push(format!("owner {partition}: {cleanup}"));
+                    }
+                }
+                let _ = self.write_timeline.finish();
+                return Err(LocalDbError::new(format!(
+                    "owner timeline arm failed: {error}; disarm failures: {}",
+                    failures.join(", ")
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish_write_timeline(
+        &self,
+    ) -> Result<super::super::write_timeline::WriteTimelineExport, LocalDbError> {
+        if !self.write_timeline.enabled() {
+            return Err(LocalDbError::new("write timeline is not armed"));
+        }
+        let mut records = Vec::new();
+        let mut dropped = 0u64;
+        let mut incomplete = 0u64;
+        let mut captured = 0;
+        let mut errors = Vec::new();
+        for (partition, client) in &self.io_clients {
+            match client.control(|client| Ok(client.owner_timeline_fetch_partial())) {
+                Ok((mut page, owner_dropped, owner_incomplete, fetch_error)) => {
+                    for record in &mut page {
+                        record.owner = *partition;
+                    }
+                    records.extend(page);
+                    dropped = dropped.saturating_add(owner_dropped);
+                    incomplete = incomplete.saturating_add(owner_incomplete);
+                    if let Some(error) = fetch_error {
+                        errors.push(owner_timeline_error(
+                            *partition,
+                            "fetch",
+                            LocalDbError::component(error),
+                        ));
+                    } else {
+                        captured += 1;
+                    }
+                }
+                Err(error) => errors.push(owner_timeline_error(*partition, "fetch", error)),
+            }
+        }
+        for (partition, client) in &self.io_clients {
+            if let Err(error) = client.control(|client| client.owner_timeline_arm(0)) {
+                errors.push(owner_timeline_error(*partition, "disarm", error));
+            }
+        }
+        self.write_timeline.set_owner_records(
+            records,
+            dropped,
+            incomplete,
+            self.io_clients.len(),
+            captured,
+            errors,
+        );
+        self.write_timeline.finish().map_err(LocalDbError::new)
+    }
+    pub(crate) fn finish_write_timeline_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<super::super::write_timeline::WriteTimelineExport, LocalDbError> {
+        if !self.write_timeline.enabled() {
+            return Err(LocalDbError::new("write timeline is not armed"));
+        }
+        let mut records = Vec::new();
+        let mut dropped = 0u64;
+        let mut incomplete = 0u64;
+        let mut captured = 0;
+        let mut errors = Vec::new();
+        for (partition, client) in &self.io_clients {
+            let mut offset = 0usize;
+            let mut owner_dropped = 0u64;
+            let mut owner_incomplete = 0u64;
+            loop {
+                match client.control_until(deadline, move |client| {
+                    client.owner_timeline_page_until(offset, deadline)
+                }) {
+                    Ok((mut page, page_dropped, page_incomplete, more)) => {
+                        for record in &mut page {
+                            record.owner = *partition;
+                        }
+                        offset += page.len();
+                        records.extend(page);
+                        owner_dropped = page_dropped;
+                        owner_incomplete = page_incomplete;
+                        if !more {
+                            captured += 1;
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        errors.push(owner_timeline_error(*partition, "fetch", error));
+                        break;
+                    }
+                }
+            }
+            dropped = dropped.saturating_add(owner_dropped);
+            incomplete = incomplete.saturating_add(owner_incomplete);
+        }
+        for (partition, client) in &self.io_clients {
+            if let Err(error) = client.control_until(deadline, move |client| {
+                client.owner_timeline_arm_until(0, deadline)
+            }) {
+                errors.push(owner_timeline_error(*partition, "disarm", error));
+            }
+        }
+        self.write_timeline
+            .finish_with_owner_until(
+                deadline,
+                super::super::write_timeline::OwnerTimelineCollection {
+                    records,
+                    dropped,
+                    incomplete,
+                    expected: self.io_clients.len(),
+                    captured,
+                    errors,
+                },
+            )
+            .map_err(LocalDbError::new)
+    }
+    /// Setup-time evidence for the existing owner-monitor connections only.
+    #[cfg(feature = "experimental-fabric")]
+    pub fn fabric_provider_evidence(&self) -> Vec<FabricProviderEvidence> {
+        self.io_clients
+            .iter()
+            .map(|(partition, client)| {
+                let client = client.client.lock();
+                FabricProviderEvidence {
+                    partition: *partition,
+                    provider: client.provider_info().cloned(),
+                    open_profile: client.connect_profile().fabric_open,
+                }
+            })
+            .collect()
+    }
+
     #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
     pub(crate) fn install_nvmeof_file_fixture(
         &self,
@@ -164,7 +381,12 @@ impl ConcurrentRemoteDatabase {
         &self,
         registry: &prometheus::Registry,
     ) -> Result<(), LocalDbError> {
-        self.reads.register_nvmeof_metrics(registry)
+        self.reads.register_nvmeof_metrics(registry)?;
+        if let Some(metrics) = &self.live_metrics {
+            super::super::nvmeof::live_prometheus::register(registry, metrics.clone())
+                .map_err(LocalDbError::component)?;
+        }
+        Ok(())
     }
 
     /// Transfer a drained authority into the bounded serving owner.
@@ -183,6 +405,7 @@ impl ConcurrentRemoteDatabase {
             changed: Condvar::new(),
             max_requests: db.config.max_pending_batches,
             max_bytes: db.config.max_pending_bytes,
+            first_failure: db.first_failure.clone(),
         });
         let snapshot = Arc::new(Mutex::new(Snapshot {
             stats: db.stats(),
@@ -191,6 +414,10 @@ impl ConcurrentRemoteDatabase {
             metadata_history_bytes: db.metadata_history_bytes(),
             checkpoint_diagnostics: db.checkpoint_diagnostic_summary(),
         }));
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        let live_final_requested = Arc::new(AtomicBool::new(false));
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        let live_final_targets = Arc::new(Mutex::new(None));
         let (sender, receiver) = mpsc::sync_channel(db.config.max_pending_batches);
         let mut owner = Self {
             sender: Some(sender),
@@ -199,10 +426,18 @@ impl ConcurrentRemoteDatabase {
             admission: admission.clone(),
             snapshot: snapshot.clone(),
             failure: db.concurrent_failure.clone(),
+            first_failure: db.first_failure.clone(),
             index: db.index.clone(),
             reads: db.reads.clone(),
             cache: db.read_cache.clone(),
             write_profile: db.write_profile.clone(),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            live_metrics: db.live_metrics.clone(),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            live_final_requested: live_final_requested.clone(),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            live_final_targets: live_final_targets.clone(),
+            write_timeline: db.write_timeline.clone(),
             shape: db.shape.clone(),
             config: db.config.clone(),
             epoch: db.epoch,
@@ -222,22 +457,33 @@ impl ConcurrentRemoteDatabase {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         drive_owner(&mut db, receiver, &admission, &snapshot)
                     }));
-                    {
-                        let mut budget = admission.budget.lock();
-                        budget.closed = true;
-                        admission.changed.notify_all();
-                    }
                     let result = match outcome {
                         Ok(result) => result,
                         Err(_) => Err(LocalDbError::new(
                             "write authority panicked; recovery required",
                         )),
                     };
-                    if result.is_err() {
+                    if let Err(error) = &result {
+                        record_first_failure(&db.first_failure, None, None, "write_owner", error);
                         db.concurrent_failure.store(true, Ordering::Release);
                         db.reads.poison();
                         db.healthy = false;
                     }
+                    {
+                        let mut budget = admission.budget.lock();
+                        budget.closed = true;
+                        admission.changed.notify_all();
+                    }
+                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                    let shutdown = if result.is_ok() && live_final_requested.load(Ordering::Acquire)
+                    {
+                        db.shutdown_live_target_final().map(|targets| {
+                            *live_final_targets.lock() = Some(targets);
+                        })
+                    } else {
+                        db.shutdown()
+                    };
+                    #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
                     let shutdown = db.shutdown();
                     result.and(shutdown)
                 })
@@ -248,9 +494,10 @@ impl ConcurrentRemoteDatabase {
 
     pub(super) fn ensure_healthy(&self) -> Result<(), LocalDbError> {
         if self.failure.load(Ordering::Acquire) || self.reads.failed() {
-            return Err(LocalDbError::new(
+            return Err(LocalDbError::new(failure_context(
+                &self.first_failure,
                 "TCP authority requires recovery or is closed",
-            ));
+            )));
         }
         Ok(())
     }
@@ -273,7 +520,7 @@ impl ConcurrentRemoteDatabase {
     /// Rejects an unhealthy authority before or after capturing its committed cut.
     pub fn published_cut(&self) -> Result<IndexReadCut, LocalDbError> {
         self.ensure_healthy()?;
-        let cut = self.index.read().latest_cut();
+        let cut = self.index.latest_cut();
         self.ensure_healthy()?;
         Ok(cut)
     }
@@ -283,7 +530,7 @@ impl ConcurrentRemoteDatabase {
         &self,
     ) -> Result<(IndexReadCut, super::super::native_index::IndexReadPin), LocalDbError> {
         self.ensure_healthy()?;
-        let index = self.index.read();
+        let index = &self.index;
         let cut = index.latest_cut();
         let pin = index
             .pin_cut(cut.clone())
@@ -297,25 +544,21 @@ impl ConcurrentRemoteDatabase {
         cut: IndexReadCut,
     ) -> Result<super::super::native_index::IndexReadPin, LocalDbError> {
         self.ensure_healthy()?;
-        let pin = self
-            .index
-            .read()
-            .pin_cut(cut)
-            .map_err(LocalDbError::component)?;
+        let pin = self.index.pin_cut(cut).map_err(LocalDbError::component)?;
         self.ensure_healthy()?;
         Ok(pin)
     }
 
     pub fn retention_floor(&self) -> IndexReadCut {
-        self.index.read().retention_floor()
+        self.index.retention_floor()
     }
 
     pub fn index_stats(&self) -> super::super::native_index::NativeIndexStats {
-        self.index.read().stats()
+        self.index.stats()
     }
 
     pub fn index_history_bytes(&self) -> usize {
-        self.index.read().retained_metadata_bytes()
+        self.index.retained_metadata_bytes()
     }
 
     pub fn metadata_history_bytes(&self) -> usize {
@@ -334,7 +577,6 @@ impl ConcurrentRemoteDatabase {
         let started = Instant::now();
         let result = self
             .index
-            .read()
             .get(ks, key, cut)
             .map_err(LocalDbError::component);
         self.read_resolve_ns
@@ -355,7 +597,6 @@ impl ConcurrentRemoteDatabase {
         self.ensure_healthy()?;
         let result = self
             .index
-            .read()
             .scan_reduced(ks, after_reduced, reverse, 256, cut)
             .map_err(LocalDbError::component);
         self.ensure_healthy()?;
@@ -369,7 +610,6 @@ impl ConcurrentRemoteDatabase {
     ) -> Result<super::super::native_index::NativeIndexHistory, LocalDbError> {
         self.ensure_healthy()?;
         self.index
-            .read()
             .relocation_history(ks, cut)
             .map_err(LocalDbError::component)
     }
@@ -379,7 +619,7 @@ impl ConcurrentRemoteDatabase {
         history: &mut super::super::native_index::NativeIndexHistory,
     ) -> Result<Option<(Bytes, ValueRecordReference)>, LocalDbError> {
         self.ensure_healthy()?;
-        Ok(history.next(&self.index.read()))
+        Ok(history.next(&self.index))
     }
 
     /// Submit one complete batch and wait for synced, ordered publication.
@@ -392,6 +632,28 @@ impl ConcurrentRemoteDatabase {
         operation: [u8; 16],
         mutations: Vec<Mutation>,
     ) -> Result<BatchVersion, LocalDbError> {
+        self.write_batch_inner(operation, mutations, None)
+    }
+
+    pub(crate) fn write_batch_traced(
+        &self,
+        operation: [u8; 16],
+        mutations: Vec<Mutation>,
+        sample: Option<WriteTimelineSample>,
+    ) -> Result<BatchVersion, LocalDbError> {
+        self.write_batch_inner(operation, mutations, sample)
+    }
+
+    fn write_batch_inner(
+        &self,
+        operation: [u8; 16],
+        mutations: Vec<Mutation>,
+        sample: Option<WriteTimelineSample>,
+    ) -> Result<BatchVersion, LocalDbError> {
+        if let Some(sample) = sample {
+            self.write_timeline
+                .event(sample, WriteTimelineStage::ValidationStart);
+        }
         self.ensure_healthy()?;
         let validated = CompleteBatch::validated_mutations(
             &self.shape,
@@ -415,7 +677,15 @@ impl ConcurrentRemoteDatabase {
             })
             .and_then(|bytes| bytes.checked_add(2048))
             .ok_or_else(|| LocalDbError::new("write admission byte overflow"))?;
+        if let Some(sample) = sample {
+            self.write_timeline
+                .event(sample, WriteTimelineStage::AdmissionWaitStarted);
+        }
         let credit = self.reserve(bytes)?;
+        if let Some(sample) = sample {
+            self.write_timeline
+                .event(sample, WriteTimelineStage::AdmissionAcquired);
+        }
         // Bytes may be tiny views of arbitrarily large caller allocations.
         // Detach exactly the admitted contents before retaining them in a queue.
         let mutations = mutations
@@ -442,16 +712,37 @@ impl ConcurrentRemoteDatabase {
             version: None,
             _credit: credit,
         };
-        self.sender
-            .as_ref()
-            .ok_or_else(|| LocalDbError::new("write authority closed"))?
+        if let Some(sample) = sample {
+            self.write_timeline
+                .event(sample, WriteTimelineStage::OwnerEnqueueStarted);
+        }
+        let sender = self.sender.as_ref().ok_or_else(|| {
+            LocalDbError::new(failure_context(
+                &self.first_failure,
+                "write authority closed",
+            ))
+        })?;
+        self.write_timeline
+            .wait_enter(WriteWait::OwnerEnqueueToDequeue, 1);
+        sender
             .send(OwnerCommand::Write {
                 operation,
                 mutations,
                 reply,
             })
-            .map_err(|_| LocalDbError::new("write authority stopped"))?;
-        let _ = self.wake.try_send(());
+            .map_err(|_| {
+                self.write_timeline
+                    .wait_leave(WriteWait::OwnerEnqueueToDequeue, 1);
+                LocalDbError::new(failure_context(
+                    &self.first_failure,
+                    "write authority stopped",
+                ))
+            })?;
+        let wake_result = self.wake.try_send(());
+        self.write_timeline.wait_wake(
+            WriteWait::OwnerEnqueueToDequeue,
+            matches!(wake_result, Err(mpsc::TrySendError::Full(()))),
+        );
         let version = receive(receiver)?;
         self.ensure_healthy()?;
         Ok(version)
@@ -465,7 +756,10 @@ impl ConcurrentRemoteDatabase {
         loop {
             self.ensure_healthy()?;
             if budget.closed {
-                return Err(LocalDbError::new("write authority closed"));
+                return Err(LocalDbError::new(failure_context(
+                    &self.first_failure,
+                    "write authority closed",
+                )));
             }
             if budget.requests < self.admission.max_requests
                 && bytes <= self.admission.max_bytes - budget.bytes
@@ -500,6 +794,8 @@ impl ConcurrentRemoteDatabase {
     }
 
     /// Persist a Stop-aware floor and reclaim wholly unreachable sealed files.
+    /// Live retirement can return a non-fatal busy error while a read is held;
+    /// finish or drop the read and retry without reopening the authority.
     pub(crate) fn retire_history_before(&self, floor: IndexReadCut) -> Result<(), LocalDbError> {
         self.ensure_healthy()?;
         let (reply, receiver) = mpsc::sync_channel(1);
@@ -514,12 +810,18 @@ impl ConcurrentRemoteDatabase {
     }
 
     pub fn read_cache_stats(&self) -> ReadCacheStats {
-        self.cache.lock().stats()
+        self.cache.stats()
+    }
+    pub fn index_shard_stats(&self) -> super::super::native_index::IndexShardStats {
+        self.index.shard_stats()
+    }
+    pub fn read_cache_shard_stats(&self) -> super::ReadCacheShardStats {
+        self.cache.shard_stats()
     }
     pub fn per_keyspace_read_cache_stats(
         &self,
     ) -> [PerKeyspaceReadCacheStats; KEYSPACE_COUNTER_COUNT] {
-        self.cache.lock().per_keyspace_stats()
+        self.cache.per_keyspace_stats()
     }
     pub fn stats(&self) -> LocalDbStats {
         let mut stats = self.snapshot.lock().stats;
@@ -543,7 +845,7 @@ impl ConcurrentRemoteDatabase {
         visit(WriteMetricsSnapshot {
             authority: snapshot.authority,
             pipeline: self.pipeline_stats(),
-            read_cache: self.cache.lock().stats(),
+            read_cache: self.cache.stats(),
             write_profile: *self.write_profile.lock(),
             checkpoint_diagnostics: snapshot.checkpoint_diagnostics,
         });
@@ -553,7 +855,7 @@ impl ConcurrentRemoteDatabase {
         let snapshot = {
             let stored = self.snapshot.try_lock()?;
             let budget = self.admission.budget.try_lock()?;
-            let cache = self.cache.try_lock()?;
+            let cache = &self.cache;
             let write_profile = self.write_profile.try_lock()?;
             let mut pipeline = stored.pipeline;
             pipeline.concurrent_queued_peak = budget.peak_requests;
@@ -576,7 +878,7 @@ impl ConcurrentRemoteDatabase {
         usize,
         IndexReadCut,
     )> {
-        let index = self.index.try_read()?;
+        let index = &self.index;
         Some((
             index.stats(),
             index.retained_metadata_bytes(),
@@ -587,7 +889,7 @@ impl ConcurrentRemoteDatabase {
         Some(self.snapshot.try_lock()?.metadata_history_bytes)
     }
     pub fn try_read_cache_stats(&self) -> Option<ReadCacheStats> {
-        Some(self.cache.try_lock()?.stats())
+        Some(self.cache.stats())
     }
     pub fn try_stats(&self) -> Option<LocalDbStats> {
         let mut stats = self.snapshot.try_lock()?.stats;
@@ -599,13 +901,44 @@ impl ConcurrentRemoteDatabase {
     pub fn try_per_keyspace_read_cache_stats(
         &self,
     ) -> Option<[PerKeyspaceReadCacheStats; KEYSPACE_COUNTER_COUNT]> {
-        Some(self.cache.try_lock()?.per_keyspace_stats())
+        Some(self.cache.per_keyspace_stats())
     }
     pub fn read_evidence_monitor(&self) -> ReadEvidenceMonitor {
         ReadEvidenceMonitor {
             clients: self.io_clients.clone(),
             reads: self.reads.clone(),
         }
+    }
+    /// Explicit flush: return only when every owner's synced frontier covers all
+    /// writes it acknowledged before this call. Owners flush in parallel (one
+    /// scoped thread per owner, bounded by the configured owner count); each
+    /// request is queued behind that owner's earlier appends and runs the owner's
+    /// control barrier, which flushes every log's frontier before replying. A
+    /// `Synchronous` owner has nothing unsynced, so this costs one round trip.
+    ///
+    /// # Errors
+    /// Returns the first owner failure; owners that already flushed stay flushed.
+    pub fn flush_durable(&self) -> Result<(), LocalDbError> {
+        self.ensure_healthy()?;
+        let outcomes: Vec<Result<(), LocalDbError>> = std::thread::scope(|scope| {
+            let flushes: Vec<_> = self
+                .io_clients
+                .iter()
+                .map(|(_, handle)| {
+                    scope.spawn(move || handle.control(|client| client.status().map(|_| ())))
+                })
+                .collect();
+            flushes
+                .into_iter()
+                .map(|flush| {
+                    flush
+                        .join()
+                        .unwrap_or_else(|_| Err(LocalDbError::new("owner flush panicked")))
+                })
+                .collect()
+        });
+        outcomes.into_iter().collect::<Result<Vec<_>, _>>()?;
+        self.ensure_healthy()
     }
     /// Request advisory mapped-WAL eviction on every owner at a quiescent boundary.
     /// The owner control handler visits all retained source epochs, not just the
@@ -635,15 +968,14 @@ impl ConcurrentRemoteDatabase {
                 "mapped-WAL eviction requires disabled coordinator read cache",
             ));
         }
+        let epoch = self.epoch;
         let result = self
             .io_clients
             .iter()
             .map(|(partition, client)| {
                 client
-                    .lock()
-                    .read_evidence_for_benchmark(self.epoch, true)
+                    .control(move |client| client.read_evidence_for_benchmark(epoch, true))
                     .map(|evidence| (*partition, evidence))
-                    .map_err(LocalDbError::component)
             })
             .collect::<Result<Vec<_>, _>>()?;
         self.ensure_healthy()?;
@@ -675,6 +1007,27 @@ impl ConcurrentRemoteDatabase {
     /// Returns write-owner, transport, or shutdown failures after joining progress.
     pub fn shutdown(mut self) -> Result<(), LocalDbError> {
         self.stop()
+    }
+
+    /// Final campaign teardown, distinct from ordinary close/reopen.
+    /// Returns only owner-reported target evidence after successful drain and seal.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub fn shutdown_live_target_final(mut self) -> Result<LiveFinalShutdownEvidence, LocalDbError> {
+        let metrics = self
+            .live_metrics
+            .clone()
+            .ok_or_else(|| LocalDbError::new("live NVMe is not configured"))?;
+        self.live_final_requested.store(true, Ordering::Release);
+        self.stop()?;
+        let targets = self
+            .live_final_targets
+            .lock()
+            .take()
+            .ok_or_else(|| LocalDbError::new("final live target evidence unavailable"))?;
+        Ok(LiveFinalShutdownEvidence {
+            metrics: metrics.snapshot(),
+            targets,
+        })
     }
     /// Arm a fresh bounded profile after warm-up has drained.
     pub fn arm_write_profile(&self, limit: usize) -> Result<(), LocalDbError> {
@@ -754,6 +1107,7 @@ fn drive_owner(
     snapshot: &Mutex<Snapshot>,
 ) -> Result<(), LocalDbError> {
     let mut pending: VecDeque<WriteReply> = VecDeque::new();
+    let mut head: Option<DeferredWrite> = None;
     let mut barrier: Option<Reply<()>> = None;
     let mut disconnected = false;
     let mut finish_profiles = false;
@@ -765,21 +1119,51 @@ fn drive_owner(
     // This serving loop intentionally lives until all senders close or a fatal
     // error occurs. Each pass admits at most the configured request bound.
     loop {
-        db.ensure_healthy()?;
+        db.ensure_healthy().inspect_err(|error| {
+            record_first_failure(
+                &db.first_failure,
+                None,
+                error.uncertain_version,
+                "owner_health",
+                error,
+            );
+        })?;
         // Harvest completions first, without dispatching short tails. Drain only
         // commands already ready below, then send the resulting groups at once.
         // There is no timer or wait for a second request: singletons stay prompt.
-        db.progress_pipeline(false)?;
+        db.progress_pipeline(false).inspect_err(|error| {
+            record_first_failure(
+                &db.first_failure,
+                None,
+                error.uncertain_version,
+                "progress_pipeline",
+                error,
+            );
+        })?;
         for _ in 0..pending.len() {
             let reply = pending.pop_front().unwrap();
             let version = reply.version.unwrap();
             if version.epoch < db.epoch || db.publication.is_published(version) {
-                db.ensure_healthy()?;
+                db.ensure_healthy().inspect_err(|error| {
+                    record_first_failure(
+                        &db.first_failure,
+                        None,
+                        error.uncertain_version,
+                        "publication_health",
+                        error,
+                    );
+                })?;
                 db.pipeline_stats.concurrent_completed += 1;
                 if db.config.write_profile_limit != 0 {
                     // Diagnostic snapshots must be visible before client completion.
                     refresh_snapshot(db, snapshot);
                 }
+                db.write_timeline.batch_event(
+                    version,
+                    WriteTimelineStage::CallerReplyQueued,
+                    None,
+                    None,
+                );
                 reply.finish(Ok(version));
             } else {
                 pending.push_back(reply);
@@ -788,6 +1172,7 @@ fn drive_owner(
         if barrier.is_some() && db.submissions.is_empty() {
             let finishing_profiles = finish_profiles;
             let arming_profile = arm_profile_limit.take();
+            let retiring = retirement.is_some();
             let result = if let Some(limit) = arming_profile {
                 db.arm_write_profile(limit)
             } else if finishing_profiles {
@@ -798,11 +1183,25 @@ fn drive_owner(
                 db.commit_checkpoint()
             };
             finish_profiles = false;
-            let failed = result.is_err();
+            let fatal = result.is_err()
+                && !finishing_profiles
+                && (!retiring || db.ensure_healthy().is_err());
+            if fatal && let Err(error) = &result {
+                record_first_failure(
+                    &db.first_failure,
+                    None,
+                    error.uncertain_version,
+                    "checkpoint",
+                    error,
+                );
+            }
             refresh_snapshot(db, snapshot);
             let _ = barrier.take().unwrap().send(result);
-            if failed && !finishing_profiles {
-                return Err(LocalDbError::new("checkpoint failed; recovery required"));
+            if fatal {
+                return Err(LocalDbError::new(failure_context(
+                    &db.first_failure,
+                    "checkpoint failed; recovery required",
+                )));
             }
         }
         refresh_snapshot(db, snapshot);
@@ -810,47 +1209,209 @@ fn drive_owner(
         if let Some(events) = db.concurrent_progress.lock().as_ref() {
             let _ = events.try_send(db.pipeline_stats());
         }
-        if disconnected && db.submissions.is_empty() {
+        if disconnected && head.is_none() && db.submissions.is_empty() {
             return Ok(());
         }
         let mut admitted = false;
         if barrier.is_none() && !disconnected {
             for _ in 0..admission.max_requests {
-                match receiver.try_recv() {
-                    Ok(OwnerCommand::Write {
-                        operation,
-                        mutations,
-                        mut reply,
-                    }) => {
-                        match db.submit(operation, mutations) {
-                            Ok(version) => {
-                                reply.version = Some(version);
-                                pending.push_back(reply);
-                                db.pipeline_stats.concurrent_admitted += 1;
-                                db.pipeline_stats.concurrent_pending_peak =
-                                    db.pipeline_stats.concurrent_pending_peak.max(pending.len());
-                                #[cfg(test)]
-                                if db.panic_after_concurrent_admissions
-                                    == Some(db.pipeline_stats.concurrent_admitted)
-                                {
-                                    panic!("injected concurrent authority panic after admission");
+                let command = if head.is_some() {
+                    None
+                } else {
+                    match receiver.try_recv() {
+                        Ok(OwnerCommand::Write {
+                            operation,
+                            mutations,
+                            reply,
+                        }) => {
+                            db.write_timeline
+                                .wait_leave(WriteWait::OwnerEnqueueToDequeue, 1);
+                            db.write_timeline
+                                .operation_event(operation, WriteTimelineStage::OwnerDequeued);
+                            let started = Instant::now();
+                            let before = db.authority_write_stats();
+                            let prepared = db.prepare_submit(operation, mutations);
+                            if let Ok(prepared) = &prepared {
+                                db.write_timeline.batch_event(
+                                    prepared.batch.version(),
+                                    WriteTimelineStage::Prepared,
+                                    None,
+                                    None,
+                                );
+                            }
+                            db.record_admission_span(started, before);
+                            match prepared {
+                                Ok(prepared) => {
+                                    head = Some(DeferredWrite {
+                                        prepared,
+                                        reply,
+                                        since: None,
+                                        drained_generation: None,
+                                        fresh_generation: None,
+                                    })
+                                }
+                                Err(error) => {
+                                    let poisoned = !db.healthy || db.ensure_healthy().is_err();
+                                    if poisoned {
+                                        record_first_failure(
+                                            &db.first_failure,
+                                            None,
+                                            error.uncertain_version,
+                                            "prepare_submit",
+                                            &error,
+                                        );
+                                    }
+                                    reply.finish(Err(error));
+                                    if poisoned {
+                                        return Err(LocalDbError::new(
+                                            "write failed; recovery required",
+                                        ));
+                                    }
+                                    admitted = true;
+                                    continue;
                                 }
                             }
-                            Err(error) => {
-                                let poisoned = !db.healthy || db.ensure_healthy().is_err();
-                                if poisoned {
-                                    db.concurrent_failure.store(true, Ordering::Release);
-                                    db.reads.poison();
+                            None
+                        }
+                        other => Some(other),
+                    }
+                };
+                if let Some(mut write) = head.take() {
+                    let trace_identity = db.write_timeline.enabled().then(|| {
+                        (
+                            write.prepared.batch.id().operation,
+                            write.prepared.batch.version(),
+                        )
+                    });
+                    let pressure = db.prepared_pressure(&write.prepared);
+                    let full = db.submissions.len() >= db.config.max_admitted_batches
+                        || db.submissions.len() >= db.config.max_pending_batches;
+                    let result = match pressure {
+                        Err(error) => Some(Err(error)),
+                        Ok(pressure)
+                            if pressure.is_none()
+                                && (!full
+                                    || write.prepared.batch.version().sequence
+                                        != db.submission_next()
+                                    || write.prepared.batch.version().epoch != db.epoch) =>
+                        {
+                            let started = Instant::now();
+                            let before = db.authority_write_stats();
+                            let result = db.admit_prepared_with_progress(write.prepared, false);
+                            db.record_admission_span(started, before);
+                            Some(result)
+                        }
+                        Ok(pressure) => {
+                            if write.since.is_none() {
+                                db.trace_admission_pressure(pressure.as_ref());
+                                write.since = Some(Instant::now());
+                                db.write_stats.concurrent_checkpoint_deferrals += 1;
+                            }
+                            if db.submissions.is_empty() {
+                                let generation = *write
+                                    .drained_generation
+                                    .get_or_insert(db.snapshot_generation);
+                                if write.fresh_generation.is_none()
+                                    && db.snapshot_generation > generation
+                                {
+                                    write.fresh_generation = Some(db.snapshot_generation);
                                 }
-                                reply.finish(Err(error));
-                                if poisoned {
-                                    return Err(LocalDbError::new(
-                                        "write failed; recovery required",
-                                    ));
+                                if let Some(fresh) = write.fresh_generation {
+                                    if db.snapshot_generation > fresh
+                                        || db.background_checkpoint.is_none()
+                                    {
+                                        let error = match pressure {
+                                            Some(pressure) => db.admission_capacity_error(pressure),
+                                            None => Err(LocalDbError::new(
+                                                "TCP authority admission capacity reached",
+                                            )),
+                                        };
+                                        Some(error.and_then(|()| {
+                                            Err(LocalDbError::new("admission capacity reached"))
+                                        }))
+                                    } else {
+                                        head = Some(write);
+                                        break;
+                                    }
+                                } else if db.background_checkpoint.is_none() {
+                                    db.start_checkpoint().inspect_err(|error| {
+                                        record_first_failure(
+                                            &db.first_failure,
+                                            None,
+                                            error.uncertain_version,
+                                            "start_checkpoint",
+                                            error,
+                                        );
+                                    })?;
+                                    if db.background_checkpoint.is_some() {
+                                        write.fresh_generation = Some(db.snapshot_generation);
+                                        head = Some(write);
+                                        break;
+                                    }
+                                    let error = match pressure {
+                                        Some(pressure) => db.admission_capacity_error(pressure),
+                                        None => Err(LocalDbError::new(
+                                            "TCP authority admission capacity reached",
+                                        )),
+                                    };
+                                    Some(error.and_then(|()| {
+                                        Err(LocalDbError::new("admission capacity reached"))
+                                    }))
+                                } else {
+                                    head = Some(write);
+                                    break;
                                 }
+                            } else {
+                                head = Some(write);
+                                break;
                             }
                         }
-                        admitted = true;
+                    };
+                    if let Some(since) = write.since {
+                        db.write_stats.concurrent_checkpoint_wait_ns += elapsed(since);
+                    }
+                    match result.unwrap() {
+                        Ok(version) => {
+                            write.reply.version = Some(version);
+                            pending.push_back(write.reply);
+                            db.pipeline_stats.concurrent_admitted += 1;
+                            db.pipeline_stats.concurrent_pending_peak =
+                                db.pipeline_stats.concurrent_pending_peak.max(pending.len());
+                            #[cfg(test)]
+                            if db.panic_after_concurrent_admissions
+                                == Some(db.pipeline_stats.concurrent_admitted)
+                            {
+                                panic!("injected concurrent authority panic after admission");
+                            }
+                        }
+                        Err(error) => {
+                            if let Some((operation, version)) = trace_identity {
+                                db.write_timeline.forget_version(operation, version);
+                            }
+                            let poisoned = !db.healthy || db.ensure_healthy().is_err();
+                            if poisoned {
+                                record_first_failure(
+                                    &db.first_failure,
+                                    None,
+                                    error.uncertain_version,
+                                    "admit_prepared",
+                                    &error,
+                                );
+                                db.concurrent_failure.store(true, Ordering::Release);
+                                db.reads.poison();
+                            }
+                            write.reply.finish(Err(error));
+                            if poisoned {
+                                return Err(LocalDbError::new("write failed; recovery required"));
+                            }
+                        }
+                    }
+                    admitted = true;
+                    continue;
+                }
+                match command.expect("command or deferred write") {
+                    Ok(OwnerCommand::Write { .. }) => {
+                        unreachable!("write commands are prepared above")
                     }
                     Ok(OwnerCommand::Flush(reply)) => {
                         barrier = Some(reply);
@@ -883,7 +1444,15 @@ fn drive_owner(
                 }
             }
         }
-        db.progress_pipeline(true)?;
+        db.progress_pipeline(true).inspect_err(|error| {
+            record_first_failure(
+                &db.first_failure,
+                None,
+                error.uncertain_version,
+                "progress_pipeline",
+                error,
+            );
+        })?;
         if !admitted {
             // Notifications share the append completion channel, so either new
             // input or ANY node completion wakes the owner. The timeout covers

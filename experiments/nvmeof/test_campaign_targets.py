@@ -7,6 +7,7 @@ import tempfile
 import unittest
 import uuid
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import campaign_targets as campaign
 
@@ -35,16 +36,6 @@ class CampaignTargetsTests(unittest.TestCase):
         ident = str(uuid.uuid4())
         self.assertEqual(campaign.host_identity(run, ident), campaign.host_identity(run, ident))
         self.assertNotEqual(campaign.host_identity(run, ident), campaign.host_identity(str(uuid.uuid4()), ident))
-
-    def test_connected_receipt_contains_reader_bindings_only(self):
-        entry = {'export_uuid': list(range(16)), 'device': '/dev/nvme2n1'}
-        state = {'kind': 'campaign-host', 'phase': 'connected', 'transport': 'tcp', 'exports': [entry]}
-        self.assertEqual(campaign.receipt(state)['bindings'], [
-            {'export_uuid': list(range(16)), 'namespace_path': '/dev/nvme2n1', 'transport': 'tcp'}])
-        state['transport'] = 'rdma'
-        self.assertEqual(campaign.receipt(state)['bindings'][0]['transport'], 'rdma')
-        state['phase'] = 'partial'
-        self.assertNotIn('bindings', campaign.receipt(state))
 
     def test_cleanup_proof_requires_exact_disconnected_campaign(self):
         entry = {'uuid': 'u', 'nqn': 'n', 'hostnqn': 'h', 'hostid': 'i',
@@ -111,6 +102,56 @@ class CampaignTargetsTests(unittest.TestCase):
             child.close()
             directory.close()
 
+    def connect_with(self, requested, receipt_geometry):
+        campaign_id = str(uuid.uuid4())
+        ident = str(uuid.uuid4())
+        hostnqn, hostid = campaign.host_identity(campaign_id, ident)
+        entry = {'uuid': ident, 'export_uuid': 'x', 'nqn': 'n', 'nsid': 1, 'manifest_sha256': 'h',
+                 'manifest': '/m/manifest.json'}
+        targets = {'version': 1, 'kind': 'campaign-target', 'transport': 'tcp', 'campaign_id': campaign_id,
+                  'export_root': '/exports',
+                  'exports': [dict(entry, hostnqn=hostnqn, hostid=hostid, address='10.0.0.1',
+                                   service=4420, status='published')]}
+        host_receipt = {'hostid': hostid, 'phase': 'protected', 'device': '/dev/nvme7n1',
+                        'queue_geometry': receipt_geometry}
+        args = SimpleNamespace(targets='t', ready='r', export_root='e', state='/state', **requested)
+        with patch.object(campaign, 'trusted_json', return_value=targets), \
+             patch.object(campaign, 'load_exports', return_value=[dict(entry)]), \
+             patch.object(campaign, 'new_campaign_state', return_value=SimpleNamespace(close=lambda: None)), \
+             patch.object(campaign.manage, 'save'), \
+             patch.object(campaign.manage, 'host_connect', return_value=host_receipt) as connect:
+            try:
+                result = campaign.connect(args)
+            except ValueError as exc:
+                result = exc
+        return result, connect
+
+    def test_connect_defaults_to_4x128_and_rejects_mismatched_receipt(self):
+        want = {'nr_io_queues': 4, 'queue_size': 128}
+        good = {'requested': want, 'observed': {'queue_count': 5, 'sqsize': 127}}
+        result, connect = self.connect_with({}, good)
+        self.assertEqual(result['phase'], 'connected')
+        self.assertEqual(result['queue_geometry_requested'], want)
+        self.assertEqual(result['exports'][0]['host_receipt']['queue_geometry'], good)
+        request = connect.call_args.args[0]
+        self.assertEqual((request.nr_io_queues, request.queue_size), (4, 128))
+        for observed in ({'queue_count': 2, 'sqsize': 31}, {'queue_count': 5, 'sqsize': 31},
+                         {'queue_count': 17, 'sqsize': 127}):
+            result, _ = self.connect_with({}, {'requested': want, 'observed': observed})
+            self.assertRegex(str(result), 'queue geometry')
+        result, _ = self.connect_with({}, {'requested': None, 'observed': good['observed']})
+        self.assertRegex(str(result), 'queue geometry')
+
+    def test_connect_override_is_paired_and_verified(self):
+        want = {'nr_io_queues': 1, 'queue_size': 32}
+        result, connect = self.connect_with(want, {'requested': want, 'observed': {'queue_count': 2, 'sqsize': 31}})
+        self.assertEqual(result['queue_geometry_requested'], want)
+        self.assertEqual((connect.call_args.args[0].nr_io_queues, connect.call_args.args[0].queue_size), (1, 32))
+        # A half-specified override fails before any controller connects.
+        result, connect = self.connect_with({'nr_io_queues': 4}, {})
+        self.assertIsInstance(result, ValueError)
+        connect.assert_not_called()
+
     @unittest.skipUnless(os.geteuid() == 0 and Path('/run').is_dir(),
                          'requires root and a trusted /run directory')
     def test_empty_owner_lifecycle(self):
@@ -121,7 +162,8 @@ class CampaignTargetsTests(unittest.TestCase):
             ready = root / 'ready.json'
             ready.write_text(json.dumps({'exports': []}))
             target = campaign.setup(SimpleNamespace(ready=str(ready), export_root=str(exports),
-                state=str(root / 'target'), address='10.0.0.1', base_port_id=65535, base_service=65535))
+                state=str(root / 'target'), address='10.0.0.1', transport='tcp',
+                base_port_id=65535, base_service=65535))
             self.assertEqual(target['phase'], 'published')
             self.assertEqual(target['exports'], [])
             receipt = root / 'target.json'

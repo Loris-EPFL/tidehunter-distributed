@@ -88,33 +88,42 @@ class ControllerObjects(unittest.TestCase):
 
 
 class PhysicalFleet(unittest.TestCase):
-    def test_google_devices_require_six_independent_boots_and_serials(self):
+    def test_google_devices_require_exact_unique_instance_and_boot_not_global_serial(self):
+        ids = [str(1000 + index) for index in range(6)]
         proofs = [{'qualification_only': False, 'independent_nvme_admitted': True,
-                   'host_identity': {'boot_id': 'boot-' + str(index)},
-                   'block_devices': {'blockdevices': [{'model': 'Google Local SSD', 'serial': 'ssd-' + str(index)}]}}
+                   'host_identity': {'boot_id': 'boot-' + str(index), 'instance_id': ids[index]},
+                   'block_devices': {'blockdevices': [{'model': 'nvme_card0', 'serial': 'local-nvme-ssd-0'}]}}
                   for index in range(6)]
-        self.assertTrue(controller.validate_physical_proofs(proofs, provider='gcp'))
-        for field in ('boot', 'serial'):
+        self.assertTrue(controller.validate_physical_proofs(proofs, provider='gcp', expected_instance_ids=ids))
+        for field in ('boot_id', 'instance_id'):
             changed = copy.deepcopy(proofs)
-            if field == 'boot':
-                changed[5]['host_identity'] = changed[0]['host_identity']
-            else:
-                changed[5]['block_devices'] = changed[0]['block_devices']
-            with self.assertRaises(controller.SafetyError):
-                controller.validate_physical_proofs(changed, provider='gcp')
+            changed[5]['host_identity'][field] = changed[0]['host_identity'][field]
+            with self.subTest(field=field), self.assertRaises(controller.SafetyError):
+                controller.validate_physical_proofs(changed, provider='gcp', expected_instance_ids=ids)
+        changed = copy.deepcopy(proofs)
+        changed[5]['host_identity']['instance_id'] = '9999'
+        with self.assertRaises(controller.SafetyError):
+            controller.validate_physical_proofs(changed, provider='gcp', expected_instance_ids=ids)
+        changed = copy.deepcopy(proofs)
+        changed[5]['block_devices']['blockdevices'][0]['model'] = 'Google Hyperdisk'
+        with self.assertRaises(controller.SafetyError):
+            controller.validate_physical_proofs(changed, provider='gcp', expected_instance_ids=ids)
         with self.assertRaises(controller.SafetyError):
             controller.validate_physical_proofs(proofs)
 
     def test_backend_start_admits_google_storage_without_using_aws_model_rules(self):
         campaign = object.__new__(controller.Controller)
-        campaign.config = {'platform': {'name': 'gcp'}}
+        campaign.local_mode = None
+        hosts = [{'numeric_id': str(1000 + index)} for index in range(6)]
+        campaign.config = {'platform': {'name': 'gcp'},
+                           'fleet': {'coordinator': hosts[0], 'nodes': hosts[1:]}}
         campaign.sequence = 0
         def layout(backend, operation, index, **kwargs):
             return {'proof': {'nvme': {
                 'qualification_only': False, 'independent_nvme_admitted': True,
-                'host_identity': {'boot_id': 'boot-' + str(index)},
+                'host_identity': {'boot_id': 'boot-' + str(index), 'instance_id': str(1001 + index)},
                 'block_devices': {'blockdevices': [
-                    {'model': 'Google Local SSD', 'serial': 'ssd-' + str(index)}]}}}}
+                    {'model': 'nvme_card0', 'serial': 'local-nvme-ssd-0'}]}}}}
         campaign.layout = layout
         with tempfile.TemporaryDirectory() as directory:
             campaign.root = Path(directory)

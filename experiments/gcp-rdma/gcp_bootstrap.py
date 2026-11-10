@@ -6,7 +6,7 @@ import shlex
 import gcp_runtime
 
 
-def startup_script(bucket, run_id, source_sha256, deadline_utc):
+def _preamble(bucket, run_id, source_sha256, deadline_utc, deadline_setup=''):
     if not isinstance(bucket, str) or not re.fullmatch(r'[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]', bucket):
         raise ValueError('invalid bucket')
     gcp_runtime._run(run_id)
@@ -15,14 +15,11 @@ def startup_script(bucket, run_id, source_sha256, deadline_utc):
     constants = json.dumps({'bucket': bucket, 'run_id': run_id, 'source_sha256': source_sha256,
                             'deadline_utc': deadline_utc, 'guest_python': gcp_runtime.GUEST_PYTHON,
                             'guest_path': gcp_runtime.GUEST_PATH}, sort_keys=True)
-    return '''#!/bin/bash
-set -euo pipefail
-export PATH=''' + shlex.quote(gcp_runtime.GUEST_PATH) + '''
-exec ''' + shlex.quote(gcp_runtime.GUEST_PYTHON) + ''' - <<'TIDEHUNTER_BOOTSTRAP'
-''' + 'constants = ' + repr(constants) + '''
+    return 'constants = ' + repr(constants) + '''
 import datetime, hashlib, json, os, pathlib, shutil, subprocess, tarfile, time, urllib.error, urllib.parse, urllib.request, zipfile
 c = json.loads(constants)
 deadline = datetime.datetime.fromisoformat(c['deadline_utc'].replace('Z', '+00:00')).timestamp()
+''' + deadline_setup + '''
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 def metadata(path):
     req = urllib.request.Request('http://metadata.google.internal/computeMetadata/v1/' + path, headers={'Metadata-Flavor':'Google'})
@@ -34,11 +31,11 @@ if (metadata('instance/attributes/tidehunter-run-id') != c['run_id'] or
     metadata('instance/attributes/tidehunter-deadline-utc') != c['deadline_utc']):
     raise ValueError('startup metadata mismatch')
 if time.time() >= deadline: raise ValueError('startup expired')
-# Stop this run's control worker; GCE DELETE bounds the VM and separate workload units.
-subprocess.run(['/usr/bin/systemd-run', '--unit=tidehunter-expire-' + c['run_id'],
-                '--on-calendar=' + datetime.datetime.fromtimestamp(deadline, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
-                '/usr/bin/systemctl', 'stop', 'tidehunter-worker-' + c['run_id'] + '.service'], check=True, timeout=30)
-def get(key, generation=None, limit=536870912):
+'''
+
+
+def _fetch_program():
+    return '''def get(key, generation=None, limit=536870912):
     token = json.loads(metadata('instance/service-accounts/default/token'))['access_token']
     url = 'https://storage.googleapis.com/storage/v1/b/' + urllib.parse.quote(c['bucket'], safe='') + '/o/' + urllib.parse.quote(key, safe='') + '?alt=media'
     if generation is not None: url += '&generation=' + urllib.parse.quote(str(generation), safe='')
@@ -98,6 +95,20 @@ with zipfile.ZipFile(target / 'source.zip') as source:
             raise ValueError('installed source differs from admitted snapshot')
     actual = {p.relative_to(target / 'source').as_posix() for p in (target / 'source').rglob('*') if not p.is_dir()}
     if actual != names: raise ValueError('source inventory mismatch')
+'''
+
+
+def startup_script(bucket, run_id, source_sha256, deadline_utc):
+    preamble = _preamble(bucket, run_id, source_sha256, deadline_utc)
+    return ('''#!/bin/bash
+set -euo pipefail
+export PATH=''' + shlex.quote(gcp_runtime.GUEST_PATH) + '''
+exec ''' + shlex.quote(gcp_runtime.GUEST_PYTHON) + ''' - <<'TIDEHUNTER_BOOTSTRAP'
+''' + preamble + '''# Stop this run's control worker; GCE DELETE bounds the VM and separate workload units.
+subprocess.run(['/usr/bin/systemd-run', '--unit=tidehunter-expire-' + c['run_id'],
+                '--on-calendar=' + datetime.datetime.fromtimestamp(deadline, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
+                '/usr/bin/systemctl', 'stop', 'tidehunter-worker-' + c['run_id'] + '.service'], check=True, timeout=30)
+''' + _fetch_program() + '''
 subprocess.run(['mount', '--bind', str(target), str(target)], check=True, timeout=30)
 subprocess.run(['mount', '-o', 'remount,bind,ro', str(target)], check=True, timeout=30)
 config_path = root / 'runtime.json'
@@ -113,4 +124,4 @@ subprocess.run(['/usr/bin/systemd-run', '--unit=tidehunter-worker-' + c['run_id'
                 '--property=TimeoutStopSec=1',
                 c['guest_python'], str(worker), str(config_path)], check=True, timeout=30)
 TIDEHUNTER_BOOTSTRAP
-'''
+''')

@@ -76,7 +76,7 @@ impl RemoteDatabase {
             )
             .map_err(LocalDbError::component)?;
             let encoded = validated.encoded_len();
-            if planned.contains_key(&id) && encoded > CHECKPOINT_MAX_TAIL_BYTES {
+            if planned.contains_key(&id) && encoded > self.config.replay_limits.max_encoded_bytes {
                 return Err(LocalDbError::new(
                     "batch exceeds checkpoint tail byte bound",
                 ));
@@ -235,7 +235,7 @@ impl RemoteDatabase {
                 .checked_add(prepared.metadata_bytes)
                 .ok_or_else(|| LocalDbError::new("index reservation overflow"))?;
         }
-        if self.index.read().check_capacity(index_bytes).is_err() {
+        if self.index.check_capacity(index_bytes).is_err() {
             self.ensure_admission_pressure(AdmissionPressure::Index {
                 additional_bytes: additional_index_bytes,
             })?;
@@ -245,7 +245,6 @@ impl RemoteDatabase {
                 .ok_or_else(|| LocalDbError::new("index reservation overflow"))?;
         }
         self.index
-            .read()
             .check_capacity(index_bytes)
             .map_err(LocalDbError::component)?;
         self.check_checkpoint_capacity(seen.len())?;

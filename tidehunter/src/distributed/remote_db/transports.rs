@@ -8,6 +8,46 @@ use super::*;
 
 pub(super) type SharedClient = Arc<Mutex<Client>>;
 
+/// A failed open must not leave idle kernel controllers connected. The durable
+/// connection journal retains uncertain ownership if the bounded drain fails.
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+pub(super) struct LivePoolOpenGuard {
+    pool: Arc<super::super::nvmeof::live_pool::LiveControllerPool>,
+    timeout: Duration,
+    armed: bool,
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+impl LivePoolOpenGuard {
+    pub(super) fn new(
+        pool: Arc<super::super::nvmeof::live_pool::LiveControllerPool>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            pool,
+            timeout,
+            armed: true,
+        }
+    }
+
+    pub(super) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+impl Drop for LivePoolOpenGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) = self.pool.shutdown(Instant::now() + self.timeout)
+        {
+            // Drop cannot return a secondary error. The persistent journal
+            // prevents reuse; report the unresolved cleanup rather than hide it.
+            eprintln!("live NVMe failed-open controller cleanup remains quarantined: {error}");
+        }
+    }
+}
+
 /// Optional process-owned transport lifetime for clean database reopen.
 ///
 /// Holds at most one idle database's bounded connection set. Credentials, shape
@@ -72,6 +112,12 @@ pub(super) fn connect(
     tls_config: super::super::tcp::ClientTlsConfig,
     lanes: usize,
     retained: Option<Vec<SharedClient>>,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))] pool: Option<
+        Arc<super::super::nvmeof::live_pool::LiveControllerPool>,
+    >,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))] metrics: Option<
+        Arc<super::super::nvmeof::live_metrics::LiveNvmeMetrics>,
+    >,
 ) -> Result<Connections, LocalDbError> {
     let started = Instant::now();
     let count = config.endpoints.len() * lanes;
@@ -90,26 +136,53 @@ pub(super) fn connect(
         .map(|endpoint| (endpoint, retained.next()))
         .collect();
     let clients = endpoint_map(&mut jobs, |_, (endpoint, previous)| {
-        if let Some(client) = previous.take() {
+        let client = if let Some(client) = previous.take() {
             let mut client = Arc::try_unwrap(client)
                 .map_err(|_| LocalDbError::new("retained transport still has an owner"))?
                 .into_inner();
             client
                 .refresh_for_reuse()
                 .map_err(LocalDbError::component)?;
-            return Ok(client);
+            client
+        } else {
+            let mut tls = config.tls.clone();
+            tls.server_name = endpoint.server_name.clone();
+            Client::connect_shared(
+                &endpoint.address,
+                &tls,
+                tls_config.clone(),
+                config.timeout,
+                config.partition_config(1, endpoint.partition),
+                shape,
+            )
+            .map_err(LocalDbError::component)?
+        };
+        if client.connected_status().live_nvmeof != config.live_nvme.is_some() {
+            return Err(LocalDbError::new(
+                "owner and coordinator data-plane modes differ",
+            ));
         }
-        let mut tls = config.tls.clone();
-        tls.server_name = endpoint.server_name.clone();
-        Client::connect_shared(
-            &endpoint.address,
-            &tls,
-            tls_config.clone(),
-            config.timeout,
-            config.partition_config(1, endpoint.partition),
-            shape,
-        )
-        .map_err(LocalDbError::component)
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        let client = {
+            let mut client = client;
+            if let Some(live) = &config.live_nvme {
+                let pool = pool
+                    .as_ref()
+                    .ok_or_else(|| LocalDbError::new("missing live controller pool"))?;
+                client.set_live_pool(pool.clone());
+                let metrics = metrics
+                    .as_ref()
+                    .ok_or_else(|| LocalDbError::new("missing live metrics"))?;
+                client
+                    .set_live_metrics(metrics.clone())
+                    .map_err(LocalDbError::component)?;
+                client
+                    .configure_live_nvme(live)
+                    .map_err(LocalDbError::component)?;
+            }
+            client
+        };
+        Ok(client)
     })?;
     Ok(Connections {
         clients,
@@ -129,10 +202,28 @@ impl ReadSetup {
         shape: KeyShape,
         tls_config: super::super::tcp::ClientTlsConfig,
         retained: Option<Vec<SharedClient>>,
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))] pool: Option<
+            Arc<super::super::nvmeof::live_pool::LiveControllerPool>,
+        >,
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))] metrics: Option<
+            Arc<super::super::nvmeof::live_metrics::LiveNvmeMetrics>,
+        >,
     ) -> Result<Self, LocalDbError> {
         let thread = thread::Builder::new()
             .name("wal-read-setup".to_owned())
-            .spawn(move || connect(&config, &shape, tls_config, config.read_lanes, retained))
+            .spawn(move || {
+                connect(
+                    &config,
+                    &shape,
+                    tls_config,
+                    config.read_lanes,
+                    retained,
+                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                    pool,
+                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                    metrics,
+                )
+            })
             .map_err(LocalDbError::component)?;
         Ok(Self(Some(thread)))
     }

@@ -1,9 +1,14 @@
+import copy
 import hashlib
 import json
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
 import gcp_image
+import gcp_image_qualify
+import gcp_image_receipt
 
 
 class Store:
@@ -26,6 +31,30 @@ class Api:
 
 
 class ImageAdmissionTests(unittest.TestCase):
+    def test_rdma_capabilities_are_required_without_a_threshold(self):
+        fields = {name: '0' for name in (
+            'max_mr', 'max_qp', 'max_qp_wr', 'max_cq', 'max_cqe',
+            'max_pd', 'max_sge', 'max_sge_rd', 'max_mr_size', 'page_size_cap')}
+        fields['max_cqe'] = '0xffff'
+        evidence = {'capabilities': {'available': True, 'fields': fields}}
+        gcp_image_qualify.require_rdma_capabilities(evidence)
+        del fields['max_mr']
+        with self.assertRaisesRegex(ValueError, 'capabilities unavailable'):
+            gcp_image_qualify.require_rdma_capabilities(evidence)
+        fields['max_mr'] = 'unknown'
+        with self.assertRaises(ValueError):
+            gcp_image_qualify.require_rdma_capabilities(evidence)
+        fields['max_mr'] = '10'
+        evidence['capabilities']['available'] = False
+        with self.assertRaises(ValueError):
+            gcp_image_qualify.require_rdma_capabilities(evidence)
+
+    def test_focused_container_inventory_excludes_external_store_images(self):
+        focused = gcp_image.required_containers(focused=True)
+        full = gcp_image.required_containers()
+        self.assertTrue(focused)
+        self.assertTrue(focused < full)
+
     def setUp(self):
         self.config = {'project_id': 'mysten-research', 'bucket': 'artifacts',
                        'service_account': 'guest@example.com',
@@ -78,6 +107,29 @@ class ImageAdmissionTests(unittest.TestCase):
         self.assertNotEqual(gcp_image.canonical_image_digest('other/cassandra@sha256:' + digest),
                             gcp_image.canonical_image_digest('cassandra@sha256:' + digest))
 
+    def test_selected_nvme_image_modules_are_required_on_both_guests(self):
+        modules = {'nvmet': 'modinfo', 'nvme_fabrics': 'modinfo', 'rdma_cm': 'modinfo',
+                   'nvme_rdma': 'modinfo', 'nvmet_rdma': 'modinfo'}
+        records = [{'outputs': {'nvme_modules': dict(modules)}} for _ in range(2)]
+        qualification = {'_records': records}
+        gcp_image.admit_nvme_transports(qualification, ['tidehunter_nvme_rdma'])
+        with self.assertRaisesRegex(ValueError, 'NVMe transport modules'):
+            gcp_image.admit_nvme_transports(qualification, ['tidehunter_nvme_rdma'], live=True)
+        with self.assertRaisesRegex(ValueError, 'NVMe transport modules'):
+            gcp_image.admit_nvme_transports(qualification, ['tidehunter_nvme_tcp'])
+        for record in records:
+            record['outputs']['nvme_modules'].update(nvme_tcp='modinfo', nvmet_tcp='modinfo')
+        gcp_image.admit_nvme_transports(qualification, ['tidehunter_nvme_rdma'], live=True)
+        gcp_image.admit_nvme_transports(qualification, ['tidehunter_nvme_rdma', 'tidehunter_nvme_tcp'])
+        del records[0]['outputs']['nvme_modules']['nvme_fabrics']
+        with self.assertRaisesRegex(ValueError, 'NVMe transport modules'):
+            gcp_image.admit_nvme_transports(qualification, ['tidehunter_nvme_rdma'])
+        records[0]['outputs']['nvme_modules']['nvme_fabrics'] = 'modinfo'
+        del records[1]['outputs']['nvme_modules']['nvmet_rdma']
+        with self.assertRaisesRegex(ValueError, 'NVMe transport modules'):
+            gcp_image.admit_nvme_transports(qualification, ['tidehunter_nvme_rdma'])
+        gcp_image.admit_nvme_transports({}, ['native'])
+
     def test_reciprocal_proofs_admitted_and_tampering_rejected(self):
         container = 'example/image:v1@sha256:' + 'b' * 64
         recipes = {'prepare_sha256': 'c' * 64, 'qualify_sha256': 'd' * 64}
@@ -97,13 +149,16 @@ class ImageAdmissionTests(unittest.TestCase):
                     'service_account': self.config['service_account'], 'rdma_device': 'irdma0',
                     'scratch_devices': {'local-ssd-0': '/dev/nvme0n1'}, 'local_rdma': local_ip, 'peer': peer_ip,
                     'outputs': {'io_uring': 'io_uring_setup(2) succeeded',
+                                'guest_runtime': {'executable': '/opt/tidehunter-python/bin/python3',
+                                                  'python': '3.11.13', 'yaml': '6.0.2',
+                                                  'nofile_soft': 1024, 'nofile_hard': 524288},
                                 'memlock': {'soft': 'infinity', 'hard': 'infinity', 'docker': 'infinity'},
                                 'io_uring_workload': {'jobs': [{'error': 0, 'read': {'io_bytes': 4096}}]},
                                 'nvme_ioctl': {'local-ssd-0': 'NVMe Identify Controller'},
                                 'package': {'manifest_sha256': runtime, 'runtime_checked': True,
                                             'abi': {'needed': ['libfabric.so.1'], 'version_requirements': defs},
                                             'fabric_library': fabric, 'linkage': linkage,
-                                            'valkey_runtime_linkage': {'valkey-server': linkage, 'valkey-cli': linkage}},
+                                            'valkey_runtime_linkage': {'valkey-server': linkage, 'valkey-cli': linkage, 'valkey-benchmark': linkage}},
                                 'libfabric_sha256': 'a' * 64, 'fi_info_fabric': fabric,
                                 'fi_info_ldd': 'libfabric.so.1 => /lib/libfabric.so.1',
                                 'libfabric_api_version': 65541, 'kernel': '6.12',
@@ -111,7 +166,7 @@ class ImageAdmissionTests(unittest.TestCase):
                                 'libfabric_version': 'fi_info: 2.6.0',
                                 'providers': {'verbs': 'provider: verbs;ofi_rxm', 'tcp': 'provider: tcp;ofi_rxm'},
                                 'rdma_links': 'link irdma0/1 state ACTIVE',
-                                'nvme_modules': {x: 'filename: module' for x in ('irdma', 'idpf', 'rdma_cm', 'nvme', 'nvme_rdma', 'nvmet_rdma')},
+                                'nvme_modules': {x: 'filename: module' for x in ('irdma', 'idpf', 'rdma_cm', 'nvme', 'nvmet', 'nvme_fabrics', 'nvme_rdma', 'nvmet_rdma')},
                                 'openssl': 'OpenSSL 3.2', 'python': '3.12.0',
                                 'containers': {container: [{'RepoDigests': ['docker.io/example/image@sha256:' + 'b' * 64]}]},
                                 'rdma_commands': {op: ['ib_' + op + '_lat', '-R', '-d', 'irdma0', '-p', port, '-s', '1024', '-n', '1000', peer_ip]
@@ -134,6 +189,75 @@ class ImageAdmissionTests(unittest.TestCase):
         with patch.object(gcp_image, 'recipe_hashes', return_value=recipes), \
              patch.object(gcp_image, 'required_containers', return_value={container}):
             self.assertEqual(gcp_image.admit_image(api, self.config, self.image), {**receipt, '_records': records})
+            with self.assertRaisesRegex(ValueError, 'proof list'):
+                gcp_image.validate_pair(records, identity, runtime, self.config['service_account'],
+                                        qualification_profile='focused')
+            focused = copy.deepcopy(records)
+            for item in focused:
+                item['qualification_proofs'] = list(gcp_image.FOCUSED_PROOFS)
+                del item['outputs']['valkey']
+                del item['outputs']['package']['valkey_runtime_linkage']
+                item['outputs']['package']['build_profile'] = 'focused'
+                del item['outputs']['package']['linkage']['resolved']['/lib/libfdb_c.so']
+            gcp_image.validate_pair(focused, identity, runtime, self.config['service_account'],
+                                    qualification_profile='focused')
+            gcp_image.admit_abi({'_records': focused}, {'needed': ['libfabric.so.1'],
+                'version_requirements': {'GLIBC': ['2.34'], 'GLIBCXX': [], 'CXXABI': [], 'OPENSSL': []}})
+            with self.assertRaisesRegex(ValueError, 'focused proof'):
+                gcp_image.validate_pair(focused, identity, runtime, self.config['service_account'])
+            wrong = copy.deepcopy(focused)
+            wrong[0]['qualification_proofs'].append('valkey')
+            with self.assertRaisesRegex(ValueError, 'proof list'):
+                gcp_image.validate_pair(wrong, identity, runtime, self.config['service_account'],
+                                        qualification_profile='focused')
+            wrong = copy.deepcopy(focused)
+            wrong[0]['outputs']['valkey'] = records[0]['outputs']['valkey']
+            with self.assertRaisesRegex(ValueError, 'Valkey proof'):
+                gcp_image.validate_pair(wrong, identity, runtime, self.config['service_account'],
+                                        qualification_profile='focused')
+            wrong = copy.deepcopy(focused)
+            del wrong[0]['outputs']['nvme_modules']['nvmet']
+            with self.assertRaisesRegex(ValueError, 'target modules'):
+                gcp_image.validate_pair(wrong, identity, runtime, self.config['service_account'],
+                                        qualification_profile='focused')
+            wrong = copy.deepcopy(focused)
+            wrong[0]['outputs']['rdma_read'] = 'invalid'
+            with self.assertRaisesRegex(ValueError, 'perftest'):
+                gcp_image.validate_pair(wrong, identity, runtime, self.config['service_account'],
+                                        qualification_profile='focused')
+            with tempfile.TemporaryDirectory() as directory:
+                entries = []
+                for index, item in enumerate(focused):
+                    data = json.dumps(item).encode()
+                    path = Path(directory) / str(index)
+                    path.write_bytes(data)
+                    entries.append({'file': str(path), 'reference': {
+                        'bucket': 'artifacts', 'object': f'focused-{index}', 'generation': '9',
+                        'sha256': hashlib.sha256(data).hexdigest()}})
+                focus_receipt = gcp_image_receipt.make_receipt(
+                    {'image': identity, 'runtime_sha256': runtime, 'service_account': self.config['service_account'],
+                     'evidence': entries}, qualification_profile='focused')
+                self.assertEqual(focus_receipt['qualification_proofs'], list(gcp_image.FOCUSED_PROOFS))
+                focus_api = self.put_receipt(focus_receipt)
+                for index, entry in enumerate(entries):
+                    focus_api.store.objects[(f'focused-{index}', '9')] = Path(entry['file']).read_bytes()
+                focus_config = {**self.config, 'qualification_profile': 'focused'}
+                self.assertEqual(gcp_image.admit_image(focus_api, focus_config, self.image)['_records'], focused)
+                with self.assertRaisesRegex(ValueError, 'focused receipt'):
+                    gcp_image.admit_image(focus_api, self.config, self.image)
+                bad = dict(focus_receipt, qualification_proofs=['valkey'])
+                bad_api = self.put_receipt(bad)
+                with self.assertRaisesRegex(ValueError, 'proof list'):
+                    gcp_image.admit_image(bad_api, {**self.config, 'qualification_profile': 'focused'}, self.image)
+                self.put_receipt(receipt)
+            guest = records[0]['outputs']['guest_runtime']
+            for field, value in (('executable', '/usr/bin/python3.11'), ('yaml', None),
+                                 ('nofile_hard', 1024)):
+                original = guest[field]
+                guest[field] = value
+                with self.assertRaisesRegex(ValueError, 'guest Python'):
+                    gcp_image.validate_pair(records, identity, runtime, self.config['service_account'])
+                guest[field] = original
             qualification = {'_records': records}
             versions = {'GLIBC': ['2.34'], 'GLIBCXX': [], 'CXXABI': [], 'OPENSSL': []}
             gcp_image.admit_abi(qualification, {'needed': ['libfabric.so.1'], 'version_requirements': versions})

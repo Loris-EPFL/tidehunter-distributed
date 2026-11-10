@@ -114,6 +114,7 @@ impl LocalDatabase {
             .map_or(IndexReadCut::BeforeAll, IndexReadCut::At);
         let captured = self
             .index
+            .writer()
             .prepare_compacted_image(cut, floor)
             .map_err(LocalDbError::component)?;
         let persisted = captured.persist(&image).map_err(LocalDbError::component)?;
@@ -141,7 +142,7 @@ impl LocalDatabase {
         let bytes = encode_metadata(&root).map_err(LocalDbError::component)?;
         install_metadata(&self.path, ROOT, &bytes).map_err(LocalDbError::component)?;
         // The durable root is installed before either history unmerge or unlink.
-        self.index.install_image(persisted);
+        self.index.writer().install_image(persisted);
         self.retire_unreferenced_files()?;
         let reachable = self.index.reachable_files();
         for entry in fs::read_dir(&self.path).map_err(LocalDbError::component)? {

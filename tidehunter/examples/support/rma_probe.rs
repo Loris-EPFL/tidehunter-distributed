@@ -56,6 +56,7 @@ impl Args {
                 backend: FabricBackend::SoftwareTcp,
                 domain: None,
                 source_address: None,
+                slots: None,
             },
             require_device_read: false,
             payload_bytes: 256,

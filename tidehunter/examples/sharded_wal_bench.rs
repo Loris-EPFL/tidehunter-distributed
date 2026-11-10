@@ -1819,6 +1819,7 @@ impl Case {
         }
         match &self.transport {
             Transport::Tcp => "experimental_tcp_authority",
+            Transport::TcpTrusted => "trusted_experimental_tcp_authority",
             Transport::Ofi { fabric, security } => match (&fabric.backend, security) {
                 (
                     tidehunter::distributed::tcp::FabricBackend::Efa,

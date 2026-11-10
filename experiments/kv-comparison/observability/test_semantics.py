@@ -1,4 +1,5 @@
 """Contract boundary regressions; no Docker, HTTP wiring or synthetic workload."""
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -113,6 +114,28 @@ class TargetSemantics(unittest.TestCase):
                     'http://localhost:9100/%2e%2e/secret', 'http://localhost:99999/metrics'):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 target_group(url)
+
+
+class DashboardSemantics(unittest.TestCase):
+    def dashboard(self, name):
+        path = Path(__file__).parent / 'dashboards' / (name + '.json')
+        return json.loads(path.read_text())
+
+    def test_frozen_local_snapshot_does_not_report_live_zero_rate(self):
+        dashboard = self.dashboard('comparison')
+        panel = next(panel for panel in dashboard['panels'] if panel['id'] == 6)
+        for target in panel['targets']:
+            self.assertIn('changes(kv_comparison_snapshot_timestamp_seconds', target['expr'])
+            self.assertIn(' > 0)', target['expr'])
+
+    def test_campaign_exposes_checkpoint_availability_and_wal_inventory(self):
+        dashboard = self.dashboard('campaign')
+        panels = {panel['id']: panel for panel in dashboard['panels']}
+        self.assertIn('sampled_checkpoint_control', panels[28]['targets'][0]['expr'])
+        inventory = panels[39]['targets'][0]['expr']
+        for metric in ('inventory_available', 'registered_files', 'logical_file_length_bytes'):
+            self.assertIn(metric, inventory)
+        self.assertNotIn('or vector(0)', inventory)
 
 
 if __name__ == '__main__':

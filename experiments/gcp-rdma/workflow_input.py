@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Admit explicit campaign selections and retrieve an immutable real fixture."""
 import argparse
+import copy
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -17,16 +18,27 @@ BACKENDS = {'native', 'tidehunter_tcp', 'tidehunter_verbs', 'tidehunter_verbs_na
 FIXTURE_SHA = '7eb43b71435547939760598e541d13b9a77f722c5a9d0f8c8ee5bd583b751f15'
 
 
-def specification(suite, backends, mode, fixture=None, sui_transports='tcp'):
+def specification(suite, backends, mode, fixture=None, sui_transports='tcp', selection=None):
     selected = backends.split(',')
-    if suite not in {'kv', 'sui', 'both'} or mode not in {'standard', 'nvmeof-focused'}:
+    if suite not in {'kv', 'sui', 'both'} or mode not in {'standard', 'nvmeof-focused', 'standard-with-nvmeof', 'standard-with-live-nvmeof', 'focused'}:
         raise ValueError('unsupported suite or matrix mode')
     if not selected or len(set(selected)) != len(selected) or any(x not in BACKENDS for x in selected):
         raise ValueError('select unique supported backend IDs; EFA is not a GCP backend')
+    if mode == 'focused':
+        import manual_campaign
+        if (suite != 'kv' or selection not in cloud_campaign.FOCUSED_SELECTIONS
+                or selected != manual_campaign.REVIEWED_SPECS[selection]['backends']
+                or (fixture and (fixture.get('key') or fixture.get('generation'))) or sui_transports != 'tcp'):
+            raise ValueError('focused mode requires the exact reviewed selection and backends')
+        spec = copy.deepcopy(manual_campaign.REVIEWED_SPECS[selection])
+        manual_campaign._reviewed_jobs(spec)
+        return spec
+    if selection is not None:
+        raise ValueError('selection is only valid in focused mode')
     if 'valkey_rdma' in selected and 'valkey_tcp' not in selected:
         raise ValueError('Valkey RDMA comparison requires its matched Valkey TCP control')
-    if mode != 'nvmeof-focused' and any('nvme_' in x for x in selected):
-        raise ValueError('NVMe backends require nvmeof-focused mode')
+    if mode == 'standard' and any('nvme_' in x for x in selected):
+        raise ValueError('NVMe backends require an NVMe-oF mode')
     spec = {'schema_version': 1, 'suite': suite, 'mode': mode, 'seed': 1775, 'repeats': 1,
             'value_sizes': [64, 256, 1024, 8192, 65536], 'backends': selected,
             'keys': 4096, 'max_cases': 2000, 'offered_rates': [1000, 10000, 50000],
@@ -102,6 +114,7 @@ def main():
     choose.add_argument('--suite', required=True)
     choose.add_argument('--backends', required=True)
     choose.add_argument('--mode', required=True)
+    choose.add_argument('--selection', choices=cloud_campaign.FOCUSED_SELECTIONS)
     choose.add_argument('--fixture-key', default='')
     choose.add_argument('--fixture-generation', default='')
     choose.add_argument('--output', type=Path, required=True)
@@ -122,7 +135,7 @@ def main():
     args = parser.parse_args()
     if args.action == 'spec':
         fixture = {'key': args.fixture_key, 'generation': args.fixture_generation, 'sha256': FIXTURE_SHA}
-        value = specification(args.suite, args.backends, args.mode, fixture, args.sui_transports)
+        value = specification(args.suite, args.backends, args.mode, fixture, args.sui_transports, args.selection)
         args.output.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
     elif args.action == 'fixture':
         download_fixture(args.config, args.spec, args.output)

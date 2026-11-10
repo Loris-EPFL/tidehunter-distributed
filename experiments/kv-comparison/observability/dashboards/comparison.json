@@ -366,11 +366,11 @@
         "w": 12,
         "h": 8
       },
-      "description": "Scraped counter rate, not configured target or whole-run exact throughput. Short runs may lack two scrapes; final frozen counters yield zero interval rate, not zero run throughput.",
+      "description": "Scraped counter rate, not configured target or whole-run exact throughput. A changing producer timestamp is required; short runs and frozen snapshots are unavailable.",
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (backend,phase) (rate(kv_comparison_offered_total{backend=~\"$backend\",phase=~\"$phase\"}[$__rate_interval]))",
+          "expr": "sum by (backend,phase) (rate(kv_comparison_offered_total{job=\"comparison\",backend=~\"$backend\",phase=~\"$phase\"}[$__rate_interval])) and on() (changes(kv_comparison_snapshot_timestamp_seconds{job=\"comparison\"}[$__rate_interval]) > 0)",
           "legendFormat": "offered {{backend}} {{phase}}",
           "datasource": {
             "type": "prometheus",
@@ -379,7 +379,7 @@
         },
         {
           "refId": "B",
-          "expr": "sum by (backend,phase) (rate(kv_comparison_completed_total{backend=~\"$backend\",phase=~\"$phase\"}[$__rate_interval]))",
+          "expr": "sum by (backend,phase) (rate(kv_comparison_completed_total{job=\"comparison\",backend=~\"$backend\",phase=~\"$phase\"}[$__rate_interval])) and on() (changes(kv_comparison_snapshot_timestamp_seconds{job=\"comparison\"}[$__rate_interval]) > 0)",
           "legendFormat": "completed {{backend}} {{phase}}",
           "datasource": {
             "type": "prometheus",

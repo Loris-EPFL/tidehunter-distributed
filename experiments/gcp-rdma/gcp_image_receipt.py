@@ -13,7 +13,9 @@ from pathlib import Path
 import gcp_image
 
 
-def make_receipt(spec):
+def make_receipt(spec, *, qualification_profile='full'):
+    if qualification_profile not in ('full', 'focused'):
+        raise ValueError('unknown qualification profile')
     if not isinstance(spec, dict) or set(spec) != {'image', 'runtime_sha256', 'service_account', 'evidence'}:
         raise ValueError('spec requires image, runtime_sha256, service_account and evidence')
     image = spec['image']
@@ -40,9 +42,13 @@ def make_receipt(spec):
         refs.append(ref)
     if refs[0]['bucket'] != refs[1]['bucket'] or refs[0] == refs[1]:
         raise ValueError('distinct evidence objects in one bucket required')
-    gcp_image.validate_pair(records, image, spec['runtime_sha256'], spec['service_account'])
-    return {'schema_version': 1, 'image': image, 'recipes': gcp_image.recipe_hashes(),
-            'runtime_sha256': spec['runtime_sha256'], 'evidence': refs}
+    gcp_image.validate_pair(records, image, spec['runtime_sha256'], spec['service_account'],
+                            qualification_profile=qualification_profile)
+    receipt = {'schema_version': 1, 'image': image, 'recipes': gcp_image.recipe_hashes(),
+               'runtime_sha256': spec['runtime_sha256'], 'evidence': refs}
+    if qualification_profile == 'focused':
+        receipt.update(qualification_profile='focused', qualification_proofs=list(gcp_image.FOCUSED_PROOFS))
+    return receipt
 
 
 def main():

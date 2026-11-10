@@ -18,6 +18,12 @@ fn take_wire_responses(client: &mut Client) -> Vec<Envelope<Response>> {
 #[test]
 fn one_session_pipelines_appends_but_keeps_fence_and_seal_as_barriers() {
     let server = Running::new(Transport::Tcp, WalMemberReadPolicy::Positional);
+    server
+        .node
+        .set_durability(crate::distributed::durability::DurabilityConfig::with_tier(
+            crate::distributed::durability::DurabilityTier::Synchronous,
+        ))
+        .unwrap();
     let mut client = server.client();
     client.fence_to(1).unwrap();
     let log = server.node.inventory.lock().active(1).unwrap();

@@ -23,11 +23,25 @@ import uuid
 
 import gcp_api
 import gcp_image
+import gcp_runtime
 from gcp_image_prepare import metadata
 
 
+def command_failure(exc):
+    output = getattr(exc, 'output', None) or getattr(exc, 'stdout', None) or ''
+    error = getattr(exc, 'stderr', None) or ''
+    if isinstance(output, bytes):
+        output = output.decode(errors='replace')
+    if isinstance(error, bytes):
+        error = error.decode(errors='replace')
+    return f'{type(exc).__name__}: {exc}; captured output:\n{(output + error)[-32768:]}'
+
+
 def command(argv, timeout=30):
-    return subprocess.check_output([str(x) for x in argv], text=True, stderr=subprocess.STDOUT, timeout=timeout).strip()
+    try:
+        return subprocess.check_output([str(x) for x in argv], text=True, stderr=subprocess.STDOUT, timeout=timeout).strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(command_failure(exc)) from exc
 
 
 def io_uring():
@@ -66,16 +80,25 @@ def boot_image(api, info, zone, project):
         raise ValueError('boot source must be an exact custom image and ID')
     return {'path': image, 'id': image_id}
 
+def require_rdma_capabilities(evidence):
+    caps = evidence['capabilities']
+    required = ('max_mr', 'max_qp', 'max_qp_wr', 'max_cq', 'max_cqe',
+                'max_pd', 'max_sge', 'max_sge_rd', 'max_mr_size', 'page_size_cap')
+    if (not caps['available'] or any(
+            not re.fullmatch(r'(?:0[xX][0-9a-fA-F]+|[0-9]+)', caps['fields'].get(key, ''))
+            for key in required)):
+        raise ValueError('required RDMA device capabilities unavailable: ' + str(caps)[:1000])
 
-def guest(package, peer, peer_instance, rdma_device, expected_manifest_sha):
+
+
+def guest(package, peer, peer_instance, rdma_device, expected_manifest_sha, *, qualification_profile='full'):
+    if qualification_profile not in ('full', 'focused'):
+        raise ValueError('unknown qualification profile')
     account = metadata('instance/service-accounts/default/email')
     if account != 'bench-guest@mysten-research.iam.gserviceaccount.com':
         raise ValueError('incorrect workload identity')
-    if sys.version_info < (3, 11):
-        raise ValueError('Python 3.11 or later required')
-    import yaml
-    if not yaml.safe_load('x: 1') == {'x': 1}:
-        raise ValueError('PyYAML unavailable')
+    runtime_admission = gcp_runtime.admit_guest_runtime()
+    os.environ['PATH'] = gcp_runtime.GUEST_PATH
     project = metadata('project/project-id')
     zone = metadata('instance/zone').rsplit('/', 1)[-1]
     instance = metadata('instance/name')
@@ -120,10 +143,17 @@ def guest(package, peer, peer_instance, rdma_device, expected_manifest_sha):
     links = command(['rdma', 'link', 'show'])
     if not re.search(r'\blink\s+' + re.escape(rdma_device) + r'/', links):
         raise ValueError('RDMA device missing from rdma link')
+    root = Path(__file__).resolve().parent.parent / 'kv-comparison'
+    sys.path.insert(0, str(root))
+    import rdma_diagnostics
+    resource_evidence = rdma_diagnostics.capture_resources(rdma_device)
+    require_rdma_capabilities(resource_evidence)
     outputs = {'io_uring': io_uring(), 'rdma_links': links,
                'python': sys.version, 'openssl': command(['openssl', 'version']),
                'docker': command(['docker', 'version', '--format', '{{.Server.Version}}']),
                'kernel': platform.release(), 'nvme_modules': {}}
+    outputs['rdma_resources'] = resource_evidence
+    outputs['guest_runtime'] = runtime_admission
     outputs['memlock'] = {'soft': 'infinity', 'hard': 'infinity', 'docker': docker_memlock}
     outputs['nvme_ioctl'] = {name: command(['nvme', 'id-ctrl', path]) for name, path in devices.items()}
     with tempfile.TemporaryDirectory(prefix='tidehunter-io-uring-') as directory:
@@ -142,9 +172,17 @@ def guest(package, peer, peer_instance, rdma_device, expected_manifest_sha):
         raise ValueError('CIQ IRDMA kernel module RPM missing')
     if not outputs['openssl'].startswith('OpenSSL 3.'):
         raise ValueError('OpenSSL 3 required')
-    for module in ('irdma', 'idpf', 'rdma_cm', 'nvme', 'nvme_rdma', 'nvmet_rdma'):
+    for module in ('irdma', 'idpf', 'rdma_cm', 'nvme', 'nvmet', 'nvme_fabrics', 'nvme_rdma', 'nvmet_rdma'):
         command(['modprobe', module])
         outputs['nvme_modules'][module] = command(['modinfo', module])
+    # TCP support is optional for existing profiles. Record it when available;
+    # the focused TCP arm is admitted only if both modules are evidenced.
+    for module in ('nvme_tcp', 'nvmet_tcp'):
+        try:
+            command(['modprobe', module])
+            outputs['nvme_modules'][module] = command(['modinfo', module])
+        except RuntimeError:
+            pass
     providers = {}
     for provider, name in (('verbs', 'verbs;ofi_rxm'), ('tcp', 'tcp;ofi_rxm')):
         providers[provider] = command(['fi_info', '-p', name])
@@ -153,15 +191,20 @@ def guest(package, peer, peer_instance, rdma_device, expected_manifest_sha):
         raise ValueError('libfabric 2.6.0 required')
     outputs['providers'] = providers
     outputs['containers'] = {image: json.loads(command(['docker', 'image', 'inspect', image]))
-                             for image in sorted(gcp_image.required_containers())}
-    root = Path(__file__).resolve().parent.parent / 'kv-comparison'
-    sys.path.insert(0, str(root))
+                             for image in sorted(gcp_image.required_containers(focused=qualification_profile == 'focused'))}
+    # The diagnostics import above already added the packaged KV helpers.
     import cloud_package
     package = Path(package).resolve(strict=True)
     proof = cloud_package.verify_directory(package, runtime=True, provider='gcp')
     if proof['manifest_sha256'] != expected_manifest_sha:
         raise ValueError('runtime manifest hash mismatch')
-    if 'valkey-rdma' not in json.loads((package / 'manifest.json').read_text())['features']:
+    manifest = json.loads((package / 'manifest.json').read_text())
+    features = manifest['features']
+    if qualification_profile == 'focused':
+        if (manifest.get('build_profile') != 'focused' or features != cloud_package.FOCUSED_FEATURES
+                or proof.get('build_profile') != 'focused' or 'valkey_runtime_linkage' in proof):
+            raise ValueError('focused qualification requires the TideHunter-only runtime')
+    elif 'valkey-rdma' not in features:
         raise ValueError('sealed runtime lacks Valkey RDMA')
     outputs['package'] = proof
     fabric = Path(proof['fabric_library']).resolve(strict=True)
@@ -174,7 +217,7 @@ def guest(package, peer, peer_instance, rdma_device, expected_manifest_sha):
     if len(found) != 1 or Path(found[0]).resolve(strict=True) != fabric or 'not found' in fi_ldd:
         raise ValueError('fi_info and benchmark resolve different libfabric libraries')
     probe = 'import ctypes,sys; x=ctypes.CDLL(sys.argv[1]); x.fi_version.restype=ctypes.c_uint; print(x.fi_version())'
-    api_version = int(command([sys.executable, '-c', probe, fabric]))
+    api_version = int(command([gcp_runtime.GUEST_PYTHON, '-c', probe, fabric]))
     if api_version <= 0:
         raise ValueError('actual linked libfabric API version is invalid')
     outputs['fi_info_ldd'] = fi_ldd
@@ -185,19 +228,23 @@ def guest(package, peer, peer_instance, rdma_device, expected_manifest_sha):
         argv = ['ib_' + op + '_lat', '-R', '-d', rdma_device, '-p', port, '-s', '1024', '-n', '1000', peer]
         outputs['rdma_' + op] = command(argv, timeout=60)
         outputs['rdma_commands'][op] = argv
-    cli = package / 'runtime/bin/valkey-cli'
-    key = 'tidehunter-qualification-' + uuid.uuid4().hex
-    value = uuid.uuid4().hex
-    def valkey(*args):
-        return command([cli, '--rdma', '-h', peer, '-p', '6380', *args], timeout=15)
-    if valkey('SET', key, value) != 'OK' or valkey('GET', key) != value or valkey('DEL', key) != '1':
-        raise ValueError('cross-host Valkey RDMA SET/GET/DEL failed')
-    outputs['valkey'] = {'endpoint': peer + ':6380', 'key': key, 'value': value, 'set': 'OK', 'get': value, 'del': '1'}
+    if qualification_profile == 'full':
+        cli = package / 'runtime/bin/valkey-cli'
+        key = 'tidehunter-qualification-' + uuid.uuid4().hex
+        value = uuid.uuid4().hex
+        def valkey(*args):
+            return command([cli, '--rdma', '-h', peer, '-p', '6380', *args], timeout=15)
+        if valkey('SET', key, value) != 'OK' or valkey('GET', key) != value or valkey('DEL', key) != '1':
+            raise ValueError('cross-host Valkey RDMA SET/GET/DEL failed')
+        outputs['valkey'] = {'endpoint': peer + ':6380', 'key': key, 'value': value, 'set': 'OK', 'get': value, 'del': '1'}
     recipes = gcp_image.recipe_hashes()
-    return {'kind': 'guest-diagnostic', 'image': image, 'recipes': recipes,
-            'instance_id': instance_id, 'peer_instance_id': peer_id,
-            'service_account': account, 'project': project, 'zone': zone, 'rdma_device': rdma_device,
-            'scratch_devices': devices, 'local_rdma': local_addresses[0], 'peer': peer, 'outputs': outputs}
+    result = {'kind': 'guest-diagnostic', 'image': image, 'recipes': recipes,
+              'instance_id': instance_id, 'peer_instance_id': peer_id,
+              'service_account': account, 'project': project, 'zone': zone, 'rdma_device': rdma_device,
+              'scratch_devices': devices, 'local_rdma': local_addresses[0], 'peer': peer, 'outputs': outputs}
+    if qualification_profile == 'focused':
+        result['qualification_proofs'] = list(gcp_image.FOCUSED_PROOFS)
+    return result
 
 
 def main():

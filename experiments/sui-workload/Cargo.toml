@@ -1,0 +1,12 @@
+[package]
+name = "sui-workload"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+sui-sdk-types = { path = "/home/hybr1d/.cargo/git/checkouts/sui-rust-sdk-fe7f6863fe645b2e/618b6c8/crates/sui-sdk-types", features = ["serde", "hash"] }
+bcs = "0.1.6"
+serde_json = "1"
+serde = "1"

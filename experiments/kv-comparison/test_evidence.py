@@ -9,7 +9,102 @@ import unittest
 import analyze
 
 
+class LiveTimelineAdmission(unittest.TestCase):
+    def test_live_groups_and_partial_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = root / "result"
+            result.mkdir()
+            config = {"backend": {"kind": "tidehunter"}, "diagnostics": {"write_timeline_limit": 2}}
+            backend = "tidehunter_live_nvmeof"
+            (result / "manifest.json").write_text(json.dumps(
+                {"run": {"config": config}, "backend_info": {"name": backend}}))
+            (result / "samples.csv").write_text(
+                "phase,operation,outcome,scheduled_ns,dispatched_ns,dispatch_observed,completed_ns,api_ns,response_ns,scheduling_ns,logical_keys,bytes,error_kind,caller_sample_id\n"
+                "measurement,put,success,0,1,true,11,10,11,1,1,8,,0\n"
+                "measurement,put,success,0,1,true,11,10,11,1,1,8,,1\n")
+            batches = [{"epoch": 1, "sequence": i} for i in range(2)]
+            records = [{"caller_sample_id": i, "completed": True, "error": None,
+                        "operation": [i] * 16, "batch": batches[i],
+                        "events": [{"stage": "live_io_started", "elapsed_ns": 2, "owner": 0, "envelope_id": None},
+                                   {"stage": "live_io_completed", "elapsed_ns": 5, "owner": 0, "envelope_id": None}]}
+                       for i in range(2)]
+            profile = {field: 0 for field in analyze._STORAGE_WRITE_PROFILE_FIELDS}
+            profile["persistence_capture"] = None
+            group = {"owner": 0, "batches": copy.deepcopy(batches), "reservation_token": [1] * 16,
+                     "owner_validation_ns": 3, "owner_persistence": profile}
+            trace = {"limit": 2, "records": records, "live_groups": [group], "dropped_live_groups": 0,
+                     "owner_records": [], "checkpoint_events": [], "owner_errors": [],
+                     "dropped_calls": 0, "dropped_events": 0, "incomplete_calls": 0,
+                     "dropped_checkpoint_events": 0, "owner_dropped_records": 0,
+                     "owner_incomplete_records": 0, "owner_expected_connections": 0,
+                     "owner_captured_connections": 0, "deadline_exceeded": False,
+                     "owner_storage_durations_available": False}
+            data = {"schema_version": 1, "requested_limit": 2, "measurement_attempted": True,
+                    "measurement_drained": True, "available": True, "status": "complete",
+                    "error": None, "timeline": trace}
+            path = result / "write-timeline.json"
+            def admit(value, completed=True):
+                path.write_text(json.dumps(value))
+                return analyze.admit_write_timeline(root, config, completed=completed, expected_backend=backend)
+            self.assertEqual(admit(data)["coverage"]["live_groups"], 1)
+            summary = analyze.summarize_write_timeline(list(analyze.read_samples(result / "samples.csv")), data)
+            self.assertEqual(summary["live_group_observations"]["linked_groups"], 1)
+            self.assertEqual(summary["live_group_observations"]["linked_memberships"], 2)
+            self.assertEqual(len(summary["live_group_observations"]["owner_persistence"]), 1)
+            self.assertEqual(summary["stage_summaries_ns"]["live_io_ns"]["p50"], 3)
+            retry = copy.deepcopy(data)
+            retry["timeline"]["live_groups"].append(copy.deepcopy(group))
+            self.assertEqual(admit(retry)["coverage"]["live_groups"], 2)
+            for mutate in ("legacy", "duplicate", "unknown", "owner", "token", "storage", "counter"):
+                broken = copy.deepcopy(data)
+                g = broken["timeline"]["live_groups"][0]
+                if mutate == "legacy":
+                    g["batches"] = [[1, 0]]
+                elif mutate == "duplicate":
+                    g["batches"].append(g["batches"][0])
+                elif mutate == "unknown":
+                    g["batches"][0]["sequence"] = 9
+                elif mutate == "owner":
+                    g["owner"] = 99
+                elif mutate == "token":
+                    g["reservation_token"][0] = True
+                elif mutate == "storage":
+                    g["owner_persistence"]["persist_calls"] = None
+                else:
+                    broken["timeline"]["dropped_live_groups"] = True
+                with self.subTest(mutate=mutate), self.assertRaises(ValueError):
+                    admit(broken)
+            partial = copy.deepcopy(data)
+            partial.update(available=False, status="failed", error="completion failed")
+            partial["timeline"]["live_groups"][0].update(reservation_token=None, owner_validation_ns=None,
+                                                            owner_persistence=None)
+            partial["timeline"]["records"][0].update(completed=False, error="completion failed")
+            partial["timeline"]["incomplete_calls"] = 1
+            self.assertFalse(admit(partial, completed=False)["coverage"]["available"])
+            partial["timeline"]["live_groups"][0]["owner"] = 99
+            partial["timeline"]["dropped_events"] = 1
+            admit(partial, completed=False)
+            partial_summary = analyze.summarize_write_timeline(
+                list(analyze.read_samples(result / "samples.csv")), partial)
+            self.assertEqual(partial_summary["live_group_observations"]["linked_groups"], 0)
+            with self.assertRaises(ValueError):
+                admit(partial)
+
+
 class EvidenceAdmission(unittest.TestCase):
+    def test_nvme_route_is_requested_population_not_observed_proof(self):
+        live = {"job": {"backend": "tidehunter_nvme_tcp", "cohort": "primary_rf1",
+                        "nvmeof_route": "live"}}
+        sealed = {"job": {"backend": "tidehunter_nvme_tcp", "cohort": "sealed_read",
+                          "nvmeof_route": "sealed_read"}}
+        self.assertEqual(analyze.requested_nvmeof_route(live), "live")
+        self.assertEqual(analyze.requested_nvmeof_route(sealed), "sealed_read")
+        self.assertIsNone(analyze.requested_nvmeof_route({}))
+        sealed["job"]["cohort"] = "primary_rf1"
+        with self.assertRaisesRegex(ValueError, "population disagree"):
+            analyze.requested_nvmeof_route(sealed)
+
     def binding(self, root):
         result = root / 'result'
         result.mkdir()
@@ -72,6 +167,23 @@ class EvidenceAdmission(unittest.TestCase):
             receipt["read_diagnostics"]["observed"] = data
             path.write_text('{"schema_version": 2}')
             with self.assertRaisesRegex(ValueError, "read diagnostics.*integrity binding"):
+                analyze.verify_binding(root, config, receipt, manifest, summary)
+
+    def test_fair_native_write_diagnostics_require_binding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, receipt, manifest, summary = self.binding(root)
+            receipt["job"] = {"selection": "fair_native"}
+            path = root / "result/write-diagnostics.json"
+            data = {"schema_version": 1}
+            path.write_text(json.dumps(data))
+            with self.assertRaisesRegex(ValueError, "write diagnostics.*integrity binding"):
+                analyze.verify_binding(root, config, receipt, manifest, summary)
+            receipt["write_diagnostics"] = {"path": "result/write-diagnostics.json",
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "observed": data}
+            analyze.verify_binding(root, config, receipt, manifest, summary)
+            path.write_text("{}")
+            with self.assertRaisesRegex(ValueError, "write diagnostics.*integrity binding"):
                 analyze.verify_binding(root, config, receipt, manifest, summary)
 
     def test_result_swap_rejected_even_when_its_artifact_hash_is_updated(self):
@@ -457,6 +569,122 @@ class ClockAdmission(unittest.TestCase):
     def sample(self):
         return dict(zip(self.fields, ['measurement','read','success',100,110,'true',140,30,40,10,1,256,'']))
 
+    def test_timeline_ids_and_partial_records(self):
+        self.assertIsNone(self.read_row(self.sample())['caller_sample_id'])
+        self.fields = self.fields + ['caller_sample_id']
+        sample = self.sample()
+        sample['caller_sample_id'] = '7'
+        row = self.read_row(sample)
+        self.assertEqual(row['caller_sample_id'], 7)
+        sample['caller_sample_id'] = '-1'
+        with self.assertRaises(ValueError):
+            self.read_row(sample)
+        evidence = {'available': True, 'timeline': {'records': [
+            {'caller_sample_id': 7, 'completed': False, 'error': 'error',
+             'events': [{'stage': 'caller_start', 'elapsed_ns': 10},
+                        {'stage': 'gate_acquired', 'elapsed_ns': 20},
+                        {'stage': 'tx_queued', 'elapsed_ns': 21, 'owner': 3, 'envelope_id': 9},
+                        {'stage': 'completion_harvested', 'elapsed_ns': 30, 'owner': 3, 'envelope_id': 9},
+                        {'stage': 'owner_enqueue_started', 'elapsed_ns': 15},
+                        {'stage': 'owner_dequeued', 'elapsed_ns': 19},
+                        {'stage': 'append_enqueue_started', 'elapsed_ns': 20},
+                        {'stage': 'worker_dequeued', 'elapsed_ns': 21},
+                        {'stage': 'published', 'elapsed_ns': 35},
+                        {'stage': 'caller_reply_queued', 'elapsed_ns': 39}]},
+            {'caller_sample_id': 8, 'completed': False, 'events': []}],
+            'owner_records': [{'owner': 3, 'envelope_id': 9, 'success': True,
+                               'control_queue_ns': 5, 'wal_file_persist_ns': None}],
+            'owner_storage_durations_available': True, 'owner_dropped_records': 0,
+            'dropped_calls': 0, 'dropped_events': 1, 'incomplete_calls': 2}}
+        result = analyze.summarize_write_timeline([row], evidence)
+        self.assertEqual(result['joined_calls'], 1)
+        self.assertEqual(result['records_without_raw'], 1)
+        self.assertEqual(result['stage_summaries_ns']['shared_gate_ns']['p50'], 10)
+        self.assertEqual(result['stage_summaries_ns']['queued_to_harvest_including_remote_ns']['p50'], 9)
+        self.assertEqual(result['stage_summaries_ns']['owner_enqueue_to_dequeue_ns']['p50'], 4)
+        self.assertEqual(result['stage_summaries_ns']['append_enqueue_to_dequeue_ns']['p50'], 1)
+        self.assertEqual(result['stage_summaries_ns']['publication_to_reply_queued_ns']['p50'], 4)
+        self.assertEqual(result['owner_envelope_stage_summaries_ns']['control_queue_ns']['p50'], 5)
+        self.assertIsNone(result['owner_envelope_stage_summaries_ns']['wal_file_persist_ns']['p50'])
+        self.assertEqual(result['slowest_calls'][0]['owner_records'][0]['envelope_id'], 9)
+        self.assertIsNone(result['slowest_calls'][0]['stages_ns']['publication_ns'])
+        self.assertEqual(result['slowest_calls'][0]['record']['error'], 'error')
+        evidence['available'] = False
+        evidence['status'] = 'failed'
+        evidence['error'] = 'deadline exceeded'
+        partial = analyze.summarize_write_timeline([row], evidence)
+        self.assertFalse(partial['available'])
+        self.assertEqual(partial['status'], 'failed')
+        self.assertEqual(partial['joined_calls'], 1)
+        self.assertFalse(analyze.summarize_write_timeline([], {'available': False, 'error': 'failed'})['available'])
+
+    def test_timeline_reports_admission_to_append_gap_and_unavailable_events(self):
+        rows = [{'caller_sample_id': n, 'api_ns': 20_000_000 + n} for n in (1, 2, 3, 4)]
+        records = [
+            {'caller_sample_id': 1, 'events': [
+                {'stage': 'prepared', 'elapsed_ns': 95},
+                {'stage': 'admitted', 'elapsed_ns': 100},
+                {'stage': 'append_enqueue_started', 'elapsed_ns': 13_362_352},
+                {'stage': 'worker_dequeued', 'elapsed_ns': 13_362_362, 'owner': 2},
+                {'stage': 'tx_queued', 'elapsed_ns': 13_362_372, 'owner': 2, 'envelope_id': 9},
+                {'stage': 'caller_reply_queued', 'elapsed_ns': 14_000_000},
+                {'stage': 'caller_finished', 'elapsed_ns': 14_000_010}]},
+            {'caller_sample_id': 2, 'events': [{'stage': 'admitted', 'elapsed_ns': 100}]},
+            {'caller_sample_id': 3, 'events': [
+                {'stage': 'admitted', 'elapsed_ns': 100},
+                {'stage': 'admitted', 'elapsed_ns': 101},
+                {'stage': 'append_enqueue_started', 'elapsed_ns': 200}]},
+            {'caller_sample_id': 4, 'events': [
+                {'stage': 'admitted', 'elapsed_ns': 200},
+                {'stage': 'append_enqueue_started', 'elapsed_ns': 100}]},
+        ]
+        result = analyze.summarize_write_timeline(
+            rows, {'available': True, 'timeline': {'records': records}})
+        gap = result['stage_summaries_ns']['admitted_to_append_enqueue_start_ns']
+        self.assertEqual((gap['count'], gap['p50'], gap['max']), (1, 13_362_252, 13_362_252))
+        self.assertEqual(gap['unavailable'],
+                         {'missing_event': 1, 'multiple_events': 1, 'reversed_events': 1})
+        slow = {item['caller_sample_id']: item for item in result['slowest_calls']}
+        self.assertEqual(slow[1]['stages_ns']['prepared_to_admitted_ns'], 5)
+        self.assertEqual(slow[1]['stages_ns']['worker_dequeue_to_tx_queued_ns'], 10)
+        self.assertEqual(slow[1]['stages_ns']['reply_queued_to_caller_finished_ns'], 10)
+        for sample, reason in ((2, 'missing_event'), (3, 'multiple_events'), (4, 'reversed_events')):
+            self.assertIsNone(slow[sample]['stages_ns']['admitted_to_append_enqueue_start_ns'])
+            self.assertEqual(slow[sample]['stage_unavailable']['admitted_to_append_enqueue_start_ns'], reason)
+
+    def test_timeline_owner_envelopes_are_joined_and_deduplicated(self):
+        rows = [{'caller_sample_id': n, 'api_ns': 100 + n} for n in (1, 2, 3, 4)]
+        records = [{'caller_sample_id': n, 'events': [
+            {'stage': 'tx_queued', 'elapsed_ns': 10, 'owner': 5, 'envelope_id': 12},
+            {'stage': 'completion_harvested', 'elapsed_ns': 30, 'owner': 5, 'envelope_id': 12},
+        ]} for n in (1, 2, 3)]
+        records.append({'caller_sample_id': 4, 'events': [
+            {'stage': 'tx_queued', 'elapsed_ns': 20, 'owner': 5, 'envelope_id': 13},
+        ]})
+        owner = {'owner': 5, 'envelope_id': 12, 'epoch': 2, 'success': True,
+                 'wal_file_persist_ns': 50, 'appender_queue_ns': 7,
+                 'persistence_capture': {'durable_end': 0, 'captured_appended_end': 10,
+                                         'cumulative_appended_groups': 3}}
+        unrelated = {'owner': 6, 'envelope_id': 1, 'success': True, 'wal_file_persist_ns': 900}
+        evidence = {'available': True, 'timeline': {'records': records,
+                    'owner_records': [owner, unrelated], 'owner_dropped_records': 0}}
+        summary = analyze.summarize_write_timeline(rows, evidence)
+        self.assertEqual(summary['joined_calls'], 4)
+        self.assertEqual(summary['linked_owner_envelopes'], 2)
+        self.assertEqual(summary['linked_owner_envelopes_without_record'], 1)
+        linked = summary['owner_envelope_stage_summaries_ns']['wal_file_persist_ns']
+        self.assertEqual((linked['count'], linked['p50']), (1, 50))
+        self.assertEqual(summary['all_owner_envelope_stage_summaries_ns']['wal_file_persist_ns']['count'], 2)
+        slow = {item['caller_sample_id']: item for item in summary['slowest_calls']}
+        self.assertEqual(slow[1]['owner_records'], [owner])
+        self.assertEqual(slow[2]['owner_records'], [owner])
+        self.assertEqual(slow[3]['owner_records'], [owner])
+        self.assertEqual(slow[4]['owner_records_unavailable'], 1)
+        self.assertFalse(summary['captured_group_deltas']['available'])
+        evidence['timeline']['owner_records'].append(owner)
+        with self.assertRaisesRegex(ValueError, 'duplicate owner/envelope'):
+            analyze.summarize_write_timeline(rows, evidence)
+
     def test_clock_decomposition_and_undispatched_rejection_are_distinct(self):
         row = self.read_row(self.sample())
         self.assertEqual(row['response_ns'], row['api_ns'] + row['scheduling_ns'])
@@ -526,6 +754,59 @@ class EffectiveRoleIdentity(unittest.TestCase):
         changed_heap = json.loads(json.dumps(original))
         changed_heap['Config']['Env'][-1] = 'MAX_HEAP_SIZE=1G'
         self.assertNotEqual(local.runtime_configuration_hash(changed_heap), identity)
+
+
+class MeasurementTimeline(unittest.TestCase):
+    @staticmethod
+    def call(start, end, *, outcome="ok", scheduled=None):
+        return {"operation": "put", "outcome": outcome, "logical_keys": 1,
+                "scheduled_ns": start if scheduled is None else scheduled,
+                "dispatched_ns": start, "completed_ns": end,
+                "api_ns": end - start, "response_ns": end - start, "scheduling_ns": 0}
+
+    def test_rare_full_concurrency_stall_survives_ordinary_p99(self):
+        samples = []
+        for _ in range(16):
+            samples.append(self.call(0, 400_000_000))
+            samples.extend(self.call(400_000_000 + index * 100_000,
+                                     400_100_000 + index * 100_000) for index in range(255))
+        samples.sort(key=lambda row: row["completed_ns"], reverse=True)
+        population = analyze.aggregate(samples)["populations"][0]
+        self.assertEqual(population["api_ns"]["p99"], 100_000)
+        self.assertEqual(population["api_ns"]["p999"], 400_000_000)
+        timeline = analyze.measurement_timeline(samples)
+        self.assertEqual(timeline["largest_completion_gap_ns"], 400_000_000)
+        self.assertEqual(timeline["api_calls_above_ns"]["100000000"], 16)
+        self.assertEqual(sum(window["completed_calls"] for window in timeline["completion_windows"]), 4096)
+        self.assertEqual([row["dispatch_offset_ns"] for row in timeline["slowest_calls"]], [0] * 16)
+        self.assertLess(timeline["mean_observed_api_concurrency"], 16.01)
+
+    def test_rejected_arrivals_keep_exposure_without_inventing_api_time(self):
+        rejected = self.call(0, 20, outcome="rejected", scheduled=0)
+        rejected["api_ns"] = None
+        rejected["dispatched_ns"] = 0
+        samples = [self.call(10, 15), rejected]
+        timeline = analyze.measurement_timeline(samples)
+        self.assertEqual(timeline["duration_ns"], 20)
+        self.assertEqual(timeline["dispatched_calls"], 1)
+        self.assertEqual(timeline["api_time_sum_ns"], 5)
+        self.assertEqual(sum(row["successful_calls"] for row in timeline["completion_windows"]), 1)
+        only_rejected = analyze.measurement_timeline([rejected])
+        self.assertIsNone(only_rejected["api_time_sum_ns"])
+        self.assertIsNone(only_rejected["mean_observed_api_concurrency"])
+        self.assertIsNone(only_rejected["api_calls_above_ns"])
+
+    def test_integer_clock_boundaries_preserve_every_completion(self):
+        origin = 10**18
+        samples = [self.call(origin + index, origin + index + 1) for index in range(67)]
+        timeline = analyze.measurement_timeline(samples)
+        self.assertEqual(timeline["duration_ns"], 67)
+        self.assertEqual(timeline["largest_completion_gap_ns"], 1)
+        self.assertEqual(len(timeline["completion_windows"]), 32)
+        self.assertEqual(sum(window["completed_calls"] for window in timeline["completion_windows"]), 67)
+        self.assertEqual(timeline["completion_windows"][-1]["end_offset_ns"], 67)
+        with self.assertRaisesRegex(ValueError, "positive"):
+            analyze.measurement_timeline([self.call(origin, origin)])
 
 
 if __name__ == '__main__':

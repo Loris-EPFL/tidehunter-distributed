@@ -1,29 +1,57 @@
-//! Static RF1 storage transport with authenticated TCP/OFI and explicit trusted OFI modes.
+//! Static RF1 storage transport with authenticated TCP/OFI and explicit trusted
+//! (no-TLS) TCP and OFI modes.
 //!
 //! The Tidehunter paper's complete-batch replay and values-in-WAL rules remain
 //! the authority boundary. Transport is not a global log or consensus service.
 //! TLS modes require a dedicated CA and validate both peers with rustls.
-//! Trusted OFI modes omit application authentication and encryption; deployment
-//! isolation is required. WAL integrity, fencing and durability checks remain.
+//! Trusted TCP and trusted OFI modes omit application authentication and
+//! encryption; deployment isolation is required. WAL integrity, fencing and
+//! durability checks remain. A trusted mode is always an explicit opt-in
+//! (`Transport::TcpTrusted`, `FabricSecurity::Trusted`), never a default,
+//! fallback or downgrade, and receipts record `Transport::security_label()`.
+//!
+//! Fair experiments pair like with like: `Transport::Tcp` against OFI with
+//! `FabricSecurity::MutualTls` (both mutual TLS), and `Transport::TcpTrusted`
+//! against OFI with `FabricSecurity::Trusted` (both trusted-network/no-TLS).
 
 pub mod checkpoint;
 mod reactor;
 mod read_executor;
-pub use read_executor::ReadExecutorStats;
+pub use read_executor::{LockProfileStats, ReadExecutorStats};
 mod diagnostics;
 mod fabric;
 pub use fabric::{FabricBackend, FabricConfig, FabricSecurity, Transport, TransportProgressStats};
+mod owner_transport;
+pub(crate) use owner_transport::OwnerTransportCounters;
+pub use owner_transport::OwnerTransportStats;
 #[cfg(feature = "experimental-fabric")]
 pub use tidehunter_fabric::ProviderInfo;
 mod control;
 mod inventory;
+mod live_client;
 mod payload;
+pub use live_client::LiveClientConfig;
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+pub(super) use live_client::LiveGroupBudget;
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+mod live_control;
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+pub(super) mod live_read;
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+mod live_recovery;
 pub use diagnostics::{ConnectionProfile, PollingProfile, SocketProfile, WorkProfile};
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+pub use live_control::{
+    LiveCompletion, LiveRecordLocation, LiveRecordLocations, LiveRecoveryEntry, LiveRecoveryPage,
+    LiveReserveResponse, LiveReserved,
+};
 use payload::WireBytes;
 #[cfg(test)]
 mod probe;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod transport_security_tests;
 
 #[cfg(all(test, feature = "experimental-fabric"))]
 pub(super) fn software_transport(security: FabricSecurity) -> Transport {
@@ -59,13 +87,20 @@ use std::time::{Duration, Instant};
 pub use inventory::NodeInventory;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub use inventory::SealedOwnerExport;
-const PROTOCOL: u32 = 15;
+/// Wire protocol version. 21: `ReadExecutorStats` gained the owner-wide
+/// `transport` aggregate. 20: `ReadExecutorStats` and `TransportProgressStats`
+/// gained lock-profile, send-size and EAGAIN counters; `Transport::TcpTrusted`.
+const PROTOCOL: u32 = 21;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
+/// Leave one protocol request slot available for ordered checkpoint control.
+pub(super) const APPEND_COMMAND_WINDOW: usize = reactor::SESSION_REQUESTS - 1;
+pub(super) const APPEND_SESSION_BYTES: usize = reactor::SESSION_BYTES;
 const MODE_MAGIC: [u8; 4] = *b"THDP";
 
 fn transport_mode_id(transport: &Transport) -> u8 {
     match transport {
         Transport::Tcp => 1,
+        Transport::TcpTrusted => 10,
         Transport::Ofi { fabric, security } => match (&fabric.backend, security) {
             (FabricBackend::Efa, FabricSecurity::MutualTls) => 2,
             (FabricBackend::Efa, FabricSecurity::Trusted) => 3,
@@ -128,6 +163,10 @@ pub struct NodeConfig {
     pub read_max_inflight_bytes: usize,
     #[serde(default = "default_device_reads")]
     pub read_max_device_reads: usize,
+    /// Optional live target. Once enabled, its persisted configuration is
+    /// required on every restart so outstanding namespaces can be revoked.
+    #[serde(default)]
+    pub live_target: Option<super::nvmeof::LiveTargetConfig>,
 }
 
 fn default_read_workers() -> usize {
@@ -148,8 +187,8 @@ fn default_device_reads() -> usize {
 pub(crate) fn default_read_memory_allowance_bytes() -> usize {
     512 * 1024 * 1024
 }
-/// TLS credentials and transport selection. Trusted OFI requires empty
-/// credential paths; mutual-TLS modes require a dedicated CA.
+/// TLS credentials and transport selection. Trusted TCP and trusted OFI require
+/// empty credential paths; mutual-TLS modes require a dedicated CA.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsFiles {
@@ -161,15 +200,17 @@ pub struct TlsFiles {
     pub cert: PathBuf,
     #[serde(default)]
     pub key: PathBuf,
-    /// Expected server DNS name; ignored by the listener and trusted OFI modes.
+    /// Expected server DNS name; ignored by the listener and trusted modes.
     #[serde(default)]
     pub server_name: String,
 }
 
 /// Network-owner scheduling only, not a whole-system lock-free guarantee.
 /// Adaptive waits for socket readiness only when a TCP owner is fully drained;
-/// arrivals wake it without an idle-sleep floor. Active TCP yields; fabric keeps
-/// bounded spin/yield CQ progress even while idle (no TCP readiness dependency).
+/// arrivals wake it without an idle-sleep floor. Active TCP yields. An idle
+/// fabric owner parks on the provider CQ wait object when the provider grants
+/// one (software RxM; `verbs` through a wait fd) and otherwise keeps bounded
+/// spin/yield CQ progress (no TCP readiness dependency).
 /// Busy keeps bounded sweeps and all shutdown, deadline and peer checks, but
 /// never explicitly sleeps/yields while driving the established connection.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -231,6 +272,8 @@ pub struct NodeStatus {
     pub max_epochs: usize,
     pub epochs: Vec<NodeEpoch>,
     pub active_epoch: Option<u64>,
+    /// False means only a strictly higher live fence may recover this owner.
+    pub healthy: bool,
     /// Negotiated bound for each encoded request/response frame.
     pub max_frame_bytes: usize,
     pub max_reads: usize,
@@ -238,6 +281,8 @@ pub struct NodeStatus {
     pub max_read_bytes: usize,
     pub recovery_page_batches: usize,
     pub polling: PollingPolicy,
+    /// The owner is configured for direct live NVMe-oF WAL access.
+    pub live_nvmeof: bool,
 }
 pub struct RecoveryPage {
     pub batches: Vec<(CompleteBatch, DurableBatch)>,
@@ -515,6 +560,45 @@ enum Request {
         epoch: u64,
         token: [u8; 16],
     },
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    ReleaseLiveEpochPin {
+        epoch: u64,
+        token: [u8; 16],
+    },
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    ReserveLiveGroup {
+        epoch: u64,
+        descriptor: super::nvmeof::live_storage::LiveGroupDescriptor,
+    },
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    CompleteLiveGroup {
+        epoch: u64,
+        token: [u8; 16],
+    },
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    ResolveLiveRecords {
+        authority_epoch: u64,
+        references: Vec<ValueRecordReference>,
+    },
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    RecoverLiveMetadata {
+        authority_epoch: u64,
+        source_epoch: u64,
+        cursor: usize,
+        limit: usize,
+    },
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    LiveTargetStats,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    ShutdownLiveTarget {
+        epoch: u64,
+    },
+    OwnerTimelineArm {
+        limit: usize,
+    },
+    OwnerTimelineFetch {
+        offset: usize,
+    },
 }
 impl Request {
     fn is_measurement_control(&self) -> bool {
@@ -523,7 +607,9 @@ impl Request {
             | Self::StatsDetailed
             | Self::ReadIoStats
             | Self::OperationalReadIoStats
-            | Self::ConnectionProfile { .. } => true,
+            | Self::ConnectionProfile { .. }
+            | Self::OwnerTimelineArm { .. }
+            | Self::OwnerTimelineFetch { .. } => true,
             #[cfg(all(target_os = "linux", feature = "test-utils"))]
             Self::ReadEvidence { .. } => true,
             #[cfg(all(target_os = "linux", feature = "test-utils"))]
@@ -584,6 +670,8 @@ enum Response {
         barriers: u64,
         namespace_syncs: u64,
         inventory_witnesses: u64,
+        live_frontier_file_syncs: u64,
+        live_frontier_namespace_syncs: u64,
         records: usize,
         metadata: usize,
     },
@@ -612,6 +700,23 @@ enum Response {
     NvmeofEpochPinned([u8; 16]),
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     NvmeofEpochReleased,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    LiveReserved(live_control::LiveReserveWire),
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    LiveCompleted(Box<live_control::LiveCompletionWire>),
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    LiveRecords(LiveRecordLocations),
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    LiveRecovery(live_control::LiveRecoveryWire),
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    LiveTargetStats(super::nvmeof::LiveTargetStats),
+    OwnerTimelineArmed,
+    OwnerTimelinePage {
+        records: Vec<super::write_timeline::OwnerTimelineRecord>,
+        dropped: u64,
+        incomplete: u64,
+        more: bool,
+    },
 }
 
 /// Authenticated owner metadata for an exact, durable member of a sealed WAL.
@@ -645,6 +750,8 @@ pub struct StorageNode {
     read_config: read_executor::ReadExecutorConfig,
     read_admission: Arc<read_executor::ReadAdmission>,
     terminal: Arc<AtomicBool>,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(super) live_nvme_selected: bool,
     #[cfg(any(test, feature = "test-utils"))]
     drop_append_response: AtomicBool,
     #[cfg(test)]
@@ -654,6 +761,12 @@ pub struct StorageNode {
 }
 impl StorageNode {
     pub fn open(config: NodeConfig, metrics: Arc<Metrics>) -> Result<Arc<Self>, TcpError> {
+        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+        if config.live_target.is_some() {
+            return Err(TcpError::new(
+                "live NVMe-oF target requires experimental-nvmeof on Linux",
+            ));
+        }
         if !(1..=8).contains(&config.read_workers) {
             return Err(TcpError::new("read_workers must be in 1..=8"));
         }
@@ -678,6 +791,8 @@ impl StorageNode {
         let read_admission =
             Arc::new(read_executor::ReadAdmission::new(read_config).map_err(TcpError::component)?);
         let inventory = NodeInventory::open(config, metrics)?;
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        let live_nvme_selected = inventory.live_target.is_some();
         let readers = inventory.readers.clone();
         let terminal = inventory.terminal.clone();
         let append_shape = inventory.shape.clone();
@@ -695,6 +810,10 @@ impl StorageNode {
             readers: readers.clone(),
             terminal: terminal.clone(),
             poison_pending: Arc::new(AtomicBool::new(false)),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            recoverable_live_failure: AtomicBool::new(false),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            poison_gate: Mutex::new(()),
             append_shape,
             append_batch_limits,
             append_group_limits,
@@ -725,6 +844,8 @@ impl StorageNode {
             wal_member_read,
             read_config,
             read_admission,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            live_nvme_selected,
             #[cfg(any(test, feature = "test-utils"))]
             drop_append_response: AtomicBool::new(false),
             #[cfg(test)]
@@ -738,6 +859,24 @@ impl StorageNode {
             return Err(TcpError::new("reader authority is poison-pending"));
         }
         self.inventory.lock().status()
+    }
+    /// Final owner-process shutdown, after serving sessions have stopped.
+    /// Returns actual target teardown evidence; ordinary database close must
+    /// not call this because the owner cannot accept another epoch afterward.
+    pub fn finish_live_target_shutdown(
+        &self,
+    ) -> Result<Option<super::nvmeof::LiveTargetStats>, TcpError> {
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        {
+            if !self.live_nvme_selected {
+                return Ok(None);
+            }
+            self.control.finish_live_target_shutdown().map(Some)
+        }
+        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+        {
+            Ok(None)
+        }
     }
     /// Enable local maintenance diagnostics for current and later epochs.
     /// This does not change the wire protocol or enable per-write clocks.
@@ -840,6 +979,23 @@ impl StorageNode {
             .active(epoch)
             .map_err(TcpError::component)?;
         Ok(log.pause_next_persist())
+    }
+    #[cfg(test)]
+    pub(crate) fn pause_inventory(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let inventory = self.inventory.clone();
+        let (entered, waiting) = std::sync::mpsc::sync_channel(1);
+        let (release, resumed) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _guard = inventory.lock();
+            let _ = entered.send(());
+            let _ = resumed.recv();
+        });
+        (waiting, release)
     }
     #[cfg(test)]
     pub(crate) fn contains_batch(&self, epoch: u64, id: BatchId) -> Result<bool, TcpError> {
@@ -1006,9 +1162,18 @@ impl StorageNode {
         let mut io = DeadlineIo::new(socket, limits.io_timeout)?;
         if transport.is_native() {
             read_transport_mode(&mut io, transport)?;
+            if !transport.is_fabric() {
+                return reactor::serve_session(
+                    self,
+                    reactor::Session::new_plain(io)?,
+                    limits,
+                    shutdown,
+                    None,
+                );
+            }
             #[cfg(feature = "experimental-fabric")]
             {
-                let endpoint = fabric::bootstrap(&mut io, transport)?;
+                let endpoint = fabric::bootstrap_idle_parking(&mut io, transport)?;
                 io.fabric = Some(endpoint);
                 return reactor::serve_session(
                     self,
@@ -1041,7 +1206,7 @@ impl StorageNode {
         if transport.is_fabric() {
             #[cfg(feature = "experimental-fabric")]
             {
-                let endpoint = fabric::bootstrap(&mut stream, transport)?;
+                let endpoint = fabric::bootstrap_idle_parking(&mut stream, transport)?;
                 stream.sock.fabric = Some(endpoint);
             }
             #[cfg(not(feature = "experimental-fabric"))]
@@ -1238,6 +1403,20 @@ pub struct Client {
     reuse_verifier: Option<Arc<rustls::client::WebPkiServerVerifier>>,
     server_name: Option<ServerName<'static>>,
     polling: PollingPolicy,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    live_config: Option<LiveClientConfig>,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    live_pool: Option<Arc<super::nvmeof::live_pool::LiveControllerPool>>,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    live_writer: Option<live_client::LiveWriteQueue>,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    live_writer_closing: bool,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    live_counters: Option<Arc<super::nvmeof::live_metrics::LiveNvmeCounters>>,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    live_metrics: Option<Arc<super::nvmeof::live_metrics::LiveNvmeMetrics>>,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    live_unreleased_tokens: Vec<(u64, [u8; 16])>,
     #[cfg(feature = "test-utils")]
     ram_probe_bytes: Option<usize>,
 }
@@ -1387,16 +1566,20 @@ impl Client {
         }
         let (session, reuse_verifier, server_name, tls_ns, fabric_ns) = if tls.transport.is_native()
         {
-            #[cfg(feature = "experimental-fabric")]
-            {
-                let endpoint = fabric::bootstrap(&mut io, &tls.transport)?;
-                io.fabric = Some(endpoint);
-                let fabric_ns = Some(elapsed_ns(setup_started));
-                (reactor::Session::new_native(io)?, None, None, 0, fabric_ns)
-            }
-            #[cfg(not(feature = "experimental-fabric"))]
-            {
-                return Err(TcpError::new("trusted OFI transport was not compiled"));
+            if !tls.transport.is_fabric() {
+                (reactor::Session::new_plain(io)?, None, None, 0, None)
+            } else {
+                #[cfg(feature = "experimental-fabric")]
+                {
+                    let endpoint = fabric::bootstrap(&mut io, &tls.transport)?;
+                    io.fabric = Some(endpoint);
+                    let fabric_ns = Some(elapsed_ns(setup_started));
+                    (reactor::Session::new_native(io)?, None, None, 0, fabric_ns)
+                }
+                #[cfg(not(feature = "experimental-fabric"))]
+                {
+                    return Err(TcpError::new("trusted OFI transport was not compiled"));
+                }
             }
         } else {
             let name =
@@ -1465,6 +1648,20 @@ impl Client {
             reuse_verifier,
             server_name,
             polling: PollingPolicy::Adaptive,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            live_config: None,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            live_pool: None,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            live_writer: None,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            live_writer_closing: false,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            live_counters: None,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            live_metrics: None,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            live_unreleased_tokens: Vec::new(),
             #[cfg(feature = "test-utils")]
             ram_probe_bytes: None,
         };
@@ -1580,6 +1777,113 @@ impl Client {
                 profile.client = previous;
                 profile.client_transport = client_transport;
                 Ok(*profile)
+            }
+            _ => self.wrong_response(),
+        }
+    }
+    pub(crate) fn owner_timeline_arm(&mut self, limit: usize) -> Result<(), TcpError> {
+        match self.request(Request::OwnerTimelineArm { limit })? {
+            Response::OwnerTimelineArmed => Ok(()),
+            _ => self.wrong_response(),
+        }
+    }
+
+    pub(crate) fn owner_timeline_fetch_partial(
+        &mut self,
+    ) -> (
+        Vec<super::write_timeline::OwnerTimelineRecord>,
+        u64,
+        u64,
+        Option<TcpError>,
+    ) {
+        let mut records = Vec::new();
+        let mut dropped = 0;
+        let mut incomplete = 0;
+        loop {
+            match self.request(Request::OwnerTimelineFetch {
+                offset: records.len(),
+            }) {
+                Ok(Response::OwnerTimelinePage {
+                    records: page,
+                    dropped: d,
+                    incomplete: i,
+                    more,
+                }) => {
+                    if more && page.is_empty() {
+                        return (
+                            records,
+                            dropped,
+                            incomplete,
+                            Some(TcpError::new("empty owner timeline page")),
+                        );
+                    }
+                    records.extend(page);
+                    dropped = d;
+                    incomplete = i;
+                    if !more {
+                        return (records, dropped, incomplete, None);
+                    }
+                }
+                Ok(_) => {
+                    return (
+                        records,
+                        dropped,
+                        incomplete,
+                        Some(TcpError::new("unexpected owner timeline response")),
+                    );
+                }
+                Err(error) => return (records, dropped, incomplete, Some(error)),
+            }
+        }
+    }
+    pub(crate) fn owner_timeline_arm_until(
+        &mut self,
+        limit: usize,
+        deadline: Instant,
+    ) -> Result<(), TcpError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(TcpError::new("owner timeline deadline expired"));
+        }
+        let previous = self.timeout;
+        self.timeout = previous.min(remaining);
+        let result = self.owner_timeline_arm(limit);
+        self.timeout = previous;
+        result
+    }
+
+    pub(crate) fn owner_timeline_page_until(
+        &mut self,
+        offset: usize,
+        deadline: Instant,
+    ) -> Result<
+        (
+            Vec<super::write_timeline::OwnerTimelineRecord>,
+            u64,
+            u64,
+            bool,
+        ),
+        TcpError,
+    > {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(TcpError::new("owner timeline deadline expired"));
+        }
+        let previous = self.timeout;
+        self.timeout = previous.min(remaining);
+        let response = self.request(Request::OwnerTimelineFetch { offset });
+        self.timeout = previous;
+        match response? {
+            Response::OwnerTimelinePage {
+                records,
+                dropped,
+                incomplete,
+                more,
+            } => {
+                if more && records.is_empty() {
+                    return Err(TcpError::new("empty owner timeline page"));
+                }
+                Ok((records, dropped, incomplete, more))
             }
             _ => self.wrong_response(),
         }
@@ -1826,7 +2130,7 @@ impl Client {
     }
 
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    pub(crate) fn release_nvmeof_epoch_pin(
+    pub fn release_nvmeof_epoch_pin(
         &mut self,
         epoch: u64,
         token: [u8; 16],
@@ -1872,6 +2176,43 @@ impl Client {
         references: &[ValueRecordReference],
         profile: Option<&mut TcpReadProfile>,
     ) -> Result<Vec<Mutation>, TcpError> {
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if self.live_config.is_some() {
+            if !self.live_unreleased_tokens.is_empty() {
+                return Err(TcpError::new("live read has quarantined owner grants"));
+            }
+            // A direct caller has no persistent published-index cache. Resolve
+            // its references afresh; the read-service lanes retain their own
+            // bounded, trusted-index grants across requests.
+            let mut cache = live_read::LiveReadCache::default();
+            let result = self.live_read_records(
+                &mut cache,
+                epoch,
+                references,
+                Instant::now() + self.timeout,
+                None,
+            );
+            let cleanup = cache.close(self, epoch);
+            self.live_unreleased_tokens.extend(
+                cache
+                    .take_unreleased()
+                    .into_iter()
+                    .map(|token| (epoch, token)),
+            );
+            // Legacy TCP/server clocks stay unavailable (sample counts zero).
+            // Live I/O and validation clocks come from live_nvmeof_stats.
+            return match (result, cleanup) {
+                (Ok(values), Ok(())) => Ok(values),
+                (Err(error), Ok(())) => Err(error),
+                (result, Err(cleanup)) => {
+                    self.broken = true;
+                    Err(TcpError::new(format!(
+                        "live read result {:?}; owner grant cleanup remains quarantined: {cleanup}",
+                        result.err(),
+                    )))
+                }
+            };
+        }
         self.read_records_correlated(epoch, references, profile)
     }
     pub fn recovery_page(
@@ -1880,6 +2221,12 @@ impl Client {
         cursor: usize,
         limit: usize,
     ) -> Result<RecoveryPage, TcpError> {
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if self.live_config.is_some() {
+            return Err(TcpError::new(
+                "live NVMe-oF recovery requires metadata-only control",
+            ));
+        }
         if limit == 0 || limit > 1024 {
             return Err(TcpError::new("invalid recovery page limit"));
         }
@@ -1931,6 +2278,8 @@ impl Client {
                 barriers,
                 namespace_syncs,
                 inventory_witnesses,
+                live_frontier_file_syncs,
+                live_frontier_namespace_syncs,
                 records,
                 metadata,
             } => Ok(PartitionStats {
@@ -1938,6 +2287,8 @@ impl Client {
                 persistence_barriers: barriers,
                 namespace_syncs,
                 inventory_witnesses,
+                live_frontier_file_syncs,
+                live_frontier_namespace_syncs,
                 registered_records: records,
                 reference_metadata_bytes: metadata,
             }),
@@ -1956,7 +2307,7 @@ impl TlsFiles {
                 .any(|path| !path.as_os_str().is_empty())
         {
             return Err(TcpError::new(
-                "trusted OFI transport requires empty TLS credential paths",
+                "trusted-network transport requires empty TLS credential paths",
             ));
         }
         Ok(trusted)
@@ -2035,7 +2386,7 @@ impl TlsFiles {
     pub(crate) fn client_config(&self) -> Result<Arc<ClientConfig>, TcpError> {
         self.client_config_with_identity()?
             .config
-            .ok_or_else(|| TcpError::new("trusted OFI transport has no TLS client config"))
+            .ok_or_else(|| TcpError::new("trusted-network transport has no TLS client config"))
     }
     pub(crate) fn client_config_with_identity(&self) -> Result<ClientTlsConfig, TcpError> {
         if self.trusted_mode()? {

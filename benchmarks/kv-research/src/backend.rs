@@ -103,6 +103,22 @@ pub trait KvBackend: Send + Sync + 'static {
         entries: &[(Bytes, Bytes)],
     ) -> impl Future<Output = BackendResult<()>> + Send;
 
+    /// Bounded measurement-phase client diagnostics, separate from engine profiles.
+    fn arm_client_profile(&self, limit: usize) -> BackendResult<()> {
+        if limit == 0 {
+            Ok(())
+        } else {
+            Err(unsupported("client operation profiling"))
+        }
+    }
+
+    fn finish_client_profile(
+        &self,
+        _deadline: std::time::Instant,
+    ) -> BackendResult<serde_json::Value> {
+        Err(unsupported("client operation profiling"))
+    }
+
     /// Observe read counters outside timed API calls. Unsupported backends report absence.
     fn read_observation(&self) -> serde_json::Value {
         serde_json::json!({"available": false, "error": "backend does not expose read observations"})
@@ -134,11 +150,75 @@ pub trait KvBackend: Send + Sync + 'static {
         }
     }
 
+    /// Non-destructive coordinator evidence before the completion gate, when supported.
+    fn snapshot_write_profile(&self) -> BackendResult<serde_json::Value> {
+        Ok(
+            serde_json::json!({"available": false, "reason": "backend does not expose a write interval snapshot"}),
+        )
+    }
+
     /// Finalize a selected write profile and return its engine-owned evidence.
     fn finish_write_profile(
         &self,
     ) -> impl Future<Output = BackendResult<serde_json::Value>> + Send {
         async { Ok(serde_json::json!({"supported": false})) }
+    }
+
+    /// Independent, bounded request-linked measurement timeline.
+    fn arm_write_timeline(&self, limit: usize) -> BackendResult<()> {
+        if limit == 0 {
+            Ok(())
+        } else {
+            Err(unsupported("write timeline"))
+        }
+    }
+
+    fn finish_write_timeline(
+        &self,
+        _deadline: std::time::Instant,
+    ) -> BackendResult<serde_json::Value> {
+        Err(unsupported("write timeline"))
+    }
+
+    fn traced_get(
+        &self,
+        key: &[u8],
+        _id: u64,
+    ) -> impl Future<Output = BackendResult<Option<Bytes>>> + Send {
+        self.get(key)
+    }
+
+    fn traced_get_many(
+        &self,
+        keys: &[Bytes],
+        _id: u64,
+    ) -> impl Future<Output = BackendResult<Vec<Option<Bytes>>>> + Send {
+        self.get_many(keys)
+    }
+
+    fn traced_put(
+        &self,
+        key: Bytes,
+        value: Bytes,
+        _id: u64,
+    ) -> impl Future<Output = BackendResult<()>> + Send {
+        self.put(key, value)
+    }
+
+    fn traced_delete(
+        &self,
+        key: Bytes,
+        _id: u64,
+    ) -> impl Future<Output = BackendResult<()>> + Send {
+        self.delete(key)
+    }
+
+    fn traced_put_batch(
+        &self,
+        entries: &[(Bytes, Bytes)],
+        _id: u64,
+    ) -> impl Future<Output = BackendResult<()>> + Send {
+        self.put_batch(entries)
     }
 
     /// Same mutation semantics as `put`, with stage clocks only for selected diagnostics.

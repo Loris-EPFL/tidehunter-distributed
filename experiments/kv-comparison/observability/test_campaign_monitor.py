@@ -54,6 +54,32 @@ class CampaignMonitorBoundaries(unittest.TestCase):
         with self.assertRaises(ValueError):
             monitor.validate_spec(spec)
 
+    def test_gcp_run_identity_and_six_host_contract(self):
+        run = 'bench-b35a62e24b47faaf'
+        spec = copy.deepcopy(self.spec)
+        spec.update(run_id=run, allow_loopback_hosts=False,
+                    state_dir='/var/lib/tidehunter-observation/' + run,
+                    hosts=[{'index': index, 'role': 'coordinator' if index == -1 else f'storage-{index}',
+                            'address': f'10.7.0.{index + 3}'} for index in range(-1, 5)])
+        self.assertEqual(monitor.validate_spec(spec), spec)
+        for identity in ('bench-b35a62e24b47faa', 'bench-b35a62e24b47faaf0',
+                         'bench-B35a62e24b47faaf', 'bench-b35a62e24b47faa/',
+                         'bench-b35a62e24b47faag', '../bench-b35a62e24b47faaf'):
+            with self.subTest(identity=identity), self.assertRaises(ValueError):
+                monitor.validate_spec(spec | {'run_id': identity})
+        with self.assertRaises(ValueError):
+            monitor.validate_spec(spec | {'state_dir': '/var/lib/tidehunter-observation/bench-0000000000000000'})
+
+    def test_gcp_session_cannot_be_adopted_by_another_run(self):
+        spec = self.spec | {'run_id': 'bench-b35a62e24b47faaf'}
+        state, owner = monitor.state_for(spec, create=True)
+        self.assertEqual(owner['run_id'], spec['run_id'])
+        self.assertEqual(state.stat().st_mode & 0o777, 0o700)
+        with self.assertRaisesRegex(ValueError, 'not owned'):
+            monitor.state_for(spec | {'run_id': 'bench-0000000000000000'})
+        with self.assertRaisesRegex(ValueError, 'not owned'):
+            monitor.stop_collector(spec | {'run_id': 'bench-0000000000000000'})
+
     def test_spec_does_not_require_remote_controller_results_to_exist(self):
         self.spec['results_root'] = str(self.root / 'absent-controller-results')
         self.assertEqual(monitor.validate_spec(self.spec), self.spec)
@@ -166,6 +192,61 @@ class CampaignMonitorBoundaries(unittest.TestCase):
         self.assertEqual(terminal['resource_evidence'], resource)
         self.assertIsNone(terminal['metrics'])
         self.assertIn(self.job['case_id'], monitor.load_json(state / 'session.json')['seen_case_ids'])
+
+    def test_standalone_case_is_observed_through_its_terminal_record_and_a_kv_case_still_needs_its_snapshot(self):
+        state, _, result = self.initialize_selection()
+        expressions = []
+        def observed(spec, expression, **kwargs):
+            expressions.append(expression)
+            return {'resultType': 'vector', 'result': [{'metric': {}, 'value': [time.time(), '1']}]}
+        fio = self.job | {'case_kind': 'fio_floor'}
+        monitor.select_case(self.spec, fio, result)
+        with patch.object(monitor, 'query', side_effect=observed):
+            answer = monitor.finish_case(self.spec, fio, result, status='completed')
+        self.assertTrue(answer['complete'])
+        self.assertIn('kv_observer_case_terminal', expressions[0])
+        self.assertNotIn('kv_observer_snapshot_final', expressions[0])
+        self.assertIn('status="completed"', expressions[0])
+        self.assertIn(fio['case_id'], monitor.load_json(state / 'session.json')['seen_case_ids'])
+        for index, kind in enumerate(('net_floor', 'ssd_floor', 'ssd_write_floor'), start=3):
+            case = self.job | {'case_id': f'case-0{index}', 'case_kind': kind}
+            (self.results / f'cases/case-0{index}').mkdir()
+            case_result = self.results / f'cases/case-0{index}/result'
+            monitor.select_case(self.spec, case, case_result)
+            with patch.object(monitor, 'query', side_effect=observed):
+                answer = monitor.finish_case(self.spec, case, case_result, status='completed')
+            self.assertTrue(answer['complete'])
+            self.assertIn('kv_observer_case_terminal', expressions[-1])
+            self.assertNotIn('kv_observer_snapshot_final', expressions[-1])
+        # The next case may be selected because the standalone case is recorded as observed.
+        kv = self.job | {'case_id': 'case-02'}
+        (self.results / 'cases/case-02').mkdir()
+        monitor.select_case(self.spec, kv, self.results / 'cases/case-02/result')
+        with patch.object(monitor, 'query', side_effect=observed):
+            monitor.finish_case(self.spec, kv, self.results / 'cases/case-02/result', status='completed')
+        self.assertIn('kv_observer_snapshot_final', expressions[-1])
+
+    def test_stage_measurements_require_kv_final_snapshots(self):
+        state, _, result = self.initialize_selection()
+        expressions = []
+        def observed(spec, expression, **kwargs):
+            expressions.append(expression)
+            return {'resultType': 'vector', 'result': [{'metric': {}, 'value': [time.time(), '1']}]}
+        for index, kind in enumerate(('native_op', 'native_media_read', 'hybrid_put'), start=1):
+            case_id = f'case-0{index}'
+            job = self.job | {'case_id': case_id, 'case_kind': kind}
+            if kind == 'hybrid_put':
+                job.update(backend='tidehunter_nvme_rdma', cohort='primary_rf1',
+                           nvmeof_route='sealed_read', nvmeof_target='kernel')
+            if index != 1:
+                (self.results / 'cases' / case_id).mkdir()
+            case_result = self.results / 'cases' / case_id / 'result'
+            monitor.select_case(self.spec, job, case_result)
+            with patch.object(monitor, 'query', side_effect=observed):
+                answer = monitor.finish_case(self.spec, job, case_result, status='completed')
+            self.assertTrue(answer['complete'])
+            self.assertIn('kv_observer_snapshot_final', expressions[-1])
+            self.assertIn(case_id, monitor.load_json(state / 'session.json')['seen_case_ids'])
 
     def test_malformed_terminal_metrics_cannot_poison_active_selection(self):
         state, _, result = self.initialize_selection()
@@ -284,6 +365,22 @@ class CampaignMonitorBoundaries(unittest.TestCase):
         terminal = monitor.load_json(state / 'benchmark/selection.json')['terminal']
         self.assertEqual(terminal['cold_device_evidence'], evidence)
 
+    def test_target_interval_evidence_is_validated_and_retained(self):
+        state, _, result = self.initialize_selection()
+        monitor.select_case(self.spec, self.job, result)
+        before = (state / 'benchmark/selection.json').read_bytes()
+        with self.assertRaises(ValueError):
+            monitor.finish_case(self.spec, self.job, result, nvmeof_target_evidence={'version': 0})
+        self.assertEqual((state / 'benchmark/selection.json').read_bytes(), before)
+        interval = {'start_monotonic_ns': 1, 'end_monotonic_ns': 2, 'delta': {}}
+        target = {'version': 1, 'block_device': 'nvme0n1', 'block': interval, 'cpu': interval}
+        observed = {'resultType': 'vector', 'result': [{'metric': {}, 'value': [time.time(), '1']}]}
+        with patch.object(monitor, 'query', return_value=observed):
+            monitor.finish_case(self.spec, self.job, result, nvmeof_target_evidence=target)
+        terminal = monitor.load_json(state / 'benchmark/selection.json')['terminal']
+        self.assertEqual(terminal['nvmeof_target_evidence'], target)
+        self.assertNotIn('nvmeof_trace_evidence', terminal)
+
     def test_terminal_write_diagnostics_are_validated_before_atomic_publication(self):
         state, _, result = self.initialize_selection()
         monitor.select_case(self.spec, self.job, result)
@@ -336,6 +433,29 @@ class CampaignMonitorBoundaries(unittest.TestCase):
         self.assertEqual(monitor.query_digest(first), monitor.query_digest(second))
         second['result'][0]['values'][0][0] += 1
         self.assertNotEqual(monitor.query_digest(first), monitor.query_digest(second))
+
+    def test_capture_inventory_preserves_missing_signals_and_legacy_replay(self):
+        state, _ = monitor.state_for(self.spec, create=True)
+        window = {'start': 1600000000, 'end': 1600000001}
+        empty = {'resultType': 'matrix', 'result': []}
+        with patch.object(monitor, 'query', return_value=empty):
+            captured, _ = monitor.collect_query_evidence(self.spec, state, window)
+            self.assertEqual(captured['schema_version'], 3)
+            metrics = {page['metric'] for page in captured['pages']}
+            self.assertEqual(metrics, set(monitor.QUERY_METRICS))
+            self.assertIn('kv_client_pool_evidence_available', metrics)
+            self.assertIn('kv_live_nvmeof_lifetime_peak', metrics)
+            self.assertIn('kv_case_native_wal_registered_files', metrics)
+            self.assertTrue(all(monitor.load_json(state / 'query-evidence' / page['file'])['result'] == []
+                                for page in captured['pages']))
+            legacy = {'schema_version': 2, 'page_interval': '(start,end]',
+                      'pages': [page for page in captured['pages'] if page['metric'] in monitor.LEGACY_QUERY_METRICS]}
+            replayed, _ = monitor.collect_query_evidence(self.spec, state, window, legacy)
+            self.assertEqual(replayed, legacy)
+            incomplete = copy.deepcopy(captured)
+            incomplete['pages'].pop()
+            with self.assertRaises(ValueError):
+                monitor.validate_query_evidence(incomplete, window)
 
     def test_full_matrix_pages_retain_samples_without_monolithic_json(self):
         state, _ = monitor.state_for(self.spec, create=True)

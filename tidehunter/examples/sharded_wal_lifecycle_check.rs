@@ -920,8 +920,7 @@ fn exercise(launch: &Launch, report: &mut Report) -> Result<()> {
         "cold_reopen_after_retirement",
     )?;
     require(
-        remote.recovery_stats().tail_batches
-            <= tidehunter::distributed::remote_db::CHECKPOINT_MAX_TAIL_BATCHES as u64,
+        remote.recovery_stats().tail_batches <= launch.remote.replay_limits.max_batches as u64,
         "recovery exceeded configured hard tail bound",
     )?;
     report

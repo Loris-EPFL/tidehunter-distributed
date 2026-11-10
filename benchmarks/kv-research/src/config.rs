@@ -3,6 +3,12 @@ use std::path::{Path, PathBuf};
 
 use crate::backend::BackendResult;
 
+/// Engine acknowledgement tier, re-used so the harness cannot drift from the engine. Comparisons
+/// never mix tiers: `Synchronous` matches native `value_wal_barrier`,
+/// `value_wal_group_barrier` and Valkey `appendfsync always`;
+/// `Native` matches only the native `page_cache` cohort.
+pub use tidehunter::distributed::durability::DurabilityTier;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackendSpec {
@@ -56,6 +62,14 @@ impl OperationMix {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PutKeyPolicy {
+    #[default]
+    Overwrite,
+    New,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkloadConfig {
@@ -63,6 +77,8 @@ pub struct WorkloadConfig {
     pub mix: OperationMix,
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    #[serde(default)]
+    pub put_key_policy: PutKeyPolicy,
 }
 fn default_batch_size() -> usize {
     32
@@ -73,6 +89,7 @@ fn default_batch_size() -> usize {
 pub enum ExecutionMode {
     ClosedLoop,
     OpenLoop,
+    Interference,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -87,6 +104,32 @@ pub struct ExecutionConfig {
     /// Independent arrival rate for open-loop only; operations per second.
     #[serde(default)]
     pub offered_ops_per_second: Option<f64>,
+}
+
+/// Explicit dual-stream settings. No campaign value is a harness default.
+///
+/// Use `execution.mode = interference`. `execution.concurrency` is the read worker count;
+/// `execution.queue_capacity` must cover read workers plus put workers. The read-only workload
+/// selects prepared keys; puts use new ids above that range. No warmup, aging or sweep runs.
+/// `phases.measurement_operations` is a hard offered-call ceiling, not a duration or target.
+/// Reaching it early fails the case. `limits.max_bytes` must cover the baseline plus that ceiling.
+/// Admission stops after `duration_seconds`; both pools drain before the result end clock.
+/// A full raw-sample writer queue fails the case without delaying arrival admission.
+/// Unscheduled reads at the end gate also fail the case; no arrivals are added after that gate.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterferenceConfig {
+    pub read_offered_per_second: u64,
+    pub read_queue_capacity: usize,
+    pub put_concurrency: usize,
+    pub duration_seconds: u64,
+    pub key_policy: InterferenceKeyPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InterferenceKeyPolicy {
+    DisjointReadPut,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -162,15 +205,26 @@ pub struct DiagnosticsConfig {
     /// Maximum write operations to sample in the measured phase. Zero disables profiling.
     #[serde(default)]
     pub write_profile_limit: usize,
+    /// Maximum measurement-phase mutations with request-linked timelines; zero disables.
+    #[serde(default)]
+    pub write_timeline_limit: usize,
     /// Maximum remote read requests to sample in the measured phase. Zero disables profiling.
     #[serde(default)]
     pub read_profile_limit: usize,
+    /// Maximum retained Valkey owner-pipeline timing records; zero disables.
+    #[serde(default)]
+    pub valkey_profile_limit: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunConfig {
     pub schema_version: u32,
+    /// Artifact identity for focused cases. Old configs do not need this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interference: Option<InterferenceConfig>,
     pub backend: BackendSpec,
     pub seed: u64,
     /// Non-secret human label; does not select the physical key namespace.
@@ -204,12 +258,38 @@ impl RunConfig {
         Ok(config)
     }
 
+    /// Requested Tidehunter tier (`backend.options.durability_tier`, default `native`).
+    /// `None` for other backends, whose durability contract is fixed by their own options.
+    pub fn durability_tier(&self) -> BackendResult<Option<DurabilityTier>> {
+        if self.backend.kind != "tidehunter" {
+            return Ok(None);
+        }
+        match self.backend.options.get("durability_tier") {
+            None => Ok(Some(DurabilityTier::default())),
+            Some(value) => Ok(Some(serde_json::from_value(value.clone())?)),
+        }
+    }
+
     // Keep all admission bounds together so their cross-field constraints remain visible.
     #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> BackendResult<()> {
         let invalid = |message: &str| -> BackendResult<()> {
             Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, message.to_owned()).into())
         };
+        if self.case_id.as_ref().is_some_and(|id| {
+            id.is_empty()
+                || id.len() > 160
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+        }) {
+            return invalid("case_id must be 1-160 ASCII letters, digits, '-' or '_'");
+        }
+        if self.durability_tier().is_err() {
+            return invalid(
+                "backend.options.durability_tier must be \"native\" or \"synchronous\"",
+            );
+        }
         if let Some(namespace) = &self.key_namespace_hex
             && (namespace.len() != 32
                 || !namespace
@@ -274,11 +354,39 @@ impl RunConfig {
         if self.diagnostics.write_profile_limit > 65_536 {
             return invalid("diagnostics.write_profile_limit must not exceed 65536");
         }
+        if self.diagnostics.write_timeline_limit > 65_536 {
+            return invalid("diagnostics.write_timeline_limit must not exceed 65536");
+        }
+        if self.diagnostics.write_timeline_limit > 0 && self.backend.kind != "tidehunter" {
+            return invalid("diagnostics.write_timeline_limit is only supported by tidehunter");
+        }
+        if self.diagnostics.write_timeline_limit > 0 && self.diagnostics.write_profile_limit > 0 {
+            return invalid(
+                "write timeline cannot be combined with the admission-gated write profile",
+            );
+        }
         if self.diagnostics.read_profile_limit > 65_536 {
             return invalid("diagnostics.read_profile_limit must not exceed 65536");
         }
         if self.diagnostics.read_profile_limit > 0 && self.backend.kind != "tidehunter" {
             return invalid("diagnostics.read_profile_limit is only supported by tidehunter");
+        }
+        if self.diagnostics.valkey_profile_limit > 65_536 {
+            return invalid("diagnostics.valkey_profile_limit must not exceed 65536");
+        }
+        if self.diagnostics.valkey_profile_limit > 0
+            && !(self.backend.kind == "valkey_rdma"
+                || (self.backend.kind == "valkey_tcp"
+                    && self
+                        .backend
+                        .options
+                        .get("client")
+                        .and_then(|value| value.as_str())
+                        == Some("libvalkey")))
+        {
+            return invalid(
+                "Valkey client profiling requires valkey_rdma or valkey_tcp with client=libvalkey",
+            );
         }
         if self.schema_version != 1 {
             return invalid("schema_version must be 1");
@@ -357,6 +465,27 @@ impl RunConfig {
         if bytes.is_none_or(|bytes| bytes > self.limits.max_bytes) {
             return invalid("dataset exceeds limits.max_bytes");
         }
+        if self.workload.put_key_policy == PutKeyPolicy::New {
+            if self.execution.mode == ExecutionMode::Interference {
+                return invalid(
+                    "workload.put_key_policy=new is not supported in interference mode",
+                );
+            }
+            if self.phases.measurement_key_sweep {
+                return invalid("workload.put_key_policy=new cannot use measurement_key_sweep");
+            }
+            let mix = &self.workload.mix;
+            if (mix.put == 0 && mix.put_batch == 0)
+                || mix.read != 0
+                || mix.get_many != 0
+                || mix.missing_read != 0
+                || mix.delete != 0
+            {
+                return invalid(
+                    "workload.put_key_policy=new requires only put and/or put_batch operations",
+                );
+            }
+        }
         if self.workload.mix.total_weight() == 0 {
             return invalid("workload.mix must include an operation");
         }
@@ -432,6 +561,54 @@ impl RunConfig {
                 "execution concurrency and queue capacity must be bounded, nonzero, and queue_capacity >= concurrency",
             );
         }
+        if self.execution.mode == ExecutionMode::Interference {
+            let Some(interference) = &self.interference else {
+                return invalid("interference mode requires explicit interference settings");
+            };
+            let workers = self
+                .execution
+                .concurrency
+                .checked_add(interference.put_concurrency);
+            let reads = interference
+                .read_offered_per_second
+                .checked_mul(interference.duration_seconds);
+            let storage = self
+                .dataset
+                .keys
+                .checked_add(self.phases.measurement_operations)
+                .and_then(|keys| keys.checked_mul(self.dataset.value_size as u64));
+            if self.case_id.is_none()
+                || self.qualification_only
+                || !(self.phases.preload || self.phases.verify_existing_dataset)
+                || self.phases.warmup_operations != 0
+                || self.phases.aging_operations != 0
+                || self.phases.warmup_key_sweep
+                || self.phases.measurement_key_sweep
+                || self.workload.mix.read == 0
+                || self.workload.mix.put != 0
+                || self.workload.mix.delete != 0
+                || self.workload.mix.missing_read != 0
+                || self.workload.mix.get_many != 0
+                || self.workload.mix.put_batch != 0
+                || self.execution.offered_ops_per_second.is_some()
+                || !(1..=1_000_000_000).contains(&interference.read_offered_per_second)
+                || !(1..=65_536).contains(&interference.read_queue_capacity)
+                || interference.read_queue_capacity < self.execution.concurrency
+                || !(1..=4096).contains(&interference.put_concurrency)
+                || workers.is_none_or(|n| n > 4096 || n > self.execution.queue_capacity)
+                || interference.duration_seconds == 0
+                || interference.duration_seconds >= self.limits.deadline_seconds
+                || reads.is_none_or(|n| n >= self.phases.measurement_operations)
+                || self.phases.measurement_operations > 100_000_000
+                || storage.is_none_or(|n| n > self.limits.max_bytes)
+            {
+                return invalid(
+                    "interference requires a case_id, prepared read-only baseline, no warmup/aging/sweeps, explicit bounded streams, total worker capacity, duration within deadline, and operation/storage headroom",
+                );
+            }
+        } else if self.interference.is_some() {
+            return invalid("interference settings require interference mode");
+        }
         match self.execution.mode {
             ExecutionMode::OpenLoop => {
                 let Some(rate) = self.execution.offered_ops_per_second else {
@@ -447,6 +624,7 @@ impl RunConfig {
                 return invalid("closed_loop must not specify offered_ops_per_second");
             }
             ExecutionMode::ClosedLoop => {}
+            ExecutionMode::Interference => {}
         }
         if !self.qualification_only && self.phases.measurement_operations == 0 {
             return invalid(
@@ -501,6 +679,8 @@ mod tests {
     fn config() -> RunConfig {
         RunConfig {
             schema_version: 1,
+            case_id: None,
+            interference: None,
             backend: BackendSpec {
                 kind: "native".to_owned(),
                 options: serde_json::json!({}),
@@ -520,6 +700,7 @@ mod tests {
                     ..OperationMix::default()
                 },
                 batch_size: 32,
+                put_key_policy: PutKeyPolicy::Overwrite,
             },
             execution: ExecutionConfig {
                 mode: ExecutionMode::ClosedLoop,
@@ -551,6 +732,182 @@ mod tests {
                 shutdown_grace_seconds: 5,
             },
         }
+    }
+
+    #[test]
+    fn put_key_policy_defaults_to_overwrite_and_rejects_unknown_values() {
+        let mut json = serde_json::to_value(config()).unwrap();
+        json["workload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("put_key_policy");
+        let c: RunConfig = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(c.workload.put_key_policy, PutKeyPolicy::Overwrite);
+        assert!(c.validate().is_ok());
+        for policy in ["overwrite", "new"] {
+            json["workload"]["put_key_policy"] = serde_json::json!(policy);
+            let c: RunConfig = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(c).unwrap()["workload"]["put_key_policy"],
+                policy
+            );
+        }
+        json["workload"]["put_key_policy"] = serde_json::json!("insert");
+        assert!(serde_json::from_value::<RunConfig>(json).is_err());
+    }
+
+    #[test]
+    fn new_put_keys_require_a_put_only_mix_without_measurement_sweep_or_interference() {
+        for (put, put_batch) in [(1, 0), (0, 1), (1, 1)] {
+            let mut c = config();
+            c.workload.put_key_policy = PutKeyPolicy::New;
+            c.workload.mix = OperationMix {
+                put,
+                put_batch,
+                ..OperationMix::default()
+            };
+            assert!(c.validate().is_ok());
+            for field in ["read", "get_many", "missing_read", "delete"] {
+                let mut json = serde_json::to_value(&c).unwrap();
+                json["workload"]["mix"][field] = serde_json::json!(1);
+                let bad: RunConfig = serde_json::from_value(json).unwrap();
+                assert!(
+                    bad.validate()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("put_key_policy")
+                );
+            }
+            c.phases.measurement_key_sweep = true;
+            assert!(
+                c.validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("measurement_key_sweep")
+            );
+        }
+        let mut c = config();
+        c.workload.put_key_policy = PutKeyPolicy::New;
+        assert!(c.validate().is_err());
+        c.workload.mix = OperationMix::default();
+        assert!(c.validate().is_err());
+        let mut c = interference_config();
+        c.workload.put_key_policy = PutKeyPolicy::New;
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("interference")
+        );
+    }
+
+    #[test]
+    fn explicit_high_concurrency_capacity_preserves_existing_bounds() {
+        for concurrency in [64, 256] {
+            let mut c = config();
+            c.execution.concurrency = concurrency;
+            c.execution.queue_capacity = concurrency;
+            assert!(c.validate().is_ok());
+            c.execution.queue_capacity = concurrency - 1;
+            assert!(c.validate().is_err());
+            c.execution.queue_capacity = 65_537;
+            assert!(c.validate().is_err());
+            c.execution.queue_capacity = 65_536;
+            assert!(c.validate().is_ok());
+        }
+    }
+
+    fn interference_config() -> RunConfig {
+        let mut c = config();
+        c.case_id = Some("interference-test".into());
+        c.execution.mode = ExecutionMode::Interference;
+        c.execution.queue_capacity = 18;
+        c.phases.warmup_operations = 0;
+        c.phases.measurement_operations = 30_000;
+        c.limits.max_operations = 40_000;
+        c.limits.max_bytes = 20_000_000;
+        c.interference = Some(InterferenceConfig {
+            read_offered_per_second: 1000,
+            read_queue_capacity: 4096,
+            put_concurrency: 16,
+            duration_seconds: 20,
+            key_policy: InterferenceKeyPolicy::DisjointReadPut,
+        });
+        c
+    }
+
+    #[test]
+    fn interference_requires_explicit_consistent_bounded_settings() {
+        let c = interference_config();
+        assert!(c.validate().is_ok());
+        let mut bad = c.clone();
+        bad.interference = None;
+        assert!(bad.validate().is_err());
+        let mut bad = c.clone();
+        bad.execution.mode = ExecutionMode::ClosedLoop;
+        assert!(bad.validate().is_err());
+        for field in [
+            "read_offered_per_second",
+            "read_queue_capacity",
+            "put_concurrency",
+            "duration_seconds",
+        ] {
+            let mut json = serde_json::to_value(&c).unwrap();
+            json["interference"][field] = serde_json::json!(0);
+            let bad: RunConfig = serde_json::from_value(json).unwrap();
+            assert!(bad.validate().is_err(), "{field}");
+        }
+        for mutate in [
+            |c: &mut RunConfig| c.execution.queue_capacity = 17,
+            |c: &mut RunConfig| c.execution.queue_capacity = 65_537,
+            |c: &mut RunConfig| c.interference.as_mut().unwrap().read_queue_capacity = 1,
+            |c: &mut RunConfig| c.interference.as_mut().unwrap().read_queue_capacity = 65_537,
+            |c: &mut RunConfig| c.interference.as_mut().unwrap().put_concurrency = usize::MAX,
+            |c: &mut RunConfig| c.interference.as_mut().unwrap().read_offered_per_second = u64::MAX,
+            |c: &mut RunConfig| c.interference.as_mut().unwrap().duration_seconds = 60,
+            |c: &mut RunConfig| c.phases.measurement_operations = 20_000,
+            |c: &mut RunConfig| c.limits.max_bytes = 25_600,
+            |c: &mut RunConfig| c.phases.warmup_operations = 1,
+            |c: &mut RunConfig| c.phases.preload = false,
+            |c: &mut RunConfig| c.workload.mix.put = 1,
+            |c: &mut RunConfig| c.execution.offered_ops_per_second = Some(1000.0),
+            |c: &mut RunConfig| c.case_id = Some("../bad".into()),
+        ] {
+            let mut bad = c.clone();
+            mutate(&mut bad);
+            assert!(bad.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn interference_serde_rejects_missing_unknown_and_noninteger_fields() {
+        let c = serde_json::to_value(interference_config()).unwrap();
+        for field in [
+            "read_offered_per_second",
+            "read_queue_capacity",
+            "put_concurrency",
+            "duration_seconds",
+            "key_policy",
+        ] {
+            let mut bad = c.clone();
+            bad["interference"].as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<RunConfig>(bad).is_err());
+        }
+        for value in [
+            serde_json::json!(true),
+            serde_json::json!(1.5),
+            serde_json::json!(-1),
+        ] {
+            let mut bad = c.clone();
+            bad["interference"]["read_queue_capacity"] = value;
+            assert!(serde_json::from_value::<RunConfig>(bad).is_err());
+        }
+        let mut bad = c.clone();
+        bad["interference"]["extra"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<RunConfig>(bad).is_err());
+        let mut bad = c;
+        bad["interference"]["key_policy"] = serde_json::json!("shared");
+        assert!(serde_json::from_value::<RunConfig>(bad).is_err());
     }
 
     #[test]
@@ -664,6 +1021,29 @@ mod tests {
     }
 
     #[test]
+    fn tidehunter_durability_tier_defaults_to_native_and_rejects_other_values() {
+        let mut c = config();
+        assert_eq!(c.durability_tier().unwrap(), None);
+        c.backend.kind = "tidehunter".to_owned();
+        c.backend.options = serde_json::json!({});
+        assert_eq!(c.durability_tier().unwrap(), Some(DurabilityTier::Native));
+        c.backend.options = serde_json::json!({"durability_tier": "synchronous"});
+        assert_eq!(
+            c.durability_tier().unwrap(),
+            Some(DurabilityTier::Synchronous)
+        );
+        assert!(c.validate().is_ok());
+        for bad in [serde_json::json!("sync"), serde_json::json!(1)] {
+            c.backend.options = serde_json::json!({"durability_tier": bad});
+            assert!(c.validate().is_err());
+        }
+        assert_ne!(
+            DurabilityTier::Native.comparison_cohort(),
+            DurabilityTier::Synchronous.comparison_cohort()
+        );
+    }
+
+    #[test]
     fn rejects_unknown_json_configuration_fields() {
         let decoded =
             serde_json::from_str::<BackendSpec>(r#"{"kind":"native","options":{},"secret":"x"}"#);
@@ -730,6 +1110,47 @@ mod tests {
                 .read_profile_limit,
             0
         );
+    }
+
+    #[test]
+    fn write_timeline_requires_tidehunter_and_is_bounded_independently() {
+        let mut config = config();
+        assert_eq!(config.diagnostics.write_timeline_limit, 0);
+        config.diagnostics.write_timeline_limit = 1;
+        assert!(config.validate().is_err());
+        config.backend.kind = "tidehunter".to_owned();
+        assert!(config.validate().is_ok());
+        config.diagnostics.write_timeline_limit = 65_536;
+        assert!(config.validate().is_ok());
+        config.diagnostics.write_timeline_limit = 65_537;
+        assert!(config.validate().is_err());
+        config.diagnostics.write_timeline_limit = 1;
+        config.diagnostics.write_profile_limit = 1;
+        assert!(config.validate().is_err());
+        assert_eq!(
+            serde_json::from_str::<DiagnosticsConfig>("{}")
+                .unwrap()
+                .write_timeline_limit,
+            0
+        );
+    }
+
+    #[test]
+    fn valkey_profile_requires_the_matched_client_and_bounded_records() {
+        let mut config = config();
+        config.diagnostics.valkey_profile_limit = 1;
+        assert!(config.validate().is_err());
+        config.backend.kind = "valkey_tcp".to_owned();
+        assert!(config.validate().is_err());
+        config.backend.options = serde_json::json!({"client": "libvalkey"});
+        assert!(config.validate().is_ok());
+        config.diagnostics.valkey_profile_limit = 65_536;
+        assert!(config.validate().is_ok());
+        config.diagnostics.valkey_profile_limit = 65_537;
+        assert!(config.validate().is_err());
+        config.backend.kind = "valkey_rdma".to_owned();
+        config.diagnostics.valkey_profile_limit = 1;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

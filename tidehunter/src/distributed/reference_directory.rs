@@ -12,6 +12,7 @@ use super::types::{
 };
 use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
+use std::hash::BuildHasher;
 use std::mem::size_of;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -119,7 +120,228 @@ impl RegisteredBatch {
 struct Authority {
     history: HistoryReader,
     pending: Vec<Arc<RegisteredBatch>>,
+    // Hash positions over `pending`, kept in step with it under this lock.
+    index: PendingIndex,
+    // `None` when the rooted history already held receipts at open: its keys
+    // are unknown, so every history lookup reads the on-disk index.
+    seen: Option<SeenKeys>,
     last_end: u64,
+}
+
+/// Slots per pending position table: a power of two, at least twice the
+/// largest pending window, so linear probing keeps its load factor <= 1/2.
+const INDEX_SLOTS: usize = 2 * MAX_RESIDENT_BATCHES;
+const _: () = assert!(INDEX_SLOTS.is_power_of_two() && INDEX_SLOTS <= u16::MAX as usize);
+const FILTER_HASHES: u64 = 3;
+
+/// Mixes a 128-bit key with a per-directory random seed. Clients choose batch
+/// identities, so an unseeded hash would let them force long probe chains.
+fn mix(seed: u64, key: u128) -> u64 {
+    const K: u64 = 0xD6E8_FEB8_6659_FD93;
+    let mut h = (key as u64 ^ seed).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 32;
+    h = (h ^ (key >> 64) as u64).wrapping_mul(K);
+    h ^= h >> 32;
+    h = h.wrapping_mul(K);
+    h ^ (h >> 32)
+}
+
+/// Work done by one conflict lookup, for opt-in write diagnostics.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LookupWork {
+    /// Pending-table slots examined; replaces the former linear pending scan.
+    pub(crate) pending_probes: u64,
+    /// Reads of the rooted on-disk identity/version index.
+    pub(crate) history_lookups: u64,
+    /// Rooted-index reads avoided because the filter proved the key absent.
+    pub(crate) filter_skips: u64,
+}
+
+/// Result of an exact identity-then-version lookup for one batch.
+pub(crate) enum ConflictLookup {
+    Free,
+    /// The identity is already registered; the caller compares version/digest.
+    Existing(AppendedBatch),
+    /// A different batch owns this version.
+    VersionTaken,
+}
+
+/// Open-addressed tables of `position + 1` (0 is empty) into `Authority::pending`,
+/// one keyed by identity and one by version. Probe loops are bounded by the table
+/// size. Rebuilt in full when the pending prefix drains, which happens once per
+/// history spill, so the cost is amortized over the spilled batches.
+struct PendingIndex {
+    seed: u64,
+    ids: Box<[u16]>,
+    versions: Box<[u16]>,
+}
+impl PendingIndex {
+    fn new() -> Self {
+        Self {
+            seed: std::collections::hash_map::RandomState::new().hash_one(0u8),
+            ids: vec![0; INDEX_SLOTS].into_boxed_slice(),
+            versions: vec![0; INDEX_SLOTS].into_boxed_slice(),
+        }
+    }
+    fn id_hash(&self, id: BatchId) -> u64 {
+        mix(self.seed, u128::from_be_bytes(id.operation))
+    }
+    fn version_hash(&self, version: BatchVersion) -> u64 {
+        mix(self.seed, u128::from(version.sequence))
+    }
+    /// Keeps the first position for a repeated key, so lookups find the oldest.
+    fn insert(table: &mut [u16], hash: u64, position: usize, same: impl Fn(usize) -> bool) -> bool {
+        let Ok(value) = u16::try_from(position + 1) else {
+            return false;
+        };
+        let mask = table.len() - 1;
+        let mut slot = hash as usize & mask;
+        for _ in 0..table.len() {
+            match usize::from(table[slot]).checked_sub(1) {
+                None => {
+                    table[slot] = value;
+                    return true;
+                }
+                Some(existing) if same(existing) => return true,
+                Some(_) => slot = (slot + 1) & mask,
+            }
+        }
+        false
+    }
+    /// Index `pending[position]`; false when a table cannot hold it.
+    fn push(&mut self, pending: &[Arc<RegisteredBatch>], position: usize) -> bool {
+        let batch = &pending[position];
+        let (id, version) = (batch.id, batch.version);
+        let id_hash = self.id_hash(id);
+        let version_hash = self.version_hash(version);
+        Self::insert(&mut self.ids, id_hash, position, |other| {
+            pending[other].id == id
+        }) && Self::insert(&mut self.versions, version_hash, position, |other| {
+            pending[other].version == version
+        })
+    }
+    fn rebuild(&mut self, pending: &[Arc<RegisteredBatch>]) -> bool {
+        self.ids.fill(0);
+        self.versions.fill(0);
+        (0..pending.len()).all(|position| self.push(pending, position))
+    }
+    fn find(
+        table: &[u16],
+        hash: u64,
+        pending: &[Arc<RegisteredBatch>],
+        work: &mut LookupWork,
+        matches: impl Fn(&RegisteredBatch) -> bool,
+    ) -> Option<usize> {
+        let mask = table.len() - 1;
+        let mut slot = hash as usize & mask;
+        for _ in 0..table.len() {
+            work.pending_probes += 1;
+            let position = usize::from(table[slot]).checked_sub(1)?;
+            if pending.get(position).is_some_and(|batch| matches(batch)) {
+                return Some(position);
+            }
+            slot = (slot + 1) & mask;
+        }
+        None
+    }
+}
+
+/// Bloom filter over every key ever published to this directory, pending or
+/// rooted. It never forgets a key, so "absent" is exact; "present" only means
+/// the rooted index must be read. Once more than a quarter of its bits could be
+/// set it stops filtering (every answer is "maybe"), keeping the false-positive
+/// rate bounded instead of silently degrading.
+struct KeyFilter {
+    words: Box<[u64]>,
+    inserted: usize,
+}
+impl KeyFilter {
+    fn new(bytes: usize) -> Self {
+        Self {
+            words: vec![0; bytes / size_of::<u64>()].into_boxed_slice(),
+            inserted: 0,
+        }
+    }
+    fn bit_mask(&self) -> u64 {
+        (self.words.len() as u64 * 64) - 1
+    }
+    fn insert(&mut self, hash: u64) {
+        let (step, mask) = (hash.rotate_left(32) | 1, self.bit_mask());
+        for round in 0..FILTER_HASHES {
+            let bit = hash.wrapping_add(round.wrapping_mul(step)) & mask;
+            self.words[(bit / 64) as usize] |= 1 << (bit % 64);
+        }
+        self.inserted = self.inserted.saturating_add(1);
+    }
+    fn may_contain(&self, hash: u64) -> bool {
+        let (step, mask) = (hash.rotate_left(32) | 1, self.bit_mask());
+        if (self.inserted as u64).saturating_mul(FILTER_HASHES + 1) > mask + 1 {
+            return true;
+        }
+        (0..FILTER_HASHES).all(|round| {
+            let bit = hash.wrapping_add(round.wrapping_mul(step)) & mask;
+            self.words[(bit / 64) as usize] & (1 << (bit % 64)) != 0
+        })
+    }
+}
+struct SeenKeys {
+    ids: KeyFilter,
+    versions: KeyFilter,
+}
+
+impl Authority {
+    fn pending_id(
+        &self,
+        id: BatchId,
+        hash: u64,
+        work: &mut LookupWork,
+    ) -> Option<&Arc<RegisteredBatch>> {
+        PendingIndex::find(&self.index.ids, hash, &self.pending, work, |batch| {
+            batch.id == id
+        })
+        .map(|position| &self.pending[position])
+    }
+    fn pending_version(&self, version: BatchVersion, hash: u64, work: &mut LookupWork) -> bool {
+        PendingIndex::find(&self.index.versions, hash, &self.pending, work, |batch| {
+            batch.version == version
+        })
+        .is_some()
+    }
+    /// Pending offsets strictly increase (checked at publication).
+    fn pending_address(&self, address: PhysicalValueAddress) -> Option<&Arc<RegisteredBatch>> {
+        let position = self
+            .pending
+            .partition_point(|batch| batch.address.offset < address.offset);
+        self.pending
+            .get(position)
+            .filter(|batch| batch.address == address)
+    }
+    /// False only when the rooted history provably lacks the key.
+    fn history_may_hold(
+        &self,
+        filter: impl Fn(&SeenKeys) -> &KeyFilter,
+        hash: u64,
+        work: &mut LookupWork,
+    ) -> bool {
+        if self.history.root().count == 0 {
+            return false;
+        }
+        if let Some(seen) = &self.seen
+            && !filter(seen).may_contain(hash)
+        {
+            work.filter_skips += 1;
+            return false;
+        }
+        true
+    }
+    fn drain_prefix(&mut self, count: usize) -> Result<(), StorageError> {
+        drop(self.pending.drain(..count));
+        if self.index.rebuild(&self.pending) {
+            Ok(())
+        } else {
+            Err(DirectoryError::Capacity.into())
+        }
+    }
 }
 struct CachedAuthority {
     batch: Arc<RegisteredBatch>,
@@ -165,6 +387,8 @@ fn root_charge() -> usize {
         // Preallocated pending window plus the immutable spill capture. Charge
         // both conservatively even while empty, so retained capacity is bounded.
         + 2 * MAX_RESIDENT_BATCHES * size_of::<Arc<RegisteredBatch>>()
+        // The identity and version position tables over the pending window.
+        + 2 * INDEX_SLOTS * size_of::<u16>()
 }
 
 fn authority_cache_capacity(metadata_limit: usize) -> usize {
@@ -178,6 +402,25 @@ fn authority_cache_capacity(metadata_limit: usize) -> usize {
 fn extra_cache_table_bytes(metadata_limit: usize) -> usize {
     (authority_cache_capacity(metadata_limit) - AUTHORITY_CACHE_ENTRIES)
         * CACHE_TABLE_BYTES_PER_EXTRA_ENTRY
+}
+
+// Each of the two history key filters gets 1/128 of the budget headroom (the
+// largest power of two not above it), capped at 256 KiB. A budget too small for
+// 2 KiB per filter has no filter and always reads the rooted index.
+const MIN_FILTER_BYTES: usize = 2048;
+const MAX_FILTER_BYTES: usize = 256 * 1024;
+fn filter_bytes(metadata_limit: usize) -> usize {
+    let target = (metadata_limit.saturating_sub(root_charge()) / 128).min(MAX_FILTER_BYTES);
+    if target < MIN_FILTER_BYTES {
+        0
+    } else {
+        1 << target.ilog2()
+    }
+}
+
+/// Fixed charge taken from the budget at open, before any batch.
+fn extra_fixed_bytes(metadata_limit: usize) -> usize {
+    extra_cache_table_bytes(metadata_limit) + 2 * filter_bytes(metadata_limit)
 }
 
 /// Authority planning is separate from value residency and physical device I/O.
@@ -373,7 +616,7 @@ impl ReferenceDirectory {
         }
         if batches > max_batches.min(MAX_RESIDENT_BATCHES)
             || Self::metadata_bytes(batches, descriptors)?
-                .checked_add(extra_cache_table_bytes(max_metadata_bytes))
+                .checked_add(extra_fixed_bytes(max_metadata_bytes))
                 .is_none_or(|bytes| bytes > max_metadata_bytes)
         {
             return Err(DirectoryError::Capacity);
@@ -419,8 +662,18 @@ impl ReferenceDirectory {
             max_batches: config.max_batches.min(MAX_RESIDENT_BATCHES),
             max_metadata_bytes: config.max_reference_metadata_bytes,
             authority: RwLock::new(Authority {
+                seen: (reader.root().count == 0
+                    && filter_bytes(config.max_reference_metadata_bytes) != 0)
+                    .then(|| {
+                        let bytes = filter_bytes(config.max_reference_metadata_bytes);
+                        SeenKeys {
+                            ids: KeyFilter::new(bytes),
+                            versions: KeyFilter::new(bytes),
+                        }
+                    }),
                 history: reader,
                 pending: Vec::with_capacity(config.max_batches.min(MAX_RESIDENT_BATCHES)),
+                index: PendingIndex::new(),
                 last_end,
             }),
             cache: Mutex::new(AuthorityCache {
@@ -443,9 +696,7 @@ impl ReferenceDirectory {
             fail_history_after_root: AtomicBool::new(false),
             budget: Arc::new(MetadataBudget {
                 limit: config.max_reference_metadata_bytes - root_charge(),
-                used: AtomicUsize::new(extra_cache_table_bytes(
-                    config.max_reference_metadata_bytes,
-                )),
+                used: AtomicUsize::new(extra_fixed_bytes(config.max_reference_metadata_bytes)),
                 descriptors: AtomicUsize::new(0),
             }),
         });
@@ -563,11 +814,7 @@ impl ReferenceDirectory {
             self.reads.resident_misses.fetch_add(1, Ordering::Relaxed);
             return None;
         };
-        let batch = authority
-            .pending
-            .iter()
-            .find(|batch| batch.address == address)
-            .cloned();
+        let batch = authority.pending_address(address).cloned();
         if batch.is_some() {
             self.reads.resident_hits.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -645,11 +892,7 @@ impl ReferenceDirectory {
         }
         let reader = {
             let authority = self.authority.read();
-            if let Some(batch) = authority
-                .pending
-                .iter()
-                .find(|batch| batch.address == address)
-            {
+            if let Some(batch) = authority.pending_address(address) {
                 return Ok(Some(batch.clone()));
             }
             authority.history.clone()
@@ -705,10 +948,15 @@ impl ReferenceDirectory {
     }
     pub(crate) fn lookup_id(&self, id: BatchId) -> Result<Option<AppendedBatch>, StorageError> {
         self.check_health()?;
+        let mut work = LookupWork::default();
         let reader = {
             let authority = self.authority.read();
-            if let Some(batch) = authority.pending.iter().find(|batch| batch.id == id) {
+            let hash = authority.index.id_hash(id);
+            if let Some(batch) = authority.pending_id(id, hash, &mut work) {
                 return Ok(Some(batch.receipt()));
+            }
+            if !authority.history_may_hold(|seen| &seen.ids, hash, &mut work) {
+                return Ok(None);
             }
             authority.history.clone()
         };
@@ -719,20 +967,71 @@ impl ReferenceDirectory {
         version: BatchVersion,
     ) -> Result<Option<AppendedBatch>, StorageError> {
         self.check_health()?;
+        let mut work = LookupWork::default();
         let reader = {
             let authority = self.authority.read();
-            if let Some(batch) = authority
-                .pending
-                .iter()
-                .find(|batch| batch.version == version)
-            {
-                return Ok(Some(batch.receipt()));
+            let hash = authority.index.version_hash(version);
+            if let Some(position) = PendingIndex::find(
+                &authority.index.versions,
+                hash,
+                &authority.pending,
+                &mut work,
+                |batch| batch.version == version,
+            ) {
+                return Ok(Some(authority.pending[position].receipt()));
+            }
+            if !authority.history_may_hold(|seen| &seen.versions, hash, &mut work) {
+                return Ok(None);
             }
             authority.history.clone()
         };
         Ok(reader
             .lookup_version(version)?
             .map(|record| record.receipt()))
+    }
+    /// Exact identity-then-version admission lookup under one authority read
+    /// guard. Same precedence as `lookup_id` followed by `lookup_version`: a
+    /// rooted identity match wins over a pending version match.
+    pub(crate) fn lookup_conflict(
+        &self,
+        id: BatchId,
+        version: BatchVersion,
+        work: &mut LookupWork,
+    ) -> Result<ConflictLookup, StorageError> {
+        self.check_health()?;
+        let (version_pending, history_id, history_version, reader) = {
+            let authority = self.authority.read();
+            let id_hash = authority.index.id_hash(id);
+            if let Some(batch) = authority.pending_id(id, id_hash, work) {
+                return Ok(ConflictLookup::Existing(batch.receipt()));
+            }
+            let version_hash = authority.index.version_hash(version);
+            let version_pending = authority.pending_version(version, version_hash, work);
+            let history_id = authority.history_may_hold(|seen| &seen.ids, id_hash, work);
+            let history_version = !version_pending
+                && authority.history_may_hold(|seen| &seen.versions, version_hash, work);
+            let reader = (history_id || history_version).then(|| authority.history.clone());
+            (version_pending, history_id, history_version, reader)
+        };
+        if let Some(reader) = reader {
+            if history_id {
+                work.history_lookups += 1;
+                if let Some(record) = reader.lookup(id)? {
+                    return Ok(ConflictLookup::Existing(record.receipt()));
+                }
+            }
+            if !version_pending && history_version {
+                work.history_lookups += 1;
+                if reader.lookup_version(version)?.is_some() {
+                    return Ok(ConflictLookup::VersionTaken);
+                }
+            }
+        }
+        Ok(if version_pending {
+            ConflictLookup::VersionTaken
+        } else {
+            ConflictLookup::Free
+        })
     }
     pub(crate) fn receipt_page(
         &self,
@@ -861,10 +1160,10 @@ impl ReferenceDirectoryWriter {
     pub(crate) fn receipt_group_end(&self, receipt: AppendedBatch) -> Result<u64, StorageError> {
         let reader = {
             let authority = self.directory.authority.read();
+            let hash = authority.index.id_hash(receipt.id());
             if let Some(batch) = authority
-                .pending
-                .iter()
-                .find(|batch| batch.receipt() == receipt)
+                .pending_id(receipt.id(), hash, &mut LookupWork::default())
+                .filter(|batch| batch.receipt() == receipt)
             {
                 return Ok(batch.group_end);
             }
@@ -988,10 +1287,27 @@ impl ReferenceDirectoryWriter {
             self.directory
                 .max_metadata_bytes
                 .saturating_sub(bytes)
-                .saturating_sub(extra_cache_table_bytes(self.directory.max_metadata_bytes)),
+                .saturating_sub(extra_fixed_bytes(self.directory.max_metadata_bytes)),
         );
         authority.last_end = group_end;
+        let first = authority.pending.len();
         authority.pending.extend(batches.into_iter().map(Arc::new));
+        let Authority {
+            pending,
+            index,
+            seen,
+            ..
+        } = &mut *authority;
+        for position in first..pending.len() {
+            if !index.push(pending, position) {
+                return Err(DirectoryError::Capacity.into());
+            }
+            if let Some(seen) = seen {
+                seen.ids.insert(index.id_hash(pending[position].id));
+                seen.versions
+                    .insert(index.version_hash(pending[position].version));
+            }
+        }
         Ok(())
     }
     /// Start one durable-prefix rewrite. The prepaid root charge covers the
@@ -1097,7 +1413,7 @@ impl ReferenceDirectoryWriter {
                                 ));
                             }
                             authority.history = root;
-                            drop(authority.pending.drain(..captured.len()));
+                            authority.drain_prefix(captured.len())?;
                         }
                         drop(history);
                         directory.retain_adopted(captured);
@@ -1161,7 +1477,7 @@ impl ReferenceDirectoryWriter {
         {
             let mut authority = self.directory.authority.write();
             authority.history = history.reader();
-            drop(authority.pending.drain(..captured.len()));
+            authority.drain_prefix(captured.len())?;
         }
         drop(history);
         self.directory.retain_adopted(captured);

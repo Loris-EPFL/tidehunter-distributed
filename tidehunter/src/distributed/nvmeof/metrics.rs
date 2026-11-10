@@ -2,7 +2,8 @@ use prometheus::core::{Collector, Desc};
 use prometheus::proto::{Counter, Gauge, Metric, MetricFamily, MetricType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -10,14 +11,6 @@ pub struct StageStats {
     pub count: u64,
     pub sum_ns: u64,
     pub max_ns: u64,
-}
-impl StageStats {
-    pub(crate) fn add(&mut self, elapsed: Duration) {
-        let n = elapsed.as_nanos().min(u64::MAX as u128) as u64;
-        self.count = self.count.saturating_add(1);
-        self.sum_ns = self.sum_ns.saturating_add(n);
-        self.max_ns = self.max_ns.max(n);
-    }
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct NvmeofStats {
@@ -46,8 +39,108 @@ pub struct NvmeofStats {
     pub submit_to_cq: StageStats,
     pub extraction: StageStats,
     pub verification: StageStats,
+    /// Time a coordinator thread waited for the dispatch lock. One observation
+    /// per contended acquisition; an uncontended `try_lock` records nothing.
+    #[serde(default)]
+    pub lock_wait: StageStats,
+    /// Time the dispatch lock was held, one observation per acquisition.
+    #[serde(default)]
+    pub lock_hold: StageStats,
+    /// Aligned reads (SQEs) admitted after same-block merging.
+    #[serde(default)]
+    pub admitted_sqes: u64,
+    /// Members that were served by another member's SQE (`members - sqes`).
+    #[serde(default)]
+    pub merged_members: u64,
+    /// Aligned buffers taken from the reader's pool.
+    #[serde(default)]
+    pub pool_hits: u64,
+    /// Aligned buffers allocated because the pool was empty or the size was
+    /// larger than the biggest pooled class.
+    #[serde(default)]
+    pub pool_misses: u64,
+    /// Buffers returned to the pool after their last slice dropped.
+    #[serde(default)]
+    pub pool_recycled: u64,
+    /// Buffers freed instead of returned because the class was full or the
+    /// size was unpooled.
+    #[serde(default)]
+    pub pool_discarded: u64,
 }
-pub(crate) type SharedStats = Arc<Mutex<NvmeofStats>>;
+
+/// Lock-free accumulator for [`StageStats`]; relaxed ordering because every
+/// field is an independent statistic and readers accept a non-atomic snapshot.
+#[derive(Default)]
+pub(crate) struct AtomicStage {
+    count: AtomicU64,
+    sum_ns: AtomicU64,
+    max_ns: AtomicU64,
+}
+impl AtomicStage {
+    pub(crate) fn add(&self, elapsed: Duration) {
+        let n = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_ns.fetch_add(n, Ordering::Relaxed);
+        self.max_ns.fetch_max(n, Ordering::Relaxed);
+    }
+    fn load(&self) -> StageStats {
+        StageStats {
+            count: self.count.load(Ordering::Relaxed),
+            sum_ns: self.sum_ns.load(Ordering::Relaxed),
+            max_ns: self.max_ns.load(Ordering::Relaxed),
+        }
+    }
+}
+
+// One atomic per statistic, so no thread ever takes a shared mutex to count.
+macro_rules! reader_stats {
+    (counters: [$($counter:ident),+ $(,)?], stages: [$($stage:ident),+ $(,)?]) => {
+        /// Per-reader statistics updated by atomics from any thread.
+        pub(crate) struct ReaderStats {
+            identity: NvmeofStats,
+            $(pub(crate) $counter: AtomicU64,)+
+            $(pub(crate) $stage: AtomicStage,)+
+        }
+        impl ReaderStats {
+            pub(crate) fn new(identity: NvmeofStats) -> Self {
+                Self {
+                    identity,
+                    $($counter: AtomicU64::new(0),)+
+                    $($stage: AtomicStage::default(),)+
+                }
+            }
+            /// Sequential relaxed loads; not a globally atomic cut.
+            pub(crate) fn snapshot(&self) -> NvmeofStats {
+                let mut stats = self.identity.clone();
+                $(stats.$counter = self.$counter.load(Ordering::Relaxed);)+
+                $(stats.$stage = self.$stage.load();)+
+                stats
+            }
+        }
+    };
+}
+reader_stats!(
+    counters: [
+        logical_requests,
+        logical_members,
+        eligible_hits,
+        ineligible_fallbacks,
+        aligned_requested_bytes,
+        aligned_read_bytes,
+        io_submissions,
+        io_completions,
+        io_errors,
+        io_timeouts,
+        admitted_sqes,
+        merged_members,
+        pool_hits,
+        pool_misses,
+        pool_recycled,
+        pool_discarded,
+    ],
+    stages: [alignment, admission, queue, submit_to_cq, extraction, verification, lock_wait, lock_hold]
+);
+pub(crate) type SharedStats = Arc<ReaderStats>;
 
 fn fields(s: &NvmeofStats) -> Vec<(&'static str, u64, bool)> {
     let mut v = vec![
@@ -65,6 +158,12 @@ fn fields(s: &NvmeofStats) -> Vec<(&'static str, u64, bool)> {
         ("io_completions_total", s.io_completions, false),
         ("io_errors_total", s.io_errors, false),
         ("io_timeouts_total", s.io_timeouts, false),
+        ("admitted_sqes_total", s.admitted_sqes, false),
+        ("merged_members_total", s.merged_members, false),
+        ("pool_hits_total", s.pool_hits, false),
+        ("pool_misses_total", s.pool_misses, false),
+        ("pool_recycled_total", s.pool_recycled, false),
+        ("pool_discarded_total", s.pool_discarded, false),
     ];
     for (name, stage) in [
         ("alignment", s.alignment),
@@ -73,6 +172,8 @@ fn fields(s: &NvmeofStats) -> Vec<(&'static str, u64, bool)> {
         ("submit_to_cq", s.submit_to_cq),
         ("extraction", s.extraction),
         ("verification", s.verification),
+        ("lock_wait", s.lock_wait),
+        ("lock_hold", s.lock_hold),
     ] {
         let names = match name {
             "alignment" => [
@@ -99,6 +200,16 @@ fn fields(s: &NvmeofStats) -> Vec<(&'static str, u64, bool)> {
                 "extraction_observations_total",
                 "extraction_seconds_total",
                 "extraction_max_seconds",
+            ],
+            "lock_wait" => [
+                "lock_wait_observations_total",
+                "lock_wait_seconds_total",
+                "lock_wait_max_seconds",
+            ],
+            "lock_hold" => [
+                "lock_hold_observations_total",
+                "lock_hold_seconds_total",
+                "lock_hold_max_seconds",
             ],
             _ => [
                 "verification_observations_total",
@@ -132,7 +243,7 @@ impl Collector for StatsCollector {
         let sources = self.sources.read().unwrap_or_else(|e| e.into_inner());
         let mut values = sources.retired.clone();
         for source in &sources.active {
-            let snapshot = source.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let snapshot = source.snapshot();
             for (target, (_, value, max)) in values.iter_mut().zip(fields(&snapshot)) {
                 target.1 = if max {
                     target.1.max(value)
@@ -195,8 +306,7 @@ impl NvmeofMetrics {
         Ok(Self { sources })
     }
     /// Replace the live reader set after installation or removal.
-    pub fn replace_sources(&self, readers: &[&super::NvmeofReader]) {
-        let next: Vec<_> = readers.iter().map(|reader| reader.stats.clone()).collect();
+    pub(crate) fn replace_sources(&self, next: Vec<SharedStats>) {
         let mut sources = self.sources.write().unwrap_or_else(|e| e.into_inner());
         let removed: Vec<_> = sources
             .active
@@ -205,7 +315,7 @@ impl NvmeofMetrics {
             .cloned()
             .collect();
         for source in removed {
-            let snapshot = source.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let snapshot = source.snapshot();
             for (target, (_, value, max)) in sources.retired.iter_mut().zip(fields(&snapshot)) {
                 target.1 = if max {
                     target.1.max(value)

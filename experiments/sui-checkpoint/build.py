@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -22,6 +23,15 @@ def digest(path):
 
 def save(path, value):
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+
+def staged_protocol(engine):
+    """Derive the wire identity from the exact engine frozen into the archive."""
+    source = (engine / 'tidehunter/src/distributed/tcp.rs').read_text()
+    versions = re.findall(r'(?m)^const PROTOCOL: u32 = ([0-9]+);$', source)
+    if len(versions) != 1 or not 1 <= int(versions[0]) <= 65535:
+        raise ValueError('staged engine must declare one literal wire protocol fitting the preface')
+    return int(versions[0])
 
 
 class OwnedProcess:
@@ -292,7 +302,7 @@ def prepare(args):
         archive.add(sources, arcname='sources')
     save(output / 'plan.json', {'schema': 1, 'source_archive_sha256': digest(output / 'sources.tar.gz'),
           'source_manifest_sha256': digest(output / 'source-manifest.json'), 'fabric': args.fabric,
-          'jobs': args.jobs, 'profile': 'release', 'protocol': 15,
+          'jobs': args.jobs, 'profile': 'release', 'protocol': staged_protocol(sources / 'tidehunter-sharded-wal'),
           'native_features': ['typed-store/tidehunter'], 'remote_features': ['sui-node/sharded-wal' + ('-fabric' if args.fabric else '')]})
     print(output / 'plan.json')
 

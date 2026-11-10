@@ -272,6 +272,10 @@ def build_config(base, job, state, output, seed, qualification, transport=None):
             raise ValueError("explicit transport provider/security differs from the selected research case")
     config["backend"] = {"kind": runtime_backend(kind),
                          "options": backend_options(kind, state, output, selected_transport)}
+    if kind == "native":
+        config["backend"]["options"].update(
+            durability="page_cache",
+            native_wal_geometry="small" if qualification else "native_default")
     config["seed"] = seed
     config["namespace"] = "local-" + uuid.uuid4().hex
     config["dataset"]["keys"] = job["profile"]["keys"]
@@ -458,6 +462,10 @@ def run_one(args, spec, base, job, index):
             returncode = supervise([str(args.binary), "--config", str(run_dir / "normalized-config.json"), "--output", str(result_dir)],
                                    log, run_dir / "client-resources.jsonl", cpus, spec.get("client_memory_mib", 2048),
                                    config["limits"]["deadline_seconds"], config["limits"]["shutdown_grace_seconds"], child_environment)
+        timeline = analyze.admit_write_timeline(
+            run_dir, config, completed=returncode == 0, expected_backend=job["backend"])
+        if timeline is not None:
+            receipt["write_timeline"] = timeline
         receipt["observation_after"] = observer_snapshot(args.observe)
         if receipt["observation_after"] != receipt["observation"]:
             raise RuntimeError("observer presence/health/resource identity changed during run; no matched observation contract")
@@ -486,7 +494,21 @@ def run_one(args, spec, base, job, index):
         receipt["error"] = str(exc)
         raise
     finally:
+        partial_error = None
+        if (run_dir / "result/write-timeline.json").is_file() and "write_timeline" not in receipt:
+            try:
+                admitted = json.loads((run_dir / "normalized-config.json").read_text())
+                timeline = analyze.admit_write_timeline(run_dir, admitted, completed=False,
+                                                        expected_backend=job["backend"])
+                if timeline is not None:
+                    receipt["write_timeline"] = timeline
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                receipt["status"] = "failed"
+                receipt["write_timeline_admission_error"] = str(exc)
+                partial_error = exc
         finalize_run(run_dir, state_dir, external, bool(args.reuse_state), receipt)
+        if partial_error is not None:
+            raise ValueError("partial write timeline admission failed") from partial_error
 
 
 def main():

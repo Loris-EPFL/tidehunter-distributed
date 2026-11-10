@@ -8,7 +8,7 @@
   "instance_types": ["g6.8xlarge", "g6.16xlarge", "g6e.8xlarge", "c6id.32xlarge"],
   "ttl_seconds": 10800,
   "export_reserve_seconds": 600,
-  "raw_export_max_gib": 32,
+  "raw_export_max_gib": 33,
   "fleet": {
     "server_cpus": 8,
     "server_memory_mib": 16384,
@@ -17,7 +17,7 @@
   },
   "cost_assumptions": {
     "retention_days": 30,
-    "result_gib": 32,
+    "result_gib": 33,
     "request_count": 200000,
     "reconciliation_seconds": 600
   }

@@ -21,6 +21,428 @@ fn put_key(key: u32, value: u8) -> Mutation {
 }
 
 #[test]
+fn control_monitor_waits_for_occupied_checkpoint_slot_and_stops_cleanly() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 70), vec![put(1)])
+        .unwrap();
+    let monitor = db.read_evidence_monitor();
+    let (entered, release) = fixture.nodes[0].pause_inventory();
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (reply, proof) = mpsc::sync_channel(1);
+    db.clients[0]
+        .send(Command::Checkpoint(db.epoch, db.epoch, 1, reply))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if db.clients[0].client.lock().checkpoint_control_pending() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            drop(release);
+            panic!("checkpoint control was not submitted");
+        }
+        thread::yield_now();
+    }
+    let (called, called_rx) = mpsc::sync_channel(1);
+    let (done, completed) = mpsc::sync_channel(1);
+    db.clients[0]
+        .send(Command::Control(Box::new(move |client| {
+            let _ = called.send(());
+            let _ = done.send(client.read_io_stats());
+        })))
+        .unwrap();
+    assert!(called_rx.try_recv().is_err());
+    let monitoring = ReadEvidenceMonitor {
+        clients: monitor.clients.clone(),
+        reads: monitor.reads.clone(),
+    };
+    let (begun, starting) = mpsc::sync_channel(1);
+    let (finished, result) = mpsc::sync_channel(1);
+    let sampler = thread::spawn(move || {
+        let _ = begun.send(());
+        let _ = finished.send(monitoring.sample_owner_read_io());
+    });
+    starting.recv_timeout(Duration::from_secs(5)).unwrap();
+    let early = result.recv_timeout(Duration::from_millis(100));
+    release.send(()).unwrap();
+    let checkpoint = proof.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+    assert_eq!(checkpoint.prefix, 1);
+    called_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    completed
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    let sampled = match early {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            result.recv_timeout(Duration::from_secs(5)).unwrap()
+        }
+        Err(error) => panic!("monitor disconnected: {error}"),
+    };
+    sampler.join().unwrap();
+    assert_eq!(sampled.unwrap().len(), 5);
+    assert_eq!(monitor.sample_owner_read_io().unwrap().len(), 5);
+    db.shutdown().unwrap();
+    assert!(monitor.sample_owner_read_io().is_err());
+}
+
+#[test]
+fn public_diagnostic_controls_wait_for_checkpoint_without_consuming_proof() {
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    let cases = 4;
+    #[cfg(not(all(target_os = "linux", feature = "test-utils")))]
+    let cases = 2;
+    for case in 0..cases {
+        let fixture = Fixture::new();
+        let mut db = fixture.open();
+        db.write_batch(fixture.operation(0, 73), vec![put(1)])
+            .unwrap();
+        let receipt = *db.known.values().next().unwrap();
+        let expected = super::super::tcp::checkpoint::prefix_digest(
+            db.config.storage.database,
+            0,
+            db.epoch,
+            std::iter::once(receipt.into()),
+        );
+        let (entered, release) = fixture.nodes[0].pause_inventory();
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (reply, proof) = mpsc::sync_channel(1);
+        db.clients[0]
+            .send(Command::Checkpoint(db.epoch, db.epoch, 1, reply))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !db.clients[0].client.lock().checkpoint_control_pending() {
+            if Instant::now() >= deadline {
+                drop(release);
+                panic!("checkpoint control was not submitted");
+            }
+            thread::yield_now();
+        }
+        let (started, starting) = mpsc::sync_channel(1);
+        let (finished, result) = mpsc::sync_channel(1);
+        let owner = thread::spawn(move || {
+            let _ = started.send(());
+            let outcome = match case {
+                0 => db.read_io_stats().map(|_| ()),
+                1 => db.connection_profiles(true, true).map(|_| ()),
+                #[cfg(all(target_os = "linux", feature = "test-utils"))]
+                2 => db.read_evidence_for_benchmark(false).map(|_| ()),
+                #[cfg(all(target_os = "linux", feature = "test-utils"))]
+                3 => db.process_resources_for_benchmark().map(|_| ()),
+                _ => unreachable!(),
+            };
+            let _ = finished.send((db, outcome));
+        });
+        starting.recv_timeout(Duration::from_secs(5)).unwrap();
+        let early = result.recv_timeout(Duration::from_millis(100));
+        release.send(()).unwrap();
+        let proof = proof.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        assert_eq!(proof.prefix, 1);
+        assert_eq!(proof.digest, expected);
+        let completed = match early {
+            Ok(result) => Ok(result),
+            Err(mpsc::RecvTimeoutError::Timeout) => result.recv_timeout(Duration::from_secs(5)),
+            Err(error) => Err(error),
+        };
+        let (mut db, outcome) = match completed {
+            Ok(result) => result,
+            Err(error) => {
+                std::mem::forget(fixture);
+                panic!("diagnostic control did not complete: {error}");
+            }
+        };
+        owner.join().unwrap();
+        outcome.unwrap();
+        if case == 1 {
+            db.connection_profiles(false, false).unwrap();
+        }
+        db.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn nonpipelined_write_behind_pending_checkpoint_is_durable_and_recoverable() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    db.config.pipelined_writes = false;
+    db.write_batch(fixture.operation(0, 74), vec![put(1)])
+        .unwrap();
+    let (entered, release) = fixture.nodes[0].pause_inventory();
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    db.start_checkpoint().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !db.clients[0].client.lock().checkpoint_control_pending() {
+        if Instant::now() >= deadline {
+            drop(release);
+            panic!("checkpoint control was not submitted");
+        }
+        thread::yield_now();
+    }
+    let operation = fixture.operation(0, 75);
+    let (started, starting) = mpsc::sync_channel(1);
+    let (finished, result) = mpsc::sync_channel(1);
+    let owner = thread::spawn(move || {
+        let _ = started.send(());
+        let outcome = db.write_batch(operation, vec![put(2)]);
+        let _ = finished.send((db, outcome));
+    });
+    starting.recv_timeout(Duration::from_secs(5)).unwrap();
+    release.send(()).unwrap();
+    let (mut db, outcome) = match result.recv_timeout(Duration::from_secs(5)) {
+        Ok(result) => result,
+        Err(error) => {
+            std::mem::forget(fixture);
+            panic!("nonpipelined write did not complete: {error}");
+        }
+    };
+    owner.join().unwrap();
+    let version = outcome.unwrap();
+    db.flush_index().unwrap();
+    db.shutdown().unwrap();
+    drop(db);
+    let mut reopened = fixture.open();
+    assert_eq!(
+        reopened.write_batch(operation, vec![put(2)]).unwrap(),
+        version
+    );
+    assert_eq!(
+        reopened
+            .get(KeySpace(0), &1u32.to_be_bytes())
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        &[2; 32]
+    );
+    reopened.shutdown().unwrap();
+}
+
+#[cfg(all(target_os = "linux", feature = "test-utils"))]
+#[test]
+fn concurrent_eviction_waits_for_pending_checkpoint_control() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 76), vec![put(1)])
+        .unwrap();
+    let (entered, release) = fixture.nodes[0].pause_inventory();
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (reply, proof) = mpsc::sync_channel(1);
+    db.clients[0]
+        .send(Command::Checkpoint(db.epoch, db.epoch, 1, reply))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !db.clients[0].client.lock().checkpoint_control_pending() {
+        if Instant::now() >= deadline {
+            drop(release);
+            panic!("checkpoint control was not submitted");
+        }
+        thread::yield_now();
+    }
+    let db = ConcurrentRemoteDatabase::new(db).unwrap();
+    let (started, starting) = mpsc::sync_channel(1);
+    let (finished, result) = mpsc::sync_channel(1);
+    let owner = thread::spawn(move || {
+        let _ = started.send(());
+        let outcome = db.evict_mapped_wal_for_benchmark();
+        let _ = finished.send((db, outcome));
+    });
+    starting.recv_timeout(Duration::from_secs(5)).unwrap();
+    let early = result.recv_timeout(Duration::from_millis(100));
+    release.send(()).unwrap();
+    assert_eq!(
+        proof
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
+            .prefix,
+        1
+    );
+    let completed = match early {
+        Ok(result) => Ok(result),
+        Err(mpsc::RecvTimeoutError::Timeout) => result.recv_timeout(Duration::from_secs(5)),
+        Err(error) => Err(error),
+    };
+    let (db, outcome) = match completed {
+        Ok(result) => result,
+        Err(error) => {
+            std::mem::forget(fixture);
+            panic!("concurrent eviction did not complete: {error}");
+        }
+    };
+    owner.join().unwrap();
+    assert_eq!(outcome.unwrap().len(), 5);
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn scalar_write_uses_worker_while_checkpoint_awaits_verification() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 71), vec![put(1)])
+        .unwrap();
+    let before = db.pipeline_stats.direct_appends;
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (resume, gate) = mpsc::sync_channel(1);
+    db.checkpoint_prefix_pause = Some((entered, gate));
+    db.start_checkpoint().unwrap();
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    let operation = fixture.operation(0, 72);
+    let (finished, result) = mpsc::sync_channel(1);
+    let owner = thread::spawn(move || {
+        let outcome = db.write_batch(operation, vec![put(2)]);
+        let direct_appends = db.pipeline_stats.direct_appends;
+        let _ = finished.send((db, outcome, direct_appends));
+    });
+    let before_resume = result.recv_timeout(Duration::from_secs(5));
+    let _ = resume.send(());
+    let (mut db, outcome, direct_appends) = match before_resume {
+        Ok(result) => result,
+        Err(error) => {
+            std::mem::forget(fixture);
+            panic!("scalar write did not finish before checkpoint verification: {error}");
+        }
+    };
+    owner.join().unwrap();
+    let version = outcome.unwrap();
+    assert_eq!(direct_appends, before);
+    db.shutdown().unwrap();
+    drop(db);
+    let mut reopened = fixture.open();
+    assert_eq!(
+        reopened.write_batch(operation, vec![put(2)]).unwrap(),
+        version
+    );
+    reopened.shutdown().unwrap();
+}
+
+#[test]
+fn cancelled_checkpoint_reply_drains_before_worker_shutdown() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 51), vec![put(1)])
+        .unwrap();
+    let (reply, cancelled) = mpsc::sync_channel(1);
+    db.clients[0]
+        .send(Command::Checkpoint(db.epoch, db.epoch, 1, reply))
+        .unwrap();
+    drop(cancelled);
+    let operation = fixture.operation(0, 52);
+    let version = db.write_batch(operation, vec![put(2)]).unwrap();
+    db.shutdown().unwrap();
+    drop(db);
+    let mut reopened = fixture.open();
+    assert_eq!(
+        reopened.write_batch(operation, vec![put(2)]).unwrap(),
+        version
+    );
+    reopened.shutdown().unwrap();
+}
+
+#[test]
+fn failed_shutdown_joins_checkpoint_before_worker_senders() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 54), vec![put(1)])
+        .unwrap();
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (resume, gate) = mpsc::sync_channel(1);
+    db.checkpoint_prefix_pause = Some((entered, gate));
+    db.start_checkpoint().unwrap();
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    db.concurrent_failure
+        .store(true, std::sync::atomic::Ordering::Release);
+    let (finished, result) = mpsc::sync_channel(1);
+    let owner = thread::spawn(move || {
+        let result = db.shutdown();
+        let _ = finished.send(result);
+    });
+    let _ = resume.send(());
+    let shutdown = match result.recv_timeout(Duration::from_secs(5)) {
+        Ok(result) => result,
+        Err(error) => {
+            // A stuck owner may still hold node connections. Do not join it or
+            // block fixture teardown on the very deadlock this test detects.
+            std::mem::forget(fixture);
+            panic!("checkpoint shutdown did not complete: {error}");
+        }
+    };
+    owner.join().unwrap();
+    assert!(shutdown.is_err());
+}
+
+#[test]
+fn checkpoint_rejects_mismatched_captured_prefix_digest_before_adoption() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    let operation = fixture.operation(0, 55);
+    let version = db.write_batch(operation, vec![put(1)]).unwrap();
+    let previous = db
+        .manifest
+        .checkpoint
+        .as_ref()
+        .map(|checkpoint| (checkpoint.epoch, checkpoint.generation));
+    db.corrupt_checkpoint_proof = true;
+    db.start_checkpoint().unwrap();
+    let error = db.progress_checkpoint(true).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("checkpoint prefix differs from published receipts")
+    );
+    assert_eq!(
+        db.manifest
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| (checkpoint.epoch, checkpoint.generation)),
+        previous
+    );
+    assert!(db.shutdown().is_err());
+    drop(db);
+    let mut reopened = fixture.open();
+    assert_eq!(
+        reopened.write_batch(operation, vec![put(1)]).unwrap(),
+        version
+    );
+    reopened.shutdown().unwrap();
+}
+
+#[test]
+fn invalid_checkpoint_prefix_fails_without_adoption() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    db.write_batch(fixture.operation(0, 53), vec![put(1)])
+        .unwrap();
+    let previous = db
+        .manifest
+        .checkpoint
+        .as_ref()
+        .map(|checkpoint| (checkpoint.epoch, checkpoint.generation));
+    let (reply, pending) = mpsc::sync_channel(1);
+    db.clients[0]
+        .send(Command::Checkpoint(db.epoch, db.epoch, usize::MAX, reply))
+        .unwrap();
+    assert!(
+        pending
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_err()
+    );
+    assert!(
+        db.concurrent_failure
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+    assert_eq!(
+        db.manifest
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| (checkpoint.epoch, checkpoint.generation)),
+        previous
+    );
+    assert!(db.shutdown().is_err());
+}
+
+#[test]
 fn checkpoint_over_gap_and_lost_response_replay_sparse_ack_and_retry_identity() {
     let fixture = Fixture::new();
     let mut db = fixture.open();
@@ -35,6 +457,7 @@ fn checkpoint_over_gap_and_lost_response_replay_sparse_ack_and_retry_identity() 
     db.submit(fixture.operation(1, 33), vec![put_key(3, 4)])
         .unwrap();
     let group = db.inflight[1].pop_front().unwrap();
+    db.inflight_bytes[1] -= group.charge;
     let receipts = group
         .reply
         .recv_timeout(Duration::from_secs(5))
@@ -101,6 +524,7 @@ fn sparse_ack_survives_crash_when_earlier_disjoint_batch_never_reached_wal() {
     db.submit(fixture.operation(1, 42), vec![put_key(3, 3)])
         .unwrap();
     let group = db.inflight[1].pop_front().unwrap();
+    db.inflight_bytes[1] -= group.charge;
     let receipts = group
         .reply
         .recv_timeout(Duration::from_secs(5))
@@ -154,7 +578,7 @@ fn sparse_ack_survives_crash_when_earlier_disjoint_batch_never_reached_wal() {
 
 #[test]
 fn acknowledged_suffix_survives_every_background_checkpoint_adoption_stage() {
-    for stage in 0..=4 {
+    for stage in 0..=8 {
         let fixture = Fixture::new();
         let mut db = fixture.open();
         let first = fixture.operation(0, 1);
@@ -360,7 +784,7 @@ fn index_pressure_waits_for_existing_capture_before_rejecting_live_residency() {
         .unwrap()
         .checked_add(1)
         .unwrap();
-    assert!(db.index.read().check_capacity(additional_bytes).is_err());
+    assert!(db.index.check_capacity(additional_bytes).is_err());
 
     let (entered, waiting) = mpsc::sync_channel(1);
     let (resume, gate) = mpsc::sync_channel(1);
@@ -376,7 +800,7 @@ fn index_pressure_waits_for_existing_capture_before_rejecting_live_residency() {
 
     assert_eq!(db.snapshot_generation, generation);
     assert!(db.background_checkpoint.is_none());
-    db.index.read().check_capacity(additional_bytes).unwrap();
+    db.index.check_capacity(additional_bytes).unwrap();
 }
 
 #[test]
@@ -516,7 +940,7 @@ fn remaining_index_pressure_requires_one_new_capture_after_the_existing_cut() {
         fixture.config.storage.batch_limits,
     )
     .unwrap();
-    let additional_bytes = db.index.read().estimated_batch_bytes(&incoming).unwrap();
+    let additional_bytes = db.index.estimated_batch_bytes(&incoming).unwrap();
     db.shutdown().unwrap();
     drop(db);
     fixture.config.max_index_bytes = resident_directory.checked_add(additional_bytes).unwrap();
@@ -537,7 +961,7 @@ fn remaining_index_pressure_requires_one_new_capture_after_the_existing_cut() {
     db.ensure_admission_pressure(pressure).unwrap();
     assert_eq!(db.snapshot_generation, generation + 1);
     assert!(db.background_checkpoint.is_none());
-    db.index.read().check_capacity(additional_bytes).unwrap();
+    db.index.check_capacity(additional_bytes).unwrap();
     assert_eq!(
         db.get(KeySpace(0), &1u32.to_be_bytes())
             .unwrap()

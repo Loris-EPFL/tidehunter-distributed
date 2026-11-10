@@ -15,6 +15,7 @@ use super::remote_db::{
     ConcurrentRemoteDatabase, PendingScanPage, RemoteDatabase, RemoteDatabaseConfig,
 };
 use super::types::{BatchVersion, MutationVersion, ValueRecordReference};
+use super::write_timeline::{WriteTimelineExport, WriteTimelineSample, WriteTimelineStage};
 use crate::config::Config;
 use crate::db::{Db as NativeDb, DbError};
 use crate::key_shape::{KeyShape, KeySpace};
@@ -26,6 +27,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
+
+pub(crate) mod kv_capture;
 
 pub type Result<T, E = DbError> = std::result::Result<T, E>;
 fn error(e: impl std::fmt::Display) -> DbError {
@@ -113,6 +116,41 @@ macro_rules! visit_stages {
     };
 }
 
+fn visit_checkpoint_profile(
+    set: &mut impl FnMut(&'static str, u64),
+    profile: &super::remote_db::WriteProfileSnapshot,
+) {
+    let enabled = profile.limit_per_connection != 0;
+    set("write_profile_checkpoint_available", u64::from(enabled));
+    if !enabled {
+        return;
+    }
+    for (name, value) in [
+        (
+            "write_profile_checkpoint_requests",
+            profile.checkpoint_requests,
+        ),
+        (
+            "write_profile_checkpoint_completed",
+            profile.checkpoint_completed,
+        ),
+        (
+            "write_profile_checkpoint_wait_ns",
+            profile.checkpoint_wait_ns,
+        ),
+        (
+            "write_profile_checkpoint_append_completions",
+            profile.checkpoint_append_completions,
+        ),
+        (
+            "write_profile_checkpoint_admission_stalls",
+            profile.checkpoint_admission_stalls,
+        ),
+    ] {
+        set(name, value);
+    }
+}
+
 #[derive(Default)]
 struct NativeWriteProfile {
     limit: AtomicU64,
@@ -148,7 +186,7 @@ impl NativeWriteProfile {
     }
 }
 
-fn visit_write_connection_profile(
+pub(crate) fn visit_write_connection_profile(
     set: &mut impl FnMut(&'static str, u64),
     profile: super::tcp::ConnectionProfile,
 ) {
@@ -287,6 +325,15 @@ fn visit_write_connection_profile(
         cq_poll_gap_samples,
         cq_poll_gap_max_ns,
     );
+    if profile.client_transport.cq_timed_calls != 0 {
+        fields!(
+            "write_profile_client_transport_",
+            profile.client_transport;
+            tx_all_slots_pending_polls,
+            rx_no_posted_slots_polls,
+            rx_unread_slots_polls,
+        );
+    }
     work!(
         "write_profile_client_transport_frame_encode_",
         profile.client_transport.frame_encode
@@ -371,6 +418,15 @@ fn visit_write_connection_profile(
         cq_poll_gap_samples,
         cq_poll_gap_max_ns,
     );
+    if profile.transport.cq_timed_calls != 0 {
+        fields!(
+            "write_profile_transport_",
+            profile.transport;
+            tx_all_slots_pending_polls,
+            rx_no_posted_slots_polls,
+            rx_unread_slots_polls,
+        );
+    }
     work!(
         "write_profile_transport_frame_encode_",
         profile.transport.frame_encode
@@ -426,6 +482,11 @@ fn visit_write_connection_profile(
         append_total_ns,
         append_state_lock_wait_ns,
         append_validation_ns,
+        append_basic_validation_ns,
+        append_conflict_lookup_ns,
+        append_geometry_capacity_ns,
+        append_metadata_reservation_ns,
+        append_descriptor_preparation_ns,
         append_history_ns,
         append_wal_ns,
         append_publication_ns,
@@ -457,6 +518,7 @@ fn visit_write_connection_profile(
 pub struct Db {
     backend: Backend,
     shape: KeyShape,
+    capture_id: u64,
     writes: RwLock<()>,
     write_gate_wait: Stage,
     durable_native: AtomicBool,
@@ -577,6 +639,30 @@ impl Db {
         }
     }
 
+    /// Live payload counters and verified namespace evidence, not configuration
+    /// intent. Returns `None` when this database does not use live NVMe-oF.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub fn live_nvmeof_stats(&self) -> Option<super::nvmeof::live_metrics::LiveNvmeStats> {
+        match &self.backend {
+            Backend::Remote(remote) => remote.db.live_nvmeof_stats(),
+            Backend::Native(_) => None,
+        }
+    }
+
+    /// Final benchmark/owner teardown. Unlike ordinary close this destroys the
+    /// live target's exported namespaces and is not a reopen operation.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub fn shutdown_live_target_final(
+        self: Arc<Self>,
+    ) -> Result<super::remote_db::LiveFinalShutdownEvidence> {
+        let database = Arc::try_unwrap(self)
+            .map_err(|_| error("Sui database still has live owners during final shutdown"))?;
+        match database.backend {
+            Backend::Remote(remote) => remote.db.shutdown_live_target_final().map_err(error),
+            Backend::Native(_) => Err(error("final live shutdown requires a live remote backend")),
+        }
+    }
+
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     pub fn register_nvmeof_metrics(&self, registry: &prometheus::Registry) -> Result<()> {
         match &self.backend {
@@ -602,7 +688,8 @@ impl Db {
     ) -> Result<Arc<Self>> {
         let db = NativeDb::open(path, shape, config, metrics)?;
         let shape = NativeDb::load_key_shape(path)?;
-        Ok(Self::new(Backend::Native(db), shape))
+        let capture_id = kv_capture::open(path, &shape, None).map_err(error)?;
+        Ok(Self::new(Backend::Native(db), shape, capture_id))
     }
     pub fn open_remote(
         path: &Path,
@@ -612,6 +699,8 @@ impl Db {
         let timeout = config.timeout;
         let batch_limits = config.storage.batch_limits;
         let metrics = Metrics::new_in_enabled(&prometheus::Registry::new(), false);
+        let capture_id =
+            kv_capture::open(path, &shape, Some(&config.storage.database)).map_err(error)?;
         let mut db = RemoteDatabase::open(path, &shape, config, metrics).map_err(error)?;
         db.configure_sui_read_cache();
         let epoch = db.epoch();
@@ -633,12 +722,14 @@ impl Db {
                 profile,
             }),
             shape,
+            capture_id,
         ))
     }
-    fn new(backend: Backend, shape: KeyShape) -> Arc<Self> {
+    fn new(backend: Backend, shape: KeyShape, capture_id: u64) -> Arc<Self> {
         Arc::new(Self {
             backend,
             shape,
+            capture_id,
             writes: RwLock::new(()),
             write_gate_wait: Stage::default(),
             durable_native: AtomicBool::new(false),
@@ -697,12 +788,64 @@ impl Db {
         }
         Ok(())
     }
+    /// Arm request-linked coordinator diagnostics at a quiescent benchmark boundary.
+    pub fn arm_write_timeline(&self, limit: usize) -> Result<()> {
+        let _gate = self.write_gate();
+        match &self.backend {
+            Backend::Remote(remote) => remote.db.arm_write_timeline(limit).map_err(error),
+            Backend::Native(_) => Err(error("write timeline requires a remote backend")),
+        }
+    }
+
+    /// Export after foreground measurement; incomplete records remain explicit.
+    pub fn finish_write_timeline(&self) -> Result<WriteTimelineExport> {
+        let _gate = self.write_gate();
+        match &self.backend {
+            Backend::Remote(remote) => remote.db.finish_write_timeline().map_err(error),
+            Backend::Native(_) => Err(error("write timeline requires a remote backend")),
+        }
+    }
+    /// Finish diagnostics before an absolute monotonic deadline.
+    pub fn finish_write_timeline_until(&self, deadline: Instant) -> Result<WriteTimelineExport> {
+        let Backend::Remote(remote) = &self.backend else {
+            return Err(error("write timeline requires a remote backend"));
+        };
+        let Some(_gate) = self.writes.try_write_until(deadline) else {
+            remote.db.write_timeline.abort();
+            return Err(error(
+                "write timeline gate deadline expired; owner disarm may be incomplete",
+            ));
+        };
+        remote
+            .db
+            .finish_write_timeline_until(deadline)
+            .map_err(error)
+    }
+
     /// Set before serving; zero disables extra actor/protocol diagnostic clocks.
     pub fn set_read_profile_limit(&self, limit: u64) {
         if let Backend::Remote(remote) = &self.backend {
             remote.db.set_read_profile_limit(limit);
         }
     }
+    /// Snapshot best-effort caller-local traces; aggregate samples remain independent.
+    pub fn read_trace_snapshot(&self) -> Option<super::remote_db::ReadTraceSnapshot> {
+        match &self.backend {
+            Backend::Remote(remote) => Some(remote.db.read_trace_snapshot()),
+            Backend::Native(_) => None,
+        }
+    }
+    /// Provider setup evidence from owner-monitor connections, not all lanes.
+    #[cfg(feature = "experimental-fabric")]
+    pub fn fabric_provider_evidence(
+        &self,
+    ) -> Option<Vec<super::remote_db::FabricProviderEvidence>> {
+        match &self.backend {
+            Backend::Remote(remote) => Some(remote.db.fabric_provider_evidence()),
+            Backend::Native(_) => None,
+        }
+    }
+
     /// Snapshot sampled owner spans by configured partition without network I/O.
     /// Native backends have no remote owner partitions.
     pub fn visit_read_profile_partitions(&self, mut set: impl FnMut(u32, &'static str, u64)) {
@@ -876,6 +1019,8 @@ impl Db {
                     index_persist_count,
                     metadata_install_ns,
                     metadata_install_count,
+                    root_adoption_ns,
+                    root_adoption_count,
                     owner_adoption_ns,
                     owner_adoption_count,
                     obsolete_cleanup_ns,
@@ -917,6 +1062,14 @@ impl Db {
                 set(
                     "write_foreground_checkpoint_count",
                     authority.foreground_checkpoint_count,
+                );
+                set(
+                    "write_concurrent_checkpoint_deferrals",
+                    authority.concurrent_checkpoint_deferrals,
+                );
+                set(
+                    "write_concurrent_checkpoint_wait_ns",
+                    authority.concurrent_checkpoint_wait_ns,
                 );
                 set(
                     "write_background_checkpoint_suffix_batches",
@@ -982,6 +1135,7 @@ impl Db {
                 set("cache_admitted_bytes", cache.admitted_bytes);
                 set("cache_entries", cache.entries as u64);
                 let write_profile = snapshot.write_profile;
+                visit_checkpoint_profile(&mut set, &write_profile);
                 set(
                     "write_profile_limit",
                     write_profile.limit_per_connection as u64,
@@ -1164,6 +1318,8 @@ impl Db {
                     index_persist_count,
                     metadata_install_ns,
                     metadata_install_count,
+                    root_adoption_ns,
+                    root_adoption_count,
                     owner_adoption_ns,
                     owner_adoption_count,
                     obsolete_cleanup_ns,
@@ -1205,6 +1361,14 @@ impl Db {
                 set(
                     "write_foreground_checkpoint_count",
                     authority.foreground_checkpoint_count,
+                );
+                set(
+                    "write_concurrent_checkpoint_deferrals",
+                    authority.concurrent_checkpoint_deferrals,
+                );
+                set(
+                    "write_concurrent_checkpoint_wait_ns",
+                    authority.concurrent_checkpoint_wait_ns,
                 );
                 set(
                     "write_background_checkpoint_suffix_batches",
@@ -1270,6 +1434,7 @@ impl Db {
                 set("cache_admitted_bytes", cache.admitted_bytes);
                 set("cache_entries", cache.entries as u64);
                 let write_profile = snapshot.write_profile;
+                visit_checkpoint_profile(&mut set, &write_profile);
                 set(
                     "write_profile_limit",
                     write_profile.limit_per_connection as u64,
@@ -1325,6 +1490,10 @@ impl Db {
             Backend::Native(_) => panic!("test requires the remote backend"),
         }
     }
+    #[cfg(test)]
+    pub(crate) fn shared_write_gate_for_test(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
+        self.writes.read()
+    }
     pub fn shape(&self) -> &KeyShape {
         &self.shape
     }
@@ -1354,6 +1523,12 @@ impl Db {
         }
     }
     pub fn get(&self, ks: KeySpace, key: &[u8]) -> Result<Option<Bytes>> {
+        if let Some(call) = kv_capture::Call::begin(self.capture_id, ks, kv_capture::GET, 1) {
+            let result = self.get(ks, key);
+            kv_capture::read(&call, ks, key, &result, 0);
+            call.finish(result.is_ok());
+            return result;
+        }
         self.read_calls.fetch_add(1, Ordering::Relaxed);
         self.read_keys.fetch_add(1, Ordering::Relaxed);
         match &self.backend {
@@ -1365,7 +1540,31 @@ impl Db {
                 }),
         }
     }
+    pub fn traced_get(&self, ks: KeySpace, key: &[u8], caller_id: u64) -> Result<Option<Bytes>> {
+        if let Some(call) = kv_capture::Call::begin(self.capture_id, ks, kv_capture::GET, 1) {
+            let result = self.traced_get(ks, key, caller_id);
+            kv_capture::read(&call, ks, key, &result, 0);
+            call.finish(result.is_ok());
+            return result;
+        }
+        self.read_calls.fetch_add(1, Ordering::Relaxed);
+        self.read_keys.fetch_add(1, Ordering::Relaxed);
+        match &self.backend {
+            Backend::Native(db) => db.get(ks, key),
+            Backend::Remote(remote) => remote
+                .scalar_read
+                .run_if(remote.db.read_profile_enabled(), || {
+                    remote.db.traced_get(ks, key, caller_id).map_err(error)
+                }),
+        }
+    }
     pub fn exists(&self, ks: KeySpace, key: &[u8]) -> Result<bool> {
+        if let Some(call) = kv_capture::Call::begin(self.capture_id, ks, kv_capture::EXISTS, 1) {
+            let result = self.exists(ks, key);
+            kv_capture::exists(&call, ks, key, &result, 0);
+            call.finish(result.is_ok());
+            return result;
+        }
         match &self.backend {
             Backend::Native(db) => {
                 self.read_calls.fetch_add(1, Ordering::Relaxed);
@@ -1389,20 +1588,58 @@ impl Db {
         ks: KeySpace,
         keys: &[K],
     ) -> Vec<Result<Option<Bytes>>> {
+        self.multi_get_inner(ks, keys, None)
+    }
+
+    pub fn traced_multi_get<K: AsRef<[u8]>>(
+        &self,
+        ks: KeySpace,
+        keys: &[K],
+        caller_id: u64,
+    ) -> Vec<Result<Option<Bytes>>> {
+        self.multi_get_inner(ks, keys, Some(caller_id))
+    }
+
+    fn multi_get_inner<K: AsRef<[u8]>>(
+        &self,
+        ks: KeySpace,
+        keys: &[K],
+        caller_id: Option<u64>,
+    ) -> Vec<Result<Option<Bytes>>> {
+        if let Some(call) =
+            kv_capture::Call::begin(self.capture_id, ks, kv_capture::MULTI_GET, keys.len())
+        {
+            let result = self.multi_get_inner(ks, keys, caller_id);
+            for (position, (key, value)) in keys.iter().zip(&result).enumerate() {
+                kv_capture::read(&call, ks, key.as_ref(), value, position);
+            }
+            call.finish(result.iter().all(Result::is_ok));
+            return result;
+        }
         self.read_calls.fetch_add(1, Ordering::Relaxed);
         self.read_keys
             .fetch_add(keys.len() as u64, Ordering::Relaxed);
-        if keys.is_empty() {
-            return Vec::new();
-        }
         let Backend::Remote(remote) = &self.backend else {
             let db = self.native().expect("native backend");
             return keys.iter().map(|key| db.get(ks, key.as_ref())).collect();
         };
+        let trace = caller_id.and_then(|id| remote.db.begin_read_trace(id, keys.len()));
+        if keys.is_empty() {
+            if let Some(trace) = trace {
+                trace.event("api_finished");
+                trace.finish(true);
+            }
+            return Vec::new();
+        }
         let (cut, _pin) = if keys.len() > 256 {
             match remote.db.protected_published_cut() {
                 Ok((cut, pin)) => (cut, Some(pin)),
-                Err(e) => return keys.iter().map(|_| Err(error(&e))).collect(),
+                Err(e) => {
+                    if let Some(trace) = trace {
+                        trace.finish(false);
+                    }
+                    return keys.iter().map(|_| Err(error(&e))).collect();
+                }
             }
         } else {
             // One bounded window resolves under one index guard and pins only
@@ -1410,18 +1647,37 @@ impl Db {
             (IndexReadCut::Latest, None)
         };
         let mut output = Vec::with_capacity(keys.len());
-        for chunk in keys.chunks(256) {
-            match remote
-                .bulk_read
-                .run(|| remote.db.get_many_cut(ks, chunk, cut.clone()))
-            {
+        for (window, chunk) in keys.chunks(256).enumerate() {
+            match remote.bulk_read.run(|| {
+                if let Some(trace) = trace.as_ref() {
+                    remote
+                        .db
+                        .traced_get_many_cut(ks, chunk, cut.clone(), Some(trace), window * 256)
+                } else {
+                    remote.db.get_many_cut(ks, chunk, cut.clone())
+                }
+            }) {
                 Ok(values) => output.extend(values.into_iter().map(|value| value.map_err(error))),
                 Err(e) => output.extend(chunk.iter().map(|_| Err(error(&e)))),
             }
         }
+        if let Some(trace) = trace {
+            trace.event("api_finished");
+            trace.finish(output.iter().all(Result::is_ok));
+        }
         output
     }
     pub fn multi_exists(&self, ks: KeySpace, keys: &[Vec<u8>]) -> Vec<Result<bool>> {
+        if let Some(call) =
+            kv_capture::Call::begin(self.capture_id, ks, kv_capture::MULTI_EXISTS, keys.len())
+        {
+            let result = self.multi_exists(ks, keys);
+            for (position, (key, value)) in keys.iter().zip(&result).enumerate() {
+                kv_capture::exists(&call, ks, key, value, position);
+            }
+            call.finish(result.iter().all(Result::is_ok));
+            return result;
+        }
         if self.native().is_none() && self.shape.ks(ks).need_check_index_key() {
             return self
                 .multi_get(ks, keys)
@@ -1459,6 +1715,14 @@ impl Db {
         key: impl Into<Bytes>,
         value: impl Into<Bytes>,
     ) -> Result<()> {
+        if let Some(call) = kv_capture::Call::begin(self.capture_id, ks, kv_capture::PUT, 1) {
+            let key = key.into();
+            let value = value.into();
+            call.member(ks, &key, Some(&value), 1, 0);
+            let result = self.insert(ks, key, value);
+            call.finish(result.is_ok());
+            return result;
+        }
         if let Backend::Native(db) = &self.backend {
             let _guard = self
                 .durable_native
@@ -1472,6 +1736,13 @@ impl Db {
         batch.commit()
     }
     pub fn remove(self: &Arc<Self>, ks: KeySpace, key: impl Into<Bytes>) -> Result<()> {
+        if let Some(call) = kv_capture::Call::begin(self.capture_id, ks, kv_capture::DELETE, 1) {
+            let key = key.into();
+            call.member(ks, &key, None, 1, 0);
+            let result = self.remove(ks, key);
+            call.finish(result.is_ok());
+            return result;
+        }
         if let Backend::Native(db) = &self.backend {
             let _guard = self
                 .durable_native
@@ -1502,7 +1773,11 @@ impl Db {
         }
         Ok(())
     }
-    fn commit_remote(&self, mutations: Vec<Mutation>) -> Result<()> {
+    fn commit_remote(
+        &self,
+        mutations: Vec<Mutation>,
+        sample: Option<WriteTimelineSample>,
+    ) -> Result<()> {
         let Backend::Remote(remote) = &self.backend else {
             return Err(error("not a remote database"));
         };
@@ -1513,10 +1788,13 @@ impl Db {
         let mut operation = [0u8; 16];
         operation[..8].copy_from_slice(&remote.epoch.to_le_bytes());
         operation[8..].copy_from_slice(&sequence.to_le_bytes());
+        if let Some(sample) = sample {
+            remote.db.write_timeline.operation(sample, operation);
+        }
         remote.write_commit.run(|| {
             remote
                 .db
-                .write_batch(operation, mutations)
+                .write_batch_traced(operation, mutations, sample)
                 .map(|_| ())
                 .map_err(error)
         })
@@ -1528,6 +1806,7 @@ impl Db {
             native,
             mutations: Vec::new(),
             payload_bytes: 0,
+            capture: kv_capture::Batch::begin(self.capture_id),
         }
     }
     /// Advisory mapped-WAL eviction at a caller-enforced quiescent benchmark boundary.
@@ -1567,22 +1846,28 @@ impl Db {
         }
     }
     pub fn iterator(self: &Arc<Self>, ks: KeySpace) -> DbIterator {
-        match &self.backend {
+        let iterator = match &self.backend {
             Backend::Native(db) => DbIterator::Native(db.iterator(ks)),
             Backend::Remote(remote) => DbIterator::Remote(RemoteIterator::new(
                 self.clone(),
                 ks,
                 remote.db.protected_published_cut().map_err(error),
             )),
-        }
+        };
+        kv_capture::CapturedIterator::wrap(iterator, self.capture_id, ks)
     }
     pub fn checkpoint(self: &Arc<Self>) -> Checkpoint {
-        match &self.backend {
+        let checkpoint = match &self.backend {
             Backend::Native(db) => Checkpoint::Native(db.checkpoint()),
             Backend::Remote(remote) => Checkpoint::Remote(
                 self.clone(),
                 remote.db.protected_published_cut().map_err(error),
             ),
+        };
+        if kv_capture::enabled() {
+            Checkpoint::Captured(Box::new(checkpoint), self.capture_id)
+        } else {
+            checkpoint
         }
     }
     /// Obtain remote read evidence for quiescent measurement boundaries.
@@ -1776,7 +2061,7 @@ impl Db {
                 }
             }
             if !deletes.is_empty() {
-                self.commit_remote(deletes)?;
+                self.commit_remote(deletes, None)?;
             }
         }
         drop(pin);
@@ -1835,7 +2120,10 @@ impl Db {
             && (deletes.len() == capacity
                 || *encoded_bytes + member_bytes > limits.max_encoded_bytes)
         {
-            self.commit_remote(std::mem::replace(deletes, Vec::with_capacity(capacity)))?;
+            self.commit_remote(
+                std::mem::replace(deletes, Vec::with_capacity(capacity)),
+                None,
+            )?;
             *encoded_bytes = HEADER_LEN;
         }
         *encoded_bytes += member_bytes;
@@ -1870,7 +2158,7 @@ impl Db {
             }
         }
         if !deletes.is_empty() {
-            self.commit_remote(deletes)?;
+            self.commit_remote(deletes, None)?;
         }
         Ok(())
     }
@@ -1880,6 +2168,15 @@ impl Db {
         from: &[u8],
         to: &[u8],
     ) -> Result<()> {
+        if let Some(call) =
+            kv_capture::Call::begin(self.capture_id, ks, kv_capture::RANGE_DELETE, 0)
+        {
+            call.bound(from, false);
+            call.bound(to, true);
+            let result = self.drop_cells_in_range(ks, from, to);
+            call.finish(result.is_ok());
+            return result;
+        }
         if let Backend::Native(db) = &self.backend {
             let _guard = self
                 .durable_native
@@ -1941,7 +2238,7 @@ impl Db {
             }
         }
         if !deletes.is_empty() {
-            self.commit_remote(deletes)?;
+            self.commit_remote(deletes, None)?;
         }
         Ok(())
     }
@@ -1952,11 +2249,15 @@ pub struct WriteBatch {
     native: Option<crate::batch::WriteBatch>,
     mutations: Vec<Mutation>,
     payload_bytes: usize,
+    capture: Option<kv_capture::Batch>,
 }
 impl WriteBatch {
     pub fn write(&mut self, ks: KeySpace, key: impl Into<Bytes>, value: impl Into<Bytes>) {
         let key = key.into();
         let value = value.into();
+        if let Some(capture) = &mut self.capture {
+            capture.member(ks, &key, Some(&value));
+        }
         self.payload_bytes = self
             .payload_bytes
             .saturating_add(key.len())
@@ -1973,6 +2274,9 @@ impl WriteBatch {
     }
     pub fn delete(&mut self, ks: KeySpace, key: impl Into<Bytes>) {
         let key = key.into();
+        if let Some(capture) = &mut self.capture {
+            capture.member(ks, &key, None);
+        }
         self.payload_bytes = self.payload_bytes.saturating_add(key.len());
         if let Some(batch) = &mut self.native {
             batch.delete(ks, key);
@@ -1984,41 +2288,81 @@ impl WriteBatch {
         self.payload_bytes
     }
     pub fn commit(self) -> Result<()> {
-        if let Some(batch) = self.native {
+        let call = kv_capture::Call::begin(self.db.capture_id, KeySpace(0), kv_capture::BATCH, 0);
+        let result = if let Some(batch) = self.native {
             let _guard = self
                 .db
                 .durable_native
                 .load(Ordering::Relaxed)
                 .then(|| self.db.write_gate());
-            batch.commit()?;
-            self.db.native_barrier(true)
+            batch.commit().and_then(|()| self.db.native_barrier(true))
         } else {
             let _guard = self.db.shared_write_gate();
-            self.db.commit_remote(self.mutations)
+            self.db.commit_remote(self.mutations, None)
+        };
+        if let Some(capture) = self.capture {
+            capture.finish(result.is_ok());
         }
+        if let Some(call) = call {
+            call.finish(result.is_ok());
+        }
+        result
+    }
+
+    /// Commit with a caller-provided measurement identity, distinct from the operation ID.
+    pub fn commit_traced(self, caller_sample_id: u64) -> Result<()> {
+        let Backend::Remote(remote) = &self.db.backend else {
+            return Err(error("write timeline requires a remote backend"));
+        };
+        let sample = remote.db.write_timeline.begin(caller_sample_id);
+        let _guard = self.db.shared_write_gate();
+        if let Some(sample) = sample {
+            remote
+                .db
+                .write_timeline
+                .event(sample, WriteTimelineStage::GateAcquired);
+        }
+        let result = self.db.commit_remote(self.mutations, sample);
+        if let Some(sample) = sample {
+            remote.db.write_timeline.complete(
+                sample,
+                result.as_ref().err().map(|error| format!("{error:?}")),
+            );
+        }
+        result
     }
 }
 
 pub enum Checkpoint {
     Native(Arc<crate::checkpoint::DbCheckpoint>),
     Remote(Arc<Db>, Result<(IndexReadCut, IndexReadPin)>),
+    Captured(Box<Checkpoint>, u64),
 }
 impl Checkpoint {
     pub fn iterator(self, ks: KeySpace) -> DbIterator {
         match self {
             Self::Native(checkpoint) => DbIterator::Native(checkpoint.iterator(ks)),
             Self::Remote(db, cut) => DbIterator::Remote(RemoteIterator::new(db, ks, cut)),
+            Self::Captured(checkpoint, db) => {
+                kv_capture::CapturedIterator::wrap(checkpoint.iterator(ks), db, ks)
+            }
         }
     }
 }
 pub enum DbIterator {
     Native(crate::iterators::db_iterator::DbIterator),
     Remote(RemoteIterator),
+    Captured(Box<kv_capture::CapturedIterator>),
 }
 impl DbIterator {
     pub fn set_lower_bound(&mut self, bound: impl Into<Bytes>) {
         match self {
             Self::Native(iter) => iter.set_lower_bound(bound),
+            Self::Captured(iter) => {
+                let bound = bound.into();
+                iter.bound(&bound, false);
+                iter.inner.set_lower_bound(bound);
+            }
             Self::Remote(iter) => {
                 iter.lower = Some(bound.into());
                 iter.reset();
@@ -2028,6 +2372,11 @@ impl DbIterator {
     pub fn set_upper_bound(&mut self, bound: impl Into<Bytes>) {
         match self {
             Self::Native(iter) => iter.set_upper_bound(bound),
+            Self::Captured(iter) => {
+                let bound = bound.into();
+                iter.bound(&bound, true);
+                iter.inner.set_upper_bound(bound);
+            }
             Self::Remote(iter) => {
                 iter.upper = Some(bound.into());
                 iter.reset();
@@ -2037,6 +2386,10 @@ impl DbIterator {
     pub fn reverse(&mut self) {
         match self {
             Self::Native(iter) => iter.reverse(),
+            Self::Captured(iter) => {
+                iter.reverse();
+                iter.inner.reverse();
+            }
             Self::Remote(iter) => {
                 iter.reverse = !iter.reverse;
                 iter.reset();
@@ -2050,6 +2403,7 @@ impl Iterator for DbIterator {
         match self {
             Self::Native(iter) => iter.next(),
             Self::Remote(iter) => iter.next(),
+            Self::Captured(iter) => iter.next(),
         }
     }
 }

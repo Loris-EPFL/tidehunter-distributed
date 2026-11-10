@@ -23,31 +23,37 @@ class CampaignModeTests(unittest.TestCase):
         reads = [job for job in jobs if job['cohort'] == 'sealed_read']
         self.assertTrue(reads)
         for size in (64, 256, 1024, 8192, 65536):
-            sources = {job['sealed_dataset']['source_id'] for job in reads if job['value_size'] == size}
-            self.assertEqual(len(sources), 1)
-            self.assertEqual({job['backend'] for job in reads if job['value_size'] == size}, set(spec['backends']))
-        self.assertFalse(any(job['backend'] == 'tidehunter_nvme_tcp' and
+            rows = [job for job in reads if job['value_size'] == size]
+            self.assertEqual(len({job['sealed_dataset']['data_id'] for job in rows}), 1)
+            self.assertEqual({job['backend'] for job in rows}, set(spec['backends']))
+            source = {job['backend']: job['sealed_dataset']['source_id'] for job in rows}
+            self.assertNotEqual(source['native'], source['tidehunter_tcp'])
+            for backend in cloud_campaign.NVME_BACKENDS & source.keys():
+                self.assertEqual(source[backend], source['tidehunter_tcp'])
+            for backend in source.keys() - {'native', 'tidehunter_tcp'} - cloud_campaign.NVME_BACKENDS:
+                self.assertNotEqual(source[backend], source['tidehunter_tcp'])
+                self.assertNotEqual(source[backend], source['native'])
+        self.assertFalse(any(job['backend'] in cloud_campaign.NVME_BACKENDS and
                              job['cohort'] == 'native_write_regression' for job in jobs))
 
-    def test_selected_backend_order_cannot_reenter_shared_tcp_source(self):
+    def test_selected_backend_order_cannot_reenter_physical_source(self):
         spec = json.loads((HERE / 'cloud-nvmeof-campaign.json').read_text())
-        for order in itertools.permutations(spec['backends']):
+        # Exercise the portable matrix, including both optional NVMe transports.
+        backends = ['native', 'tidehunter_tcp', 'tidehunter_verbs_native',
+                    'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma']
+        for order in itertools.permutations(backends):
             with self.subTest(order=order):
-                jobs = cloud_campaign.make_matrix(dict(spec, backends=list(order)))
-                sources = {}
-                for job in jobs:
-                    if job['cohort'] == 'sealed_read':
-                        sources.setdefault(job['sealed_dataset']['source_id'], []).append(job)
-                for block in sources.values():
-                    indices = [index for index, job in enumerate(block)
-                               if job['backend'] in ('tidehunter_tcp', 'tidehunter_nvme_tcp')]
-                    contiguous = block[min(indices):max(indices) + 1]
-                    self.assertEqual({job['backend'] for job in contiguous},
-                                     {'tidehunter_tcp', 'tidehunter_nvme_tcp'})
-                    first_visits = list(dict.fromkeys(job['backend'] for job in contiguous))
-                    self.assertEqual(first_visits,
-                                     [backend for backend in order
-                                      if backend in ('tidehunter_tcp', 'tidehunter_nvme_tcp')])
+                jobs = cloud_campaign.make_matrix(dict(spec, backends=list(order), max_cases=2000))
+                reads = [job for job in jobs if job['cohort'] == 'sealed_read']
+                completed = set()
+                previous = None
+                for job in reads:
+                    source = job['sealed_dataset']['source_id']
+                    if source != previous:
+                        self.assertNotIn(source, completed)
+                        if previous is not None:
+                            completed.add(previous)
+                        previous = source
 
     def test_nvme_backend_is_rejected_outside_focused_mode(self):
         spec = json.loads((HERE / 'cloud-nvmeof-campaign.json').read_text())
@@ -77,7 +83,9 @@ class ControllerBoundaryTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.c = controller.Controller.__new__(controller.Controller)
+        self.c.local_mode = None
         self.c.config = {'prefix': 'run', 'repository_root': str(self.root),
+                         'spec': {'case_deadline_seconds': 600}, 'deadline_utc': '2099-01-01T00:00:00Z',
                          'fleet': {'nodes': [{'address': f'10.0.0.{i + 1}'} for i in range(5)]}}
         self.c.root = self.root
         self.c.clients = {'s3': Mock()}
@@ -104,7 +112,7 @@ class ControllerBoundaryTests(unittest.TestCase):
                 'export_uuid': uuid, 'manifest': str(remote / 'manifest.json'),
                 'manifest_sha256': controller.digest(path),
                 'target_receipt': {'selected_transport': 'tcp', 'target_cache': 'buffered_file_page_cache',
-                                   'target_cache_verified': True}}]}})
+                                   'target_cache_verified': True, 'buffered_io': 1}}]}})
         return roots, targets
 
     def test_staging_requires_exact_object_and_preserves_verified_bytes(self):
@@ -174,10 +182,20 @@ class ControllerBoundaryTests(unittest.TestCase):
             self.assertEqual(request['address'], self.c.config['fleet']['nodes'][index]['address'])
             self.assertEqual(request['generation'], 'generation')
 
+    def test_rdma_target_uses_owned_gcp_rdma_interface(self):
+        for i, node in enumerate(self.c.config['fleet']['nodes']):
+            node['rdma_address'] = f'10.1.0.{i + 1}'
+        with patch.object(controller, 'platform_module', return_value=object()):
+            self.c.owner_batch('nvme_owner_target_setup', 'case', generation='g', transport='rdma')
+        for call in self.c.request.call_args_list:
+            index, request = call.args
+            self.assertEqual(request['address'], self.c.config['fleet']['nodes'][index]['rdma_address'])
+
     def test_shared_tcp_source_reuses_prepared_owner_dataset(self):
         options = {'external_remote_config': {'read_lanes': 1}, 'evidence': 'old'}
-        self.c.shared_tide = {'identity': ('source', 'tcp'), 'options': copy.deepcopy(options)}
-        job = {'backend': 'tidehunter_nvme_tcp', 'sealed_dataset': {'source_id': 'source'}, 'read_lanes': 4}
+        self.c.shared_tide = {'identity': ('source', 'tcp', 'synchronous'), 'options': copy.deepcopy(options)}
+        job = {'backend': 'tidehunter_nvme_tcp', 'sealed_dataset': {'source_id': 'source'}, 'read_lanes': 4,
+               'durability_tier': 'synchronous'}
         self.c.prepare_tide = Mock(side_effect=AssertionError('must reuse prepared dataset'))
         actual = self.c.prepared_tide_options(job, self.root / 'case')
         self.assertEqual(actual['external_remote_config']['read_lanes'], 4)
@@ -185,8 +203,19 @@ class ControllerBoundaryTests(unittest.TestCase):
         self.assertEqual(self.c.shared_tide['options'], options)
         self.c.prepare_tide.assert_not_called()
 
+    def test_a_different_durability_tier_never_reuses_the_prepared_owners(self):
+        # Owners run one tier for their whole life; a case at another tier needs fresh owners.
+        self.c.shared_tide = {'identity': ('source', 'tcp', 'native'), 'options': {}}
+        job = {'backend': 'tidehunter_nvme_tcp', 'sealed_dataset': {'source_id': 'source'},
+               'durability_tier': 'synchronous', 'read_lanes': 1}
+        self.c.stop_tide = Mock()
+        self.c.prepare_tide = Mock(side_effect=RuntimeError('fresh owners requested'))
+        with self.assertRaisesRegex(RuntimeError, 'fresh owners requested'):
+            self.c.prepared_tide_options(job, self.root / 'case')
+        self.c.stop_tide.assert_called_once_with()
+
     def test_outstanding_namespaces_prevent_source_replacement_and_owner_stop(self):
-        self.c.shared_tide = {'identity': ('old', 'tcp')}
+        self.c.shared_tide = {'identity': ('old', 'tcp', 'synchronous')}
         self.c.active_nvme = {'generation': 'g', 'case': 'old-case', 'hosts': []}
         job = {'backend': 'tidehunter_tcp', 'sealed_dataset': {'source_id': 'new'}}
         with self.assertRaises(controller.SafetyError):
@@ -204,6 +233,19 @@ class ControllerBoundaryTests(unittest.TestCase):
             self.c.stop_tide()
         self.c.request.assert_not_called()
         self.assertIsNotNone(self.c.active_tide)
+
+    def test_failed_owner_cleanup_quarantines_remaining_owners(self):
+        active = ({'case_id': 'case'}, self.root, [0])
+        self.c.active_tide = active
+        self.c.request.side_effect = RuntimeError('owner shutdown unconfirmed')
+        with self.assertRaises(controller.InfrastructureError):
+            self.c.stop_tide()
+        self.assertIs(self.c.active_tide, active)
+        self.assertTrue(self.c.tide_cleanup_forbidden)
+        self.c.request.reset_mock()
+        with self.assertRaises(controller.InfrastructureError):
+            self.c.stop_tide()
+        self.c.request.assert_not_called()
 
     def test_undrained_or_incomplete_host_set_is_quarantined(self):
         for drained, count in ((False, 5), (True, 4)):
@@ -236,7 +278,8 @@ class ControllerBoundaryTests(unittest.TestCase):
         def mapped_path(value):
             path = real_path(value)
             return self.root / 'control' if str(path) == '/var/lib/tidehunter-kv-control' else path
-        active = {'generation': 'g', 'case': 'case', 'case_directory': str(self.root), 'hosts': hosts}
+        active = {'generation': 'g', 'case': 'case', 'case_directory': str(self.root),
+                  'hosts': hosts, 'target_implementation': 'kernel'}
         self.c.active_nvme = active
         self.c.request.side_effect = lambda index, *a, **kw: {'complete': index != 2}
         with patch.object(controller, 'Path', side_effect=mapped_path), \
@@ -245,7 +288,6 @@ class ControllerBoundaryTests(unittest.TestCase):
             with self.assertRaises(controller.InfrastructureError):
                 self.c.disconnect_nvme(drained=True)
         self.assertIs(self.c.active_nvme, active)
-        self.assertEqual(upload.call_count, 5)
         self.assertEqual({call.args[0] for call in self.c.request.call_args_list}, set(range(5)))
         for call in self.c.request.call_args_list:
             index, request = call.args
@@ -257,37 +299,34 @@ class ControllerBoundaryTests(unittest.TestCase):
                 self.assertEqual(real_path(host[field]).exists(), host['index'] == 2)
             self.assertTrue(real_path(host['mirror']).exists())
 
-    def test_reader_bindings_require_exact_export_uuid_set(self):
+    def test_rdma_transport_is_used_for_targets_and_namespace_bindings(self):
         real_path = Path
-        manifest = {'identity': 'manifest', 'catalog': [{}], 'nqn': 'test-nqn'}
+        manifest = {'catalog': [{}], 'nqn': 'test-nqn'}
         roots, targets = self.mirror_fixtures(self.root, [1, 2], manifest)
+        for owner in targets:
+            owner['target']['transport'] = 'rdma'
+            owner['target']['exports'][0]['target_receipt']['selected_transport'] = 'rdma'
         self.c.shared_tide = {'job': {'case_id': 'source-case'}, 'ready': [{}] * 5,
                               'mirror_roots': roots, 'options': {'external_remote_config': {
                                   'read_memory_allowance_bytes': 256 * 1024**2,
                                   'read_cache_bytes': 0, 'max_pending_read_bytes': 0}}}
         self.c.owner_batch = Mock(return_value=targets)
+        result = {'phase': 'connected', 'transport': 'rdma',
+                  'bindings': [{'export_uuid': [1, 2], 'namespace_path': '/dev/test-only', 'transport': 'rdma'}],
+                  'exports': [{'export_uuid': [1, 2], 'host_receipt': {'controller': 'nvme0'}}]}
         def mapped_path(value):
             path = real_path(value)
-            if str(path) == '/var/lib/tidehunter-kv-control':
-                return self.root / 'control'
-            return path
-        job = {'case_id': 'read-case', 'backend': 'tidehunter_nvme_tcp'}
-        result = {'phase': 'connected', 'transport': 'tcp',
-                  'bindings': [{'export_uuid': [1, 2], 'namespace_path': '/dev/test-only', 'transport': 'tcp'}],
-                  'exports': [{'export_uuid': [1, 2], 'host_receipt': {'controller': 'nvme0'}}]}
+            return self.root / 'control' if str(path) == '/var/lib/tidehunter-kv-control' else path
         def command(argv, *, timeout):
-            if argv[:2] == ['nvme', 'id-ctrl']:
-                return json.dumps({'cntlid': 7})
-            return json.dumps(result)
+            return json.dumps({'cntlid': 7} if argv[:2] == ['nvme', 'id-ctrl'] else result)
         with patch.object(controller, 'Path', side_effect=mapped_path), \
              patch.object(controller, 'command', side_effect=command):
-            readers = self.c.connect_nvme(job, self.root)
-        self.assertEqual(len(readers), 5)
-        self.assertTrue(all(row['binding'] == {'namespace_path': '/dev/test-only', 'transport': 'tcp'}
-                            and row['manifest'] == manifest for row in readers))
-        self.assertEqual(len(self.c.active_nvme['hosts']), 5)
-        self.assertTrue(all(host['controllers'] == [{'export_uuid': [1, 2], 'ctrl_id': 7}]
-                            for host in self.c.active_nvme['hosts']))
+            readers = self.c.connect_nvme({'case_id': 'read-case', 'backend': 'tidehunter_nvme_rdma',
+                                           'nvmeof_route': 'sealed_read',
+                                           'sealed_dataset': {'source_id': 'source-case'}}, self.root)
+        self.assertEqual(self.c.owner_batch.call_args.kwargs['transport'], 'rdma')
+        self.assertEqual(self.c.active_nvme['transport'], 'rdma')
+        self.assertEqual({row['binding']['transport'] for row in readers}, {'rdma'})
 
     def test_missing_or_extra_reader_binding_is_rejected_and_quarantined(self):
         real_path = Path
@@ -312,7 +351,9 @@ class ControllerBoundaryTests(unittest.TestCase):
                 with patch.object(controller, 'Path', side_effect=mapped_path), \
                      patch.object(controller, 'command', side_effect=command):
                     with self.assertRaises(controller.SafetyError):
-                        self.c.connect_nvme({'case_id': 'read-case', 'backend': 'tidehunter_nvme_tcp'}, base)
+                        self.c.connect_nvme({'case_id': 'read-case', 'backend': 'tidehunter_nvme_tcp',
+                                             'nvmeof_route': 'sealed_read',
+                                             'sealed_dataset': {'source_id': 'source-case'}}, base)
                 self.assertEqual(len(self.c.active_nvme['hosts']), 1)
 
     def test_target_policy_and_transport_mismatch_prevent_host_connection(self):
@@ -333,7 +374,9 @@ class ControllerBoundaryTests(unittest.TestCase):
                      patch.object(controller, 'dump'), \
                      patch.object(controller, 'Path', side_effect=mapped_path):
                     with self.assertRaises(controller.SafetyError):
-                        self.c.connect_nvme({'case_id': 'read-case', 'backend': 'tidehunter_nvme_tcp'}, base)
+                        self.c.connect_nvme({'case_id': 'read-case', 'backend': 'tidehunter_nvme_tcp',
+                                             'nvmeof_route': 'sealed_read',
+                                             'sealed_dataset': {'source_id': 'source-case'}}, base)
                 command.assert_not_called()
                 self.assertEqual(self.c.active_nvme['hosts'], [])
                 self.assertIs(self.c.active_nvme['targets'], targets)

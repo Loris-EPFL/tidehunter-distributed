@@ -19,6 +19,36 @@ fn entry() -> BackendResult<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     if arguments
         .first()
+        .is_some_and(|arg| arg == "--experimental-live-nvmeof-qualification-child")
+    {
+        if arguments.len() != 3 {
+            return Err("qualification child requires INPUT.json and a fresh READY.json".into());
+        }
+        #[cfg(all(feature = "nvmeof", target_os = "linux"))]
+        return backends::tidehunter::qualify_live_nvmeof_child(
+            PathBuf::from(&arguments[1]).as_path(),
+            PathBuf::from(&arguments[2]).as_path(),
+        );
+        #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
+        return Err("live NVMe-oF qualification requires Linux and the nvmeof feature".into());
+    }
+    if arguments
+        .first()
+        .is_some_and(|arg| arg == "--experimental-live-nvmeof-qualification")
+    {
+        if arguments.len() != 4 || arguments[2] != "--output" {
+            return Err("usage: kv-research --experimental-live-nvmeof-qualification INPUT.json --output FRESH_DIR".into());
+        }
+        #[cfg(all(feature = "nvmeof", target_os = "linux"))]
+        return backends::tidehunter::qualify_live_nvmeof(
+            PathBuf::from(&arguments[1]).as_path(),
+            PathBuf::from(&arguments[3]).as_path(),
+        );
+        #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
+        return Err("live NVMe-oF qualification requires Linux and the nvmeof feature".into());
+    }
+    if arguments
+        .first()
         .is_some_and(|arg| arg == "prepare-nvmeof-dataset" || arg == "export-nvmeof-dataset")
     {
         #[cfg(all(feature = "nvmeof", target_os = "linux"))]
@@ -80,7 +110,10 @@ fn entry() -> BackendResult<()> {
         }
     }
     let config_path = config_path.ok_or("--config is required")?;
-    let config: RunConfig = serde_json::from_slice(&std::fs::read(config_path)?)?;
+    let mut config: RunConfig = serde_json::from_slice(&std::fs::read(config_path)?)?;
+    if config.backend.kind == "native" {
+        backends::native::normalize_options(&mut config.backend.options)?;
+    }
     config.validate()?;
     backends::validate_options(&config.backend.kind, &config.backend.options)?;
     if validate_only {

@@ -69,7 +69,7 @@ pub(super) fn root_bindings(path: &Path) -> (Vec<u8>, Vec<RootBinding>) {
 }
 
 fn install_shape_batch(
-    index: &mut NativeIndex,
+    index: &NativeIndex,
     log: &PartitionLog,
     shape: &KeyShape,
     config: &PartitionConfig,
@@ -142,12 +142,15 @@ fn more_than_4096_tiny_cells_share_one_container_reuse_ranges_and_survive_unlink
         .unwrap()
     };
     let first = make(0, (0..CELLS).map(|n| put(0, &key(n), &[1])).collect());
-    let mut index = NativeIndex::new(&shape, DATABASE, BUDGET).unwrap();
-    install_shape_batch(&mut index, &log, &shape, &config, &first);
+    let index = NativeIndex::new(&shape, DATABASE, BUDGET).unwrap();
+    install_shape_batch(&index, &log, &shape, &config, &first);
     assert_eq!(index.stats().cells, CELLS as usize);
     let first_root = temp.path().join("first.index");
-    let capture = index.prepare_image(IndexReadCut::Latest).unwrap();
-    assert_eq!(capture.new_files(&first_root).unwrap().len(), 1);
+    let capture = index.writer().prepare_image(IndexReadCut::Latest).unwrap();
+    assert_eq!(
+        capture.reserved_files(&first_root).unwrap(),
+        ["first.index.cells"]
+    );
     assert!(index.stats().transient_metadata_bytes <= BUDGET);
     let persisted = capture.persist(&first_root).unwrap();
     let first_files = persisted.files();
@@ -156,7 +159,7 @@ fn more_than_4096_tiny_cells_share_one_container_reuse_ranges_and_survive_unlink
         1,
         "thousands of cells have one data barrier backing"
     );
-    index.install_image(persisted);
+    index.writer().install_image(persisted);
     assert_eq!(index.reachable_files(), first_files);
     assert_eq!(
         physical_files(temp.path()),
@@ -175,11 +178,15 @@ fn more_than_4096_tiny_cells_share_one_container_reuse_ranges_and_survive_unlink
     let old_pin = index.pin_cut(IndexReadCut::Latest).unwrap();
 
     let clean_root = temp.path().join("clean.index");
-    let capture = index.prepare_image(IndexReadCut::Latest).unwrap();
-    assert!(capture.new_files(&clean_root).unwrap().is_empty());
+    let capture = index.writer().prepare_image(IndexReadCut::Latest).unwrap();
+    assert_eq!(
+        capture.reserved_files(&clean_root).unwrap(),
+        ["clean.index.cells"]
+    );
     let persisted = capture.persist(&clean_root).unwrap();
+    assert!(!temp.path().join("clean.index.cells").exists());
     assert_eq!(persisted.files(), first_files);
-    index.install_image(persisted);
+    index.writer().install_image(persisted);
     assert_eq!(
         physical_files(temp.path()),
         3,
@@ -192,10 +199,13 @@ fn more_than_4096_tiny_cells_share_one_container_reuse_ranges_and_survive_unlink
 
     let changed = 2048;
     let second = make(1, vec![put(0, &key(changed), &[2])]);
-    install_shape_batch(&mut index, &log, &shape, &config, &second);
+    install_shape_batch(&index, &log, &shape, &config, &second);
     let second_root = temp.path().join("second.index");
-    let capture = index.prepare_image(IndexReadCut::Latest).unwrap();
-    assert_eq!(capture.new_files(&second_root).unwrap().len(), 1);
+    let capture = index.writer().prepare_image(IndexReadCut::Latest).unwrap();
+    assert_eq!(
+        capture.reserved_files(&second_root).unwrap(),
+        ["second.index.cells"]
+    );
     let persisted = capture.persist(&second_root).unwrap();
     let second_files = persisted.files();
     assert_eq!(
@@ -203,7 +213,7 @@ fn more_than_4096_tiny_cells_share_one_container_reuse_ranges_and_survive_unlink
         2,
         "one old shared container plus one changed-cell container"
     );
-    index.install_image(persisted);
+    index.writer().install_image(persisted);
     let (_, current) = root_bindings(&second_root);
     for (old, new) in original.iter().zip(&current) {
         assert_eq!(old.identity, new.identity);
@@ -262,11 +272,12 @@ fn more_than_4096_tiny_cells_share_one_container_reuse_ranges_and_survive_unlink
     // its anchors still support the pin while obsolete container names retire.
     let compacted_root = temp.path().join("compacted.index");
     let capture = index
+        .writer()
         .prepare_compacted_image(IndexReadCut::Latest, index.latest_cut())
         .unwrap();
     let persisted = capture.persist(&compacted_root).unwrap();
     assert_eq!(persisted.files().len(), 1);
-    index.install_image(persisted);
+    index.writer().install_image(persisted);
     assert_eq!(index.retention_floor(), old_pin.cut());
     let live: BTreeSet<_> = index.reachable_files().into_iter().collect();
     for name in second_files {
@@ -307,10 +318,13 @@ fn root_bound_container_ranges_reject_overlap_overflow_wrong_cells_and_bad_diges
     let log = log(&temp.path().join("wal"));
     let batch = batch(0, vec![put(0, A, b"first"), put(0, B, b"second")]);
     let receipt = durable(&log, std::slice::from_ref(&batch))[0];
-    let mut index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
-    install(&mut index, &log, &batch, receipt);
+    let index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
+    install(&index, &log, &batch, receipt);
     let root = temp.path().join("root.index");
-    index.flush_and_unload(&root, IndexReadCut::Latest).unwrap();
+    index
+        .writer()
+        .flush_and_unload(&root, IndexReadCut::Latest)
+        .unwrap();
     let (payload, bindings) = root_bindings(&root);
     assert_eq!(bindings.len(), 2);
     assert_eq!(bindings[0].name, bindings[1].name);
@@ -390,10 +404,13 @@ fn shared_container_offsets_above_one_gib_do_not_raise_the_per_cell_cap() {
     let log = log(&temp.path().join("wal"));
     let batch = batch(0, vec![put(0, A, b"small range")]);
     let receipt = durable(&log, std::slice::from_ref(&batch))[0];
-    let mut index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
-    install(&mut index, &log, &batch, receipt);
+    let index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
+    install(&index, &log, &batch, receipt);
     let root = temp.path().join("root.index");
-    index.flush_and_unload(&root, IndexReadCut::Latest).unwrap();
+    index
+        .writer()
+        .flush_and_unload(&root, IndexReadCut::Latest)
+        .unwrap();
     let (mut payload, bindings) = root_bindings(&root);
     let cell = &bindings[0];
     let original = std::fs::read(temp.path().join(&cell.name)).unwrap();

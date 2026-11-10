@@ -6,17 +6,19 @@ fn obsolete_cell_unlink_preserves_existing_mapped_read_owners() {
     let log = log(&temp.path().join("wal"));
     let batches = [batch(0, vec![put(0, A, b"old")]), batch(1, vec![delete(A)])];
     let receipts = durable(&log, &batches);
-    let mut index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
-    install(&mut index, &log, &batches[0], receipts[0]);
+    let index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
+    install(&index, &log, &batches[0], receipts[0]);
     let old_root = temp.path().join("old.index");
     index
+        .writer()
         .flush_and_unload(&old_root, IndexReadCut::Latest)
         .unwrap();
     let reader = NativeIndex::open_snapshot(&old_root, &shape(), DATABASE, BUDGET).unwrap();
     let old_cells = index.reachable_files();
-    install(&mut index, &log, &batches[1], receipts[1]);
+    install(&index, &log, &batches[1], receipts[1]);
     let new_root = temp.path().join("new.index");
     index
+        .writer()
         .flush_and_unload(&new_root, IndexReadCut::Latest)
         .unwrap();
     let current = index.reachable_files();
@@ -46,8 +48,8 @@ fn wal_reachability_includes_old_puts_until_protected_compaction_releases_them()
     let log = log(&temp.path().join("wal"));
     let batches = [batch(0, vec![put(0, A, b"old")]), batch(1, vec![delete(A)])];
     let receipts = durable(&log, &batches);
-    let mut index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
-    install(&mut index, &log, &batches[0], receipts[0]);
+    let index = NativeIndex::new(&shape(), DATABASE, BUDGET).unwrap();
+    install(&index, &log, &batches[0], receipts[0]);
     let address = index
         .get(KeySpace(0), A, IndexReadCut::Latest)
         .unwrap()
@@ -64,13 +66,16 @@ fn wal_reachability_includes_old_puts_until_protected_compaction_releases_them()
     };
     assert!(references(&index), "dirty overlay is reachable");
     let pin = index.pin_cut(cut(0, 0)).unwrap();
-    install(&mut index, &log, &batches[1], receipts[1]);
+    install(&index, &log, &batches[1], receipts[1]);
     assert_eq!(value(&index, &log, A, IndexReadCut::Latest), None);
     let retained_root = temp.path().join("retained.index");
     let captured = index
+        .writer()
         .prepare_compacted_image(IndexReadCut::Latest, cut(1, 0))
         .unwrap();
-    index.install_image(captured.persist(&retained_root).unwrap());
+    index
+        .writer()
+        .install_image(captured.persist(&retained_root).unwrap());
     assert!(
         references(&index),
         "the old Put stays mapped for the protected cut"
@@ -96,9 +101,12 @@ fn wal_reachability_includes_old_puts_until_protected_compaction_releases_them()
     drop(pin);
     let reclaimed_root = temp.path().join("reclaimed.index");
     let captured = index
+        .writer()
         .prepare_compacted_image(IndexReadCut::Latest, cut(1, 0))
         .unwrap();
-    index.install_image(captured.persist(&reclaimed_root).unwrap());
+    index
+        .writer()
+        .install_image(captured.persist(&reclaimed_root).unwrap());
     assert!(
         !references(&index),
         "a retained index tombstone needs no old payload"

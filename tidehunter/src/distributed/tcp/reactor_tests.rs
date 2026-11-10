@@ -425,6 +425,47 @@ fn native_software_provider_mixed_rpc_reads_complete_out_of_order() {
 #[cfg(feature = "experimental-fabric")]
 #[test]
 #[ignore = "requires libfabric tcp;ofi_rxm software provider"]
+fn software_fabric_owner_transport_aggregate_sums_sessions_and_keeps_closed_ones() {
+    let server = Running::new(
+        software_transport(FabricSecurity::Trusted),
+        WalMemberReadPolicy::Positional,
+    );
+    let sent = |stats: &ReadExecutorStats| {
+        let transport = stats.transport;
+        transport.send_size_le_4k
+            + transport.send_size_le_16k
+            + transport.send_size_le_64k
+            + transport.send_size_gt_64k
+    };
+    let mut first = server.client();
+    let (batches, references) = server.data(&mut first);
+    let mut second = server.client();
+    for client in [&mut first, &mut second] {
+        for index in 0..8 {
+            assert_eq!(
+                client.read_record(1, &references[index % 2]).unwrap(),
+                batches[index % 2].mutations()[0]
+            );
+        }
+    }
+    // A session publishes its counters at the end of every sweep, so its own
+    // later stats request already includes everything it sent before.
+    let both_open = first.read_io_stats().unwrap();
+    let second_only = second.read_io_stats().unwrap();
+    assert!(sent(&both_open) >= 16, "{:?}", both_open.transport);
+    assert!(sent(&second_only) >= sent(&both_open));
+    drop(first);
+    drop(second);
+    let reopened = server.client().read_io_stats().unwrap();
+    assert!(
+        sent(&reopened) >= sent(&second_only),
+        "closed sessions must stay in the total"
+    );
+}
+
+#[cfg(feature = "experimental-fabric")]
+#[test]
+#[ignore = "requires libfabric tcp;ofi_rxm software provider"]
 fn fabric_tcp_native_rejects_invalid_reference_and_epoch_without_tls() {
     let server = Running::new(
         software_transport(FabricSecurity::Trusted),
@@ -1086,6 +1127,35 @@ fn ram_probe_round_trip(transport: Transport, polling: PollingPolicy) {
             assert!(transport.receive_post_calls > 0);
             assert!(transport.cq_timed_calls > 0);
             assert!(transport.cq_dispatch_calls > 0);
+            assert!(transport.tx_all_slots_pending_polls <= transport.cq_timed_calls);
+            assert!(transport.rx_no_posted_slots_polls <= transport.cq_timed_calls);
+            assert!(transport.rx_unread_slots_polls <= transport.cq_timed_calls);
+        }
+    }
+    let mut exported = std::collections::BTreeMap::new();
+    crate::distributed::sui::visit_write_connection_profile(
+        &mut |name, value| {
+            exported.insert(name, value);
+        },
+        profile,
+    );
+    let json = serde_json::to_value(&exported).unwrap();
+    for side in ["client_transport", "transport"] {
+        for field in [
+            "tx_all_slots_pending_polls",
+            "rx_no_posted_slots_polls",
+            "rx_unread_slots_polls",
+        ] {
+            let key = format!("write_profile_{side}_{field}");
+            if transport == Transport::Tcp {
+                assert!(json.get(key.as_str()).is_none());
+            } else {
+                assert!(
+                    json.get(key.as_str())
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some()
+                );
+            }
         }
     }
     if polling == PollingPolicy::Busy {

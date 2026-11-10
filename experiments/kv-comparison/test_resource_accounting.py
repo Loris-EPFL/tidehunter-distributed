@@ -1,5 +1,6 @@
 """Resource deltas must belong to one live owned cgroup, not inferred zeroes."""
 import copy
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -54,7 +55,7 @@ class ResourceAccountingTests(unittest.TestCase):
                 lambda f: f["processes"][0].update(inode=f["processes"][0]["inode"] + 1),
                 lambda f: f["processes"][0]["cpu"].update(usage_usec=1),
                 lambda f: f["processes"][0].update(monotonic_ns=1_000_000_000),
-                lambda f: f["processes"][0]["io_devices"]["259:1"].update(rbytes=0),
+                lambda f: f["processes"][0]["cpu"].update(nr_periods=0),
                 lambda f: f["processes"][0]["cpu"].update(nr_throttled=100)):
             broken = copy.deepcopy(after)
             mutate(broken)
@@ -82,11 +83,15 @@ class ResourceAccountingTests(unittest.TestCase):
         for frame in (before, after):
             frame["processes"][0]["cpu"].pop("throttled_usec")
         row = resources.interval([before], [after])["processes"][0]
-        self.assertTrue(row["available"])
+        self.assertFalse(row["available"])
+        self.assertTrue(row["core_available"])
+        self.assertIn("IO counters unavailable", row["reason"])
+        self.assertEqual(row["memory_current_bytes"], 1048576)
         self.assertEqual(row["cpu_seconds"], 0)
         self.assertEqual(row["cpu_periods"], 0)
         self.assertNotIn("cpu_throttled_seconds", row)
         self.assertNotIn("io_read_bytes", row)
+        self.assertNotIn("io_write_bytes", row)
         self.assertNotIn("memory_peak_bytes", row)
 
     def test_changed_io_device_population_is_unavailable(self):
@@ -100,8 +105,44 @@ class ResourceAccountingTests(unittest.TestCase):
                 row = resources.interval([before], [boundary])["processes"][0]
                 self.assertFalse(row["available"])
                 self.assertIn("device population changed", row["reason"])
+                self.assertTrue(row["core_available"])
+                self.assertEqual(row["cpu_seconds"], .7)
+                self.assertEqual(row["memory_current_bytes"], 1048576)
                 self.assertNotIn("io_read_bytes", row)
                 self.assertNotIn("io_write_bytes", row)
+
+    def test_captured_client_device_change_and_io_reset_preserve_core(self):
+        path = Path(__file__).with_name("resource-client-boundaries-0024.json")
+        before, after = json.loads(path.read_text())
+        for kind in ("added", "removed", "reset"):
+            start, end = copy.deepcopy(before), copy.deepcopy(after)
+            if kind == "removed":
+                start["processes"][0]["io_devices"]["259:0"] = copy.deepcopy(
+                    end["processes"][0]["io_devices"]["259:0"])
+                del end["processes"][0]["io_devices"]["259:0"]
+            elif kind == "reset":
+                del end["processes"][0]["io_devices"]["259:0"]
+                end["processes"][0]["io_devices"]["259:3"]["wbytes"] = 0
+            with self.subTest(kind=kind):
+                row = resources.interval([start], [end])["processes"][0]
+                self.assertFalse(row["available"])
+                self.assertTrue(row["core_available"])
+                self.assertEqual(row["cpu_seconds"], 0.670104)
+                self.assertEqual(row["memory_current_bytes"], 19963904)
+                self.assertNotIn("io_read_bytes", row)
+                self.assertNotIn("io_write_bytes", row)
+                self.assertIn("reset" if kind == "reset" else "device population changed", row["reason"])
+        for mutation in (
+                lambda frame: frame["processes"][0]["cpu"].update(usage_usec=0),
+                lambda frame: frame["processes"][0].update(inode=frame["processes"][0]["inode"] + 1),
+                lambda frame: frame.update(boot_id="different-boot")):
+            broken = copy.deepcopy(after)
+            mutation(broken)
+            row = resources.interval([before], [broken])["processes"][0]
+            self.assertFalse(row["available"])
+            self.assertNotIn("core_available", row)
+            self.assertNotIn("cpu_seconds", row)
+            self.assertNotIn("memory_current_bytes", row)
 
     def test_foreign_root_traversal_symlink_and_duplicate_roles_are_rejected(self):
         for group in ("/", "relative", "/system.slice/../owned.service"):

@@ -1,8 +1,9 @@
-"""Offline artifact-boundary tests; no Docker, compiler, AWS or database required."""
+"""Offline artifact-boundary tests, including real ELF loader checks when tools exist."""
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import io
 import os
+import shutil
 from pathlib import Path
 import stat
 import subprocess
@@ -36,6 +37,37 @@ class PackageTests(unittest.TestCase):
 
     def git(self, *argv):
         return subprocess.check_output(["git", *argv], cwd=self.repo, text=True)
+
+    def test_nvmet_assets_must_be_declared_complete_and_source_bound(self):
+        files = {"nvmet-fix/" + name: {} for name in package.NVMET_FILES}
+        files.update({"source/" + package.NVMET_HELPER: {}, "source/" + package.NVMET_PATCH: {}})
+        candidate = {"module_sha256": "a" * 64}
+        with patch.object(package, "nvmet_fix_identity", return_value=candidate):
+            self.assertEqual(package.admit_nvmet_assets(self.root, files, candidate), candidate)
+            with self.assertRaisesRegex(ValueError, "undeclared"):
+                package.admit_nvmet_assets(self.root, files, None)
+            with self.assertRaisesRegex(ValueError, "inventory"):
+                package.admit_nvmet_assets(self.root, {k: v for k, v in files.items()
+                                                       if k != "nvmet-fix/nvmet.ko"}, candidate)
+            with self.assertRaisesRegex(ValueError, "source closure"):
+                package.admit_nvmet_assets(self.root, {k: v for k, v in files.items()
+                                                       if k != "source/" + package.NVMET_HELPER}, candidate)
+            with self.assertRaisesRegex(ValueError, "static identity"):
+                package.admit_nvmet_assets(self.root, files, {"module_sha256": "b" * 64})
+        self.assertIsNone(package.admit_nvmet_assets(self.root, {}, None))
+
+    def test_nvmet_patch_must_equal_frozen_source_before_static_admission(self):
+        source_patch = self.root / "source" / package.NVMET_PATCH
+        source_patch.parent.mkdir(parents=True)
+        source_patch.write_bytes(b"reviewed patch")
+        prefix = self.root / "fix"
+        prefix.mkdir()
+        (prefix / "partial-nowait-read.patch").write_bytes(b"different patch")
+        with patch.object(package, "nvmet_fix_module") as helper:
+            with self.assertRaisesRegex(ValueError, "differs from frozen source"):
+                package.nvmet_fix_identity(self.root / "source", prefix)
+            helper.assert_not_called()
+
     def test_valkey_source_admission_requires_pinned_clean_rdma_artifacts(self):
         source = self.root / "valkey"
         source.mkdir()
@@ -128,6 +160,14 @@ class PackageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "required source closure"):
             package.snapshot(self.repo, self.root / "snapshot")
 
+    def test_focused_report_source_closure_requires_analyzer(self):
+        for name in ("experiments/kv-comparison/analyze.py",
+                     "experiments/kv-comparison/campaign.py"):
+            self.assertIn(name, package.REQUIRED)
+        (self.repo / "experiments/kv-comparison/analyze.py").unlink()
+        with self.assertRaisesRegex(ValueError, "required source closure"):
+            package.source_paths(self.repo)
+
     def test_new_untracked_monitoring_closure_is_hash_bound_in_manual_package(self):
         names = sorted(name for name in package.REQUIRED if "/observability/" in name)
         self.git("rm", "--cached", "--", *names)
@@ -140,6 +180,34 @@ class PackageTests(unittest.TestCase):
                 self.assertEqual(archive.read(name), (self.repo / name).read_bytes())
         missing = self.repo / "experiments/kv-comparison/observability/campaign_monitor.py"
         missing.unlink()
+        with self.assertRaisesRegex(ValueError, "required source closure"):
+            package.source_paths(self.repo)
+
+    def test_live_nvme_sources_are_required_and_hash_bound(self):
+        names = ("tidehunter/src/distributed/nvmeof/live_storage.rs",
+                 "tidehunter/src/distributed/nvmeof/live_io.rs",
+                 "tidehunter/src/distributed/nvmeof/live_target.rs",
+                 "tidehunter/src/distributed/nvmeof/live_target/spdk.rs",
+                 "tidehunter/src/distributed/nvmeof/live_connect.rs",
+                 "tidehunter/src/distributed/nvmeof/live_namespace.rs")
+        self.git("rm", "--cached", "--", *names)
+        snapshot = package.snapshot(self.repo, self.root / "snapshot")
+        with zipfile.ZipFile(self.root / "snapshot/source.zip") as archive:
+            for name in names:
+                self.assertIn(name, snapshot["sha256"])
+                self.assertEqual(archive.read(name), (self.repo / name).read_bytes())
+        (self.repo / names[0]).unlink()
+        with self.assertRaisesRegex(ValueError, "required source closure"):
+            package.source_paths(self.repo)
+
+    def test_live_spdk_helpers_are_required_in_source_closure(self):
+        names = ("experiments/nvmeof/live_spdk_daemon.py",
+                 "experiments/nvmeof/spdk_targets.py",
+                 "experiments/nvmeof/spdk_artifacts.py",
+                 "experiments/nvmeof/spdk_measurement.py")
+        for name in names:
+            self.assertIn(name, package.REQUIRED)
+        (self.repo / names[0]).unlink()
         with self.assertRaisesRegex(ValueError, "required source closure"):
             package.source_paths(self.repo)
 
@@ -197,6 +265,18 @@ class PackageTests(unittest.TestCase):
                     package.elf_identity(library)
         with patch.object(package, "command", side_effect=[header, "(NEEDED) [libc.so.6]", "Version needs section GLIBC_2.39"]):
             self.assertEqual(package.elf_identity(library)["version_requirements"]["GLIBC"], ["2.39"])
+
+    def test_hwloc_is_admitted_only_for_gcp_resolved_closure(self):
+        library = self.root / "fabric"
+        library.write_bytes(b"fixture")
+        header = "ELF64 Advanced Micro Devices X86-64"
+        dynamic = "(NEEDED) Shared library: [libhwloc.so.15]"
+        with patch.object(package, "command", side_effect=[header, dynamic, ""]):
+            self.assertIn("libhwloc.so.15", package.elf_identity(library, "gcp")["needed"])
+        for provider in ("aws", "other"):
+            with self.subTest(provider=provider), patch.object(package, "command", side_effect=[header, dynamic, ""]):
+                with self.assertRaises(ValueError):
+                    package.elf_identity(library, provider)
 
     def test_newer_host_is_not_silently_packaged_as_portable(self):
         with patch.object(package.platform, "machine", return_value="x86_64"), patch.object(package, "command", return_value="glibc 2.40"):
@@ -262,6 +342,64 @@ class NativeClientAdmissionTests(unittest.TestCase):
         self.assertEqual(receipt["client_version"], self.version)
         self.assertEqual(receipt["sha256"], package.FDB_SHA256)
         self.assertEqual(receipt["blake2b512"], package.FDB_BLAKE2B)
+
+
+@unittest.skipUnless(all(shutil.which(tool) for tool in ("cc", "readelf", "ldd")), "native ELF tools unavailable")
+class HostAbiClosureTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        (self.root / "crypto.c").write_text("int answer(void) { return 7; }\n")
+        (self.root / "ssl.c").write_text("extern int answer(void); int ssl_answer(void) { return answer(); }\n")
+        (self.root / "main.c").write_text("extern int ssl_answer(void); int main(void) { return ssl_answer() != 7; }\n")
+        self.provider(self.root, "OPENSSL_3.4.0")
+        self.cc("-shared", "-fPIC", "-nostdlib", self.root / "ssl.c", "-L" + str(self.root),
+                "-lcrypto", "-Wl,-soname,libssl.so.3", "-o", self.root / "libssl.so.3")
+        (self.root / "libssl.so").symlink_to("libssl.so.3")
+        self.cc(self.root / "main.c", "-L" + str(self.root), "-lssl", "-lcrypto",
+                "-o", self.root / "client")
+
+    def cc(self, *arguments):
+        subprocess.run(["cc", *(str(value) for value in arguments)], check=True, capture_output=True, timeout=30)
+
+    def provider(self, directory, version):
+        arguments = []
+        if version is not None:
+            script = directory / "versions.map"
+            script.write_text(version + " { global: answer; local: *; };\n")
+            arguments.append("-Wl,--version-script=" + str(script))
+        self.cc("-shared", "-fPIC", "-nostdlib", self.root / "crypto.c", *arguments,
+                "-Wl,-soname,libcrypto.so.3", "-o", directory / "libcrypto.so.3")
+        (directory / "libcrypto.so").symlink_to("libcrypto.so.3")
+
+    def test_newer_compatible_host_closure_does_not_relax_packaged_artifact_floor(self):
+        environment = package.clean_environment()
+        environment["LD_LIBRARY_PATH"] = str(self.root)
+        subprocess.run([self.root / "client"], env=environment, check=True, timeout=10)
+        with self.assertRaisesRegex(ValueError, "OPENSSL_3.4.0"):
+            package.elf_identity(self.root / "libssl.so.3")
+        closure = package.linked_libraries(self.root / "client", environment)
+        self.assertEqual(closure["resolved"][str(self.root / "libssl.so.3")]["version_requirements"]["OPENSSL"],
+                         ["3.4.0"])
+
+    def test_runtime_rejects_provider_missing_the_required_symbol_version(self):
+        broken = self.root / "broken"
+        broken.mkdir()
+        self.provider(broken, "OPENSSL_3.0.0")
+        environment = package.clean_environment()
+        environment["LD_LIBRARY_PATH"] = str(broken) + ":" + str(self.root)
+        with self.assertRaises((ValueError, RuntimeError, subprocess.CalledProcessError)):
+            package.linked_libraries(self.root / "client", environment)
+
+    def test_runtime_rejects_provider_without_version_definitions(self):
+        unversioned = self.root / "unversioned"
+        unversioned.mkdir()
+        self.provider(unversioned, None)
+        environment = package.clean_environment()
+        environment["LD_LIBRARY_PATH"] = str(unversioned) + ":" + str(self.root)
+        with self.assertRaisesRegex(ValueError, "symbol version"):
+            package.linked_libraries(self.root / "client", environment)
 
 
 if __name__ == "__main__":

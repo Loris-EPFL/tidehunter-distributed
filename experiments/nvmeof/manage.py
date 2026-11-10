@@ -5,6 +5,7 @@ Run as trusted root. State directories must be private, local and persistent.
 No operation removes an image or invokes a global NVMe disconnect.
 """
 import argparse
+import errno
 import fcntl
 import ipaddress
 import json
@@ -35,6 +36,65 @@ def fail(message):
 def nqn(value):
     if not isinstance(value, str) or not NQN.fullmatch(value):
         fail('invalid NQN')
+    return value
+
+
+# Sealed controllers default to 4 I/O queues of depth 128 (decision of the
+# 2026-11-06 follow-up; the 2026-11-06 run set no queue flags, so sealed results
+# are not comparable). queue_count includes the admin queue and sqsize is
+# zero-based, as in the Rust live connector. The effective geometry is always
+# read back from sysfs and any mismatch refuses admission.
+DEFAULT_NR_IO_QUEUES = 4
+DEFAULT_QUEUE_SIZE = 128
+
+
+def queue_geometry_request(args):
+    """Return the (nr_io_queues, queue_size) to request; both default together."""
+    queues = getattr(args, 'nr_io_queues', None)
+    size = getattr(args, 'queue_size', None)
+    if queues is None and size is None:
+        return DEFAULT_NR_IO_QUEUES, DEFAULT_QUEUE_SIZE
+    if type(queues) is not int or not 1 <= queues <= 64:
+        fail('nr_io_queues out of range or not paired with queue_size')
+    if type(size) is not int or not 2 <= size <= 1024:
+        fail('queue_size out of range or not paired with nr_io_queues')
+    return queues, size
+
+def sysfs_unsigned(path):
+    text = path.read_text().strip()
+    if not text.isascii() or not text.isdigit():
+        fail('invalid controller attribute ' + path.name)
+    return int(text)
+
+
+def verify_queue_geometry(ctrl, requested):
+    """Read the kernel's effective geometry back; refuse any mismatch or
+    unreadable attribute."""
+    observed = {'queue_count': sysfs_unsigned(ctrl / 'queue_count'),
+                'sqsize': sysfs_unsigned(ctrl / 'sqsize')}
+    queues, size = requested
+    if observed['queue_count'] != queues + 1 or observed['sqsize'] != size - 1:
+        fail('unexpected controller queue geometry: queue_count=%d, sqsize=%d (requested nr_io_queues=%d, queue_size=%d)'
+             % (observed['queue_count'], observed['sqsize'], queues, size))
+    return {'requested': {'nr_io_queues': queues, 'queue_size': size}, 'observed': observed}
+
+
+def export_target(value):
+    if value in ('kernel', 'kernel_direct'):
+        return value
+    if not isinstance(value, dict) or set(value) != {'spdk'} or not isinstance(value['spdk'], dict):
+        fail('explicit kernel, kernel_direct or SPDK export target required')
+    target = value['spdk']
+    if set(target) != {'rpc_socket', 'pid', 'process_start_ticks', 'bdev_name', 'image_path'}:
+        fail('invalid SPDK target identity fields')
+    if any(type(target[k]) is not int or target[k] <= 0 for k in ('pid', 'process_start_ticks')):
+        fail('invalid SPDK target process identity')
+    if not isinstance(target['bdev_name'], str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', target['bdev_name']):
+        fail('invalid SPDK bdev name')
+    for key in ('rpc_socket', 'image_path'):
+        path = target[key]
+        if not isinstance(path, str) or not Path(path).is_absolute() or any(p in ('.', '..') for p in path.split('/')):
+            fail('SPDK target paths must be absolute canonical paths')
     return value
 
 
@@ -229,11 +289,16 @@ def put(path, value):
     path.write_text(str(value))
 
 
-def enable_buffered_io(namespace):
+def enable_buffered_io(namespace, target='kernel'):
+    if target not in ('kernel', 'kernel_direct'):
+        fail('kernel target kind required')
     attribute = namespace / 'buffered_io'
-    put(attribute, '1')
-    if attribute.read_text().strip() != '1':
+    expected = '0' if target == 'kernel_direct' else '1'
+    put(attribute, expected)
+    observed = attribute.read_text().strip()
+    if observed != expected:
         fail('target buffered_io readback failed')
+    return int(observed)
 
 
 def owned_link(path, destination):
@@ -303,6 +368,9 @@ def target_cleanup(directory, s):
 
 
 def target_setup(args):
+    target = getattr(args, 'target_kind', 'kernel')
+    if target not in ('kernel', 'kernel_direct'):
+        fail('kernel target kind required')
     readiness_evidence = preflight(args.transport, True)
     mpath = Path(args.manifest)
     m = manifest(mpath)
@@ -320,7 +388,9 @@ def target_setup(args):
          'image': str(image), 'image_device': image.stat().st_dev, 'image_inode': image.stat().st_ino,
          'nqn': m['nqn'], 'hostnqn': hostnqn, 'nsid': m['nsid'], 'uuid': m['uuid_string'],
          'port_id': args.port_id, 'service': args.service, 'address': str(addr),
-         'transport': args.transport, 'target_cache': 'buffered_file_page_cache',
+         'transport': args.transport, 'target_implementation': target,
+         'target_cache': ('direct_file_no_OS_pagecache' if target == 'kernel_direct'
+                          else 'buffered_file_page_cache'),
          'preflight': readiness_evidence,
          'initiator_cache': 'O_DIRECT required by reader', 'created_at_unix_ns': time.time_ns()}
     directory = new_state(args.state, s)
@@ -339,7 +409,8 @@ def target_setup(args):
         save(directory, s)
         put(ns / 'device_path', image)
         put(ns / 'device_uuid', m['uuid_string'])
-        enable_buffered_io(ns)
+        # nvmet permits this policy change only before namespace enable.
+        s['buffered_io'] = enable_buffered_io(ns, target)
         s['target_cache_verified'] = True
         put(ns / 'enable', '1')
         for key, value in [('addr_trtype', args.transport), ('addr_adrfam', 'ipv4' if addr.version == 4 else 'ipv6'),
@@ -367,17 +438,18 @@ def controller_snapshot(timeout=5.0):
     """Return two matching complete sysfs inventories, or fail closed.
 
     A controller can disappear between enumeration and attribute reads while a
-    different owned disconnect is running. ENOENT is a rescan signal, never
-    evidence by itself that an enumerated controller was absent.
+    different owned disconnect is running. ENOENT and ENODEV require a rescan,
+    never an inference that an enumerated controller is absent.
     """
     if timeout <= 0:
         fail('positive controller inventory timeout required')
     deadline = time.monotonic() + timeout
     previous = None
     while True:
-        names = controllers()
-        current = {}
+        current = None
         try:
+            names = controllers()
+            candidate = {}
             for name in sorted(names):
                 path = SYS_NVME / name
                 before = path.stat().st_ino
@@ -389,16 +461,16 @@ def controller_snapshot(timeout=5.0):
                     raise FileNotFoundError('controller changed during inventory')
                 if not nqn_value or not transport or not address:
                     fail('controller inventory contains an empty identity attribute')
-                current[name] = {'nqn': nqn_value, 'transport': transport,
-                                 'address': address, 'inode': before}
-        except FileNotFoundError:
-            current = None
-        if current is not None and controllers() == names:
-            if current == previous:
-                return current
-            previous = current
-        else:
-            previous = None
+                candidate[name] = {'nqn': nqn_value, 'transport': transport,
+                                   'address': address, 'inode': before}
+            if controllers() == names:
+                current = candidate
+        except OSError as exc:
+            if not isinstance(exc, FileNotFoundError) and exc.errno != errno.ENODEV:
+                raise
+        if current is not None and current == previous:
+            return current
+        previous = current
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             fail('controller inventory did not stabilize; controller identity remains unknown')
@@ -423,6 +495,45 @@ def new_controller_matches(before, current, expected_nqn, transport, address, se
     return [name for name, _ in candidates]
 
 
+def delete_controller(ctrl, identity, expected_attrs=None):
+    """Delete one verified sysfs object, not a replacement at the same name.
+
+    A vanished object is benign here. The caller must still prove final absence
+    with complete inventories before it releases any ownership state.
+    """
+    if not isinstance(ctrl, str) or not CONTROLLER.fullmatch(ctrl):
+        fail('invalid recorded controller')
+    if expected_attrs is not None and set(expected_attrs) != {'hostnqn'}:
+        fail('only the expected host NQN may supplement controller identity')
+    hostnqn = (expected_attrs or {}).get('hostnqn', identity.get('hostnqn'))
+    attributes = {'subsysnqn': identity['nqn'], 'hostnqn': hostnqn,
+                  'transport': identity['transport'], 'address': identity['address']}
+    if any(not isinstance(value, str) or not value for value in attributes.values()):
+        fail('complete controller identity including host NQN is required')
+    try:
+        directory = os.open(SYS_NVME / ctrl, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            if os.fstat(directory).st_ino != identity['inode']:
+                fail('recorded controller inode changed; refusing sysfs delete')
+            for name, expected in attributes.items():
+                attribute = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory)
+                with os.fdopen(attribute, 'r') as stream:
+                    if stream.read(4097).strip() != expected:
+                        fail('recorded controller identity changed; refusing sysfs delete')
+            attribute = os.open('delete_controller', os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                                dir_fd=directory)
+            try:
+                if os.write(attribute, b'1') != 1:
+                    fail('controller delete write was incomplete')
+            finally:
+                os.close(attribute)
+        finally:
+            os.close(directory)
+    except OSError as exc:
+        if exc.errno not in (errno.ENOENT, errno.ENODEV):
+            raise
+
+
 def disconnect(s):
     ctrl = s.get('controller')
     if ctrl is None:
@@ -444,9 +555,12 @@ def disconnect(s):
     try:
         run(['nvme', 'disconnect', '-d', str(DEV / ctrl)])
     except ValueError:
-        # A failed command is benign only after a fresh complete inventory
-        # proves the recorded name and every matching NQN absent.
+        # A CLI failure can leave its controller live. Retry this exact object
+        # once without libnvme, then retain the same complete absence proof.
         current = controller_snapshot()
+        if current.get(ctrl) == identity:
+            delete_controller(ctrl, identity, {'hostnqn': s.get('hostnqn')})
+            current = controller_snapshot()
         if ctrl in current or any(row['nqn'] == s['nqn'] for row in current.values()):
             raise
 
@@ -468,18 +582,25 @@ def discovery_has_endpoint(value, expected_nqn, transport, address, service):
 
 
 def namespace_candidates(ctrl, m, timeout=5.0):
-    """Rescan transient sysfs removals; persistent or inaccessible state is unknown."""
+    """Require two complete matching scans; ENOENT and ENODEV reset stability."""
     if timeout <= 0:
         fail('positive namespace inventory timeout required')
     deadline = time.monotonic() + timeout
+    previous = None
     while True:
+        current = None
         try:
-            return _namespace_candidates_once(ctrl, m)
-        except FileNotFoundError:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                fail('namespace inventory did not stabilize; identity remains unknown')
-            time.sleep(min(.02, remaining))
+            current = _namespace_candidates_once(ctrl, m)
+        except OSError as exc:
+            if not isinstance(exc, FileNotFoundError) and exc.errno != errno.ENODEV:
+                raise
+        if current is not None and current == previous:
+            return current
+        previous = current
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fail('namespace inventory did not stabilize; identity remains unknown')
+        time.sleep(min(.02, remaining))
 
 
 def _namespace_candidates_once(ctrl, m):
@@ -524,7 +645,7 @@ def _namespace_candidates_once(ctrl, m):
 
 
 def ensure_host_readonly(device):
-    # Target feature and identify checks are separate and must precede this.
+    # This is an independent host guard, not proof of target write rejection.
     fd = os.open(device, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
         if not stat.S_ISBLK(os.fstat(fd).st_mode):
@@ -542,6 +663,8 @@ def ensure_host_readonly(device):
 
 
 def host_connect(args):
+    target = export_target(getattr(args, 'export_target', 'kernel'))
+    requested = queue_geometry_request(args)
     readiness_evidence = preflight(args.transport, False)
     m = manifest(Path(args.manifest))
     hostnqn = nqn(args.hostnqn)
@@ -562,11 +685,13 @@ def host_connect(args):
     s = {'version': 1, 'kind': 'host', 'phase': 'connecting', 'manifest': args.manifest,
          'nqn': m['nqn'], 'uuid': m['uuid_string'], 'nsid': m['nsid'], 'hostnqn': hostnqn, 'hostid': hostid,
          'address': addr, 'service': args.service, 'transport': args.transport,
-         'created_at_unix_ns': time.time_ns(), 'initiator_cache': 'O_DIRECT required by reader'}
+         'created_at_unix_ns': time.time_ns(), 'initiator_cache': 'O_DIRECT required by reader',
+         'target': target, 'queue_geometry': {'requested': {'nr_io_queues': requested[0], 'queue_size': requested[1]}}}
     s['preflight'] = readiness_evidence
     directory = new_state(args.state, s)
     try:
-        run(['nvme', 'connect', *common, '-n', m['nqn'], '-l', '0'])
+        run(['nvme', 'connect', *common, '-n', m['nqn'], '-l', '0',
+             '-i', str(requested[0]), '-Q', str(requested[1])])
         deadline = time.monotonic() + 20
         while True:
             remaining = deadline - time.monotonic()
@@ -588,15 +713,22 @@ def host_connect(args):
             fail('controller transport mismatch')
         s['selected_transport'] = current[matching[0]]['transport']
         s['rdma_cm_path'] = 'connected' if args.transport == 'rdma' else 'not_applicable'
+        # The kernel may clamp or ignore queue options; the geometry must read
+        # back exactly, else the controller is not admitted.
+        s['queue_geometry'] = verify_queue_geometry(ctrl, requested)
+        save(directory, s)
         devctrl = DEV / s['controller']
-        run(['nvme', 'set-feature', str(devctrl), '-f', '0x84', '-n', str(m['nsid']), '-V', '1'])
-        feature = run(['nvme', 'get-feature', str(devctrl), '-f', '0x84', '-n', str(m['nsid'])])
-        found = re.search(r'Current value\s*:\s*(0x[0-9a-f]+|[0-9]+)', feature, re.I)
-        if not found or int(found.group(1), 0) != 1:
-            fail('namespace write protection readback failed: ' + feature.strip())
+        if target in ('kernel', 'kernel_direct'):
+            run(['nvme', 'set-feature', str(devctrl), '-f', '0x84', '-n', str(m['nsid']), '-V', '1'])
+            feature = run(['nvme', 'get-feature', str(devctrl), '-f', '0x84', '-n', str(m['nsid'])])
+            found = re.search(r'Current value\s*:\s*(0x[0-9a-f]+|[0-9]+)', feature, re.I)
+            if not found or int(found.group(1), 0) != 1:
+                fail('namespace write protection readback failed: ' + feature.strip())
+        # Stock SPDK has no feature 0x84 or NSATTR RO bit. Its explicit policy
+        # requires separate authenticated owner RO-bdev admission before reads.
         ident = run(['nvme', 'id-ns', str(devctrl), '-n', str(m['nsid']), '-b'], binary=True)
-        if len(ident) != 4096 or not ident[99] & 1:
-            fail('identify namespace does not report read-only')
+        if len(ident) != 4096 or (target in ('kernel', 'kernel_direct') and not ident[99] & 1):
+            fail('identify namespace read-only or response-length mismatch')
         flbas = (ident[26] & 15) | ((ident[26] & 0x60) >> 1)
         block_size = 1 << ident[128 + 4 * flbas + 2]
         if int.from_bytes(ident[:8], 'little') * block_size != m['image_len'] or block_size != m['block_size']:
@@ -651,6 +783,13 @@ def main():
         c.add_argument('--hostnqn', required=True)
         if name == 'target-setup':
             c.add_argument('--port-id', type=int, required=True)
+            c.add_argument('--target-kind', choices=('kernel', 'kernel_direct'), default='kernel')
+        else:
+            c.add_argument('--export-target', type=json.loads, default=argparse.SUPPRESS)
+            c.add_argument('--nr-io-queues', type=int, default=None,
+                           help='I/O queue count (default 4; set together with --queue-size); sysfs readback must match')
+            c.add_argument('--queue-size', type=int, default=None,
+                           help='I/O queue depth (default 128; set together with --nr-io-queues); sysfs readback must match')
     for name in ('target-cleanup', 'host-disconnect'):
         c = commands.add_parser(name); c.add_argument('--state', required=True)
         if name == 'target-cleanup':

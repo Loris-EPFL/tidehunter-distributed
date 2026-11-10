@@ -7,6 +7,7 @@ from unittest import mock
 from pathlib import Path
 
 import gcp_budget
+import workflow_input
 from gcp_api import ApiError
 from gcp_campaign import StateFile, save, cleanup, instance_body, mutation, owned_instance, has_delete_expiry, collect_results, coordinator_timeout
 
@@ -136,6 +137,23 @@ class LifecycleTests(unittest.TestCase):
         self.candidate = {'zone': 'us-central1-a', 'ordinary_subnet': 'o', 'rdma_subnet': 'r'}
         self.state['policy'] = {'name': self.state['run_id'] + '-placement', 'region': 'us-central1'}
 
+    def test_observer_preflight_uses_archive_source_and_actual_gcp_namespace(self):
+        import gcp_campaign
+        gcp_campaign.sys.path.insert(0, str(Path(gcp_campaign.__file__).resolve().parents[1] / 'kv-comparison'))
+        import cloud_package
+        receipt = {'archive_path': '/admitted/bundle.tar.gz', 'sha256': 'c' * 64,
+                   'source_sha256': 'a' * 64, 'binary_sha256': 'b' * 64}
+        def extract(archive, digest, destination):
+            self.assertEqual(str(archive), receipt['archive_path'])
+            self.assertEqual(digest, receipt['sha256'])
+            destination.mkdir()
+            (destination / 'source').symlink_to(Path(gcp_campaign.__file__).resolve().parents[2])
+            return {'source_sha256': receipt['source_sha256'], 'binary_sha256': receipt['binary_sha256']}
+        with mock.patch.object(cloud_package, 'verify_archive', side_effect=extract):
+            gcp_campaign.admit_sealed_observer(receipt, self.state['run_id'], self.state['deadline'])
+            with self.assertRaises(Exception):
+                gcp_campaign.admit_sealed_observer(receipt, 'bench-invalid', self.state['deadline'])
+
     def vm(self):
         body = instance_body(self.config, self.candidate, self.state, 0, 'startup', 'a' * 32)
         body['id'] = '42'
@@ -188,8 +206,10 @@ class LifecycleTests(unittest.TestCase):
             gcp_campaign.validate({**config, 'service_account': 'other@example.invalid'}, budget, self.state['run_id'], self.state['source_sha256'], deadline)
         with self.assertRaises(ValueError):
             gcp_campaign.validate(config, budget, 'th-0123456789abcdef', self.state['source_sha256'], deadline)
-        with self.assertRaises(ValueError):
-            gcp_campaign.validate(config, {**budget, 'max_duration_seconds': 6 * 3600}, self.state['run_id'], self.state['source_sha256'], deadline)
+        for hours in (5, 6):
+            with self.subTest(ci_duration_hours=hours), self.assertRaises(ValueError):
+                gcp_campaign.validate(config, {**budget, 'max_duration_seconds': hours * 3600},
+                                      self.state['run_id'], self.state['source_sha256'], deadline)
         with self.assertRaises(ValueError):
             gcp_campaign.validate(config, {**budget, 'max_duration_seconds': 4 * 3600}, self.state['run_id'], self.state['source_sha256'], (now + dt.timedelta(hours=5)).isoformat())
         with self.assertRaises(ValueError):
@@ -254,13 +274,15 @@ class LifecycleTests(unittest.TestCase):
                 budget = {'weekly_limit_cents': 10000, 'run_upper_bound_cents': 9000,
                           'max_duration_seconds': 7200, 'quote_description': 'bounded quote'}
                 receipt = {'source_sha256': self.state['source_sha256']}
-                for name, value in (('config', config), ('budget', budget), ('receipt', receipt), ('spec', {})):
+                spec = workflow_input.specification('kv', 'native', 'standard')
+                for name, value in (('config', config), ('budget', budget), ('receipt', receipt), ('spec', spec)):
                     Path(tmp, name + '.json').write_text(json.dumps(value))
                 args = ['run', '--config', tmp + '/config.json', '--budget', tmp + '/budget.json',
                         '--run-id', self.state['run_id'], '--source-sha', self.state['source_sha256'],
                         '--package-receipt', tmp + '/receipt.json', '--spec', tmp + '/spec.json',
                         '--deadline', deadline, '--state', tmp + '/state.json', '--output-dir', tmp, '--activate']
-                with mock.patch.object(gcp_campaign, 'GoogleApi', return_value=api):
+                with mock.patch.object(gcp_campaign, 'GoogleApi', return_value=api), \
+                     mock.patch.object(gcp_campaign, 'admit_sealed_observer'):
                     with self.assertRaisesRegex(ValueError, 'missing permissions'):
                         gcp_campaign.main(args)
                 self.assertEqual(api.mutations, [])

@@ -20,7 +20,8 @@ use std::{
 };
 
 const CHUNK: usize = 65_536;
-const SLOTS: usize = 4;
+/// Default per-endpoint slot count; a `FabricConfig` selects the actual count.
+const SLOTS: usize = crate::DEFAULT_SLOTS;
 const PROGRESS_LIMIT: usize = 10_000_000;
 pub(crate) const ENDPOINTS: usize = 1024;
 pub(super) const RMA_CANCELLED: u64 = 1 << 63;
@@ -35,6 +36,13 @@ pub struct ProgressStats {
     pub cq_empty_polls: u64,
     pub cq_completions: u64,
     pub cq_max_poll_gap_ns: u64,
+    /// Diagnostic poll samples with all application TX slots provider-owned.
+    pub tx_all_slots_pending_polls: u64,
+    /// Diagnostic poll samples with no application RX slot recorded as posted.
+    /// Pending receives may already have an unobserved CQ completion.
+    pub rx_no_posted_slots_polls: u64,
+    /// Diagnostic poll samples with at least one completed, unread RX slot.
+    pub rx_unread_slots_polls: u64,
     /// Opt-in synchronous work; post time is not completion residence or RTT.
     pub send_copy_ns: u64,
     pub send_copy_calls: u64,
@@ -71,6 +79,19 @@ pub struct ProgressStats {
     pub efa_direct_credit_posts: u64,
     /// Successful DATA posts that advanced the advertised cumulative credit frontier.
     pub efa_direct_credit_piggyback_advances: u64,
+    /// Successful `fi_send` posts by posted message length. Always on: plain
+    /// counter increments, no clock reads. Every normal post is at most 64 KiB,
+    /// so the last bucket stays zero except for a future larger chunk size.
+    pub send_size_le_4k: u64,
+    pub send_size_le_16k: u64,
+    pub send_size_le_64k: u64,
+    pub send_size_gt_64k: u64,
+    /// Every `fi_send` that returned EAGAIN (always on, unlike `send_post_would_block`).
+    pub send_post_eagain: u64,
+    /// Posts that reused the filled slot of an earlier EAGAIN without copying again.
+    pub send_post_retries: u64,
+    /// Idle sweeps that parked on the provider CQ wait object (not busy polls).
+    pub cq_idle_waits: u64,
 }
 
 /// Successful endpoint setup stages, not an estimate of hardware latency.
@@ -147,6 +168,62 @@ pub struct ProviderInfo {
     pub bus_address: Option<String>,
     pub rma_capabilities: Option<RmaCapabilities>,
     pub capability_evidence: String,
+    /// Effective provider and geometry facts read once during open.
+    #[serde(default)]
+    pub geometry: ProviderGeometry,
+}
+
+/// One libfabric environment parameter owned by the selected provider.
+/// `value` is the configured override (`None` when the environment does not set
+/// it). `configured_or_default` is that override, else the default libfabric
+/// states in the parameter's help text (parsed, so a heuristic). Neither is the
+/// value the provider finally uses: `RxM` may clamp or derive limits internally
+/// and libfabric does not expose them, so the actual eager and SAR thresholds
+/// are unverified.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderParameter {
+    pub name: String,
+    pub value: Option<String>,
+    pub configured_or_default: Option<String>,
+    pub help: String,
+}
+
+/// Provider/domain/endpoint attributes captured from the selected `fi_info`.
+/// These are negotiated capacities, not hardware queue depths or latencies.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderGeometry {
+    /// `fi_version()` of the loaded libfabric, formatted `major.minor`.
+    pub libfabric_api_version: String,
+    /// API version passed to `fi_getinfo`, formatted `major.minor`.
+    pub requested_api_version: String,
+    /// `fi_fabric_attr::prov_version`, formatted `major.minor`.
+    pub provider_version: String,
+    pub protocol: u32,
+    pub protocol_version: u32,
+    /// `tx_attr.inject_size` as reported by `fi_getinfo`. Not the `RxM` eager
+    /// threshold: on the software provider it is 64 while the `RxM` buffer size
+    /// default is 16384.
+    pub tx_inject_size: usize,
+    pub tx_size: usize,
+    pub rx_size: usize,
+    pub tx_iov_limit: usize,
+    pub rx_iov_limit: usize,
+    pub max_msg_size: usize,
+    pub mr_mode: i32,
+    pub mr_mode_flags: Vec<String>,
+    pub data_progress: String,
+    pub control_progress: String,
+    pub threading: String,
+    /// Application TX/RX slot count (each 64 KiB) selected for this endpoint.
+    pub slots: usize,
+    /// Completion-queue wait object actually opened: `none`, `fd` or `unspec`,
+    /// plus why waiting is unavailable when the provider refused it.
+    pub cq_wait: String,
+    /// All `FI_OFI_RXM_*` parameters (buffer, SAR, eager, inject, queue sizes)
+    /// when the selected provider is RxM-based; empty otherwise.
+    pub rxm_parameters: Vec<ProviderParameter>,
 }
 
 /// Wire-safe remote address; contains no process-local MR descriptor.
@@ -281,8 +358,8 @@ impl ReadBuffer {
     }
 }
 
-/// One exclusively operated `FI_EP_RDM` endpoint with four 64 KiB slots each
-/// for sends and receives (512 KiB total).
+/// One exclusively operated `FI_EP_RDM` endpoint with `slots` 64 KiB slots each
+/// for sends and receives (default four, 512 KiB total; at most 64 each).
 /// Buffers and provider contexts have stable allocations across thread moves.
 pub struct Endpoint {
     resources: Option<Box<Resources>>,
@@ -322,13 +399,32 @@ impl Endpoint {
     /// Reports invalid configuration, unavailable providers, unsupported
     /// capabilities, exhausted admission or native resource-setup failures.
     pub fn open(config: &FabricConfig, rma: Option<RmaConfig>) -> io::Result<Self> {
+        Self::open_checked(config, rma, false)
+    }
+
+    /// Like [`Endpoint::open`], for an owner that parks while idle: `verbs`
+    /// additionally requests a CQ wait fd (software already parks in a bounded
+    /// `fi_cq_sread`). Whether the provider granted a wait object is reported in
+    /// `ProviderInfo::geometry.cq_wait`; a refusal keeps busy polling.
+    ///
+    /// # Errors
+    /// Same as [`Endpoint::open`].
+    pub fn open_idle_parking(config: &FabricConfig, rma: Option<RmaConfig>) -> io::Result<Self> {
+        Self::open_checked(config, rma, true)
+    }
+
+    fn open_checked(
+        config: &FabricConfig,
+        rma: Option<RmaConfig>,
+        park_idle: bool,
+    ) -> io::Result<Self> {
         config.validate()?;
         if config.backend == FabricBackend::Efa && rma.is_some() {
             return Err(invalid(
                 "regular EFA RMA is unsupported; select the explicit efa-direct backend",
             ));
         }
-        Self::open_inner(config, rma)
+        Self::open_inner(config, rma, park_idle)
     }
 
     /// Test-only packet-protocol exercise over the explicitly selected software provider.
@@ -338,6 +434,7 @@ impl Endpoint {
             backend: FabricBackend::SoftwareTcp,
             domain: domain.map(str::to_owned),
             source_address: None,
+            slots: None,
         };
         let mut endpoint = Self::open(&config, None)?;
         endpoint.inner().enable_test_packet_adapter();
@@ -345,7 +442,11 @@ impl Endpoint {
         Ok(endpoint)
     }
 
-    fn open_inner(config: &FabricConfig, rma: Option<RmaConfig>) -> io::Result<Self> {
+    fn open_inner(
+        config: &FabricConfig,
+        rma: Option<RmaConfig>,
+        park_idle: bool,
+    ) -> io::Result<Self> {
         LIVE.fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
             (live < ENDPOINTS).then_some(live + 1)
         })
@@ -357,7 +458,7 @@ impl Endpoint {
             failed: false,
         };
         endpoint.inner().open_profile.allocation_ns = resources::elapsed_ns(allocation);
-        endpoint.inner().open_mode(config, rma)?;
+        endpoint.inner().open_mode(config, rma, park_idle)?;
         if config.backend.is_direct() {
             endpoint.direct = Some(Box::new(DirectState::new(endpoint.open_profile().mtu)?));
         }
@@ -624,7 +725,9 @@ impl Endpoint {
     /// retries, sleeps or retains the caller's slices.
     /// # Errors
     /// `WouldBlock` accepts no bytes and leaves the endpoint usable. A copied but
-    /// unposted slot is immediately reusable. Other progress/post errors poison.
+    /// unposted slot owns no ordinal and is immediately reusable. If the next call
+    /// presents the same bytes, the endpoint posts that filled slot without
+    /// copying again; different bytes are copied afresh. Other errors poison.
     pub fn try_send_vectored(&mut self, bytes: &[IoSlice<'_>]) -> io::Result<usize> {
         self.try_send_vectored_inner(bytes, true)
     }
@@ -651,12 +754,7 @@ impl Endpoint {
                 if poll {
                     state.poll()?;
                 }
-                let slot = state.free_send_slot().ok_or(io::ErrorKind::WouldBlock)?;
-                let len = state.copy_send(slot, bytes);
-                if !state.post_send(slot, len)? {
-                    return Err(io::ErrorKind::WouldBlock.into());
-                }
-                Ok(len)
+                state.send_copied(bytes)
             })()
         };
         self.finish_try(result)
@@ -1020,7 +1118,7 @@ impl Endpoint {
     }
 
     /// Copies a chunk into an owned slot and posts it without waiting for its
-    /// completion. Up to four sends can be in flight. The caller must continue
+    /// completion. Up to the configured slot count of sends can be in flight. The caller must continue
     /// progress with sends, receives or flush before waiting outside the fabric.
     /// # Errors
     /// A progress failure poisons the endpoint. Expired deadlines submit no work.
@@ -1377,6 +1475,7 @@ mod tests {
             backend: FabricBackend::Verbs,
             domain: Some("verbs\0device".to_owned()),
             source_address: None,
+            slots: None,
         };
         assert_eq!(
             config.validate().unwrap_err().kind(),

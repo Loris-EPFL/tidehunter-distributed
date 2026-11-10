@@ -171,7 +171,8 @@ class SafetyTests(unittest.TestCase):
             state = {'controller': 'nvme7', 'nqn': 'nqn.2026-01.example:a', 'transport': 'tcp',
                      'controller_inode': ctrl.stat().st_ino, 'controller_address': 'traddr=127.0.0.1,trsvcid=4420'}
             with patch.object(manage, 'SYS_NVME', root):
-                with patch.object(manage, 'run', side_effect=ValueError('disconnect failed')) as run:
+                with patch.object(manage, 'run', side_effect=ValueError('disconnect failed')) as run, \
+                     patch.object(manage, 'delete_controller'):
                     with self.assertRaisesRegex(ValueError, 'disconnect failed'):
                         manage.disconnect(state)
                     self.assertEqual(run.call_args.args[0], ['nvme', 'disconnect', '-d', '/dev/nvme7'])
@@ -314,6 +315,96 @@ class SafetyTests(unittest.TestCase):
              patch.object(manage.os, 'close'), patch.object(manage.fcntl, 'ioctl', side_effect=ioctl) as call:
             manage.ensure_host_readonly('/dev/nvme4n1')
             self.assertEqual([c.args[1] for c in call.call_args_list], [0x125e, 0x125d, 0x125e])
+
+    def test_requested_queue_geometry_accepts_only_exact_readback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctrl = Path(tmp)
+            def readback(count, size):
+                (ctrl / 'queue_count').write_text(count)
+                (ctrl / 'sqsize').write_text(size)
+                return manage.verify_queue_geometry(ctrl, (4, 128))
+            # queue_count includes the admin queue; sqsize is zero-based.
+            self.assertEqual(readback('5\n', '127\n'), {
+                'requested': {'nr_io_queues': 4, 'queue_size': 128},
+                'observed': {'queue_count': 5, 'sqsize': 127}})
+            for count, size in (('4\n', '127\n'), ('6\n', '127\n'), ('5\n', '128\n'), ('5\n', '31\n'),
+                                ('2\n', '31\n'), ('5\n', '-1\n'), ('five\n', '127\n'), ('5\n', '\n'),
+                                ('\u0665\n', '127\n')):
+                with self.subTest(count=count, size=size), self.assertRaises(ValueError):
+                    readback(count, size)
+            (ctrl / 'queue_count').write_text('5\n')
+            (ctrl / 'sqsize').unlink()
+            with self.assertRaises(FileNotFoundError):
+                manage.verify_queue_geometry(ctrl, (4, 128))
+
+    def test_queue_geometry_request_defaults_to_4x128_and_overrides_are_paired_and_bounded(self):
+        self.assertEqual(manage.queue_geometry_request(SimpleNamespace()), (4, 128))
+        self.assertEqual(manage.queue_geometry_request(SimpleNamespace(nr_io_queues=None, queue_size=None)), (4, 128))
+        self.assertEqual(manage.queue_geometry_request(SimpleNamespace(nr_io_queues=1, queue_size=32)), (1, 32))
+        for bad in ({'nr_io_queues': 4}, {'queue_size': 128}, {'nr_io_queues': 0, 'queue_size': 128},
+                    {'nr_io_queues': 65, 'queue_size': 128}, {'nr_io_queues': True, 'queue_size': 128},
+                    {'nr_io_queues': 4, 'queue_size': 1}, {'nr_io_queues': 4, 'queue_size': 1025},
+                    {'nr_io_queues': 4, 'queue_size': '128'}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                manage.queue_geometry_request(SimpleNamespace(**bad))
+
+    def host_connect_with(self, queue_count, sqsize, **geometry):
+        identity = {'nqn': 'nqn.2026-01.test:wal', 'transport': 'tcp',
+                    'address': 'traddr=10.0.0.1,trsvcid=4420', 'inode': 7}
+        snapshots = iter([{}, {'nvme7': identity}])
+        manifest = {'nqn': identity['nqn'], 'uuid_string': str(manage.uuid.uuid4()), 'nsid': 1,
+                    'image_len': 4096, 'block_size': 4096}
+        args = SimpleNamespace(manifest='/m/manifest.json', state='/s', transport='tcp', address='10.0.0.1',
+                               service=4420, hostnqn='nqn.2026-01.test:host', **geometry)
+        states, commands = [], []
+        def run(argv, **kwargs):
+            commands.append(argv)
+            return '[]' if argv[1] == 'discover' else ''
+        def new_state(path, state):
+            states.append(state)
+            return SimpleNamespace(close=lambda: None)
+        with tempfile.TemporaryDirectory() as tmp:
+            sysfs = Path(tmp)
+            (sysfs / 'nvme7').mkdir()
+            (sysfs / 'nvme7' / 'queue_count').write_text('%d\n' % queue_count)
+            (sysfs / 'nvme7' / 'sqsize').write_text('%d\n' % sqsize)
+            with patch.object(manage, 'SYS_NVME', sysfs), patch.object(manage, 'preflight', return_value={}), \
+                 patch.object(manage, 'manifest', return_value=manifest), \
+                 patch.object(manage, 'controller_snapshot', side_effect=lambda **_: next(snapshots)), \
+                 patch.object(manage, 'run', side_effect=run), \
+                 patch.object(manage, 'discovery_has_endpoint', return_value=True), \
+                 patch.object(manage, 'new_state', side_effect=new_state), \
+                 patch.object(manage, 'save'), patch.object(manage, 'disconnect') as disconnect:
+                try:
+                    manage.host_connect(args)
+                    error = None
+                except ValueError as exc:
+                    error = str(exc)
+        return error, states[0], commands, disconnect
+
+    def test_host_connect_defaults_to_4x128_and_refuses_a_mismatched_readback_before_admission(self):
+        # The kernel kept the old 1x32 geometry (queue_count=2, sqsize=31).
+        error, state, commands, disconnect = self.host_connect_with(2, 31)
+        self.assertIn('queue geometry', error)
+        connect = next(c for c in commands if c[1] == 'connect')
+        self.assertEqual(connect[connect.index('-i') + 1], '4')
+        self.assertEqual(connect[connect.index('-Q') + 1], '128')
+        self.assertFalse(any(c[1] in ('set-feature', 'id-ns') for c in commands))
+        disconnect.assert_called_once()
+
+    def test_host_connect_records_effective_geometry_in_the_receipt_state(self):
+        error, state, commands, disconnect = self.host_connect_with(5, 127)
+        # Admission passed geometry and reached write protection (the stub fails there).
+        self.assertIn('write protection', error)
+        self.assertEqual(state['queue_geometry'], {
+            'requested': {'nr_io_queues': 4, 'queue_size': 128},
+            'observed': {'queue_count': 5, 'sqsize': 127}})
+
+    def test_host_connect_override_requests_and_verifies_that_geometry(self):
+        error, state, commands, disconnect = self.host_connect_with(5, 127, nr_io_queues=1, queue_size=32)
+        self.assertIn('queue geometry', error)
+        connect = next(c for c in commands if c[1] == 'connect')
+        self.assertEqual((connect[connect.index('-i') + 1], connect[connect.index('-Q') + 1]), ('1', '32'))
 
     def test_trace_recovery_refuses_replaced_instance(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -459,6 +550,185 @@ class SafetyTests(unittest.TestCase):
         b['values']['read_sectors'] = 3
         with self.assertRaises(ValueError): collect.delta(a, b)
         with self.assertRaises(ValueError): collect.block_snapshot('../nvme0n1')
+
+    def test_case_boundary_identity_missing_and_reset(self):
+        import copy
+        first = {'boot_id': {'available': True, 'value': 'boot-one'},
+                 'image': {'available': True, 'st_dev': 1, 'inode': 2,
+                           'backing_device_verified': True},
+                 'block': {'available': True, 'identity': {'dev': '259:0',
+                           'diskseq': {'available': True, 'value': 1}},
+                           'snapshot': {'values': {'read_sectors': 10, 'writes_completed': 0,
+                                                   'in_flight': 3}}},
+                 'target_cache': {'available': False}}
+        last = copy.deepcopy(first)
+        last['block']['snapshot']['values'] = {'read_sectors': 9, 'writes_completed': 0,
+                                               'in_flight': 0, 'read_ms': 1}
+        row = collect.case_delta(first, last)
+        self.assertTrue(row['available'])
+        self.assertFalse(row['block']['read_sectors']['available'])
+        self.assertEqual(row['block']['writes_completed']['delta'], 0)
+        self.assertFalse(row['block']['read_ms']['available'])
+        self.assertEqual(row['block']['in_flight']['end'], 0)
+        last['image']['inode'] = 3
+        self.assertFalse(collect.case_delta(first, last)['available'])
+        last['image']['inode'] = 2
+        last['image']['backing_device_verified'] = False
+        self.assertFalse(collect.case_delta(first, last)['available'])
+        last['image']['backing_device_verified'] = True
+        last['block']['identity']['dev'] = '259:1'
+        self.assertFalse(collect.case_delta(first, last)['available'])
+
+    def test_case_snapshots_reject_reboots_and_recreated_disks(self):
+        class Rdma:
+            @staticmethod
+            def capture(root):
+                return {'available': False, 'devices': [], 'errors': []}
+
+            @staticmethod
+            def capture_resources():
+                return {'resources': {'available': False}}
+
+            @staticmethod
+            def compare(begin, end):
+                return {'available': False, 'ports': []}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image = root / 'image'
+            image.write_bytes(b'wal')
+            boot = root / 'boot_id'
+            boot.write_text('boot-one\n')
+            block = root / 'class/block/testdisk'
+            block.mkdir(parents=True)
+            (block / 'dev').write_text('259:0\n')
+            (block / 'diskseq').write_text('42\n')
+            (block / 'stat').write_text('10 0 20 0 0 0 0 0 0 0 0\n')
+            backing = root / 'dev/block'
+            backing.mkdir(parents=True)
+            info = image.stat()
+            (backing / f'{os.major(info.st_dev)}:{os.minor(info.st_dev)}').symlink_to(block)
+            binding = [{'image': str(image), 'block_device': 'testdisk'}]
+            with patch.object(collect, 'file_residency', return_value={'available': False}):
+                begin = collect.case_capture('case', 'begin', binding, [], Rdma,
+                                             sys_root=root, boot_id_path=boot)
+                self.assertFalse(begin['rdma_resources']['resources']['available'])
+                (block / 'stat').write_text('15 0 30 0 0 0 0 0 0 0 0\n')
+                end = collect.case_capture('case', 'end', binding, [], Rdma,
+                                           sys_root=root, boot_id_path=boot)
+                first, last = begin['images'][0]['snapshot'], end['images'][0]['snapshot']
+                self.assertEqual(first['boot_id']['value'], 'boot-one')
+                self.assertEqual(first['block']['identity']['diskseq']['value'], 42)
+                self.assertEqual(collect.case_delta(first, last)['block']['reads_completed']['delta'], 5)
+                self.assertEqual(collect.case_compare(begin, end, Rdma)['images'][0]
+                                 ['comparison']['block']['read_sectors']['delta'], 10)
+                import copy
+                inconsistent = copy.deepcopy(end)
+                inconsistent['images'][0]['snapshot']['boot_id']['value'] = 'other-boot'
+                self.assertFalse(collect.case_compare(begin, inconsistent, Rdma)['images'][0]
+                                 ['comparison']['available'])
+
+                (block / 'diskseq').write_text('43\n')
+                recreated = collect.case_capture('case', 'end', binding, [], Rdma,
+                                                 sys_root=root, boot_id_path=boot)
+                self.assertTrue(recreated['images'][0]['snapshot']['block']['available'])
+                self.assertFalse(collect.case_delta(first, recreated['images'][0]['snapshot'])['available'])
+                self.assertFalse(collect.case_compare(begin, recreated, Rdma)['images'][0]
+                                 ['comparison']['available'])
+                (block / 'diskseq').unlink()
+                missing_disk = collect.case_snapshot(str(image), 'testdisk', root, boot_id_path=boot)
+                self.assertTrue(missing_disk['block']['available'])
+                self.assertFalse(missing_disk['block']['identity']['diskseq']['available'])
+                self.assertFalse(collect.case_delta(first, missing_disk)['available'])
+                (block / 'diskseq').write_text('0\n')
+                zero_disk = collect.case_snapshot(str(image), 'testdisk', root, boot_id_path=boot)
+                self.assertFalse(zero_disk['block']['identity']['diskseq']['available'])
+                self.assertFalse(collect.case_delta(first, zero_disk)['available'])
+                (block / 'diskseq').write_text('42\n')
+                boot.write_text('boot-two\n')
+                rebooted = collect.case_capture('case', 'end', binding, [], Rdma,
+                                                sys_root=root, boot_id_path=boot)
+                self.assertFalse(collect.case_delta(first, rebooted['images'][0]['snapshot'])['available'])
+                self.assertFalse(collect.case_compare(begin, rebooted, Rdma)['available'])
+                boot.unlink()
+                missing_boot = collect.case_capture('case', 'end', binding, [], Rdma,
+                                                   sys_root=root, boot_id_path=boot)
+                self.assertTrue(missing_boot['images'][0]['snapshot']['block']['available'])
+                self.assertFalse(collect.case_delta(first, missing_boot['images'][0]['snapshot'])['available'])
+                self.assertFalse(collect.case_compare(begin, missing_boot, Rdma)['available'])
+
+    def test_controller_attributes_missing_are_not_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctrl = root / 'class/nvme/nvme0'
+            ctrl.mkdir(parents=True)
+            (ctrl / 'queue_count').write_text('4\n')
+            row = collect.controller_snapshot('nvme0', root)
+            self.assertEqual(row['queue_count']['value'], 4)
+            self.assertFalse(row['sqsize']['available'])
+            self.assertFalse(collect.controller_snapshot('nvme1', root)['available'])
+            with self.assertRaises(ValueError):
+                collect.controller_snapshot('../nvme0', root)
+
+    def test_fincore_residency_is_identity_bound_and_optional(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'wal_0000000000000000'
+            path.write_bytes(b'1234')
+            info = path.stat()
+            identity = {'st_dev': info.st_dev, 'inode': info.st_ino, 'size_bytes': info.st_size}
+            output = json.dumps({'fincore': [{'file': str(path), 'res': 0, 'size': 4}]}).encode()
+            with patch.object(collect.shutil, 'which', return_value='/usr/bin/fincore'), \
+                 patch.object(collect.subprocess, 'run', return_value=SimpleNamespace(stdout=output, stderr=b'', returncode=0)):
+                observed = collect.file_residency(str(path), identity)
+                self.assertTrue(observed['available'])
+                self.assertEqual(observed['resident_bytes'], 0)
+                self.assertIn('not per-I/O', observed['scope'])
+                self.assertFalse(collect.file_residency(str(path), {**identity, 'inode': info.st_ino + 1})['available'])
+            with patch.object(collect.shutil, 'which', return_value=None):
+                self.assertFalse(collect.file_residency(str(path), identity)['available'])
+
+    def test_whole_case_boundaries_and_boot_identity(self):
+        class Rdma:
+            count = 6
+            @staticmethod
+            def capture(root):
+                return {'available': False, 'devices': [], 'errors': ['not installed']}
+
+            @classmethod
+            def capture_resources(cls):
+                cls.count += 1
+                return {'resources': {'available': True, 'devices': [{'counts': {'mr': cls.count}}]}}
+
+            @staticmethod
+            def compare(begin, end):
+                return {'ports': [], 'available': False}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            boot = root / 'boot_id'
+            boot.write_text('boot-one')
+            ctrl = root / 'class/nvme/nvme0'
+            ctrl.mkdir(parents=True)
+            (ctrl / 'serial').write_text('serial-1')
+            (ctrl / 'queue_count').write_text('4')
+            begin = collect.case_capture('case', 'begin', [], ['nvme0'], Rdma,
+                                         sys_root=root, boot_id_path=boot)
+            end = collect.case_capture('case', 'end', [], ['nvme0'], Rdma,
+                                       sys_root=root, boot_id_path=boot)
+            self.assertEqual(begin['rdma_resources']['resources']['devices'][0]['counts']['mr'], 7)
+            self.assertEqual(end['rdma_resources']['resources']['devices'][0]['counts']['mr'], 8)
+            result = collect.case_compare(begin, end, Rdma)
+            self.assertTrue(result['available'])
+            self.assertTrue(result['controllers'][0]['available'])
+            self.assertFalse(result['rdma']['available'])
+            boot.write_text('boot-two')
+            end = collect.case_capture('case', 'end', [], ['nvme0'], Rdma,
+                                       sys_root=root, boot_id_path=boot)
+            self.assertFalse(collect.case_compare(begin, end, Rdma)['available'])
+            with self.assertRaises(ValueError):
+                collect.case_capture('case', 'begin', [], ['nvme0'] * 257, Rdma)
+            with self.assertRaises(ValueError):
+                collect.case_capture('case', 'begin', [], [['nvme0']], Rdma)
 
     def test_target_trace_pairs_and_ambiguous_requests(self):
         lines = [

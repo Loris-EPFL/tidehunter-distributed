@@ -39,7 +39,9 @@ MAX_MEMBERS = 100000
 MAX_JSON = 16 * 1024**2
 SCRAPE_SECONDS = 1
 QUERY_PAGE_SECONDS = 300
-QUERY_METRICS = ('kv_observer_snapshot_final', 'kv_observer_case_terminal', 'kv_observer_data_available', 'up',
+# Case kinds that run no KV client, so no exporter ever sees a final result snapshot for them.
+STANDALONE_CASE_KINDS = ('fio_floor', 'net_floor', 'ssd_floor', 'ssd_write_floor')
+LEGACY_QUERY_METRICS = ('kv_observer_snapshot_final', 'kv_observer_case_terminal', 'kv_observer_data_available', 'up',
                  'kv_case_success_calls_per_second', 'kv_case_api_quantile_seconds', 'kv_case_read_path_calls',
                  'kv_case_resource_interval_available', 'kv_case_resource_interval_elapsed_seconds',
                  'kv_case_resource_interval_core_available', 'kv_case_resource_interval_io_available',
@@ -55,6 +57,8 @@ QUERY_METRICS = ('kv_observer_snapshot_final', 'kv_observer_case_terminal', 'kv_
                  'kv_observer_read_profile_enabled', 'kv_case_read_diagnostic_available',
                  'kv_case_read_diagnostic_operations', 'kv_case_read_diagnostic_stage_seconds',
                  'kv_case_read_diagnostic_stage_count', 'kv_case_read_diagnostic_stage_available',
+                 'kv_case_correlated_stage_seconds_sum', 'kv_case_correlated_stage_samples',
+                 'kv_case_valkey_cq_availability', 'kv_case_valkey_diagnostic_observations',
                  'kv_case_read_boundary_stage_available', 'kv_case_read_boundary_stage_seconds',
                  'kv_case_read_boundary_stage_count', 'kv_case_read_boundary_gauge', 'kv_case_cache_policy_available',
                  'kv_case_cache_policy_info', 'kv_case_cache_policy_value', 'kv_case_cache_policy_field_available',
@@ -62,7 +66,42 @@ QUERY_METRICS = ('kv_observer_snapshot_final', 'kv_observer_case_terminal', 'kv_
                  'kv_case_block_trace_available', 'kv_case_block_trace_qualified', 'kv_case_block_trace_truncated',
                  'kv_case_block_trace_count', 'kv_case_block_trace_counter_available', 'kv_case_block_trace_timestamp_available',
                  'kv_case_block_trace_timestamp_seconds', 'kv_case_block_interval_available',
-                 'kv_case_block_interval_count', 'kv_case_block_interval_seconds')
+                 'kv_case_block_interval_count', 'kv_case_block_interval_seconds',
+                 'kv_spdk_target_evidence_available', 'kv_spdk_target_read_ops',
+                 'kv_spdk_target_read_bytes', 'kv_spdk_target_read_completion_seconds',
+                 'kv_spdk_live_target_evidence_available', 'kv_spdk_live_target_owner_available',
+                 'kv_spdk_live_target_io_error_available', 'kv_spdk_live_target_io_errors',
+                 'kv_spdk_live_target_ops', 'kv_spdk_live_target_bytes',
+                 'kv_spdk_live_target_completion_seconds',
+                 'kv_case_owned_wal_evidence_available', 'kv_case_owned_wal_read_bytes',
+                 'kv_case_owned_wal_interval_available', 'kv_case_owned_wal_interval_count',
+                 'kv_case_owned_wal_interval_seconds')
+QUERY_METRICS = LEGACY_QUERY_METRICS + (
+    'kv_observer_case_status', 'kv_observer_write_profile_enabled',
+    'kv_case_read_evidence_available', 'kv_case_read_transport_observations',
+    'kv_case_native_wal_inventory_available', 'kv_case_native_wal_registered_files',
+    'kv_case_native_wal_logical_file_length_bytes',
+    'kv_client_pool_evidence_available', 'kv_client_pool_events',
+    'kv_live_nvmeof_evidence_available', 'kv_live_nvmeof_events', 'kv_live_nvmeof_bytes',
+    'kv_live_nvmeof_stage_available', 'kv_live_nvmeof_stage_samples',
+    'kv_live_nvmeof_stage_seconds', 'kv_live_nvmeof_lifetime_peak',
+    'kv_nvmeof_reader_evidence_available', 'kv_nvmeof_reader_available',
+    'kv_nvmeof_reader_count', 'kv_nvmeof_reader_stage_available',
+    'kv_nvmeof_reader_stage_count', 'kv_nvmeof_reader_stage_seconds',
+    'kv_nvmeof_reader_lifetime_count', 'kv_nvmeof_reader_lifetime_stage_samples',
+    'kv_nvmeof_reader_lifetime_stage_seconds',
+    'kv_nvmeof_target_interval_seconds', 'kv_nvmeof_target_interval_delta',
+    'kv_nvmeof_target_trace_available', 'kv_nvmeof_target_cpu_ticks_per_second',
+    'kv_nvmeof_trace_interval_seconds', 'kv_nvmeof_trace_dropped_events',
+    'kv_nvmeof_trace_stage_events', 'kv_nvmeof_trace_stage_seconds',
+    'kv_case_offered_calls', 'kv_case_success_calls', 'kv_case_rejected_calls',
+    'kv_case_outcome_calls', 'kv_case_timed_samples', 'kv_case_response_quantile_seconds',
+    'kv_case_scheduling_quantile_seconds', 'kv_case_measurement_seconds',
+    'kv_case_success_logical_keys_per_second', 'kv_case_success_value_mib_per_second',
+    'kv_observer_cgroup_available', 'kv_observer_cgroup_memory_current_bytes',
+    'kv_observer_cgroup_memory_peak_bytes', 'kv_observer_cgroup_oom_kills_total',
+    'kv_observer_host_selection_available', 'kv_observer_info_section_available',
+    'kv_observer_info_counter_total', 'kv_observer_info_gauge')
 CAPS = {'prometheus': ('1', '1g'), 'grafana': ('0.5', '768m'),
         'benchmark': ('0.25', '256m'), 'host': ('0.1', '128m'), 'node': ('0.1', '128m')}
 TOKEN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$')
@@ -237,8 +276,8 @@ def validate_spec(value):
                'hosts', 'ports', 'allow_loopback_hosts'}
     if set(spec) - allowed or type(spec.get('schema_version')) is not int or spec['schema_version'] != 1:
         raise ValueError('invalid session spec schema')
-    if not isinstance(spec.get('run_id'), str) or not re.fullmatch(r'th-[A-Za-z0-9][A-Za-z0-9_-]{0,78}', spec['run_id']):
-        raise ValueError('run_id must be a safe th-* identity')
+    if not isinstance(spec.get('run_id'), str) or not re.fullmatch(r'(?:th-[A-Za-z0-9][A-Za-z0-9_-]{0,78}|bench-[0-9a-f]{16})', spec['run_id']):
+        raise ValueError('run_id must be a safe th-* or bench-<16 lowercase hex> identity')
     state = absolute(spec['state_dir'])
     results = absolute(spec['results_root'])
     if state == results or state.is_relative_to(results):
@@ -739,7 +778,8 @@ def select_host(spec, index, job, processes):
 def finish_case(spec, job, result_dir, *, metrics=None, status='completed', write_profile_enabled=None,
                 read_profile_enabled=None, read_evidence=None, measurement_read_evidence=None,
                 resource_evidence=None, write_diagnostics=None, read_diagnostics=None,
-                read_tier_effective=None, cold_device_evidence=None):
+                read_tier_effective=None, cold_device_evidence=None, correlation_summaries=None,
+                spdk_target_io=None, nvmeof_target_evidence=None, nvmeof_trace_evidence=None):
     started = time.monotonic()
     spec = validate_spec(spec)
     state, _ = state_for(spec)
@@ -777,6 +817,16 @@ def finish_case(spec, job, result_dir, *, metrics=None, status='completed', writ
         terminal['read_tier_effective'] = read_tier_effective
     if cold_device_evidence is not None:
         terminal['cold_device_evidence'] = cold_device_evidence
+    if correlation_summaries is not None:
+        terminal['correlation_summaries'] = correlation_summaries
+    if spdk_target_io is not None:
+        if job.get('nvmeof_target') != 'spdk':
+            raise ValueError('SPDK target timing requires a selected SPDK target')
+        terminal['spdk_target_io'] = spdk_target_io
+    if nvmeof_target_evidence is not None:
+        terminal['nvmeof_target_evidence'] = nvmeof_target_evidence
+    if nvmeof_trace_evidence is not None:
+        terminal['nvmeof_trace_evidence'] = nvmeof_trace_evidence
     import campaign_exporter
     campaign_exporter.terminal_metrics(terminal, {})
     campaign_exporter.read_tier_metrics(job, {}, read_tier_effective)
@@ -784,7 +834,9 @@ def finish_case(spec, job, result_dir, *, metrics=None, status='completed', writ
     published_at = time.time()
     atomic_json(state / 'benchmark/selection.json', selected, 0o444, max_bytes=campaign_exporter.MAX_SELECTION)
     labels = '{run_id=' + json.dumps(spec['run_id']) + ',case_id=' + json.dumps(job['case_id']) + '}'
-    metric = ('kv_observer_snapshot_final' if status == 'completed' else 'kv_observer_case_terminal') + labels
+    # A standalone case (fio) has no KV producer, hence never a final snapshot: its terminal record is the observation.
+    standalone = job.get('case_kind') in STANDALONE_CASE_KINDS
+    metric = ('kv_observer_snapshot_final' if status == 'completed' and not standalone else 'kv_observer_case_terminal') + labels
     status_labels = labels[:-1] + ',status=' + json.dumps(status) + '}'
     expression = (metric + ' == 1 and on(run_id,case_id) kv_observer_case_status' + status_labels
                   + ' == 1 and on(run_id,case_id) (timestamp(kv_observer_case_terminal' + labels
@@ -1041,19 +1093,21 @@ def collect_query_evidence(spec, state, time_range, captured=None):
 
     for metric, left, right in plan:
         retain(metric, left, right)
-    result = {'schema_version': 2, 'page_interval': '(start,end]', 'pages': pages}
+    result = {'schema_version': captured['schema_version'] if captured is not None else 3,
+              'page_interval': '(start,end]', 'pages': pages}
     validate_query_evidence(result, time_range)
     return result, seen
 
 
 def validate_query_evidence(evidence, time_range):
-    if (not isinstance(evidence, dict) or evidence.get('schema_version') != 2
+    if (not isinstance(evidence, dict) or evidence.get('schema_version') not in (2, 3)
             or evidence.get('page_interval') != '(start,end]' or not isinstance(evidence.get('pages'), list)
             or not 0 < len(evidence['pages']) < MAX_MEMBERS):
         raise ValueError('invalid bounded query evidence index')
     end = time_range['end']
     lower = end - max(1, math.ceil(end - time_range['start']))
-    cursors = {metric: lower for metric in QUERY_METRICS}
+    metrics = LEGACY_QUERY_METRICS if evidence['schema_version'] == 2 else QUERY_METRICS
+    cursors = {metric: lower for metric in metrics}
     for page in evidence['pages']:
         if not isinstance(page, dict):
             raise ValueError('query page index row must be an object')
@@ -1410,6 +1464,9 @@ def main():
             command.add_argument('--read-profile-enabled', choices=('true', 'false'))
             command.add_argument('--read-evidence', type=Path)
             command.add_argument('--measurement-read-evidence', type=Path)
+            command.add_argument('--spdk-target-io', type=Path)
+            command.add_argument('--nvmeof-target-evidence', type=Path)
+            command.add_argument('--nvmeof-trace-evidence', type=Path)
             command.add_argument('--resource-evidence', type=Path)
             command.add_argument('--write-diagnostics', type=Path)
             command.add_argument('--read-diagnostics', type=Path)
@@ -1454,6 +1511,9 @@ def main():
                     read_profile_enabled=None if args.read_profile_enabled is None else args.read_profile_enabled == 'true',
                     read_evidence=load_json(args.read_evidence) if args.read_evidence else None,
                     measurement_read_evidence=load_json(args.measurement_read_evidence) if args.measurement_read_evidence else None,
+                    spdk_target_io=load_json(args.spdk_target_io) if args.spdk_target_io else None,
+                    nvmeof_target_evidence=load_json(args.nvmeof_target_evidence) if args.nvmeof_target_evidence else None,
+                    nvmeof_trace_evidence=load_json(args.nvmeof_trace_evidence) if args.nvmeof_trace_evidence else None,
                     resource_evidence=load_json(args.resource_evidence) if args.resource_evidence else None,
                     write_diagnostics=load_json(args.write_diagnostics) if args.write_diagnostics else None,
                     read_diagnostics=load_json(args.read_diagnostics) if args.read_diagnostics else None)

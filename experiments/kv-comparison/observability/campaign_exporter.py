@@ -23,10 +23,15 @@ COORDINATOR_INTERVAL_COUNTERS = {
     "write_storage_wait_ns", "write_publication_ns", "write_dispatch_ns", "write_preparation_admission_ns",
     "write_checkpoint_ns", "write_checkpoint_count", "write_foreground_checkpoint_ns",
     "write_foreground_checkpoint_count", "write_background_checkpoint_ns",
+    "write_concurrent_checkpoint_deferrals", "write_concurrent_checkpoint_wait_ns",
     "write_background_checkpoint_suffix_batches", "write_durable_receipt_publication_blocked_ns",
     "write_durable_receipt_publication_blocked_batches", "write_append_requests", "write_direct_appends",
     "write_durable_batches", "write_concurrent_admitted", "write_concurrent_completed",
-    "write_out_of_prefix_published_batches", "write_dependency_wait_batches"}
+    "write_out_of_prefix_published_batches", "write_dependency_wait_batches",
+    "write_checkpoint_diagnostic_root_adoption_ns", "write_checkpoint_diagnostic_root_adoption_count",
+    "write_checkpoint_diagnostic_owner_adoption_ns", "write_checkpoint_diagnostic_owner_adoption_count",
+    "write_checkpoint_diagnostic_obsolete_cleanup_ns", "write_checkpoint_diagnostic_obsolete_cleanup_count",
+    "write_checkpoint_diagnostic_index_prepare_ns", "write_checkpoint_diagnostic_index_prepare_count"}
 
 
 def absolute(value):
@@ -79,6 +84,25 @@ def context(run_id, job):
     labels.update(case_id=token(job["case_id"]), requested_backend=token(job["backend"]),
                   profile=token(job["profile"]), cohort=token(job["cohort"]),
                   value_bytes=str(count(job["value_size"])), repeat=str(count(job["repeat"])))
+    route = job.get("nvmeof_route")
+    if route is not None:
+        if (route not in ("live", "sealed_read")
+                or job["backend"] not in ("tidehunter_nvme_tcp", "tidehunter_nvme_rdma")
+                or (job.get("case_kind") == "hybrid_put" and
+                    (route != "sealed_read" or job["cohort"] != "primary_rf1" or job["backend"] != "tidehunter_nvme_rdma"))
+                or (job.get("case_kind") != "hybrid_put" and
+                    (route == "sealed_read") != (job["cohort"] == "sealed_read"))):
+            raise ValueError("invalid requested NVMe-oF route or population")
+        labels["requested_nvmeof_route"] = route
+        target = job.get("nvmeof_target", "kernel")
+        if target not in ("kernel", "spdk") or target == "spdk" and job["backend"] != "tidehunter_nvme_rdma":
+            raise ValueError("invalid NVMe-oF target implementation")
+        labels["requested_nvmeof_target"] = target
+        if target == "spdk":
+            labels["requested_backend"] = ("tidehunter_spdk_live_rdma" if route == "live"
+                                           else "tidehunter_spdk_rdma")
+    elif job.get("nvmeof_target") is not None or job.get("case_kind") == "hybrid_put":
+        raise ValueError("target implementation requires an NVMe-oF route")
     return labels
 
 
@@ -198,10 +222,14 @@ def measurement_read_metrics(evidence, labels):
     if not isinstance(deltas, dict):
         raise ValueError("measurement read deltas missing")
     labels = labels | {"scope": "measurement_boundary"}
+    supplemental = client_pool_metrics(evidence.get("client_pool"), labels)
+    supplemental += live_nvmeof_peak_metrics(evidence.get("live_nvmeof_peaks"), labels)
+    supplemental += nvmeof_reader_boundaries(evidence, labels)
     result = ""
     if deltas.get("available") is False:
         return (sample("kv_case_read_evidence_available", 0, labels | {"component": "measurement"})
-                + nvmeof_reader_metrics(evidence.get("nvmeof"), labels))
+                + nvmeof_reader_metrics(evidence.get("nvmeof"), labels)
+                + live_nvmeof_metrics(evidence.get("live_nvmeof"), labels) + supplemental)
     def emit(row, local):
         if not isinstance(row, dict) or type(row.get("available")) is not bool:
             raise ValueError("invalid measurement read component")
@@ -387,7 +415,124 @@ def measurement_read_metrics(evidence, labels):
                         result += sample("kv_case_read_boundary_gauge", count(row[field]),
                                          labels | {"boundary": boundary, "component": component,
                                                    "partition": partition, "gauge": field})
-    return result + nvmeof_reader_metrics(evidence.get("nvmeof"), labels)
+    return (result + nvmeof_reader_metrics(evidence.get("nvmeof"), labels)
+            + live_nvmeof_metrics(evidence.get("live_nvmeof"), labels) + supplemental)
+
+
+def client_pool_metrics(evidence, labels):
+    if evidence is None:
+        return ""
+    if not isinstance(evidence, dict) or type(evidence.get("available")) is not bool:
+        raise ValueError("invalid client pool evidence")
+    result = sample("kv_client_pool_evidence_available", int(evidence["available"]), labels)
+    if evidence["available"]:
+        counters = evidence.get("counters")
+        if not isinstance(counters, dict):
+            raise ValueError("invalid client pool counters")
+        for field, value in counters.items():
+            result += sample("kv_client_pool_events", count(value), labels | {"counter": token(field)})
+    return result
+
+
+def live_nvmeof_peak_metrics(evidence, labels):
+    if evidence is None:
+        return ""
+    if not isinstance(evidence, dict) or set(evidence) - {"lane_inflight_request_max", "lane_inflight_op_max"}:
+        raise ValueError("invalid live NVMe-oF peaks")
+    result = ""
+    for field, row in evidence.items():
+        if not isinstance(row, dict):
+            raise ValueError("invalid live NVMe-oF peak")
+        for boundary, key in (("start", "at_start"), ("end", "at_end")):
+            value = row.get(key)
+            if value is not None:
+                result += sample("kv_live_nvmeof_lifetime_peak", count(value),
+                                 labels | {"scope": "node_lifetime", "boundary": boundary, "peak": field})
+    return result
+
+
+def nvmeof_reader_boundaries(evidence, labels):
+    """Expose new sealed-reader fields as lifetime snapshots, not interval deltas."""
+    result = ""
+    for boundary in ("start", "end"):
+        snapshot = evidence.get(boundary)
+        nvme = snapshot.get("nvmeof") if isinstance(snapshot, dict) else None
+        if not isinstance(nvme, dict) or nvme.get("available") is not True:
+            continue
+        readers = nvme.get("readers")
+        if not isinstance(readers, list) or len(readers) > 128:
+            raise ValueError("invalid NVMe reader boundary")
+        for index, reader in enumerate(readers):
+            if not isinstance(reader, dict):
+                raise ValueError("invalid NVMe reader boundary row")
+            local = labels | {"scope": "node_lifetime", "boundary": boundary, "reader": str(index),
+                              "partition": str(count(reader.get("partition")))}
+            for field in ("admitted_sqes", "merged_members", "pool_hits", "pool_misses",
+                          "pool_recycled", "pool_discarded"):
+                if field in reader and reader[field] is not None:
+                    result += sample("kv_nvmeof_reader_lifetime_count", count(reader[field]),
+                                     local | {"counter": field})
+            for stage in ("lock_wait", "lock_hold"):
+                row = reader.get(stage)
+                if row is None:
+                    continue
+                if not isinstance(row, dict):
+                    raise ValueError("invalid NVMe reader boundary stage")
+                samples = count(row.get("count"))
+                total = count(row.get("sum_ns"))
+                maximum = count(row.get("max_ns"))
+                if not samples and (total or maximum):
+                    raise ValueError("NVMe reader boundary timing without samples")
+                dimensions = local | {"stage": stage}
+                result += sample("kv_nvmeof_reader_lifetime_stage_samples", samples, dimensions)
+                if samples:
+                    result += sample("kv_nvmeof_reader_lifetime_stage_seconds", total / 1e9,
+                                     dimensions | {"statistic": "sum"})
+                    result += sample("kv_nvmeof_reader_lifetime_stage_seconds", maximum / 1e9,
+                                     dimensions | {"statistic": "max"})
+    return result
+
+
+def live_nvmeof_metrics(evidence, labels):
+    """Export only admitted measurement deltas, not lifetime snapshots or route claims."""
+    if evidence is None:
+        return ""
+    if not isinstance(evidence, dict) or type(evidence.get("available")) is not bool:
+        raise ValueError("invalid live NVMe-oF measurement evidence")
+    result = sample("kv_live_nvmeof_evidence_available", int(evidence["available"]), labels)
+    if not evidence["available"]:
+        return result
+    counters = evidence.get("counters")
+    fields = ("completed_read_ops", "completed_read_bytes", "completed_write_ops",
+              "completed_write_bytes", "recovery_read_ops", "recovery_read_bytes",
+              "metadata_requests", "namespace_connects", "payload_rpc_requests",
+              "unknown_writes", "errors", "route_evidence_dropped", "fence_evidence_dropped")
+    stages = ("queue", "submit", "cq", "control", "validation", "allocation",
+              "publication", "namespace_setup", "read_io", "persistence", "owner_completion",
+              "wal_persistence", "wal_namespace", "frontier_file", "frontier_namespace")
+    extra_fields = ("lane_inflight_samples", "lane_inflight_request_sum", "lane_inflight_op_sum",
+                    "grant_hits", "grant_misses", "grant_evictions", "copy_bytes_avoided")
+    extra_stages = ("delivery", "controller_connect", "controller_disconnect")
+    expected = set(fields) | {stage + suffix for stage in stages for suffix in ("_ns", "_samples")}
+    allowed = expected | set(extra_fields) | {stage + suffix for stage in extra_stages for suffix in ("_ns", "_samples")}
+    if not isinstance(counters, dict) or not expected <= counters.keys() or counters.keys() - allowed:
+        raise ValueError("incomplete live NVMe-oF measurement counters")
+    for field in fields + tuple(field for field in extra_fields if field in counters):
+        metric = "kv_live_nvmeof_bytes" if field.endswith("_bytes") or field == "copy_bytes_avoided" else "kv_live_nvmeof_events"
+        result += sample(metric, count(counters[field]), labels | {"counter": field})
+    for stage in stages + tuple(stage for stage in extra_stages if stage + "_ns" in counters or stage + "_samples" in counters):
+        if stage + "_ns" not in counters or stage + "_samples" not in counters:
+            raise ValueError("incomplete live NVMe-oF timing")
+        samples = count(counters[stage + "_samples"])
+        total = count(counters[stage + "_ns"])
+        if not samples and total:
+            raise ValueError("live NVMe-oF timing sum without samples")
+        stage_labels = labels | {"stage": stage}
+        result += sample("kv_live_nvmeof_stage_available", int(samples > 0), stage_labels)
+        result += sample("kv_live_nvmeof_stage_samples", samples, stage_labels)
+        if samples:
+            result += sample("kv_live_nvmeof_stage_seconds", total / 1e9, stage_labels | {"statistic": "sum"})
+    return result
 
 
 def nvmeof_reader_metrics(nvme, labels):
@@ -437,6 +582,72 @@ def nvmeof_reader_metrics(nvme, labels):
                         result += sample("kv_nvmeof_reader_stage_count", count(values.get("count")), stage_labels)
                         result += sample("kv_nvmeof_reader_stage_seconds", count(values.get("sum_ns")) / 1e9,
                                          stage_labels | {"statistic": "sum"})
+    return result
+
+
+def spdk_target_metrics(evidence, labels):
+    if evidence is None:
+        return ""
+    if isinstance(evidence, dict) and evidence.get("kind") == "live":
+        return spdk_live_target_metrics(evidence, labels)
+    if not isinstance(evidence, dict) or evidence.get("available") is not True:
+        raise ValueError("SPDK metrics require admitted target intervals")
+    owners = evidence.get("owners")
+    if (not isinstance(owners, list) or len(owners) != 5
+            or {row.get("index") for row in owners} != set(range(5))):
+        raise ValueError("SPDK target metrics require every owner")
+    result = sample("kv_spdk_target_evidence_available", 1, labels)
+    for owner, row in [("all", evidence)] + [(str(row["index"]), row) for row in owners]:
+        local = labels | {"target_owner": owner}
+        reads, size = count(row["read_ops"]), count(row["read_bytes"])
+        mean = row.get("mean_read_completion_us")
+        if bool(reads) != bool(size) or (reads == 0) != (mean is None):
+            raise ValueError("SPDK target sample count, bytes and mean disagree")
+        result += sample("kv_spdk_target_read_ops", reads, local)
+        result += sample("kv_spdk_target_read_bytes", size, local)
+        if mean is not None:
+            result += sample("kv_spdk_target_read_completion_seconds", number(mean) / 1e6,
+                             local | {"statistic": "mean"})
+    return result
+
+
+def spdk_live_target_metrics(evidence, labels):
+    """Export admitted owner intervals, without inventing partial aggregates."""
+    owners = evidence.get("owners")
+    if (type(evidence.get("available")) is not bool or not isinstance(owners, list)
+            or len(owners) != 5 or any(not isinstance(row, dict) for row in owners)
+            or {row.get("index") for row in owners} != set(range(5))
+            or any(type(row.get("available")) is not bool for row in owners)
+            or evidence["available"] != all(row["available"] for row in owners)):
+        raise ValueError("invalid live SPDK owner availability")
+    result = sample("kv_spdk_live_target_evidence_available", int(evidence["available"]), labels)
+    rows = [(str(row["index"]), row) for row in owners]
+    if evidence["available"]:
+        rows.insert(0, ("all", evidence))
+    for owner, row in rows:
+        local = labels | {"target_owner": owner}
+        result += sample("kv_spdk_live_target_owner_available", int(row["available"]), local)
+        if not row["available"]:
+            continue
+        if type(row.get("io_error_available")) is not bool:
+            raise ValueError("invalid live SPDK error availability")
+        result += sample("kv_spdk_live_target_io_error_available", int(row["io_error_available"]), local)
+        if row["io_error_available"]:
+            errors = row.get("io_errors")
+            if not isinstance(errors, dict):
+                raise ValueError("missing live SPDK error counters")
+            for status, value in errors.items():
+                result += sample("kv_spdk_live_target_io_errors", count(value), local | {"status": token(status)})
+        for direction in ("read", "write"):
+            ops, size = count(row[direction + "_ops"]), count(row[direction + "_bytes"])
+            mean = row.get("mean_" + direction + "_completion_us")
+            if bool(ops) != bool(size) or (ops == 0) != (mean is None):
+                raise ValueError("live SPDK operation count, bytes and mean disagree")
+            result += sample("kv_spdk_live_target_ops", ops, local | {"direction": direction})
+            result += sample("kv_spdk_live_target_bytes", size, local | {"direction": direction})
+            if mean is not None:
+                result += sample("kv_spdk_live_target_completion_seconds", number(mean) / 1e6,
+                                 local | {"direction": direction, "statistic": "mean"})
     return result
 
 
@@ -518,35 +729,53 @@ def cold_device_metrics(evidence, labels):
                     raise ValueError("invalid block trace timestamp precision")
                 result += sample("kv_case_block_trace_timestamp_seconds", value / 1e9,
                                  local | {"precision": field})
-        interval = row.get("intervals_ns")
-        if interval is not None:
-            if backend != "request_identity" or not isinstance(interval, dict):
-                raise ValueError("only request-identity intervals may be exported")
-            required = {"count", "sum", "max", "mean", "population_stddev", "p50", "p95", "p99", "p999", "tail_warnings"}
-            if set(interval) != required or not isinstance(interval["tail_warnings"], list):
-                raise ValueError("invalid block interval distribution")
-            n = count(interval["count"])
-            total = count(interval["sum"])
-            if row.get("matched_reads") != n:
-                raise ValueError("block interval population differs from matched requests")
-            for field in ("max", "mean", "population_stddev", "p50", "p95", "p99", "p999"):
-                value = interval[field]
-                if (n == 0) != (value is None):
-                    raise ValueError("invalid block interval availability")
-                if value is not None:
-                    number(value)
-            if n == 0 and total != 0:
-                raise ValueError("empty block interval population has nonzero sum")
-            usable = n > 0 and row.get("lost") == 0 and not row["truncated"]
-            result += sample("kv_case_block_interval_available", int(usable), local)
-            if usable:
-                result += sample("kv_case_block_interval_count", n, local)
-                result += sample("kv_case_block_interval_seconds", total / 1e9, local | {"statistic": "sum"})
+        populations = [(row, local, "kv_case_block_interval")]
+        owned = row.get("owned_wal_io")
+        if owned is not None:
+            if not isinstance(owned, dict) or type(owned.get("available")) is not bool:
+                raise ValueError("invalid owned-WAL evidence availability")
+            owned_labels = local | {"scope": "collector_window_owned_wal_extent_subset"}
+            result += sample("kv_case_owned_wal_evidence_available", int(owned["available"]), owned_labels)
+            if owned["available"]:
+                if backend != "request_identity" or row["qualified"] is not True:
+                    raise ValueError("owned-WAL attribution requires a qualified request-identity trace")
+                reads = count(owned.get("read_ops"))
+                size = count(owned.get("read_bytes"))
+                if type(owned.get("qualified")) is not bool or owned["qualified"] != bool(reads) or bool(size) != bool(reads):
+                    raise ValueError("owned-WAL I/O counts and qualification disagree")
+                result += sample("kv_case_owned_wal_read_bytes", size, owned_labels)
+                populations.append((owned | {"matched_reads": reads, "lost": row["lost"], "truncated": row["truncated"]},
+                                    owned_labels, "kv_case_owned_wal_interval"))
+        for population, interval_labels, prefix in populations:
+            interval = population.get("intervals_ns")
+            if interval is not None:
+                if backend != "request_identity" or not isinstance(interval, dict):
+                    raise ValueError("only request-identity intervals may be exported")
+                required = {"count", "sum", "max", "mean", "population_stddev", "p50", "p95", "p99", "p999", "tail_warnings"}
+                if set(interval) != required or not isinstance(interval["tail_warnings"], list):
+                    raise ValueError("invalid block interval distribution")
+                n = count(interval["count"])
+                total = count(interval["sum"])
+                if population.get("matched_reads") != n:
+                    raise ValueError("block interval population differs from matched requests")
                 for field in ("max", "mean", "population_stddev", "p50", "p95", "p99", "p999"):
-                    result += sample("kv_case_block_interval_seconds", interval[field] / 1e9,
-                                     local | {"statistic": field})
-        else:
-            result += sample("kv_case_block_interval_available", 0, local)
+                    value = interval[field]
+                    if (n == 0) != (value is None):
+                        raise ValueError("invalid block interval availability")
+                    if value is not None:
+                        number(value)
+                if n == 0 and total != 0:
+                    raise ValueError("empty block interval population has nonzero sum")
+                usable = n > 0 and population.get("lost") == 0 and not population["truncated"]
+                result += sample(prefix + "_available", int(usable), interval_labels)
+                if usable:
+                    result += sample(prefix + "_count", n, interval_labels)
+                    result += sample(prefix + "_seconds", total / 1e9, interval_labels | {"statistic": "sum"})
+                    for field in ("max", "mean", "population_stddev", "p50", "p95", "p99", "p999"):
+                        result += sample(prefix + "_seconds", interval[field] / 1e9,
+                                         interval_labels | {"statistic": field})
+            else:
+                result += sample(prefix + "_available", 0, interval_labels)
     return result
 
 
@@ -609,6 +838,21 @@ def resource_interval_metrics(evidence, labels):
     return result
 
 
+LIVE_NVME_WRITE_COUNTERS = {
+    "completed_read_ops", "completed_read_bytes", "completed_write_ops", "completed_write_bytes",
+    "recovery_read_ops", "recovery_read_bytes", "metadata_requests", "namespace_connects",
+    "unknown_writes", "errors", "payload_rpc_requests",
+    "lane_inflight_samples", "lane_inflight_request_sum", "lane_inflight_op_sum",
+    "grant_hits", "grant_misses", "grant_evictions", "copy_bytes_avoided",
+    *(stage + suffix for stage in ("queue", "submit", "cq", "control", "validation", "persistence",
+                                   "allocation", "publication", "namespace_setup", "read_io",
+                                   "owner_completion", "wal_persistence", "wal_namespace",
+                                   "frontier_file", "frontier_namespace", "delivery",
+                                   "controller_connect", "controller_disconnect")
+      for suffix in ("_ns", "_samples")),
+}
+
+
 def write_diagnostic_metrics(evidence, labels):
     """Bounded accumulated clocks/counts with independent explicit population scopes."""
     if evidence is None:
@@ -616,7 +860,7 @@ def write_diagnostic_metrics(evidence, labels):
     required = {"schema_version", "backend", "phase", "phase_attempted", "runtime_enabled",
                 "runtime_observation_mode", "selection", "clock_scope", "overlap_semantics",
                 "unsupported_stages", "profile", "error"}
-    if not isinstance(evidence, dict) or set(evidence) != required:
+    if not isinstance(evidence, dict) or set(evidence) - {"pre_completion_gate", "measurement_drained"} != required:
         raise ValueError("invalid write diagnostic artifact fields")
     if len(json.dumps(evidence, allow_nan=False, separators=(",", ":")).encode()) > 64 * 1024:
         raise ValueError("write diagnostic artifact exceeds 64KiB")
@@ -646,6 +890,8 @@ def write_diagnostic_metrics(evidence, labels):
                 raise ValueError("write diagnostic numeric field count exceeds bound")
 
     bounded_tree(evidence)
+    if "measurement_drained" in evidence and type(evidence["measurement_drained"]) is not bool:
+        raise ValueError("invalid write measurement drain status")
     if (type(evidence["schema_version"]) is not int or evidence["schema_version"] != 1
             or evidence["phase"] != "measurement" or type(evidence["phase_attempted"]) is not bool
             or type(evidence["runtime_enabled"]) is not bool
@@ -670,13 +916,86 @@ def write_diagnostic_metrics(evidence, labels):
     profile = evidence["profile"]
     if profile is not None and not isinstance(profile, dict):
         raise ValueError("write diagnostic profile must be an object or null")
-    available = (evidence["phase_attempted"] and evidence["runtime_enabled"] and observed > 0
+    mode = evidence["runtime_observation_mode"]
+    nvme = backend == "tidehunter_live_nvmeof" and mode == "live_nvmeof_phase_counters"
+    if mode == "live_nvmeof_phase_counters" and not nvme:
+        raise ValueError("live NVMe write window requires the live NVMe backend")
+    if profile is not None and not nvme:
+        stages = profile.get("stages")
+        if (profile.get("scope") == "measurement_nvme_io_cumulative_delta"
+                or isinstance(stages, dict) and "live_nvmeof" in stages):
+            raise ValueError("live NVMe write evidence requires the live backend and observation mode")
+    if nvme and profile is not None:
+        stages = profile.get("stages")
+        counters = stages.get("live_nvmeof") if isinstance(stages, dict) else None
+        if (profile.get("scope") != "measurement_nvme_io_cumulative_delta"
+                or profile.get("runtime_observation_mode") != mode
+                or type(profile.get("requested_limit")) is not int
+                or profile["requested_limit"] != selection["requested_limit"]
+                or not isinstance(counters, dict) or set(stages) != {"live_nvmeof"}
+                or set(counters) - LIVE_NVME_WRITE_COUNTERS
+                or type(profile.get("selected_operations")) is not int
+                or type(counters.get("completed_write_ops")) is not int
+                or profile["selected_operations"] != observed
+                or counters["completed_write_ops"] != observed
+                or type(counters.get("errors")) is not int or counters["errors"] != 0
+                or type(counters.get("unknown_writes")) is not int or counters["unknown_writes"] != 0
+                or profile.get("finalization_error") is not None
+                or evidence["runtime_enabled"] != (observed > 0)):
+            raise ValueError("invalid live NVMe write counter window")
+        for field, value in counters.items():
+            token(field)
+            count(value)
+        for field in counters:
+            if field.endswith("_ns") and field[:-3] + "_samples" not in counters:
+                raise ValueError("live NVMe clock lacks its sample count")
+    elif nvme and (observed or evidence["runtime_enabled"]):
+        raise ValueError("live NVMe write counter window is unavailable")
+    elif backend == "tidehunter_live_nvmeof" and evidence["runtime_enabled"]:
+        raise ValueError("unrecognized live NVMe write observation mode")
+    if profile is not None and profile.get("runtime_observation_mode") == "live_nvmeof_phase_counters" and not nvme:
+        raise ValueError("live NVMe write profile mode differs from artifact")
+    scope = "measurement_nvme_io_cumulative_delta" if nvme else "sampled_prefix"
+    boundary_eligible = evidence["phase_attempted"] and evidence.get("measurement_drained") is not False
+    available = (boundary_eligible and (not nvme or evidence.get("measurement_drained") is True)
+                 and evidence["runtime_enabled"] and observed > 0
                  and profile is not None and isinstance(profile.get("stages"), dict)
                  and bool(profile["stages"]) and evidence["error"] is None)
-    local = labels | {"phase": "measurement", "scope": "sampled_prefix", "diagnostic_backend": backend}
+    local = labels | {"phase": "measurement", "scope": scope, "diagnostic_backend": backend}
     result = sample("kv_case_write_diagnostic_available", int(available), local)
     result += sample("kv_case_write_diagnostic_operations", selection["requested_limit"], local | {"population": "requested_limit"})
-    result += sample("kv_case_write_diagnostic_operations", observed, local | {"population": "observed_samples"})
+    result += sample("kv_case_write_diagnostic_operations", observed, local | {
+        "population": "completed_write_ops" if nvme else "observed_samples"})
+    pre = evidence.get("pre_completion_gate")
+    if pre is not None:
+        if not isinstance(pre, dict) or type(pre.get("available")) is not bool:
+            raise ValueError("invalid pre-completion-gate snapshot")
+        boundary = local | {"scope": "coordinator_arm_through_pre_completion_gate"}
+        result += sample("kv_case_write_diagnostic_available", int(pre["available"] and boundary_eligible), boundary)
+        if pre["available"]:
+            if (set(pre) != {"available", "scope", "clock_scope", "stages"}
+                    or pre["scope"] != boundary["scope"]
+                    or not isinstance(pre["clock_scope"], str) or not pre["clock_scope"].strip()
+                    or not isinstance(pre["stages"], dict) or not pre["stages"]
+                    or set(pre["stages"]) - COORDINATOR_INTERVAL_COUNTERS):
+                raise ValueError("invalid pre-completion-gate coordinator interval")
+            checkpoint_available = profile.get("coordinator_checkpoint_diagnostics_available") if profile else None
+            if checkpoint_available is not None and type(checkpoint_available) is not bool:
+                raise ValueError("invalid coordinator checkpoint diagnostic availability")
+            for field, value in sorted(pre["stages"].items()):
+                value = count(value)
+                if not boundary_eligible:
+                    continue
+                if field.startswith("write_checkpoint_diagnostic_") and checkpoint_available is not True:
+                    continue
+                if field.endswith("_ns"):
+                    result += sample("kv_case_write_diagnostic_stage_seconds", value / 1e9,
+                                     boundary | {"component": "coordinator_interval", "stage": field})
+                else:
+                    result += sample("kv_case_write_diagnostic_stage_count", value,
+                                     boundary | {"component": "coordinator_interval", "counter": field})
+        elif set(pre) != {"available", "reason"} or not isinstance(pre["reason"], str) or not pre["reason"]:
+            raise ValueError("unavailable pre-completion-gate snapshot requires a reason")
     if profile is None:
         return result
     stages = profile.get("stages")
@@ -697,16 +1016,22 @@ def write_diagnostic_metrics(evidence, labels):
             token(field)
             if isinstance(value, dict):
                 stage_tree(value, component + "." + field, depth + 1)
-            elif isinstance(value, str) and field in ("status", "reason"):
+            elif ((value is None and field in ("sampled_registered_files_min", "sampled_registered_files_max"))
+                  or (isinstance(value, str) and field in ("status", "reason"))):
                 continue
             else:
                 value = count(value)
+                if nvme and component == "stages.live_nvmeof" and field.endswith("_ns") and tree.get(field[:-3] + "_samples") == 0:
+                    continue
                 if field.endswith("_ns"):
                     counters.append(("kv_case_write_diagnostic_stage_seconds", value / 1e9,
                                      {"component": component, "stage": field}))
-                elif field.endswith(("_calls", "_errors", "_samples", "_requests", "_retries", "_groups",
-                                     "_receipts", "_publications", "_successes", "_operations", "_barriers",
-                                     "_connections", "_count", "_batches", "_appends", "_admitted", "_completed")):
+                elif (field in ("sampled_registered_files_min", "sampled_registered_files_max")
+                      or field.endswith(("_calls", "_errors", "_samples", "_requests", "_retries", "_groups",
+                                         "_receipts", "_publications", "_successes", "_operations", "_barriers",
+                                         "_connections", "_count", "_batches", "_appends", "_admitted", "_completed",
+                                         "_polls", "_would_block", "_stalls", "_completions", "_ops", "_bytes"))
+                      or (nvme and component == "stages.live_nvmeof")):
                     counters.append(("kv_case_write_diagnostic_stage_count", value,
                                      {"component": component, "counter": field}))
 
@@ -714,9 +1039,41 @@ def write_diagnostic_metrics(evidence, labels):
         stage_tree(stages, "stages")
     if persistence is not None:
         stage_tree(persistence, "value_wal_persistence")
-    if available:
-        for metric, value, dimensions in counters:
+    checkpoint_fields = {"write_profile_checkpoint_requests", "write_profile_checkpoint_completed",
+                         "write_profile_checkpoint_wait_ns", "write_profile_checkpoint_append_completions",
+                         "write_profile_checkpoint_admission_stalls"}
+    checkpoint_state = stages.get("write_profile_checkpoint_available") if stages else None
+    if checkpoint_state is not None:
+        if type(checkpoint_state) is not int or checkpoint_state not in (0, 1):
+            raise ValueError("invalid sampled checkpoint availability")
+        if checkpoint_state and not checkpoint_fields <= stages.keys():
+            raise ValueError("sampled checkpoint counters incomplete")
+        checkpoint_available = bool(checkpoint_state and boundary_eligible and evidence["error"] is None)
+        result += sample("kv_case_write_diagnostic_available", int(checkpoint_available),
+                         local | {"scope": "sampled_checkpoint_control"})
+    else:
+        checkpoint_available = False
+    for metric, value, dimensions in counters:
+        field = dimensions.get("stage", dimensions.get("counter"))
+        if (checkpoint_available if field in checkpoint_fields else available):
             result += sample(metric, value, local | dimensions)
+    inventory = profile.get("value_wal_inventory")
+    if inventory is not None and boundary_eligible:
+        if not isinstance(inventory, dict):
+            raise ValueError("invalid Value-WAL inventory")
+        for boundary in ("start", "end"):
+            row = inventory.get(boundary)
+            if row is None:
+                continue
+            if not isinstance(row, dict) or type(row.get("available")) is not bool:
+                raise ValueError("invalid Value-WAL inventory boundary")
+            dimensions = local | {"scope": "measurement_boundary", "boundary": boundary}
+            result += sample("kv_case_native_wal_inventory_available", int(row["available"]), dimensions)
+            if row["available"]:
+                for field in ("registered_files", "logical_file_length_bytes"):
+                    result += sample("kv_case_native_wal_" + field, count(row.get(field)), dimensions)
+            elif "registered_files" in row or "logical_file_length_bytes" in row:
+                raise ValueError("unavailable Value-WAL inventory claims observed quantities")
     coordinator = profile.get("coordinator_interval")
     coordinator_error = profile.get("coordinator_interval_error")
     if coordinator_error is not None:
@@ -732,10 +1089,17 @@ def write_diagnostic_metrics(evidence, labels):
         for value in coordinator["stages"].values():
             count(value)
         boundary_labels = local | {"scope": coordinator["scope"]}
-        boundary_available = evidence["phase_attempted"]
+        boundary_available = boundary_eligible
         result += sample("kv_case_write_diagnostic_available", int(boundary_available), boundary_labels)
         if boundary_available:
+            checkpoint_available = profile.get("coordinator_checkpoint_diagnostics_available")
+            if checkpoint_available is not None and type(checkpoint_available) is not bool:
+                raise ValueError("invalid coordinator checkpoint diagnostic availability")
+            result += sample("kv_case_write_diagnostic_available", int(checkpoint_available is True),
+                             boundary_labels | {"component": "coordinator_checkpoint"})
             for field, value in sorted(coordinator["stages"].items()):
+                if field.startswith("write_checkpoint_diagnostic_") and checkpoint_available is not True:
+                    continue
                 if field.endswith("_ns"):
                     result += sample("kv_case_write_diagnostic_stage_seconds", value / 1e9,
                                      boundary_labels | {"component": "coordinator_interval", "stage": field})
@@ -897,6 +1261,32 @@ def read_diagnostic_metrics(evidence, labels):
                                      local | {"partition": partition, "population": field})
         if not eligible:
             continue
+        transport_fields = ("cq_timed_calls", "tx_all_slots_pending_polls", "rx_no_posted_slots_polls",
+                            "rx_unread_slots_polls", "send_post_would_block", "receive_post_would_block")
+        denominator = group_counters.get("read_profile_transport_cq_timed_calls")
+        if denominator is not None and count(denominator) > 0:
+            for suffix in transport_fields:
+                field = "read_profile_transport_" + suffix
+                if field in group_counters:
+                    result += sample("kv_case_read_transport_observations", group_counters[field],
+                                     local | {"partition": partition, "counter": suffix})
+        if group_counters.get("read_profile_transport_progress_available") == 1:
+            for suffix in ("sweeps", "frame_gate_stalls", "retirement_stalls", "cq_polls",
+                           "cq_empty_polls", "cq_completions", "send_size_le_4k", "send_size_le_16k",
+                           "send_size_le_64k", "send_size_gt_64k", "send_post_eagain",
+                           "send_post_retries", "cq_idle_waits"):
+                field = "read_profile_transport_" + suffix
+                if field in group_counters:
+                    result += sample("kv_case_read_transport_observations", group_counters[field],
+                                     local | {"partition": partition, "counter": suffix})
+        if selected:
+            for suffix in ("admission_retry_credit", "admission_retry_flight", "admission_retry_lane",
+                           "admission_retry_paused", "admission_retry_config", "admission_retry_mixed",
+                           "live_lane_full", "live_lane_depth_max", "live_lane_pending_max"):
+                field = "read_profile_" + suffix
+                if field in group_counters:
+                    result += sample("kv_case_read_diagnostic_stage_count", group_counters[field],
+                                     local | {"partition": partition, "clock_domain": "coordinator", "counter": field})
         for stage, value in sorted(observations):
             domain = "owner" if stage.startswith("server_") else "coordinator"
             dimensions = local | {"partition": partition, "clock_domain": domain}
@@ -924,7 +1314,9 @@ def read_diagnostic_metrics(evidence, labels):
                 or not isinstance(resolution["selection_policy"], str)
                 or not resolution["selection_policy"]
                 or not isinstance(resolution["stages"], dict)
-                or set(resolution["stages"]) != stage_names):
+                or not stage_names <= set(resolution["stages"])
+                or not set(resolution["stages"]) <= stage_names | {
+                    "batch_wait", "postread_cache_fill", "result_materialization"}):
             raise ValueError("invalid coordinator resolution profile")
         for field in populations:
             count(resolution[field])
@@ -1021,6 +1413,272 @@ def nvmeof_trace_metrics(evidence, labels):
     return result
 
 
+# These intervals are coordinator-local and may overlap. They are not wire or
+# device latency; the retained records, rather than these sums, describe tails.
+CORRELATED_READ_PAIRS = {
+    "api": ("api_started", "api_finished"),
+    "index_resolution": ("index_resolution_started", "index_resolution_finished"),
+    "admission_wait": ("admission_wait_started", "admission_wait_finished"),
+}
+CORRELATED_READ_GROUP_PAIRS = {
+    "admission": ("admission_started", "admitted"),
+    "actor_to_worker": ("actor_dequeued", "live_worker_dequeued"),
+    "live_resolve": ("live_resolve_started", "live_resolve_completed"),
+    "flight_to_delivery": ("flight_completed", "request_result_delivered"),
+    "live_io": ("live_io_sqe_submitted", "live_io_cqe_observed"),
+    "sealed_nvme_request": ("sealed_nvme_request_submitted", "sealed_nvme_completion_observed"),
+    "sealed_nvme_validation": ("sealed_nvme_validation_started", "sealed_nvme_validation_finished"),
+}
+CORRELATED_WRITE_PAIRS = {
+    "caller": ("caller_start", "caller_finished"),
+    "admission_wait": ("admission_wait_started", "admission_acquired"),
+    "live_group_build": ("live_group_build_started", "live_group_built"),
+    "live_reserve": ("live_reserve_started", "live_reserve_completed"),
+    "live_namespace_setup": ("live_namespace_setup_started", "live_namespace_setup_completed"),
+    "live_io": ("live_io_started", "live_io_completed"),
+    "live_complete": ("live_complete_started", "live_complete_completed"),
+}
+VALKEY_STAGES = ("mutex_wait", "blocking_enqueue_to_start", "blocking_return_to_wake",
+                 "command_encode", "transport_and_parser", "reply_decode")
+VALKEY_CQ_STAGES = {"poll_wait": "poll_calls", "cq_poll": "cq_poll_calls",
+                    "wake_to_cq": "wake_to_cq_samples"}
+OWNER_WRITE_STAGES = ("control_queue", "session_admission_wait", "appender_queue", "flusher_queue",
+                      "append_barrier_wait", "append_wal", "append_validation",
+                      "append_basic_validation", "append_conflict_lookup", "append_geometry_capacity",
+                      "append_metadata_reservation", "append_descriptor_preparation", "append_persist",
+                      "wal_file_persist", "handler", "response_ready", "namespace_persist")
+LIVE_PERSIST_STAGES = {"persist_total": "persist_calls", "persist_wal_file": "file_persist_calls",
+                       "persist_namespace": "namespace_persist_calls",
+                       "persist_inventory_file": "inventory_file_persist_calls",
+                       "persist_inventory_namespace": "inventory_namespace_persist_calls",
+                       "live_frontier_file": "live_frontier_file_calls",
+                       "live_frontier_namespace": "live_frontier_namespace_calls"}
+
+
+def summarize_correlated_timings(kind, artifact, backend):
+    """Reduce admitted raw records to bounded sums; missing endpoints are never zero."""
+    if kind not in ("valkey", "read", "write") or not isinstance(artifact, dict):
+        raise ValueError("invalid correlated timing artifact")
+    token(backend)
+    totals = {}
+    availability = None
+
+    def add(scope, population, stage, duration, observations=1):
+        count(duration)
+        count(observations)
+        if not observations:
+            return
+        key = (scope, population, stage)
+        total = totals.setdefault(key, [0, 0])
+        total[0] += duration
+        total[1] += observations
+
+    def intervals(events, pairs, scope, population, name_field, keyed=False):
+        if not isinstance(events, list):
+            raise ValueError("invalid timing events")
+        for stage, (start, end) in pairs.items():
+            pending = {}
+            for event in events:
+                if not isinstance(event, dict):
+                    raise ValueError("invalid timing event")
+                name = event.get(name_field)
+                if name not in (start, end):
+                    continue
+                if keyed and stage in ("live_io", "sealed_nvme_request"):
+                    queue, io_token = event.get("io_queue_id"), event.get("io_token")
+                    if queue is None or io_token is None:
+                        continue
+                    key = (count(queue), count(io_token))
+                elif kind == "write" and stage not in ("caller", "admission_wait"):
+                    key = (event.get("owner"), event.get("envelope_id"))
+                    if key[0] is None:
+                        continue
+                else:
+                    key = ()
+                timestamp = count(event.get("elapsed_ns"))
+                if name == start:
+                    # Ambiguous overlapping starts cannot establish an interval.
+                    pending[key] = timestamp if key not in pending else None
+                else:
+                    begin = pending.pop(key, None)
+                    if begin is not None and timestamp >= begin:
+                        add(scope, population, stage, timestamp - begin)
+
+    if kind == "valkey":
+        profile = artifact.get("profile")
+        if isinstance(profile, dict) and profile.get("available") is False:
+            profile = None
+        if profile is not None:
+            if not isinstance(profile, dict) or not isinstance(profile.get("records"), list):
+                raise ValueError("invalid Valkey timing profile")
+            if type(profile.get("cq_available")) is not bool:
+                raise ValueError("invalid Valkey CQ availability")
+            availability = {"cq_status": "available" if profile["cq_available"] else "unavailable",
+                            "unfinished_workers": 0, "cq_missing_records": 0,
+                            "cq_clock_failure_records": 0, "cq_clock_failures": 0}
+            for record in profile["records"]:
+                if not isinstance(record, dict):
+                    raise ValueError("invalid Valkey timing record")
+                if type(record.get("worker_finished")) is not bool:
+                    raise ValueError("invalid Valkey worker completion")
+                if not record["worker_finished"]:
+                    availability["unfinished_workers"] += 1
+                operation = record.get("operation")
+                outcome = record.get("pipeline_outcome")
+                if operation not in ("get", "put", "delete", "get_many"):
+                    continue
+                if outcome not in ("ok", "error", "cancelled", None):
+                    raise ValueError("invalid Valkey pipeline outcome")
+                population = operation + "_" + (outcome or "incomplete")
+                for stage in VALKEY_STAGES:
+                    value = record.get(stage + "_ns")
+                    if value is not None:
+                        add("client_pipeline", population, stage, value)
+                cq = record.get("cq")
+                if profile.get("cq_available") is True and cq is None:
+                    availability["cq_missing_records"] += 1
+                if cq is not None:
+                    if not isinstance(cq, dict):
+                        raise ValueError("invalid Valkey CQ sample")
+                    failures = count(cq["clock_failures"])
+                    availability["cq_clock_failures"] += failures
+                    availability["cq_clock_failure_records"] += int(failures > 0)
+                    if profile.get("cq_available") is True and count(cq["clock_failures"]) == 0:
+                        for stage, denominator in VALKEY_CQ_STAGES.items():
+                            add("client_cq", population, stage, count(cq[stage + "_ns"]),
+                                count(cq[denominator]))
+    elif kind == "read":
+        profile = artifact.get("profile")
+        correlation = profile.get("caller_correlation") if isinstance(profile, dict) else None
+        trace = correlation.get("trace") if isinstance(correlation, dict) else None
+        if trace is not None:
+            if not isinstance(trace, dict) or not isinstance(trace.get("calls"), list):
+                raise ValueError("invalid read correlation trace")
+            for call in trace["calls"]:
+                if not isinstance(call, dict) or not isinstance(call.get("groups"), list):
+                    raise ValueError("invalid read correlation call")
+                status = call.get("status")
+                if status not in ("complete", "error", "incomplete", "cancelled_or_incomplete"):
+                    raise ValueError("invalid read correlation status")
+                intervals(call.get("events"), CORRELATED_READ_PAIRS, "read_call", status, "name")
+                for group in call["groups"]:
+                    if not isinstance(group, dict):
+                        raise ValueError("invalid read correlation group")
+                    if group.get("membership_classified") is True:
+                        intervals(group.get("events"), CORRELATED_READ_GROUP_PAIRS,
+                                  "read_group", status, "name", keyed=True)
+    else:
+        timeline = artifact.get("timeline")
+        if timeline is not None:
+            if not isinstance(timeline, dict) or not isinstance(timeline.get("records"), list):
+                raise ValueError("invalid write correlation timeline")
+            for record in timeline["records"]:
+                if not isinstance(record, dict) or type(record.get("completed")) is not bool:
+                    raise ValueError("invalid write correlation record")
+                population = ("incomplete" if not record["completed"] else
+                              "error" if record.get("error") is not None else "success")
+                intervals(record.get("events"), CORRELATED_WRITE_PAIRS, "write_call", population, "stage")
+            owners = timeline.get("owner_records", [])
+            if not isinstance(owners, list):
+                raise ValueError("invalid write owner records")
+            for owner in owners:
+                if not isinstance(owner, dict) or type(owner.get("success")) is not bool:
+                    raise ValueError("invalid write owner record")
+                population = "success" if owner["success"] else "error"
+                for stage in OWNER_WRITE_STAGES:
+                    value = owner.get(stage + "_ns")
+                    if value is not None:
+                        add("write_owner_envelope", population, stage, value)
+            groups = timeline.get("live_groups", [])
+            if not isinstance(groups, list):
+                raise ValueError("invalid live write groups")
+            for group in groups:
+                if not isinstance(group, dict):
+                    raise ValueError("invalid live write group")
+                validation = group.get("owner_validation_ns")
+                if validation is not None:
+                    add("live_owner_group", "observed_group", "owner_validation", validation)
+                persistence = group.get("owner_persistence")
+                if persistence is not None:
+                    if not isinstance(persistence, dict):
+                        raise ValueError("invalid live owner persistence")
+                    for stage, denominator in LIVE_PERSIST_STAGES.items():
+                        if stage + "_ns" in persistence and denominator in persistence:
+                            add("live_owner_persistence", denominator, stage,
+                                count(persistence[stage + "_ns"]), count(persistence[denominator]))
+    result = {"schema_version": 1, "kind": kind, "backend": backend,
+              "stages": [{"scope": scope, "population": population, "stage": stage,
+                          "sum_ns": values[0], "count": values[1]}
+                         for (scope, population, stage), values in sorted(totals.items())]}
+    if kind == "valkey":
+        result["availability"] = availability
+    return result
+
+
+def correlated_timing_metrics(summaries, labels):
+    if summaries is None:
+        return ""
+    if not isinstance(summaries, list) or len(summaries) > 3:
+        raise ValueError("invalid correlated timing summaries")
+    result, identities, kinds = "", set(), set()
+    for summary in summaries:
+        if (not isinstance(summary, dict) or set(summary) != ({"schema_version", "kind", "backend", "stages", "availability"} if summary.get("kind") == "valkey" else {"schema_version", "kind", "backend", "stages"})
+                or type(summary["schema_version"]) is not int or summary["schema_version"] != 1
+                or summary["kind"] not in ("valkey", "read", "write")
+                or summary["kind"] in kinds or not isinstance(summary["stages"], list)
+                or len(summary["stages"]) > 512):
+            raise ValueError("invalid correlated timing summary")
+        kind = summary["kind"]
+        kinds.add(kind)
+        backend = token(summary["backend"])
+        if kind == "valkey":
+            availability = summary["availability"]
+            if availability is None:
+                result += sample("kv_case_valkey_cq_availability", 1,
+                                 labels | {"diagnostic_backend": backend, "status": "profile_unavailable"})
+            else:
+                fields = ("unfinished_workers", "cq_missing_records", "cq_clock_failure_records", "cq_clock_failures")
+                if (not isinstance(availability, dict) or set(availability) != set(fields) | {"cq_status"}
+                        or availability["cq_status"] not in ("available", "unavailable")):
+                    raise ValueError("invalid Valkey CQ availability summary")
+                result += sample("kv_case_valkey_cq_availability", 1,
+                                 labels | {"diagnostic_backend": backend, "status": availability["cq_status"]})
+                for field in fields:
+                    result += sample("kv_case_valkey_diagnostic_observations", count(availability[field]),
+                                     labels | {"diagnostic_backend": backend, "population": field})
+        for entry in summary["stages"]:
+            if not isinstance(entry, dict) or set(entry) != {"scope", "population", "stage", "sum_ns", "count"}:
+                raise ValueError("invalid correlated timing stage")
+            scope, population, stage = entry["scope"], entry["population"], entry["stage"]
+            if kind == "valkey":
+                valid = (scope == "client_pipeline" and stage in VALKEY_STAGES or
+                         scope == "client_cq" and stage in VALKEY_CQ_STAGES)
+                valid = valid and population in {op + "_" + outcome
+                    for op in ("get", "put", "delete", "get_many")
+                    for outcome in ("ok", "error", "cancelled", "incomplete")}
+            elif kind == "read":
+                valid = ((scope == "read_call" and stage in CORRELATED_READ_PAIRS or
+                          scope == "read_group" and stage in CORRELATED_READ_GROUP_PAIRS)
+                         and population in ("complete", "error", "incomplete", "cancelled_or_incomplete"))
+            else:
+                valid = (scope == "write_call" and stage in CORRELATED_WRITE_PAIRS
+                         and population in ("success", "error", "incomplete") or
+                         scope == "write_owner_envelope" and stage in OWNER_WRITE_STAGES
+                         and population in ("success", "error") or
+                         scope == "live_owner_group" and stage == "owner_validation" and population == "observed_group" or
+                         scope == "live_owner_persistence" and stage in LIVE_PERSIST_STAGES
+                         and LIVE_PERSIST_STAGES[stage] == population)
+            identity = (kind, backend, scope, population, stage)
+            if not valid or identity in identities or count(entry["count"]) == 0:
+                raise ValueError("invalid or duplicate correlated timing population")
+            identities.add(identity)
+            dimensions = labels | {"phase": "measurement", "diagnostic_backend": backend,
+                                   "scope": scope, "population": population, "stage": stage}
+            result += sample("kv_case_correlated_stage_seconds_sum", count(entry["sum_ns"]) / 1e9, dimensions)
+            result += sample("kv_case_correlated_stage_samples", entry["count"], dimensions)
+    return result
+
+
 def terminal_metrics(terminal, labels):
     if terminal is None:
         return sample("kv_observer_case_terminal", 0, labels)
@@ -1040,10 +1698,12 @@ def terminal_metrics(terminal, labels):
         result += sample("kv_observer_read_profile_enabled", int(enabled), labels)
     result += read_path_metrics(terminal.get("read_evidence"), labels)
     result += measurement_read_metrics(terminal.get("measurement_read_evidence"), labels)
+    result += spdk_target_metrics(terminal.get("spdk_target_io"), labels)
     result += cold_device_metrics(terminal.get("cold_device_evidence"), labels)
     result += resource_interval_metrics(terminal.get("resource_evidence"), labels)
     result += write_diagnostic_metrics(terminal.get("write_diagnostics"), labels)
     result += read_diagnostic_metrics(terminal.get("read_diagnostics"), labels)
+    result += correlated_timing_metrics(terminal.get("correlation_summaries"), labels)
     result += nvmeof_target_metrics(terminal.get("nvmeof_target_evidence"), labels)
     result += nvmeof_trace_metrics(terminal.get("nvmeof_trace_evidence"), labels)
     metrics = terminal.get("metrics")

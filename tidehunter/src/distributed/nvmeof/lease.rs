@@ -4,7 +4,7 @@
 //! Persisted admissions survive a crash and remain quarantined until explicitly
 //! released after the initiator has drained and closed its namespace FD.
 
-use super::{ExportManifest, MAX_EXPORT_MANIFEST_BYTES};
+use super::{ExportManifest, ExportTarget, MAX_EXPORT_MANIFEST_BYTES};
 use crate::distributed::storage::{StorageError, encode_metadata, read_metadata};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -33,6 +33,8 @@ pub struct ExportBinding {
     pub source_device: u64,
     pub source_inode: u64,
     pub durable_frontier: u64,
+    #[serde(default)]
+    pub target: ExportTarget,
 }
 impl From<&ExportManifest> for ExportBinding {
     fn from(m: &ExportManifest) -> Self {
@@ -51,7 +53,26 @@ impl From<&ExportManifest> for ExportBinding {
             source_device: m.source_device,
             source_inode: m.source_inode,
             durable_frontier: m.durable_frontier,
+            target: ExportTarget::Kernel,
         }
+    }
+}
+impl ExportBinding {
+    fn matches_manifest(&self, m: &ExportManifest) -> bool {
+        self.database_uuid == m.database_uuid
+            && self.epoch == m.epoch
+            && self.partition == m.partition
+            && self.generation == m.generation
+            && self.export_uuid == m.export_uuid
+            && self.nqn == m.nqn
+            && self.nsid == m.nsid
+            && self.wal_file_bytes == m.wal_file_bytes
+            && self.source_file_index == m.source_file_index
+            && self.image_len == m.image_len
+            && self.block_size == m.block_size
+            && self.source_device == m.source_device
+            && self.source_inode == m.source_inode
+            && self.durable_frontier == m.durable_frontier
     }
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -97,7 +118,7 @@ fn invalid(msg: &'static str) -> StorageError {
 fn attr(path: &Path) -> Result<String, StorageError> {
     Ok(fs::read_to_string(path)?.trim().to_owned())
 }
-fn uuid_string(b: [u8; 16]) -> String {
+pub(super) fn uuid_string(b: [u8; 16]) -> String {
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         b[0],
@@ -126,7 +147,7 @@ fn valid_nqn(nqn: &str) -> bool {
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b':' | b'-'))
 }
-fn verify_root_protected(path: &Path) -> Result<(), StorageError> {
+pub(super) fn verify_root_protected(path: &Path) -> Result<(), StorageError> {
     if !path.is_absolute()
         || path.components().any(|c| {
             matches!(
@@ -305,19 +326,36 @@ impl ExportLeaseRegistry {
         Ok(file)
     }
     fn inspect(&self, binding: &ExportBinding) -> Result<(Entry, File), StorageError> {
-        self.check_configfs()?;
         let ns = self.namespace(binding)?;
-        let meta = fs::symlink_metadata(&ns)?;
-        if !meta.file_type().is_dir()
-            || attr(&ns.join("device_uuid"))? != uuid_string(binding.export_uuid)
-            || attr(&ns.join("enable"))? != "1"
-        {
-            return Err(invalid("unmatched or disabled target namespace"));
-        }
-        if attr(&ns.join("buffered_io"))? != "1" {
-            return Err(invalid("target namespace must use buffered file I/O"));
-        }
-        let image = PathBuf::from(attr(&ns.join("device_path"))?);
+        let (namespace_device, namespace_inode, image) = match &binding.target {
+            ExportTarget::Kernel | ExportTarget::KernelDirect => {
+                self.check_configfs()?;
+                let meta = fs::symlink_metadata(&ns)?;
+                if !meta.file_type().is_dir()
+                    || attr(&ns.join("device_uuid"))? != uuid_string(binding.export_uuid)
+                    || attr(&ns.join("enable"))? != "1"
+                {
+                    return Err(invalid("unmatched or disabled target namespace"));
+                }
+                let expected = if binding.target == ExportTarget::KernelDirect {
+                    "0"
+                } else {
+                    "1"
+                };
+                if attr(&ns.join("buffered_io"))? != expected {
+                    return Err(invalid("target namespace file I/O policy mismatch"));
+                }
+                (
+                    meta.dev(),
+                    meta.ino(),
+                    PathBuf::from(attr(&ns.join("device_path"))?),
+                )
+            }
+            ExportTarget::Spdk(target) => {
+                let meta = super::spdk::inspect(target, binding)?;
+                (meta.dev(), meta.ino(), target.image_path.clone())
+            }
+        };
         let file = self.trusted_image(&image)?;
         let image_meta = file.metadata()?;
         if image_meta.len() != binding.image_len {
@@ -347,7 +385,7 @@ impl ExportLeaseRegistry {
         }
         let manifest: ExportManifest =
             serde_json::from_slice(&bytes).map_err(|_| invalid("invalid export manifest"))?;
-        if manifest.version != 1 || ExportBinding::from(&manifest) != *binding {
+        if manifest.version != 1 || !binding.matches_manifest(&manifest) {
             return Err(invalid("target manifest provenance mismatch"));
         }
         Ok((
@@ -355,8 +393,8 @@ impl ExportLeaseRegistry {
                 owner_epoch: 0,
                 token: [0; 16],
                 binding: binding.clone(),
-                namespace_device: meta.dev(),
-                namespace_inode: meta.ino(),
+                namespace_device,
+                namespace_inode,
                 image_path: image,
                 image_device: image_meta.dev(),
                 image_inode: image_meta.ino(),
@@ -534,6 +572,23 @@ impl ExportLeaseRegistry {
         Ok(())
     }
     fn disable(&self, entry: &Entry) -> Result<(), StorageError> {
+        if let ExportTarget::Spdk(target) = &entry.binding.target {
+            let file = self.trusted_image(&entry.image_path)?;
+            let image = file.metadata()?;
+            if target.image_path != entry.image_path
+                || image.dev() != entry.image_device
+                || image.ino() != entry.image_inode
+                || image.len() != entry.binding.image_len
+            {
+                return Err(invalid("registered SPDK image identity changed"));
+            }
+            return Ok(super::spdk::disable(
+                target,
+                &entry.binding,
+                entry.namespace_device,
+                entry.namespace_inode,
+            )?);
+        }
         self.check_configfs()?;
         let ns = self.namespace(&entry.binding)?;
         let meta = match fs::symlink_metadata(&ns) {
@@ -609,6 +664,69 @@ impl ExportLeaseRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_binding_encodings_round_trip_without_migration() {
+        #[derive(Serialize)]
+        #[serde(rename_all = "snake_case")]
+        enum LegacyTarget {
+            Kernel,
+            Spdk(super::super::SpdkTarget),
+        }
+        let prefix = concat!(
+            "{\"database_uuid\":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],",
+            "\"epoch\":1,\"partition\":3,\"generation\":1,",
+            "\"export_uuid\":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7],",
+            "\"nqn\":\"nqn.2026-01.test:wal\",\"nsid\":1,\"wal_file_bytes\":4096,",
+            "\"source_file_index\":0,\"image_len\":4096,\"block_size\":512,",
+            "\"source_device\":10,\"source_inode\":11,\"durable_frontier\":4096,\"target\":"
+        );
+        let spdk = super::super::SpdkTarget {
+            rpc_socket: "/run/owned/rpc.sock".into(),
+            pid: 12,
+            process_start_ticks: 34,
+            bdev_name: "wal0".into(),
+            image_path: "/export/image.wal".into(),
+        };
+        let targets = [
+            ("\"kernel\"".to_owned(), LegacyTarget::Kernel),
+            (
+                concat!(
+                    "{\"spdk\":{\"rpc_socket\":\"/run/owned/rpc.sock\",\"pid\":12,",
+                    "\"process_start_ticks\":34,\"bdev_name\":\"wal0\",",
+                    "\"image_path\":\"/export/image.wal\"}}"
+                )
+                .to_owned(),
+                LegacyTarget::Spdk(spdk),
+            ),
+        ];
+        let temp = tempdir::TempDir::new("nvmeof-binding-codec").unwrap();
+        let path = temp.path().join("binding");
+        for (target_json, legacy) in targets {
+            let bytes = format!("{prefix}{target_json}}}").into_bytes();
+            let binding: ExportBinding = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(serde_json::to_vec(&binding).unwrap(), bytes);
+            assert_eq!(
+                serde_yaml::to_string(&binding.target).unwrap(),
+                serde_yaml::to_string(&legacy).unwrap()
+            );
+            assert_eq!(
+                bincode::serialize(&binding.target).unwrap(),
+                bincode::serialize(&legacy).unwrap()
+            );
+            let persisted = encode_metadata(&binding).unwrap();
+            fs::write(&path, &persisted).unwrap();
+            let recovered: ExportBinding = read_metadata(&path).unwrap();
+            assert_eq!(recovered, binding);
+            assert_eq!(encode_metadata(&recovered).unwrap(), persisted);
+        }
+        assert_eq!(ExportTarget::default(), ExportTarget::Kernel);
+        assert!(serde_json::from_str::<ExportTarget>("\"unknown\"").is_err());
+        assert_eq!(
+            serde_json::to_string(&ExportTarget::KernelDirect).unwrap(),
+            "\"kernel_direct\""
+        );
+    }
 
     #[test]
     fn owner_manifest_limit_admits_large_catalog_but_keeps_provenance_and_nofollow() {
@@ -702,8 +820,27 @@ mod tests {
             ExportLeaseRegistry::open_fixture(&root, &configfs, 8, MAX_EXPORT_MANIFEST_BYTES)
                 .unwrap();
         assert!(registry.inspect(&binding).is_ok());
+        let mut direct = binding.clone();
+        direct.target = ExportTarget::KernelDirect;
+        assert!(registry.inspect(&direct).is_err());
         fs::write(ns.join("buffered_io"), "0\n").unwrap();
         assert!(registry.inspect(&binding).is_err());
+        assert!(registry.inspect(&direct).is_ok());
+        let mut direct_registry =
+            ExportLeaseRegistry::open_fixture(&root, &configfs, 8, MAX_EXPORT_MANIFEST_BYTES)
+                .unwrap();
+        let token = direct_registry.register(1, &direct).unwrap();
+        drop(direct_registry);
+        let mut recovered =
+            ExportLeaseRegistry::open_fixture(&root, &configfs, 8, MAX_EXPORT_MANIFEST_BYTES)
+                .unwrap();
+        assert_eq!(
+            recovered.entries[0].binding.target,
+            ExportTarget::KernelDirect
+        );
+        recovered.release(1, token).unwrap();
+        assert_eq!(attr(&ns.join("enable")).unwrap(), "0");
+        fs::write(ns.join("enable"), "1\n").unwrap();
         fs::write(ns.join("buffered_io"), "1\n").unwrap();
         let mut forged = binding.clone();
         forged.source_inode += 1;

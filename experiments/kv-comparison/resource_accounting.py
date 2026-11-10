@@ -171,26 +171,34 @@ def interval(before_hosts, after_hosts):
                     raise ValueError("CPU usage is missing at a boundary")
                 if observed.get("cpu_throttled_periods", 0) > observed.get("cpu_periods", math.inf):
                     raise ValueError("throttled periods exceed observed CPU periods")
-                if start.get("available") and end.get("available") and "io_devices" in start and "io_devices" in end:
-                    devices = start["io_devices"].keys()
-                    if devices != end["io_devices"].keys():
-                        raise ValueError("cgroup IO device population changed between boundaries")
-                    reads = writes = 0
-                    for device in devices:
-                        previous = start["io_devices"][device]
-                        current = end["io_devices"][device]
-                        reads += difference(previous["rbytes"], current["rbytes"])
-                        writes += difference(previous["wbytes"], current["wbytes"])
-                    observed.update(io_read_bytes=reads, io_write_bytes=writes)
                 for name in ("memory_current_bytes", "memory_peak_bytes"):
                     if name in end:
                         value = end[name]
                         if type(value) is not int or value < 0:
                             raise ValueError("invalid observed memory counter")
                         observed[name] = value
-                if not start.get("available") or not end.get("available"):
+                io_reason = None
+                try:
+                    if not start.get("available") or not end.get("available"):
+                        raise ValueError("cgroup IO counters unavailable or ambiguous at a boundary")
+                    if "io_devices" in start and "io_devices" in end:
+                        devices = start["io_devices"].keys()
+                        if devices != end["io_devices"].keys():
+                            raise ValueError("cgroup IO device population changed between boundaries")
+                        reads = writes = 0
+                        for device in devices:
+                            previous = start["io_devices"][device]
+                            current = end["io_devices"][device]
+                            reads += difference(previous["rbytes"], current["rbytes"])
+                            writes += difference(previous["wbytes"], current["wbytes"])
+                        observed.update(io_read_bytes=reads, io_write_bytes=writes)
+                    else:
+                        raise ValueError("cgroup IO counters unavailable at a boundary")
+                except (KeyError, TypeError, ValueError) as error:
+                    io_reason = "cgroup IO: " + str(error)
+                if io_reason:
                     row.update(core_available=True, **observed)
-                    row["reason"] = "cgroup IO counters unavailable or ambiguous at a boundary"
+                    row["reason"] = io_reason[:300]
                 else:
                     row.update(available=True, **observed)
             except (KeyError, TypeError, ValueError) as error:
@@ -199,3 +207,15 @@ def interval(before_hosts, after_hosts):
     if len(rows) > MAX_PROCESSES:
         raise ValueError("terminal process accounting exceeds total process bound")
     return {"schema_version": 1, "scope": SCOPE, "processes": rows}
+
+
+def coverage(resources):
+    """Coverage of a recomputed interval; core is independent of IO totals."""
+    processes = resources["processes"]
+    core_complete = bool(processes) and all(
+        row.get("available") is True or row.get("core_available") is True for row in processes)
+    io_complete = bool(processes) and all(
+        row.get("available") is True and "io_read_bytes" in row and "io_write_bytes" in row
+        for row in processes)
+    return {"complete": core_complete and io_complete, "core_complete": core_complete,
+            "io_complete": io_complete}

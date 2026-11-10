@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tidehunter::distributed::durability::{DurabilityConfig, DurabilityTier};
 use tidehunter::distributed::local_inventory::LocalInventoryConfig;
 use tidehunter::distributed::remote_db::{RemoteDatabaseConfig, RemoteEndpoint};
 use tidehunter::distributed::storage::{PartitionConfig, StaticInventory};
@@ -44,6 +45,45 @@ pub fn prepare_external_case(
     read_memory_allowance_bytes: usize,
     polling: PollingPolicy,
     read_resident_first: bool,
+) -> Result<()> {
+    prepare_external_case_with_durability(
+        directory,
+        guest_root,
+        addresses,
+        shape,
+        storage,
+        max_admitted_batches,
+        max_index_bytes,
+        transport,
+        owner_transports,
+        read_workers,
+        wal_member_read,
+        read_memory_allowance_bytes,
+        polling,
+        read_resident_first,
+        DurabilityConfig::default(),
+    )
+}
+
+/// Same as [`prepare_external_case`], with the durability config every owner launch applies.
+#[allow(dead_code)] // Only the benchmark executable selects a non-default tier.
+#[allow(clippy::too_many_arguments)] // Explicit harness inputs bind the external namespace and transport.
+pub fn prepare_external_case_with_durability(
+    directory: &Path,
+    guest_root: &Path,
+    addresses: &[SocketAddr],
+    shape: &KeyShape,
+    storage: LocalInventoryConfig,
+    max_admitted_batches: usize,
+    max_index_bytes: usize,
+    transport: Transport,
+    owner_transports: &[Transport],
+    read_workers: usize,
+    wal_member_read: tidehunter::distributed::storage::WalMemberReadPolicy,
+    read_memory_allowance_bytes: usize,
+    polling: PollingPolicy,
+    read_resident_first: bool,
+    durability: DurabilityConfig,
 ) -> Result<()> {
     if !guest_root.is_absolute()
         || addresses.len() != storage.partitions.len()
@@ -136,6 +176,7 @@ pub fn prepare_external_case(
                 read_max_inflight_requests: 32,
                 read_max_inflight_bytes: 64 * 1024 * 1024,
                 read_max_device_reads: 128,
+                live_target: None,
             },
             tls: TlsFiles {
                 transport: owner_transport.clone(),
@@ -153,6 +194,8 @@ pub fn prepare_external_case(
             ready_file: node_root.join("ready"),
             stop_file: node_root.join("stop"),
             drop_first_append_response: false,
+            durability,
+            launch_nonce: String::new(),
         };
         fs::write(
             local_node.join("launch.yaml"),
@@ -190,6 +233,9 @@ pub fn prepare_external_case(
         max_index_bytes,
         max_pending_batches: 128,
         max_pending_bytes: 64 * 1024 * 1024,
+        replay_limits: Default::default(),
+        owner_append_occupancy: RemoteDatabaseConfig::DEFAULT_OWNER_APPEND_OCCUPANCY,
+        live_nvme: None,
         pipelined_writes: true,
         read_cache_bytes: 8 * 1024 * 1024,
         read_memory_allowance_bytes: 512 * 1024 * 1024,
@@ -199,12 +245,18 @@ pub fn prepare_external_case(
         max_pending_reads: 256,
         max_pending_read_bytes: 64 * 1024 * 1024,
         write_profile_limit: 0,
+        index_shards: tidehunter::distributed::native_index::DEFAULT_INDEX_SHARDS,
     };
     fs::write(
         directory.join("remote.yaml"),
         serde_yaml::to_string(&config)?,
     )?;
     fs::write(directory.join("shape.yaml"), serde_yaml::to_string(shape)?)?;
+    // Declared tier of every owner launch file; each owner process publishes its effective one.
+    fs::write(
+        directory.join("durability.json"),
+        serde_json::to_vec_pretty(&durability)?,
+    )?;
     Ok(())
 }
 
@@ -217,6 +269,146 @@ struct NodeLaunch {
     ready_file: PathBuf,
     stop_file: PathBuf,
     drop_first_append_response: bool,
+    /// Absent in older launch files: the native tier, the engine default.
+    #[serde(default)]
+    durability: DurabilityConfig,
+    /// Fresh per start; the owner echoes it in its receipt so a stale receipt is recognizable.
+    #[serde(default)]
+    launch_nonce: String,
+}
+
+/// Owner process output that proves the tier it applied; written before the ready file.
+fn durability_file(ready_file: &Path) -> PathBuf {
+    ready_file.with_extension("durability.json")
+}
+
+/// Temporary file, fsync, rename, directory fsync: a reader never sees a partial file.
+fn publish_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let pending = path.with_extension("pending");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&pending)?;
+        io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()?;
+    }
+    fs::rename(&pending, path)?;
+    match path.parent() {
+        Some(parent) => fs::File::open(parent)?.sync_all(),
+        None => Ok(()),
+    }
+}
+
+/// Durability fields of a receipt, all required: unlike the launch config, a receipt that omits
+/// the tier (or the sync age, even when it is `null`) must never be read as the native default.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptDurability {
+    pub tier: DurabilityTier,
+    #[serde(deserialize_with = "present_option")]
+    pub max_unsynced_age_ms: Option<u64>,
+    pub max_pending_completions: usize,
+}
+
+/// `Option` fields default to `None` when absent; going through `deserialize_with` makes the
+/// field required (it may still be an explicit `null`).
+fn present_option<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error> {
+    <Option<u64> as Deserialize>::deserialize(deserializer)
+}
+
+impl ReceiptDurability {
+    fn of(config: DurabilityConfig) -> Self {
+        Self {
+            tier: config.tier,
+            max_unsynced_age_ms: config.max_unsynced_age_ms,
+            max_pending_completions: config.max_pending_completions,
+        }
+    }
+
+    pub fn config(&self) -> DurabilityConfig {
+        DurabilityConfig {
+            tier: self.tier,
+            max_unsynced_age_ms: self.max_unsynced_age_ms,
+            max_pending_completions: self.max_pending_completions,
+        }
+    }
+}
+
+/// What one owner process publishes before its ready file. It names the owner (partition,
+/// database, bound address), the exact process (pid, boot id, start time) and the launch
+/// (nonce), so one receipt can neither confirm another partition nor outlive a restart.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerReceipt {
+    pub partition: u32,
+    pub database: [u8; 16],
+    pub address: String,
+    pub launch_nonce: String,
+    pub pid: u32,
+    pub boot_id: String,
+    pub started_unix_ns: u64,
+    pub durability: ReceiptDurability,
+}
+
+/// Owner receipt from `path`. A missing, unreadable or incomplete file is an error: a tier the
+/// owner did not confirm cannot be reported.
+#[allow(dead_code)] // Only the benchmark executable reads external owner receipts.
+pub fn read_owner_receipt(path: &Path) -> Result<OwnerReceipt> {
+    let bytes = fs::read(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("owner receipt {} unreadable: {error}", path.display()),
+        )
+    })?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// 128 random bits as hex, fresh for every owner start.
+fn fresh_nonce() -> io::Result<String> {
+    let mut bytes = [0_u8; 16];
+    io::Read::read_exact(&mut fs::File::open("/dev/urandom")?, &mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// The receipt an owner start published, checked against the launch the controller wrote.
+fn confirm_owner_start(
+    node: &ManagedNode,
+    partition: u32,
+    requested: DurabilityConfig,
+) -> Result<OwnerReceipt> {
+    let receipt = read_owner_receipt(&durability_file(&node.config.ready_file))?;
+    let address = fs::read_to_string(&node.config.ready_file)?;
+    if node.config.launch_nonce.is_empty()
+        || receipt.partition != partition
+        || receipt.database != node.config.node.partition.inventory.database
+        || receipt.address != address.trim()
+        || receipt.launch_nonce != node.config.launch_nonce
+        || receipt.durability.config() != requested
+    {
+        return Err(io::Error::other(format!(
+            "owner {partition} receipt does not match its launch or the requested durability {requested:?}"
+        ))
+        .into());
+    }
+    Ok(receipt)
+}
+
+fn qualified_live_target_shutdown(
+    implementation: tidehunter::distributed::nvmeof::LiveTargetImplementation,
+    serve_ok: bool,
+    target: Option<&tidehunter::distributed::nvmeof::LiveTargetStats>,
+) -> bool {
+    serve_ok
+        && target.is_some_and(|stats| {
+            !stats.fixture_only
+                && stats.target_implementation == implementation
+                && stats.errors == 0
+                && stats.owned_namespace_count == 0
+        })
 }
 
 /// Must run before normal CLI parsing in either example executable.
@@ -244,14 +436,36 @@ pub fn maybe_run_storage_node() -> Result<bool> {
             return Err(io::Error::other("controller exited during node startup").into());
         }
     }
-    let config: NodeLaunch = serde_yaml::from_slice(&fs::read(&file)?)?;
+    let launch_bytes = fs::read(&file)?;
+    let config: NodeLaunch = serde_yaml::from_slice(&launch_bytes)?;
+    let live_shutdown_owner = config.node.live_target.as_ref().map(|target| {
+        let implementation = if target.spdk.is_some() {
+            tidehunter::distributed::nvmeof::LiveTargetImplementation::Spdk
+        } else {
+            tidehunter::distributed::nvmeof::LiveTargetImplementation::Kernel
+        };
+        (
+            serde_json::json!({
+                "database": config.node.partition.inventory.database,
+                "partition": config.node.partition.partition,
+                "root": config.node.root,
+            }),
+            implementation,
+        )
+    });
     println!(
         "shard_read_memory_allowance_bytes={}",
         config.node.read_memory_allowance_bytes
     );
     println!("read_resident_first={}", config.node.read_resident_first);
     let metrics = Metrics::new_in_enabled(&prometheus::Registry::new(), false);
+    let partition = config.node.partition.partition;
+    let database = config.node.partition.inventory.database;
     let node = StorageNode::open(config.node, metrics)?;
+    // Applied before the listener exists, so no client request can see another tier.
+    node.set_durability(config.durability)?;
+    let effective = node.durability();
+    println!("durability_tier={}", effective.tier);
     let history_diagnostics =
         if std::env::var_os("TIDEHUNTER_HISTORY_DIAGNOSTICS").is_some_and(|value| value == "1") {
             node.set_history_maintenance_diagnostics(true);
@@ -267,6 +481,27 @@ pub fn maybe_run_storage_node() -> Result<bool> {
     }
     let listener = TcpListener::bind(config.listen)?;
     let address = listener.local_addr()?;
+    // The receipt names this exact process and launch and lands before the ready file.
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+        .trim()
+        .to_owned();
+    if boot_id.is_empty() {
+        return Err(io::Error::other("empty boot id").into());
+    }
+    let receipt = OwnerReceipt {
+        partition,
+        database,
+        address: address.to_string(),
+        launch_nonce: config.launch_nonce.clone(),
+        pid: std::process::id(),
+        boot_id,
+        started_unix_ns: u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?,
+        durability: ReceiptDurability::of(effective),
+    };
+    publish_synced(
+        &durability_file(&config.ready_file),
+        &serde_json::to_vec_pretty(&receipt)?,
+    )?;
     let pending_ready = config.ready_file.with_extension("pending");
     fs::write(&pending_ready, address.to_string())?;
     fs::rename(pending_ready, &config.ready_file)?;
@@ -287,6 +522,68 @@ pub fn maybe_run_storage_node() -> Result<bool> {
     monitor
         .join()
         .map_err(|_| io::Error::other("node stop monitor panicked"))?;
+    if let Some((owner, implementation)) = live_shutdown_owner {
+        use blake2::{Blake2b512, Digest};
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        // This runs only after every serving session has joined. Ordinary
+        // database close does not destroy the target: it must permit reopen.
+        let cleanup = node.finish_live_target_shutdown();
+        let target = cleanup.as_ref().ok().and_then(Option::as_ref);
+        let complete = qualified_live_target_shutdown(implementation, result.is_ok(), target);
+        let scope = match implementation {
+            tidehunter::distributed::nvmeof::LiveTargetImplementation::Kernel => {
+                "kernel_live_target_shutdown"
+            }
+            tidehunter::distributed::nvmeof::LiveTargetImplementation::Spdk => {
+                "spdk_live_target_shutdown"
+            }
+        };
+        let launch_hash: String = Blake2b512::digest(&launch_bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let process_stat = fs::read_to_string("/proc/self/stat")?;
+        let process_start_ticks = process_stat
+            .rsplit_once(')')
+            .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+            .ok_or_else(|| io::Error::other("missing process start time"))?
+            .parse::<u64>()?;
+        let proof = serde_json::json!({
+            "schema_version": 1,
+            "scope": scope,
+            "complete": complete,
+            "launch_blake2b512": launch_hash,
+            "owner": owner,
+            "process_id": std::process::id(),
+            "process_start_ticks": process_start_ticks,
+            "target": target,
+            "serve_error": result.as_ref().err().map(ToString::to_string),
+            "cleanup_error": cleanup.as_ref().err().map(ToString::to_string),
+        });
+        let path = Path::new(&file).with_extension("live-target-shutdown.json");
+        let pending = path.with_extension(format!("pending-{}", rand::random::<u64>()));
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&pending)?;
+        output.write_all(&serde_json::to_vec_pretty(&proof)?)?;
+        output.sync_all()?;
+        fs::rename(&pending, &path)?;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        fs::File::open(parent)?.sync_all()?;
+        result
+            .as_ref()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        cleanup?;
+        if !complete {
+            return Err(io::Error::other("live target shutdown was not qualified").into());
+        }
+    }
     result?;
     if let Some(path) = history_diagnostics {
         fs::write(
@@ -317,13 +614,19 @@ impl ManagedNode {
         if self.child.is_some() {
             return Err(io::Error::other("node already has an owned process").into());
         }
-        for file in [&self.config.ready_file, &self.config.stop_file] {
+        let durability_receipt = durability_file(&self.config.ready_file);
+        for file in [
+            &self.config.ready_file,
+            &self.config.stop_file,
+            &durability_receipt,
+        ] {
             match fs::remove_file(file) {
                 Ok(()) => (),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => (),
                 Err(e) => return Err(e.into()),
             }
         }
+        self.config.launch_nonce = fresh_nonce()?;
         fs::write(&self.config_file, serde_yaml::to_string(&self.config)?)?;
         let log = |kind| {
             OpenOptions::new().create_new(true).write(true).open(
@@ -430,6 +733,9 @@ impl Drop for ManagedNode {
 
 pub struct LoopbackCluster {
     nodes: Vec<ManagedNode>,
+    /// Receipt each owner process published at its latest start, one per partition.
+    receipts: Vec<OwnerReceipt>,
+    requested: DurabilityConfig,
     pub config: RemoteDatabaseConfig,
 }
 
@@ -478,6 +784,43 @@ impl LoopbackCluster {
         polling: PollingPolicy,
         read_resident_first: bool,
     ) -> Result<Self> {
+        Self::start_with_durability(
+            data,
+            evidence,
+            shape,
+            storage,
+            max_admitted_batches,
+            max_index_bytes,
+            drop_first_on_partition,
+            transport,
+            read_workers,
+            wal_member_read,
+            read_memory_allowance_bytes,
+            polling,
+            read_resident_first,
+            DurabilityConfig::default(),
+        )
+    }
+
+    /// Same as [`Self::start_with_transport`]; every owner process must confirm exactly
+    /// `durability` or startup fails.
+    #[allow(clippy::too_many_arguments)] // Same bounded harness configuration, plus the tier.
+    pub fn start_with_durability(
+        data: &Path,
+        evidence: &Path,
+        shape: &KeyShape,
+        storage: LocalInventoryConfig,
+        max_admitted_batches: usize,
+        max_index_bytes: usize,
+        drop_first_on_partition: Option<u32>,
+        transport: Transport,
+        read_workers: usize,
+        wal_member_read: tidehunter::distributed::storage::WalMemberReadPolicy,
+        read_memory_allowance_bytes: usize,
+        polling: PollingPolicy,
+        read_resident_first: bool,
+        durability: DurabilityConfig,
+    ) -> Result<Self> {
         transport.validate()?;
         fs::create_dir_all(data)?;
         fs::create_dir_all(evidence)?;
@@ -496,6 +839,7 @@ impl LoopbackCluster {
             ..TcpLimits::default()
         };
         let mut nodes = Vec::new();
+        let mut confirmed = Vec::with_capacity(storage.partitions.len());
         let mut endpoints = Vec::new();
         for (i, &partition) in storage.partitions.iter().enumerate() {
             let node_data = data.join(format!("node-{partition}"));
@@ -545,6 +889,7 @@ impl LoopbackCluster {
                     read_max_inflight_requests: 32,
                     read_max_inflight_bytes: 64 * 1024 * 1024,
                     read_max_device_reads: 128,
+                    live_target: None,
                 },
                 tls: TlsFiles {
                     transport: transport.clone(),
@@ -558,6 +903,8 @@ impl LoopbackCluster {
                 ready_file: node_data.join("ready"),
                 stop_file: node_data.join("stop"),
                 drop_first_append_response: drop_first_on_partition == Some(partition),
+                durability,
+                launch_nonce: String::new(),
             };
             let mut node = ManagedNode {
                 config: launch,
@@ -567,6 +914,8 @@ impl LoopbackCluster {
                 start_number: 0,
             };
             let address = node.start()?;
+            // Fail closed: the owner must confirm this launch and exactly the requested tier.
+            confirmed.push(confirm_owner_start(&node, partition, durability)?);
             endpoints.push(RemoteEndpoint {
                 partition,
                 address: address.to_string(),
@@ -600,6 +949,9 @@ impl LoopbackCluster {
             max_index_bytes,
             max_pending_batches: 128,
             max_pending_bytes: 64 * 1024 * 1024,
+            replay_limits: Default::default(),
+            owner_append_occupancy: RemoteDatabaseConfig::DEFAULT_OWNER_APPEND_OCCUPANCY,
+            live_nvme: None,
             pipelined_writes: true,
             read_cache_bytes: 8 * 1024 * 1024,
             read_memory_allowance_bytes: 512 * 1024 * 1024,
@@ -609,6 +961,7 @@ impl LoopbackCluster {
             max_pending_reads: 256,
             max_pending_read_bytes: 64 * 1024 * 1024,
             write_profile_limit: 0,
+            index_shards: tidehunter::distributed::native_index::DEFAULT_INDEX_SHARDS,
         };
         // TLS configuration contains only paths, but it must not be presented as
         // a persistent usable credential bundle after the private tempdir closes.
@@ -629,7 +982,17 @@ impl LoopbackCluster {
                     .collect::<Vec<_>>(),
             )?,
         )?;
-        Ok(Self { nodes, config })
+        Ok(Self {
+            nodes,
+            receipts: confirmed,
+            requested: durability,
+            config,
+        })
+    }
+
+    /// Receipt each owner process published at its latest start, by partition.
+    pub fn owner_receipts(&self) -> &[OwnerReceipt] {
+        &self.receipts
     }
 
     pub fn kill_partition(&mut self, partition: u32) -> Result<()> {
@@ -679,7 +1042,19 @@ impl LoopbackCluster {
         })
     }
     pub fn restart_partition(&mut self, partition: u32) -> Result<()> {
-        self.node_mut(partition)?.start()?;
+        let requested = self.requested;
+        let receipt = {
+            let node = self.node_mut(partition)?;
+            node.start()?;
+            confirm_owner_start(node, partition, requested)?
+        };
+        if let Some(slot) = self
+            .receipts
+            .iter_mut()
+            .find(|existing| existing.partition == partition)
+        {
+            *slot = receipt;
+        }
         Ok(())
     }
     fn node_mut(&mut self, partition: u32) -> Result<&mut ManagedNode> {
@@ -701,5 +1076,157 @@ impl LoopbackCluster {
             return Err(error);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod durability_receipt_tests {
+    use super::{
+        DurabilityConfig, OwnerReceipt, ReceiptDurability, durability_file, publish_synced,
+        read_owner_receipt,
+    };
+    use tidehunter::distributed::durability::DurabilityTier;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "tcp-cluster-{name}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn receipt(partition: u32, tier: DurabilityTier) -> OwnerReceipt {
+        OwnerReceipt {
+            partition,
+            database: [7; 16],
+            address: "127.0.0.1:9400".to_owned(),
+            launch_nonce: "nonce".to_owned(),
+            pid: 1,
+            boot_id: "boot".to_owned(),
+            started_unix_ns: 5,
+            durability: ReceiptDurability::of(DurabilityConfig::with_tier(tier)),
+        }
+    }
+
+    #[test]
+    fn owner_receipt_round_trips_and_a_missing_file_fails_closed() {
+        let directory = scratch("receipt");
+        let receipt_path = durability_file(&directory.join("ready"));
+        assert!(read_owner_receipt(&receipt_path).is_err());
+        let written = receipt(2, DurabilityTier::Synchronous);
+        publish_synced(&receipt_path, &serde_json::to_vec(&written).unwrap()).unwrap();
+        assert_eq!(read_owner_receipt(&receipt_path).unwrap(), written);
+        // The temporary name is gone: a reader sees only complete receipts.
+        assert!(!receipt_path.with_extension("pending").exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn an_incomplete_receipt_is_never_read_as_the_native_default() {
+        let directory = scratch("incomplete");
+        let path = durability_file(&directory.join("ready"));
+        let mut value = serde_json::to_value(receipt(0, DurabilityTier::Synchronous)).unwrap();
+        let cases = [
+            serde_json::json!({}),
+            {
+                let mut missing_tier = value.clone();
+                missing_tier["durability"] = serde_json::json!({});
+                missing_tier
+            },
+            {
+                let mut missing_age = value.clone();
+                missing_age["durability"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("max_unsynced_age_ms");
+                missing_age
+            },
+            {
+                let mut missing_identity = value.clone();
+                missing_identity
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("partition");
+                missing_identity
+            },
+        ];
+        for case in cases {
+            publish_synced(&path, &serde_json::to_vec(&case).unwrap()).unwrap();
+            assert!(read_owner_receipt(&path).is_err(), "{case}");
+        }
+        value["unexpected"] = serde_json::json!(1);
+        publish_synced(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(read_owner_receipt(&path).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod live_shutdown_tests {
+    use super::qualified_live_target_shutdown;
+    use tidehunter::distributed::nvmeof::{LiveTargetImplementation, LiveTargetStats};
+
+    #[test]
+    fn shutdown_requires_actual_matching_backend_and_clean_counters() {
+        let mut stats = LiveTargetStats {
+            target_implementation: LiveTargetImplementation::Kernel,
+            ..Default::default()
+        };
+        assert!(qualified_live_target_shutdown(
+            LiveTargetImplementation::Kernel,
+            true,
+            Some(&stats)
+        ));
+        assert!(!qualified_live_target_shutdown(
+            LiveTargetImplementation::Spdk,
+            true,
+            Some(&stats)
+        ));
+        stats.target_implementation = LiveTargetImplementation::Spdk;
+        assert!(qualified_live_target_shutdown(
+            LiveTargetImplementation::Spdk,
+            true,
+            Some(&stats)
+        ));
+        assert!(!qualified_live_target_shutdown(
+            LiveTargetImplementation::Kernel,
+            true,
+            Some(&stats)
+        ));
+        assert!(!qualified_live_target_shutdown(
+            LiveTargetImplementation::Spdk,
+            false,
+            Some(&stats)
+        ));
+        assert!(!qualified_live_target_shutdown(
+            LiveTargetImplementation::Spdk,
+            true,
+            None
+        ));
+        stats.owned_namespace_count = 1;
+        assert!(!qualified_live_target_shutdown(
+            LiveTargetImplementation::Spdk,
+            true,
+            Some(&stats)
+        ));
+        stats.owned_namespace_count = 0;
+        stats.errors = 1;
+        assert!(!qualified_live_target_shutdown(
+            LiveTargetImplementation::Spdk,
+            true,
+            Some(&stats)
+        ));
+        stats.errors = 0;
+        stats.fixture_only = true;
+        assert!(!qualified_live_target_shutdown(
+            LiveTargetImplementation::Spdk,
+            true,
+            Some(&stats)
+        ));
     }
 }

@@ -10,12 +10,19 @@ import math
 from pathlib import Path
 import re
 
+import gcp_runtime
 _HEX = re.compile(r'^[0-9a-f]{64}$')
 _IMAGE = re.compile(r'^projects/([a-z][a-z0-9-]{4,61}[a-z0-9])/global/images/([a-z][a-z0-9-]{0,61}[a-z0-9])$')
 _FAMILIES = frozenset({'GLIBC', 'GLIBCXX', 'CXXABI', 'OPENSSL'})
+FOCUSED_PROOFS = ('guest_runtime', 'runtime_abi', 'scratch_nvme_cli', 'io_uring',
+                  'nvme_modules', 'libfabric_verbs', 'rdma_read_send', 'monitoring_images')
 
 
-def required_containers():
+def required_containers(*, focused=False):
+    if focused:
+        root = Path(__file__).resolve().parent.parent / 'kv-comparison'
+        monitoring = json.loads((root / 'observability' / 'images.lock.json').read_text())['images']
+        return {entry['image'] for entry in monitoring.values()}
     root = Path(__file__).resolve().parent.parent / 'kv-comparison'
     tree = ast.parse((root / 'local.py').read_text())
     assignments = [node for node in tree.body if isinstance(node, ast.Assign)
@@ -121,7 +128,9 @@ def _envelope(record):
     _, baseline_versions = _abi(package.get('abi'))
     sonames = set()
     versions = {family: set(baseline_versions[family]) for family in _FAMILIES}
-    proofs = [package['linkage'], *package['valkey_runtime_linkage'].values()]
+    proofs = [package['linkage'], *package.get('valkey_runtime_linkage', {}).values()]
+    if 'spdk' in package:
+        proofs.append(package['spdk_runtime_linkage'])
     for proof in proofs:
         for elf in _linkage(proof).values():
             if elf.get('soname'):
@@ -151,14 +160,21 @@ def admit_abi(qualification, abi):
             raise ValueError(f'{family} versions absent from qualified guest: ' + ', '.join(sorted(missing)))
 
 
-def validate_pair(records, image, runtime_sha, service_account):
+def validate_pair(records, image, runtime_sha, service_account, *, qualification_profile='full'):
     """Validate two reciprocal real-command records, not a pass/fail checklist."""
     _digest(runtime_sha, 'runtime manifest')
+    if qualification_profile not in ('full', 'focused'):
+        raise ValueError('unknown qualification profile')
     if not isinstance(records, list) or len(records) != 2:
         raise ValueError('two guest diagnostics are required')
     for record in records:
         if not isinstance(record, dict) or record.get('kind') != 'guest-diagnostic' or record.get('image') != image:
             raise ValueError('guest evidence does not bind the exact image')
+        if qualification_profile == 'focused':
+            if record.get('qualification_proofs') != list(FOCUSED_PROOFS):
+                raise ValueError('focused qualification proof list mismatch')
+        elif 'qualification_proofs' in record:
+            raise ValueError('focused proof cannot qualify a full campaign')
         if record.get('recipes') != recipe_hashes() or record.get('service_account') != service_account:
             raise ValueError('guest evidence recipe or workload identity mismatch')
         for key in ('instance_id', 'peer_instance_id'):
@@ -174,6 +190,14 @@ def validate_pair(records, image, runtime_sha, service_account):
         outputs = record.get('outputs')
         if not isinstance(outputs, dict) or outputs.get('io_uring') != 'io_uring_setup(2) succeeded':
             raise ValueError('successful io_uring syscall evidence required')
+        guest = outputs.get('guest_runtime')
+        if (not isinstance(guest, dict) or guest.get('executable') != gcp_runtime.GUEST_PYTHON
+                or guest.get('yaml') != '6.0.2'
+                or not isinstance(guest.get('python'), str)
+                or not guest['python'].startswith(('3.11.', '3.12.', '3.13.', '3.14.'))
+                or type(guest.get('nofile_soft')) is not int or type(guest.get('nofile_hard')) is not int
+                or (guest['nofile_hard'] != -1 and guest['nofile_hard'] < 524288)):
+            raise ValueError('canonical guest Python, PyYAML and NOFILE hard-limit evidence required')
         memlock = outputs.get('memlock')
         if not isinstance(memlock, dict) or memlock.get('soft') != 'infinity' or memlock.get('hard') != 'infinity' or memlock.get('docker') not in ('infinity', '18446744073709551615'):
             raise ValueError('unlimited workload and Docker locked memory evidence required')
@@ -189,13 +213,23 @@ def validate_pair(records, image, runtime_sha, service_account):
             raise ValueError('sealed runtime linkage evidence mismatch')
         resolved = _linkage(package.get('linkage'))
         valkey_linkage = package.get('valkey_runtime_linkage')
-        if not isinstance(valkey_linkage, dict) or set(valkey_linkage) != {'valkey-server', 'valkey-cli'}:
-            raise ValueError('both Valkey executable linkage records required')
-        for linkage in valkey_linkage.values():
-            _linkage(linkage)
+        if qualification_profile == 'focused':
+            if package.get('build_profile') != 'focused':
+                raise ValueError('focused qualification requires the focused package')
+            if valkey_linkage is not None or 'valkey' in outputs:
+                raise ValueError('focused qualification must not contain Valkey proof')
+        else:
+            if not isinstance(valkey_linkage, dict) or set(valkey_linkage) != {'valkey-server', 'valkey-cli', 'valkey-benchmark'}:
+                raise ValueError('server, CLI and native benchmark Valkey linkage records required')
+            for linkage in valkey_linkage.values():
+                _linkage(linkage)
+        if 'spdk' in package:
+            _linkage(package.get('spdk_runtime_linkage'))
         fabric_path = package.get('fabric_library')
-        if not isinstance(fabric_path, str) or fabric_path not in resolved or not any(Path(path).name.startswith('libfdb_c.so') for path in resolved):
-            raise ValueError('benchmark FDB and libfabric linkage required')
+        has_fdb = any(Path(path).name.startswith('libfdb_c.so') for path in resolved)
+        if (not isinstance(fabric_path, str) or fabric_path not in resolved
+                or has_fdb is (qualification_profile == 'focused')):
+            raise ValueError('benchmark FDB and libfabric linkage differs from profile')
         fabric_sha = _digest(outputs.get('libfabric_sha256'), 'libfabric')
         if resolved[fabric_path]['identity']['sha256'] != fabric_sha:
             raise ValueError('linked libfabric digest mismatch')
@@ -219,10 +253,14 @@ def validate_pair(records, image, runtime_sha, service_account):
         modules = outputs.get('nvme_modules', {})
         if not isinstance(modules, dict) or any(not isinstance(modules.get(x), str) or not modules[x] for x in ('irdma', 'idpf', 'rdma_cm', 'nvme', 'nvme_rdma', 'nvmet_rdma')):
             raise ValueError('required kernel modules missing')
+        if qualification_profile == 'focused' and any(
+                not isinstance(modules.get(x), str) or not modules[x]
+                for x in ('nvmet', 'nvme_fabrics')):
+            raise ValueError('focused NVMe target modules missing')
         if not str(outputs.get('openssl', '')).startswith('OpenSSL 3.') or not str(outputs.get('python', '')).startswith(('3.11.', '3.12.', '3.13.', '3.14.')):
             raise ValueError('Python/OpenSSL runtime evidence invalid')
         containers = outputs.get('containers')
-        if not isinstance(containers, dict) or set(containers) != required_containers():
+        if not isinstance(containers, dict) or set(containers) != required_containers(focused=qualification_profile == 'focused'):
             raise ValueError('container inventory differs from reviewed pins')
         for reference, inspected in containers.items():
             if not isinstance(inspected, list) or len(inspected) != 1 or not isinstance(inspected[0], dict):
@@ -247,9 +285,10 @@ def validate_pair(records, image, runtime_sha, service_account):
                 raise ValueError('perftest latency result invalid') from exc
             if not all(math.isfinite(value) for value in values) or any(value <= 0 for index, value in enumerate(values) if index != 4) or values[4] < 0:
                 raise ValueError('perftest latency values must be finite and positive')
-        valkey = outputs.get('valkey', {})
-        if not isinstance(valkey, dict) or valkey.get('endpoint') != str(record.get('peer')) + ':6380' or valkey.get('set') != 'OK' or valkey.get('del') != '1' or not re.fullmatch(r'[0-9a-f]{32}', str(valkey.get('value', ''))) or valkey.get('get') != valkey['value']:
-            raise ValueError('Valkey RDMA SET/GET/DEL evidence invalid')
+        if qualification_profile == 'full':
+            valkey = outputs.get('valkey', {})
+            if not isinstance(valkey, dict) or valkey.get('endpoint') != str(record.get('peer')) + ':6380' or valkey.get('set') != 'OK' or valkey.get('del') != '1' or not re.fullmatch(r'[0-9a-f]{32}', str(valkey.get('value', ''))) or valkey.get('get') != valkey['value']:
+                raise ValueError('Valkey RDMA SET/GET/DEL evidence invalid')
     if records[0]['instance_id'] != records[1]['peer_instance_id'] or records[1]['instance_id'] != records[0]['peer_instance_id']:
         raise ValueError('guest hardware proofs must be reciprocal')
     if records[0].get('local_rdma') != records[1].get('peer') or records[1].get('local_rdma') != records[0].get('peer') or records[0].get('local_rdma') == records[1].get('local_rdma'):
@@ -259,6 +298,65 @@ def validate_pair(records, image, runtime_sha, service_account):
             raise ValueError(f'qualification guests differ in {field}')
     if _envelope(records[0]) != _envelope(records[1]):
         raise ValueError('qualified guest ABI envelopes differ')
+
+
+
+def admit_nvme_transports(qualification, backends, *, live=False):
+    """Require both physical image guests to evidence each selected NVMe transport.
+
+    RDMA-CM perftest in validate_pair proves the underlying peer fabric, not
+    NVMe target discovery or I/O; those must still succeed during the campaign.
+    """
+    required = set()
+    for backend, modules in (
+        ('tidehunter_nvme_rdma', ('nvmet', 'nvme_fabrics', 'rdma_cm', 'nvme_rdma', 'nvmet_rdma')),
+        ('tidehunter_nvme_tcp', ('nvmet', 'nvme_fabrics', 'nvme_tcp', 'nvmet_tcp')),
+    ):
+        if backend in backends:
+            required.update(modules)
+    if live and required:
+        # The live target privately commissions namespace geometry over loopback TCP.
+        required.update(('nvme_tcp', 'nvmet_tcp'))
+    if not required:
+        return
+    records = qualification.get('_records')
+    if not isinstance(records, list) or len(records) != 2:
+        raise ValueError('validated image guest records required for NVMe')
+    for record in records:
+        modules = record.get('outputs', {}).get('nvme_modules', {})
+        if not isinstance(modules, dict) or any(
+                not isinstance(modules.get(name), str) or not modules[name].strip()
+                for name in required):
+            raise ValueError('qualified image lacks selected NVMe transport modules')
+
+
+def admit_spdk_scope(spec, identity):
+    if spec.get('spdk_comparison') and spec.get('mode') in ('standard-with-live-nvmeof', 'focused'):
+        if (not isinstance(identity, dict)
+                or identity.get('target_scope') != 'file_aio_direct_live_and_sealed'
+                or identity.get('source_patch_sha256') != 'ba21692d7ac70190a505a7b94dc749c8f544d6eef8632a38980f4acf5e987373'):
+            label = 'live SPDK' if spec['mode'] == 'standard-with-live-nvmeof' else 'focused SPDK'
+            raise ValueError(label + ' requires the reviewed writable target and namespace-drain patch')
+
+
+def admit_spdk(qualification, spec):
+    """Require the selected SPDK package and runtime linker proof on both guests."""
+    if not spec.get('spdk_comparison'):
+        return
+    records = qualification.get('_records')
+    if not isinstance(records, list) or len(records) != 2:
+        raise ValueError('validated image guest records required for SPDK')
+    identities = []
+    for record in records:
+        package = record.get('outputs', {}).get('package', {})
+        identity = package.get('spdk')
+        if not isinstance(identity, dict) or not identity:
+            raise ValueError('qualified image lacks SPDK package evidence')
+        admit_spdk_scope(spec, identity)
+        _linkage(package.get('spdk_runtime_linkage'))
+        identities.append(identity)
+    if identities[0] != identities[1]:
+        raise ValueError('qualified image guests differ in SPDK package identity')
 
 
 def admit_image(api, config, image_info):
@@ -277,6 +375,15 @@ def admit_image(api, config, image_info):
         raise ValueError('fetched image identity does not match configured path')
     receipt = _load(api, ref, config.get('bucket'), 1024 * 1024)
     identity = {'path': image, 'id': image_id}
+    profile = config.get('qualification_profile', 'full')
+    if profile not in ('full', 'focused'):
+        raise ValueError('unknown qualification profile')
+    if profile == 'focused':
+        if (receipt.get('qualification_profile') != 'focused'
+                or receipt.get('qualification_proofs') != list(FOCUSED_PROOFS)):
+            raise ValueError('focused receipt proof list mismatch')
+    elif 'qualification_profile' in receipt or 'qualification_proofs' in receipt:
+        raise ValueError('focused receipt cannot qualify a full campaign')
     if receipt.get('schema_version') != 1 or receipt.get('image') != identity:
         raise ValueError('qualification does not bind this exact image and numeric ID')
     if receipt.get('recipes') != recipe_hashes():
@@ -285,5 +392,6 @@ def admit_image(api, config, image_info):
     if not isinstance(evidence, list) or len(evidence) != 2:
         raise ValueError('two generation-pinned hardware evidence objects required')
     records = [_load(api, item, config['bucket'], 16 * 1024 * 1024) for item in evidence]
-    validate_pair(records, identity, receipt.get('runtime_sha256'), config.get('service_account'))
+    validate_pair(records, identity, receipt.get('runtime_sha256'), config.get('service_account'),
+                  qualification_profile=profile)
     return {**receipt, '_records': records}
