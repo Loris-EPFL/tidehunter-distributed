@@ -24,7 +24,7 @@ struct Options {
 
 impl Options {
     fn parse(value: &JsonValue) -> BackendResult<Self> {
-        let options: Self = serde_json::from_value(value.clone())?;
+        let options = Self::deserialize(value)?;
         if options.nodes.is_empty() {
             return Err(invalid("nodes must contain at least one host:port"));
         }
@@ -203,7 +203,7 @@ fn fields(info: &str) -> BTreeMap<&str, &str> {
         .collect()
 }
 
-fn parse_config(values: &[String]) -> BackendResult<BTreeMap<String, String>> {
+fn parse_config(values: &[String]) -> BackendResult<BTreeMap<&str, &str>> {
     if !values.len().is_multiple_of(2) {
         return Err(invalid(
             "Valkey CONFIG GET returned an incomplete key/value list",
@@ -211,7 +211,7 @@ fn parse_config(values: &[String]) -> BackendResult<BTreeMap<String, String>> {
     }
     let mut config = BTreeMap::new();
     for pair in values.chunks_exact(2) {
-        config.insert(pair[0].clone(), pair[1].clone());
+        config.insert(pair[0].as_str(), pair[1].as_str());
     }
     for (key, expected) in [
         ("appendonly", "yes"),
@@ -219,7 +219,7 @@ fn parse_config(values: &[String]) -> BackendResult<BTreeMap<String, String>> {
         ("no-appendfsync-on-rewrite", "no"),
         ("maxmemory-policy", "noeviction"),
     ] {
-        if config.get(key).map(String::as_str) != Some(expected) {
+        if config.get(key).copied() != Some(expected) {
             return Err(invalid(&format!(
                 "Valkey requires CONFIG {key}={expected}; observed {:?}",
                 config.get(key)
@@ -337,14 +337,9 @@ impl ValkeyTcpBackend {
                     "Valkey cluster_enabled does not match the requested standalone/cluster layout",
                 ));
             }
-            cluster_modes.push(cluster_enabled.to_owned());
+            cluster_modes.push(cluster_enabled);
             configs.push(parse_config(config)?);
-            persistence.push(
-                fields(persistence_info)
-                    .into_iter()
-                    .map(|(key, value)| (key.to_owned(), value.to_owned()))
-                    .collect::<BTreeMap<_, _>>(),
-            );
+            persistence.push(fields(persistence_info));
         }
         let topology = if options.cluster {
             let client = redis::Client::open(format!("redis://{}/", options.nodes[0]))?;
@@ -506,5 +501,40 @@ impl KvBackend for ValkeyTcpBackend {
 
     async fn put_batch(&self, _entries: &[(Bytes, Bytes)]) -> BackendResult<()> {
         Err(unsupported("Valkey cross-slot atomic put_batch"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_preserves_serialized_fields_and_checks_required_values() {
+        let mut values: Vec<String> = [
+            "appendonly",
+            "yes",
+            "appendfsync",
+            "always",
+            "no-appendfsync-on-rewrite",
+            "no",
+            "maxmemory-policy",
+            "noeviction",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(
+            serde_json::to_value(parse_config(&values).unwrap()).unwrap(),
+            json!({
+                "appendonly": "yes",
+                "appendfsync": "always",
+                "no-appendfsync-on-rewrite": "no",
+                "maxmemory-policy": "noeviction"
+            })
+        );
+        values[3] = "everysec".to_owned();
+        assert!(parse_config(&values).is_err());
+        values.pop();
+        assert!(parse_config(&values).is_err());
     }
 }

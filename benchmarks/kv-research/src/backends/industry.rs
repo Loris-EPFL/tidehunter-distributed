@@ -75,7 +75,7 @@ struct Options {
 }
 impl Options {
     fn parse(value: &Value) -> BackendResult<Self> {
-        let o: Self = serde_json::from_value(value.clone())?;
+        let o = Self::deserialize(value)?;
         if !o.cluster
             || o.nodes.len() != 5
             || o.required_primary_nodes != 5

@@ -180,9 +180,9 @@ pub fn prepare_external_case_with_durability(
             },
             tls: TlsFiles {
                 transport: owner_transport.clone(),
-                ca: ca.clone(),
-                cert: cert.clone(),
-                key: key.clone(),
+                ca,
+                cert,
+                key,
                 server_name: server_name.clone(),
             },
             limits: TcpLimits {
@@ -209,7 +209,7 @@ pub fn prepare_external_case_with_durability(
     }
     let client_tls = if let Some(certs) = certs.as_ref() {
         TlsFiles {
-            transport: transport.clone(),
+            transport,
             ca: rebase(&certs.ca),
             cert: rebase(&certs.authority.certificate),
             key: rebase(&certs.authority.private_key),
@@ -217,7 +217,7 @@ pub fn prepare_external_case_with_durability(
         }
     } else {
         TlsFiles {
-            transport: transport.clone(),
+            transport,
             ca: PathBuf::new(),
             cert: PathBuf::new(),
             key: PathBuf::new(),
@@ -492,7 +492,7 @@ pub fn maybe_run_storage_node() -> Result<bool> {
         partition,
         database,
         address: address.to_string(),
-        launch_nonce: config.launch_nonce.clone(),
+        launch_nonce: config.launch_nonce,
         pid: std::process::id(),
         boot_id,
         started_unix_ns: u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?,
@@ -893,9 +893,9 @@ impl LoopbackCluster {
                 },
                 tls: TlsFiles {
                     transport: transport.clone(),
-                    ca: ca.clone(),
-                    cert: cert.clone(),
-                    key: key.clone(),
+                    ca,
+                    cert,
+                    key,
                     server_name: server_name.clone(),
                 },
                 limits,
@@ -919,13 +919,13 @@ impl LoopbackCluster {
             endpoints.push(RemoteEndpoint {
                 partition,
                 address: address.to_string(),
-                server_name: server_name.clone(),
+                server_name,
             });
             nodes.push(node);
         }
         let client_tls = if let Some(certs) = certs {
             TlsFiles {
-                transport: transport.clone(),
+                transport,
                 ca: certs.ca,
                 cert: certs.authority.certificate,
                 key: certs.authority.private_key,
@@ -933,7 +933,7 @@ impl LoopbackCluster {
             }
         } else {
             TlsFiles {
-                transport: transport.clone(),
+                transport,
                 ca: PathBuf::new(),
                 cert: PathBuf::new(),
                 key: PathBuf::new(),

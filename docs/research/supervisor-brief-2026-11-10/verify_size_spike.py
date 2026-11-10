@@ -148,8 +148,10 @@ def check_sizes_spike(pages, definitions):
         else:
             assert str(int(float(row['value']))) in line
     # Check every added B key, including generated table cells, against its raw-checked CSV.
+    local_fair = check_local_fair()
     text = '\n'.join((HERE / name).read_text() for name in
-                     ('cross-store-sizes.tex', 'cross-store-spike.tex', 'tab-sui-sizes.tex', 'tab-spike.tex'))
+                     ('cross-store-sizes.tex', 'cross-store-spike.tex', 'tab-sui-sizes.tex', 'tab-spike.tex',
+                      'tab-local-structure.tex', 'cross-store-fair-native.tex', 'tab-fair-native.tex'))
     key_checks = []
     for key in set(re.findall(r'\\N\{(B:[^{}]+)\}', text)):
         bare, _, spec = key.partition('|')
@@ -163,4 +165,60 @@ def check_sizes_spike(pages, definitions):
             'modes': dict(Counter(r['mode'] for r in cases)), 'new_B_keys_checked': sorted(key_checks),
             'value_observations': count, 'large_value_observations': large,
             'large_value_percent': summary['ge64_value_pct'], 'large_call_percent': summary['ge64_api_pct'],
+            'local_structure_and_plan': local_fair,
             'scope': 'one corrected remote private-chain capture including initialization; sizes only; no persistence/cache qualification or mainnet frequency'}
+
+
+def check_local_fair():
+    """Check audit transcriptions, not unavailable laptop samples; generate no runs."""
+    import hashlib
+    import json
+    import sys
+    local = read_csv(HERE / 'local-structure-test.csv')
+    assert len(local) == len({r['label'] for r in local}) == 40
+    assert {r['variant'] for r in local} == {
+        'Fresh', 'MAP_POPULATE', 'Write-prefault', 'pwrite', 'Anonymous', 'Data sync', 'Grouped data sync'}
+    audit_files = {}
+    for row in local:
+        cells = [cell.strip() for cell in row['report_row'].strip('|').split('|')]
+        assert cells[:3] == [row['variant'], row['kib'], row['concurrency']]
+        run = int(row['run'])
+        values = [value.strip() for value in cells[2 + run].split('/')]
+        assert [row['p50_us'], row['p99_us'], row['mean_us'], row['puts_s']] == values
+        assert float(row['p50_ms']) == float(row['p50_us']) / 1000
+        assert 'Subsequent IEEE CRC and missing controls' in row['provenance']
+        assert f'IEEE run {run}' in row['provenance']
+        assert 'raw samples not retained' in row['provenance']
+        source = Path(row['report_path'])
+        if source.exists():
+            if source not in audit_files:
+                audit_files[source] = source.read_text().splitlines()
+            lines = audit_files[source]
+            index = int(row['report_line']) - 1
+            assert lines[index] == row['report_row']
+            assert any(line.startswith('## Subsequent IEEE CRC and missing controls') for line in lines[:index])
+    sys.path.insert(0, str(ROOT / 'tidehunter-sharded-wal/experiments/kv-comparison'))
+    import cloud_campaign
+    fair = cloud_campaign.make_focused_matrix('fair_native')
+    parity = cloud_campaign.make_focused_matrix('parity')
+    generated = {group: [job for job in fair if job['group'] == group]
+                 for group in ('G14N', 'G14S', 'G14O1', 'G14O5', 'G14P')}
+    generated.update(fair_native=fair, parity=parity, G13W=[j for j in parity if j['group'] == 'G13W'])
+    for selection in ('recommended', 'full', 'device', 'floors', 'stages', 'unified'):
+        generated['frozen_' + selection] = cloud_campaign.make_focused_matrix(selection)
+    plan = read_csv(HERE / 'fair-native-plan.csv')
+    assert {r['label'] for r in plan} == set(generated)
+    for row in plan:
+        jobs = generated[row['label']]
+        assert int(row['cases']) == len(jobs)
+        writers = sorted({job['concurrency'] for job in jobs})
+        for i in range(3):
+            assert row['writer' + str(i)] == (str(writers[i]) if i < len(writers) else '')
+        assert row['matrix_sha256'] == hashlib.sha256(json.dumps(jobs, sort_keys=True).encode()).hexdigest()
+    campaign = (ROOT / 'tidehunter-sharded-wal/docs/distributed/FOCUSED_CAMPAIGN_2026-11-07.md').read_text()
+    for group, jobs in generated.items():
+        if group.startswith('G14'):
+            assert re.search(r'\| ' + group + r' \| ' + str(len(jobs)) + r' \|', campaign)
+    return {'transcribed_ieee_rows': len(local), 'raw_local_samples': 'not retained; transcription checked against audit report',
+            'matrix_counts': {label: len(jobs) for label, jobs in generated.items()},
+            'status': 'planned, not run; read-only make_focused_matrix calls; no launch'}

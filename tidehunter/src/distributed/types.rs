@@ -1,7 +1,6 @@
 //! Distinct identity, authorization, ordering and location domains.
 //!
-//! See the October 6 architecture decision, §7.2. Native `WalPosition` is
-//! deliberately unchanged: its offsets are not comparable across partitions.
+//! Native `WalPosition` offsets are not comparable across partitions.
 
 use serde::{Deserialize, Serialize};
 

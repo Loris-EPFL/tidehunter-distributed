@@ -106,7 +106,7 @@ pub struct NativeBackend {
 }
 
 fn parse_options(value: &serde_json::Value) -> BackendResult<Options> {
-    let options: Options = serde_json::from_value(value.clone())?;
+    let options = Options::deserialize(value)?;
     if !(1..=16).contains(&options.native_shards) {
         return Err("native_shards must be between 1 and 16".into());
     }

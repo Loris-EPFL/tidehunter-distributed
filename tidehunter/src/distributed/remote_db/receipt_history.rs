@@ -532,19 +532,9 @@ impl ReceiptHistory {
     }
 
     pub(super) fn sync(&mut self) -> Result<(), LocalDbError> {
-        // Like the distributed native WAL's data barrier, sync_data includes
-        // file-size metadata needed to retrieve appended bytes; namespace
-        // durability remains a separate directory sync. Native Index WAL's
-        // dirty row maintenance writes a common append log (large_table.rs);
-        // a consolidated metadata log could reduce barriers further when many
-        // streams change, but requires new ordinal-to-offset indexing, replay,
-        // root reachability, retention and crash-safe migration. It also trades
-        // fixed-slot direct reads for indirection and shared-log contention.
-        // Existing append-only Patricia pages and fixed ordinal streams already
-        // permit this smaller optimization without another value WAL or format
-        // change. Valkey 9.1.3 beforeSleep/flushAppendOnlyFile orders its
-        // AOF_FSYNC_ALWAYS barrier before replies; unchanged-file elimination
-        // similarly leaves the required data and namespace barriers intact.
+        // sync_data persists appended bytes and the file size. Directory sync
+        // separately persists stream names. Reopened roots must sync all retained
+        // streams; live roots need only the files changed since the last barrier.
         if self.reopened || self.dirty_nodes {
             #[cfg(test)]
             Self::sync_step(&mut self.fail_sync_after)?;

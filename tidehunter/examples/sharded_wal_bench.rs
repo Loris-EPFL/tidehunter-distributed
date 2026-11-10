@@ -2765,7 +2765,7 @@ fn run_case(args: &Args, case: &Case, output: &mut Output) -> Result<()> {
     let mut expected: Vec<_> = oracle
         .iter()
         .enumerate()
-        .filter_map(|(i, g)| g.map(|g| (key(i).to_vec(), value(i, g, case.value_bytes))))
+        .filter_map(|(i, g)| g.map(|g| (key(i), value(i, g, case.value_bytes))))
         .collect();
     expected.sort_by(|a, b| a.0.cmp(&b.0));
     if scanned.len() != expected.len()
@@ -2965,7 +2965,7 @@ fn main() -> Result<()> {
             BackendParameters::new(Kind::Tcp, directory.join("database"), &args, args.values[0]);
         let owner_transports = select_owner_transports(
             &args.transport,
-            args.owner_transports.clone(),
+            args.owner_transports,
             args.remote_endpoints.len(),
         )?;
         tcp_cluster::prepare_external_case(

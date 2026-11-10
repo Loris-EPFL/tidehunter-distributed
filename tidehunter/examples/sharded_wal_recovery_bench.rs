@@ -66,8 +66,13 @@ impl Args {
             let value = arguments
                 .next()
                 .ok_or_else(|| invalid(format!("missing value for {name}")))?;
-            if options.insert(name.clone(), value).is_some() {
-                return Err(invalid(format!("duplicate option {name}")).into());
+            match options.entry(name) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(value);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    return Err(invalid(format!("duplicate option {}", entry.key())).into());
+                }
             }
         }
         let mut required = |name: &str| {

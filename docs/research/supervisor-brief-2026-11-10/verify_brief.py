@@ -59,7 +59,7 @@ def main():
     text = subprocess.check_output(['pdftotext', '-layout', str(HERE / 'main.pdf'), '-'], text=True)
     (HERE / 'main.txt').write_text(text)
     pages = [p for p in text.split('\f') if p.strip()]
-    assert len(pages) <= 38, len(pages)
+    assert len(pages) <= 40, len(pages)
     assert 'Scope and findings' in pages[0] and 'Cross-store results stay separate' in pages[0]
     assert 'Value size and concurrency' in pages[3]
     assert 'Serving-node memory' in pages[7]
@@ -308,6 +308,7 @@ def main():
                         ('Topology, contracts and the Native result', 'Where Valkey is ahead',
                          'Agreement with the Tidehunter paper', 'Unexplained features',
                          'points are reproducible', 'Where 64 KiB values occur',
+                         'Local structure test', 'Planned fair Native comparison',
                          'Protocol allowance is not', 'Exact chart sizes versus', 'large-value stress point',
                          'unchanged scoreboard', 'Other stores, unchanged', 'RDMA against TCP',
                          'Provenance and limits', 'Durable scalar puts', 'case-level SSD-service qualification'))})

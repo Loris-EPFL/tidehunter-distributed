@@ -518,7 +518,7 @@ impl ConcurrentRemoteDatabase {
         }
     }
 
-    // Preserve the existing key/routing/pin contract when adding optional diagnostics.
+    // Keep key, route, pin ownership and optional diagnostics explicit.
     #[allow(clippy::too_many_arguments)]
     fn prepare_concurrent_miss(
         &self,
@@ -563,7 +563,7 @@ impl ConcurrentRemoteDatabase {
         } else {
             let read = self.reads.submit_until_owned(
                 node,
-                vec![reference],
+                std::slice::from_ref(&reference),
                 key.len(),
                 false,
                 ReadContext {
@@ -666,7 +666,7 @@ impl ConcurrentRemoteDatabase {
                 .ok_or_else(|| LocalDbError::new("reference names unregistered partition"))?;
             Some(self.reads.submit_until(
                 node,
-                vec![reference],
+                std::slice::from_ref(&reference),
                 0,
                 false,
                 ReadContext {

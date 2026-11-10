@@ -237,8 +237,6 @@ fn panic_after_append_fails_active_and_later_commands_closed() {
     assert!(command(&node, 2, append_request(&config, 1, 1), 4096, &completed).is_ok());
     assert!(command(&node, 3, Request::Seal { epoch: 1 }, 1, &completed).is_ok());
     drop(inventory);
-    // Appends overlap, so their completion order is free; the seal is an
-    // exclusive barrier and therefore completes last.
     let mut outcomes = std::collections::HashMap::new();
     let mut order = Vec::new();
     for _ in 0..3 {

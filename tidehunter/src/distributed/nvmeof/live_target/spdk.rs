@@ -369,14 +369,15 @@ impl LiveTargetManager {
         let subsystems = inventory
             .as_array()
             .ok_or_else(|| invalid("invalid SPDK subsystem list"))?;
-        let matches: Vec<_> = subsystems
+        let mut matches = subsystems
             .iter()
-            .filter(|s| s.get("nqn").and_then(Value::as_str) == Some(binding.nqn.as_str()))
-            .collect();
-        if matches.len() != 1 {
+            .filter(|s| s.get("nqn").and_then(Value::as_str) == Some(binding.nqn.as_str()));
+        let sub = matches
+            .next()
+            .ok_or_else(|| invalid("SPDK subsystem identity is not unique"))?;
+        if matches.next().is_some() {
             return Err(invalid("SPDK subsystem identity is not unique"));
         }
-        let sub = matches[0];
         let host = if private {
             &self.state.private_host
         } else {
@@ -474,9 +475,8 @@ impl LiveTargetManager {
             .exports
             .iter()
             .find(|e| e.binding.uuid == binding.uuid)
-            .ok_or_else(|| invalid("missing export"))?
-            .clone();
-        self.spdk_inventory(&export, true)?;
+            .ok_or_else(|| invalid("missing export"))?;
+        self.spdk_inventory(export, true)?;
         self.spdk_access(binding, true)?;
         let local = LiveConnectTarget {
             nqn: binding.nqn.clone(),
@@ -541,7 +541,7 @@ impl LiveTargetManager {
             NvmeofTransport::Rdma => "RDMA",
         };
         self.spdk_true("nvmf_subsystem_add_listener", json!({"nqn":binding.nqn,"listen_address":{"trtype":transport,"adrfam":family,"traddr":binding.address,"trsvcid":binding.service.to_string()}}))?;
-        self.spdk_inventory(&export, true)?;
+        self.spdk_inventory(export, true)?;
         self.spdk_access(binding, false)?;
         self.spdk_phase(binding.uuid, Phase::Active)?;
         self.stats.namespaces_exposed = self.stats.namespaces_exposed.saturating_add(1);

@@ -143,8 +143,8 @@ fn storage(shards: usize) -> LocalInventoryConfig {
 
 fn connect(config: &RemoteDatabaseConfig, shape: &KeyShape) -> Result<Vec<Client>> {
     let mut clients = Vec::with_capacity(config.endpoints.len());
+    let mut tls = config.tls.clone();
     for endpoint in &config.endpoints {
-        let mut tls = config.tls.clone();
         tls.server_name.clone_from(&endpoint.server_name);
         let storage = &config.storage;
         clients.push(Client::connect(

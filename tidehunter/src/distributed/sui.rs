@@ -1619,9 +1619,11 @@ impl Db {
         self.read_calls.fetch_add(1, Ordering::Relaxed);
         self.read_keys
             .fetch_add(keys.len() as u64, Ordering::Relaxed);
-        let Backend::Remote(remote) = &self.backend else {
-            let db = self.native().expect("native backend");
-            return keys.iter().map(|key| db.get(ks, key.as_ref())).collect();
+        let remote = match &self.backend {
+            Backend::Native(db) => {
+                return keys.iter().map(|key| db.get(ks, key.as_ref())).collect();
+            }
+            Backend::Remote(remote) => remote,
         };
         let trace = caller_id.and_then(|id| remote.db.begin_read_trace(id, keys.len()));
         if keys.is_empty() {
@@ -2009,6 +2011,7 @@ impl Db {
                     if page.is_empty() {
                         break;
                     }
+                    after = page.last().map(|(key, _)| key.clone());
                     for (key, reference) in page {
                         let next_cell = descriptor.cell_id(&key);
                         if cell.as_ref().is_some_and(|cell| cell != &next_cell) {
@@ -2016,7 +2019,6 @@ impl Db {
                             rows.clear();
                         }
                         cell = Some(next_cell);
-                        after = Some(key.clone());
                         rows.push((key, reference));
                     }
                 }
@@ -2039,25 +2041,24 @@ impl Db {
                     break;
                 }
                 for (key, reference) in page {
-                    after = Some(key.clone());
-                    if cutoff.is_some_and(|stop| reference.batch_version >= stop) {
-                        continue;
+                    if cutoff.is_none_or(|stop| reference.batch_version < stop) {
+                        let Mutation::Put { key, value, .. } =
+                            remote.record(descriptor.id(), &key, reference, &pin)?
+                        else {
+                            return Err(error("live relocation row resolved to a tombstone"));
+                        };
+                        if matches!(filter(&key, &value), crate::Decision::Remove) {
+                            self.push_pruning_delete(
+                                &mut deletes,
+                                &mut encoded_bytes,
+                                Mutation::Delete {
+                                    keyspace: descriptor.id(),
+                                    key,
+                                },
+                            )?;
+                        }
                     }
-                    let Mutation::Put { key, value, .. } =
-                        remote.record(descriptor.id(), &key, reference, &pin)?
-                    else {
-                        return Err(error("live relocation row resolved to a tombstone"));
-                    };
-                    if matches!(filter(&key, &value), crate::Decision::Remove) {
-                        self.push_pruning_delete(
-                            &mut deletes,
-                            &mut encoded_bytes,
-                            Mutation::Delete {
-                                keyspace: descriptor.id(),
-                                key,
-                            },
-                        )?;
-                    }
+                    after = Some(key);
                 }
             }
             if !deletes.is_empty() {
@@ -2223,10 +2224,8 @@ impl Db {
                     ));
                 }
                 let mutation = remote.record(ks, &reduced, reference, &pin)?;
-                deletes.push(Mutation::Delete {
-                    keyspace: ks,
-                    key: mutation.key().clone(),
-                });
+                let (Mutation::Put { key, .. } | Mutation::Delete { key, .. }) = mutation;
+                deletes.push(Mutation::Delete { keyspace: ks, key });
                 after = reduced;
             }
             page = remote
@@ -2486,7 +2485,7 @@ impl RemoteIterator {
                 &self.lower
             };
             if let Some(bound) = bound {
-                let reduced: Bytes = descriptor.reduce_key(bound).as_ref().to_vec().into();
+                let reduced = descriptor.reduced_key_bytes(bound.clone());
                 if let Some(reference) = remote
                     .db
                     .index_reference(self.ks, bound, self.cut.clone())

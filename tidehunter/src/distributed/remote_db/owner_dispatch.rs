@@ -1,8 +1,7 @@
 //! Bounded coordinator-side owner append scheduling.
 //!
-//! The local audit in BENCHMARK_ANOMALY_AUDIT_2026-11-03 §§13–14 observed
-//! scalar owner occupancy rising from two to seven/eight while RPC groups got
-//! smaller; neither two nor the transport maximum is an established optimum.
+//! Scalar and batch workloads can need different owner occupancy limits.
+//! Neither the early-coalescing limit nor the transport maximum is a fixed optimum.
 //! This policy bounds already-admitted work, not durability. Like Valkey 9.1.3
 //! `beforeSleep`, draining processes ready input without waiting for new input;
 //! the existing durable owner receipt still precedes publication and reply.

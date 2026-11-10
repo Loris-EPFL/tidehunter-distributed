@@ -510,8 +510,9 @@ impl LiveIo {
             ));
         }
         // SAFETY: SQEs reference allocations moved into operations below; they and
-        // the namespace descriptor remain alive until every terminal CQE. No SQPOLL
-        // is enabled, so the kernel cannot observe these SQEs before submit.
+        // the namespace descriptor remain alive until every terminal CQE. Drop
+        // aborts if operations remain. No SQPOLL is enabled, so the kernel cannot
+        // observe these SQEs before submit. push_multiple is all-or-nothing.
         if unsafe { self.ring.submission().push_multiple(&entries) }.is_err() {
             for (_, op) in prepared {
                 self.pool.push(op.buffer);

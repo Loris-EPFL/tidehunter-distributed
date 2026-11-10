@@ -34,7 +34,7 @@ class FocusedAdmissionTest(unittest.TestCase):
                     gcp_image.admit_spdk_scope(spec, invalid)
 
     def test_both_reviewed_specs_bind_exact_canonical_matrix(self):
-        for selection, count in (('recommended', 279), ('full', 333), ('device', 120), ('floors', 69), ('stages', 183), ('unified', 270), ('append_floors', 48), ('fair_native', 168), ('parity', 216)):
+        for selection, count in (('recommended', 279), ('full', 333), ('device', 120), ('floors', 69), ('stages', 183), ('unified', 270), ('append_floors', 48), ('fair_native', 168), ('parity', 216), ('parity_compact', 177), ('fair_five_owner', 39)):
             with self.subTest(selection=selection):
                 spec = copy.deepcopy(manual.REVIEWED_SPECS[selection])
                 jobs = workflow_input.cloud_campaign.make_focused_matrix(selection)
@@ -46,6 +46,8 @@ class FocusedAdmissionTest(unittest.TestCase):
                             if selection in ('stages', 'unified') else
                             {'G14N': 54, 'G14S': 36, 'G14O1': 36, 'G14O5': 36, 'G14P': 6} if selection == 'fair_native' else
                             {'G13W': 48, 'G14N': 54, 'G14S': 36, 'G14O1': 36, 'G14O5': 36, 'G14P': 6} if selection == 'parity' else
+                            {'G13W': 48, 'G14N': 54, 'G14S': 36, 'G14O1': 36, 'G14P': 3} if selection == 'parity_compact' else
+                            {'G14O5': 36, 'G14P': 3} if selection == 'fair_five_owner' else
                             {'G13W': 48} if selection == 'append_floors' else
                             {'G11N': 45, 'G11S': 24} if selection == 'floors' else
                             {'G10R': 60, 'G10W': 60} if selection == 'device' else
@@ -56,8 +58,19 @@ class FocusedAdmissionTest(unittest.TestCase):
                     expected.update(G11N=45, G11S=24, G11W=18)
                 for group, group_count in expected.items():
                     self.assertEqual(counts[group], group_count)
-                manual._check_config(CONFIG, spec, manual.CEILING_CENTS - manual.COMPUTE_CENTS)
-                gcp_campaign.validate_spec(spec)
+                compact = selection == 'parity_compact'
+                self.assertEqual(spec.get('owner_hosts', 5), 1 if compact else 5)
+                self.assertEqual(workflow_input.cloud_campaign.selection_owner_hosts(selection), spec.get('owner_hosts', 5))
+                limit = ((manual.COMPACT_CEILING_CENTS - manual.COMPACT_COMPUTE_CENTS) if compact
+                         else manual.CEILING_CENTS - manual.COMPUTE_CENTS)
+                manual._check_config(CONFIG, spec, limit)
+                with self.assertRaises(ValueError):
+                    manual._check_config(CONFIG, spec, limit + 1)
+                if compact:
+                    with self.assertRaises(ValueError):
+                        gcp_campaign.validate_spec(spec)
+                else:
+                    gcp_campaign.validate_spec(spec)
                 with patch.object(workflow_input.cloud_campaign, 'make_focused_matrix', return_value=jobs + [{}]):
                     with self.assertRaisesRegex(ValueError, 'focused matrix differs'):
                         manual._check_config(CONFIG, spec, 0)
@@ -113,7 +126,7 @@ class FocusedAdmissionTest(unittest.TestCase):
 
     def test_workflow_spec_selects_only_reviewed_inputs(self):
         backends = ','.join(manual.REVIEWED_SPECS['full']['backends'])
-        for selection in ('recommended', 'full', 'device', 'floors', 'stages', 'unified', 'append_floors', 'fair_native', 'parity'):
+        for selection in ('recommended', 'full', 'device', 'floors', 'stages', 'unified', 'append_floors', 'fair_native', 'parity', 'parity_compact', 'fair_five_owner'):
             selected = ','.join(manual.REVIEWED_SPECS[selection]['backends'])
             spec = workflow_input.specification('kv', selected, 'focused', selection=selection)
             self.assertEqual(spec, manual.REVIEWED_SPECS[selection])
@@ -143,6 +156,42 @@ class FocusedAdmissionTest(unittest.TestCase):
         config['spec']['direct_control_arm'] = False
         with self.assertRaises(ValueError):
             gcp_runtime.validate_runtime(config)
+
+    def test_compact_budget_and_runtime_admission(self):
+        self.assertEqual((manual.COMPUTE_CENTS, manual.CEILING_CENTS), (11834, 14500))
+        self.assertEqual((manual.COMPACT_COMPUTE_CENTS, manual.COMPACT_CEILING_CENTS), (3945, 4834))
+        now = datetime.now(timezone.utc)
+        hosts = [{'index': i, 'role': 'coordinator' if i == 0 else 'owner', 'name': f'run-{i}',
+                  'id': str(100 + i), 'zone': 'us-central1-a', 'internal_ip': f'10.0.0.{i+1}',
+                  'rdma_ip': f'10.1.0.{i+1}'} for i in range(6)]
+        for count in (2, 6):
+            self.assertEqual(gcp_runtime._fleet(hosts[:count]), hosts[:count])
+        for count in (0, 1, 3, 4, 5):
+            with self.assertRaises(gcp_runtime.RuntimeSafetyError):
+                gcp_runtime._fleet(hosts[:count])
+        config = {'project_id': 'project', 'project_number': '123', 'bucket': 'bucket',
+                  'machine_type': 'z4m-highmem-16', 'run_id': 'run', 'fleet': hosts[:2],
+                  'source_sha256': 'a' * 64, 'deadline_utc': (now + timedelta(minutes=5)).isoformat(),
+                  'campaign_deadline_utc': (now + timedelta(minutes=2)).isoformat(),
+                  'package_root': '/mnt/tidehunter/run/package',
+                  'package': {'source_sha256': 'a' * 64, 'source_revision': 'b' * 40,
+                              'object_key': 'runs/run/package.tar', 'generation': '1', 'sha256': 'c' * 64},
+                  'spec': copy.deepcopy(manual.REVIEWED_SPECS['parity_compact'])}
+        self.assertIs(gcp_runtime.validate_runtime(config), config)
+        for mutation in ({'mode': 'standard'}, {'suite': 'sui'}, {'backends': ['tikv']},
+                         {'selection': 'parity'}):
+            with self.subTest(mutation=mutation), self.assertRaises((ValueError, gcp_runtime.RuntimeSafetyError)):
+                gcp_runtime.validate_runtime({**config, 'spec': {**config['spec'], **mutation}})
+
+    def test_direct_ci_launch_rejects_compact_before_cloud_access(self):
+        from unittest.mock import Mock
+        api = Mock()
+        spec = manual.REVIEWED_SPECS['parity_compact']
+        for candidate in (spec, {key: value for key, value in spec.items() if key != 'owner_hosts'}):
+            with self.assertRaisesRegex(ValueError, 'five.owner'):
+                gcp_campaign.launch(api, {}, {}, {}, None, {}, candidate, '/unused')
+        api.assert_not_called()
+        self.assertEqual(api.mock_calls, [])
 
     def test_planning_estimate_fits_work_window_but_not_worst_case(self):
         work_minutes = (3 * (1069.5 + 240 + 120 + 156.9 + 1904 + 2 * 19.4)

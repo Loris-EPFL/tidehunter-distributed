@@ -286,6 +286,8 @@ def node_action(args):
 
 def run_suite(config, mailbox, package, fixture, *, output_root):
     """Run paired native/distributed Sui cells; raise on any incomplete evidence."""
+    if len(config['fleet']) != 6:
+        raise ValueError('Sui suite requires five owner hosts')
     spec, fleet, store = config['spec'], config['fleet'], mailbox.store
     transports = selected_transports(spec)
     output = Path(output_root)

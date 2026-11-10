@@ -31,6 +31,9 @@ from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT.parent))
+import cloud_layout
+
 LABEL = 'org.tidehunter.campaign-observer'
 DASHBOARD = 'kv-comparison-campaign'
 DATASOURCE = 'kv-campaign-prometheus'
@@ -293,9 +296,10 @@ def validate_spec(value):
     if not isinstance(local, bool):
         raise ValueError('allow_loopback_hosts must be boolean')
     hosts = spec['hosts']
-    if not isinstance(hosts, list) or len(hosts) not in ((1, 6) if local else (6,)):
-        raise ValueError('expected six cloud hosts or one/six explicit local loopback hosts')
-    expected = {-1} if len(hosts) == 1 else {-1, 0, 1, 2, 3, 4}
+    allowed_counts = tuple(count + 1 for count in cloud_layout.OWNER_HOST_COUNTS)
+    if not isinstance(hosts, list) or len(hosts) not in ((1,) + allowed_counts if local else allowed_counts):
+        raise ValueError('expected two or six cloud hosts or explicit local loopback hosts')
+    expected = set(range(-1, len(hosts) - 1))
     indexes, addresses = set(), set()
     for host in hosts:
         if not isinstance(host, dict) or set(host) != {'index', 'address', 'role'} or type(host['index']) is not int:

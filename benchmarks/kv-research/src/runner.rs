@@ -120,7 +120,7 @@ pub async fn run<B: KvBackend>(
             "preload"
         });
         match preload(
-            Arc::clone(&backend),
+            &backend,
             &config,
             &namespace,
             started,
@@ -146,7 +146,7 @@ pub async fn run<B: KvBackend>(
         }
         reporter.set_phase(phase);
         if let Err(error) = run_phase(
-            Arc::clone(&backend),
+            &backend,
             &config,
             &namespace,
             &mut generator,
@@ -267,7 +267,7 @@ pub async fn run<B: KvBackend>(
             read_start = backend.read_observation();
             let phase_result = if config.execution.mode == ExecutionMode::Interference {
                 let (result, phase_result) = run_interference_phase(
-                    Arc::clone(&backend),
+                    &backend,
                     &config,
                     &namespace,
                     &mut generator,
@@ -287,7 +287,7 @@ pub async fn run<B: KvBackend>(
                 }
             } else {
                 run_phase(
-                    Arc::clone(&backend),
+                    &backend,
                     &config,
                     &namespace,
                     &mut generator,
@@ -315,9 +315,11 @@ pub async fn run<B: KvBackend>(
                 deadline + Duration::from_secs(config.limits.shutdown_grace_seconds),
             )
         } else {
-            Err(invalid(&client_profile_arm_error.unwrap_or_else(|| {
-                "client profile not armed for measurement".to_owned()
-            })))
+            Err(invalid(
+                client_profile_arm_error
+                    .as_deref()
+                    .unwrap_or("client profile not armed for measurement"),
+            ))
         };
         let (profile, error) = match result {
             Ok(profile) => (Some(profile), None),
@@ -413,10 +415,10 @@ pub async fn run<B: KvBackend>(
                 Ok(exported) => write_wait_metrics_exported = exported,
                 Err(export_error) => {
                     let detail = format!("write wait metrics export failed: {export_error}");
-                    error = Some(error.map_or_else(
-                        || detail.clone(),
-                        |previous| format!("{previous}; {detail}"),
-                    ));
+                    error = Some(match error {
+                        Some(previous) => format!("{previous}; {detail}"),
+                        None => detail,
+                    });
                 }
             }
         }
@@ -562,15 +564,17 @@ pub async fn run<B: KvBackend>(
             "workload recorded {} timeout/unknown and {} error/wrong-value outcomes",
             totals.3, totals.4
         );
-        fatal_reason =
-            Some(fatal_reason.map_or(detail.clone(), |previous| format!("{previous}; {detail}")));
+        fatal_reason = Some(match fatal_reason {
+            Some(previous) => format!("{previous}; {detail}"),
+            None => detail,
+        });
     }
     let durability = durability_receipt(&config, &info);
     let summary = RunSummary {
         status: if failed { "failed".to_owned() } else { "completed".to_owned() },
         started_unix_seconds: started_wall,
         finished_unix_seconds: finished_wall,
-        durability: durability.clone(),
+        durability,
         backend: info,
         phase_counts: serde_json::json!({
             "offered": totals.0, "completed_terminal": totals.1, "succeeded": totals.6, "rejected": totals.2,
@@ -597,7 +601,7 @@ pub async fn run<B: KvBackend>(
         "source_revision": config.source_revision.as_deref().or(option_env!("GIT_COMMIT")),
         "hardware": hardware_identity(),
         "timing": {"clock": "std::time::Instant monotonic", "timer_start": "backend API dispatch after bounded admission", "timer_end": "response materialized", "worker_release": "released_ns, after oracle verification; closed-loop cycle time is released_ns minus dispatched_ns"},
-        "durability": durability,
+        "durability": summary.durability,
         "read_oracle": {"mode": if !config.qualification_only && (config.phases.preload || config.phases.verify_existing_dataset) { if config.workload.mix.delete > 0 || config.workload.mix.put > 0 || config.workload.mix.put_batch > 0 { "per_key_overlap_aware" } else { "strict_present_after_baseline" } } else { "disabled_no_baseline_dataset" }},
         "client_pool_final": client_pool_final,
         "request_timeout_ms": config.execution.request_timeout_ms,
@@ -624,9 +628,7 @@ pub async fn run<B: KvBackend>(
     }
     reporter.finish(&summary, failed, &manifest_extra)?;
     if failed {
-        return Err(invalid(
-            &fatal_reason.unwrap_or_else(|| "run failed".to_owned()),
-        ));
+        return Err(invalid(fatal_reason.as_deref().unwrap_or("run failed")));
     }
     Ok(())
 }
@@ -744,6 +746,34 @@ fn nvmeof_counter_delta(
     counter_delta(start, end, fields)
 }
 
+fn nvmeof_reader_index(
+    snapshot: &serde_json::Value,
+) -> Option<std::collections::BTreeMap<String, &serde_json::Value>> {
+    if snapshot["available"] != true {
+        return None;
+    }
+    let mut readers = std::collections::BTreeMap::new();
+    for reader in snapshot["readers"].as_array()? {
+        let bytes = |name: &str| {
+            let values = reader.get(name)?.as_array()?;
+            (values.len() == 16 && values.iter().all(|v| v.as_u64().is_some_and(|n| n <= 255)))
+                .then_some(values)
+        };
+        let database = bytes("database_uuid")?;
+        let export = bytes("export_uuid")?;
+        if export.iter().all(|v| v.as_u64() == Some(0)) {
+            return None;
+        }
+        let epoch = reader.get("epoch")?.as_u64().filter(|epoch| *epoch > 0)?;
+        let partition = u32::try_from(reader.get("partition")?.as_u64()?).ok()?;
+        let identity = serde_json::json!([database, epoch, partition, export]).to_string();
+        if readers.insert(identity, reader).is_some() {
+            return None;
+        }
+    }
+    (!readers.is_empty()).then_some(readers)
+}
+
 fn nvmeof_deltas(start: &serde_json::Value, end: &serde_json::Value) -> serde_json::Value {
     const COUNTERS: &[&str] = &[
         "logical_requests",
@@ -773,25 +803,7 @@ fn nvmeof_deltas(start: &serde_json::Value, end: &serde_json::Value) -> serde_js
         "lock_wait",
         "lock_hold",
     ];
-    let index = |snapshot: &serde_json::Value| -> Option<std::collections::BTreeMap<String, serde_json::Value>> {
-        if snapshot["available"] != true { return None; }
-        let mut readers = std::collections::BTreeMap::new();
-        for reader in snapshot["readers"].as_array()? {
-            let bytes = |name: &str| {
-                let values = reader.get(name)?.as_array()?;
-                (values.len() == 16 && values.iter().all(|v| v.as_u64().is_some_and(|n| n <= 255))).then_some(values)
-            };
-            let database = bytes("database_uuid")?;
-            let export = bytes("export_uuid")?;
-            if export.iter().all(|v| v.as_u64() == Some(0)) { return None; }
-            let epoch = reader.get("epoch")?.as_u64().filter(|epoch| *epoch > 0)?;
-            let partition = u32::try_from(reader.get("partition")?.as_u64()?).ok()?;
-            let identity = serde_json::json!([database, epoch, partition, export]).to_string();
-            if readers.insert(identity, reader.clone()).is_some() { return None; }
-        }
-        (!readers.is_empty()).then_some(readers)
-    };
-    let (Some(a), Some(b)) = (index(start), index(end)) else {
+    let (Some(a), Some(b)) = (nvmeof_reader_index(start), nvmeof_reader_index(end)) else {
         return serde_json::json!({"available":false,"error":"NVMe-oF reader identity or boundary unavailable"});
     };
     if a.keys().ne(b.keys()) {
@@ -800,8 +812,8 @@ fn nvmeof_deltas(start: &serde_json::Value, end: &serde_json::Value) -> serde_js
     let mut readers = serde_json::Map::new();
     let mut available = true;
     for (identity, first) in a {
-        let last = &b[&identity];
-        let counters = nvmeof_counter_delta(&first, last, COUNTERS);
+        let last = b[&identity];
+        let counters = nvmeof_counter_delta(first, last, COUNTERS);
         let mut reader_available =
             counters["available"] == true && first.get("transport") == last.get("transport");
         let mut stages = serde_json::Map::new();
@@ -1042,7 +1054,7 @@ fn measurement_read_evidence(
 }
 
 async fn preload<B: KvBackend>(
-    backend: Arc<B>,
+    backend: &Arc<B>,
     config: &RunConfig,
     namespace: &[u8; 16],
     origin: Instant,
@@ -1057,7 +1069,7 @@ async fn preload<B: KvBackend>(
         "preload"
     };
     let mut preparation_failed = false;
-    let mut pool = WorkerPool::new(&backend, config, namespace, origin, oracle)?;
+    let mut pool = WorkerPool::new(backend, config, namespace, origin, oracle)?;
     let drain_deadline = deadline + Duration::from_secs(config.limits.shutdown_grace_seconds);
     let mut next_snapshot = Instant::now() + Duration::from_secs(1);
     let mut expired = false;
@@ -1804,6 +1816,7 @@ async fn wait_for_measurement_gate(
     }
 }
 
+// Keep the measurement boundaries and selected diagnostic state explicit at export.
 #[allow(clippy::too_many_arguments)]
 async fn export_read_diagnostics<B: KvBackend>(
     backend: &B,
@@ -1941,7 +1954,7 @@ async fn export_read_diagnostics<B: KvBackend>(
         "overlap_semantics": field("overlap_semantics").cloned().unwrap_or_else(|| serde_json::json!("stage clocks overlap and are not additive")),
         "unsupported_stages": field("unsupported_stages").cloned().unwrap_or_else(|| serde_json::json!(["measurement_read_stage_profile"])),
         "profile": profile,
-        "error": finish_error.clone()
+        "error": finish_error
     });
     std::fs::write(
         output.join("read-diagnostics.json"),
@@ -1950,6 +1963,7 @@ async fn export_read_diagnostics<B: KvBackend>(
     Ok(finish_error)
 }
 
+// Keep the measurement boundaries and selected diagnostic state explicit at export.
 #[allow(clippy::too_many_arguments)]
 async fn export_write_diagnostics<B: KvBackend>(
     backend: &B,
@@ -2035,7 +2049,7 @@ async fn export_write_diagnostics<B: KvBackend>(
             .cloned()
             .unwrap_or_else(|| serde_json::json!(["measurement_write_stage_profile"])),
         "profile": profile,
-        "error": finish_error.clone()
+        "error": finish_error
     });
     std::fs::write(
         output.join("write-diagnostics.json"),
@@ -2128,7 +2142,7 @@ const INTERFERENCE_ARRIVAL_CATCH_UP: Duration = Duration::from_millis(250);
 /// Each pool owns fixed worker queues and drains before the common end clock.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_interference_phase<B: KvBackend>(
-    backend: Arc<B>,
+    backend: &Arc<B>,
     config: &RunConfig,
     namespace: &[u8; 16],
     generator: &mut WorkloadGenerator,
@@ -2155,7 +2169,7 @@ async fn run_interference_phase<B: KvBackend>(
     let mut read_config = config.clone();
     read_config.execution.mode = ExecutionMode::OpenLoop;
     read_config.execution.queue_capacity = settings.read_queue_capacity;
-    let mut reads = match WorkerPool::new(&backend, &read_config, namespace, origin, oracle) {
+    let mut reads = match WorkerPool::new(backend, &read_config, namespace, origin, oracle) {
         Ok(pool) => pool,
         Err(error) => return (result, Err(error)),
     };
@@ -2164,7 +2178,7 @@ async fn run_interference_phase<B: KvBackend>(
     put_config.execution.mode = ExecutionMode::ClosedLoop;
     put_config.execution.concurrency = settings.put_concurrency;
     put_config.execution.queue_capacity = settings.put_concurrency;
-    let mut puts = match WorkerPool::new(&backend, &put_config, namespace, origin, oracle) {
+    let mut puts = match WorkerPool::new(backend, &put_config, namespace, origin, oracle) {
         Ok(pool) => pool,
         Err(error) => {
             reads.shutdown(true);
@@ -2373,7 +2387,7 @@ fn export_write_wait_metrics(
 // Match makes the received-event and disconnected-channel paths explicit in select branches.
 #[allow(clippy::single_match_else)]
 async fn run_phase<B: KvBackend>(
-    backend: Arc<B>,
+    backend: &Arc<B>,
     config: &RunConfig,
     namespace: &[u8; 16],
     generator: &mut WorkloadGenerator,
@@ -2384,7 +2398,7 @@ async fn run_phase<B: KvBackend>(
     oracle: &Arc<KeyOracle>,
     reporter: &mut Reporter,
 ) -> BackendResult<()> {
-    let mut pool = WorkerPool::new(&backend, config, namespace, origin, oracle)?;
+    let mut pool = WorkerPool::new(backend, config, namespace, origin, oracle)?;
     let phase_start = Instant::now();
     let mut scheduled_index = 0_u64;
     let mut phase_expired = false;
@@ -4190,7 +4204,7 @@ mod tests {
             let origin = Instant::now();
             let oracle = Arc::new(KeyOracle::new(false, 0, false).unwrap());
             let mut phase = Box::pin(run_interference_phase(
-                Arc::clone(&backend),
+                &backend,
                 &config,
                 &[1; 16],
                 &mut generator,
@@ -4415,7 +4429,7 @@ mod tests {
         let (result, status) = tokio::time::timeout(
             Duration::from_secs(2),
             run_interference_phase(
-                Arc::clone(&backend),
+                &backend,
                 &config,
                 &[1; 16],
                 &mut generator,
@@ -4503,7 +4517,7 @@ mod tests {
             let origin = Instant::now();
             let oracle = Arc::new(KeyOracle::new(false, 0, false).unwrap());
             let (result, status) = run_interference_phase(
-                Arc::clone(&backend),
+                &backend,
                 &config,
                 &[1; 16],
                 &mut generator,

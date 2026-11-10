@@ -937,7 +937,7 @@ impl ConcurrentRemoteDatabase {
                 })
                 .collect()
         });
-        outcomes.into_iter().collect::<Result<Vec<_>, _>>()?;
+        outcomes.into_iter().collect::<Result<(), _>>()?;
         self.ensure_healthy()
     }
     /// Request advisory mapped-WAL eviction on every owner at a quiescent boundary.
@@ -1015,7 +1015,7 @@ impl ConcurrentRemoteDatabase {
     pub fn shutdown_live_target_final(mut self) -> Result<LiveFinalShutdownEvidence, LocalDbError> {
         let metrics = self
             .live_metrics
-            .clone()
+            .take()
             .ok_or_else(|| LocalDbError::new("live NVMe is not configured"))?;
         self.live_final_requested.store(true, Ordering::Release);
         self.stop()?;
@@ -1089,7 +1089,6 @@ impl Drop for ConcurrentRemoteDatabase {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)] // Receiver ownership resolves queued replies on every exit.
 fn refresh_snapshot(db: &RemoteDatabase, snapshot: &Mutex<Snapshot>) {
     *snapshot.lock() = Snapshot {
         stats: db.stats(),
@@ -1100,6 +1099,7 @@ fn refresh_snapshot(db: &RemoteDatabase, snapshot: &Mutex<Snapshot>) {
     };
 }
 
+#[allow(clippy::needless_pass_by_value)] // Receiver ownership resolves queued replies on every exit.
 fn drive_owner(
     db: &mut RemoteDatabase,
     receiver: mpsc::Receiver<OwnerCommand>,

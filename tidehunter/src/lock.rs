@@ -254,10 +254,9 @@ mod tests {
         let dropping = std::thread::spawn(move || drop(first));
         paused.recv_timeout(Duration::from_secs(5)).unwrap();
 
-        // The predecessor's Drop has released its registry entry but has not
-        // returned to automatic field destruction. The previous implementation
-        // still held its File here: closing it AFTER this same-process acquire
-        // silently unlocked the successor. No timing loop is needed to force it.
+        // Pause after unregistering, before automatic field destruction.
+        // Closing the old File after this same-process acquire would release
+        // the successor's process-wide lock.
         let second = DbLock::acquire(dir.path(), Duration::ZERO).unwrap();
         resume.send(()).unwrap();
         dropping.join().unwrap();

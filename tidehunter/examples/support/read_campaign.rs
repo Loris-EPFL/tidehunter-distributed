@@ -227,6 +227,7 @@ fn cold_single_probes_run(
     for probe_index in 0..probe_count {
         let preparation = Instant::now();
         backend.drain()?;
+        // Match the other phases' pointer-width truncation on 32-bit hosts.
         #[allow(clippy::cast_possible_truncation)]
         let key_index = mix(probe_index as u64) as usize % oracle.len();
         let expected_value = oracle[key_index]
@@ -357,6 +358,7 @@ fn cold_group_probe(
 ) -> Result<(super::Sample, bool)> {
     let preparation = Instant::now();
     backend.drain()?;
+    // Match the other phases' pointer-width truncation on 32-bit hosts.
     #[allow(clippy::cast_possible_truncation)]
     let start_key_index = mix(probe_index as u64) as usize % oracle.len();
     let key_indices = cold_group_key_indices(start_key_index, oracle.len())?;
@@ -483,7 +485,6 @@ fn cold_group_probe(
     ))
 }
 
-#[allow(clippy::too_many_lines)]
 fn cold_group_probes_run(
     backend: &mut Backend,
     case: &Case,

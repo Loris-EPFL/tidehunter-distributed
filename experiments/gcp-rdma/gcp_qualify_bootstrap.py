@@ -155,8 +155,8 @@ def fleet_startup_script(bucket, run_id, source_sha256, deadline_utc, manifest_s
         raise ValueError('unknown qualification profile')
     if qualification_profile == 'focused' and (live_transports or live_spdk):
         raise ValueError('focused qualification forbids live and Valkey probes')
-    if not isinstance(members, (list, tuple)) or len(members) != 6:
-        raise ValueError('exactly six fleet members required')
+    if not isinstance(members, (list, tuple)) or len(members) - 1 not in gcp_runtime.owner_host_counts():
+        raise ValueError('fleet must have one or five owner hosts')
     normalized = []
     for member in members:
         if not isinstance(member, dict):
@@ -171,7 +171,7 @@ def fleet_startup_script(bucket, run_id, source_sha256, deadline_utc, manifest_s
             raise ValueError('invalid fleet RDMA address')
         normalized.append({'name': name, 'id': instance_id, 'rdma_ip': str(address)})
     for key in ('name', 'id', 'rdma_ip'):
-        if len({member[key] for member in normalized}) != 6:
+        if len({member[key] for member in normalized}) != len(normalized):
             raise ValueError('fleet members must have distinct identities and RDMA addresses')
     pair_startup_script(bucket, run_id, source_sha256, deadline_utc, manifest_sha256,
                         normalized[1]['name'], normalized[1]['rdma_ip'], rdma_device,

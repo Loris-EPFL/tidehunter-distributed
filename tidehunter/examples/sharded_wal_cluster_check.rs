@@ -128,13 +128,8 @@ fn coordinator_crash(config: &Path) -> Result<()> {
     config.frag_size = MIB as u64;
     config.wal_file_size = (128 * MIB) as u64;
     config.metrics_enabled = false;
-    let native = Db::open(
-        &native_path,
-        launch.shape.clone(),
-        Arc::new(config),
-        metrics(),
-    )
-    .map_err(|e| error(format!("native open failed: {e:?}")))?;
+    let native = Db::open(&native_path, launch.shape, Arc::new(config), metrics())
+        .map_err(|e| error(format!("native open failed: {e:?}")))?;
     for batch in 0..BATCHES {
         remote.submit(operation(batch), initial_batch(ks, batch))?;
         native_apply(&native, initial_batch(ks, batch))?;

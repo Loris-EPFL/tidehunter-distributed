@@ -341,7 +341,7 @@ impl CompleteBatch {
             let checksum = MemberChecksum(cursor.u32()?);
             let start = cursor.position;
             cursor.take(len)?;
-            let mutation = decode_native(shape, encoded.slice(start..start + len))?;
+            let mutation = decode_native(shape, &encoded.slice(start..start + len))?;
             let mut descriptor = describe_mutation(operation_index as u32, offset, &mutation);
             descriptor.checksum = checksum;
             mutations.push(mutation);
@@ -468,17 +468,6 @@ impl CompleteBatch {
         reference: &ValueRecordReference,
         encoded_member: Bytes,
     ) -> Result<Mutation, CodecError> {
-        let native = checked_record_native(reference, &encoded_member)?;
-        if reference.descriptor.checksum
-            != member_checksum(
-                reference.batch_id,
-                reference.batch_version,
-                &reference.descriptor,
-                native,
-            )
-        {
-            return Err(CodecError::ChecksumMismatch);
-        }
         decode_record_mutation(shape, reference, &encoded_member)
     }
 
@@ -487,14 +476,15 @@ impl CompleteBatch {
     /// No partial result escapes on any failure.
     ///
     /// The caller must authenticate membership exactly as for `decode_record`.
-    /// Values share their input buffers; no sibling bytes are read or copied.
+    /// Verification borrows input buffers; decoded keys and values retain them.
+    /// No sibling bytes are read or copied.
     pub fn decode_records(
         shape: &KeyShape,
         records: &[(ValueRecordReference, Bytes)],
     ) -> Result<Vec<Mutation>, CodecError> {
         let mut mutations = Vec::with_capacity(records.len());
         for (reference, bytes) in records {
-            mutations.push(Self::decode_record(shape, reference, bytes.clone())?);
+            mutations.push(decode_record_mutation(shape, reference, bytes)?);
         }
         Ok(mutations)
     }
@@ -577,8 +567,8 @@ pub fn validate_reference_bounds(reference: &ValueRecordReference) -> Result<(),
     Ok(())
 }
 
-fn decode_native(shape: &KeyShape, encoded: Bytes) -> Result<Mutation, CodecError> {
-    let mut native = Cursor::new(&encoded);
+fn decode_native(shape: &KeyShape, encoded: &Bytes) -> Result<Mutation, CodecError> {
+    let mut native = Cursor::new(encoded);
     let tag = native.u8()?;
     let keyspace = KeySpace(native.u8()?);
     let mutation = match tag {
@@ -628,8 +618,19 @@ fn decode_record_mutation(
     reference: &ValueRecordReference,
     encoded_member: &Bytes,
 ) -> Result<Mutation, CodecError> {
+    let native = checked_record_native(reference, encoded_member)?;
+    if reference.descriptor.checksum
+        != member_checksum(
+            reference.batch_id,
+            reference.batch_version,
+            &reference.descriptor,
+            native,
+        )
+    {
+        return Err(CodecError::ChecksumMismatch);
+    }
     let descriptor = &reference.descriptor;
-    let mutation = decode_native(shape, encoded_member.slice(MEMBER_HEADER_LEN..))?;
+    let mutation = decode_native(shape, &encoded_member.slice(MEMBER_HEADER_LEN..))?;
     let mut expected = describe_mutation(
         descriptor.operation_index,
         descriptor.offset as usize,

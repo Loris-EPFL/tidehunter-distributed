@@ -69,6 +69,94 @@ class OwnerCountTests(unittest.TestCase):
             self.assertTrue(result["available"])
             self.assertEqual(result["device_identity"], ",".join(map(str, range(count))))
 
+    def test_compact_rejects_five_owner_and_unsupported_cases_before_dispatch(self):
+        config = config_fixture()
+        config["fleet"]["nodes"] = config["fleet"]["nodes"][:1]
+        config["spec"].update(mode="focused", selection="parity_compact")
+        runtime = controller.Controller(config, clients_fixture(config))
+        runtime.run_floor_case = Mock()
+        runtime.run_fio_case = Mock()
+        base = {"case_id": "case", "case_kind": "remote_put", "backend": "tidehunter_tcp",
+                "durability_tier": "synchronous"}
+        cases = [base, {**base, "owner_count": 5}, {**base, "backend": "tikv"},
+                 {**base, "owner_count": 1, "case_kind": "interference"},
+                 {**base, "owner_count": 1, "case_kind": "fio_floor"},
+                 {**base, "owner_count": 1, "case_kind": "unknown"}]
+        matrix = controller.cloud_campaign.make_focused_matrix("parity_compact")
+        cases.append(next(job for job in controller.cloud_campaign.make_focused_matrix("fair_five_owner")
+                          if job["case_kind"] == "remote_put"))
+        valid_owner = next(job for job in matrix if job["case_kind"] == "remote_put")
+        cases.extend(({**valid_owner, "case_id": "unknown"}, {**valid_owner, "keys": valid_owner["keys"] + 1},
+                      {key: value for key, value in valid_owner.items() if key != "owner_count"}))
+        for kind in ("native_op", "ssd_write_floor", "remote_put"):
+            valid = next(job for job in matrix if job["case_kind"] == kind)
+            cases.extend(({**valid, "sealed_dataset": {}}, {**valid, "nvmeof_route": "live"},
+                          {**valid, "interference": {}}, {**valid, "fio": {}}))
+        cases += [{"case_id": "bad", "case_kind": "native_op", "backend": "tidehunter_tcp",
+                   "owner_count": 1},
+                  {"case_id": "bad", "case_kind": "ssd_write_floor", "backend": "native", "group": "G13W"},
+                  {"case_id": "bad", "case_kind": "ssd_write_floor", "backend": "tidehunter_verbs_native",
+                   "group": "G11W"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime.root = Path(tmp)
+            for job in cases:
+                with self.subTest(job=job), self.assertRaises(ValueError):
+                    runtime.run_case(job)
+            self.assertEqual(list(runtime.root.iterdir()), [])
+        runtime.run_floor_case.assert_not_called()
+        runtime.run_fio_case.assert_not_called()
+        runtime.config["spec"]["selection"] = "parity"
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime.root = Path(tmp)
+            with self.assertRaises(ValueError):
+                runtime.run_case(matrix[0])
+            self.assertEqual(list(runtime.root.iterdir()), [])
+        runtime.run_floor_case.assert_not_called()
+        runtime.run_fio_case.assert_not_called()
+
+    def test_compact_snapshots_contact_only_two_hosts(self):
+        config = config_fixture()
+        config["fleet"]["nodes"] = config["fleet"]["nodes"][:1]
+        runtime = controller.Controller(config, clients_fixture(config))
+        runtime.request = Mock(side_effect=lambda index, request, **kwargs: {"index": index})
+        result = runtime.all_hosts({"action": "bootstrap"})
+        self.assertEqual(result, [{"index": -1}, {"index": 0}])
+        self.assertEqual(sorted(call.args[0] for call in runtime.request.call_args_list), [-1, 0])
+
+    def test_compact_accepts_native_and_owner_floor_without_extra_hosts(self):
+        config = config_fixture()
+        config["fleet"]["nodes"] = config["fleet"]["nodes"][:1]
+        config["spec"].update(mode="focused", selection="parity_compact")
+        runtime = controller.Controller(config, clients_fixture(config))
+        runtime.run_floor_case = Mock(return_value="floor")
+        matrix = controller.cloud_campaign.make_focused_matrix("parity_compact")
+        floor = next(job for job in matrix if job["case_kind"] == "ssd_write_floor")
+        self.assertEqual(runtime.run_case(floor), "floor")
+        native = next(job for job in matrix if job["case_kind"] == "native_op")
+        remotes = [next(job for job in matrix if job["case_kind"] == "remote_put" and job["backend"] == backend)
+                   for backend in ("tidehunter_tcp", "tidehunter_verbs_native")]
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime.root = Path(tmp)
+            for job in (native, *remotes):
+                with self.subTest(kind=job["case_kind"]), \
+                     patch.object(controller, "guarded", side_effect=RuntimeError("guard reached")):
+                    with self.assertRaisesRegex(RuntimeError, "guard reached"):
+                        runtime.run_case(job)
+
+    def test_compact_backend_cleanup_uses_only_fleet_hosts(self):
+        config = config_fixture()
+        config["fleet"]["nodes"] = config["fleet"]["nodes"][:1]
+        runtime = controller.Controller(config, clients_fixture(config))
+        runtime.active_backend = "tikv"
+        runtime.cleanup_deadline = Mock(return_value=300)
+        runtime.cleanup_timeout = Mock(return_value=30)
+        runtime.request = Mock(return_value={"status": "reset", "data_empty": True,
+                                             "initialization_removed": True})
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime.root = Path(tmp)
+            runtime.stop_backend()
+        self.assertEqual([call.args[0] for call in runtime.request.call_args_list], [-1, 0] * 3)
+
     def test_invalid_one_owner_case_rejected_before_directory_creation(self):
         runtime = controller.Controller(config_fixture(), clients_fixture(config_fixture()))
         runtime.run_floor_case = Mock()
@@ -471,6 +559,7 @@ class NvmeActionAdmissionTests(unittest.TestCase):
 
     def test_live_spdk_boundary_retains_partial_owner_failures(self):
         runtime = object.__new__(controller.Controller)
+        runtime.config = config_fixture()
         def request(index, request, **kwargs):
             if index == 2:
                 raise RuntimeError("owner unavailable")

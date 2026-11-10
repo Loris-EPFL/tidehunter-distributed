@@ -106,6 +106,11 @@ class Compute:
             raise ValueError('invalid source identity')
         if not re.fullmatch(r'[0-9a-f]{32}', state.get('owner_nonce', '')):
             raise ValueError('independent 128-bit owner nonce required')
+        from gcp_runtime import owner_host_counts
+        count = state.get('host_count', 6)
+        if type(count) is not int or count - 1 not in owner_host_counts():
+            raise ValueError('invalid persisted fleet host count')
+        self.host_count = count
         parse_time(state['deadline'])
         candidates = [c for c in config.get('candidates', []) if c.get('zone') == ZONE]
         if len(candidates) != 1:
@@ -391,7 +396,7 @@ class Compute:
 
     async def create_vm(self, index, image, deadline, startup):
         self._live()
-        if type(index) is not int or index not in range(6) or not isinstance(startup, str) or not startup:
+        if type(index) is not int or index not in range(self.host_count) or not isinstance(startup, str) or not startup:
             raise ValueError('invalid VM index or startup')
         if parse_time(deadline) != parse_time(self.state['deadline']):
             raise ValueError('VM deadline must equal persisted absolute deadline')
@@ -404,7 +409,7 @@ class Compute:
         if not self._policy_owned(actual_policy, policy):
             raise ComputeError('placement identity changed')
         name = self.state['run_id'] + '-' + str(index)
-        if any(r.get('name') == name for r in self.state['instances']) or len(self.state['instances']) >= 6:
+        if any(r.get('name') == name for r in self.state['instances']) or len(self.state['instances']) >= self.host_count:
             raise ComputeError('instance already recorded or fleet limit reached')
         if await self._exists('instance', name) or await self._exists('disk', name):
             raise ComputeError('instance or disk name already exists')
@@ -492,7 +497,7 @@ class Compute:
         return fleet
 
     async def _cleanup_instance(self, rec):
-        if rec.get('name') not in {self.state['run_id'] + '-' + str(i) for i in range(6)} or rec.get('zone') != ZONE:
+        if rec.get('name') not in {self.state['run_id'] + '-' + str(i) for i in range(self.host_count)} or rec.get('zone') != ZONE:
             raise ComputeError('invalid instance record')
         if rec.get('conflict'):
             raise ComputeError('refusing conflicting instance name')
@@ -525,7 +530,7 @@ class Compute:
             self._save()
 
     async def _cleanup_disk(self, rec):
-        if rec.get('name') not in {self.state['run_id'] + '-' + str(i) for i in range(6)} or rec.get('zone') != ZONE:
+        if rec.get('name') not in {self.state['run_id'] + '-' + str(i) for i in range(self.host_count)} or rec.get('zone') != ZONE:
             raise ComputeError('invalid disk record')
         if rec.get('uncertain'):
             raise ComputeError('cannot delete disk while instance create is unresolved')
@@ -603,11 +608,11 @@ class Compute:
                     failures.append(label + ' ' + str(rec.get('name')) + ': ' + str(exc))
             return failures
 
-        # At most six records are admitted. Saves are synchronous on this event
+        # At most the persisted fleet size is admitted. Saves are synchronous on this event
         # loop, so each persisted intent completes before any callback yields.
         # A slow delete must not prevent the other owned VMs from being issued.
         records = list(reversed(self.state.get('instances', [])))
-        if len(records) > 6:
+        if len(records) > self.host_count:
             raise ComputeError('fleet limit exceeded during cleanup')
         for failures in await asyncio.gather(*(cleanup_record(rec) for rec in records)):
             errors.extend(failures)

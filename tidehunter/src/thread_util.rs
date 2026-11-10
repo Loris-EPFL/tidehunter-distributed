@@ -9,7 +9,7 @@ use std::time::Duration;
 /// files after the old owner releases its lock and a replacement opens them.
 /// This deliberately does not promise bounded shutdown: a stalled worker keeps
 /// ownership rather than permitting unsafe directory reuse. Default native
-/// production builds retain their historical timeout-and-warning behavior.
+/// production builds return after the timeout and warn.
 ///
 /// # Arguments
 /// * `jh` - The thread's JoinHandle to wait for
@@ -75,8 +75,8 @@ mod tests {
         let (done, wait_for_done) = mpsc::channel();
         let owner = std::thread::spawn(move || {
             started.send(()).unwrap();
-            // A zero timeout distinguishes strict ownership from the former
-            // detached joiner's immediate timeout path without a long sleep.
+            // A zero timeout distinguishes strict ownership from the default
+            // native timeout path without a long sleep.
             join_thread_with_timeout(worker, "test-owned-worker", 0);
             assert!(worker_exited.load(Ordering::Acquire));
             drop(lock);

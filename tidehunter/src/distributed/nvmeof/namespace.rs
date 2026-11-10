@@ -126,10 +126,11 @@ fn verify_transport_at(
     let mut controllers = 0usize;
     for entry in std::fs::read_dir(parent)? {
         let entry = entry?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
             continue;
         };
-        if !controller_name(&name) {
+        if !controller_name(name) {
             continue;
         }
         controllers += 1;
@@ -137,7 +138,7 @@ fn verify_transport_at(
             return Err(invalid("multiple namespace controllers are not supported"));
         }
         let controller = std::fs::canonicalize(entry.path())?;
-        if controller != std::fs::canonicalize(class_root.join("nvme").join(&name))? {
+        if controller != std::fs::canonicalize(class_root.join("nvme").join(name))? {
             return Err(invalid("subsystem controller is not registered"));
         }
         verify_controller(&controller)?;

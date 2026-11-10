@@ -155,7 +155,7 @@ pub(super) fn prepare(input: &Path, output: &Path) -> BackendResult<()> {
             .as_deref()
             .ok_or("explicit key_namespace_hex required")?,
     )?;
-    let options: Options = serde_json::from_value(run.backend.options.clone())?;
+    let options: Options = serde_json::from_value(run.backend.options)?;
     let config = options
         .external_remote_config
         .ok_or("external_remote_config required")?;
@@ -266,7 +266,7 @@ pub(super) fn export(launch: &Path, prepared_path: &Path, output: &Path) -> Back
     let shape: KeyShape = serde_yaml::from_str(&node.shape_yaml)?;
     let ks = shape.iter_ks().next().ok_or("empty key shape")?.id();
     let expected: HashMap<_, _> = (0..p.keys)
-        .map(|id| (key_bytes(&p.namespace, p.seed, id).to_vec(), id))
+        .map(|id| (key_bytes(&p.namespace, p.seed, id), id))
         .collect();
     if expected.len() != p.keys as usize {
         return Err("generated duplicate keys".into());

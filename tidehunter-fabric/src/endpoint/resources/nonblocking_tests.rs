@@ -49,11 +49,12 @@ unsafe extern "C" fn trywait(
     state.trywait_result
 }
 
-// SAFETY: Only the fixture invokes these callbacks through generated libfabric
-// dispatch. All handles and vtables have stable heap addresses until Endpoint
-// closes. Their context points to the fixture's live UnsafeCell<Provider>. Calls
-// are serialized, with no Provider reference live across an Endpoint call.
+// The fixture keeps callback handles, vtables and UnsafeCell<Provider> at stable
+// heap addresses until Endpoint closes. Calls are serialized, with no Provider
+// reference live across an Endpoint call.
 unsafe extern "C" fn read_cq(cq: *mut ffi::fid_cq, buf: *mut c_void, count: usize) -> isize {
+    // SAFETY: cq is a live fixture handle whose context points to its Provider.
+    // Serialized dispatch gives this callback exclusive access to that state.
     let state = unsafe { &mut *(*cq).fid.context.cast::<Provider>() };
     state.polls += 1;
     state.cq_capacity = count;
@@ -71,9 +72,11 @@ unsafe extern "C" fn read_error(
     buf: *mut ffi::fi_cq_err_entry,
     _flags: u64,
 ) -> isize {
-    // SAFETY: Same fixture ownership as read_cq; poll supplies one error entry.
+    // SAFETY: cq is a live fixture handle whose context points to its Provider;
+    // serialized dispatch gives this callback exclusive access.
     let state = unsafe { &mut *(*cq).fid.context.cast::<Provider>() };
     state.error_reads += 1;
+    // SAFETY: poll supplies a writable, aligned error-entry local for this call.
     unsafe {
         buf.write(ffi::fi_cq_err_entry {
             err: i32::try_from(ffi::FI_EIO).unwrap(),
@@ -91,7 +94,8 @@ unsafe extern "C" fn send(
     _peer: ffi::fi_addr_t,
     context: *mut c_void,
 ) -> isize {
-    // SAFETY: The fixture context is live and exclusively accessed in this call.
+    // SAFETY: ep is a live fixture handle whose context points to its Provider;
+    // serialized dispatch gives this callback exclusive access.
     let state = unsafe { &mut *(*ep).fid.context.cast::<Provider>() };
     state.sends += 1;
     if state.send_result == 0 {
@@ -116,7 +120,8 @@ unsafe extern "C" fn receive(
     _peer: ffi::fi_addr_t,
     context: *mut c_void,
 ) -> isize {
-    // SAFETY: The fixture context is live and exclusively accessed in this call.
+    // SAFETY: ep is a live fixture handle whose context points to its Provider;
+    // serialized dispatch gives this callback exclusive access.
     let state = unsafe { &mut *(*ep).fid.context.cast::<Provider>() };
     state.received = buf.cast();
     state.received_context = context;
@@ -125,10 +130,12 @@ unsafe extern "C" fn receive(
 }
 
 unsafe extern "C" fn close(fid: *mut ffi::fid) -> i32 {
-    // SAFETY: Both fixture handles use this context. Endpoint must retain sent
-    // bytes until endpoint close, which precedes CQ close and buffer release.
+    // SAFETY: Each fixture handle has a live Provider context. Serialized close
+    // callbacks have exclusive state access before fixture storage is dropped.
     let state = unsafe { &mut *(*fid).context.cast::<Provider>() };
     if state.closes == 0 && !state.sent.is_null() {
+        // SAFETY: A successful nonempty send stored sent. Endpoint retains that
+        // initialized TX slot through endpoint close; the fixture never writes it.
         state.closed_byte = Some(unsafe { state.sent.read() });
     }
     state.closes += 1;

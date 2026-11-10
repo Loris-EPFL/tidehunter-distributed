@@ -84,14 +84,19 @@ fn software_provider_source_byte_budget_tracks_registration_and_retirement() -> 
         source.register_read_region(&middle, vec![2; 1]),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock
     ));
-    // No descriptor was sent to the peer, so this retirement is unpublished.
+    // SAFETY: No descriptor or equivalent address/key/length reached the peer,
+    // so no remote read can reference first.
     unsafe { source.retire_unpublished_read_region(first)? };
     source.register_read_region(&middle, vec![2; 4])?;
     assert!(matches!(
         source.register_read_region(&middle, vec![9; 1]),
         Err(error) if error.kind() == io::ErrorKind::InvalidInput
     ));
+    // SAFETY: last's descriptor and equivalent address/key/length never reached
+    // the peer; no remote read can reference this allocation.
     unsafe { source.retire_unpublished_read_region(last)? };
+    // SAFETY: middle's descriptor and equivalent address/key/length never reached
+    // the peer; no remote read can reference this allocation.
     unsafe { source.retire_unpublished_read_region(middle)? };
     Ok(())
 }
@@ -962,19 +967,13 @@ fn software_provider_records_effective_geometry_and_rxm_parameters() -> io::Resu
             .find(|param| param.name == name)
             .unwrap_or_else(|| panic!("missing {name}: {:?}", geometry.rxm_parameters))
             .configured_or_default
-            .clone()
+            .as_deref()
     };
     if std::env::var_os("FI_OFI_RXM_BUFFER_SIZE").is_none() {
-        assert_eq!(
-            configured("FI_OFI_RXM_BUFFER_SIZE").as_deref(),
-            Some("16384")
-        );
+        assert_eq!(configured("FI_OFI_RXM_BUFFER_SIZE"), Some("16384"));
     }
     if std::env::var_os("FI_OFI_RXM_SAR_LIMIT").is_none() {
-        assert_eq!(
-            configured("FI_OFI_RXM_SAR_LIMIT").as_deref(),
-            Some("131072")
-        );
+        assert_eq!(configured("FI_OFI_RXM_SAR_LIMIT"), Some("131072"));
     }
     Ok(())
 }

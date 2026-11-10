@@ -123,7 +123,7 @@ class StageControllerTests(unittest.TestCase):
                    if j['case_kind'] == 'native_media_read')
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            config = {'fleet': {'data_root': str(root)}}
+            config = {'fleet': {'data_root': str(root), 'nodes': [{} for _ in range(5)]}}
             request = {'index': -1, 'action': 'snapshot', 'resource_job': job}
             frame = {'nvme': {'host_identity': {'boot_id': 'boot'}}, 'diskstats': 'diskstats'}
             with patch.object(controller, 'verify_local_identity', return_value={}), \
@@ -232,7 +232,7 @@ class StageControllerTests(unittest.TestCase):
             runtime.root = Path(tmp)
             directory = runtime.root / 'cases' / job['case_id']
             runtime.config = {'prefix': 'test', 'binary': '/unused', 'binary_blake2b512': 'a' * 128,
-                'source_revision': 'b' * 40, 'fleet': {'client_cpus': 8, 'client_memory_mib': 1024},
+                'source_revision': 'b' * 40, 'fleet': {'client_cpus': 8, 'client_memory_mib': 1024, 'nodes': [{} for _ in range(5)]},
                 'spec': {'case_deadline_seconds': 600}}
             runtime.local_mode = MagicMock()
             runtime.local_mode.snapshot_client.return_value = {}
@@ -367,7 +367,7 @@ class StageControllerTests(unittest.TestCase):
                 runtime.root = Path(tmp)
                 runtime.local_mode = None
                 runtime.config = {'prefix': 'test', 'binary': '/unused', 'binary_blake2b512': 'a' * 128,
-                    'source_revision': 'b' * 40, 'fleet': {'client_cpus': 8, 'client_memory_mib': 1024},
+                    'source_revision': 'b' * 40, 'fleet': {'client_cpus': 8, 'client_memory_mib': 1024, 'nodes': [{} for _ in range(5)]},
                     'spec': {'case_deadline_seconds': 600}}
                 runtime.active_nvme = runtime.active_tide = runtime.active_backend = runtime.shared_tide = None
                 runtime.shared_native = {}

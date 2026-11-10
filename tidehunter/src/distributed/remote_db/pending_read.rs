@@ -237,7 +237,7 @@ fn member_charge(reference: &ValueRecordReference) -> Result<usize, LocalDbError
 }
 
 pub(super) fn admission_error(error: &LocalDbError) -> bool {
-    matches!(error.to_string().as_str(), BACKPRESSURE | BYTE_BUDGET)
+    matches!(error.message(), BACKPRESSURE | BYTE_BUDGET)
 }
 
 struct ReadContext {
@@ -409,7 +409,7 @@ impl ReadBatch {
             });
             let mut request = match service.submit_until_owned(
                 *node,
-                references,
+                &references,
                 0,
                 false,
                 ReadContext {
@@ -455,14 +455,13 @@ impl ReadBatch {
     }
 
     pub(super) fn finish_one(&mut self) -> Result<(), LocalDbError> {
-        let state = self
+        let state = &self
             .reads
             .front()
             .ok_or_else(|| LocalDbError::new(BACKPRESSURE))?
             .1
             .credit
-            .state
-            .clone();
+            .state;
         let signal = self.signal.as_ref().expect("admitted batch has a signal");
         // Check only readiness atomics while holding this batch's predicate
         // mutex; producers take the same mutex before notifying.
@@ -1193,8 +1192,8 @@ impl State {
         self.admission_changed.notify_all();
     }
 }
-struct PoisonOnPanic(Arc<State>);
-impl Drop for PoisonOnPanic {
+struct PoisonOnPanic<'a>(&'a State);
+impl Drop for PoisonOnPanic<'_> {
     fn drop(&mut self) {
         if thread::panicking() {
             self.0.poison();
@@ -1205,13 +1204,13 @@ impl Drop for PoisonOnPanic {
 /// reader serves only its own endpoint's requests, so no other reactor's
 /// state matters here.
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-struct NvmeActorBarrier {
-    state: Arc<State>,
+struct NvmeActorBarrier<'a> {
+    state: &'a State,
     node: usize,
     ready: bool,
 }
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-impl NvmeActorBarrier {
+impl NvmeActorBarrier<'_> {
     fn arrive(&mut self) {
         self.state.begin_nvme_shutdown(self.node);
         self.ready = true;
@@ -1221,7 +1220,7 @@ impl NvmeActorBarrier {
     }
 }
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-impl Drop for NvmeActorBarrier {
+impl Drop for NvmeActorBarrier<'_> {
     fn drop(&mut self) {
         if !self.ready && thread::panicking() {
             self.state.begin_nvme_shutdown(self.node);
@@ -1421,9 +1420,7 @@ impl Request {
         let state = self._credit.state.clone();
         let flight_slot = self.flight.slot;
         let credit = self._credit.clone();
-        let completion = self.flight.completion.clone();
-        *completion.result.lock() = Some(result);
-        drop(completion);
+        *self.flight.completion.result.lock() = Some(result);
         #[cfg(test)]
         if let Some((entered, resume)) = state.completion_pause.lock().take() {
             entered.send(()).unwrap();
@@ -1450,8 +1447,7 @@ struct ReadFlight {
     grouped_inline: AtomicBool,
     completion: Arc<FlightCompletion>,
     _pin: Option<IndexReadPin>,
-    // The flight, rather than a notifier's temporary completion Arc, owns the
-    // retained-result credit for as long as any caller can consume its result.
+    // Keep retained-result credit while any caller can consume the flight.
     _credit: Arc<Credit>,
 }
 
@@ -1989,7 +1985,7 @@ fn drive_live_reads(
             }
         }
     }
-    let _poison = PoisonOnPanic(state.clone());
+    let _poison = PoisonOnPanic(&state);
     let mut inboxes = Vec::with_capacity(lanes.len());
     let mut workers = Vec::with_capacity(lanes.len());
     for lane in lanes {
@@ -2128,13 +2124,13 @@ fn drive_reads(
         drive_live_reads(state, receiver, lanes, node, base, epoch, max_requests);
         return;
     }
-    let _poison = PoisonOnPanic(state.clone());
+    let _poison = PoisonOnPanic(&state);
     let mut disconnected = false;
     let mut first_lane = 0;
     let mut empty_polls = 0u8;
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     let mut nvme_barrier = NvmeActorBarrier {
-        state: state.clone(),
+        state: &state,
         node,
         ready: false,
     };
@@ -3357,7 +3353,7 @@ impl ReadService {
             entered.send(()).unwrap();
             resume.recv().unwrap();
         }
-        let _poison = PoisonOnPanic(self.state.clone());
+        let _poison = PoisonOnPanic(&self.state);
         let sampled = self.state.diagnostics.select();
         let started = sampled.then(Instant::now);
         let transport_before = sampled.then(|| {
@@ -3437,7 +3433,7 @@ impl ReadService {
     ) -> Result<ReadRequest, LocalDbError> {
         self.submit_until(
             node,
-            references,
+            &references,
             extra_bytes,
             profiled,
             ReadContext {
@@ -3450,7 +3446,7 @@ impl ReadService {
     fn submit_until(
         &self,
         node: usize,
-        references: Vec<ValueRecordReference>,
+        references: &[ValueRecordReference],
         extra_bytes: usize,
         profiled: bool,
         context: ReadContext,
@@ -3463,7 +3459,7 @@ impl ReadService {
     fn submit_until_owned(
         &self,
         node: usize,
-        references: Vec<ValueRecordReference>,
+        references: &[ValueRecordReference],
         extra_bytes: usize,
         profiled: bool,
         context: ReadContext,
@@ -3496,7 +3492,7 @@ impl ReadService {
             }
             planned.members
         } else {
-            for reference in &references {
+            for reference in references {
                 computed.push(self.plan_member(&routing, reference)?);
             }
             &computed
@@ -3713,7 +3709,7 @@ impl ReadService {
             let sender_guard = self.sender.lock();
             let Some(sender) = sender_guard.get(node) else {
                 if reserved {
-                    drop(InlineLaneReservation(lane.scheduling.clone()));
+                    drop(InlineLaneReservation(lane.scheduling));
                 }
                 drop(request);
                 drop(sender_guard);
@@ -3982,7 +3978,7 @@ impl RemoteDatabase {
                 .ok_or_else(|| LocalDbError::new("reference names unregistered partition"))?;
             Some(self.reads.submit_until(
                 node,
-                vec![reference],
+                std::slice::from_ref(&reference),
                 0,
                 false,
                 ReadContext {
@@ -4052,7 +4048,7 @@ impl RemoteDatabase {
         self.submit_get_cut(ks, key, IndexReadCut::Latest)
     }
     pub fn read_backpressured(error: &LocalDbError) -> bool {
-        error.to_string() == BACKPRESSURE
+        error.message() == BACKPRESSURE
     }
     pub fn submit_get_cut(
         &mut self,

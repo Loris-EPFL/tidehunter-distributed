@@ -134,6 +134,9 @@ class FloorTests(unittest.TestCase):
         for job in jobs:
             cloud_controller.cloud_campaign.validate_focused_job(job)
         instance = object.__new__(cloud_controller.Controller)
+        instance.config = {'fleet': {'nodes': [
+            {'index': i, 'instance_id': f'i-owner-{i}', 'address': f'10.0.0.{i + 2}'}
+            for i in range(5)]}}
         for job in jobs:
             with patch.object(instance, 'run_floor_case', return_value='dispatched') as dispatch:
                 self.assertEqual(instance.run_case(job), 'dispatched')

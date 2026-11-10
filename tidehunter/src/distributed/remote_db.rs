@@ -1,8 +1,7 @@
 //! Static RF1 database authority over authenticated TCP Value WAL partitions.
 //!
-//! This is the controlled single-coordinator-host deployment from NEXT_STEPS
-//! M4/M5. A native directory lock and durable authority manifest stay on that
-//! host. Every restart durably reserves a new epoch, fences ALL registered nodes,
+//! One coordinator host holds the native directory lock and durable authority
+//! manifest. Every restart durably reserves a new epoch, fences ALL registered nodes,
 //! then validates a committed checkpoint and replays its complete sealed tails.
 //! Copying the authority directory to another live host is unsupported; failover
 //! requires a separately established lease/consensus protocol.
@@ -211,7 +210,7 @@ impl OperationalReadIoSampler {
                         pending.config,
                         pending.shape,
                         pending.tls_config,
-                        thread_state.clone(),
+                        &thread_state,
                         stopped,
                     )
                 }));
@@ -287,7 +286,7 @@ fn operational_sample_loop(
     config: RemoteDatabaseConfig,
     shape: KeyShape,
     tls_config: super::tcp::ClientTlsConfig,
-    state: Arc<OperationalReadIoState>,
+    state: &OperationalReadIoState,
     stop: mpsc::Receiver<()>,
 ) {
     let mut clients: Vec<Option<Client>> = (0..config.endpoints.len()).map(|_| None).collect();
@@ -1628,11 +1627,14 @@ impl RemoteDatabase {
             || manifest.storage != config.storage
             || manifest.endpoints != config.endpoints
             || manifest.shape_yaml != shape_yaml
-            || manifest.live_nvme_identity
+            || manifest
+                .live_nvme_identity
+                .as_ref()
+                .map(|(host_nqn, host_id)| (host_nqn.as_str(), *host_id))
                 != config
                     .live_nvme
                     .as_ref()
-                    .map(|live| (live.host_nqn.clone(), live.host_id))
+                    .map(|live| (live.host_nqn.as_str(), live.host_id))
             || manifest.epochs.len() >= config.storage.max_epochs
             || manifest
                 .epochs
@@ -1719,7 +1721,7 @@ impl RemoteDatabase {
         let connected = transports::connect(
             &config,
             &shape,
-            tls_config.clone(),
+            &tls_config,
             1,
             retained_controls,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -1921,13 +1923,13 @@ impl RemoteDatabase {
             (config.write_profile_limit != 0).then(|| VecDeque::with_capacity(128));
         let reads = Arc::new(reads);
         let operational_sampler =
-            OperationalReadIoSampler::dormant(config.clone(), shape.clone(), tls_config.clone());
+            OperationalReadIoSampler::dormant(config.clone(), shape.clone(), tls_config);
         let mut database = Self {
             clients: workers,
             reads,
             preparation_pool,
             read_cache: Arc::new(ReadCache::new(config.read_cache_bytes)),
-            write_profile: write_profile.clone(),
+            write_profile,
             write_timeline,
             transport_pool,
             transport_key,
@@ -3152,11 +3154,12 @@ impl RemoteDatabase {
                         }
                         (count, charge)
                     };
-                    let slots: Vec<_> = self.staged[node].drain(..count).collect();
-                    let batches: Vec<_> = slots
-                        .iter()
-                        .map(|&slot| {
-                            self.submissions[slot - self.submission_base as usize]
+                    let submissions = &self.submissions;
+                    let submission_base = self.submission_base as usize;
+                    let batches: Vec<_> = self.staged[node]
+                        .drain(..count)
+                        .map(|slot| {
+                            submissions[slot - submission_base]
                                 .batch
                                 .as_ref()
                                 .unwrap()
@@ -4162,7 +4165,7 @@ fn checkpoint_metadata_fits(config: &RemoteDatabaseConfig, receipts: usize) -> b
 
 /// K-way merge of bounded pages. Never retain the database's value history in
 /// coordinator RAM merely to sort it; the index receives one batch at a time.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // Keep independently owned recovery state explicit.
 fn replay_history(
     clients: &mut [Client],
     histories: &[Vec<u64>],
@@ -4322,7 +4325,7 @@ fn checkpoint_file_digest(path: &Path) -> Result<(u64, [u8; 32]), LocalDbError> 
     Ok((length, digest.finalize().into()))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // Validate against the same fenced state used by tail replay.
 fn load_checkpoint(
     path: &Path,
     commit: &CheckpointCommit,
@@ -4502,7 +4505,7 @@ fn cleanup_checkpoint_artifacts(
         .checkpoint
         .as_ref()
         .map(|commit| (commit.epoch, commit.generation));
-    let staged = manifest.checkpoint_staging.clone();
+    let staged = manifest.checkpoint_staging.as_ref();
     let obsolete = manifest
         .checkpoint_obsolete
         .as_ref()
@@ -4516,7 +4519,7 @@ fn cleanup_checkpoint_artifacts(
     }
     // The CRC-protected ledger names only generations reserved by this authority.
     // Validate every intent before deleting anything, especially the live root.
-    for (files, retiring) in [(staged.as_ref(), false), (obsolete.as_ref(), true)] {
+    for (files, retiring) in [(staged, false), (obsolete.as_ref(), true)] {
         if let Some(files) = files {
             let identity = (files.epoch, files.generation);
             if files.generation == 0
@@ -4560,7 +4563,7 @@ fn cleanup_checkpoint_artifacts(
             }
         }
     }
-    for files in [staged, obsolete].into_iter().flatten() {
+    for files in [staged, obsolete.as_ref()].into_iter().flatten() {
         for name in files.names() {
             if manifest
                 .checkpoint
@@ -5181,8 +5184,7 @@ impl ClientWorker {
                                 );
                                 failure.store(true, std::sync::atomic::Ordering::Release);
                                 for (_, (first, reply)) in appends.drain() {
-                                    let _ = reply
-                                        .send(Err(LocalDbError::unknown(first, error.to_string())));
+                                    let _ = reply.send(Err(LocalDbError::unknown(first, &error)));
                                     let _ = wake.try_send(());
                                 }
                                 if let Some(started) = checkpoint_started.take() {

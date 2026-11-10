@@ -150,7 +150,9 @@ class ControllerBoundaryTests(unittest.TestCase):
     def test_guest_owner_cleanup_accepts_only_exact_s3_proof_location(self):
         import nvme_campaign_owner
         config = {'prefix': 'run', 'spec': {'mode': 'nvmeof-focused'},
-                  'fleet': {'data_root': '/unused'}}
+                  'fleet': {'data_root': '/unused', 'nodes': [
+                      {'index': i, 'instance_id': f'i-owner-{i}', 'address': f'10.0.0.{i + 2}'}
+                      for i in range(5)]}}
         request = {'index': 2, 'action': 'nvme_owner_target_cleanup', 'case_id': 'case',
                    'generation': 'gen', 'host_disconnected_key': 'run/results/cells/case/storage/2/nvme-disconnect/gen.json'}
         clients = {'s3': Mock()}

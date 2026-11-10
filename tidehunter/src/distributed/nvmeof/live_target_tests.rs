@@ -156,10 +156,10 @@ fn crash_before_namespace_configuration_cleans_disabled_object() {
     manager.save().unwrap();
     let sub = PathBuf::from("subsystems").join(&binding.nqn);
     manager
-        .record_create(id, sub.clone(), Kind::Directory, None)
+        .record_create(id, &sub, Kind::Directory, None)
         .unwrap();
     manager
-        .record_create(id, sub.join("namespaces/1"), Kind::Directory, None)
+        .record_create(id, &sub.join("namespaces/1"), Kind::Directory, None)
         .unwrap();
     drop(manager);
     let mut reopened = f.open().unwrap();

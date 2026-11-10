@@ -354,7 +354,7 @@ fn partially_applied_batch_is_invisible_at_the_watermark_until_publication() {
     // The publisher held the writer mutex while blocked, so maintenance is
     // checked only now.
     assert!(matches!(
-        index.writer().begin_capture(version_two.clone()),
+        index.writer().begin_capture(version_two),
         Err(NativeIndexError::UnpublishedCut)
     ));
     index.writer().publish_latest();

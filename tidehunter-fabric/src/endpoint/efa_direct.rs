@@ -169,9 +169,9 @@ pub(super) fn decode(bytes: &[u8], mtu: usize) -> io::Result<Packet<'_>> {
     }
 }
 
-/// Cumulative credit and bounded ordinal admission. `post_data` is deliberately
-/// a two-phase operation: call it only after a successful provider post, so an
-/// EAGAIN retry neither consumes stream bytes nor advances the ordinal.
+/// Cumulative credit and bounded ordinal admission. Call `posted` only after
+/// a successful provider post, so an EAGAIN retry neither consumes stream bytes
+/// nor advances the ordinal.
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct SendWindow {
     next: u64,

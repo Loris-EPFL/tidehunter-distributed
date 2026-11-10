@@ -241,8 +241,8 @@ impl super::Client {
         }
         if self.live_config.as_ref() != Some(config) {
             self.drain_live_writer()?;
+            self.live_config = Some(config.clone());
         }
-        self.live_config = Some(config.clone());
         Ok(())
     }
 

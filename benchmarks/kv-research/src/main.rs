@@ -1,7 +1,7 @@
 use kv_research::backend::BackendResult;
 use kv_research::{backends, config::RunConfig, runner};
 use prometheus::Registry;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     if let Err(error) = entry() {
@@ -26,8 +26,8 @@ fn entry() -> BackendResult<()> {
         }
         #[cfg(all(feature = "nvmeof", target_os = "linux"))]
         return backends::tidehunter::qualify_live_nvmeof_child(
-            PathBuf::from(&arguments[1]).as_path(),
-            PathBuf::from(&arguments[2]).as_path(),
+            Path::new(&arguments[1]),
+            Path::new(&arguments[2]),
         );
         #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
         return Err("live NVMe-oF qualification requires Linux and the nvmeof feature".into());
@@ -41,8 +41,8 @@ fn entry() -> BackendResult<()> {
         }
         #[cfg(all(feature = "nvmeof", target_os = "linux"))]
         return backends::tidehunter::qualify_live_nvmeof(
-            PathBuf::from(&arguments[1]).as_path(),
-            PathBuf::from(&arguments[3]).as_path(),
+            Path::new(&arguments[1]),
+            Path::new(&arguments[3]),
         );
         #[cfg(not(all(feature = "nvmeof", target_os = "linux")))]
         return Err("live NVMe-oF qualification requires Linux and the nvmeof feature".into());
@@ -55,9 +55,9 @@ fn entry() -> BackendResult<()> {
         {
             return match (arguments[0].as_str(), arguments.as_slice()) {
                 ("prepare-nvmeof-dataset", [_, input, output]) =>
-                    backends::tidehunter::prepare_nvmeof_dataset(PathBuf::from(input).as_path(), PathBuf::from(output).as_path()),
+                    backends::tidehunter::prepare_nvmeof_dataset(Path::new(input), Path::new(output)),
                 ("export-nvmeof-dataset", [_, launch, prepared, output]) =>
-                    backends::tidehunter::export_nvmeof_dataset(PathBuf::from(launch).as_path(), PathBuf::from(prepared).as_path(), PathBuf::from(output).as_path()),
+                    backends::tidehunter::export_nvmeof_dataset(Path::new(launch), Path::new(prepared), Path::new(output)),
                 _ => Err("usage: prepare-nvmeof-dataset RUN_CONFIG.json OUTPUT.json | export-nvmeof-dataset NODE_LAUNCH.yaml PREPARED.json OUTPUT_DIR".into()),
             };
         }
@@ -74,11 +74,11 @@ fn entry() -> BackendResult<()> {
             );
         }
         return backends::tidehunter::prepare_external_case_file(
-            PathBuf::from(&arguments[1]).as_path(),
-            PathBuf::from(&arguments[3]).as_path(),
+            Path::new(&arguments[1]),
+            Path::new(&arguments[3]),
         );
     }
-    let mut args = std::env::args().skip(1);
+    let mut args = arguments.into_iter();
     let mut config_path = None;
     let mut output = None;
     let mut validate_only = false;

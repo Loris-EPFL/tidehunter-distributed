@@ -537,7 +537,6 @@ pub(super) fn run_abrupt_child(input_path: &Path, ready: &Path) -> BackendResult
     validate_tier(&input)?;
     let remote = input
         .remote_config
-        .as_ref()
         .ok_or("child requires remote configuration")?;
     check(
         matches!(input.expected_route.as_str(), "tcp" | "rdma") && remote.live_nvme.is_some(),
@@ -554,8 +553,7 @@ pub(super) fn run_abrupt_child(input_path: &Path, ready: &Path) -> BackendResult
     };
     progress.mark("child_open", None);
     let shape = KeyShape::new_single(32, 16, KeyType::uniform(64));
-    let db = sui::Db::open_remote(&input.coordinator_path, shape, remote.clone())
-        .map_err(native_error)?;
+    let db = sui::Db::open_remote(&input.coordinator_path, shape, remote).map_err(native_error)?;
     progress.mark("child_open_complete", Some(&db));
     let ks = db.ks("root");
     let start = stats(&db)?;
@@ -604,6 +602,251 @@ pub(super) fn run_abrupt_child(input_path: &Path, ready: &Path) -> BackendResult
     progress.mark("child_ready_synced", Some(&db));
     // Deliberately skip Rust destructors: a graceful Db shutdown checkpoints the tail.
     std::process::exit(0)
+}
+
+/// Sentinels retained for the graceful and abrupt recovery checks.
+struct MemberTransition {
+    before_key: Bytes,
+    before_value: Bytes,
+    after_key: Bytes,
+    after_value: Bytes,
+    delete_key: Bytes,
+    evidence: serde_json::Value,
+}
+
+fn qualify_member_transition(
+    db: &std::sync::Arc<sui::Db>,
+    ks: tidehunter::key_shape::KeySpace,
+    remote: &RemoteDatabaseConfig,
+    input: &Input,
+    early_key: &Bytes,
+    early_value: &Bytes,
+) -> BackendResult<MemberTransition> {
+    check(
+        remote.storage.wal_file_bytes > 0
+            && remote.storage.wal_file_bytes <= 1024 * 1024 * 1024
+            && remote.storage.fragment_bytes >= 128 * 1024,
+        "member transition qualification geometry is outside its bounded fixture",
+    )?;
+    let transition_start = stats(db)?;
+    verify_routes(
+        &transition_start,
+        &input.expected_route,
+        &input.target_implementation,
+    )?;
+    let initial_routes = transition_start["routes"]
+        .as_array()
+        .ok_or("member transition routes unavailable")?;
+    let initial_writer = initial_routes
+        .iter()
+        .find(|route| !route["writer"].is_null())
+        .ok_or("initial writable member evidence unavailable")?;
+    let initial_epoch = initial_writer["writer"]["epoch"]
+        .as_u64()
+        .ok_or("initial writable epoch unavailable")?;
+    let initial_file = initial_writer["writer"]["file_index"]
+        .as_u64()
+        .ok_or("initial writable file index unavailable")?;
+    let initial_uuid = &initial_writer["namespace_identity"]["uuid"];
+    check(
+        initial_epoch == 1 && initial_file == 0,
+        "qualification did not start in the first member",
+    )?;
+    let before_key = key_bytes(&input.namespace, 17, 6);
+    let filler_key = key_bytes(&input.namespace, 17, 7);
+    let delete_key = key_bytes(&input.namespace, 17, 8);
+    let after_key = key_bytes(&input.namespace, 17, 9);
+    let before_value = value_bytes(&input.namespace, 29, 6, 65536, 1.0);
+    let filler_value = value_bytes(&input.namespace, 29, 7, 65536, 1.0);
+    let delete_value = value_bytes(&input.namespace, 29, 8, 65536, 1.0);
+    let after_value = value_bytes(&input.namespace, 29, 9, 65536, 1.0);
+    check(
+        before_value != filler_value
+            && before_value != delete_value
+            && before_value != after_value
+            && filler_value != delete_value
+            && filler_value != after_value
+            && delete_value != after_value,
+        "member sentinel payloads are not distinct",
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let mut writes_acknowledged = 0u64;
+    let mut transition_end = transition_start.clone();
+    transition_write(
+        db,
+        &transition_start,
+        &mut transition_end,
+        deadline,
+        &mut writes_acknowledged,
+        || {
+            db.insert(ks, before_key.clone(), before_value.clone())
+                .map_err(native_error)
+        },
+    )?;
+    transition_write(
+        db,
+        &transition_start,
+        &mut transition_end,
+        deadline,
+        &mut writes_acknowledged,
+        || {
+            db.insert(ks, delete_key.clone(), delete_value)
+                .map_err(native_error)
+        },
+    )?;
+    loop {
+        transition_write(
+            db,
+            &transition_start,
+            &mut transition_end,
+            deadline,
+            &mut writes_acknowledged,
+            || {
+                db.insert(ks, filler_key.clone(), filler_value.clone())
+                    .map_err(native_error)
+            },
+        )?;
+        if !writes_acknowledged.is_multiple_of(32) {
+            continue;
+        }
+        let sample = &transition_end;
+        let routes = sample["routes"]
+            .as_array()
+            .ok_or("member transition routes unavailable")?;
+        if delta(&transition_start, sample, "completed_write_bytes")?
+            > remote.storage.wal_file_bytes
+            && routes.iter().any(|route| {
+                route["writer"]["epoch"].as_u64() == Some(initial_epoch)
+                    && route["writer"]["file_index"]
+                        .as_u64()
+                        .is_some_and(|file| file > initial_file)
+                    && &route["namespace_identity"]["uuid"] != initial_uuid
+            })
+        {
+            verify_routes(sample, &input.expected_route, &input.target_implementation)?;
+            break;
+        }
+    }
+    transition_write(
+        db,
+        &transition_start,
+        &mut transition_end,
+        deadline,
+        &mut writes_acknowledged,
+        || {
+            db.insert(ks, after_key.clone(), after_value.clone())
+                .map_err(native_error)
+        },
+    )?;
+    transition_write(
+        db,
+        &transition_start,
+        &mut transition_end,
+        deadline,
+        &mut writes_acknowledged,
+        || db.remove(ks, delete_key.clone()).map_err(native_error),
+    )?;
+    read_expected(db, ks, &delete_key, None)?;
+    read_expected_live(db, ks, &before_key, &before_value)?;
+    read_expected_live(db, ks, &after_key, &after_value)?;
+    read_expected(db, ks, early_key, Some(early_value))?;
+    check(
+        Instant::now() < deadline,
+        "member transition reads exceeded time bound",
+    )?;
+    let transition_checked = stats(db)?;
+    check(
+        delta(
+            &transition_start,
+            &transition_checked,
+            "payload_rpc_requests",
+        )? == 0
+            && delta(&transition_start, &transition_checked, "errors")? == 0
+            && delta(&transition_start, &transition_checked, "unknown_writes")? == 0,
+        "member transition used payload RPC or encountered an unknown write",
+    )?;
+    let member_transition = serde_json::json!({
+        "wal_file_bytes": remote.storage.wal_file_bytes,
+        "completed_write_bytes": delta(&transition_start, &transition_end, "completed_write_bytes")?,
+        "completed_write_ops": delta(&transition_start, &transition_end, "completed_write_ops")?,
+        "writes_acknowledged": writes_acknowledged,
+        "writer_routes": transition_end["routes"].as_array()
+            .ok_or("member transition routes unavailable")?
+            .iter().filter(|route| route["writer"]["epoch"].as_u64() == Some(initial_epoch))
+            .collect::<Vec<_>>(),
+        "before_key_read": true,
+        "after_key_read": true,
+        "early_key_read": true,
+        "post_transition_delete": true
+    });
+    Ok(MemberTransition {
+        before_key,
+        before_value,
+        after_key,
+        after_value,
+        delete_key,
+        evidence: member_transition,
+    })
+}
+
+fn qualify_abrupt_child(
+    input: &Input,
+    input_bytes: &[u8],
+    output: &Path,
+    progress: &mut QualificationProgress,
+) -> BackendResult<serde_json::Value> {
+    let frozen_input = output.join("abrupt-child-input.json");
+    let child_ready = output.join("abrupt-child-ready.json");
+    fs::write(&frozen_input, input_bytes)?;
+    let mut child = std::process::Command::new(std::env::current_exe()?)
+        .arg("--experimental-live-nvmeof-qualification-child")
+        .arg(&frozen_input)
+        .arg(&child_ready)
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill()?;
+            child.wait()?;
+            return Err("abrupt qualification child exceeded its 300-second deadline".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    check(status.success(), "abrupt qualification child failed")?;
+    let child_evidence: serde_json::Value = serde_json::from_slice(&fs::read(&child_ready)?)?;
+    progress.mark_value("abrupt_child_complete", child_evidence.get("end").cloned());
+    check(
+        child_evidence["kind"] == "acknowledged_unrooted_mixed_batch"
+            && child_evidence["exit_model"] == "process_exit_without_db_drop_or_checkpoint",
+        "invalid abrupt child evidence",
+    )?;
+    check(
+        delta(
+            &child_evidence["start"],
+            &child_evidence["end"],
+            "completed_write_ops",
+        )? > 0
+            && delta(
+                &child_evidence["start"],
+                &child_evidence["end"],
+                "completed_write_bytes",
+            )? > 0
+            && delta(
+                &child_evidence["start"],
+                &child_evidence["end"],
+                "payload_rpc_requests",
+            )? == 0,
+        "abrupt child evidence did not prove live payload write",
+    )?;
+    verify_routes(
+        &child_evidence["end"],
+        &input.expected_route,
+        &input.target_implementation,
+    )?;
+    Ok(child_evidence)
 }
 
 pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
@@ -664,7 +907,7 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
             && remote.replay_limits.max_encoded_bytes >= 4 * (input.value_bytes + 4096),
         "two-host qualification requires one owner, four epochs and a replay window above the child batch",
     )?;
-    let partitions = remote.storage.partitions.clone();
+    let partitions = &remote.storage.partitions;
     fs::create_dir(output)?;
     let mut progress = QualificationProgress {
         directory: output.to_path_buf(),
@@ -767,163 +1010,14 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
     // Keep this in one authority epoch: a second verified writer namespace
     // then demonstrates a file transition, not an epoch-recovery export.
     progress.mark("member_transition", Some(&db));
-    check(
-        remote.storage.wal_file_bytes > 0
-            && remote.storage.wal_file_bytes <= 1024 * 1024 * 1024
-            && remote.storage.fragment_bytes >= 128 * 1024,
-        "member transition qualification geometry is outside its bounded fixture",
-    )?;
-    let transition_start = stats(&db)?;
-    verify_routes(
-        &transition_start,
-        &input.expected_route,
-        &input.target_implementation,
-    )?;
-    let initial_routes = transition_start["routes"]
-        .as_array()
-        .ok_or("member transition routes unavailable")?;
-    let initial_writer = initial_routes
-        .iter()
-        .find(|route| !route["writer"].is_null())
-        .ok_or("initial writable member evidence unavailable")?;
-    let initial_epoch = initial_writer["writer"]["epoch"]
-        .as_u64()
-        .ok_or("initial writable epoch unavailable")?;
-    let initial_file = initial_writer["writer"]["file_index"]
-        .as_u64()
-        .ok_or("initial writable file index unavailable")?;
-    let initial_uuid = initial_writer["namespace_identity"]["uuid"].clone();
-    check(
-        initial_epoch == 1 && initial_file == 0,
-        "qualification did not start in the first member",
-    )?;
-    let before_key = key_bytes(&input.namespace, 17, 6);
-    let filler_key = key_bytes(&input.namespace, 17, 7);
-    let delete_key = key_bytes(&input.namespace, 17, 8);
-    let after_key = key_bytes(&input.namespace, 17, 9);
-    let before_value = value_bytes(&input.namespace, 29, 6, 65536, 1.0);
-    let filler_value = value_bytes(&input.namespace, 29, 7, 65536, 1.0);
-    let delete_value = value_bytes(&input.namespace, 29, 8, 65536, 1.0);
-    let after_value = value_bytes(&input.namespace, 29, 9, 65536, 1.0);
-    check(
-        before_value != filler_value
-            && before_value != delete_value
-            && before_value != after_value
-            && filler_value != delete_value
-            && filler_value != after_value
-            && delete_value != after_value,
-        "member sentinel payloads are not distinct",
-    )?;
-    let deadline = Instant::now() + Duration::from_secs(300);
-    let mut writes_acknowledged = 0u64;
-    let mut transition_end = transition_start.clone();
-    transition_write(
-        &db,
-        &transition_start,
-        &mut transition_end,
-        deadline,
-        &mut writes_acknowledged,
-        || {
-            db.insert(ks, before_key.clone(), before_value.clone())
-                .map_err(native_error)
-        },
-    )?;
-    transition_write(
-        &db,
-        &transition_start,
-        &mut transition_end,
-        deadline,
-        &mut writes_acknowledged,
-        || {
-            db.insert(ks, delete_key.clone(), delete_value)
-                .map_err(native_error)
-        },
-    )?;
-    loop {
-        transition_write(
-            &db,
-            &transition_start,
-            &mut transition_end,
-            deadline,
-            &mut writes_acknowledged,
-            || {
-                db.insert(ks, filler_key.clone(), filler_value.clone())
-                    .map_err(native_error)
-            },
-        )?;
-        if !writes_acknowledged.is_multiple_of(32) {
-            continue;
-        }
-        let sample = &transition_end;
-        let routes = sample["routes"]
-            .as_array()
-            .ok_or("member transition routes unavailable")?;
-        if delta(&transition_start, sample, "completed_write_bytes")?
-            > remote.storage.wal_file_bytes
-            && routes.iter().any(|route| {
-                route["writer"]["epoch"].as_u64() == Some(initial_epoch)
-                    && route["writer"]["file_index"]
-                        .as_u64()
-                        .is_some_and(|file| file > initial_file)
-                    && route["namespace_identity"]["uuid"] != initial_uuid
-            })
-        {
-            verify_routes(sample, &input.expected_route, &input.target_implementation)?;
-            break;
-        }
-    }
-    transition_write(
-        &db,
-        &transition_start,
-        &mut transition_end,
-        deadline,
-        &mut writes_acknowledged,
-        || {
-            db.insert(ks, after_key.clone(), after_value.clone())
-                .map_err(native_error)
-        },
-    )?;
-    transition_write(
-        &db,
-        &transition_start,
-        &mut transition_end,
-        deadline,
-        &mut writes_acknowledged,
-        || db.remove(ks, delete_key.clone()).map_err(native_error),
-    )?;
-    read_expected(&db, ks, &delete_key, None)?;
-    read_expected_live(&db, ks, &before_key, &before_value)?;
-    read_expected_live(&db, ks, &after_key, &after_value)?;
-    read_expected(&db, ks, &keys[0], Some(&values[0]))?;
-    check(
-        Instant::now() < deadline,
-        "member transition reads exceeded time bound",
-    )?;
-    let transition_checked = stats(&db)?;
-    check(
-        delta(
-            &transition_start,
-            &transition_checked,
-            "payload_rpc_requests",
-        )? == 0
-            && delta(&transition_start, &transition_checked, "errors")? == 0
-            && delta(&transition_start, &transition_checked, "unknown_writes")? == 0,
-        "member transition used payload RPC or encountered an unknown write",
-    )?;
-    let member_transition = serde_json::json!({
-        "wal_file_bytes": remote.storage.wal_file_bytes,
-        "completed_write_bytes": delta(&transition_start, &transition_end, "completed_write_bytes")?,
-        "completed_write_ops": delta(&transition_start, &transition_end, "completed_write_ops")?,
-        "writes_acknowledged": writes_acknowledged,
-        "writer_routes": transition_end["routes"].as_array()
-            .ok_or("member transition routes unavailable")?
-            .iter().filter(|route| route["writer"]["epoch"].as_u64() == Some(initial_epoch))
-            .cloned().collect::<Vec<_>>(),
-        "before_key_read": true,
-        "after_key_read": true,
-        "early_key_read": true,
-        "post_transition_delete": true
-    });
+    let MemberTransition {
+        before_key,
+        before_value,
+        after_key,
+        after_value,
+        delete_key,
+        evidence: member_transition,
+    } = qualify_member_transition(&db, ks, remote, &input, &keys[0], &values[0])?;
     progress.mark("member_transition_complete", Some(&db));
     progress.mark("flush", Some(&db));
     db.flush().map_err(native_error)?;
@@ -956,7 +1050,7 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
     let ks = reopened.ks("root");
     let recovery = stats(&reopened)?;
     progress.mark("graceful_reopen_complete", Some(&reopened));
-    verify_fences(&recovery, &partitions, &input.target_implementation)?;
+    verify_fences(&recovery, partitions, &input.target_implementation)?;
     check(
         count(&recovery, "payload_rpc_requests")? == 0 && count(&recovery, "errors")? == 0,
         "recovery used RPC payload or failed",
@@ -1012,64 +1106,14 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
         .wait_for_background_threads_to_finish()
         .map_err(native_error)?;
     progress.mark("abrupt_child_start", None);
-    let frozen_input = output.join("abrupt-child-input.json");
-    let child_ready = output.join("abrupt-child-ready.json");
-    fs::write(&frozen_input, input_bytes)?;
-    let mut child = std::process::Command::new(std::env::current_exe()?)
-        .arg("--experimental-live-nvmeof-qualification-child")
-        .arg(&frozen_input)
-        .arg(&child_ready)
-        .spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(300);
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            child.kill()?;
-            child.wait()?;
-            return Err("abrupt qualification child exceeded its 300-second deadline".into());
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    check(status.success(), "abrupt qualification child failed")?;
-    let child_evidence: serde_json::Value = serde_json::from_slice(&fs::read(&child_ready)?)?;
-    progress.mark_value("abrupt_child_complete", child_evidence.get("end").cloned());
-    check(
-        child_evidence["kind"] == "acknowledged_unrooted_mixed_batch"
-            && child_evidence["exit_model"] == "process_exit_without_db_drop_or_checkpoint",
-        "invalid abrupt child evidence",
-    )?;
-    check(
-        delta(
-            &child_evidence["start"],
-            &child_evidence["end"],
-            "completed_write_ops",
-        )? > 0
-            && delta(
-                &child_evidence["start"],
-                &child_evidence["end"],
-                "completed_write_bytes",
-            )? > 0
-            && delta(
-                &child_evidence["start"],
-                &child_evidence["end"],
-                "payload_rpc_requests",
-            )? == 0,
-        "abrupt child evidence did not prove live payload write",
-    )?;
-    verify_routes(
-        &child_evidence["end"],
-        &input.expected_route,
-        &input.target_implementation,
-    )?;
+    let child_evidence = qualify_abrupt_child(&input, &input_bytes, output, &mut progress)?;
     progress.mark("abrupt_recovery_open", None);
     let crash_reopened =
         sui::Db::open_remote(&input.coordinator_path, shape.clone(), remote.clone())
             .map_err(native_error)?;
     let crash_recovery = stats(&crash_reopened)?;
     progress.mark("abrupt_recovery_open_complete", Some(&crash_reopened));
-    verify_fences(&crash_recovery, &partitions, &input.target_implementation)?;
+    verify_fences(&crash_recovery, partitions, &input.target_implementation)?;
     check(
         count(&crash_recovery, "recovery_read_ops")? > 0
             && count(&crash_recovery, "recovery_read_bytes")? > 0

@@ -767,7 +767,7 @@ impl NvmeofReader {
         if Instant::now() >= deadline {
             return Err(NvmeofError::Timeout);
         }
-        let stats = self.catalog.stats.clone();
+        let stats = &self.catalog.stats;
         stats.admission.add(admission_start.elapsed());
         let final_token = self
             .next_token

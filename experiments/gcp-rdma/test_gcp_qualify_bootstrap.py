@@ -58,6 +58,22 @@ class QualificationBootstrapTests(unittest.TestCase):
             bootstrap.pair_startup_script(*args, peer_instance_id='12', machine_type='z4m-highmem-16',
                                           live_transports=['local_file'])
 
+
+    def test_fleet_startup_admits_two_or_six_distinct_members(self):
+        members = [{'name': f'run-1-{i}', 'id': str(i + 1), 'rdma_ip': f'10.0.0.{i + 1}'}
+                   for i in range(6)]
+        args = ('test-bucket', 'run-1', 'a' * 64, '2030-01-01T00:00:00Z', 'b' * 64, 'c' * 64)
+        for count in (2, 6):
+            self.assertIn('TIDEHUNTER_BOOTSTRAP', bootstrap.fleet_startup_script(
+                *args, members=members[:count], rdma_device='irdma0', machine_type='z4m-highmem-16',
+                qualification_profile='focused'))
+        for count in (1, 3, 4, 5):
+            with self.assertRaises(ValueError):
+                bootstrap.fleet_startup_script(*args, members=members[:count],
+                    rdma_device='irdma0', machine_type='z4m-highmem-16')
+        with self.assertRaises(ValueError):
+            bootstrap.fleet_startup_script(*args, members=[members[0], members[0]],
+                rdma_device='irdma0', machine_type='z4m-highmem-16')
     def test_absolute_deadline_is_enforced(self):
         with self.assertRaises(TimeoutError):
             bootstrap._remaining(time.time() - 1, 60)

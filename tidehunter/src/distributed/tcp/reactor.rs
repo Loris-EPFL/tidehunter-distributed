@@ -4,8 +4,8 @@
 //! src/rpc_impl/{rpc_ev_loop,rpc_resp}.cc. IDs name live slots, not durability.
 //! ReFlex §§3.1/4.1: bounded two-stage progress, never disk waits on this owner.
 //! HERD §4.1.1: advance ready pipeline work without waiting for another arrival.
-//! Newly admitted page-cache reads and bounded output stay in the same sweep;
-//! cold io_uring/worker execution and manual CQ ownership do not move.
+//! Page-cache reads and bounded output progress in the same sweep;
+//! cold io_uring/worker execution stays off the network owner.
 //! Provider contract: libfabric 3cc1095272b07ebeb5cc8f44851af6aa3eb75e41,
 //! man/fi_efa.7.md Progress: normal `efa` RDM requires manual CQ progress;
 //! it does not require a TCP syscall per CQ poll.
@@ -15,11 +15,10 @@
 //! through a wait fd, see `tidehunter_fabric::Endpoint::open_idle_parking`) and
 //! otherwise keeps bounded manual progress; busy polling continues while any
 //! request is outstanding.
-//! eRPC §3.2 / ReFlex §§3.1, 4.1 motivate keeping completion and reply
-//! submission inline while cold I/O remains asynchronous, not weakening sync
-//! durability. Inventory try-locks for admission and response epoch validation
-//! remain; node read admission is atomic with per-session buffer pools and a
-//! sharded per-device credit lock; no storage lock is removed.
+//! Completion and reply submission stay inline; cold I/O stays asynchronous.
+//! Sync durability and inventory try-locks for admission and response epoch
+//! validation remain. Read admission uses atomics, per-session buffer pools,
+//! and a sharded per-device credit lock.
 //! https://www.usenix.org/system/files/nsdi19-kalia.pdf
 //! ReFlex source: papers/parsed/ReFlex-2017.md, §§3.1 and 4.1.
 use super::*;
@@ -1141,7 +1140,7 @@ impl Session {
             });
         }
     }
-    /// Local observer output, never a protocol-v8 field or durability receipt.
+    /// Local observer output, never a wire field or durability receipt.
     /// Profile boundaries occur outside clean API timing; no CQ is acquired here.
     #[cfg(feature = "experimental-fabric")]
     fn finish_direct_diagnostic(&mut self, reason: &'static str) {
@@ -2064,10 +2063,9 @@ impl Client {
                     pending.profile.server_response_recheck_ns += profile.response_recheck_ns;
                     pending.profile.server_response_recheck_samples +=
                         profile.response_recheck_samples;
-                    let error = TcpError::new(message);
+                    let mut error = TcpError::new(message);
                     pending.profile.exchange_ns = pending.began.map_or(0, elapsed_ns);
                     pending.profile.exchange_count += u64::from(pending.began.is_some());
-                    let mut error = error;
                     error.read_profile = Some(Box::new(pending.profile));
                     self.reactor.ready.push_back((
                         ReadCompletion {
@@ -2130,7 +2128,6 @@ impl Client {
             pending.start = pending.end;
             pending.wire_id = 0;
             if pending.start != pending.references.len() {
-                pending.wire_id = 0;
                 self.reactor.reads.insert(aggregate, pending);
             } else {
                 pending.profile.exchange_ns = pending.began.map_or(0, elapsed_ns);
@@ -2342,16 +2339,56 @@ struct OwnerTimeline {
     dropped: u64,
     records: Vec<super::super::write_timeline::OwnerTimelineRecord>,
 }
+
+impl OwnerTimeline {
+    #[cold]
+    fn page(&self, id: u64, offset: usize, frame_limit: usize) -> Result<Response, TcpError> {
+        if offset > self.records.len() {
+            return Ok(Response::Error("invalid owner timeline offset".into()));
+        }
+        let empty = Envelope {
+            protocol: PROTOCOL,
+            id,
+            body: Response::OwnerTimelinePage {
+                records: Vec::new(),
+                dropped: self.dropped,
+                incomplete: self.selected.saturating_sub(self.records.len()) as u64,
+                more: true,
+            },
+        };
+        let mut bytes = wire_codec(HARD_FRAME_LIMIT)
+            .serialized_size(&empty)
+            .map_err(TcpError::component)?;
+        let mut end = offset;
+        for record in self.records[offset..].iter().take(512) {
+            let size = wire_codec(HARD_FRAME_LIMIT)
+                .serialized_size(record)
+                .map_err(TcpError::component)?;
+            if bytes.saturating_add(size) > frame_limit as u64 {
+                break;
+            }
+            bytes += size;
+            end += 1;
+        }
+        if end == offset && offset < self.records.len() {
+            Ok(Response::Error(
+                "owner timeline record exceeds frame bound".into(),
+            ))
+        } else {
+            Ok(Response::OwnerTimelinePage {
+                records: self.records[offset..end].to_vec(),
+                dropped: self.dropped,
+                incomplete: self.selected.saturating_sub(self.records.len()) as u64,
+                more: end < self.records.len(),
+            })
+        }
+    }
+}
 struct DeferredRead {
     id: u64,
     epoch: u64,
     references: Vec<ValueRecordReference>,
-    members: Option<
-        Vec<(
-            Arc<super::super::storage::PartitionLog>,
-            ValueRecordReference,
-        )>,
-    >,
+    members: Option<Vec<ReadMember>>,
     plans: Option<Vec<read_executor::PlannedRead>>,
 }
 
@@ -3139,50 +3176,7 @@ pub(super) fn serve_session(
                 } else if let Request::OwnerTimelineFetch { offset } = request {
                     let response = if let Some(timeline) = owner_timeline.as_mut() {
                         timeline.active = false;
-                        if offset > timeline.records.len() {
-                            Response::Error("invalid owner timeline offset".into())
-                        } else {
-                            let empty = Envelope {
-                                protocol: PROTOCOL,
-                                id,
-                                body: Response::OwnerTimelinePage {
-                                    records: Vec::new(),
-                                    dropped: timeline.dropped,
-                                    incomplete: timeline
-                                        .selected
-                                        .saturating_sub(timeline.records.len())
-                                        as u64,
-                                    more: true,
-                                },
-                            };
-                            let mut bytes = wire_codec(HARD_FRAME_LIMIT)
-                                .serialized_size(&empty)
-                                .map_err(TcpError::component)?;
-                            let mut end = offset;
-                            for record in timeline.records[offset..].iter().take(512) {
-                                let size = wire_codec(HARD_FRAME_LIMIT)
-                                    .serialized_size(record)
-                                    .map_err(TcpError::component)?;
-                                if bytes.saturating_add(size) > limits.max_frame_bytes as u64 {
-                                    break;
-                                }
-                                bytes += size;
-                                end += 1;
-                            }
-                            if end == offset && offset < timeline.records.len() {
-                                Response::Error("owner timeline record exceeds frame bound".into())
-                            } else {
-                                Response::OwnerTimelinePage {
-                                    records: timeline.records[offset..end].to_vec(),
-                                    dropped: timeline.dropped,
-                                    incomplete: timeline
-                                        .selected
-                                        .saturating_sub(timeline.records.len())
-                                        as u64,
-                                    more: end < timeline.records.len(),
-                                }
-                            }
-                        }
+                        timeline.page(id, offset, limits.max_frame_bytes)?
                     } else {
                         Response::Error("owner timeline is not armed".into())
                     };

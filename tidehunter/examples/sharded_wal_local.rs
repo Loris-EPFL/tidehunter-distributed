@@ -105,7 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // all admission resources before allocating each version.
     let mut publication = PublicationTracker::new(inventory.database, 1, 80)?;
     let mut completions = CompletionInbox::new(inventory.database, 1, 80)?;
-    let configs: Vec<_> = inventory
+    let entries: Vec<_> = inventory
         .partitions
         .iter()
         .map(|partition| PartitionConfig {
@@ -124,15 +124,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_batches: 32,
             max_reference_metadata_bytes: 1024 * 1024,
         })
-        .collect();
-    let entries: Vec<_> = configs
-        .iter()
         .map(|config| {
             (
                 temporary
                     .path()
                     .join(format!("partition-{}", config.partition)),
-                config.clone(),
+                config,
             )
         })
         .collect();

@@ -263,15 +263,15 @@ pub(crate) fn publish_export(
         .collect();
     let staging = parent.join(format!(".nvmeof-export-{suffix}.partial"));
     std::fs::create_dir(&staging)?;
-    struct Rollback(std::path::PathBuf, bool);
-    impl Drop for Rollback {
+    struct Rollback<'a>(&'a std::path::Path, bool);
+    impl Drop for Rollback<'_> {
         fn drop(&mut self) {
             if self.1 {
-                let _ = std::fs::remove_dir_all(&self.0);
+                let _ = std::fs::remove_dir_all(self.0);
             }
         }
     }
-    let mut rollback = Rollback(staging.clone(), true);
+    let mut rollback = Rollback(&staging, true);
     let mut image = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -323,7 +323,7 @@ pub(crate) fn publish_export(
     if renamed != 0 {
         return Err(io::Error::last_os_error().into());
     }
-    rollback.0 = directory.to_path_buf();
+    rollback.0 = directory;
     std::fs::File::open(parent)?.sync_all()?;
     rollback.1 = false;
     Ok(manifest)

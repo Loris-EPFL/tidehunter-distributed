@@ -12,6 +12,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'nvmeof'))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'kv-comparison'))
+from cloud_layout import OWNER_HOST_COUNTS
 import manage
 import rdma_diagnostics
 
@@ -23,7 +24,7 @@ SERVICE = 19420
 
 
 def identities(run_id, owner, count=COUNT_PER_OWNER):
-    if (not re.fullmatch(r'bench-[0-9a-f]{16}', run_id) or type(owner) is not int or not 1 <= owner <= 5
+    if (not re.fullmatch(r'bench-[0-9a-f]{16}', run_id) or type(owner) is not int or not 1 <= owner <= max(OWNER_HOST_COUNTS)
             or type(count) is not int or not 1 <= count <= MAX_CONTROLLERS):
         raise ValueError('invalid probe identity')
     host = 'nqn.2026-01.io.tidehunter:headroom.' + run_id
@@ -179,7 +180,7 @@ def retire_controllers(expected, hostnqn, timeout=180):
 
 
 def probe(run_id, addresses, device, seconds=120):
-    if len(addresses) not in (1, 5) or not re.fullmatch(r'[A-Za-z0-9_]+', device):
+    if len(addresses) not in OWNER_HOST_COUNTS or not re.fullmatch(r'[A-Za-z0-9_]+', device):
         raise ValueError('one or five owners and a valid RDMA device are required')
     addresses = [str(ipaddress.IPv4Address(x)) for x in addresses]
     hostnqn, _ = identities(run_id, 1)

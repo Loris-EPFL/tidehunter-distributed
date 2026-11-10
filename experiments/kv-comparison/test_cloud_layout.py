@@ -19,6 +19,31 @@ def fleet(qualification=False):
 
 
 class Plans(unittest.TestCase):
+    def test_compact_fleet_and_five_host_backend_admission(self):
+        value = fleet()
+        for count in range(7):
+            candidate = copy.deepcopy(value)
+            candidate["nodes"] = [{"index": i, "instance_id": f"i-storage-{i}",
+                                   "address": f"10.1.0.{i + 21}"} for i in range(count)]
+            if count in (1, 5):
+                self.assertEqual(layout.validate_fleet(candidate), candidate)
+            else:
+                with self.subTest(count=count), self.assertRaises(ValueError):
+                    layout.validate_fleet(candidate)
+        compact = copy.deepcopy(value)
+        compact["nodes"] = compact["nodes"][:1]
+        for backend in layout.BACKENDS:
+            with self.subTest(backend=backend):
+                with self.assertRaisesRegex(ValueError, "five owner hosts"):
+                    layout.node_config(compact, backend, 0)
+                with self.assertRaisesRegex(ValueError, "five owner hosts"):
+                    layout.backend_options(compact, backend, "/tmp")
+                with self.assertRaisesRegex(ValueError, "five owner hosts"):
+                    layout.build_plan(compact, backend)
+        compact["nodes"][0]["index"] = 1
+        with self.assertRaises(ValueError):
+            layout.validate_fleet(compact)
+
     def test_matched_valkey_uses_distinct_rdma_addresses_and_same_server(self):
         value = fleet()
         value["valkey_rdma_package"] = True

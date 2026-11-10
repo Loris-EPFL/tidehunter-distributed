@@ -27,6 +27,10 @@ class Store:
 
 
 class SuiAdmissionTests(unittest.TestCase):
+    def test_compact_suite_rejected_before_mailbox_access(self):
+        with self.assertRaisesRegex(ValueError, 'five owner'):
+            gcp_sui.run_suite({'fleet': [{}, {}]}, None, None, None, output_root='/unused')
+
     def test_archive_preflight_and_extraction_share_symlink_safety(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -508,7 +508,7 @@ fn overlapping_groups_share_members_and_preserve_each_callers_slot_order() {
         .reads
         .submit_until(
             node,
-            vec![references[1], references[2], references[1]],
+            &[references[1], references[2], references[1]],
             0,
             false,
             ReadContext {
@@ -818,7 +818,7 @@ fn stale_plans_are_the_only_sealed_admission_retry() {
         .reads
         .submit_until_owned(
             node,
-            vec![reference],
+            std::slice::from_ref(&reference),
             0,
             false,
             context(),
@@ -839,7 +839,7 @@ fn stale_plans_are_the_only_sealed_admission_retry() {
         .reads
         .submit_until_owned(
             node,
-            vec![reference],
+            std::slice::from_ref(&reference),
             0,
             false,
             context(),

@@ -254,8 +254,8 @@ fn main() -> Result<()> {
     drop(db);
     cluster.shutdown()?;
 
-    let expected: HashMap<Vec<u8>, u64> = (0..keys)
-        .map(|id| (key_bytes(&namespace, SEED, id).to_vec(), id))
+    let expected: HashMap<_, u64> = (0..keys)
+        .map(|id| (key_bytes(&namespace, SEED, id), id))
         .collect();
     let mut found = HashSet::new();
     let mut exports = Vec::<(ExportManifest, PathBuf)>::new();

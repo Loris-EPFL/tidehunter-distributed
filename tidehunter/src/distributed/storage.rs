@@ -177,7 +177,7 @@ struct LiveFrontier {
     tail: Option<LiveFrontierTail>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct LiveFrontierTail {
     offset: u64,
     crc: u32,
@@ -377,8 +377,7 @@ pub struct StorageWriteProfile {
     /// Identity/version lookups, one per batch checked by an append.
     #[serde(default)]
     pub append_conflict_lookups: u64,
-    /// Pending-table slots examined by those lookups. Before the table existed
-    /// each lookup scanned every pending entry; this is the replacement length.
+    /// Pending-table slots examined by those lookups.
     #[serde(default)]
     pub append_conflict_pending_probes: u64,
     /// Rooted on-disk index reads performed by those lookups.
@@ -2414,7 +2413,6 @@ impl PartitionLog {
             if state.live {
                 let tail = state
                     .live_tail
-                    .clone()
                     .ok_or(StorageError::Invalid("missing live frontier tail"))?;
                 let mut frontier = LiveFrontier::new(self.config());
                 frontier.end = state.appended_end;
@@ -3101,7 +3099,7 @@ impl PartitionLog {
             .store(if after { 2 } else { 1 }, Ordering::Release);
     }
 
-    /// Stable physical append ordinal; includes the sole pending group.
+    /// Stable physical append ordinal; includes all pending groups.
     pub fn receipt_count(&self) -> usize {
         self.references.len()
     }

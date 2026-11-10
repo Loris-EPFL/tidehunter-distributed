@@ -1266,6 +1266,71 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(state['cleanup_verified'])
             self.assertIsNone(gcp_lease.read(store))
 
+    async def test_compact_campaign_creates_and_cleans_exact_pair(self):
+        from unittest.mock import AsyncMock
+        revision, source = 'b' * 40, 'a' * 64
+        image = 'projects/mysten-research/global/images/base-image'
+        receipt = {'source_revision': revision, 'source_sha256': source,
+                   'manifest_sha256': 'c' * 64, 'sha256': 'd' * 64}
+        spec = manual.REVIEWED_SPECS['parity_compact']
+        operations = []
+
+        async def execute(argv):
+            operations.append(tuple(argv))
+            return {}
+
+        class PairCompute:
+            def __init__(self, config, state, state_path, execute):
+                self.state, self.path, self.execute = state, state_path, execute
+
+            async def create_policy(self):
+                self.state['policy'] = {'name': self.state['run_id'] + '-placement', 'id': '9'}
+
+            async def create_vm(self, index, image, deadline, startup):
+                name = self.state['run_id'] + '-' + str(index)
+                await self.execute(['create', name])
+                host = {'name': name, 'id': str(index + 1), 'index': index,
+                        'zone': 'us-central1-a', 'internal_ip': '10.1.0.' + str(index + 1),
+                        'rdma_ip': '10.2.0.' + str(index + 1)}
+                self.state['instances'].append({'name': name, 'id': host['id'], 'fleet': host})
+                gcp_campaign.save(self.path, self.state)
+                return host
+
+            async def admit_guests(self):
+                return [record['fleet'] for record in self.state['instances']]
+
+            async def cleanup(self):
+                for record in self.state['instances']:
+                    await self.execute(['delete', record['name']])
+
+        async def stop_after_creation(*args, **kwargs):
+            raise RuntimeError('stop after creation')
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package = root / 'package'
+            package.mkdir()
+            (package / 'spec.json').write_text(json.dumps(spec))
+            with patch.object(manual, '_admit_package', return_value=(receipt, {'tree_sha256': 'f' * 64, 'dirty': True})), \
+                 patch.object(manual, '_qualify_observer', return_value={}), \
+                 patch.object(manual, '_check_snapshot'), \
+                 patch.object(manual.gcp_manual_preflight, 'permission_preflight'), \
+                 patch.object(manual.gcp_manual_preflight, 'infrastructure_preflight', new_callable=AsyncMock,
+                              return_value={'id': '42', 'status': 'READY', 'selfLink': 'https://example/' + image}), \
+                 patch.object(manual.gcp_budget, 'reserve', return_value={}), \
+                 patch.object(manual, '_stage', return_value=({'manifest_sha256': 'c' * 64}, 'e' * 64)), \
+                 patch.object(manual, '_admit_boot_images', side_effect=stop_after_creation), \
+                 patch('gcp_manual_compute.Compute', PairCompute):
+                with self.assertRaises(Exception):
+                    await manual.run(CONFIG, package_dir=package, revision=revision, spec=spec, wheels=[],
+                                     base_image=image, base_image_id='42', rdma_device='irdma0',
+                                     output=root / 'out', execute=execute, artifacts=Store(), surcharge_cents=0)
+            state = json.loads((root / 'out/state.json').read_text())['children']['fleet']
+            expected = {state['run_id'] + '-0', state['run_id'] + '-1'}
+            self.assertEqual(state['host_count'], 2)
+            self.assertEqual({name for action, name in operations if action == 'create'}, expected)
+            self.assertEqual({name for action, name in operations if action == 'delete'}, expected)
+
     async def test_single_fleet_failures_never_allocate_replacement_or_start_suite(self):
         import gcp_lease
         from unittest.mock import AsyncMock

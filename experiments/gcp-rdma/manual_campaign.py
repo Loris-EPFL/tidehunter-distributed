@@ -3,7 +3,7 @@
 Compute operations use an injected asynchronous command callback: MCP is
 preferred; a CLI fallback must preserve argv and exit status. Storage uses
 an injected ObjectStore-compatible transport (or DelegatedArtifacts). The persisted
-parent lease owns one six-host fleet with a shared absolute expiry.
+parent lease owns one admitted fleet with a shared absolute expiry.
 Cleanup is recoverable without GitHub. Compute describe/delete is necessarily a
 TOCTOU: the API does not provide an ID precondition for name-based deletion.
 """
@@ -45,6 +45,8 @@ CAMPAIGN_MARGIN_SECONDS = 120
 CEILING_CENTS = 14500
 # Rounded-up compute for six six-hour guests at $3.287109973 per host-hour.
 COMPUTE_CENTS = (3287109973 * 6 * FLEET_SECONDS * 100 + 3600 * 10**9 - 1) // (3600 * 10**9)
+COMPACT_COMPUTE_CENTS = (3287109973 * 2 * FLEET_SECONDS * 100 + 3600 * 10**9 - 1) // (3600 * 10**9)
+COMPACT_CEILING_CENTS = (COMPACT_COMPUTE_CENTS * CEILING_CENTS + COMPUTE_CENTS - 1) // COMPUTE_CENTS
 # This spec keeps the previously reviewed live and sealed comparison.
 REVIEWED_SPEC = {
     'schema_version': 1, 'suite': 'kv', 'mode': 'standard-with-live-nvmeof', 'seed': 1775,
@@ -74,6 +76,8 @@ FOCUSED_MATRIX_SHA256 = {
     'append_floors': '646f9ff50949c4ecab44a4d77d2ad38e5b2700311cb5c1ce69e742ed521f4e40',
     'fair_native': '7a8e64eeb181b0f5040f3b02105d76def85823e87f591fea448d34bcb6a7f2d9',
     'parity': 'ee942bda8565ff1295814a61fb00040f6feedce9cd73304dea29dec095169ec6',
+    'parity_compact': '4978687ab42ca839e2c864978fb1489854ae201d28f06facf89a283cdea8e0aa',
+    'fair_five_owner': '479601db27b3a709e83944dcdfa9b77e7f8e4bacac9637a29e04327e09151946',
 }
 REVIEWED_SPECS = {
     selection: {
@@ -86,6 +90,7 @@ REVIEWED_SPECS = {
         'case_deadline_seconds': 600, 'hard_deadline_seconds': FLEET_SECONDS,
         'export_reserve_seconds': EXPORT_RESERVE_SECONDS,
         'diagnostics': {'write_profile_limit': 256, 'read_profile_limit': 256, 'write_timeline_limit': 8192},
+        **({'owner_hosts': 1} if selection == 'parity_compact' else {}),
     }
     for selection, digest, count in (
         ('recommended', FOCUSED_MATRIX_SHA256['recommended'], 279),
@@ -97,6 +102,8 @@ REVIEWED_SPECS = {
         ('append_floors', FOCUSED_MATRIX_SHA256['append_floors'], 48),
         ('fair_native', FOCUSED_MATRIX_SHA256['fair_native'], 168),
         ('parity', FOCUSED_MATRIX_SHA256['parity'], 216),
+        ('parity_compact', FOCUSED_MATRIX_SHA256['parity_compact'], 177),
+        ('fair_five_owner', FOCUSED_MATRIX_SHA256['fair_five_owner'], 39),
     )
 }
 
@@ -202,6 +209,11 @@ def _reviewed_jobs(spec):
     if (workflow_input.cloud_campaign.FOCUSED_COUNTS.get(spec['selection']) != spec['job_count']
             or len(jobs) != spec['job_count'] or _digest(_json(jobs)) != spec['matrix_sha256']):
         raise ValueError('focused matrix differs from the reviewed specification')
+    owners = spec.get('owner_hosts', 5)
+    if (type(owners) is not int or owners not in gcp_runtime.owner_host_counts()
+            or workflow_input.cloud_campaign.selection_owner_hosts(spec['selection']) != owners
+            or any(workflow_input.cloud_campaign.job_owner_hosts(job) > owners for job in jobs)):
+        raise ValueError('focused selection and reviewed owner layout disagree')
     return jobs
 
 
@@ -214,9 +226,12 @@ def _check_config(config, spec, surcharge_cents):
             or len(config.get('candidates', [])) != 1
             or config['candidates'][0].get('zone') != 'us-central1-a'):
         raise ValueError('manual campaign requires the reviewed single zonal configuration')
-    if type(surcharge_cents) is not int or not 0 <= surcharge_cents <= CEILING_CENTS - COMPUTE_CENTS:
-        raise ValueError('non-compute quote exceeds the aggregate $145 ceiling')
     _reviewed_jobs(spec)
+    owners = spec.get('owner_hosts', 5)
+    ceiling, compute = ((COMPACT_CEILING_CENTS, COMPACT_COMPUTE_CENTS)
+                        if owners == 1 else (CEILING_CENTS, COMPUTE_CENTS))
+    if type(surcharge_cents) is not int or not 0 <= surcharge_cents <= ceiling - compute:
+        raise ValueError('non-compute quote exceeds the selected fleet ceiling')
 
 
 def _check_snapshot(source, revision):
@@ -922,7 +937,7 @@ async def _headroom(mailbox, fleet, state, package_root, rdma_device, output):
     try:
         created = await _joined_waiters(
             request(index, 'create', ['--owner', str(index), '--address', fleet[index]['rdma_ip']])
-            for index in range(1, 6))
+            for index in range(1, len(fleet)))
         if any(item['exit_code'] != 0 for item in created):
             raise RuntimeError('headroom target creation failed; see mailbox receipts')
         probe_submitted = True
@@ -942,7 +957,7 @@ async def _headroom(mailbox, fleet, state, package_root, rdma_device, output):
         if cleanup_timeout < 1:
             raise TimeoutError('headroom teardown deadline exhausted')
         cleaned = await _joined_waiters(request(index, 'cleanup', ['--owner', str(index)])
-                                        for index in range(1, 6))
+                                        for index in range(1, len(fleet)))
         if probe_submitted and time.time() > result['teardown_started_unix'] + 180:
             raise TimeoutError('headroom teardown exceeded 180 seconds')
         if any(item['exit_code'] != 0 or json.loads(item['stdout']).get('clean') is not True for item in cleaned):
@@ -976,8 +991,9 @@ async def _suite(store, config, state, path, fleet, package, spec, output, rdma_
     root = runtime['package_root']
     mailbox = gcp_runtime.RemoteMailbox(_StoreApi(store, config['bucket']), config['bucket'],
                                         state['run_id'], fleet, state['source_sha256'], state['deadline'])
-    state['headroom_probe'] = await _headroom(mailbox, fleet, state, root, rdma_device, output)
-    await _blocking(campaign.save, path, state)
+    if len(fleet) > 2:
+        state['headroom_probe'] = await _headroom(mailbox, fleet, state, root, rdma_device, output)
+        await _blocking(campaign.save, path, state)
     remaining = campaign.coordinator_timeout(state['deadline'], EXPORT_RESERVE_SECONDS, dt.datetime.now(dt.timezone.utc))
     state['campaign_submitted'] = True
     await _blocking(campaign.save, path, state)
@@ -1144,6 +1160,9 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
     from gcp_manual_compute import Compute, _json_response
 
     _check_config(config, spec, surcharge_cents)
+    host_count = spec.get('owner_hosts', 5) + 1
+    ceiling, compute = ((COMPACT_CEILING_CENTS, COMPACT_COMPUTE_CENTS)
+                        if host_count == 2 else (CEILING_CENTS, COMPUTE_CENTS))
     weekly_limit = json.loads(Path(__file__).with_name('budget.json').read_text()).get('weekly_limit_cents')
     if type(weekly_limit) is not int or weekly_limit <= 0:
         raise ValueError('budget.json requires a positive integer weekly_limit_cents')
@@ -1174,7 +1193,7 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
     parent = {'run_id': _run_id(), 'project_id': config['project_id'], 'source_sha256': source,
               'deadline': _utc(start + FLEET_SECONDS),
               'children': {}, 'phase': 'initial', 'cleanup_verified': False,
-              'budget': {'ceiling_cents': CEILING_CENTS, 'compute_cents': COMPUTE_CENTS,
+              'budget': {'ceiling_cents': ceiling, 'compute_cents': compute,
                          'non_compute_quote_cents': surcharge_cents, 'weekly_limit_cents': weekly_limit},
               'base_image': {'path': base_image, 'id': str(base_image_id)},
               'package': {'sha256': receipt['sha256'], 'manifest_sha256': receipt['manifest_sha256'],
@@ -1191,11 +1210,12 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
         await _blocking(_start_lease, store, parent, path)
         await _blocking(_lease_owned, store, parent)
         await _blocking(_record, path, parent, 'budget')
-        report = await _blocking(gcp_budget.reserve, store, parent['run_id'], CEILING_CENTS, weekly_limit)
+        report = await _blocking(gcp_budget.reserve, store, parent['run_id'], ceiling, weekly_limit)
         (out / 'budget-report.json').write_bytes(_json(report))
 
         await _blocking(_record, path, parent, 'fleet')
         fleet_state, fleet_path = await _blocking(_new_child, parent, path, 'fleet', FLEET_SECONDS)
+        fleet_state['host_count'] = host_count
         package, prep_sha = await _blocking(_stage, store, config['bucket'], fleet_state, receipt, wheels)
         fleet_state['package'] = package
         fleet_state['preparation_sha256'] = prep_sha
@@ -1206,7 +1226,7 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
         await fleet_compute.create_policy()
         fleet = []
         gated = _gate(config['bucket'], fleet_state)
-        for i in range(6):
+        for i in range(host_count):
             await _blocking(_lease_owned, store, parent)
             fleet.append(await fleet_compute.create_vm(i, base_image, fleet_state['deadline'], gated))
         if await fleet_compute.admit_guests() != fleet:

@@ -2,8 +2,8 @@
 //!
 //! The hot read path never takes a shared mutex here:
 //!
-//! * `validate` is two `ArcSwap` loads of an immutable [`Bounds`] (floor and
-//!   in-progress floor).
+//! * `validate` reads immutable [`Bounds`] (floor and in-progress floor)
+//!   through `ArcSwap`.
 //! * A pin registers in one of [`PIN_SHARDS`] mutexes chosen by a per-thread
 //!   slot, so concurrent readers rarely meet. The registration quota is one
 //!   padded atomic.
@@ -499,18 +499,18 @@ impl NativeIndex {
     /// writer's newest promoted version.
     pub(super) fn capture_lease(
         &self,
-        cut: IndexReadCut,
+        cut: &IndexReadCut,
         floor: IndexReadCut,
         latest: Option<MutationVersion>,
     ) -> Result<CaptureLease, NativeIndexError> {
         let retention = &self.retention;
         let mut cold = retention.cold.lock();
         let bounds = retention.bounds.load_full();
-        bounds.validate(&cut)?;
+        bounds.validate(cut)?;
         if matches!(cut, IndexReadCut::Sparse(_))
             || matches!(floor, IndexReadCut::Latest | IndexReadCut::Sparse(_))
             || position(&floor) < position(&bounds.floor)
-            || position(&floor) > position(&cut)
+            || position(&floor) > position(cut)
             || position(&floor)
                 > position(&latest.map_or(IndexReadCut::BeforeAll, IndexReadCut::At))
         {

@@ -573,10 +573,9 @@ impl Wal {
                     if end > file.metadata()?.len() {
                         return Err(invalid());
                     }
-                    // Sealed history may have no resident WalMaps entry. Map
-                    // only the requested member, without touching its siblings.
-                    // PartitionLog retains the immutable file; it has no GC,
+                    // SAFETY: PartitionLog keeps the file immutable and forbids
                     // truncation or address reuse while references are live.
+                    // The checked range covers only existing member bytes.
                     let map = unsafe {
                         memmap2::MmapOptions::new()
                             .offset(offset)

@@ -48,16 +48,13 @@ pub struct WalGuardMaker {
 /// processed frontier across an uncertain WAL hole.
 #[cfg(feature = "experimental-nvmeof")]
 pub(crate) struct ExternalWalGuard {
-    release: Option<mpsc::Sender<()>>,
+    release: mpsc::Sender<()>,
 }
 
 #[cfg(feature = "experimental-nvmeof")]
 impl ExternalWalGuard {
-    pub(crate) fn release(mut self) -> Result<(), std::sync::mpsc::SendError<()>> {
-        self.release
-            .take()
-            .expect("external guard released once")
-            .send(())
+    pub(crate) fn release(self) -> Result<(), std::sync::mpsc::SendError<()>> {
+        self.release.send(())
     }
 }
 
@@ -225,9 +222,7 @@ impl WalTracker {
                 result,
             })
             .map_err(|_| std::io::Error::other("WAL tracker stopped"))?;
-        Ok(ExternalWalGuard {
-            release: Some(release),
-        })
+        Ok(ExternalWalGuard { release })
     }
 
     #[cfg(feature = "experimental-nvmeof")]

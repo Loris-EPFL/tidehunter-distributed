@@ -69,7 +69,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         for row in hashes {
             hash.update(row);
         }
-        tables.insert(ks.name().to_owned(), serde_json::json!({"records":records,
+        tables.insert(ks.name(), serde_json::json!({"records":records,
             "key_bytes":key_bytes,"value_bytes":value_bytes,"sorted_row_sha256":format!("{:x}",hash.finalize())}));
     }
     if tables.is_empty() {

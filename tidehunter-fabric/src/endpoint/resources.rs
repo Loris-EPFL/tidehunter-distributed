@@ -97,19 +97,22 @@ impl Memory {
 
     fn rx(&self, slot: usize) -> *mut u8 {
         debug_assert!(slot < self.slots);
-        // SAFETY: As above; provider writes are permitted inside UnsafeCell.
+        // SAFETY: Callers use slot < self.slots in this live allocation. Forming
+        // a raw pointer into UnsafeCell creates no reference to provider memory.
         unsafe { UnsafeCell::raw_get(self.rx.as_ptr().add(slot)).cast::<u8>() }
     }
 
     fn tx_context(&self, slot: usize) -> *mut c_void {
         debug_assert!(slot < self.slots);
-        // SAFETY: The context has the same lifetime and stable allocation.
+        // SAFETY: Callers use slot < self.slots. The context allocation stays
+        // live and fixed until teardown; raw_get creates no Rust reference.
         unsafe { UnsafeCell::raw_get(self.tx_context.as_ptr().add(slot)).cast() }
     }
 
     fn rx_context(&self, slot: usize) -> *mut c_void {
         debug_assert!(slot < self.slots);
-        // SAFETY: The context has the same lifetime and stable allocation.
+        // SAFETY: Callers use slot < self.slots. The context allocation stays
+        // live and fixed until teardown; raw_get creates no Rust reference.
         unsafe { UnsafeCell::raw_get(self.rx_context.as_ptr().add(slot)).cast() }
     }
 
@@ -145,8 +148,9 @@ impl Default for Memory {
 
 impl Drop for Memory {
     fn drop(&mut self) {
-        // SAFETY: Endpoint frees Resources only after close() succeeds for all
-        // handles. Failed close leaks Resources, including these unique owners.
+        // SAFETY: Each pointer and self.slots are the original zeroed_array pair,
+        // released once. Endpoint drops registered memory only after all handles
+        // close; failed close retains Resources and these allocations.
         unsafe {
             release_array(self.tx, self.slots);
             release_array(self.rx, self.slots);
@@ -483,8 +487,9 @@ impl RmaState {
                     charged_slots: 1,
                 });
                 let mut mr = ptr::null_mut();
-                // SAFETY: The Arc's boxed allocation is stable until its provider MR
-                // closes after endpoint teardown and all consumers release their Arc.
+                // SAFETY: The caller supplies a live domain. The boxed slot has
+                // slot_bytes writable bytes in UnsafeCell and a stable address.
+                // Its Arc is retained until MR close, or leaked if close is uncertain.
                 let code = unsafe {
                     ffi::fi_mr_reg(
                         domain,
@@ -499,6 +504,8 @@ impl RmaState {
                     )
                 };
                 if code != 0 || mr.is_null() {
+                    // SAFETY: A non-null MR is owned by this registration attempt;
+                    // no read was posted. Failed close retains the slot allocation.
                     let current_uncertain =
                         !mr.is_null() && unsafe { ffi::fi_close(&raw mut (*mr).fid) } != 0;
                     if current_uncertain {
@@ -625,8 +632,9 @@ impl RmaState {
         }
         for slot in &mut self.destinations {
             if !slot.mr.is_null() {
-                // SAFETY: All accepted reads have terminal completions. The MR
-                // closes before its stable storage can be released.
+                // SAFETY: This non-null MR is uniquely owned; all accepted reads
+                // have terminal completions. Storage stays live through close,
+                // and uncertain close retains it without retrying the MR.
                 let status = unsafe { ffi::fi_close(&raw mut (*slot.mr).fid) };
                 if status != 0 {
                     slot.mr = ptr::null_mut();
@@ -735,8 +743,8 @@ fn optional_c_string(pointer: *const libc::c_char) -> Option<String> {
     if pointer.is_null() {
         None
     } else {
-        // SAFETY: libfabric owns valid NUL-terminated attribute strings for
-        // the lifetime of the fi_info result.
+        // SAFETY: Callers pass a libfabric-owned NUL-terminated attribute or
+        // parameter string and keep its fi_info or parameter array live here.
         Some(
             unsafe { CStr::from_ptr(pointer) }
                 .to_string_lossy()
@@ -745,8 +753,9 @@ fn optional_c_string(pointer: *const libc::c_char) -> Option<String> {
     }
 }
 fn selected_source_address(info: &ffi::fi_info) -> Option<std::net::IpAddr> {
-    // SAFETY: `info` is live until this function returns, and each sockaddr
-    // read is guarded by its advertised format, address length and pointer.
+    // SAFETY: Callers keep the fi_getinfo result and its source allocation live.
+    // Format, length and null checks bound each read; read_unaligned does not
+    // require the provider's sockaddr pointer to have Rust alignment.
     unsafe {
         match info.addr_format {
             ffi::FI_SOCKADDR_IN
@@ -924,7 +933,8 @@ fn rxm_parameters() -> Vec<ProviderParameter> {
 ///
 /// # Safety
 /// `selected` must be a successful `fi_getinfo` result whose fabric, domain,
-/// endpoint, TX and RX attribute pointers are non-null.
+/// endpoint, TX and RX attribute pointers are non-null. The caller must keep
+/// the result and its nested allocations live for this call.
 unsafe fn capture_geometry(
     selected: &ffi::fi_info,
     requested_api: u32,
@@ -957,7 +967,8 @@ unsafe fn capture_geometry(
         max_msg_size: ep.max_msg_size,
         mr_mode: domain.mr_mode,
         mr_mode_flags: mr_mode_flags(domain.mr_mode),
-        // SAFETY: data_progress and progress are the same fi_progress union field.
+        // SAFETY: libfabric initializes this union as fi_progress; both union
+        // names have that type, which accepts every underlying integer value.
         data_progress: progress_name(unsafe { domain.__bindgen_anon_1.data_progress }).to_owned(),
         control_progress: progress_name(domain.control_progress).to_owned(),
         threading: threading_name(domain.threading).to_owned(),
@@ -1075,7 +1086,10 @@ impl Resources {
             if owned_address.is_null() {
                 return Err(error("allocate source address hint", ffi::FI_ENOMEM));
             }
-            // SAFETY: The source struct is live and exactly address_size bytes.
+            // SAFETY: address points to the selected live sockaddr struct;
+            // owned_address is a distinct, non-null allocation of address_size.
+            // hints owns its initialized fi_info and any prior C-allocated address.
+            // Replace that address once, transferring the new allocation to Info.
             unsafe {
                 ptr::copy_nonoverlapping(address, owned_address.cast(), address_size);
                 if !(*hints.0).src_addr.is_null() {
@@ -1104,6 +1118,8 @@ impl Resources {
             active_rma = None;
             hints = Info::hints(&provider, &domain, direct_fabric, false)?;
             apply_source_hint(&hints)?;
+            // SAFETY: The replacement hints and empty Info output are live for
+            // this synchronous call; Info owns any returned allocation.
             discovered = unsafe {
                 ffi::fi_getinfo(api, ptr::null(), ptr::null(), 0, hints.0, &raw mut info.0)
             };
@@ -1127,8 +1143,13 @@ impl Resources {
                 "fabric returned no provider info"
             }));
         }
-        // SAFETY: Successful getinfo returns populated attribute structures.
-        // Their ownership remains in Info until all handle creation completes.
+        // SAFETY: info owns the non-null fi_getinfo result throughout this block.
+        // Required attribute pointers are checked before use; optional NIC fields
+        // and strings are checked before dereference. Union reads use the reported
+        // discriminant, or the equivalent fi_progress fields. Native handles are
+        // used only after successful creation and saved for ordered teardown.
+        // Registered buffers and contexts stay allocated until close succeeds;
+        // output pointers address live locals or exclusively borrowed fields.
         let mut selected_rma_capabilities = None;
         unsafe {
             let selected = &*info.0;
@@ -1541,8 +1562,10 @@ impl Resources {
             count: 1,
             ..ffi::fi_av_attr::default()
         };
-        // SAFETY: Called only with our live domain and getinfo allocation.
-        // Every acquired handle is saved before the next fallible operation.
+        // SAFETY: The caller supplies a live domain and fi_getinfo allocation.
+        // CQ/AV attributes and output pointers stay live for each synchronous call.
+        // Each handle is used only after successful creation and saved before the
+        // next fallible step; teardown closes the endpoint before its bindings.
         unsafe {
             let stage = Instant::now();
             let mut code =
@@ -1822,8 +1845,9 @@ impl Resources {
             return Err(invalid("RMA source length overflow"));
         };
         let mut mr = ptr::null_mut();
-        // SAFETY: The boxed immutable source never moves while its MR is live.
-        // Remote peers receive read-only permission; no remote writes are enabled.
+        // SAFETY: self.domain is live. The box owns len initialized immutable
+        // bytes at a stable address until MR close, or quarantine on uncertain
+        // close. Only remote reads are enabled, and mr is a live output local.
         let began = observation.as_ref().map(|_| std::time::Instant::now());
         let status = unsafe {
             ffi::fi_mr_reg(
@@ -2021,8 +2045,10 @@ impl Resources {
             // and final consumer release; no deregistration can race this call.
             unsafe { ffi::fi_mr_desc(slot.mr) }
         };
-        // SAFETY: Range and unique destination ownership were checked above.
-        // The registered allocation and stable context survive terminal CQ.
+        // SAFETY: The endpoint, peer and destination MR are live. Range checks
+        // bound len by this slot's allocation; exclusive Arc ownership and no
+        // pending read prevent aliasing. The UnsafeCell bytes and fixed context
+        // survive terminal CQ completion, or quarantine on uncertain teardown.
         let code = unsafe {
             ffi::fi_read(
                 self.ep,
@@ -2170,8 +2196,9 @@ impl Resources {
         let mut offset = 0;
         for source in bytes {
             let len = source.len().min(CHUNK - offset);
-            // SAFETY: This slot is ours, has CHUNK bytes, and has no pending
-            // operation. Other slots may be in use; the copy never overlaps them.
+            // SAFETY: source supplies len readable bytes and cannot alias the
+            // private TX allocation. This free slot has CHUNK writable bytes;
+            // offset + len <= CHUNK, with no pending provider operation.
             unsafe {
                 ptr::copy_nonoverlapping(source.as_ptr(), self.memory.tx(slot).add(offset), len);
             }
@@ -2272,8 +2299,9 @@ impl Resources {
         }
         let len = bytes.len().min(self.rx_len[slot] - self.rx_offset);
         let began = self.time_progress.then(Instant::now);
-        // SAFETY: A validated completion set this slot's length <= CHUNK and
-        // cleared pending. Repost waits until every byte in this slot is copied.
+        // SAFETY: A terminal completion set this slot's length <= CHUNK and
+        // cleared pending. The bounded range is initialized and cannot overlap
+        // the caller's writable output. Repost waits until all bytes are copied.
         unsafe {
             ptr::copy_nonoverlapping(
                 self.memory.rx(slot).add(self.rx_offset),
@@ -2411,8 +2439,9 @@ impl Resources {
         };
         let len = self.rx_len[slot];
         let began = self.time_progress.then(Instant::now);
-        // SAFETY: CQ validation established the completed slot length; this
-        // immutable borrow ends before the receive slot is reposted below.
+        // SAFETY: A terminal CQE established len <= CHUNK in this live slot.
+        // No provider write remains; the visitor cannot retain its slice, and
+        // this immutable borrow ends before the receive slot is reposted below.
         process(unsafe { std::slice::from_raw_parts(self.memory.rx(slot), len) })?;
         // Direct receives include checksum validation and reassembly copying,
         // not just the ordinary transport's completed-buffer copy.
@@ -2441,8 +2470,9 @@ impl Resources {
     fn post_receive(&mut self, slot: usize) -> io::Result<bool> {
         let peer = self.peer.ok_or_else(|| invalid("missing fabric peer"))?;
         let began = self.time_progress.then(Instant::now);
-        // SAFETY: try_post_receive ensures a free slot with no unread bytes. The
-        // provider sees only its stable allocation, registration and context.
+        // SAFETY: try_post_receive selects an in-bounds free slot with no unread
+        // bytes or Rust borrows. The endpoint, peer and optional MR are live;
+        // allocation and context stay fixed until completion or successful close.
         let code = unsafe {
             let desc = if self.rx_mr.is_null() {
                 ptr::null_mut()
@@ -3153,8 +3183,8 @@ mod tests {
         for ordinal in 1..=super::super::efa_direct::DATA_WINDOW {
             sender.posted(ordinal).unwrap();
         }
-        // SAFETY: The fixture has no provider. This exact context is a pending
-        // TX slot and complete() validates it before changing ownership.
+        // This exact context identifies a pending TX slot; complete validates it
+        // before changing ownership.
         state.complete(state.memory.tx_context(0), || 0).unwrap();
         assert_eq!(state.send_fences(), (4, 1));
         assert_eq!(state.free_send_slot(), Some(0));

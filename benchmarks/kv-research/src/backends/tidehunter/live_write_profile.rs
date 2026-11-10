@@ -133,7 +133,7 @@ impl Window {
                 }),
             );
         }
-        let selected = deltas["completed_write_ops"].clone();
+        let selected = &deltas["completed_write_ops"];
         Ok(json!({
             "runtime_observation_mode": "live_nvmeof_phase_counters",
             "scope": "measurement_nvme_io_cumulative_delta",

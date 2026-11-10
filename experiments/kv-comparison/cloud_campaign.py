@@ -14,6 +14,7 @@ import uuid
 import sys
 
 import analyze
+from cloud_layout import OWNER_HOST_COUNTS
 import local
 import resource_accounting
 
@@ -53,7 +54,7 @@ def durability_tier(job):
 
 def active_owner_count(job):
     count = job.get("owner_count", 5)
-    if type(count) is not int or count not in (1, 5):
+    if type(count) is not int or count not in OWNER_HOST_COUNTS:
         raise ValueError("owner_count must be 1 or 5")
     if count == 1 and (job.get("case_kind") not in ONE_OWNER_CASE_KINDS
                        or job.get("backend") not in ("tidehunter_verbs_native", "tidehunter_tcp")
@@ -604,10 +605,10 @@ def make_read_tier_matrix(spec, backends, diagnostics):
 
 
 FOCUSED_SELECTIONS = ("recommended", "full", "device", "floors", "stages", "unified",
-                      "append_floors", "fair_native", "parity")
+                      "append_floors", "fair_native", "parity", "parity_compact", "fair_five_owner")
 FOCUSED_COUNTS = {"recommended": 279, "full": 333, "device": 120, "floors": 69,
                   "stages": 183, "ssd_write": 18, "unified": 270, "append_floors": 48,
-                  "fair_native": 168, "parity": 216}
+                  "fair_native": 168, "parity": 216, "parity_compact": 177, "fair_five_owner": 39}
 _FOCUSED_GROUP_COUNTS = {
     "recommended": {"G1": 81, "G2": 24, "G3": 6, "G4": 12, "G5": 150, "anchors": 6},
     "full": {"G1": 81, "G2": 24, "G3": 6, "G4": 12, "G5": 150,
@@ -621,14 +622,32 @@ _FOCUSED_GROUP_COUNTS = {
     "append_floors": {"G13W": 48},
     "fair_native": {"G14N": 54, "G14S": 36, "G14O1": 36, "G14O5": 36, "G14P": 6},
     "parity": {"G13W": 48, "G14N": 54, "G14S": 36, "G14O1": 36, "G14O5": 36, "G14P": 6},
+    "parity_compact": {"G13W": 48, "G14N": 54, "G14S": 36, "G14O1": 36, "G14P": 3},
+    "fair_five_owner": {"G14O5": 36, "G14P": 3},
 }
+
+
+def selection_owner_hosts(selection):
+    """Return the reviewed layout's owner host count."""
+    return 1 if selection == "parity_compact" else 5
+
+
+def job_owner_hosts(job):
+    """Return the owner hosts required by this job."""
+    # Native and these floors need at most owner 0 regardless of the fleet layout.
+    if job.get("backend") == "native" or job.get("case_kind") == "ssd_write_floor":
+        return 1
+    count = job.get("owner_count", 5)
+    if type(count) is not int or count not in OWNER_HOST_COUNTS:
+        raise ValueError("owner_count must be 1 or 5")
+    return count
 
 
 def focused_group_counts(selection):
     if selection not in FOCUSED_SELECTIONS:
         raise ValueError("unknown focused selection")
     groups = dict(_FOCUSED_GROUP_COUNTS[selection])
-    if selection in ("stages", "unified", "append_floors", "fair_native", "parity"):
+    if selection in ("stages", "unified", "append_floors", "fair_native", "parity", "parity_compact", "fair_five_owner"):
         jobs = make_focused_matrix(selection)
         for kind in {job["case_kind"] for job in jobs}:
             groups[kind] = sum(job["case_kind"] == kind for job in jobs)
@@ -1129,8 +1148,12 @@ def make_focused_matrix(selection):
         return jobs[write_end:append_end]
     if selection == "fair_native":
         return jobs[append_end:]
-    if selection == "parity":
-        return jobs[append_end:append_end + 1] + jobs[write_end:append_end] + jobs[append_end + 1:]
+    if selection in ("parity", "parity_compact", "fair_five_owner"):
+        parity = jobs[append_end:append_end + 1] + jobs[write_end:append_end] + jobs[append_end + 1:]
+        if selection == "parity":
+            return parity
+        wanted = 1 if selection == "parity_compact" else 5
+        return [job for job in parity if job_owner_hosts(job) == wanted]
     return jobs[floors_end:stages_end] + jobs[device_end:floors_end] + jobs[stages_end:write_end]
 
 

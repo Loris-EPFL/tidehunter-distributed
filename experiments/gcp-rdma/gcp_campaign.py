@@ -36,6 +36,15 @@ def parse_time(value):
     return result.astimezone(dt.timezone.utc)
 
 
+def _require_six_host_spec(spec):
+    if spec.get('owner_hosts', 5) != 5:
+        raise ValueError('CI workflow requires five owner hosts')
+    if spec.get('mode') == 'focused':
+        import workflow_input
+        if workflow_input.cloud_campaign.selection_owner_hosts(spec.get('selection')) != 5:
+            raise ValueError('CI workflow requires a five-owner selection')
+
+
 def validate_spec(spec):
     """Reject unsupported selections before any fleet allocation."""
     import workflow_input
@@ -48,6 +57,7 @@ def validate_spec(spec):
         raise ValueError('invalid GCP backend selection; EFA is unavailable')
     if spec.get('mode') not in {'standard', 'nvmeof-focused', 'standard-with-nvmeof', 'standard-with-live-nvmeof', 'focused'}:
         raise ValueError('invalid campaign mode')
+    _require_six_host_spec(spec)
     if spec['mode'] == 'focused':
         import manual_campaign
         manual_campaign._reviewed_jobs(spec)
@@ -518,6 +528,7 @@ def upload_file(store, path, digest, key):
 
 
 def launch(api, config, budget, state, state_path, receipt, spec, output):
+    _require_six_host_spec(spec)
     if (spec.get('mode') == 'standard-with-live-nvmeof'
             and set(spec.get('backends', ())) & {'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma'}):
         raise ValueError('direct launcher has no two-host live qualification; physical route/counter evidence must be established before fleet allocation')

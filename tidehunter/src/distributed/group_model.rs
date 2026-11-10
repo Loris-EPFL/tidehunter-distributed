@@ -1,8 +1,7 @@
-//! Independent bounded model for M2's complete persistence groups.
+//! Independent bounded model of complete persistence groups.
 //!
-//! This is a design model, deliberately independent of `CompleteGroup`, CRC,
-//! filesystem calls and production locks. Run before relaxing the storage rule:
-//! `rustc --edition 2024 --test .../group_model.rs -o /tmp/group-model`.
+//! This model is independent of `CompleteGroup`, CRC, filesystem calls and locks.
+//! It permits a second group only after a persistence barrier.
 //! Tidehunter §§3.1/3.3 and native `wal_replay.rs` require complete atomic batches
 //! and recoverable prefixes. Raft Engine's `WriteBarrier` motivates amortizing a
 //! barrier across callers, not its distinct on-disk recovery protocol:

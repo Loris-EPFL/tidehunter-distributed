@@ -224,6 +224,31 @@ def context():
     return result, [paper, protocol]
 
 
+def fair_native_plan():
+    """Read-only matrix generation; this does not launch or run any case."""
+    import sys
+    sys.path.insert(0, str(ROOT / 'tidehunter-sharded-wal/experiments/kv-comparison'))
+    import cloud_campaign
+    fair = cloud_campaign.make_focused_matrix('fair_native')
+    parity = cloud_campaign.make_focused_matrix('parity')
+    source = 'tidehunter-sharded-wal/experiments/kv-comparison/cloud_campaign.py'
+    records = []
+    selections = [(group, [job for job in fair if job['group'] == group])
+                  for group in ('G14N', 'G14S', 'G14O1', 'G14O5', 'G14P')]
+    selections += [('fair_native', fair), ('parity', parity),
+                   ('G13W', [job for job in parity if job['group'] == 'G13W'])]
+    selections += [('frozen_' + selection, cloud_campaign.make_focused_matrix(selection))
+                   for selection in ('recommended', 'full', 'device', 'floors', 'stages', 'unified')]
+    for label, jobs in selections:
+        writers = sorted({job['concurrency'] for job in jobs})
+        records.append(dict(label=label, cases=len(jobs),
+                            writer0=writers[0], writer1=writers[1] if len(writers) > 1 else '',
+                            writer2=writers[2] if len(writers) > 2 else '',
+                            matrix_sha256=hashlib.sha256(json.dumps(jobs, sort_keys=True).encode()).hexdigest(),
+                            source=source, method='cloud_campaign.make_focused_matrix; read-only generation'))
+    return records, [ROOT / source, ROOT / 'tidehunter-sharded-wal/docs/distributed/FOCUSED_CAMPAIGN_2026-11-07.md']
+
+
 def main():
     manifest = json.loads((HERE / 'inputs.json').read_text())
     size_rows, size_summary, sources = trace_sizes()
@@ -232,8 +257,10 @@ def main():
         'benchmarks/kv-research/src/backends/native.rs', 'tidehunter/src/db.rs', 'tidehunter/src/crc.rs')]
     spike_rows, spike_summary, spike_sources = spike_samples()
     context_rows, context_sources = context()
+    plan_rows, plan_sources = fair_native_plan()
     outputs = {'sui-value-sizes.csv': size_rows, 'size-summary.csv': size_summary,
-               'spike-cases.csv': spike_rows, 'spike-summary.csv': spike_summary, 'size-context.csv': context_rows}
+               'spike-cases.csv': spike_rows, 'spike-summary.csv': spike_summary, 'size-context.csv': context_rows,
+               'fair-native-plan.csv': plan_rows}
     for name, records in outputs.items():
         path = HERE / name
         with path.open('w', newline='') as stream:
@@ -241,7 +268,17 @@ def main():
             writer.writeheader()
             writer.writerows(records)
         manifest['outputs'][name] = sha(path)
-    for source in set(sources + spike_sources + context_sources):
+    local_csv = HERE / 'local-structure-test.csv'
+    manifest['outputs'][local_csv.name] = sha(local_csv)
+    local_records = list(rows(local_csv))
+    report_paths = {Path(row['report_path']) for row in local_records}
+    sources += [local_csv] + [path for path in report_paths if path.exists()]
+    manifest['local_structure_transcription'] = {
+        'source': 'local://report-spike.md, Subsequent IEEE CRC and missing controls',
+        'selection': 'IEEE CRC32 only; seven requested variants; each run retained separately',
+        'evidence': 'transcribed from the audit report; raw samples not retained',
+        'rows': len(local_records)}
+    for source in set(sources + spike_sources + context_sources + plan_sources):
         manifest['sources'][str(source)] = sha(source)
     manifest['size_spike_rules'] = {'trace': 'one corrected remote capture; successful put members; found payload reads including scan rows; no exists or missing sizes; scalar batches deduplicated',
                                   'quantiles': 'nearest rank, no trimming; successful measurement put samples; quarters by dispatch order',

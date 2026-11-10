@@ -8,6 +8,7 @@ from collections import Counter
 from pathlib import Path
 
 import cloud_campaign as campaign
+import cloud_layout
 
 
 class FocusedMatrixTests(unittest.TestCase):
@@ -222,6 +223,53 @@ class FocusedMatrixTests(unittest.TestCase):
             altered['measurement_operations'] += 1
             with self.assertRaises(ValueError):
                 campaign.validate_focused_job(altered)
+
+    def test_compact_selections_partition_parity(self):
+        parity = campaign.make_focused_matrix('parity')
+        compact = campaign.make_focused_matrix('parity_compact')
+        five = campaign.make_focused_matrix('fair_five_owner')
+        self.assertEqual((len(compact), len(five)), (177, 39))
+        compact_ids = [job['case_id'] for job in compact]
+        five_ids = [job['case_id'] for job in five]
+        self.assertEqual(len(set(compact_ids + five_ids)), len(parity))
+        self.assertEqual(set(compact_ids + five_ids), {job['case_id'] for job in parity})
+        self.assertEqual(compact_ids, [j['case_id'] for j in parity
+                                      if j['group'] in ('G13W', 'G14N', 'G14S', 'G14O1')
+                                      or (j['group'] == 'G14P'
+                                          and (j['backend'] == 'native' or j.get('owner_count') == 1))])
+        self.assertEqual(five_ids, [j['case_id'] for j in parity if j['case_id'] not in set(compact_ids)])
+        self.assertEqual(compact[0], parity[0])
+        self.assertEqual(five[0]['group'], 'G14O5')
+        self.assertEqual((campaign.selection_owner_hosts('parity_compact'),
+                          campaign.selection_owner_hosts('fair_five_owner')), (1, 5))
+        for job in compact:
+            self.assertEqual(campaign.job_owner_hosts(job), 1)
+        for job in five:
+            self.assertEqual(campaign.job_owner_hosts(job), 5)
+        for selection, digest in (
+            ('parity_compact', '4978687ab42ca839e2c864978fb1489854ae201d28f06facf89a283cdea8e0aa'),
+            ('fair_five_owner', '479601db27b3a709e83944dcdfa9b77e7f8e4bacac9637a29e04327e09151946'),
+            ('unified', 'a73d7a070f8416f555aab6434e1c6893b4deca756e77036d0509001b23bc3506'),
+            ('append_floors', '646f9ff50949c4ecab44a4d77d2ad38e5b2700311cb5c1ce69e742ed521f4e40'),
+            ('fair_native', '7a8e64eeb181b0f5040f3b02105d76def85823e87f591fea448d34bcb6a7f2d9'),
+            ('parity', 'ee942bda8565ff1295814a61fb00040f6feedce9cd73304dea29dec095169ec6')):
+            encoded = json.dumps(campaign.make_focused_matrix(selection),
+                                 sort_keys=True, separators=(',', ':')).encode()
+            self.assertEqual(hashlib.sha256(encoded).hexdigest(), digest)
+
+    def test_owner_host_requirements(self):
+        self.assertIs(campaign.OWNER_HOST_COUNTS, cloud_layout.OWNER_HOST_COUNTS)
+        floors = campaign.make_focused_matrix('append_floors')
+        self.assertEqual({job['ssd_write']['mode'] for job in floors},
+                         {'fdatasync', 'append_pwrite', 'append_mmap', 'append_mmap_fsync'})
+        self.assertTrue(all(campaign.job_owner_hosts(job) == 1 for job in floors))
+        self.assertEqual(campaign.job_owner_hosts({'backend': 'native'}), 1)
+        self.assertEqual(campaign.job_owner_hosts({'backend': 'tidehunter_tcp', 'owner_count': 1}), 1)
+        self.assertEqual(campaign.job_owner_hosts({'backend': 'tidehunter_tcp'}), 5)
+        self.assertEqual(campaign.job_owner_hosts({'backend': 'tidehunter_tcp', 'owner_count': 5}), 5)
+        for invalid in (True, 0, 2, '1', None):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                campaign.job_owner_hosts({'backend': 'tidehunter_tcp', 'owner_count': invalid})
 
     def test_fair_topology_identity_and_native_options(self):
         jobs = campaign.make_focused_matrix('fair_native')

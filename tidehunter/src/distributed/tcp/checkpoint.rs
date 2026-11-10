@@ -8,7 +8,7 @@ fn metadata_hasher() -> blake2b_simd::State {
     blake2b_simd::Params::new().hash_length(32).to_state()
 }
 
-fn finish_metadata_hash(digest: blake2b_simd::State) -> [u8; 32] {
+fn finish_metadata_hash(digest: &blake2b_simd::State) -> [u8; 32] {
     let hash = digest.finalize();
     let mut bytes = [0; 32];
     bytes.copy_from_slice(hash.as_bytes());
@@ -67,7 +67,7 @@ pub(crate) fn prefix_digest(
     digest.finish()
 }
 
-/// Incrementally extensible exact-prefix evidence (transport protocol 8).
+/// Incrementally extensible exact-prefix evidence.
 /// Rooted page states permit O(1) old-prefix proofs without scanning or keeping
 /// completed receipt history resident. The final digest also binds the count.
 pub(crate) struct PrefixDigest {
@@ -83,7 +83,7 @@ impl PrefixDigest {
         digest.update(&partition.to_be_bytes());
         digest.update(&epoch.to_be_bytes());
         Self {
-            state: finish_metadata_hash(digest),
+            state: finish_metadata_hash(&digest),
             count,
         }
     }
@@ -101,7 +101,7 @@ impl PrefixDigest {
         digest.update(&receipt.address.segment_generation.to_be_bytes());
         digest.update(&receipt.address.offset.to_be_bytes());
         digest.update(&receipt.address.len.to_be_bytes());
-        self.state = finish_metadata_hash(digest);
+        self.state = finish_metadata_hash(&digest);
         // Receipt owners check count admission/exhaustion before appending.
         self.count += 1;
     }
@@ -119,7 +119,7 @@ impl PrefixDigest {
         digest.update(b"tidehunter-checkpoint-prefix-v2");
         digest.update(&(self.count as u64).to_be_bytes());
         digest.update(&self.state);
-        finish_metadata_hash(digest)
+        finish_metadata_hash(&digest)
     }
 }
 

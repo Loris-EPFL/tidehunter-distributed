@@ -157,8 +157,8 @@ struct LockProfile {
     hold_ns: AtomicU64,
 }
 impl LockProfile {
-    /// Runs `work` under `mutex`. A parking_lot guard is never returned, so no
-    /// lock outlives this call and none is held across a syscall.
+    /// Runs `work` under `mutex` without returning the guard.
+    /// Callers must not do I/O inside `work`.
     fn run<T, R>(&self, mutex: &Mutex<T>, work: impl FnOnce(&mut T) -> R) -> R {
         let (mut guard, waited) = if let Some(guard) = mutex.try_lock() {
             (guard, 0)
@@ -748,7 +748,9 @@ struct ReadBuffer {
 impl AsRef<[u8]> for ReadBuffer {
     fn as_ref(&self) -> &[u8] {
         let buffer = self.buffer.as_ref().expect("owned read buffer");
-        // SAFETY: constructed only after a fully initialized NOWAIT read or CQE.
+        // SAFETY: an exact NOWAIT read or a CQE for the full remaining suffix
+        // initialized every byte. This owner retains the allocation, and no
+        // kernel read or pool reuse can write to it while this borrow exists.
         unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast(), buffer.len()) }
     }
 }
@@ -847,10 +849,10 @@ fn resident_preadv2(
         iov_base: buffer.as_mut_ptr().cast(),
         iov_len: buffer.len(),
     };
-    // SAFETY: the iovec points to this exclusively borrowed owned allocation
-    // for the duration of preadv2; the kernel initializes at most iov_len
-    // bytes. No bytes are read or exposed unless the exact requested length
-    // was returned. The plan pins the file and its immutable authorized range.
+    // SAFETY: the iovec points to this exclusively borrowed allocation for the
+    // duration of preadv2; the kernel initializes at most iov_len bytes. The plan
+    // pins the file and its authorized range. A short result stays private until
+    // an async read initializes the remaining suffix.
     *attempted = true;
     let result = unsafe {
         libc::preadv2(
@@ -1071,7 +1073,7 @@ impl ReadExecutor {
         if lease.is_none() {
             *lease = self.admission.reserve_reply(charge)?;
         }
-        let Some(reservation) = lease.as_ref() else {
+        let Some(reservation) = lease.as_mut() else {
             return Ok(SubmitOutcome::Full(plans));
         };
         if !Arc::ptr_eq(&reservation.admission, &self.admission) || reservation.charge < charge {
@@ -1079,7 +1081,7 @@ impl ReadExecutor {
                 "read plan exceeds its reply reservation",
             ));
         }
-        let prepared = lease.as_mut().unwrap().prepared.take();
+        let prepared = reservation.prepared.take();
         let resuming_prepared = prepared.is_some();
         let mut retained_signature = None;
         let (
@@ -1100,7 +1102,7 @@ impl ReadExecutor {
                         *saved != (*reference, plan.member.offset, plan.member.len, plan.device)
                     })
             {
-                lease.as_mut().unwrap().prepared = Some(prepared);
+                reservation.prepared = Some(prepared);
                 return Err(StorageError::Invalid(
                     "retried read does not match prepared resident progress",
                 ));
@@ -1246,7 +1248,7 @@ impl ReadExecutor {
             let counters = &self.pool.counters;
             bump(&counters.resident_read_attempts, resident_attempts as u64);
             bump(&counters.resident_read_successes, resident_successes as u64);
-            lease.as_mut().unwrap().prepared = Some(PreparedRead {
+            reservation.prepared = Some(PreparedRead {
                 signature: retained_signature.unwrap_or_else(|| read_plan_signature(&plans)),
                 records,
                 resident_buffers,
@@ -1320,7 +1322,7 @@ impl ReadExecutor {
             full = !self.admission.reserve_device_reads(&devices, io_count);
         }
         if full {
-            lease.as_mut().unwrap().prepared = Some(PreparedRead {
+            reservation.prepared = Some(PreparedRead {
                 signature: retained_signature.unwrap_or_else(|| read_plan_signature(&plans)),
                 records,
                 resident_buffers,
@@ -1405,9 +1407,10 @@ impl ReadExecutor {
         }
         #[cfg(target_os = "linux")]
         {
-            // SAFETY: heap buffer addresses do not move; Operation retains the
-            // exact file plus PartitionLog. No buffer is read or freed until
-            // its CQE; all error/drop paths drain before releasing owners.
+            // SAFETY: Operation owns stable heap buffers and pins each file and
+            // PartitionLog until its CQE. No buffer is read or reused before
+            // completion. Shutdown drains the ring or Drop aborts before live
+            // kernel pointers can be freed.
             if unsafe { self.ring.submission().push_multiple(&self.entries) }.is_err() {
                 self.operations.retain(|_, op| op.request_id != request_id);
                 let request = self.requests.remove(&request_id).unwrap();

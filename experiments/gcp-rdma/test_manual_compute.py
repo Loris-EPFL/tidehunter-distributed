@@ -275,6 +275,25 @@ class ManualComputeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.state['instances'][0]['disk_deleted'])
         self.assertTrue(self.state['policy']['deleted'])
 
+    async def test_compact_owned_creation_and_cleanup_boundaries(self):
+        self.state['host_count'] = 2
+        self.compute = Compute(self.config, self.state, self.path, self.api)
+        await self.make_vm()
+        await self.compute.create_vm(1, self.config['image'], self.state['deadline'], 'startup')
+        with self.assertRaises(ValueError):
+            await self.compute.create_vm(2, self.config['image'], self.state['deadline'], 'startup')
+        foreign = {'name': self.state['run_id'] + '-2', 'zone': 'us-central1-a'}
+        with self.assertRaises(ComputeError):
+            await self.compute._cleanup_instance(foreign)
+        with self.assertRaises(ComputeError):
+            await self.compute._cleanup_disk(foreign)
+        await self.compute.cleanup()
+        names = {self.state['run_id'] + '-0', self.state['run_id'] + '-1'}
+        self.assertEqual({name for kind, action, name in self.api.mutations
+                          if kind == 'instance' and action == 'create'}, names)
+        self.assertEqual({name for kind, action, name in self.api.mutations
+                          if kind == 'instance' and action == 'delete'}, names)
+
     async def test_cleanup_deletes_already_powered_off_guest(self):
         await self.make_vm()
         rec = self.state['instances'][0]

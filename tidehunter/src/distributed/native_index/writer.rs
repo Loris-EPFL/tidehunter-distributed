@@ -390,7 +390,7 @@ impl IndexWriter<'_> {
             .generation
             .checked_add(1)
             .ok_or(NativeIndexError::Capacity)?;
-        let lease = index.capture_lease(cut.clone(), floor, state.latest)?;
+        let lease = index.capture_lease(&cut, floor, state.latest)?;
         state.generation = generation;
         state.capture = Some(ImageCapture {
             cursor: 0,

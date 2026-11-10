@@ -382,6 +382,46 @@ def size_spike_tables():
     table('tab-spike.tex', ['Mode', 'Source/profile', r'r0 p50 \us', r'r1 p50 \us', r'r2 p50 \us'], body)
 
 
+def local_fair_tables():
+    local = focused.table('local-structure-test')
+    names = {'Fresh': 'Fresh mapping', 'MAP_POPULATE': r'\texttt{MAP\_POPULATE}',
+             'Write-prefault': 'Write-prefault', 'pwrite': r'\texttt{pwrite}',
+             'Anonymous': 'Anonymous memory', 'Data sync': 'Data sync per put',
+             'Grouped data sync': 'Grouped data-sync model'}
+    body = []
+    for variant, title in names.items():
+        for size in ('8', '64'):
+            for concurrency in ('1', '16'):
+                records = [r for r in local if (r['variant'], r['kib'], r['concurrency']) == (variant, size, concurrency)]
+                first = focused.unique([r for r in records if r['run'] == '1'], (variant, size, concurrency))
+                prefix = f'B:local-structure-test:{first["label"]}:'
+                cells = [title, number(prefix + 'kib|.0f'), number(prefix + 'concurrency|.0f')]
+                for field, fmt in [('p50_us', ',.2f'), ('p99_us', ',.2f'), ('puts_s', ',.0f')]:
+                    values = [number(f'B:local-structure-test:{r["label"]}:{field}|{fmt}')
+                              for r in sorted(records, key=lambda r: int(r['run']))]
+                    cells.append('; '.join(values) + ('; --' if len(values) == 1 else ''))
+                body.append(cells)
+    out = [r'\footnotesize\setlength{\tabcolsep}{3pt}', r'\begin{tabular}{lrrrrr}\toprule',
+           r'Variant & KiB & $c$ & p50 \us & p99 \us & puts/s\\\midrule']
+    write('tab-local-structure.tex', out + [' & '.join(row) + r'\\' for row in body] + [r'\bottomrule\end{tabular}'])
+    arms = [
+        ('G14N', 'One Native Db', 'Db/owner instances and hosts differ; one SSD versus the multi-owner arm; no network; Native sync calls; key routing.'),
+        ('G14S', 'Five Native Db, one process/SSD', 'Db instances share one SSD; no network; Native sync calls; key routing versus owner operation-ID routing.'),
+        ('G14O1', 'One active owner', 'Remote owner instance/host and network remain; owner covering sync and operation-ID routing differ from Native.'),
+        ('G14O5', 'Five active owners', 'Separate owner instances and five SSDs versus one Native SSD; network, covering sync and operation-ID routing remain.'),
+        ('G14P', 'Separate Native/owner profiles', 'Each source arm retains its instance, SSD, network, sync and routing differences; diagnostics are not unprofiled controls.')]
+    rows = []
+    for group, arm, unmatched in arms:
+        record = focused.unique([r for r in focused.table('fair-native-plan') if r['label'] == group], group)
+        writers = ', '.join(number(f'B:fair-native-plan:{group}:{field}|.0f')
+                            for field in ('writer0', 'writer1', 'writer2') if record[field] != '')
+        rows.append([group, number(f'B:fair-native-plan:{group}:cases|.0f'), arm + '; writers ' + writers, unmatched])
+    out = [r'\small\setlength{\tabcolsep}{3pt}',
+           r'\begin{tabular}{L{.08\linewidth}L{.07\linewidth}L{.28\linewidth}L{.47\linewidth}}\toprule',
+           r'Group & Cases & Arm / total writers & What stays unmatched\\\midrule']
+    write('tab-fair-native.tex', out + [' & '.join(row) + r'\\' for row in rows] + [r'\bottomrule\end{tabular}'])
+
+
 def write_numbers():
     keys = set()
     pattern = re.compile(r'\\(%s)\{([^{}]+)\}\{([^{}]+)\}\{([^{}]+)\}' % '|'.join(MACROS))
@@ -420,6 +460,7 @@ if __name__ == '__main__':
     run7_tables()
     per_node_table()
     size_spike_tables()
+    local_fair_tables()
     appendix()
     write_macros()
     print('Resolved number keys:', write_numbers())

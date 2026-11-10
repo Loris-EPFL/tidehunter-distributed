@@ -46,10 +46,10 @@ fn controller_name(name: &str) -> bool {
         .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
 }
 fn verify_transport(sysfs: &Path, nqn: &str, transport: NvmeofTransport) -> io::Result<()> {
-    let parent = std::fs::canonicalize(sysfs)?
+    let resolved = std::fs::canonicalize(sysfs)?;
+    let parent = resolved
         .parent()
-        .ok_or_else(|| invalid("namespace has no sysfs parent"))?
-        .to_owned();
+        .ok_or_else(|| invalid("namespace has no sysfs parent"))?;
     let name = parent
         .file_name()
         .and_then(|n| n.to_str())
@@ -71,7 +71,7 @@ fn verify_transport(sysfs: &Path, nqn: &str, transport: NvmeofTransport) -> io::
         if std::fs::canonicalize(Path::new("/sys/class/nvme").join(name))? != parent {
             return Err(invalid("unregistered controller"));
         }
-        return verify(&parent);
+        return verify(parent);
     }
     if !name.starts_with("nvme-subsys")
         || std::fs::canonicalize(Path::new("/sys/class/nvme-subsystem").join(name))? != parent
@@ -80,7 +80,7 @@ fn verify_transport(sysfs: &Path, nqn: &str, transport: NvmeofTransport) -> io::
         return Err(invalid("subsystem identity mismatch"));
     }
     let mut count = 0;
-    for entry in std::fs::read_dir(&parent)? {
+    for entry in std::fs::read_dir(parent)? {
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
@@ -217,7 +217,7 @@ impl LiveNamespace {
         let mut readonly: libc::c_int = 0;
         let mut block_size: libc::c_int = 0;
         let mut bytes: u64 = 0;
-        // SAFETY: Linux block ioctls write the indicated output types to live pointers.
+        // SAFETY: BLKROGET writes an int to readonly; fd and the output stay live.
         if unsafe { libc::ioctl(fd, 0x125e, &mut readonly) } < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -249,7 +249,8 @@ impl LiveNamespace {
                 data_len: 4096,
                 ..Default::default()
             };
-            // SAFETY: passthrough reads the command and writes only the live identify buffer before returning.
+            // SAFETY: cmd has the Linux NVMe passthrough layout. Its data_len
+            // matches the live 4096-byte identify buffer; ioctl is synchronous.
             let result = unsafe { libc::ioctl(fd, 0xc0484e41, &mut cmd) };
             if result < 0 {
                 return Err(io::Error::last_os_error());

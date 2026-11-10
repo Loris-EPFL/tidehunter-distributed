@@ -266,7 +266,7 @@ impl RunConfig {
         }
         match self.backend.options.get("durability_tier") {
             None => Ok(Some(DurabilityTier::default())),
-            Some(value) => Ok(Some(serde_json::from_value(value.clone())?)),
+            Some(value) => Ok(Some(DurabilityTier::deserialize(value)?)),
         }
     }
 

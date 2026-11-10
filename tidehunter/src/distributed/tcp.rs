@@ -1049,8 +1049,8 @@ impl StorageNode {
             })
             .map_err(TcpError::component)?;
         tls.transport.validate()?;
-        let transport = tls.transport.clone();
         let server = tls.server_config()?;
+        let transport = tls.transport;
         listener.set_nonblocking(true)?;
         struct ConnectionPermit(Arc<AtomicUsize>);
         impl Drop for ConnectionPermit {
@@ -1289,11 +1289,6 @@ impl StorageNode {
                 log.validate_durable_record_reference(reference)
                     .map_err(TcpError::component)?;
             }
-            let logs = snapshot
-                .members
-                .into_iter()
-                .map(|(log, _)| log)
-                .collect::<Vec<_>>();
             if let Some(began) = began {
                 profile.authority_lookup_ns = elapsed_ns(began);
             }
@@ -1315,8 +1310,9 @@ impl StorageNode {
             // Explicit mapped/positional diagnostic controls only. Session count
             // and byte credits bound queued work; indexed collection preserves order.
             let records = self.read_pool.install(|| {
-                logs.par_iter()
-                    .zip(references.par_iter())
+                snapshot
+                    .members
+                    .par_iter()
                     .map(|(log, reference)| {
                         #[cfg(test)]
                         {

@@ -611,7 +611,7 @@ fn retry(
 fn native_pruning_deletes(
     db: &Arc<Db>,
     ks: KeySpace,
-    keys: &[Vec<u8>],
+    keys: &[&[u8]],
     report: &mut Report,
 ) -> Result<()> {
     for keys in keys.chunks(16) {
@@ -773,7 +773,7 @@ fn exercise(launch: &Launch, report: &mut Report) -> Result<()> {
         "payload disappeared before pruning root commit",
     )?;
     db.start_relocation().map_err(adapter_error)?;
-    native_pruning_deletes(&native, ks, &[key(BEFORE_STOP_KEY)], report)?;
+    native_pruning_deletes(&native, ks, &[&key(BEFORE_STOP_KEY)], report)?;
     report.operations.pruning_passes += 1;
     expected.remove(&key(BEFORE_STOP_KEY));
     require(
@@ -802,7 +802,7 @@ fn exercise(launch: &Launch, report: &mut Report) -> Result<()> {
     let removed: Vec<_> = expected
         .iter()
         .filter(|(_, value)| value[0] != 1)
-        .map(|(key, _)| key.clone())
+        .map(|(key, _)| key.as_slice())
         .collect();
     native_pruning_deletes(&native, ks, &removed, report)?;
     report.operations.pruning_passes += 1;

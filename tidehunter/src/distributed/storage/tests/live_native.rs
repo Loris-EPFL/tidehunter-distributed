@@ -191,7 +191,7 @@ fn write_unfinished(
 ) -> AppendedBatch {
     let group = CompleteGroup::new_live(
         &shape(),
-        vec![item.clone()],
+        vec![item],
         config.batch_limits,
         config.group_limits,
     )
@@ -209,13 +209,14 @@ fn write_unfinished(
         .unwrap()
         .write_all_at(&frame, reservation.frame_offset % reservation.segment.bytes)
         .unwrap();
+    let item = &group.batches()[0];
     receipt_for(
         config,
-        &item,
+        item,
         member_position(
             WalPosition::new(reservation.frame_offset, reservation.frame_len),
             group.batch_offsets()[0],
-            &item,
+            item,
         ),
     )
 }

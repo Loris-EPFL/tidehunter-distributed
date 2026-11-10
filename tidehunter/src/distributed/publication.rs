@@ -225,8 +225,8 @@ impl PublicationTracker {
         entry.durable = Some(durable);
         entry.state = PublicationState::Durable;
         self.durable_unpublished += 1;
-        // Prefixes cannot exceed the configured usize capacity: every advance
-        // consumes an admitted dense slot. External sequences are never cast.
+        // Retained prefix offsets fit the configured usize capacity: every
+        // advance consumes an admitted dense slot. External sequences are never cast.
         while self
             .entries
             .get((self.durable_prefix - self.retained_start) as usize)

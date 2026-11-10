@@ -111,6 +111,10 @@ def admit_terminal_write_timeline(directory, job, config, manifest, receipt):
         receipt["write_timeline"] = timeline
 
 
+def admitted_host_count(count):
+    return count - 1 in cloud_layout.OWNER_HOST_COUNTS
+
+
 def controller_matrix(spec):
     if spec.get("mode") == "focused":
         return cloud_campaign.make_focused_matrix(spec["selection"])
@@ -167,7 +171,7 @@ def record_phase_span(spans, operation, action, *args, **kwargs):
 
 def block_trace_evidence(case_id, scope, traces, owner_count=5):
     """Report only observed loss and leave file roles unclaimed without proof."""
-    rows = traces[1:1 + owner_count] if isinstance(traces, list) and len(traces) == 6 else []
+    rows = traces[1:1 + owner_count] if isinstance(traces, list) and admitted_host_count(len(traces)) else []
     captured = len(rows) == owner_count and all(isinstance(row, dict) and row.get("available") is True for row in rows)
     losses = [row.get("lost") for row in rows] if captured else []
     loss_known = len(losses) == owner_count and all(type(value) is int and value >= 0 for value in losses)
@@ -749,7 +753,7 @@ def validate_read_tier_memory(jobs, fleet):
 def tracer_terminal(result):
     """Only a completed exact-owned collector result proves teardown finished."""
     rows = ([row for row in result[1:] if not (isinstance(row, dict) and row.get("inactive") is True)]
-            if isinstance(result, list) and len(result) == 6 else [result])
+            if isinstance(result, list) and admitted_host_count(len(result)) else [result])
     return bool(rows) and all(isinstance(row, dict) and isinstance(row.get("state_dir"), str)
         and not row.get("cleanup_error") and row.get("reason") != "collector stop timed out"
         for row in rows)
@@ -776,7 +780,7 @@ def cleanup_unfinished_tracer(attempted, terminal, stop, receipt):
 def terminal_device_evidence(job, receipt):
     """Keep node-local evidence separate and never invent missing host results."""
     evidence = receipt.get("cold_device_evidence")
-    if isinstance(evidence, list) and len(evidence) == 6:
+    if isinstance(evidence, list) and admitted_host_count(len(evidence)):
         rows = [(index, value) for index, value in enumerate(evidence[1:1 + job.get("owner_count", 5)])]
     elif job.get("backend") == "native" and isinstance(evidence, dict):
         rows = [(-1, evidence)]
@@ -1236,7 +1240,7 @@ def monitoring_spec(config, results_root):
         "results_root": str(results_root), "deadline_utc": config["deadline_utc"],
         "hosts": [{"index": index, "address": host["address"],
                    "role": "coordinator" if index == -1 else "storage-" + str(index)}
-                  for index, host in zip(range(-1, 5), [fleet["coordinator"], *fleet["nodes"]])],
+                  for index, host in enumerate([fleet["coordinator"], *fleet["nodes"]], start=-1)],
         "ports": {"prometheus": 19090, "grafana": 13000, "benchmark": 19899,
                   "node": 19100, "host": 19898}, "allow_loopback_hosts": False}
 
@@ -1321,7 +1325,7 @@ def owned_monitor_processes(config, index, job, owner_case=None):
     processes, missing, identities = [], [], []
     role = "client" if index == -1 else "storage-" + str(index)
     if index == -1 or (job["backend"] in cloud_campaign.TRANSPORTS
-                       and index < job.get("owner_count", 5)):
+                       and index < job.get("owner_count", len(config["fleet"]["nodes"]))):
         name = unit_name(config, owner_case if index >= 0 and owner_case is not None else job["case_id"], role) + ".service"
         processes.append({"role": role, "cgroup": "/system.slice/" + name})
     if job["backend"] in cloud_layout.BACKENDS:
@@ -1467,8 +1471,8 @@ def snapshot(config, name=None, *, drop=False, completed=False):
 
 def host_cpu_interval(before, after):
     """Host-wide CPU, including kernel workers, not a cgroup or target attribution."""
-    if len(before) != 6 or len(after) != 6:
-        raise ValueError("six host CPU snapshots required")
+    if not admitted_host_count(len(before)) or len(after) != len(before):
+        raise ValueError("matching two or six host CPU snapshots required")
     rows = []
     for index, (start, end) in enumerate(zip(before, after), start=-1):
         row = {"host_index": index, "available": False}
@@ -1684,8 +1688,8 @@ def initiator_failure_frame(config, case, since, until, active):
     receipts.extend(additional)
     if not receipts:
         frame["controllers_unavailable"] = "no sealed-session host receipts; live or incomplete connection"
-    frame["controller_limit"] = 5
-    frame["controllers_omitted"] = max(0, len(receipts) - 5)
+    frame["controller_limit"] = len(config["fleet"]["nodes"])
+    frame["controllers_omitted"] = max(0, len(receipts) - frame["controller_limit"])
 
     def capture(row):
         index, receipt = row
@@ -1717,7 +1721,7 @@ def initiator_failure_frame(config, case, since, until, active):
         return result
 
     with ThreadPoolExecutor(max_workers=5) as pool:
-        frame["controllers"].extend(pool.map(capture, receipts[:5]))
+        frame["controllers"].extend(pool.map(capture, receipts[:frame["controller_limit"]]))
     return frame
 
 
@@ -1905,7 +1909,7 @@ def floor_client_attempts(argv, deadline, *, perftest):
 
 def guest_operation(config, request, clients, *, local_mode=None):
     index = request["index"]
-    if type(index) is not int or index not in range(-1, 5):
+    if type(index) is not int or index not in range(-1, len(config["fleet"]["nodes"])):
         raise SafetyError("exact guest index required")
     identity = (verify_local_identity(config, index) if local_mode is None
                 else local_mode.identity(index))
@@ -2279,7 +2283,7 @@ def guest_operation(config, request, clients, *, local_mode=None):
     if action == "snapshot":
         observed = snapshot(config, request.get("unit"), drop=request.get("drop", False))
         resource_job = request.get("resource_job")
-        if (isinstance(resource_job, dict) and resource_job.get("owner_count", 5) == 1
+        if (isinstance(resource_job, dict) and resource_job.get("owner_count", len(config["fleet"]["nodes"])) == 1
                 and resource_job.get("backend") in cloud_campaign.TRANSPORTS and index >= 1):
             name = unit_name(config, resource_job["case_id"], "storage-" + str(index))
             status = unit_status(name)
@@ -2288,7 +2292,7 @@ def guest_operation(config, request, clients, *, local_mode=None):
                 raise SafetyError("inactive owner host has a running case owner")
             observed["owner_activity"] = {"active": False, "unit": status}
         if (index >= 0 and isinstance(resource_job, dict) and resource_job.get("case_kind") == "media_read"
-                and index < resource_job.get("owner_count", 5)):
+                and index < resource_job.get("owner_count", len(config["fleet"]["nodes"]))):
             try:
                 owner_case = request.get("resource_owner_case", resource_job["case_id"])
                 owner_root = guarded(root / "cells" / owner_case / ("node-" + str(index)), root, must_exist=True)
@@ -2787,7 +2791,7 @@ class Controller:
             raise SnapshotTimeout("SSM read-only snapshot deadline exceeded")
         raise InfrastructureError("SSM exact operation deadline exceeded; state may still be live")
 
-    def all_hosts(self, request, *, case="startup", timeout=180, export=False, owner_count=5):
+    def all_hosts(self, request, *, case="startup", timeout=180, export=False, owner_count=None):
         # A retry gets a fresh operation key only for a genuinely read-only
         # snapshot. The measurement gate remains closed until all hosts return.
         cancelled = threading.Event()
@@ -2807,7 +2811,9 @@ class Controller:
                 return self.request(index, request, case=case, timeout=remaining, export=export)
 
         pool = ThreadPoolExecutor(max_workers=6)
-        indices = range(-1, owner_count) if owner_count != 5 else range(-1, 5)
+        host_count = len(self.config["fleet"]["nodes"])
+        active_count = host_count if owner_count is None else owner_count
+        indices = range(-1, active_count)
         futures = [pool.submit(capture, index) for index in indices]
         try:
             done, _ = wait(futures, return_when=FIRST_EXCEPTION)
@@ -2818,7 +2824,7 @@ class Controller:
                         pending.cancel()
                     raise future.exception()
             return [future.result() for future in futures] + [
-                {"inactive": True} for _ in range(owner_count, 5)]
+                {"inactive": True} for _ in range(active_count, host_count)]
         finally:
             # A read-only snapshot may still be finishing on another host, but
             # it cannot release the case gate or mutate the measured state.
@@ -2895,7 +2901,7 @@ class Controller:
             return self.observe(f"{action}:{index}", lambda: self.request(index,
                 {"action": action}, timeout=timeout, export=export))
         with ThreadPoolExecutor(max_workers=6) as pool:
-            return list(pool.map(host, range(-1, 5)))
+            return list(pool.map(host, range(-1, len(self.config["fleet"]["nodes"]))))
 
     def monitor_spec(self):
         if self.local_mode is not None:
@@ -3030,13 +3036,13 @@ class Controller:
     def start_backend(self, backend):
         self.active_backend = backend  # Retain partial start for finally cleanup.
         proofs = []
-        for index in range(-1, 5):
+        for index in range(-1, len(self.config["fleet"]["nodes"])):
             self.layout(backend, "prepare", index)
             self.layout(backend, "start", index)
             if backend == "cassandra" and index >= 0:
                 self.layout(backend, "probe", index, timeout=180)
         proofs.append(self.layout(backend, "probe", -1, timeout=180, initialize=True, cluster=True))
-        for index in range(5):
+        for index in range(len(self.config["fleet"]["nodes"])):
             proofs.append(self.layout(backend, "probe", index, timeout=180, cluster=True))
         if self.local_mode is None:
             provider = "gcp" if platform_module(self.config) else "aws"
@@ -3068,14 +3074,14 @@ class Controller:
         deployment = self.root / "deployments" / f"{backend}-stop-{self.sequence}"
         # No host is stopped before all six export attempts finish. Even if
         # export fails, stop every exact-owned host, but preserve its data.
-        for index in range(-1, 5):
+        for index in range(-1, len(self.config["fleet"]["nodes"])):
             try:
                 evidence = self.request(index, {"action": "layout", "backend": backend, "operation": "export"},
                                         timeout=self.cleanup_timeout(deadline), export=True)
                 dump(deployment / f"host-{index}-export.json", evidence)
             except Exception as exc:
                 errors.append(f"host {index} export: {exc!r}")
-        for index in range(-1, 5):
+        for index in range(-1, len(self.config["fleet"]["nodes"])):
             try:
                 stopped = self.request(index, {"action": "layout", "backend": backend, "operation": "stop"},
                                        timeout=self.cleanup_timeout(deadline), export=True)
@@ -3088,7 +3094,7 @@ class Controller:
             raise InfrastructureError("backend export/stop incomplete; data reset forbidden: " + "; ".join(errors))
         # Fleet-wide stop admission is a prerequisite for the node-local
         # reset helper, which can prove only that its own containers are absent.
-        for index in range(-1, 5):
+        for index in range(-1, len(self.config["fleet"]["nodes"])):
             try:
                 reset = self.request(index, {"action": "layout", "backend": backend, "operation": "reset-data"},
                                      timeout=self.cleanup_timeout(deadline), export=True)
@@ -3109,7 +3115,7 @@ class Controller:
         guest_root = str(Path(self.config["fleet"]["data_root"]) / "cells" / case)
         allowance = job.get("owner_read_memory_allowance_bytes",
             min(512 * 1024**2, int(self.config["fleet"]["server_memory_mib"] * 1024**2 // 4)))
-        owner_count = job.get("owner_count", 5)
+        owner_count = job.get("owner_count", len(self.config["fleet"]["nodes"]))
         prep = {"guest_root": guest_root, "addresses": [h["address"] + ":9400" for h in self.config["fleet"]["nodes"][:owner_count]],
                 "transport": cloud_campaign.TRANSPORTS[
                     "tidehunter_verbs_native" if job.get("case_kind") and
@@ -3290,7 +3296,7 @@ class Controller:
                 raise InfrastructureError("owner lifecycle failed: " + json.dumps(result))
             return result
         with ThreadPoolExecutor(max_workers=5) as pool:
-            return list(pool.map(execute, sorted(self.active_tide[2]) if self.active_tide else range(5)))
+            return list(pool.map(execute, sorted(self.active_tide[2]) if self.active_tide else range(len(self.config["fleet"]["nodes"]))))
 
     def refresh_owner_receipts(self, options, rows, tier):
         """After an owner restart, replace each receipt copy with the new process's own receipt.
@@ -3557,7 +3563,7 @@ class Controller:
                     return {"case_id": job["case_id"], "index": index, "available": False,
                             "reason": type(exc).__name__ + ": " + str(exc)}
             with ThreadPoolExecutor(max_workers=5) as pool:
-                rows = list(pool.map(capture, range(5)))
+                rows = list(pool.map(capture, range(len(self.config["fleet"]["nodes"]))))
         else:
             active = self.active_nvme
             if not active or active.get("target_implementation") != "spdk":
@@ -3570,7 +3576,7 @@ class Controller:
 
     def nvme_trace(self, action, duration=None, *, export=False):
         active = self.active_nvme
-        if not active or len(active["hosts"]) != 5:
+        if not active or len(active["hosts"]) != len(self.config["fleet"]["nodes"]):
             raise SafetyError("target trace requires every protected host binding")
         def capture(host):
             if action == "stop" and host.get("trace_already_stopped") is not None:
@@ -3591,7 +3597,7 @@ class Controller:
         active = self.active_nvme
         if active is None:
             return
-        if not drained or len(active["hosts"]) != 5:
+        if not drained or len(active["hosts"]) != len(self.config["fleet"]["nodes"]):
             raise InfrastructureError("reader drain or complete namespace ownership is unconfirmed; quarantine retained")
         script = Path(self.config["repository_root"]) / "experiments/nvmeof/campaign_targets.py"
         deadline = self.cleanup_deadline()
@@ -3678,7 +3684,7 @@ class Controller:
             return {"index": index, "path": str(path.relative_to(directory)), "sha256": digest(path),
                     "available": frame.get("available", True)}
         with ThreadPoolExecutor(max_workers=6) as pool:
-            return list(pool.map(capture, range(-1, 5)))
+            return list(pool.map(capture, range(-1, len(self.config["fleet"]["nodes"]))))
 
     def live_boundary_deltas(self, directory):
         script = Path(self.config["repository_root"]) / "experiments/nvmeof/collect.py"
@@ -3686,7 +3692,7 @@ class Controller:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         results = []
-        for index in range(-1, 5):
+        for index in range(-1, len(self.config["fleet"]["nodes"])):
             try:
                 base = directory / "live-observation"
                 first = json.loads((base / f"begin-{index}.json").read_text())
@@ -3962,10 +3968,22 @@ class Controller:
 
 
     def run_case(self, job):
-        owner_count = job.get("owner_count", 5)
-        if type(owner_count) is not int or owner_count not in (1, 5):
+        host_count = len(self.config["fleet"]["nodes"])
+        owner_count = job.get("owner_count", host_count)
+        if host_count == 1:
+            selection = self.config["spec"].get("selection")
+            if (self.config["spec"].get("mode") != "focused"
+                    or cloud_campaign.selection_owner_hosts(selection) != 1):
+                raise ValueError("compact fleet requires a compact focused selection")
+            expected = next((candidate for candidate in cloud_campaign.make_focused_matrix(selection)
+                             if candidate["case_id"] == job.get("case_id")), None)
+            if (expected is None or not cloud_campaign._focused_exact(job, expected)
+                    or cloud_campaign.job_owner_hosts(job) > host_count):
+                raise ValueError("case is not in the reviewed compact selection")
+        if type(owner_count) is not int or owner_count not in cloud_layout.OWNER_HOST_COUNTS:
             raise ValueError("owner_count must be 1 or 5")
-        if owner_count == 1 and (
+        if owner_count == 1 and ("owner_count" in job or
+                (job.get("backend") in cloud_campaign.TRANSPORTS and job.get("case_kind") != "ssd_write_floor")) and (
                 job.get("case_kind") not in cloud_campaign.ONE_OWNER_CASE_KINDS
                 or job.get("backend") not in ("tidehunter_tcp", "tidehunter_verbs_native")
                 or job.get("durability_tier") != "synchronous"
@@ -4221,7 +4239,7 @@ class Controller:
                        if "sealed_dataset" in job and backend != "native" else {}),
                     **({"monitor_job": job} if self.monitoring_attempted else {})}, case=job["case_id"], timeout=60)
                 if self.monitoring_attempted:
-                    for index, host in zip(range(-1, 5), before):
+                    for index, host in enumerate(before, start=-1):
                         self.observe(f"host_select:{index}:" + job["case_id"],
                             lambda host=host: host.get("monitoring", {"complete": False, "error": "guest omitted host selector evidence"}))
                 process_before = (snapshot(self.config, client) if self.local_mode is None
@@ -4462,7 +4480,7 @@ class Controller:
                 if evidence.is_file():
                     try:
                         observed = json.loads(evidence.read_text())
-                        verify_counter_evidence(job, observed)
+                        verify_counter_evidence(job, observed, owner_count)
                         receipt["counter_evidence"] = {"path": str(evidence.relative_to(directory)), "sha256": digest(evidence),
                                                        "coordinator_scope": "cumulative_adapter_lifetime_not_measurement_interval",
                                                        "owner_io_scope": "latest_passive_sample_may_be_stale_not_measurement_interval",
@@ -4496,7 +4514,7 @@ class Controller:
                 native_media = job["case_kind"] == "native_media_read"
                 history = owner_history_boundaries(read_interval["observed"] if read_interval else {}, owner_count)
                 try:
-                    if len(before) != 6 or len(ended) != 6:
+                    if len(before) != host_count + 1 or len(ended) != host_count + 1:
                         raise ValueError("missing host snapshots")
                     first_hosts = before[:1] if native_media else before[1:1 + owner_count]
                     last_hosts = ended[:1] if native_media else ended[1:1 + owner_count]
@@ -4854,12 +4872,12 @@ class Controller:
                 valkey_cloud.run(self)
             if self.config["spec"].get("mode", "standard") in ("focused", "read-tier", "read-tier-focused"):
                 probes = self.all_hosts({"action": "cold_trace_probe"}, timeout=120)
-                if not isinstance(probes, list) or len(probes) != 6:
+                if not isinstance(probes, list) or len(probes) != len(self.config["fleet"]["nodes"]) + 1:
                     raise InfrastructureError("trace capability probe returned incomplete fleet evidence")
                 capability = {"schema_version": 1, "hosts": probes,
                     "identity_backend_available": all(p.get("identity_backend_available") is True for p in probes),
                     "gaps": [{"host_index": index, "gaps": proof.get("gaps", [])}
-                             for index, proof in zip(range(-1, 5), probes)
+                             for index, proof in enumerate(probes, start=-1)
                              if proof.get("identity_backend_available") is not True],
                     "scope": "premeasurement attach/stop only; no device-I/O or timing claim"}
                 dump(self.root / "trace-capability.json", capability)
@@ -4939,11 +4957,11 @@ class Controller:
 
 
 def validate_physical_proofs(proofs, *, provider="aws", expected_instance_ids=None):
-    if len(proofs) != 6:
-        raise SafetyError("six physical host proofs required")
+    if not admitted_host_count(len(proofs)):
+        raise SafetyError("two or six physical host proofs required")
     if provider not in ("aws", "gcp"):
         raise SafetyError("unknown physical storage provider")
-    if expected_instance_ids is not None and (provider != "gcp" or len(expected_instance_ids) != 6):
+    if expected_instance_ids is not None and (provider != "gcp" or len(expected_instance_ids) != len(proofs)):
         raise SafetyError("invalid expected physical instance identities")
     boot_ids, serials, instance_ids = set(), set(), set()
     for index, proof in enumerate(proofs):
@@ -4972,7 +4990,7 @@ def validate_physical_proofs(proofs, *, provider="aws", expected_instance_ids=No
     return True
 
 
-def verify_counter_evidence(job, evidence):
+def verify_counter_evidence(job, evidence, owner_count=None):
     coordinator = evidence.get("coordinator")
     owners = evidence.get("owner_read_configuration")
     expected_backend = cloud_campaign.diagnostic_backend(job)
@@ -4983,7 +5001,7 @@ def verify_counter_evidence(job, evidence):
         raise SafetyError("actual RPC/cache counters are missing")
     if coordinator["cache"].get("budget_bytes") != job["coordinator_cache_bytes"]:
         raise SafetyError("actual coordinator cache budget differs from declared cohort")
-    owner_count = job.get("owner_count", 5)
+    owner_count = job.get("owner_count", 5) if owner_count is None else owner_count
     if (not isinstance(owners, list) or len(owners) != owner_count or
             {owner.get("partition") for owner in owners} != set(range(owner_count))):
         raise SafetyError("actual owner configurations differ from declared partitions")
@@ -5045,7 +5063,7 @@ def guest_main(config, payload):
         raise SafetyError("guest operation deadline differs from bounded fleet expiry")
     request, key = payload["request"], payload["key"]
     index = request["index"]
-    if type(index) is not int or index not in range(5):
+    if type(index) is not int or index not in range(len(config["fleet"]["nodes"])):
         raise SafetyError("SSM guest action is restricted to storage indices")
     expected = f"{config['prefix']}/results/cells/"
     if not key.startswith(expected) or f"/storage/{index}/" not in key or ".." in key.split("/"):

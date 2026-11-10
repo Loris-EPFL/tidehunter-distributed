@@ -111,6 +111,7 @@ impl OwnerTransportCounters {
     }
 
     #[cfg(feature = "experimental-fabric")]
+    // Relaxed assignment needs no ordering: every shard is valid for every session.
     pub(super) fn attach(self: &std::sync::Arc<Self>) -> OwnerTransportSink {
         OwnerTransportSink {
             counters: self.clone(),
@@ -139,6 +140,7 @@ impl OwnerTransportSink {
             // rebase; publishing nothing is safe and the baseline follows.
             let delta = now.saturating_sub(*flushed);
             if delta != 0 {
+                // Independent statistics do not publish or guard session state.
                 counter.fetch_add(delta, Ordering::Relaxed);
             }
             *flushed = now;

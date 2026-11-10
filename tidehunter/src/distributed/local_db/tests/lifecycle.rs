@@ -73,7 +73,7 @@ fn bounded_windows_pins_compaction_retirement_and_exact_retries_survive_reopen()
             .unwrap()
             .is_empty()
     );
-    db.compact_history(latest.clone()).unwrap();
+    db.compact_history(latest).unwrap();
     assert!(
         db.logs[&(1, 0)].read_batch(old).is_err(),
         "sealed obsolete payload should be reclaimed after root adoption"
@@ -100,7 +100,7 @@ fn bounded_windows_pins_compaction_retirement_and_exact_retries_survive_reopen()
         db.get(KeySpace(0), &0u64.to_be_bytes()).unwrap(),
         Some(vec![39; 128].into())
     );
-    assert!(db.index.validate_cut(old_cut.clone()).is_err());
+    assert!(db.index.validate_cut(old_cut).is_err());
 }
 
 fn placed_operation(db: &LocalDatabase, partition: u32, seed: u64) -> [u8; 16] {

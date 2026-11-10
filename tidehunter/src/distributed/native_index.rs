@@ -262,7 +262,7 @@ impl NativeIndexHistory {
             let next = {
                 // One shard read lock per row; no lock is held between rows.
                 let shard = index.shard_for(&self.cells[last]).read();
-                shard[&self.cells[last]].next_history(self.after.as_ref(), self.cut.clone())
+                shard[&self.cells[last]].next_history(self.after.as_ref(), &self.cut)
             };
             if let Some((key, reference)) = next {
                 self.after = Some((key.clone(), reference.mutation_version()));
@@ -286,9 +286,7 @@ impl NativeIndexScan {
     }
 
     fn advance(&mut self, index: &NativeIndex, cell: usize) {
-        while let Some((key, reference)) =
-            self.cells[cell].next(index, self.reverse, self.cut.clone())
-        {
+        while let Some((key, reference)) = self.cells[cell].next(index, self.reverse, &self.cut) {
             if reference.descriptor.kind == RecordKind::Put {
                 self.heads.push(ScanHead {
                     key,
@@ -317,12 +315,12 @@ impl CellScan {
         source: &CellIndex,
         after: Option<&Bytes>,
         reverse: bool,
-        cut: IndexReadCut,
+        cut: &IndexReadCut,
     ) -> Self {
-        let base_position = Self::base_position(source, after.map(|key| key.as_ref()), reverse);
+        let base_position = Self::base_position(source, after.map(Bytes::as_ref), reverse);
         let mut cursor = Self {
             identity,
-            overlay: source.next_overlay(after.map(|key| key.as_ref()), reverse, cut.clone()),
+            overlay: source.next_overlay(after.map(Bytes::as_ref), reverse, cut),
             base: None,
             base_position,
             base_owner: source.base.as_ref().map(|block| block.bytes.clone()),
@@ -346,7 +344,7 @@ impl CellScan {
         })
     }
 
-    fn advance_base(&mut self, source: &CellIndex, reverse: bool, cut: IndexReadCut) {
+    fn advance_base(&mut self, source: &CellIndex, reverse: bool, cut: &IndexReadCut) {
         self.base = None;
         let Some(block) = &source.base else { return };
         while if reverse {
@@ -362,7 +360,7 @@ impl CellScan {
                 self.base_position += 1;
                 position
             };
-            if let Some(reference) = block.selected(position, &cut) {
+            if let Some(reference) = block.selected(position, cut) {
                 self.base = Some((
                     block.bytes.slice_to_bytes(block.entry(position).0),
                     reference,
@@ -376,7 +374,7 @@ impl CellScan {
         &mut self,
         index: &NativeIndex,
         reverse: bool,
-        cut: IndexReadCut,
+        cut: &IndexReadCut,
     ) -> Option<(Bytes, ValueRecordReference)> {
         // One shard read lock per step; none is held between steps, so a scan
         // never blocks publication of its shard across pages.
@@ -392,8 +390,8 @@ impl CellScan {
         if replaced {
             self.base_position = Self::base_position(source, self.after.as_deref(), reverse);
             self.base_owner = source.base.as_ref().map(|block| block.bytes.clone());
-            self.overlay = source.next_overlay(self.after.as_deref(), reverse, cut.clone());
-            self.advance_base(source, reverse, cut.clone());
+            self.overlay = source.next_overlay(self.after.as_deref(), reverse, cut);
+            self.advance_base(source, reverse, cut);
         }
         let order = match (&self.overlay, &self.base) {
             (None, None) => return None,
@@ -409,7 +407,7 @@ impl CellScan {
         };
         let mut result = if order != Ordering::Greater {
             let result = self.overlay.take().expect("overlay head");
-            self.overlay = source.next_overlay(Some(&result.0), reverse, cut.clone());
+            self.overlay = source.next_overlay(Some(&result.0), reverse, cut);
             result
         } else {
             self.base.take().expect("base head")
@@ -422,7 +420,7 @@ impl CellScan {
                 )
                 .expect("merged head");
             }
-            self.advance_base(source, reverse, cut.clone());
+            self.advance_base(source, reverse, cut);
         }
         self.after = Some(result.0.clone());
         Some(result)
@@ -737,7 +735,7 @@ impl NativeIndex {
                                 source,
                                 after_reduced.as_ref(),
                                 reverse,
-                                cut.clone(),
+                                &cut,
                             )
                         }),
                 );
@@ -1015,7 +1013,7 @@ impl CellIndex {
         &self,
         previous: Option<&[u8]>,
         reverse: bool,
-        cut: IndexReadCut,
+        cut: &IndexReadCut,
     ) -> Option<(Bytes, ValueRecordReference)> {
         let next = |overlay: &Overlay<ValueRecordReference>| {
             let start = previous.map_or(Bound::Unbounded, Bound::Excluded);
@@ -1060,7 +1058,7 @@ impl CellIndex {
     fn next_history(
         &self,
         after: Option<&(Bytes, MutationVersion)>,
-        cut: IndexReadCut,
+        cut: &IndexReadCut,
     ) -> Option<(Bytes, ValueRecordReference)> {
         let base = self.base.as_ref().and_then(|block| {
             let first = after.map_or(0, |(key, _)| {
@@ -1381,7 +1379,7 @@ fn decode_reference(bytes: &[u8]) -> Result<ValueRecordReference, NativeIndexErr
         descriptor,
     })
 }
-fn encode_cut(cut: IndexReadCut, output: &mut Vec<u8>) {
+fn encode_cut(cut: &IndexReadCut, output: &mut Vec<u8>) {
     match cut {
         IndexReadCut::BeforeAll => {
             output.push(0);
@@ -1389,7 +1387,7 @@ fn encode_cut(cut: IndexReadCut, output: &mut Vec<u8>) {
         }
         IndexReadCut::At(version) => {
             output.push(1);
-            output.extend_from_slice(&LogicalValueId::new(version).encode());
+            output.extend_from_slice(&LogicalValueId::new(*version).encode());
         }
         IndexReadCut::Latest | IndexReadCut::Sparse(_) => {
             unreachable!("persisted cut must be a prefix")

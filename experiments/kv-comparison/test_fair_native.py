@@ -104,6 +104,17 @@ class FairNativeTests(unittest.TestCase):
         self.assertEqual(text.count('## 1024 bytes'), 2)
         self.assert_table_captions(text, 2)
 
+    def test_absent_compact_arms_are_not_run(self):
+        cases = [case(job('n', 'G14N', 'native', 1, mode='page_cache'), status='not_run'),
+                 case(job('o', 'G14O1', 'tidehunter_tcp', 1, owner_count=1), status='failed')]
+        self.publish(cases)
+        fair_native.generate(self.export, self.report, self.root / 'out')
+        text = (self.root / 'out' / 'fair_native.md').read_text()
+        self.assertIn('Five-owner arms: not run (not included in this campaign matrix)', text)
+        self.assertIn('n not_run', text)
+        self.assertIn('o failed', text)
+        self.assertNotIn('One-owner arms: not run', text)
+
     def test_workload_and_cohort_separate_tables(self):
         native = job('native', 'G14N', 'native', 5, mode='value_wal_barrier')
         owner = job('owner', 'G14O1', 'tidehunter_tcp', 5, owner_count=1)

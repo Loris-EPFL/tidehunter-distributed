@@ -45,9 +45,11 @@ impl ProcessResources {
         if status.len() as u64 > LIMIT {
             return Err(io::Error::other("process status exceeds diagnostic bound"));
         }
-        // SAFETY: rusage is an output-only C structure and getrusage writes
-        // within it. RUSAGE_SELF includes every thread, not only the caller.
+        // SAFETY: all fields of libc::rusage are integers or integer-only
+        // structures, so an all-zero value is valid.
         let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: usage is a live, aligned rusage output buffer. getrusage
+        // writes only within it; RUSAGE_SELF requires no additional inputs.
         if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
             return Err(io::Error::last_os_error());
         }

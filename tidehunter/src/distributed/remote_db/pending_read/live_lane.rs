@@ -27,8 +27,8 @@ const MAX_POLL_WAIT: Duration = Duration::from_secs(1);
 /// The waker the actor uses after queueing a request on this lane.
 pub(super) type LaneWaker = Arc<OnceLock<LiveReadWaker>>;
 
-struct LaneInbox {
-    state: Arc<State>,
+struct LaneInbox<'a> {
+    state: &'a State,
     receiver: mpsc::Receiver<LiveLaneCommand>,
     depth: Arc<AtomicUsize>,
     /// Received, not yet admitted by the cache, oldest first. Bounded by
@@ -39,7 +39,7 @@ struct LaneInbox {
     done: Vec<LiveReadDone>,
     disconnected: bool,
 }
-impl LaneInbox {
+impl LaneInbox<'_> {
     fn intake(&mut self, command: LiveLaneCommand) {
         match command {
             LiveLaneCommand::Request(request) => {
@@ -121,7 +121,7 @@ pub(super) fn run(
     epoch: u64,
     max_requests: usize,
 ) {
-    let _poison = PoisonOnPanic(state.clone());
+    let _poison = PoisonOnPanic(&state);
     let mut cache = LiveReadCache::default();
     match cache.waker() {
         Ok(created) => {
@@ -140,7 +140,7 @@ pub(super) fn run(
         }
     }
     let mut inbox = LaneInbox {
-        state: state.clone(),
+        state: &state,
         receiver,
         depth,
         waiting: VecDeque::new(),
@@ -268,7 +268,7 @@ pub(super) fn run(
         state
             .live_unreleased
             .lock()
-            .push((lane.client.clone(), epoch, unreleased));
+            .push((lane.client, epoch, unreleased));
         state.poison();
     }
 }

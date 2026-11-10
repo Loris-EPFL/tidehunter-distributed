@@ -806,7 +806,7 @@ impl Syncer {
     /// Stop, drain, and join. `Err(Failed)` if the frontier failed.
     pub fn shutdown(mut self) -> Result<(), FrontierError> {
         self.stop_and_join();
-        if self.frontier.failure().is_some() {
+        if self.frontier.state.lock().failure.is_some() {
             Err(FrontierError::Failed)
         } else {
             Ok(())

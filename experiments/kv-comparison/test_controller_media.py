@@ -192,7 +192,9 @@ class MediaEvidenceTests(unittest.TestCase):
         for mode in ("failure", "cleanup_failure", "safety", "success"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
                 root = Path(tmp)
-                config = {"fleet": {"data_root": str(root)}, "spec": {"mode": "focused"},
+                config = {"fleet": {"data_root": str(root), "nodes": [
+                    {"index": i, "instance_id": f"i-owner-{i}", "address": f"10.0.0.{i + 2}"}
+                    for i in range(5)]}, "spec": {"mode": "focused"},
                           "deadline_utc": (controller.utc() + timedelta(minutes=5)).isoformat()}
                 stack.enter_context(patch.object(controller, "verify_local_identity", return_value={}))
                 stack.enter_context(patch.object(controller, "guarded", side_effect=lambda p, *a, **kw: Path(p)))

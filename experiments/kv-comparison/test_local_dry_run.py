@@ -121,7 +121,9 @@ class CloudIsolationTests(unittest.TestCase):
         mode = mock.Mock()
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.object(cloud_controller, "guarded", return_value=Path(directory)):
-            config = {"fleet": {"data_root": directory}}
+            config = {"fleet": {"data_root": directory, "nodes": [
+                {"index": i, "instance_id": f"i-owner-{i}", "address": f"10.0.0.{i + 2}"}
+                for i in range(5)]}}
             for action in ("cold_trace_probe", "cold_trace_start", "cold_trace_stop",
                            "nvme_trace_start", "nvme_trace_stop"):
                 with self.subTest(action=action), self.assertRaises(cloud_controller.SafetyError):

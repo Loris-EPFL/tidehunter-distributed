@@ -5,9 +5,8 @@
 //! random reads; finding a valid inner frame alone NEVER authorizes recovery.
 //! The caller must authenticate/fence all members before emitting this group.
 //!
-//! The independent `group_model` passed before implementing this format. The
-//! storage refinement must still permit only one unpersisted group per stream,
-//! fail-stop on uncertain I/O and discover only registered fragment boundaries.
+//! Storage must fail closed on uncertain I/O and discover recovery frames only
+//! at registered fragment boundaries.
 //! Each group occupies one native allocation within one fragment; splitting a
 //! native-sized batch across groups is deliberately unsupported, not silently
 //! substituted for atomicity. Native `Db`'s accepted batch API remains unchanged.

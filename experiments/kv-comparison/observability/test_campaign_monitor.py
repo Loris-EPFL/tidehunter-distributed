@@ -53,6 +53,23 @@ class CampaignMonitorBoundaries(unittest.TestCase):
         spec['hosts'][0]['address'] = '8.8.8.8'
         with self.assertRaises(ValueError):
             monitor.validate_spec(spec)
+    def test_compact_cloud_fleet_requires_exact_two_hosts(self):
+        spec = copy.deepcopy(self.spec)
+        spec['allow_loopback_hosts'] = False
+        spec['state_dir'] = '/var/lib/tidehunter-observation/' + spec['run_id']
+        hosts = [{'index': i, 'role': 'coordinator' if i == -1 else f'storage-{i}',
+                  'address': f'10.7.0.{i + 3}'} for i in range(-1, 5)]
+        for count in (2, 6):
+            self.assertEqual(monitor.validate_spec(spec | {'hosts': hosts[:count]})['hosts'], hosts[:count])
+        for count in (0, 1, 3, 4, 5):
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                monitor.validate_spec(spec | {'hosts': hosts[:count]})
+        bad = copy.deepcopy(hosts[:2])
+        bad[1]['index'] = 1
+        bad[1]['role'] = 'storage-1'
+        with self.assertRaises(ValueError):
+            monitor.validate_spec(spec | {'hosts': bad})
+
 
     def test_gcp_run_identity_and_six_host_contract(self):
         run = 'bench-b35a62e24b47faaf'

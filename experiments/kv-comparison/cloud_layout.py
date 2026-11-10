@@ -21,6 +21,7 @@ import physical_storage
 import binascii
 
 BACKENDS = ("tikv", "cassandra", "foundationdb", "valkey_tcp", "valkey_rdma", "garnet", "kvrocks")
+OWNER_HOST_COUNTS = (1, 5)
 RUN_LABEL = "io.tidehunter.kv-comparison.run"
 NODE_LABEL = "io.tidehunter.kv-comparison.node"
 BACKEND_LABEL = "io.tidehunter.kv-comparison.backend"
@@ -46,8 +47,10 @@ def validate_fleet(fleet):
     if root.parent not in allowed or root.name != fleet["run_id"] or str(root) != fleet["data_root"]:
         raise ValueError("data_root must be canonical /mnt/tidehunter-kv-comparison/<run_id> (or /tmp for qualification)")
     nodes = fleet.get("nodes", [])
-    if not isinstance(nodes, list) or len(nodes) != 5 or any(not isinstance(x, dict) or type(x.get("index")) is not int for x in nodes) or [x["index"] for x in nodes] != list(range(5)):
-        raise ValueError("exact ordered node indices 0..4 required")
+    if (not isinstance(nodes, list) or len(nodes) not in OWNER_HOST_COUNTS
+            or any(not isinstance(x, dict) or type(x.get("index")) is not int for x in nodes)
+            or [x["index"] for x in nodes] != list(range(len(nodes)))):
+        raise ValueError("one or five ordered owner node indices starting at 0 required")
     hosts = [fleet.get("coordinator", {})] + nodes
     addresses, instances = set(), set()
     for host in hosts:
@@ -59,7 +62,7 @@ def validate_fleet(fleet):
             raise ValueError("qualification requires loopback; physical deployment requires RFC1918 IPv4")
         identity = host.get("instance_id", "")
         if not isinstance(identity, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", identity) or str(address) in addresses or identity in instances:
-            raise ValueError("six distinct valid IPs and machine IDs required")
+            raise ValueError("distinct valid IPs and machine IDs required")
         addresses.add(str(address))
         instances.add(identity)
     for key, minimum, maximum in (("server_cpus", 2, 256), ("client_cpus", 2, 256),
@@ -83,6 +86,8 @@ def valkey_control_endpoints(fleet):
 
 def backend_options(fleet, backend, root):
     validate_fleet(fleet)
+    if len(fleet["nodes"]) != 5:
+        raise ValueError("external store backends require five owner hosts")
     pd = fleet["coordinator"]["address"]
     if backend == "tikv":
         return {"pd_endpoints": [pd + ":2379"], "pd_api_endpoints": ["http://" + pd + ":2379"],
@@ -118,6 +123,8 @@ def backend_options(fleet, backend, root):
 
 def node_config(fleet, backend, index):
     validate_fleet(fleet)
+    if len(fleet["nodes"]) != 5:
+        raise ValueError("external store backends require five owner hosts")
     if backend not in BACKENDS or type(index) is not int or index not in range(-1, 5):
         raise ValueError("unsupported backend or node index")
     if backend == "valkey_rdma" and not paired_valkey(fleet, backend):

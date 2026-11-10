@@ -959,7 +959,6 @@ impl LiveReadCache {
         }
         let (slot_capacity, byte_capacity) = grant.io.capacity();
         let segment = &grant.location.segment;
-        let mut scratch = grant.location.clone();
         let mut selected = Vec::new();
         let mut ranges = Vec::new();
         let mut charge = 0usize;
@@ -978,10 +977,13 @@ impl LiveReadCache {
                     .checked_add(8)
                     .and_then(|n| n.checked_add(u64::from(reference.descriptor.offset)))
                     .ok_or_else(|| TcpError::new("live record offset overflow"))?;
-                scratch.reference = *reference;
-                scratch.offset = offset;
-                scratch.len = u64::from(reference.descriptor.len);
-                if !client.valid_live_record(&scratch, reference) {
+                if !client.valid_live_record_geometry(
+                    segment,
+                    &grant.location.binding,
+                    reference,
+                    offset,
+                    u64::from(reference.descriptor.len),
+                ) {
                     return Err(TcpError::new("invalid cached live record geometry"));
                 }
                 let len = reference.descriptor.len as usize;
@@ -1575,6 +1577,37 @@ mod tests {
         }
         assert_eq!(lane.cache.grants[0].io.outstanding(), 0);
         assert!(lane.cache.grants[0].io.stats().read_requests >= 3);
+    }
+
+    #[test]
+    fn lane_rejects_invalid_cached_member_geometry_before_io() {
+        let mut lane = lane(4);
+        let mut outside = lane.a;
+        outside.descriptor.offset = outside.batch_address.len;
+        let invalid = lane.submit(vec![outside]);
+        assert!(
+            lane.cache
+                .grants
+                .iter()
+                .all(|grant| grant.io.outstanding() == 0)
+        );
+        let valid = lane.submit(vec![lane.b]);
+        let done = lane.collect(2);
+        assert!(
+            done.iter()
+                .find(|result| result.token == invalid)
+                .unwrap()
+                .result
+                .is_err()
+        );
+        assert!(
+            done.iter()
+                .find(|result| result.token == valid)
+                .unwrap()
+                .result
+                .is_ok()
+        );
+        assert_eq!(lane.metrics.snapshot().counts.completed_read_ops, 1);
     }
 
     #[test]

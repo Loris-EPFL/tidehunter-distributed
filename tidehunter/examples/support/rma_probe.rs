@@ -3,7 +3,7 @@ use serde::Serialize;
 use std::error::Error;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 use tidehunter_fabric::{
@@ -169,11 +169,11 @@ fn read_u64(bytes: &[u8], offset: usize) -> io::Result<u64> {
 }
 
 #[derive(Serialize)]
-struct Capabilities {
+struct Capabilities<'a> {
     address_mode: &'static str,
     read_mode: &'static str,
     provider_info: serde_json::Value,
-    fabric_config: FabricConfig,
+    fabric_config: &'a FabricConfig,
     require_device_read: bool,
     max_read_bytes: usize,
 }
@@ -190,16 +190,16 @@ struct Sample {
     valid: bool,
 }
 #[derive(Serialize)]
-struct Report {
+struct Report<'a> {
     benchmark: &'static str,
     claim: &'static str,
     role: &'static str,
     topology: &'static str,
     control_security: &'static str,
-    provider_info: serde_json::Value,
-    fabric_config: FabricConfig,
-    fabric: String,
-    capabilities: Capabilities,
+    provider_info: &'a serde_json::Value,
+    fabric_config: &'a FabricConfig,
+    fabric: &'static str,
+    capabilities: &'a Capabilities<'a>,
     payload_bytes: usize,
     accepted_fi_reads: usize,
     samples_requested: usize,
@@ -298,7 +298,7 @@ fn remaining(deadline: Instant) -> io::Result<Duration> {
         .filter(|d| !d.is_zero())
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "RMA probe deadline expired"))
 }
-fn capabilities(endpoint: &Endpoint, args: &Args) -> io::Result<Capabilities> {
+fn capabilities<'a>(endpoint: &Endpoint, args: &'a Args) -> io::Result<Capabilities<'a>> {
     let caps = endpoint
         .rma_capabilities()
         .ok_or_else(|| io::Error::other("provider did not negotiate FI_READ"))?;
@@ -318,7 +318,7 @@ fn capabilities(endpoint: &Endpoint, args: &Args) -> io::Result<Capabilities> {
             RmaReadMode::Unknown => "unknown",
         },
         provider_info: serde_json::to_value(endpoint.provider_info()).map_err(io::Error::other)?,
-        fabric_config: args.fabric.clone(),
+        fabric_config: &args.fabric,
         require_device_read: args.require_device_read,
         max_read_bytes: caps.max_read_bytes,
     })
@@ -489,10 +489,10 @@ fn server(args: &Args, deadline: Instant) -> Result<()> {
         role: "server",
         topology: "two_process_control_tcp_and_provider_fabric",
         control_security: "bounded_trusted_test_tcp_no_authentication",
-        provider_info: caps.provider_info.clone(),
-        fabric_config: args.fabric.clone(),
-        fabric: fabric_label(&args.fabric).to_owned(),
-        capabilities: caps,
+        provider_info: &caps.provider_info,
+        fabric_config: &args.fabric,
+        fabric: fabric_label(&args.fabric),
+        capabilities: &caps,
         payload_bytes: args.payload_bytes,
         accepted_fi_reads: args.warmup + args.samples,
         samples_requested: args.samples,
@@ -652,10 +652,10 @@ fn client(args: &Args, deadline: Instant) -> Result<()> {
         role: "client",
         topology: "two_process_control_tcp_and_provider_fabric",
         control_security: "bounded_trusted_test_tcp_no_authentication",
-        provider_info: caps.provider_info.clone(),
-        fabric_config: args.fabric.clone(),
-        fabric: fabric_label(&args.fabric).to_owned(),
-        capabilities: caps,
+        provider_info: &caps.provider_info,
+        fabric_config: &args.fabric,
+        fabric: fabric_label(&args.fabric),
+        capabilities: &caps,
         payload_bytes: args.payload_bytes,
         accepted_fi_reads: args.warmup + args.samples,
         samples_requested: args.samples,
@@ -676,7 +676,7 @@ fn client(args: &Args, deadline: Instant) -> Result<()> {
     write_report(&args.output, &report)?;
     Ok(())
 }
-fn write_report(path: &PathBuf, report: &Report) -> Result<()> {
+fn write_report(path: &Path, report: &Report<'_>) -> Result<()> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

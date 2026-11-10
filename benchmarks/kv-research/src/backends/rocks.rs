@@ -43,7 +43,7 @@ pub struct RocksBackend {
 }
 
 fn parse_options(value: &serde_json::Value) -> BackendResult<OptionsConfig> {
-    let config: OptionsConfig = serde_json::from_value(value.clone())?;
+    let config = OptionsConfig::deserialize(value)?;
     if config.path.as_os_str().is_empty() {
         return Err("RocksDB path must not be empty".into());
     }
@@ -131,10 +131,7 @@ impl KvBackend for RocksBackend {
     }
 
     async fn get(&self, key: &[u8]) -> BackendResult<Option<Bytes>> {
-        self.db
-            .get(key)?
-            .map(Bytes::from)
-            .map_or(Ok(None), |value| Ok(Some(value)))
+        Ok(self.db.get(key)?.map(Bytes::from))
     }
 
     async fn put(&self, key: Bytes, value: Bytes) -> BackendResult<()> {

@@ -138,7 +138,7 @@ fn column_index(
 }
 
 fn parse_options(value: &JsonValue) -> BackendResult<Options> {
-    let options: Options = serde_json::from_value(value.clone())?;
+    let options = Options::deserialize(value)?;
     if options.nodes.is_empty() {
         return Err(invalid("nodes must contain at least one CQL host"));
     }
@@ -374,7 +374,7 @@ impl CassandraBackend {
         })
     }
 
-    async fn get_value(&self, key: Vec<u8>) -> BackendResult<Option<Bytes>> {
+    async fn get_value(&self, key: &[u8]) -> BackendResult<Option<Bytes>> {
         let rows = self
             .session
             .execute_unpaged(&self.get, (key,))
@@ -400,7 +400,7 @@ impl KvBackend for CassandraBackend {
     }
 
     async fn get(&self, key: &[u8]) -> BackendResult<Option<Bytes>> {
-        self.get_value(key.to_vec()).await
+        self.get_value(key).await
     }
 
     async fn put(&self, key: Bytes, value: Bytes) -> BackendResult<()> {
@@ -432,11 +432,11 @@ impl KvBackend for CassandraBackend {
             while next < keys.len() && pending.len() < self.get_many_concurrency {
                 let session = self.session.clone();
                 let statement = self.get.clone();
-                let key = keys[next].as_ref().to_vec();
+                let key = keys[next].clone();
                 let index = next;
                 pending.spawn(async move {
                     let rows = session
-                        .execute_unpaged(&statement, (key,))
+                        .execute_unpaged(&statement, (key.as_ref(),))
                         .await
                         .map_err(normalize_cql_error)?
                         .into_rows_result()?;

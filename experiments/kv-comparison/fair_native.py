@@ -193,6 +193,12 @@ def generate(export, report, output):
              'Group barrier statistics in the CSV are cumulative per shard over the whole process, including warmup. '
              'Runs include errors; mean group size uses successful runs. Maximum group size is a histogram upper bound, '
              'not an exact maximum. Missing evidence is not zero.', '']
+    if not any(row['owner_count'] == 5 for row in rows):
+        lines.extend(['Five-owner arms: not run (not included in this campaign matrix).', ''])
+    if not any(row['native_shards'] is not None for row in rows):
+        lines.extend(['Native arms: not run (not included in this campaign matrix).', ''])
+    if not any(row['owner_count'] == 1 for row in rows):
+        lines.extend(['One-owner arms: not run (not included in this campaign matrix).', ''])
     case_by_id = {case['case_id']: case for case in selected}
     partitions = {}
     for row in rows:

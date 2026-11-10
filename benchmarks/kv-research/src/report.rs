@@ -14,8 +14,8 @@ use crate::backend::{BackendInfo, BackendResult};
 use crate::duration_ns;
 /// Raw sample queue: owner is the single `kv-research-sample-writer` thread; producers are the
 /// scheduling task (completions, rejections) and snapshot flush requests.
-/// Capacity: 4096 messages (about 0.5 MiB of `Sample`), above the at most 65536 admitted
-/// in-flight requests per phase draining at one row each, so a stall is a measured exception.
+/// Capacity: 4096 messages (about 0.5 MiB of `Sample`). Up to 65536 admitted requests can
+/// drain one row each, so the queue can fill before all completions are recorded.
 /// Full-queue policy: old single streams wait and count the stall. Interference rows use
 /// `try_send`; saturation fails the case and marks raw samples incomplete. Admission never
 /// waits for telemetry in interference. Flush requests use `try_send` and are skipped when full.
@@ -696,7 +696,6 @@ impl Reporter {
         }
         let raw_samples_complete = sample_error.is_none();
         let failed = failed || !raw_samples_complete;
-        let sample_writer_error = sample_error.clone();
         self.status.set(if failed { 2 } else { 1 });
         self.current_phase.set(0);
         self.snapshot_timestamp.set(unix_seconds());
@@ -728,7 +727,7 @@ impl Reporter {
             "logical_keys_completed": self.keys_completed_total,
             "logical_keys_rejected": self.keys_rejected_total,
             "raw_samples_complete": raw_samples_complete,
-            "raw_sample_writer_error": sample_writer_error,
+            "raw_sample_writer_error": sample_error,
             "sample_writer_backpressure_ns": self.sample_backpressure_ns,
             "sample_writer_backpressure_events": self.sample_backpressure_events,
             "sample_writer_admission": {
@@ -821,14 +820,14 @@ fn write_sample_row<W: Write>(samples: &mut W, sample: &Sample) -> std::io::Resu
     )
 }
 
-fn csv(value: &str) -> String {
+fn csv(value: &str) -> Cow<'_, str> {
     if value
         .bytes()
         .any(|b| b == b',' || b == b'"' || b == b'\n' || b == b'\r')
     {
-        format!("\"{}\"", value.replace('"', "\"\""))
+        Cow::Owned(format!("\"{}\"", value.replace('"', "\"\"")))
     } else {
-        value.to_owned()
+        Cow::Borrowed(value)
     }
 }
 
@@ -940,6 +939,9 @@ mod tests {
         assert_eq!(csv("a,\"b"), "\"a,\"\"b\"");
         assert_eq!(csv("plain"), "plain");
         assert_eq!(csv("a\rb"), "\"a\rb\"");
+        assert_eq!(csv("a\nb"), "\"a\nb\"");
+        assert!(matches!(csv("plain"), Cow::Borrowed("plain")));
+        assert!(matches!(csv("a,b"), Cow::Owned(_)));
     }
 
     fn row(outcome: &'static str) -> WriterMessage {

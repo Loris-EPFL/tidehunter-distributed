@@ -283,6 +283,7 @@ impl LiveTargetManager {
             return Err(invalid("target state directory identity changed"));
         }
         let state_path = config.state_dir.join(STATE);
+        let spdk = config.spdk.is_some();
         let state = match OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -330,7 +331,7 @@ impl LiveTargetManager {
                 let meta = fs::symlink_metadata(&path)?;
                 State {
                     version: 1,
-                    config: config.clone(),
+                    config,
                     registry_id: random_id()?,
                     private_host: format!(
                         "nqn.2026-01.local.tidehunter:commission-{}",
@@ -346,7 +347,7 @@ impl LiveTargetManager {
             }
             Err(e) => return Err(e),
         };
-        let sealed_path = config.state_dir.join("sealed");
+        let sealed_path = state.config.state_dir.join("sealed");
         let sealed_directory = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -368,7 +369,7 @@ impl LiveTargetManager {
             fixture,
             stats: LiveTargetStats {
                 fixture_only: fixture,
-                target_implementation: if config.spdk.is_some() {
+                target_implementation: if spdk {
                     super::LiveTargetImplementation::Spdk
                 } else {
                     super::LiveTargetImplementation::Kernel
@@ -443,32 +444,28 @@ impl LiveTargetManager {
     fn record_create(
         &mut self,
         group: [u8; 16],
-        path: PathBuf,
+        path: &Path,
         kind: Kind,
-        destination: Option<PathBuf>,
+        destination: Option<&Path>,
     ) -> io::Result<()> {
-        let full = self.full(&path)?;
+        let full = self.full(path)?;
         match fs::symlink_metadata(&full) {
             Ok(_) => return Err(invalid("refusing to share configfs object")),
             Err(e) if e.kind() == io::ErrorKind::NotFound => (),
             Err(e) => return Err(e),
         }
         self.state.objects.push(Object {
-            path: path.clone(),
+            path: path.to_path_buf(),
             group,
             kind,
             identity: None,
-            destination: destination.clone(),
+            destination: destination.map(Path::to_path_buf),
         });
         self.save()?;
         match kind {
             Kind::Directory => fs::create_dir(&full)?,
             Kind::Link => symlink(
-                self.full(
-                    destination
-                        .as_deref()
-                        .ok_or_else(|| invalid("missing link destination"))?,
-                )?,
+                self.full(destination.ok_or_else(|| invalid("missing link destination"))?)?,
                 &full,
             )?,
         }
@@ -480,7 +477,7 @@ impl LiveTargetManager {
             .identity = Some(identity);
         self.save()?;
         if self.fixture && kind == Kind::Directory {
-            self.fixture_attributes(&path)?;
+            self.fixture_attributes(path)?;
         }
         Ok(())
     }
@@ -542,7 +539,7 @@ impl LiveTargetManager {
         let private_port =
             PathBuf::from("ports").join(self.state.config.commissioning_port_id.to_string());
         for p in [&host, &private, &public_port, &private_port] {
-            self.record_create(g, p.clone(), Kind::Directory, None)?;
+            self.record_create(g, p, Kind::Directory, None)?;
         }
         let (af, addr) = match self
             .state
@@ -574,13 +571,14 @@ impl LiveTargetManager {
                 self.state.config.commissioning_service,
             ),
         ] {
+            let service = service.to_string();
             for (key, value) in [
-                ("addr_trtype", tr.to_owned()),
-                ("addr_adrfam", family.to_owned()),
-                ("addr_traddr", address.to_owned()),
-                ("addr_trsvcid", service.to_string()),
+                ("addr_trtype", tr),
+                ("addr_adrfam", family),
+                ("addr_traddr", address),
+                ("addr_trsvcid", service.as_str()),
             ] {
-                self.put(&p.join(key), &value)?;
+                self.put(&p.join(key), value)?;
             }
         }
         Ok(())
@@ -745,9 +743,9 @@ impl LiveTargetManager {
         let id = binding.uuid;
         let sub = PathBuf::from("subsystems").join(&binding.nqn);
         let ns = sub.join("namespaces/1");
-        self.record_create(id, sub.clone(), Kind::Directory, None)?;
+        self.record_create(id, &sub, Kind::Directory, None)?;
         self.put(&sub.join("attr_allow_any_host"), "0")?;
-        self.record_create(id, ns.clone(), Kind::Directory, None)?;
+        self.record_create(id, &ns, Kind::Directory, None)?;
         let file_path = file
             .path
             .to_str()
@@ -769,15 +767,15 @@ impl LiveTargetManager {
         let private_host = PathBuf::from("hosts").join(&self.state.private_host);
         self.record_create(
             id,
-            sub.join("allowed_hosts").join(&self.state.private_host),
+            &sub.join("allowed_hosts").join(&self.state.private_host),
             Kind::Link,
-            Some(private_host),
+            Some(&private_host),
         )?;
         let private_link = PathBuf::from("ports")
             .join(self.state.config.commissioning_port_id.to_string())
             .join("subsystems")
             .join(&binding.nqn);
-        self.record_create(id, private_link.clone(), Kind::Link, Some(sub.clone()))?;
+        self.record_create(id, &private_link, Kind::Link, Some(&sub))?;
         if !self.fixture {
             let local = LiveConnectTarget {
                 nqn: binding.nqn.clone(),
@@ -828,15 +826,15 @@ impl LiveTargetManager {
         let host = PathBuf::from("hosts").join(&self.state.config.host_nqn);
         self.record_create(
             id,
-            sub.join("allowed_hosts").join(&self.state.config.host_nqn),
+            &sub.join("allowed_hosts").join(&self.state.config.host_nqn),
             Kind::Link,
-            Some(host),
+            Some(&host),
         )?;
         let public_link = PathBuf::from("ports")
             .join(self.state.config.port_id.to_string())
             .join("subsystems")
             .join(&binding.nqn);
-        self.record_create(id, public_link, Kind::Link, Some(sub))?;
+        self.record_create(id, &public_link, Kind::Link, Some(&sub))?;
         self.stats.namespaces_exposed = self.stats.namespaces_exposed.saturating_add(1);
         Ok(())
     }
@@ -891,7 +889,6 @@ impl LiveTargetManager {
             .exports
             .iter()
             .filter(|e| group.is_none_or(|g| e.binding.uuid == g))
-            .cloned()
             .collect();
         let mut disabled = false;
         for export in &exports {

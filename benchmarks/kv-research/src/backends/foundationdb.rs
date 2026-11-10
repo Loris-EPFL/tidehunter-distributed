@@ -188,22 +188,15 @@ fn require_full_replication(status: &JsonValue) -> BackendResult<()> {
 fn redact_sensitive_fields(value: &mut JsonValue) {
     match value {
         JsonValue::Object(object) => {
-            let sensitive: Vec<String> = object
-                .keys()
-                .filter(|key| {
-                    let key = key.to_ascii_lowercase();
-                    key.contains("password")
-                        || key.contains("credential")
-                        || key.contains("private_key")
-                        || key.contains("secret")
-                        || key.contains("authorization")
-                        || key.contains("tls_key")
-                })
-                .cloned()
-                .collect();
-            for key in sensitive {
-                object.remove(&key);
-            }
+            object.retain(|key, _| {
+                let key = key.to_ascii_lowercase();
+                !(key.contains("password")
+                    || key.contains("credential")
+                    || key.contains("private_key")
+                    || key.contains("secret")
+                    || key.contains("authorization")
+                    || key.contains("tls_key"))
+            });
             for child in object.values_mut() {
                 redact_sensitive_fields(child);
             }
@@ -218,7 +211,7 @@ fn redact_sensitive_fields(value: &mut JsonValue) {
 }
 
 fn parse_options(value: &JsonValue) -> BackendResult<Options> {
-    let options: Options = serde_json::from_value(value.clone())?;
+    let options = Options::deserialize(value)?;
     if options.cluster_file.as_os_str().is_empty() || options.cluster_file.to_str().is_none() {
         return Err(invalid("cluster_file must be a nonempty UTF-8 path"));
     }
@@ -255,7 +248,7 @@ impl FoundationDbBackend {
                 "FoundationDB API is process-global and this adapter can only be opened once per process",
             ));
         }
-        // Safety: this adapter owns the returned handle for its full lifetime and
+        // SAFETY: this adapter owns the returned handle for its full lifetime and
         // drops it before program exit; the FoundationDB network API is booted once.
         let network = unsafe { foundationdb::boot() };
         let (client_library_path, client_library_blake2b512) = loaded_client_library()?;
@@ -471,6 +464,28 @@ pub async fn open(options: &JsonValue, registry: &Registry) -> BackendResult<Fou
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redaction_removes_sensitive_fields_from_nested_objects_and_arrays() {
+        let mut status = serde_json::json!({
+            "Password": "hidden",
+            "cluster": {
+                "storage_replicas": 3,
+                "processes": [{"TLS_KEY": "hidden", "version": "7.3"}],
+                "authorization": {"nested": "hidden"}
+            }
+        });
+        redact_sensitive_fields(&mut status);
+        assert_eq!(
+            status,
+            serde_json::json!({
+                "cluster": {
+                    "storage_replicas": 3,
+                    "processes": [{"version": "7.3"}]
+                }
+            })
+        );
+    }
 
     #[test]
     fn client_timeout_codes_are_classified_as_timeouts() {

@@ -145,19 +145,21 @@ impl Client {
             && segment.bytes.is_multiple_of(u64::from(segment.block_size))
     }
 
-    pub(super) fn valid_live_record(
+    /// Validate member geometry against a retained file grant without copying it.
+    pub(super) fn valid_live_record_geometry(
         &self,
-        entry: &LiveRecordLocation,
+        segment: &LiveWalSegment,
+        binding: &LiveTargetBinding,
         reference: &ValueRecordReference,
+        offset: u64,
+        len: u64,
     ) -> bool {
-        entry.reference == *reference
-            && self.valid_live_segment(
-                &entry.segment,
-                &entry.binding,
-                reference.batch_version.epoch,
-                reference.batch_address.offset,
-            )
-            && reference.batch_id.database == self.expected.inventory.database
+        self.valid_live_segment(
+            segment,
+            binding,
+            reference.batch_version.epoch,
+            reference.batch_address.offset,
+        ) && reference.batch_id.database == self.expected.inventory.database
             && self
                 .expected
                 .inventory
@@ -177,15 +179,14 @@ impl Client {
                         .checked_add(reference.descriptor.len)
                         .is_some_and(|end| end <= len)
                 })
-            && entry.len == u64::from(reference.descriptor.len)
-            && (reference.batch_address.offset % entry.segment.bytes)
+            && len == u64::from(reference.descriptor.len)
+            && (reference.batch_address.offset % segment.bytes)
                 .checked_add(8)
                 .and_then(|offset| offset.checked_add(u64::from(reference.descriptor.offset)))
-                == Some(entry.offset)
-            && entry
-                .offset
-                .checked_add(entry.len)
-                .is_some_and(|end| end <= entry.segment.bytes)
+                == Some(offset)
+            && offset
+                .checked_add(len)
+                .is_some_and(|end| end <= segment.bytes)
     }
 
     pub fn reserve_live_group(
@@ -319,7 +320,16 @@ impl Client {
                         .entries
                         .iter()
                         .zip(references)
-                        .all(|(entry, reference)| self.valid_live_record(entry, reference))
+                        .all(|(entry, reference)| {
+                            entry.reference == *reference
+                                && self.valid_live_record_geometry(
+                                    &entry.segment,
+                                    &entry.binding,
+                                    reference,
+                                    entry.offset,
+                                    entry.len,
+                                )
+                        })
                 {
                     return self
                         .invalid_live_metadata(authority_epoch, Some(locations.epoch_pin_token));

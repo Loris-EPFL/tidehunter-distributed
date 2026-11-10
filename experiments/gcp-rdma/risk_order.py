@@ -77,7 +77,7 @@ def generate_order(jobs):
     # G14N and G14S cover one and five native Dbs; G14O1 and G14O5
     # cover one and five RPC owners. G14P profiles paired c1 and c16 writes.
     # Preserve the reviewed order and run the native group-barrier canary first.
-    ordered = ([job['case_id'] for job in jobs] if jobs and all(job.get('selection') in ('device', 'floors', 'stages', 'unified', 'append_floors', 'fair_native', 'parity') for job in jobs)
+    ordered = ([job['case_id'] for job in jobs] if jobs and all(job.get('selection') in ('device', 'floors', 'stages', 'unified', 'append_floors', 'fair_native', 'parity', 'parity_compact', 'fair_five_owner') for job in jobs)
                else [job['case_id'] for block in sorted(blocks, key=priority) for job in block])
     document = {
         'matrix_sha256': hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(',', ':')).encode()).hexdigest(),

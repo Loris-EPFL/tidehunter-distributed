@@ -572,13 +572,13 @@ impl LiveController {
         };
         let intent_path = registry.reserve(&intent)?;
         let registry = registry.clone();
-        let target_copy = target.clone();
-        let host_nqn = host_nqn.to_owned();
+        let target_copy = intent.target;
+        let host_nqn = intent.host_nqn;
         let (tx, rx) = mpsc::sync_channel(0);
         std::thread::Builder::new()
             .name("live-nvme-connect".into())
             .spawn(move || {
-                let result = Self::create(target_copy, &host_nqn, host_id, registry, intent_path);
+                let result = Self::create(target_copy, host_nqn, host_id, registry, intent_path);
                 if let Err(mpsc::SendError(Ok(mut controller))) = tx.send(result)
                     && let Err(error) =
                         controller.disconnect_inner(Instant::now() + CLEANUP_TIMEOUT)
@@ -606,7 +606,7 @@ impl LiveController {
     }
     fn create(
         target: LiveConnectTarget,
-        host_nqn: &str,
+        host_nqn: String,
         host_id: [u8; 16],
         registry: LiveConnectionRegistry,
         intent_path: PathBuf,
@@ -661,7 +661,7 @@ impl LiveController {
         let metadata = directory.metadata()?;
         let controller = Self {
             target,
-            host_nqn: host_nqn.to_owned(),
+            host_nqn,
             host_id,
             instance,
             name,

@@ -55,6 +55,7 @@ class WriteFloorTests(unittest.TestCase):
 
     def test_dispatch_and_mismatched_guest_job(self):
         runtime = controller.Controller.__new__(controller.Controller)
+        runtime.config = {'fleet': {'nodes': [{} for _ in range(5)]}}
         with patch.object(runtime, 'run_floor_case', return_value='ok') as run:
             job = {'case_kind': 'ssd_write_floor'}
             self.assertEqual(runtime.run_case(job), 'ok')
@@ -250,7 +251,7 @@ class WriteFloorTests(unittest.TestCase):
     def test_append_guest_host_and_quiescence_guard(self):
         with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
             root = Path(tmp)
-            config = {'fleet': {'data_root': str(root)}, 'spec': {'mode': 'focused'},
+            config = {'fleet': {'data_root': str(root), 'nodes': [{} for _ in range(5)]}, 'spec': {'mode': 'focused'},
                       'deadline_utc': (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()}
             job = {'case_kind': 'ssd_write_floor', 'case_id': 'x',
                    'ssd_write': {**self.spec('append_pwrite'), 'host': 'client'}}
@@ -295,7 +296,7 @@ class WriteFloorTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
                 root = Path(tmp)
                 job = {'case_kind': 'ssd_write_floor', 'case_id': 'x', 'ssd_write': self.spec()}
-                config = {'fleet': {'data_root': str(root)}, 'spec': {'mode': 'focused'},
+                config = {'fleet': {'data_root': str(root), 'nodes': [{} for _ in range(5)]}, 'spec': {'mode': 'focused'},
                           'deadline_utc': (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()}
                 request = {'index': 0, 'action': 'ssd_write_floor', 'case_id': 'x',
                            'job': job, 'quiescent': True, 'timeout': 60}

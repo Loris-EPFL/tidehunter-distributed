@@ -308,15 +308,13 @@ impl NvmeofMetrics {
     /// Replace the live reader set after installation or removal.
     pub(crate) fn replace_sources(&self, next: Vec<SharedStats>) {
         let mut sources = self.sources.write().unwrap_or_else(|e| e.into_inner());
-        let removed: Vec<_> = sources
-            .active
+        let SourceSet { active, retired } = &mut *sources;
+        for source in active
             .iter()
             .filter(|old| !next.iter().any(|new| Arc::ptr_eq(old, new)))
-            .cloned()
-            .collect();
-        for source in removed {
+        {
             let snapshot = source.snapshot();
-            for (target, (_, value, max)) in sources.retired.iter_mut().zip(fields(&snapshot)) {
+            for (target, (_, value, max)) in retired.iter_mut().zip(fields(&snapshot)) {
                 target.1 = if max {
                     target.1.max(value)
                 } else {
@@ -324,6 +322,6 @@ impl NvmeofMetrics {
                 };
             }
         }
-        sources.active = next;
+        *active = next;
     }
 }

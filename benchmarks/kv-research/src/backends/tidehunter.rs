@@ -562,7 +562,7 @@ pub struct TidehunterBackend {
 // External transport, owner identity and payload bounds form one admission boundary.
 #[allow(clippy::too_many_lines)]
 fn parse_options(value: &serde_json::Value) -> BackendResult<Options> {
-    let options: Options = serde_json::from_value(value.clone())?;
+    let options = Options::deserialize(value)?;
     let name = backend_name(&options.transport);
     if let Some(limits) = options.replay_limits {
         limits
@@ -827,10 +827,9 @@ async fn open_for(
     registry: &prometheus::Registry,
 ) -> BackendResult<TidehunterBackend> {
     let options = parse_options(value)?;
-    let transport = options.transport.clone();
+    let transport = options.transport;
     let evidence_path = options
         .evidence
-        .clone()
         .unwrap_or_else(|| options.path.join("evidence"));
     fs::create_dir_all(&options.path)?;
     fs::create_dir_all(&evidence_path)?;
@@ -952,11 +951,7 @@ async fn open_for(
     // in startup qualification, preload or warm-up via open-time configuration.
     remote_config.write_profile_limit = 0;
     let effective_max_batches = remote_config.storage.max_batches_per_partition;
-    let endpoints: Vec<(u32, String)> = remote_config
-        .endpoints
-        .iter()
-        .map(|endpoint| (endpoint.partition, endpoint.address.clone()))
-        .collect();
+    let endpoints = receipt_endpoints;
     let configured_partitions: HashSet<u32> =
         remote_config.storage.partitions.iter().copied().collect();
     let endpoint_partitions: HashSet<u32> =
@@ -1308,7 +1303,11 @@ fn partition_snapshot<T: serde::Serialize>(
         .iter()
         .map(|(partition, _)| partition.to_string())
         .collect();
-    if partitions.keys().cloned().collect::<HashSet<_>>() != expected {
+    if partitions.len() != expected.len()
+        || partitions
+            .keys()
+            .any(|partition| !expected.contains(partition))
+    {
         return serde_json::json!({"available": false, "error": "sampled partitions differ from configured owners", "partitions": partitions});
     }
     serde_json::json!({"available": true, "partitions": partitions})
@@ -2174,6 +2173,10 @@ mod tests {
             partition_snapshot(vec![(3, 1)], &endpoints)["available"],
             false
         );
+        assert_eq!(
+            partition_snapshot(vec![(3, 1), (9, 2)], &endpoints)["available"],
+            false
+        );
         let sample = partition_snapshot(vec![(8, 4), (3, 2)], &endpoints);
         assert_eq!(sample["partitions"]["3"], 2);
         assert_eq!(sample["partitions"]["8"], 4);
@@ -2387,7 +2390,7 @@ mod tests {
         assert!(confirm(&good, [4; 16], DurabilityTier::Native).is_err());
         // A missing receipt, and a receipt with no launch nonce.
         assert!(confirm(&good[..1], [4; 16], DurabilityTier::Synchronous).is_err());
-        let mut unlaunched = good.clone();
+        let mut unlaunched = good;
         unlaunched[1].launch_nonce.clear();
         assert!(confirm(&unlaunched, [4; 16], DurabilityTier::Synchronous).is_err());
     }

@@ -488,6 +488,27 @@ def sui_summary():
             "approximately 8 to 12 KiB.")
 
 
+def engine_guard():
+    data = load(HERE / 'engine-guard-initial.csv')
+    groups = defaultdict(list)
+    for row in data:
+        groups[(row['mode'], row['bytes'], row['arm'])].append(row)
+    rows = []
+    for size in ('1024', '64'):
+        for mode in ('write', 'get', 'mixed'):
+            cells = []
+            for arm in ('baseline', 'baseline-forklock', 'fork'):
+                samples = groups[(mode, size, arm)]
+                if len(samples) != 2 or {r['repeat'] for r in samples} != {'1', '2'}:
+                    raise ValueError(f'Incomplete engine guard: {mode}, {size}, {arm}')
+                values = [int(r['target_ops_s']) for r in samples]
+                if any(float(r['firefox_max_percent']) <= 30 or r['status'] != 'invalid: competing process' for r in samples):
+                    raise ValueError(f'Unexpected engine guard status: {mode}, {size}, {arm}')
+                cells.append(f'{sum(values) // 2:,} ({min(values):,}–{max(values):,})')
+            rows.append([mode, size, *cells, 'undecided: invalid'])
+    return table(['Mode', 'Bytes', 'Upstream own lock', 'Upstream fork lock', 'Fork', 'Verdict'], rows)
+
+
 def per_node():
     source_rows = load(CROSS / 'populations.csv')
     specs = [('native', 1, 'per-put file and directory barrier'),
@@ -781,7 +802,7 @@ def build_tables():
         'stall': stall,
         'run7_reads': lambda: run7_spread('device_read_spread.csv', {'api_p50_us', 'api_p99_us', 'successful_calls_per_second', 'read_ops_per_success'}),
         'run7_puts': lambda: run7_spread('device_put_spread.csv', {'api_p50_us', 'api_p99_us', 'api_p999_us', 'successful_calls_per_second'}) + '\n\n' + tier_ratios(),
-        'run7_sustained': sustained_summary, 'cross_store': cross_store, 'per_node': per_node, 'fair_plan': fair_plan, 'fair_counts': fair_counts, 'spike': spike_summary, 'sui': sui_summary,
+        'run7_sustained': sustained_summary, 'cross_store': cross_store, 'per_node': per_node, 'fair_plan': fair_plan, 'fair_counts': fair_counts, 'spike': spike_summary, 'sui': sui_summary, 'engine_guard': engine_guard,
         'failures': lambda: fields(load(RUN8 / 'failed_cases.csv'), ['case_id', 'case_kind', 'repeat', 'error']),
         'unqualified': lambda: fields(load(RUN8 / 'unqualified.csv'), ['case_id', 'route', 'size_bytes', 'concurrency', 'verdict', 'reason_codes']),
     }

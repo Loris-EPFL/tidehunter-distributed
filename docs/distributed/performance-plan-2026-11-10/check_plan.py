@@ -290,7 +290,68 @@ def main():
     checked += 2
     checked += 5
     print(f'{checked:02d} planned cases, spike p50 and Sui value counts checked')
-    print(f'PASS: {checked} independent raw-source checks')
+    with (HERE / 'engine-guard-initial.csv').open(newline='') as f:
+        guard = list(csv.DictReader(f))
+    guard_rows = [r for h, rows in found if h == ['Mode', 'Bytes', 'Upstream own lock', 'Upstream fork lock', 'Fork', 'Verdict'] for r in rows]
+    if len(guard) != 36 or len(guard_rows) != 6:
+        raise SystemExit('Engine guard case count mismatch')
+    arm_columns = [('baseline', 'Upstream own lock'), ('baseline-forklock', 'Upstream fork lock'), ('fork', 'Fork')]
+    by_case = defaultdict(list)
+    for r in guard:
+        if r['status'] != 'invalid: competing process' or float(r['firefox_max_percent']) <= 30:
+            raise SystemExit('Engine guard interference verdict mismatch')
+        by_case[(r['mode'], r['bytes'], r['arm'])].append(r)
+        checked += 1
+    for row in guard_rows:
+        if row['Verdict'] != 'undecided: invalid':
+            raise SystemExit('Engine guard row verdict mismatch')
+        checked += 1
+        for arm, col in arm_columns:
+            samples = by_case[(row['Mode'], row['Bytes'], arm)]
+            if len(samples) != 2 or {r['repeat'] for r in samples} != {'1', '2'}:
+                raise SystemExit('Engine guard repetition mismatch')
+            values = [int(r['target_ops_s']) for r in samples]
+            shown = re.fullmatch(r'([\d,]+) \(([\d,]+)–([\d,]+)\)', row[col])
+            if not shown:
+                raise SystemExit('Engine guard summary malformed')
+            for actual, expected in zip(shown.groups(), (sum(values) / 2, min(values), max(values))):
+                if int(actual.replace(',', '')) != expected:
+                    raise SystemExit('Engine guard throughput mismatch')
+                checked += 1
+    for mode, size in [('get', '64'), ('mixed', '64'), ('get', '1024')]:
+        means = [statistics.mean(int(r['target_ops_s']) for r in by_case[(mode, size, arm)]) for arm, _ in arm_columns]
+        if max(means) / min(means) >= 1.02:
+            raise SystemExit('Engine guard cross-arm observation mismatch')
+        checked += 1
+    write64 = [statistics.mean(int(r['target_ops_s']) for r in by_case[('write', '64', arm)]) for arm in ('baseline', 'fork')]
+    write64.append(next(int(r['target_ops_s']) for r in by_case[('write', '64', 'baseline-forklock')] if r['repeat'] == '2'))
+    if max(write64) / min(write64) >= 1.02:
+        raise SystemExit('Engine guard 64-byte write observation mismatch')
+    write1024 = [int(r['target_ops_s']) for r in by_case[('write', '1024', 'baseline')]]
+    if max(write1024) / min(write1024) <= 2:
+        raise SystemExit('Engine guard 1 KiB write spread mismatch')
+    checked += 2
+    print(f'{checked:02d} checks including engine guard CSV consistency')
+    raw_root = Path('/tmp/perf/results')
+    raw_checked = 0
+    for r in guard:
+        name = f"{r['arm']}-{r['mode']}-{r['bytes']}-r{r['repeat']}.json"
+        original = raw_root / 'first-attempts' / name
+        path = original if original.is_file() else raw_root / name
+        if not path.is_file():
+            continue
+        source = json.loads(path.read_text())
+        expected_identity = (r['arm'], r['mode'], int(r['bytes']), int(r['repeat']))
+        if (source['tree'], source['mode'], source['value_size_bytes'], source['repetition']) != expected_identity:
+            raise SystemExit(f'Engine guard raw identity mismatch: {path}')
+        rate = source['phases']['mixed']['operations_per_second_reported_rounded']
+        firefox = [sample['cpu_percent_one_core'] for sample in source['competing_processes']
+                   if 'firefox' in sample['command'].lower()]
+        if (round(rate) != int(r['target_ops_s']) or not firefox
+                or max(firefox) != float(r['firefox_max_percent']) or source['status'] != r['status']):
+            raise SystemExit(f'Engine guard raw evidence mismatch: {path}')
+        raw_checked += 1
+    print(f'PASS: {checked} checks; engine guard: {raw_checked}/36 initial raw JSON records checked')
 
 
 if __name__ == '__main__':

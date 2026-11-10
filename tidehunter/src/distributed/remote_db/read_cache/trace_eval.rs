@@ -1016,7 +1016,7 @@ fn csv_row(
     )
 }
 
-/// Reads a positive integer from the environment, or returns `default` when the variable is unset.
+/// Read an integer from the environment, or return `default` when the variable is unset.
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name).map_or(default, |text| {
         text.trim()
@@ -1076,9 +1076,8 @@ fn synthetic_mrc_sweep() {
                             model.name(),
                             correlation.name()
                         );
-                        let controls: Vec<_> = [Policy::Lru, Policy::Clock, Policy::WindowTinyLfu]
-                            .into_iter()
-                            .map(|policy| {
+                        let controls =
+                            [Policy::Lru, Policy::Clock, Policy::WindowTinyLfu].map(|policy| {
                                 (
                                     policy,
                                     replay_control(
@@ -1089,8 +1088,7 @@ fn synthetic_mrc_sweep() {
                                         seed,
                                     ),
                                 )
-                            })
-                            .collect();
+                            });
                         let result = replay(&trace.events, trace.warmup, budget, seed);
                         csv_row(&mut output, &id, config, budget, "production", &result).unwrap();
                         for (policy, result) in &controls {
@@ -1661,7 +1659,7 @@ fn csv_row_preserves_evaluation_fields() {
     );
 }
 
-/// Same fixed-seed, prebuilt inputs before and after the accounting cutover.
+/// Fixed-seed, prebuilt inputs keep input generation outside the timed interval.
 /// Get measures resident scalar hits. Insert measures demand observation,
 /// verified preparation, detachment, admission and insertion, including rejects.
 #[test]

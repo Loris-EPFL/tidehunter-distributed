@@ -234,8 +234,8 @@ struct Connection {
     poisoned: bool,
     timeout_ms: u64,
 }
-// SAFETY: The context has exclusive ownership and is only accessed while its
-// per-connection mutex is held. libvalkey contexts can be moved between threads.
+// SAFETY: The context has one owner and moves between threads without concurrent
+// access. Once pooled, each access holds the per-connection mutex.
 unsafe impl Send for Connection {}
 impl Drop for Connection {
     fn drop(&mut self) {
@@ -439,9 +439,9 @@ impl Connection {
             let remaining_ms =
                 u64::try_from(remaining.as_millis().saturating_add(1)).unwrap_or(u64::MAX);
             let mut timed_out = 0;
-            // SAFETY: this thread exclusively owns the live context and the
-            // shim returns a uniquely owned reply or null on failure.
             let transport_start = sample.as_ref().map(|_| Instant::now());
+            // SAFETY: this worker has exclusive access to the live context. The shim
+            // returns an owned reply or null; timed_out is writable stack storage.
             let p = unsafe {
                 kv_get_reply(
                     self.ptr.as_ptr(),
@@ -455,8 +455,8 @@ impl Connection {
             }
             self.timed_out = timed_out != 0;
             let reply = Reply(NonNull::new(p).ok_or_else(|| self.error())?);
-            // SAFETY: reply owns the live root for the duration of decoding.
             let decode_start = sample.as_ref().map(|_| Instant::now());
+            // SAFETY: reply retains the root and its borrowed children until decode returns.
             let decoded = unsafe { decode(reply.0.as_ptr()) };
             if let (Some(start), Some(sample)) = (decode_start, sample.as_deref_mut()) {
                 *sample.reply_decode_ns.get_or_insert(0) += elapsed_ns(start);

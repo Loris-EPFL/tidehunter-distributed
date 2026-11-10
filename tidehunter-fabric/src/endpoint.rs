@@ -313,8 +313,9 @@ struct ReadBufferStorage {
     charged_slots: usize,
 }
 
-// SAFETY: Resources returns a ReadBuffer only for a terminal successful CQE.
-// It does not reuse the backing slot while any ReadBuffer Arc remains alive.
+// SAFETY: Shared byte slices are exposed only after a successful terminal CQE.
+// Resources requires exclusive Arc ownership before posting another DMA write,
+// so no provider write can overlap a consumer's immutable slice. len is atomic.
 unsafe impl Sync for ReadBufferStorage {}
 
 impl Drop for ReadBufferStorage {
@@ -331,8 +332,9 @@ pub struct ReadBuffer {
 
 impl AsRef<[u8]> for ReadBufferStorage {
     fn as_ref(&self) -> &[u8] {
-        // SAFETY: Only a completed DMA slot is exposed as an owner, and Arc
-        // ownership prevents endpoint reuse while this immutable borrow exists.
+        // SAFETY: Resources stores len <= bytes.len() before exposing a completed
+        // DMA slot. UnsafeCell<u8> has the layout of u8, and the Arc lease blocks
+        // slot reuse while this immutable slice borrows the live allocation.
         unsafe {
             std::slice::from_raw_parts(
                 self.bytes.as_ptr().cast::<u8>(),
@@ -387,9 +389,10 @@ impl DirectState {
     }
 }
 
-// SAFETY: FI_THREAD_DOMAIN permits serialized operations from different threads.
-// Every operation requires &mut self. The exclusively owned domain, endpoint,
-// buffers and contexts have no aliases exposed to Rust callers and never move.
+// SAFETY: Provider operations require &mut self and use a domain negotiated as
+// FI_THREAD_DOMAIN or FI_THREAD_SAFE, so moving the sole endpoint owner preserves
+// serialized access. Provider handles, buffers and contexts keep stable addresses;
+// retained ReadBuffer leases prevent DMA slot reuse across thread moves.
 unsafe impl Send for Endpoint {}
 
 impl Endpoint {
@@ -630,7 +633,8 @@ impl Endpoint {
         region: RegisteredReadRegion,
     ) -> io::Result<()> {
         self.ready()?;
-        // SAFETY: The caller upholds the documented unpublished-region proof.
+        // SAFETY: The caller proves this exact region's address/key/length never
+        // reached the peer. Forwarding the region preserves that proof.
         let result = unsafe { self.inner().retire_unpublished_read_region(region) };
         if result
             .as_ref()
@@ -1396,9 +1400,8 @@ fn remaining(deadline: Instant) -> io::Result<()> {
 }
 
 /// Diagnostic synchronous progress policy. Production reactors use the bounded
-/// `try_*` operations above instead of parking inside an endpoint. EFA 2.4 uses
-/// manual progress without wait objects, so diagnostic active waits spin/yield,
-/// and idle waits alone use a bounded sleep backoff.
+/// `try_*` operations above instead of parking inside an endpoint. Active waits
+/// spin/yield; idle waits alone use bounded sleep backoff.
 struct Progress {
     idle: bool,
     last_completion: Instant,

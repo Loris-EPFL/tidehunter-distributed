@@ -620,11 +620,8 @@ fn run(shared: &Shared, shape: &KeyShape) {
                     queue.flush_failed = true;
                     queue
                         .terminal_error
-                        .get_or_insert(WorkerError::WorkerLostOutcome);
-                    queue
-                        .terminal_error
+                        .get_or_insert(WorkerError::WorkerLostOutcome)
                         .clone()
-                        .unwrap_or(WorkerError::WorkerLostOutcome)
                 };
                 for job in commit.listeners.into_iter().flatten() {
                     finish(shared, job, Err(failure.clone()));

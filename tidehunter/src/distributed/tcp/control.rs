@@ -88,9 +88,9 @@ struct Queue {
     flush_failed: bool,
     // Appends between dequeue and flush-queue hand-off (or failure).
     active_appends: usize,
-    // A non-append control is executing; nothing else may start.
     // Next append ticket to hand out, in queue (submission) order.
     next_ticket: u64,
+    // A non-append control is executing; nothing else may start.
     control_active: bool,
 }
 struct Shared {
@@ -1078,7 +1078,7 @@ fn flush_batch(shared: &Shared, batch: &mut Vec<PendingFlush>) -> bool {
             .position(|pending| pending.measured)
             .unwrap_or(0);
         let started = batch[leader].measured.then(Instant::now);
-        let log = batch[0].log.clone();
+        let log = &batch[0].log;
         let synced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let frontier = log
                 .frontier()
@@ -1185,6 +1185,7 @@ fn fail_queued_flush(shared: &Shared, receiver: &mpsc::Receiver<FlushCommand>, e
     }
 }
 
+// Keep completion fields inline; a wrapper would only move this argument list.
 #[allow(clippy::too_many_arguments)]
 fn complete(
     shared: &Shared,

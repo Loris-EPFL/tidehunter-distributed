@@ -109,7 +109,7 @@ pub(super) struct Connections {
 pub(super) fn connect(
     config: &RemoteDatabaseConfig,
     shape: &KeyShape,
-    tls_config: super::super::tcp::ClientTlsConfig,
+    tls_config: &super::super::tcp::ClientTlsConfig,
     lanes: usize,
     retained: Option<Vec<SharedClient>>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))] pool: Option<
@@ -215,7 +215,7 @@ impl ReadSetup {
                 connect(
                     &config,
                     &shape,
-                    tls_config,
+                    &tls_config,
                     config.read_lanes,
                     retained,
                     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]

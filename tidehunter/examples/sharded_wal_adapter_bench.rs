@@ -191,7 +191,7 @@ fn run_case(
             max_reference_metadata_bytes: 64 * MIB,
             max_epochs: 4,
         };
-        cluster = Some(tcp_cluster::LoopbackCluster::start_with_transport(
+        let owned = tcp_cluster::LoopbackCluster::start_with_transport(
             &temporary.path().join("cluster"),
             &output.join("nodes"),
             &shape,
@@ -205,12 +205,9 @@ fn run_case(
             128 * MIB,
             PollingPolicy::Adaptive,
             true,
-        )?);
-        let mut config = cluster
-            .as_ref()
-            .expect("cluster was created")
-            .config
-            .clone();
+        )?;
+        let mut config = owned.config.clone();
+        cluster = Some(owned);
         config.read_cache_bytes = cache_bytes;
         config.write_profile_limit = if profile { 128 } else { 0 };
         Db::open_remote(&database, shape, config).map_err(adapter_error)?
@@ -267,14 +264,14 @@ fn run_case(
             |actual| actual.as_deref() == Some(value.as_ref()),
         )?);
     }
-    let bulk: Vec<Vec<u8>> = keys[..32].iter().map(|key| key.to_vec()).collect();
+    let bulk = &keys[..32];
     rows.push(measure(
         &db,
         "warm_multi_get",
         1,
         32,
         128,
-        |_, _| Ok(db.multi_get(ks, &bulk)),
+        |_, _| Ok(db.multi_get(ks, bulk)),
         |values| {
             values.len() == bulk.len()
                 && values
@@ -303,7 +300,7 @@ fn run_case(
                     .all(|((key, actual), expected)| key == expected && actual == &value)
         },
     )?);
-    let mut expected = vec![value.clone(); KEYS];
+    let mut expected = vec![value; KEYS];
     for batch_size in [1, 32] {
         for workers in [1, 8] {
             let values: Vec<Vec<Bytes>> = (0..workers)

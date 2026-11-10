@@ -39,7 +39,7 @@ fn validate_endpoint_url(endpoint: &str, allow_bare_host_port: bool) -> BackendR
             "PD endpoints must be host:port or root http(s) URLs without credentials",
         ));
     }
-    Ok(url.to_string().trim_end_matches('/').to_owned())
+    Ok(url.as_str().trim_end_matches('/').to_owned())
 }
 
 fn normalize_tikv_error(error: tikv_client::Error) -> Box<dyn std::error::Error + Send + Sync> {
@@ -105,7 +105,7 @@ async fn pd_json(http: &HttpClient, endpoints: &[String], path: &str) -> Backend
 }
 
 fn parse_options(value: &JsonValue) -> BackendResult<Options> {
-    let options: Options = serde_json::from_value(value.clone())?;
+    let options = Options::deserialize(value)?;
     if options.pd_endpoints.is_empty() {
         return Err(invalid(
             "pd_endpoints must contain at least one PD endpoint",
@@ -149,7 +149,7 @@ pub fn validate_options(value: &JsonValue) -> BackendResult<()> {
 impl TikvBackend {
     pub async fn open(options: &JsonValue, _registry: &Registry) -> BackendResult<Self> {
         let options = parse_options(options)?;
-        let api_endpoints = options.pd_api_endpoints.clone();
+        let api_endpoints = options.pd_api_endpoints;
         let http = HttpClient::builder()
             .timeout(Duration::from_millis(options.request_timeout_ms))
             .build()?;
@@ -172,7 +172,7 @@ impl TikvBackend {
             .get("stores")
             .and_then(JsonValue::as_array)
             .ok_or_else(|| invalid("PD stores API did not expose store metadata"))?;
-        let store_versions: std::collections::BTreeSet<String> = store_rows
+        let store_versions: std::collections::BTreeSet<&str> = store_rows
             .iter()
             .filter_map(|entry| {
                 entry
@@ -180,14 +180,13 @@ impl TikvBackend {
                     .and_then(|store| store.get("version"))
                     .and_then(JsonValue::as_str)
             })
-            .map(str::to_owned)
             .collect();
         if store_rows.is_empty() || store_versions.is_empty() {
             return Err(invalid("PD stores API did not expose TiKV node versions"));
         }
         let server_version = format!(
             "TiKV {}; PD {}",
-            store_versions.iter().cloned().collect::<Vec<_>>().join(","),
+            store_versions.into_iter().collect::<Vec<_>>().join(","),
             pd_version
                 .as_str()
                 .or_else(|| pd_version.get("version").and_then(JsonValue::as_str))
@@ -263,9 +262,9 @@ impl KvBackend for TikvBackend {
             .await
             .map_err(normalize_tikv_error)?;
         let mut by_key = HashMap::with_capacity(found.len());
-        for pair in found {
-            let key: Vec<u8> = pair.key().clone().into();
-            by_key.insert(key, Bytes::from(pair.into_value()));
+        for tikv_client::KvPair(key, value) in found {
+            let key: Vec<u8> = key.into();
+            by_key.insert(key, Bytes::from(value));
         }
         Ok(keys
             .iter()

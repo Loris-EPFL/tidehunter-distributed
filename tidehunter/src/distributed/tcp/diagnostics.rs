@@ -1,5 +1,5 @@
-//! Opt-in monotonic clocks. Protocol v9 retains interleaved requests: socket clocks are
-//! connection-wide (including control traffic); they are not assigned to a read.
+//! Opt-in monotonic clocks. Interleaved requests make socket clocks connection-wide
+//! (including control traffic); they are not assigned to a read.
 //! Handler spans overlap. A completed read first awaits its authority recheck,
 //! then response encoding, then response-send (output queue/TLS/local retirement).
 //! Transport output queue/submit/retire use their own transition clocks, not an
@@ -114,7 +114,7 @@ pub struct ConnectionProfile {
     /// Client transport captured before the profile-control exchange.
     pub client_transport: super::TransportProgressStats,
     pub requests: u64,
-    /// Not attributable under v2 multiplexing; retained as zero. Partial-frame
+    /// Not attributable to one request under multiplexing; retained as zero. Partial-frame
     /// receive and idle intervals are not presented as execution time.
     pub receive_frame_including_idle_ns: u64,
     pub request_decode_ns: u64,

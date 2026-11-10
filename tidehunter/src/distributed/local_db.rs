@@ -185,7 +185,7 @@ impl LocalDatabase {
                 .map_err(LocalDbError::component)?
                 .first()
                 .copied();
-            replay.push((log.clone(), start, next));
+            replay.push((log, start, next));
         }
         if let Some(root) = &root {
             for prefix in &root.prefixes {
@@ -896,6 +896,9 @@ impl LocalDbError {
             message: message.into(),
             uncertain_version: None,
         }
+    }
+    pub(crate) fn message(&self) -> &str {
+        &self.message
     }
     pub(crate) fn component(error: impl fmt::Display) -> Self {
         Self::new(error.to_string())

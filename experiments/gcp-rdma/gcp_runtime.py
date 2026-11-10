@@ -67,9 +67,15 @@ def _run(value):
     return value
 
 
+def owner_host_counts():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'kv-comparison'))
+    from cloud_layout import OWNER_HOST_COUNTS
+    return OWNER_HOST_COUNTS
+
+
 def _fleet(fleet):
-    if not isinstance(fleet, list) or len(fleet) != 6:
-        raise RuntimeSafetyError('exact six-host fleet required')
+    if not isinstance(fleet, list) or len(fleet) - 1 not in owner_host_counts():
+        raise RuntimeSafetyError('fleet must have one or five owner hosts')
     ids, names, addresses = set(), set(), set()
     for index, host in enumerate(fleet):
         if not isinstance(host, dict) or type(host.get('index')) is not int or host['index'] != index or host.get('role') != ('coordinator' if index == 0 else 'owner'):
@@ -88,7 +94,7 @@ def _fleet(fleet):
             raise RuntimeSafetyError('invalid fleet interface address')
         addresses.update(map(str, ips))
         ids.add(str(host['id'])); names.add(host['name'])
-    if len(ids) != 6 or len(names) != 6 or len(addresses) != 12 or len({h['zone'] for h in fleet}) != 1:
+    if len(ids) != len(fleet) or len(names) != len(fleet) or len(addresses) != 2 * len(fleet) or len({h['zone'] for h in fleet}) != 1:
         raise RuntimeSafetyError('fleet identities must be distinct and zonal')
     return fleet
 
@@ -128,9 +134,24 @@ def validate_runtime(config):
     mode = config['spec'].get('mode', 'standard')
     if mode not in {'standard', 'nvmeof-focused', 'standard-with-nvmeof', 'standard-with-live-nvmeof', 'focused'}:
         raise RuntimeSafetyError('invalid matrix mode')
+    if len(config['fleet']) == 2:
+        if mode != 'focused' or config['spec'].get('suite') != 'kv':
+            raise RuntimeSafetyError('compact fleet requires a focused KV selection')
+        if set(backends) & {'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'valkey_rdma', 'garnet', 'kvrocks'}:
+            raise RuntimeSafetyError('backend requires five owner hosts')
+        import workflow_input
+        selection = config['spec'].get('selection')
+        if (config['spec'].get('owner_hosts', 5) != 1
+                or workflow_input.cloud_campaign.selection_owner_hosts(selection) != 1):
+            raise RuntimeSafetyError('selection does not admit a compact fleet')
+        jobs = workflow_input.cloud_campaign.make_focused_matrix(selection)
+        if any(workflow_input.cloud_campaign.job_owner_hosts(job) > 1 for job in jobs):
+            raise RuntimeSafetyError('selection contains a five-owner job')
     if mode == 'focused':
         import manual_campaign
         manual_campaign._reviewed_jobs(config['spec'])
+        if config['spec'].get('owner_hosts', 5) != len(config['fleet']) - 1:
+            raise RuntimeSafetyError('reviewed selection and fleet size disagree')
     if mode == 'standard' and set(backends) & {'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma'}:
         raise RuntimeSafetyError('NVMe backends require an NVMe-oF mode')
     if mode == 'standard-with-live-nvmeof' and set(backends) & {'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma'}:
@@ -269,7 +290,7 @@ class RemoteMailbox:
         self.deadline_utc = deadline_utc
 
     def submit(self, index, argv, *, operation_id, timeout_seconds, env=None, cwd=None):
-        if type(index) is not int or index not in range(6):
+        if type(index) is not int or index not in range(len(self.fleet)):
             raise RuntimeSafetyError('invalid fleet index')
         if not isinstance(operation_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', operation_id):
             raise RuntimeSafetyError('invalid operation ID')
@@ -299,7 +320,7 @@ class RemoteMailbox:
         if type(timeout_seconds) not in (int, float) or timeout_seconds <= 0:
             raise RuntimeSafetyError('positive wait timeout required')
         index = reference.get('index')
-        if type(index) is not int or index not in range(6) or str(self.fleet[index]['id']) != reference.get('instance_id'):
+        if type(index) is not int or index not in range(len(self.fleet)) or str(self.fleet[index]['id']) != reference.get('instance_id'):
             raise RuntimeSafetyError('reference host mismatch')
         op = reference.get('operation_id')
         if not isinstance(op, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', op):
@@ -358,6 +379,8 @@ def validate_controller_config(config):
         raise RuntimeSafetyError('source revision or deadline mismatch')
     cloud_layout.validate_fleet(config['fleet'])
     hosts = [config['fleet']['coordinator'], *config['fleet']['nodes']]
+    if len(runtime['fleet']) != len(hosts):
+        raise RuntimeSafetyError('controller fleet size differs from GCE identities')
     for admitted, actual in zip(runtime['fleet'], hosts):
         if (actual.get('instance_id') != admitted['name'] or actual.get('numeric_id') != str(admitted['id'])
             or actual.get('address') != admitted['internal_ip'] or actual.get('rdma_address') != admitted['rdma_ip']):
