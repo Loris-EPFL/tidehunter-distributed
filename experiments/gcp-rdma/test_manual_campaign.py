@@ -106,7 +106,7 @@ def publish_export(store, state, status='incomplete'):
 class ManualCampaignTest(unittest.TestCase):
     def test_nvmeof_path_reviewed_spec_is_bounded(self):
         for selection in manual.NVMEOF_PATH_SELECTIONS:
-            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37}[selection]
+            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37, 'nvmeof_first_put': 12}[selection]
             with self.subTest(selection=selection):
                 spec = manual.REVIEWED_SPECS[selection]
                 self.assertEqual(spec['max_cases'], expected_count)
@@ -118,6 +118,7 @@ class ManualCampaignTest(unittest.TestCase):
                     'nvmeof_path_compact': '8da5d9479b5fc470ff90c21211b3c3510a66d15bd3f03e520c9eefe38b7b2036',
                     'nvmeof_path_core': 'f286ce6c7255d21f98c9cef8b334b3d6540b1cc84005bc265e0f39751225ff55',
                     'nvmeof_path_fix': 'aa94a3842d196bd9cdb486b0c746e9939455b25d4d152e8127c1aba51f9ef606',
+                    'nvmeof_first_put': 'bc17406e8712b9ad7f49662554bcca316cff7c87774216c39c5cc42aebe1efdc',
                 }[selection])
 
     def test_state_save_retries_transient_with_original_generation(self):
@@ -1840,9 +1841,10 @@ class ManualSuiTests(unittest.TestCase):
         import manual_sui
         self.sui = manual_sui
         self.spec = copy.deepcopy(manual_sui.REVIEWED_SUI_SPECS['sui_nvmeof_compact'])
+        self.abi = json.loads((Path(__file__).parent/'fixtures/sui-library-abi.json').read_text())['sui_abi']
 
     def test_reviewed_sui_exact_and_each_field_mutation(self):
-        self.assertEqual(manual._reviewed_jobs(self.spec), [])
+        self.assertEqual(len(manual._reviewed_jobs(self.spec)), self.spec.get("job_count", 0))
         manual._check_config(CONFIG, self.spec, 0)
         self.assertTrue(self.sui.focused_qualification(self.spec))
         self.assertEqual(manual._qualify_observer('/unused', self.spec),
@@ -1866,8 +1868,9 @@ class ManualSuiTests(unittest.TestCase):
             root.mkdir()
             receipt = dict(sui_sha256=hashlib.sha256(b'sui').hexdigest(),
                            verification_sha256=hashlib.sha256(b'proof').hexdigest(),
-                           sui_revision=self.sui.SUI_REVISION, sui_abi={'sealed': True})
-            for field in receipt:
+                           sui_revision=self.sui.SUI_REVISION, sui_abi=self.abi,
+                           abi=json.loads((Path(__file__).parent/'fixtures/sui-library-abi.json').read_text())['records'][0]['outputs']['package']['abi'])
+            for field in ('sui_sha256','verification_sha256','sui_revision','sui_abi'):
                 changed = dict(receipt)
                 changed.pop(field)
                 with self.assertRaisesRegex(ValueError, 'Sui package is missing'):
@@ -1876,10 +1879,15 @@ class ManualSuiTests(unittest.TestCase):
                 self.sui.admit_sui_package(tmp, receipt)
             (root / 'sui-package.tar.gz').write_bytes(b'sui')
             (root / 'verification.tar.gz').write_bytes(b'proof')
-            with patch.object(manual.prepare, 'admit_sui_archives', return_value={'sealed': True}):
+            with patch.object(manual.prepare, 'admit_sui_archives', return_value=self.abi):
                 self.sui.admit_sui_package(tmp, receipt)
+                self.assertEqual(receipt['sui_extra_libraries'], ['libstdc++.so.6'])
+                newer = copy.deepcopy(receipt)
+                newer['sui_abi']['version_requirements']['GLIBCXX'].append('3.4.30')
+                with self.assertRaisesRegex(ValueError, 'Rocky 9'):
+                    self.sui.admit_sui_package(tmp, newer)
                 for field, value, error in [('sui_revision', 'bad', 'revision'),
-                        ('sui_sha256', '0'*64, 'digest'), ('sui_abi', {'bad': True}, 'ABI')]:
+                        ('sui_sha256', '0'*64, 'digest'), ('sui_abi', {**self.abi, 'needed':['different.so']}, 'ABI')]:
                     with self.subTest(field=field), self.assertRaisesRegex(ValueError, error):
                         self.sui.admit_sui_package(tmp, dict(receipt, **{field: value}))
 
@@ -1895,7 +1903,7 @@ class ManualSuiTests(unittest.TestCase):
         self.assertEqual(self.spec['sui_verification']['generation'], '42')
         self.assertEqual(self.spec['sui_fixture']['key'], 'runs/run/sui-fixture.tar.gz')
         self.assertTrue(self.sui.reviewed_sui_spec(self.sui.reviewed_part(self.spec)))
-        self.assertEqual(manual._reviewed_jobs(self.spec), [])
+        self.assertEqual(len(manual._reviewed_jobs(self.spec)), self.spec.get("job_count", 0))
         with self.assertRaisesRegex(ValueError, 'requires a fixture path'):
             self.sui.stage_sui(None, '', receipt, None)
 
@@ -1933,7 +1941,8 @@ class ManualSuiTests(unittest.TestCase):
             root.mkdir()
             (root/'bundle.tar.gz').write_bytes(b'archive')
             (root/'manifest.json').write_text(json.dumps(dict(build_profile='focused',
-                    features=manual.prepare.cloud_package.FOCUSED_FEATURES, files={})))
+                    features=manual.prepare.cloud_package.FOCUSED_FEATURES,
+                    files={'source/experiments/kv-comparison/nvme_campaign_owner.py':{}})))
             receipt = dict(verified, source_revision=revision, qualification=proof,
                            sha256=hashlib.sha256(b'archive').hexdigest())
             (Path(tmp)/'package-receipt.json').write_text(json.dumps(receipt))
@@ -2061,7 +2070,9 @@ class SuiRunGateTests(unittest.IsolatedAsyncioTestCase):
         original = copy.deepcopy(spec)
         image = 'projects/mysten-research/global/images/base-image'
         receipt = dict(source_revision='a'*40, source_sha256='b'*64, manifest_sha256='c'*64,
-                       sha256='d'*64, abi={'engine': True}, sui_abi={'sui': True})
+                       sha256='d'*64,
+                       abi=json.loads((Path(__file__).parent/'fixtures/sui-library-abi.json').read_text())['records'][0]['outputs']['package']['abi'],
+                       sui_abi=json.loads((Path(__file__).parent/'fixtures/sui-library-abi.json').read_text())['sui_abi'])
         hosts = [dict(name=f'host-{i}', id=str(i+1), zone='us-central1-a',
                       internal_ip=f'10.0.0.{i+1}', rdma_ip=f'10.1.0.{i+1}') for i in range(2)]
         instance = Mock()
@@ -2097,7 +2108,7 @@ class SuiRunGateTests(unittest.IsolatedAsyncioTestCase):
                     raise args[-1]
             with ExitStack() as stack:
                 patches = [patch.object(manual, '_admit_package', return_value=(receipt,dict(tree_sha256='a'*64,dirty=True))),
-                    patch.object(manual, '_check_snapshot'), patch.object(manual, '_stage', side_effect=stage),
+                    patch.object(manual, '_check_snapshot'), patch.object(manual, '_qualify_observer', return_value={}), patch.object(manual, '_stage', side_effect=stage),
                     patch.object(manual, '_start_lease'), patch.object(manual, '_lease_owned'),
                     patch.object(manual, '_gate', return_value='gate'), patch.object(manual, '_release_gate'),
                     patch.object(manual, '_wait_status', side_effect=status), patch.object(manual, '_evidence', side_effect=evidence),
@@ -2125,10 +2136,72 @@ class SuiRunGateTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([call.args[1] for call in abi.call_args_list], [receipt['abi'],receipt['sui_abi']])
                 self.assertEqual(script.call_args.kwargs['qualification_profile'], 'focused')
                 self.assertEqual(script.call_args.kwargs['suite_spec'], original)
+                self.assertEqual(script.call_args.kwargs['sui_extra_libraries'], ['libstdc++.so.6'])
+                self.assertEqual(script.call_args.kwargs['sui_needed_libraries'], receipt['sui_abi']['needed'])
+                self.assertTrue(abi.call_args_list[1].kwargs['sui'])
                 self.assertEqual(suite.call_args.args[6], staged)
                 self.assertEqual(suite.call_args.args[1]['qualification_profile'], 'focused')
         self.assertEqual(spec, original)
         self.assertTrue(manual_sui.reviewed_sui_spec(spec))
+
+
+class CombinedSuiAdmissionTests(ManualSuiTests):
+    def setUp(self):
+        super().setUp()
+        self.spec = copy.deepcopy(self.sui.REVIEWED_SUI_SPECS['sui_nvmeof_with_kv'])
+
+    def test_reviewed_sui_exact_and_each_field_mutation(self):
+        self.assertEqual(len(manual._reviewed_jobs(self.spec)), 12)
+        manual._check_config(CONFIG, self.spec, 0)
+        for key in self.spec:
+            changed = copy.deepcopy(self.spec)
+            changed[key] = None
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                manual._reviewed_jobs(changed)
+        expected = manual._reviewed_jobs(self.spec)
+        proof = dict(planned_cases=12,matrix_sha256=manual._digest(manual._json(expected)))
+        with patch.object(manual.subprocess, 'run', return_value=type('Result',(),dict(returncode=0,stdout=json.dumps(proof)))()) as observer:
+            self.assertEqual(manual._qualify_observer('/package',self.spec),proof)
+        self.assertEqual(json.loads(observer.call_args.kwargs['input'])['suite'],'both')
+
+
+class CombinedSuiSuiteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_incomplete_half_preserves_both_result_archives(self):
+        import manual_sui
+        from unittest.mock import Mock
+        spec=manual_sui.REVIEWED_SUI_SPECS['sui_nvmeof_with_kv']
+        for incomplete in ('kv','sui'):
+            with self.subTest(incomplete=incomplete), tempfile.TemporaryDirectory() as tmp:
+                store,state=Store(),parent()
+                state['policy']=dict(name='policy',id='1')
+                package=publish_export(store,state,status='incomplete' if incomplete=='kv' else 'completed')
+                key=state['run_id']+'/results/sui-results.tar.gz'
+                meta=store.put(key,b'archive')
+                result=dict(kv=dict(complete=incomplete!='kv',planned_cases=12,completed_cases=12),
+                    sui=dict(complete=incomplete!='sui',cells=spec['sui_cells']),
+                    sui_archive=dict(key=key,generation=meta['generation'],sha256=hashlib.sha256(b'archive').hexdigest()))
+                mailbox=Mock()
+                mailbox.wait.return_value=dict(exit_code=0,stdout=json.dumps(result))
+                ready=dict(_reference=dict(object='ready',generation='1',sha256='a'*64))
+                with patch.object(manual.gcp_runtime,'build_runtime_config',return_value={'package_root':'/package'}), \
+                     patch.object(manual.gcp_runtime,'RemoteMailbox',return_value=mailbox), \
+                     patch.object(manual.campaign,'save'), \
+                     patch.object(manual,'_wait_status',return_value=ready), \
+                     patch.object(manual,'_admit_nvmet_proof'):
+                    with self.assertRaisesRegex(RuntimeError,'coordinator did not complete'):
+                        await manual._suite(store,CONFIG,state,Path(tmp)/'state.json',
+                            [dict(name='coordinator',id='1'),dict(name='owner',id='2')],package,spec,tmp,'irdma0')
+                self.assertIn(key,state['terminal_export'])
+                self.assertIn(state['run_id']+'/results/controller.tar.gz',state['terminal_export'])
+
+
+class CombinedSuiRunGateTests(SuiRunGateTests):
+    async def test_run_forwards_staged_copy_focused_spec_and_both_abis(self):
+        import manual_sui
+        # Reuse the full launcher gate test with the exact combined reviewed spec.
+        with patch.dict(manual_sui.REVIEWED_SUI_SPECS,
+                        sui_nvmeof_compact=manual_sui.REVIEWED_SUI_SPECS['sui_nvmeof_with_kv']):
+            await super().test_run_forwards_staged_copy_focused_spec_and_both_abis()
 
 
 if __name__ == '__main__':

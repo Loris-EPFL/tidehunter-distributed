@@ -32,7 +32,8 @@ PROFILE_COUNTERS = {'lease_reserve_ns': 'lease_profile_samples',
                     'adopt_close_scan_bytes': 'adopt_profile_samples'}
 RESULTS += tuple(name + '_mean' for name in PROFILE_COUNTERS) + (
     'lease_profile_samples', 'adopt_profile_samples', 'extent_preleases', 'extent_switch_waits')
-STALL_FIELDS = ('case_id', 'first_sample', 'calls', 'max_api_us', 'label', 'switch_us')
+RESULTS += ('first_call_us',)
+STALL_FIELDS = ('case_id', 'first_sample', 'calls', 'max_api_us', 'label', 'switch_us', 'first_measured_call')
 
 
 def load(path):
@@ -115,6 +116,12 @@ def first(data, *keys):
     return None
 
 
+def first_measured_sample(samples):
+    """The first API call is the observed dispatch with the earliest start."""
+    return min((sample for sample in samples if sample['dispatch_observed'] == 'true'),
+               key=lambda sample: sample['dispatched_ns'], default=None)
+
+
 def result_row(case, export):
     j = case['job']; op = operation(j)
     directory = export / 'cases' / case['case_id'] / 'result'
@@ -129,6 +136,8 @@ def result_row(case, export):
                lease_ahead=j.get('live_lease_ahead', True) if live(j) else None,
                polled_writes=j.get('live_polled_writes', False) if live(j) else None)
     samples = list(analyze.read_samples(directory / 'samples.csv')) if (directory / 'samples.csv').is_file() and case.get('status') == 'completed' else []
+    first_call = first_measured_sample(samples)
+    row['first_call_us'] = first_call['api_ns'] / 1000 if first_call is not None else None
     good = [s['api_ns'] for s in samples if s['operation'] == op and s['outcome'] in ('ok', 'success') and nonnegative(s['api_ns']) is not None]
     if good:
         span = max(s['completed_ns'] for s in samples) - min(s['scheduled_ns'] for s in samples)
@@ -203,6 +212,15 @@ def stall_rows(case, export):
         if sample_id in records:
             raise ValueError('duplicate caller sample ID in timeline')
         records[sample_id] = record
+    first_call = first_measured_sample(samples)
+    first_record = records.get(first_call.get('caller_sample_id'), {}) if first_call is not None else {}
+    first_batch = first_record.get('batch')
+    first_group_batches = set()
+    if first_batch is not None:
+        for group in timeline.get('live_groups', []):
+            batches = {(batch['epoch'], batch['sequence']) for batch in group['batches']}
+            if (first_batch['epoch'], first_batch['sequence']) in batches:
+                first_group_batches.update(batches)
     generations = {}
     for event in timeline.get('checkpoint_events', []):
         if event.get('generation') is not None:
@@ -239,7 +257,10 @@ def stall_rows(case, export):
                     label = 'checkpoint:' + stage
         rows.append(dict(case_id=case['case_id'], first_sample=sample_id,
                          calls=1, max_api_us=sample['api_ns'] / 1000,
-                         label=label, switch_us=switch_us))
+                         label=label, switch_us=switch_us,
+                         first_measured_call=sample is first_call or (
+                             record.get('batch') is not None and
+                             (record['batch']['epoch'], record['batch']['sequence']) in first_group_batches)))
     return rows
 
 
@@ -288,7 +309,7 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
         selection = data.get('spec', {}).get('selection', selection)
     if selection not in NVMEOF_PATH_SELECTIONS:
         raise ValueError('export selection is not a reviewed NVMe-oF data path selection')
-    if any(j.get('group') not in ('G18F', 'G18N', 'G18W', 'G18R', 'G18M', 'G18B', 'G18X', 'G19W', 'G19R', 'G19N', 'G19X') for j in jobs):
+    if any(j.get('group') not in ('G18F', 'G18N', 'G18W', 'G18R', 'G18M', 'G18B', 'G18X', 'G19W', 'G19R', 'G19N', 'G19X', 'G20W', 'G20R', 'G20N') for j in jobs):
         raise ValueError('unexpected case group')
     setting_rows, errors = settings(jobs)
     records = [data]
@@ -323,8 +344,8 @@ def generate(export=None, report=None, output=None, matrix=None, settings_only=F
             row['native_p50_ratio'] = row['p50_us'] / refs[0]['p50_us']
     lines.extend(['One row per case. Quantiles use exact nearest rank. Repetitions are not pooled.', '', PAGE_CACHE, '', DEVICE_WINDOW, ''])
     tables = {'puts': [r for r in rows if r['group'] in ('G18N', 'G18W') and r['operation'] in ('put', 'put_batch')], 'reads': [r for r in rows if r['group'] in ('G18N', 'G18R', 'G18M') and r['operation'] in ('read', 'get_many')], 'batches': [r for r in rows if r['group'] == 'G18B'], 'many_files': [r for r in rows if r['group'] == 'G18X'], 'floors': floors([c for c in cases if c['job']['group'] == 'G18F'], export)}
-    tables['puts'] += [r for r in rows if r['group'] in ('G19N', 'G19W') and r['operation'] in ('put', 'put_batch')]
-    tables['reads'] += [r for r in rows if r['group'] in ('G19N', 'G19R') and r['operation'] in ('read', 'get_many')]
+    tables['puts'] += [r for r in rows if r['group'] in ('G19N', 'G19W', 'G20N', 'G20W') and r['operation'] in ('put', 'put_batch')]
+    tables['reads'] += [r for r in rows if r['group'] in ('G19N', 'G19R', 'G20N', 'G20R') and r['operation'] in ('read', 'get_many')]
     tables['many_files'] += [r for r in rows if r['group'] == 'G19X']
     write_csv(output / 'stalls.csv', STALL_FIELDS,
               [row for case in cases for row in stall_rows(case, export)])

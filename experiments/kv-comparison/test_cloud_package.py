@@ -402,5 +402,25 @@ class HostAbiClosureTests(unittest.TestCase):
             package.linked_libraries(self.root / "client", environment)
 
 
+    def test_extra_soname_uses_loader_and_rejects_silently_ignored_preload(self):
+        self.cc('-shared', '-fPIC', '-nostdlib', self.root / 'crypto.c',
+                '-Wl,-soname,libstdc++.so.6', '-o', self.root / 'libstdc++.so.6')
+        environment = package.clean_environment()
+        environment['LD_LIBRARY_PATH'] = str(self.root)
+        baseline = package.linked_libraries(self.root / 'client', environment)
+        self.assertNotIn('libstdc++.so.6', {x['soname'] for x in baseline['resolved'].values()})
+        proof = package.linked_libraries(self.root / 'client', environment, extra_names=['libstdc++.so.6'])
+        self.assertEqual(proof['resolved'][str(self.root / 'libstdc++.so.6')]['soname'], 'libstdc++.so.6')
+        with self.assertRaisesRegex(ValueError, 'libmissing-sui.so.1'):
+            package.linked_libraries(self.root / 'client', environment, extra_names=['libmissing-sui.so.1'])
+        for names in (['../lib.so'], ['lib:bad'], ['lib bad'], ['same', 'same'], ['x']*17):
+            with self.subTest(names=names), self.assertRaisesRegex(ValueError, 'invalid extra'):
+                package.linked_libraries(self.root / 'client', environment, extra_names=names)
+        with patch.object(package, 'command', return_value=baseline['ldd']) as loader, \
+             patch.object(package, 'elf_identity', side_effect=lambda path, *args, **kwargs: baseline['resolved'][str(path)]):
+            self.assertEqual(package.linked_libraries(self.root / 'client', environment, extra_names=()), baseline)
+        self.assertEqual(loader.call_args.kwargs['env'], {**environment, 'LC_ALL':'C'})
+
+
 if __name__ == "__main__":
     unittest.main()

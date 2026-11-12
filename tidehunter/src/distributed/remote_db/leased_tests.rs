@@ -224,6 +224,121 @@ fn leased_worker_failed_adoption_and_digest_mismatch_poison_while_idle() {
 }
 
 #[test]
+fn leased_measurement_gate_observations_keep_warm_extent() {
+    use crate::distributed::storage::HistoryPersistence;
+
+    let mut cold_restarts = Vec::new();
+    for mode in [
+        HistoryPersistence::WalReplay,
+        HistoryPersistence::OnDisk,
+        #[cfg(feature = "test-utils")]
+        HistoryPersistence::MemoryOnly,
+    ] {
+        for (ahead, timeline) in [(false, false), (false, true), (true, false), (true, true)] {
+            let fixture = Fixture::new(DurabilityTier::Native, 128 * 1024);
+            fixture.node.set_history_persistence(mode).unwrap();
+            let mut client = if ahead {
+                fixture.writer()
+            } else {
+                fixture.writer_without_ahead()
+            };
+            let warmup = client
+                .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+                .unwrap()[0];
+            // Complete the warmup driver's prelease and adoption before the gate.
+            for _ in 0..2 {
+                client.submit_leased_adoption().unwrap();
+                client.wait_leased_control().unwrap();
+            }
+            let (worker, failure) = worker(&fixture, client);
+            if mode == HistoryPersistence::WalReplay {
+                let through =
+                    warmup.appended().address().offset + u64::from(warmup.appended().address().len);
+                let (reply, checkpoint) = mpsc::sync_channel(1);
+                worker
+                    .send(Command::CheckpointPosition(1, 1, through, reply))
+                    .unwrap();
+                assert!(receive(checkpoint).unwrap().durable_end >= through);
+            } else {
+                let (reply, checkpoint) = mpsc::sync_channel(1);
+                worker.send(Command::Checkpoint(1, 1, 1, reply)).unwrap();
+                assert_eq!(receive(checkpoint).unwrap().prefix, 1);
+            }
+            receive(worker.stats().unwrap()).unwrap();
+            assert!(worker.client.lock().leased_test_frontier().1);
+            // The gate can arm the owner timeline before taking read observations.
+            // Neither typed command should terminate the warm extents.
+            let before = fixture.metrics.snapshot().counts;
+            if timeline {
+                worker.control_handle().owner_timeline_arm(64).unwrap();
+            }
+            worker.read_io_stats().unwrap();
+            let gate = fixture.metrics.snapshot().counts;
+            let open = worker.client.lock().leased_test_frontier().1;
+            let measured = receive(worker.append(1, vec![fixture.batch(1)]).unwrap()).unwrap()[0];
+            let first = fixture.metrics.snapshot().counts;
+            eprintln!(
+                "mode={mode:?} lease_ahead={ahead} timeline={timeline}: gate open={open}, skips={}, synchronous closes={}, first-put leases={}",
+                gate.leased_skip_markers - before.leased_skip_markers,
+                gate.adoption_sync_exchanges - before.adoption_sync_exchanges,
+                first.lease_exchanges - gate.lease_exchanges,
+            );
+            if !open
+                || first.lease_exchanges != before.lease_exchanges
+                || gate.leased_skip_markers != before.leased_skip_markers
+                || gate.adoption_sync_exchanges != before.adoption_sync_exchanges
+            {
+                cold_restarts.push((mode, ahead, timeline));
+            }
+            let log = fixture.node.log_for_test(1);
+            for (sequence, receipt) in [(0, warmup), (1, measured)] {
+                let batch = fixture.batch(sequence);
+                let reference = batch
+                    .record_reference(receipt.appended().address(), 0)
+                    .unwrap();
+                assert_eq!(log.read_record(&reference).unwrap(), batch.mutations()[0]);
+            }
+            drop(worker);
+            assert!(!failure.load(Ordering::Acquire));
+            if mode == HistoryPersistence::WalReplay {
+                // The worker is gone. Recover a copy of its quiescent WAL
+                // and root, with no live owner state or receipt cache.
+                let recovered_root = tempdir::TempDir::new("leased-gate-recovery").unwrap();
+                let stream = fixture.config.root.join("epoch_0000000000000001");
+                for entry in std::fs::read_dir(stream).unwrap() {
+                    let entry = entry.unwrap();
+                    assert!(entry.file_type().unwrap().is_file());
+                    std::fs::copy(entry.path(), recovered_root.path().join(entry.file_name()))
+                        .unwrap();
+                }
+                let recovered = crate::distributed::storage::PartitionLog::recover_live_sealed(
+                    recovered_root.path(),
+                    &fixture.config.partition,
+                    Metrics::new_in_enabled(&prometheus::Registry::new(), false),
+                    // These copied inodes were never exposed by a live target.
+                    || Ok(()),
+                )
+                .unwrap();
+                for (sequence, receipt) in [(0, warmup), (1, measured)] {
+                    let batch = fixture.batch(sequence);
+                    let reference = batch
+                        .record_reference(receipt.appended().address(), 0)
+                        .unwrap();
+                    assert_eq!(
+                        recovered.read_record(&reference).unwrap(),
+                        batch.mutations()[0]
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        cold_restarts.is_empty(),
+        "gate discarded warm extents: {cold_restarts:?}"
+    );
+}
+
+#[test]
 fn leased_worker_control_closes_extent_but_stats_does_not() {
     let fixture = Fixture::new(DurabilityTier::Native, 16384);
     let (worker, failure) = worker(&fixture, fixture.writer_without_ahead());

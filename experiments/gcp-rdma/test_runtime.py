@@ -621,18 +621,83 @@ class ReviewedSuiRuntimeTests(unittest.TestCase):
         import manual_campaign
         config = self.config()
         config['package']['manifest_sha256'] = 'e'*64
+        fixture = json.loads((Path(__file__).parent/'fixtures/sui-library-abi.json').read_text())
+        config['package']['abi'] = fixture['records'][0]['outputs']['package']['abi']
+        config['package']['sui_abi'] = fixture['sui_abi']
         hosts = config['live_qualification']['pair_hosts']
         records = [dict(instance_id=host['id'], peer_instance_id=hosts[1-i]['id'],
                         local_rdma=host['rdma_ip'], peer=hosts[1-i]['rdma_ip'])
                    for i, host in enumerate(hosts)]
+        for record in records:
+            record['outputs'] = {'package': {'sui_library_linkage': {'ld_library_path': None}}}
         qualification = dict(runtime_sha256='e'*64, _records=records)
         api = SimpleNamespace(request=lambda *args: {'id': '1'})
         with patch.object(gcp_api, 'GoogleApi', return_value=api), \
              patch.object(gcp_image, 'admit_image', return_value=qualification) as image, \
              patch.object(gcp_image, 'admit_nvme_transports'), \
-             patch.object(manual_campaign, '_admit_live_pair'):
+             patch.object(manual_campaign, '_admit_live_pair'), \
+             patch('gcp_worker.identify', return_value={'index':0}), patch.dict('os.environ', {}, clear=True):
             runtime.admit_live_qualification(config)
+            with patch.dict('os.environ', {'LD_LIBRARY_PATH':'/changed'}):
+                with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'search path differs'):
+                    runtime.admit_live_qualification(config)
         self.assertEqual(image.call_args.args[1]['qualification_profile'], 'focused')
+
+
+class ReviewedCombinedRuntimeTests(ReviewedSuiRuntimeTests):
+    def config(self):
+        import copy
+        import manual_sui
+        config=super().config()
+        config['spec']=copy.deepcopy(manual_sui.REVIEWED_SUI_SPECS['sui_nvmeof_with_kv'])
+        config['spec']['sui_fixture'].update(key='fixture',generation='1')
+        config['spec']['sui_verification']=dict(key='proof',generation='2',sha256='f'*64)
+        return config
+
+    def test_controller_gets_only_the_exact_focused_kv_spec(self):
+        import manual_sui
+        config=self.config()
+        import cloud_package
+        manifest=dict(revision='b'*40,source_sha256=config['source_sha256'],
+                      binary_sha256='c'*64,binary_blake2b512='d'*128,build_profile='focused',
+                      features=cloud_package.FOCUSED_FEATURES,
+                      files={'source/experiments/kv-comparison/nvme_campaign_owner.py':{}})
+        with patch.object(Path,'read_text',return_value=json.dumps(manifest)):
+            controller=runtime._controller_config(config)
+        expected=manual_sui.kv_spec(config['spec'])
+        expected.pop('suite')
+        self.assertEqual(controller['spec'],expected)
+        self.assertFalse(any(key.startswith('sui_') for key in controller['spec']))
+
+
+    def test_kv_report_continues_to_sui_but_kv_exception_does_not(self):
+        import gcp_sui
+        import cloud_controller
+        from unittest.mock import Mock
+        config=self.config()
+        api=Mock()
+        for failed in (False, True):
+            controller=Mock()
+            if failed:
+                controller.run.side_effect=RuntimeError('KV exception')
+            else:
+                controller.run.return_value=dict(complete=False,planned_cases=12,completed_cases=11)
+            with self.subTest(failed=failed), patch.object(runtime,'validate_runtime'), \
+                 patch('gcp_worker.identify',return_value={'index':0}), \
+                 patch.object(runtime,'RemoteMailbox'), patch.object(runtime,'_controller_config',return_value={}), \
+                 patch.object(runtime,'make_clients'), patch.object(runtime,'verify_fleet',return_value=[]), \
+                 patch.object(runtime,'admit_live_qualification'), patch.object(runtime,'_put_once'), \
+                 patch.object(cloud_controller,'Controller',return_value=controller), \
+                 patch.object(gcp_sui,'run_suite',return_value={'complete':True}) as sui:
+                if failed:
+                    with self.assertRaisesRegex(RuntimeError,'KV exception'):
+                        runtime.execute_campaign(config,api=api)
+                    sui.assert_not_called()
+                else:
+                    result=runtime.execute_campaign(config,api=api)
+                    self.assertFalse(result['kv']['complete'])
+                    self.assertTrue(result['sui']['complete'])
+                    sui.assert_called_once()
 
 
 if __name__ == '__main__':

@@ -18,8 +18,8 @@ def focused_qualification(spec):
 
 def _specs():
     # Lazy import: manual_campaign imports this module before defining constants.
-    from manual_campaign import FLEET_SECONDS, EXPORT_RESERVE_SECONDS
-    return {'sui_nvmeof_compact': dict(
+    from manual_campaign import FLEET_SECONDS, EXPORT_RESERVE_SECONDS, REVIEWED_SPECS
+    specs = {'sui_nvmeof_compact': dict(
         schema_version=1, suite='sui', mode='standard-with-live-nvmeof', owner_hosts=1,
         backends=['native', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma'],
         sui_cells=[dict(transport=transport, contract=contract, owner_tier=tier, owner_wal='engine_default')
@@ -29,6 +29,12 @@ def _specs():
         sui_live_queue_geometry=dict(io_queues=1, queue_size=32, poll_queues=0),
         sui_fixture=dict(sha256=FIXTURE_SHA256), hard_deadline_seconds=FLEET_SECONDS,
         export_reserve_seconds=EXPORT_RESERVE_SECONDS)}
+    combined = copy.deepcopy(REVIEWED_SPECS["nvmeof_first_put"])
+    combined.update({key: copy.deepcopy(value) for key, value in specs["sui_nvmeof_compact"].items()
+                     if key.startswith("sui_")})
+    combined["suite"] = "both"
+    specs["sui_nvmeof_with_kv"] = combined
+    return specs
 
 
 def reviewed_part(spec):
@@ -46,9 +52,21 @@ def reviewed_sui_spec(spec):
                for value in REVIEWED_SUI_SPECS.values())
 
 
+def extra_libraries(receipt):
+    return sorted(set(receipt["sui_abi"]["needed"]) - set(receipt["abi"]["needed"]))
+
+
+def kv_spec(spec):
+    value = {key: copy.deepcopy(value) for key, value in spec.items() if not key.startswith("sui_")}
+    value["suite"] = "kv"
+    return value
+
+
 def admit_sui_package(package_dir, receipt):
     if any(not receipt.get(key) for key in ('sui_sha256', 'verification_sha256', 'sui_abi', 'sui_revision')):
         raise ValueError('Sui package is missing')
+    prepare.admit_rocky9_abi(receipt['sui_abi'])
+    receipt['sui_extra_libraries'] = extra_libraries(receipt)
     if receipt['sui_revision'] != SUI_REVISION:
         raise ValueError('transferred Sui revision is not reviewed')
     for path_key, sha_key, filename in (

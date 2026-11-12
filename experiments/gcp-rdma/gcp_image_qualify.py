@@ -91,7 +91,28 @@ def require_rdma_capabilities(evidence):
 
 
 
-def guest(package, peer, peer_instance, rdma_device, expected_manifest_sha, *, qualification_profile='full'):
+def sui_library_linkage(package, needed):
+    """Use the Sui process's inherited loader search, without the KV override."""
+    import cloud_package
+    if (not isinstance(needed, (list, tuple)) or not needed or len(needed) > 16
+            or any(not isinstance(name, str) or not name or re.search(r'[/\s:]', name) for name in needed)
+            or len(set(needed)) != len(needed)):
+        raise ValueError('invalid Sui library SONAMEs')
+    binary = Path(package) / 'runtime/bin/kv-research'
+    environment = dict(os.environ)
+    baseline = cloud_package.linked_libraries(binary, environment, provider='gcp')
+    present = {elf.get('soname') for elf in baseline['resolved'].values()}
+    extra = sorted(set(needed) - present - {'ld-linux-x86-64.so.2'})
+    proof = (cloud_package.linked_libraries(binary, environment, provider='gcp', extra_names=extra)
+             if extra else baseline)
+    missing = set(needed) - {elf.get('soname') for elf in proof['resolved'].values()}
+    if missing:
+        raise ValueError('unresolved Sui libraries: ' + ', '.join(sorted(missing)))
+    proof['ld_library_path'] = environment.get('LD_LIBRARY_PATH')
+    return proof
+
+
+def guest(package, peer, peer_instance, rdma_device, expected_manifest_sha, *, qualification_profile='full', sui_needed_libraries=()):
     if qualification_profile not in ('full', 'focused'):
         raise ValueError('unknown qualification profile')
     account = metadata('instance/service-accounts/default/email')
@@ -206,6 +227,9 @@ def guest(package, peer, peer_instance, rdma_device, expected_manifest_sha, *, q
             raise ValueError('focused qualification requires the TideHunter-only runtime')
     elif 'valkey-rdma' not in features:
         raise ValueError('sealed runtime lacks Valkey RDMA')
+    if sui_needed_libraries:
+        proof['sui_library_linkage'] = sui_library_linkage(package, sui_needed_libraries)
+        proof['sui_needed_libraries'] = list(sui_needed_libraries)
     outputs['package'] = proof
     fabric = Path(proof['fabric_library']).resolve(strict=True)
     outputs['libfabric_sha256'] = hashlib.sha256(fabric.read_bytes()).hexdigest()

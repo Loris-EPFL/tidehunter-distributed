@@ -40,7 +40,7 @@ DURABILITY_TIERS = ("native", "synchronous")
 # ran the engine default, which is native.
 DEFAULT_DURABILITY_TIER = "synchronous"
 ONE_OWNER_CASE_KINDS = frozenset({"remote_put"})
-NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix")
+NVMEOF_PATH_SELECTIONS = ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put")
 
 
 
@@ -642,7 +642,8 @@ FOCUSED_COUNTS = {"recommended": 279, "full": 333, "device": 120, "floors": 69,
                   "stages": 183, "ssd_write": 18, "unified": 270, "append_floors": 48,
                   "fair_native": 168, "parity": 216, "parity_compact": 177, "fair_five_owner": 39,
                   "remote_rw_compact": 342, "fabric_ab_compact": 80, "leased_ab_compact": 72,
-                  "nvmeof_path_compact": 157, "nvmeof_path_core": 66, "nvmeof_path_fix": 37}
+                  "nvmeof_path_compact": 157, "nvmeof_path_core": 66, "nvmeof_path_fix": 37,
+                  "nvmeof_first_put": 12}
 NVMEOF_PATH_NATIVE_SETTING_KEYS = ("native_shards", "native_wal_geometry")
 NVMEOF_PATH_REMOTE_SETTING_KEYS = ("owner_count", "owner_polling", "owner_wal_geometry", "history_persistence")
 NVMEOF_PATH_LIVE_SETTING_KEYS = (*NVMEOF_PATH_REMOTE_SETTING_KEYS, "nvmeof_route", "nvmeof_target",
@@ -679,6 +680,7 @@ _FOCUSED_GROUP_COUNTS = {
     "nvmeof_path_core": {"G18F": 4, "G18N": 17, "G18W": 19, "G18R": 12,
                           "G18M": 7, "G18B": 5, "G18X": 2},
     "nvmeof_path_fix": {"G19W": 21, "G19R": 7, "G19N": 8, "G19X": 1},
+    "nvmeof_first_put": {"G20W": 9, "G20R": 1, "G20N": 2},
 }
 
 
@@ -1470,6 +1472,47 @@ def _nvmeof_path_fix(path, fabric):
     return result
 
 
+def _nvmeof_first_put(sources):
+    """Keep the reviewed first-put checks in their canary-first order."""
+    result = []
+    def pick(group, backend, size=1024, concurrency=1, repeat=0, **overrides):
+        fields = dict(group=group, backend=backend, value_size=size, concurrency=concurrency,
+                      repeat=repeat, diagnostics=None, measurement_operations=4096)
+        if backend == "native":
+            fields["native_durability"] = "page_cache"
+        else:
+            fields.update(history_persistence="wal_replay", live_write_mode="leased",
+                          durability_tier="native", live_lease_ahead=True,
+                          live_polled_writes=False, live_poll_queues=0)
+        fields.update(overrides)
+        matches = [source for source in sources
+                   if all(source.get(key) == value for key, value in fields.items())]
+        if len(matches) != 1:
+            raise ValueError("NVMe-oF first-put source cell is not unique: " + str(fields))
+        job = copy.deepcopy(matches[0])
+        job.update(selection="nvmeof_first_put", group=group.replace("G19", "G20", 1))
+        identity = hashlib.sha256(json.dumps(
+            {key: value for key, value in job.items() if key != "case_id"},
+            sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:20]
+        job["case_id"] = f"{job['group']}-r{repeat}-{identity}"
+        result.append(job)
+    pick("G19N", "native")
+    pick("G19W", "tidehunter_nvme_rdma")
+    pick("G19R", "tidehunter_nvme_rdma", size=65536, require_media_qualified=True,
+         durability_tier="synchronous")
+    pick("G19W", "tidehunter_nvme_rdma", repeat=1)
+    for repeat in (0, 1):
+        pick("G19W", "tidehunter_nvme_rdma", concurrency=16, repeat=repeat)
+    for repeat in (0, 1):
+        pick("G19W", "tidehunter_nvme_rdma", size=65536, concurrency=16, repeat=repeat)
+    for size, concurrency in ((1024, 1), (65536, 16)):
+        pick("G19W", "tidehunter_nvme_rdma", size=size, concurrency=concurrency,
+             diagnostics={"write_timeline_limit": 4096})
+    pick("G19W", "tidehunter_nvme_rdma", concurrency=16, measurement_operations=200000)
+    pick("G19N", "native", size=65536, concurrency=16)
+    return result
+
+
 def make_focused_matrix(selection):
     if selection not in FOCUSED_SELECTIONS:
         raise ValueError("unknown focused selection")
@@ -1595,6 +1638,8 @@ def make_focused_matrix(selection):
             return path
         if selection == "nvmeof_path_fix":
             return _nvmeof_path_fix(path, make_focused_matrix("fabric_ab_compact"))
+        if selection == "nvmeof_first_put":
+            return _nvmeof_first_put(make_focused_matrix("nvmeof_path_fix"))
         result = []
         for source in path:
             group = source["group"]
@@ -2066,7 +2111,7 @@ def qualify_live_nvme_measurement(evidence, job):
             if (type(a) is not int or type(b) is not int or type(value) is not int
                     or a < 0 or b < a or b >= 2**64 - 1 or value != b - a):
                 reasons.append(f"invalid live NVMe counter {name}")
-        if not reasons and job["group"] in ("G17W", "G18W", "G18B", "G19W") and any(
+        if not reasons and job["group"] in ("G17W", "G18W", "G18B", "G19W", "G20W") and any(
                 job["mix"].get(name, 0) for name in ("put", "put_batch")):
             if job["live_write_mode"] == "leased":
                 if counters["reserve_exchanges"] or counters["complete_exchanges"] or counters["leased_frames"] <= 0:
@@ -2077,7 +2122,7 @@ def qualify_live_nvme_measurement(evidence, job):
                     reasons.append("leased FUA count differs from frames and skip markers")
             elif counters["leased_frames"]:
                 reasons.append("reserved write observed leased frames")
-        if job["group"] in ("G17R", "G18R", "G18M", "G18X", "G19R", "G19X") and job["mix"]["read"] == 100:
+        if job["group"] in ("G17R", "G18R", "G18M", "G18X", "G19R", "G19X", "G20R") and job["mix"]["read"] == 100:
             coordinator = (data.get("deltas") or {}).get("coordinator") or {}
             value = (coordinator.get("counters") or {}).get("read_profile_live_inline")
             first = (data.get("start") or {}).get("coordinator") or {}

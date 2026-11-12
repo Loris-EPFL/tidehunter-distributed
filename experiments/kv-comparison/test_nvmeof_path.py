@@ -13,11 +13,13 @@ class NvmeofPathTests(unittest.TestCase):
         samples = []
         records = []
         for index, start in enumerate((0, 10_000_000, 20_000_000)):
-            samples.append(dict(caller_sample_id=index, api_ns=6_000_000))
+            samples.append(dict(caller_sample_id=index, api_ns=6_000_000,
+                                dispatch_observed='true', dispatched_ns=start))
             records.append(dict(caller_sample_id=index, batch=dict(epoch=1, sequence=index),
                                 events=[dict(stage='caller_start', elapsed_ns=start, owner=0),
                                         dict(stage='caller_finished', elapsed_ns=start + 6_000_000, owner=0)]))
-        samples.append(dict(caller_sample_id=3, api_ns=7_000_000))
+        samples.append(dict(caller_sample_id=3, api_ns=7_000_000,
+                            dispatch_observed='true', dispatched_ns=30_000_000))
         records[0]['events'].extend([
             dict(stage='live_extent_switch_started', elapsed_ns=1),
             dict(stage='live_extent_switch_completed', elapsed_ns=5001)])
@@ -34,6 +36,51 @@ class NvmeofPathTests(unittest.TestCase):
         self.assertEqual(rows[0]['switch_us'], 5)
         self.assertEqual([row['first_sample'] for row in rows], [0, 1, 2, 3])
         self.assertEqual([row['calls'] for row in rows], [1, 1, 1, 1])
+        self.assertEqual([row['first_measured_call'] for row in rows], [True, False, False, False])
+
+    def test_first_measured_call_uses_dispatch_order_and_exports_g20_tables(self):
+        directory = self.add(group='G20N', latency=6_000_000, selection='nvmeof_first_put')
+        self.add('tidehunter_nvme_rdma', group='G20R', op='read',
+                 selection='nvmeof_first_put')
+        path = directory / 'samples.csv'
+        with path.open(newline='') as stream:
+            reader = csv.DictReader(stream)
+            fields = reader.fieldnames
+            samples = list(reader)
+        for sample, start in zip(samples, (100, 1)):
+            sample.update(scheduled_ns=start, dispatched_ns=start,
+                          completed_ns=start + int(sample['api_ns']))
+        with path.open('w', newline='') as stream:
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(samples)
+        (directory / 'write-timeline.json').write_text(json.dumps(dict(timeline=dict(records=[]))))
+        matrix = self.publish()
+        matrix.write_text(json.dumps(dict(spec=dict(selection='nvmeof_first_put'), jobs=self.jobs)))
+        rows = analysis.generate(self.export, self.report, self.output)
+        self.assertEqual(rows[0]['first_call_us'], 18000)
+        with (self.output / 'puts.csv').open() as stream:
+            self.assertEqual(next(csv.DictReader(stream))['first_call_us'], '18000.0')
+        with (self.output / 'reads.csv').open() as stream:
+            self.assertEqual(next(csv.DictReader(stream))['group'], 'G20R')
+        with (self.output / 'stalls.csv').open() as stream:
+            self.assertEqual([row['first_measured_call'] for row in csv.DictReader(stream)], ['False', 'True'])
+        self.assertEqual(analysis.stall_rows(self.cases[1], self.export), [])
+
+    def test_first_measured_call_marks_other_members_of_its_live_group(self):
+        from unittest.mock import patch
+        directory = self.add('tidehunter_nvme_rdma', group='G20W')
+        records = [dict(caller_sample_id=index, batch=dict(epoch=1, sequence=index), events=[])
+                   for index in (0, 1)]
+        timeline = dict(records=records, live_groups=[
+            dict(batches=[dict(epoch=1, sequence=index) for index in (0, 1)], owner=0)])
+        (directory / 'write-timeline.json').write_text(json.dumps(dict(timeline=timeline)))
+        samples = [dict(caller_sample_id=index, api_ns=1 if index == 0 else 6_000_000,
+                        dispatch_observed='true', dispatched_ns=index) for index in (0, 1)]
+        with patch.object(analysis.analyze, 'read_samples', return_value=iter(samples)):
+            rows = analysis.stall_rows(self.cases[0], self.export)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]['first_measured_call'])
 
     def test_profile_means_and_history_default(self):
         directory = self.add('tidehunter_nvme_rdma', group='G19W', history_persistence='wal_replay')

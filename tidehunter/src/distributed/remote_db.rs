@@ -357,17 +357,14 @@ impl ReadEvidenceMonitor {
     /// Sample owner read I/O counters outside the measured interval. Callers
     /// must finish all reads and writes first; sequential owner replies do not
     /// constitute a globally consistent cut.
+    /// Counter sampling does not close current or preleased writer extents.
     pub fn sample_owner_read_io(
         &self,
     ) -> Result<Vec<(u32, super::tcp::ReadExecutorStats)>, LocalDbError> {
         self.reads.ensure_idle()?;
         self.clients
             .iter()
-            .map(|(partition, client)| {
-                client
-                    .control(|client| client.read_io_stats())
-                    .map(|stats| (*partition, stats))
-            })
+            .map(|(partition, client)| client.read_io_stats().map(|stats| (*partition, stats)))
             .collect()
     }
 }
@@ -3970,6 +3967,7 @@ impl RemoteDatabase {
 
     /// Read-only node counters outside timed reads. Outstanding work makes a
     /// phase boundary ambiguous, so callers must drain writes and finish reads.
+    /// Counter sampling does not close current or preleased writer extents.
     pub fn read_io_stats(&self) -> Result<Vec<(u32, super::tcp::ReadExecutorStats)>, LocalDbError> {
         self.ensure_healthy()?;
         self.reads.ensure_idle()?;
@@ -3983,7 +3981,7 @@ impl RemoteDatabase {
             .zip(&self.config.endpoints)
             .map(|(client, endpoint)| {
                 client
-                    .control(|client| client.read_io_stats())
+                    .read_io_stats()
                     .map(|stats| (endpoint.partition, stats))
             })
             .collect()
@@ -5092,8 +5090,11 @@ enum Command {
     ),
     CheckpointPosition(u64, u64, u64, Reply<CheckpointPositionProof>),
     Stats(Reply<PartitionStats>),
+    // Counter observation shares the control slot but must not close a lease.
+    ReadIoStats(Reply<super::tcp::ReadExecutorStats>),
     Seal(u64, Reply<()>),
     ArmProfile(usize, Reply<()>),
+    OwnerTimelineArm(usize, Reply<()>),
     FinishProfile(Reply<()>),
     Control(Box<dyn FnOnce(&mut Client) + Send>),
 }
@@ -5118,6 +5119,24 @@ struct ControlHandle {
     sender: std::sync::Weak<mpsc::SyncSender<Command>>,
 }
 impl ControlHandle {
+    fn read_io_stats(&self) -> Result<super::tcp::ReadExecutorStats, LocalDbError> {
+        let (reply, pending) = mpsc::sync_channel(1);
+        self.sender
+            .upgrade()
+            .ok_or_else(|| LocalDbError::new("TCP worker stopped"))?
+            .send(Command::ReadIoStats(reply))
+            .map_err(|_| LocalDbError::new("TCP worker lost request outcome"))?;
+        receive(pending)
+    }
+    fn owner_timeline_arm(&self, limit: usize) -> Result<(), LocalDbError> {
+        let (reply, pending) = mpsc::sync_channel(1);
+        self.sender
+            .upgrade()
+            .ok_or_else(|| LocalDbError::new("TCP worker stopped"))?
+            .send(Command::OwnerTimelineArm(limit, reply))
+            .map_err(|_| LocalDbError::new("TCP worker lost request outcome"))?;
+        receive(pending)
+    }
     fn control<T: Send + 'static>(
         &self,
         operation: impl FnOnce(&mut Client) -> Result<T, super::tcp::TcpError> + Send + 'static,
@@ -5238,11 +5257,14 @@ impl ClientWorker {
                     }
                     let result = match command {
                         Command::Checkpoint(..) => client.settle_leased_extent(),
-                        Command::CheckpointPosition(..) => client.wait_leased_control(),
-                        Command::Seal(..) | Command::Control(_) => client.close_leased_extent(),
-                        Command::Stats(_) | Command::ArmProfile(..) | Command::FinishProfile(_) => {
+                        Command::CheckpointPosition(..) | Command::ReadIoStats(_) => {
                             client.wait_leased_control()
                         }
+                        Command::Seal(..) | Command::Control(_) => client.close_leased_extent(),
+                        Command::Stats(_)
+                        | Command::ArmProfile(..)
+                        | Command::OwnerTimelineArm(..)
+                        | Command::FinishProfile(_) => client.wait_leased_control(),
                         Command::Append(..) => Ok(()),
                     };
                     if let Err(error) = result {
@@ -5855,6 +5877,9 @@ impl ClientWorker {
                                         Command::Stats(reply) => {
                                             let _ = reply.send(Err(LocalDbError::new(&message)));
                                         }
+                                        Command::ReadIoStats(reply) => {
+                                            let _ = reply.send(Err(LocalDbError::new(&message)));
+                                        }
                                         Command::CheckpointPosition(_, _, _, reply) => {
                                             let _ = reply.send(Err(LocalDbError::new(&message)));
                                         }
@@ -5862,6 +5887,7 @@ impl ClientWorker {
                                             let _ = reply.send(Err(LocalDbError::new(&message)));
                                         }
                                         Command::ArmProfile(_, reply)
+                                        | Command::OwnerTimelineArm(_, reply)
                                         | Command::Seal(_, reply)
                                         | Command::FinishProfile(reply) => {
                                             let _ = reply.send(Err(LocalDbError::new(&message)));
@@ -5900,6 +5926,8 @@ impl ClientWorker {
                     if appends.is_empty() && checkpoint.is_none() && position.is_none() {
                         match queued.front() {
                             Some(Command::Stats(_))
+                            | Some(Command::ReadIoStats(_))
+                            | Some(Command::OwnerTimelineArm(_, _))
                             | Some(Command::Seal(_, _))
                             | Some(Command::ArmProfile(_, _))
                             | Some(Command::FinishProfile(_))
@@ -5915,6 +5943,18 @@ impl ClientWorker {
                                     Command::Stats(reply) => {
                                         let _ = reply
                                             .send(client.stats().map_err(LocalDbError::component));
+                                    }
+                                    Command::OwnerTimelineArm(limit, reply) => {
+                                        let _ = reply.send(
+                                            client
+                                                .owner_timeline_arm(limit)
+                                                .map_err(LocalDbError::component),
+                                        );
+                                    }
+                                    Command::ReadIoStats(reply) => {
+                                        let _ = reply.send(
+                                            client.read_io_stats().map_err(LocalDbError::component),
+                                        );
                                     }
                                     Command::Seal(epoch, reply) => {
                                         let _ = reply.send(
@@ -6047,6 +6087,9 @@ impl ClientWorker {
         operation: impl FnOnce(&mut Client) -> Result<T, super::tcp::TcpError> + Send + 'static,
     ) -> Result<T, LocalDbError> {
         self.control_handle().control(operation)
+    }
+    fn read_io_stats(&self) -> Result<super::tcp::ReadExecutorStats, LocalDbError> {
+        self.control_handle().read_io_stats()
     }
 
     fn send(&self, command: Command) -> Result<(), LocalDbError> {

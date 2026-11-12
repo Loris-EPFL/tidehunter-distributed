@@ -4,6 +4,7 @@ import base64
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import resource
 import time
@@ -135,7 +136,7 @@ def validate_runtime(config):
     if mode not in {'standard', 'nvmeof-focused', 'standard-with-nvmeof', 'standard-with-live-nvmeof', 'focused'}:
         raise RuntimeSafetyError('invalid matrix mode')
     if len(config['fleet']) == 2:
-        if config['spec'].get('suite') == 'sui':
+        if config['spec'].get('suite') in ('sui', 'both'):
             import manual_sui
             if not manual_sui.reviewed_sui_spec(manual_sui.reviewed_part(config['spec'])):
                 raise RuntimeSafetyError('compact fleet requires a focused KV selection')
@@ -195,7 +196,7 @@ def validate_runtime(config):
                 or pair[0]['zone'] != pair[1]['zone'] or pair[0]['zone'] != config['fleet'][0]['zone']
                 or len({host[key] for host in pair for key in ('internal_ip', 'rdma_ip')}) != 4):
             raise RuntimeSafetyError('live pair guests and addresses must be distinct, bound to the receipt and zonal')
-        if (mode == 'focused' or config['spec'].get('suite') == 'sui') and any(
+        if (mode == 'focused' or config['spec'].get('suite') in ('sui', 'both')) and any(
                 any(str(pair[i][key]) != str(config['fleet'][i][key])
                     for key in ('name', 'id', 'zone', 'internal_ip', 'rdma_ip'))
                 for i in range(2)):
@@ -262,12 +263,21 @@ def admit_live_qualification(runtime):
     import manual_sui
     if manual_sui.focused_qualification(spec):
         image_config['qualification_profile'] = 'focused'
+    if spec.get('suite') in ('sui', 'both'):
+        image_config['sui_extra_libraries'] = manual_sui.extra_libraries(runtime['package'])
+        image_config['sui_needed_libraries'] = runtime['package']['sui_abi']['needed']
     qualification = gcp_image.admit_image(api, image_config, image)
     if qualification.get('runtime_sha256') != runtime['package'].get('manifest_sha256'):
         raise RuntimeSafetyError('live pair qualification does not bind this package manifest')
     gcp_image.admit_nvme_transports(qualification, spec['backends'], live=True)
     gcp_image.admit_spdk(qualification, spec)
     records, hosts = qualification['_records'], binding['pair_hosts']
+    if spec.get('suite') in ('sui', 'both'):
+        import gcp_worker
+        index = gcp_worker.identify(runtime)['index']
+        proof = records[index]['outputs']['package']['sui_library_linkage']
+        if os.environ.get('LD_LIBRARY_PATH') != proof.get('ld_library_path'):
+            raise RuntimeSafetyError('Sui library search path differs from guest qualification')
     for index, record in enumerate(records):
         if (record.get('instance_id') != str(hosts[index]['id'])
                 or record.get('peer_instance_id') != str(hosts[1 - index]['id'])
@@ -418,7 +428,7 @@ def validate_controller_config(config):
         raise RuntimeSafetyError('unsupported GCP backend or AWS EFA selected')
     if runtime['spec'].get('mode') == 'focused':
         expected = {k: v for k, v in runtime['spec'].items()
-                    if k not in {'suite', 'sui_fixture', 'sui_verification', 'sui_transports'}}
+                    if k != 'suite' and not k.startswith('sui_')}
         if json.dumps(config['spec'], sort_keys=True) != json.dumps(expected, sort_keys=True):
             raise RuntimeSafetyError('focused controller spec differs from reviewed runtime')
         jobs = cloud_campaign.make_focused_matrix(runtime['spec']['selection'])
@@ -791,8 +801,7 @@ def _controller_config(runtime):
              'server_cpus': 8, 'client_cpus': 8, 'server_memory_mib': 16384, 'client_memory_mib': 16384}
     if 'valkey_rdma' in runtime['spec']['backends']:
         fleet['valkey_rdma_package'] = True
-    extra = {'suite', 'sui_fixture', 'sui_verification', 'sui_transports'}
-    spec = {k: v for k, v in runtime['spec'].items() if k not in extra}
+    spec = {k: v for k, v in runtime['spec'].items() if k != 'suite' and not k.startswith('sui_')}
     return {'fleet': fleet, 'bucket': runtime['bucket'], 'bucket_region': region, 'prefix': runtime['run_id'],
             'account': runtime['project_number'], 'source_revision': manifest['revision'],
             'source_sha256': runtime['source_sha256'], 'binary_sha256': manifest['binary_sha256'],
@@ -828,6 +837,7 @@ def execute_campaign(runtime_config, *, api=None):
         if runtime['spec'].get('valkey_reproduction_profiles'):
             results['kv']['native_valkey_reproduction'] = report['native_valkey_reproduction']
     if suite in ('sui', 'both'):
+        admit_live_qualification(runtime)
         _put_once(api.objects(runtime['bucket']), 'runs/' + runtime['run_id'] + '/poweroff/sui-started.json',
                   _encode({'run_id': runtime['run_id'], 'source_sha256': runtime['source_sha256'], 'suite': 'sui'}))
         import gcp_sui

@@ -395,16 +395,29 @@ def fdb_identity(prefix):
             "elf": elf_identity(library), "client_version": fdb_client_version(library)}
 
 
-def linked_libraries(path, environment, provider="aws"):
+def linked_libraries(path, environment, provider="aws", *, extra_names=()):
     # Build floors constrain shipped artifacts, not compatible newer host libraries.
     # Ask the host loader to check the actual SONAME and symbol-version closure.
-    text = command(["ldd", "-v", path], env={**environment, "LC_ALL": "C"})
+    if (not isinstance(extra_names, (list, tuple)) or len(extra_names) > 16
+            or any(not isinstance(name, str) or not name or re.search(r"[/\s:]", name) for name in extra_names)
+            or len(set(extra_names)) != len(extra_names)):
+        raise ValueError("invalid extra library SONAMEs")
+    loader_environment = {**environment, "LC_ALL": "C"}
+    if extra_names:
+        loader_environment["LD_PRELOAD"] = ":".join([*extra_names, *filter(None, [environment.get("LD_PRELOAD")])])
+    text = command(["ldd", "-v", path], env=loader_environment)
+    if extra_names and "cannot be preloaded" in text:
+        raise ValueError("Sui libraries cannot be preloaded: " + ", ".join(extra_names) + ": " + text)
     if "not found" in text or "no version information available" in text:
         raise ValueError(f"unresolved runtime library or symbol version: {text}")
     listing = text.split("Version information:", 1)[0]
     paths = sorted(set(re.findall(r"(?:=>\s+|^\s*)(/[^\s]+)", listing, re.MULTILINE)))
-    return {"ldd": text, "resolved": {str(Path(p).resolve(strict=True)):
+    result = {"ldd": text, "resolved": {str(Path(p).resolve(strict=True)):
             elf_identity(Path(p).resolve(strict=True), provider, portable=False) for p in paths}}
+    missing = set(extra_names) - {elf.get("soname") for elf in result["resolved"].values()}
+    if missing:
+        raise ValueError("unresolved Sui libraries: " + ", ".join(sorted(missing)))
+    return result
 
 
 def valkey_source_identity(source):

@@ -86,6 +86,7 @@ FOCUSED_MATRIX_SHA256 = {
     'nvmeof_path_compact': '8da5d9479b5fc470ff90c21211b3c3510a66d15bd3f03e520c9eefe38b7b2036',
     'nvmeof_path_core': 'f286ce6c7255d21f98c9cef8b334b3d6540b1cc84005bc265e0f39751225ff55',
     'nvmeof_path_fix': 'aa94a3842d196bd9cdb486b0c746e9939455b25d4d152e8127c1aba51f9ef606',
+    'nvmeof_first_put': 'bc17406e8712b9ad7f49662554bcca316cff7c87774216c39c5cc42aebe1efdc',
 }
 REVIEWED_SPECS = {
     selection: {
@@ -126,6 +127,7 @@ REVIEWED_SPECS = {
         ('nvmeof_path_compact', FOCUSED_MATRIX_SHA256['nvmeof_path_compact'], 157),
         ('nvmeof_path_core', FOCUSED_MATRIX_SHA256['nvmeof_path_core'], 66),
         ('nvmeof_path_fix', FOCUSED_MATRIX_SHA256['nvmeof_path_fix'], 37),
+        ('nvmeof_first_put', FOCUSED_MATRIX_SHA256['nvmeof_first_put'], 12),
     )
 }
 
@@ -221,11 +223,11 @@ def _record(path, state, phase):
 
 
 def _reviewed_jobs(spec):
-    if isinstance(spec, dict) and spec.get("suite") == "sui":
+    if isinstance(spec, dict) and spec.get("suite") in ("sui", "both"):
         import manual_sui
         if not manual_sui.reviewed_sui_spec(manual_sui.reviewed_part(spec)):
             raise ValueError("an exact reviewed focused specification is required")
-        return []
+        return [] if spec["suite"] == "sui" else _reviewed_jobs(manual_sui.kv_spec(manual_sui.reviewed_part(spec)))
     if isinstance(spec, dict) and _json(spec) == _json(REVIEWED_SPEC):
         return workflow_input.cloud_campaign.make_matrix({k: v for k, v in spec.items() if k != 'suite'})
     if (not isinstance(spec, dict) or type(spec.get('selection')) is not str
@@ -327,7 +329,7 @@ def _admit_package(package_dir, revision, spec):
     prepare.ci_prepare.admit_qualification(package_dir / 'qualification', proof,
                                            **({'focused': True} if focused else {}))
     _check_snapshot(source, revision)
-    if spec.get('suite') == 'sui':
+    if spec.get('suite') in ('sui', 'both'):
         manual_sui.admit_sui_package(package_dir, receipt)
     receipt['archive_path'] = str(archive.resolve())
     return receipt, source
@@ -365,7 +367,7 @@ def _stage(store, bucket, state, receipt, wheels=None, *, qualification=False, s
     package = dict(receipt)
     package['object_key'] = prefix + 'package.tar'
     package['generation'] = campaign.upload_file(store, package['archive_path'], package['sha256'], package['object_key'])
-    if spec is not None and spec.get('suite') == 'sui':
+    if spec is not None and spec.get('suite') in ('sui', 'both'):
         import manual_sui
         staged = manual_sui.stage_sui(store, prefix, receipt, fixture)
         package.update({k: staged[k] for k in ('sui_object_key', 'sui_generation')})
@@ -873,11 +875,19 @@ async def recover_cleanup(config, *, run_id, state_path, execute, artifacts=None
     return parent
 
 
-def _terminal_export(store, state, package, *, require_complete=True, result=None):
+def _terminal_export(store, state, package, *, require_complete=True, result=None, suite=None):
     """Pin the final controller receipt and its durable archive descriptors."""
     if result is not None:
         import manual_sui
-        return manual_sui.terminal_export_sui(store, state, result, require_complete=require_complete)
+        references = {}
+        if 'kv' in result or suite == 'both':
+            try:
+                references.update(_terminal_export(store, state, package, require_complete=require_complete))
+            except ApiError as error:
+                if require_complete or error.status != 404:
+                    raise
+        references.update(manual_sui.terminal_export_sui(store, state, result, require_complete=require_complete))
+        return references
     prefix = state['run_id'] + '/results/'
     key = prefix + 'receipt.json'
     meta = store.head(key)
@@ -1106,12 +1116,16 @@ async def _suite(store, config, state, path, fleet, package, spec, output, rdma_
                             or native.get('planned_cases') != len(expected) or native.get('completed_cases') != len(expected)
                             or any(case.get('complete') is not True or case.get('owned_server_stopped') is not True for case in cases)):
                         raise RuntimeError('coordinator did not complete every isolated native Valkey control')
+            if spec.get('suite') == 'both':
+                import manual_sui
+                if not manual_sui.sui_complete(result, spec):
+                    raise RuntimeError('coordinator did not complete the reviewed Sui suite')
         except Exception as exc:
             workload_error = exc
     try:
         references = await _blocking(_terminal_export, store, state, package,
                                      require_complete=workload_error is None,
-                                     **({"result": result} if spec.get("suite") == "sui" else {}))
+                                     **({"result": result, "suite": spec["suite"]} if spec.get("suite") in ("sui", "both") else {}))
         state['terminal_export'] = references
         try:
             await _blocking(campaign.save, path, state)
@@ -1207,7 +1221,7 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
     from gcp_manual_compute import Compute, _json_response
 
     import manual_sui
-    if spec.get("suite") == "sui" and fixture is None:
+    if spec.get("suite") in ("sui", "both") and fixture is None:
         raise ValueError("Sui suite requires a fixture path")
     _check_config(config, spec, surcharge_cents)
     spec = copy.deepcopy(spec)
@@ -1268,7 +1282,7 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
         fleet_state, fleet_path = await _blocking(_new_child, parent, path, 'fleet', FLEET_SECONDS)
         fleet_state['host_count'] = host_count
         package, prep_sha = await _blocking(_stage, store, config['bucket'], fleet_state, receipt, wheels,
-                                                **({"spec": spec, "fixture": fixture} if spec.get("suite") == "sui" else {}))
+                                                **({"spec": spec, "fixture": fixture} if spec.get("suite") in ("sui", "both") else {}))
         fleet_state['package'] = package
         fleet_state['preparation_sha256'] = prep_sha
         await _blocking(campaign.save, fleet_path, fleet_state)
@@ -1294,7 +1308,7 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
             receipt['manifest_sha256'], prep_sha, members=fleet, rdma_device=rdma_device,
             machine_type=config['machine_type'], live_transports=live_transports,
             live_spdk=bool(spec.get('spdk_comparison') and gcp_runtime.live_mode(spec)),
-            **({'qualification_profile': 'focused', 'selection': spec.get('selection'), **({'suite_spec': manual_sui.reviewed_part(spec)} if spec.get('suite') == 'sui' else {})}
+            **({'qualification_profile': 'focused', 'selection': spec.get('selection'), **({'suite_spec': manual_sui.reviewed_part(spec), 'sui_extra_libraries': manual_sui.extra_libraries(receipt), 'sui_needed_libraries': receipt['sui_abi']['needed']} if spec.get('suite') in ('sui', 'both') else {})}
                if manual_sui.focused_qualification(spec) else {}))
         await _blocking(_record, path, parent, 'preparation')
         async with asyncio.timeout(PREPARATION_SECONDS):
@@ -1345,6 +1359,9 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
         await _blocking(campaign.save, fleet_path, fleet_state)
         (out / 'image-receipt.json').write_bytes(_json(image_receipt))
         admitted_config = dict(config, image=image['path'], image_qualification=reference)
+        if spec.get('suite') in ('sui', 'both'):
+            admitted_config['sui_extra_libraries'] = manual_sui.extra_libraries(receipt)
+            admitted_config['sui_needed_libraries'] = receipt['sui_abi']['needed']
         if manual_sui.focused_qualification(spec):
             admitted_config['qualification_profile'] = 'focused'
         if gcp_runtime.live_mode(spec):
@@ -1365,8 +1382,8 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
                                         live=gcp_runtime.live_mode(spec))
         gcp_image.admit_spdk(qualification, spec)
         gcp_image.admit_abi(qualification, receipt['abi'])
-        if spec.get('suite') == 'sui':
-            gcp_image.admit_abi(qualification, receipt['sui_abi'])
+        if spec.get('suite') in ('sui', 'both'):
+            gcp_image.admit_abi(qualification, receipt['sui_abi'], sui=True)
         if await fleet_compute.admit_guests() != fleet:
             raise RuntimeError('guest fleet identity changed after qualification')
         await _admit_boot_images(fleet_compute, fleet_state, image)

@@ -148,7 +148,7 @@ def pair_startup_script(bucket, run_id, source_sha256, deadline_utc, manifest_sh
 
 def fleet_startup_script(bucket, run_id, source_sha256, deadline_utc, manifest_sha256,
                          preparation_sha256, *, members, rdma_device, machine_type,
-                         live_transports=(), live_spdk=False, qualification_profile='full', selection=None, suite_spec=None):
+                         live_transports=(), live_spdk=False, qualification_profile='full', selection=None, suite_spec=None, sui_extra_libraries=(), sui_needed_libraries=()):
     """Prepare and qualify the admitted fleet before starting its ordinary worker."""
     gcp_runtime._sha(preparation_sha256)
     if qualification_profile not in ('full', 'focused'):
@@ -187,6 +187,8 @@ def fleet_startup_script(bucket, run_id, source_sha256, deadline_utc, manifest_s
     extra = {'qualification_profile': 'focused', 'selection': selection} if qualification_profile == 'focused' else {}
     if suite_spec is not None:
         extra['suite_spec'] = suite_spec
+        extra['sui_extra_libraries'] = list(sui_extra_libraries)
+        extra['sui_needed_libraries'] = list(sui_needed_libraries)
     return _script(bucket, run_id, source_sha256, deadline_utc, manifest_sha256, 'fleet',
                    preparation_sha256=preparation_sha256, members=normalized,
                    rdma_device=rdma_device, machine_type=machine_type,
@@ -407,7 +409,9 @@ def _pair(package, cfg, deadline, store, own, identity):
         if profile == 'focused':
             result = gcp_image_qualify.guest(package, cfg['peer_ip'], cfg['peer_instance'],
                                              cfg['rdma_device'], cfg['manifest_sha256'],
-                                             qualification_profile='focused')
+                                             qualification_profile='focused',
+                                             **({'sui_needed_libraries': cfg['sui_needed_libraries']}
+                                                if cfg.get('sui_needed_libraries') else {}))
         else:
             result = gcp_image_qualify.guest(package, cfg['peer_ip'], cfg['peer_instance'],
                                              cfg['rdma_device'], cfg['manifest_sha256'])

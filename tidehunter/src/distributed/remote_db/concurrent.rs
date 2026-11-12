@@ -200,7 +200,7 @@ impl ConcurrentRemoteDatabase {
             return Ok(());
         }
         for (_, client) in &self.io_clients {
-            if let Err(error) = client.control(move |client| client.owner_timeline_arm(limit)) {
+            if let Err(error) = client.owner_timeline_arm(limit) {
                 let mut failures = Vec::new();
                 for (partition, client) in &self.io_clients {
                     if let Err(cleanup) = client.control(|client| client.owner_timeline_arm(0)) {

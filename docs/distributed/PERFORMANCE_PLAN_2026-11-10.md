@@ -938,10 +938,10 @@ The step-size rule above did not apply: no slow call has one of the three labels
 
 Open after run 13:
 
-1. First put after a close: initial lease and pre-lease cost 15 to 24 ms each (`reserve_external`). `wal_replay` adds one close before the first measured put (probable cause: a control command at the measurement gate; not confirmed). Candidate: no close for control commands that do not need it, or pre-lease at close.
+1. First put after a close: traced to the benchmark's owner read-I/O counter sample and timeline arming. Generic `Command::Control` closes the warm extent; lease-ahead also closes its unused next extent. The earlier `wal_replay`-specific attribution was wrong. Fixed with typed `ReadIoStats` and `OwnerTimelineArm`, both wait-only; no change to durable flush, eviction or retirement. Regression passes all 12 history/lease/timeline combinations. Confirm with `nvmeof_first_put` on the same focused two-VM fleet as Sui.
 2. The remote small put is 20 to 25 times the `native` p50 (46.6 µs against 1.9 µs) and the 64 KiB put with 16 writers is 11 times. `wal_replay` removed the stalls, not the per-call cost of the network and the device.
 3. Recovery was executed (owner restart with data, coordinator reopen) but not timed. Crash tests on hardware were not done.
-4. Sui replay over NVMe-oF has no hardware result. The one launch stopped before the suite at the guest library gate (`libstdc++.so.6` is not in the proof of a focused guest). See `FOCUSED_CAMPAIGN_2026-11-07.md`, "Sui replay over NVMe-oF".
+4. Sui replay over NVMe-oF has no hardware result yet. The first launch stopped at the guest library gate. The correction retains the focused profile and adds a separate Sui linkage proof under the replay environment; one combined KV+Sui rerun is authorized. See `FOCUSED_CAMPAIGN_2026-11-07.md`, "Combined focused confirmation".
 
 ## Regression reference
 Compare each new run against this table and investigate a regression. Match fleet, route, workload, size, concurrency, cache and durability. Fleet-to-fleet spread is about 13%; do not subtract separate fleets.

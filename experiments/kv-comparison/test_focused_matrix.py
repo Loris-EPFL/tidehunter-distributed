@@ -12,6 +12,53 @@ import cloud_layout
 
 
 class FocusedMatrixTests(unittest.TestCase):
+    def test_nvmeof_first_put_matrix(self):
+        jobs = campaign.make_focused_matrix("nvmeof_first_put")
+        sources = campaign.make_focused_matrix("nvmeof_path_fix")
+        self.assertEqual(len(jobs), 12)
+        groups = {"G20W": 9, "G20R": 1, "G20N": 2}
+        self.assertEqual(Counter(job["group"] for job in jobs), groups)
+        self.assertEqual(campaign.FOCUSED_COUNTS["nvmeof_first_put"], 12)
+        self.assertEqual(campaign.selection_owner_hosts("nvmeof_first_put"), 1)
+        self.assertEqual({key: count for key, count in campaign.focused_group_counts(
+            "nvmeof_first_put").items() if key.startswith("G20")}, groups)
+        self.assertEqual(hashlib.sha256(json.dumps(jobs, sort_keys=True,
+                         separators=(",", ":")).encode()).hexdigest(),
+                         "bc17406e8712b9ad7f49662554bcca316cff7c87774216c39c5cc42aebe1efdc")
+        shape = lambda job: (job["group"], job["value_size"], job["concurrency"], job["repeat"],
+                             bool(job.get("diagnostics")), job["measurement_operations"])
+        self.assertEqual([shape(job) for job in jobs], [
+            ("G20N", 1024, 1, 0, False, 4096),
+            ("G20W", 1024, 1, 0, False, 4096),
+            ("G20R", 65536, 1, 0, False, 4096),
+            ("G20W", 1024, 1, 1, False, 4096),
+            ("G20W", 1024, 16, 0, False, 4096),
+            ("G20W", 1024, 16, 1, False, 4096),
+            ("G20W", 65536, 16, 0, False, 4096),
+            ("G20W", 65536, 16, 1, False, 4096),
+            ("G20W", 1024, 1, 0, True, 4096),
+            ("G20W", 65536, 16, 0, True, 4096),
+            ("G20W", 1024, 16, 0, False, 200000),
+            ("G20N", 65536, 16, 0, False, 4096)])
+        def source_fields(job):
+            return {key: value for key, value in job.items()
+                    if key not in ("case_id", "selection", "group")}
+        for job in jobs:
+            self.assertTrue(any(source_fields(job) == source_fields(source) for source in sources))
+            identity = hashlib.sha256(json.dumps(
+                {key: value for key, value in job.items() if key != "case_id"},
+                sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:20]
+            self.assertEqual(job["case_id"], f"{job['group']}-r{job['repeat']}-{identity}")
+            campaign.validate_focused_job(job)
+            if job["backend"] != "native":
+                self.assertTrue(set(campaign.NVMEOF_PATH_LIVE_SETTING_KEYS) <= job.keys())
+                self.assertEqual(job["history_persistence"], "wal_replay")
+                self.assertTrue(job["live_lease_ahead"])
+                self.assertFalse(job["live_polled_writes"])
+        self.assertTrue(jobs[2]["require_media_qualified"])
+        with self.assertRaises(ValueError):
+            campaign.validate_focused_job(dict(jobs[1], live_lease_ahead=False))
+
     def test_nvmeof_path_fix_matrix(self):
         jobs = campaign.make_focused_matrix("nvmeof_path_fix")
         self.assertEqual(len(jobs), 37)
@@ -36,7 +83,7 @@ class FocusedMatrixTests(unittest.TestCase):
         jobs = campaign.make_focused_matrix("nvmeof_path_core")
         compact = campaign.make_focused_matrix("nvmeof_path_compact")
         self.assertEqual(campaign.NVMEOF_PATH_SELECTIONS,
-                         ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix"))
+                         ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix", "nvmeof_first_put"))
         self.assertEqual(len(jobs), 66)
         groups = {"G18F": 4, "G18N": 17, "G18W": 19, "G18R": 12,
                   "G18M": 7, "G18B": 5, "G18X": 2}
