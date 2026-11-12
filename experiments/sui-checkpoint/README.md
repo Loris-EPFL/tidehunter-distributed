@@ -335,7 +335,10 @@ state-sync-only fullnodes bounded at tip+1, so they stay alive for final metrics
 at the frozen tip. Their certified completed tip must equal the producer.
 The producer alone receives `source_environment(prior)`: its original fragment
 size and durability policy, with historical defaults of 32 MiB and asynchronous
-writes. Measured durable settings must never reinterpret the producer's WAL.
+writes, and the reviewed fixture's one default mutex. The measured contract must
+not reinterpret the producer's WAL or persisted key layout. In particular,
+`original_default` still uses engine defaults for the new measured DBs, not for
+the frozen producer.
 The native control runs first because it exports the authoritative complete
 namespace/key-shape inventory. This fixed order is recorded, not randomized.
 

@@ -156,10 +156,11 @@ def wait_rpc(child, address):
 
 
 def source_environment(previous):
-    # Frozen sources predate these fields and used 32 MiB asynchronous native WALs.
-    # Do not reinterpret their existing files with a new fragment size.
+    # The reviewed frozen producer uses one default mutex and a 32 MiB
+    # asynchronous WAL. Its layout must not inherit the measured contract.
     return {"TH_FRAG_SIZE": str(previous.get("fragment_mib", 32) << 20),
-            "TH_SYNC_WRITES": str(previous.get("durable", False)).lower()}
+            "TH_SYNC_WRITES": str(previous.get("durable", False)).lower(),
+            "TH_DEFAULT_MUTEX_COUNT": "1"}
 
 
 def compare_local_store(relative, left, right):

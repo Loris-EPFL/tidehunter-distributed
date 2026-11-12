@@ -1183,6 +1183,10 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
         state['children']['fleet'] = child
         package = publish_export(store, child)
         child['terminal_export'] = manual._terminal_export(store, child, package, require_complete=False)
+        sui_key = child['run_id'] + '/results/sui-results.tar.gz'
+        store.put(sui_key, b'partial Sui archive')
+        child['terminal_export'].update(manual._terminal_export(
+            store, child, {}, result={}, require_complete=False))
         key = child['run_id'] + '/results/case/data'
         store.put(key, b'partial')
         actions = []
@@ -1202,6 +1206,8 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
                     await manual._finish_campaign(CONFIG, state, None, store, None, tmp,
                                                   RuntimeError('original failure'))
             self.assertEqual((Path(tmp) / 'results/case/data').read_bytes(), b'partial')
+            self.assertEqual((Path(tmp) / 'results/sui-results.tar.gz').read_bytes(), b'partial Sui archive')
+            self.assertEqual(child['terminal_export'][sui_key]['descriptor'], 'object_metadata')
 
     async def test_frozen_observer_mismatch_stops_before_preflight_or_allocation(self):
         revision = 'b' * 40

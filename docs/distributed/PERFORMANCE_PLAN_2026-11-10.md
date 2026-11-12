@@ -938,10 +938,10 @@ The step-size rule above did not apply: no slow call has one of the three labels
 
 Open after run 13:
 
-1. First put after a close: traced to the benchmark's owner read-I/O counter sample and timeline arming. Generic `Command::Control` closes the warm extent; lease-ahead also closes its unused next extent. The earlier `wal_replay`-specific attribution was wrong. Fixed with typed `ReadIoStats` and `OwnerTimelineArm`, both wait-only; no change to durable flush, eviction or retirement. Regression passes all 12 history/lease/timeline combinations. Confirm with `nvmeof_first_put` on the same focused two-VM fleet as Sui.
+1. First-put pause closed by the combined focused run (`e0af084`): first 1 KiB put at 1 writer is 124 to 132 µs instead of 33 to 35 ms; at 16 writers 319 to 331 µs instead of 33 to 34 ms. Normal and timeline gates preserve the warm extent. All 12 KV cases completed, 245,056 successful calls; sustained 200,000 puts reached 94,975 puts/s with no call above 5 ms. Two 64 KiB cases still had 16 later calls above 5 ms each; attribution remains open.
 2. The remote small put is 20 to 25 times the `native` p50 (46.6 µs against 1.9 µs) and the 64 KiB put with 16 writers is 11 times. `wal_replay` removed the stalls, not the per-call cost of the network and the device.
 3. Recovery was executed (owner restart with data, coordinator reopen) but not timed. Crash tests on hardware were not done.
-4. Sui replay over NVMe-oF has no hardware result yet. The first launch stopped at the guest library gate. The correction retains the focused profile and adds a separate Sui linkage proof under the replay environment; one combined KV+Sui rerun is authorized. See `FOCUSED_CAMPAIGN_2026-11-07.md`, "Combined focused confirmation".
+4. Sui guest library gate fixed on hardware using the focused profile. Replay remains unvalidated: r01's frozen producer inherited the measured default mutex count (1,024 rather than its stored 1) and aborted before RPC readiness. Post-run source-environment correction passed real producer startup and source-digest checks under both contracts locally. A separate partial-export collector schema error was also fixed; both archives were retained and verified. No further fleet is authorized. See `FOCUSED_CAMPAIGN_2026-11-07.md`, "Combined run result".
 
 ## Regression reference
 Compare each new run against this table and investigate a regression. Match fleet, route, workload, size, concurrency, cache and durability. Fleet-to-fleet spread is about 13%; do not subtract separate fleets.

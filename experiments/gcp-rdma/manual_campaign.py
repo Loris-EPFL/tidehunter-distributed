@@ -1186,7 +1186,7 @@ async def _finish_campaign(config, parent, path, store, execute, output, error):
                 await _blocking(_collect, store, fleet_state['run_id'], output, saved)
                 for key, expected in fleet_state.get('terminal_export', {}).items():
                     actual = saved.get(key)
-                    if actual is None or any(actual[field] != value for field, value in expected.items()):
+                    if actual is None or any(actual[field] != expected[field] for field in ('generation', 'size', 'sha256')):
                         raise ValueError('collected controller export differs from terminal generation')
             except BaseException as exc:
                 failures.append(exc)

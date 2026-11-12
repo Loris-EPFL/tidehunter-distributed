@@ -1284,4 +1284,28 @@ One owner-authorized two-VM fleet runs KV selection `nvmeof_first_put` (12 cases
 
 The combined suite uses only the focused package. Each Sui cell must complete the replay, match the native checkpoint digest, and pass the state audit. Both archives are exported when available. An exception from the KV controller still aborts before Sui; the combined path does not suppress infrastructure errors.
 
-Local checks passed: engine 1,372 passed, 15 ignored; four clippy configurations and format check; KV tests 135 and 155+5; Python KV 864 (4 skipped), observability 147, GCP 396, Sui 188 (1 skipped). The new library proof also admitted the sealed Sui ABI against actual local ELF libraries. These are functional checks only. No combined fleet launched yet.
+Local checks passed before launch: engine 1,372 passed, 15 ignored; four clippy configurations and format check; KV tests 135 and 155+5; Python KV 864 (4 skipped), observability 147, GCP 396, Sui 188 (1 skipped). The new library proof also admitted the sealed Sui ABI against actual local ELF libraries.
+
+#### Combined run result
+
+Revision `e0af084edbf97f32a9376cd64e2a40b39e19df01`; fleet `bench-e3638332bc2b43a1`; two VMs created at 22:29:46 and 22:30:36 UTC on 12 November 2026. Both instances, disks and placement policy verified absent by 22:43:18 UTC; `cleanup_verified: true`. Compute upper bound `$1.47`, excluding storage and network. No replacement fleet launched.
+
+Both guests passed the focused profile and the separate Sui library proof, including `libstdc++.so.6`, with no `LD_LIBRARY_PATH` override. All 12 KV cases completed: 245,056 measured calls, all successful. First-put stall removed in normal and timeline cases:
+
+| Leased put, native tier | First call, run 13 (ms) | First call, combined run (ms) | Combined p99.9 (ms) |
+|---|---:|---:|---:|
+| 1 KiB, 1 writer, 2 repetitions | 33.37 to 34.58 | 0.124 to 0.132 | 0.365 to 0.398 |
+| 1 KiB, 16 writers, 2 repetitions | 32.99 to 33.91 | 0.319 to 0.331 | 0.701 to 1.249 |
+| 64 KiB, 16 writers, 2 repetitions | 31.24 to 31.43 | 1.851 to 1.895 | 9.237 to 11.261 |
+| Sustained 200,000 puts, 1 KiB, 16 writers | 32.06 | 0.324 | 1.317 |
+
+The sustained case achieved 94,975 puts/s with no call above 5 ms. Both 1 KiB timeline and normal cases had no call above 5 ms. The 64 KiB timeline case had first call 1.952 ms and no call above 5 ms; `stalls.csv` is empty. The two non-timeline 64 KiB cases still had 16 calls each above 5 ms, not at the start; their cause is not established by this run. One native 64 KiB call also exceeded 5 ms. Every leased case had `extent_switch_waits: 0`. Different fleets and binaries: the numerical comparison with run 13 is context, while the local gate regression proves the removed side effect.
+
+Sui r01 started but its frozen producer aborted before RPC readiness, before either measured replay. The persisted `checkpoint_content` layout has `mutexes=1`; the inherited `original_default` environment declared 1,024. The previous local package verification used only the harness contract, which supplied 1 and hid this error. No Sui replay timing, digest comparison or state audit completed on hardware.
+
+Two post-run harness corrections (not in deployed revision `e0af084`):
+
+- `source_environment` now explicitly restores the reviewed producer's one default mutex, in addition to its WAL geometry and durability. New measured DBs retain their selected contract. With the actual sealed native executable, copied frozen producer and both measured contracts, local producer startup succeeded at checkpoint 1,775 and the full source digest range matched. This verifies the failed startup path, not a full cloud replay.
+- The partial-export collector compared terminal provenance field `descriptor` with download inventory entries that contain only object identity, causing `KeyError`. It now compares generation, size and SHA-256; the existing retention regression also covers the partial Sui archive. GCP 396 and Sui 188 (1 skipped) checks passed after both corrections.
+
+Both result archives were preserved and SHA-256 verified: KV `a4ab4dedb82e2e2622de1e57e3a7b81ceee4fb22666c1064827635b17ed2d1d2`; partial Sui `29ac3071ce4c950524ab15c66488afe86005cfc9e04a8841e657d5d4a92a274c`. Evidence: `checkpoint-work/combined-launch-20261113-firstput1/analysis/output/`, `results-top/`, and `fleet-output/`. A further cloud run requires new authorization; no Sui hardware performance claim is made.

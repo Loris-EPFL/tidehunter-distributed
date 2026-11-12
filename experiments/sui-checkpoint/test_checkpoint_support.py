@@ -52,9 +52,10 @@ class ConfigurationContract(unittest.TestCase):
             self.assertEqual(support.configuration(root, "node"), {"run-with-range": {"Epoch": 2}, "other": True})
 
     def test_frozen_source_environment_uses_original_defaults_and_explicit_fields(self):
-        self.assertEqual(support.source_environment({}), {"TH_FRAG_SIZE": "33554432", "TH_SYNC_WRITES": "false"})
+        self.assertEqual(support.source_environment({}),
+                         {"TH_FRAG_SIZE": "33554432", "TH_SYNC_WRITES": "false", "TH_DEFAULT_MUTEX_COUNT": "1"})
         self.assertEqual(support.source_environment({"fragment_mib": 8, "durable": True}),
-                         {"TH_FRAG_SIZE": "8388608", "TH_SYNC_WRITES": "true"})
+                         {"TH_FRAG_SIZE": "8388608", "TH_SYNC_WRITES": "true", "TH_DEFAULT_MUTEX_COUNT": "1"})
 
 
 class RpcContract(unittest.TestCase):
