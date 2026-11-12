@@ -15,14 +15,14 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tidehunter::distributed::codec::{BatchLimits, Mutation};
+use tidehunter::distributed::codec::{BatchLimits, CompleteBatch, Mutation};
 use tidehunter::distributed::group::GroupLimits;
 use tidehunter::distributed::local_inventory::LocalInventoryConfig;
 use tidehunter::distributed::nvmeof::{
     ExportConfig, ExportManifest, NamespaceBinding, NvmeofReaderConfig, NvmeofTransport,
 };
 use tidehunter::distributed::remote_db::RemoteDatabase;
-use tidehunter::distributed::storage::{PartitionLog, StaticInventory};
+use tidehunter::distributed::storage::{HistoryPersistence, PartitionLog, StaticInventory};
 use tidehunter::distributed::sui;
 use tidehunter::distributed::types::{BatchId, ValueRecordReference};
 use tidehunter::key_shape::{KeyShape, KeyType};
@@ -274,32 +274,49 @@ fn main() -> Result<()> {
             metrics(),
         )?);
         let mut groups: BTreeMap<u64, Vec<ValueRecordReference>> = BTreeMap::new();
-        let mut cursor = 0;
-        loop {
-            let page = log.receipt_page(cursor, 128)?;
-            if page.is_empty() {
-                break;
+        let mut record = |batch: &CompleteBatch, receipt| -> Result<()> {
+            for (index, mutation) in batch.mutations().iter().enumerate() {
+                let Mutation::Put { key, value, .. } = mutation else {
+                    return Err(fail("unexpected non-put in sealed dataset").into());
+                };
+                let id = *expected
+                    .get(&key[..])
+                    .ok_or_else(|| fail("unexpected key in sealed dataset"))?;
+                if value[..] != value_bytes(&namespace, SEED, id, value_size, 1.0)[..]
+                    || !found.insert(id)
+                {
+                    return Err(fail("sealed dataset value mismatch or duplicate key").into());
+                }
+                let reference = log.record_reference(receipt, index as u32)?;
+                groups
+                    .entry(reference.batch_address.offset / storage.wal_file_bytes)
+                    .or_default()
+                    .push(reference);
             }
-            cursor += page.len();
-            for receipt in page {
-                let batch = log.read_batch(receipt)?;
-                for (index, mutation) in batch.mutations().iter().enumerate() {
-                    let Mutation::Put { key, value, .. } = mutation else {
-                        return Err(fail("unexpected non-put in sealed dataset").into());
-                    };
-                    let id = *expected
-                        .get(&key[..])
-                        .ok_or_else(|| fail("unexpected key in sealed dataset"))?;
-                    if value[..] != value_bytes(&namespace, SEED, id, value_size, 1.0)[..]
-                        || !found.insert(id)
-                    {
-                        return Err(fail("sealed dataset value mismatch or duplicate key").into());
+            Ok(())
+        };
+        if log.history_persistence() == HistoryPersistence::WalReplay {
+            let mut from = 0;
+            loop {
+                let page = log.replay_page(from, 256, usize::MAX, 0)?;
+                for decoded in page.groups {
+                    for (batch, receipt) in decoded.group.batches().iter().zip(decoded.receipts) {
+                        record(batch, receipt)?;
                     }
-                    let reference = log.record_reference(receipt, index as u32)?;
-                    groups
-                        .entry(reference.batch_address.offset / storage.wal_file_bytes)
-                        .or_default()
-                        .push(reference);
+                }
+                let Some(next) = page.next else { break };
+                from = next;
+            }
+        } else {
+            let mut cursor = 0;
+            loop {
+                let page = log.receipt_page(cursor, 128)?;
+                if page.is_empty() {
+                    break;
+                }
+                cursor += page.len();
+                for receipt in page {
+                    record(&log.read_batch(receipt)?, receipt)?;
                 }
             }
         }

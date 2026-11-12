@@ -21,7 +21,7 @@ pub(super) struct Fixture {
     pub(super) nodes: Vec<Arc<StorageNode>>,
     shutdown: Arc<AtomicBool>,
     servers: Vec<JoinHandle<Result<(), TcpError>>>,
-    startups: Vec<(NodeConfig, TlsFiles, TcpListener)>,
+    pub(super) startups: Vec<(NodeConfig, TlsFiles, TcpListener)>,
     pub(super) temp: tempdir::TempDir,
 }
 

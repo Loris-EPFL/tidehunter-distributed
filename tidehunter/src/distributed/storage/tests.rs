@@ -2004,6 +2004,13 @@ fn profiled_pre_io_failure_never_counts_a_barrier_or_durable_receipt() {
 #[cfg(feature = "experimental-nvmeof")]
 #[test]
 fn sealed_export_preserves_native_offsets_and_rejects_forged_or_existing_paths() {
+    for mode in [HistoryPersistence::OnDisk, HistoryPersistence::WalReplay] {
+        sealed_export_preserves_native_offsets_mode(mode);
+    }
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+fn sealed_export_preserves_native_offsets_mode(mode: HistoryPersistence) {
     use crate::distributed::nvmeof::ExportConfig;
     let temp = tempdir::TempDir::new("sealed-export").unwrap();
     let config = config(vec![3], 3);
@@ -2016,6 +2023,7 @@ fn sealed_export_preserves_native_offsets_and_rejects_forged_or_existing_paths()
         )
         .unwrap(),
     );
+    log.set_history_persistence(mode).unwrap();
     let receipt = log
         .append_complete_batch(authority(&config), &batch(&config, 0))
         .unwrap();
@@ -2082,6 +2090,13 @@ fn sealed_export_preserves_native_offsets_and_rejects_forged_or_existing_paths()
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 #[test]
 fn sealed_export_async_reads_keep_duplicate_order_and_enforce_bounds() {
+    for mode in [HistoryPersistence::OnDisk, HistoryPersistence::WalReplay] {
+        sealed_export_async_reads_mode(mode);
+    }
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+fn sealed_export_async_reads_mode(mode: HistoryPersistence) {
     use crate::distributed::nvmeof::{
         Eligibility, ExportConfig, NamespaceBinding, NvmeofReader, NvmeofReaderConfig,
         NvmeofTransport, SubmitOutcome,
@@ -2097,6 +2112,7 @@ fn sealed_export_async_reads_keep_duplicate_order_and_enforce_bounds() {
         )
         .unwrap(),
     );
+    log.set_history_persistence(mode).unwrap();
     let receipt = log
         .append_complete_batch(authority(&config), &batch(&config, 0))
         .unwrap();

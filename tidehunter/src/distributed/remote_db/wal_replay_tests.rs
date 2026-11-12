@@ -69,6 +69,114 @@ fn wal_replay_retry_older_than_window_is_written_again_and_newest_wins() {
     assert!(!reopened.path.join("receipt-history-v2").exists());
 }
 
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+#[test]
+fn wal_replay_checkpointed_dataset_exports_all_keys_and_owner_restart_reads_them() {
+    use crate::distributed::nvmeof::ExportConfig;
+    use crate::distributed::tcp::SealedOwnerExport;
+    use std::collections::HashSet;
+    use std::os::unix::fs::FileExt;
+
+    let mut fixture = Fixture::new_with_capacity(8192).synchronous();
+    fixture.config.max_index_bytes = 64 * 1024 * 1024;
+    fixture.config.read_cache_bytes = 0;
+    let mut db = fixture.open();
+    let epoch = db.epoch;
+    for id in 0..5000u32 {
+        db.write_batch(
+            fixture.operation(0, u64::from(id)),
+            vec![checkpoint_put(id, id as u8)],
+        )
+        .unwrap();
+        if id == 2499 {
+            db.flush_index().unwrap();
+            // The position proof persists the owner root at this fragment.
+            // Thus the restart window no longer starts at WAL offset zero.
+            assert!(db.positions[&(0, epoch)].replay_from > 0);
+        }
+    }
+    db.shutdown().unwrap();
+    drop(db);
+    fixture.stop_owners();
+
+    let owner = SealedOwnerExport::open(
+        &fixture.startups[0].0,
+        epoch,
+        super::tests::recovery_metrics(),
+    )
+    .unwrap();
+    assert_eq!(
+        owner.log().history_persistence(),
+        HistoryPersistence::WalReplay
+    );
+    let mut by_file: BTreeMap<u64, Vec<ValueRecordReference>> = BTreeMap::new();
+    let mut ids = HashSet::new();
+    let mut from = 0;
+    loop {
+        let page = owner.log().replay_page(from, 256, usize::MAX, 0).unwrap();
+        for decoded in page.groups {
+            for (batch, receipt) in decoded.group.batches().iter().zip(decoded.receipts) {
+                let reference = owner.log().record_reference(receipt, 0).unwrap();
+                let key = batch.mutations()[0].key();
+                assert!(ids.insert(u32::from_be_bytes(key.as_ref().try_into().unwrap())));
+                by_file
+                    .entry(reference.batch_address.offset / fixture.config.storage.wal_file_bytes)
+                    .or_default()
+                    .push(reference);
+            }
+        }
+        let Some(next) = page.next else { break };
+        from = next;
+    }
+    assert_eq!(ids.len(), 5000);
+    assert!((0..5000).all(|id| ids.contains(&id)));
+    let mut exported = 0;
+    for (file, references) in by_file {
+        let mut uuid = [7; 16];
+        uuid[..8].copy_from_slice(&file.to_le_bytes());
+        let directory = fixture.temp.path().join(format!("offline-export-{file}"));
+        let manifest = owner
+            .export_sealed_readset(
+                &directory,
+                &references,
+                &ExportConfig {
+                    export_uuid: uuid,
+                    nqn: format!("nqn.2026-01.test:checkpointed-{file}"),
+                    nsid: 1,
+                    block_size: 512,
+                    max_catalog_bytes: references.len() * 4096 + 16384,
+                },
+            )
+            .unwrap();
+        assert_eq!(manifest.catalog.len(), references.len());
+        let image = fs::File::open(directory.join("image.wal")).unwrap();
+        for (entry, reference) in manifest.catalog.iter().zip(&references) {
+            let mut bytes = vec![0; entry.len];
+            image.read_exact_at(&mut bytes, entry.offset).unwrap();
+            let mutation =
+                CompleteBatch::decode_record(&fixture.shape, reference, bytes.into()).unwrap();
+            let id = u32::from_be_bytes(mutation.key().as_ref().try_into().unwrap());
+            assert_eq!(mutation, checkpoint_put(id, id as u8));
+            exported += 1;
+        }
+    }
+    assert_eq!(exported, 5000);
+    drop(owner);
+    fixture.restart_owners().unwrap();
+    let mut reopened = fixture.open();
+    for id in [0u32, 1, 899, 2499, 2500, 4095, 4096, 4999] {
+        assert_eq!(
+            reopened
+                .get(KeySpace(0), &id.to_be_bytes())
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            &[id as u8; 32]
+        );
+    }
+    reopened.shutdown().unwrap();
+}
+
 #[test]
 fn wal_replay_mode_mismatch_fails_open() {
     let mut fixture = Fixture::new();

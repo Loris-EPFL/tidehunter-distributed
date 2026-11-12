@@ -1603,9 +1603,22 @@ mod tests {
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     #[test]
     fn offline_export_requires_sealed_epoch_and_retains_owner_lock() {
+        for mode in [
+            crate::distributed::storage::HistoryPersistence::OnDisk,
+            crate::distributed::storage::HistoryPersistence::WalReplay,
+        ] {
+            offline_export_requires_sealed_epoch_mode(mode);
+        }
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    fn offline_export_requires_sealed_epoch_mode(
+        mode: crate::distributed::storage::HistoryPersistence,
+    ) {
         let temporary = tempdir::TempDir::new("node-sealed-export").unwrap();
         let config = config(&temporary.path().join("node"));
         let mut inventory = NodeInventory::open(config.clone(), metrics()).unwrap();
+        inventory.set_history_persistence(mode).unwrap();
         inventory.fence_to(1).unwrap();
         assert!(SealedOwnerExport::open(&config, 1, metrics()).is_err());
         drop(inventory);

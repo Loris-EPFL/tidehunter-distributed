@@ -21,6 +21,7 @@ use tidehunter::{
         codec::{BatchLimits, CodecError, CompleteBatch, Mutation},
         nvmeof::ExportConfig,
         remote_db::RemoteDatabase,
+        storage::{HistoryPersistence, PartitionLog},
         tcp::{NodeConfig, SealedOwnerExport},
         types::{BatchId, BatchVersion, ValueRecordReference},
     },
@@ -241,6 +242,90 @@ fn export_uuid(p: &Prepared, partition: u32, file: u64) -> [u8; 16] {
     uuid
 }
 
+fn sealed_references(
+    log: &PartitionLog,
+    shape: &KeyShape,
+    p: &Prepared,
+    wal_file_bytes: u64,
+) -> BackendResult<(usize, BTreeMap<u64, Vec<ValueRecordReference>>)> {
+    let ks = shape.iter_ks().next().ok_or("empty key shape")?.id();
+    let expected: HashMap<_, _> = (0..p.keys)
+        .map(|id| (key_bytes(&p.namespace, p.seed, id), id))
+        .collect();
+    if expected.len() != p.keys as usize {
+        return Err("generated duplicate keys".into());
+    }
+    let mut seen = HashSet::new();
+    let mut groups: BTreeMap<u64, Vec<ValueRecordReference>> = BTreeMap::new();
+    let mut receipts = 0usize;
+    let mut record = |batch: &CompleteBatch, receipt| -> BackendResult<()> {
+        receipts = receipts.checked_add(1).ok_or("receipt count overflow")?;
+        if receipts > p.keys as usize {
+            return Err("too many receipts in sealed dataset".into());
+        }
+        if batch.mutations().is_empty() || batch.mutations().len() > p.preload_batch_max_members {
+            return Err("sealed receipt exceeds prepared batch bound".into());
+        }
+        for (index, mutation) in batch.mutations().iter().enumerate() {
+            let Mutation::Put {
+                keyspace,
+                key,
+                value,
+            } = mutation
+            else {
+                return Err("non-put in sealed dataset".into());
+            };
+            if *keyspace != ks {
+                return Err("unexpected keyspace in sealed dataset".into());
+            }
+            let id = *expected
+                .get(&key[..])
+                .ok_or("unexpected key in sealed dataset")?;
+            if !seen.insert(id)
+                || value[..] != value_bytes(&p.namespace, p.seed, id, p.value_bytes, p.entropy)[..]
+            {
+                return Err("duplicate key or value mismatch in sealed dataset".into());
+            }
+            let reference = log.record_reference(receipt, u32::try_from(index)?)?;
+            let file = reference.batch_address.offset / wal_file_bytes;
+            let group = groups.entry(file).or_default();
+            if group.len() >= p.keys as usize {
+                return Err("catalog bound exceeded".into());
+            }
+            group.push(reference);
+        }
+        Ok(())
+    };
+    if log.history_persistence() == HistoryPersistence::WalReplay {
+        let mut from = 0;
+        loop {
+            let page = log.replay_page(from, 256, usize::MAX, 0)?;
+            for decoded in page.groups {
+                for (batch, receipt) in decoded.group.batches().iter().zip(decoded.receipts) {
+                    record(batch, receipt)?;
+                }
+            }
+            let Some(next) = page.next else { break };
+            from = next;
+        }
+    } else {
+        let mut cursor = 0usize;
+        loop {
+            let page = log.receipt_page(cursor, PAGE)?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = cursor
+                .checked_add(page.len())
+                .ok_or("receipt count overflow")?;
+            for receipt in page {
+                record(&log.read_batch(receipt)?, receipt)?;
+            }
+        }
+    }
+    Ok((seen.len(), groups))
+}
+
 pub(super) fn export(launch: &Path, prepared_path: &Path, output: &Path) -> BackendResult<()> {
     let launch: Launch = serde_yaml::from_slice(&fs::read(launch)?)?;
     let p: Prepared = serde_json::from_slice(&fs::read(prepared_path)?)?;
@@ -262,66 +347,9 @@ pub(super) fn export(launch: &Path, prepared_path: &Path, output: &Path) -> Back
     let owner = SealedOwnerExport::open(&node, p.source_epoch, metrics())?;
     fs::create_dir(&output)?;
     fs::set_permissions(&output, fs::Permissions::from_mode(0o700))?;
-    let log = owner.log();
     let shape: KeyShape = serde_yaml::from_str(&node.shape_yaml)?;
-    let ks = shape.iter_ks().next().ok_or("empty key shape")?.id();
-    let expected: HashMap<_, _> = (0..p.keys)
-        .map(|id| (key_bytes(&p.namespace, p.seed, id), id))
-        .collect();
-    if expected.len() != p.keys as usize {
-        return Err("generated duplicate keys".into());
-    }
-    let mut seen = HashSet::new();
-    let mut groups: BTreeMap<u64, Vec<ValueRecordReference>> = BTreeMap::new();
-    let mut cursor = 0usize;
-    loop {
-        let page = log.receipt_page(cursor, PAGE)?;
-        if page.is_empty() {
-            break;
-        }
-        cursor = cursor
-            .checked_add(page.len())
-            .ok_or("receipt count overflow")?;
-        if cursor > p.keys as usize {
-            return Err("too many receipts in sealed dataset".into());
-        }
-        for receipt in page {
-            let batch = log.read_batch(receipt)?;
-            if batch.mutations().is_empty() || batch.mutations().len() > p.preload_batch_max_members
-            {
-                return Err("sealed receipt exceeds prepared batch bound".into());
-            }
-            for (index, mutation) in batch.mutations().iter().enumerate() {
-                let Mutation::Put {
-                    keyspace,
-                    key,
-                    value,
-                } = mutation
-                else {
-                    return Err("non-put in sealed dataset".into());
-                };
-                if *keyspace != ks {
-                    return Err("unexpected keyspace in sealed dataset".into());
-                }
-                let id = *expected
-                    .get(&key[..])
-                    .ok_or("unexpected key in sealed dataset")?;
-                if !seen.insert(id)
-                    || value[..]
-                        != value_bytes(&p.namespace, p.seed, id, p.value_bytes, p.entropy)[..]
-                {
-                    return Err("duplicate key or value mismatch in sealed dataset".into());
-                }
-                let reference = log.record_reference(receipt, u32::try_from(index)?)?;
-                let file = reference.batch_address.offset / node.partition.wal_file_bytes;
-                let group = groups.entry(file).or_default();
-                if group.len() >= p.keys as usize {
-                    return Err("catalog bound exceeded".into());
-                }
-                group.push(reference);
-            }
-        }
-    }
+    let (members, groups) =
+        sealed_references(owner.log(), &shape, &p, node.partition.wal_file_bytes)?;
     let mut exports = Vec::new();
     for (file, references) in groups {
         let uuid = export_uuid(&p, partition, file);
@@ -339,7 +367,7 @@ pub(super) fn export(launch: &Path, prepared_path: &Path, output: &Path) -> Back
         let m = owner.export_sealed_readset(&dir, &references, &config)?;
         exports.push(serde_json::json!({"partition":m.partition,"epoch":m.epoch,"source_file_index":m.source_file_index,"manifest_path":dir.join("manifest.json"),"image_path":dir.join("image.wal"),"export_uuid":m.export_uuid,"nqn":m.nqn,"nsid":m.nsid,"image_len":m.image_len,"block_size":m.block_size,"members":m.catalog.len()}));
     }
-    let ready = serde_json::json!({"schema_version":1,"namespace":p.namespace,"seed":p.seed,"keys":p.keys,"value_bytes":p.value_bytes,"entropy":p.entropy,"source_epoch":p.source_epoch,"partition":partition,"members":seen.len(),"preload_batch_max_members":p.preload_batch_max_members,"preload_recipe":p.preload_recipe,"exports":exports});
+    let ready = serde_json::json!({"schema_version":1,"namespace":p.namespace,"seed":p.seed,"keys":p.keys,"value_bytes":p.value_bytes,"entropy":p.entropy,"source_epoch":p.source_epoch,"partition":partition,"members":members,"preload_batch_max_members":p.preload_batch_max_members,"preload_recipe":p.preload_recipe,"exports":exports});
     write_new(
         &output.join("ready.json"),
         &serde_json::to_vec_pretty(&ready)?,
@@ -351,6 +379,117 @@ pub(super) fn export(launch: &Path, prepared_path: &Path, output: &Path) -> Back
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sealed_dataset_references_cover_all_records_in_both_history_modes() {
+        for mode in [HistoryPersistence::OnDisk, HistoryPersistence::WalReplay] {
+            sealed_dataset_references(mode);
+        }
+    }
+
+    fn sealed_dataset_references(mode: HistoryPersistence) {
+        use tidehunter::distributed::{
+            group::GroupLimits,
+            storage::{PartitionConfig, StaticInventory},
+            types::RequestAuthority,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "kv-sealed-references-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir(&root).unwrap();
+        let shape = KeyShape::new_single(32, 16, KeyType::uniform(64));
+        let p = Prepared {
+            schema_version: 1,
+            source_epoch: 1,
+            namespace: [3; 16],
+            seed: 9,
+            keys: 300,
+            value_bytes: 1024,
+            entropy: 1.0,
+            database: [4; 16],
+            partitions: vec![0],
+            preload_batch_max_members: 1,
+            preload_recipe: PRELOAD_RECIPE.to_owned(),
+        };
+        let config = PartitionConfig {
+            inventory: StaticInventory {
+                database: p.database,
+                epoch: 1,
+                segment_generation: 1,
+                partitions: vec![0],
+            },
+            partition: 0,
+            batch_limits: BatchLimits {
+                max_operations: 1,
+                max_encoded_bytes: 2048,
+            },
+            group_limits: GroupLimits {
+                max_batches: 1,
+                max_encoded_bytes: 4088,
+            },
+            fragment_bytes: 4096,
+            wal_file_bytes: 65536,
+            max_batches: 1024,
+            max_reference_metadata_bytes: 16 * 1024 * 1024,
+        };
+        let authority = RequestAuthority { epoch: 1 };
+        let log =
+            PartitionLog::create(&root.join("stream"), config.clone(), &shape, metrics()).unwrap();
+        log.set_history_persistence(mode).unwrap();
+        let mut expected = HashSet::new();
+        for id in 0..p.keys {
+            let mut operation = [0; 16];
+            operation[..8].copy_from_slice(&id.to_le_bytes());
+            let batch = CompleteBatch::new(
+                &shape,
+                BatchId {
+                    database: p.database,
+                    operation,
+                },
+                BatchVersion {
+                    epoch: 1,
+                    sequence: id,
+                },
+                vec![Mutation::Put {
+                    keyspace: shape.iter_ks().next().unwrap().id(),
+                    key: key_bytes(&p.namespace, p.seed, id),
+                    value: value_bytes(&p.namespace, p.seed, id, p.value_bytes, p.entropy),
+                }],
+                config.batch_limits,
+            )
+            .unwrap();
+            let appended = log.append_complete_batch(authority, &batch).unwrap();
+            log.persist_through(appended).unwrap();
+            expected.insert(log.record_reference(appended, 0).unwrap());
+            if mode == HistoryPersistence::WalReplay && id == 150 {
+                let address = appended.address();
+                log.persist_wal_through(address.offset + u64::from(address.len))
+                    .unwrap();
+            }
+        }
+        log.seal_epoch(authority).unwrap();
+        drop(log);
+        let log = PartitionLog::recover_sealed(&root.join("stream"), &config, metrics()).unwrap();
+        let (members, groups) = sealed_references(&log, &shape, &p, config.wal_file_bytes).unwrap();
+        assert_eq!(members, p.keys as usize);
+        assert_eq!(
+            groups.values().map(Vec::len).sum::<usize>(),
+            p.keys as usize
+        );
+        assert_eq!(
+            groups.values().flatten().copied().collect::<HashSet<_>>(),
+            expected
+        );
+        let bad = Prepared {
+            value_bytes: p.value_bytes + 1,
+            ..p
+        };
+        assert!(sealed_references(&log, &shape, &bad, config.wal_file_bytes).is_err());
+        drop(log);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn namespace_requires_exact_hex() {
         assert!(namespace("00112233445566778899aabbccddeeff").is_ok());

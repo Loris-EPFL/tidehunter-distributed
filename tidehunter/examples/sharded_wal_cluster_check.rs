@@ -495,7 +495,7 @@ fn main() -> Result<()> {
         return Err(error("forged record membership accepted").into());
     }
     client.seal(1)?;
-    let recovered = client.recovery_page(1, 0, 128)?;
+    let recovered = client.replay_wal_page(1, 1, 0, 128, 0)?;
     if recovered.batches.len() != 1
         || recovered.batches[0].0.id() != batch.id()
         || recovered.next.is_some()
@@ -521,7 +521,7 @@ fn main() -> Result<()> {
         return Err(error("stale epoch write accepted").into());
     }
     client.seal(2)?;
-    if !client.recovery_page(2, 0, 128)?.batches.is_empty() {
+    if !client.replay_wal_page(2, 2, 0, 128, 0)?.batches.is_empty() {
         return Err(error("stale mutation appeared in new epoch").into());
     }
     drop(client);

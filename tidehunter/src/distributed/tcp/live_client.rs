@@ -3870,6 +3870,63 @@ mod leased_rollover_tests {
     use crate::distributed::write_timeline::WriteTimeline;
 
     #[test]
+    fn lease_ahead_switch_into_a_new_wal_file_rebinds_the_writer_queue() {
+        for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+            let fixture = leased_tests::Fixture::new(tier, 16384);
+            let mut client = fixture.writer();
+            let mut receipts = Vec::with_capacity(9);
+            let mut first_binding = None;
+            for sequence in 0..9 {
+                receipts.push(
+                    client
+                        .write_leased_group(
+                            1,
+                            vec![fixture.batch(sequence)],
+                            &WriteTimeline::default(),
+                            2,
+                        )
+                        .unwrap()[0],
+                );
+                if sequence == 0 {
+                    first_binding = Some(client.live_writer.as_ref().unwrap().target.uuid);
+                }
+                if sequence < 8 {
+                    client.wait_closing_extent(true).unwrap();
+                }
+            }
+            let current = client.live_leased.current.as_ref().unwrap();
+            assert_eq!(current.lease.extent.segment.file_index, 1);
+            assert_eq!(current.lease.extent.start, 32768);
+            let writer = client.live_writer.as_ref().unwrap();
+            assert!(writer.matches(&current.lease.binding));
+            assert_ne!(Some(writer.target.uuid), first_binding);
+            let closing = client.live_leased.closing.as_ref().unwrap();
+            assert_eq!(closing.lease.extent.segment.file_index, 0);
+            // Drive the background close, not a synchronous settle. Its reply
+            // must adopt every old-file frame while the new queue stays bound.
+            client.wait_closing_extent(false).unwrap();
+            assert!(client.live_leased.closing.is_none());
+            assert_eq!(fixture.metrics.snapshot().counts.adoption_sync_exchanges, 0);
+            assert_eq!(fixture.metrics.snapshot().counts.extent_switch_waits, 0);
+            assert_eq!(fixture.metrics.snapshot().counts.leased_skip_markers, 0);
+            assert_eq!(fixture.node.log_for_test(1).receipt_count(), 8);
+            let mut reader = fixture.client();
+            for (sequence, receipt) in receipts.into_iter().enumerate() {
+                let batch = fixture.batch(sequence as u64);
+                let reference = batch
+                    .record_reference(receipt.appended().address(), 0)
+                    .unwrap();
+                assert_eq!(
+                    reader.read_records(1, &[reference]).unwrap(),
+                    batch.mutations()
+                );
+            }
+            client.close_leased_extent().unwrap();
+            assert_eq!(fixture.node.log_for_test(1).receipt_count(), 9);
+        }
+    }
+
+    #[test]
     fn leased_full_extents_roll_into_a_new_file_without_skip_or_stale_binding() {
         let fixture = leased_tests::Fixture::new(DurabilityTier::Synchronous, 16384);
         let mut client = fixture.writer_without_ahead();
