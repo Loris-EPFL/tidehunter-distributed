@@ -1395,7 +1395,8 @@ def admit_write_timeline(run, config, *, completed, expected_backend=None):
               "durable_observed", "published", "caller_reply_queued", "caller_finished",
               "live_group_build_started", "live_group_built", "live_reserve_started", "live_reserve_completed",
               "live_namespace_setup_started", "live_namespace_setup_completed", "live_io_started",
-              "live_io_completed", "live_complete_started", "live_complete_completed", "live_receipts_validated"}
+              "live_io_completed", "live_complete_started", "live_complete_completed", "live_receipts_validated",
+              "live_extent_switch_started", "live_extent_switch_completed"}
     ids, owner_keys = set(), set()
     owner_success = {}
     operations, batches = set(), set()

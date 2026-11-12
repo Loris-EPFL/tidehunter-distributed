@@ -292,6 +292,15 @@ class CaseIdentityTests(unittest.TestCase):
         self.assertIn('counter="lease_exchanges"} 2', text)
         self.assertNotIn('stage="adoption_async",statistic="sum"', text)
         self.assertIn('stage="adoption_settle",statistic="sum"} 3e-08', text)
+        # Run 13 first launch: the engine exports owner lease/adoption profiles and lease-ahead counts.
+        counters.update(lease_reserve_ns=60177392, lease_namespace_sync_ns=199, lease_publish_ns=2807,
+                        lease_profile_samples=3, adopt_owner_ns=356584672, adopt_close_scan_ns=86328087,
+                        adopt_close_scan_bytes=4096, adopt_profile_samples=93, extent_preleases=2,
+                        extent_switch_waits=0)
+        text = campaign.measurement_read_metrics(evidence, {})
+        self.assertIn('counter="extent_preleases"} 2', text)
+        self.assertIn('counter="lease_reserve_ns"} 60177392', text)
+        self.assertIn('kv_live_nvmeof_bytes{scope="measurement_boundary",counter="adopt_close_scan_bytes"} 4096', text)
         counters["unknown_leased_counter"] = 0
         with self.assertRaises(ValueError):
             campaign.measurement_read_metrics(evidence, {})

@@ -74,6 +74,21 @@ class WriteTimelineAdmissionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing"):
                 cloud.admit_write_timeline(root, job, config, completed=True)
 
+    def test_extent_switch_stages_are_admitted(self):
+        # Run 13 first launch: the engine emits these stages on a call whose group switched extents.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job, config, data, path = self.fixture(root)
+            events = data["timeline"]["records"][0]["events"]
+            events[1:1] = [{"stage": "live_extent_switch_started", "elapsed_ns": 2, "owner": 0, "envelope_id": None},
+                           {"stage": "live_extent_switch_completed", "elapsed_ns": 3, "owner": 0, "envelope_id": None}]
+            path.write_text(json.dumps(data))
+            self.assertEqual(cloud.admit_write_timeline(root, job, config, completed=True)["coverage"]["joined_records"], 1)
+            events[1]["stage"] = "live_extent_switch_unknown"
+            path.write_text(json.dumps(data))
+            with self.assertRaises(ValueError):
+                cloud.admit_write_timeline(root, job, config, completed=True)
+
     def test_sparse_write_ids_join_with_mixed_and_unprofiled_measurement_calls(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
