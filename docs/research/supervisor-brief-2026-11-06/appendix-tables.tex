@@ -1,0 +1,51 @@
+\appendix
+\section{Full 1, 8 and 64 KiB comparison}
+Each entry is API p50/p99 in \us\ followed by successful calls/s. Primary live, native and Valkey cells are c16, RF1; scalar read $n=8192$, scalar write $n=4096$, and batch $n=2048$. Sealed cells are separate first-touch c16 read cases, not matched to primary live; they have the same per-operation counts. Sealed writes were not measured in this cohort, and 64 KiB sealed c16 cases are absent. Valkey write-batch32 is unsupported. A dash means no comparable case, not zero. One repetition; cache, resource and persistence contracts differ.
+\begin{center}\scriptsize
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lrrrr}\toprule
+Backend & Scalar read & Scalar write & Read-many32 & Write-batch32\\\midrule
+Native & 1.5/2.6/270631 & 68.7/169.6/157365 & 64.5/103.8/98852 & 1148.5/1425.0/12605\\
+TH TCP & 63.6/283.5/160111 & 373.2/906.3/38490 & 1252.1/3781.5/10868 & 2522.9/3561.8/6495\\
+TH verbs & 35.8/191.2/239334 & 361.9/833.5/39462 & 1126.0/3707.8/11563 & 2573.5/3474.2/6426\\
+NVMe kernel live & 46.0/373.3/111589 & 1477.4/4323.2/9198 & 1187.8/4570.2/10566 & 2226.3/3777.2/6636\\
+NVMe kernel sealed & 254.1/2412.7/35862 & -- & 7956.8/214410.2/586 & --\\
+NVMe SPDK live & 124.4/380.7/97561 & 1525.9/4132.6/8959 & 1332.3/6356.7/8975 & 2364.5/4339.4/6248\\
+NVMe SPDK sealed & 287.4/2503.3/33364 & -- & 7721.3/191637.3/626 & --\\
+Valkey TCP & 49.5/94.9/200965 & 177.2/438.0/78150 & 372.7/797.1/31498 & --\\
+Valkey RDMA & 41.2/92.5/150160 & 172.9/439.6/80146 & 320.7/788.2/35821 & --\\
+\bottomrule\end{tabular}}\\[3pt]
+1 KiB: successful API p50/p99 (\us) / calls per second.
+\end{center}
+\begin{center}\scriptsize
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lrrrr}\toprule
+Backend & Scalar read & Scalar write & Read-many32 & Write-batch32\\\midrule
+Native & 2.7/4.3/305956 & 230.5/387.4/62567 & 81.9/258.8/45566 & 11675.4/13482.1/1390\\
+TH TCP & 80.0/356.5/117956 & 553.4/1441.8/26211 & 1392.0/4946.9/9150 & 8060.2/14283.8/1848\\
+TH verbs & 44.8/231.3/197619 & 582.4/1024.6/25865 & 1171.3/3320.8/10622 & 7843.1/14726.1/1888\\
+NVMe kernel live & 53.3/369.6/102897 & 1679.1/4562.7/8418 & 1243.2/9625.6/8797 & 6707.2/14770.0/2045\\
+NVMe kernel sealed & 295.9/2368.8/32874 & -- & 8226.7/196691.3/630 & --\\
+NVMe SPDK live & 148.2/459.5/67086 & 1774.9/4758.0/7894 & 1384.5/21671.7/7394 & 7980.6/16382.0/1803\\
+NVMe SPDK sealed & 313.3/2327.7/32399 & -- & 7925.0/174969.6/666 & --\\
+Valkey TCP & 64.1/142.7/155699 & 224.8/534.7/61155 & 517.9/198143.5/3332 & --\\
+Valkey RDMA & 45.9/80.2/142170 & 216.9/520.8/63414 & 375.5/1148.9/21097 & --\\
+\bottomrule\end{tabular}}\\[3pt]
+8 KiB: successful API p50/p99 (\us) / calls per second.
+\end{center}
+\begin{center}\scriptsize
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lrrrr}\toprule
+Backend & Scalar read & Scalar write & Read-many32 & Write-batch32\\\midrule
+Native & 14.8/26.3/199283 & 2934.9/3543.0/5738 & 1252.9/7879.7/2544 & 62053.2/72191.7/250\\
+TH TCP & 163.3/723.7/50613 & 1629.9/3158.9/9168 & 5857.4/15312.9/1725 & 40909.5/60727.2/394\\
+TH verbs & 82.2/339.8/99756 & 1632.0/3175.0/9073 & 1658.2/33731.3/3594 & 41336.3/58792.8/403\\
+NVMe kernel live & 94.9/270.8/65193 & 2144.4/6711.8/6302 & 1784.4/37827.1/3115 & 47645.1/280717.5/256\\
+NVMe kernel sealed & -- & -- & -- & --\\
+NVMe SPDK live & 193.2/590.4/48302 & 2629.8/8089.9/5254 & 2100.9/39674.1/2829 & 60180.7/530516.3/182\\
+NVMe SPDK sealed & -- & -- & -- & --\\
+Valkey TCP & 144.1/3173.4/21940 & 444.3/1254.9/29605 & 4431.8/365683.8/243 & --\\
+Valkey RDMA & 117.2/276.0/82860 & 418.7/1119.7/31902 & 1439.9/43334.1/2159 & --\\
+\bottomrule\end{tabular}}\\[3pt]
+64 KiB: successful API p50/p99 (\us) / calls per second.
+\end{center}

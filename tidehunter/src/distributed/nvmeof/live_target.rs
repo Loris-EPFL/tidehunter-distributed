@@ -7,7 +7,7 @@
 //! write protection can be changed by an authorized controller.
 use super::live_connect::{LiveConnectTarget, LiveConnectionRegistry};
 use super::live_namespace::LiveNamespaceAccess;
-use super::{LiveTargetConfig, LiveTargetStats, NvmeofTransport};
+use super::{LiveExportMode, LiveTargetConfig, LiveTargetStats, NvmeofTransport};
 use crate::lock::DbLock;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -62,6 +62,8 @@ pub struct LiveTargetBinding {
     pub readonly: bool,
     #[serde(default)]
     pub spdk: Option<std::sync::Arc<super::SpdkTarget>>,
+    #[serde(default)]
+    pub permanent: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -193,6 +195,9 @@ fn check_path(path: &Path, private: bool) -> io::Result<()> {
     Ok(())
 }
 fn validate_config(c: &LiveTargetConfig) -> io::Result<()> {
+    if c.export_mode != LiveExportMode::OnDemand && c.spdk.is_some() {
+        return Err(invalid("permanent live export requires the kernel target"));
+    }
     if c.address.parse::<IpAddr>().is_err()
         || !nqn_valid(&c.host_nqn)
         || c.service == 0
@@ -618,6 +623,109 @@ impl LiveTargetManager {
         }
         Ok(file)
     }
+    pub fn export_mode(&self) -> LiveExportMode {
+        self.state.config.export_mode
+    }
+
+    pub fn endpoint(&self) -> (String, u16, NvmeofTransport) {
+        let config = &self.state.config;
+        (config.address.clone(), config.service, config.transport)
+    }
+
+    pub fn export_permanent(
+        &mut self,
+        name: &super::live_storage::WalExportName,
+        file: LiveFileIdentity,
+    ) -> io::Result<LiveTargetBinding> {
+        if self.poisoned {
+            return Err(invalid("target manager is quarantined"));
+        }
+        if let Some(export) = self
+            .state
+            .exports
+            .iter()
+            .find(|export| export.file.device == file.device && export.file.inode == file.inode)
+        {
+            return if export.binding.uuid == name.uuid {
+                Ok(export.binding.clone())
+            } else {
+                Err(invalid("WAL file already exported"))
+            };
+        }
+        let result = self.export_permanent_inner(name, file);
+        if result.is_err() {
+            self.poisoned = true;
+            self.stats.errors = self.stats.errors.saturating_add(1);
+        }
+        result
+    }
+
+    fn export_permanent_inner(
+        &mut self,
+        name: &super::live_storage::WalExportName,
+        file: LiveFileIdentity,
+    ) -> io::Result<LiveTargetBinding> {
+        let sub = PathBuf::from("subsystems").join(&name.nqn);
+        if !self.state.objects.iter().any(|object| object.path == sub) {
+            self.record_create(name.subsystem_id, &sub, Kind::Directory, None)?;
+            self.put(&sub.join("attr_allow_any_host"), "0")?;
+            let host = PathBuf::from("hosts").join(&self.state.config.host_nqn);
+            self.record_create(
+                name.subsystem_id,
+                &sub.join("allowed_hosts").join(&self.state.config.host_nqn),
+                Kind::Link,
+                Some(&host),
+            )?;
+            let public_link = PathBuf::from("ports")
+                .join(self.state.config.port_id.to_string())
+                .join("subsystems")
+                .join(&name.nqn);
+            self.record_create(name.subsystem_id, &public_link, Kind::Link, Some(&sub))?;
+        }
+        let pin = self.file(&file)?;
+        let binding = LiveTargetBinding {
+            nqn: name.nqn.clone(),
+            uuid: name.uuid,
+            nsid: name.nsid,
+            bytes: file.bytes,
+            block_size: file.block_size,
+            address: self.state.config.address.clone(),
+            service: self.state.config.service,
+            transport: self.state.config.transport,
+            readonly: false,
+            spdk: None,
+            permanent: true,
+        };
+        self.state.exports.push(Export {
+            binding: binding.clone(),
+            file: file.clone(),
+            readonly: false,
+            spdk_phase: None,
+        });
+        self.pins.insert(name.uuid, pin);
+        self.save()?;
+        let ns = sub.join(format!("namespaces/{}", name.nsid));
+        self.record_create(name.uuid, &ns, Kind::Directory, None)?;
+        let path = file
+            .path
+            .to_str()
+            .ok_or_else(|| invalid("WAL path is not UTF-8"))?;
+        self.put(&ns.join("device_path"), path)?;
+        self.put(&ns.join("device_uuid"), &uuid(name.uuid))?;
+        self.put(&ns.join("buffered_io"), "1")?;
+        drop(self.file(&file)?);
+        let pinned = self
+            .pins
+            .get(&name.uuid)
+            .ok_or_else(|| invalid("missing WAL pin"))?
+            .metadata()?;
+        if pinned.dev() != file.device || pinned.ino() != file.inode || pinned.len() != file.bytes {
+            return Err(invalid("pinned WAL changed"));
+        }
+        self.put(&ns.join("enable"), "1")?;
+        self.stats.namespaces_exposed = self.stats.namespaces_exposed.saturating_add(1);
+        Ok(binding)
+    }
     pub fn export_writable(&mut self, file: LiveFileIdentity) -> io::Result<LiveTargetBinding> {
         let result = self.export(file, false);
         if result.is_err() {
@@ -652,7 +760,7 @@ impl LiveTargetManager {
         for export in &self.state.exports {
             let path = PathBuf::from("subsystems")
                 .join(&export.binding.nqn)
-                .join("namespaces/1");
+                .join(format!("namespaces/{}", export.binding.nsid));
             if let Some(object) = self.state.objects.iter().find(|object| object.path == path)
                 && self.verify_object(object)?
             {
@@ -713,6 +821,7 @@ impl LiveTargetManager {
             } else {
                 None
             },
+            permanent: false,
         };
         if binding.spdk.is_some() {
             self.state.spdk_issued.push(id);
@@ -742,7 +851,7 @@ impl LiveTargetManager {
         self.save()?; // durable quarantine precedes any possible exposure
         let id = binding.uuid;
         let sub = PathBuf::from("subsystems").join(&binding.nqn);
-        let ns = sub.join("namespaces/1");
+        let ns = sub.join(format!("namespaces/{}", binding.nsid));
         self.record_create(id, &sub, Kind::Directory, None)?;
         self.put(&sub.join("attr_allow_any_host"), "0")?;
         self.record_create(id, &ns, Kind::Directory, None)?;
@@ -787,6 +896,7 @@ impl LiveTargetManager {
                 service: self.state.config.commissioning_service,
                 transport: NvmeofTransport::Tcp,
                 spdk: binding.spdk.clone(),
+                geometry: Default::default(),
             };
             let deadline = Instant::now() + Duration::from_secs(20);
             let (mut controller, namespace) = self
@@ -894,7 +1004,7 @@ impl LiveTargetManager {
         for export in &exports {
             let ns = PathBuf::from("subsystems")
                 .join(&export.binding.nqn)
-                .join("namespaces/1");
+                .join(format!("namespaces/{}", export.binding.nsid));
             if let Some(object) = self.state.objects.iter().find(|o| o.path == ns)
                 && self.verify_object(object)?
             {
@@ -977,7 +1087,26 @@ impl LiveTargetManager {
         if !self.state.exports.iter().any(|e| e.binding == *binding) {
             return Err(invalid("unknown target binding"));
         }
-        let result = self.cleanup(Some(binding.uuid));
+        let result = self.cleanup(Some(binding.uuid)).and_then(|()| {
+            if binding.permanent
+                && !self
+                    .state
+                    .exports
+                    .iter()
+                    .any(|export| export.binding.nqn == binding.nqn)
+            {
+                let sub = PathBuf::from("subsystems").join(&binding.nqn);
+                let group = self
+                    .state
+                    .objects
+                    .iter()
+                    .find(|object| object.path == sub)
+                    .ok_or_else(|| invalid("missing subsystem registration"))?
+                    .group;
+                self.cleanup(Some(group))?;
+            }
+            Ok(())
+        });
         if result.is_err() {
             self.poisoned = true;
             self.stats.errors = self.stats.errors.saturating_add(1);

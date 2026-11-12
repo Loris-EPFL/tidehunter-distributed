@@ -129,24 +129,29 @@ def validate_runtime(config):
         raise RuntimeSafetyError('package source, revision or immutable object identity mismatch')
     _sha(package.get('sha256'))
     backends = config['spec'].get('backends', [])
-    if not isinstance(backends, list) or not set(backends) <= {'native', 'tidehunter_tcp', 'tidehunter_verbs', 'tidehunter_verbs_native', 'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma', 'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'valkey_rdma', 'garnet', 'kvrocks'}:
+    if not isinstance(backends, list) or not set(backends) <= {'native', 'tidehunter_tcp', 'tidehunter_tcp_trusted', 'tidehunter_verbs', 'tidehunter_verbs_native', 'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma', 'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'valkey_rdma', 'garnet', 'kvrocks'}:
         raise RuntimeSafetyError('invalid GCP backend selection')
     mode = config['spec'].get('mode', 'standard')
     if mode not in {'standard', 'nvmeof-focused', 'standard-with-nvmeof', 'standard-with-live-nvmeof', 'focused'}:
         raise RuntimeSafetyError('invalid matrix mode')
     if len(config['fleet']) == 2:
-        if mode != 'focused' or config['spec'].get('suite') != 'kv':
-            raise RuntimeSafetyError('compact fleet requires a focused KV selection')
-        if set(backends) & {'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'valkey_rdma', 'garnet', 'kvrocks'}:
-            raise RuntimeSafetyError('backend requires five owner hosts')
-        import workflow_input
-        selection = config['spec'].get('selection')
-        if (config['spec'].get('owner_hosts', 5) != 1
-                or workflow_input.cloud_campaign.selection_owner_hosts(selection) != 1):
-            raise RuntimeSafetyError('selection does not admit a compact fleet')
-        jobs = workflow_input.cloud_campaign.make_focused_matrix(selection)
-        if any(workflow_input.cloud_campaign.job_owner_hosts(job) > 1 for job in jobs):
-            raise RuntimeSafetyError('selection contains a five-owner job')
+        if config['spec'].get('suite') == 'sui':
+            import manual_sui
+            if not manual_sui.reviewed_sui_spec(manual_sui.reviewed_part(config['spec'])):
+                raise RuntimeSafetyError('compact fleet requires a focused KV selection')
+        else:
+            if mode != 'focused' or config['spec'].get('suite') != 'kv':
+                raise RuntimeSafetyError('compact fleet requires a focused KV selection')
+            if set(backends) & {'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'valkey_rdma', 'garnet', 'kvrocks'}:
+                raise RuntimeSafetyError('backend requires five owner hosts')
+            import workflow_input
+            selection = config['spec'].get('selection')
+            if (config['spec'].get('owner_hosts', 5) != 1
+                    or workflow_input.cloud_campaign.selection_owner_hosts(selection) != 1):
+                raise RuntimeSafetyError('selection does not admit a compact fleet')
+            jobs = workflow_input.cloud_campaign.make_focused_matrix(selection)
+            if any(workflow_input.cloud_campaign.job_owner_hosts(job) > 1 for job in jobs):
+                raise RuntimeSafetyError('selection contains a five-owner job')
     if mode == 'focused':
         import manual_campaign
         manual_campaign._reviewed_jobs(config['spec'])
@@ -154,7 +159,7 @@ def validate_runtime(config):
             raise RuntimeSafetyError('reviewed selection and fleet size disagree')
     if mode == 'standard' and set(backends) & {'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma'}:
         raise RuntimeSafetyError('NVMe backends require an NVMe-oF mode')
-    if mode == 'standard-with-live-nvmeof' and set(backends) & {'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma'}:
+    if live_mode(config['spec']) and set(backends) & {'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma'}:
         live = config.get('live_qualification')
         if not isinstance(live, dict) or set(live) != {'image', 'image_qualification', 'pair_hosts', 'rdma_device', 'service_account'}:
             raise RuntimeSafetyError('generation-pinned live pair qualification is required')
@@ -190,6 +195,11 @@ def validate_runtime(config):
                 or pair[0]['zone'] != pair[1]['zone'] or pair[0]['zone'] != config['fleet'][0]['zone']
                 or len({host[key] for host in pair for key in ('internal_ip', 'rdma_ip')}) != 4):
             raise RuntimeSafetyError('live pair guests and addresses must be distinct, bound to the receipt and zonal')
+        if (mode == 'focused' or config['spec'].get('suite') == 'sui') and any(
+                any(str(pair[i][key]) != str(config['fleet'][i][key])
+                    for key in ('name', 'id', 'zone', 'internal_ip', 'rdma_ip'))
+                for i in range(2)):
+            raise RuntimeSafetyError('focused live pair must match the campaign fleet')
     if not isinstance(config.get('machine_type'), str) or config['machine_type'] not in LOCAL_SSD_COUNTS:
         raise RuntimeSafetyError('machine type must have an admitted local SSD layout')
     policy = config.get('placement_policy')
@@ -227,6 +237,12 @@ def build_runtime_config(launch_config, fleet, package_receipt, spec, deadline_u
     return validate_runtime(config)
 
 
+def live_mode(spec):
+    from workflow_input import cloud_campaign
+    return (spec.get('mode') == 'standard-with-live-nvmeof'
+            or (spec.get('mode') == 'focused' and spec.get('selection') in ('leased_ab_compact', *cloud_campaign.NVMEOF_PATH_SELECTIONS)))
+
+
 def admit_live_qualification(runtime):
     """Revalidate the immutable pair proof on the guest before live owner setup."""
     import gcp_api
@@ -234,7 +250,7 @@ def admit_live_qualification(runtime):
     import manual_campaign
     validate_runtime(runtime)
     spec = runtime['spec']
-    if (spec.get('mode') != 'standard-with-live-nvmeof'
+    if (not live_mode(spec)
             or not set(spec['backends']) & {'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma'}):
         raise RuntimeSafetyError('live qualification requested for a non-live campaign')
     binding = runtime['live_qualification']
@@ -243,6 +259,9 @@ def admit_live_qualification(runtime):
     image_config = {'project_id': runtime['project_id'], 'bucket': runtime['bucket'],
                     'image': binding['image'], 'image_qualification': binding['image_qualification'],
                     'service_account': binding['service_account']}
+    import manual_sui
+    if manual_sui.focused_qualification(spec):
+        image_config['qualification_profile'] = 'focused'
     qualification = gcp_image.admit_image(api, image_config, image)
     if qualification.get('runtime_sha256') != runtime['package'].get('manifest_sha256'):
         raise RuntimeSafetyError('live pair qualification does not bind this package manifest')
@@ -392,7 +411,7 @@ def validate_controller_config(config):
     if (config.get('repository_root') != str(root / 'source') or config.get('binary') != str(root / 'runtime/bin/kv-research')
         or config.get('fdb_library_dir') != str(root / 'runtime/lib')):
         raise RuntimeSafetyError('package paths differ from sealed layout')
-    allowed = {'native', 'tidehunter_tcp', 'tidehunter_verbs', 'tidehunter_verbs_native',
+    allowed = {'native', 'tidehunter_tcp', 'tidehunter_tcp_trusted', 'tidehunter_verbs', 'tidehunter_verbs_native',
                'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma',
                'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'valkey_rdma', 'garnet', 'kvrocks'}
     if not set(config['spec']['backends']) <= allowed:
@@ -563,13 +582,15 @@ def admit_fabrics(config, index, clients, root):
     backends = set(config['spec']['backends'])
     nvme_requested = 'tidehunter_nvme_rdma' in backends
     nvme_tcp_requested = 'tidehunter_nvme_tcp' in backends
-    nvme_live = (config['spec'].get('mode') == 'standard-with-live-nvmeof'
+    nvme_live = (live_mode(config['spec'])
                  and (nvme_requested or nvme_tcp_requested))
     valkey_requested = 'valkey_rdma' in backends
     runtime_spec = config.get('platform', {}).get('runtime', {}).get('spec', {})
-    sui_verbs = (runtime_spec.get('suite') in ('sui', 'both')
-                 and bool(set(runtime_spec.get('sui_transports', []))
-                          & {'tidehunter_verbs', 'tidehunter_verbs_native'}))
+    sui_verbs = False
+    if runtime_spec.get('suite') in ('sui', 'both'):
+        import gcp_sui
+        sui_verbs = any(cell['transport'] in ('tidehunter_verbs', 'tidehunter_verbs_native')
+                        for cell in gcp_sui.sui_cells(runtime_spec))
     requested = nvme_requested or valkey_requested or sui_verbs or bool(
         backends & {'tidehunter_verbs', 'tidehunter_verbs_native'})
     evidence = {'provider': 'gcp', 'nvme_rdma_requested': nvme_requested,
@@ -741,12 +762,14 @@ def _controller_config(runtime):
     if not required_features <= set(manifest.get('features', [])):
         raise RuntimeSafetyError('packaged binary lacks selected industry backend features')
     required_artifacts = set()
+    if live_mode(runtime['spec']):
+        required_artifacts.add('source/experiments/kv-comparison/nvme_campaign_owner.py')
     if runtime['spec'].get('spdk_comparison'):
         required_artifacts |= {'runtime/spdk/spdk.json', 'runtime/spdk/bin/nvmf_tgt',
                                'source/experiments/nvmeof/spdk_targets.py',
                                'source/experiments/nvmeof/spdk_artifacts.py',
                                'source/experiments/nvmeof/spdk_measurement.py'}
-        if runtime['spec'].get('mode') == 'standard-with-live-nvmeof':
+        if live_mode(runtime['spec']):
             required_artifacts |= {'source/experiments/nvmeof/live_spdk_daemon.py',
                                    'source/experiments/kv-comparison/nvme_campaign_owner.py'}
     if runtime['spec'].get('valkey_reproduction_profiles'):

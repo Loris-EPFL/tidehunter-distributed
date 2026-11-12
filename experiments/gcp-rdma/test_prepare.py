@@ -6,6 +6,9 @@ import subprocess
 from pathlib import Path
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
+import sys
+import gcp_sui
 
 import prepare
 
@@ -70,6 +73,32 @@ class CheckoutAdmissionTest(unittest.TestCase):
             bad = {'version_requirements': dict(abi['version_requirements'], **{family: [version]})}
             with self.subTest(family=family), self.assertRaisesRegex(ValueError, family):
                 prepare.admit_rocky9_abi(bad)
+
+class SuiNvmePreparationTest(unittest.TestCase):
+    def test_prepare_command_defaults_and_nvme(self):
+        revision = 'ef6701911cc07d9102f55e52f5a0632e5ddb0a86'
+        for nvmeof in (False, True):
+            with self.subTest(nvmeof=nvmeof), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                (root/'package-receipt.json').write_text(json.dumps({'source_revision': 'engine'}))
+                ci = SimpleNamespace(unpack_fixture=lambda fixture, output: root/'fixture',
+                    local_replay_transport=lambda: {}, write_local_replay_transport=lambda path: None)
+                spec = SimpleNamespace(loader=SimpleNamespace(exec_module=lambda module: None))
+                captured = []
+                def capture(command, deadline):
+                    captured.append(command)
+                    raise RuntimeError('stop after command')
+                with patch.object(prepare, 'checkout'), patch.object(gcp_sui, 'inspect_archive'), \
+                     patch.object(prepare.importlib.util, 'spec_from_file_location', return_value=spec), \
+                     patch.object(prepare.importlib.util, 'module_from_spec', return_value=ci), \
+                     patch.object(prepare.ci_prepare, 'bounded', side_effect=capture):
+                    with self.assertRaisesRegex(RuntimeError, 'stop after command'):
+                        prepare.prepare_sui(root, root, revision, root/'fixture.tar.gz', root/'target', 1800, nvmeof=nvmeof)
+                expected = [sys.executable, prepare.ROOT/'experiments/sui-checkpoint/build.py', 'prepare',
+                            '--sui', root, '--engine', prepare.ROOT, '--output', root/'sui/build',
+                            '--fabric', '--jobs', '2']
+                self.assertEqual(captured[0], expected + (['--nvmeof'] if nvmeof else []))
+
 
 class BuildContainerOwnershipTest(unittest.TestCase):
     def inspect_result(self, owner):

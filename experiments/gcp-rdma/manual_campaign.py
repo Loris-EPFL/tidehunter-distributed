@@ -8,6 +8,7 @@ Cleanup is recoverable without GitHub. Compute describe/delete is necessarily a
 TOCTOU: the API does not provide an ID precondition for name-based deletion.
 """
 import asyncio
+import copy
 from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
 import hashlib
@@ -31,6 +32,7 @@ import gcp_qualify_bootstrap as qualify
 import gcp_runtime
 import prepare
 import workflow_input
+from cloud_campaign import NVMEOF_PATH_SELECTIONS
 from gcp_api import ApiError
 from gcp_manual_storage import ACCOUNT, PROJECT, CredentialUnavailable, DelegatedArtifacts, TRANSPORT
 
@@ -78,19 +80,33 @@ FOCUSED_MATRIX_SHA256 = {
     'parity': 'ee942bda8565ff1295814a61fb00040f6feedce9cd73304dea29dec095169ec6',
     'parity_compact': '4978687ab42ca839e2c864978fb1489854ae201d28f06facf89a283cdea8e0aa',
     'fair_five_owner': '479601db27b3a709e83944dcdfa9b77e7f8e4bacac9637a29e04327e09151946',
+    'remote_rw_compact': 'b2f2afc44afc1d066bedb27f819c5fa7789e000f96da0c7beb4c6f9359122620',
+    'fabric_ab_compact': '8e12ba4352dc461680565b3bfaef5db705e702e03bce986323cc1e31ae9bde6e',
+    'leased_ab_compact': '52029dc2047cecca4903b4240d7a84d8dcb402bfbfddcad827d605405f15c2dc',
+    'nvmeof_path_compact': '8da5d9479b5fc470ff90c21211b3c3510a66d15bd3f03e520c9eefe38b7b2036',
+    'nvmeof_path_core': 'f286ce6c7255d21f98c9cef8b334b3d6540b1cc84005bc265e0f39751225ff55',
+    'nvmeof_path_fix': 'aa94a3842d196bd9cdb486b0c746e9939455b25d4d152e8127c1aba51f9ef606',
 }
 REVIEWED_SPECS = {
     selection: {
         'schema_version': 1, 'suite': 'kv', 'mode': 'focused', 'selection': selection,
         'matrix_sha256': digest, 'job_count': count, 'seed': 1775, 'repeats': 3,
-        'backends': (['native', 'tidehunter_tcp', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma', 'tidehunter_verbs']
+        'backends': (['native', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma']
+                     if selection in NVMEOF_PATH_SELECTIONS else
+                     ['tidehunter_verbs_native', 'tidehunter_nvme_rdma']
+                     if selection == 'leased_ab_compact' else
+                     ['tidehunter_tcp', 'tidehunter_tcp_trusted', 'tidehunter_verbs_native',
+                      'tidehunter_nvme_rdma', 'tidehunter_nvme_tcp']
+                     if selection == 'fabric_ab_compact' else
+                     ['native', 'tidehunter_tcp', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma', 'tidehunter_verbs']
                      if selection in ('stages', 'unified') else
                      ['native', 'tidehunter_tcp', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma']),
-        'keys': 4096, 'spdk_comparison': True, 'direct_control_arm': True, 'max_cases': 333,
+        'keys': 4096, 'spdk_comparison': selection not in ('leased_ab_compact', *NVMEOF_PATH_SELECTIONS), 'direct_control_arm': True,
+        'max_cases': count if selection in NVMEOF_PATH_SELECTIONS else 72 if selection == 'leased_ab_compact' else 80 if selection == 'fabric_ab_compact' else 342 if selection == 'remote_rw_compact' else 333,
         'case_deadline_seconds': 600, 'hard_deadline_seconds': FLEET_SECONDS,
         'export_reserve_seconds': EXPORT_RESERVE_SECONDS,
         'diagnostics': {'write_profile_limit': 256, 'read_profile_limit': 256, 'write_timeline_limit': 8192},
-        **({'owner_hosts': 1} if selection == 'parity_compact' else {}),
+        **({'owner_hosts': 1} if selection in ('parity_compact', 'remote_rw_compact', 'fabric_ab_compact', 'leased_ab_compact', *NVMEOF_PATH_SELECTIONS) else {}),
     }
     for selection, digest, count in (
         ('recommended', FOCUSED_MATRIX_SHA256['recommended'], 279),
@@ -104,6 +120,12 @@ REVIEWED_SPECS = {
         ('parity', FOCUSED_MATRIX_SHA256['parity'], 216),
         ('parity_compact', FOCUSED_MATRIX_SHA256['parity_compact'], 177),
         ('fair_five_owner', FOCUSED_MATRIX_SHA256['fair_five_owner'], 39),
+        ('remote_rw_compact', FOCUSED_MATRIX_SHA256['remote_rw_compact'], 342),
+        ('fabric_ab_compact', FOCUSED_MATRIX_SHA256['fabric_ab_compact'], 80),
+        ('leased_ab_compact', FOCUSED_MATRIX_SHA256['leased_ab_compact'], 72),
+        ('nvmeof_path_compact', FOCUSED_MATRIX_SHA256['nvmeof_path_compact'], 157),
+        ('nvmeof_path_core', FOCUSED_MATRIX_SHA256['nvmeof_path_core'], 66),
+        ('nvmeof_path_fix', FOCUSED_MATRIX_SHA256['nvmeof_path_fix'], 37),
     )
 }
 
@@ -199,6 +221,11 @@ def _record(path, state, phase):
 
 
 def _reviewed_jobs(spec):
+    if isinstance(spec, dict) and spec.get("suite") == "sui":
+        import manual_sui
+        if not manual_sui.reviewed_sui_spec(manual_sui.reviewed_part(spec)):
+            raise ValueError("an exact reviewed focused specification is required")
+        return []
     if isinstance(spec, dict) and _json(spec) == _json(REVIEWED_SPEC):
         return workflow_input.cloud_campaign.make_matrix({k: v for k, v in spec.items() if k != 'suite'})
     if (not isinstance(spec, dict) or type(spec.get('selection')) is not str
@@ -262,7 +289,8 @@ def _admit_package(package_dir, revision, spec):
     receipt = json.loads((package_dir / 'package-receipt.json').read_text())
     root = package_dir / 'package'
     verified = package.verify_directory(root)
-    focused = spec.get('mode') == 'focused'
+    import manual_sui
+    focused = manual_sui.focused_qualification(spec)
     if focused and verified.get('build_profile') != 'focused':
         raise ValueError('focused campaign requires the focused package profile')
     if not focused and verified.get('build_profile') is not None:
@@ -288,7 +316,7 @@ def _admit_package(package_dir, revision, spec):
             or proof.get('binary_blake2b512') != verified['binary_blake2b512']):
         raise ValueError('qualification does not bind the sealed executable')
     manifest = json.loads((root / 'manifest.json').read_text())
-    if spec.get('mode') == 'focused' and (
+    if focused and (
             'valkey-rdma' in manifest.get('features', [])
             or any(name.startswith('runtime/bin/valkey-') or name == 'runtime/valkey-rdma.json'
                    for name in manifest.get('files', {}))):
@@ -299,12 +327,16 @@ def _admit_package(package_dir, revision, spec):
     prepare.ci_prepare.admit_qualification(package_dir / 'qualification', proof,
                                            **({'focused': True} if focused else {}))
     _check_snapshot(source, revision)
+    if spec.get('suite') == 'sui':
+        manual_sui.admit_sui_package(package_dir, receipt)
     receipt['archive_path'] = str(archive.resolve())
     return receipt, source
 
 
 def _qualify_observer(package_dir, spec):
     """Exercise the admitted package's own matrix and observer without cloud access."""
+    if spec.get("suite") == "sui":
+        return {"skipped": "sui suite has no KV matrix"}
     script = Path(package_dir).resolve() / 'package/source/experiments/gcp-rdma/qualify_observer_matrix.py'
     result = subprocess.run([sys.executable, '-I', '-B', str(script)], input=json.dumps(spec),
                             capture_output=True, text=True, timeout=120)
@@ -327,12 +359,17 @@ def _put_json(store, key, value):
     return {'object': key, 'generation': str(meta['generation']), 'sha256': _digest(raw)}
 
 
-def _stage(store, bucket, state, receipt, wheels=None, *, qualification=False):
+def _stage(store, bucket, state, receipt, wheels=None, *, qualification=False, spec=None, fixture=None):
     """Stage the same locally admitted source and archive for each child."""
     prefix = 'runs/' + state['run_id'] + '/'
     package = dict(receipt)
     package['object_key'] = prefix + 'package.tar'
     package['generation'] = campaign.upload_file(store, package['archive_path'], package['sha256'], package['object_key'])
+    if spec is not None and spec.get('suite') == 'sui':
+        import manual_sui
+        staged = manual_sui.stage_sui(store, prefix, receipt, fixture)
+        package.update({k: staged[k] for k in ('sui_object_key', 'sui_generation')})
+        spec.update({k: staged[k] for k in ('sui_fixture', 'sui_verification')})
     _put_json(store, prefix + 'package.json', package)
     # The qualification bootstrap only uses these identity fields. Normal fleet
     # runtime is written later, once all numeric IDs and addresses are admitted.
@@ -472,7 +509,7 @@ def _evidence(store, bucket, state, name, output):
             'generation': str(meta['generation']), 'sha256': _digest(data)}}
 
 def _admit_live_pair(records, hosts, spec, rdma_device, run_id=None):
-    if spec.get('mode') != 'standard-with-live-nvmeof':
+    if not gcp_runtime.live_mode(spec):
         return
     import gcp_live_qualification
     if len(records) != 2 or len(hosts) != 2 or hosts[0]['name'] == hosts[1]['name']:
@@ -836,8 +873,11 @@ async def recover_cleanup(config, *, run_id, state_path, execute, artifacts=None
     return parent
 
 
-def _terminal_export(store, state, package, *, require_complete=True):
+def _terminal_export(store, state, package, *, require_complete=True, result=None):
     """Pin the final controller receipt and its durable archive descriptors."""
+    if result is not None:
+        import manual_sui
+        return manual_sui.terminal_export_sui(store, state, result, require_complete=require_complete)
     prefix = state['run_id'] + '/results/'
     key = prefix + 'receipt.json'
     meta = store.head(key)
@@ -1027,7 +1067,7 @@ async def _suite(store, config, state, path, fleet, package, spec, output, rdma_
         except ApiError as exc:
             cause = exc.__cause__
             if (not isinstance(store, DelegatedArtifacts) or exc.status is not None
-                    or not isinstance(cause, (urllib.error.URLError, TimeoutError))
+                    or not isinstance(cause, (urllib.error.URLError, TimeoutError, ConnectionError))
                     or isinstance(cause, urllib.error.HTTPError) or _certificate_failure(exc)):
                 raise
             if time.time() >= campaign.parse_time(state['deadline']).timestamp() - 60:
@@ -1039,32 +1079,39 @@ async def _suite(store, config, state, path, fleet, package, spec, output, rdma_
     # that the coordinator has stopped writing.
     Path(output, 'campaign-receipt.json').write_bytes(_json(terminal))
     workload_error = None
+    result = {}
     if terminal['exit_code'] != 0:
         workload_error = RuntimeError('coordinator failed; see campaign-receipt.json')
     else:
         try:
             result = json.loads(terminal['stdout'])
-            kv = result.get('kv', {})
-            expected_cases = (spec['job_count'] if spec.get('mode') == 'focused' else
-                              len(workflow_input.cloud_campaign.make_matrix(
-                                  {k: v for k, v in spec.items() if k != 'suite'})))
-            if kv.get('complete') is not True or kv.get('planned_cases') != expected_cases or kv.get('completed_cases') != expected_cases:
-                raise RuntimeError('coordinator did not complete the reviewed combined suite')
-            profiles = spec.get('valkey_reproduction_profiles', [])
-            if profiles:
-                native = kv.get('native_valkey_reproduction', {})
-                expected = {(profile, transport) for profile in profiles for transport in ('tcp', 'rdma')}
-                cases = native.get('cases', [])
-                observed = {(case.get('profile'), case.get('transport')) for case in cases}
-                if (native.get('complete') is not True or observed != expected or len(cases) != len(expected)
-                        or native.get('planned_cases') != len(expected) or native.get('completed_cases') != len(expected)
-                        or any(case.get('complete') is not True or case.get('owned_server_stopped') is not True for case in cases)):
-                    raise RuntimeError('coordinator did not complete every isolated native Valkey control')
+            if spec.get('suite') == 'sui':
+                import manual_sui
+                if not manual_sui.sui_complete(result, spec):
+                    raise RuntimeError('coordinator did not complete the reviewed Sui suite')
+            else:
+                kv = result.get('kv', {})
+                expected_cases = (spec['job_count'] if spec.get('mode') == 'focused' else
+                                  len(workflow_input.cloud_campaign.make_matrix(
+                                      {k: v for k, v in spec.items() if k != 'suite'})))
+                if kv.get('complete') is not True or kv.get('planned_cases') != expected_cases or kv.get('completed_cases') != expected_cases:
+                    raise RuntimeError('coordinator did not complete the reviewed combined suite')
+                profiles = spec.get('valkey_reproduction_profiles', [])
+                if profiles:
+                    native = kv.get('native_valkey_reproduction', {})
+                    expected = {(profile, transport) for profile in profiles for transport in ('tcp', 'rdma')}
+                    cases = native.get('cases', [])
+                    observed = {(case.get('profile'), case.get('transport')) for case in cases}
+                    if (native.get('complete') is not True or observed != expected or len(cases) != len(expected)
+                            or native.get('planned_cases') != len(expected) or native.get('completed_cases') != len(expected)
+                            or any(case.get('complete') is not True or case.get('owned_server_stopped') is not True for case in cases)):
+                        raise RuntimeError('coordinator did not complete every isolated native Valkey control')
         except Exception as exc:
             workload_error = exc
     try:
         references = await _blocking(_terminal_export, store, state, package,
-                                     require_complete=workload_error is None)
+                                     require_complete=workload_error is None,
+                                     **({"result": result} if spec.get("suite") == "sui" else {}))
         state['terminal_export'] = references
         try:
             await _blocking(campaign.save, path, state)
@@ -1149,7 +1196,7 @@ async def _finish_campaign(config, parent, path, store, execute, output, error):
 
 async def run(config, *, package_dir, revision, spec, wheels, base_image,
               base_image_id, rdma_device, output, execute, artifacts=None,
-              surcharge_cents, preflight_api=None):
+              surcharge_cents, preflight_api=None, fixture=None):
     """Run one reviewed campaign; never creates a replacement on failure.
 
     ``execute`` is an async callback accepting gcloud argv without ``gcloud``.
@@ -1159,7 +1206,11 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
     """
     from gcp_manual_compute import Compute, _json_response
 
+    import manual_sui
+    if spec.get("suite") == "sui" and fixture is None:
+        raise ValueError("Sui suite requires a fixture path")
     _check_config(config, spec, surcharge_cents)
+    spec = copy.deepcopy(spec)
     host_count = spec.get('owner_hosts', 5) + 1
     ceiling, compute = ((COMPACT_CEILING_CENTS, COMPACT_COMPUTE_CENTS)
                         if host_count == 2 else (CEILING_CENTS, COMPUTE_CENTS))
@@ -1216,7 +1267,8 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
         await _blocking(_record, path, parent, 'fleet')
         fleet_state, fleet_path = await _blocking(_new_child, parent, path, 'fleet', FLEET_SECONDS)
         fleet_state['host_count'] = host_count
-        package, prep_sha = await _blocking(_stage, store, config['bucket'], fleet_state, receipt, wheels)
+        package, prep_sha = await _blocking(_stage, store, config['bucket'], fleet_state, receipt, wheels,
+                                                **({"spec": spec, "fixture": fixture} if spec.get("suite") == "sui" else {}))
         fleet_state['package'] = package
         fleet_state['preparation_sha256'] = prep_sha
         await _blocking(campaign.save, fleet_path, fleet_state)
@@ -1236,13 +1288,14 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
         pair_hosts = fleet[:2]
         live_transports = ([backend.removeprefix('tidehunter_nvme_') for backend in spec['backends']
                             if backend in ('tidehunter_nvme_tcp', 'tidehunter_nvme_rdma')]
-                           if spec.get('mode') == 'standard-with-live-nvmeof' else [])
+                           if gcp_runtime.live_mode(spec) else [])
         script = qualify.fleet_startup_script(
             config['bucket'], fleet_state['run_id'], source, fleet_state['deadline'],
             receipt['manifest_sha256'], prep_sha, members=fleet, rdma_device=rdma_device,
             machine_type=config['machine_type'], live_transports=live_transports,
-            live_spdk=bool(spec.get('spdk_comparison') and spec.get('mode') == 'standard-with-live-nvmeof'),
-            **({'qualification_profile': 'focused'} if spec.get('mode') == 'focused' else {}))
+            live_spdk=bool(spec.get('spdk_comparison') and gcp_runtime.live_mode(spec)),
+            **({'qualification_profile': 'focused', 'selection': spec.get('selection'), **({'suite_spec': manual_sui.reviewed_part(spec)} if spec.get('suite') == 'sui' else {})}
+               if manual_sui.focused_qualification(spec) else {}))
         await _blocking(_record, path, parent, 'preparation')
         async with asyncio.timeout(PREPARATION_SECONDS):
             for host in fleet:
@@ -1285,16 +1338,16 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
         image_receipt = gcp_image_receipt.make_receipt(
             {'image': image, 'runtime_sha256': receipt['manifest_sha256'],
              'service_account': config['service_account'], 'evidence': evidence},
-            **({'qualification_profile': 'focused'} if spec.get('mode') == 'focused' else {}))
+            **({'qualification_profile': 'focused'} if manual_sui.focused_qualification(spec) else {}))
         reference = await _blocking(_put_json, store, 'runs/' + fleet_state['run_id'] + '/qualification/image-receipt.json', image_receipt)
         reference['bucket'] = config['bucket']
         fleet_state['qualification_receipt'] = reference
         await _blocking(campaign.save, fleet_path, fleet_state)
         (out / 'image-receipt.json').write_bytes(_json(image_receipt))
         admitted_config = dict(config, image=image['path'], image_qualification=reference)
-        if spec.get('mode') == 'focused':
+        if manual_sui.focused_qualification(spec):
             admitted_config['qualification_profile'] = 'focused'
-        if spec.get('mode') == 'standard-with-live-nvmeof':
+        if gcp_runtime.live_mode(spec):
             admitted_config['live_qualification'] = {
                 'image': image['path'], 'image_qualification': reference,
                 'pair_hosts': [{key: host[key] for key in ('name', 'id', 'zone', 'internal_ip', 'rdma_ip')}
@@ -1309,9 +1362,11 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
             timeout=min(30, remaining - EXPORT_RESERVE_SECONDS)))
         qualification = await _blocking(gcp_image.admit_image, _StoreApi(store, config['bucket']), admitted_config, info)
         gcp_image.admit_nvme_transports(qualification, spec['backends'],
-                                        live=spec.get('mode') == 'standard-with-live-nvmeof')
+                                        live=gcp_runtime.live_mode(spec))
         gcp_image.admit_spdk(qualification, spec)
         gcp_image.admit_abi(qualification, receipt['abi'])
+        if spec.get('suite') == 'sui':
+            gcp_image.admit_abi(qualification, receipt['sui_abi'])
         if await fleet_compute.admit_guests() != fleet:
             raise RuntimeError('guest fleet identity changed after qualification')
         await _admit_boot_images(fleet_compute, fleet_state, image)

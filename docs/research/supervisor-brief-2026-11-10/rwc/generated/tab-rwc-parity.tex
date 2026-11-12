@@ -1,0 +1,12 @@
+\begin{table}[H]\centering\small\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lrrrrr}\toprule
+Grid / rep. & Matched pairs & Missing pairs & Failed cases & Unqual. cases & Other cases\\\midrule
+Write / r0 & \N{RWC:availability:G14O1:0:matched} & \N{RWC:availability:G14O1:0:missing partner} & \N{RWC:availability:G14O1:0:failed} & \N{RWC:availability:G14O1:0:unqualified cold} & \N{RWC:availability:G14O1:0:not available}\\
+Write / r1 & \N{RWC:availability:G14O1:1:matched} & \N{RWC:availability:G14O1:1:missing partner} & \N{RWC:availability:G14O1:1:failed} & \N{RWC:availability:G14O1:1:unqualified cold} & \N{RWC:availability:G14O1:1:not available}\\
+Cold read / r0 & \N{RWC:availability:G15C:0:matched} & \N{RWC:availability:G15C:0:missing partner} & \N{RWC:availability:G15C:0:failed} & \N{RWC:availability:G15C:0:unqualified cold} & \N{RWC:availability:G15C:0:not available}\\
+Cold read / r1 & \N{RWC:availability:G15C:1:matched} & \N{RWC:availability:G15C:1:missing partner} & \N{RWC:availability:G15C:1:failed} & \N{RWC:availability:G15C:1:unqualified cold} & \N{RWC:availability:G15C:1:not available}\\
+Warm read / r0 & \N{RWC:availability:G15M:0:matched} & \N{RWC:availability:G15M:0:missing partner} & \N{RWC:availability:G15M:0:failed} & \N{RWC:availability:G15M:0:unqualified cold} & \N{RWC:availability:G15M:0:not available}\\
+Warm read / r1 & \N{RWC:availability:G15M:1:matched} & \N{RWC:availability:G15M:1:missing partner} & \N{RWC:availability:G15M:1:failed} & \N{RWC:availability:G15M:1:unqualified cold} & \N{RWC:availability:G15M:1:not available}\\
+\bottomrule\end{tabular}
+\caption{First two columns count pairs; last three distinct main-grid cases including Native. An owner write has three Native controls, an owner read one. Columns are not a partition. The three failed network-floor cases are separate, not failed KV calls. All sizes and c1/c5/c16 included; pairing does not equalize read lanes or durability. Unmatched dimensions: sync/grouping, RPC/security, index/routing, and host SSD (Native coordinator SSD versus owner SSD). Read lanes: Native 0, owner 1 at c1/c5 and 4 at c16; c5 owner reads are lane-limited, not a transport ranking. Floors are separate populations.}
+\end{table}

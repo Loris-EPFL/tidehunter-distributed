@@ -13,6 +13,235 @@ from test_nvme_campaign_native import config as native_config
 
 
 class StageControllerTests(unittest.TestCase):
+    def test_g18_native_and_remote_device_counter_sources(self):
+        client = {'owner_index': -1, 'major': 259, 'minor': 3, 'read_ops': 1,
+                  'read_sectors': 2, 'write_ops': 3, 'write_sectors': 4}
+        owner = {**client, 'owner_index': 0}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for backend, expected in [('native', client), ('tidehunter_verbs_native', owner)]:
+                job = {'backend': backend, 'device_counters': True}
+                frames = [{'media_device': client}, {'media_device': owner}]
+                controller.store_measurement_device_evidence(root, {}, job, None, frames, frames, 1)
+                self.assertEqual(json.loads((root / 'device_counters.json').read_text())['before'], [expected])
+            with self.assertRaisesRegex(controller.SafetyError, 'client device counters unavailable'):
+                controller.store_measurement_device_evidence(root, {}, {'backend': 'native', 'device_counters': True},
+                                                             None, [{}, {'media_device': owner}], frames, 1)
+
+    def test_g18_live_measurement_device_qualification(self):
+        counter = {'owner_index': 0, 'major': 259, 'minor': 3, 'read_ops': 11214,
+                   'read_sectors': 99872, 'write_ops': 2032957, 'write_sectors': 221232720}
+        def frame(row):
+            return [{}, {'nvme': {'host_identity': {'boot_id': '72305c5b-2565-467c-8d6b-6919294e8aaa'}},
+                         'media_device': row}]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for expected, calls, delta, status in [('cold', 2048, 1900, 'qualified'),
+                                                    ('cold', 2048, 1700, 'unqualified'),
+                                                    ('memory', 8192, 10, 'qualified')]:
+                job = {'case_id': 'case', 'case_kind': 'live_read', 'media': {'expected': expected}}
+                first, last = frame(counter), frame({**counter, 'read_ops': counter['read_ops'] + delta})
+                samples = [{'operation': 'read', 'outcome': 'success'}] * calls
+                media = controller.measurement_media_evidence(job, samples, 32, first, last, 1, 1, True, None)
+                self.assertEqual(media['status'], status)
+                controller.store_measurement_device_evidence(root, {}, job, media, first, last, 1)
+                self.assertEqual(json.loads((root / 'media_evidence.json').read_text())['status'], status)
+                if status == 'unqualified':
+                    with self.assertRaisesRegex(controller.SafetyError, 'required cold canary is not device-served'):
+                        controller.store_measurement_device_evidence(root, {}, {**job, 'require_media_qualified': True},
+                                                                     media, first, last, 1)
+                    self.assertEqual(json.loads((root / 'media_evidence.json').read_text())['status'], status)
+        batch_job = {'case_id': 'batch', 'case_kind': 'native_media_read', 'media': {'expected': 'cold'}}
+        client = {**counter, 'owner_index': -1}
+        client_frame = [{'nvme': {'host_identity': {'boot_id': 'client-boot'}}, 'media_device': client}, {}]
+        client_end = copy.deepcopy(client_frame)
+        client_end[0]['media_device']['read_ops'] += 8000
+        result = controller.measurement_media_evidence(
+            batch_job, [{'operation': 'get_many', 'outcome': 'success'}] * 256, 32,
+            client_frame, client_end, 1, 1, True, None)
+        self.assertEqual(result['successful_reads'], 8192)
+        self.assertEqual(result['status'], 'qualified')
+
+    def test_g18_snapshot_selects_native_or_owner_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            native = root / 'results/cases/case/database'
+            native.mkdir(parents=True)
+            config = {'fleet': {'data_root': str(root), 'nodes': [{}]}}
+            frame = {'nvme': {'host_identity': {'boot_id': 'boot'}}, 'diskstats': 'diskstats'}
+            native_job = {'case_id': 'case', 'case_kind': 'native_op', 'backend': 'native', 'device_counters': True}
+            remote = {'case_id': 'case', 'case_kind': 'remote_put', 'backend': 'tidehunter_verbs_native',
+                      'device_counters': True, 'owner_count': 1}
+            live = {**remote, 'case_kind': 'live_read', 'device_counters': False, 'media': {'expected': 'cold'}}
+            def guarded(path, root, must_exist=False):
+                path = Path(path)
+                if must_exist and not path.exists():
+                    raise controller.SafetyError("required owned path missing")
+                return path
+            with patch.object(controller, 'verify_local_identity', return_value={}), \
+                 patch.object(controller, 'guarded', side_effect=guarded), \
+                 patch.object(controller, 'snapshot', side_effect=lambda *a, **k: copy.deepcopy(frame)), \
+                 patch.object(controller, 'owned_monitor_processes', return_value={'processes': [], 'missing': []}), \
+                 patch.object(controller.resource_accounting, 'capture', return_value={'processes': []}), \
+                 patch.object(controller.rdma_diagnostics, 'capture', return_value={}), \
+                 patch.object(controller, 'media_device_snapshot', return_value={'read_ops': 1}) as snapshot:
+                result = controller.guest_operation(config, {'index': -1, 'action': 'snapshot', 'resource_job': native_job}, None)
+                self.assertEqual(result['media_device'], {'read_ops': 1})
+                self.assertEqual(snapshot.call_args.args[0], native)
+                snapshot.reset_mock()
+                controller.guest_operation(config, {'index': 0, 'action': 'snapshot', 'resource_job': native_job}, None)
+                snapshot.assert_not_called()
+                with self.assertRaisesRegex(controller.SafetyError, 'required owned path missing'):
+                    controller.guest_operation(config, {'index': 0, 'action': 'snapshot', 'resource_job': remote}, None)
+                (root / 'cells/case/node-0').mkdir(parents=True)
+                result = controller.guest_operation(config, {'index': 0, 'action': 'snapshot', 'resource_job': live}, None)
+                self.assertEqual(result['media_device'], {'read_ops': 1})
+                self.assertEqual(snapshot.call_args.args[0], root / 'cells/case/node-0')
+                batch_job = next(job for job in controller.cloud_campaign.make_focused_matrix('nvmeof_path_core')
+                                 if job['backend'] == 'native' and job['case_kind'] == 'native_media_read'
+                                 and job['mix']['get_many'])
+                batch_path = root / 'results/cases' / batch_job['case_id'] / 'database'
+                batch_path.mkdir(parents=True)
+                controller.guest_operation(config, {'index': -1, 'action': 'snapshot', 'resource_job': batch_job}, None)
+                self.assertEqual(snapshot.call_args.args[0], batch_path)
+
+    def test_prepared_geometry_mismatch_fails(self):
+        from test_cloud_controller import config_fixture
+        runtime = controller.Controller.__new__(controller.Controller)
+        runtime.config = config_fixture()
+        runtime.remaining = MagicMock(return_value=60)
+        job = {'case_id': 'case', 'backend': 'tidehunter_tcp', 'owner_count': 1,
+               'keys': 1, 'warmup_operations': 0, 'measurement_operations': 1,
+               'coordinator_cache_bytes': 0}
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            def prepare(argv, **kwargs):
+                node = directory / 'prepared' / 'node-0'
+                node.mkdir(parents=True)
+                (node / 'launch.yaml').write_text('node: {partition: {fragment_bytes: 1, wal_file_bytes: 1}}')
+            with patch.object(controller, 'command', side_effect=prepare), \
+                 patch.object(controller, 'platform_module', return_value=None), \
+                 patch.object(controller, 'environment', return_value={}):
+                with self.assertRaisesRegex(controller.SafetyError, 'prepared owner WAL geometry differs from the planned case'):
+                    runtime.prepare_tide(job, directory)
+
+    def test_prepared_history_persistence_matches_planned_default(self):
+        from test_cloud_controller import config_fixture
+        for planned, launched in (('memory_only', None), ('memory_only', 'on_disk'),
+                                  (None, 'memory_only'), ('on_disk', 'memory_only'),
+                                  (None, None), ('on_disk', None), (None, 'on_disk'),
+                                  ('memory_only', 'memory_only')):
+            with self.subTest(planned=planned, launched=launched), tempfile.TemporaryDirectory() as tmp:
+                runtime = controller.Controller.__new__(controller.Controller)
+                runtime.config = config_fixture()
+                runtime.remaining = MagicMock(return_value=60)
+                job = {'case_id': 'case', 'backend': 'tidehunter_tcp', 'owner_count': 1,
+                       'keys': 1, 'warmup_operations': 0, 'measurement_operations': 1,
+                       'coordinator_cache_bytes': 0}
+                if planned is not None:
+                    job['history_persistence'] = planned
+                directory = Path(tmp)
+                def prepare(argv, **kwargs):
+                    import yaml
+                    launch = {'node': {'partition': {'fragment_bytes': 4194304,
+                                                     'wal_file_bytes': 1073741824}}}
+                    if launched is not None:
+                        launch['history_persistence'] = launched
+                    node = directory / 'prepared' / 'node-0'
+                    node.mkdir(parents=True)
+                    (node / 'launch.yaml').write_text(yaml.safe_dump(launch))
+                with patch.object(controller, 'command', side_effect=prepare), \
+                     patch.object(controller, 'platform_module', return_value=None), \
+                     patch.object(controller, 'environment', return_value={}):
+                    if (planned or 'on_disk') != (launched or 'on_disk'):
+                        with self.assertRaisesRegex(controller.SafetyError,
+                                'prepared owner history persistence differs from the planned case'):
+                            runtime.prepare_tide(job, directory)
+                    else:
+                        # Reaching the absent remote.json proves history admission
+                        # passed before any owner was started.
+                        with self.assertRaises(FileNotFoundError):
+                            runtime.prepare_tide(job, directory)
+                        self.assertEqual(runtime.active_tide, (job, directory, []))
+
+    def test_owner_history_diagnostics_require_all_epochs_and_owners(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            path = directory / 'owner-durability' / 'node-0.history-maintenance.json'
+            evidence = {'schema_version': 1, 'epoch_stats': [[0, {'waits': 0}], [1, {'waits': 0}]]}
+            controller.dump(path, evidence)
+            controller.require_zero_owner_history_waits(directory, 1)
+            with self.assertRaisesRegex(RuntimeError, 'owner history diagnostics missing or invalid'):
+                controller.require_zero_owner_history_waits(directory, 2)
+            evidence['epoch_stats'][1][1]['waits'] = 1
+            controller.dump(path, evidence)
+            with self.assertRaisesRegex(RuntimeError, 'memory-only owner waited for history'):
+                controller.require_zero_owner_history_waits(directory, 1)
+            for epochs in ([], {}, [[0, {}]], [[0, {'waits': False}]], [[0, {'waits': -1}]]):
+                controller.dump(path, {'schema_version': 1, 'epoch_stats': epochs})
+                with self.subTest(epochs=epochs), self.assertRaisesRegex(
+                        RuntimeError, 'owner history diagnostics missing or invalid'):
+                    controller.require_zero_owner_history_waits(directory, 1)
+
+    def test_nvmeof_path_live_admission_is_selection_bound(self):
+        jobs = [{'case_id': 'live', 'nvmeof_route': 'live'}, {'case_id': 'sealed', 'nvmeof_route': 'sealed_read'}]
+        for selection in controller.cloud_campaign.NVMEOF_PATH_SELECTIONS:
+            with self.subTest(selection=selection):
+                spec = {'mode': 'focused', 'selection': selection}
+                with patch.object(controller.cloud_campaign, 'make_focused_matrix', return_value=jobs) as matrix:
+                    self.assertTrue(controller.admitted_live_campaign({'spec': spec}, 'live'))
+                    self.assertFalse(controller.admitted_live_campaign({'spec': spec}, 'sealed'))
+                    self.assertFalse(controller.admitted_live_campaign({'spec': spec}, 'unknown'))
+                    matrix.assert_called_with(selection)
+
+    def test_get_many_successful_key_count(self):
+        samples = [{'operation': 'get_many', 'outcome': 'success'}] * 4
+        config = {'workload': {'batch_size': 32}}
+        self.assertEqual(analyze.successful_read_keys(samples, 32), 128)
+        controller.cloud_campaign.validate_media_sample_count({'successful_reads': 128}, samples, config)
+        with self.assertRaisesRegex(ValueError, 'media successful reads differ from raw samples'):
+            controller.cloud_campaign.validate_media_sample_count({'successful_reads': 4}, samples, config)
+
+    def test_required_canary_persists_before_failure(self):
+        media = {'status': 'unqualified'}
+        frames = [{}, {'media_device': {'read_ops': 1, 'read_sectors': 2, 'write_ops': 3, 'write_sectors': 4}}]
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            receipt = {}
+            job = {'device_counters': True, 'require_media_qualified': True}
+            with self.assertRaisesRegex(controller.SafetyError, 'required cold canary is not device-served'):
+                controller.store_measurement_device_evidence(directory, receipt, job, media, frames, frames, 1)
+            self.assertEqual(json.loads((directory / 'media_evidence.json').read_text()), media)
+            self.assertEqual(json.loads((directory / 'device_counters.json').read_text())['before'], [frames[1]['media_device']])
+            self.assertEqual(set(receipt), {'media_evidence', 'device_counters'})
+            controller.store_measurement_device_evidence(directory, {}, {'device_counters': True}, media, frames, frames, 1)
+
+    def test_v2_media_counters_and_validator(self):
+        before = {'owner_index': 0, 'major': 259, 'minor': 1, 'read_ops': 10,
+                  'read_sectors': 20, 'write_ops': 3, 'write_sectors': 4}
+        after = {**before, 'read_ops': 1910, 'read_sectors': 15220}
+        media = {'expected': 'cold'}
+        result = controller.qualify_media_evidence('case', media, [before], [after], 2048, True)
+        self.assertEqual(result['status'], 'qualified')
+        self.assertAlmostEqual(result['read_ops_per_success'], 1900 / 2048)
+        self.assertEqual(result['device_bytes_per_read'], 4096)
+        job = {'case_id': 'case', 'media': media}
+        receipt = {'measurement_evidence': {'gate_released': True, 'completion_gate_observed': True}}
+        analyze._validate_focused_artifact('media_evidence', result, job, receipt)
+        with self.assertRaisesRegex(ValueError, 'media bytes per read differs'):
+            analyze._validate_focused_artifact('media_evidence', {**result, 'device_bytes_per_read': 1}, job, receipt)
+        after['read_ops'] = 1710
+        result = controller.qualify_media_evidence('case', media, [before], [after], 2048, True)
+        self.assertIn('cold_read_ratio_below_threshold', result['reason_codes'])
+
+    def test_memory_only_read_admission(self):
+        runtime = controller.Controller.__new__(controller.Controller)
+        runtime.config = {'fleet': {'data_root': '/tmp'}}
+        for job in ({'backend': 'tidehunter_verbs_native'}, {'nvmeof_route': 'live'}):
+            with self.assertRaisesRegex(controller.SafetyError, 'memory-only history admits reads only with permanent live export'):
+                runtime.prepare_tide({**job, 'case_id': 'case', 'history_persistence': 'memory_only',
+                                      'mix': {'get_many': 1}}, Path('/tmp'))
+
     def test_direct_hybrid_route_is_admitted_without_widening_reads(self):
         jobs = controller.cloud_campaign.make_focused_matrix('stages')
         for job in jobs:
@@ -141,8 +370,9 @@ class StageControllerTests(unittest.TestCase):
 
     def test_native_media_ratio_and_owner_schema(self):
         media = {'expected': 'cold', 'history': 'normal'}
-        first = [{'owner_index': -1, 'major': 259, 'minor': 4, 'read_ops': 10}]
-        end = [{'owner_index': -1, 'major': 259, 'minor': 4, 'read_ops': 19}]
+        first = [{'owner_index': -1, 'major': 259, 'minor': 4, 'read_ops': 10,
+                  'read_sectors': 0, 'write_ops': 0, 'write_sectors': 0}]
+        end = [{**first[0], 'read_ops': 19}]
         result = controller.qualify_media_evidence('case', media, first, end, 10, True, client=True)
         self.assertEqual(result['status'], 'qualified')
         self.assertEqual(result['read_ops_per_success'], .9)
@@ -156,15 +386,16 @@ class StageControllerTests(unittest.TestCase):
         media = {'expected': 'cold', 'history': 'normal'}
         job = {'case_kind': 'native_media_read', 'case_id': 'case', 'media': media}
         result = controller.qualify_media_evidence('case', media,
-            [{'owner_index': -1, 'major': 259, 'minor': 4, 'read_ops': 10}],
-            [{'owner_index': -1, 'major': 259, 'minor': 4, 'read_ops': 19}], 10, True, client=True)
+            [{'owner_index': -1, 'major': 259, 'minor': 4, 'read_ops': 10, 'read_sectors': 0, 'write_ops': 0, 'write_sectors': 0}],
+            [{'owner_index': -1, 'major': 259, 'minor': 4, 'read_ops': 19, 'read_sectors': 0, 'write_ops': 0, 'write_sectors': 0}], 10, True, client=True)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             gate = {'gate_released': True, 'completion_gate_observed': True}
             for field, reads in (('before', 10), ('end', 19)):
                 host = {'nvme': {'host_identity': {'boot_id': 'boot'}},
-                        'diskstats': f'259 4 nvme0n1 {reads} 0 0 0',
-                        'media_device': {'owner_index': -1, 'major': 259, 'minor': 4, 'read_ops': reads}}
+                        'diskstats': f'259 4 nvme0n1 {reads} 0 0 0 0 0 0',
+                        'media_device': {'owner_index': -1, 'major': 259, 'minor': 4, 'read_ops': reads,
+                                         'read_sectors': 0, 'write_ops': 0, 'write_sectors': 0}}
                 path = root / (field + '.json')
                 path.write_text(json.dumps({'hosts': [host]}))
                 gate[field], gate[field + '_sha256'] = path.name, hashlib.sha256(path.read_bytes()).hexdigest()

@@ -24,6 +24,12 @@ TRANSPORT = 'json-rest-with-SDK-delegation'
 MAX_JSON_BYTES = 16 * 1024 * 1024
 TOKEN_ATTEMPTS = 3
 TOKEN_CACHE_SECONDS = 60
+SOCKET_SECONDS = 10
+# An upload streams its body in 1 MiB chunks; one socket write sends one chunk.
+# With 10 s a chunk needs about 105 KiB/s, and a slower uplink fails the launch
+# before any VM exists (12 November 2026). The absolute deadline still applies
+# before each chunk.
+UPLOAD_SOCKET_SECONDS = 300
 
 
 class CredentialUnavailable(RuntimeError):
@@ -168,8 +174,10 @@ class DelegatedArtifacts(ObjectStore):
 
     def _bounded_open(self, request, timeout):
         remaining = self._remaining()
+        streamed = request.data is not None and not isinstance(request.data, (bytes, bytearray))
         try:
-            response = self._open(request, timeout=min(timeout, remaining, 10))
+            response = self._open(request, timeout=min(
+                timeout, remaining, UPLOAD_SOCKET_SECONDS if streamed else SOCKET_SECONDS))
         except urllib.error.HTTPError as error:
             if error.fp is not None:
                 bounded = _DeadlineResponse(error.fp, self._remaining, 65536)

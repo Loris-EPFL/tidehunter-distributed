@@ -4,6 +4,15 @@
 use super::*;
 use crate::distributed::storage::AppendedBatch;
 
+/// Synced WAL position bound to one owner stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointPositionProof {
+    pub database: [u8; 16],
+    pub partition: u32,
+    pub epoch: u64,
+    pub durable_end: u64,
+}
+
 fn metadata_hasher() -> blake2b_simd::State {
     blake2b_simd::Params::new().hash_length(32).to_state()
 }
@@ -190,6 +199,134 @@ impl Client {
         self.validate_checkpoint_response(response, epoch, prefix)
     }
 
+    pub fn checkpoint_position(
+        &mut self,
+        authority_epoch: u64,
+        epoch: u64,
+        through: u64,
+    ) -> Result<CheckpointPositionProof, TcpError> {
+        let response = self.request(Request::CheckpointPosition {
+            authority_epoch,
+            epoch,
+            through,
+        })?;
+        self.validate_checkpoint_position_response(response, epoch, through)
+    }
+
+    pub(crate) fn submit_checkpoint_position(
+        &mut self,
+        authority_epoch: u64,
+        epoch: u64,
+        through: u64,
+        deadline: Instant,
+    ) -> Result<bool, TcpError> {
+        self.submit_control(
+            &Request::CheckpointPosition {
+                authority_epoch,
+                epoch,
+                through,
+            },
+            deadline,
+        )
+    }
+
+    pub(crate) fn take_checkpoint_position(
+        &mut self,
+        epoch: u64,
+        through: u64,
+    ) -> Option<Result<CheckpointPositionProof, TcpError>> {
+        self.take_control()
+            .map(|response| self.validate_checkpoint_position_response(response?, epoch, through))
+    }
+
+    fn validate_checkpoint_position_response(
+        &mut self,
+        response: Response,
+        epoch: u64,
+        through: u64,
+    ) -> Result<CheckpointPositionProof, TcpError> {
+        match response {
+            Response::CheckpointPosition {
+                database,
+                partition,
+                epoch: source,
+                durable_end,
+            } if database == self.expected.inventory.database
+                && partition == self.expected.partition
+                && source == epoch
+                && durable_end >= through =>
+            {
+                Ok(CheckpointPositionProof {
+                    database,
+                    partition,
+                    epoch,
+                    durable_end,
+                })
+            }
+            _ => {
+                self.broken = true;
+                Err(TcpError::new("checkpoint position proof differs"))
+            }
+        }
+    }
+
+    /// Replay whole WAL groups. `next` is a WAL byte offset, not a receipt ordinal.
+    pub fn replay_wal_page(
+        &mut self,
+        authority_epoch: u64,
+        source_epoch: u64,
+        from: u64,
+        limit: usize,
+        require_end: u64,
+    ) -> Result<RecoveryPage, TcpError> {
+        usize::try_from(from).map_err(|_| TcpError::new("replay offset exceeds address space"))?;
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if self.live_config.is_some() {
+            return Err(TcpError::new(
+                "live NVMe-oF recovery requires metadata-only control",
+            ));
+        }
+        if limit == 0 || limit > 1024 {
+            return Err(TcpError::new("invalid recovery page limit"));
+        }
+        match self.request(Request::ReplayWal {
+            authority_epoch,
+            source_epoch,
+            from,
+            limit: limit.min(self.page_limit),
+            require_end,
+        })? {
+            Response::Recovery { batches, next }
+                if batches.len() <= limit.max(self.expected.group_limits.max_batches as usize)
+                    && next.is_none_or(|next| {
+                        !batches.is_empty() && u64::try_from(next).is_ok_and(|next| next > from)
+                    }) =>
+            {
+                self.broken = true;
+                let mut result = Vec::with_capacity(batches.len());
+                for (encoded, receipt) in batches {
+                    let batch = CompleteBatch::decode_owned(
+                        &self.shape,
+                        encoded.into_vec(),
+                        self.expected.batch_limits,
+                    )
+                    .map_err(TcpError::component)?;
+                    if batch.version().epoch != source_epoch || receipt.address.offset < from {
+                        return self.wrong_response();
+                    }
+                    let durable = self.check_receipt(&batch, receipt)?;
+                    result.push((batch, durable));
+                }
+                self.broken = false;
+                Ok(RecoveryPage {
+                    batches: result,
+                    next,
+                })
+            }
+            _ => self.wrong_response(),
+        }
+    }
+
     pub fn retirement_files(
         &mut self,
         authority_epoch: u64,
@@ -240,6 +377,31 @@ impl Client {
             authority_epoch,
             epoch,
             prefix,
+            files,
+        })? {
+            Response::Retired => Ok(()),
+            _ => self.wrong_response(),
+        }
+    }
+
+    pub fn retire_wal_files(
+        &mut self,
+        authority_epoch: u64,
+        epoch: u64,
+        files: Vec<u64>,
+    ) -> Result<(), TcpError> {
+        if files.len() > 256
+            || epoch >= authority_epoch
+            || files.windows(2).any(|pair| pair[0] >= pair[1])
+            || files
+                .iter()
+                .any(|offset| offset % self.expected.wal_file_bytes != 0)
+        {
+            return Err(TcpError::new("invalid retained WAL retirement decision"));
+        }
+        match self.request(Request::RetireWalFiles {
+            authority_epoch,
+            epoch,
             files,
         })? {
             Response::Retired => Ok(()),

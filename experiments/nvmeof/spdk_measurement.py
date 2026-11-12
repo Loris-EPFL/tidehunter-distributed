@@ -12,7 +12,9 @@ COUNTERS = ("bytes_read", "num_read_ops", "bytes_written", "num_write_ops", "rea
 IDENTITY = ("campaign_id", "unit_name", "pid", "process_start_ticks", "binary_sha256")
 
 
-def _snapshot(directory, binding, boundary):
+def _snapshot(directory, binding, boundary, *, owner_count=5):
+    if type(owner_count) is not int or not 1 <= owner_count <= 5:
+        raise ValueError("invalid SPDK owner count")
     name = "spdk-target-" + boundary + ".json"
     if not isinstance(binding, dict) or binding.get("path") != name:
         raise ValueError("SPDK boundary binding has an unexpected path")
@@ -23,12 +25,12 @@ def _snapshot(directory, binding, boundary):
     if hashlib.sha256(raw).hexdigest() != binding.get("sha256"):
         raise ValueError("SPDK boundary differs from its integrity binding")
     rows = json.loads(raw)
-    if not isinstance(rows, list) or len(rows) != 5:
-        raise ValueError("SPDK boundary requires all five owners")
+    if not isinstance(rows, list) or len(rows) != owner_count:
+        raise ValueError("SPDK boundary requires all active owners")
     result = {}
     for row in rows:
         index = row.get("index") if isinstance(row, dict) else None
-        if type(index) is not int or index not in range(5) or index in result or row.get("complete") is not True:
+        if type(index) is not int or index not in range(owner_count) or index in result or row.get("complete") is not True:
             raise ValueError("SPDK owner boundary identity is missing or duplicated")
         target = row.get("target")
         if (not isinstance(target, dict) or target.get("kind") != "spdk-target-stats"
@@ -58,18 +60,18 @@ def _snapshot(directory, binding, boundary):
     return result
 
 
-def admit(directory, binding, *, allow_zero_reads=False):
+def admit(directory, binding, *, allow_zero_reads=False, owner_count=5):
     """Reject restarts, resets, errors, writes, mixed binaries and missing samples."""
     if type(allow_zero_reads) is not bool:
         raise ValueError("invalid SPDK zero-read policy")
     if not isinstance(binding, dict):
         raise ValueError("SPDK target measurement binding is unavailable")
-    start = _snapshot(directory, binding.get("start"), "start")
-    end = _snapshot(directory, binding.get("end"), "end")
+    start = _snapshot(directory, binding.get("start"), "start", owner_count=owner_count)
+    end = _snapshot(directory, binding.get("end"), "end", owner_count=owner_count)
     owners, binaries = [], set()
     reads = total_bytes = 0
     latency_seconds = 0.0
-    for index in range(5):
+    for index in range(owner_count):
         before, first, bdevs = start[index]
         after, last, completed = end[index]
         if any(before[k] != after[k] for k in IDENTITY):

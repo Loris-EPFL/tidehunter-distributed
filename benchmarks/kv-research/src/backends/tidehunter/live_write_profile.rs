@@ -56,6 +56,42 @@ const COUNTERS: &[&str] = &[
     "grant_misses",
     "grant_evictions",
     "copy_bytes_avoided",
+    "reserve_exchanges",
+    "complete_exchanges",
+    "lease_exchanges",
+    "leased_frames",
+    "leased_bytes",
+    "leased_skip_markers",
+    "extents_leased",
+    "adoption_async_exchanges",
+    "adoption_sync_exchanges",
+    "adoption_async_ns",
+    "adoption_async_samples",
+    "adoption_settle_ns",
+    "adoption_settle_samples",
+    "adoption_history_full_settles",
+    "fua_writes",
+    "leased_write_ns",
+    "leased_write_samples",
+    "extent_switch_ns",
+    "extent_switch_samples",
+    "lease_reserve_ns",
+    "lease_namespace_sync_ns",
+    "lease_publish_ns",
+    "lease_profile_samples",
+    "adopt_owner_ns",
+    "adopt_close_scan_ns",
+    "adopt_close_scan_bytes",
+    "adopt_profile_samples",
+    "extent_preleases",
+    "extent_switch_waits",
+    "leased_failed_writes",
+    "leased_short_writes",
+    "leased_timed_out_writes",
+    "leased_full_writes",
+    "failed_write_ops",
+    "short_write_ops",
+    "short_write_bytes",
 ];
 
 /// Lifetime maxima kept across lanes. A gauge peak is not additive and a delta of it is
@@ -65,6 +101,57 @@ const PEAKS: &[&str] = &["lane_inflight_request_max", "lane_inflight_op_max"];
 fn counts(stats: Option<LiveNvmeStats>) -> Result<Value, String> {
     let stats = stats.ok_or("live NVMe counter snapshot unavailable")?;
     serde_json::to_value(stats.counts).map_err(|error| error.to_string())
+}
+
+/// Call only after API callers drain. The owner worker continues to harvest
+/// adoption replies while idle. Reserved and non-live routes never wait here.
+/// An adoption not yet submitted at the boundary falls outside the window.
+/// This excludes at most one adoption per boundary; the sum/count pair stays
+/// consistent. Return the second snapshot with equal submitted, validated and
+/// nanosecond values, not the first snapshot.
+pub(super) fn boundary_snapshot(
+    leased: bool,
+    mut snapshot: impl FnMut() -> Option<LiveNvmeStats>,
+    timeout: std::time::Duration,
+) -> Result<Option<LiveNvmeStats>, crate::backend::LiveAdoptionBoundaryError> {
+    use crate::backend::LiveAdoptionBoundaryError;
+    if !leased {
+        return Ok(snapshot());
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    let mut previous = None;
+    loop {
+        let stats = snapshot().ok_or(LiveAdoptionBoundaryError(
+            "leased adoption boundary counter snapshot unavailable",
+        ))?;
+        let counts = stats.counts;
+        if counts.errors != 0 || counts.unknown_writes != 0 {
+            return Err(LiveAdoptionBoundaryError(
+                "leased adoption boundary observed a failed or poisoned live client",
+            ));
+        }
+        let observed = (
+            counts.adoption_async_exchanges,
+            counts.adoption_async_samples,
+            counts.adoption_async_ns,
+        );
+        if counts.adoption_async_exchanges == counts.adoption_async_samples
+            && previous == Some(observed)
+        {
+            return Ok(Some(stats));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(LiveAdoptionBoundaryError(
+                "leased adoption boundary did not quiesce before the bounded wait expired",
+            ));
+        }
+        previous =
+            (counts.adoption_async_exchanges == counts.adoption_async_samples).then_some(observed);
+        std::thread::sleep(
+            std::time::Duration::from_millis(1)
+                .min(deadline.saturating_duration_since(std::time::Instant::now())),
+        );
+    }
 }
 
 pub(super) struct Window {
@@ -153,6 +240,94 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn leased_boundary_waits_for_validated_reply_before_freezing() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+        use tidehunter::distributed::nvmeof::live_metrics::{LiveNvmeMetrics, LiveTimingStage};
+        let metrics = LiveNvmeMetrics::new();
+        let producer = metrics.register().unwrap();
+        producer.record_adoption(false);
+        let (release, reply) = mpsc::sync_channel(1);
+        let owner = std::thread::spawn(move || {
+            reply.recv().unwrap();
+            producer.record_timing(LiveTimingStage::AdoptionAsync, 7_000, 1);
+        });
+        let (entered, first_snapshot) = mpsc::sync_channel(1);
+        let (finished, result) = mpsc::sync_channel(1);
+        let source = Arc::clone(&metrics);
+        let boundary = std::thread::spawn(move || {
+            let mut entered = Some(entered);
+            let snapshot = boundary_snapshot(
+                true,
+                || {
+                    let snapshot = source.snapshot();
+                    if let Some(entered) = entered.take() {
+                        entered.send(()).unwrap();
+                    }
+                    Some(snapshot)
+                },
+                Duration::from_secs(1),
+            );
+            finished.send(snapshot).unwrap();
+        });
+        first_snapshot.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        release.send(()).unwrap();
+        let stats = result
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        owner.join().unwrap();
+        boundary.join().unwrap();
+        assert_eq!(stats.counts.adoption_async_exchanges, 1);
+        assert_eq!(stats.counts.adoption_async_samples, 1);
+        assert_eq!(stats.counts.adoption_async_ns, 7_000);
+        let window = Window::arm(1, Some(stats)).unwrap();
+        assert_eq!(window.baseline["adoption_async_ns"], 7_000);
+        assert_eq!(window.baseline["adoption_async_samples"], 1);
+    }
+
+    #[test]
+    fn leased_boundary_times_out_or_reports_poison() {
+        use std::time::{Duration, Instant};
+        let mut stats = LiveNvmeStats::default();
+        stats.counts.adoption_async_exchanges = 1;
+        let began = Instant::now();
+        let error =
+            boundary_snapshot(true, || Some(stats.clone()), Duration::from_millis(5)).unwrap_err();
+        assert!(error.to_string().contains("did not quiesce"));
+        assert!(began.elapsed() >= Duration::from_millis(5));
+        assert!(began.elapsed() < Duration::from_secs(1));
+        stats.counts.errors = 1;
+        let error = boundary_snapshot(true, || Some(stats.clone()), Duration::ZERO).unwrap_err();
+        assert!(error.to_string().contains("failed or poisoned"));
+    }
+
+    #[test]
+    fn reserved_and_nonlive_boundaries_do_not_wait_for_adoption() {
+        let mut stats = LiveNvmeStats::default();
+        stats.counts.adoption_async_exchanges = 1;
+        let mut snapshots = 0;
+        let result = boundary_snapshot(
+            false,
+            || {
+                snapshots += 1;
+                Some(stats.clone())
+            },
+            std::time::Duration::ZERO,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(snapshots, 1);
+        assert_eq!(result.counts.adoption_async_samples, 0);
+        assert!(
+            boundary_snapshot(false, || None, std::time::Duration::ZERO)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn window_freezes_actual_write_and_read_deltas() {
@@ -165,6 +340,11 @@ mod tests {
         end.counts.completed_read_ops = 10;
         end.counts.cq_ns = 90;
         end.counts.cq_samples = 3;
+        end.counts.adoption_async_ns = 4_000;
+        end.counts.adoption_async_samples = 2;
+        end.counts.adoption_settle_ns = 9_000;
+        end.counts.adoption_settle_samples = 3;
+        end.counts.adoption_history_full_settles = 1;
         window.freeze(Some(end.clone())).unwrap();
         end.counts.completed_write_ops = 100;
         assert!(window.freeze(Some(end)).is_err());
@@ -172,6 +352,15 @@ mod tests {
         assert_eq!(result["selected_operations"], 3);
         assert_eq!(result["stages"]["live_nvmeof"]["completed_read_ops"], 2);
         assert_eq!(result["stages"]["live_nvmeof"]["cq_samples"], 3);
+        for (name, expected) in [
+            ("adoption_async_ns", 4_000),
+            ("adoption_async_samples", 2),
+            ("adoption_settle_ns", 9_000),
+            ("adoption_settle_samples", 3),
+            ("adoption_history_full_settles", 1),
+        ] {
+            assert_eq!(result["stages"]["live_nvmeof"][name], expected);
+        }
         assert!(result.get("sampled_requests").is_none());
     }
 
@@ -260,7 +449,50 @@ mod tests {
         }
         let mut window = Window::arm(1, Some(LiveNvmeStats::default())).unwrap();
         window.freeze(Some(LiveNvmeStats::default())).unwrap();
-        assert_eq!(window.finish().unwrap()["selected_operations"], 0);
+        let result = window.finish().unwrap();
+        assert_eq!(result["selected_operations"], 0);
+        // Zero-sample timings remain present as unavailable observations, not
+        // fabricated nonzero samples or fields dropped by the phase exporter.
+        for name in [
+            "reserve_exchanges",
+            "complete_exchanges",
+            "lease_exchanges",
+            "leased_frames",
+            "leased_bytes",
+            "leased_skip_markers",
+            "extents_leased",
+            "adoption_async_exchanges",
+            "adoption_sync_exchanges",
+            "adoption_async_ns",
+            "adoption_async_samples",
+            "adoption_settle_ns",
+            "adoption_settle_samples",
+            "adoption_history_full_settles",
+            "fua_writes",
+            "leased_write_ns",
+            "leased_write_samples",
+            "extent_switch_ns",
+            "extent_switch_samples",
+            "lease_reserve_ns",
+            "lease_namespace_sync_ns",
+            "lease_publish_ns",
+            "lease_profile_samples",
+            "adopt_owner_ns",
+            "adopt_close_scan_ns",
+            "adopt_close_scan_bytes",
+            "adopt_profile_samples",
+            "extent_preleases",
+            "extent_switch_waits",
+            "leased_failed_writes",
+            "leased_short_writes",
+            "leased_timed_out_writes",
+            "leased_full_writes",
+            "failed_write_ops",
+            "short_write_ops",
+            "short_write_bytes",
+        ] {
+            assert_eq!(result["stages"]["live_nvmeof"][name], 0, "{name}");
+        }
     }
 
     #[test]

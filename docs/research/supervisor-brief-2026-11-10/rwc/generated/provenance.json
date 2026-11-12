@@ -1,0 +1,47 @@
+{
+  "synthetic": false,
+  "run_id": "bench-41ecdf3f69fb47ec",
+  "parent_run_id": "bench-bb40628be5664257",
+  "selection": "remote_rw_compact",
+  "matrix_sha256": "b2f2afc44afc1d066bedb27f819c5fa7789e000f96da0c7beb4c6f9359122620",
+  "package_sha256": "bff17b53be14bedd0d5271cbe4fcbff90d2451b920439b5701cfa29142ba0a6a",
+  "binary_sha256": "aca3d64bd1b55e115425fdd8702e7391421feb6dfa7822faa2197006ba848551",
+  "manifest_sha256": "8512079b6712f89e5377172e70c9508dc1d2077f4c3b46cdc0aa8250206e8ae2",
+  "source_revision": "0d9bd94f1bb371296437dc5ec3e2090edf7ac473",
+  "source_dirty": true,
+  "source_tree_sha256": "0356f0c998f7f4446ed60e916578f0c4205c5ca4a70a1616fe843836f1c44e02",
+  "launch_time": "2026-11-10T12:03:35Z",
+  "creation_completed": "2026-11-10T12:04:09Z",
+  "deletion_time": "2026-11-10T14:10:20Z",
+  "vm_names": [
+    "bench-41ecdf3f69fb47ec-0",
+    "bench-41ecdf3f69fb47ec-1"
+  ],
+  "machine_type": "z4m-highmem-16",
+  "zone": "us-central1-a",
+  "placement": "compact",
+  "cleanup_verified": true,
+  "cleanup_summary": "No instance, disk or placement policy remained; Main final cleanup report and state.cleanup_verified.",
+  "cost_model": {
+    "hours_estimate": 2.11,
+    "hosts": 2,
+    "list_price_usd_per_host_hour": 3.287109973,
+    "classification": "INFERENCE; list-price estimate, not an invoice"
+  },
+  "aborted_attempt": {
+    "fleet": "bench-f369f00616c841e4",
+    "parent": "bench-7513b3e4178e470f",
+    "minutes_estimate": 7,
+    "append_controls_before_abort": "8 of 9",
+    "cost_estimate_usd": 0.8,
+    "reason": "Controller descriptor-inspection race; fixed before attempt 2 by bounded consistent descriptor inspection.",
+    "result_use": "No results used; only the controller fix and reordered 46-case canary head differ; the 342 jobs are identical."
+  },
+  "receipt_sources": [
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-rwcompact2/fleet-output/state.json",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-rwcompact2/package-root/package-receipt.json",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-rwcompact2/fleet-output/campaign-receipt.json",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-rwcompact2/export/controller-outcome.json"
+  ],
+  "timestamp_cost_and_first_attempt_source": "Main final campaign handoff; timestamps UTC and cost values estimates."
+}

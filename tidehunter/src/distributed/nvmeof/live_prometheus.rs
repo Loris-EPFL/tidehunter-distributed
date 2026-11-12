@@ -10,6 +10,144 @@ fn fields(s: &LiveNvmeStats) -> Vec<(&'static str, u64, bool, &'static str)> {
     let c = s.counts;
     let mut values = vec![
         (
+            "reserve_exchanges_total",
+            c.reserve_exchanges,
+            false,
+            "Reserved mode reserve control exchanges",
+        ),
+        (
+            "complete_exchanges_total",
+            c.complete_exchanges,
+            false,
+            "Reserved mode completion control exchanges",
+        ),
+        (
+            "lease_exchanges_total",
+            c.lease_exchanges,
+            false,
+            "Initial extent lease control exchanges",
+        ),
+        (
+            "leased_frames_total",
+            c.leased_frames,
+            false,
+            "Completed leased frames",
+        ),
+        (
+            "leased_bytes_total",
+            c.leased_bytes,
+            false,
+            "Completed leased frame bytes",
+        ),
+        (
+            "leased_skip_markers_total",
+            c.leased_skip_markers,
+            false,
+            "Completed leased skip marker blocks",
+        ),
+        (
+            "extents_leased_total",
+            c.extents_leased,
+            false,
+            "Leased WAL extents",
+        ),
+        (
+            "extent_preleases_total",
+            c.extent_preleases,
+            false,
+            "Preleased WAL extents",
+        ),
+        (
+            "extent_switch_waits_total",
+            c.extent_switch_waits,
+            false,
+            "Extent switches waiting for lease-ahead",
+        ),
+        (
+            "lease_profile_samples_total",
+            c.lease_profile_samples,
+            false,
+            "Validated owner lease profiles",
+        ),
+        (
+            "adopt_profile_samples_total",
+            c.adopt_profile_samples,
+            false,
+            "Validated owner adoption profiles",
+        ),
+        (
+            "adopt_close_scan_bytes_total",
+            c.adopt_close_scan_bytes,
+            false,
+            "Owner close suffix bytes scanned",
+        ),
+        (
+            "adoption_async_exchanges_total",
+            c.adoption_async_exchanges,
+            false,
+            "Submitted asynchronous adoptions",
+        ),
+        (
+            "adoption_sync_exchanges_total",
+            c.adoption_sync_exchanges,
+            false,
+            "Synchronous adoption exchanges",
+        ),
+        (
+            "adoption_history_full_settles_total",
+            c.adoption_history_full_settles,
+            false,
+            "Successful settles forced by full leased prefix history",
+        ),
+        (
+            "leased_failed_writes_total",
+            c.leased_failed_writes,
+            false,
+            "Leased write failures excluding short, timeout and full outcomes",
+        ),
+        (
+            "leased_short_writes_total",
+            c.leased_short_writes,
+            false,
+            "Leased writes with a short terminal CQE",
+        ),
+        (
+            "leased_timed_out_writes_total",
+            c.leased_timed_out_writes,
+            false,
+            "Leased writes failing their I/O deadline",
+        ),
+        (
+            "leased_full_writes_total",
+            c.leased_full_writes,
+            false,
+            "Leased writes rejected by queue credit",
+        ),
+        (
+            "fua_writes_total",
+            c.fua_writes,
+            false,
+            "Admitted Data FUA writes including skip markers; not a terminal success count",
+        ),
+        (
+            "failed_write_ops_total",
+            c.failed_write_ops,
+            false,
+            "Negative terminal write CQEs including retirement after a timeout",
+        ),
+        (
+            "short_write_ops_total",
+            c.short_write_ops,
+            false,
+            "Short terminal write CQEs including retirement after a timeout",
+        ),
+        (
+            "short_write_bytes_total",
+            c.short_write_bytes,
+            false,
+            "Bytes reported by short write CQEs; not acknowledged bytes",
+        ),
+        (
             "completed_read_ops_total",
             c.completed_read_ops,
             false,
@@ -72,7 +210,7 @@ fn fields(s: &LiveNvmeStats) -> Vec<(&'static str, u64, bool, &'static str)> {
         ),
     ];
     macro_rules! stage {
-        ($name:literal, $ns:ident, $samples:ident, $help:literal) => {
+        ($name:literal, $ns:ident, $samples:ident, $help:literal $(,)?) => {
             values.push((concat!($name, "_seconds_total"), c.$ns, false, $help));
             values.push((
                 concat!($name, "_samples_total"),
@@ -82,6 +220,62 @@ fn fields(s: &LiveNvmeStats) -> Vec<(&'static str, u64, bool, &'static str)> {
             ));
         };
     }
+    stage!(
+        "leased_write",
+        leased_write_ns,
+        leased_write_samples,
+        "Successful leased block writes including skips: admission to terminal CQE seconds; excludes failed writes and drain",
+    );
+    stage!(
+        "extent_switch",
+        extent_switch_ns,
+        extent_switch_samples,
+        "Synchronous leased extent switch seconds including skip and adoption"
+    );
+    values.extend([
+        (
+            "lease_reserve_seconds_total",
+            c.lease_reserve_ns,
+            false,
+            "Owner extent allocation seconds",
+        ),
+        (
+            "lease_namespace_sync_seconds_total",
+            c.lease_namespace_sync_ns,
+            false,
+            "Owner lease namespace persistence seconds",
+        ),
+        (
+            "lease_publish_seconds_total",
+            c.lease_publish_ns,
+            false,
+            "Owner lease export publication seconds",
+        ),
+        (
+            "adopt_owner_seconds_total",
+            c.adopt_owner_ns,
+            false,
+            "Owner adoption seconds including close scan",
+        ),
+        (
+            "adopt_close_scan_seconds_total",
+            c.adopt_close_scan_ns,
+            false,
+            "Owner close suffix scan seconds",
+        ),
+    ]);
+    stage!(
+        "adoption_async",
+        adoption_async_ns,
+        adoption_async_samples,
+        "Successful asynchronous adoption submission to validated reply seconds"
+    );
+    stage!(
+        "adoption_settle",
+        adoption_settle_ns,
+        adoption_settle_samples,
+        "Successful open-extent settle seconds including pending asynchronous adoption"
+    );
     stage!(
         "queue",
         queue_ns,
@@ -412,6 +606,38 @@ mod tests {
         let metrics = LiveNvmeMetrics::new();
         let producer = metrics.register().unwrap();
         producer.record_timing(LiveTimingStage::Completion, 2_000_000_000, 2);
+        producer.record_leased_frame(4096);
+        producer.record_leased_skip();
+        producer.record_extent_lease();
+        producer.record_adoption(false);
+        producer.record_adoption(true);
+        producer.record_fua_write();
+        producer.record_terminal_write_outcomes(1, 2, 2048);
+        producer.record_timing(LiveTimingStage::LeasedWrite, 1_000_000_000, 1);
+        producer.record_timing(LiveTimingStage::ExtentSwitch, 3_000_000_000, 1);
+        producer.record_timing(LiveTimingStage::AdoptionAsync, 4_000_000_000, 2);
+        producer.record_timing(LiveTimingStage::AdoptionSettle, 6_000_000_000, 3);
+        producer.record_adoption_history_full_settle();
+        producer.record_lease_profile(crate::distributed::tcp::LeaseProfile {
+            reserve_ns: 1_000_000_000,
+            namespace_sync_ns: 2_000_000_000,
+            publish_ns: 3_000_000_000,
+        });
+        producer.record_adopt_profile(crate::distributed::tcp::AdoptProfile {
+            frames: 2,
+            adopt_ns: 5_000_000_000,
+            close_scan_ns: 4_000_000_000,
+            close_scan_bytes: 4096,
+        });
+        use crate::distributed::nvmeof::live_metrics::LiveWriteFailure;
+        for outcome in [
+            LiveWriteFailure::Failed,
+            LiveWriteFailure::Short,
+            LiveWriteFailure::TimedOut,
+            LiveWriteFailure::Full,
+        ] {
+            producer.record_leased_write_failure(outcome);
+        }
         for (partition, drains, fixture) in [(2, 1, false), (2, 3, false), (3, 9, true)] {
             metrics.record_fence(LiveFenceEvidence {
                 partition,
@@ -434,6 +660,70 @@ mod tests {
                 .value()
         };
         assert_eq!(counter("tidehunter_nvmeof_live_cq_seconds_total"), 2.0);
+        for (name, expected) in [
+            ("adoption_async_seconds_total", 4.0),
+            ("adoption_async_samples_total", 2.0),
+            ("adoption_settle_seconds_total", 6.0),
+            ("adoption_settle_samples_total", 3.0),
+            ("adoption_history_full_settles_total", 1.0),
+            ("lease_reserve_seconds_total", 1.0),
+            ("lease_namespace_sync_seconds_total", 2.0),
+            ("lease_publish_seconds_total", 3.0),
+            ("lease_profile_samples_total", 1.0),
+            ("adopt_owner_seconds_total", 5.0),
+            ("adopt_close_scan_seconds_total", 4.0),
+            ("adopt_close_scan_bytes_total", 4096.0),
+            ("adopt_profile_samples_total", 1.0),
+            ("extent_preleases_total", 0.0),
+            ("extent_switch_waits_total", 0.0),
+        ] {
+            assert_eq!(counter(&format!("tidehunter_nvmeof_live_{name}")), expected);
+        }
+        assert_eq!(counter("tidehunter_nvmeof_live_leased_frames_total"), 1.0);
+        assert_eq!(counter("tidehunter_nvmeof_live_leased_bytes_total"), 4096.0);
+        assert_eq!(
+            counter("tidehunter_nvmeof_live_leased_skip_markers_total"),
+            1.0
+        );
+        assert_eq!(counter("tidehunter_nvmeof_live_extents_leased_total"), 1.0);
+        assert_eq!(
+            counter("tidehunter_nvmeof_live_adoption_async_exchanges_total"),
+            1.0
+        );
+        assert_eq!(
+            counter("tidehunter_nvmeof_live_adoption_sync_exchanges_total"),
+            1.0
+        );
+        assert_eq!(counter("tidehunter_nvmeof_live_fua_writes_total"), 1.0);
+        assert_eq!(
+            counter("tidehunter_nvmeof_live_failed_write_ops_total"),
+            1.0
+        );
+        assert_eq!(counter("tidehunter_nvmeof_live_short_write_ops_total"), 2.0);
+        assert_eq!(
+            counter("tidehunter_nvmeof_live_short_write_bytes_total"),
+            2048.0
+        );
+        assert_eq!(
+            counter("tidehunter_nvmeof_live_leased_write_seconds_total"),
+            1.0
+        );
+        assert_eq!(
+            counter("tidehunter_nvmeof_live_leased_write_samples_total"),
+            1.0
+        );
+        for name in ["failed", "short", "timed_out", "full"] {
+            assert_eq!(
+                counter(&format!(
+                    "tidehunter_nvmeof_live_leased_{name}_writes_total"
+                )),
+                1.0
+            );
+        }
+        assert_eq!(
+            counter("tidehunter_nvmeof_live_extent_switch_seconds_total"),
+            3.0
+        );
         assert_eq!(
             counter("tidehunter_nvmeof_live_target_disable_drain_total"),
             3.0

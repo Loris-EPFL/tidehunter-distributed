@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "run_id": "th-6449c7068670440c",
+  "source_revision": "87465ef68abb6fa9b7b9cb27224281a7c4994e6d",
+  "source_root": "checkpoint-work/kv-comparison/cloud-ops/th-6449c7068670440c/github/extracted/aws-efa-40573961972-1/validated-results",
+  "monitor_evidence": "observability/monitoring.tar.gz:evidence/{capture,verification,ui-readiness}.json",
+  "capture": {"receipt_complete": true, "expected_cases": 258, "seen_cases": 258, "terminal_observations": 258, "capture_gaps": [], "verification_gaps": [], "online_verification_complete": true, "offline_replay_observed": false, "visual_verification": false, "observer_overhead_calibrated": false, "query_pages": 459, "query_page_files_unique": 401, "query_metric_families": 27, "scrape_targets_at_verification": 13, "targets_up_at_verification": 13, "host_count": 6, "host_scrape_interval_seconds": 5, "benchmark_scrape_interval_seconds": 1, "grafana_datasource_health": "OK", "grafana_dashboard_uid": "kv-comparison-campaign", "executable_panels": 27, "capture_start_unix": 1793132516.1844225, "capture_end_unix": 1793137445.2049584, "snapshot_start_unix": 1793132523.095, "snapshot_end_exclusive_unix": 1793137457.541, "snapshot_skip_head": false},
+  "coverage_by_variant": {"foundationdb": 25, "valkey_tcp": 25, "tidehunter_efa_native": 32, "tidehunter_efa": 30, "tikv": 25, "tidehunter_efa_direct": 30, "native": 36, "tidehunter_tcp": 30, "cassandra": 25},
+  "interval_coverage": {"case_files": 258, "selected_process_cgroups": 1418, "available_process_cgroups": 1418, "scope": "measurement_boundary_interval; cgroup counters, not individual process CPU or RSS"},
+  "matched_examples": {
+    "cohort": "primary_rf1", "profile": "read-concurrent", "value_bytes": 1024, "repeat": 0,
+    "interpretation": "Resource intervals are independently timestamped, include boundary overhead and are not per-operation measurements. memory_peak_bytes is cgroup lifetime high-water, not interval RSS. Cgroup IO bytes are kernel accounting, not logical application bytes or proof of device attribution.",
+    "cases": [
+      {"case_id":"0013-foundationdb-1024-read-concurrent-primary_rf1-r0","client_cpu_seconds":0.663,"client_elapsed_seconds":2.33,"client_throttled_periods":0,"client_memory_peak_bytes":23695360},
+      {"case_id":"0038-valkey_tcp-1024-read-concurrent-primary_rf1-r0","client_cpu_seconds":0.511,"client_elapsed_seconds":2.09,"client_throttled_periods":0,"client_memory_peak_bytes":11165696},
+      {"case_id":"0063-tidehunter_efa_native-1024-read-concurrent-primary_rf1-r0","client_cpu_seconds":0.812,"client_elapsed_seconds":2.11,"client_throttled_periods":1,"client_periods":14,"client_throttled_seconds":0.005657,"client_memory_peak_bytes":125063168,"storage_cpu_seconds":[8.694,8.546,8.495,8.585,8.505]},
+      {"case_id":"0095-tidehunter_efa-1024-read-concurrent-primary_rf1-r0","client_cpu_seconds":0.841,"client_elapsed_seconds":2.07,"client_throttled_periods":1,"client_memory_peak_bytes":412073984,"storage_cpu_seconds":[8.466,8.334,8.321,8.417,8.561]},
+      {"case_id":"0125-tikv-1024-read-concurrent-primary_rf1-r0","client_cpu_seconds":0.760,"client_elapsed_seconds":2.33,"client_throttled_periods":0,"client_memory_peak_bytes":12734464},
+      {"case_id":"0150-tidehunter_efa_direct-1024-read-concurrent-primary_rf1-r0","client_cpu_seconds":0.845,"client_elapsed_seconds":2.14,"client_throttled_periods":1,"client_memory_peak_bytes":125009920,"storage_cpu_seconds":[8.442,8.334,8.361,8.523,8.524]},
+      {"case_id":"0180-native-1024-read-concurrent-primary_rf1-r0","client_cpu_seconds":0.180,"client_elapsed_seconds":2.10,"client_throttled_periods":0,"client_memory_peak_bytes":24727552},
+      {"case_id":"0216-tidehunter_tcp-1024-read-concurrent-primary_rf1-r0","client_cpu_seconds":1.410,"client_elapsed_seconds":2.14,"client_throttled_periods":1,"client_periods":14,"client_throttled_seconds":0.0625,"client_memory_peak_bytes":34377728,"storage_cpu_seconds":[0.150,0.159,0.132,0.148,0.150]},
+      {"case_id":"0246-cassandra-1024-read-concurrent-primary_rf1-r0","client_cpu_seconds":0.548,"client_elapsed_seconds":2.14,"client_throttled_periods":0,"client_memory_peak_bytes":12201984}
+    ],
+    "scheduling_nearest_rank_ns": {"source":"cases/<case_id>/result/samples.csv; phase=measurement, operation=read, outcome=success", "0013":{"n":8192,"p50":12641,"p99":31391,"p999":55381},"0063":{"n":8192,"p50":13600,"p99":29290,"p999":65121},"0180":{"n":8192,"p50":10140,"p99":25130,"p999":55971},"0216":{"n":8192,"p50":14740,"p99":37211,"p999":119613}},
+    "physical_device_example": {"source":"cases/<case_id>/measurement-before.json and measurement-end.json, hosts diskstats nvme1n1; sector delta * 512", "cases": {"0038":{"storage_read_bytes":[0,0,0,0,0],"storage_write_bytes":[0,0,0,0,12288]},"0063":{"storage_read_bytes":[0,0,0,0,0],"storage_write_bytes":[0,0,0,0,0]},"0216":{"storage_read_bytes":[0,0,0,0,0],"storage_write_bytes":[0,0,0,0,0]}},"qualification":"Host-wide, not process-attributed; read zeros only cover these warm measurement boundary intervals."}
+  },
+  "cold_65536_device_read_deltas": {
+    "source":"cases/<case_id>/measurement-before.json and measurement-end.json, hosts diskstats nvme1n1; selected cgroups from resource-interval.json",
+    "host_order":["coordinator","storage-0","storage-1","storage-2","storage-3","storage-4"],
+    "selected_cgroup_order":["client","storage-0","storage-1","storage-2","storage-3","storage-4"],
+    "sector_bytes":512,
+    "before_host_flags":{"drop_os_caches":true,"application_caches_evicted":false},
+    "qualification":"Host-wide device deltas and independently sampled cgroup accounting include different scopes; they cannot attribute every request to NVMe. Native has no storage-role cgroups. Valkey GET is RAM-backed.",
+    "cases":[
+      {"case_id":"0024-foundationdb-65536-cold-os-large-cold_os_cache-r0","read_sectors":[2472,1224,1224,1224,1208,1208],"read_bytes":[1265664,626688,626688,626688,618496,618496],"selected_cgroup_io_read_bytes":[1081344,0,0,4096,0,0],"additional_coordinator_cgroups":{"fdb-control":0}},
+      {"case_id":"0049-valkey_tcp-65536-cold-os-large-cold_os_cache-r0","read_sectors":[384,1472,1424,1208,1208,1208],"read_bytes":[196608,753664,729088,618496,618496,618496],"selected_cgroup_io_read_bytes":[4096,131072,106496,0,0,0]},
+      {"case_id":"0081-tidehunter_efa_native-65536-cold-os-large-cold_os_cache-r0","read_sectors":[19328,140840,134032,148568,143312,142792],"read_bytes":[9895936,72110080,68624384,76066816,73375744,73109504],"selected_cgroup_io_read_bytes":[9797632,71503872,68018176,75460608,72769536,72503296]},
+      {"case_id":"0111-tidehunter_efa-65536-cold-os-large-cold_os_cache-r0","read_sectors":[20816,142504,140432,142168,143480,141440],"read_bytes":[10657792,72962048,71901184,72790016,73461760,72417280],"selected_cgroup_io_read_bytes":[10596352,72355840,71294976,72183808,72855552,71811072]},
+      {"case_id":"0136-tikv-65536-cold-os-large-cold_os_cache-r0","read_sectors":[720,98960,106704,943280,118032,822952],"read_bytes":[368640,50667520,54632448,482959360,60432384,421351424],"selected_cgroup_io_read_bytes":[4096,50049024,54013952,482349056,59813888,420732928],"additional_coordinator_cgroups":{"pd":159744}},
+      {"case_id":"0166-tidehunter_efa_direct-65536-cold-os-large-cold_os_cache-r0","read_sectors":[19064,134488,138424,148920,139416,147912],"read_bytes":[9760768,68857856,70873088,76247040,71380992,75730944],"selected_cgroup_io_read_bytes":[9691136,68251648,70266880,75640832,70774784,75124736]},
+      {"case_id":"0202-native-65536-cold-os-large-cold_os_cache-r0","read_sectors":[546048,1216,1216,1216,1216,1216],"read_bytes":[279576576,622592,622592,622592,622592,622592],"selected_cgroup_io_read_bytes":[279474176,null,null,null,null,null]},
+      {"case_id":"0232-tidehunter_tcp-65536-cold-os-large-cold_os_cache-r0","read_sectors":[19776,138848,141312,143120,140808,144952],"read_bytes":[10125312,71090176,72351744,73277440,72093696,74215424],"selected_cgroup_io_read_bytes":[10027008,70483968,71745536,72671232,71483392,73605120]},
+      {"case_id":"0257-cassandra-65536-cold-os-large-cold_os_cache-r0","read_sectors":[456,174616,186920,304480,314880,301968],"read_bytes":[233472,89403392,95703040,155893760,161218560,154607616],"selected_cgroup_io_read_bytes":[4096,89096192,95088640,155275264,160595968,153985024]}
+    ]
+  },
+  "native_terminal_application_metrics": {"case_id":"0180-native-1024-read-concurrent-primary_rf1-r0","source":"cases/0180-native-1024-read-concurrent-primary_rf1-r0/result/metrics.prom","scope":"Cumulative terminal values, including earlier phases; not measurement-window deltas or physical I/O","lookup_cache_found":8720,"lookup_cache_not_found":12,"mapped_record_reads":8720,"mapped_record_read_bytes":9230912,"syscall_record_reads":0,"index_cache_memory_estimate_bytes":1572864,"wal_written_bytes_gauge":4394928,"interpretation":"Current checkout computes index_cache estimate from configuration; cache lookup is index overlay, not value LRU. WAL gauge is position offset; not physical disk bytes. Current source is an interpretation aid, not proof of exact campaign source."},
+  "unavailable_or_not_extracted": {"observer_perturbation_calibration":null,"offline_replay_verification_for_this_run":null,"visual_dashboard_verification":null,"per_case_network_bytes":null,"per_case_host_pressure":null,"comparable_backend_block_cache_hit_rates":null,"per_process_rss":null,"per_operation_physical_device_read_attribution":null,"unavailable_does_not_mean_zero":true}
+}

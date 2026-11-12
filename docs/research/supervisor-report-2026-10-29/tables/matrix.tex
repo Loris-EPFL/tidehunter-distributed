@@ -1,0 +1,36 @@
+\begin{landscape}
+\scriptsize
+\setlength{\tabcolsep}{2pt}
+\sloppy
+\begin{longtable}{p{3cm}p{2.5cm}p{3.1cm}rrrp{7cm}}
+\caption{Exact case matrix: 258 cases, one repetition each; key counts are in the case index. TCP/EFA/Direct/EFAnative denote Tidehunter variants; FDB denotes FoundationDB; Valkey denotes Valkey TCP. Backend names and values refer to observed cases, not a claim of every possible combination.}\label{data-matrix}\\
+\toprule
+Cohort & Profile & Value bytes & C & Offered/s & Cases & Backends\\
+\midrule
+\endfirsthead
+\toprule
+Cohort & Profile & Value bytes & C & Offered/s & Cases & Backends\\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+cold\_\allowbreak{}os\_\allowbreak{}cache & cold-os-large & 65536 & 16 & -- & 9 & Cassandra, FDB, Native, EFA, Direct, EFAnative, TCP, TiKV, Valkey\\
+coordinator\_\allowbreak{}cache\_\allowbreak{}configured & coordinator-cache & 256, 8192 & 1 & -- & 8 & EFA, Direct, EFAnative, TCP\\
+native\_\allowbreak{}pagecache & point-mixed & 64, 256, 1024, 8192, 65536 & 1 & -- & 5 & Native\\
+native\_\allowbreak{}pagecache & read-many32 & 64, 256, 1024, 8192, 65536 & 16 & -- & 5 & Native\\
+owner\_\allowbreak{}cache\_\allowbreak{}configured & owner-cache & 256, 8192 & 1 & -- & 8 & EFA, Direct, EFAnative, TCP\\
+primary\_\allowbreak{}rf1 & offered-1000 & 1024 & 32 & 1000 & 9 & Cassandra, FDB, Native, EFA, Direct, EFAnative, TCP, TiKV, Valkey\\
+primary\_\allowbreak{}rf1 & offered-10000 & 1024 & 32 & 10000 & 9 & Cassandra, FDB, Native, EFA, Direct, EFAnative, TCP, TiKV, Valkey\\
+primary\_\allowbreak{}rf1 & offered-50000 & 1024 & 32 & 50000 & 9 & Cassandra, FDB, Native, EFA, Direct, EFAnative, TCP, TiKV, Valkey\\
+primary\_\allowbreak{}rf1 & point-mixed & 64, 256, 1024, 8192, 65536 & 1 & -- & 45 & Cassandra, FDB, Native, EFA, Direct, EFAnative, TCP, TiKV, Valkey\\
+primary\_\allowbreak{}rf1 & read-concurrent & 64, 256, 1024, 8192, 65536 & 16 & -- & 45 & Cassandra, FDB, Native, EFA, Direct, EFAnative, TCP, TiKV, Valkey\\
+primary\_\allowbreak{}rf1 & read-many32 & 64, 256, 1024, 8192, 65536 & 16 & -- & 45 & Cassandra, FDB, Native, EFA, Direct, EFAnative, TCP, TiKV, Valkey\\
+primary\_\allowbreak{}rf1 & write-concurrent & 64, 256, 1024, 8192, 65536 & 16 & -- & 45 & Cassandra, FDB, Native, EFA, Direct, EFAnative, TCP, TiKV, Valkey\\
+primary\_\allowbreak{}rf1 & zipf-read & 1024 & 16 & -- & 9 & Cassandra, FDB, Native, EFA, Direct, EFAnative, TCP, TiKV, Valkey\\
+registered\_\allowbreak{}ram\_\allowbreak{}configured & registered-ram & 256, 8192 & 1 & -- & 2 & EFAnative\\
+write\_\allowbreak{}stage\_\allowbreak{}diagnostics & write-concurrent & 1024 & 16 & -- & 5 & Native, EFA, Direct, EFAnative, TCP\\
+\end{longtable}
+\normalsize
+\end{landscape}
+
+

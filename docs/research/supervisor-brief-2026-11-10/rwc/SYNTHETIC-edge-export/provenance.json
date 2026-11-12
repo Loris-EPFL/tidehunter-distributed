@@ -1,0 +1,14 @@
+{
+  "synthetic": true,
+  "run_id": "SYNTHETIC-run-9",
+  "package_sha256": "SYNTHETIC-not-a-package",
+  "source_revision": "SYNTHETIC-not-a-revision",
+  "source_dirty": true,
+  "launch_time": "SYNTHETIC-not-launched",
+  "vm_names": [
+    "SYNTHETIC-coordinator",
+    "SYNTHETIC-owner0"
+  ],
+  "selection": "remote_rw_compact",
+  "matrix_sha256": "3a4265e80102063263f28545bb68fd05e5110e03503aa1c732e2e13e2e996eef"
+}

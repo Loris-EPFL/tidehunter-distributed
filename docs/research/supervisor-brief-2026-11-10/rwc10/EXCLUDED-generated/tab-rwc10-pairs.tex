@@ -1,0 +1,16 @@
+\begin{table}[H]\centering\small\setlength{\tabcolsep}{3pt}
+\begin{tabular}{llllll}\toprule
+A / B & Rep. & 1 KiB c1 & 1 KiB c16 & 64 KiB c1 & 64 KiB c16\\\midrule
+TLS cost & r0 & \N{F10:ab_pairs:0:mean_ratio_a_over_b:1|.2f} & not run & not run & not run\\
+TLS cost & r1 & not run & not run & not run & not run\\
+transport adaptive & r0 & \N{F10:ab_pairs:1:mean_ratio_a_over_b:1|.2f} & not run & not run & not run\\
+transport adaptive & r1 & not run & not run & not run & not run\\
+transport busy & r0 & \N{F10:ab_pairs:2:mean_ratio_a_over_b:1|.2f} & not run & not run & not run\\
+transport busy & r1 & not run & not run & not run & not run\\
+parking TCP & r0 & \N{F10:ab_pairs:3:mean_ratio_a_over_b:1|.2f} & not run & not run & not run\\
+parking TCP & r1 & not run & not run & not run & not run\\
+parking verbs & r0 & \N{F10:ab_pairs:4:mean_ratio_a_over_b:1|.2f} & not run & not run & not run\\
+parking verbs & r1 & not run & not run & not run & not run\\
+\bottomrule\end{tabular}
+\caption{\textbf{EXCLUDED ABORTED ATTEMPT --- layout test only, never final results.} Ratios of matched per-case means, A/B: TLS = TCP mTLS/TCP trusted (adaptive); transport = trusted TCP/trusted verbs at the named policy; parking = adaptive/Busy for the named trusted transport. Ratios are not differences or isolated wire/crypto timers. No ratio for failed, unqualified, missing or unmatched partners. Coordinator cache off; lanes one at c1, four at c16; r0/r1 separate. Busy spins owner and coordinator read driver, not kernel busy poll. Unmatched dimensions: TLS/security, polling, RPC/direct I/O; NVMe control is verbs trusted Adaptive.}
+\end{table}

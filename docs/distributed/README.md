@@ -2,6 +2,14 @@
 
 Started 6 October 2026 in a separate checkout named `tidehunter-sharded-wal`.
 
+[Performance plan and benchmark references, 10 November 2026](PERFORMANCE_PLAN_2026-11-10.md).
+
+The distributed node configuration exposes `live_target` independently of the
+NVMe-oF feature. A nonempty target requires `experimental-nvmeof` on Linux;
+unsupported builds reject it rather than starting a native node silently.
+Final target-shutdown evidence is available through the same node API in both
+builds, with `None` identifying a native node.
+
 **Distributed-KV research comparison:**
 [Experimental protocol, guarantee tiers and source mapping](KV_COMPARISON_PROTOCOL.md).
 The local framework under `benchmarks/kv-research` and

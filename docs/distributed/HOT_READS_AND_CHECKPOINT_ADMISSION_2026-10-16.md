@@ -2,6 +2,43 @@
 
 Date: 16 October 2026; amended 18 October 2026.
 
+## 3 November 2026: background root adoption and cleanup
+
+Checkpoint completion previously synchronized the authority manifest in
+`progress_checkpoint` on the write owner before it could deliver published
+replies or process other commands. The existing checkpoint worker now durably
+adopts the root after its staged artifacts are durable. The owner installs the
+captured index only after that success, then explicitly authorizes the same
+worker to unlink obsolete artifacts, sync the directory and persist the cleared
+cleanup intent. A checkpoint stays in flight through both phases, so no later
+checkpoint can replace the root during cleanup. Worker cancellation closes the
+authorization channel before joining. Failure fences serving; reopening uses
+the durable root and intent to complete recovery. The captured prefix and
+all later acknowledged suffixes remain WAL-backed.
+
+This removes the two checkpoint manifest synchronizations and obsolete cleanup
+from the owner, not all maintenance stalls. Index capture and sorting and live
+installation remain synchronous. Checkpoint RPCs can contend with append
+connections. Existing checkpoint phase aggregates are not correlated per-request
+timings; they cannot establish which phase caused a particular benchmark tail or
+be subtracted from API latency to estimate network time. `root_adoption_ns`
+measures the worker's root-manifest sync separately. `owner_adoption_ns` now
+covers live installation and accounting only, so it is not comparable to its
+earlier meaning; `obsolete_cleanup_ns` now measures worker cleanup.
+Regressions pause adoption and cleanup independently while a suffix completes,
+then check reopen and retry. Interruption coverage includes the durable-root
+before live-install window, unlink before directory sync, and completed cleanup.
+No local or cloud performance result is implied.
+
+Arming a nonzero write profile now finishes any pre-existing checkpoint before
+enabling and resetting the bounded checkpoint diagnostic ring. Disabling the
+profile clears its counters and reports the diagnostics unavailable; rearming
+starts a fresh phase without reusing record cursors. Before this correction,
+opening with a zero write-profile limit and arming later left the ring disabled.
+Zero phase counts from that configuration are unavailable observations, not
+evidence that checkpoints took zero time. This instrumentation change does
+not establish a cause for any observed write tail.
+
 ## Decision
 
 The 16 October change keeps complete values on the existing owner-local Value WALs. Improve bounded coordinator residency, reuse decoded Sui summaries, and remove avoidable foreground checkpoint I/O. That cache change does not alter wire formats, durable acknowledgement, consecutive publication, replication, consensus, or WAL ownership. The separate 17 October write/transport implementation below preserves these storage guarantees but adds an explicitly selected EFA-direct packet format. AWS campaign approval and execution remain separate.

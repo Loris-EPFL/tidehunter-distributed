@@ -34,7 +34,7 @@ class FocusedAdmissionTest(unittest.TestCase):
                     gcp_image.admit_spdk_scope(spec, invalid)
 
     def test_both_reviewed_specs_bind_exact_canonical_matrix(self):
-        for selection, count in (('recommended', 279), ('full', 333), ('device', 120), ('floors', 69), ('stages', 183), ('unified', 270), ('append_floors', 48), ('fair_native', 168), ('parity', 216), ('parity_compact', 177), ('fair_five_owner', 39)):
+        for selection, count in (('recommended', 279), ('full', 333), ('device', 120), ('floors', 69), ('stages', 183), ('unified', 270), ('append_floors', 48), ('fair_native', 168), ('parity', 216), ('parity_compact', 177), ('fair_five_owner', 39), ('remote_rw_compact', 342)):
             with self.subTest(selection=selection):
                 spec = copy.deepcopy(manual.REVIEWED_SPECS[selection])
                 jobs = workflow_input.cloud_campaign.make_focused_matrix(selection)
@@ -48,6 +48,7 @@ class FocusedAdmissionTest(unittest.TestCase):
                             {'G13W': 48, 'G14N': 54, 'G14S': 36, 'G14O1': 36, 'G14O5': 36, 'G14P': 6} if selection == 'parity' else
                             {'G13W': 48, 'G14N': 54, 'G14S': 36, 'G14O1': 36, 'G14P': 3} if selection == 'parity_compact' else
                             {'G14O5': 36, 'G14P': 3} if selection == 'fair_five_owner' else
+                            {'G13W': 48, 'G11N': 45, 'G11S': 24, 'G15F': 24, 'G14N': 54, 'G14O1': 36, 'G14P': 3, 'G15C': 54, 'G15M': 54} if selection == 'remote_rw_compact' else
                             {'G13W': 48} if selection == 'append_floors' else
                             {'G11N': 45, 'G11S': 24} if selection == 'floors' else
                             {'G10R': 60, 'G10W': 60} if selection == 'device' else
@@ -58,7 +59,7 @@ class FocusedAdmissionTest(unittest.TestCase):
                     expected.update(G11N=45, G11S=24, G11W=18)
                 for group, group_count in expected.items():
                     self.assertEqual(counts[group], group_count)
-                compact = selection == 'parity_compact'
+                compact = selection in ('parity_compact', 'remote_rw_compact')
                 self.assertEqual(spec.get('owner_hosts', 5), 1 if compact else 5)
                 self.assertEqual(workflow_input.cloud_campaign.selection_owner_hosts(selection), spec.get('owner_hosts', 5))
                 limit = ((manual.COMPACT_CEILING_CENTS - manual.COMPACT_COMPUTE_CENTS) if compact
@@ -124,9 +125,61 @@ class FocusedAdmissionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'zonal'):
             manual._check_config({**CONFIG, 'max_distance': 2}, spec, 0)
 
+    def test_fabric_ab_reviewed_spec_and_mutations(self):
+        spec = manual.REVIEWED_SPECS['fabric_ab_compact']
+        jobs = manual._reviewed_jobs(spec)
+        self.assertEqual(len(jobs), 80)
+        self.assertEqual(workflow_input.cloud_campaign.make_matrix(
+            {key: value for key, value in spec.items() if key != 'suite'}), jobs)
+        self.assertEqual(spec['max_cases'], 80)
+        self.assertEqual(spec['owner_hosts'], 1)
+        self.assertEqual(spec['backends'], ['tidehunter_tcp', 'tidehunter_tcp_trusted',
+                         'tidehunter_verbs_native', 'tidehunter_nvme_rdma', 'tidehunter_nvme_tcp'])
+        encoded = ','.join(spec['backends'])
+        self.assertEqual(workflow_input.specification('kv', encoded, 'focused', selection='fabric_ab_compact'), spec)
+        for mutation in ({'job_count': 81}, {'matrix_sha256': '0' * 64},
+                         {'owner_hosts': 5}, {'backends': ['native']}):
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                manual._check_config(CONFIG, {**spec, **mutation}, 0)
+
+    def test_leased_compact_exact_spec_and_budget(self):
+        spec = copy.deepcopy(manual.REVIEWED_SPECS['leased_ab_compact'])
+        jobs = manual._reviewed_jobs(spec)
+        self.assertEqual(len(jobs), 72)
+        self.assertFalse(spec['spdk_comparison'])
+        self.assertEqual(spec['backends'], ['tidehunter_verbs_native', 'tidehunter_nvme_rdma'])
+        manual._check_config(CONFIG, spec, 889)
+        with self.assertRaises(ValueError):
+            manual._check_config(CONFIG, spec, 890)
+        for mutation in ({'job_count': 71}, {'matrix_sha256': '0' * 64}, {'owner_hosts': 5}):
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                manual._reviewed_jobs({**spec, **mutation})
+        with self.assertRaisesRegex(ValueError, 'five.owner'):
+            gcp_campaign._require_six_host_spec(spec)
+
+    def test_nvmeof_path_exact_spec(self):
+        for selection in manual.NVMEOF_PATH_SELECTIONS:
+            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37}[selection]
+            with self.subTest(selection=selection):
+                spec = copy.deepcopy(manual.REVIEWED_SPECS[selection])
+                jobs = manual._reviewed_jobs(spec)
+                self.assertEqual(len(jobs), expected_count)
+                self.assertEqual(spec['max_cases'], expected_count)
+                self.assertEqual(spec['owner_hosts'], 1)
+                self.assertFalse(spec['spdk_comparison'])
+                self.assertEqual(spec['backends'], ['native', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma'])
+                self.assertEqual(workflow_input.specification(
+                    'kv', ','.join(spec['backends']), 'focused', selection=selection), spec)
+                self.assertTrue(gcp_runtime.live_mode(spec))
+                for mutation in ({'job_count': expected_count - 1}, {'matrix_sha256': '0' * 64},
+                                 {'owner_hosts': 5}, {'spdk_comparison': True},
+                                 {'backends': ['tidehunter_verbs_native', 'tidehunter_nvme_rdma']}):
+                    with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                        manual._reviewed_jobs({**spec, **mutation})
+
     def test_workflow_spec_selects_only_reviewed_inputs(self):
         backends = ','.join(manual.REVIEWED_SPECS['full']['backends'])
-        for selection in ('recommended', 'full', 'device', 'floors', 'stages', 'unified', 'append_floors', 'fair_native', 'parity', 'parity_compact', 'fair_five_owner'):
+        for selection in ('recommended', 'full', 'device', 'floors', 'stages', 'unified', 'append_floors', 'fair_native', 'parity', 'parity_compact', 'fair_five_owner', 'remote_rw_compact'):
             selected = ','.join(manual.REVIEWED_SPECS[selection]['backends'])
             spec = workflow_input.specification('kv', selected, 'focused', selection=selection)
             self.assertEqual(spec, manual.REVIEWED_SPECS[selection])
@@ -177,9 +230,12 @@ class FocusedAdmissionTest(unittest.TestCase):
                   'package': {'source_sha256': 'a' * 64, 'source_revision': 'b' * 40,
                               'object_key': 'runs/run/package.tar', 'generation': '1', 'sha256': 'c' * 64},
                   'spec': copy.deepcopy(manual.REVIEWED_SPECS['parity_compact'])}
-        self.assertIs(gcp_runtime.validate_runtime(config), config)
+        for selection in ('parity_compact', 'remote_rw_compact', 'fabric_ab_compact'):
+            config['spec'] = copy.deepcopy(manual.REVIEWED_SPECS[selection])
+            self.assertIs(gcp_runtime.validate_runtime(config), config)
         for mutation in ({'mode': 'standard'}, {'suite': 'sui'}, {'backends': ['tikv']},
-                         {'selection': 'parity'}):
+                         {'selection': 'parity'}, {'owner_hosts': 5}, {'job_count': 81},
+                         {'matrix_sha256': '0' * 64}, {'backends': ['tidehunter_tcp']}):
             with self.subTest(mutation=mutation), self.assertRaises((ValueError, gcp_runtime.RuntimeSafetyError)):
                 gcp_runtime.validate_runtime({**config, 'spec': {**config['spec'], **mutation}})
 

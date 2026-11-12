@@ -1,0 +1,68 @@
+{
+  "schema": 1,
+  "generated_utc": "2026-10-29T12:33:09.121103+00:00",
+  "report": "Distributed Tidehunter: Architecture, Correctness and Comparative Evaluation",
+  "evidence_date": "2026-10-29",
+  "measured_engine_commit": "ba3a6a0194cca6f171e5916649e7f4eeba65aeb0",
+  "repository": "https://github.com/Loris-EPFL/tidehunter-distributed",
+  "local_branch": "perf/async-authority-history",
+  "local_head": "0bf11268d490b76d33bc37977b70be9af7b25172",
+  "local_tracked_diff_from_measured_source": [
+    "experiments/aws-sharded-wal/README.md",
+    "experiments/aws-sharded-wal/ci-config.json",
+    "experiments/kv-comparison/ci-config.json"
+  ],
+  "runtime_rust_diff_observed": false,
+  "github_run": "https://github.com/Loris-EPFL/tidehunter-distributed/actions/runs/40848651463",
+  "campaign_id": "th-343ae02a3d9353ed",
+  "complete_cases": 258,
+  "current_operation_outcome_populations": 453,
+  "independent_repetitions": 1,
+  "repetition_variability_established": false,
+  "sui_checkpoint_replay_in_latest_campaign": false,
+  "aws_cluster_closed_verified": true,
+  "new_aws_experiments_for_report": false,
+  "sources": [
+    {
+      "workspace_relative_path": "checkpoint-work/aws-ci-runs/2026-10-29-run-40848651463/aws-efa/validated-results/comparison.json",
+      "bytes": 13662168,
+      "sha256": "aa6a0d32a999d2dd1c1a38cc4573c0464a038ec9603a56e4672107e5d03cdfde"
+    },
+    {
+      "workspace_relative_path": "checkpoint-work/aws-ci-runs/2026-10-29-run-40848651463/analysis/all-results.csv",
+      "bytes": 413532,
+      "sha256": "c556830d65498424f220c66da9010fbb951f2346880f4923c10e514b8cfe34ea"
+    },
+    {
+      "workspace_relative_path": "checkpoint-work/aws-ci-runs/2026-10-29-run-40848651463/analysis/historical-comparison.csv",
+      "bytes": 184494,
+      "sha256": "81975540ba32468e66614203490947db25acdd89f4acfc7b433f35249b5e052a"
+    },
+    {
+      "workspace_relative_path": "checkpoint-work/aws-ci-runs/2026-10-29-run-40848651463/operations-manifest.json",
+      "bytes": 10367,
+      "sha256": "2b0111660402beefc79fcf4aa29d4da69b1864b93590846fc4c8c4be9b2f1d76"
+    },
+    {
+      "workspace_relative_path": "checkpoint-work/aws-ci-runs/2026-10-29-run-40848651463/aws-costs/aggregate.json",
+      "bytes": 58635,
+      "sha256": "88e1b4001b8db137cea58934053b40ee4e2bd76857e60972e4b3e2966d11e31b"
+    },
+    {
+      "workspace_relative_path": "checkpoint-work/aws-ci-runs/2026-10-29-run-40848651463/aws-efa/validated-results/observability/receipt.json",
+      "bytes": 2702925,
+      "sha256": "7ba3e358caf7b1a9ca72e78eb503695a601bbfe77570c29c357327406ea347e4"
+    },
+    {
+      "workspace_relative_path": "papers/Tidehunter-2026-v2.pdf",
+      "bytes": 1941893,
+      "sha256": "73957df11a17dc80b61eef8f18a4f8af988954c1772402553e595d2a6c5e4127"
+    },
+    {
+      "workspace_relative_path": "papers/parsed/Distributed-Tidehunter-2026-06-Design-Note.md",
+      "bytes": 285237,
+      "sha256": "11176e377bc36132236663486bd7b2890043f474f4f85ac1482448e3722fb344"
+    }
+  ],
+  "raw_evidence_scope": "Full raw artifacts retained separately; this project embeds analysis inputs/figures and does not replace original raw samples or telemetry archives."
+}

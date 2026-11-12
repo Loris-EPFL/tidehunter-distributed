@@ -1,0 +1,12 @@
+{
+  "pass_check": true,
+  "numbers": 390,
+  "tables": 6,
+  "figure_points": 349,
+  "figures": 5,
+  "synthetic": false,
+  "excluded_from_final": false,
+  "pages": 54,
+  "pdf_sha256": "334745e1e45c96414fcc67a99652c77fc04d266417f4a1de8d046b714b770350",
+  "visual_inspection": "separate rendered-image review, not asserted by this checker"
+}

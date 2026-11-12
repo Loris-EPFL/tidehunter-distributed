@@ -1,0 +1,62 @@
+\clearpage
+\section{Run 10: fabric, security and polling}\label{sec:rwc10}
+\textbf{Topology and scope.} The reviewed \texttt{fabric\_ab\_compact} selection uses one coordinator VM and one remote shard-WAL VM, both \texttt{z4m-highmem-16} in \texttt{us-central1-a} with compact placement, not five owners. There are two value sizes (1 and 64 KiB), one or sixteen readers and separate r0/r1 cases. The coordinator cache is off. Ordinary owner reads traverse RPC; warm cases prewarm the serving-node page cache. Lanes are one at c1 and four at c16. Matching caller counts does not establish saturation, fleet spread or physical-device service.
+
+\textbf{Run-9 security correction.} Run 9's TCP owner arm used mutual TLS, while its verbs arm was trusted without TLS: those TCP/verbs ratios include the security difference and are not like-for-like transport comparisons. Run 10 adds trusted TCP and keeps it distinct from mTLS. Trusted modes do not supply cryptographic peer authentication; no downgrade is proposed for an untrusted network.
+
+\RWCtenTable{arms}
+\textbf{Polling contract.} A means Adaptive; B means the Busy policy. Busy is \emph{owner spins in user space}; the coordinator read driver adopts that policy and also spins. It is not an owner-only intervention, not a guarantee that all threads never block, and not kernel socket busy polling. \texttt{SO\_BUSY\_POLL} is not wired in the engine. The raw run-9 socket floor that uses it remains a different experiment.
+
+\textbf{Measurements and absent evidence.} API latency covers successful calls; the CSVs retain successful counts, offered/unsuccessful calls, finite-case rates, observed in-flight calls, process CPU, CQ waits, statuses and reasons. Missing counters are not zero. A low Busy CPU window or zero CQ waits is a screening observation, not proof that a policy did or did not run. Two case repetitions on one fleet supply neither a confidence interval nor fleet-to-fleet variability.
+
+Launched identifiers, package hash, dirty revision and VM names are recorded in Section~\ref{sec:provenance}; no planned or synthetic identity is a launched fleet.
+
+\RWCtenFinding{answer}
+
+\clearpage
+\subsection{Warm owner reads: security and polling controls}
+\begin{figure}[H]\centering\RWCtenFigure{warm}
+\caption{Warm owner RPC, with security and polling named on each arm; means for r0/r1 are separate markers. Every panel matches size, readers and lane count. Coordinator cache off; Busy spins on owner and coordinator, not in kernel busy poll.}
+\end{figure}
+\RWCtenTable{warm}
+\RWCtenFinding{warm}
+\RWCtenFinding{capacity}
+
+\clearpage
+\subsection{Matched ratios, not isolated timers}
+\begin{figure}[H]\centering\RWCtenFigure{gap}
+\caption{Matched mean ratios, with numerator/denominator named. TLS uses adaptive TCP; like-for-like transport uses trusted TCP and verbs under the same policy; parking compares Adaptive with Busy within one trusted transport. Size, readers and repetition never change within a ratio.}
+\end{figure}
+\RWCtenTable{pairs}
+For size $s$ (bytes), readers $c$ and repetition $r$, the plotted ratio is $\rho_{A/B}(s,c,r)=\overline L_A(s,c,r)/\overline L_B(s,c,r)$, where $\overline L$ is the successful-call API mean in \us{}. These are separate matched cases, not paired calls. Ratios do not isolate a wire interval, crypto timer or owner-only parking cost; the Busy intervention also changes client progress.
+
+For the retained measurement window, let $X$ be successful calls/s, $\overline L$ the API mean in seconds and $Q$ the reported mean in-flight API calls. The CSVs satisfy $Q=X\overline L$: their time-integrated call durations, count and window give a same-window accounting identity, not an independent test of a queueing model or a bottleneck diagnosis.
+
+\clearpage
+\subsection{The process-CPU price of spinning}
+\begin{figure}[H]\centering\RWCtenFigure{cpu}
+\caption{Process cores against whole-call mean latency, by cell and configured arm. Circles/triangles denote client/owner; filled/open denote r0/r1. Missing CPU has no marker, not a zero. Security and both ends' polling policy remain part of the comparison.}
+\end{figure}
+\RWCtenTable{cpu}
+\RWCtenFinding{cpu}
+For host $h$, $C_h=\Delta t_{\mathrm{CPU},h}/\Delta t_{\mathrm{wall},h}$ is the cgroup's CPU-seconds per elapsed second (cores), not CPU per API call. Hosts have independently sampled gate windows including startup/drain overlap. The owner cgroup includes its process threads but not arbitrary kernel \texttt{nvmet} workers. CQ idle waits are an OFI counter, not a TCP spinning counter; recorded TCP absence is NR. The pair CSV also retains CPU differences between independent case windows; these are descriptive, not call-linked costs.
+
+\clearpage
+\subsection{Device-qualified cold reads and NVMe-oF}
+\begin{figure}[H]\centering\RWCtenFigure{cold}
+\caption{Cold whole-call means: owner RPC versus direct namespace paths. Labels annotate device reads per successful call in r0/r1 order; U and an absent latency marker retain an unqualified case. Kernel targets use direct backing I/O; SPDK uses file AIO; all use the kernel initiator. The NVMe-oF control channel is verbs trusted Adaptive, including NVMe/TCP.}
+\end{figure}
+\RWCtenTable{cold}
+\RWCtenFinding{cold}
+\RWCtenFinding{coldcomparison}
+The qualified media/path and sealed-accounting gates remain case-level proxies, not proof of physical NAND service per call.
+
+\clearpage
+\subsection{Why RDMA gains depend on the case}\label{sec:rwc10-ladder}
+\begin{figure}[H]\centering\RWCtenFigure{ladder}
+\caption{A latency ladder, not a decomposition: run-9 standalone round-trip tools on a different fleet beside run-10 trusted warm owner RPC at 1 KiB c1. Every repetition remains visible. A raw READ floor is not an engine READ feature. Do not subtract these populations, stack them, or call their difference measured software overhead.}
+\end{figure}
+\RWCtenTable{ladder}
+\textbf{[INFERENCE]} A smaller standalone transport floor need not produce a comparably smaller RPC mean: index/routing, framing, validation, owner execution and coordinator completion remain work on both paths. The measured controls now separate security from transport and show a c1 verbs spinning benefit with a CPU cost, but not a consistent c16 benefit. They do not identify an additive software remainder or the cause of the 64-KiB rate ceiling; cross-fleet floors cannot supply either missing measurement.
+
+\textbf{Limits and next decisions.} One-sided RDMA READ is \emph{not implemented in the engine}: the fabric crate has a primitive, but engine endpoints pass \texttt{rma=None} and export no registration keys. NVMe-oF/RDMA is a separate namespace path, not that missing engine feature. This run does not test kernel busy poll, five-owner scale-out, Spot/other machine types, failover, Sui replay or production capacity. Preserve security requirements and qualification when choosing a policy; raw floors, one fleet and two repetitions do not justify a general transport ranking.

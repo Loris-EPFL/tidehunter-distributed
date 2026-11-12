@@ -17,7 +17,20 @@ fn take_wire_responses(client: &mut Client) -> Vec<Envelope<Response>> {
 
 #[test]
 fn one_session_pipelines_appends_but_keeps_fence_and_seal_as_barriers() {
-    let server = Running::new(Transport::Tcp, WalMemberReadPolicy::Positional);
+    // The server closes a session whose accepted request waits longer than
+    // `io_timeout`. This test holds the first append paused across two client
+    // waits of up to 2 s each, so the server bound must exceed their sum.
+    let server = Running::with_limits(
+        Transport::Tcp,
+        WalMemberReadPolicy::Positional,
+        crate::distributed::tcp::default_read_bytes(),
+        crate::distributed::tcp::default_device_reads(),
+        crate::distributed::tcp::TcpLimits {
+            io_timeout: Duration::from_secs(10),
+            max_frame_bytes: 2 * 1024 * 1024,
+            ..TcpLimits::default()
+        },
+    );
     server
         .node
         .set_durability(crate::distributed::durability::DurabilityConfig::with_tier(

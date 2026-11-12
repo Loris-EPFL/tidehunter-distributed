@@ -1,0 +1,17 @@
+case_id,field,total_ns,n,mean_us
+G12D-r0-0ce5f8eaa8fde37f6566,connection_handler_ns,239980960,4096,58.5891015625
+G12D-r0-0ce5f8eaa8fde37f6566,connection_control_queue_ns,44109387,4116,10.716566326530613
+G12D-r0-0ce5f8eaa8fde37f6566,connection_request_decode_ns,2746006,4096,0.67041162109375
+G12D-r0-0ce5f8eaa8fde37f6566,connection_append_decode_ns,10350266,4096,2.52692041015625
+G12D-r0-0ce5f8eaa8fde37f6566,connection_append_group_build_ns,4161761,4096,1.016054931640625
+G12D-r0-0ce5f8eaa8fde37f6566,connection_append_wal_ns,35426942,4096,8.64915576171875
+G12D-r0-0ce5f8eaa8fde37f6566,connection_append_persist_ns,159914197,4096,39.04155200195312
+G12D-r0-0ce5f8eaa8fde37f6566,connection_response_encode_ns,2764182,4096,0.67484912109375
+G12D-r0-0ce5f8eaa8fde37f6566,storage_persist_total_ns,118977856,4096,29.047328125
+G12D-r0-0ce5f8eaa8fde37f6566,storage_persist_wal_file_ns,114945797,4096,28.062938720703126
+G12D-r0-0ce5f8eaa8fde37f6566,storage_persist_publication_ns,1073031,4096,0.261970458984375
+G12D-r0-0ce5f8eaa8fde37f6566,storage_persist_serialization_lock_wait_ns,458201,4096,0.111865478515625
+G12D-r0-0ce5f8eaa8fde37f6566,storage_persist_state_lock_wait_ns,909130,4096,0.22195556640625
+G12D-r0-0ce5f8eaa8fde37f6566,storage_persist_validation_ns,901883,4096,0.220186279296875
+G12D-r0-0ce5f8eaa8fde37f6566,codec_sum_ns,20022215,4096,4.888236083984375
+G12D-r0-0ce5f8eaa8fde37f6566,locks_publication_sum_ns,2440362,4096,0.59579150390625

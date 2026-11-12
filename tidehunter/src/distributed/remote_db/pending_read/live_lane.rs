@@ -1,11 +1,11 @@
 //! Live NVMe-oF lane worker: many requests in flight per lane.
 //!
-//! Owner: this thread owns the lane's `LiveReadCache` (grants, `LiveIo` slots,
-//! requests in flight). Input: a bounded `sync_channel` fed by the endpoint
-//! actor; capacity `max_requests`, and every queued request holds a global
-//! flight credit, so the channel never holds more than that. The actor never
-//! blocks on it: it `try_send`s, wakes this thread through the lane's
-//! eventfd, and keeps overflow in its own bounded per-lane queue.
+//! Owner: the worker and an idle scalar caller borrow `LiveReadCache` under
+//! the lane's existing driver mutex, then its client mutex. The worker alone
+//! moves an active cache out while sleeping; outstanding flight credits keep
+//! callers out until it restores the cache. Both locks are free during sleep.
+//! Input: a bounded `sync_channel` of `max_requests`; every entry holds a
+//! global flight credit. The actor uses `try_send` and bounded overflow.
 //!
 //! Requests are admitted in arrival order while the cache has room, finish in
 //! any order, and each caller reads its own result slot, so per-caller result
@@ -15,7 +15,7 @@
 //! does not spin.
 use super::*;
 use crate::distributed::tcp::live_read::{
-    LiveReadCache, LiveReadDone, LiveReadRequest, LiveReadSubmitError, LiveReadToken, LiveReadWaker,
+    LiveReadDone, LiveReadRequest, LiveReadSubmitError, LiveReadToken, LiveReadWaker,
 };
 use std::sync::OnceLock;
 
@@ -122,7 +122,10 @@ pub(super) fn run(
     max_requests: usize,
 ) {
     let _poison = PoisonOnPanic(&state);
-    let mut cache = LiveReadCache::default();
+    let mut driver = lane.driver.lock();
+    #[cfg(test)]
+    let node = driver.node;
+    let cache = driver.live_cache.get_or_insert_with(Default::default);
     match cache.waker() {
         Ok(created) => {
             let _ = waker.set(created);
@@ -139,6 +142,8 @@ pub(super) fn run(
             return;
         }
     }
+    drop(driver);
+    let mut sleeping_cache = None;
     let mut inbox = LaneInbox {
         state: &state,
         receiver,
@@ -150,17 +155,30 @@ pub(super) fn run(
         disconnected: false,
     };
     'lane: loop {
-        if inbox.waiting.is_empty() && cache.in_flight() == 0 {
-            // Idle: the only place this thread blocks on its channel.
+        if inbox.waiting.is_empty() && inbox.flying.is_empty() {
             if inbox.disconnected {
                 break;
             }
-            if !inbox.wait_one(IDLE_GRANT_RELEASE)
-                && cache.close(&mut lane.client.lock(), epoch).is_err()
-            {
-                state.poison();
+            if !inbox.wait_one(IDLE_GRANT_RELEASE) {
+                let mut driver = lane.driver.lock();
+                if let Some(cache) = driver.live_cache.as_mut()
+                    && cache.close(&mut lane.client.lock(), epoch).is_err()
+                {
+                    state.poison();
+                }
             }
         }
+        #[cfg(test)]
+        if let Some((entered, resume)) = state.reactor_pause[node].lock().take() {
+            // Reuse the reactor test hook before taking either lane mutex.
+            entered.send(()).unwrap();
+            resume.recv().unwrap();
+        }
+        let mut driver = lane.driver.lock();
+        let Some(mut cache) = sleeping_cache.take().or_else(|| driver.live_cache.take()) else {
+            state.poison();
+            break;
+        };
         inbox.drain_channel(max_requests);
         if !inbox.drains.is_empty() {
             let mut client = lane.client.lock();
@@ -174,6 +192,8 @@ pub(super) fn run(
             }
             inbox.deliver();
             for reply in inbox.drains.drain(..) {
+                // Release: CQ retirement and grant close precede drain completion.
+                state.live_drains.fetch_sub(1, Ordering::Release);
                 let _ = reply.send(result.clone());
             }
         }
@@ -229,33 +249,44 @@ pub(super) fn run(
                 &error,
             );
             state.poison();
-            inbox.deliver();
-            inbox.fail_all(&error.to_string());
+            driver.live_cache = Some(cache);
             break 'lane;
         }
         let delivered = inbox.deliver();
-        if cache.in_flight() > 0 {
-            if !delivered {
-                // Sleeps until a CQE is ready, the actor wakes us, or a deadline.
-                if let Err(error) = cache.wait(MAX_POLL_WAIT) {
-                    // The eventfd or poll failed: a CQE or wake may be lost, so
-                    // stop sleeping. Shutdown below still drains every DMA buffer.
-                    super::super::record_first_failure(
-                        &state.first_failure,
-                        None,
-                        None,
-                        "live_read_wait",
-                        &error,
-                    );
-                    state.poison();
-                    break 'lane;
-                }
+        if cache.in_flight() == 0 {
+            driver.live_cache = Some(cache);
+            drop(driver);
+            if !inbox.waiting.is_empty() {
+                inbox.wait_one(Duration::from_micros(100));
             }
-        } else if !inbox.waiting.is_empty() {
-            // Not admittable and nothing in flight to wait on: await an arrival.
-            inbox.wait_one(Duration::from_micros(100));
+            continue;
         }
+        // Only active flights move the cache out of the driver. Their global
+        // credits and lane outstanding count prevent inline admission.
+        drop(driver);
+        if !delivered {
+            // Sleeps until a CQE is ready, the actor wakes us, or a deadline.
+            if let Err(error) = cache.wait(MAX_POLL_WAIT) {
+                // Shutdown below still drains every DMA buffer after a lost wake.
+                super::super::record_first_failure(
+                    &state.first_failure,
+                    None,
+                    None,
+                    "live_read_wait",
+                    &error,
+                );
+                state.poison();
+                sleeping_cache = Some(cache);
+                break 'lane;
+            }
+        }
+        sleeping_cache = Some(cache);
     }
+    let mut driver = lane.driver.lock();
+    let Some(mut cache) = sleeping_cache.take().or_else(|| driver.live_cache.take()) else {
+        state.poison();
+        return;
+    };
     let mut client = lane.client.lock();
     if cache.shutdown(&mut client, epoch, &mut inbox.done).is_err() {
         state.poison();

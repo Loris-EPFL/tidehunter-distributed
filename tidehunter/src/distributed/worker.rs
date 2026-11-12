@@ -1318,6 +1318,8 @@ mod tests {
             )
             .unwrap(),
         );
+        log.set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
+            .unwrap();
         let mut worker = GroupCommitWorker::start(log.clone(), &shape(), worker_config()).unwrap();
         let (entered, release) = log.pause_next_persist();
         let first = worker.try_submit(batch(0, 0)).unwrap();
@@ -1521,6 +1523,8 @@ mod tests {
         let log = Arc::new(
             PartitionLog::create(&dir.path().join("stream"), config, &shape(), metrics).unwrap(),
         );
+        log.set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
+            .unwrap();
         let mut worker = GroupCommitWorker::start(log.clone(), &shape(), worker_config()).unwrap();
         worker.commit(batch(0, 0)).unwrap();
         // The one-batch resident window spills the first completed authority.
@@ -1569,6 +1573,8 @@ mod tests {
                 PartitionLog::create(&dir.path().join("stream"), config, &shape(), metrics)
                     .unwrap(),
             );
+            log.set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
+                .unwrap();
             let mut worker =
                 GroupCommitWorker::start(log.clone(), &shape(), worker_config()).unwrap();
             let pending = worker

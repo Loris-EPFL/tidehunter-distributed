@@ -1,0 +1,201 @@
+{
+  "status": "PASS: integrated real second-attempt export; not a clean campaign-level success",
+  "pdf": "main.pdf",
+  "pdf_sha256": "73c2eb5f90c1edaf84e42ca9c2fddea3695a80312dbd068f29296c1529e8426f",
+  "pages": 47,
+  "page_budget": 48,
+  "source_analysis": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-rwcompact2/analysis2",
+  "source_export": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-rwcompact2/export",
+  "campaign": {
+    "selection": "remote_rw_compact",
+    "parent": "bench-bb40628be5664257",
+    "fleet": "bench-41ecdf3f69fb47ec",
+    "planned": 342,
+    "controller_completed": 339,
+    "failed": 3,
+    "complete": false,
+    "unqualified_native_cold_cases": 6,
+    "unqualified_grid": "1 KiB, c1/c5/c16, r0/r1",
+    "owner_cold_cases_qualified": 36,
+    "excluded_attempt": "bench-f369f00616c841e4"
+  },
+  "independent_rwc_checks": {
+    "controller_completed": 339,
+    "failed_cases": 3,
+    "figure_points": 512,
+    "figures": 6,
+    "numbers": 577,
+    "pages": 47,
+    "pass_check": true,
+    "pdf_sha256": "73c2eb5f90c1edaf84e42ca9c2fddea3695a80312dbd068f29296c1529e8426f",
+    "synthetic": false,
+    "tables": 6,
+    "visual_inspection": "separate image inspection; not asserted by this checker"
+  },
+  "retained_brief_checks": "PASS: 47 pages; 82 existing PDF number checks; 1235 curve values; 79 curve number keys; 33 raw owner-stage checks; 14 vector figures.",
+  "retained_curve_checks": "PASS: 1235 curve values; 810 source contributor checks; 108 per-node cells.",
+  "historical_figure_count": 14,
+  "new_figure_count": 6,
+  "final_figure_count": 20,
+  "minimum_figure_font_pt": 7.3603498,
+  "latex": {
+    "engine": "pdfLaTeX via latexmk",
+    "passes_managed_by": "latexmk",
+    "warnings": [],
+    "errors": [],
+    "log": "main.log",
+    "command_log": "rwc/real-build-output.txt"
+  },
+  "visual_inspection": {
+    "performed": true,
+    "final_pdf_sha256": "73c2eb5f90c1edaf84e42ca9c2fddea3695a80312dbd068f29296c1529e8426f",
+    "pages": [
+      1,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      46,
+      47
+    ],
+    "images": "rwc/rendered-corrections/",
+    "standalone_figures_inspected": [
+      "throughput",
+      "floors"
+    ],
+    "findings": "Inspected every requested page as PNG. Tables 13\u201315 have real r0/r1 rows and explicit repetition columns aligned with Size/Arm and all three concurrency cells. Figure 7 has clear vertical gaps; Figure 8 uses 8 B/1 KiB/4 KiB/64 KiB network ticks and an external non-overlapping API legend. New cold-population sentence fits section 5.2; expanded two-sentence Native/owner context fits front page. Microsecond word spacing is correct; read-lane text occurs once per generated caption."
+  },
+  "integration": {
+    "authorization": "Main explicit post-campaign go to integrate real main.tex; initial scratch-only seal no longer applicable",
+    "main_backup": "main.tex.pre-run9",
+    "baseline_pdf": "rwc/main-pre-run9.pdf",
+    "baseline_validation": "rwc/validation-pre-run9.json",
+    "final_main_diff": "rwc/main-tex.patch",
+    "tracked_verifier_diff": "rwc/verify-brief-run9.patch",
+    "tracked_file_modified_by_this_task": "verify_brief.py",
+    "other_tracked_builders_and_verifiers": "unchanged",
+    "page_saving": "Compressed obsolete prospective append-floor decision table into a measured-control summary on retained sync page; full new controls remain in the appendix. No old measured table/data population removed."
+  },
+  "source_files": [
+    "rwc/make_synthetic_export.py",
+    "rwc/rwc_data.py",
+    "rwc/build_rwc_inputs.py",
+    "rwc/plot_rwc.py",
+    "rwc/verify_rwc.py",
+    "rwc/section-rwc.tex",
+    "rwc/appendix-rwc.tex",
+    "rwc/run9-provenance.json",
+    "rwc/RUNBOOK.md",
+    "rwc/EDIT-PLAN.md",
+    "rwc/main-tex.patch",
+    "rwc/verify-brief-run9.patch"
+  ],
+  "updated_document_sources": [
+    "main.tex",
+    "README.md",
+    "cross-store-explanation.tex",
+    "cross-store-fair-native.tex",
+    "cross-store-curves.tex",
+    "cross-store-spike.tex",
+    "cross-store-paper.tex"
+  ],
+  "preserved_sources": [
+    "cross-store-sizes.tex",
+    "appendix-tables.tex",
+    "14 historical figure data sets",
+    "2185 retained number definitions (existing twelve late-rate corrections retained)"
+  ],
+  "generated_groups": [
+    "rwc/data/run9-output/{six analyzer CSVs,remote_rw.md,campaign_cases.csv,cold_qualification.csv}",
+    "rwc/generated/tab-rwc-{parity,write,read-cold,read-warm,cold-qualification,floors}.tex",
+    "rwc/generated/rwc-{numbers,findings,figure-hooks,failures,provenance}.tex",
+    "rwc/generated/{inputs-rwc.json,figure-evidence.json,provenance.json,validation-rwc.json}",
+    "figures/rwc-{write-latency,read-latency,throughput,cold-warm,floors,parity}.pdf",
+    "inputs.json",
+    "main.pdf",
+    "validation.json",
+    "build-output.txt",
+    "rwc/real-build-output.txt",
+    "rwc/rendered-real/*"
+  ],
+  "synthetic_policy": "Preparation fixtures and previous synthetic acceptance retained; no SYNTHETIC source registered or input in final main.fls/PDF.",
+  "commands": [
+    {
+      "command": [
+        "latexmk",
+        "-pdf",
+        "-interaction=nonstopmode",
+        "-halt-on-error",
+        "main.tex"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/home/hybr1d/Desktop/PDM/TideHunter/.venv/bin/python",
+        "-B",
+        "verify_brief.py"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/home/hybr1d/Desktop/PDM/TideHunter/.venv/bin/python",
+        "-B",
+        "rwc/verify_rwc.py",
+        "--pdf"
+      ],
+      "returncode": 0
+    }
+  ],
+  "runbook": "rwc/RUNBOOK.md",
+  "open_questions": [],
+  "limitations": [
+    "Failed event-mode network-write floors have no latency statistics.",
+    "c5 owner reads are one-lane limited, not transport limits or rankings.",
+    "One final fleet, main-grid r0/r1, no fleet-spread/significance evidence.",
+    "Independent SSD/network floors do not identify additive overhead; Native/owner sync, security, index/routing, SSD location and read lanes remain unmatched.",
+    "No five-owner scale-out, NVMe-oF reads, Spot/other types, Sui replay, failover or production-capacity result.",
+    "List-price cost estimates are not invoices."
+  ],
+  "review_corrections": {
+    "all_eight_requests_addressed": true,
+    "source_files_changed": [
+      "rwc/build_rwc_inputs.py",
+      "rwc/plot_rwc.py",
+      "rwc/verify_rwc.py",
+      "rwc/section-rwc.tex",
+      "rwc/RUNBOOK.md"
+    ],
+    "generated_changes": [
+      "rwc/generated/tab-rwc-write.tex",
+      "rwc/generated/tab-rwc-read-cold.tex",
+      "rwc/generated/tab-rwc-read-warm.tex",
+      "rwc/generated/rwc-findings.tex",
+      "rwc/generated/rwc-numbers.tex",
+      "rwc/generated/inputs-rwc.json",
+      "rwc/generated/figure-evidence.json",
+      "rwc/generated/validation-rwc.json",
+      "figures/rwc-{write-latency,read-latency,throughput,cold-warm,floors,parity}.pdf",
+      "inputs.json",
+      "main.pdf",
+      "main.txt",
+      "main.log",
+      "validation.json",
+      "build-output.txt",
+      "rwc/real-build-output.txt",
+      "rwc/corrections-build-output.txt",
+      "rwc/REAL-ACCEPTANCE.json",
+      "rwc/rendered-corrections/*"
+    ],
+    "binary_moves": "All six figures/rwc-SYNTHETIC-*.pdf moved unchanged to rwc/synthetic-figures/; synthetic producer and include hooks now use that directory.",
+    "tracked_files_changed_during_corrections": [],
+    "data_policy": "No source measurement, repetition, numeric formatting or population changed. Six additional source-traced number keys supply the requested Native/TCP write means; device ratios reuse existing source-checked keys.",
+    "compile_status": "latexmk success, 47 pages; final log checked with zero overfull/underfull boxes or LaTeX warnings.",
+    "verification_log": "rwc/corrections-build-output.txt"
+  }
+}

@@ -1,0 +1,16 @@
+\small
+\begin{tabular}{lrrrrr}\toprule
+Store & p50 \us & writes/put (owners) & KiB/put (owners) & KiB/put (all hosts) & flushes/put\\\midrule
+Native & 63.8 & 0.34 & 1.9 & 1.9 & 0.00\\
+TH TCP & 322 & 0.54 & 13.2 & 17.8 & 0.00\\
+TH verbs & 295 & 0.52 & 13.1 & 17.7 & 0.00\\
+TH NVMe-oF kernel & 657 & 2.61 & 45.2 & 49.9 & 0.00\\
+TH NVMe-oF SPDK & 702 & 2.57 & 44.2 & 49.0 & 0.00\\
+Valkey TCP & 183 & 1.94 & 14.0 & 14.1 & 0.00\\
+Valkey RDMA & 173 & 1.94 & 13.9 & 14.1 & 0.00\\
+TiKV & 286 & 1.46 & 11.1 & 11.1 & 0.00\\
+Cassandra & 263 & 1.29 & 9.2 & 9.4 & 0.00\\
+FoundationDB & 986 & 0.13 & 4.2 & 6.5 & 0.00\\
+Kvrocks & 262 & 3.00 & 17.1 & 17.5 & 0.00\\
+Garnet & 144 & 0.94 & 4.9 & 5.0 & 0.00\\
+\bottomrule\end{tabular}

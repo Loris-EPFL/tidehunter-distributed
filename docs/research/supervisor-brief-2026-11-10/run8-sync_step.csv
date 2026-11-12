@@ -1,0 +1,34 @@
+case_id,route,size_bytes,concurrency,durability,step,n,calls,mean_us,p50_us,p99_us
+G12D-r0-2d96d2b8eeab0e23aab1,native,65536,1,value_wal_barrier: file fsync + directory fsync,directory fsync,4096,4096,1.7050390625,missing,missing
+G12D-r0-2d96d2b8eeab0e23aab1,native,65536,1,value_wal_barrier: file fsync + directory fsync,file fsync,4096,4096,113.04507495117187,missing,missing
+G12D-r0-be14bc607d9e72aafdea,native,1024,1,value_wal_barrier: file fsync + directory fsync,directory fsync,4096,4096,2.150923095703125,missing,missing
+G12D-r0-be14bc607d9e72aafdea,native,1024,1,value_wal_barrier: file fsync + directory fsync,file fsync,4096,4096,25.190425048828125,missing,missing
+G12D-r0-cd8da7873f178cd0ac99,native,1024,16,value_wal_barrier: file fsync + directory fsync,file fsync,4096,4096,57.8538076171875,missing,missing
+G12D-r0-cd8da7873f178cd0ac99,native,1024,16,value_wal_barrier: file fsync + directory fsync,directory fsync,4096,4096,6.902251220703125,missing,missing
+G11W-r0-12c27f0c47b5d28b50f4,owner0 overwrite floor,65536,1,fdatasync; overwrites a pre-written file; not a WAL append reference,file fdatasync,100000,missing,37.81906615,37.075,46.649
+G11W-r0-2315eb0815b251976896,owner0 overwrite floor,1024,1,fdatasync; overwrites a pre-written file; not a WAL append reference,file fdatasync,100000,missing,19.35373951,19.213,26.009
+G11W-r0-85b8924f27ba377dee5a,owner0 overwrite floor,8192,1,fdatasync; overwrites a pre-written file; not a WAL append reference,file fdatasync,100000,missing,21.354560560000003,20.866,26.877
+G11W-r1-6da4a765f6c220c9ba1a,owner0 overwrite floor,8192,1,fdatasync; overwrites a pre-written file; not a WAL append reference,file fdatasync,100000,missing,21.35577003,20.814,27.437
+G11W-r1-ebe4433eec3d837e461c,owner0 overwrite floor,1024,1,fdatasync; overwrites a pre-written file; not a WAL append reference,file fdatasync,100000,missing,19.33208914,19.299,25.901
+G11W-r1-f111d3ef78c6c8225d1f,owner0 overwrite floor,65536,1,fdatasync; overwrites a pre-written file; not a WAL append reference,file fdatasync,100000,missing,37.4674931,36.847,46.174
+G12D-r0-08a9a20ff91943a18559,owner verbs,1024,1,synchronous owner WAL fdatasync,file fdatasync,4096,missing,34.02788623046875,27.081,184.042
+G12D-r0-08a9a20ff91943a18559,owner verbs,1024,1,synchronous owner WAL fdatasync,append persistence (inclusive),4096,missing,44.19433203125,37.529,196.207
+G12D-r0-2d96d2b8eeab0e23aab1,native,65536,1,value_wal_barrier: file fsync + directory fsync,file + directory fsync,4096,missing,114.75011401367188,missing,missing
+G12D-r0-356b4518eb3e5ab9f8c5,owner TCP,1024,16,synchronous owner WAL fdatasync,file fdatasync,1610,missing,31.82381242236025,28.818,131.432
+G12D-r0-356b4518eb3e5ab9f8c5,owner TCP,1024,16,synchronous owner WAL fdatasync,append persistence (inclusive),1610,missing,42.037862111801246,38.47,148.759
+G12D-r0-5ac5e1c809e1545074bf,verbs mTLS,1024,1,synchronous owner WAL fdatasync,file fdatasync,4096,missing,27.455640625,26.833,37.485
+G12D-r0-5ac5e1c809e1545074bf,verbs mTLS,1024,1,synchronous owner WAL fdatasync,append persistence (inclusive),4096,missing,38.30061279296875,37.811,51.923
+G12D-r0-891f83803fec3548795e,owner verbs,1024,16,synchronous owner WAL fdatasync,file fdatasync,1515,missing,31.532709570957095,28.479,150.768
+G12D-r0-891f83803fec3548795e,owner verbs,1024,16,synchronous owner WAL fdatasync,append persistence (inclusive),1517,missing,40.454364535266976,36.886,163.598
+G12D-r0-946e08ec43aceab58b29,owner TCP,1024,1,synchronous owner WAL fdatasync,file fdatasync,4096,missing,28.6911748046875,26.237,56.949
+G12D-r0-946e08ec43aceab58b29,owner TCP,1024,1,synchronous owner WAL fdatasync,append persistence (inclusive),4096,missing,38.33852465820313,36.194,84.759
+G12D-r0-9eaa39f00ad063fef4cf,owner verbs,65536,1,synchronous owner WAL fdatasync,file fdatasync,4096,missing,159.40827954101562,150.433,384.369
+G12D-r0-9eaa39f00ad063fef4cf,owner verbs,65536,1,synchronous owner WAL fdatasync,append persistence (inclusive),4096,missing,170.62029248046875,161.856,396.497
+G12D-r0-be14bc607d9e72aafdea,native,1024,1,value_wal_barrier: file fsync + directory fsync,file + directory fsync,4096,missing,27.34134814453125,missing,missing
+G12D-r0-ca7078fc585acc3331ce,hybrid kernel DIRECT,1024,1,synchronous owner WAL fdatasync,file fdatasync,4096,missing,28.501243896484375,26.077,148.752
+G12D-r0-ca7078fc585acc3331ce,hybrid kernel DIRECT,1024,1,synchronous owner WAL fdatasync,append persistence (inclusive),4096,missing,38.84041162109375,36.326,159.557
+G12D-r0-cd8da7873f178cd0ac99,native,1024,16,value_wal_barrier: file fsync + directory fsync,file + directory fsync,4096,missing,64.75605883789062,missing,missing
+G12D-r0-e44182bb7585ecb016b5,owner TCP,65536,1,synchronous owner WAL fdatasync,file fdatasync,4096,missing,152.2178203125,149.684,206.256
+G12D-r0-e44182bb7585ecb016b5,owner TCP,65536,1,synchronous owner WAL fdatasync,append persistence (inclusive),4096,missing,163.39819873046875,160.918,215.749
+G12D-r0-f154e627c9d924039b33,hybrid SPDK,1024,1,synchronous owner WAL fdatasync,file fdatasync,4096,missing,29.000186767578125,26.947,42.665
+G12D-r0-f154e627c9d924039b33,hybrid SPDK,1024,1,synchronous owner WAL fdatasync,append persistence (inclusive),4096,missing,38.48952587890625,36.16,73.385

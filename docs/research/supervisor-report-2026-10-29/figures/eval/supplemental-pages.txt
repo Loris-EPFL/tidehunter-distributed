@@ -1,0 +1,9 @@
+Each clock PDF: primary RF1, successful populations, value bytes 64, 256, 1024, 8192, 65536.
+1. Scalar write (C16): profile=write-concurrent, operation=put
+2. Scalar read (C16): profile=read-concurrent, operation=read
+3. Batch32 read per call (C16): profile=read-many32, operation=get_many
+4. Mixed: read (C1): profile=point-mixed, operation=read
+5. Mixed: put (C1): profile=point-mixed, operation=put
+6. Mixed: delete (C1): profile=point-mixed, operation=delete
+7. Mixed: missing read (C1): profile=point-mixed, operation=missing_read
+Each page: mean, within-case SD, min, p50, p95, p99, p99.9, max; µs; symmetric-log axes preserve zero. The cohort/case counts and exact values are in the tables and data/all-results.csv. Tail quantiles are descriptive; no error bars or pooling. get_many values are per 32-key call.

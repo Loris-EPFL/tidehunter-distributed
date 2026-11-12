@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "reference": "https://zenn.dev/colincollapsed/articles/f45eb5304bcc98",
+  "reference_version": "8.0.1 plus an unpinned redis-benchmark RDMA fork",
+  "source_commit": "fe8d406c0b5a64ec897f6455e4de684629883764",
+  "selected_version": "9.0.7",
+  "clients": 30,
+  "threads": 8,
+  "requests_per_test": 10000000,
+  "value_bytes": 512,
+  "pipeline": 1,
+  "keepalive": 1,
+  "tests": "ping,set,get",
+  "case_deadline_seconds": 900,
+  "qualification_requests": 2000,
+  "qualification_keys": 128,
+  "maxmemory": "20gb",
+  "maxmemory_policy": "volatile-lru",
+  "profiles": {
+    "published-as-written": {
+      "key_ranges": {"tcp": 1000000000, "rdma": 1000000},
+      "save": "3600 1 300 100 60 10000",
+      "prefill": false,
+      "seed": null,
+      "interpretation": "Confounded reference reproduction: different key ranges and hit fractions; RDB snapshots remain enabled despite AOF being off. Not a transport-only comparison."
+    },
+    "matched-ram": {
+      "key_ranges": {"tcp": 1000000, "rdma": 1000000},
+      "save": "",
+      "prefill": true,
+      "seed": 1775,
+      "interpretation": "Matched RAM transport control: sequential full-keyspace prefill; same keys, clients and client implementation; no AOF or RDB persistence. Not a durable-write comparison."
+    }
+  },
+  "limits": [
+    "PING/SET/GET subset only; the reference LRANGE_100 and its LPUSH preparation are not KV operations and are not included.",
+    "Use separate freshly started standalone servers with identical dual-listener configuration for each transport; no cluster sharding.",
+    "The current pinned upstream client replaces the historical unpinned fork. Hardware, version, affinity and NIC differences remain explicit.",
+    "Native benchmark stdout contains latency histograms, not every operation's raw API/scheduling timings; this does not replace the durable research suite.",
+    "The local qualifier is TCP-only, uses smaller explicitly labeled counts, and makes no remote RDMA performance claim."
+  ]
+}

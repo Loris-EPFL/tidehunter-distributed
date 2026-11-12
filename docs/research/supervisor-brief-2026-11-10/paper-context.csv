@@ -1,0 +1,4 @@
+key,value,source,matched_text
+write_ops_s,830000.0,papers/parsed/Tidehunter-2026-v2.md,achieves 830K ops/sec
+uniform_get_ops_s,392000.0,papers/parsed/Tidehunter-2026-v2.md,achieves 392K ops/s
+skew_get_ops_s,3980000.0,papers/parsed/Tidehunter-2026-v2.md,Tidehunter’s 3.98M ops/s

@@ -1,0 +1,18 @@
+\small\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrrrr}\toprule
+Component, mean \us & Verbs & TCP & Verbs mTLS & Kernel direct & SPDK & Native\\\midrule
+Owner append-persist (includes software) & \N{C:p1v:persist} & \N{C:p1t:persist} & \N{C:p1m:persist} & \N{C:p1k:persist} & \N{C:p1s:persist} & \N{C:p1n:persist}\\
+Network (stacks, TLS, dispatch included) & \N{C:p1v:network} & \N{C:p1t:network} & \N{C:p1m:network} & \N{C:p1k:network} & \N{C:p1s:network} & \N{C:p1n:network}\\
+Coordinator / native library insert$^{a}$ & \N{C:p1v:coordinator} & \N{C:p1t:coordinator} & \N{C:p1m:coordinator} & \N{C:p1k:coordinator} & \N{C:p1s:coordinator} & \N{C:p1n:coordinator}\\
+Owner software & \N{C:p1v:owner} & \N{C:p1t:owner} & \N{C:p1m:owner} & \N{C:p1k:owner} & \N{C:p1s:owner} & \N{C:p1n:owner}\\
+Durable wait / native file sync$^{a}$ & \N{C:p1v:durable} & \N{C:p1t:durable} & \N{C:p1m:durable} & \N{C:p1k:durable} & \N{C:p1s:durable} & \N{C:p1n:durable}\\
+Waiting and coalescing & \N{C:p1v:coalescing} & \N{C:p1t:coalescing} & \N{C:p1m:coalescing} & \N{C:p1k:coalescing} & \N{C:p1s:coalescing} & \N{C:p1n:coalescing}\\
+Client queueing and wake-up & \N{C:p1v:queue} & \N{C:p1t:queue} & \N{C:p1m:queue} & \N{C:p1k:queue} & \N{C:p1s:queue} & \N{C:p1n:queue}\\
+Residual & \N{C:p1v:residual} & \N{C:p1t:residual} & \N{C:p1m:residual} & \N{C:p1k:residual} & \N{C:p1s:residual} & \N{C:p1n:residual}\\
+Client encode, decode, verify & \N{C:p1v:messaging} & \N{C:p1t:messaging} & \N{C:p1m:messaging} & \N{C:p1k:messaging} & \N{C:p1s:messaging} & \N{C:p1n:messaging}\\
+SSD device & \N{C:p1v:device} & \N{C:p1t:device} & \N{C:p1m:device} & \N{C:p1k:device} & \N{C:p1s:device} & \N{C:p1n:device}\\
+Device + fabric + stack (unsplit) & \N{C:p1v:combined} & \N{C:p1t:combined} & \N{C:p1m:combined} & \N{C:p1k:combined} & \N{C:p1s:combined} & \N{C:p1n:combined}\\
+Owner + network exchange (unsplit) & \N{C:p1v:exchange} & \N{C:p1t:exchange} & \N{C:p1m:exchange} & \N{C:p1k:exchange} & \N{C:p1s:exchange} & \N{C:p1n:exchange}\\
+\textbf{TOTAL: same-case API mean} & \N{D:p1v:mean_us} & \N{D:p1t:mean_us} & \N{D:p1m:mean_us} & \N{D:p1k:mean_us} & \N{D:p1s:mean_us} & \N{D:p1n:mean_us}\\
+API p50 & \N{D:p1v:p50_us} & \N{D:p1t:p50_us} & \N{D:p1m:p50_us} & \N{D:p1k:p50_us} & \N{D:p1s:p50_us} & \N{D:p1n:p50_us}\\
+\bottomrule\end{tabular}

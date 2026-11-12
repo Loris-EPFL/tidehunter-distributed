@@ -51,6 +51,7 @@ pub struct NodeInventory {
     pub(super) readers: Arc<RwLock<ReaderAuthority>>,
     metrics: Arc<Metrics>,
     history_diagnostics: bool,
+    history_persistence: crate::distributed::storage::HistoryPersistence,
     history_failure_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
     // Partition handles each retain this root lock as well.
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -483,6 +484,18 @@ impl NodeInventory {
                 EpochState::Abandoned => {}
             }
         }
+        let history_persistence = logs.values().next().map_or_else(
+            crate::distributed::storage::HistoryPersistence::default,
+            |log| log.history_persistence(),
+        );
+        if logs
+            .values()
+            .any(|log| log.history_persistence() != history_persistence)
+        {
+            return Err(TcpError::new(
+                "owner epochs have different history persistence",
+            ));
+        }
         // Restart always seals the old authority, even if it previously shut
         // down cleanly. It never resumes an old logical counter/writer epoch.
         persist(&config.root, &manifest)?;
@@ -501,6 +514,7 @@ impl NodeInventory {
             readers,
             metrics,
             history_diagnostics: false,
+            history_persistence,
             history_failure_notifier: None,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             nvmeof_leases,
@@ -520,6 +534,18 @@ impl NodeInventory {
         for log in self.logs.values() {
             log.set_history_maintenance_diagnostics(enabled);
         }
+    }
+
+    pub(super) fn set_history_persistence(
+        &mut self,
+        mode: crate::distributed::storage::HistoryPersistence,
+    ) -> Result<(), TcpError> {
+        for log in self.logs.values() {
+            log.set_history_persistence(mode)
+                .map_err(TcpError::component)?;
+        }
+        self.history_persistence = mode;
+        Ok(())
     }
 
     pub(super) fn history_maintenance_stats(
@@ -561,6 +587,7 @@ impl NodeInventory {
     fn status_snapshot(&self, healthy: bool) -> Result<NodeStatus, TcpError> {
         Ok(NodeStatus {
             partition: self.config.partition.clone(),
+            history_persistence: self.history_persistence,
             shape_yaml: self.config.shape_yaml.clone(),
             max_epochs: self.config.max_epochs,
             epochs: self
@@ -710,6 +737,8 @@ impl NodeInventory {
                 .map_err(TcpError::component)?;
                 let log = Arc::new(log.retain_local_authority(self.lock.clone()));
                 log.set_history_maintenance_diagnostics(self.history_diagnostics);
+                log.set_history_persistence(self.history_persistence)
+                    .map_err(TcpError::component)?;
                 if let Some(notifier) = &self.history_failure_notifier {
                     log.set_history_failure_notifier(notifier.clone());
                 }
@@ -756,6 +785,8 @@ impl NodeInventory {
         let log = log.map_err(TcpError::component)?;
         let log = Arc::new(log.retain_local_authority(self.lock.clone()));
         log.set_history_maintenance_diagnostics(self.history_diagnostics);
+        log.set_history_persistence(self.history_persistence)
+            .map_err(TcpError::component)?;
         if let Some(notifier) = &self.history_failure_notifier {
             log.set_history_failure_notifier(notifier.clone());
         }
@@ -803,9 +834,10 @@ impl NodeInventory {
     pub(super) fn reap_idle_live_segments(&mut self, epoch: u64) -> Result<(), TcpError> {
         let log = self.active(epoch)?;
         let mut revoke = Vec::new();
-        for (&key, (_, _, writable)) in &self.live_bindings {
+        for (&key, (_, binding, writable)) in &self.live_bindings {
             if key.0 == epoch
                 && *writable
+                && !binding.permanent
                 && !self.live_pins.values().any(|(_, leases)| {
                     leases
                         .iter()
@@ -870,6 +902,48 @@ impl NodeInventory {
     }
 
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    pub(super) fn publish_permanent_segment(
+        &mut self,
+        segment: &super::super::nvmeof::live_storage::LiveWalSegment,
+    ) -> Result<super::super::nvmeof::live_target::LiveTargetBinding, TcpError> {
+        use super::super::nvmeof::{live_storage::wal_export_name, live_target::LiveFileIdentity};
+        let key = (segment.epoch, segment.file_index);
+        if let Some((_, binding, _)) = self.live_bindings.get(&key) {
+            return Ok(binding.clone());
+        }
+        let target = self
+            .live_target
+            .as_mut()
+            .ok_or_else(|| TcpError::new("live target not configured"))?;
+        let files = target
+            .export_mode()
+            .files_per_subsystem()
+            .ok_or_else(|| TcpError::new("permanent live export is not configured"))?;
+        let name = wal_export_name(
+            files,
+            segment.database,
+            segment.partition,
+            segment.epoch,
+            segment.file_index,
+        );
+        let binding = target
+            .export_permanent(
+                &name,
+                LiveFileIdentity {
+                    path: segment.path.clone(),
+                    device: segment.device,
+                    inode: segment.inode,
+                    bytes: segment.bytes,
+                    block_size: segment.block_size,
+                },
+            )
+            .map_err(TcpError::component)?;
+        self.live_bindings
+            .insert(key, (segment.clone(), binding.clone(), true));
+        Ok(binding)
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     fn revoke_live_targets(&mut self) -> Result<(), TcpError> {
         let Some(target) = self.live_target.as_mut() else {
             return Ok(());
@@ -907,6 +981,7 @@ impl NodeInventory {
         for lease in leases {
             let key = (lease.segment.epoch, lease.segment.file_index);
             let releasable = match self.live_bindings.get(&key) {
+                Some((_, binding, _)) if binding.permanent => false,
                 Some((_, _, false)) => true,
                 Some((_, _, true)) => self
                     .logs
@@ -1135,6 +1210,27 @@ impl NodeInventory {
         prefix: usize,
         files: &[u64],
     ) -> Result<(), TcpError> {
+        self.require_history(false)?;
+        self.retire_files_inner(authority_epoch, epoch, Some(prefix), files)
+    }
+
+    pub(super) fn retire_wal_files(
+        &mut self,
+        authority_epoch: u64,
+        epoch: u64,
+        files: &[u64],
+    ) -> Result<(), TcpError> {
+        self.require_history(true)?;
+        self.retire_files_inner(authority_epoch, epoch, None, files)
+    }
+
+    fn retire_files_inner(
+        &mut self,
+        authority_epoch: u64,
+        epoch: u64,
+        prefix: Option<usize>,
+        files: &[u64],
+    ) -> Result<(), TcpError> {
         if files.len() > 256 {
             return Err(TcpError::new("retirement file count exceeds bound"));
         }
@@ -1167,8 +1263,11 @@ impl NodeInventory {
         } else {
             Vec::new()
         };
-        log.retire_files(prefix, files)
-            .map_err(TcpError::component)?;
+        match prefix {
+            Some(prefix) => log.retire_files(prefix, files),
+            None => log.retire_wal_files(files),
+        }
+        .map_err(TcpError::component)?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if let Some(target) = self.live_target.as_mut() {
             for identity in retired_identities {
@@ -1186,6 +1285,7 @@ impl NodeInventory {
         epoch: u64,
         prefix: usize,
     ) -> Result<checkpoint::CheckpointProof, TcpError> {
+        self.require_history(false)?;
         self.active(authority_epoch)?;
         let record = self
             .manifest
@@ -1240,6 +1340,7 @@ impl NodeInventory {
         limit: usize,
         limits: TcpLimits,
     ) -> Result<Response, TcpError> {
+        self.require_history(false)?;
         self.ensure_healthy()?;
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if self.live_target.is_some() {
@@ -1301,6 +1402,132 @@ impl NodeInventory {
         }
         let end = cursor + batches.len();
         let next = (end < count).then_some(end);
+        Ok(Response::Recovery { batches, next })
+    }
+
+    pub(super) fn require_history(&self, replay: bool) -> Result<(), TcpError> {
+        use crate::distributed::storage::HistoryPersistence;
+        if replay {
+            if self.history_persistence != HistoryPersistence::WalReplay {
+                return Err(TcpError::new("request requires WAL replay history"));
+            }
+        } else if self.history_persistence == HistoryPersistence::WalReplay {
+            return Err(TcpError::new("request requires on-disk history"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn checkpoint_position(
+        &self,
+        authority_epoch: u64,
+        epoch: u64,
+        through: u64,
+    ) -> Result<checkpoint::CheckpointPositionProof, TcpError> {
+        self.require_history(true)?;
+        self.active(authority_epoch)?;
+        let record = self
+            .manifest
+            .epochs
+            .iter()
+            .find(|entry| entry.epoch == epoch)
+            .ok_or_else(|| TcpError::new("checkpoint epoch absent"))?;
+        let durable_end = match record.state {
+            EpochState::Active | EpochState::Sealed => self
+                .logs
+                .get(&epoch)
+                .ok_or_else(|| TcpError::new("checkpoint stream absent"))?
+                .persist_wal_through(through)
+                .map_err(TcpError::component)?,
+            EpochState::Abandoned => 0,
+            EpochState::Preparing => return Err(TcpError::new("checkpoint epoch incomplete")),
+        };
+        Ok(checkpoint::CheckpointPositionProof {
+            database: self.config.partition.inventory.database,
+            partition: self.config.partition.partition,
+            epoch,
+            durable_end,
+        })
+    }
+
+    pub(super) fn replay_wal_page(
+        &self,
+        authority_epoch: u64,
+        epoch: u64,
+        from: u64,
+        limit: usize,
+        require_end: u64,
+        limits: TcpLimits,
+    ) -> Result<Response, TcpError> {
+        self.require_history(true)?;
+        self.active(authority_epoch)?;
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if self.live_target.is_some() {
+            return Err(TcpError::new(
+                "live NVMe-oF recovery requires metadata-only control",
+            ));
+        }
+        if limit == 0 || limit > limits.recovery_page_batches {
+            return Err(TcpError::new("recovery page count exceeds bound"));
+        }
+        let record = self
+            .manifest
+            .epochs
+            .iter()
+            .find(|entry| entry.epoch == epoch)
+            .ok_or_else(|| TcpError::new("recovery epoch absent"))?;
+        if record.state == EpochState::Abandoned {
+            return if from == 0 {
+                Ok(Response::Recovery {
+                    batches: Vec::new(),
+                    next: None,
+                })
+            } else {
+                Err(TcpError::new("invalid abandoned epoch cursor"))
+            };
+        }
+        if record.state != EpochState::Sealed {
+            return Err(TcpError::new("recovery requires sealed immutable epoch"));
+        }
+        let log = self
+            .logs
+            .get(&epoch)
+            .ok_or_else(|| TcpError::new("recovery stream absent"))?;
+        let page = log
+            .replay_page(
+                from,
+                limit.min(256),
+                limits.max_frame_bytes.saturating_sub(32),
+                require_end,
+            )
+            .map_err(TcpError::component)?;
+        let mut size = 32usize;
+        let mut batches = Vec::new();
+        let next = page.next;
+        for decoded in page.groups {
+            let group_size = decoded.receipts.iter().try_fold(size, |size, receipt| {
+                size.checked_add(receipt.address().len as usize + 256)
+                    .ok_or_else(|| TcpError::new("recovery response overflow"))
+            })?;
+            if group_size > limits.max_frame_bytes {
+                return Err(TcpError::new("one recovery batch exceeds transport frame"));
+            }
+            size = group_size;
+            for (batch, receipt) in decoded.group.batches().iter().zip(decoded.receipts) {
+                batches.push((
+                    batch.encoded().clone().into(),
+                    Receipt {
+                        id: receipt.id(),
+                        version: receipt.version(),
+                        digest: receipt.digest(),
+                        address: receipt.address(),
+                    },
+                ));
+            }
+        }
+        let next = next
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| TcpError::new("replay offset exceeds address space"))?;
         Ok(Response::Recovery { batches, next })
     }
     pub(super) fn stats(&self) -> Result<PartitionStats, TcpError> {
@@ -1415,6 +1642,9 @@ mod tests {
         let temporary = tempdir::TempDir::new("node-preparing-fence").unwrap();
         let config = config(&temporary.path().join("node"));
         let mut inventory = NodeInventory::open(config.clone(), metrics()).unwrap();
+        inventory
+            .set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
+            .unwrap();
         inventory.fence_to(1).unwrap();
         inventory.seal(1).unwrap();
         inventory.manifest.epochs.push(Epoch {
@@ -1467,6 +1697,9 @@ mod tests {
         let temporary = tempdir::TempDir::new("node-checkpoint-proof").unwrap();
         let config = config(&temporary.path().join("node"));
         let mut inventory = NodeInventory::open(config.clone(), metrics()).unwrap();
+        inventory
+            .set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
+            .unwrap();
         inventory.fence_to(1).unwrap();
         let mut receipts = Vec::new();
         for sequence in 0..2 {

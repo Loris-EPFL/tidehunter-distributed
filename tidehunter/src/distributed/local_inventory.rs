@@ -327,6 +327,8 @@ impl LocalInventory {
                 &self.shape,
                 metrics.clone(),
             )?;
+            // The in-process database checkpoints and replays receipt ordinals.
+            log.set_history_persistence(super::storage::HistoryPersistence::OnDisk)?;
             active.push(Arc::new(log.retain_local_authority(self.lock.clone())));
         }
         self.manifest

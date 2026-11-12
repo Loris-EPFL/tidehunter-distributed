@@ -1,0 +1,14 @@
+{
+  "synthetic": true,
+  "deltas": {
+    "owner_executor": {
+      "partitions": {
+        "0": {
+          "counters": {
+            "transport.cq_idle_waits": 8318
+          }
+        }
+      }
+    }
+  }
+}

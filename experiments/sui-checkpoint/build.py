@@ -233,6 +233,34 @@ def bind_staged_engine(sources, identities, fabric):
     return manifests
 
 
+def add_staged_nvmeof_features(sources, identities):
+    engine = sources / 'tidehunter-sharded-wal/tidehunter/Cargo.toml'
+    if 'experimental-nvmeof' not in tomllib.loads(engine.read_text()).get('features', {}):
+        raise ValueError('staged engine has no NVMe-oF feature')
+    for relative, dependency in (
+        ('crates/typed-store/Cargo.toml', 'tidehunter/experimental-nvmeof'),
+        ('crates/sui-node/Cargo.toml', 'typed-store/sharded-wal-nvmeof'),
+    ):
+        path = sources / 'sui' / relative
+        if path.is_symlink() or not path.is_file():
+            raise ValueError('staged Sui manifest must be an ordinary file')
+        text = path.read_text()
+        fabric_dep = 'tidehunter/experimental-fabric' if 'typed-store' in relative else 'typed-store/sharded-wal-fabric'
+        anchor = f'sharded-wal-fabric = ["sharded-wal", "{fabric_dep}"]'
+        if text.splitlines().count(anchor) != 1:
+            raise ValueError('staged Sui feature anchor differs')
+        expected = ['sharded-wal-fabric', dependency]
+        existing = tomllib.loads(text).get('features', {}).get('sharded-wal-nvmeof')
+        if existing is not None and existing != expected:
+            raise ValueError('staged Sui NVMe-oF feature differs')
+        if existing is None:
+            text = text.replace(anchor, anchor + f'\nsharded-wal-nvmeof = ["sharded-wal-fabric", "{dependency}"]', 1)
+            path.write_text(text)
+        if tomllib.loads(path.read_text()).get('features', {}).get('sharded-wal-nvmeof') != expected:
+            raise ValueError('staged Sui NVMe-oF feature differs')
+        identities['sui']['files'][relative] = {'sha256': digest(path), 'mode': path.stat().st_mode & 0o777}
+
+
 def verify_engine_metadata(metadata, manifests, fabric):
     """Admit Cargo's resolved package graph, not just manifest override text."""
     expected = {'tidehunter'} | ({'tidehunter-fabric'} if fabric else set())
@@ -262,16 +290,21 @@ def verify_engine_metadata(metadata, manifests, fabric):
         raise ValueError('Cargo dependency graph does not select the staged engine packages')
 
 
-def metadata_features(relative, fabric):
+def metadata_features(relative, fabric, nvmeof=False):
     if relative == 'sui':
-        return ['typed-store/tidehunter', 'sui-node/sharded-wal' + ('-fabric' if fabric else '')]
+        suffix = '-nvmeof' if nvmeof else ('-fabric' if fabric else '')
+        return ['typed-store/tidehunter', 'sui-node/sharded-wal' + suffix]
     if relative == 'tidehunter-sharded-wal':
         return ['tidehunter/experimental-distributed', 'tidehunter/test-utils'] + (
-            ['tidehunter/experimental-fabric'] if fabric else [])
-    return ['fabric'] if fabric else []
+            ['tidehunter/experimental-fabric'] if fabric else []) + (
+            ['tidehunter/experimental-nvmeof'] if nvmeof else [])
+    return ['nvmeof'] if nvmeof else (['fabric'] if fabric else [])
 
 
 def prepare(args):
+    nvmeof = getattr(args, 'nvmeof', False)
+    if nvmeof and not args.fabric:
+        raise ValueError('NVMe-oF build requires the fabric build')
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     sources = output / 'sources'
@@ -279,13 +312,15 @@ def prepare(args):
                   for name, path in [('sui', args.sui), ('tidehunter-sharded-wal', args.engine)]}
     verify_staged(output, identities)
     manifests = bind_staged_engine(sources, identities, args.fabric)
+    if nvmeof:
+        add_staged_nvmeof_features(sources, identities)
     # Resolve only in owned copies, then archive the actual build inputs. Cargo
     # metadata preserves existing pins where possible and accommodates new paths.
     for relative in ('sui', 'tidehunter-sharded-wal', 'tidehunter-sharded-wal/experiments/sui-checkpoint/audit'):
         workspace = sources / relative
         stem = 'resolve-' + relative.replace('/', '-')
         metadata_path = output / (stem + '.json')
-        features = metadata_features(relative, args.fabric)
+        features = metadata_features(relative, args.fabric, nvmeof)
         command = ['cargo', 'metadata', '--format-version', '1']
         if features:
             command.extend(['--features', ','.join(features)])
@@ -301,9 +336,9 @@ def prepare(args):
     with tarfile.open(output / 'sources.tar.gz', 'w:gz') as archive:
         archive.add(sources, arcname='sources')
     save(output / 'plan.json', {'schema': 1, 'source_archive_sha256': digest(output / 'sources.tar.gz'),
-          'source_manifest_sha256': digest(output / 'source-manifest.json'), 'fabric': args.fabric,
+          'source_manifest_sha256': digest(output / 'source-manifest.json'), 'fabric': args.fabric, 'nvmeof': nvmeof,
           'jobs': args.jobs, 'profile': 'release', 'protocol': staged_protocol(sources / 'tidehunter-sharded-wal'),
-          'native_features': ['typed-store/tidehunter'], 'remote_features': ['sui-node/sharded-wal' + ('-fabric' if args.fabric else '')]})
+          'native_features': ['typed-store/tidehunter'], 'remote_features': [metadata_features('sui', args.fabric, nvmeof)[1]]})
     print(output / 'plan.json')
 
 
@@ -387,10 +422,11 @@ def build(args):
     compile_one('sui-node-native', sui, ['-p', 'sui-node', '--features', ','.join(plan['native_features'])], 'sui-node')
     compile_one('sui-node-remote', sui, ['-p', 'sui-node', '--features', ','.join(plan['remote_features'])], 'sui-node')
     compile_one('rocksdb-audit', sui, ['-p', 'sui-node', '--features', ','.join([*plan['native_features'], 'sui-node/testing']), '--example', 'distributed_storage_local_audit'], 'examples/distributed_storage_local_audit')
-    features = 'experimental-distributed,test-utils' + (',experimental-fabric' if plan['fabric'] else '')
+    features = 'experimental-distributed,test-utils' + (',experimental-fabric' if plan['fabric'] else '') + (',experimental-nvmeof' if plan.get('nvmeof', False) else '')
     compile_one('storage-node', engine, ['-p', 'tidehunter', '--example', 'sharded_wal_bench', '--features', features], 'examples/sharded_wal_bench')
     compile_one('transport-floor', engine, ['-p', 'tidehunter', '--example', 'sharded_wal_transport_bench', '--features', features], 'examples/sharded_wal_transport_bench')
-    compile_one('state-audit', engine / 'experiments/sui-checkpoint/audit', ['--features', 'fabric'] if plan['fabric'] else [], 'sui-sharded-state-audit')
+    audit_features = ['--features', 'nvmeof'] if plan.get('nvmeof', False) else (['--features', 'fabric'] if plan['fabric'] else [])
+    compile_one('state-audit', engine / 'experiments/sui-checkpoint/audit', audit_features, 'sui-sharded-state-audit')
     verify_staged(root, identities)
     portability = {}
     for binary in bins.iterdir():
@@ -422,6 +458,7 @@ def main():
     prep.add_argument('--engine', type=Path, required=True)
     prep.add_argument('--output', type=Path, required=True)
     prep.add_argument('--fabric', action='store_true')
+    prep.add_argument('--nvmeof', action='store_true')
     prep.add_argument('--jobs', type=int, default=2)
     compile_parser = sub.add_parser('build')
     compile_parser.add_argument('--output', type=Path, required=True)

@@ -628,6 +628,7 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
         bootstrap._put(store, prefix + name + '.json', {**identity, **data})
     if not own_is_owner:
         preparation = {'guest_root': str(root), 'addresses': [owner_control + ':9400'], 'transport': {'kind': 'tcp'},
+            'owner_wal_geometry': 'research',
             'durability_tier': tier, 'max_batches_per_partition': 16384, 'max_admitted_batches': 16384, 'max_index_bytes': 128 * 1024**2,
             'max_epochs': 4, 'coordinator_cache_bytes': 4 * 1024**2, 'owner_read_workers': 2,
             'owner_wal_member_read': 'async', 'owner_read_resident_first': False,

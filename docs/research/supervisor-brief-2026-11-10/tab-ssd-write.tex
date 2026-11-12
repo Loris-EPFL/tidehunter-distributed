@@ -1,0 +1,13 @@
+\small\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrr}\toprule
+Overwrite QD1; r0 of 2 & Total mean & Total p50 & Write mean & Sync mean\\\midrule
+fdatasync, 1 KiB & \N{Q:run8-ssd_write_floor:0:mean_us} & \N{Q:run8-ssd_write_floor:0:p50_us} & \N{Q:run8-ssd_write_floor:0:write_mean_us} & \N{Q:run8-ssd_write_floor:0:sync_mean_us}\\
+direct, 1 KiB & \N{Q:run8-ssd_write_floor:1:mean_us} & \N{Q:run8-ssd_write_floor:1:p50_us} & \N{Q:run8-ssd_write_floor:1:write_mean_us} & \N{Q:run8-ssd_write_floor:1:sync_mean_us}\\
+buffered, 1 KiB & \N{Q:run8-ssd_write_floor:2:mean_us} & \N{Q:run8-ssd_write_floor:2:p50_us} & \N{Q:run8-ssd_write_floor:2:write_mean_us} & \N{Q:run8-ssd_write_floor:2:sync_mean_us}\\
+fdatasync, 64 KiB & \N{Q:run8-ssd_write_floor:6:mean_us} & \N{Q:run8-ssd_write_floor:6:p50_us} & \N{Q:run8-ssd_write_floor:6:write_mean_us} & \N{Q:run8-ssd_write_floor:6:sync_mean_us}\\
+direct, 64 KiB & \N{Q:run8-ssd_write_floor:7:mean_us} & \N{Q:run8-ssd_write_floor:7:p50_us} & \N{Q:run8-ssd_write_floor:7:write_mean_us} & \N{Q:run8-ssd_write_floor:7:sync_mean_us}\\
+buffered, 64 KiB & \N{Q:run8-ssd_write_floor:8:mean_us} & \N{Q:run8-ssd_write_floor:8:p50_us} & \N{Q:run8-ssd_write_floor:8:write_mean_us} & \N{Q:run8-ssd_write_floor:8:sync_mean_us}\\
+direct, 8 KiB & \N{Q:run8-ssd_write_floor:12:mean_us} & \N{Q:run8-ssd_write_floor:12:p50_us} & \N{Q:run8-ssd_write_floor:12:write_mean_us} & \N{Q:run8-ssd_write_floor:12:sync_mean_us}\\
+fdatasync, 8 KiB & \N{Q:run8-ssd_write_floor:13:mean_us} & \N{Q:run8-ssd_write_floor:13:p50_us} & \N{Q:run8-ssd_write_floor:13:write_mean_us} & \N{Q:run8-ssd_write_floor:13:sync_mean_us}\\
+buffered, 8 KiB & \N{Q:run8-ssd_write_floor:14:mean_us} & \N{Q:run8-ssd_write_floor:14:p50_us} & \N{Q:run8-ssd_write_floor:14:write_mean_us} & \N{Q:run8-ssd_write_floor:14:sync_mean_us}\\
+\bottomrule\end{tabular}

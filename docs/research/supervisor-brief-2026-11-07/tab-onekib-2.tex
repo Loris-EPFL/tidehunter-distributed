@@ -1,0 +1,12 @@
+\small
+\begin{tabular}{lrrr|rrr}\toprule
+& \multicolumn{3}{c|}{Read-many32} & \multicolumn{3}{c}{Write-batch32}\\
+Backend & p50 & p99 & calls/s & p50 & p99 & calls/s\\\midrule
+Native & 55.3 & 113 & 110{,}340 & 1{,}047 & 1{,}247 & 13{,}901\\
+TH TCP & 840 & 2{,}418 & 16{,}895 & 2{,}554 & 3{,}576 & 6{,}363\\
+TH verbs & 688 & 1{,}723 & 19{,}913 & 2{,}256 & 3{,}212 & 7{,}191\\
+TH NVMe-oF kernel & 641 & 2{,}846 & 18{,}272 & 2{,}421 & 3{,}810 & 6{,}322\\
+TH NVMe-oF SPDK & 642 & 2{,}740 & 18{,}391 & 2{,}253 & 4{,}030 & 6{,}405\\
+Valkey TCP & 389 & 807 & 29{,}860 & -- & -- & --\\
+Valkey RDMA & 321 & 803 & 35{,}821 & -- & -- & --\\
+\bottomrule\end{tabular}

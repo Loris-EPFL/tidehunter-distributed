@@ -1,0 +1,38 @@
+{
+  "status": "EXCLUDED aborted attempt; layout test only; no final findings",
+  "excluded_from_final": true,
+  "publication_eligible": false,
+  "controller_status_counts": {
+    "completed": 9,
+    "not_run": 71
+  },
+  "verification": {
+    "excluded_from_final": true,
+    "figure_points": 63,
+    "figures": 5,
+    "numbers": 65,
+    "pages": null,
+    "pass_check": true,
+    "pdf_sha256": null,
+    "synthetic": false,
+    "tables": 6,
+    "visual_inspection": "separate rendered-image review, not asserted by this checker"
+  },
+  "registration_guard_rejected": true,
+  "visual_inspection": {
+    "performed": true,
+    "figures": [
+      "warm",
+      "gap",
+      "cpu",
+      "cold",
+      "ladder"
+    ],
+    "renders": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/EXCLUDED-renders",
+    "observations": "All figures marked EXCLUDED; wholly absent panels say NOT RUN; missing r1 explicitly labeled; points have margin and no labels overlap."
+  },
+  "raw_export": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export",
+  "analysis_output": "/tmp/f10-partial",
+  "provenance": "EXCLUDED-attempt1-provenance.json",
+  "final_inputs_registered": false
+}

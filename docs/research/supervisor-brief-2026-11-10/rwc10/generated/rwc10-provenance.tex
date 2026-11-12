@@ -1,0 +1,11 @@
+\textbf{Run-10 provenance.} Parent \path{bench-38b1466b6b0e4e1e}; fleet \path{bench-afdfe33817034a7c}; package SHA-256 \path{66ace73b57835ba97bced258aa39363d8bd878abaeb9af97b683c53772df3661}; source \path{0d9bd94f1bb371296437dc5ec3e2090edf7ac473}; dirty true. Launch 2026-11-10T21:56:35.352+00:00 (coordinator VM creation timestamp); VMs \path{bench-afdfe33817034a7c-0}, \path{bench-afdfe33817034a7c-1}.
+
+SHA-256: manifest \path{bfd46dafd0a26dc118bcae9e0f577d23bed74fd4c466904859a29f2e21ca0f30}; binary \path{aca3d64bd1b55e115425fdd8702e7391421feb6dfa7822faa2197006ba848551}; source tree \path{665d535ba531828278079d8fd77569a40ddb44a25dfc991d57cbf959aa8d874f}; matrix \path{8e12ba4352dc461680565b3bfaef5db705e702e03bce986323cc1e31ae9bde6e}.
+
+\textbf{Excluded first attempt.} Fleet bench-9dc7f51e57e9449f, parent bench-3309de6a3c344e0f, aborted after 9 of 80 cases at the monitoring exporter: sealed SPDK target metrics required five owner rows. The exporter was fixed to admit one or five owner rows before attempt two. No measurement from attempt one is used in any final table, figure or finding.
+
+\textbf{Timing and derivation.} All times UTC, 10 November 2026. Coordinator VM creation: 21:56:35.352 (instance-list receipt). Create-operation starts 21:56:33 and 21:57:10 are derived from operation IDs. Main first observed the suite at 21:58:41. Exported last case checkpoint: 23:07:46.745; controller outcome: 23:07:51.638. Main later observed complete/STOPPING at 23:11:39, not the case-end time.
+
+\textbf{Terminal outcome and cleanup.} All 80 of 80 controller cases completed, exit 0. Both instance-delete replies timed out (outcome may be unknown). The launcher subsequently verified cleanup: cleanup\_verified true; deleted and disk\_deleted true for both VMs, and the placement policy deleted. The recorded final policy listing at 23:13:53 is empty. Main independently reported an empty VM/policy listing at 23:29:43; this document did not repeat a cloud query.
+
+\textbf{[INFERENCE] List-price estimate.} List-price assumptions supplied by Main: USD 3.287109973 per host-hour, two hosts; about 1.25 hours per host for attempt two (USD 8.2), about 0.25 hours per host for attempt one (USD 1.6); total about USD 9.9, computed before rounding. These are estimates, not invoices. Receipt budget: launch ceiling 4834 cents; weekly ledger limit 319300 cents.

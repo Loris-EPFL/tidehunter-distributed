@@ -47,6 +47,32 @@ Benchmark backend kind is unified as `tidehunter`; case identities such as
 aliases. Preserve provider/security distinctions in any new labels and never
 compare trusted and mutual-TLS cohorts as security-equivalent.
 
+### Security parity and the trusted TCP mode
+
+Standard `{"kind":"tcp"}` always uses mutual TLS. `{"kind":"tcp-trusted"}` is an
+explicit opt-in plain-TCP mode with the trust model of `"security":"trusted"`
+OFI: no encryption and no cryptographic peer authentication, empty TLS
+credential paths required, isolated network only. It is never a default or a
+fallback; an mTLS peer and a trusted peer cannot connect to each other. WAL
+integrity, fencing and durability checks are unchanged. Receipts record
+`Transport::label()` and `Transport::security_label()` (`mutual_tls` or
+`trusted_network_no_tls`).
+
+Compare like with like:
+
+| Security class | TCP | OFI (verbs) |
+| --- | --- | --- |
+| `mutual_tls` | `{"kind":"tcp"}` | `{"kind":"ofi","fabric":{"backend":"verbs"},"security":"mutual-tls"}` |
+| `trusted_network_no_tls` | `{"kind":"tcp-trusted"}` | `{"kind":"ofi","fabric":{"backend":"verbs"},"security":"trusted"}` |
+
+OFI with mutual TLS already exists and is the comparison partner for standard
+TCP. An unencrypted verbs cell against a TLS TCP cell mixes TLS cost with
+transport cost and must not be reported as a network effect.
+
+`fabric.slots` (optional, `1..=64`, default 4) sets the per-endpoint TX and RX
+slot count of the OFI message transport; EFA backends accept only the default.
+Record it with the run.
+
 ## Research questions
 
 1. At a fixed offered rate and resource budget, how do completed throughput, response-time distributions and failure rates compare?

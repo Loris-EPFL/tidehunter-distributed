@@ -1,0 +1,17 @@
+label,value,kib,mib,source,line
+max_tx_size_bytes,131072,128.0,0.125,sui/crates/sui-protocol-config/src/lib.rs,2585
+max_serialized_tx_effects_size_bytes,524288,512.0,0.5,sui/crates/sui-protocol-config/src/lib.rs,2588
+max_move_object_size,256000,250.0,0.244140625,sui/crates/sui-protocol-config/src/lib.rs,2618
+max_move_package_size,102400,100.0,0.09765625,sui/crates/sui-protocol-config/src/lib.rs,2619
+max_checkpoint_size_bytes,31457280,30720.0,30.0,sui/crates/sui-protocol-config/src/lib.rs,2678
+dedup_low,4,,,papers/parsed/Tidehunter-2026-v2.md,31
+dedup_high,64,,,papers/parsed/Tidehunter-2026-v2.md,31
+photo_low,8,,,papers/parsed/Tidehunter-2026-v2.md,31
+photo_high,64,,,papers/parsed/Tidehunter-2026-v2.md,31
+sui_low_kb,1,,,papers/parsed/Tidehunter-2026-v2.md,375
+sui_high_mb,1,,,papers/parsed/Tidehunter-2026-v2.md,375
+eval_1KB,1,,,papers/parsed/Tidehunter-2026-v2.md,237
+eval_64bytes,64,,,papers/parsed/Tidehunter-2026-v2.md,237
+eval_128bytes,128,,,papers/parsed/Tidehunter-2026-v2.md,237
+figure_256,256,,,papers/parsed/Tidehunter-2026-v2.md,23
+figure_512,512,,,papers/parsed/Tidehunter-2026-v2.md,23

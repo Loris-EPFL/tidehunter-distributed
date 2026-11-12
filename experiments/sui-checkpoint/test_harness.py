@@ -24,6 +24,228 @@ import build
 import run
 
 
+class NvmeDeploymentContract(unittest.TestCase):
+    def test_environment_contract(self):
+        original = run.replay_environment({'TH_DEFAULT_OLD': 'x'}, 'original_default', 0, 0)
+        self.assertEqual(original['TH_SYNC_WRITES'], 'false')
+        self.assertFalse(any(k.startswith('TH_DEFAULT_') for k in original))
+        for key in ('TH_FRAG_SIZE', 'TH_MAX_MAPS', 'TH_MAX_INDEX_MAPS'):
+            self.assertNotIn(key, original)
+        harness = run.replay_environment({}, 'harness', 0, 0)
+        self.assertEqual(harness['TH_SYNC_WRITES'], 'true')
+        self.assertEqual(harness['TH_FRAG_SIZE'], str(8 * deployment.MIB))
+        self.assertEqual(harness['TH_MAX_MAPS'], '3')
+        self.assertEqual(harness['TH_MAX_INDEX_MAPS'], '3')
+        self.assertEqual(harness['TH_DEFAULT_VALUE_CACHE_SIZE'], '1000')
+        self.assertEqual(harness, dict(RUST_LOG='info', TOKIO_WORKER_THREADS='4', USE_TIDEHUNTER='1',
+            TH_SYNC_WRITES='true', TH_FRAG_SIZE=str(8*deployment.MIB), TH_MAX_MAPS='3',
+            TH_MAX_INDEX_MAPS='3', TH_DEFAULT_MUTEX_COUNT='1', TH_DEFAULT_MAX_DIRTY_KEYS='128',
+            TH_DEFAULT_VALUE_CACHE_SIZE='1000', SUI_TH_READ_PROFILE_LIMIT='0',
+            SUI_TH_NATIVE_WRITE_PROFILE_LIMIT='0'))
+
+    def test_external_host_validation(self):
+        transport = {'kind': 'tcp'}
+        hosts = [f'10.0.0.{i}' for i in range(1, 6)]
+        manifest = dict(schema=2, transport=transport, owner_transports=[transport]*5,
+                        hosts=[dict(host=h, partition=i, transport=transport) for i, h in enumerate(hosts)])
+        config = dict(databases={'db': dict(tls=dict(transport=transport), read_cache_bytes=0,
+                      endpoints=[dict(address=f'{h}:24000') for h in hosts])})
+        run.validate_external_hosts(manifest, config, 0)
+        grouped = dict(schema=3, transport=transport, owner_transports=[transport]*5,
+                       hosts=[dict(host=hosts[0], partitions=list(range(5)), transport=transport)])
+        grouped_config = copy.deepcopy(config)
+        grouped_config['databases']['db']['endpoints'] = [dict(address=f'{hosts[0]}:{24000+i}') for i in range(5)]
+        run.validate_external_hosts(grouped, grouped_config, 0)
+        for parts in ([0, 1, 2, 3, 3], [0, 1, 2, 3]):
+            bad = copy.deepcopy(grouped)
+            bad['hosts'][0]['partitions'] = parts
+            with self.assertRaisesRegex(ValueError, 'inventory differs'):
+                run.validate_external_hosts(bad, grouped_config, 0)
+        bad = copy.deepcopy(grouped)
+        bad['hosts'][0]['transport'] = transport_for_case('efa-native')
+        with self.assertRaisesRegex(ValueError, 'inventory differs'):
+            run.validate_external_hosts(bad, grouped_config, 0)
+        with self.assertRaisesRegex(ValueError, 'control endpoints differ'):
+            run.validate_external_hosts(grouped, config, 0)
+
+
+    def test_default_deployment_exact_structure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            directory = root/'deployment'
+            transport = transport_for_case('fabric-tcp-native')
+            with patch('deployment.uuid.uuid4', return_value=__import__('uuid').UUID(int=1)):
+                deployment.prepare(directory, {'db': {}}, root/'dbroot', shape_yamls={'db': 'shape'},
+                                   hosts=['127.0.0.1']*5, port=24000, transport=transport, coordinator_cache=0)
+            identity = [0]*15 + [1]
+            batch = dict(max_operations=65536, max_encoded_bytes=8*deployment.MIB)
+            group = dict(max_batches=64, max_encoded_bytes=12*deployment.MIB)
+            storage = dict(database=identity, partitions=list(range(5)), batch_limits=batch, group_limits=group,
+                fragment_bytes=16*deployment.MIB, wal_file_bytes=256*deployment.MIB,
+                max_batches_per_partition=1000000, max_reference_metadata_bytes=256*deployment.MIB, max_epochs=32)
+            def tls(name):
+                return dict(transport=transport, ca='', cert='', key='', server_name=name)
+            endpoints = [dict(partition=i, address=f'127.0.0.1:{24000+i}', server_name=f'node-{i}') for i in range(5)]
+            database = dict(history_persistence="wal_replay", storage=storage, endpoints=endpoints, tls=tls('authority'), timeout=dict(secs=30, nanos=0),
+                max_admitted_batches=1000000, max_index_bytes=512*deployment.MIB, max_pending_batches=128,
+                max_pending_bytes=128*deployment.MIB, pipelined_writes=True, write_profile_limit=0,
+                read_cache_bytes=0, read_memory_allowance_bytes=128*deployment.MIB, preparation_workers=2,
+                scan_prefetch_pages=2, read_lanes=2, max_pending_reads=256, max_pending_read_bytes=64*deployment.MIB)
+            self.assertEqual(json.loads((directory/'config.json').read_text()),
+                             dict(root=str(root/'dbroot'), databases={'db': database}))
+            slug = hashlib.sha256(b'db').hexdigest()[:16]
+            expected_nodes = []
+            for i in range(5):
+                node_dir = directory/slug/f'node-{i}'
+                inventory = dict(database=identity, partitions=list(range(5)), epoch=1, segment_generation=1)
+                partition = dict(inventory=inventory, partition=i, batch_limits=batch, group_limits=group,
+                    fragment_bytes=16*deployment.MIB, wal_file_bytes=256*deployment.MIB,
+                    max_batches=1000000, max_reference_metadata_bytes=256*deployment.MIB)
+                node = dict(root=str(node_dir/'storage'), partition=partition, shape_yaml='shape', max_epochs=32,
+                    read_workers=2, wal_member_read='async', read_resident_first=True,
+                    read_memory_allowance_bytes=128*deployment.MIB, read_max_inflight_requests=32,
+                    read_max_inflight_bytes=64*deployment.MIB, read_max_device_reads=128)
+                launch = dict(history_persistence="wal_replay", node=node, tls=tls(f'node-{i}'),
+                    limits=dict(max_frame_bytes=16*deployment.MIB, max_connections=16, max_reads=256,
+                        recovery_page_batches=128, io_timeout=dict(secs=60, nanos=0), polling='adaptive'),
+                    listen=f'127.0.0.1:{24000+i}', ready_file=str(node_dir/'ready'),
+                    stop_file=str(node_dir/'stop'), drop_first_append_response=False)
+                self.assertEqual(yaml.safe_load((node_dir/'launch.yaml').read_text()), launch)
+                expected_nodes.append(dict(namespace='db', partition=i, host='127.0.0.1',
+                    launch=str(node_dir/'launch.yaml'), ready=str(node_dir/'ready'), stop=str(node_dir/'stop')))
+            self.assertEqual(json.loads((directory/'nodes.json').read_text()), expected_nodes)
+
+    def test_deployment_defaults_and_live_options(self):
+        live = dict(addresses=['10.0.0.1'] * 5, host_nqn='nqn.test', host_id=[1] * 16,
+                    queue_geometry=dict(io_queues=1, queue_size=32, poll_queues=0),
+                    export_mode='per_owner')
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            schema = {str(i): {} for i in range(3)}
+            common = dict(shape_yamls={name: 'shape' for name in schema}, hosts=['127.0.0.1'] * 5,
+                          port=24000, transport=transport_for_case('fabric-tcp-native'),
+                          coordinator_cache=0)
+            with patch('deployment.uuid.uuid4', return_value=__import__('uuid').UUID(int=1)):
+                config, nodes = deployment.prepare(root/'default', schema, root/'db', **common)
+                self.assertEqual(json.loads((root/'default'/'config.json').read_text()), config)
+                self.assertEqual(json.loads((root/'default'/'nodes.json').read_text()), nodes)
+                self.assertEqual(run.owner_durability(nodes), 'native')
+                self.assertEqual(set(config), {'root', 'databases'})
+                self.assertEqual(set(config['databases']), set(schema))
+                self.assertEqual(config['root'], str(root/'db'))
+                self.assertTrue(all(db['storage']['database'] == [0]*15 + [1]
+                                    for db in config['databases'].values()))
+                for node in nodes:
+                    launch = yaml.safe_load(Path(node['launch']).read_text())
+                    self.assertNotIn('durability', launch)
+                    self.assertNotIn('live_target', launch['node'])
+                    self.assertEqual(launch['node']['partition']['fragment_bytes'], 16*deployment.MIB)
+                    self.assertEqual(launch['node']['partition']['wal_file_bytes'], 256*deployment.MIB)
+                self.assertTrue(all('live_nvme' not in db for db in config['databases'].values()))
+                config, nodes = deployment.prepare(root/'live', schema, root/'db', **common,
+                    owner_tier='synchronous', owner_wal='engine_default', live_nvme=live)
+                launches = [yaml.safe_load(Path(n['launch']).read_text()) for n in nodes]
+                self.assertEqual(run.owner_durability(nodes), 'synchronous')
+                self.assertEqual(len({x['node']['live_target']['service'] for x in launches}), 15)
+                self.assertEqual(len({x['node']['live_target']['port_id'] for x in launches}), 15)
+                self.assertEqual(len({x['listen'] for x in launches}), 15)
+                targets = [x['node']['live_target'] for x in launches]
+                self.assertEqual(len({x[k] for x in targets for k in ('service', 'commissioning_service')}), 30)
+                self.assertEqual(len({x[k] for x in targets for k in ('port_id', 'commissioning_port_id')}), 30)
+                for k, (node, launch) in enumerate(zip(nodes, launches)):
+                    self.assertEqual(launch['durability'], {'tier': 'synchronous'})
+                    runtime_node = Path(node['ready']).parent
+                    self.assertEqual(launch['node']['live_target'], dict(
+                        address='10.0.0.1', service=4420+2*k, transport='rdma',
+                        host_nqn='nqn.test', port_id=1000+2*k, state_dir=str(runtime_node/'live-nvmeof'),
+                        commissioning_port_id=1001+2*k, commissioning_service=4421+2*k,
+                        export_mode='per_owner'))
+                for db in config['databases'].values():
+                    self.assertEqual(db['live_nvme'], dict(host_nqn='nqn.test', host_id=[1]*16,
+                        max_inflight_requests=32, max_inflight_bytes=16*deployment.MIB,
+                        connect_timeout_ms=30000, io_timeout_ms=30000, write_mode='leased',
+                        leased_durability='synchronous', inline_reads=True,
+                        queue_geometry=live['queue_geometry'], export_mode='per_owner'))
+                self.assertTrue(all(x['node']['partition']['fragment_bytes'] == 128*deployment.MIB for x in launches))
+                self.assertTrue(all(x['node']['partition']['wal_file_bytes'] == 10240*deployment.MIB for x in launches))
+                self.assertTrue(all(x['live_nvme']['leased_durability'] == 'synchronous' for x in config['databases'].values()))
+                for changed in (dict(live, host_id=[0]*16), dict(live, addresses=['a']*4),
+                                dict(live, host_nqn='bad'), dict(live, export_mode='bad')):
+                    with self.assertRaisesRegex(ValueError, 'invalid live NVMe-oF deployment'):
+                        deployment.prepare(root/'invalid-live', schema, root/'db', **common, live_nvme=changed)
+                first = Path(nodes[0]['launch'])
+                launch = yaml.safe_load(first.read_text())
+                launch['durability']['tier'] = 'native'
+                first.write_text(yaml.safe_dump(launch))
+                with self.assertRaisesRegex(ValueError, 'owner durability tiers differ'):
+                    run.owner_durability(nodes)
+            for key, value, message in [('owner_tier', 'bad', 'owner tier must'),
+                                        ('owner_wal', 'bad', 'owner WAL layout must'),
+                                        ('live_nvme', {}, 'invalid live NVMe-oF')]:
+                with self.assertRaisesRegex(ValueError, message):
+                    deployment.prepare(root/'bad', schema, root/'db', **common, **{key: value})
+
+    def test_external_manifest_grouping(self):
+        import prepare_external
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            build_dir = root/'build'
+            (build_dir/'binaries').mkdir(parents=True)
+            (build_dir/'binaries'/'storage-node').write_bytes(b'binary')
+            manifest = dict(binaries={'storage-node': build.digest(build_dir/'binaries'/'storage-node')},
+                            protocol='p', fabric=True, source_archive_sha256='s')
+            (build_dir/'build-manifest.json').write_text(json.dumps(manifest))
+            (build_dir/'plan.json').write_text(json.dumps({'protocol': 'p'}))
+            schema_dir = root/'schema'
+            schema_dir.mkdir()
+            schema = {str(i): {} for i in range(3)}
+            for name in schema:
+                (schema_dir/name).mkdir()
+                (schema_dir/name/'shape.yaml').write_text('shape')
+            transport = root/'transport.json'
+            transport.write_text(json.dumps({'kind': 'tcp'}))
+            base = ['prepare_external.py', '--schema', str(schema_dir), '--build', str(build_dir),
+                    '--output', str(root/'invalid'), '--db-root', '/db', '--guest-root', '/guest',
+                    '--transport-config', str(transport)]
+            for count in (2, 3, 4):
+                hosts = [f'10.0.0.{i % count}' for i in range(5)]
+                with patch.object(sys, 'argv', base + ['--hosts', ','.join(hosts)]):
+                    with self.assertRaisesRegex(ValueError, 'five distinct hosts and absolute owned roots required'):
+                        prepare_external.main()
+            owners = root/'owners.json'
+            owners.write_text(json.dumps([{'kind': 'tcp'}]*4 + [transport_for_case('efa-native')]))
+            with patch.object(sys, 'argv', base + ['--hosts', ','.join(['10.0.0.1']*5),
+                                                  '--owner-transports', str(owners)]), \
+                 patch.object(deployment, 'select_owner_transports', return_value=json.loads(owners.read_text())), \
+                 patch.object(deployment, 'schemas', return_value=schema), \
+                 patch.object(deployment, 'prepare', return_value=({}, [])):
+                with self.assertRaisesRegex(ValueError, 'owner transports differ on one host'):
+                    prepare_external.main()
+            for index, hosts in enumerate((['10.0.0.1']*5, [f'10.0.0.{i}' for i in range(1, 6)])):
+                output = root/f'out{index}'
+                argv = ['prepare_external.py', '--schema', str(schema_dir), '--build', str(build_dir),
+                        '--output', str(output), '--db-root', '/db', '--guest-root', '/guest',
+                        '--hosts', ','.join(hosts), '--transport-config', str(transport)]
+                with patch.object(sys, 'argv', argv), patch.object(deployment, 'schemas', return_value=schema), \
+                     patch.object(deployment, 'certificates') as certificates:
+                    def fake_certificates(path):
+                        path.mkdir()
+                        for name in ['ca.der'] + [f'node-{i}.{ext}' for i in range(5) for ext in ('der', 'pk8')]:
+                            (path/name).write_text('cert')
+                    certificates.side_effect = fake_certificates
+                    prepare_external.main()
+                result = json.loads((output/'external-manifest.json').read_text())
+                self.assertEqual(result['schema'], 3 if index == 0 else 2)
+                if index == 0:
+                    self.assertEqual(len(result['hosts']), 1)
+                    with tarfile.open(result['hosts'][0]['archive']) as archive:
+                        self.assertEqual(len([n for n in archive.getnames() if n.endswith('/launch.yaml')]), 15)
+                    self.assertEqual(result['hosts'][0]['partitions'], list(range(5)))
+                    self.assertEqual(len(result['hosts'][0]['commands']), 15)
+                else:
+                    self.assertEqual([x['partition'] for x in result['hosts']], list(range(5)))
+
+
 class SoftwareFabricGeometry(unittest.TestCase):
     def test_excessive_or_invalid_software_receive_geometry_is_rejected(self):
         for value in ('', '4096', '0'):

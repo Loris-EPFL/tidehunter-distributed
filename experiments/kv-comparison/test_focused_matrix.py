@@ -12,6 +12,252 @@ import cloud_layout
 
 
 class FocusedMatrixTests(unittest.TestCase):
+    def test_nvmeof_path_fix_matrix(self):
+        jobs = campaign.make_focused_matrix("nvmeof_path_fix")
+        self.assertEqual(len(jobs), 37)
+        self.assertEqual(Counter(job["group"] for job in jobs),
+                         {"G19W": 21, "G19R": 7, "G19N": 8, "G19X": 1})
+        self.assertEqual(campaign.selection_owner_hosts("nvmeof_path_fix"), 1)
+        self.assertEqual(hashlib.sha256(json.dumps(jobs, sort_keys=True,
+                         separators=(",", ":")).encode()).hexdigest(),
+                         "aa94a3842d196bd9cdb486b0c746e9939455b25d4d152e8127c1aba51f9ef606")
+        self.assertEqual([job["group"] for job in jobs[:8]],
+                         ["G19N", "G19W", "G19W", "G19R", "G19R", "G19R", "G19W", "G19W"])
+        for job in jobs:
+            fields = {key: value for key, value in job.items() if key != "case_id"}
+            identity = hashlib.sha256(json.dumps(fields, sort_keys=True,
+                                                 separators=(",", ":")).encode()).hexdigest()[:20]
+            self.assertEqual(job["case_id"], f"{job['group']}-r{job['repeat']}-{identity}")
+            if job.get("nvmeof_route") == "live":
+                self.assertIn("live_lease_ahead", job)
+                self.assertIn("live_polled_writes", job)
+
+    def test_nvmeof_path_core_matrix(self):
+        jobs = campaign.make_focused_matrix("nvmeof_path_core")
+        compact = campaign.make_focused_matrix("nvmeof_path_compact")
+        self.assertEqual(campaign.NVMEOF_PATH_SELECTIONS,
+                         ("nvmeof_path_compact", "nvmeof_path_core", "nvmeof_path_fix"))
+        self.assertEqual(len(jobs), 66)
+        groups = {"G18F": 4, "G18N": 17, "G18W": 19, "G18R": 12,
+                  "G18M": 7, "G18B": 5, "G18X": 2}
+        self.assertEqual(Counter(job["group"] for job in jobs), groups)
+        self.assertEqual(campaign.FOCUSED_COUNTS["nvmeof_path_core"], 66)
+        self.assertEqual(campaign.selection_owner_hosts("nvmeof_path_core"), 1)
+        self.assertEqual({key: value for key, value in campaign.focused_group_counts(
+            "nvmeof_path_core").items() if key.startswith("G18")}, groups)
+        self.assertEqual(hashlib.sha256(json.dumps(jobs, sort_keys=True,
+                         separators=(",", ":")).encode()).hexdigest(),
+                         "f286ce6c7255d21f98c9cef8b334b3d6540b1cc84005bc265e0f39751225ff55")
+        def source_shape(job):
+            return {key: value for key, value in job.items()
+                    if key not in ("selection", "case_id")}
+        shapes = [source_shape(job) for job in compact]
+        self.assertEqual(source_shape(jobs[0]), shapes[0])
+        self.assertTrue(jobs[1]["require_media_qualified"])
+        self.assertEqual((jobs[2]["group"], jobs[2]["backend"], jobs[2]["mix"]["get_many"],
+                          jobs[2]["media"]["expected"]), ("G18B", "native", 100, "cold"))
+        # Two compact canaries lead; the other ten follow the inserted batch canary.
+        self.assertEqual([source_shape(job) for job in jobs[3:13]],
+                         [shape for index, shape in enumerate(shapes[:12]) if index not in (0, 6)])
+        # Moving the three priority jobs must preserve the order of every other job.
+        positions = [shapes.index(source_shape(job)) for job in jobs[3:]]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(len({job["case_id"] for job in jobs}), 66)
+        self.assertEqual(sum(job.get("require_media_qualified", False) for job in jobs), 1)
+        self.assertTrue(jobs[1]["require_media_qualified"])
+        for job in jobs:
+            self.assertEqual(job["selection"], "nvmeof_path_core")
+            self.assertIn(source_shape(job), shapes)
+            self.assertNotIn(job["case_id"], {source["case_id"] for source in compact})
+            identity = hashlib.sha256(json.dumps(
+                {key: value for key, value in job.items() if key != "case_id"},
+                sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:20]
+            self.assertEqual(job["case_id"], f"{job['group']}-r{job['repeat']}-{identity}")
+            self.assertTrue(set(campaign.NVMEOF_PATH_SETTING_KEYS[job["backend"]]) <= job.keys())
+            self.assertEqual(campaign.active_owner_count(job), job.get("owner_count", 5))
+            campaign.validate_focused_job(job)
+        changed = dict(jobs[5], live_poll_queues=True)
+        with self.assertRaises(ValueError):
+            campaign.validate_focused_job(changed)
+        removed = next(source for source in compact if source_shape(source) not in
+                       [source_shape(job) for job in jobs])
+        with self.assertRaises(ValueError):
+            campaign.validate_focused_job(dict(removed, selection="nvmeof_path_core"))
+
+    def test_nvmeof_path_core_retains_native_read_references(self):
+        jobs = campaign.make_focused_matrix("nvmeof_path_core")
+        reads = [job for job in jobs if job["group"] != "G18F"
+                 and (job["mix"]["read"] or job["mix"]["get_many"])]
+        def cell(job):
+            return (job["mix"]["get_many"], job["value_size"], job["concurrency"],
+                    job["repeat"], job["media"]["expected"], job["batch_size"], job["keys"])
+        references = {cell(job) for job in reads if job["backend"] == "native"}
+        cached = []
+        for job in reads:
+            if job["backend"] != "tidehunter_nvme_rdma":
+                continue
+            if job["coordinator_cache_bytes"]:
+                cached.append(job)
+            else:
+                self.assertIn(cell(job), references, job["case_id"])
+        self.assertEqual(len(cached), 1)
+
+    def test_nvmeof_path_exact_matrix(self):
+        jobs = campaign.make_focused_matrix("nvmeof_path_compact")
+        self.assertEqual(len(jobs), 157)
+        self.assertEqual(Counter(j["group"] for j in jobs),
+                         {"G18F": 10, "G18N": 32, "G18W": 35, "G18R": 24,
+                          "G18M": 18, "G18B": 30, "G18X": 8})
+        self.assertEqual(hashlib.sha256(json.dumps(jobs, sort_keys=True,
+                         separators=(",", ":")).encode()).hexdigest(),
+                         "8da5d9479b5fc470ff90c21211b3c3510a66d15bd3f03e520c9eefe38b7b2036")
+        self.assertEqual([j["group"] for j in jobs[:12]],
+                         ["G18N", "G18W", "G18W", "G18N", "G18M", "G18R",
+                          "G18R", "G18R", "G18R", "G18B", "G18X", "G18F"])
+        self.assertTrue(all(j["repeat"] == 0 for j in jobs[:12]))
+        self.assertEqual([next(k for k, v in j["mix"].items() if v == 100) for j in jobs[:12]],
+                         ["put", "put", "put", "read", "read", "read", "read",
+                          "read", "read", "put_batch", "read", "read"])
+        self.assertEqual(jobs[6]["value_size"], 65536)
+        self.assertTrue(jobs[6]["require_media_qualified"])
+        self.assertEqual(sum(j.get("require_media_qualified", False) for j in jobs), 1)
+        self.assertEqual(jobs[7]["live_poll_queues"], 1)
+        self.assertEqual((jobs[8]["concurrency"], jobs[8]["read_lanes"],
+                          jobs[8]["live_io_queues"], jobs[8]["live_io_queue_size"]), (16, 4, 4, 128))
+        self.assertEqual((jobs[11]["net"]["tool"], jobs[11]["net"]["mode"]), ("ib_read_lat", "polled"))
+        order = ("G18F", "G18N", "G18W", "G18M", "G18R", "G18B", "G18X")
+        self.assertEqual(jobs[12:], sorted(jobs[12:], key=lambda j: order.index(j["group"])))
+        for job in jobs:
+            campaign.validate_focused_job(job)
+            backend = job["backend"]
+            keys = campaign.NVMEOF_PATH_SETTING_KEYS[backend]
+            self.assertTrue(set(keys) <= job.keys())
+            if backend != "native":
+                self.assertEqual(job["history_persistence"], "memory_only")
+                self.assertEqual(job["owner_count"], 1)
+            if backend == "tidehunter_nvme_rdma":
+                self.assertEqual((job["live_write_mode"], job["live_export_mode"]), ("leased", "per_owner"))
+                self.assertNotIn("sealed_dataset", job)
+            if job["mix"]["put"] or job["mix"]["put_batch"]:
+                self.assertTrue(job["device_counters"])
+            if job["group"] == "G18B":
+                self.assertEqual(job["batch_size"], 32)
+            if job["group"] == "G18X":
+                self.assertEqual(job["owner_wal_geometry"], "sui_harness")
+                self.assertTrue(job["drop_os_caches"])
+                self.assertTrue(job["evict_mapped_wal_before_measurement"])
+            if job.get("distribution") == {"zipf": {"exponent": 0.99}}:
+                self.assertEqual((job["keys"], job["coordinator_cache_bytes"], job["measurement_operations"]),
+                                 (65536, 8388608, 8192))
+            if backend == "native" and job["mix"]["read"]:
+                self.assertEqual(job["keys"], 65536)
+        for key, value in (("history_persistence", "on_disk"), ("live_export_mode", "on_demand"),
+                           ("live_io_queues", 4), ("live_inline_reads", False)):
+            changed = dict(jobs[5], **{key: value})
+            with self.assertRaises(ValueError):
+                campaign.validate_focused_job(changed)
+        changed = dict(jobs[5], live_io_queues=True)
+        with self.assertRaises(ValueError):
+            campaign.validate_focused_job(changed)
+
+    def test_nvmeof_path_read_populations_match_native_references(self):
+        jobs = campaign.make_focused_matrix("nvmeof_path_compact")
+        # Floors inherit a read mix but execute no benchmark read.
+        reads = [j for j in jobs if j["group"] != "G18F"
+                 and (j["mix"]["read"] or j["mix"]["get_many"])]
+        self.assertTrue(all(j["keys"] == 65536 for j in reads))
+        def cell(job):
+            operation = "get_many" if job["mix"]["get_many"] else "read"
+            return (operation, job["value_size"], job["concurrency"], job["repeat"],
+                    job["media"]["expected"], job["batch_size"], job["keys"])
+        references = {cell(j) for j in reads if j["backend"] == "native"}
+        cache_cases = []
+        for job in reads:
+            if job["backend"] != "tidehunter_nvme_rdma":
+                continue
+            if job["coordinator_cache_bytes"]:
+                # G18M(b), the Zipf coordinator-cache arm, has no native reference.
+                self.assertEqual(job["group"], "G18M")
+                self.assertEqual(job["distribution"], {"zipf": {"exponent": 0.99}})
+                cache_cases.append(job)
+                continue
+            # Lane, polled, queue-geometry and G18X arms share the native cell.
+            self.assertIn(cell(job), references, job["case_id"])
+            if job["media"]["expected"] == "memory":
+                self.assertEqual(job["warmup_operations"], 65536)
+                self.assertTrue(job["warmup_key_sweep"])
+                self.assertEqual(job["measurement_operations"], 8192)
+                config = campaign.make_run_config(job, Path("/tmp/population-case"), {},
+                                                  "revision", deadline_seconds=600)
+                self.assertEqual(config["limits"]["deadline_seconds"], 600)
+                self.assertLessEqual(job["keys"], config["limits"]["max_keys"])
+                self.assertLessEqual(job["keys"] * job["value_size"], config["limits"]["max_bytes"])
+                self.assertLessEqual(job["keys"] + job["warmup_operations"] + job["measurement_operations"],
+                                     config["limits"]["max_operations"])
+        self.assertEqual(len(cache_cases), 2)
+
+    def test_leased_compact_and_historical_hashes(self):
+        pins = {
+            'recommended': 'e033a68d931e9db33cacd5ac25ef43f0647bb3d919a1d7c7ac608d8c0414f08d',
+            'full': '04dff9517aff741c01289d534e6a55f2f3b1d0e211b2f0ea9cb58c8b5bf6650c',
+            'device': '8a0cf7c9ebf16552ef32d616aec14d6876d3f1a84eb904ee53e7a24cc28d9a43',
+            'floors': '5fb477358bc57c14c8fad9b7e0958b93afb22ff4d1ba085204d44b1e74fcd429',
+            'stages': '646207fe6727aa37367b727759a4d46005ebd56a59f29ec49b13a690de24a724',
+            'unified': 'a73d7a070f8416f555aab6434e1c6893b4deca756e77036d0509001b23bc3506',
+            'append_floors': '646f9ff50949c4ecab44a4d77d2ad38e5b2700311cb5c1ce69e742ed521f4e40',
+            'fair_native': '7a8e64eeb181b0f5040f3b02105d76def85823e87f591fea448d34bcb6a7f2d9',
+            'parity': 'ee942bda8565ff1295814a61fb00040f6feedce9cd73304dea29dec095169ec6',
+            'parity_compact': '4978687ab42ca839e2c864978fb1489854ae201d28f06facf89a283cdea8e0aa',
+            'fair_five_owner': '479601db27b3a709e83944dcdfa9b77e7f8e4bacac9637a29e04327e09151946',
+            'remote_rw_compact': 'b2f2afc44afc1d066bedb27f819c5fa7789e000f96da0c7beb4c6f9359122620',
+            'fabric_ab_compact': '8e12ba4352dc461680565b3bfaef5db705e702e03bce986323cc1e31ae9bde6e',
+            'leased_ab_compact': '52029dc2047cecca4903b4240d7a84d8dcb402bfbfddcad827d605405f15c2dc',
+            'nvmeof_path_compact': '8da5d9479b5fc470ff90c21211b3c3510a66d15bd3f03e520c9eefe38b7b2036',
+        }
+        for selection, pin in pins.items():
+            data = json.dumps(campaign.make_focused_matrix(selection), sort_keys=True, separators=(',', ':')).encode()
+            self.assertEqual(hashlib.sha256(data).hexdigest(), pin, selection)
+        jobs = campaign.make_focused_matrix('leased_ab_compact')
+        self.assertEqual(len(jobs), 72)
+        self.assertEqual(Counter(j['group'] for j in jobs), {'G17W': 50, 'G17R': 22})
+        canaries = [j for j in jobs if j['repeat'] == 0 and j['value_size'] == 1024
+                    and j['concurrency'] == 1 and not j.get('diagnostics')]
+        self.assertEqual(jobs[:len(canaries)], canaries)
+        for job in jobs:
+            campaign.validate_focused_job(job)
+            self.assertNotIn('sealed_dataset', job)
+            if job['group'] == 'G17R':
+                self.assertEqual(job['cohort'], 'primary_rf1')
+                config = campaign.make_run_config(job, Path('/tmp/live-case'), {}, 'revision')
+                self.assertTrue(config['phases']['preload'])
+                self.assertTrue(config['phases']['warmup_key_sweep'])
+                self.assertEqual(config['phases']['warmup_operations'], 4096)
+                self.assertEqual(job['read_lanes'], 4 if job['concurrency'] == 16 else 1)
+        source = next(j for j in jobs if j.get('live_write_mode') == 'leased')
+        for field, value in [('durability_tier', 'bad'), ('live_write_mode', 'reserved'),
+                             ('nvmeof_route', 'sealed_read'), ('value_size', 8192), ('owner_count', 5)]:
+            changed = copy.deepcopy(source)
+            changed[field] = value
+            with self.assertRaises(ValueError):
+                campaign.validate_focused_job(changed)
+
+    def test_live_route_consumers_accept_unsealed_population(self):
+        import analyze
+        import plot_cloud_comparison as plots
+        jobs = campaign.make_focused_matrix('leased_ab_compact')
+        for group in ('G17R', 'G17W'):
+            job = next(j for j in jobs if j['group'] == group and j.get('nvmeof_route') == 'live')
+            self.assertEqual(analyze.requested_nvmeof_route({'job': job}), 'live')
+            def document(item):
+                return {'schema_version': 1, 'planned_cases': 1, 'completed_cases': 0,
+                        'cases': [{'case_id': item['case_id'], 'job': item, 'status': 'not_run', 'metrics': None}]}
+            plots.Dataset(document(job))
+            bad = dict(job, nvmeof_route='sealed_read')
+            with self.assertRaises(ValueError):
+                analyze.requested_nvmeof_route({'job': bad})
+            with self.assertRaises(ValueError):
+                plots.Dataset(document(bad))
+
     def test_geometry_prefix_and_ids(self):
         full = campaign.make_focused_matrix('full')
         recommended = campaign.make_focused_matrix('recommended')
@@ -161,7 +407,7 @@ class FocusedMatrixTests(unittest.TestCase):
         fair = campaign.make_focused_matrix('fair_native')
         append = campaign.make_focused_matrix('append_floors')
         parity = campaign.make_focused_matrix('parity')
-        self.assertEqual(fair, raw[771:])
+        self.assertEqual(fair, raw[771:771 + len(fair)])
         self.assertEqual(parity, fair[:1] + append + fair[1:])
         self.assertEqual(len(fair), 168)
         self.assertEqual(len(parity), 216)
@@ -256,6 +502,278 @@ class FocusedMatrixTests(unittest.TestCase):
             encoded = json.dumps(campaign.make_focused_matrix(selection),
                                  sort_keys=True, separators=(',', ':')).encode()
             self.assertEqual(hashlib.sha256(encoded).hexdigest(), digest)
+
+    def test_fabric_compact_matrix_and_canaries(self):
+        jobs = campaign.make_focused_matrix('fabric_ab_compact')
+        self.assertEqual(len(jobs), 80)
+        self.assertEqual(Counter(j['group'] for j in jobs), {'G16P': 40, 'G16C': 40})
+        self.assertEqual(campaign.focused_group_counts('fabric_ab_compact'),
+                         {'G16P': 40, 'G16C': 40, 'sealed_knee': 40, 'media_read': 40})
+        self.assertEqual(campaign.selection_owner_hosts('fabric_ab_compact'), 1)
+        self.assertTrue(all(campaign.job_owner_hosts(j) == 1 for j in jobs))
+        self.assertEqual(len({j['case_id'] for j in jobs}), 80)
+        data = json.dumps(jobs, sort_keys=True, separators=(',', ':')).encode()
+        self.assertEqual(hashlib.sha256(data).hexdigest(),
+                         '8e12ba4352dc461680565b3bfaef5db705e702e03bce986323cc1e31ae9bde6e')
+        self.assertEqual(campaign.fabric_parity_violations(jobs), [])
+        self.assertEqual([j['group'] for j in jobs[:10]], ['G16P'] * 5 + ['G16C'] * 5)
+        self.assertTrue(all((j['value_size'], j['concurrency'], j['repeat']) == (1024, 1, 0)
+                            for j in jobs[:10]))
+        self.assertEqual([j['backend'] for j in jobs[10:13]],
+                         ['tidehunter_nvme_rdma', 'tidehunter_nvme_rdma', 'tidehunter_nvme_tcp'])
+        self.assertTrue(all((j['value_size'], j['concurrency'], j['repeat']) == (65536, 16, 0)
+                            for j in jobs[10:15]))
+        self.assertEqual([j['owner_polling'] for j in jobs[13:15]], ['busy', 'busy'])
+        phases = [0 if j['group'] == 'G16P' else 2 if j['backend'] in campaign.NVME_BACKENDS else 1
+                  for j in jobs[15:]]
+        self.assertEqual(phases, sorted(phases))
+        for group in ('G16P', 'G16C'):
+            for size in (1024, 65536):
+                for concurrency in (1, 16):
+                    for nvme in ((False, True) if group == 'G16C' else (False,)):
+                        blocks = [[(j['backend'], j.get('nvmeof_target'), j.get('owner_polling'))
+                                   for j in jobs[15:] if j['group'] == group
+                                   and (j['backend'] in campaign.NVME_BACKENDS) == nvme
+                                   and (j['value_size'], j['concurrency'], j['repeat']) ==
+                                       (size, concurrency, repeat)]
+                                  for repeat in (0, 1)]
+                        self.assertEqual(blocks[0], [arm for arm in reversed(blocks[1]) if arm in blocks[0]])
+        for j in jobs:
+            self.assertIs(campaign.validate_focused_job(j), j)
+        for selection, digest in (
+                ('unified', 'a73d7a070f8416f555aab6434e1c6893b4deca756e77036d0509001b23bc3506'),
+                ('append_floors', '646f9ff50949c4ecab44a4d77d2ad38e5b2700311cb5c1ce69e742ed521f4e40'),
+                ('fair_native', '7a8e64eeb181b0f5040f3b02105d76def85823e87f591fea448d34bcb6a7f2d9'),
+                ('parity', 'ee942bda8565ff1295814a61fb00040f6feedce9cd73304dea29dec095169ec6'),
+                ('parity_compact', '4978687ab42ca839e2c864978fb1489854ae201d28f06facf89a283cdea8e0aa'),
+                ('fair_five_owner', '479601db27b3a709e83944dcdfa9b77e7f8e4bacac9637a29e04327e09151946'),
+                ('remote_rw_compact', 'b2f2afc44afc1d066bedb27f819c5fa7789e000f96da0c7beb4c6f9359122620')):
+            encoded = json.dumps(campaign.make_focused_matrix(selection), sort_keys=True, separators=(',', ':')).encode()
+            self.assertEqual(hashlib.sha256(encoded).hexdigest(), digest)
+
+    def test_fabric_parity_rejects_missing_and_changed_arms(self):
+        jobs = campaign.make_focused_matrix('fabric_ab_compact')
+        self.assertEqual(campaign.fabric_parity_violations(jobs), [])
+        index = next(i for i, j in enumerate(jobs) if j['group'] == 'G16P'
+                     and j['backend'] == 'tidehunter_tcp_trusted' and j['owner_polling'] == 'adaptive')
+        for field, value in (('value_size', 65536), ('concurrency', 16), ('repeat', 1),
+                             ('keys', 65536), ('measurement_operations', 2),
+                             ('owner_polling', 'busy'), ('read_lanes', 4)):
+            altered = copy.deepcopy(jobs)
+            altered[index][field] = value
+            with self.subTest(field=field):
+                self.assertTrue(campaign.fabric_parity_violations(altered))
+        self.assertTrue(campaign.fabric_parity_violations(jobs[:index] + jobs[index + 1:]))
+        self.assertTrue(campaign.fabric_parity_violations(jobs + [copy.deepcopy(jobs[index])]))
+        missing_cell = [j for j in jobs if not (j['group'] == 'G16P' and
+                        (j['value_size'], j['concurrency'], j['repeat']) == (1024, 1, 0))]
+        no_cold = [j for j in jobs if j['group'] != 'G16C']
+        for partial in (missing_cell, no_cold):
+            self.assertTrue(campaign.fabric_parity_violations(partial))
+            self.assertEqual(campaign.fabric_parity_violations(partial, complete=False), [])
+        for field, value in (('seed', 10), ('data_id', 'other'), ('instrumentation', 'profile')):
+            altered = copy.deepcopy(jobs)
+            altered[index]['sealed_dataset'][field] = value
+            with self.subTest(dataset_field=field):
+                self.assertTrue(campaign.fabric_parity_violations(altered))
+        for index in (5, 6, 7, 8, 9):
+            altered = copy.deepcopy(jobs)
+            altered[index]['sealed_dataset']['page_cache_policy'] = 'wrong'
+            self.assertTrue(campaign.fabric_parity_violations(altered))
+
+    def test_fabric_allowed_arm_differences_and_cache_policies(self):
+        jobs = campaign.make_focused_matrix('fabric_ab_compact')
+        cell = [j for j in jobs if j['group'] == 'G16C'
+                and (j['value_size'], j['concurrency'], j['repeat']) == (1024, 1, 0)]
+        owner = next(j for j in cell if j['backend'] == 'tidehunter_tcp_trusted')
+        verbs = next(j for j in cell if j['backend'] == 'tidehunter_verbs_native')
+        nvmes = [j for j in cell if j['backend'] in campaign.NVME_BACKENDS]
+        allowed = {'backend', 'owner_polling', 'nvmeof_route', 'nvmeof_target', 'target_io',
+                   'evict_mapped_wal_before_measurement', 'case_id', 'profile', 'media', 'sealed_dataset'}
+        dataset_allowed = {'source_id', 'directness', 'target_cache', 'mapped_wal_eviction',
+                           'cold_claim', 'page_cache_policy'}
+        for nvme in nvmes:
+            differing = {key for key in owner.keys() | nvme.keys() if owner.get(key) != nvme.get(key)}
+            self.assertFalse(differing - allowed)
+            differences = {key for key in owner['sealed_dataset'].keys() | nvme['sealed_dataset'].keys()
+                           if owner['sealed_dataset'].get(key) != nvme['sealed_dataset'].get(key)}
+            self.assertFalse(differences - dataset_allowed)
+            self.assertEqual(nvme['sealed_dataset']['page_cache_policy'], 'drop_at_measurement_gate')
+            self.assertEqual({k: v for k, v in nvme['media'].items() if k != 'wal_eviction'},
+                             {k: v for k, v in owner['media'].items() if k != 'wal_eviction'})
+        self.assertEqual(owner['sealed_dataset']['page_cache_policy'],
+                         'evict_mapped_wal_then_drop_at_measurement_gate')
+        self.assertEqual(owner['sealed_dataset']['page_cache_policy'], verbs['sealed_dataset']['page_cache_policy'])
+        altered = copy.deepcopy(jobs)
+        altered[5]['profile'] = 'different'
+        altered[5]['sealed_dataset']['source_id'] = 'other'
+        altered[5]['sealed_dataset']['cold_claim'] = 'different text'
+        self.assertEqual(campaign.fabric_parity_violations(altered), [])
+
+    def test_fabric_does_not_change_default_backends_or_standard_matrix(self):
+        self.assertNotIn('tidehunter_tcp_trusted', campaign.BACKENDS)
+        self.assertNotIn('tidehunter_tcp_trusted', campaign.LEGACY_BACKENDS)
+        self.assertIn('tidehunter_tcp_trusted', campaign.PORTABLE_BACKENDS)
+        spec = json.loads(Path(campaign.__file__).with_name('cloud-campaign.json').read_text())
+        jobs = campaign.make_matrix(spec)
+        self.assertEqual(len(jobs), 315)
+        self.assertNotIn('tidehunter_tcp_trusted', {j['backend'] for j in jobs})
+        self.assertEqual(hashlib.sha256(json.dumps(jobs, sort_keys=True, separators=(',', ':')).encode()).hexdigest(),
+                         '175607be6d0c1499461f1644d338dfdddf66167ce26d2a18b3263250b39df765')
+
+    def test_focused_nvme_client_transport_and_standard_tcp_control(self):
+        jobs = campaign.make_focused_matrix('fabric_ab_compact')
+        for job in jobs[:10]:
+            expected = (campaign.transport_for_case('tidehunter_verbs_native')
+                        if job['backend'] in campaign.NVME_BACKENDS else campaign.TRANSPORTS[job['backend']])
+            with self.subTest(case=job['case_id']):
+                config = campaign.make_run_config(job, '/tmp/fabric-case', {}, 'revision')
+                self.assertEqual(campaign.protocol_key(config['backend']['options']['transport']),
+                                 campaign.protocol_key(expected))
+        tcp = next(j for j in jobs if j['backend'] == 'tidehunter_nvme_tcp')
+        with self.assertRaisesRegex(ValueError, 'runtime transport differs'):
+            campaign.make_run_config(tcp, '/tmp/fabric-case', {'transport': {'kind': 'tcp'}}, 'revision')
+        for route in ('sealed_read', 'live'):
+            standard = copy.deepcopy(tcp)
+            del standard['case_kind']
+            standard['owner_count'] = 5
+            standard['nvmeof_route'] = route
+            config = campaign.make_run_config(standard, '/tmp/fabric-case', {}, 'revision')
+            self.assertEqual(config['backend']['options']['transport'], {'kind': 'tcp'})
+
+    def test_spdk_compact_owner_count_is_passed(self):
+        compact = next(j for j in campaign.make_focused_matrix('fabric_ab_compact')
+                       if j.get('nvmeof_target') == 'spdk')
+        original = next(j for j in campaign.make_focused_matrix('device')
+                        if j.get('nvmeof_target') == 'spdk')
+        with mock.patch.object(campaign.spdk_measurement, 'admit', return_value={'ok': True}) as admit:
+            self.assertEqual(campaign.admit_spdk_target_measurement('/tmp', compact,
+                             {'spdk_target_measurement': {}}, completed=True), {'ok': True})
+            admit.assert_called_with('/tmp', {}, allow_zero_reads=False, owner_count=1)
+            campaign.admit_spdk_target_measurement('/tmp', original,
+                {'spdk_target_measurement': {}}, completed=True)
+            admit.assert_called_with('/tmp', {}, allow_zero_reads=False, owner_count=5)
+
+    def test_remote_rw_compact_grid_and_frozen_reuse(self):
+        jobs = campaign.make_focused_matrix('remote_rw_compact')
+        self.assertEqual(len(jobs), 342)
+        self.assertEqual(campaign.selection_owner_hosts('remote_rw_compact'), 1)
+        self.assertEqual(Counter(j['group'] for j in jobs),
+                         {'G13W': 48, 'G11N': 45, 'G11S': 24, 'G15F': 24,
+                          'G14N': 54, 'G14O1': 36, 'G14P': 3, 'G15C': 54, 'G15M': 54})
+        self.assertEqual(len({j['case_id'] for j in jobs}), len(jobs))
+        self.assertTrue(all(campaign.job_owner_hosts(j) == 1 for j in jobs))
+        self.assertEqual([(j['group'], j['backend']) for j in jobs[:5]],
+                         [('G15C', 'native'), ('G15C', 'tidehunter_tcp'),
+                          ('G15C', 'tidehunter_verbs_native'), ('G15M', 'native'),
+                          ('G15M', 'tidehunter_verbs_native')])
+        self.assertTrue(all((j['value_size'], j['concurrency'], j['repeat']) == (1024, 1, 0)
+                            for j in jobs[:5]))
+        encoded = json.dumps(jobs, sort_keys=True, separators=(',', ':')).encode()
+        self.assertEqual(hashlib.sha256(encoded).hexdigest(),
+                         'b2f2afc44afc1d066bedb27f819c5fa7789e000f96da0c7beb4c6f9359122620')
+        frozen = campaign.make_focused_matrix('parity_compact') + campaign.make_focused_matrix('floors')
+        expected = {j['case_id']: j for j in frozen if j['group'] in
+                    ('G13W', 'G11N', 'G11S', 'G14N', 'G14O1', 'G14P')}
+        reused = {j['case_id']: j for j in jobs if j['group'] in
+                  ('G13W', 'G11N', 'G11S', 'G14N', 'G14O1', 'G14P')}
+        self.assertEqual(reused, expected)
+        floors = [j for j in jobs if j['group'] == 'G15F']
+        actual = Counter(json.dumps({k: v for k, v in j['ssd'].items() if k != 'host'}, sort_keys=True)
+                         for j in floors)
+        original = Counter(json.dumps(j['ssd'], sort_keys=True) for j in frozen if j['group'] == 'G11S')
+        self.assertEqual(actual, original)
+        self.assertTrue(all(j['ssd']['host'] == 'client' for j in floors))
+        self.assertEqual(campaign.parity_violations(jobs, complete=True), [])
+        self.assertEqual(campaign.focused_group_counts('remote_rw_compact')['G15C'], 54)
+        for job in (jobs[0], jobs[1], jobs[3], floors[0]):
+            self.assertIs(campaign.validate_focused_job(job), job)
+        head, rest = jobs[:46], jobs[46:]
+        self.assertEqual((head[5]['group'], head[5]['backend'], head[5]['value_size'],
+                          head[5]['concurrency'], head[5]['repeat']),
+                         ('G15M', 'tidehunter_tcp', 1024, 1, 0))
+        self.assertEqual(Counter(j['group'] for j in head),
+                         {'G15C': 6, 'G15M': 6, 'G13W': 8, 'G11N': 15, 'G11S': 2,
+                          'G15F': 2, 'G14N': 3, 'G14O1': 2, 'G14P': 2})
+        self.assertTrue(all(j['repeat'] == 0 for j in head))
+        self.assertTrue(all((j['value_size'], j['concurrency']) == (65536, 16)
+                            for j in head[6:12]))
+        self.assertEqual({(j['ssd_write']['mode'], j['ssd_write']['host']) for j in head
+                          if j['group'] == 'G13W'},
+                         {(mode, host) for mode in ('fdatasync', 'append_pwrite', 'append_mmap', 'append_mmap_fsync')
+                          for host in ('client', 'owner0')})
+        self.assertTrue(all(j['ssd_write']['block_bytes'] == 65536
+                            for j in head if j['group'] == 'G13W'))
+        for group in ('G11S', 'G15F'):
+            cases = [j for j in head if j['group'] == group]
+            self.assertEqual({j['ssd']['state'] for j in cases}, {'fresh', 'aged'})
+            self.assertTrue(all((j['ssd']['block_bytes'], j['ssd']['region_bytes']) == (65536, 2147483648)
+                                for j in cases))
+        self.assertEqual(len({(j['net']['tool'], j['net']['mode'], j['net']['interface'],
+                               j['net']['provider'], j['net']['endpoint'])
+                              for j in head if j['group'] == 'G11N'}), 15)
+        self.assertTrue(all((j['value_size'], j['concurrency']) == (65536, 16)
+                            for j in head if j['group'] in ('G14N', 'G14O1', 'G14P')))
+        self.assertEqual(campaign.parity_violations(list(reversed(jobs))), [])
+        head_ids = {j['case_id'] for j in head}
+        raw = campaign._focused_jobs()
+        old_floors = ([j for j in campaign.make_focused_matrix('append_floors')]
+                      + campaign.make_focused_matrix('floors')
+                      + [j for j in raw if j['group'] == 'G15F'])
+        self.assertEqual([j['case_id'] for j in rest if j['group'] in ('G13W', 'G11N', 'G11S', 'G15F')],
+                         [j['case_id'] for j in old_floors if j['case_id'] not in head_ids])
+        self.assertEqual([j['case_id'] for j in rest if j['group'] in ('G15C', 'G15M')],
+                         [j['case_id'] for j in raw if j['group'] in ('G15C', 'G15M')
+                          and j['case_id'] not in head_ids])
+        for group in ('G15C', 'G15M'):
+            for size in (1024, 8192, 65536):
+                for concurrency in (1, 5, 16):
+                    blocks = [[j['backend'] for j in rest if j['group'] == group
+                               and (j['value_size'], j['concurrency'], j['repeat']) == (size, concurrency, repeat)]
+                              for repeat in (0, 1)]
+                    self.assertEqual(set(blocks[1]), {'native', 'tidehunter_tcp', 'tidehunter_verbs_native'})
+                    self.assertEqual(blocks[0], [arm for arm in reversed(blocks[1]) if arm in blocks[0]])
+        for size in (1024, 8192, 65536):
+            for concurrency in (1, 5, 16):
+                blocks = [[(j['backend'], j['durability_tier']) for j in rest
+                           if j['group'] in ('G14N', 'G14O1')
+                           and (j['value_size'], j['concurrency'], j['repeat']) == (size, concurrency, repeat)]
+                          for repeat in (0, 1)]
+                self.assertEqual(len(blocks[1]), 5)
+                self.assertEqual(blocks[0], [arm for arm in reversed(blocks[1]) if arm in blocks[0]])
+
+    def test_remote_rw_parity_rejects_mutations(self):
+        jobs = campaign.make_focused_matrix('remote_rw_compact')
+        index = next(i for i, j in enumerate(jobs) if j['group'] == 'G15C' and j['backend'] == 'native')
+        for field, value in (('concurrency', 5), ('value_size', 8192), ('repeat', 1),
+                             ('keys', 4096), ('measurement_operations', 4096), ('cohort', 'different')):
+            altered = copy.deepcopy(jobs)
+            altered[index][field] = value
+            with self.subTest(field=field):
+                self.assertTrue(campaign.parity_violations(altered))
+        self.assertTrue(campaign.parity_violations(jobs[:index] + jobs[index + 1:]))
+        for field, value in (('durability_tier', 'synchronous'), ('native_durability', 'page_cache')):
+            altered = copy.deepcopy(jobs)
+            altered[index][field] = value
+            with self.subTest(field=field):
+                self.assertTrue(campaign.parity_violations(altered, complete=True))
+        write = next(i for i, j in enumerate(jobs) if j['group'] == 'G14N')
+        altered = copy.deepcopy(jobs)
+        altered[write]['native_durability'] = 'incorrect'
+        self.assertTrue(campaign.parity_violations(altered, complete=True))
+        missing_cell = [j for j in jobs if not (j['group'] == 'G15C' and
+                        (j['value_size'], j['concurrency'], j['repeat']) == (1024, 1, 0))]
+        no_reads = [j for j in jobs if j['group'] not in ('G15C', 'G15M')]
+        no_writes = [j for j in jobs if j['group'] not in ('G14N', 'G14O1')]
+        for partial in (missing_cell, no_reads, no_writes):
+            self.assertTrue(campaign.parity_violations(partial))
+            self.assertEqual(campaign.parity_violations(partial, complete=False), [])
+        for field, value in (('seed', 17), ('page_cache_policy', 'not_dropped'),
+                             ('mapped_wal_eviction', 'not_requested'), ('directness', 'other')):
+            altered = copy.deepcopy(jobs)
+            altered[index]['sealed_dataset'][field] = value
+            with self.subTest(field=field):
+                self.assertTrue(campaign.parity_violations(altered))
 
     def test_owner_host_requirements(self):
         self.assertIs(campaign.OWNER_HOST_COUNTS, cloud_layout.OWNER_HOST_COUNTS)

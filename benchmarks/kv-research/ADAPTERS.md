@@ -21,6 +21,41 @@ physical NVMe reads. See the [comparison evidence notes](../../experiments/kv-co
 
 Security is a workload dimension, not an equivalence claim: the existing native TCP adapter uses mTLS, TiKV RawKV and Valkey TCP use plaintext, CQL reports either plaintext or CA-verified TLS, and FoundationDB reports negotiated transport/trust as unverified from its live status. Runs with different trust modes must remain explicitly labeled and are not security-matched comparisons. The adapters' `validate_options` entrypoints are pure JSON parsing/semantic validation, share their deny-unknown-fields parser with `open`, and do not inspect live endpoints or generated files. In particular, FDB preflight validates only that `cluster_file` is a nonempty UTF-8 path; its presence is checked only when opening the backend after lifecycle preparation.
 
+## Workload key selection
+
+`workload.mix` weights the six operations (`read`, `put`, `delete`,
+`missing_read`, `get_many`, `put_batch`). `workload.distribution` selects
+`"uniform"` or `{"zipf":{"exponent":1.2}}` within the prepared key range.
+`workload.batch_size` sets the number of members in each grouped operation.
+
+`workload.put_key_policy` accepts `"overwrite"` (the default when absent) or
+`"new"`. Unknown values fail config admission. For example, a put-only workload is:
+
+```json
+{
+  "distribution": "uniform",
+  "mix": {"read": 0, "put": 1, "delete": 0, "missing_read": 0, "get_many": 0, "put_batch": 1},
+  "batch_size": 32,
+  "put_key_policy": "new"
+}
+```
+
+`"overwrite"` keeps the existing seeded random key sequence. `"new"` assigns
+each scalar put and each put-batch member a unique logical id `dataset.keys + n`.
+One shared atomic counter starts at zero per run and continues across warm-up,
+aging and measurement; all worker/backend requests use these ids through the
+common `WorkItem` path. Overflow fails the run rather than wrapping. The physical
+key still hashes the namespace, seed and logical id. Preload remains `0..dataset.keys`.
+Rejected open-loop calls can leave gaps among stored ids; no id is reused.
+
+`"new"` requires a nonzero `put` or `put_batch` weight and zero `read`,
+`get_many`, `missing_read` and `delete` weights. It cannot be combined with a
+measurement key sweep or `execution.mode="interference"`. The interference mode
+keeps its own disjoint read/put id policy. Distribution does not select new put ids.
+The manifest echoes the effective policy in `run.config.workload.put_key_policy`
+and `run.data_policy.put_key_policy`, including the default `"overwrite"`.
+
+
 ## Selected Rust clients and dependency rationale
 
 All clients are optional Cargo dependencies behind individual `tikv`, `cassandra`, `foundationdb`, `valkey-tcp`, `garnet`, and `kvrocks` features. A native-only invocation does not compile/link them. The manifest pins each database client to the reviewed release to limit API drift; the workspace lockfile records its dependency closure. Do not enable `--all-features` as a generic check: FoundationDB additionally needs a user-owned native client library.
@@ -36,6 +71,26 @@ All clients are optional Cargo dependencies behind individual `tikv`, `cassandra
 Manifest support dependencies are purpose-specific: `reqwest` for PD metadata over HTTP, `tonic` for typed TiKV gRPC status handling, `rustls` plus `rustls-pemfile` for explicit verified CQL TLS, and the RocksDB crate/features for the separate native-adapter owner. `foundationdb` disables default convenience recipes and uses embedded **headers only** (`embedded-fdb-include`) with `fdb-7_3`; no client shared library is embedded. Review each client's resolved dependency closure with its exact manifest/lockfile pin; do not accept unrelated version churn. Redis-rs 1.8.0 also declares a target-specific Tokio >=1.51 requirement, so its addition requires updating this workspace's older unified Tokio family.
 
 ## Adapter-specific contract and observation boundary
+
+### Native Tidehunter
+
+| Option | Default | Contract |
+|---|---|---|
+| `path` | required | One Db at this path with one instance; parent of `shard-00` through `shard-{N-1:02}` with multiple instances. |
+| `key_count` | 1,048,576 | Positive dataset bound; the same bound is given to each Db. |
+| `durability` | `page_cache` | `page_cache`, `value_wal_barrier` or `value_wal_group_barrier`; all instances use the same mode. |
+| `native_wal_geometry` | `native_default` | `native_default`, `small`, `large_files` or `owner_matched`; the same geometry is used per instance. |
+| `native_shards` | 1 | Integer 1 through 16; independent Db instances in one process, without extra caller threads; filesystem device numbers are checked at open; SSD backing needs controller device-admission evidence. |
+
+Multiple native instances use FNV-1a over each key, not the distributed backend's
+operation-ID placement. Match total caller concurrency explicitly; five instances
+with 16 total callers are not five SSDs or a distributed placement replica.
+Use the same filesystem (checked by device number); SSD backing needs controller device-admission evidence.
+The receipt records device IDs at open and `same_filesystem` for multiple instances;
+`backing_block_device` remains `not verified by the adapter`.
+With `native_shards>1`, atomic `put_batch` and write profiling are unsupported.
+Engine metrics stay private; group-barrier metrics carry a `shard` label. See
+`NATIVE.md` for paths, receipts, routing and comparison limits.
 
 ### TiKV
 
@@ -84,6 +139,33 @@ See the pinned [Garnet runtime CONFIG implementation](https://github.com/microso
 For a matched-client TCP control, use backend `valkey_tcp`, add `"client":"libvalkey"` to its options, and enable both `valkey-tcp` and `valkey-rdma`. This explicitly selects ordinary TCP; the default TCP client remains redis-rs. Both matched controls use four persistent connections per node, per-connection serialization, Tokio's blocking pool, and identical static cluster routing. Cluster MGET groups by slot, appends groups to upstream libvalkey pipelines per primary, concurrently drains up to five primary pipelines, and restores input order, misses and duplicates. The shim uses upstream buffer and reply-reader APIs with a shrinking deadline, since `valkeyGetReply` renews the timeout for each read. A partially failed pipeline leaves its connection unusable rather than allowing unread responses to contaminate later commands; shutdown waits for outstanding blocking calls. This is not the redis-rs asynchronous progress model; retain the client and transport labels in comparisons.
 
 Set `VALKEY_SOURCE_DIR` at Cargo build time to a clean checkout of Valkey 9.0.7 at `fe8d406c0b5a64ec897f6455e4de684629883764`. Install a C compiler, `ar`, and rdma-core development libraries (`librdmacm` and `libibverbs`). Build the server from the pinned source with `BUILD_RDMA=yes`. Separately, in a clean client checkout at the same commit, run `make -C "$VALKEY_SOURCE_DIR/deps/libvalkey" USE_RDMA=1 static`. The client checkout must contain `deps/libvalkey/lib/libvalkey.a` and `libvalkey_rdma.a`; the shim compiles against its `deps/libvalkey/include` headers. Do not reuse the server's libvalkey archive: the server build supplies its own SDS and dictionary implementations. The checkout commit and tracked-file cleanliness are checked at build; artifact provenance remains an operator assertion, not a cryptographic attestation. Native-only and default TCP builds need none of these libraries.
+
+The matched libvalkey adapter also supports bounded, opt-in client call
+diagnostics. Prepare a new pinned checkout with
+`prepare_valkey_rdma.py --output PATH --cq-diagnostics` to compile the
+measurement-only CQ hook into the standalone client; the server is built before
+that hook is applied. The build checks the exact source transformation, rejects
+other tracked changes and rejects a source/archive hook-symbol mismatch.
+Keep the recorded source and archive SHA-256 values with results: the build
+does not independently reproduce or attest the operator-built libraries.
+Unmodified pinned client builds remain supported, with CQ data unavailable.
+
+Selected calls record caller sample ID, operation, owner and connection,
+mutex wait, blocking-pool enqueue-to-start and return-to-async-wake, command
+encoding inside the pipeline (excluding initial argument-vector construction),
+libvalkey transport plus parser, and materialization/decode. MGET
+can produce one record per primary pipeline with the same caller ID; the
+bounded limit counts records, not keys. Error and cancelled calls may have
+partial fields; `pipeline_outcome` reports pipeline completion, not outer API
+semantic validation. A snapshot explicitly marks unfinished workers. Zero is
+a measured value, while null means absent. For hooked RDMA only, CQ records
+count actual `ibv_poll_cq` invocations/completions, time those calls, measure
+the `poll` wait on both CQ and CM descriptors, and measure userspace return
+from a CQ-ready poll to the first CQ poll. The poll interval includes kernel
+blocking and scheduling: OS wakeup-to-scheduling latency is unavailable
+without kernel tracing. TCP has no RDMA CQ and reports it unavailable, not zero.
+These nested intervals are not additive and do not isolate wire or server time.
+
 
 The upstream Cluster client hardcodes TCP for node connections; it is not used for RDMA. Instead admission queries each explicit endpoint for `CLUSTER MYID`, verifies each node's `CLUSTER NODES` and `CLUSTER SLOTS` views agree, all 16,384 slots, healthy non-migrating distinct primaries, RF1 and durability settings. This maps node IDs to slots without assuming TCP-advertised and RDMA IPs or ports match. The fixed map is a static-topology cohort: MOVED/ASK and other server errors fail without retry, and topology changes that do not produce a redirect are not actively monitored. Cross-slot atomic batch writes are unsupported. Each transport error or timeout may leave a mutation's result unknown. GET remains RAM-resident; the AOF is a durability log, not an NVMe read tier.
 
@@ -210,6 +292,19 @@ Effective JSON retains transport, security, coordinator cache settings, owner
 storage/read configuration, and placement evidence. External topology is not
 asserted to use independent NVMe unless deployment evidence establishes it.
 
+With feature `fabric`, effective JSON includes `fabric_provider_evidence` for
+the existing owner-monitor connections. Provider identity, domain and fabric
+are selected values; the open profile includes selected TX/RX capacities,
+MTU and provider version when observed. Null means unavailable, including
+unspecified zero queue hints and reused connections without an open profile.
+These are OFI capacities, not hardware WQE or CQ occupancy. They cover monitor
+connections only, not every lane. Sampled read and write profile counter maps
+include the application-slot CQ-poll samples described in the
+[fabric design](../../tidehunter-fabric/DESIGN.md); absent fields mean no timed
+fabric CQ samples, not zero pressure. The existing Sui adapter Prometheus
+collector exports these same visitor fields; the KV benchmark's `metrics.prom`
+does not itself export this profile map.
+
 Use the built binary's pure prep mode to generate engine-native external configs instead of reconstructing their YAML in deployment code:
 
 ```sh
@@ -223,7 +318,9 @@ positive `max_batches_per_partition`, `max_admitted_batches`, and
 `max_index_bytes`; nonnegative `coordinator_cache_bytes`; positive
 `owner_read_workers` and `owner_read_memory_allowance_bytes`;
 `owner_wal_member_read` (`async`, `mapped`, or `positional`); optional
-`owner_read_resident_first` enables Linux page-cache NOWAIT with async reads;
+`owner_read_resident_first` (default `true`) enables Linux page-cache NOWAIT with
+async reads; set it explicitly to `false` for `mapped`, `positional`, or forced
+async controls;
 and `polling` (`adaptive` or `busy`). The helper fixes the keyshape at 16 mutexes
 × 64 cells and writes `node-{0..4}/launch.yaml`, `remote.yaml`, `remote.json`,
 `shape.yaml`, generated `tls/` material when TLS is selected, and
@@ -265,6 +362,143 @@ python3 experiments/kv-comparison/cloud_campaign.py plan \
 The plan is not hardware qualification. AWS CI rejects NVMe/RDMA before
 allocation; a compatible provider and verified path remain required elsewhere.
 
+### Live NVMe-oF reads and writes
+
+`standard-with-live-nvmeof` selects the final-owner-inode data path, including
+scalar writes/deletes, atomic batches and mixed workloads. Historical sealed
+controls carry the explicit `sealed_read` route and remain separate populations.
+See [live WAL architecture and source map](../../experiments/nvmeof/LIVE_WAL.md).
+
+The external preparation CLI accepts one, two or five owners and a
+`live_nvmeof` target configuration. It emits the exact owner target settings
+and persistent initiator NQN/UUID into the generated remote configuration.
+Selected RDMA requires the actual Linux NVMe/RDMA initiator; there is no TCP payload fallback.
+Private loopback TCP commissioning is a target-control prerequisite, not the
+selected payload route.
+
+Run `kv-research --experimental-live-nvmeof-qualification INPUT.json --output FRESH_DIR`
+before admitting a physical campaign. `expected_route=local_file` is explicitly
+component-only. TCP/RDMA input requires already running owners and verified
+Linux initiator namespaces. The optional `target_implementation` is `kernel`
+by default or explicitly `spdk`: the latter requires the SPDK owner daemon and
+verified actual SPDK binding, not merely the requested value. The native run
+verifies live writes, mixed/delete batches, ordered and missing reads,
+checkpoints/iteration, cache miss/hit, graceful reopen and separate abrupt-exit
+tail recovery. Its final receipts require actual namespace-drain and
+target-specific shutdown evidence. TCP qualification does not establish
+physical RDMA performance or power-loss durability.
+
+Qualification input requires `durability_tier` (`native` or `synchronous`).
+The guest gate runs each selected target in both tiers, with separate receipts
+and fresh owner launches. Admission checks the proof against the independently
+collected owner process identity and effective durability receipt; a requested
+tier alone is not evidence. `local_file` records its tier but does not qualify
+an owner process or physical transport.
+
+Live Prometheus collection is registered for live mode even without a sealed
+reader. `tidehunter_nvmeof_live_*` and the typed quiescent boundary artifact
+retain their own stage/sample populations. Submission-to-CQ is a composite
+kernel/fabric/target/storage interval, not pure network time. A zero timing
+sample count is unavailable. Owner completion and persistence stages are
+observed only when the corresponding profiled completion reply is received.
+
+
+## Read oracle, sample admission and worker-release clock
+
+**Read oracle.** The generator derives each value from its logical key, so every put of a key
+writes the same bytes and presence is the only mutable fact. With a baseline dataset
+(`preload` or `verify_existing_dataset`) a read of a baseline key must return the exact
+bytes unless a mutation explains absence. Without a delete, put or put_batch in the mix any
+missing value is `wrong_value`. With mutations, each key owns two atomic words (no lock, no
+shared state between keys): a delete sets `maybe_absent` when it starts; only an acknowledged
+put whose whole interval overlapped no delete clears it; a delete with an unknown outcome
+(error or timeout) sets a sticky `uncertain` bit that blocks clearing. Deletes and puts each
+publish an in-flight count and a started-operation epoch. A read may return absence only if
+`maybe_absent` was set before or after the call, or a delete or a put of that key was in flight
+at either end of the call or started during it. A put that finished before the read began
+explains nothing. Present values are always compared byte for byte. Without a baseline dataset
+every key may be absent, as before. This is a concurrency-aware presence check, not a
+linearizability proof; it costs one `SeqCst` load pair per read key and is outside the API
+clock. Memory is 16 bytes per logical key, allocated only when the mix contains a mutation. A key
+repeated inside one batch counts once per operation, so a key's in-flight count never exceeds
+`execution.concurrency`; the run is refused if that cannot fit the 20-bit field.
+The manifest records `run.read_oracle.mode` (`disabled_no_baseline_dataset`,
+`strict_present_after_baseline`, `per_key_overlap_aware`).
+
+**Sample admission.** The raw sample queue is a bounded `tokio::sync::mpsc` channel of
+4096 messages. A full queue suspends only the scheduling task (`send().await`); no
+runtime thread blocks and no sample is dropped. A stopped writer fails the run. The manifest
+records `sample_writer_admission` with `stall_total_ns`, `stall_events` and `submit_errors`;
+the older `sample_writer_backpressure_ns/_events` keys carry the same stall totals. The
+writer thread flushes on a `Flush` message sent with each periodic snapshot and at least
+once per second while rows flow.
+
+**Worker-release clock.** `completed_ns` stays the API response boundary. The
+`released_ns` column (last column of `samples.csv`; older files lack it) is taken after oracle
+verification on the same origin clock, so the closed-loop cycle time of a worker is
+`released_ns - dispatched_ns`. `summary.json` distributions gain a per-operation `oracle`
+metric (`released_ns - completed_ns`, dispatched samples only) and the manifest
+`worker_release` aggregate records sample count, sum and maximum oracle time.
+
+**Valkey client pool repair.** A libvalkey connection is poisoned from the first appended
+command byte until all replies are consumed. A request whose deadline expired before any
+byte was written fails with a timeout and leaves the connection usable. A poisoned
+connection, or one in sticky context error, is replaced with a fresh connection before its
+next request (at most 2 attempts per request, each bounded by the connection timeout;
+nothing is attempted after the request deadline). Counters `connections_poisoned`,
+`connections_replaced`, `replacement_attempts_failed` and `timeouts_before_send` appear in
+the measurement read evidence (`client_pool` delta) and in `manifest.run.client_pool_final`.
+The redis-rs based `valkey_tcp` adapter has no pool or poison state: it clones one
+multiplexed handle and a timed-out request only drops its own waiter.
+
+**Transport receipts.** The Tidehunter adapter deserializes the engine `Transport` directly.
+`transport.kind` is `tcp` (mutual TLS), `tcp-trusted` (no TLS) or `ofi`; an `ofi`
+selector accepts `fabric.slots` (omitted means the engine default; EFA accepts only the
+default). The effective configuration receipt carries `transport_config` (the full
+serialized selector) and `transport_security`, so every transport knob of a run is recorded.
+
+**Durability tier and comparison rule.** Distributed Tidehunter has two acknowledgement tiers,
+selected by `backend.options.durability_tier` (default `native`; any other value is rejected
+at config validation):
+
+| Tier | Acknowledgement | Matched cohort (same run set only) |
+|---|---|---|
+| `native` | WAL page-cache write and publication; fsync in the background; explicit flush for stronger durability | native `durability=page_cache` only |
+| `synchronous` | covering WAL barrier completed | native `durability=value_wal_barrier` or `durability=value_wal_group_barrier`, and Valkey `appendfsync always` |
+
+Never mix tiers in one comparison: a `native` Tidehunter result is not compared with Valkey
+`appendfsync always`, and a `synchronous` result is not compared with native `page_cache`.
+The runner records the requested tier and its cohort in `summary.json` (`durability`) and
+`manifest.json` (`durability` and `run.durability`, plus `backend_info.configuration`). The run fails
+at startup unless the adapter's receipt (`configuration.durability_tier`) confirms the requested
+tier, so a tier the engine did not apply cannot be reported. The tier is constant per run and is
+therefore a file-level field, not a `samples.csv` column. Native and Valkey runs report their
+fixed contract (`page_cache`, `value_wal_barrier`, `value_wal_group_barrier`, `appendfsync_always`) through the same
+`durability` object.
+
+Native `value_wal_group_barrier` removes the unshared per-put barrier from the concurrent
+durable comparison. A shared run must start after the caller enters the post-mutation
+barrier. It syncs the same registered Value-WAL files and directory. A failed sync fails
+all waiters and later calls; there is no retry. This is an adapter change, not an engine
+change. See `NATIVE.md` for group-size metrics and the limits of this comparison.
+
+The tier is applied inside each owner process: the launch file carries `durability` (omitted
+means `native`; fields `tier`, optional `max_unsynced_age_ms`) and a fresh `launch_nonce`. The
+process calls `StorageNode::set_durability` before it listens, then writes a receipt to
+`<ready_file>.durability.json` (temporary file, fsync, rename, directory fsync) before the ready
+file. The receipt names the owner (`partition`, `database`, bound `address`), the process (`pid`,
+`boot_id`, `started_unix_ns`), the launch (`launch_nonce`) and its `durability` with an explicit
+`tier` and `max_unsynced_age_ms` (`null` allowed, absent rejected); an incomplete receipt is never
+read as native. A local cluster checks each receipt against its launch and request after every
+start and restart. An external topology (`external_remote_config`) lists one receipt file per
+owner in `external_owner_durability_receipts`; the adapter pairs a receipt with a partition by the
+partition it names, and accepts it only if its database, endpoint address, nonce (non-empty) and
+tier match, so one receipt cannot confirm several partitions. After an owner restart the
+orchestrator replaces each copy with the restarted process's own later receipt. A missing list,
+file or mismatch fails the open. `prepare` input accepts `durability_tier`. The adapter receipt
+`configuration.durability` lists every owner receipt, the receipt label (`appended` for `native`,
+`synced` for `synchronous`) and the comparison cohort.
+
 ## Measurement gate for external cold-state capture
 
 An optional `RunConfig.measurement_gate` pauses after preload, warm-up and aging have drained, immediately before the `measurement` phase begins. Its shape is:
@@ -279,13 +513,27 @@ An optional `RunConfig.measurement_completion_gate` uses the same shape and mark
 
 ## Measurement-phase write diagnostics
 
-`RunConfig.diagnostics.write_profile_limit` defaults to `0`, which leaves the ordinary backend write paths unprofiled and emits no `write-diagnostics.json`. Values from `1` through `65_536` request sampled evidence. The runner arms profiling only after warm-up/aging and the optional pre-measurement gate; it finalizes the profile only after the completion gate, before post-workload qualification. With `measurement_completion_gate`, this ensures the live client process remains available for end accounting before a remote profile finalizer performs its drain/control work.
+`RunConfig.diagnostics.write_profile_limit` defaults to `0`, which leaves the ordinary backend write paths unprofiled and emits no `write-diagnostics.json`. Values from `1` through `65_536` request diagnostic evidence; selection depends on the backend. The runner arms profiling only after warm-up/aging and the optional pre-measurement gate; it finalizes the profile only after the completion gate, before post-workload qualification. With `measurement_completion_gate`, this ensures the live client process remains available for end accounting before a remote profile finalizer performs its drain/control work.
 
 Native scalar `put`/`delete` samples time the existing `WalWriter::write` append and `LargeTable` index application separately through benchmark-only entry points; those entry points preserve the native write algorithm and add clocks only on selected operations. A configured Value-WAL barrier has a separate existing file/namespace persistence profile; page-cache mode reports that barrier as not applicable. Native batch writes are explicitly excluded from native append/index stage sampling.
 
 TCP/EFA adapters arm the existing append-owner connection profiler dynamically at the measurement boundary. Their cap is per append-owning connection; the artifact reports expected/captured connections, sampled requests, transport/client/server scopes and owner append/persistence scopes. A zero sample count or incomplete profile remains visibly unavailable. The legacy receive-frame clock is not collected under multiplexing; zero is not a measured receive cost. Client, transport and owner timers can overlap and are not additive shares of API latency. These clocked samples are bounded diagnostic evidence, not per-operation percentiles, physical device I/O, or a representative latency distribution. The artifact records unsupported stages and phase/selection policy explicitly.
 
-Distributed evidence also includes an optional `coordinator_interval` of whitelisted monotone coordinator counters, computed from a fresh snapshot immediately after profile arm and a fresh snapshot after the last measured write reply, before profile finalization drains or sends control requests. It is separate from sampled owner-prefix clocks and excludes pre-measurement counters by subtraction. Its nanosecond stages are cumulative stage-clock deltas, not wall time; overlapping coordinator stages and checkpoint work must not be added as disjoint fractions. Missing or decreased counters are reported as unavailable rather than zero-filled.
+For `tidehunter_live_nvmeof`, the nonzero limit enables an existing fixed-space
+counter window; it does not select a first-N prefix. The arm snapshot is taken
+after warmup and the end is frozen before the completion gate, excluding the
+gate and finalizer. `stages.live_nvmeof` contains checked cumulative scalar
+deltas, with completed NVMe writes as `selected_operations`. One I/O frame
+need not equal one key or API call. Reads, metadata, errors and each elapsed
+clock's sample count remain separate populations. Missing or reset counters,
+unfrozen ends, errors and unknown writes fail the diagnostic; zero writes are
+unavailable for admission. These clocks overlap and include scheduling, kernel,
+fabric and target work where applicable; they are not device or wire latency
+or stage percentiles. See [live timing interpretation](../../experiments/nvmeof/LIVE_WAL.md#timing-interpretation).
+
+Distributed evidence also includes an optional `coordinator_interval` of whitelisted monotone coordinator counters, computed from a fresh snapshot immediately after profile arm through a snapshot **after the completion gate**, before profile finalization drains or sends control requests. Its legacy `measurement_boundary_cumulative_delta` scope name does not imply an exact measured-request window: background/checkpoint completions during gate observation can enter this delta. It is separate from sampled owner-prefix clocks and subtracts values already charged at arm time. Checkpoint phase sums/counts are charged when a checkpoint completes; they can include work begun before arm and exclude checkpoints still in flight at the end. Root adoption, live owner installation, worker cleanup and index preparation remain separate phase populations. These cumulative stage-clock deltas are not wall time or per-request durations; overlapping stages must not be added as disjoint fractions. Missing or decreased counters are reported as unavailable rather than zero-filled.
+
+The checkpoint phase subset additionally requires `coordinator_checkpoint_diagnostics_available=true`. A missing/false flag suppresses those Prometheus clocks, even if stale numeric fields exist; a zero phase count does not mean zero latency. Dynamic profile arming now completes older checkpoint work before enabling/resetting its bounded diagnostic ring, outside measurement. This does not add collection to unprofiled primary cases.
 
 Connection/transport counters and owner append samples are not interchangeable
 populations. The local functional run recorded 1280 sampled append requests
@@ -294,6 +542,84 @@ own count, not the owner sample count, when interpreting its accumulated clocks.
 The 4096 logical measured writes are a third count; append grouping can coalesce
 multiple logical batches into one RPC. None of these totals is a per-operation
 stage latency percentile.
+
+Cloud Markdown reports now show write-stage sums and their own denominators, including mixed append/checkpoint-control exchanges, owner file syncs and separately scoped coordinator pressure/checkpoint phases. Missing observations are not zero-filled. The adapter omits legacy unattributable receive/send/header/body clock fields from its exported stage samples and lists them as unsupported; the peer wire format is unchanged. The unconditional `cq_poll_gap_max_ns` includes idle periods, whereas `cq_max_poll_gap_ns` covers pending local TX only; neither measures outstanding-RPC response delay or physical wire RTT. The current first-N policy has no join to individual slow API rows. Diagnostic arming drains an older checkpoint before measurement, so these runs are not isolated measurements of timer overhead versus unprofiled cases.
+
+
+## Request-linked write timelines
+
+`diagnostics.write_timeline_limit` defaults to zero; `1..=65536` selects the first
+admitted measurement-phase put, delete, or put_batch calls for a distributed
+Tidehunter backend. It is independent of the aggregate write profiler and cannot
+be combined with `write_profile_limit`: that profiler's cap changes admission.
+Warmup and qualification are not traced. Selection does not stop or drain
+measurement when the cap is reached. `samples.csv` includes an optional
+`caller_sample_id`; an empty field, including in historical CSVs, means no ID.
+The bounded `write-timeline.json` is exported after measurement and the optional
+completion gate. It retains dropped/incomplete counters, errors and absent stages.
+Finalization runs on a dedicated thread with the global deadline plus shutdown
+grace passed to the engine. If it cannot finish in time, the run fails and the
+timeline is marked unavailable; terminal benchmark artifacts are still published.
+An outstanding finalizer retains its backend reference, so shutdown also reports
+that ownership remains outstanding rather than claiming cleanup completed.
+
+For a local distributed configuration with a fresh output directory, set
+`"diagnostics":{"write_timeline_limit":4096,"write_profile_limit":0}` and run:
+
+```sh
+kv-research --config /path/to/local-distributed.json --output /path/to/fresh-result
+python3 experiments/kv-comparison/analyze_write_timeline.py /path/to/fresh-result --output /path/to/timeline-analysis.json
+```
+
+The analysis joins on caller ID, summarizes available intervals and shows the
+slowest calls with their raw events and errors. Coordinator timestamps share one
+monotonic origin; stage intervals overlap and are not additive. `tx_queued`
+marks local reactor queueing, not a NIC or kernel send; `completion_harvested`
+marks worker observation, not the decode instant. Their interval includes remote
+work and local processing and is not isolated wire latency. Server clocks, when
+available, belong to another clock domain and cannot be subtracted from these
+timestamps. Owner records join by owner and envelope ID and are summarized per
+envelope, not per logical call. `session_admission_wait_ns` includes session
+barrier and submit backpressure; `appender_queue_ns` runs from submit attempt to
+control dequeue. `control_queue_ns` combines session, appender, flusher and
+barrier waits; `wal_file_persist_ns` includes lookup and locking as well as
+synchronization and is not a pure fsync syscall timer. An absent file-persistence
+observation is not a zero-duration fsync. Instrumented runs are diagnostic, not
+a replacement for profile-zero primary measurements; missing records or events
+are unavailable, not zero.
+The linked owner summary counts each `(owner, envelope_id)` once even when an
+RPC covers multiple callers; the all-owner summary is a separate population.
+Raw persistence capture frontiers and cumulative group counts are retained, but
+their deltas are unavailable without independent proof that no untraced capture
+on another connection intervened.
+For live NVMe writes, `live_groups` joins sampled records by `BatchVersion` and
+owner. It retains the reservation token when received, and the owner completion
+RPC's validation duration and full persistence profile only when returned.
+These are group observations, not per-batch costs: count each group once even
+when it contains multiple sampled calls. `dropped_live_groups` counts groups
+omitted at the group limit or the four-times-limit total membership budget;
+missing completion stages or owner profile
+remain absent on errors. Coordinator events separate group construction,
+reserve RPC, NVMe submission through completion, completion RPC, and receipt
+validation; namespace setup has separate events when a new queue is needed. They include local
+scheduling and are not isolated network or media latency. The persistence
+profile's call counts determine which of its duration fields were observed;
+nested WAL and frontier durations must not be summed with their enclosing total.
+On owner failure, the first recorded cause is retained in a bounded diagnostic
+string and attached to later failed admissions and dropped write replies. An
+uncertain reply still identifies that reply's own batch version, not the first
+failed batch. This evidence does not identify the cause of earlier runs that
+did not retain it.
+
+
+Local and cloud campaign receipts bind this sidecar by its exact SHA-256, path
+and compact coverage summary, without duplicating the event payload. A requested
+completed capture requires matching case configuration, caller/raw joins and
+complete owner coverage. Missing or tampered evidence fails admission; failed
+partial captures remain partial. Generic result archives already retain JSON
+sidecars. Existing matrix defaults/counts are unchanged: enable the limit in
+both the selected job and its executed configuration, with the legacy write
+profile limit zero. Protocol 19 requires rebuilding all clients and owners.
 
 ## Measurement-phase read diagnostics
 
@@ -325,6 +651,30 @@ qualification. The optional completion gate remains outside the measurement.
   outcomes and failures whose owner profile was retained or unavailable.
 - `profile.read_evidence`: separate measurement-boundary coordinator-cache,
   WAL, NOWAIT, async and NVMe-reader observations. These are not the sampled prefix.
+- `profile.caller_correlation.trace`: a separate bounded, best-effort caller-ID
+  sample. Calls retain logical-member offsets and owner-dispatch attempts, lane
+  and reusable flight slots, request events, and, for live NVMe, SQE/CQE tokens.
+  Pair SQE and CQE events by nonzero queue ID and token; slots can be reused.
+  `members` and `coalesced_members` are logical API indices, not physical I/O
+  counts. When `membership_classified` is true, `coalesced_members` identifies
+  members joining pre-existing flights; duplicates within the same attempt can
+  also share one physical reference. Do not count the remaining members as I/O.
+  A coalesced follower does not inherit another call's device events. For live
+  I/O, count observed completions using unique paired nonzero queue-ID/token
+  events; sealed NVMe events describe logical requests, not individual SQEs. A
+  conservative 4 MiB total charge, group/event caps, contention, cancellation
+  and incomplete/error status are reported; missing observations are not zero.
+  All timestamps are coordinator-local monotonic offsets from that call's start.
+  SQE-to-CQE intervals include kernel and scheduling time, not pure wire or
+  physical-media latency. Aggregate resolution and physical-flight populations
+  remain independently selected and cannot be joined to these callers.
+
+The correlation follows the existing `remote_db/pending_read.rs` flight,
+`ReadRequest` and lane queues and `tcp/reactor.rs` `PendingRead` request map;
+the underlying authority and validation paths are unchanged. Its owner-thread
+locality is analogous to [eRPC's pinned event loop](https://github.com/erpc-io/eRPC/blob/de83dab3eab4a0fb19bfc4881c11d4a6b89ff17d/src/rpc_impl/rpc_ev_loop.cc)
+and [request dispatch](https://github.com/erpc-io/eRPC/blob/de83dab3eab4a0fb19bfc4881c11d4a6b89ff17d/src/rpc_impl/rpc_req.cc);
+this does not import eRPC's transport or hardware latency claims.
 
 `profile.owners` maps actual partition IDs to their own server stages and
 counters. It reuses the globally selected requests; it does not give each
@@ -404,6 +754,11 @@ point/bulk cache hits, negative index results, remote misses and errors, unlike
 the unchanged first-N *physical remote-flight* sampler. Its snapshot records
 index-lock wait, member-only index lookup, cache-lock wait and cache lookup,
 plus separate cut validation/capture, route, pin and batch-construction clocks.
+Bulk samples also record admitted batch wait, post-read cache-fill/accounting,
+and result materialization. These spans count only APIs that reach their end;
+preparation outcome counters do not imply that a later remote read succeeded.
+Older evidence without these three stages remains readable and does not emit
+invented zero-duration observations for them.
 Each has its own count, accumulated ns and maximum; bulk envelopes are not
 pooled with member lookups. Logical member outcomes
 and API resolution counts are distinct. `profile.coordinator_resolution_valid`
@@ -473,6 +828,29 @@ warm-WAL, storage-observation and bounded-mixed controls. Baseline/profiled
 twins are separate populations with the same input data. Backend-independent
 `data_id` binds matching key/value bytes; `source_id` identifies each population.
 Warm-up does not prove that every WAL read hit the Linux page cache.
+
+Normal local Tidehunter owners and new standard cloud cohorts now request
+`owner_read_resident_first=true`: a bounded NOWAIT read from the Linux page cache
+can finish without an asynchronous value-read completion. Cold standard cohorts
+request `false`; focused read-tier and sealed-storage controls retain their
+explicit policies. Preparation and adapter options must agree with the actual
+owner launch configurations. This does not add an owner application value cache.
+Unsupported NOWAIT, missing pages, partial reads and exhausted sweep budgets
+retain the bounded asynchronous fallback.
+
+Adjacent or overlapping authorized ranges in the same pinned file/log can share
+one asynchronous read, limited to 32 consecutive input slots and 64 KiB, without
+sorting or reading gaps. Results retain original order and duplicate slots.
+`async_read_submissions` and sampled owner async counts describe submitted I/O
+operations; `completed_reads` and `wal_reads` describe logical members. A single
+I/O can now cover multiple members. Neither population establishes physical
+NVMe accesses, and their difference is not a cache-miss count.
+
+The comparison runner already provides one dedicated OS worker per configured
+concurrency slot. Native and Tidehunter adapters call their synchronous DB APIs
+directly there. Do not insert another semaphore, `spawn_blocking` queue or
+`block_in_place` layer merely because the outer trait uses `async`: it adds
+overhead without freeing these already-dedicated workers.
 
 ### Cold-device evidence is not a per-API NAND timer
 

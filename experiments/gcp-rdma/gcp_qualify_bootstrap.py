@@ -148,15 +148,22 @@ def pair_startup_script(bucket, run_id, source_sha256, deadline_utc, manifest_sh
 
 def fleet_startup_script(bucket, run_id, source_sha256, deadline_utc, manifest_sha256,
                          preparation_sha256, *, members, rdma_device, machine_type,
-                         live_transports=(), live_spdk=False, qualification_profile='full'):
+                         live_transports=(), live_spdk=False, qualification_profile='full', selection=None, suite_spec=None):
     """Prepare and qualify the admitted fleet before starting its ordinary worker."""
     gcp_runtime._sha(preparation_sha256)
     if qualification_profile not in ('full', 'focused'):
         raise ValueError('unknown qualification profile')
-    if qualification_profile == 'focused' and (live_transports or live_spdk):
-        raise ValueError('focused qualification forbids live and Valkey probes')
     if not isinstance(members, (list, tuple)) or len(members) - 1 not in gcp_runtime.owner_host_counts():
         raise ValueError('fleet must have one or five owner hosts')
+    if suite_spec is not None:
+        import manual_sui
+    if suite_spec is not None and not manual_sui.reviewed_sui_spec(manual_sui.reviewed_part(suite_spec)):
+        raise ValueError('unreviewed Sui qualification specification')
+    if qualification_profile == 'focused' and (live_transports or live_spdk):
+        if (not (gcp_runtime.live_mode({'mode': 'focused', 'selection': selection})
+                 or (suite_spec is not None and manual_sui.focused_qualification(suite_spec)))
+                or list(live_transports) != ['rdma'] or live_spdk or len(members) != 2):
+            raise ValueError('focused qualification forbids unreviewed live and Valkey probes')
     normalized = []
     for member in members:
         if not isinstance(member, dict):
@@ -177,7 +184,9 @@ def fleet_startup_script(bucket, run_id, source_sha256, deadline_utc, manifest_s
                         normalized[1]['name'], normalized[1]['rdma_ip'], rdma_device,
                         peer_instance_id=normalized[1]['id'], machine_type=machine_type,
                         live_transports=live_transports, live_spdk=live_spdk)
-    extra = {'qualification_profile': 'focused'} if qualification_profile == 'focused' else {}
+    extra = {'qualification_profile': 'focused', 'selection': selection} if qualification_profile == 'focused' else {}
+    if suite_spec is not None:
+        extra['suite_spec'] = suite_spec
     return _script(bucket, run_id, source_sha256, deadline_utc, manifest_sha256, 'fleet',
                    preparation_sha256=preparation_sha256, members=normalized,
                    rdma_device=rdma_device, machine_type=machine_type,
@@ -354,9 +363,18 @@ def _pair(package, cfg, deadline, store, own, identity):
     profile = cfg.get('qualification_profile', 'full')
     if profile not in ('full', 'focused'):
         raise ValueError('unknown qualification profile')
+    suite_spec = cfg.get('suite_spec')
+    if suite_spec is not None:
+        import manual_sui
+    if suite_spec is not None and not manual_sui.reviewed_sui_spec(manual_sui.reviewed_part(suite_spec)):
+        raise ValueError('unreviewed Sui qualification specification')
     if profile == 'focused' and (cfg.get('live_transports') or cfg.get('live_spdk')
                                  or cfg.get('valkey_qualification')):
-        raise ValueError('focused qualification forbids live and Valkey probes')
+        if (not (gcp_runtime.live_mode({'mode': 'focused', 'selection': cfg.get('selection')})
+                 or (suite_spec is not None and manual_sui.focused_qualification(suite_spec)))
+                or cfg.get('live_transports') != ['rdma'] or cfg.get('live_spdk')
+                or cfg.get('valkey_qualification')):
+            raise ValueError('focused qualification forbids unreviewed live and Valkey probes')
     sys.path.insert(0, str(package / 'source/experiments/kv-comparison'))
     import cloud_package
     proof = cloud_package.verify_directory(package, runtime=True, provider='gcp')

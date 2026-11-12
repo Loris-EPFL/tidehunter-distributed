@@ -1,0 +1,16 @@
+\begin{table}[H]\centering\small\setlength{\tabcolsep}{3pt}
+\begin{tabular}{llllll}\toprule
+A / B & Rep. & 1 KiB c1 & 1 KiB c16 & 64 KiB c1 & 64 KiB c16\\\midrule
+TLS cost & r0 & \N{F10:ab_pairs:0:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:10:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:20:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:30:mean_ratio_a_over_b:1|.2f}\\
+TLS cost & r1 & \N{F10:ab_pairs:5:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:15:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:25:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:35:mean_ratio_a_over_b:1|.2f}\\
+transport adaptive & r0 & \N{F10:ab_pairs:1:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:11:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:21:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:31:mean_ratio_a_over_b:1|.2f}\\
+transport adaptive & r1 & \N{F10:ab_pairs:6:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:16:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:26:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:36:mean_ratio_a_over_b:1|.2f}\\
+transport busy & r0 & \N{F10:ab_pairs:2:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:12:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:22:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:32:mean_ratio_a_over_b:1|.2f}\\
+transport busy & r1 & \N{F10:ab_pairs:7:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:17:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:27:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:37:mean_ratio_a_over_b:1|.2f}\\
+parking TCP & r0 & \N{F10:ab_pairs:3:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:13:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:23:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:33:mean_ratio_a_over_b:1|.2f}\\
+parking TCP & r1 & \N{F10:ab_pairs:8:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:18:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:28:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:38:mean_ratio_a_over_b:1|.2f}\\
+parking verbs & r0 & \N{F10:ab_pairs:4:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:14:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:24:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:34:mean_ratio_a_over_b:1|.2f}\\
+parking verbs & r1 & \N{F10:ab_pairs:9:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:19:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:29:mean_ratio_a_over_b:1|.2f} & \N{F10:ab_pairs:39:mean_ratio_a_over_b:1|.2f}\\
+\bottomrule\end{tabular}
+\caption{\textbf{SYNTHETIC --- invented layout fixture, not results.} Ratios of matched per-case means, A/B: TLS = TCP mTLS/TCP trusted (adaptive); transport = trusted TCP/trusted verbs at the named policy; parking = adaptive/Busy for the named trusted transport. Ratios are not differences or isolated wire/crypto timers. No ratio for failed, unqualified, missing or unmatched partners. Coordinator cache off; lanes one at c1, four at c16; r0/r1 separate. Busy spins owner and coordinator read driver, not kernel busy poll. Unmatched dimensions: TLS/security, polling, RPC/direct I/O; NVMe control is verbs trusted Adaptive.}
+\end{table}

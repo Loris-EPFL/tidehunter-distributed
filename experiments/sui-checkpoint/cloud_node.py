@@ -74,18 +74,19 @@ def sha256(path):
 
 def validate_config(config_path, owned_base=None):
     cfg = json.loads(bounded_text(config_path, 128 * 1024))
-    if not isinstance(cfg, dict) or not re.fullmatch(r'th-[0-9a-f]{16}', cfg.get('run_id', '')):
+    if not isinstance(cfg, dict) or not re.fullmatch(r'(?:th|bench)-[0-9a-f]{16}', cfg.get('run_id', '')):
         raise ValueError('invalid owned run ID')
     owner = (OWNED_BASE if owned_base is None else owned_base) / cfg['run_id']
     transport = cfg.get('transport')
     if (transport not in ('tcp', 'efa', 'efa-direct', 'efa-native',
-                          'tidehunter_verbs', 'tidehunter_verbs_native')
+                          'tidehunter_verbs', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma')
             or not isinstance(cfg.get('cell_id'), str)
             or not re.fullmatch(r'r0[1-4]-' + re.escape(transport) + (r'(?:-rma)?' if transport == 'efa-native' else ''), cfg['cell_id'])):
         raise ValueError('invalid matrix cell/transport identity')
     client_transport = validate_transport(cfg.get('client_transport'))
     owner_transport = validate_transport(cfg.get('owner_transport'))
-    if protocol_key(client_transport) != protocol_key(transport_for_case(transport)):
+    control_label = 'tidehunter_verbs_native' if transport == 'tidehunter_nvme_rdma' else transport
+    if protocol_key(client_transport) != protocol_key(transport_for_case(control_label)):
         raise ValueError('client Transport protocol differs from matrix cell')
     if protocol_key(client_transport) != protocol_key(owner_transport):
         raise ValueError('storage owner transport protocol differs from client')
@@ -143,6 +144,22 @@ def validate_config(config_path, owned_base=None):
             raise ValueError('invalid storage launch YAML') from None
         if not isinstance(document, dict) or not isinstance(document.get('node'), dict):
             raise ValueError('missing storage node configuration')
+        live_target = document['node'].get('live_target')
+        if transport != 'tidehunter_nvme_rdma' and 'live_target' in document['node']:
+            raise ValueError('live target requires the NVMe-oF cell')
+        if transport == 'tidehunter_nvme_rdma' and not isinstance(live_target, dict):
+            raise ValueError('NVMe-oF cell requires a live target')
+        if live_target is not None:
+            state = owned_path(live_target.get('state_dir'), root, 'absent')
+            if state != launch.parent / 'live-nvmeof':
+                raise ValueError('live target state directory differs from launch')
+            if live_target.get('export_mode', 'on_demand') not in ('on_demand', 'per_file', 'per_owner'):
+                raise ValueError('invalid live export mode')
+            outputs.append(state)
+        if 'durability' in document:
+            durability = document['durability']
+            if not isinstance(durability, dict) or durability.get('tier') not in ('native', 'synchronous'):
+                raise ValueError('invalid owner durability tier')
         data = owned_path(document['node'].get('root'), root, 'absent')
         ready = owned_path(cfg['ready_files'][index], root, 'absent')
         stop = owned_path(cfg['stop_files'][index], root, 'absent')

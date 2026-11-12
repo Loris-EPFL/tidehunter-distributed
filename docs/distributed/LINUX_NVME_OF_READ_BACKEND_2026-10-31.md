@@ -12,6 +12,23 @@ The original NVMe experiment started at `348b6dca3e53e71c74af5fd04dea466e5052d7d
 
 **Not hardware-qualified on this branch:** NVMe/RDMA. The namespace reader and lifecycle tools select `tcp` or `rdma` explicitly and verify the actual connection. A compatible RDMA-CM/RC path is required. An active adapter, EFA/SRD messaging, or libfabric `FI_READ` support alone is not such proof. Ordinary TCP/EFA record messaging remains available; the engine no longer uses registered-value grants.
 
+### Sealed direct-I/O measurement control
+
+The explicit `kernel_direct` binding selects kernel nvmet `buffered_io=0` for
+an immutable sealed read-only export image. It is never the default. Target setup
+writes and reads back this value before namespace enable. Owner lease admission
+requires 0 for `kernel_direct` and 1 for `kernel`; both require the same image,
+manifest, identity and namespace write-protection checks. Existing persisted
+`kernel` and SPDK bindings keep their encoding and registry version.
+
+The focused campaign admits direct targets only for G1 cold `media_read` jobs
+on `tidehunter_nvme_rdma` with route `sealed_read` and target `kernel`.
+The reader binding becomes `kernel_direct`. Per-owner read-back values are in
+`nvme-targets.json`: `[owner].target.exports[export].target_receipt.buffered_io`.
+Missing or mismatching read-back fails setup. All live writable WAL targets
+remain buffered. Local fixture tests do not prove hardware or media performance.
+
+
 ## Data path
 
 ```mermaid
@@ -40,7 +57,35 @@ The checked file-relative member offset is:
 
 The eight-byte prefix is the native CRC frame header. Group offsets already resolved by the receipt must not be added twice. Reads round outward to the namespace's verified block size, check overflow and image bounds, and expose only the exact encoded member. Terminal CQ retirement permits moving the aligned allocation into `minibytes::Bytes` and slicing it without another member-data copy. `CompleteBatch::decode_record` still validates the native member checksum and expected key/keyspace/descriptor.
 
-One member can require more aligned bytes than its application value. A batch is not promised to become one NVMe command; kernel splitting and merging also mean io_uring operation counts are not physical-command counts. Identical logical misses can use the existing coalescing path; general overlapping-block range merging is not claimed.
+One member can require more aligned bytes than its application value. A batch is not promised to become one NVMe command; kernel splitting and merging also mean io_uring operation counts are not physical-command counts. Identical logical misses can use the existing coalescing path. Within one request, members that hit the same, overlapping or adjacent aligned blocks of the same reader (one source file and generation) are merged into one SQE; see "Planning, merging and buffers".
+
+## Sealed reader concurrency
+
+Each installed reader serves one owner endpoint (its manifest partition). Only that endpoint's reactor submits to it and harvests its CQ. The reader lives in its own cell with its own mutex (`pending_read/sealed.rs`). The mutex covers ring submit and CQ harvest only; record verification and request completion run with no lock held. No lock is shared between two readers, and a caller thread never touches a reader on the read path.
+
+Callers plan without a lock. Each reader exposes an immutable `NvmeofCatalog` (eligibility, aligned range, byte charge). The reader set is an `ArcSwap` snapshot (`NvmeRouting`) that only install and release replace, with admission paused and no read outstanding. Shutdown is per endpoint: a reactor closes its own readers once its channel is drained.
+
+Admission has two separate signals. `admission_generation` wakes callers waiting for credit and advances on every credit release. `NvmeRouting::generation` advances only when the reader set changes. A request is planned against one routing snapshot, and the credit reservation checks under the credit mutex that the snapshot is still current. A credit release therefore never invalidates an admission in progress. The generation guards nothing else.
+
+Counters (read evidence, `read_profile_*`): `admission_retry_{credit,flight,lane,paused,config,mixed}` give the cause of every refused admission; only `config` means a reader-set change and only `credit` means exhausted request or byte credit. Per reader (`NvmeofStats`): `lock_wait` (contended acquisitions only), `lock_hold`, `alignment` (one observation per planned member), `admitted_sqes`, `merged_members`, `pool_hits`, `pool_misses`, `pool_recycled`, `pool_discarded`. Live lanes: `live_lane_full`, `live_lane_depth_max`, `live_lane_pending_max`, `live_pending_wait_ns`.
+
+## Planning, merging and buffers
+
+A request is planned once. `plan_member` computes the aligned range and charge of one member (one alignment observation). The batch keeps these plans, admission sums them, and the reader receives a prebuilt `ReadPlan` (SQE layout), so a retry or a full reader repeats no alignment or merge. Only a changed reader set replans.
+
+Merging sorts members by aligned offset and folds neighbours whose ranges overlap or touch. A merged read never covers a byte that no member's aligned range covers (no gap reads), serves at most 32 members, and is at most `max_inflight_bytes` long. Every member keeps its own slice and is verified by `decode_record` as before. Members of other files or generations are never admitted by the reader, so they cannot merge.
+
+Aligned buffers come from a bounded per-reader pool with one class per length of 1 to 32 alignment units (128 KiB at 4 KiB alignment); longer reads are allocated exactly and not retained. A pooled buffer is exactly as large as the byte charge assumes, so pooling never exceeds `max_inflight_bytes`. Idle memory, counted as whole allocations including alignment slack, is at most a quarter of that limit and 8 MiB, split evenly over the classes; a class whose share holds no whole buffer retains none. At most 256 buffers per class. One shared `Bytes` owner backs all slices of a read; the buffer returns to the pool when the last slice drops, never before the terminal CQE and never while a slice lives. A fresh buffer is zero-filled only because safe Rust has no uninitialized `Vec<u8>`; a recycled buffer keeps stale bytes, which no caller can observe because the exposed window is exactly the bytes the CQE reported written.
+
+## Live lane worker
+
+Each live lane has one worker thread that owns its `LiveReadCache`. The endpoint actor never blocks on a lane: it `try_send`s into the lane's bounded inbox (capacity = flight slots, and every queued request holds a flight credit), wakes the worker through the lane eventfd, and keeps any overflow in a per-lane queue bounded by the same credits. The worker keeps many requests in flight, admits them in arrival order while `LiveIo` slots and byte credits allow, and delivers each to its caller as it finishes, in any order. Each caller owns its own result slot, so per-caller result order does not depend on completion order. The worker blocks on its channel only when nothing is queued or in flight; with requests in flight it sleeps in `LiveReadCache::wait` (CQ readiness, the waker, or the nearest deadline). Counters: `live_lane_full`, `live_lane_depth_max`, `live_lane_pending_max`, `live_pending_wait_ns`.
+
+Terminal namespace read errors retain the original OS error and report the CQE
+result, aligned offset and requested length, token, partition, namespace path and
+export UUID. The coordinator records a failed read completion before publishing
+the shared fail-closed state, so later authority-health errors retain the cause.
+This diagnostic does not retry a failed read or bypass recovery.
 
 ## Authority and lifetime: deliberate safety restriction
 
@@ -67,7 +112,7 @@ Target disable alone is not proof that an initiator has consumed every completio
 - No change to inherited WAL encoding, application value records, index lookup format, complete-batch placement, write durability barrier, replay, relocation or GC algorithm.
 - No global physical WAL or new per-write replicated log.
 - No external Sui repository modification. `distributed::sui::Db` gains optional backend-control/metrics methods; the actual Sui checkpoint pipeline is not claimed tested here.
-- No original Tidehunter mutex was removed. New locks protect queue ownership, short statistics updates, installation/shutdown and durable authority transitions. No lock-free or zero-overhead claim is made.
+- No original Tidehunter mutex was removed. Each sealed reader has its own mutex (see "Sealed reader concurrency"); other new locks protect queue ownership, installation/shutdown and durable authority transitions. Reader statistics are atomics. No lock-free or zero-overhead claim is made.
 - No new per-value metadata-validation RPC. Authority work is amortized at setup and teardown.
 - No new cryptographic binding on each value. Native checksum verification remains. The existing authenticated control channel is retained.
 
@@ -109,6 +154,16 @@ Use the root-managed commands in `experiments/nvmeof/README.md`. The source owne
 `nvmeof-check NEW_DIRECTORY NAMESPACE_HEX [KEYS=64] [VALUE_BYTES=256]` prepares a bounded dataset and emits `ready.json`. Supply atomically published `bindings.json` containing exactly one `{export_uuid, namespace_path, transport}` binding per export. After the first reader closes and releases, the driver emits `rebind-ready.json`: disconnect the old owned controllers, remove the owned targets, recreate/protect them, and publish fresh paths in `rebind-done.json`. A previous device pathname is not a valid identity proof.
 
 The helper supplies a stable private host ID derived from the explicit host NQN. Reusing the machine's ambient host ID for a different NQN failed on this host with kernel `found same hostid ... but different hostnqn`; no `/etc/nvme` settings were changed. CLI failures now retain their actual stderr.
+
+Controller and namespace inventories require two complete matching scans.
+During asynchronous deletion, `ENOENT` and `ENODEV` invalidate a scan and reset
+that proof. They do not prove absence. Persistent churn reaches the existing
+bounded timeout with identity unknown; cleanup remains blocked.
+
+Probe retirement writes `delete_controller` through a retained sysfs directory
+descriptor after checking inode, NQN, host NQN, transport and address. A failed
+sealed-route CLI disconnect uses this path once for the unchanged controller.
+Both paths still require a complete final absence proof before cleanup.
 
 ### External campaign preparation
 
@@ -187,6 +242,8 @@ Reader details in backend receipts contain namespace binding, source identity, g
 
 `measurement-read-evidence.json` preserves raw lifetime boundary snapshots and provides per-reader stage count/sum deltas and means for the drained measurement interval. Verification and warmup are excluded by subtraction. Changed or malformed reader identities, missing/decreasing/saturated counters, and invalid maxima make the affected evidence unavailable; zero observations have no mean. `measurement_max_ns` is unavailable, not a difference of lifetime maxima.
 
+The per-reader deltas also carry the monotone counters `admitted_sqes`, `merged_members`, `pool_hits`, `pool_misses`, `pool_recycled` and `pool_discarded`, and the stages `lock_wait` (contended dispatch-lock acquisitions only; zero observations mean no contention) and `lock_hold`. A reader snapshot that lacks any of them makes that reader's evidence unavailable. In `write-diagnostics.json` the live write window (`profile.stages.live_nvmeof`) adds the lane in-flight sums and sample count, `delivery_*`, `controller_connect_*`, `controller_disconnect_*`, `grant_hits`, `grant_misses`, `grant_evictions` and `copy_bytes_avoided` as deltas. The two lane maxima are gauges: `profile.live_nvmeof_peaks.<name>` records `at_start` and `at_end` and is never subtracted.
+
 Focused initial-cold cases can opt into `phases.evict_mapped_wal_before_measurement`. With Linux `test-utils` on every participating binary, this runs once after warmup and aging drain and before the measurement gate; the controller can then drop OS page cache while the gate is held. Native uses its existing mapped-WAL evidence helper; remote owners use authenticated control to evict mappings for every retained epoch, requiring a disabled coordinator value cache. Results or errors are recorded in `pre-measurement-wal-eviction.json`; unsupported backends and failed evictions reject the run. This advisory initial state does not prove physical NAND access or prevent buffered reads warming the cache again.
 
 `submit_to_cq` includes initiator kernel, transport, target and backing-storage work. It is not pure network or device time. On the current branch, initiator `O_DIRECT` bypasses initiator caching, **not** the buffered target's Linux page cache. The historical direct-target run also bypassed target page cache. Neither positive block counters nor a first-touch key sweep establish physical-NAND service for every request.
@@ -228,6 +285,31 @@ Current Sui replay build plans now declare wire protocol 15. An actual offline `
 A full `typed-store --features sharded-wal` run without `SUI_SHARDED_WAL_CONFIG` passed 33 tests and failed three database-opening fixtures at the required configuration guard. Neither the guard nor those tests was weakened. This is not a complete distributed Sui test or checkpoint replay qualification; no full checkpoint replay was rerun for this branch. The small retained evidence and explicit validation boundaries are in `checkpoint-work/linux-pagecache-nvme-rdma-local-8927f23e/qualification-summary.json`.
 
 This laptop has no visible active RDMA device; preflight reported missing `nvme_rdma`, `rdma_cm` and root execution as well. No privileged namespace/hotplug test, cloud launch or RDMA latency claim follows from these checks. The next hardware qualification needs a compatible RDMA-CM/RC fabric, isolated trusted networking, root-managed kernel NVMe targets/initiators, read-only protection and the existing drain/cleanup procedure. Run `nvmeof-check` to prove mixed coordinator hits, uncached ordered/duplicate batches with actual namespace completions, cached repeats, clear and rebind before measuring cluster latency.
+
+## Buffered-target short-read repair, 2026-11-05
+
+Linux's nonblocking file-target submission can return a positive short read.
+The examined target code handles `-EAGAIN` and `-EOPNOTSUPP` by scheduling
+blocking work, but treated a positive short read as NVMe INTERNAL/DNR.
+A local paired kernel trace recorded a 4096-byte result for an 8192-byte
+`IOCB_NOWAIT` request. The preserved cloud failure is consistent with this
+mechanism, but its controller status alone does not prove the same internal
+return occurred there.
+
+The reviewed patch in `experiments/nvmeof/patches/` uses the existing blocking
+workqueue for this positive-short, nonblocking-read case. It does not retry
+completed errors, report partial data as successful, alter write/FUA/flush,
+or disable the target page cache. The full-range retry is safe for an immutable
+sealed image; blocking short reads and actual errors retain their failure path.
+
+The actual five-owner local buffered-kernel run passed 65,536 verification
+reads and 2,048 batch-32/C16 API measurements, with no value errors, outstanding
+work or leaked controllers. Stock local module identity was restored afterward.
+This is not physical RDMA or NAND timing evidence. The separate CIQ cloud
+module has exact-kernel source/ABI admission; real cloud load and the complete
+matrix remain separate gates. See
+[`experiments/gcp-rdma/setup.md`](../../experiments/gcp-rdma/setup.md#buffered-linux-nvme-target-repair-2026-11-05)
+for the pinned asset and six-guest admission.
 
 ## Primary references
 

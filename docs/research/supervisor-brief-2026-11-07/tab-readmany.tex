@@ -1,0 +1,9 @@
+\small
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lrrrrrrrrr}\toprule
+Case (8 KiB, c16) & calls & owners & total & pre-flight & group gap & admit & submit wait & flight & deliver + post\\\midrule
+verbs, random keys (0474) & 222 & 4.7 & 892 & 134 & 116 & 66 & 265 & 149 & 161\\
+TCP, random keys (0483) & 225 & 4.6 & 933 & 130 & 140 & 83 & 95 & 372 & 114\\
+verbs, repeat batch (0095) & 226 & 4.8 & 729 & 114 & 136 & 59 & 183 & 170 & 68\\
+verbs, sweep batch (0093) & 192 & 1.0 & 692 & 49 & 0 & 83 & 24 & 515 & 21\\
+\bottomrule\end{tabular}}

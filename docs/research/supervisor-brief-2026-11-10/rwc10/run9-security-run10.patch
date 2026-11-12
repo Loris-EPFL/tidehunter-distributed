@@ -1,0 +1,11 @@
+--- a/rwc/section-rwc.tex
++++ b/rwc/section-rwc.tex
+@@ -2,7 +2,7 @@
+ \section{Two-VM remote reads and writes (run 9)}\label{sec:rwc}
+ \textbf{\RWCstate} \RWCFINDING{parity}
+ 
+-\textbf{Topology and parity.} Selection \texttt{remote\_rw\_compact} uses one coordinator and one remote shard-WAL VM, both \texttt{z4m-highmem-16}, in \texttt{us-central1-a} with compact placement. Native runs in process on the coordinator SSD; owner TCP/verbs use the remote owner SSD. Workloads match size, caller count and repetition; read arms also match keys/order, geometry, distribution, operation/warmup counts, mix, read tier and zero coordinator-cache bytes within each temperature. Network/security, index/history, routing and host SSD remain different.
++\textbf{Topology and parity.} Selection \texttt{remote\_rw\_compact} uses one coordinator and one remote shard-WAL VM, both \texttt{z4m-highmem-16}, in \texttt{us-central1-a} with compact placement. Native runs in process on the coordinator SSD; owner TCP/verbs use the remote owner SSD. Workloads match size, caller count and repetition; read arms also match keys/order, geometry, distribution, operation/warmup counts, mix, read tier and zero coordinator-cache bytes within each temperature. Network/security, index/history, routing and host SSD remain different. Run-9 TCP used mutual TLS and verbs trusted/no TLS, so their ratios include the security difference; run 10 adds trusted TCP rather than treating run 9 as like-for-like transport evidence.
+ 
+ \textbf{Lanes and acknowledgement.} Native has zero remote-read lanes (in-process). Each owner uses one lane at c1/c5 and four at c16. Thus c5 owner reads are lane-limited, \emph{not a transport limit or a basis to rank transports}. Native page cache is not durable; Native per-put file/directory fsync, grouped Native barrier and owner covering file fdatasync remain distinct. Similar durable intent does not establish equal crash recovery; RF1 is not failover.
+ 

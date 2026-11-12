@@ -30,9 +30,12 @@ mod control;
 mod inventory;
 mod live_client;
 mod payload;
-pub use live_client::LiveClientConfig;
+pub use super::nvmeof::{LiveExportMode, LiveQueueGeometry};
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub(super) use live_client::LiveGroupBudget;
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+pub(crate) use live_client::leased_tests;
+pub use live_client::{LiveClientConfig, LiveWriteMode};
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 mod live_control;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -42,8 +45,8 @@ mod live_recovery;
 pub use diagnostics::{ConnectionProfile, PollingProfile, SocketProfile, WorkProfile};
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub use live_control::{
-    LiveCompletion, LiveRecordLocation, LiveRecordLocations, LiveRecoveryEntry, LiveRecoveryPage,
-    LiveReserveResponse, LiveReserved,
+    AdoptProfile, LeaseProfile, LiveAdopted, LiveCompletion, LiveLeased, LiveRecordLocation,
+    LiveRecordLocations, LiveRecoveryEntry, LiveRecoveryPage, LiveReserveResponse, LiveReserved,
 };
 use payload::WireBytes;
 #[cfg(test)]
@@ -87,10 +90,10 @@ use std::time::{Duration, Instant};
 pub use inventory::NodeInventory;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 pub use inventory::SealedOwnerExport;
-/// Wire protocol version. 21: `ReadExecutorStats` gained the owner-wide
-/// `transport` aggregate. 20: `ReadExecutorStats` and `TransportProgressStats`
-/// gained lock-profile, send-size and EAGAIN counters; `Transport::TcpTrusted`.
-const PROTOCOL: u32 = 21;
+/// Wire protocol version. 22 adds leased live WAL extents and adoption proofs.
+/// 23 adds OpenLiveExports for permanent live export.
+/// 24 adds lease profiles, PreleaseLiveExtent, CheckpointPosition, ReplayWal, ReplayLiveWal and RetireWalFiles.
+const PROTOCOL: u32 = 24;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
 /// Leave one protocol request slot available for ordered checkpoint control.
 pub(super) const APPEND_COMMAND_WINDOW: usize = reactor::SESSION_REQUESTS - 1;
@@ -268,6 +271,7 @@ pub struct NodeEpoch {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeStatus {
     pub partition: PartitionConfig,
+    pub history_persistence: super::storage::HistoryPersistence,
     pub shape_yaml: String,
     pub max_epochs: usize,
     pub epochs: Vec<NodeEpoch>,
@@ -599,6 +603,52 @@ enum Request {
     OwnerTimelineFetch {
         offset: usize,
     },
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    LeaseLiveExtent {
+        epoch: u64,
+    },
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    AdoptLiveExtent {
+        epoch: u64,
+        token: [u8; 16],
+        through: u64,
+        close: bool,
+        lease_next: bool,
+    },
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    OpenLiveExports {
+        authority_epoch: u64,
+    },
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    PreleaseLiveExtent {
+        epoch: u64,
+        after: [u8; 16],
+    },
+    CheckpointPosition {
+        authority_epoch: u64,
+        epoch: u64,
+        through: u64,
+    },
+    ReplayWal {
+        authority_epoch: u64,
+        source_epoch: u64,
+        from: u64,
+        limit: usize,
+        require_end: u64,
+    },
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    ReplayLiveWal {
+        authority_epoch: u64,
+        source_epoch: u64,
+        from: u64,
+        limit: usize,
+        require_end: u64,
+    },
+    RetireWalFiles {
+        authority_epoch: u64,
+        epoch: u64,
+        files: Vec<u64>,
+    },
 }
 impl Request {
     fn is_measurement_control(&self) -> bool {
@@ -642,6 +692,12 @@ impl Receipt {
 #[derive(Serialize, Deserialize)]
 enum Response {
     Checkpoint(checkpoint::CheckpointProof),
+    CheckpointPosition {
+        database: [u8; 16],
+        partition: u32,
+        epoch: u64,
+        durable_end: u64,
+    },
     RetirementFiles(Vec<u64>),
     Retired,
     ReadIoStats(ReadExecutorStats),
@@ -717,6 +773,12 @@ enum Response {
         incomplete: u64,
         more: bool,
     },
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    LiveLeased(LiveLeased),
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    LiveAdopted(LiveAdopted),
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    LiveExports(live_control::LiveExportInfo),
 }
 
 /// Authenticated owner metadata for an exact, durable member of a sealed WAL.
@@ -884,6 +946,14 @@ impl StorageNode {
         self.inventory
             .lock()
             .set_history_maintenance_diagnostics(enabled);
+    }
+
+    /// Select owner receipt persistence before accepting writes.
+    pub fn set_history_persistence(
+        &self,
+        mode: super::storage::HistoryPersistence,
+    ) -> Result<(), TcpError> {
+        self.inventory.lock().set_history_persistence(mode)
     }
 
     /// Cumulative local snapshots, paired with epoch, without an RPC.
@@ -1402,11 +1472,19 @@ pub struct Client {
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_config: Option<LiveClientConfig>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    live_exports: Option<(u64, live_control::LiveExportInfo, u64)>,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_pool: Option<Arc<super::nvmeof::live_pool::LiveControllerPool>>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_writer: Option<live_client::LiveWriteQueue>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_writer_closing: bool,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    live_leased: live_client::LeasedWriter,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    live_write_failed: bool,
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    live_write_local_fixture: bool,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_counters: Option<Arc<super::nvmeof::live_metrics::LiveNvmeCounters>>,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -1647,11 +1725,19 @@ impl Client {
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_config: None,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            live_exports: None,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_pool: None,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_writer: None,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_writer_closing: false,
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            live_leased: live_client::LeasedWriter::default(),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            live_write_failed: false,
+            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            live_write_local_fixture: false,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_counters: None,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]

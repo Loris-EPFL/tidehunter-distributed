@@ -21,10 +21,19 @@ pub(super) struct Fixture {
     pub(super) nodes: Vec<Arc<StorageNode>>,
     shutdown: Arc<AtomicBool>,
     servers: Vec<JoinHandle<Result<(), TcpError>>>,
+    startups: Vec<(NodeConfig, TlsFiles, TcpListener)>,
     pub(super) temp: tempdir::TempDir,
 }
 
 impl Fixture {
+    pub(super) fn history(mut self, mode: HistoryPersistence) -> Self {
+        self.config.history_persistence = mode;
+        for node in &self.nodes {
+            node.set_history_persistence(mode).unwrap();
+        }
+        self
+    }
+
     pub(super) fn new() -> Self {
         Self::new_with_capacity(128)
     }
@@ -83,6 +92,7 @@ impl Fixture {
         let temp = tempdir::TempDir::new("remote-pipeline-mtls").unwrap();
         let certs = tls_material::TestCertificates::generate(&temp.path().join("tls"), 5).unwrap();
         let mut config = RemoteDatabaseConfig {
+            history_persistence: HistoryPersistence::default(),
             storage: LocalInventoryConfig {
                 database: [71; 16],
                 partitions: vec![0, 1, 2, 3, 4],
@@ -133,25 +143,25 @@ impl Fixture {
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut nodes = Vec::new();
         let mut servers = Vec::new();
+        let mut startups = Vec::new();
         for (index, identity) in certs.nodes.into_iter().enumerate() {
-            let node = StorageNode::open(
-                NodeConfig {
-                    root: temp.path().join(format!("node-{index}")),
-                    partition: config.partition_config(1, index as u32),
-                    shape_yaml: shape.to_yaml().unwrap(),
-                    max_epochs: config.storage.max_epochs,
-                    read_workers: 2,
-                    wal_member_read: Default::default(),
-                    read_resident_first: false,
-                    read_memory_allowance_bytes: 512 * 1024 * 1024,
-                    read_max_inflight_requests: 32,
-                    read_max_inflight_bytes: 64 * 1024 * 1024,
-                    read_max_device_reads: 128,
-                    live_target: None,
-                },
-                metrics(),
-            )
-            .unwrap();
+            let node_config = NodeConfig {
+                root: temp.path().join(format!("node-{index}")),
+                partition: config.partition_config(1, index as u32),
+                shape_yaml: shape.to_yaml().unwrap(),
+                max_epochs: config.storage.max_epochs,
+                read_workers: 2,
+                wal_member_read: Default::default(),
+                read_resident_first: false,
+                read_memory_allowance_bytes: 512 * 1024 * 1024,
+                read_max_inflight_requests: 32,
+                read_max_inflight_bytes: 64 * 1024 * 1024,
+                read_max_device_reads: 128,
+                live_target: None,
+            };
+            let node = StorageNode::open(node_config.clone(), metrics()).unwrap();
+            node.set_history_persistence(config.history_persistence)
+                .unwrap();
             node.set_durability(crate::distributed::durability::DurabilityConfig::with_tier(
                 tier,
             ))
@@ -169,6 +179,7 @@ impl Fixture {
                 key: identity.private_key,
                 server_name: identity.server_name,
             };
+            startups.push((node_config, tls.clone(), listener.try_clone().unwrap()));
             let serving = Arc::clone(&node);
             let stop = Arc::clone(&shutdown);
             servers.push(thread::spawn(move || {
@@ -190,8 +201,42 @@ impl Fixture {
             nodes,
             shutdown,
             servers,
+            startups,
             temp,
         }
+    }
+
+    pub(super) fn stop_owners(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        for server in self.servers.drain(..) {
+            server.join().unwrap().unwrap();
+        }
+        self.nodes.clear();
+    }
+
+    pub(super) fn restart_owners(&mut self) -> Result<(), TcpError> {
+        self.shutdown.store(false, Ordering::Release);
+        for (config, tls, listener) in &self.startups {
+            let node = StorageNode::open(config.clone(), metrics())?;
+            node.set_history_persistence(self.config.history_persistence)?;
+            let serving = node.clone();
+            let tls = tls.clone();
+            let listener = listener.try_clone().unwrap();
+            let stop = self.shutdown.clone();
+            self.servers.push(thread::spawn(move || {
+                serving.serve(
+                    listener,
+                    tls,
+                    TcpLimits {
+                        io_timeout: Duration::from_secs(30),
+                        ..Default::default()
+                    },
+                    stop,
+                )
+            }));
+            self.nodes.push(node);
+        }
+        Ok(())
     }
 
     pub(super) fn open(&self) -> RemoteDatabase {
@@ -688,7 +733,22 @@ fn sparse_publication_retains_bounded_window_until_earlier_prefix_publishes() {
 
 #[test]
 fn conflicting_and_transitive_batches_wait_for_their_whole_predecessors() {
-    for transitive in [false, true] {
+    let wait_for_receipts = |db: &mut RemoteDatabase, expected| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            db.progress_pipeline(false).unwrap();
+            if db.pipeline_stats.durable_batches == expected {
+                break;
+            }
+            assert!(Instant::now() < deadline, "owner replies did not complete");
+            let _ = db
+                .completion_wake
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        }
+    };
+    for (transitive, harvest_before_last) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
         let fixture = Fixture::new();
         let mut db = fixture.open();
         let connection = Arc::clone(&db.clients[0].client);
@@ -713,19 +773,17 @@ fn conflicting_and_transitive_batches_wait_for_their_whole_predecessors() {
         // dispatching or waiting on the blocked first owner.
         db.submit(fixture.operation(1, 13), vec![put(10, 10)])
             .unwrap();
+        if harvest_before_last {
+            // Force the reply to be harvested before the next submit, which
+            // can also harvest it during normal admission.
+            wait_for_receipts(&mut db, 2);
+            assert!(db.inflight[1].is_empty());
+        }
         db.submit(fixture.operation(2, 14), vec![put(11, 11)])
             .unwrap();
-        for node in [1usize, 2] {
-            let group = db.inflight[node].pop_front().unwrap();
-            db.inflight_bytes[node] -= group.charge;
-            let receipts = group
-                .reply
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap()
-                .unwrap();
-            db.accept_receipts(receipts).unwrap();
-        }
-        db.publish_completed().unwrap();
+        // Admission may already have harvested either owner's reply. Wait for
+        // all four receipts without flushing the blocked first owner's tail.
+        wait_for_receipts(&mut db, 4);
         let before = (
             db.publication.is_published(first),
             db.publication.is_published(second),
@@ -1299,7 +1357,9 @@ fn same_shard_window_appends_successor_before_prefix_is_durable() {
 #[test]
 fn tail_flush_dispatches_third_group_before_prior_durability() {
     let shape = KeyShape::new_single(4, 1, KeyType::uniform(1));
-    let fixture = Fixture::new_with_shape_and_group(128, shape, 1).synchronous();
+    let fixture = Fixture::new_with_shape_and_group(128, shape, 1)
+        .synchronous()
+        .history(HistoryPersistence::OnDisk);
     let mut db = fixture.open();
     let (entered, release) = fixture.nodes[0].pause_next_persist(1).unwrap();
     let operations: Vec<_> = (0..3u64)
@@ -1358,7 +1418,9 @@ fn tail_flush_dispatches_third_group_before_prior_durability() {
 #[test]
 fn tail_flush_respects_bounded_owner_command_window() {
     let shape = KeyShape::new_single(4, 1, KeyType::uniform(1));
-    let mut fixture = Fixture::new_with_shape_and_group(128, shape, 1).synchronous();
+    let mut fixture = Fixture::new_with_shape_and_group(128, shape, 1)
+        .synchronous()
+        .history(HistoryPersistence::OnDisk);
     fixture.config.owner_append_occupancy = super::super::tcp::APPEND_COMMAND_WINDOW;
     let mut db = fixture.open();
     let (entered, release) = fixture.nodes[0].pause_next_persist(1).unwrap();

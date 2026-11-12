@@ -17,7 +17,8 @@ class ApiError(RuntimeError):
         super().__init__(f'Google API {status}: {message}')
 
 def local_token(project):
-    return subprocess.check_output(['gcloud', 'auth', 'print-access-token', '--project=' + project, '--quiet'], text=True, timeout=30).strip()
+    # 120 s: a token refresh over a degraded workstation uplink exceeded 30 s (12 November 2026).
+    return subprocess.check_output(['gcloud', 'auth', 'print-access-token', '--project=' + project, '--quiet'], text=True, timeout=120).strip()
 
 
 def metadata_token():
@@ -50,7 +51,9 @@ class GoogleApi:
                 detail = exc.read().decode('utf-8', 'replace')
                 if exc.code not in (429, 500, 502, 503, 504) or n + 1 == attempts:
                     raise ApiError(exc.code, detail) from exc
-            except (urllib.error.URLError, TimeoutError) as exc:
+            # urlopen wraps only connect/send errors as URLError; a peer close
+            # while waiting for the response surfaces as a raw ConnectionError.
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
                 if n + 1 == attempts:
                     raise ApiError(None, str(exc)) from exc
             time.sleep(min(2 ** n, 4))

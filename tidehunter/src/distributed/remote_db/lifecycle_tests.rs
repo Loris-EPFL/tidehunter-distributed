@@ -22,7 +22,7 @@ fn put_key(key: u32, value: u8) -> Mutation {
 
 #[test]
 fn control_monitor_waits_for_occupied_checkpoint_slot_and_stops_cleanly() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 70), vec![put(1)])
         .unwrap();
@@ -94,7 +94,7 @@ fn public_diagnostic_controls_wait_for_checkpoint_without_consuming_proof() {
     #[cfg(not(all(target_os = "linux", feature = "test-utils")))]
     let cases = 2;
     for case in 0..cases {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
         let mut db = fixture.open();
         db.write_batch(fixture.operation(0, 73), vec![put(1)])
             .unwrap();
@@ -220,7 +220,7 @@ fn nonpipelined_write_behind_pending_checkpoint_is_durable_and_recoverable() {
 #[cfg(all(target_os = "linux", feature = "test-utils"))]
 #[test]
 fn concurrent_eviction_waits_for_pending_checkpoint_control() {
-    let mut fixture = Fixture::new();
+    let mut fixture = Fixture::new().history(HistoryPersistence::OnDisk);
     fixture.config.read_cache_bytes = 0;
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 76), vec![put(1)])
@@ -318,7 +318,7 @@ fn scalar_write_uses_worker_while_checkpoint_awaits_verification() {
 
 #[test]
 fn cancelled_checkpoint_reply_drains_before_worker_shutdown() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 51), vec![put(1)])
         .unwrap();
@@ -373,7 +373,7 @@ fn failed_shutdown_joins_checkpoint_before_worker_senders() {
 
 #[test]
 fn checkpoint_rejects_mismatched_captured_prefix_digest_before_adoption() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
     let mut db = fixture.open();
     let operation = fixture.operation(0, 55);
     let version = db.write_batch(operation, vec![put(1)]).unwrap();
@@ -409,7 +409,7 @@ fn checkpoint_rejects_mismatched_captured_prefix_digest_before_adoption() {
 
 #[test]
 fn invalid_checkpoint_prefix_fails_without_adoption() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 53), vec![put(1)])
         .unwrap();
@@ -444,7 +444,20 @@ fn invalid_checkpoint_prefix_fails_without_adoption() {
 
 #[test]
 fn checkpoint_over_gap_and_lost_response_replay_sparse_ack_and_retry_identity() {
-    let fixture = Fixture::new();
+    checkpoint_over_gap_and_lost_response_replay_sparse_ack_and_retry_identity_mode(
+        HistoryPersistence::OnDisk,
+    );
+}
+#[test]
+fn wal_replay_checkpoint_over_gap_and_lost_response_replay_sparse_ack_and_retry_identity() {
+    checkpoint_over_gap_and_lost_response_replay_sparse_ack_and_retry_identity_mode(
+        HistoryPersistence::WalReplay,
+    );
+}
+fn checkpoint_over_gap_and_lost_response_replay_sparse_ack_and_retry_identity_mode(
+    mode: HistoryPersistence,
+) {
+    let fixture = Fixture::new().history(mode);
     let mut db = fixture.open();
     let baseline = fixture.operation(4, 30);
     db.write_batch(baseline, vec![put_key(0, 1)]).unwrap();
@@ -578,8 +591,21 @@ fn sparse_ack_survives_crash_when_earlier_disjoint_batch_never_reached_wal() {
 
 #[test]
 fn acknowledged_suffix_survives_every_background_checkpoint_adoption_stage() {
+    acknowledged_suffix_survives_every_background_checkpoint_adoption_stage_mode(
+        HistoryPersistence::OnDisk,
+    );
+}
+#[test]
+fn wal_replay_acknowledged_suffix_survives_every_background_checkpoint_adoption_stage() {
+    acknowledged_suffix_survives_every_background_checkpoint_adoption_stage_mode(
+        HistoryPersistence::WalReplay,
+    );
+}
+fn acknowledged_suffix_survives_every_background_checkpoint_adoption_stage_mode(
+    mode: HistoryPersistence,
+) {
     for stage in 0..=8 {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new().history(mode);
         let mut db = fixture.open();
         let first = fixture.operation(0, 1);
         let captured = fixture.operation(0, 2);
@@ -610,9 +636,9 @@ fn acknowledged_suffix_survives_every_background_checkpoint_adoption_stage() {
         );
         resume.send(()).unwrap();
         assert!(db.progress_checkpoint(true).is_err());
-        if stage == 4 {
+        if stage == 4 && mode != HistoryPersistence::WalReplay {
             use std::os::unix::fs::FileExt;
-            let ordinal = db.receipt_history.counts[&(0, db.epoch)];
+            let ordinal = db.receipt_history.as_ref().unwrap().counts[&(0, db.epoch)];
             let stream = db
                 .path
                 .join(format!("receipt-history-v2/stream-0-{}.pages", db.epoch));
@@ -697,7 +723,7 @@ fn failed_staging_intent_fences_serving_without_authorizing_outputs() {
 
 #[test]
 fn completed_owner_metadata_is_bounded_across_lifetime_capacity_and_reopens() {
-    let fixture = Fixture::new_with_capacity(8);
+    let fixture = Fixture::new_with_capacity(8).history(HistoryPersistence::OnDisk);
     let original = fixture.operation(0, 100);
     let mut original_version = None;
     let mut resident_bound = None;
@@ -739,7 +765,7 @@ fn completed_owner_metadata_is_bounded_across_lifetime_capacity_and_reopens() {
 #[test]
 fn absent_or_corrupt_pageable_retry_authority_fails_closed() {
     for missing in [false, true] {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
         let mut db = fixture.open();
         let operation = fixture.operation(0, 1);
         db.write_batch(operation, vec![put(1)]).unwrap();

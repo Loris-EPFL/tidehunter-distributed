@@ -1,0 +1,12 @@
+\small\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrr}\toprule
+1 KiB round-trip p50, \us & r0 & r1 & r2\\\midrule
+ib\_send\_lat, polled & \N{Q:run8-net_floor:117:round_trip_p50_us|.2f} & \N{Q:run8-net_floor:115:round_trip_p50_us|.2f} & \N{Q:run8-net_floor:116:round_trip_p50_us|.2f}\\
+ib\_send\_lat, event & \N{Q:run8-net_floor:2:round_trip_p50_us|.2f} & \N{Q:run8-net_floor:3:round_trip_p50_us|.2f} & \N{Q:run8-net_floor:4:round_trip_p50_us|.2f}\\
+ib\_read\_lat, polled & \N{Q:run8-net_floor:155:round_trip_p50_us|.2f} & \N{Q:run8-net_floor:156:round_trip_p50_us|.2f} & \N{Q:run8-net_floor:154:round_trip_p50_us|.2f}\\
+ib\_read\_lat, event & \N{Q:run8-net_floor:21:round_trip_p50_us|.2f} & \N{Q:run8-net_floor:18:round_trip_p50_us|.2f} & \N{Q:run8-net_floor:22:round_trip_p50_us|.2f}\\
+ib\_write\_lat, polled & \N{Q:run8-net_floor:108:round_trip_p50_us|.2f} & \N{Q:run8-net_floor:107:round_trip_p50_us|.2f} & \N{Q:run8-net_floor:109:round_trip_p50_us|.2f}\\
+tcp\_rtt, block & \N{Q:run8-net_floor:87:round_trip_p50_us|.2f} & \N{Q:run8-net_floor:71:round_trip_p50_us|.2f} & \N{Q:run8-net_floor:90:round_trip_p50_us|.2f}\\
+tcp\_rtt, spin & \N{Q:run8-net_floor:78:round_trip_p50_us|.2f} & \N{Q:run8-net_floor:79:round_trip_p50_us|.2f} & \N{Q:run8-net_floor:75:round_trip_p50_us|.2f}\\
+tcp\_rtt, busy\_poll & \N{Q:run8-net_floor:43:round_trip_p50_us|.2f} & \N{Q:run8-net_floor:48:round_trip_p50_us|.2f} & \N{Q:run8-net_floor:40:round_trip_p50_us|.2f}\\
+\bottomrule\end{tabular}

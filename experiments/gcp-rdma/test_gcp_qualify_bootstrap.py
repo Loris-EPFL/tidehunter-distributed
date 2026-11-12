@@ -78,6 +78,18 @@ class QualificationBootstrapTests(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             bootstrap._remaining(time.time() - 1, 60)
 
+    def test_focused_live_pair_is_restricted_to_compact_leased_rdma(self):
+        members = [{'name': f'run-1-{i}', 'id': str(i + 1), 'rdma_ip': f'10.0.0.{i + 1}'}
+                   for i in range(6)]
+        args = ('test-bucket', 'run-1', 'a' * 64, '2030-01-01T00:00:00Z', 'b' * 64, 'c' * 64)
+        options = {'members': members[:2], 'rdma_device': 'irdma0', 'machine_type': 'z4m-highmem-16',
+                   'qualification_profile': 'focused', 'selection': 'leased_ab_compact', 'live_transports': ['rdma']}
+        self.assertIn('TIDEHUNTER_BOOTSTRAP', bootstrap.fleet_startup_script(*args, **options))
+        for change in ({'selection': 'parity_compact'}, {'members': members},
+                       {'live_transports': ['tcp']}, {'live_spdk': True}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                bootstrap.fleet_startup_script(*args, **{**options, **change})
+
     def test_fleet_startup_accepts_six_hours_but_rejects_more(self):
         import datetime
         import signal
@@ -790,6 +802,28 @@ class FleetBootstrapTests(unittest.TestCase):
                                            machine_type='z4m-highmem-16', qualification_profile='focused',
                                            live_transports=['rdma'])
 
+
+
+
+
+class ReviewedSuiQualificationTests(unittest.TestCase):
+    def test_reviewed_sui_uses_focused_live_pair_qualification(self):
+        import copy
+        import manual_sui
+        spec = copy.deepcopy(manual_sui.REVIEWED_SUI_SPECS['sui_nvmeof_compact'])
+        members = [dict(name=f'run-1-{i}', id=str(i+1), rdma_ip=f'10.0.0.{i+1}') for i in range(2)]
+        args = ('test-bucket', 'run-1', 'a'*64, '2030-01-01T00:00:00Z', 'b'*64, 'c'*64)
+        with mock.patch.object(bootstrap, '_script', return_value='script') as script:
+            bootstrap.fleet_startup_script(*args, members=members, rdma_device='irdma0',
+                machine_type='z4m-highmem-16', live_transports=['rdma'],
+                qualification_profile='focused', suite_spec=spec)
+        self.assertEqual(script.call_args.kwargs['qualification_profile'], 'focused')
+        self.assertEqual(script.call_args.kwargs['suite_spec'], spec)
+        spec['sui_cells'][0]['contract'] = 'harness'
+        with self.assertRaisesRegex(ValueError, 'unreviewed Sui'):
+            bootstrap.fleet_startup_script(*args, members=members, rdma_device='irdma0',
+                machine_type='z4m-highmem-16', live_transports=['rdma'],
+                qualification_profile='focused', suite_spec=spec)
 
 
 if __name__ == '__main__':

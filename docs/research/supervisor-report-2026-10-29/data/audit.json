@@ -1,0 +1,36 @@
+{
+  "exported_population_rows": 453,
+  "case_count": 258,
+  "csv_comparison_mismatches": [],
+  "raw_audit": [
+    {
+      "case_id": "0180-native-1024-read-concurrent-primary_rf1-r0",
+      "source": "aws-efa/validated-results/cases/0180-native-1024-read-concurrent-primary_rf1-r0/result/samples.csv",
+      "sha256": "0e14d35f9761f8dcd439d9cfb68521886f8cddaf283879e36a2c64ab3e12bc74",
+      "measurement_rows": 8192,
+      "errors": []
+    },
+    {
+      "case_id": "0063-tidehunter_efa_native-1024-read-concurrent-primary_rf1-r0",
+      "source": "aws-efa/validated-results/cases/0063-tidehunter_efa_native-1024-read-concurrent-primary_rf1-r0/result/samples.csv",
+      "sha256": "12012fa1fc2f33642965dcdb0493fa9208d8014f44e56c409e077691fca0f8f6",
+      "measurement_rows": 8192,
+      "errors": []
+    },
+    {
+      "case_id": "0000-foundationdb-8192-read-many32-primary_rf1-r0",
+      "source": "aws-efa/validated-results/cases/0000-foundationdb-8192-read-many32-primary_rf1-r0/result/samples.csv",
+      "sha256": "293de8174f39a3ec3105a5563b938bd89ece3a8cccfe10af6766cec6e0e662b0",
+      "measurement_rows": 2048,
+      "errors": []
+    },
+    {
+      "case_id": "0245-cassandra-1024-offered-10000-primary_rf1-r0",
+      "source": "aws-efa/validated-results/cases/0245-cassandra-1024-offered-10000-primary_rf1-r0/result/samples.csv",
+      "sha256": "5a44bf6bcac0a8e1a51fbdcbe3cbe59c9ee1ee184c40d1e5386d8f69a89ce269",
+      "measurement_rows": 80000,
+      "errors": []
+    }
+  ],
+  "method": "analyze.py measurement-only; validate per-row monotonic clocks and dispatch presence, nearest-rank producer quantiles by exact operation/outcome, compare all three clock summaries and counts. No quantile recalculated for publication."
+}

@@ -5,6 +5,8 @@ from pathlib import Path
 import tarfile
 import tempfile
 import unittest
+import re
+import uuid
 from unittest.mock import patch
 from types import SimpleNamespace
 
@@ -28,8 +30,8 @@ class Store:
 
 class SuiAdmissionTests(unittest.TestCase):
     def test_compact_suite_rejected_before_mailbox_access(self):
-        with self.assertRaisesRegex(ValueError, 'five owner'):
-            gcp_sui.run_suite({'fleet': [{}, {}]}, None, None, None, output_root='/unused')
+        with self.assertRaisesRegex(ValueError, 'Sui suite requires one or five owner hosts'):
+            gcp_sui.run_suite({'fleet': [{}, {}, {}]}, None, None, None, output_root='/unused')
 
     def test_archive_preflight_and_extraction_share_symlink_safety(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -81,9 +83,39 @@ class SuiAdmissionTests(unittest.TestCase):
     def test_unsupported_transports_are_explicitly_rejected(self):
         self.assertEqual(gcp_sui.selected_transports({}), ['tcp'])
         self.assertEqual(gcp_sui.selected_transports({'sui_transports': ['tcp', 'tidehunter_verbs']}), ['tcp', 'tidehunter_verbs'])
+        self.assertEqual(gcp_sui.selected_transports({'sui_transports': ['tidehunter_nvme_rdma']}), ['tidehunter_nvme_rdma'])
         for backend in ('nvme-tcp', 'nvme-rdma', 'efa', 'fabric-tcp', 'fabric-tcp-native'):
             with self.assertRaisesRegex(ValueError, 'unsupported Sui transport'):
                 gcp_sui.selected_transports({'sui_transports': [backend]})
+
+    def test_cell_settings_and_identity(self):
+        settings = gcp_sui.sui_cell_settings({})
+        self.assertEqual(settings, dict(sui_contract='harness', sui_owner_tier=None, sui_owner_wal='harness',
+            sui_live_export_mode='per_owner', sui_live_queue_geometry=dict(io_queues=1, queue_size=32, poll_queues=0)))
+        for key, value in [('sui_contract', 'bad'), ('sui_owner_tier', 'bad'), ('sui_owner_wal', 'bad'),
+                           ('sui_live_export_mode', 'bad'), ('sui_live_queue_geometry', {'io_queues': True})]:
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, 'invalid Sui cell setting: ' + key):
+                gcp_sui.sui_cell_settings({key: value})
+        self.assertIsNotNone(re.fullmatch(gcp_sui.CELL_PATTERN, 'r02-tidehunter_nvme_rdma'))
+        live = gcp_sui.live_nvme_config([{'rdma_ip': '10.2.0.1'}]*5, settings)
+        self.assertEqual(live['addresses'], ['10.2.0.1']*5)
+        self.assertEqual(live['host_id'], list(uuid.UUID(live['host_nqn'].rsplit(':', 1)[1]).bytes))
+
+    def test_explicit_cells(self):
+        default = dict(transport='tcp', contract='harness', owner_tier=None, owner_wal='harness')
+        self.assertEqual(gcp_sui.sui_cells({}), [default])
+        cells = [dict(default, transport='tidehunter_nvme_rdma'),
+                 dict(default, transport='tidehunter_nvme_rdma', contract='original_default',
+                      owner_tier='native', owner_wal='engine_default')]
+        self.assertEqual(gcp_sui.sui_cells({'sui_cells': cells}), cells)
+        for key in ('sui_transports', 'sui_contract', 'sui_owner_tier', 'sui_owner_wal'):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, 'sui_cells replaces'):
+                gcp_sui.sui_cells({'sui_cells': cells, key: None})
+        for bad in ([], [default]*5, [{}], [dict(default, transport='bad')],
+                    [dict(default, contract='bad')], [dict(default, owner_tier='bad')],
+                    [dict(default, owner_wal='bad')], [dict(default, extra=1)]):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, 'invalid Sui cell setting: sui_cells'):
+                gcp_sui.sui_cells({'sui_cells': bad})
 
     def test_revision_mismatch_fails_before_build_execution(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -137,6 +169,104 @@ class SuiAdmissionTests(unittest.TestCase):
     def test_remote_failure_does_not_qualify(self):
         with self.assertRaises(RuntimeError):
             gcp_sui.check_receipt({'exit_code': 1, 'stderr': 'audit failed'})
+
+
+
+
+class ReviewedCompactSuiCells(unittest.TestCase):
+    def test_four_reviewed_cells_use_compact_owner_addresses(self):
+        import manual_sui
+        spec = manual_sui.REVIEWED_SUI_SPECS['sui_nvmeof_compact']
+        cells = gcp_sui.sui_cells(spec)
+        self.assertEqual(len(cells), 4)
+        self.assertEqual(cells, spec['sui_cells'])
+        settings = gcp_sui.sui_cell_settings(spec)
+        live = gcp_sui.live_nvme_config([{'rdma_ip': '10.2.0.2'}] * 5, settings)
+        self.assertEqual(live['addresses'], ['10.2.0.2'] * 5)
+        self.assertEqual(live['export_mode'], 'per_owner')
+
+    def test_four_cells_complete_with_one_owner_mailbox(self):
+        import copy
+        from unittest.mock import Mock
+        import manual_sui
+        spec = copy.deepcopy(manual_sui.REVIEWED_SUI_SPECS['sui_nvmeof_compact'])
+        desc = dict(key='object', generation='1', sha256='a'*64)
+        spec['sui_verification'] = desc
+        manifest = dict(fabric=True, nvmeof=True, source_archive_sha256='a'*64,
+                        binaries={'storage-node': 'a'*64})
+        node_data = json.dumps(dict(receipt={'complete': True}, logs=desc, resources={})).encode()
+        collected = dict(key='resources', generation='1', sha256=hashlib.sha256(node_data).hexdigest())
+        store = Mock()
+        store.upload.return_value = {'generation': '1'}
+        store.get.return_value = node_data
+        mailbox = Mock(store=store)
+        def submit(index, argv, **kwargs):
+            self.assertEqual(index, 1)
+            return dict(index=index, action=argv[3])
+        def wait(ref, **kwargs):
+            return dict(exit_code=0, stdout=json.dumps(collected) if ref['action'] == 'collect' else '{}')
+        mailbox.submit.side_effect = submit
+        mailbox.wait.side_effect = wait
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root/'data'
+            data.mkdir()
+            owner = dict(internal_ip='10.0.0.2', rdma_ip='10.1.0.2')
+            config = dict(fleet=[dict(internal_ip='10.0.0.1', rdma_ip='10.1.0.1'), owner], spec=spec,
+                package_root=str(root/'package'), run_id='bench-test', project_id='project', bucket='bucket',
+                deadline_utc='2030-01-01T00:00:00Z')
+            package = dict(sui_object_key='build', sui_generation='1', sui_sha256='a'*64)
+            def extract(archive, target):
+                target = Path(target)
+                target.mkdir(parents=True, exist_ok=True)
+                if target.name == 'fixture':
+                    (target/'fixture').mkdir()
+                    (target/'fixture/distributed.yaml').write_text('db-path: distributed/db\n')
+            def load(path):
+                path = Path(path)
+                name = path.name
+                if name == 'build-receipt.json':
+                    return dict(bundle_sha256='a'*64, build_manifest_sha256='a'*64, source_archive_sha256='a'*64)
+                if name == 'manifest.json':
+                    return {'revision': 'b'*40}
+                if name == 'source.json':
+                    return {'sha256': {}}
+                if name == 'source-manifest.json':
+                    return {'tidehunter-sharded-wal': {'files': {}}}
+                if name == 'external-manifest.json':
+                    return dict(config_sha256='a'*64, build_manifest_sha256='a'*64, storage_binary_sha256='a'*64,
+                        hosts=[dict(host=owner['internal_ip'], partitions=list(range(5)), archive='payload',
+                                    archive_sha256='a'*64, commands=[], ready_files=[], stop_files=[])])
+                if name in ('remote-starting.json', 'remote-finished.json', 'resources-required.json'):
+                    return dict(config_sha256='a'*64, build_manifest_sha256='a'*64,
+                                checkpoint_digest=gcp_sui.CHECKPOINT, stage=path.stem)
+                if name == 'results.json':
+                    return dict(complete=True, audit={'all_equal': True}, binaries=manifest['binaries'],
+                                checkpoint_digest=gcp_sui.CHECKPOINT)
+                if name == 'receipt.json':
+                    return dict(complete=True, evidence_sha256='a'*64)
+                raise AssertionError(str(path))
+            def popen(argv, **kwargs):
+                stage = Path(argv[argv.index('--external-stage-dir')+1])
+                (stage/'resources-required.json').write_text('{}')
+                child = Mock()
+                child.poll.return_value = None
+                def finish(**kwargs):
+                    child.poll.return_value = 0
+                    return 0
+                child.wait.side_effect = finish
+                return child
+            with patch.object(gcp_sui, 'storage_root', return_value=data), \
+                 patch.object(gcp_sui, 'fetch'), patch.object(gcp_sui, 'extract', side_effect=extract), \
+                 patch.object(gcp_sui, 'load', side_effect=load), patch.object(gcp_sui, 'sha', return_value='a'*64), \
+                 patch.object(gcp_sui, 'admit_build', return_value=manifest), patch.object(gcp_sui, 'admit_fixture'), \
+                 patch.object(gcp_sui, 'command'), patch.object(gcp_sui.shutil, 'copy2'), \
+                 patch.object(gcp_sui.subprocess, 'Popen', side_effect=popen):
+                result = gcp_sui.run_suite(config, mailbox, package, desc, output_root=root/'results')
+            self.assertTrue(result['complete'])
+            self.assertEqual([{k: c[k] for k in ('transport','contract','owner_tier','owner_wal')}
+                              for c in result['cells']], spec['sui_cells'])
+            self.assertEqual(mailbox.submit.call_count, 16)
 
 
 if __name__ == '__main__':

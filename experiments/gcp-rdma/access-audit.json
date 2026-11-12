@@ -1,21 +1,66 @@
 {
-  "observed_utc": "2026-11-01T23:02:15.424727+00:00",
-  "method": "Google MCP read-only discovery plus Cloud Resource Manager testIamPermissions",
+  "observed_utc": "2026-11-02T12:38:36.382230+00:00",
+  "method": "GCP MCP read-only discovery and existing REST testIamPermissions client; no allocation or IAM/network changes",
   "project_id": "mysten-research",
   "project_number": "514867804006",
   "principal": "loris.tran@epfl.ch",
-  "granted_project_permissions": [
+  "requested_project_permissions": [
     "compute.instances.create",
+    "compute.instances.get",
     "compute.instances.delete",
     "compute.instances.setMetadata",
+    "compute.instances.setLabels",
     "compute.instances.setServiceAccount",
+    "compute.disks.create",
+    "compute.machineTypes.get",
+    "compute.networks.get",
+    "compute.subnetworks.get",
+    "compute.subnetworks.use",
+    "compute.subnetworks.setPrivateIpGoogleAccess",
+    "compute.resourcePolicies.create",
+    "compute.resourcePolicies.get",
+    "compute.resourcePolicies.use",
+    "compute.resourcePolicies.delete",
+    "compute.zoneOperations.get",
+    "compute.regionOperations.get",
+    "compute.images.create",
+    "iam.serviceAccounts.create",
+    "iam.serviceAccounts.setIamPolicy",
+    "iam.workloadIdentityPools.list",
+    "iam.workloadIdentityPools.create",
+    "iam.workloadIdentityPoolProviders.create",
+    "resourcemanager.projects.setIamPolicy",
+    "storage.buckets.create",
+    "storage.buckets.list",
+    "serviceusage.services.enable",
+    "serviceusage.services.use",
+    "cloudquotas.quotas.get",
+    "serviceusage.quotas.get"
+  ],
+  "granted_project_permissions": [
+    "compute.disks.create",
+    "compute.images.create",
+    "compute.instances.create",
+    "compute.instances.delete",
+    "compute.instances.get",
+    "compute.instances.setLabels",
+    "compute.instances.setMetadata",
+    "compute.instances.setServiceAccount",
+    "compute.machineTypes.get",
+    "compute.networks.get",
+    "compute.regionOperations.get",
     "compute.resourcePolicies.create",
     "compute.resourcePolicies.delete",
-    "iam.serviceAccounts.actAs"
+    "compute.resourcePolicies.get",
+    "compute.resourcePolicies.use",
+    "compute.subnetworks.get",
+    "compute.subnetworks.use",
+    "compute.zoneOperations.get",
+    "serviceusage.quotas.get"
   ],
   "not_granted_queried_project_permissions": [
-    "compute.networks.create",
-    "compute.subnetworks.create",
+    "cloudquotas.quotas.get",
+    "compute.subnetworks.setPrivateIpGoogleAccess",
     "iam.serviceAccounts.create",
     "iam.serviceAccounts.setIamPolicy",
     "iam.workloadIdentityPoolProviders.create",
@@ -24,24 +69,10 @@
     "resourcemanager.projects.setIamPolicy",
     "serviceusage.services.enable",
     "serviceusage.services.use",
-    "storage.buckets.create"
+    "storage.buckets.create",
+    "storage.buckets.list"
   ],
-  "project_iam_policy_read": "denied",
-  "wif_pool_list": "denied_not_proof_of_absence",
-  "visible_service_accounts": [
-    "514867804006-compute@developer.gserviceaccount.com",
-    "orchestrator@mysten-research.iam.gserviceaccount.com"
-  ],
-  "subnets_examined": 40,
-  "nondefault_subnets_in_examined_page": [],
-  "complete_subnet_inventory": false,
-  "iam_or_resource_mutations": false,
-  "guest_service_account_permissions_verified": false,
-  "real_new_rest_client_qualification": {
-    "project_permissions": [
-      "compute.instances.create",
-      "compute.instances.delete"
-    ],
+  "service_account_permissions": {
     "orchestrator@mysten-research.iam.gserviceaccount.com": [
       "iam.serviceAccounts.actAs"
     ],
@@ -49,18 +80,251 @@
       "iam.serviceAccounts.actAs"
     ]
   },
-  "targeted_service_account_permissions": {
-    "orchestrator@mysten-research.iam.gserviceaccount.com": [
-      "iam.serviceAccounts.actAs"
+  "subnet_permissions": {
+    "default": [
+      "compute.subnetworks.get",
+      "compute.subnetworks.use"
     ],
-    "514867804006-compute@developer.gserviceaccount.com": [
-      "iam.serviceAccounts.actAs"
+    "falcon-rdma-europe-west4": [
+      "compute.subnetworks.get",
+      "compute.subnetworks.use"
     ]
   },
-  "filtered_nondefault_subnets": [],
-  "custom_project_images_in_bounded_query": [],
-  "artifact_bucket_listing": "denied_not_proof_of_absence",
-  "regional_generic_cpu_limit": 5000,
-  "regional_generic_cpu_usage": 4,
-  "z4m_specific_quota_verified": false
+  "observed_resources": {
+    "falcon_network": {
+      "name": "falcon-rdma",
+      "networkProfile": "https://www.googleapis.com/compute/v1/projects/mysten-research/global/networkProfiles/europe-west4-b-vpc-falcon",
+      "routingConfig": {
+        "bgpBestPathSelectionMode": "LEGACY",
+        "routingMode": "REGIONAL"
+      },
+      "selfLink": "https://www.googleapis.com/compute/v1/projects/mysten-research/global/networks/falcon-rdma",
+      "subnetworks": [
+        "https://www.googleapis.com/compute/v1/projects/mysten-research/regions/europe-west4/subnetworks/falcon-rdma-europe-west4"
+      ]
+    },
+    "falcon_profile": {
+      "creationTimestamp": "1969-12-31T16:00:00.000-08:00",
+      "description": "A VPC network that supports RDMA connectivity over Falcon, compatible with Intel NICs",
+      "features": {
+        "addressPurposes": [
+          "GCE_ENDPOINT"
+        ],
+        "allowAliasIpRanges": "ALIAS_IP_RANGES_BLOCKED",
+        "allowAutoModeSubnet": "AUTO_MODE_SUBNET_BLOCKED",
+        "allowCloudNat": "CLOUD_NAT_BLOCKED",
+        "allowCloudRouter": "CLOUD_ROUTER_BLOCKED",
+        "allowDefaultNicAttachment": "DEFAULT_NIC_ATTACHMENT_BLOCKED",
+        "allowExternalIpAccess": "EXTERNAL_IP_ACCESS_BLOCKED",
+        "allowFirewallPolicy": "FIREWALL_POLICY_ALLOWED",
+        "allowInterconnect": "INTERCONNECT_BLOCKED",
+        "allowIpForwarding": "IP_FORWARDING_BLOCKED",
+        "allowLoadBalancing": "LOAD_BALANCING_BLOCKED",
+        "allowMultiNicInSameNetwork": "MULTI_NIC_IN_SAME_NETWORK_ALLOWED",
+        "allowMulticast": "MULTICAST_BLOCKED",
+        "allowNcc": "NCC_BLOCKED",
+        "allowNetworkMigration": "NETWORK_MIGRATION_BLOCKED",
+        "allowPacketMirroring": "PACKET_MIRRORING_BLOCKED",
+        "allowPrivateGoogleAccess": "PRIVATE_GOOGLE_ACCESS_BLOCKED",
+        "allowPsc": "PSC_BLOCKED",
+        "allowStaticRoutes": "STATIC_ROUTES_BLOCKED",
+        "allowSubInterfaces": "SUBINTERFACES_BLOCKED",
+        "allowVpcPeering": "VPC_PEERING_BLOCKED",
+        "allowVpn": "VPN_BLOCKED",
+        "interfaceTypes": [
+          "IRDMA"
+        ],
+        "subnetPurposes": [
+          "SUBNET_PURPOSE_PRIVATE"
+        ],
+        "subnetStackTypes": [
+          "SUBNET_STACK_TYPE_IPV4_ONLY"
+        ],
+        "subnetworkPurposes": [
+          "PRIVATE"
+        ],
+        "subnetworkStackTypes": [
+          "IPV4_ONLY"
+        ]
+      },
+      "id": "30003",
+      "kind": "compute#networkProfile",
+      "location": {
+        "name": "europe-west4-b",
+        "scope": "ZONE"
+      },
+      "name": "europe-west4-b-vpc-falcon",
+      "profileType": {
+        "networkType": "RDMA",
+        "rdmaSubtype": "FALCON"
+      },
+      "selfLink": "https://www.googleapis.com/compute/v1/projects/mysten-research/global/networkProfiles/europe-west4-b-vpc-falcon",
+      "selfLinkWithId": "https://www.googleapis.com/compute/v1/projects/mysten-research/global/networkProfiles/30003"
+    },
+    "falcon_subnet": {
+      "ipCidrRange": "10.10.0.0/20",
+      "name": "falcon-rdma-europe-west4",
+      "network": "https://www.googleapis.com/compute/v1/projects/mysten-research/global/networks/falcon-rdma",
+      "privateIpGoogleAccess": false,
+      "purpose": "PRIVATE",
+      "region": "https://www.googleapis.com/compute/v1/projects/mysten-research/regions/europe-west4",
+      "selfLink": "https://www.googleapis.com/compute/v1/projects/mysten-research/regions/europe-west4/subnetworks/falcon-rdma-europe-west4",
+      "stackType": "IPV4_ONLY"
+    },
+    "ordinary_subnet": {
+      "ipCidrRange": "10.164.0.0/20",
+      "name": "default",
+      "network": "https://www.googleapis.com/compute/v1/projects/mysten-research/global/networks/default",
+      "privateIpGoogleAccess": false,
+      "purpose": "PRIVATE",
+      "region": "https://www.googleapis.com/compute/v1/projects/mysten-research/regions/europe-west4",
+      "selfLink": "https://www.googleapis.com/compute/v1/projects/mysten-research/regions/europe-west4/subnetworks/default",
+      "stackType": "IPV4_ONLY"
+    },
+    "falcon_firewall": {
+      "allowed": [
+        {
+          "IPProtocol": "all"
+        }
+      ],
+      "direction": "INGRESS",
+      "disabled": false,
+      "name": "falcon-rdma-allow-internal",
+      "network": "https://www.googleapis.com/compute/v1/projects/mysten-research/global/networks/falcon-rdma",
+      "sourceRanges": [
+        "10.10.0.0/20"
+      ]
+    },
+    "h4d_highmem": {
+      "architecture": "X86_64",
+      "guestCpus": 192,
+      "isSharedCpu": false,
+      "memoryMb": 1523712,
+      "name": "h4d-highmem-192-lssd",
+      "selfLink": "https://www.googleapis.com/compute/v1/projects/mysten-research/zones/europe-west4-b/machineTypes/h4d-highmem-192-lssd"
+    },
+    "project_images": [],
+    "project_accounts": [
+      {
+        "disabled": false,
+        "displayName": "Compute Engine default service account",
+        "email": "514867804006-compute@developer.gserviceaccount.com"
+      },
+      {
+        "disabled": false,
+        "displayName": "VM orchestrator (CLI on headless machines)",
+        "email": "orchestrator@mysten-research.iam.gserviceaccount.com"
+      }
+    ],
+    "rdma_images": [
+      {
+        "creationTimestamp": "2026-10-30T00:25:12.429-07:00",
+        "family": "slurm-gcp-6-11-hpc-rocky-linux-8",
+        "guestOsFeatures": [
+          {
+            "type": "UEFI_COMPATIBLE"
+          },
+          {
+            "type": "GVNIC"
+          }
+        ],
+        "name": "slurm-gcp-6-11-hpc-rocky-linux-8-v20260904",
+        "selfLink": "https://www.googleapis.com/compute/v1/projects/cloud-hpc-image-public/global/images/slurm-gcp-6-11-hpc-rocky-linux-8-v20260904",
+        "status": "READY"
+      },
+      {
+        "creationTimestamp": "2026-10-23T03:35:16.166-07:00",
+        "family": "hpc-rocky-linux-8",
+        "guestOsFeatures": [
+          {
+            "type": "UEFI_COMPATIBLE"
+          },
+          {
+            "type": "GVNIC"
+          }
+        ],
+        "name": "hpc-rocky-linux-8-v20260930",
+        "selfLink": "https://www.googleapis.com/compute/v1/projects/cloud-hpc-image-public/global/images/hpc-rocky-linux-8-v20260930",
+        "status": "READY"
+      },
+      {
+        "creationTimestamp": "2026-10-23T03:35:14.509-07:00",
+        "family": "hpc-rocky-linux-9",
+        "guestOsFeatures": [
+          {
+            "type": "UEFI_COMPATIBLE"
+          },
+          {
+            "type": "GVNIC"
+          }
+        ],
+        "name": "hpc-rocky-linux-9-v20260930",
+        "selfLink": "https://www.googleapis.com/compute/v1/projects/cloud-hpc-image-public/global/images/hpc-rocky-linux-9-v20260930",
+        "status": "READY"
+      }
+    ]
+  },
+  "z4m_highmem_16_europe_west4_b": "not_found_not_a_capacity_probe",
+  "z4m_highmem_16_us_central1_c": {
+    "exists": true,
+    "vcpus": 16,
+    "memory_mib": 124928
+  },
+  "regional_generic_cpu_quota": {
+    "region": "europe-west4",
+    "limit": 5000,
+    "usage": 0
+  },
+  "h4d_quota": {
+    "verified": false,
+    "cloud_quotas_api": "denied_cloudquotas.quotas.get",
+    "service_usage_metric_query": "empty_not_zero",
+    "service_usage_display_name_query": "empty_not_zero",
+    "required_vcpus": 1152,
+    "required_local_ssd_gib": 22500
+  },
+  "artifact_bucket_inventory": "denied_not_proof_of_absence",
+  "wif_pool_inventory": "denied_not_proof_of_absence",
+  "labelled_benchmark_vm_query": {
+    "filter": "labels.bench-run:*",
+    "limit": 50,
+    "matches": []
+  },
+  "github_activation": false,
+  "list_price_observations": [
+    {
+      "machine": "h4d-highmem-192-lssd",
+      "region": "europe-west4",
+      "usd_per_vm_hour": "10.083789168",
+      "usd_per_six_host_hour": "60.502735008",
+      "source": "https://cloud.google.com/products/compute/pricing/compute-optimized",
+      "method": "browser H4D selector set to Netherlands; default Iowa price not used"
+    },
+    {
+      "machine": "z4m-highmem-16",
+      "region": "us-central1",
+      "usd_per_vm_hour": "3.287109973",
+      "usd_per_six_host_hour": "19.722659838",
+      "source": "https://cloud.google.com/products/compute/pricing/storage-optimized",
+      "method": "published Iowa/us-central1 table"
+    }
+  ],
+  "price_exclusions": [
+    "boot disks",
+    "network traffic",
+    "retained artifacts",
+    "taxes",
+    "account-specific discounts"
+  ],
+  "ready_for_cloud_launch": false,
+  "remaining_prerequisites": [
+    "ordinary subnet Private Google Access or compatible pre-enabled subnet",
+    "H4D family CPU and SSD quota verification",
+    "artifact bucket and guest service-account identity and scoped permissions",
+    "GitHub workload-identity federation and orchestrator identity",
+    "qualified guest image and actual executable ABI compatibility",
+    "approved complete run and weekly budget"
+  ],
+  "cloud_resources_created": false,
+  "iam_or_network_mutations": false
 }

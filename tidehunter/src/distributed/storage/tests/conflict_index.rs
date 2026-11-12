@@ -41,6 +41,8 @@ fn pending_conflicts_are_exact_and_cost_is_independent_of_pending_length() {
         metrics(),
     )
     .unwrap();
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     let mut receipts = Vec::new();
     for n in 0..40 {
         receipts.push(
@@ -119,6 +121,8 @@ fn conflicts_stay_exact_after_pending_entries_move_to_history() {
         metrics(),
     )
     .unwrap();
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     let mut receipts = Vec::new();
     for n in 0..12 {
         let group = group_of(&config, batch_with(&config, n, n, n as u8));

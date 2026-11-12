@@ -1,0 +1,6 @@
+--- a/main.tex
++++ b/main.tex
+@@ -1 +1,3 @@
++\def\RWCtenSynthetic{1}
++\AddToHook{shipout/background}{\put(110,-420){\rotatebox{35}{\textcolor{gray!12}{\fontsize{60}{60}\selectfont SYNTHETIC}}}}
+ \documentclass[10pt,a4paper]{article}

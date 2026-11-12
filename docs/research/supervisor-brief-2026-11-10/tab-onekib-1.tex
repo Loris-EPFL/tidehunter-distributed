@@ -1,0 +1,12 @@
+\small
+\begin{tabular}{lrrr|rrr}\toprule
+& \multicolumn{3}{c|}{Scalar read} & \multicolumn{3}{c}{Scalar write}\\
+Backend & p50 & p99 & calls/s & p50 & p99 & calls/s\\\midrule
+Native & 1.37 & 2.18 & 277{,}534 & 63.8 & 168 & 168{,}290\\
+TH TCP & 60.1 & 209 & 172{,}074 & 322 & 506 & 47{,}427\\
+TH verbs & 45.0 & 176 & 220{,}750 & 295 & 575 & 51{,}467\\
+TH NVMe-oF kernel & 55.9 & 242 & 181{,}799 & 657 & 1{,}206 & 23{,}841\\
+TH NVMe-oF SPDK & 71.7 & 156 & 147{,}290 & 702 & 1{,}248 & 22{,}172\\
+Valkey TCP & 53.4 & 113 & 188{,}256 & 183 & 469 & 73{,}443\\
+Valkey RDMA & 43.1 & 92.5 & 165{,}026 & 173 & 410 & 80{,}146\\
+\bottomrule\end{tabular}

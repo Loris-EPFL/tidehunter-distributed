@@ -1,0 +1,16 @@
+\begin{table}[H]\centering\small\setlength{\tabcolsep}{3pt}
+\begin{tabular}{llllll}\toprule
+Arm & Rep. & 1 KiB c1 & 1 KiB c16 & 64 KiB c1 & 64 KiB c16\\\midrule
+TM-A & r0 & \N{F10:ab_warm:0:mean_us:1|.1f}/\N{F10:ab_warm:0:p50_us:1|.1f}/\N{F10:ab_warm:0:p99_us:1|.1f} & not run & not run & not run\\
+TM-A & r1 & not run & not run & not run & not run\\
+TT-A & r0 & \N{F10:ab_warm:1:mean_us:1|.1f}/\N{F10:ab_warm:1:p50_us:1|.1f}/\N{F10:ab_warm:1:p99_us:1|.1f} & not run & not run & not run\\
+TT-A & r1 & not run & not run & not run & not run\\
+TT-B & r0 & \N{F10:ab_warm:2:mean_us:1|.1f}/\N{F10:ab_warm:2:p50_us:1|.1f}/\N{F10:ab_warm:2:p99_us:1|.1f} & not run & not run & not run\\
+TT-B & r1 & not run & not run & not run & not run\\
+V-A & r0 & \N{F10:ab_warm:3:mean_us:1|.1f}/\N{F10:ab_warm:3:p50_us:1|.1f}/\N{F10:ab_warm:3:p99_us:1|.1f} & not run & not run & not run\\
+V-A & r1 & not run & not run & not run & not run\\
+V-B & r0 & \N{F10:ab_warm:4:mean_us:1|.1f}/\N{F10:ab_warm:4:p50_us:1|.1f}/\N{F10:ab_warm:4:p99_us:1|.1f} & not run & not run & not run\\
+V-B & r1 & not run & not run & not run & not run\\
+\bottomrule\end{tabular}
+\caption{\textbf{EXCLUDED ABORTED ATTEMPT --- layout test only, never final results.} Warm owner reads: mean/p50/p99 API latency (\us{}). One real row per arm/repetition; all four matched cells. Full arm names/security/polling are in the arm table. NR means not recorded, never zero. Coordinator cache off; lanes one at c1, four at c16; r0/r1 separate. Busy spins owner and coordinator read driver, not kernel busy poll. Unmatched dimensions: TLS/security, polling, RPC/direct I/O; NVMe control is verbs trusted Adaptive.}
+\end{table}

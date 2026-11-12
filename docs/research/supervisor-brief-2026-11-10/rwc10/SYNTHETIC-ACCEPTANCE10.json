@@ -1,0 +1,175 @@
+{
+  "status": "SYNTHETIC preparation only; not campaign results",
+  "synthetic": true,
+  "publication_eligible": false,
+  "selection": "fabric_ab_compact",
+  "reviewed_jobs": 80,
+  "independent_verification": {
+    "excluded_from_final": false,
+    "figure_points": 348,
+    "figures": 5,
+    "numbers": 360,
+    "pages": 53,
+    "pass_check": true,
+    "pdf_sha256": "3bc46ef34fdedc81549a2c6ee6836fedda8bd4cc778bb8cb68708cb7b0bad3e6",
+    "synthetic": true,
+    "tables": 6,
+    "visual_inspection": "separate rendered-image review, not asserted by this checker"
+  },
+  "archived_pdf": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-supervisor-brief-run10.pdf",
+  "pdf_sha256": "3bc46ef34fdedc81549a2c6ee6836fedda8bd4cc778bb8cb68708cb7b0bad3e6",
+  "pages": 53,
+  "page_budget": 56,
+  "visual_inspection": {
+    "performed": true,
+    "figure_names": [
+      "warm",
+      "gap",
+      "cpu",
+      "cold",
+      "ladder"
+    ],
+    "scratch_pages": [
+      1,
+      2,
+      10,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      46
+    ],
+    "renders": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-renders",
+    "observations": "Axes have units, separate r0/r1 markers and readable legends; no overlapping labels or clipped rightmost markers. Cold unqualified cell has no latency marker. Scope, arm definitions, CPU/cold tables and first-attempt exclusion reviewed."
+  },
+  "latex": {
+    "engine": "pdfLaTeX via latexmk",
+    "returncode": 0,
+    "workflow": "latexmk -pdf -interaction=nonstopmode -halt-on-error main.tex",
+    "mcp_limitation": "Server denies /tmp paths; supported local latexmk fallback used."
+  },
+  "original_brief_baseline": {
+    "checked_files": 15,
+    "changed": [],
+    "original_main_and_tracked_scripts_modified": false,
+    "original_brief_pages": 47
+  },
+  "source_files": [
+    "make_synthetic_export.py",
+    "rwc10_data.py",
+    "build_rwc10_inputs.py",
+    "plot_rwc10.py",
+    "verify_rwc10.py",
+    "prepare_patches.py",
+    "prepare_scratch.py",
+    "section-rwc10.tex",
+    "RUNBOOK10.md",
+    "main-tex-run10.patch",
+    "run9-security-run10.patch",
+    "verify-brief-run10.patch",
+    "synthetic-only.patch",
+    "run10-launched.json",
+    "EXCLUDED-attempt1-provenance.json",
+    "seal-baseline.json"
+  ],
+  "commands": [
+    {
+      "command": [
+        "/home/hybr1d/Desktop/PDM/TideHunter/.venv/bin/python",
+        "-B",
+        "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/build_rwc10_inputs.py",
+        "--output",
+        "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-output",
+        "--provenance",
+        "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/SYNTHETIC-provenance.json"
+      ],
+      "cwd": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/home/hybr1d/Desktop/PDM/TideHunter/.venv/bin/python",
+        "-B",
+        "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/plot_rwc10.py",
+        "--output",
+        "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-output",
+        "--synthetic"
+      ],
+      "cwd": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/home/hybr1d/Desktop/PDM/TideHunter/.venv/bin/python",
+        "-B",
+        "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/prepare_scratch.py",
+        "--output",
+        "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-output",
+        "--provenance",
+        "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/SYNTHETIC-provenance.json"
+      ],
+      "cwd": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "latexmk",
+        "-pdf",
+        "-interaction=nonstopmode",
+        "-halt-on-error",
+        "main.tex"
+      ],
+      "cwd": "/tmp/rwc10-build",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/home/hybr1d/Desktop/PDM/TideHunter/.venv/bin/python",
+        "-B",
+        "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/verify_rwc10.py",
+        "--synthetic"
+      ],
+      "cwd": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/home/hybr1d/Desktop/PDM/TideHunter/.venv/bin/python",
+        "-B",
+        "/tmp/rwc10-build/rwc10/verify_rwc10.py",
+        "--synthetic",
+        "--pdf"
+      ],
+      "cwd": "/tmp/rwc10-build",
+      "returncode": 0
+    }
+  ],
+  "quarantined_partial_verification": {
+    "excluded_from_final": true,
+    "figure_points": 63,
+    "figures": 5,
+    "numbers": 65,
+    "pages": null,
+    "pass_check": true,
+    "pdf_sha256": null,
+    "synthetic": false,
+    "tables": 6,
+    "visual_inspection": "separate rendered-image review, not asserted by this checker"
+  },
+  "registration_guard_rejected": true,
+  "launch_state": {
+    "provenance_file": "run10-launched.json",
+    "selected_fleet": "bench-afdfe33817034a7c",
+    "selected_parent": "bench-38b1466b6b0e4e1e",
+    "state": "launch 2 suite in progress per Main; no final export supplied"
+  },
+  "pending_inputs": [
+    "selected second-attempt final export/report paths",
+    "final launched receipts and exact timestamps",
+    "terminal controller outcome and analysis qualification"
+  ],
+  "retained_legacy_checker": "Not claimed passing in flat /tmp: its existing directory-depth assumption raises IndexError. Run after authorized real-repository integration, as documented.",
+  "patches_applied_to_original": false
+}

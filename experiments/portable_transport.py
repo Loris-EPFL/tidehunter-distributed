@@ -10,6 +10,7 @@ from pathlib import Path
 
 CASE_TRANSPORTS = {
     'tidehunter_tcp': ('tcp', None),
+    'tidehunter_tcp_trusted': ('tcp-trusted', None),
     'tidehunter_efa': ('efa', 'mutual-tls'),
     'tidehunter_efa_direct': ('efa-direct', 'mutual-tls'),
     'tidehunter_efa_native': ('efa-direct', 'trusted'),
@@ -60,12 +61,12 @@ def select_backends(raw, configured, supported):
 def validate_transport(value):
     if not isinstance(value, dict):
         raise ValueError('transport must be a canonical object')
-    if value.get('kind') == 'tcp':
+    if value.get('kind') in ('tcp', 'tcp-trusted'):
         if set(value) != {'kind'}:
             raise ValueError('TCP transport accepts only kind')
-        return {'kind': 'tcp'}
+        return {'kind': value['kind']}
     if value.get('kind') != 'ofi' or set(value) - {'kind', 'fabric', 'security'}:
-        raise ValueError('transport requires kind tcp or ofi and known fields')
+        raise ValueError('transport requires kind tcp, tcp-trusted or ofi and known fields')
     fabric = value.get('fabric')
     if not isinstance(fabric, dict) or set(fabric) - {'backend', 'domain', 'source_address'}:
         raise ValueError('OFI fabric requires explicit backend and known selectors')
@@ -104,8 +105,8 @@ def transport_for_case(label):
         backend, security = CASE_TRANSPORTS[DRIVER_CASES.get(label, label)]
     except (KeyError, TypeError):
         raise ValueError('unknown transport research case') from None
-    if backend == 'tcp':
-        return {'kind': 'tcp'}
+    if backend in ('tcp', 'tcp-trusted'):
+        return {'kind': backend}
     return {'kind': 'ofi', 'fabric': {'backend': backend}, 'security': security}
 
 
@@ -115,20 +116,21 @@ def runtime_backend(case_label):
 
 def protocol_key(value):
     transport = validate_transport(value)
-    return ('tcp',) if transport['kind'] == 'tcp' else (
+    return (transport['kind'],) if transport['kind'] in ('tcp', 'tcp-trusted') else (
         'ofi', transport['fabric']['backend'], transport['security'])
 
 
 def metadata_transport_label(value):
     """Match Rust Transport.label(), not the independent research case ID."""
     transport = transport_for_case(value)
-    if transport['kind'] == 'tcp':
-        return 'tcp'
+    if transport['kind'] in ('tcp', 'tcp-trusted'):
+        return transport['kind']
     return f"ofi-{transport['fabric']['backend']}-{transport['security']}"
 
 
 def is_trusted(value):
-    return validate_transport(value).get('security') == 'trusted'
+    transport = validate_transport(value)
+    return transport['kind'] == 'tcp-trusted' or transport.get('security') == 'trusted'
 
 
 def is_software(value):

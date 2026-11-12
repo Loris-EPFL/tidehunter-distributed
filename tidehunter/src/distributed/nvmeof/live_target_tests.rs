@@ -39,6 +39,7 @@ impl Fixture {
             commissioning_port_id: 43,
             commissioning_service: 4421,
             spdk: None,
+            export_mode: Default::default(),
         };
         Self {
             _tmp: tmp,
@@ -146,6 +147,7 @@ fn crash_before_namespace_configuration_cleans_disabled_object() {
         transport: f.config.transport,
         readonly: false,
         spdk: None,
+        permanent: false,
     };
     manager.state.exports.push(Export {
         binding: binding.clone(),
@@ -344,6 +346,7 @@ fn uncertain_spdk_operations_remain_durable_and_block_fencing() {
             transport: f.config.transport,
             readonly: false,
             spdk: None,
+            permanent: false,
         };
         manager.state.exports.push(Export {
             binding,
@@ -378,6 +381,7 @@ fn spdk_drained_journal_seals_exact_writable_inode() {
             transport: f.config.transport,
             readonly: false,
             spdk: None,
+            permanent: false,
         },
         file: f.file.clone(),
         readonly: false,
@@ -392,5 +396,91 @@ fn spdk_drained_journal_seals_exact_writable_inode() {
     assert_eq!(
         manager.state.exports[0].spdk_phase,
         Some(spdk::Phase::Drained)
+    );
+}
+
+#[test]
+fn permanent_namespaces_share_subsystem_and_revoke_independently() {
+    use super::super::live_storage::wal_export_name;
+    let mut f = Fixture::new();
+    f.config.export_mode = LiveExportMode::PerOwner;
+    let mut manager = f.open().unwrap();
+    let name = wal_export_name(1024, [1; 16], 2, 3, 0);
+    let first = manager.export_permanent(&name, f.file.clone()).unwrap();
+    assert_eq!(
+        manager.export_permanent(&name, f.file.clone()).unwrap(),
+        first
+    );
+    let path = f._tmp.path().join("wal-1");
+    fs::write(&path, [8; 4096]).unwrap();
+    let metadata = fs::metadata(&path).unwrap();
+    let file = LiveFileIdentity {
+        path,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        bytes: 4096,
+        block_size: 4096,
+    };
+    let second = manager
+        .export_permanent(&wal_export_name(1024, [1; 16], 2, 3, 1), file)
+        .unwrap();
+    let sub = f.configfs.join("subsystems").join(&name.nqn);
+    assert!(sub.join("namespaces/1").is_dir());
+    assert!(sub.join("namespaces/2").is_dir());
+    assert_eq!(manager.stats().unwrap().namespaces_exposed, 2);
+    manager.revoke(&first).unwrap();
+    assert!(!sub.join("namespaces/1").exists());
+    assert!(sub.join("namespaces/2").is_dir());
+    manager.revoke(&second).unwrap();
+    assert!(!sub.exists());
+    manager.shutdown().unwrap();
+}
+
+#[test]
+fn old_target_config_binding_and_state_default_to_on_demand() {
+    let f = Fixture::new();
+    let mut config = serde_json::to_value(&f.config).unwrap();
+    config.as_object_mut().unwrap().remove("export_mode");
+    assert_eq!(
+        serde_json::from_value::<LiveTargetConfig>(config)
+            .unwrap()
+            .export_mode,
+        LiveExportMode::OnDemand
+    );
+    let mut manager = f.open().unwrap();
+    let binding = manager.export_writable(f.file.clone()).unwrap();
+    let mut old = serde_json::to_value(&binding).unwrap();
+    old.as_object_mut().unwrap().remove("permanent");
+    assert!(
+        !serde_json::from_value::<LiveTargetBinding>(old)
+            .unwrap()
+            .permanent
+    );
+    let mut old_state = serde_json::to_value(&manager.state).unwrap();
+    old_state["config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("export_mode");
+    old_state["exports"][0]["binding"]
+        .as_object_mut()
+        .unwrap()
+        .remove("permanent");
+    let state: State = serde_json::from_value(old_state).unwrap();
+    assert_eq!(state.config.export_mode, LiveExportMode::OnDemand);
+    assert!(!state.exports[0].binding.permanent);
+    manager.shutdown().unwrap();
+}
+
+#[test]
+fn permanent_export_rejects_spdk() {
+    let mut f = Fixture::new();
+    f.config.export_mode = LiveExportMode::PerOwner;
+    f.config.spdk = Some(super::super::LiveSpdkConfig {
+        rpc_socket: f._tmp.path().join("rpc"),
+        executable: f._tmp.path().join("spdk"),
+    });
+    assert_eq!(
+        validate_config(&f.config).unwrap_err().to_string(),
+        "permanent live export requires the kernel target"
     );
 }

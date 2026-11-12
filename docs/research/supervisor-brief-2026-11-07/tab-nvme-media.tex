@@ -1,0 +1,10 @@
+\small
+\begin{tabular}{l|rrrrr|r|rr|r}\toprule
+& \multicolumn{5}{c|}{First-touch c1, value bytes} & Repeat c1 & \multicolumn{2}{c|}{Live read c16} & Cold c16\\
+Path & 64 & 256 & 1K & 8K & 64K & 64K & 1K & 64K & 64K\\\midrule
+Native & 0.004 & 0.004 & 0.017 & 0.073 & 0.512 & 0.000 & 0.000 & 0.000 & 0.782\\
+TH TCP & 0.006 & 0.011 & 0.025 & 0.094 & 0.542 & 0.000 & 0.000 & 0.000 & 4.182\\
+TH verbs & 0.029 & 0.075 & 0.263 & 1.001 & 1.001 & 0.000 & 0.000 & 0.000 & 4.151\\
+Kernel NVMe-oF & 0.006 & 0.011 & 0.025 & 0.094 & 1.008 & 0.000 & 0.000 & 0.000 & 1.110\\
+SPDK NVMe-oF & 1.011 & 1.013 & 1.043 & 1.045 & 1.013 & 1.000 & 1.009 & 1.009 & 1.185\\
+\bottomrule\end{tabular}

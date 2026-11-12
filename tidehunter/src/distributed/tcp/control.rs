@@ -108,8 +108,10 @@ struct Shared {
     // its reply. Native: the reply follows the WAL write and the node's syncer
     // makes it durable in the background; every non-append control flushes first.
     synchronous: AtomicBool,
-    // Lock order: `durability` before `syncers`. Both are cold (first append of
-    // each log, configuration and live fencing), never taken per request.
+    // Lock order: `durability` before `syncers`. Both are cold on the append
+    // path (first append of each log, configuration and live fencing). A live
+    // extent request (lease or adoption) reads the tier under `durability`
+    // once per request; no lock here is taken per put.
     durability: Mutex<DurabilityState>,
     // One syncer thread per log that received appends. Live fencing retires the
     // old log's worker before recovery; shutdown joins any remaining workers.
@@ -166,11 +168,19 @@ impl Shared {
     /// Wait until every log's synced frontier covers what it had appended when
     /// this began. The cold flush behind every non-append control.
     fn flush_logs(&self) -> Result<(), TcpError> {
-        let frontiers: Vec<_> = self
+        let logs: Vec<_> = self
             .syncers
             .lock()
             .iter()
-            .filter_map(|slot| slot.log.frontier().cloned())
+            .map(|slot| slot.log.clone())
+            .collect();
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        for log in &logs {
+            log.self_adopt_live_extent().map_err(TcpError::component)?;
+        }
+        let frontiers: Vec<_> = logs
+            .iter()
+            .filter_map(|log| log.frontier().cloned())
             .collect();
         // Start every flush before waiting for any: logs sync in parallel.
         let report = flush_all(&frontiers, None);
@@ -326,9 +336,9 @@ impl ControlOwner {
         })
     }
 
-    /// Select the durability tier and sync policy. Allowed only before the first
-    /// append: once a log has its frontier and syncer the policy is fixed, and a
-    /// change while appends are queued would mix the two reply policies.
+    /// Select policy before the first append or lease starts a stream frontier.
+    /// A frontier and syncer freeze the policy so queued writes cannot mix two
+    /// acknowledgement contracts.
     pub(super) fn set_durability(&self, config: DurabilityConfig) -> Result<(), TcpError> {
         let mut current = self.shared.durability.lock();
         if current.started {
@@ -336,7 +346,7 @@ impl ControlOwner {
                 Ok(())
             } else {
                 Err(TcpError::new(
-                    "durability tier cannot change after the first append",
+                    "durability tier cannot change after a stream frontier starts",
                 ))
             };
         }
@@ -481,11 +491,17 @@ impl StorageNode {
 
 /// Requests that move data through one log's WAL. They overlap each other; the
 /// log's own state lock orders them. Everything else is an exclusive control.
+// Seal/fence are exclusive barriers: they wait for active stream operations,
+// including an unlocked close scan. Direct storage callers use `sealing`.
 fn is_stream_request(request: &Request) -> bool {
     match request {
         Request::Append { .. } => true,
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-        Request::ReserveLiveGroup { .. } | Request::CompleteLiveGroup { .. } => true,
+        Request::ReserveLiveGroup { .. }
+        | Request::CompleteLiveGroup { .. }
+        | Request::LeaseLiveExtent { .. }
+        | Request::PreleaseLiveExtent { .. }
+        | Request::AdoptLiveExtent { .. } => true,
         _ => false,
     }
 }
@@ -683,6 +699,44 @@ fn run(shared: &Shared) {
                         began,
                     ),
                 }
+                continue;
+            }
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            request @ (Request::LeaseLiveExtent { .. }
+            | Request::PreleaseLiveExtent { .. }
+            | Request::AdoptLiveExtent { .. }) => {
+                let epoch = match &request {
+                    Request::LeaseLiveExtent { epoch }
+                    | Request::PreleaseLiveExtent { epoch, .. }
+                    | Request::AdoptLiveExtent { epoch, .. } => *epoch,
+                    _ => unreachable!("matched live extent request"),
+                };
+                let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let log = shared.context.inventory.lock().active(epoch)?;
+                    let frontier = shared.frontier_for(&log)?;
+                    let adoption = matches!(&request, Request::AdoptLiveExtent { .. });
+                    let closes_extent =
+                        matches!(&request, Request::AdoptLiveExtent { close: true, .. });
+                    // frontier_for freezes this authoritative policy before
+                    // any extent can be returned to the coordinator.
+                    let tier = shared.durability.lock().config.tier;
+                    let reply = shared.context.handle_live_extent(request, tier)?;
+                    // Native keeps its fragment-boundary/on-demand policy;
+                    // only synchronous adoption requests a per-prefix root sync.
+                    if adoption && (tier == DurabilityTier::Synchronous || closes_extent) {
+                        frontier.request_sync().map_err(TcpError::component)?;
+                    }
+                    Ok(reply)
+                }))
+                .unwrap_or_else(|_| {
+                    shared.context.poison_readers();
+                    Err(TcpError::new(
+                        "live extent owner panicked; outcome unknown; reopen authority",
+                    ))
+                });
+                complete(
+                    shared, id, charge, completed, response, profile, measured, began,
+                );
                 continue;
             }
             // Validation and publication run here. Persistence is handed to the
@@ -1528,6 +1582,121 @@ impl ControlContext {
             })?;
         Ok((log, receipts, validation_ns, validation_samples))
     }
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    fn lease_live_published(
+        &self,
+        epoch: u64,
+        tier: DurabilityTier,
+        after: Option<[u8; 16]>,
+    ) -> Result<LiveLeased, TcpError> {
+        let log = self.inventory.lock().active(epoch)?;
+        let leased = match after {
+            Some(after) => log.prelease_live_extent(RequestAuthority { epoch }, after),
+            None => log.lease_live_extent(RequestAuthority { epoch }),
+        };
+        let (extent, mut profile) = leased.map_err(|error| {
+            if matches!(error, StorageError::Unknown(_) | StorageError::Poisoned) {
+                self.poison_readers();
+            }
+            TcpError::component(error)
+        })?;
+        let publish_started = Instant::now();
+        let mut inventory = self.inventory.lock();
+        let binding = inventory.active(epoch).and_then(|current| {
+            // Acquire observes terminal authority published during unlocked I/O.
+            if self.poison_pending.load(Ordering::Acquire) || self.terminal.load(Ordering::Acquire)
+            {
+                return Err(TcpError::new(
+                    "live lease authority poisoned during pregrant",
+                ));
+            }
+            if !Arc::ptr_eq(&current, &log) {
+                return Err(TcpError::new("live lease authority changed"));
+            }
+            inventory.reap_idle_live_segments(epoch)?;
+            if inventory
+                .live_target
+                .as_ref()
+                .is_some_and(|target| target.export_mode().files_per_subsystem().is_some())
+            {
+                inventory.publish_permanent_segment(&extent.segment)
+            } else {
+                inventory.publish_live_segment(&extent.segment, true)
+            }
+        });
+        drop(inventory);
+        profile.publish_ns = publish_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let binding = binding.map_err(|error| {
+            log.poison_writer();
+            self.poison_readers();
+            TcpError::new(format!(
+                "live target publication failed; outcome unknown: {error}"
+            ))
+        })?;
+        Ok(LiveLeased {
+            extent,
+            binding,
+            tier,
+            profile,
+        })
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    fn handle_live_extent(
+        &self,
+        request: Request,
+        tier: DurabilityTier,
+    ) -> Result<Response, TcpError> {
+        // Acquire observes a terminal authority published after queue admission.
+        if self.poison_pending.load(Ordering::Acquire) || self.terminal.load(Ordering::Acquire) {
+            return Err(TcpError::new(
+                "log control authority is poisoned; reopen required",
+            ));
+        }
+        match request {
+            Request::LeaseLiveExtent { epoch } => self
+                .lease_live_published(epoch, tier, None)
+                .map(Response::LiveLeased),
+            Request::PreleaseLiveExtent { epoch, after } => self
+                .lease_live_published(epoch, tier, Some(after))
+                .map(Response::LiveLeased),
+            Request::AdoptLiveExtent {
+                epoch,
+                token,
+                through,
+                close,
+                lease_next,
+            } => {
+                if lease_next && !close {
+                    return Err(TcpError::new("next live extent requires close"));
+                }
+                let log = self.inventory.lock().active(epoch)?;
+                let (adoption, profile) = log
+                    .adopt_live_extent(RequestAuthority { epoch }, token, through, close)
+                    .map_err(|error| {
+                        if matches!(error, StorageError::IncompleteLiveFrame) {
+                            self.poison_incomplete_live();
+                        } else if matches!(error, StorageError::Unknown(_) | StorageError::Poisoned)
+                        {
+                            self.poison_readers();
+                        }
+                        TcpError::component(error)
+                    })?;
+                let next = if lease_next {
+                    Some(self.lease_live_published(epoch, tier, None)?)
+                } else {
+                    None
+                };
+                Ok(Response::LiveAdopted(LiveAdopted {
+                    adoption,
+                    next,
+                    profile,
+                }))
+            }
+            _ => Err(TcpError::new("not a live extent control request")),
+        }
+    }
+
     pub(super) fn handle_profiled(
         &self,
         request: Request,
@@ -1594,9 +1763,66 @@ impl ControlContext {
         }
         match request {
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            Request::OpenLiveExports { authority_epoch } => {
+                let mut inventory = self.inventory.lock();
+                let log = inventory.active(authority_epoch)?;
+                let target = inventory
+                    .live_target
+                    .as_ref()
+                    .ok_or_else(|| TcpError::new("live target not configured"))?;
+                let mode = target.export_mode();
+                let (address, service, transport) = target.endpoint();
+                let count = if mode.files_per_subsystem().is_some() {
+                    log.live_file_count().map_err(TcpError::component)?
+                } else {
+                    0
+                };
+                for file in 0..count {
+                    let segment = match log.live_segment(file) {
+                        Ok(segment) => segment,
+                        Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                            continue;
+                        }
+                        Err(error) => return Err(TcpError::component(error)),
+                    };
+                    if let Err(error) = inventory.publish_permanent_segment(&segment) {
+                        drop(inventory);
+                        log.poison_writer();
+                        self.poison_readers();
+                        return Err(TcpError::new(format!(
+                            "live target publication failed; outcome unknown: {error}"
+                        )));
+                    }
+                }
+                Ok(Response::LiveExports(live_control::LiveExportInfo {
+                    mode,
+                    address,
+                    service,
+                    transport,
+                    wal_file_bytes: log.config().wal_file_bytes,
+                    block_size: 4096,
+                    exported_files: count,
+                }))
+            }
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            Request::LeaseLiveExtent { .. }
+            | Request::PreleaseLiveExtent { .. }
+            | Request::AdoptLiveExtent { .. } => Err(TcpError::new(
+                "live extent requires the stream durability dispatch",
+            )),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             Request::ReserveLiveGroup { epoch, descriptor } => {
                 use super::super::nvmeof::live_storage::LiveReserveResult;
                 let mut inventory = self.inventory.lock();
+                if inventory
+                    .live_target
+                    .as_ref()
+                    .is_some_and(|target| target.export_mode().files_per_subsystem().is_some())
+                {
+                    return Err(TcpError::new(
+                        "permanent live export requires leased write mode",
+                    ));
+                }
                 let log = inventory.active(epoch)?;
                 let mut result =
                     log.reserve_live_group(RequestAuthority { epoch }, descriptor.clone());
@@ -1673,6 +1899,20 @@ impl ControlContext {
                 authority_epoch,
                 references,
             } => {
+                if references
+                    .iter()
+                    .any(|reference| reference.batch_version.epoch == authority_epoch)
+                    && self
+                        .inventory
+                        .lock()
+                        .live_target
+                        .as_ref()
+                        .is_some_and(|target| target.export_mode().files_per_subsystem().is_some())
+                {
+                    return Err(TcpError::new(
+                        "live record resolution is disabled for the active epoch in permanent export mode",
+                    ));
+                }
                 if references.is_empty()
                     || references.len() > self.effective_max_reads(limits).min(256)
                 {
@@ -1720,6 +1960,7 @@ impl ControlContext {
                 cursor,
                 limit,
             } => {
+                self.inventory.lock().require_history(false)?;
                 if limit == 0 || limit > limits.recovery_page_batches || limit > 256 {
                     return Err(TcpError::new("live recovery page count exceeds bound"));
                 }
@@ -1750,6 +1991,84 @@ impl ControlContext {
                     (durable, plans, (end < count).then_some(end))
                 } else {
                     if cursor != 0 {
+                        return Err(TcpError::new("invalid abandoned epoch cursor"));
+                    }
+                    (Vec::new(), Vec::new(), None)
+                };
+                let (token, locations) = self.publish_live_leases(authority_epoch, plans)?;
+                let entries = receipts
+                    .into_iter()
+                    .zip(locations)
+                    .map(|(receipt, (segment, binding, offset, len))| {
+                        live_control::LiveRecoveryEntryWire {
+                            receipt,
+                            segment,
+                            binding,
+                            offset,
+                            len,
+                        }
+                    })
+                    .collect();
+                self.bounded_live_response(
+                    authority_epoch,
+                    token,
+                    Response::LiveRecovery(live_control::LiveRecoveryWire {
+                        entries,
+                        next,
+                        epoch_pin_token: token,
+                    }),
+                    limits.max_frame_bytes,
+                )
+            }
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            Request::ReplayLiveWal {
+                authority_epoch,
+                source_epoch,
+                from,
+                limit,
+                require_end,
+            } => {
+                let log = {
+                    let inventory = self.inventory.lock();
+                    inventory.require_history(true)?;
+                    inventory.live_recovery_log(authority_epoch, source_epoch)?
+                };
+                if limit == 0 || limit > limits.recovery_page_batches || limit > 256 {
+                    return Err(TcpError::new("live recovery page count exceeds bound"));
+                }
+                let (receipts, plans, next) = if let Some(log) = log {
+                    let page = log
+                        .replay_page(
+                            from,
+                            limit,
+                            limits.max_frame_bytes.saturating_sub(32),
+                            require_end,
+                        )
+                        .map_err(TcpError::component)?;
+                    let mut receipts = Vec::new();
+                    let mut plans = Vec::new();
+                    for decoded in page.groups {
+                        for receipt in decoded.receipts {
+                            plans.push(
+                                log.resolve_live_batch(receipt)
+                                    .map_err(TcpError::component)?,
+                            );
+                            receipts.push(Receipt {
+                                id: receipt.id(),
+                                version: receipt.version(),
+                                digest: receipt.digest(),
+                                address: receipt.address(),
+                            });
+                        }
+                    }
+                    let next = page
+                        .next
+                        .map(usize::try_from)
+                        .transpose()
+                        .map_err(|_| TcpError::new("replay offset exceeds address space"))?;
+                    (receipts, plans, next)
+                } else {
+                    if from != 0 {
                         return Err(TcpError::new("invalid abandoned epoch cursor"));
                     }
                     (Vec::new(), Vec::new(), None)
@@ -1934,6 +2253,34 @@ impl ControlContext {
                 .lock()
                 .checkpoint_proof(authority_epoch, epoch, prefix)
                 .map(Response::Checkpoint),
+            Request::CheckpointPosition {
+                authority_epoch,
+                epoch,
+                through,
+            } => self
+                .inventory
+                .lock()
+                .checkpoint_position(authority_epoch, epoch, through)
+                .map(|proof| Response::CheckpointPosition {
+                    database: proof.database,
+                    partition: proof.partition,
+                    epoch: proof.epoch,
+                    durable_end: proof.durable_end,
+                }),
+            Request::ReplayWal {
+                authority_epoch,
+                source_epoch,
+                from,
+                limit,
+                require_end,
+            } => self.inventory.lock().replay_wal_page(
+                authority_epoch,
+                source_epoch,
+                from,
+                limit,
+                require_end,
+                limits,
+            ),
             Request::RetirementFiles {
                 authority_epoch,
                 epoch,
@@ -1963,6 +2310,25 @@ impl ControlContext {
                         .lock()
                         .retire_files(authority_epoch, epoch, prefix, &files);
                 result.map(|()| Response::Retired)
+            }
+            Request::RetireWalFiles {
+                authority_epoch,
+                epoch,
+                files,
+            } => {
+                self.inventory.lock().require_history(true)?;
+                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                let _leases = {
+                    let leases = self.nvmeof_leases.lock();
+                    if leases.has_live_or_quarantined() {
+                        return Err(TcpError::new("NVMe-oF leases must drain before retirement"));
+                    }
+                    leases
+                };
+                self.inventory
+                    .lock()
+                    .retire_wal_files(authority_epoch, epoch, &files)
+                    .map(|()| Response::Retired)
             }
             Request::ReadIoStats => {
                 let log = {

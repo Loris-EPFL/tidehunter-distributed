@@ -15,6 +15,8 @@ import exporter
 
 MAX_SELECTION = 1024 * 1024
 MAX_CGROUP_FILE = 256 * 1024
+# Match the compact and five-owner fleet layouts.
+SEALED_OWNER_COUNTS = (1, 5)
 TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
 METRIC = re.compile(r"[A-Za-z_:][A-Za-z0-9_:]*")
 LABEL = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*("(?:[^"\\]|\\.)*")')
@@ -511,8 +513,14 @@ def live_nvmeof_metrics(evidence, labels):
               "publication", "namespace_setup", "read_io", "persistence", "owner_completion",
               "wal_persistence", "wal_namespace", "frontier_file", "frontier_namespace")
     extra_fields = ("lane_inflight_samples", "lane_inflight_request_sum", "lane_inflight_op_sum",
-                    "grant_hits", "grant_misses", "grant_evictions", "copy_bytes_avoided")
-    extra_stages = ("delivery", "controller_connect", "controller_disconnect")
+                    "grant_hits", "grant_misses", "grant_evictions", "copy_bytes_avoided",
+                    "reserve_exchanges", "complete_exchanges", "lease_exchanges", "leased_frames",
+                    "leased_bytes", "leased_skip_markers", "extents_leased", "adoption_async_exchanges",
+                    "adoption_sync_exchanges", "fua_writes", "leased_failed_writes", "leased_short_writes",
+                    "leased_timed_out_writes", "leased_full_writes", "failed_write_ops", "short_write_ops",
+                    "short_write_bytes", "adoption_history_full_settles")
+    extra_stages = ("delivery", "controller_connect", "controller_disconnect", "leased_write",
+                    "extent_switch", "adoption_async", "adoption_settle")
     expected = set(fields) | {stage + suffix for stage in stages for suffix in ("_ns", "_samples")}
     allowed = expected | set(extra_fields) | {stage + suffix for stage in extra_stages for suffix in ("_ns", "_samples")}
     if not isinstance(counters, dict) or not expected <= counters.keys() or counters.keys() - allowed:
@@ -593,8 +601,9 @@ def spdk_target_metrics(evidence, labels):
     if not isinstance(evidence, dict) or evidence.get("available") is not True:
         raise ValueError("SPDK metrics require admitted target intervals")
     owners = evidence.get("owners")
-    if (not isinstance(owners, list) or len(owners) != 5
-            or {row.get("index") for row in owners} != set(range(5))):
+    if (not isinstance(owners, list) or len(owners) not in SEALED_OWNER_COUNTS
+            or any(not isinstance(row, dict) or type(row.get("index")) is not int for row in owners)
+            or {row["index"] for row in owners} != set(range(len(owners)))):
         raise ValueError("SPDK target metrics require every owner")
     result = sample("kv_spdk_target_evidence_available", 1, labels)
     for owner, row in [("all", evidence)] + [(str(row["index"]), row) for row in owners]:
@@ -844,11 +853,17 @@ LIVE_NVME_WRITE_COUNTERS = {
     "unknown_writes", "errors", "payload_rpc_requests",
     "lane_inflight_samples", "lane_inflight_request_sum", "lane_inflight_op_sum",
     "grant_hits", "grant_misses", "grant_evictions", "copy_bytes_avoided",
+    "reserve_exchanges", "complete_exchanges", "lease_exchanges", "leased_frames", "leased_bytes",
+    "leased_skip_markers", "extents_leased", "adoption_async_exchanges", "adoption_sync_exchanges",
+    "fua_writes", "leased_failed_writes", "leased_short_writes", "leased_timed_out_writes",
+    "leased_full_writes", "failed_write_ops", "short_write_ops", "short_write_bytes",
+    "adoption_history_full_settles",
     *(stage + suffix for stage in ("queue", "submit", "cq", "control", "validation", "persistence",
                                    "allocation", "publication", "namespace_setup", "read_io",
                                    "owner_completion", "wal_persistence", "wal_namespace",
                                    "frontier_file", "frontier_namespace", "delivery",
-                                   "controller_connect", "controller_disconnect")
+                                   "controller_connect", "controller_disconnect", "leased_write",
+                                   "extent_switch", "adoption_async", "adoption_settle")
       for suffix in ("_ns", "_samples")),
 }
 
@@ -947,8 +962,13 @@ def write_diagnostic_metrics(evidence, labels):
             token(field)
             count(value)
         for field in counters:
-            if field.endswith("_ns") and field[:-3] + "_samples" not in counters:
-                raise ValueError("live NVMe clock lacks its sample count")
+            if field.endswith("_ns"):
+                samples_field = field[:-3] + "_samples"
+                if samples_field not in counters:
+                    raise ValueError("live NVMe clock lacks its sample count")
+            elif field.endswith("_samples") and field != "lane_inflight_samples":
+                if field[:-8] + "_ns" not in counters:
+                    raise ValueError("live NVMe sample count lacks its clock")
     elif nvme and (observed or evidence["runtime_enabled"]):
         raise ValueError("live NVMe write counter window is unavailable")
     elif backend == "tidehunter_live_nvmeof" and evidence["runtime_enabled"]:

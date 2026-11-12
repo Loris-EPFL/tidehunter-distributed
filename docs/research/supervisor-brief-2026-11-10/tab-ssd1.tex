@@ -1,0 +1,18 @@
+\small\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrrr}\toprule
+Component, mean \us & Verbs & TCP & Verbs mTLS & Kernel direct & SPDK\\\midrule
+Owner append-persist (includes software) & \N{C:ssd1v:persist} & \N{C:ssd1t:persist} & \N{C:ssd1m:persist} & \N{C:ssd1k:persist} & \N{C:ssd1s:persist}\\
+Network (stacks, TLS, dispatch included) & \N{C:ssd1v:network} & \N{C:ssd1t:network} & \N{C:ssd1m:network} & \N{C:ssd1k:network} & \N{C:ssd1s:network}\\
+Coordinator / native library insert$^{a}$ & \N{C:ssd1v:coordinator} & \N{C:ssd1t:coordinator} & \N{C:ssd1m:coordinator} & \N{C:ssd1k:coordinator} & \N{C:ssd1s:coordinator}\\
+Owner software & \N{C:ssd1v:owner} & \N{C:ssd1t:owner} & \N{C:ssd1m:owner} & \N{C:ssd1k:owner} & \N{C:ssd1s:owner}\\
+Durable wait / native file sync$^{a}$ & \N{C:ssd1v:durable} & \N{C:ssd1t:durable} & \N{C:ssd1m:durable} & \N{C:ssd1k:durable} & \N{C:ssd1s:durable}\\
+Waiting and coalescing & \N{C:ssd1v:coalescing} & \N{C:ssd1t:coalescing} & \N{C:ssd1m:coalescing} & \N{C:ssd1k:coalescing} & \N{C:ssd1s:coalescing}\\
+Client queueing and wake-up & \N{C:ssd1v:queue} & \N{C:ssd1t:queue} & \N{C:ssd1m:queue} & \N{C:ssd1k:queue} & \N{C:ssd1s:queue}\\
+Residual & \N{C:ssd1v:residual} & \N{C:ssd1t:residual} & \N{C:ssd1m:residual} & \N{C:ssd1k:residual} & \N{C:ssd1s:residual}\\
+Client encode, decode, verify & \N{C:ssd1v:messaging} & \N{C:ssd1t:messaging} & \N{C:ssd1m:messaging} & \N{C:ssd1k:messaging} & \N{C:ssd1s:messaging}\\
+SSD device & \N{C:ssd1v:device} & \N{C:ssd1t:device} & \N{C:ssd1m:device} & \N{C:ssd1k:device} & \N{C:ssd1s:device}\\
+Device + fabric + stack (unsplit) & \N{C:ssd1v:combined} & \N{C:ssd1t:combined} & \N{C:ssd1m:combined} & \N{C:ssd1k:combined} & \N{C:ssd1s:combined}\\
+Owner + network exchange (unsplit) & \N{C:ssd1v:exchange} & \N{C:ssd1t:exchange} & \N{C:ssd1m:exchange} & \N{C:ssd1k:exchange} & \N{C:ssd1s:exchange}\\
+\textbf{TOTAL: same-case API mean} & \N{D:ssd1v:mean_us} & \N{D:ssd1t:mean_us} & \N{D:ssd1m:mean_us} & \N{D:ssd1k:mean_us} & \N{D:ssd1s:mean_us}\\
+API p50 & \N{D:ssd1v:p50_us} & \N{D:ssd1t:p50_us} & \N{D:ssd1m:p50_us} & \N{D:ssd1k:p50_us} & \N{D:ssd1s:p50_us}\\
+\bottomrule\end{tabular}

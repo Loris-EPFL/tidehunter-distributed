@@ -1,0 +1,18 @@
+\small\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrr}\toprule
+Component, mean \us & Verbs & TCP & Native\\\midrule
+Owner append-persist (includes software) & \N{C:p64v:persist} & \N{C:p64t:persist} & \N{C:p64n:persist}\\
+Network (stacks, TLS, dispatch included) & \N{C:p64v:network} & \N{C:p64t:network} & \N{C:p64n:network}\\
+Coordinator / native library insert$^{a}$ & \N{C:p64v:coordinator} & \N{C:p64t:coordinator} & \N{C:p64n:coordinator}\\
+Owner software & \N{C:p64v:owner} & \N{C:p64t:owner} & \N{C:p64n:owner}\\
+Durable wait / native file sync$^{a}$ & \N{C:p64v:durable} & \N{C:p64t:durable} & \N{C:p64n:durable}\\
+Waiting and coalescing & \N{C:p64v:coalescing} & \N{C:p64t:coalescing} & \N{C:p64n:coalescing}\\
+Client queueing and wake-up & \N{C:p64v:queue} & \N{C:p64t:queue} & \N{C:p64n:queue}\\
+Residual & \N{C:p64v:residual} & \N{C:p64t:residual} & \N{C:p64n:residual}\\
+Client encode, decode, verify & \N{C:p64v:messaging} & \N{C:p64t:messaging} & \N{C:p64n:messaging}\\
+SSD device & \N{C:p64v:device} & \N{C:p64t:device} & \N{C:p64n:device}\\
+Device + fabric + stack (unsplit) & \N{C:p64v:combined} & \N{C:p64t:combined} & \N{C:p64n:combined}\\
+Owner + network exchange (unsplit) & \N{C:p64v:exchange} & \N{C:p64t:exchange} & \N{C:p64n:exchange}\\
+\textbf{TOTAL: same-case API mean} & \N{D:p64v:mean_us} & \N{D:p64t:mean_us} & \N{D:p64n:mean_us}\\
+API p50 & \N{D:p64v:p50_us} & \N{D:p64t:p50_us} & \N{D:p64n:p50_us}\\
+\bottomrule\end{tabular}

@@ -1,0 +1,45 @@
+{
+  "page_count": 7,
+  "page_limit": 10,
+  "campaign": "bench-b35a62e24b47faaf",
+  "provider": "Google Cloud",
+  "compilation": {
+    "tool": "latex MCP compile_latex",
+    "engine": "pdflatex",
+    "success": true,
+    "warnings": []
+  },
+  "numeric_audit": {
+    "exact_table_fields_checked": 50,
+    "figure_case_records_checked": 150,
+    "unique_cloud_cases": 100,
+    "exact_panel_values_checked": 600,
+    "raw_populations_not_pooled": true
+  },
+  "visual_review": {
+    "pages_inspected": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "method": "pdftoppm PNG previews, scale-to 1400; final configuration labels and source page re-inspected",
+    "findings": "Legible diagrams, table, legends and plots; no observed clipping. Figure 5 exposes tails, finite exposure and value bandwidth. Local benchmark results are excluded."
+  },
+  "files": {
+    "main.tex": "a0b63346bfabc31bf93e6224f03309eac3c096263271be70c78ed213a5950139",
+    "main.pdf": "e4eb6d545c253bbd1948c93e56e4a415efbb0bca5cb8047ad8f0826f57c483f4",
+    "evidence.json": "ba3539f709e18cf94345dd259d74843c62136e652f6a74384dc8f51f4304e5f9",
+    "plot_evidence.py": "ffa43cf8e1fcc67687961914fc5eec56bdbaaf70193a4d68e4fe8730627f520f"
+  },
+  "scope": {
+    "comparison_date": "2026-11-03",
+    "synthetic_workloads": true,
+    "sui_replay": false,
+    "independent_repetitions": 1
+  },
+  "new_cloud_actions": "None"
+}

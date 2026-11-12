@@ -279,14 +279,17 @@ mod tests {
         ] {
             assert!(status_bytes(status, "VmRSS:").is_err());
         }
+        // Other test threads write between two reads of this process-wide
+        // counter. It never decreases, so the snapshot must lie between a read
+        // taken before it and a read taken after it.
+        let before = process_io_counter("write_bytes:");
         let resources = ProcessResources::process().unwrap();
+        let after = process_io_counter("write_bytes:");
         assert_eq!(resources.pid, std::process::id());
         assert!(resources.rss_bytes > 0);
         assert!(resources.peak_rss_bytes >= resources.rss_bytes);
-        assert_eq!(
-            resources.accounted_process_write_bytes,
-            process_io_counter("write_bytes:")
-        );
+        assert!(before <= resources.accounted_process_write_bytes);
+        assert!(resources.accounted_process_write_bytes <= after);
     }
 
     #[test]

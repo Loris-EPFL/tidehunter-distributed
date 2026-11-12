@@ -1,0 +1,127 @@
+Portrait panel PDFs: 6.5 inches wide, one vector page per retained panel.
+Source: data/plots.json. Curves are producer statistics; no run-to-run bars or pooling.
+Caption correction: the retained plotter incorrectly describes Valkey get-many; case metadata and the measured Rust adapter establish redis-rs MGET split by slot and ordered reassembly. The data and original source manifest are unchanged.
+
+primary-read-concurrent.pdf
+  Context: Pure reads — primary RF1, c16; One independent repetition (r0); no run-to-run variability estimate
+  Caption: Closed-loop c16; all five value sizes. One key per API call. Valkey get-many issues one MGET through redis-rs, which splits by slot and reassembles ordered results; no atomic PUT-batch support. One independent repetition; points are source per-case values/conditional quantiles. No run-to-run variability estimate or between-run errorbars. No pooled quantiles or confidence/significance claims. Successful latency is conditional on operation/outcome. RF1 does not equalize consistency, durability, security, or transaction semantics. Primary RF1 only: native uses value_wal_barrier and TH explicit caches are off; other cohorts use their stated settings. Valkey GET remains RAM-resident, including cold OS; appendfsync always acknowledges AOF writes, not value-WAL reads. Warm OS is not guaranteed cache residency. Tail quantiles are descriptive, including small populations.
+  Page 1: API p50 (metric=api_ns, operation=read, outcome=success)
+  Page 2: API p99 (metric=api_ns, operation=read, outcome=success)
+  Page 3: Response p99 (metric=response_ns, operation=read, outcome=success)
+  Page 4: Whole-workload successful calls (metric=success_calls_per_second, operation=None, outcome=success)
+  Page 5: Successful logical keys (metric=success_logical_keys_per_second, operation=None, outcome=success)
+  Page 6: Successful value payload (metric=success_value_mib_per_second, operation=None, outcome=success)
+
+primary-write-concurrent.pdf
+  Context: Pure writes — primary RF1, c16; One independent repetition (r0); no run-to-run variability estimate
+  Caption: Closed-loop c16; all five value sizes. One key per API call. Valkey get-many issues one MGET through redis-rs, which splits by slot and reassembles ordered results; no atomic PUT-batch support. One independent repetition; points are source per-case values/conditional quantiles. No run-to-run variability estimate or between-run errorbars. No pooled quantiles or confidence/significance claims. Successful latency is conditional on operation/outcome. RF1 does not equalize consistency, durability, security, or transaction semantics. Primary RF1 only: native uses value_wal_barrier and TH explicit caches are off; other cohorts use their stated settings. Valkey GET remains RAM-resident, including cold OS; appendfsync always acknowledges AOF writes, not value-WAL reads. Warm OS is not guaranteed cache residency. Tail quantiles are descriptive, including small populations.
+  Page 1: API p50 (metric=api_ns, operation=put, outcome=success)
+  Page 2: API p99 (metric=api_ns, operation=put, outcome=success)
+  Page 3: Response p99 (metric=response_ns, operation=put, outcome=success)
+  Page 4: Whole-workload successful calls (metric=success_calls_per_second, operation=None, outcome=success)
+  Page 5: Successful logical keys (metric=success_logical_keys_per_second, operation=None, outcome=success)
+  Page 6: Successful value payload (metric=success_value_mib_per_second, operation=None, outcome=success)
+
+primary-read-many32.pdf
+  Context: Read-many32 — primary RF1, c16; One independent repetition (r0); no run-to-run variability estimate
+  Caption: Closed-loop c16; all five value sizes. Get-many latency is PER CALL of 32 keys, not per key. FoundationDB performs 32 sequential transaction gets. Valkey get-many issues one MGET through redis-rs, which splits by slot and reassembles ordered results; no atomic PUT-batch support. One independent repetition; points are source per-case values/conditional quantiles. No run-to-run variability estimate or between-run errorbars. No pooled quantiles or confidence/significance claims. Successful latency is conditional on operation/outcome. RF1 does not equalize consistency, durability, security, or transaction semantics. Primary RF1 only: native uses value_wal_barrier and TH explicit caches are off; other cohorts use their stated settings. Valkey GET remains RAM-resident, including cold OS; appendfsync always acknowledges AOF writes, not value-WAL reads. Warm OS is not guaranteed cache residency. Tail quantiles are descriptive, including small populations.
+  Page 1: API p50 (metric=api_ns, operation=get_many, outcome=success)
+  Page 2: API p99 (metric=api_ns, operation=get_many, outcome=success)
+  Page 3: Response p99 (metric=response_ns, operation=get_many, outcome=success)
+  Page 4: Whole-workload successful calls (metric=success_calls_per_second, operation=None, outcome=success)
+  Page 5: Successful logical keys (metric=success_logical_keys_per_second, operation=None, outcome=success)
+  Page 6: Successful value payload (metric=success_value_mib_per_second, operation=None, outcome=success)
+
+primary-point-mixed-latency.pdf
+  Context: Point-mixed — primary RF1, c1; One independent repetition (r0); no run-to-run variability estimate
+  Caption: Closed-loop c1: 45% read, 45% put, 5% delete, 5% missing_read. Missing-read success is a successful absence result, not a hit. Each operation/outcome remains separate; delete/missing tails have small populations. One independent repetition; points are source per-case values/conditional quantiles. No run-to-run variability estimate or between-run errorbars. No pooled quantiles or confidence/significance claims. Successful latency is conditional on operation/outcome. RF1 does not equalize consistency, durability, security, or transaction semantics. Primary RF1 only: native uses value_wal_barrier and TH explicit caches are off; other cohorts use their stated settings. Valkey GET remains RAM-resident, including cold OS; appendfsync always acknowledges AOF writes, not value-WAL reads. Warm OS is not guaranteed cache residency. Tail quantiles are descriptive, including small populations.
+  Page 1: read API p50 (metric=api_ns, operation=read, outcome=success)
+  Page 2: put API p50 (metric=api_ns, operation=put, outcome=success)
+  Page 3: delete API p50 (metric=api_ns, operation=delete, outcome=success)
+  Page 4: missing_read API p50 (metric=api_ns, operation=missing_read, outcome=success)
+  Page 5: read API p99 (metric=api_ns, operation=read, outcome=success)
+  Page 6: put API p99 (metric=api_ns, operation=put, outcome=success)
+  Page 7: delete API p99 (metric=api_ns, operation=delete, outcome=success)
+  Page 8: missing_read API p99 (metric=api_ns, operation=missing_read, outcome=success)
+
+primary-point-mixed-goodput.pdf
+  Context: Point-mixed — whole-workload goodput, c1; One independent repetition (r0); no run-to-run variability estimate
+  Caption: Goodput covers the ENTIRE mixed workload, not the adjacent operation-specific latency populations. Value MiB/s uses successful value payload accounting, not wire traffic or delete/missing bytes. One independent repetition; points are source per-case values/conditional quantiles. No run-to-run variability estimate or between-run errorbars. No pooled quantiles or confidence/significance claims. Successful latency is conditional on operation/outcome. RF1 does not equalize consistency, durability, security, or transaction semantics. Primary RF1 only: native uses value_wal_barrier and TH explicit caches are off; other cohorts use their stated settings. Valkey GET remains RAM-resident, including cold OS; appendfsync always acknowledges AOF writes, not value-WAL reads. Warm OS is not guaranteed cache residency. Tail quantiles are descriptive, including small populations.
+  Page 1: Whole-workload successful calls (metric=success_calls_per_second, operation=None, outcome=success)
+  Page 2: Successful logical keys (metric=success_logical_keys_per_second, operation=None, outcome=success)
+  Page 3: Successful value payload (metric=success_value_mib_per_second, operation=None, outcome=success)
+
+offered-load-accounting.pdf
+  Context: Offered load — 1 KiB, c32; One independent repetition (r0); no run-to-run variability estimate
+  Caption: Open-loop 70% read / 30% put; c32 dispatch bound; configured arrival rates, not achieved throughput, on x. Rejection fractions retain ALL offered arrivals in the denominator. Goodput uses observed measurement span. One independent repetition; points are source per-case values/conditional quantiles. No run-to-run variability estimate or between-run errorbars. No pooled quantiles or confidence/significance claims. Successful latency is conditional on operation/outcome. RF1 does not equalize consistency, durability, security, or transaction semantics. Primary RF1 only: native uses value_wal_barrier and TH explicit caches are off; other cohorts use their stated settings. Valkey GET remains RAM-resident, including cold OS; appendfsync always acknowledges AOF writes, not value-WAL reads. Warm OS is not guaranteed cache residency. Tail quantiles are descriptive, including small populations.
+  Page 1: Whole-workload successful calls (metric=success_calls_per_second, operation=None, outcome=success)
+  Page 2: Successful logical keys (metric=success_logical_keys_per_second, operation=None, outcome=success)
+  Page 3: Successful value payload (metric=success_value_mib_per_second, operation=None, outcome=success)
+  Page 4: Rejected arrivals / offered arrivals (metric=rejection_fraction, operation=None, outcome=success)
+
+offered-load-tails.pdf
+  Context: Offered-load conditional p99 — 1 KiB, c32; One independent repetition (r0); no run-to-run variability estimate
+  Caption: Success and rejected populations are NEVER mixed. API is dispatch-to-completion; response is scheduled-arrival-to-completion; scheduling is arrival-to-dispatch. Rejected arrivals have response only (API/scheduling undefined). Rejected-response points require a timed rejection in every matched repeat; missing populations are gaps, not zeros. Read with offered-load-accounting; fast conditional tails alone do not imply accepting offered load. One independent repetition; points are source per-case values/conditional quantiles. No run-to-run variability estimate or between-run errorbars. No pooled quantiles or confidence/significance claims. Successful latency is conditional on operation/outcome. RF1 does not equalize consistency, durability, security, or transaction semantics. Primary RF1 only: native uses value_wal_barrier and TH explicit caches are off; other cohorts use their stated settings. Valkey GET remains RAM-resident, including cold OS; appendfsync always acknowledges AOF writes, not value-WAL reads. Warm OS is not guaranteed cache residency. Tail quantiles are descriptive, including small populations.
+  Page 1: read api p99 / success (metric=api_ns, operation=read, outcome=success)
+  Page 2: read response p99 / success (metric=response_ns, operation=read, outcome=success)
+  Page 3: read scheduling p99 / success (metric=scheduling_ns, operation=read, outcome=success)
+  Page 4: put api p99 / success (metric=api_ns, operation=put, outcome=success)
+  Page 5: put response p99 / success (metric=response_ns, operation=put, outcome=success)
+  Page 6: put scheduling p99 / success (metric=scheduling_ns, operation=put, outcome=success)
+  Page 7: read response p99 / rejected (metric=response_ns, operation=read, outcome=rejected)
+  Page 8: put response p99 / rejected (metric=response_ns, operation=put, outcome=rejected)
+
+zipf-versus-uniform.pdf
+  Context: Uniform versus Zipf(0.99) — 1 KiB reads, c16; One independent repetition (r0); no run-to-run variability estimate
+  Caption: Same 1 KiB c16 pure-read profile; access frequency differs, not key-bit distribution. No explicit coordinator/owner cache in either primary cohort. One independent repetition; points are source per-case values/conditional quantiles. No run-to-run variability estimate or between-run errorbars. No pooled quantiles or confidence/significance claims. Successful latency is conditional on operation/outcome. RF1 does not equalize consistency, durability, security, or transaction semantics. Primary RF1 only: native uses value_wal_barrier and TH explicit caches are off; other cohorts use their stated settings. Valkey GET remains RAM-resident, including cold OS; appendfsync always acknowledges AOF writes, not value-WAL reads. Warm OS is not guaranteed cache residency. Tail quantiles are descriptive, including small populations.
+  Page 1: API p50 (metric=api_ns, operation=read, outcome=success)
+  Page 2: API p99 (metric=api_ns, operation=read, outcome=success)
+  Page 3: Successful calls (metric=success_calls_per_second, operation=None, outcome=success)
+
+cache-cohorts.pdf
+  Context: Separate configured-cache cohorts — c1, 256 B and 8 KiB; One independent repetition (r0); no run-to-run variability estimate
+  Caption: Every row is a distinct c1 cohort; no comparison against primary c16 pure reads. Coordinator and owner cache budgets are 128 MiB where configured; Linux page cache also remains. The owner-cache cohort includes cache misses/WAL fallbacks; it is not isolated owner-cache-hit latency. Registered RAM is TH EFA native only and is mixed RMA plus message fallback, NOT isolated RDMA latency. Cumulative path counters include preload/warmup/qualification and are not timing fractions. One independent repetition; points are source per-case values/conditional quantiles. No run-to-run variability estimate or between-run errorbars. No pooled quantiles or confidence/significance claims. Successful latency is conditional on operation/outcome. RF1 does not equalize consistency, durability, security, or transaction semantics. Primary RF1 only: native uses value_wal_barrier and TH explicit caches are off; other cohorts use their stated settings. Valkey GET remains RAM-resident, including cold OS; appendfsync always acknowledges AOF writes, not value-WAL reads. Warm OS is not guaranteed cache residency. Tail quantiles are descriptive, including small populations.
+  Page 1: Coordinator cache: API p50 (metric=api_ns, operation=read, outcome=success)
+  Page 2: Coordinator cache: API p99 (metric=api_ns, operation=read, outcome=success)
+  Page 3: Coordinator cache: successful calls (metric=success_calls_per_second, operation=None, outcome=success)
+  Page 4: Owner cache: API p50 (metric=api_ns, operation=read, outcome=success)
+  Page 5: Owner cache: API p99 (metric=api_ns, operation=read, outcome=success)
+  Page 6: Owner cache: successful calls (metric=success_calls_per_second, operation=None, outcome=success)
+  Page 7: Registered RAM: API p50 (metric=api_ns, operation=read, outcome=success)
+  Page 8: Registered RAM: API p99 (metric=api_ns, operation=read, outcome=success)
+  Page 9: Registered RAM: successful calls (metric=success_calls_per_second, operation=None, outcome=success)
+
+cold-os-cache.pdf
+  Context: Cold-OS-cache protocol — 64 KiB reads, c16; One independent repetition (r0); no run-to-run variability estimate
+  Caption: 8 GiB value preload, no warmup, cache-drop gate. Valkey GET remains RAM-resident: AOF is not a read backing store. Cold OS does NOT mean isolated NVMe/device latency: engine and controller caches, network, scheduling and metadata may contribute. Systems must meet the planned-mode completion minimum to enter this separate cohort; all plotted systems share matched repeats and exclusions remain explicit. Missing results are never plotted as zero. One independent repetition; points are source per-case values/conditional quantiles. No run-to-run variability estimate or between-run errorbars. No pooled quantiles or confidence/significance claims. Successful latency is conditional on operation/outcome. RF1 does not equalize consistency, durability, security, or transaction semantics. Primary RF1 only: native uses value_wal_barrier and TH explicit caches are off; other cohorts use their stated settings. Valkey GET remains RAM-resident, including cold OS; appendfsync always acknowledges AOF writes, not value-WAL reads. Warm OS is not guaranteed cache residency. Tail quantiles are descriptive, including small populations. Cold-cohort inclusion requires at least 1 completed repetition(s) per system.
+  Page 1: API p50 (metric=api_ns, operation=read, outcome=success)
+  Page 2: API p99 (metric=api_ns, operation=read, outcome=success)
+  Page 3: Whole-workload successful calls (metric=success_calls_per_second, operation=None, outcome=success)
+  Page 4: Successful logical keys (metric=success_logical_keys_per_second, operation=None, outcome=success)
+  Page 5: Successful value payload (metric=success_value_mib_per_second, operation=None, outcome=success)
+
+native-pagecache-latency.pdf
+  Context: Native pagecache versus value-WAL barrier — distinct durability; One independent repetition (r0); no run-to-run variability estimate
+  Caption: Native-only durability extras; pagecache acknowledgment is not equivalent to value_wal_barrier. Point-mixed c1 operations are separate; get_many c16 is one 32-key call. Both modes can use Linux page cache for reads. One independent repetition; points are source per-case values/conditional quantiles. No run-to-run variability estimate or between-run errorbars. No pooled quantiles or confidence/significance claims. Successful latency is conditional on operation/outcome. RF1 does not equalize consistency, durability, security, or transaction semantics. Primary RF1 only: native uses value_wal_barrier and TH explicit caches are off; other cohorts use their stated settings. Valkey GET remains RAM-resident, including cold OS; appendfsync always acknowledges AOF writes, not value-WAL reads. Warm OS is not guaranteed cache residency. Tail quantiles are descriptive, including small populations.
+  Page 1: read API p50 (metric=api_ns, operation=read, outcome=success)
+  Page 2: put API p50 (metric=api_ns, operation=put, outcome=success)
+  Page 3: delete API p50 (metric=api_ns, operation=delete, outcome=success)
+  Page 4: missing_read API p50 (metric=api_ns, operation=missing_read, outcome=success)
+  Page 5: get_many API p50 (metric=api_ns, operation=get_many, outcome=success)
+  Page 6: read API p99 (metric=api_ns, operation=read, outcome=success)
+  Page 7: put API p99 (metric=api_ns, operation=put, outcome=success)
+  Page 8: delete API p99 (metric=api_ns, operation=delete, outcome=success)
+  Page 9: missing_read API p99 (metric=api_ns, operation=missing_read, outcome=success)
+  Page 10: get_many API p99 (metric=api_ns, operation=get_many, outcome=success)
+
+native-pagecache-goodput.pdf
+  Context: Native durability extras — whole-workload goodput; One independent repetition (r0); no run-to-run variability estimate
+  Caption: Four labeled series: mixed c1 and read-many32 c16, each with barrier/pagecache durability. Do not interpret different profiles/concurrency as a durability-only speedup. One independent repetition; points are source per-case values/conditional quantiles. No run-to-run variability estimate or between-run errorbars. No pooled quantiles or confidence/significance claims. Successful latency is conditional on operation/outcome. RF1 does not equalize consistency, durability, security, or transaction semantics. Primary RF1 only: native uses value_wal_barrier and TH explicit caches are off; other cohorts use their stated settings. Valkey GET remains RAM-resident, including cold OS; appendfsync always acknowledges AOF writes, not value-WAL reads. Warm OS is not guaranteed cache residency. Tail quantiles are descriptive, including small populations.
+  Page 1: Whole-workload successful calls (metric=success_calls_per_second, operation=None, outcome=success)
+  Page 2: Successful logical keys (metric=success_logical_keys_per_second, operation=None, outcome=success)
+  Page 3: Successful value payload (metric=success_value_mib_per_second, operation=None, outcome=success)
+
+coverage.pdf
+  Page 1: case status by backend.
+  Page 2: case status by cohort.
+  Caption: Coverage counts are not performance zeros. Performance figures use only their stated common complete repetition identities. Completed/failed/not_run are original campaign states, not reconstructed successes; no new runs or Sui replay. One independent repetition; no run-to-run variability estimate or between-run errorbars.

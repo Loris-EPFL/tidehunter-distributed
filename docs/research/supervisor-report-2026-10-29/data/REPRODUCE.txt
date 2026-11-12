@@ -1,0 +1,32 @@
+Offline data and figure reproduction
+====================================
+All commands below run from this report directory. No AWS access, build or benchmark is required. Python 3 and matplotlib are needed. The retained campaign root is checkpoint-work/aws-ci-runs/2026-10-29-run-40848651463 relative to the workspace root. Paths and SHA-256 bindings are in source-hashes.json; comparison.json is the full original case/backend metadata. The CSVs preserve source precision. Floating-point statistics, elapsed times and rates in the printed tables use five significant digits; integer counts remain exact. Raw CSV sample files are referenced by audit.json and are not copied into this report.
+
+1. Optional regeneration from external campaign evidence and the original repository (not required to rerender the included figures): generate snapshots, the historical vector chart, and LaTeX body text:
+   python data/generate.py /absolute/path/to/2026-10-29-run-40848651463
+
+2. The retained data/{matrix,backend-contracts,cases,latencies}.fragment.txt files are required reproducible LaTeX bodies, not throwaway intermediates. Generate include-only tables with the LaTeX MCP: create a minimal document containing each body, then remove the documentclass/preamble/begin-document prefix and end-document suffix with the LaTeX MCP. Save as tables/<name>.tex. Each body includes landscape and longtable environments; do not wrap it in another document.
+
+3. Self-contained render-only operations use only the included report snapshots and Python/matplotlib; no campaign files or original repository required. The source plot manifest and original maintained plotter are preserved unchanged. The original plotter incorrectly states that Valkey get-many performs bounded per-key GET; measured case metadata and benchmarks/kv-research/src/backends/valkey_tcp.rs establish a single MGET through redis-rs, split by slot and reassembled in caller order. Rerender legacy-style vectors with that caption corrected, without changing plotted data:
+   python data/correct_legacy_figures.py
+The original plots.json binds input hash, plotted cases and denominators; its historical caption remains unchanged as provenance. The separately generated historical chart is data/generate.py output.
+The historical chart can also be rerendered solely from the included historical CSV:
+   python data/historical_plot.py
+
+To split the retained plotted observations into 6.5-inch vector pages suitable for the report, with unchanged data and no additional error bars:
+   python data/report_size_plots.py
+Outputs are figures/eval/panels/*.pdf; page-index.txt maps every page and gives the corrected caption.
+
+Supplemental mean, within-case SD, minimum, all four percentile, and maximum panels for three clocks are generated directly from the copied all-results.csv:
+   python data/supplemental_charts.py
+The page-to-workload mapping and axes interpretation are in figures/eval/supplemental-pages.txt. Each page is 10 by 5.5 inches, intended for landscape inclusion at its natural width, without downscaling. These are successful primary populations only; complete tables contain all other cohorts and outcomes.
+
+The representative read/put API empirical CDFs can be rerendered from the included, filtered raw sample subset:
+   python data/generate_ecdf.py
+To regenerate that subset from the retained external raw files, append the absolute campaign root. data/ecdf-source-hashes.json records each raw case hash, filter and count. Each curve represents a separate successful measurement-phase dispatched case; samples are not pooled across cases.
+
+4. The optional source audit requires the retained raw sample files, not included in the report:
+   python data/audit_raw.py /absolute/path/to/2026-10-29-run-40848651463 /absolute/path/to/tidehunter-sharded-wal/experiments/kv-comparison
+It checks all exported population/clock values and whole-case metrics against comparison.json, and validates representative raw per-row clocks and nearest-rank producer quantiles using the maintained analyze.py. It does not replace reported quantiles. The retained audit.json records selected raw paths and SHA-256. Run step 1 after this audit to include those raw hashes in source-hashes.json.
+
+Exactly one independent repetition was taken per case. Standard deviations describe samples within a case. Quantiles of separate clocks cannot be combined; success and rejected populations are separate. Backend contracts are not equivalent and the configured registered-RAM cohorts include message fallbacks. Historical comparisons changed both region and revision. Missing observations are never imputed.

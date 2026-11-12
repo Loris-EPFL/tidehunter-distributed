@@ -1,0 +1,18 @@
+% Paper context follows the final curve without a forced page break.
+\subsection{Agreement with the Tidehunter paper}\label{sec:paper}
+\begin{center}\normalsize
+\begin{tabular}{L{.16\linewidth}L{.35\linewidth}L{.40\linewidth}}\toprule
+Item & Paper & This brief and verdict\\\midrule
+Write path and acknowledgement & Page-cache publication; finalized maps flushed in the background. Explicit flush is allowed for stronger durability. & Native page-cache mode is consistent in kind. The fork-only per-put all-file and directory barrier is not the paper's measured contract.\\[4pt]
+Value sizes & Main evaluation: 64 B, 128 B and 1 KB. & Retained curves: five sizes through 64 KiB; run 9: 1/8/64 KiB. Only overlap supplies context; workloads still differ.\\[4pt]
+Latency quantiles & No engine p50 or p99 result. & API and response quantiles are not validated or contradicted by the paper.\\[4pt]
+Throughput & Uniform writes \N{B:paper-context:write_ops_s:value|,.0f} puts/s; uniform GET \N{B:paper-context:uniform_get_ops_s:value|,.0f} reads/s; skewed GET \N{B:paper-context:skew_get_ops_s:value|,.0f} reads/s at 1 KB. & Native page-cache c16 1 KiB: \N{J:pagecache1_cps|,.0f} puts/s over \N{J:pagecache_ms} ms; Native's resident-oriented uniform-read case: \N{cps:native:primary_rf1:read-concurrent:read:1024|,.0f} reads/s. Finite exposure and load generation are not comparable to sustained paper throughput.\\[4pt]
+Hardware and method & One OpenMetal host: two Xeon Silver 4510 CPUs, 256 GB RAM, one 6.4 TB NVMe; 1 TB fill and ten-minute phases, relocation enabled. Throughput-benchmark client count not stated in the paper. & GCP VM/Local SSD; small finite datasets and different harness/maintenance. Not comparable.\\[4pt]
+8 and 64 KiB & No evaluation result. & The large-value jump and durable barrier are not measured by the paper.\\[4pt]
+Reads & Frequently used values can be memory-speed operations; uniform throughput is not a certified cold-read latency. & Native's resident-oriented 1 KiB p50 \N{p50:native:primary_rf1:read-concurrent:read:1024|.2f}~\us\ is consistent in kind, not a throughput reproduction. Valkey RAM GET and owner caches are separate contracts.\\\bottomrule
+\end{tabular}
+\end{center}
+The paper reports aggregate throughput, not per-call latency: the reciprocal of its aggregate rate is not an API mean or quantile. Our finite cases do not reproduce its dataset, duration, distribution or maintenance. The measurements do not reproduce the paper; they do not contradict it.
+Run-9 cold and prewarmed controls do not reproduce the paper's sustained uniform/skewed throughput phases; its cache and durability contracts remain separate.
+
+The fork's explicit benchmark barrier is not an upstream flush wrapper. Upstream's inspected WAL fsync targets the current file; the fork barrier visits every registered file and the directory. Native's recent mapped read and older positional-read paths also prevent a universal mmap-only description. Source audit: \path{benchmarks/kv-research/src/backends/native.rs}, \path{tidehunter/src/wal/mod.rs}, and \path{tidehunter/src/distributed/durability/synchronous.rs}. Paper: \href{https://arxiv.org/abs/2602.01873}{Chursin et al., arXiv:2602.01873v2}, write flow/durability and evaluation sections. \path{paper-context.csv} stores the parsed source matches for the throughput values.

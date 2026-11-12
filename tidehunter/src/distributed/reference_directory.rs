@@ -4,7 +4,7 @@
 //! cold I/O without an authority guard. Metadata credits survive final read/CQ
 //! owners, not just cache entries. A sole state owner freezes/persists/adopts
 //! completed prefixes; it never roots the one unpersisted recovery group.
-use super::storage::history::{History, HistoryReader, HistoryRoot};
+use super::storage::history::{History, HistoryPersistence, HistoryReader, HistoryRoot};
 use super::storage::{AppendedBatch, PartitionConfig, StorageError};
 use super::types::{
     BatchId, BatchVersion, PayloadDigest, PhysicalValueAddress, RecordDescriptor,
@@ -326,6 +326,9 @@ impl Authority {
         if self.history.root().count == 0 {
             return false;
         }
+        if self.history.windowed() {
+            return true;
+        }
         if let Some(seen) = &self.seen
             && !filter(seen).may_contain(hash)
         {
@@ -641,6 +644,7 @@ impl ReferenceDirectory {
         path: &Path,
         config: &PartitionConfig,
         create: bool,
+        mode: HistoryPersistence,
     ) -> Result<(Arc<Self>, ReferenceDirectoryWriter), StorageError> {
         Self::check_fresh_total_capacity(
             config.max_batches,
@@ -648,7 +652,9 @@ impl ReferenceDirectory {
             0,
             0,
         )?;
-        let history = if create {
+        let history = if mode != HistoryPersistence::OnDisk {
+            History::windowed(path, config, mode)
+        } else if create {
             History::create(path, config)?
         } else {
             History::open(path, config)?
@@ -787,6 +793,47 @@ impl ReferenceDirectory {
         }
     }
 
+    pub(crate) fn history_persistence(&self) -> HistoryPersistence {
+        self.authority.read().history.persistence()
+    }
+
+    pub(crate) fn cache_registered(
+        &self,
+        batch: RegisteredBatch,
+    ) -> Result<Arc<RegisteredBatch>, StorageError> {
+        let count = batch.descriptors().len();
+        let core = Self::metadata_bytes(1, count)?
+            .checked_sub(root_charge())
+            .ok_or(StorageError::Capacity)?;
+        let mut cache = self.cache.lock();
+        if let Some(entry) = cache.entries.get(&batch.address) {
+            return Ok(entry.batch.clone());
+        }
+        let (core_credit, entry_credit) =
+            match self.reserve_with_cache(&mut cache, core + CACHE_ENTRY_BYTES, count) {
+                Ok(mut credit) => (credit.take_batch(count)?, Some(credit)),
+                Err(StorageError::Capacity) => {
+                    (self.reserve_with_cache(&mut cache, core, count)?, None)
+                }
+                Err(error) => return Err(error),
+            };
+        let batch = Arc::new(batch.with_credit(core_credit));
+        if let Some(entry_credit) = entry_credit {
+            if cache.entries.len() == cache.entries.cap().get() {
+                cache.evict();
+            }
+            cache.bytes += AuthorityCache::charge(&batch);
+            cache.entries.put(
+                batch.address,
+                CachedAuthority {
+                    batch: batch.clone(),
+                    _entry_credit: entry_credit,
+                },
+            );
+        }
+        Ok(batch)
+    }
+
     pub(crate) fn root(&self) -> HistoryRoot {
         *self.authority.read().history.root()
     }
@@ -854,7 +901,7 @@ impl ReferenceDirectory {
     }
     /// Carry already charged descriptors across root adoption without making
     /// optional cache residency part of the durable publication boundary.
-    fn retain_adopted(&self, captured: Vec<Arc<RegisteredBatch>>) {
+    fn retain_adopted(&self, captured: impl IntoIterator<Item = Arc<RegisteredBatch>>) {
         let mut captured = captured.into_iter();
         while let Some(first) = captured.next() {
             let mut cache = self.cache.lock();
@@ -1045,6 +1092,11 @@ impl ReferenceDirectory {
         let (reader, count, end, tail) = {
             let authority = self.authority.read();
             let count = authority.history.root().count;
+            if start < authority.history.base() {
+                return Err(StorageError::Invalid(
+                    "receipt ordinal outside the replay window",
+                ));
+            }
             let total = count + authority.pending.len();
             if start > total {
                 return Err(StorageError::Invalid(
@@ -1088,6 +1140,11 @@ impl ReferenceDirectory {
             if prefix == 0 {
                 return Ok(PrefixDigest::new(database, self.partition, epoch, 0).finish());
             }
+            if prefix - 1 < authority.history.base() {
+                return Err(StorageError::Invalid(
+                    "receipt ordinal outside the replay window",
+                ));
+            }
             if prefix == root.count {
                 return Ok(PrefixDigest::from_state(
                     prefix,
@@ -1129,6 +1186,20 @@ impl ReferenceDirectory {
 }
 
 impl ReferenceDirectoryWriter {
+    pub(crate) fn set_history_persistence(
+        &mut self,
+        mode: HistoryPersistence,
+    ) -> Result<(), StorageError> {
+        let mut history = self.history.lock();
+        history.set_persistence(mode)?;
+        self.directory.authority.write().history = history.reader();
+        Ok(())
+    }
+
+    pub(crate) fn windowed(&self) -> bool {
+        self.directory.authority.read().history.windowed()
+    }
+
     pub(crate) fn wait_background(&self) -> Result<(), StorageError> {
         let mut started = None;
         let mut background = match self.background.try_lock() {
@@ -1232,6 +1303,10 @@ impl ReferenceDirectoryWriter {
                 batch.credit = Some(credit.take_batch(batch.descriptors.len())?);
             }
         }
+        // WAL replay has no history worker. Take the existing history lock before
+        // authority, as persist_pending does, and publish the receipt window last.
+        let mut history = (self.directory.history_persistence() == HistoryPersistence::WalReplay)
+            .then(|| self.history.lock());
         let mut authority = self.directory.authority.write();
         let group_end = batches[0].group_end;
         let database = batches[0].id.database;
@@ -1292,6 +1367,14 @@ impl ReferenceDirectoryWriter {
         authority.last_end = group_end;
         let first = authority.pending.len();
         authority.pending.extend(batches.into_iter().map(Arc::new));
+        if let Some(history) = &mut history {
+            // No pending radix rebuild or spill is needed for a replay window.
+            // Its preallocated ring/maps consume each group in O(group size).
+            history.append(&authority.pending, 1)?;
+            authority.history = history.reader();
+            self.directory.retain_adopted(authority.pending.drain(..));
+            return Ok(());
+        }
         let Authority {
             pending,
             index,
@@ -1323,6 +1406,9 @@ impl ReferenceDirectoryWriter {
         file_count: u64,
         path: &Path,
     ) -> Result<bool, StorageError> {
+        if self.windowed() {
+            return Ok(false);
+        }
         if self.failed.load(Ordering::Acquire) {
             return Err(StorageError::Poisoned);
         }
@@ -1463,6 +1549,9 @@ impl ReferenceDirectoryWriter {
 
     pub(crate) fn should_start_background(&self, durable_end: u64) -> bool {
         let authority = self.directory.authority.read();
+        if authority.history.windowed() {
+            return false;
+        }
         let used = root_charge().saturating_add(self.directory.budget.used.load(Ordering::Acquire));
         authority.pending.len() >= self.directory.max_batches.div_ceil(2)
             || used >= self.directory.max_metadata_bytes / 2

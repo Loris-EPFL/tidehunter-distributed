@@ -1,0 +1,12 @@
+{
+  "phase": "final brief including coherence, remote-read and NVMe design findings",
+  "figure_generation": ".venv/bin/python plot_final.py completed; ten vector PDF figures and evidence.json written",
+  "table_generation": ".venv/bin/python make_tables.py generated the 1, 8 and 64 KiB tables directly from the audited population CSV",
+  "data_check": "Checked each present coherence grid p50 against all-populations.csv; recomputed matched inversion counts 19/92 and 8/49; checked cited case metrics and all 15 sealed c1 scalar table cells against all-populations.csv. This did not independently recompute raw samples.",
+  "latex_mcp_validation": {"valid": true, "issues": []},
+  "latex_mcp_compile": {"success": true, "engine": "pdflatex", "pages": 9, "note": "Before the final architecture wording correction; final PDF built with latexmk."},
+  "latexmk": {"success": true, "command": "latexmk -pdf -interaction=nonstopmode -halt-on-error main.tex", "pages": 9, "main_text_and_references_pages": 8, "appendix_pages": 1},
+  "log_check": "No Overfull, Underfull, undefined, LaTeX Warning or Missing character lines after the final build.",
+  "visual_check": "pdftoppm rendered all nine pages at 120 dpi. Final executive-summary, design, reference and appendix pages 1 and 7–9 were inspected; previous builds' figure and analysis pages were inspected. Plot labels and appendix values are small but visible.",
+  "limits": "Sealed connections do not explicitly set queue flags; no per-call media-hit fraction or causal explanation for anomalous orderings is established. Proposed optimizations are design inferences, not measured improvements."
+}

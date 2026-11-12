@@ -1,7 +1,7 @@
 use super::pipeline_tests::Fixture;
 use super::*;
 
-fn checkpoint_put(key: u32, value: u8) -> Mutation {
+pub(super) fn checkpoint_put(key: u32, value: u8) -> Mutation {
     Mutation::Put {
         keyspace: KeySpace(0),
         key: key.to_be_bytes().to_vec().into(),
@@ -9,18 +9,18 @@ fn checkpoint_put(key: u32, value: u8) -> Mutation {
     }
 }
 
-fn recovery_metrics() -> Arc<Metrics> {
+pub(super) fn recovery_metrics() -> Arc<Metrics> {
     Metrics::new_in_enabled(&prometheus::Registry::new(), false)
 }
 
-fn fail_stop_without_checkpoint(mut db: RemoteDatabase) {
+pub(super) fn fail_stop_without_checkpoint(mut db: RemoteDatabase) {
     // A worker may durably adopt its captured root during drop. No explicit
     // checkpoint is requested here; recovery must accept either valid root.
     db.healthy = false;
     drop(db);
 }
 
-fn reopen_result(fixture: &Fixture) -> Result<RemoteDatabase, LocalDbError> {
+pub(super) fn reopen_result(fixture: &Fixture) -> Result<RemoteDatabase, LocalDbError> {
     RemoteDatabase::open(
         &fixture.temp.path().join("authority"),
         &fixture.shape,
@@ -145,7 +145,20 @@ fn benchmark_owner_lookup_uses_authoritative_reference_and_reports_absence() {
 
 #[test]
 fn checkpoint_restores_overwrite_delete_tail_and_original_retry_receipts() {
-    let fixture = Fixture::new();
+    checkpoint_restores_overwrite_delete_tail_and_original_retry_receipts_mode(
+        HistoryPersistence::OnDisk,
+    );
+}
+#[test]
+fn wal_replay_checkpoint_restores_overwrite_delete_tail_and_original_retry_receipts() {
+    checkpoint_restores_overwrite_delete_tail_and_original_retry_receipts_mode(
+        HistoryPersistence::WalReplay,
+    );
+}
+fn checkpoint_restores_overwrite_delete_tail_and_original_retry_receipts_mode(
+    mode: HistoryPersistence,
+) {
+    let fixture = Fixture::new().history(mode);
     let mut db = fixture.open();
     let operation = fixture.operation(0, 1);
     let original = checkpoint_put(1, 1);
@@ -288,7 +301,7 @@ fn replace_checkpoint_metadata(root: &Path, change: impl FnOnce(&mut CheckpointI
 #[test]
 fn committed_checkpoint_corruption_missing_files_and_wrong_prefixes_fail_closed() {
     for damage in 0..7 {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
         let mut db = fixture.open();
         db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 1)])
             .unwrap();
@@ -345,11 +358,22 @@ fn committed_checkpoint_corruption_missing_files_and_wrong_prefixes_fail_closed(
 
 #[test]
 fn automatic_checkpoint_admission_keeps_crash_replay_bounded() {
-    let mut fixture = Fixture::new_with_capacity(40);
+    automatic_checkpoint_admission_keeps_crash_replay_bounded_mode(HistoryPersistence::OnDisk);
+}
+#[test]
+fn wal_replay_automatic_checkpoint_admission_keeps_crash_replay_bounded() {
+    automatic_checkpoint_admission_keeps_crash_replay_bounded_mode(HistoryPersistence::WalReplay);
+}
+fn automatic_checkpoint_admission_keeps_crash_replay_bounded_mode(mode: HistoryPersistence) {
+    let mut fixture = Fixture::new_with_capacity(40).history(mode);
     fixture.config.replay_limits = ReplayLimits {
         max_batches: 32,
         max_encoded_bytes: 1024 * 1024,
     };
+    let replay = mode == HistoryPersistence::WalReplay;
+    if replay {
+        fixture.config.max_admitted_batches = 1024;
+    }
     let limits = fixture.config.replay_limits;
     assert!(checkpoint_metadata_fits(
         &fixture.config,
@@ -361,18 +385,37 @@ fn automatic_checkpoint_admission_keeps_crash_replay_bounded() {
         MAX_CHECKPOINT_METADATA_BYTES as usize / 128
     ));
     let mut db = fixture.open();
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (resume, gate) = mpsc::sync_channel(1);
+    if replay {
+        db.checkpoint_pause = Some((entered, gate));
+    }
     let mut acknowledged = Vec::new();
-    for n in 0..limits.max_batches + 3 {
+    let count = if replay {
+        4 * limits.max_batches
+    } else {
+        limits.max_batches + 3
+    };
+    for n in 0..count {
         let operation = fixture.operation((n % 5) as u32, n as u64);
         let value = n as u8;
         let version = db
             .write_batch(operation, vec![checkpoint_put(1, value)])
             .unwrap();
         acknowledged.push((operation, value, version));
-        assert!(db.checkpoint_tail_batches <= limits.max_batches);
-        assert!(db.checkpoint_tail_bytes <= limits.max_encoded_bytes);
+        if !replay {
+            assert!(db.checkpoint_tail_batches <= limits.max_batches);
+            assert!(db.checkpoint_tail_bytes <= limits.max_encoded_bytes);
+        }
     }
-    assert!(db.manifest.checkpoint.is_some());
+    if replay {
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(db.authority_write_stats().foreground_checkpoint_count, 0);
+        assert_eq!(db.checkpoint_tail_batches, count);
+        assert!(!db.path.join("receipt-history-v2").exists());
+    } else {
+        assert!(db.manifest.checkpoint.is_some());
+    }
     let retained_tail = db.checkpoint_tail_batches;
     let clocks = db.authority_write_stats();
     assert!(clocks.checkpoint_count > 0);
@@ -382,11 +425,17 @@ fn automatic_checkpoint_admission_keeps_crash_replay_bounded() {
     } else {
         assert!(clocks.foreground_checkpoint_ns > 0);
     }
+    drop(resume);
     fail_stop_without_checkpoint(db);
     let mut db = fixture.open();
+    if replay {
+        assert_eq!(db.recovery_stats().tail_batches, count as u64);
+    }
     assert!(db.recovery_stats().tail_batches <= retained_tail as u64);
-    assert!(db.recovery_stats().tail_batches <= limits.max_batches as u64);
-    assert!(db.recovery_stats().tail_bytes <= limits.max_encoded_bytes as u64);
+    if !replay {
+        assert!(db.recovery_stats().tail_batches <= limits.max_batches as u64);
+        assert!(db.recovery_stats().tail_bytes <= limits.max_encoded_bytes as u64);
+    }
     assert_eq!(
         db.get(KeySpace(0), &1u32.to_be_bytes())
             .unwrap()
@@ -406,7 +455,7 @@ fn automatic_checkpoint_admission_keeps_crash_replay_bounded() {
 #[test]
 fn checkpoint_does_not_turn_damaged_referenced_value_into_absence() {
     use std::os::unix::fs::FileExt;
-    let fixture = Fixture::new();
+    let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
     let mut db = fixture.open();
     db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 1)])
         .unwrap();
@@ -831,12 +880,19 @@ fn live_frame_can_fill_one_fragment() {
     config.storage.wal_file_bytes = 8192;
     config.storage.group_limits.max_encoded_bytes = 4088;
     config.live_nvme = Some(super::super::tcp::LiveClientConfig {
+        lease_ahead: true,
+        polled_writes: false,
+        export_mode: Default::default(),
         host_nqn: "nqn.2014-08.org.nvmexpress:uuid:11111111-1111-1111-1111-111111111111".into(),
         host_id: [1; 16],
         max_inflight_requests: 8,
         max_inflight_bytes: 64 * 1024,
         connect_timeout_ms: 1000,
         io_timeout_ms: 1000,
+        write_mode: super::super::tcp::LiveWriteMode::Reserved,
+        leased_durability: None,
+        inline_reads: true,
+        queue_geometry: Default::default(),
     });
     assert!(config.validate().is_ok());
 }
@@ -898,7 +954,20 @@ fn preparation_pool_drop_joins_scheduled_work() {
 
 #[test]
 fn parallel_replay_refills_keep_one_bounded_ordered_merge_and_exact_retries() {
-    let mut fixture = Fixture::new_with_capacity(1024);
+    parallel_replay_refills_keep_one_bounded_ordered_merge_and_exact_retries_mode(
+        HistoryPersistence::OnDisk,
+    );
+}
+#[test]
+fn wal_replay_parallel_replay_refills_keep_one_bounded_ordered_merge_and_exact_retries() {
+    parallel_replay_refills_keep_one_bounded_ordered_merge_and_exact_retries_mode(
+        HistoryPersistence::WalReplay,
+    );
+}
+fn parallel_replay_refills_keep_one_bounded_ordered_merge_and_exact_retries_mode(
+    mode: HistoryPersistence,
+) {
+    let mut fixture = Fixture::new_with_capacity(1024).history(mode);
     // Freeze an explicit bound whose low watermark lies inside this replay
     // cohort; the test exercises refill/retry semantics, not an implicit default.
     fixture.config.replay_limits = ReplayLimits::legacy();
@@ -1692,7 +1761,7 @@ fn sui_relocation_retains_stop_overwritten_within_atomic_batch() {
 
 #[test]
 fn recorded_replay_limits_reject_shrink_before_fencing_and_allow_recovered_growth() {
-    let mut fixture = Fixture::new();
+    let mut fixture = Fixture::new().history(HistoryPersistence::OnDisk);
     fixture.config.replay_limits = ReplayLimits {
         max_batches: 32,
         max_encoded_bytes: 1024 * 1024,
@@ -1750,7 +1819,7 @@ fn recorded_replay_limits_reject_shrink_before_fencing_and_allow_recovered_growt
 
 #[test]
 fn increased_replay_configuration_cannot_relax_the_recorded_recovery_check() {
-    let mut fixture = Fixture::new();
+    let mut fixture = Fixture::new().history(HistoryPersistence::OnDisk);
     fixture.config.replay_limits = ReplayLimits {
         max_batches: 32,
         max_encoded_bytes: 1024 * 1024,
@@ -1785,7 +1854,7 @@ fn increased_replay_configuration_cannot_relax_the_recorded_recovery_check() {
 
 #[test]
 fn legacy_authority_without_explicit_limits_replays_before_format_upgrade() {
-    let mut fixture = Fixture::new();
+    let mut fixture = Fixture::new().history(HistoryPersistence::OnDisk);
     fixture.config.replay_limits = ReplayLimits::legacy();
     let mut db = fixture.open();
     let operation = fixture.operation(2, 100);
@@ -1799,6 +1868,7 @@ fn legacy_authority_without_explicit_limits_replays_before_format_upgrade() {
     fields.insert("format".into(), 2u32.into());
     fields.remove(serde_yaml::Value::from("replay_limits"));
     fields.remove(serde_yaml::Value::from("live_nvme_identity"));
+    fields.remove(serde_yaml::Value::from("history_persistence"));
     install_metadata(&root, MANIFEST, &encode_metadata(&old).unwrap()).unwrap();
     let restored: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
     assert_eq!(restored.replay_limits, ReplayLimits::legacy());
@@ -1813,7 +1883,7 @@ fn legacy_authority_without_explicit_limits_replays_before_format_upgrade() {
         version
     );
     let upgraded: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
-    assert_eq!(upgraded.format, 3);
+    assert_eq!(upgraded.format, 4);
     assert_eq!(upgraded.replay_limits, fixture.config.replay_limits);
 }
 

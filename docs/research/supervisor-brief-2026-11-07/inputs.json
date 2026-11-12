@@ -1,0 +1,20 @@
+{
+  "campaign": "gcp-full-matrix-campaign-20261106T213227Z",
+  "fleet_run_id": "bench-0d99e8256fff4891",
+  "sources": {
+    "checkpoint-work/spdk-matched-storage-20261105T004442Z/analysis/gcp-full-matrix-2026-11-07/report-fixed/comparison.csv": "fc004c08200d9ec13db4dfb42ce69686e54de2256d2fa1962cb2b24c938317df",
+    "checkpoint-work/spdk-matched-storage-20261105T004442Z/gcp-queue-bounded-campaign-20261106T032027Z/final-retrieval/extract/comparison.csv": "421deac784cd72626940cb6d2e4eff4ffeffae6fcb1be32cda306bfbacdd19ae",
+    "checkpoint-work/spdk-matched-storage-20261105T004442Z/analysis/gcp-full-matrix-2026-11-07/fixes/external-store-medians.csv": "6f6597b8ee304d981b8c09e08191c5a675885b8c2861fc73030c44c3c96dfef6"
+  },
+  "outputs": {
+    "populations.csv": "843b934587f81113af71b187bba218a7b3bd2211bd67c4f82481a087d04e3f6c",
+    "previous-populations.csv": "61922a7616ea397006b472e056288f3fe11180401ec12f4f4c4228b3c054e6ec",
+    "device-reads.csv": "f0269cf07df22ca8fb6e8466edbcd67a7009fb899ecdab168a469150fd89c02e",
+    "write-timeline-spans.csv": "7ef5e63a0bee6a54f4b3640917999616a7a404f6d4643e3addddc062abfed4e5",
+    "readmany-trace.csv": "14a20ce5c45292954c4322cca576ed61d71c93385625910f209f40654b7c488c",
+    "stage-evidence.csv": "83485d5ada698a3b06774c77b679f498db517664cd85c161dd69eaaf8f0b9431",
+    "external-spread.csv": "ee27ab7c0b6ca695859a2a08abf7f908a6de0adb532449426fe6b446f701f99d"
+  },
+  "timeline_case": "0491-tidehunter_verbs_native-1024-write-concurrent-write_timeline_diagnostics-r0",
+  "cases_with_device_rows": 548
+}

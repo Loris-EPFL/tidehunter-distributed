@@ -10,7 +10,9 @@ struct CompletedCheckpoint {
     persisted: Option<PersistedIndexImage>,
     batches: usize,
     bytes: usize,
-    history: ReceiptHistory,
+    history: Option<ReceiptHistory>,
+    positions: BTreeMap<(u32, u64), StreamPosition>,
+    recent: VecDeque<RecentReceipt>,
     cut: Option<MutationVersion>,
     staging_manifest_ns: Option<u64>,
     receipt_history_ns: Option<u64>,
@@ -29,6 +31,9 @@ struct CapturingCheckpoint {
     batches: usize,
     bytes: usize,
     receipts: Vec<CheckpointReceipt>,
+    stream_last: BTreeMap<(u32, u64), (u64, u32)>,
+    positions: BTreeMap<(u32, u64), StreamPosition>,
+    recent: VecDeque<RecentReceipt>,
     jobs: Vec<(Arc<mpsc::SyncSender<Command>>, u32, Vec<u64>)>,
     published_next: u64,
     started: Instant,
@@ -168,7 +173,17 @@ impl RemoteDatabase {
         };
         let cut = self.latest;
         let index_cut = cut.map_or(IndexReadCut::BeforeAll, IndexReadCut::At);
-        let mut receipts = Vec::with_capacity(self.known.len());
+        let replay = self.config.history_persistence == HistoryPersistence::WalReplay;
+        let mut receipts = Vec::with_capacity(if replay { 0 } else { self.known.len() });
+        self.stream_last.clear();
+        let mut recent: BTreeMap<_, _> = if replay {
+            self.recent
+                .iter()
+                .map(|receipt| (receipt.version, *receipt))
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
         for receipt in self.known.values() {
             if cut.is_none_or(|cut| receipt.version() > cut.batch) {
                 continue;
@@ -184,7 +199,42 @@ impl RemoteDatabase {
                     "checkpoint receipt is outside retained inventory",
                 ));
             }
-            receipts.push((*receipt).into());
+            if replay {
+                let address = receipt.address();
+                self.stream_last
+                    .entry((address.partition, receipt.version().epoch))
+                    .and_modify(|last| {
+                        if address.offset > last.0 {
+                            *last = (address.offset, address.len);
+                        }
+                    })
+                    .or_insert((address.offset, address.len));
+                recent.insert(
+                    receipt.version(),
+                    RecentReceipt {
+                        id: receipt.id(),
+                        version: receipt.version(),
+                        digest: receipt.digest(),
+                    },
+                );
+                if recent.len() > WAL_REPLAY_WINDOW_BATCHES {
+                    recent.pop_first();
+                }
+            } else {
+                receipts.push((*receipt).into());
+            }
+        }
+        if replay {
+            debug_assert!(
+                self.known.values().all(|receipt| {
+                    cut.is_some_and(|cut| receipt.version() <= cut.batch)
+                        || self
+                            .stream_last
+                            .get(&(receipt.address().partition, receipt.version().epoch))
+                            .is_none_or(|last| receipt.address().offset > last.0)
+                }),
+                "stream offsets cross the checkpoint cut"
+            );
         }
         let jobs: Vec<_> = self
             .retained_epochs
@@ -236,6 +286,9 @@ impl RemoteDatabase {
                 batches,
                 bytes,
                 receipts,
+                stream_last: self.stream_last.clone(),
+                positions: self.positions.clone(),
+                recent: recent.into_values().collect(),
                 jobs,
                 published_next: self.publication.published_prefix().next_sequence(),
                 started,
@@ -299,6 +352,9 @@ impl RemoteDatabase {
             batches,
             bytes,
             receipts,
+            stream_last,
+            mut positions,
+            recent,
             mut jobs,
             published_next,
             started,
@@ -321,7 +377,10 @@ impl RemoteDatabase {
             }
         }
         let mut history = self.receipt_history.clone();
-        history.reset_io_stats();
+        if let Some(history) = &mut history {
+            history.reset_io_stats();
+        }
+        let fragment_bytes = self.config.storage.fragment_bytes;
         let mut staging_manifest = self.manifest.clone();
         staging_manifest.checkpoint_staging = Some(staging.clone());
         let path = self.path.clone();
@@ -346,414 +405,571 @@ impl RemoteDatabase {
         let cleanup_pause = self.checkpoint_cleanup_pause.take();
         let (sender, reply) = mpsc::sync_channel(1);
         let (authorize_cleanup, cleanup_authorized) = mpsc::sync_channel(1);
-        let thread = thread::Builder::new()
-            .name("value-wal-checkpoint".to_owned())
-            .spawn(move || {
-                #[cfg(test)]
-                if let Some(entered) = entered {
-                    let _ = entered.try_send(());
-                }
-                let result = (|| {
+        let thread =
+            thread::Builder::new()
+                .name("value-wal-checkpoint".to_owned())
+                .spawn(move || {
                     #[cfg(test)]
-                    if let Some((entered, resume)) = pause {
-                        let _ = entered.send(());
-                        resume
-                            .recv()
-                            .map_err(|_| LocalDbError::new("checkpoint test pause disconnected"))?;
+                    if let Some(entered) = entered {
+                        let _ = entered.try_send(());
                     }
-                    // Reserve output names durably before any checkpoint artifact
-                    // can be written. This immutable snapshot cannot race owner
-                    // appends, which do not replace the authority manifest.
-                    let phase_started = diagnostics_enabled.then(Instant::now);
-                    timeline.checkpoint_generation(
-                        "staging_manifest_start",
-                        None,
-                        authority_epoch,
-                        None,
-                        Some(generation),
-                    );
-                    persist_manifest(&path, &staging_manifest)?;
-                    let staging_manifest_ns = phase_started.map(elapsed);
-                    timeline.checkpoint_generation(
-                        "staging_manifest_end",
-                        None,
-                        authority_epoch,
-                        None,
-                        Some(generation),
-                    );
-                    #[cfg(test)]
-                    if interruption == Some(0) {
-                        return Err(LocalDbError::new(
-                            "injected interruption after checkpoint intent",
-                        ));
-                    }
-                    timeline.checkpoint_generation(
-                        "receipt_group_start",
-                        None,
-                        authority_epoch,
-                        None,
-                        Some(generation),
-                    );
-                    let mut by_stream: BTreeMap<(u32, u64), Vec<CheckpointReceipt>> =
-                        BTreeMap::new();
-                    for receipt in receipts {
-                        by_stream
-                            .entry((receipt.address.partition, receipt.version.epoch))
-                            .or_default()
-                            .push(receipt);
-                    }
-                    for receipts in by_stream.values_mut() {
-                        receipts.sort_unstable_by_key(|receipt| receipt.version);
-                    }
-                    timeline.checkpoint_generation(
-                        "receipt_group_end",
-                        None,
-                        authority_epoch,
-                        None,
-                        Some(generation),
-                    );
-                    timeline.checkpoint_generation(
-                        "receipt_append_start",
-                        None,
-                        authority_epoch,
-                        None,
-                        Some(generation),
-                    );
-                    let phase_started = diagnostics_enabled.then(Instant::now);
-                    for receipts in by_stream.values() {
-                        history.append_stream(receipts)?;
-                    }
-                    let receipt_history_ns = phase_started.map(elapsed);
-                    timeline.checkpoint_generation(
-                        "receipt_append_end",
-                        None,
-                        authority_epoch,
-                        None,
-                        Some(generation),
-                    );
-                    #[cfg(test)]
-                    if interruption == Some(4) {
-                        return Err(LocalDbError::new(
-                            "injected interruption before receipt metadata sync",
-                        ));
-                    }
-                    let phase_started = diagnostics_enabled.then(Instant::now);
-                    timeline.checkpoint_generation(
-                        "receipt_sync_start",
-                        None,
-                        authority_epoch,
-                        None,
-                        Some(generation),
-                    );
-                    history.sync()?;
-                    let receipt_history_sync_ns = phase_started.map(elapsed);
-                    timeline.checkpoint_generation(
-                        "receipt_sync_end",
-                        None,
-                        authority_epoch,
-                        None,
-                        Some(generation),
-                    );
-                    let phase_started = diagnostics_enabled.then(Instant::now);
-                    let streams = endpoint_map(&mut jobs, |_, (sender, partition, streams)| {
-                        let mut output = Vec::with_capacity(streams.len());
-                        for epoch in std::mem::take(streams) {
-                            let count = history
-                                .counts
-                                .get(&(*partition, epoch))
-                                .copied()
-                                .unwrap_or(0);
-                            let (reply, pending) = mpsc::sync_channel(1);
-                            timeline.checkpoint_generation(
-                                "control_enqueue",
-                                Some(*partition),
-                                epoch,
-                                Some(count),
-                                Some(generation),
-                            );
-                            sender
-                                .send(Command::Checkpoint(authority_epoch, epoch, count, reply))
-                                .map_err(|_| {
-                                    LocalDbError::new("TCP worker lost request outcome")
-                                })?;
-                            let proof = receive(pending)?;
-                            timeline.checkpoint_generation(
-                                "control_observed",
-                                Some(*partition),
-                                epoch,
-                                Some(count),
-                                Some(generation),
-                            );
-                            #[cfg(test)]
-                            let proof = if corrupt_checkpoint_proof && *partition == 0 {
-                                let mut proof = proof;
-                                proof.digest[0] ^= 1;
-                                proof
-                            } else {
-                                proof
-                            };
-                            #[cfg(test)]
-                            if *partition == 0
-                                && let Some((entered, resume)) = prefix_pause.lock().take()
-                            {
-                                let _ = entered.send(());
-                                resume.recv().map_err(|_| {
-                                    LocalDbError::new("checkpoint prefix test pause disconnected")
-                                })?;
-                            }
-                            // Later durable appends do not change this exact prefix.
-                            if proof.prefix != count
-                                || proof.retained < count
-                                || proof.digest != history.prefix(*partition, epoch, count)?
-                            {
-                                return Err(LocalDbError::new(
-                                    "checkpoint prefix differs from published receipts",
-                                ));
-                            }
-                            output.push(CheckpointStream {
-                                proof,
-                                state: history.state(*partition, epoch)?,
-                            });
+                    let result = (|| {
+                        #[cfg(test)]
+                        if let Some((entered, resume)) = pause {
+                            let _ = entered.send(());
+                            resume.recv().map_err(|_| {
+                                LocalDbError::new("checkpoint test pause disconnected")
+                            })?;
                         }
-                        Ok(output)
-                    })?
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                    let node_prefix_wait_ns = phase_started.map(elapsed);
-                    let phase_started = diagnostics_enabled.then(Instant::now);
-                    timeline.checkpoint_generation(
-                        "index_persist_start",
-                        None,
-                        authority_epoch,
-                        None,
-                        Some(generation),
-                    );
-                    let persisted = prepared
-                        .persist(&path.join(commit.index_name()))
-                        .map_err(LocalDbError::component)?;
-                    let index_persist_ns = phase_started.map(elapsed);
-                    timeline.checkpoint_generation(
-                        "index_persist_end",
-                        None,
-                        authority_epoch,
-                        None,
-                        Some(generation),
-                    );
-                    #[cfg(test)]
-                    if interruption == Some(1) {
-                        return Err(LocalDbError::new(
-                            "injected interruption after checkpoint image",
-                        ));
-                    }
-                    timeline.checkpoint_generation(
-                        "metadata_encode_start",
-                        None,
-                        authority_epoch,
-                        None,
-                        Some(generation),
-                    );
-                    let image = CheckpointImage {
-                        format: 2,
-                        database,
-                        shape_yaml,
-                        authority_epoch,
-                        generation: commit.generation,
-                        cut,
-                        published_next,
-                        index_bytes: persisted.metadata.bytes,
-                        index_digest: persisted.metadata.digest,
-                        streams,
-                        history_root: history.root,
-                    };
-                    let encoded = encode_checkpoint(&image)?;
-                    let mut commit = commit;
-                    commit.index_files = persisted.files();
-                    commit.index_files.sort_unstable();
-                    commit.index_files.dedup();
-                    commit.metadata_bytes = encoded.len() as u64;
-                    commit.metadata_digest = Blake2b::<U32>::digest(&encoded).into();
-                    timeline.checkpoint_generation(
-                        "metadata_encode_end",
-                        None,
-                        authority_epoch,
-                        None,
-                        Some(generation),
-                    );
-                    let phase_started = diagnostics_enabled.then(Instant::now);
-                    timeline.checkpoint_generation(
-                        "metadata_install_start",
-                        None,
-                        authority_epoch,
-                        None,
-                        Some(generation),
-                    );
-                    install_metadata(&path, &commit.metadata_name(), &encoded)
-                        .map_err(LocalDbError::component)?;
-                    let metadata_install_ns = phase_started.map(elapsed);
-                    timeline.checkpoint_generation(
-                        "metadata_install_end",
-                        None,
-                        authority_epoch,
-                        None,
-                        Some(generation),
-                    );
-                    #[cfg(test)]
-                    if interruption == Some(2) {
-                        return Err(LocalDbError::new(
-                            "injected interruption before checkpoint adoption",
-                        ));
-                    }
-                    #[cfg(test)]
-                    if let Some((entered, resume)) = adoption_pause {
-                        let _ = entered.send(());
-                        resume.recv().map_err(|_| {
-                            LocalDbError::new("checkpoint adoption test pause disconnected")
-                        })?;
-                    }
-                    // No other serving operation replaces the authority manifest.
-                    // Adopt the durable root before the owner installs the image;
-                    // the post-cut suffix remains recoverable from the value WALs.
-                    staging_manifest.checkpoint_obsolete =
-                        staging_manifest.checkpoint.replace(commit.clone());
-                    staging_manifest.checkpoint_staging = None;
-                    #[cfg(test)]
-                    if interruption == Some(5) {
-                        return Err(LocalDbError::new(
-                            "injected interruption before checkpoint root adoption",
-                        ));
-                    }
-                    let phase_started = diagnostics_enabled.then(Instant::now);
-                    timeline.checkpoint_generation(
-                        "root_persist_start",
-                        None,
-                        authority_epoch,
-                        None,
-                        Some(generation),
-                    );
-                    persist_manifest(&path, &staging_manifest)?;
-                    let root_adoption_ns = phase_started.map(elapsed);
-                    timeline.checkpoint_generation(
-                        "root_persist_end",
-                        None,
-                        authority_epoch,
-                        None,
-                        Some(generation),
-                    );
-                    #[cfg(test)]
-                    if interruption == Some(6) {
-                        return Err(LocalDbError::new(
-                            "injected interruption after checkpoint root adoption",
-                        ));
-                    }
-                    Ok(CompletedCheckpoint {
-                        commit,
-                        manifest: staging_manifest,
-                        persisted: Some(persisted),
-                        batches,
-                        bytes,
-                        history_io: history.io_stats,
-                        history,
-                        cut,
-                        staging_manifest_ns,
-                        receipt_history_ns,
-                        receipt_history_sync_ns,
-                        node_prefix_wait_ns,
-                        index_prepare_ns,
-                        index_persist_ns,
-                        metadata_install_ns,
-                        root_adoption_ns,
-                    })
-                })();
-                let completed = match result {
-                    Ok(completed) => completed,
-                    Err(error) => {
+                        // Reserve output names durably before any checkpoint artifact
+                        // can be written. This immutable snapshot cannot race owner
+                        // appends, which do not replace the authority manifest.
+                        let phase_started = diagnostics_enabled.then(Instant::now);
                         timeline.checkpoint_generation(
-                            "worker_failed",
+                            "staging_manifest_start",
                             None,
                             authority_epoch,
                             None,
                             Some(generation),
                         );
-                        let _ = sender.send(Err(error));
-                        let _ = wake.try_send(());
+                        persist_manifest(&path, &staging_manifest)?;
+                        let staging_manifest_ns = phase_started.map(elapsed);
+                        timeline.checkpoint_generation(
+                            "staging_manifest_end",
+                            None,
+                            authority_epoch,
+                            None,
+                            Some(generation),
+                        );
+                        #[cfg(test)]
+                        if interruption == Some(0) {
+                            return Err(LocalDbError::new(
+                                "injected interruption after checkpoint intent",
+                            ));
+                        }
+                        let (
+                            streams,
+                            receipt_history_ns,
+                            receipt_history_sync_ns,
+                            node_prefix_wait_ns,
+                        ) = if let Some(history) = &mut history {
+                            timeline.checkpoint_generation(
+                                "receipt_group_start",
+                                None,
+                                authority_epoch,
+                                None,
+                                Some(generation),
+                            );
+                            let mut by_stream: BTreeMap<(u32, u64), Vec<CheckpointReceipt>> =
+                                BTreeMap::new();
+                            for receipt in receipts {
+                                by_stream
+                                    .entry((receipt.address.partition, receipt.version.epoch))
+                                    .or_default()
+                                    .push(receipt);
+                            }
+                            for receipts in by_stream.values_mut() {
+                                receipts.sort_unstable_by_key(|receipt| receipt.version);
+                            }
+                            timeline.checkpoint_generation(
+                                "receipt_group_end",
+                                None,
+                                authority_epoch,
+                                None,
+                                Some(generation),
+                            );
+                            timeline.checkpoint_generation(
+                                "receipt_append_start",
+                                None,
+                                authority_epoch,
+                                None,
+                                Some(generation),
+                            );
+                            let phase_started = diagnostics_enabled.then(Instant::now);
+                            for receipts in by_stream.values() {
+                                history.append_stream(receipts)?;
+                            }
+                            let receipt_history_ns = phase_started.map(elapsed);
+                            timeline.checkpoint_generation(
+                                "receipt_append_end",
+                                None,
+                                authority_epoch,
+                                None,
+                                Some(generation),
+                            );
+                            #[cfg(test)]
+                            if interruption == Some(4) {
+                                return Err(LocalDbError::new(
+                                    "injected interruption before receipt metadata sync",
+                                ));
+                            }
+                            let phase_started = diagnostics_enabled.then(Instant::now);
+                            timeline.checkpoint_generation(
+                                "receipt_sync_start",
+                                None,
+                                authority_epoch,
+                                None,
+                                Some(generation),
+                            );
+                            history.sync()?;
+                            let receipt_history_sync_ns = phase_started.map(elapsed);
+                            timeline.checkpoint_generation(
+                                "receipt_sync_end",
+                                None,
+                                authority_epoch,
+                                None,
+                                Some(generation),
+                            );
+                            let phase_started = diagnostics_enabled.then(Instant::now);
+                            let streams =
+                                endpoint_map(&mut jobs, |_, (sender, partition, streams)| {
+                                    let mut output = Vec::with_capacity(streams.len());
+                                    for epoch in std::mem::take(streams) {
+                                        let count = history
+                                            .counts
+                                            .get(&(*partition, epoch))
+                                            .copied()
+                                            .unwrap_or(0);
+                                        let (reply, pending) = mpsc::sync_channel(1);
+                                        timeline.checkpoint_generation(
+                                            "control_enqueue",
+                                            Some(*partition),
+                                            epoch,
+                                            Some(count),
+                                            Some(generation),
+                                        );
+                                        sender
+                                            .send(Command::Checkpoint(
+                                                authority_epoch,
+                                                epoch,
+                                                count,
+                                                reply,
+                                            ))
+                                            .map_err(|_| {
+                                                LocalDbError::new("TCP worker lost request outcome")
+                                            })?;
+                                        let proof = receive(pending)?;
+                                        timeline.checkpoint_generation(
+                                            "control_observed",
+                                            Some(*partition),
+                                            epoch,
+                                            Some(count),
+                                            Some(generation),
+                                        );
+                                        #[cfg(test)]
+                                        let proof = if corrupt_checkpoint_proof && *partition == 0 {
+                                            let mut proof = proof;
+                                            proof.digest[0] ^= 1;
+                                            proof
+                                        } else {
+                                            proof
+                                        };
+                                        #[cfg(test)]
+                                        if *partition == 0
+                                            && let Some((entered, resume)) =
+                                                prefix_pause.lock().take()
+                                        {
+                                            let _ = entered.send(());
+                                            resume.recv().map_err(|_| {
+                                                LocalDbError::new(
+                                                    "checkpoint prefix test pause disconnected",
+                                                )
+                                            })?;
+                                        }
+                                        // Later durable appends do not change this exact prefix.
+                                        if proof.prefix != count
+                                            || proof.retained < count
+                                            || proof.digest
+                                                != history.prefix(*partition, epoch, count)?
+                                        {
+                                            return Err(LocalDbError::new(
+                                                "checkpoint prefix differs from published receipts",
+                                            ));
+                                        }
+                                        output.push(CheckpointStream {
+                                            proof,
+                                            state: history.state(*partition, epoch)?,
+                                        });
+                                    }
+                                    Ok(output)
+                                })?
+                                .into_iter()
+                                .flatten()
+                                .collect();
+                            let node_prefix_wait_ns = phase_started.map(elapsed);
+                            (
+                                streams,
+                                receipt_history_ns,
+                                receipt_history_sync_ns,
+                                node_prefix_wait_ns,
+                            )
+                        } else {
+                            let phase_started = diagnostics_enabled.then(Instant::now);
+                            let output =
+                                endpoint_map(&mut jobs, |_, (sender, partition, streams)| {
+                                    let mut output = Vec::with_capacity(streams.len());
+                                    for &epoch in streams.iter() {
+                                        let key = (*partition, epoch);
+                                        let previous = positions.get(&key);
+                                        let Some(&(offset, len)) = stream_last.get(&key) else {
+                                            output.push(previous.cloned().unwrap_or(
+                                                StreamPosition {
+                                                    partition: *partition,
+                                                    epoch,
+                                                    replay_from: 0,
+                                                    last_offset: None,
+                                                    durable_end: 0,
+                                                    complete: false,
+                                                },
+                                            ));
+                                            continue;
+                                        };
+                                        if previous.is_some_and(|position| {
+                                            position.complete
+                                                || position
+                                                    .last_offset
+                                                    .is_some_and(|last| last >= offset)
+                                        }) {
+                                            output.push(previous.unwrap().clone());
+                                            continue;
+                                        }
+                                        let through = offset
+                                            .checked_add(u64::from(len))
+                                            .ok_or_else(|| {
+                                                LocalDbError::new("checkpoint position overflow")
+                                            })?;
+                                        let (reply, pending) = mpsc::sync_channel(1);
+                                        timeline.checkpoint_generation(
+                                            "control_enqueue",
+                                            Some(*partition),
+                                            epoch,
+                                            None,
+                                            Some(generation),
+                                        );
+                                        sender
+                                            .send(Command::CheckpointPosition(
+                                                authority_epoch,
+                                                epoch,
+                                                through,
+                                                reply,
+                                            ))
+                                            .map_err(|_| {
+                                                LocalDbError::new("TCP worker lost request outcome")
+                                            })?;
+                                        let proof = receive(pending)?;
+                                        timeline.checkpoint_generation(
+                                            "control_observed",
+                                            Some(*partition),
+                                            epoch,
+                                            None,
+                                            Some(generation),
+                                        );
+                                        #[cfg(test)]
+                                        let proof = if corrupt_checkpoint_proof && *partition == 0 {
+                                            let mut proof = proof;
+                                            proof.database[0] ^= 1;
+                                            proof
+                                        } else {
+                                            proof
+                                        };
+                                        #[cfg(test)]
+                                        if *partition == 0
+                                            && let Some((entered, resume)) =
+                                                prefix_pause.lock().take()
+                                        {
+                                            let _ = entered.send(());
+                                            resume.recv().map_err(|_| {
+                                                LocalDbError::new(
+                                                    "checkpoint prefix test pause disconnected",
+                                                )
+                                            })?;
+                                        }
+                                        if proof.database != database
+                                            || proof.partition != *partition
+                                            || proof.epoch != epoch
+                                            || proof.durable_end < through
+                                        {
+                                            return Err(LocalDbError::new(
+                                                "checkpoint position proof differs",
+                                            ));
+                                        }
+                                        output.push(StreamPosition {
+                                            partition: *partition,
+                                            epoch,
+                                            replay_from: offset - offset % fragment_bytes,
+                                            last_offset: Some(offset),
+                                            durable_end: proof.durable_end,
+                                            complete: previous
+                                                .is_some_and(|position| position.complete),
+                                        });
+                                    }
+                                    Ok(output)
+                                })?;
+                            positions = output
+                                .into_iter()
+                                .flatten()
+                                .map(|position| ((position.partition, position.epoch), position))
+                                .collect();
+                            #[cfg(test)]
+                            if interruption == Some(4) {
+                                return Err(LocalDbError::new(
+                                    "injected interruption after checkpoint positions",
+                                ));
+                            }
+                            (Vec::new(), None, None, phase_started.map(elapsed))
+                        };
+                        let phase_started = diagnostics_enabled.then(Instant::now);
+                        timeline.checkpoint_generation(
+                            "index_persist_start",
+                            None,
+                            authority_epoch,
+                            None,
+                            Some(generation),
+                        );
+                        let persisted = prepared
+                            .persist(&path.join(commit.index_name()))
+                            .map_err(LocalDbError::component)?;
+                        let index_persist_ns = phase_started.map(elapsed);
+                        timeline.checkpoint_generation(
+                            "index_persist_end",
+                            None,
+                            authority_epoch,
+                            None,
+                            Some(generation),
+                        );
+                        #[cfg(test)]
+                        if interruption == Some(1) {
+                            return Err(LocalDbError::new(
+                                "injected interruption after checkpoint image",
+                            ));
+                        }
+                        timeline.checkpoint_generation(
+                            "metadata_encode_start",
+                            None,
+                            authority_epoch,
+                            None,
+                            Some(generation),
+                        );
+                        let encoded = if let Some(history) = &history {
+                            let image = CheckpointImage {
+                                format: 2,
+                                database,
+                                shape_yaml,
+                                authority_epoch,
+                                generation: commit.generation,
+                                cut,
+                                published_next,
+                                index_bytes: persisted.metadata.bytes,
+                                index_digest: persisted.metadata.digest,
+                                streams,
+                                history_root: history.root,
+                            };
+                            encode_checkpoint(&image)?
+                        } else {
+                            encode_checkpoint(&CheckpointImageV3 {
+                                format: 3,
+                                database,
+                                shape_yaml,
+                                authority_epoch,
+                                generation: commit.generation,
+                                cut,
+                                published_next,
+                                index_bytes: persisted.metadata.bytes,
+                                index_digest: persisted.metadata.digest,
+                                positions: positions.values().cloned().collect(),
+                                recent: recent.iter().copied().collect(),
+                            })?
+                        };
+                        let mut commit = commit;
+                        commit.index_files = persisted.files();
+                        commit.index_files.sort_unstable();
+                        commit.index_files.dedup();
+                        commit.metadata_bytes = encoded.len() as u64;
+                        commit.metadata_digest = Blake2b::<U32>::digest(&encoded).into();
+                        timeline.checkpoint_generation(
+                            "metadata_encode_end",
+                            None,
+                            authority_epoch,
+                            None,
+                            Some(generation),
+                        );
+                        let phase_started = diagnostics_enabled.then(Instant::now);
+                        timeline.checkpoint_generation(
+                            "metadata_install_start",
+                            None,
+                            authority_epoch,
+                            None,
+                            Some(generation),
+                        );
+                        install_metadata(&path, &commit.metadata_name(), &encoded)
+                            .map_err(LocalDbError::component)?;
+                        let metadata_install_ns = phase_started.map(elapsed);
+                        timeline.checkpoint_generation(
+                            "metadata_install_end",
+                            None,
+                            authority_epoch,
+                            None,
+                            Some(generation),
+                        );
+                        #[cfg(test)]
+                        if interruption == Some(2) {
+                            return Err(LocalDbError::new(
+                                "injected interruption before checkpoint adoption",
+                            ));
+                        }
+                        #[cfg(test)]
+                        if let Some((entered, resume)) = adoption_pause {
+                            let _ = entered.send(());
+                            resume.recv().map_err(|_| {
+                                LocalDbError::new("checkpoint adoption test pause disconnected")
+                            })?;
+                        }
+                        // No other serving operation replaces the authority manifest.
+                        // Adopt the durable root before the owner installs the image;
+                        // the post-cut suffix remains recoverable from the value WALs.
+                        staging_manifest.checkpoint_obsolete =
+                            staging_manifest.checkpoint.replace(commit.clone());
+                        staging_manifest.checkpoint_staging = None;
+                        #[cfg(test)]
+                        if interruption == Some(5) {
+                            return Err(LocalDbError::new(
+                                "injected interruption before checkpoint root adoption",
+                            ));
+                        }
+                        let phase_started = diagnostics_enabled.then(Instant::now);
+                        timeline.checkpoint_generation(
+                            "root_persist_start",
+                            None,
+                            authority_epoch,
+                            None,
+                            Some(generation),
+                        );
+                        persist_manifest(&path, &staging_manifest)?;
+                        let root_adoption_ns = phase_started.map(elapsed);
+                        timeline.checkpoint_generation(
+                            "root_persist_end",
+                            None,
+                            authority_epoch,
+                            None,
+                            Some(generation),
+                        );
+                        #[cfg(test)]
+                        if interruption == Some(6) {
+                            return Err(LocalDbError::new(
+                                "injected interruption after checkpoint root adoption",
+                            ));
+                        }
+                        Ok(CompletedCheckpoint {
+                            commit,
+                            manifest: staging_manifest,
+                            persisted: Some(persisted),
+                            batches,
+                            bytes,
+                            history_io: history
+                                .as_ref()
+                                .map_or_else(Default::default, |history| history.io_stats),
+                            history,
+                            positions,
+                            recent,
+                            cut,
+                            staging_manifest_ns,
+                            receipt_history_ns,
+                            receipt_history_sync_ns,
+                            node_prefix_wait_ns,
+                            index_prepare_ns,
+                            index_persist_ns,
+                            metadata_install_ns,
+                            root_adoption_ns,
+                        })
+                    })();
+                    let completed = match result {
+                        Ok(completed) => completed,
+                        Err(error) => {
+                            timeline.checkpoint_generation(
+                                "worker_failed",
+                                None,
+                                authority_epoch,
+                                None,
+                                Some(generation),
+                            );
+                            let _ = sender.send(Err(error));
+                            let _ = wake.try_send(());
+                            return;
+                        }
+                    };
+                    let mut manifest = completed.manifest.clone();
+                    timeline.checkpoint_generation(
+                        "result_send",
+                        None,
+                        authority_epoch,
+                        None,
+                        Some(generation),
+                    );
+                    if sender
+                        .send(Ok(CheckpointMessage::Adopted(completed)))
+                        .is_err()
+                    {
                         return;
                     }
-                };
-                let mut manifest = completed.manifest.clone();
-                timeline.checkpoint_generation(
-                    "result_send",
-                    None,
-                    authority_epoch,
-                    None,
-                    Some(generation),
-                );
-                if sender
-                    .send(Ok(CheckpointMessage::Adopted(completed)))
-                    .is_err()
-                {
-                    return;
-                }
-                let _ = wake.try_send(());
-                if cleanup_authorized.recv().is_err() {
-                    return;
-                }
-                let result = (|| {
-                    #[cfg(test)]
-                    if let Some((entered, resume)) = cleanup_pause {
-                        let _ = entered.send(());
-                        resume.recv().map_err(|_| {
-                            LocalDbError::new("checkpoint cleanup test pause disconnected")
-                        })?;
+                    let _ = wake.try_send(());
+                    if cleanup_authorized.recv().is_err() {
+                        return;
                     }
-                    #[cfg(test)]
-                    let interrupt_cleanup = interruption == Some(7);
-                    #[cfg(not(test))]
-                    let interrupt_cleanup = false;
-                    timeline.checkpoint_generation(
-                        "cleanup_start",
-                        None,
-                        authority_epoch,
-                        None,
-                        Some(generation),
-                    );
-                    let started = diagnostics_enabled.then(Instant::now);
-                    cleanup_checkpoint_artifacts(&path, &mut manifest, interrupt_cleanup).map_err(
-                        |error| {
-                            LocalDbError::new(format!(
-                                "checkpoint committed; artifact cleanup incomplete: {error}"
-                            ))
-                        },
-                    )?;
-                    let cleanup_ns = started.map(elapsed);
-                    timeline.checkpoint_generation(
-                        "cleanup_end",
-                        None,
-                        authority_epoch,
-                        None,
-                        Some(generation),
-                    );
-                    #[cfg(test)]
-                    if interruption == Some(8) {
-                        return Err(LocalDbError::new(
-                            "injected interruption after checkpoint cleanup",
-                        ));
+                    let result = (|| {
+                        #[cfg(test)]
+                        if let Some((entered, resume)) = cleanup_pause {
+                            let _ = entered.send(());
+                            resume.recv().map_err(|_| {
+                                LocalDbError::new("checkpoint cleanup test pause disconnected")
+                            })?;
+                        }
+                        #[cfg(test)]
+                        let interrupt_cleanup = interruption == Some(7);
+                        #[cfg(not(test))]
+                        let interrupt_cleanup = false;
+                        timeline.checkpoint_generation(
+                            "cleanup_start",
+                            None,
+                            authority_epoch,
+                            None,
+                            Some(generation),
+                        );
+                        let started = diagnostics_enabled.then(Instant::now);
+                        cleanup_checkpoint_artifacts(&path, &mut manifest, interrupt_cleanup)
+                            .map_err(|error| {
+                                LocalDbError::new(format!(
+                                    "checkpoint committed; artifact cleanup incomplete: {error}"
+                                ))
+                            })?;
+                        let cleanup_ns = started.map(elapsed);
+                        timeline.checkpoint_generation(
+                            "cleanup_end",
+                            None,
+                            authority_epoch,
+                            None,
+                            Some(generation),
+                        );
+                        #[cfg(test)]
+                        if interruption == Some(8) {
+                            return Err(LocalDbError::new(
+                                "injected interruption after checkpoint cleanup",
+                            ));
+                        }
+                        Ok(CheckpointMessage::Cleaned(manifest, cleanup_ns))
+                    })();
+                    if result.is_err() {
+                        timeline.checkpoint_generation(
+                            "cleanup_failed",
+                            None,
+                            authority_epoch,
+                            None,
+                            Some(generation),
+                        );
                     }
-                    Ok(CheckpointMessage::Cleaned(manifest, cleanup_ns))
-                })();
-                if result.is_err() {
-                    timeline.checkpoint_generation(
-                        "cleanup_failed",
-                        None,
-                        authority_epoch,
-                        None,
-                        Some(generation),
-                    );
-                }
-                let _ = sender.send(result);
-                let _ = wake.try_send(());
-            })
-            .map_err(LocalDbError::component)?;
+                    let _ = sender.send(result);
+                    let _ = wake.try_send(());
+                })
+                .map_err(LocalDbError::component)?;
         self.manifest.checkpoint_staging = Some(staging);
         self.background_checkpoint = Some(BackgroundCheckpoint {
             reply,
@@ -871,6 +1087,21 @@ impl RemoteDatabase {
                         };
                         self.manifest = completed.manifest;
                         self.receipt_history = completed.history;
+                        if self.config.history_persistence == HistoryPersistence::WalReplay {
+                            self.committed_complete = completed
+                                .positions
+                                .iter()
+                                .filter_map(|(key, position)| position.complete.then_some(*key))
+                                .collect();
+                            self.positions = completed.positions;
+                            self.recent = completed.recent;
+                            self.recent_ids.clear();
+                            self.recent_ids.extend(
+                                self.recent
+                                    .iter()
+                                    .map(|receipt| (receipt.id, (receipt.version, receipt.digest))),
+                            );
+                        }
                         self.known.retain(|_, receipt| {
                             completed
                                 .cut
@@ -1034,20 +1265,25 @@ impl RemoteDatabase {
         result
     }
 
-    fn retire_unreachable_sealed_files(&mut self) -> Result<(), LocalDbError> {
+    pub(super) fn retire_unreachable_sealed_files(&mut self) -> Result<(), LocalDbError> {
         for node in 0..self.clients.len() {
             let partition = self.config.endpoints[node].partition;
             for &epoch in &self.retained_epochs[node] {
                 if epoch >= self.epoch {
                     continue;
                 }
+                let replay = self.config.history_persistence == HistoryPersistence::WalReplay;
                 let prefix = self
                     .receipt_history
-                    .counts
-                    .get(&(partition, epoch))
+                    .as_ref()
+                    .and_then(|history| history.counts.get(&(partition, epoch)))
                     .copied()
                     .unwrap_or(0);
-                if prefix == 0 {
+                if if replay {
+                    !self.committed_complete.contains(&(partition, epoch))
+                } else {
+                    prefix == 0
+                } {
                     continue;
                 }
                 let mut after = None;
@@ -1074,7 +1310,11 @@ impl RemoteDatabase {
                     }
                     if !retired.is_empty() {
                         self.clients[node].control(move |client| {
-                            client.retire_files(authority_epoch, epoch, prefix, retired)
+                            if replay {
+                                client.retire_wal_files(authority_epoch, epoch, retired)
+                            } else {
+                                client.retire_files(authority_epoch, epoch, prefix, retired)
+                            }
                         })?;
                     }
                 }
@@ -1099,7 +1339,7 @@ mod tests {
 
     #[test]
     fn request_timeline_splits_checkpoint_without_legacy_profile() {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new().history(HistoryPersistence::OnDisk);
         let mut db = fixture.open();
         assert_eq!(db.config.write_profile_limit, 0);
         db.write_timeline.arm(4).unwrap();

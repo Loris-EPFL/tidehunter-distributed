@@ -1,0 +1,839 @@
+use super::*;
+use crate::distributed::remote_db::pipeline_tests::Fixture;
+use crate::distributed::tcp::live_read::tests as local;
+use std::io::{Seek, SeekFrom, Write};
+
+/// One resume message for a worker parked outside both lane mutexes. Capacity
+/// one accepts the sole drop-time send without waiting; a stopped worker drops
+/// its receiver and makes the cleanup send fail harmlessly.
+struct IdleLane(mpsc::SyncSender<()>);
+impl Drop for IdleLane {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+struct Case {
+    db: RemoteDatabase,
+    reference: ValueRecordReference,
+    node: usize,
+    path: std::path::PathBuf,
+    _fixture: Fixture,
+}
+impl Case {
+    fn new() -> Self {
+        Self::with_inline_reads(true)
+    }
+    fn with_inline_reads(inline_reads: bool) -> Self {
+        let mut fixture = Fixture::new();
+        fixture.config.read_lanes = 1;
+        fixture.config.read_cache_bytes = 0;
+        let mut db = fixture.open();
+        db.write_batch(fixture.operation(0, 0), vec![super::tests::put(0, 7)])
+            .unwrap();
+        db.write_batch(fixture.operation(0, 1), vec![super::tests::put(1, 8)])
+            .unwrap();
+        let reference = db
+            .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
+            .unwrap()
+            .unwrap();
+        let node = db.partition_indexes[&reference.batch_address.partition];
+        let clients = db
+            .reads
+            .stop_with_clients()
+            .into_iter()
+            .map(|shared| {
+                let mut client = match Arc::try_unwrap(shared) {
+                    Ok(client) => client.into_inner(),
+                    Err(_) => panic!("read client still shared after stop"),
+                };
+                local::configure_local_client(&mut client);
+                client
+            })
+            .collect();
+        db.config.live_nvme = Some(crate::distributed::tcp::LiveClientConfig {
+            lease_ahead: true,
+            polled_writes: false,
+            export_mode: Default::default(),
+            host_nqn: "nqn.2026-01.test:inline".into(),
+            host_id: [1; 16],
+            max_inflight_requests: 4,
+            max_inflight_bytes: 128 * 1024,
+            connect_timeout_ms: 1000,
+            io_timeout_ms: 10_000,
+            write_mode: crate::distributed::tcp::LiveWriteMode::Reserved,
+            leased_durability: None,
+            inline_reads,
+            queue_geometry: Default::default(),
+        });
+        db.reads = Arc::new(
+            ReadService::from_clients(
+                &db.config,
+                db.epoch,
+                clients,
+                &mut RecoveryStats::default(),
+                db.reads.state.first_failure.clone(),
+            )
+            .unwrap(),
+        );
+        let path = {
+            let lanes = db.reads.lanes.read();
+            let lane = &lanes[node][0];
+            let mut driver = lane.driver.lock();
+            local::install_owner_local(
+                driver.live_cache.as_mut().unwrap(),
+                &fixture.nodes[node],
+                reference,
+            )
+        };
+        db.set_read_profile_limit(128);
+        Self {
+            db,
+            reference,
+            node,
+            path,
+            _fixture: fixture,
+        }
+    }
+    fn park_idle_lane(&self) -> IdleLane {
+        // Admission resume alone promises neither unlocked worker startup nor
+        // a warm grant. Wait on an actual unlocked worker boundary, then warm
+        // the cache while its idle-grant cleanup cannot race this test.
+        let (entered, waiting) = mpsc::sync_channel(1);
+        let (release, resume) = mpsc::sync_channel(1);
+        let parked = IdleLane(release);
+        *self.db.reads.state.reactor_pause[self.node].lock() = Some((entered, resume));
+        waiting.recv_timeout(self.db.config.timeout).unwrap();
+        let lane = self.db.reads.lanes.read()[self.node][0].clone();
+        assert_eq!(lane.outstanding.load(Ordering::Acquire), 0);
+        assert_eq!(self.db.reads.state.live_drains.load(Ordering::Acquire), 0);
+        assert_eq!(*self.db.reads.state.retained.lock(), (0, 0));
+        {
+            let mut driver = lane
+                .driver
+                .try_lock()
+                .expect("parked worker owns no driver");
+            let cache = driver.live_cache.as_mut().unwrap();
+            assert_eq!(local::local_snapshot(cache).0, 0);
+            assert_eq!(
+                local::owner_local_pin_count(&self._fixture.nodes[self.node]),
+                0
+            );
+            local::install_owner_local(cache, &self._fixture.nodes[self.node], self.reference);
+            assert!(cache.inline_ready(&self.reference));
+            assert!(cache.inline_credit(&self.reference));
+        }
+        assert!(lane.client.try_lock().is_some());
+        parked
+    }
+    fn inline(&self) -> Result<Option<Vec<Mutation>>, LocalDbError> {
+        self.db.reads.read_inline(
+            self.node,
+            self.db.epoch,
+            &self.reference,
+            0,
+            None,
+            Some(self.db.index.pin_cut(IndexReadCut::Latest).unwrap()),
+        )
+    }
+    fn snapshot(&self) -> (usize, usize, usize) {
+        let lanes = self.db.reads.lanes.read();
+        let driver = lanes[self.node][0].driver.lock();
+        let snapshot = local::local_snapshot(driver.live_cache.as_ref().unwrap());
+        drop(driver);
+        // A retired registry flight no longer owns its index-cut pin.
+        assert!(
+            self.db
+                .reads
+                .state
+                .flights
+                .lock()
+                .slots
+                .iter()
+                .all(|flight| flight.strong_count() == 0)
+        );
+        assert_eq!(
+            local::owner_local_pin_count(&self._fixture.nodes[self.node]),
+            snapshot.0
+        );
+        snapshot
+    }
+}
+impl Drop for Case {
+    fn drop(&mut self) {
+        let node = &self._fixture.nodes[self.node];
+        let _ = self.db.reads.pause_live_for_retirement();
+        let _ = self.db.shutdown();
+        assert_eq!(local::owner_local_pin_count(node), 0);
+    }
+}
+
+#[test]
+fn live_inline_matches_worker_and_bypasses_actor() {
+    let mut case = Case::new();
+    let idle_lane = case.park_idle_lane();
+    let before = case.snapshot();
+    let values = case.inline().unwrap().unwrap();
+    assert_eq!(values, vec![super::tests::put(0, 7)]);
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .diagnostics
+            .live_inline
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .diagnostics
+            .actor_completed
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        case.db.get(KeySpace(0), &0u32.to_be_bytes()).unwrap(),
+        super::tests::value(7)
+    );
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .diagnostics
+            .live_inline
+            .load(Ordering::Relaxed),
+        2
+    );
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .diagnostics
+            .actor_completed
+            .load(Ordering::Relaxed),
+        0
+    );
+    drop(idle_lane);
+    let (worker, _) = case
+        .db
+        .reads
+        .submit(case.node, vec![case.reference], 0, false, None)
+        .unwrap()
+        .finish()
+        .unwrap();
+    assert_eq!(values, worker);
+    assert_eq!(*case.db.reads.state.retained.lock(), (0, 0));
+    assert_eq!(case.snapshot(), before);
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .inline_result_copies
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[test]
+fn live_inline_disabled_uses_worker_without_inline_counters() {
+    let mut case = Case::with_inline_reads(false);
+    assert!(case.inline().unwrap().is_none());
+    assert_eq!(
+        case.db.get(KeySpace(0), &0u32.to_be_bytes()).unwrap(),
+        super::tests::value(7)
+    );
+    let diagnostics = &case.db.reads.state.diagnostics;
+    for counter in [
+        &diagnostics.live_inline,
+        &diagnostics.live_inline_fallback_drain,
+        &diagnostics.live_inline_fallback_busy,
+        &diagnostics.live_inline_fallback_grant,
+        &diagnostics.live_inline_fallback_credit,
+        &diagnostics.live_inline_fallback_paused,
+        &diagnostics.live_inline_fallback_coalesced,
+    ] {
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+    assert_eq!(diagnostics.actor_completed.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn live_inline_busy_mutex_falls_back_without_waiting() {
+    let case = Case::new();
+    let _idle_lane = case.park_idle_lane();
+    let lanes = case.db.reads.lanes.read();
+    let held = lanes[case.node][0].client.lock();
+    assert!(case.inline().unwrap().is_none());
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .diagnostics
+            .live_inline_fallback_busy
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .inline_mutex_fallbacks
+            .load(Ordering::Relaxed),
+        1
+    );
+    drop(held);
+    drop(lanes);
+    assert_eq!(*case.db.reads.state.retained.lock(), (0, 0));
+    assert!(case.inline().unwrap().is_some());
+}
+
+#[test]
+fn live_inline_grant_miss_uses_existing_admission() {
+    let case = Case::new();
+    let _idle_lane = case.park_idle_lane();
+    let mut reference = case.reference;
+    reference.batch_address.offset += case.db.config.storage.wal_file_bytes;
+    assert!(
+        case.db
+            .reads
+            .read_inline(case.node, case.db.epoch, &reference, 0, None, None)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .diagnostics
+            .live_inline_fallback_grant
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(*case.db.reads.state.retained.lock(), (0, 0));
+}
+
+#[test]
+fn live_inline_paused_admission_falls_back() {
+    let case = Case::new();
+    let idle_lane = case.park_idle_lane();
+    let pause = case.db.reads.pause_idle_nvmeof(false).unwrap();
+    assert!(case.inline().unwrap().is_none());
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .diagnostics
+            .live_inline_fallback_paused
+            .load(Ordering::Relaxed),
+        1
+    );
+    drop(pause);
+    assert!(case.inline().unwrap().is_some());
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .diagnostics
+            .live_inline
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .diagnostics
+            .live_inline_fallback_busy
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .diagnostics
+            .live_inline_fallback_grant
+            .load(Ordering::Relaxed),
+        0
+    );
+    drop(idle_lane);
+}
+
+#[test]
+fn live_inline_blocks_retirement_and_coalesces_identical_references() {
+    let case = Case::new();
+    let _idle_lane = case.park_idle_lane();
+    let before = case.snapshot();
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (release, resume) = mpsc::sync_channel(1);
+    *case.db.reads.state.inline_pause.lock() = Some((entered, resume));
+    let reads = case.db.reads.clone();
+    let (node, epoch, reference) = (case.node, case.db.epoch, case.reference);
+    let producer = thread::spawn(move || reads.read_inline(node, epoch, &reference, 0, None, None));
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(case.db.reads.pause_live_for_retirement().is_err());
+    assert!(!case.db.reads.failed());
+    assert!(case.inline().unwrap().is_none());
+    let joined = case
+        .db
+        .reads
+        .submit(node, vec![reference], 0, false, None)
+        .unwrap();
+    release.send(()).unwrap();
+    let producer = producer.join().unwrap().unwrap().unwrap();
+    assert_ne!(*case.db.reads.state.retained.lock(), (0, 0));
+    assert_eq!(joined.finish().unwrap().0, producer);
+    assert_eq!(*case.db.reads.state.retained.lock(), (0, 0));
+    assert_eq!(case.snapshot(), before);
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .diagnostics
+            .live_inline
+            .load(Ordering::Relaxed),
+        1
+    );
+}
+
+#[test]
+fn live_inline_corruption_poisons_and_releases_credit() {
+    let case = Case::new();
+    let _idle_lane = case.park_idle_lane();
+    let before = case.snapshot();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&case.path)
+        .unwrap();
+    let offset = case.reference.batch_address.offset % case.db.config.storage.wal_file_bytes
+        + 8
+        + u64::from(case.reference.descriptor.offset)
+        + u64::from(case.reference.descriptor.len)
+        - 1;
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(&[0xff]).unwrap();
+    assert!(case.inline().is_err());
+    assert!(case.db.reads.failed());
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .diagnostics
+            .failed_owner_profile_not_applicable
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .diagnostics
+            .failed_owner_profile_unavailable
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(*case.db.reads.state.retained.lock(), (0, 0));
+    assert_eq!(case.snapshot(), before);
+}
+
+#[test]
+fn live_inline_deadline_releases_credit_only_after_retirement() {
+    let mut case = Case::new();
+    let _idle_lane = case.park_idle_lane();
+    let before = case.snapshot();
+    Arc::get_mut(&mut case.db.reads).unwrap().timeout = Duration::from_millis(50);
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (release, resume) = mpsc::sync_channel(1);
+    {
+        let lanes = case.db.reads.lanes.read();
+        let mut driver = lanes[case.node][0].driver.lock();
+        local::pause_inline_submitted(driver.live_cache.as_mut().unwrap(), entered, resume);
+    }
+    let reads = case.db.reads.clone();
+    let (node, epoch, reference) = (case.node, case.db.epoch, case.reference);
+    let pin = case.db.index.pin_cut(IndexReadCut::Latest).unwrap();
+    let worker =
+        thread::spawn(move || reads.read_inline(node, epoch, &reference, 0, None, Some(pin)));
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    let admitted_credit = *case.db.reads.state.retained.lock();
+    assert_eq!(admitted_credit.0, 1);
+    assert!(admitted_credit.1 > 0);
+    assert_eq!(local::owner_local_pin_count(&case._fixture.nodes[node]), 1);
+    assert!(case.db.reads.pause_live_for_retirement().is_err());
+    thread::sleep(Duration::from_millis(60));
+    // The SQE is now overdue but still paused before any terminal harvest.
+    assert_eq!(*case.db.reads.state.retained.lock(), admitted_credit);
+    {
+        let registry = case.db.reads.state.flights.lock();
+        let (flight, _) = registry.find(node, &reference).unwrap();
+        assert!(flight._pin.is_some());
+        assert!(flight.completion.result.lock().is_none());
+        assert!(!case.db.reads.state.flight_ready[flight.slot].is_ready());
+    }
+    assert_eq!(local::owner_local_pin_count(&case._fixture.nodes[node]), 1);
+    release.send(()).unwrap();
+    assert!(worker.join().unwrap().is_err());
+    assert!(case.db.reads.failed());
+    assert_eq!(*case.db.reads.state.retained.lock(), (0, 0));
+    assert_eq!(case.snapshot(), before);
+}
+
+#[test]
+fn live_inline_eight_callers_share_one_lane_and_exact_flight() {
+    let case = Case::new();
+    let idle_lane = case.park_idle_lane();
+    assert!(case.inline().unwrap().is_some());
+    drop(idle_lane);
+    let before = case.snapshot();
+    let gate = Arc::new(std::sync::Barrier::new(8));
+    let mut workers = Vec::new();
+    for _ in 0..8 {
+        let reads = case.db.reads.clone();
+        let gate = gate.clone();
+        let (node, epoch, reference) = (case.node, case.db.epoch, case.reference);
+        workers.push(thread::spawn(move || {
+            gate.wait();
+            for _ in 0..8 {
+                let values = match reads
+                    .read_inline(node, epoch, &reference, 0, None, None)
+                    .unwrap()
+                {
+                    Some(values) => values,
+                    None => {
+                        reads
+                            .submit(node, vec![reference], 0, false, None)
+                            .unwrap()
+                            .finish()
+                            .unwrap()
+                            .0
+                    }
+                };
+                assert_eq!(values, vec![super::tests::put(0, 7)]);
+            }
+        }));
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert!(!case.db.reads.failed());
+    assert_eq!(*case.db.reads.state.retained.lock(), (0, 0));
+    assert_eq!(case.snapshot(), before);
+    assert!(
+        case.db
+            .reads
+            .state
+            .diagnostics
+            .live_inline
+            .load(Ordering::Relaxed)
+            > 0
+    );
+}
+
+#[test]
+fn live_inline_drain_in_progress_falls_back_without_taking_lane() {
+    let case = Case::new();
+    let lane = case.db.reads.lanes.read()[case.node][0].clone();
+    let client = lane.client.lock();
+    let (reply, responses) = mpsc::sync_channel(1);
+    case.db.reads.sender.lock()[case.node]
+        .send(ReadCommand::DrainLive(reply))
+        .unwrap();
+    for _ in 0..1000 {
+        if case.db.reads.state.live_drains.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(case.db.reads.state.live_drains.load(Ordering::Acquire), 1);
+    assert!(case.inline().unwrap().is_none());
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .diagnostics
+            .live_inline_fallback_drain
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert!(matches!(
+        responses.recv_timeout(Duration::from_millis(20)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    drop(client);
+    responses
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert!(!case.db.reads.failed());
+    assert_eq!(*case.db.reads.state.retained.lock(), (0, 0));
+}
+
+#[test]
+fn live_inline_terminal_retirement_precedes_drain_reply() {
+    let case = Case::new();
+    let idle_lane = case.park_idle_lane();
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (release, resume) = mpsc::sync_channel(1);
+    *case.db.reads.state.inline_pause.lock() = Some((entered, resume));
+    let reads = case.db.reads.clone();
+    let (node, epoch, reference) = (case.node, case.db.epoch, case.reference);
+    let producer = thread::spawn(move || reads.read_inline(node, epoch, &reference, 0, None, None));
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    drop(idle_lane);
+    let (reply, responses) = mpsc::sync_channel(1);
+    case.db.reads.sender.lock()[node]
+        .send(ReadCommand::DrainLive(reply))
+        .unwrap();
+    assert!(matches!(
+        responses.recv_timeout(Duration::from_millis(20)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    release.send(()).unwrap();
+    assert_eq!(
+        producer.join().unwrap().unwrap().unwrap(),
+        vec![super::tests::put(0, 7)]
+    );
+    responses
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(local::owner_local_pin_count(&case._fixture.nodes[node]), 0);
+    assert_eq!(*case.db.reads.state.retained.lock(), (0, 0));
+    assert_eq!(case.snapshot().2, 0);
+}
+
+#[test]
+fn live_inline_queued_lane_falls_back_and_preserves_both_reads() {
+    let case = Case::new();
+    let reference = case
+        .db
+        .index_reference(KeySpace(0), &1u32.to_be_bytes(), IndexReadCut::Latest)
+        .unwrap()
+        .unwrap();
+    let lane = case.db.reads.lanes.read()[case.node][0].clone();
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (release, resume) = mpsc::sync_channel(1);
+    *case.db.reads.state.reactor_pause[case.node].lock() = Some((entered, resume));
+    let pending = case
+        .db
+        .reads
+        .submit(case.node, vec![reference], 0, false, None)
+        .unwrap();
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    // The worker has received the other reference but owns neither mutex.
+    // Without the outstanding/idle check this cached inline read would succeed.
+    assert!(lane.driver.try_lock().is_some());
+    assert!(lane.client.try_lock().is_some());
+    let mutex_fallbacks = case
+        .db
+        .reads
+        .state
+        .inline_mutex_fallbacks
+        .load(Ordering::Relaxed);
+    assert!(case.inline().unwrap().is_none());
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .diagnostics
+            .live_inline_fallback_busy
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .inline_mutex_fallbacks
+            .load(Ordering::Relaxed),
+        mutex_fallbacks
+    );
+    release.send(()).unwrap();
+    assert_eq!(pending.finish().unwrap().0, vec![super::tests::put(1, 8)]);
+    let _idle_lane = case.park_idle_lane();
+    assert_eq!(
+        case.inline().unwrap().unwrap(),
+        vec![super::tests::put(0, 7)]
+    );
+    assert_eq!(*case.db.reads.state.retained.lock(), (0, 0));
+}
+
+#[test]
+fn live_inline_io_error_retires_pin_and_credit_before_poison() {
+    let case = Case::new();
+    let _idle_lane = case.park_idle_lane();
+    let before = case.snapshot();
+    {
+        let lanes = case.db.reads.lanes.read();
+        let mut driver = lanes[case.node][0].driver.lock();
+        local::override_inline_completion(driver.live_cache.as_mut().unwrap(), -libc::EIO);
+    }
+    assert!(case.inline().is_err());
+    assert!(case.db.reads.failed());
+    assert_eq!(*case.db.reads.state.retained.lock(), (0, 0));
+    assert_eq!(case.snapshot(), before);
+}
+
+#[test]
+fn live_inline_wait_failure_drains_error_cqe_before_releasing_pins() {
+    let case = Case::new();
+    let _idle_lane = case.park_idle_lane();
+    let before = case.snapshot();
+    {
+        let lanes = case.db.reads.lanes.read();
+        let mut driver = lanes[case.node][0].driver.lock();
+        let cache = driver.live_cache.as_mut().unwrap();
+        local::fail_inline_wait(cache);
+        local::override_inline_completion(cache, -libc::EIO);
+    }
+    let error = case.inline().unwrap_err();
+    assert!(error.to_string().contains("injected inline wait failure"));
+    assert!(case.db.reads.failed());
+    assert_eq!(*case.db.reads.state.retained.lock(), (0, 0));
+    // The wait fails after submission, before any ordinary progress. Only the
+    // fatal cleanup drain can retire the injected error CQE and restore credit.
+    assert_eq!(case.snapshot(), before);
+}
+
+#[test]
+fn live_inline_error_reaches_coalesced_joiner_and_retires_credit_once() {
+    let case = Case::new();
+    let _idle_lane = case.park_idle_lane();
+    let before = case.snapshot();
+    {
+        let lanes = case.db.reads.lanes.read();
+        let mut driver = lanes[case.node][0].driver.lock();
+        local::override_inline_completion(driver.live_cache.as_mut().unwrap(), -libc::EIO);
+    }
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (release, resume) = mpsc::sync_channel(1);
+    *case.db.reads.state.inline_pause.lock() = Some((entered, resume));
+    let reads = case.db.reads.clone();
+    let (node, epoch, reference) = (case.node, case.db.epoch, case.reference);
+    let pin = case.db.index.pin_cut(IndexReadCut::Latest).unwrap();
+    let producer =
+        thread::spawn(move || reads.read_inline(node, epoch, &reference, 0, None, Some(pin)));
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    let joined = case
+        .db
+        .reads
+        .submit(node, vec![reference], 0, false, None)
+        .unwrap();
+    let flight = {
+        let registry = case.db.reads.state.flights.lock();
+        let (flight, _) = registry.find(node, &reference).unwrap();
+        assert!(Arc::ptr_eq(&flight, &joined.parts[0].0));
+        assert!(flight._pin.is_some());
+        Arc::downgrade(&flight)
+    };
+    let joined_credit = *case.db.reads.state.retained.lock();
+    assert_eq!(joined_credit.0, 1);
+    release.send(()).unwrap();
+    let producer_error = producer.join().unwrap().unwrap_err();
+    let expected = crate::distributed::nvmeof::live_io::LiveIoError::from(
+        std::io::Error::from_raw_os_error(libc::EIO),
+    )
+    .to_string();
+    assert_eq!(producer_error.to_string(), expected);
+    assert!(case.db.reads.failed());
+    assert_eq!(*case.db.reads.state.retained.lock(), joined_credit);
+    assert!(flight.upgrade().is_some());
+    let Err(joined_error) = joined.finish() else {
+        panic!("coalesced inline error was not delivered");
+    };
+    assert_eq!(joined_error.to_string(), producer_error.to_string());
+    assert!(flight.upgrade().is_none());
+    assert_eq!(*case.db.reads.state.retained.lock(), (0, 0));
+    assert_eq!(case.snapshot(), before);
+    let diagnostics = &case.db.reads.state.diagnostics;
+    assert_eq!(diagnostics.live_inline.load(Ordering::Relaxed), 1);
+    assert_eq!(diagnostics.completed.load(Ordering::Relaxed), 1);
+    assert_eq!(diagnostics.errors.load(Ordering::Relaxed), 1);
+    assert_eq!(diagnostics.actor_completed.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .coalesced_members
+            .load(Ordering::Relaxed),
+        1
+    );
+}
+
+#[test]
+fn live_inline_joiner_after_io_completion_receives_one_value() {
+    let case = Case::new();
+    let _idle_lane = case.park_idle_lane();
+    let before = case.snapshot();
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (release, resume) = mpsc::sync_channel(1);
+    *case.db.reads.state.inline_retirement_pause.lock() = Some((entered, resume));
+    let reads = case.db.reads.clone();
+    let (node, epoch, reference) = (case.node, case.db.epoch, case.reference);
+    let pin = case.db.index.pin_cut(IndexReadCut::Latest).unwrap();
+    let producer =
+        thread::spawn(move || reads.read_inline(node, epoch, &reference, 0, None, Some(pin)));
+    // The member has completed and decoded; publication and retirement have
+    // not started. Admission can still find and join this exact flight.
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    let joined = case
+        .db
+        .reads
+        .submit(node, vec![reference], 0, false, None)
+        .unwrap();
+    assert_eq!(joined.parts.len(), 1);
+    let flight = {
+        let registry = case.db.reads.state.flights.lock();
+        let (flight, _) = registry.find(node, &reference).unwrap();
+        assert!(Arc::ptr_eq(&flight, &joined.parts[0].0));
+        assert!(flight.completion.result.lock().is_none());
+        assert!(!case.db.reads.state.flight_ready[flight.slot].is_ready());
+        Arc::downgrade(&flight)
+    };
+    release.send(()).unwrap();
+    let produced = producer.join().unwrap().unwrap().unwrap();
+    assert_eq!(produced, vec![super::tests::put(0, 7)]);
+    assert_eq!(case.db.reads.state.retained.lock().0, 1);
+    let (values, _) = joined.finish().unwrap();
+    assert_eq!(values, produced);
+    assert_eq!(values.len(), 1);
+    assert!(flight.upgrade().is_none());
+    assert_eq!(*case.db.reads.state.retained.lock(), (0, 0));
+    assert_eq!(case.snapshot(), before);
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .inline_result_copies
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .diagnostics
+            .live_inline
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .diagnostics
+            .actor_completed
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        case.db
+            .reads
+            .state
+            .coalesced_members
+            .load(Ordering::Relaxed),
+        1
+    );
+}

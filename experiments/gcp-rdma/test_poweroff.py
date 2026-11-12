@@ -137,6 +137,9 @@ class PoweroffTests(unittest.TestCase):
 
     def test_sui_requires_archive(self):
         self.config['spec']['suite'] = 'sui'
+        for key in list(self.store.items):
+            if '/results/' in key:
+                self.store.items.pop(key)
         self.store.put(self.base + 'sui-started.json', encode({'run_id': 'bench-test',
                        'source_sha256': 'a' * 64, 'suite': 'sui'}))
         with self.assertRaises(gcp_api.ApiError):

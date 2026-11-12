@@ -1,0 +1,16 @@
+\begin{table}[H]\centering\small\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lllll}\toprule
+Code & Backend & Security/control & Polling & Data path\\\midrule
+TM-A & \texttt{tidehunter\_tcp} & mutual TLS & adaptive & warm owner RPC\\
+TT-A & \texttt{tidehunter\_tcp\_trusted} & trusted; no TLS & adaptive & warm owner RPC\\
+TT-B & \texttt{tidehunter\_tcp\_trusted} & trusted; no TLS & Busy spins & warm owner RPC\\
+V-A & \texttt{tidehunter\_verbs\_native} & trusted; no TLS & adaptive & warm owner RPC\\
+V-B & \texttt{tidehunter\_verbs\_native} & trusted; no TLS & Busy spins & warm owner RPC\\
+O-T & \texttt{tidehunter\_tcp\_trusted} & trusted; no TLS & adaptive & cold owner RPC\\
+O-V & \texttt{tidehunter\_verbs\_native} & trusted; no TLS & adaptive & cold owner RPC\\
+K-R & \texttt{tidehunter\_nvme\_rdma} & trusted; no TLS & adaptive & kernel direct\\
+S-R & \texttt{tidehunter\_nvme\_rdma} & trusted; no TLS & adaptive & SPDK file AIO\\
+K-T & \texttt{tidehunter\_nvme\_tcp} & trusted; no TLS & adaptive & kernel direct\\
+\bottomrule\end{tabular}
+\caption{Configured arm definitions, not measurements. TM/TT: TCP mTLS/trusted; V: verbs trusted; A: adaptive; B: Busy. O-T/O-V: cold owner RPC; K-R/S-R/K-T: kernel-RDMA/SPDK-RDMA/kernel-TCP namespace reads. NVMe-oF polling/security describe its owner control channel, not kernel target polling. No SPDK/TCP arm. Coordinator cache off; lanes one at c1, four at c16; r0/r1 separate. Busy spins owner and coordinator read driver, not kernel busy poll. Unmatched dimensions: TLS/security, polling, RPC/direct I/O; NVMe control is verbs trusted Adaptive.}
+\end{table}

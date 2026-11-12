@@ -430,6 +430,7 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch):
         try:
             prep = {"guest_root": str(guest), "addresses": [f"127.0.0.1:{control}"],
                 "transport": {"kind": "tcp"}, "durability_tier": tier,
+                "owner_wal_geometry": "research",
                 "max_batches_per_partition": 16384, "max_admitted_batches": 16384,
                 "max_index_bytes": 128 * 1024**2, "max_epochs": 4,
                 "coordinator_cache_bytes": 4 * 1024**2, "owner_read_workers": 2,

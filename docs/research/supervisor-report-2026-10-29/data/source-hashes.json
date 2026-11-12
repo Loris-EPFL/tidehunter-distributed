@@ -1,0 +1,37 @@
+{
+  "additional_sources": {
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/distributed/reports/2026-10-27-kv-comparison-ci-40573961972/all-results.csv": "3691608bfdd4667f4ec6befbf9128c084646e1f426f47f195f244e0ce6baed4e",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/experiments/kv-comparison/analyze.py": "694901a20c46e8ed34876b7514af40781d3b59a143c6440fe9a7abb9f555940e",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/experiments/kv-comparison/local.py": "c035da8ffd822e5e815e82796a5f62b4cf104fb3ac1bea2809f74cd981933765",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/experiments/kv-comparison/plot_cloud_comparison.py": "9424725f8a797fea15b6eeb0387b867750abd9e99701fd80cf7ebd531d90e58f"
+  },
+  "algorithm": "sha256",
+  "files": {
+    "analysis/all-results.csv": "c556830d65498424f220c66da9010fbb951f2346880f4923c10e514b8cfe34ea",
+    "analysis/figures/cache-cohorts.pdf": "48d77c14a6b1666e8cb7c888b0bf5f58ea4edd66d133f0057c774f8788339cd0",
+    "analysis/figures/cold-os-cache.pdf": "c473d04e20a46d0bd9f50616e6445415d9a7e4ed527437a16b77875f3d448342",
+    "analysis/figures/coverage.pdf": "51cad6c64419a8048d89b781e633458ed34e43d1336f36ad8c72004f698e6799",
+    "analysis/figures/native-pagecache-goodput.pdf": "02f35cc38f598a4d4de844bf68f4f87701841919413b2adf3b863bc7613b1355",
+    "analysis/figures/native-pagecache-latency.pdf": "d7b49dfd544ac4c814a52ad52a241911a764b2ed2215136f01ccea9f57d86cb3",
+    "analysis/figures/offered-load-accounting.pdf": "bf31b3eee9a78554e9b7e20da77795560f82777bab2a25a3816b402876d552a3",
+    "analysis/figures/offered-load-tails.pdf": "9268b3fa20ac85147c6f7e69f1fe19ee500baffb5bf341ece096a1c8e65e9df1",
+    "analysis/figures/plot-data.csv": "599245184bff09c29fd109549a6795fc318271c27cf664a9bfaef8da2e804cd8",
+    "analysis/figures/plots.json": "8f3b701e2b0d66c0c88a9a69261e204afc75fe2300f618ce5da5d45f73625f76",
+    "analysis/figures/primary-point-mixed-goodput.pdf": "d65b521e7eb2be5c89a355e3691cc6b6c303780d0d2ff8811fe2986992c683d8",
+    "analysis/figures/primary-point-mixed-latency.pdf": "b333a0450afd9bcbf55510e00bfdf7dc7d1ab1195d94ea1b03608ba3ba6ebe0b",
+    "analysis/figures/primary-read-concurrent.pdf": "38fcb4f4bb5b7c31692053fc24efd6f0c296c9cd6eb2da143bae96bc3876cd7e",
+    "analysis/figures/primary-read-many32.pdf": "d52685e9b655d3aca2d4889c61d853e45e29f99d662086953930312236cb1177",
+    "analysis/figures/primary-write-concurrent.pdf": "f9ef8527d60e60777b212e28be3b522f10559eb54209f59f7a4133a53b0c23ec",
+    "analysis/figures/zipf-versus-uniform.pdf": "59a9ff638ca7315c8fc86710467e96e5a244f0ea175f83c44eabf549d5835814",
+    "analysis/historical-comparison.csv": "81975540ba32468e66614203490947db25acdd89f4acfc7b433f35249b5e052a",
+    "analysis/summary.json": "218e9b2e894fad93d82bf42fd69367edf0e50ac12e07cb6ae5f19bfef4dc8d1e",
+    "aws-efa/validated-results/comparison.json": "aa6a0d32a999d2dd1c1a38cc4573c0464a038ec9603a56e4672107e5d03cdfde"
+  },
+  "raw_sample_sources": {
+    "aws-efa/validated-results/cases/0000-foundationdb-8192-read-many32-primary_rf1-r0/result/samples.csv": "293de8174f39a3ec3105a5563b938bd89ece3a8cccfe10af6766cec6e0e662b0",
+    "aws-efa/validated-results/cases/0063-tidehunter_efa_native-1024-read-concurrent-primary_rf1-r0/result/samples.csv": "12012fa1fc2f33642965dcdb0493fa9208d8014f44e56c409e077691fca0f8f6",
+    "aws-efa/validated-results/cases/0180-native-1024-read-concurrent-primary_rf1-r0/result/samples.csv": "0e14d35f9761f8dcd439d9cfb68521886f8cddaf283879e36a2c64ab3e12bc74",
+    "aws-efa/validated-results/cases/0245-cassandra-1024-offered-10000-primary_rf1-r0/result/samples.csv": "5a44bf6bcac0a8e1a51fbdcbe3cbe59c9ee1ee184c40d1e5386d8f69a89ce269"
+  },
+  "source_root": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/aws-ci-runs/2026-10-29-run-40848651463"
+}

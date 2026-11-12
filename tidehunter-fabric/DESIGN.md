@@ -79,6 +79,20 @@ index updates, grant/drain ownership, or the storage's existing locks. Local
 send/CQ completion is not remote application receipt or persistence. The
 durable storage receipt remains the write acknowledgement.
 
+Opt-in `ProgressStats` also samples application slot state before each CQ poll:
+`tx_all_slots_pending_polls`, `rx_no_posted_slots_polls`, and
+`rx_unread_slots_polls`. Divide by the same endpoint's timed poll count, not
+operations or elapsed time. These are poll-weighted samples, not durations.
+An RX slot still marked pending can already have an unobserved completion, so
+these counters do not measure hardware receive WQEs, RxM internal credits,
+RNR retries, CQ occupancy, or time spent starved. Four pending TX slots include
+the reserved control slot on EFA-direct; this sample is not its data-lane limit.
+They flow through the existing sampled read and write profile counters and the
+Sui adapter's `tidehunter_adapter` metrics; unsampled/TCP profiles omit them.
+They are not retroactive evidence for older runs. Disabled diagnostics do not
+sample. The serialized connection-profile layout changed, so transport protocol
+and ALPN version 16 rejects older peers.
+
 Implementation map:
 
 - `tidehunter-fabric/src/config.rs`: `FabricBackend`, `FabricConfig`, selector validation.
@@ -786,3 +800,64 @@ progress, exercises range rejection, pool pressure, retained result ownership,
 operation-drop cancellation and grant retirement. It is a local correctness
 test only; no EFA device latency, DMA-failure recovery or native-read
 performance has been demonstrated by it.
+
+## Send retry, slot count, idle parking and provider facts (6 November 2026)
+
+These changes follow the transport review of the 1 KiB/8 KiB verbs-versus-TCP
+runs. They change no wire format between peers, no completion ownership rule
+and no default geometry.
+
+- **EAGAIN keeps the copy.** `Resources::send_copied` copies the caller's slices
+  into a free registered TX slot once. If `fi_send` returns EAGAIN, the filled
+  slot stays unposted and owns no ordinal, credit or provider resource, so it is
+  an ordinary free slot (`free_send_slot`, fences and close are unchanged). The
+  next send attempt compares the offered bytes with the kept copy (a read-only
+  pass, not a copy) and, when length and content match, posts the same slot
+  again. Different bytes are copied fresh. The counters `send_post_eagain` and
+  `send_post_retries` (always on) count both; with diagnostics on, `send_copy_calls`
+  shows one copy per accepted send. The identity check keeps the public
+  contract that the endpoint never posts bytes the caller no longer offers.
+- **Slot count.** `FabricConfig::slots` (`None` = 4) selects the number of 64 KiB
+  TX and RX slots per endpoint, `1..=64` (`MAX_SLOTS`). The CQ depth, MR
+  registration, completion-context arrays and ring arithmetic follow it. EFA and
+  EFA-direct accept only the default: their queue-size proof (`efa::QUEUE`,
+  direct MTU geometry) was derived for four slots. The default is unchanged.
+- **Idle parking.** A server session opens its endpoint with
+  `Endpoint::open_idle_parking`. Software RxM keeps its bounded `fi_cq_sread`.
+  `verbs` additionally requests `FI_WAIT_FD` on the CQ, reads the descriptor with
+  `fi_control(FI_GETWAIT)` and, only when the endpoint is quiescent (no send or
+  receive slot in use, all receives posted), calls `fi_trywait` and, on success,
+  `poll(2)` on the descriptor for at most 1 ms; then it reads the CQ without
+  blocking. A nonzero `fi_trywait` means the provider has work to progress and the
+  sweep polls normally. Outstanding requests, partial frames and unread slots
+  never park. If the provider refuses the wait object (`ENOSYS`, `EOPNOTSUPP`,
+  `EINVAL`) or returns no descriptor, the CQ is opened without one and the
+  owner keeps its bounded spin/yield progress; the reason is recorded in
+  `ProviderInfo::geometry.cq_wait`. Whether `verbs;ofi_rxm` grants `FI_WAIT_FD` is a
+  provider property that only a real device can show: **unverified on hardware**.
+  EFA still has no wait object, so its idle owner still spins. `cq_idle_waits`
+  counts parked sweeps.
+- **Provider facts at open.** `ProviderInfo::geometry` records the libfabric API
+  version (`fi_version`), the version requested from `fi_getinfo`, the provider
+  version, protocol, `tx_attr.inject_size`, TX/RX sizes, iov limits,
+  `max_msg_size`, `mr_mode` (raw and decoded), data/control progress, threading,
+  the slot count, the CQ wait outcome and every `FI_OFI_RXM_*` parameter libfabric
+  reports for an RxM provider (configured override or `None`, the default parsed
+  from its help text as `configured_or_default`, and the help text). These are
+  configured/default evidence only. libfabric does not expose the values RxM
+  finally uses, and `tx_inject_size` is not the eager threshold (64 on the
+  software provider against a 16384 RxM buffer-size default), so the actual eager
+  and SAR limits are **unverified**; the size buckets below are the way to look
+  for them. The attributes recorded are negotiated capacities, not proof of a
+  protocol choice.
+  Per-endpoint `send_size_le_4k/16k/64k/gt_64k` bucket successful posts
+  by length, so a size sweep can be matched to the thresholds above. The client
+  side reads its facts through `Client::provider_info`; each accepted owner
+  session writes one `TIDEHUNTER_FABRIC_PROVIDER_FACTS {json}` line to stderr (the
+  existing local-observer line protocol, never a wire field), because
+  `ConnectionProfile` is `Copy` and cannot carry the strings. The counters live
+  in `TransportProgressStats` and are not yet in the Prometheus counter lists of
+  `remote_db/pending_read.rs` and `sui.rs`.
+- **TLS parity.** Mutual TLS runs against mutual TLS and trusted against trusted
+  (`Transport::security_label`). This crate never carries TLS; it sits below the
+  session that does.

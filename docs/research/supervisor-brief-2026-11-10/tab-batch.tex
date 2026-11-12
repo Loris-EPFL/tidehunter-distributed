@@ -1,0 +1,18 @@
+\small\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrr}\toprule
+Component, mean \us & Verbs & TCP\\\midrule
+Owner append-persist (includes software) & \N{C:batch8v:persist} & \N{C:batch8t:persist}\\
+Network (stacks, TLS, dispatch included) & \N{C:batch8v:network} & \N{C:batch8t:network}\\
+Coordinator / native library insert$^{a}$ & \N{C:batch8v:coordinator} & \N{C:batch8t:coordinator}\\
+Owner software & \N{C:batch8v:owner} & \N{C:batch8t:owner}\\
+Durable wait / native file sync$^{a}$ & \N{C:batch8v:durable} & \N{C:batch8t:durable}\\
+Waiting and coalescing & \N{C:batch8v:coalescing} & \N{C:batch8t:coalescing}\\
+Client queueing and wake-up & \N{C:batch8v:queue} & \N{C:batch8t:queue}\\
+Residual & \N{C:batch8v:residual} & \N{C:batch8t:residual}\\
+Client encode, decode, verify & \N{C:batch8v:messaging} & \N{C:batch8t:messaging}\\
+SSD device & \N{C:batch8v:device} & \N{C:batch8t:device}\\
+Device + fabric + stack (unsplit) & \N{C:batch8v:combined} & \N{C:batch8t:combined}\\
+Owner + network exchange (unsplit) & \N{C:batch8v:exchange} & \N{C:batch8t:exchange}\\
+\textbf{TOTAL: same-case API mean} & \N{D:batch8v:mean_us} & \N{D:batch8t:mean_us}\\
+API p50 & \N{D:batch8v:p50_us} & \N{D:batch8t:p50_us}\\
+\bottomrule\end{tabular}

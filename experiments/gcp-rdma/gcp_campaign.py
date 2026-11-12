@@ -18,7 +18,7 @@ from gcp_api import ApiError, GoogleApi
 from gcp_budget import reserve
 import gcp_image
 import gcp_lease
-from gcp_runtime import GUEST_PYTHON, LOCAL_SSD_COUNTS
+from gcp_runtime import GUEST_PYTHON, LOCAL_SSD_COUNTS, live_mode
 
 BOOT_DISK_GIB = 80
 GUEST_SERVICE_ACCOUNT = 'bench-guest@mysten-research.iam.gserviceaccount.com'
@@ -312,7 +312,7 @@ def preflight(api, config, receipt, spec):
         raise ValueError('image diskSizeGb must be positive and no larger than 80 GiB')
     qualification = gcp_image.admit_image(api, config, image_info)
     gcp_image.admit_nvme_transports(qualification, spec.get('backends', []),
-                                    live=spec.get('mode') == 'standard-with-live-nvmeof')
+                                    live=live_mode(spec))
     gcp_image.admit_spdk(qualification, spec)
     gcp_image.admit_abi(qualification, receipt.get('abi'))
     if spec.get('suite') in ('sui', 'both'):
@@ -529,7 +529,7 @@ def upload_file(store, path, digest, key):
 
 def launch(api, config, budget, state, state_path, receipt, spec, output):
     _require_six_host_spec(spec)
-    if (spec.get('mode') == 'standard-with-live-nvmeof'
+    if (live_mode(spec)
             and set(spec.get('backends', ())) & {'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma'}):
         raise ValueError('direct launcher has no two-host live qualification; physical route/counter evidence must be established before fleet allocation')
     from gcp_bootstrap import startup_script

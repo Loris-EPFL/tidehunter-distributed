@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "weekly_limit_cents": 10000,
+  "weekly_limit_cents": 319300,
   "run_upper_bound_cents": 9000,
   "max_duration_seconds": 14400,
-  "quote_description": "USD conservative reservation for exactly six z4m-highmem-16 hosts in us-central1 for at most four hours: public on-demand VM/mandatory-Local-SSD rate $3.287109973 per host-hour, rounded compute base $78.90; $11.10 allowance for boot disks, object storage/requests and result transfer. Source: https://cloud.google.com/products/compute/pricing/storage-optimized . Estimate, not an invoice or project-wide hard spending cap; extra fleets, other machine types/regions and artifact retention beyond the campaign are not included. Weekly $100 applies to this CI ledger only; paid activation stays disabled until guest-image and artifact-volume admission are qualified."
+  "quote_description": "USD conservative CI reservation for exactly six z4m-highmem-16 hosts in us-central1 for at most four hours: public on-demand VM/mandatory-Local-SSD rate $3.287109973 per host-hour, rounded compute base $78.90; $11.10 allowance for boot disks, object storage/requests and result transfer. Source: https://cloud.google.com/products/compute/pricing/storage-optimized . Estimate, not an invoice or project-wide hard spending cap; extra fleets, other machine types/regions and artifact retention beyond the campaign are not included in this CI quote. The reviewed manual campaign has its own aggregate $145 quote for one six-host six-hour fleet, including in-place runtime preparation and first-two-host qualification before the suite: rounded compute $118.34 and up to $26.66 for non-compute charges. The editable weekly limit applies to the shared GCP benchmark ledger for both manual and CI campaigns; paid CI activation stays disabled until guest-image and artifact-volume admission are qualified."
 }

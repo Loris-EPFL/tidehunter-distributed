@@ -2,7 +2,9 @@ use minibytes::{Bytes, BytesOwner};
 use std::alloc::{self, Layout};
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::mem::MaybeUninit;
 use std::ops::Range;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -63,8 +65,14 @@ impl FileReader {
             }
             Ok(Bytes::from_owner(buffer).slice(map_range))
         } else {
-            let mut buffer = vec![0; len];
-            self.file.read_exact_at(&mut buffer, pos)?;
+            let mut buffer = Vec::<u8>::with_capacity(len);
+            read_full_at(
+                self.file.as_ref(),
+                &mut buffer.spare_capacity_mut()[..len],
+                pos,
+            )?;
+            // SAFETY: `read_full_at` returns `Ok` only after the kernel wrote all `len` bytes.
+            unsafe { buffer.set_len(len) };
             Ok(Bytes::from(buffer))
         }
     }
@@ -128,6 +136,37 @@ impl Drop for AlignedBuffer {
 
 fn invalid_range() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, "file read range is too large")
+}
+
+fn read_full_at(file: &File, buffer: &mut [MaybeUninit<u8>], offset: u64) -> io::Result<()> {
+    let mut done = 0;
+    while done < buffer.len() {
+        let position = offset
+            .checked_add(done as u64)
+            .and_then(|position| libc::off_t::try_from(position).ok())
+            .ok_or_else(invalid_range)?;
+        // SAFETY: The descriptor is open for this call, the pointer and length
+        // are inside `buffer`, and `pread` only writes to that memory.
+        let read = unsafe {
+            libc::pread(
+                file.as_raw_fd(),
+                buffer[done..].as_mut_ptr().cast(),
+                buffer.len() - done,
+                position,
+            )
+        };
+        if read > 0 {
+            done += read as usize;
+        } else if read == 0 {
+            return Err(unexpected_eof());
+        } else {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read_direct_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {

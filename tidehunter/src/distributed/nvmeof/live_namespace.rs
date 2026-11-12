@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LiveNamespaceAccess {
     ReadOnly,
+    /// Read-only descriptor shared with a writer on the same host.
+    ReadShared,
     ReadWrite,
 }
 
@@ -132,6 +134,9 @@ fn verify_access_policy(
     spdk: bool,
     identify_readonly: Option<bool>,
 ) -> io::Result<()> {
+    if access == LiveNamespaceAccess::ReadShared {
+        return Ok(());
+    }
     let expected_ro = access == LiveNamespaceAccess::ReadOnly;
     if host_readonly != expected_ro {
         return Err(invalid("namespace access mismatch"));
@@ -284,13 +289,35 @@ impl LiveNamespace {
         block_size: u32,
         access: LiveNamespaceAccess,
     ) -> io::Result<Self> {
+        Self::open_fixture_file(path, bytes, block_size, access, true)
+    }
+
+    /// Buffered regular-file control for workstation measurements, not NVMe qualification.
+    #[cfg(test)]
+    pub(crate) fn open_local_file_buffered(
+        path: &Path,
+        bytes: u64,
+        block_size: u32,
+        access: LiveNamespaceAccess,
+    ) -> io::Result<Self> {
+        Self::open_fixture_file(path, bytes, block_size, access, false)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn open_fixture_file(
+        path: &Path,
+        bytes: u64,
+        block_size: u32,
+        access: LiveNamespaceAccess,
+        direct: bool,
+    ) -> io::Result<Self> {
         if !Self::valid_geometry(bytes, block_size) {
             return Err(invalid("invalid fixture geometry"));
         }
         let file = OpenOptions::new()
             .read(true)
             .write(access == LiveNamespaceAccess::ReadWrite)
-            .custom_flags(libc::O_DIRECT | libc::O_CLOEXEC)
+            .custom_flags(libc::O_CLOEXEC | if direct { libc::O_DIRECT } else { 0 })
             .open(path)?;
         let meta = file.metadata()?;
         if !meta.is_file() || meta.len() != bytes {
@@ -366,5 +393,16 @@ mod tests {
         assert!(verify_access_policy(ReadWrite, false, true, None).is_ok());
         assert!(verify_access_policy(ReadOnly, false, true, None).is_err());
         assert!(verify_access_policy(ReadWrite, true, true, None).is_err());
+        for (host_readonly, identify) in [(true, Some(true)), (false, Some(false)), (false, None)] {
+            assert!(
+                verify_access_policy(
+                    LiveNamespaceAccess::ReadShared,
+                    host_readonly,
+                    false,
+                    identify
+                )
+                .is_ok()
+            );
+        }
     }
 }

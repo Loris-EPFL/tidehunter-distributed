@@ -1,0 +1,37 @@
+case,group,field,count,mean_us,denominator
+0282,profile,write_profile_client_exchange_ns,1280,93.59156015625,client requests
+0282,pre_completion_gate,write_preparation_admission_ns,4096,11.334546875,durable batches
+0282,pre_completion_gate,write_durable_receipt_publication_blocked_ns,4096,6.9006123046875,durable batches
+0282,profile,write_profile_storage_persist_total_ns,1274,30.499254317111458,owner persist calls
+0282,profile,write_profile_storage_persist_wal_file_ns,1274,29.543729199372056,owner persist calls
+0447,profile,write_profile_client_exchange_ns,1280,109.31677499999999,client requests
+0447,profile,write_profile_storage_persist_total_ns,1275,31.215912156862746,owner persist calls
+0447,profile,write_profile_storage_persist_wal_file_ns,1275,30.226760784313726,owner persist calls
+0346,live_nvmeof,control_ns,3454,160.83879733642152,stage samples
+0346,live_nvmeof,persistence_ns,1727,203.5480295309786,stage samples
+0346,live_nvmeof,frontier_file_ns,1727,93.41179444122757,stage samples
+0346,live_nvmeof,frontier_namespace_ns,1727,61.0697359583092,stage samples
+0346,live_nvmeof,wal_persistence_ns,1727,35.803867400115806,stage samples
+0346,live_nvmeof,cq_ns,1727,34.83761030689057,stage samples
+0347,live_nvmeof,control_ns,3410,164.72706715542523,stage samples
+0347,live_nvmeof,persistence_ns,1705,184.59048035190617,stage samples
+0347,live_nvmeof,frontier_file_ns,1705,96.11151847507331,stage samples
+0347,live_nvmeof,frontier_namespace_ns,1705,60.51021759530792,stage samples
+0347,live_nvmeof,wal_persistence_ns,1705,14.887890322580644,stage samples
+0347,live_nvmeof,cq_ns,1705,50.23828797653959,stage samples
+0011,profile,exchange,256,49.6964609375,stage observations
+0011,profile,server_handler,256,10.05307421875,stage observations
+0041,profile,exchange,256,37.71447265625,stage observations
+0041,profile,server_handler,256,9.4829453125,stage observations
+0474,profile,exchange,256,113.1553359375,stage observations
+0474,profile,server_handler,256,27.24209375,stage observations
+0483,profile,exchange,256,317.49244921875,stage observations
+0483,profile,server_handler,256,25.15254296875,stage observations
+0282,pre_completion_gate,write_durable_receipt_publication_blocked_batches,2013,,batches
+0282,pre_completion_gate,write_durable_batches,4096,,batches
+0447,pre_completion_gate,write_durable_receipt_publication_blocked_batches,2003,,batches
+0447,pre_completion_gate,write_durable_batches,4096,,batches
+0283,authority,history_loads,2760,,measured interval
+0448,authority,history_loads,2757,,measured interval
+0348,authority,history_loads,11,,measured interval
+0349,authority,history_loads,11,,measured interval

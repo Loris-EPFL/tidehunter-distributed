@@ -1,6 +1,8 @@
 //! Bounded controller sharing. Connection setup and shutdown are blocking and
 //! must run outside the reactor. A cached lease needs no pool lock to open I/O.
-use super::live_connect::{LiveConnectTarget, LiveConnectionRegistry, LiveController};
+use super::live_connect::{
+    LiveConnectTarget, LiveConnectionRegistry, LiveController, LiveNamespaceResolver,
+};
 use super::live_namespace::{LiveNamespace, LiveNamespaceAccess, LiveNamespaceBinding};
 use std::collections::HashMap;
 use std::io;
@@ -36,6 +38,12 @@ pub struct LiveControllerLease {
     binding: LiveNamespaceBinding,
     pin: Arc<()>,
     instance: u32,
+    resolver: Arc<LiveNamespaceResolver>,
+    // Cold-path lock only: first file open is serialized and bounded by the
+    // connect deadline. In-flight reads hold an Arc and never take this lock.
+    namespaces: Mutex<HashMap<(u32, bool), Arc<LiveNamespace>>>,
+    #[cfg(test)]
+    local_fixture: bool,
 }
 impl LiveControllerLease {
     pub fn binding(&self) -> &LiveNamespaceBinding {
@@ -46,8 +54,43 @@ impl LiveControllerLease {
         self.instance
     }
     pub fn open_namespace(&self) -> io::Result<LiveNamespace> {
+        #[cfg(test)]
+        if self.local_fixture {
+            let mut namespace = LiveNamespace::open_local_file(
+                &self.binding.namespace_path,
+                self.binding.bytes,
+                self.binding.block_size,
+                self.binding.access,
+            )?;
+            namespace.controller_lease = Some(self.pin.clone());
+            return Ok(namespace);
+        }
         let mut namespace = LiveNamespace::open(&self.binding)?;
         namespace.controller_lease = Some(self.pin.clone());
+        Ok(namespace)
+    }
+    pub fn namespace(
+        &self,
+        nsid: u32,
+        uuid: [u8; 16],
+        access: LiveNamespaceAccess,
+        deadline: Instant,
+    ) -> io::Result<Arc<LiveNamespace>> {
+        let mut namespaces = self
+            .namespaces
+            .lock()
+            .map_err(|_| invalid("namespace map poisoned"))?;
+        let key = (nsid, access == LiveNamespaceAccess::ReadWrite);
+        if let Some(namespace) = namespaces.get(&key) {
+            return Ok(namespace.clone());
+        }
+        let binding = self
+            .resolver
+            .resolve_namespace(nsid, uuid, access, deadline)?;
+        let mut namespace = LiveNamespace::open(&binding)?;
+        namespace.controller_lease = Some(self.pin.clone());
+        let namespace = Arc::new(namespace);
+        namespaces.insert(key, namespace.clone());
         Ok(namespace)
     }
 }
@@ -66,7 +109,18 @@ pub struct LivePoolTimings {
     pub disconnect: Option<Duration>,
 }
 fn idle(lease: &Arc<LiveControllerLease>) -> bool {
-    Arc::strong_count(lease) == 1 && Arc::strong_count(&lease.pin) == 1
+    // A setup caller holds an external lease while resolving a namespace.
+    // Reject it before taking its map lock under the pool state lock.
+    if Arc::strong_count(lease) != 1 {
+        return false;
+    }
+    let Ok(namespaces) = lease.namespaces.lock() else {
+        std::process::abort()
+    };
+    namespaces
+        .values()
+        .all(|namespace| Arc::strong_count(namespace) == 1)
+        && Arc::strong_count(&lease.pin) == namespaces.len() + 1
 }
 // Keep bounded controller state inline; boxing would add an allocation at setup.
 #[allow(clippy::large_enum_variant)]
@@ -99,6 +153,119 @@ pub struct LiveControllerPool {
     changed: Condvar,
 }
 impl LiveControllerPool {
+    /// Local-file pool fixture. It does not create or qualify a kernel controller.
+    #[cfg(test)]
+    pub(crate) fn cache_local_shared_namespace(
+        &self,
+        target: &LiveConnectTarget,
+        host_nqn: &str,
+        host_id: [u8; 16],
+        path: &std::path::Path,
+    ) -> io::Result<()> {
+        let existing = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| invalid("controller pool poisoned"))?;
+            match state.entries.get(&target.nqn) {
+                Some(Entry::Ready { lease, .. }) => Some(lease.clone()),
+                _ => None,
+            }
+        };
+        if let Some(lease) = existing {
+            let mut namespace = LiveNamespace::open_local_file(
+                path,
+                target.bytes,
+                target.block_size,
+                LiveNamespaceAccess::ReadShared,
+            )?;
+            namespace.controller_lease = Some(lease.pin.clone());
+            lease
+                .namespaces
+                .lock()
+                .map_err(|_| invalid("namespace map poisoned"))?
+                .insert((target.nsid, false), Arc::new(namespace));
+            return Ok(());
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| invalid("fixture path has no parent"))?;
+        let controller = LiveController::deleted_for_test(&self.registry, parent, target)?;
+        let pin = Arc::new(());
+        let mut namespace = LiveNamespace::open_local_file(
+            path,
+            target.bytes,
+            target.block_size,
+            LiveNamespaceAccess::ReadShared,
+        )?;
+        namespace.controller_lease = Some(pin.clone());
+        let mut namespaces = HashMap::new();
+        namespaces.insert((target.nsid, false), Arc::new(namespace));
+        let lease = Arc::new(LiveControllerLease {
+            binding: LiveNamespaceBinding {
+                namespace_path: path.to_owned(),
+                transport: target.transport,
+                nqn: target.nqn.clone(),
+                uuid: target.uuid,
+                nsid: target.nsid,
+                bytes: target.bytes,
+                block_size: target.block_size,
+                access: LiveNamespaceAccess::ReadShared,
+                spdk: None,
+            },
+            pin,
+            instance: 0,
+            resolver: controller.resolver(),
+            namespaces: Mutex::new(namespaces),
+            local_fixture: true,
+        });
+        let mut identity = Identity {
+            target: target.clone(),
+            host_nqn: host_nqn.to_owned(),
+            host_id,
+            access: LiveNamespaceAccess::ReadWrite,
+        };
+        identity.target.nsid = 0;
+        identity.target.uuid = [0; 16];
+        self.state
+            .lock()
+            .map_err(|_| invalid("controller pool poisoned"))?
+            .entries
+            .insert(
+                target.nqn.clone(),
+                Entry::Ready {
+                    identity,
+                    lease,
+                    controller,
+                    usable: true,
+                },
+            );
+        Ok(())
+    }
+
+    /// Local-file fixture for a nonshared recovery controller identity.
+    #[cfg(test)]
+    pub(crate) fn cache_local_namespace(
+        &self,
+        target: &LiveConnectTarget,
+        host_nqn: &str,
+        host_id: [u8; 16],
+        access: LiveNamespaceAccess,
+        path: &std::path::Path,
+    ) -> io::Result<()> {
+        self.cache_local_shared_namespace(target, host_nqn, host_id, path)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid("controller pool poisoned"))?;
+        let Some(Entry::Ready { identity, .. }) = state.entries.get_mut(&target.nqn) else {
+            return Err(invalid("fixture controller absent"));
+        };
+        identity.target = target.clone();
+        identity.access = access;
+        Ok(())
+    }
+
     pub fn new(
         registry: LiveConnectionRegistry,
         max_controllers: usize,
@@ -146,12 +313,48 @@ impl LiveControllerPool {
         LivePoolAcquisition,
         LivePoolTimings,
     )> {
-        let identity = Identity {
+        self.acquire_inner(target, host_nqn, host_id, access, deadline, false)
+    }
+
+    pub fn acquire_shared(
+        &self,
+        target: &LiveConnectTarget,
+        host_nqn: &str,
+        host_id: [u8; 16],
+        access: LiveNamespaceAccess,
+        deadline: Instant,
+    ) -> io::Result<(
+        Arc<LiveControllerLease>,
+        LivePoolAcquisition,
+        LivePoolTimings,
+    )> {
+        self.acquire_inner(target, host_nqn, host_id, access, deadline, true)
+    }
+
+    fn acquire_inner(
+        &self,
+        target: &LiveConnectTarget,
+        host_nqn: &str,
+        host_id: [u8; 16],
+        access: LiveNamespaceAccess,
+        deadline: Instant,
+        shared: bool,
+    ) -> io::Result<(
+        Arc<LiveControllerLease>,
+        LivePoolAcquisition,
+        LivePoolTimings,
+    )> {
+        let mut identity = Identity {
             target: target.clone(),
             host_nqn: host_nqn.to_owned(),
             host_id,
             access,
         };
+        if shared {
+            identity.target.nsid = 0;
+            identity.target.uuid = [0; 16];
+            identity.access = LiveNamespaceAccess::ReadWrite;
+        }
         let key = target.nqn.clone();
         let mut timings = LivePoolTimings::default();
         let mut state = self
@@ -254,6 +457,10 @@ impl LiveControllerPool {
                     binding,
                     pin: Arc::new(()),
                     instance: controller.instance(),
+                    resolver: controller.resolver(),
+                    namespaces: Mutex::new(HashMap::new()),
+                    #[cfg(test)]
+                    local_fixture: false,
                 });
                 state.entries.insert(
                     key,
@@ -292,6 +499,11 @@ impl LiveControllerPool {
                 controller,
                 ..
             }) => {
+                lease
+                    .namespaces
+                    .lock()
+                    .map_err(|_| invalid("namespace map poisoned"))?
+                    .clear();
                 state
                     .entries
                     .insert(key.to_owned(), Entry::Closing { identity, lease });
@@ -383,9 +595,7 @@ impl Drop for LiveControllerPool {
             Entry::Pending(_) => true,
             // Nothing can open I/O on a controller whose delete was started.
             Entry::Quarantined | Entry::Closing { .. } => false,
-            Entry::Ready { lease, .. } => {
-                Arc::strong_count(lease) != 1 || Arc::strong_count(&lease.pin) != 1
-            }
+            Entry::Ready { lease, .. } => !idle(lease),
         }) {
             std::process::abort();
         }
@@ -396,6 +606,84 @@ impl Drop for LiveControllerPool {
 mod tests {
     use super::super::NvmeofTransport;
     use super::*;
+
+    fn local_resolver(dir: &std::path::Path) -> Arc<LiveNamespaceResolver> {
+        let registry = LiveConnectionRegistry::open(&dir.join("resolver-registry")).unwrap();
+        let target = LiveConnectTarget {
+            nqn: "nqn.2026-01.test:wal".into(),
+            uuid: [1; 16],
+            nsid: 1,
+            bytes: 4096,
+            block_size: 4096,
+            address: "127.0.0.1".into(),
+            service: 4420,
+            transport: NvmeofTransport::Tcp,
+            spdk: None,
+            geometry: Default::default(),
+        };
+        LiveController::deleted_for_test(&registry, dir, &target)
+            .unwrap()
+            .resolver()
+    }
+
+    #[test]
+    fn shared_acquisition_uses_subsystem_identity_but_strict_acquisition_keeps_namespace_identity()
+    {
+        let dir = tempdir::TempDir::new("live-pool-shared").unwrap();
+        let registry = LiveConnectionRegistry::open(&dir.path().join("registry")).unwrap();
+        let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
+        let target = ready_idle(&pool, dir.path(), "nqn.2026-01.test:shared");
+        if let Entry::Ready { identity, .. } = pool
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut(&target.nqn)
+            .unwrap()
+        {
+            identity.target.nsid = 0;
+            identity.target.uuid = [0; 16];
+        }
+        let mut other = target.clone();
+        other.nsid = 2;
+        other.uuid = [3; 16];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (first, how, _) = pool
+            .acquire_shared(
+                &target,
+                "nqn.2026-01.test:host",
+                [2; 16],
+                LiveNamespaceAccess::ReadWrite,
+                deadline,
+            )
+            .unwrap();
+        assert_eq!(how, LivePoolAcquisition::Reused);
+        let (second, how, _) = pool
+            .acquire_shared(
+                &other,
+                "nqn.2026-01.test:host",
+                [2; 16],
+                LiveNamespaceAccess::ReadShared,
+                deadline,
+            )
+            .unwrap();
+        assert_eq!(how, LivePoolAcquisition::Reused);
+        assert!(Arc::ptr_eq(&first, &second));
+        drop((first, second));
+        pool.shutdown(deadline).unwrap();
+
+        let registry = LiveConnectionRegistry::open(&dir.path().join("strict")).unwrap();
+        let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
+        let target = ready_idle(&pool, dir.path(), "nqn.2026-01.test:strict");
+        let mut other = target.clone();
+        other.nsid = 2;
+        other.uuid = [3; 16];
+        assert!(
+            matches!(pool.acquire(&other, "nqn.2026-01.test:host", [2; 16], LiveNamespaceAccess::ReadWrite, deadline),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData)
+        );
+        pool.shutdown(deadline).unwrap();
+    }
 
     #[test]
     fn pending_and_capacity_are_bounded_without_connecting() {
@@ -412,6 +700,7 @@ mod tests {
             service: 4420,
             transport: NvmeofTransport::Tcp,
             spdk: None,
+            geometry: Default::default(),
         };
         let identity = Identity {
             target: target.clone(),
@@ -499,6 +788,9 @@ mod tests {
             },
             pin: Arc::new(()),
             instance: 0,
+            resolver: local_resolver(dir.path()),
+            namespaces: Mutex::new(HashMap::new()),
+            local_fixture: false,
         });
         assert!(idle(&lease));
         let external = lease.clone();
@@ -528,6 +820,7 @@ mod tests {
             service: 4420,
             transport: NvmeofTransport::Tcp,
             spdk: None,
+            geometry: Default::default(),
         };
         let lease = Arc::new(LiveControllerLease {
             binding: LiveNamespaceBinding {
@@ -543,6 +836,9 @@ mod tests {
             },
             pin: Arc::new(()),
             instance: 0,
+            resolver: local_resolver(dir),
+            namespaces: Mutex::new(HashMap::new()),
+            local_fixture: false,
         });
         let identity = Identity {
             target: target.clone(),

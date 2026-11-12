@@ -1,0 +1,162 @@
+\appendix
+\clearpage\section{Durable scalar puts}
+Run 8, focused unified fleet. Each row is one CSV population, not pooled calls. API statistics are in \us. With two repetitions each cell is the median of per-repetition statistics. $n$ lists successful calls in each repetition; $r$ counts repetitions. B: native barrier; P: native page cache; S: owner synchronous; N: owner page cache. T: timeline; W: write profile; R: read profile; --: no profile. Row ids map to the zero-based row of \path{run8-ops_summary.csv}.
+\begin{center}\scriptsize\setlength{\tabcolsep}{3pt}
+\begin{tabular}{llrrrrrrrrr}\toprule
+Id/diag & Route/contract & KiB & $c$ & $n$ & $r$ & mean & p50 & p99 & p99.9 & State\\\midrule
+031/T & verbs/S & 1 & 1 & \N{D:op031:n} & 1 & \N{D:op031:mean_us} & \N{D:op031:p50_us} & \N{D:op031:p99_us} & \N{D:op031:p999_us} & put\\
+032/W & verbs/S & 1 & 1 & \N{D:op032:n} & 1 & \N{D:op032:mean_us} & \N{D:op032:p50_us} & \N{D:op032:p99_us} & \N{D:op032:p999_us} & put\\
+036/W & native/B & 64 & 1 & \N{D:op036:n} & 1 & \N{D:op036:mean_us} & \N{D:op036:p50_us} & \N{D:op036:p99_us} & \N{D:op036:p999_us} & put\\
+037/T & TCP/S & 1 & 16 & \N{D:op037:n} & 1 & \N{D:op037:mean_us} & \N{D:op037:p50_us} & \N{D:op037:p99_us} & \N{D:op037:p999_us} & put\\
+038/W & verbs/S & 1 & 16 & \N{D:op038:n} & 1 & \N{D:op038:mean_us} & \N{D:op038:p50_us} & \N{D:op038:p99_us} & \N{D:op038:p999_us} & put\\
+039/T & mTLS/S & 1 & 1 & \N{D:op039:n} & 1 & \N{D:op039:mean_us} & \N{D:op039:p50_us} & \N{D:op039:p99_us} & \N{D:op039:p999_us} & put\\
+042/T & verbs/S & 1 & 16 & \N{D:op042:n} & 1 & \N{D:op042:mean_us} & \N{D:op042:p50_us} & \N{D:op042:p99_us} & \N{D:op042:p999_us} & put\\
+044/T & TCP/S & 1 & 1 & \N{D:op044:n} & 1 & \N{D:op044:mean_us} & \N{D:op044:p50_us} & \N{D:op044:p99_us} & \N{D:op044:p999_us} & put\\
+045/T & verbs/S & 64 & 1 & \N{D:op045:n} & 1 & \N{D:op045:mean_us} & \N{D:op045:p50_us} & \N{D:op045:p99_us} & \N{D:op045:p999_us} & put\\
+046/W & native/B & 1 & 1 & \N{D:op046:n} & 1 & \N{D:op046:mean_us} & \N{D:op046:p50_us} & \N{D:op046:p99_us} & \N{D:op046:p999_us} & put\\
+047/T & kernel D/S & 1 & 1 & \N{D:op047:n} & 1 & \N{D:op047:mean_us} & \N{D:op047:p50_us} & \N{D:op047:p99_us} & \N{D:op047:p999_us} & put\\
+049/W & native/B & 1 & 16 & \N{D:op049:n} & 1 & \N{D:op049:mean_us} & \N{D:op049:p50_us} & \N{D:op049:p99_us} & \N{D:op049:p999_us} & put\\
+050/T & TCP/S & 64 & 1 & \N{D:op050:n} & 1 & \N{D:op050:mean_us} & \N{D:op050:p50_us} & \N{D:op050:p99_us} & \N{D:op050:p999_us} & put\\
+051/T & SPDK/S & 1 & 1 & \N{D:op051:n} & 1 & \N{D:op051:mean_us} & \N{D:op051:p50_us} & \N{D:op051:p99_us} & \N{D:op051:p999_us} & put\\
+052/-- & SPDK/S & 64 & 16 & \N{D:op052:n} & 2 & \N{D:op052:mean_us} & \N{D:op052:p50_us} & \N{D:op052:p99_us} & \N{D:op052:p999_us} & put\\
+053/-- & kernel D/S & 64 & 16 & \N{D:op053:n} & 2 & \N{D:op053:mean_us} & \N{D:op053:p50_us} & \N{D:op053:p99_us} & \N{D:op053:p999_us} & put\\
+054/-- & SPDK/S & 1 & 1 & \N{D:op054:n} & 2 & \N{D:op054:mean_us} & \N{D:op054:p50_us} & \N{D:op054:p99_us} & \N{D:op054:p999_us} & put\\
+055/-- & kernel D/S & 1 & 1 & \N{D:op055:n} & 2 & \N{D:op055:mean_us} & \N{D:op055:p50_us} & \N{D:op055:p99_us} & \N{D:op055:p999_us} & put\\
+056/-- & SPDK/S & 1 & 16 & \N{D:op056:n} & 2 & \N{D:op056:mean_us} & \N{D:op056:p50_us} & \N{D:op056:p99_us} & \N{D:op056:p999_us} & put\\
+057/-- & kernel D/S & 1 & 16 & \N{D:op057:n} & 2 & \N{D:op057:mean_us} & \N{D:op057:p50_us} & \N{D:op057:p99_us} & \N{D:op057:p999_us} & put\\
+058/-- & verbs/S & 1 & 1 & \N{D:op058:n} & 2 & \N{D:op058:mean_us} & \N{D:op058:p50_us} & \N{D:op058:p99_us} & \N{D:op058:p999_us} & put/new\\
+059/-- & native/B & 1 & 1 & \N{D:op059:n} & 2 & \N{D:op059:mean_us} & \N{D:op059:p50_us} & \N{D:op059:p99_us} & \N{D:op059:p999_us} & put/new\\
+060/-- & verbs/S & 1 & 16 & \N{D:op060:n} & 2 & \N{D:op060:mean_us} & \N{D:op060:p50_us} & \N{D:op060:p99_us} & \N{D:op060:p999_us} & put/new\\
+061/-- & native/B & 1 & 16 & \N{D:op061:n} & 2 & \N{D:op061:mean_us} & \N{D:op061:p50_us} & \N{D:op061:p99_us} & \N{D:op061:p999_us} & put/new\\
+062/-- & verbs/S & 64 & 16 & \N{D:op062:n} & 2 & \N{D:op062:mean_us} & \N{D:op062:p50_us} & \N{D:op062:p99_us} & \N{D:op062:p999_us} & put/new\\
+063/-- & native/B & 64 & 16 & \N{D:op063:n} & 2 & \N{D:op063:mean_us} & \N{D:op063:p50_us} & \N{D:op063:p99_us} & \N{D:op063:p999_us} & put/new\\
+064/-- & native/B & 8 & 16 & \N{D:op064:n} & 2 & \N{D:op064:mean_us} & \N{D:op064:p50_us} & \N{D:op064:p99_us} & \N{D:op064:p999_us} & put\\
+067/-- & native/B & 8 & 1 & \N{D:op067:n} & 2 & \N{D:op067:mean_us} & \N{D:op067:p50_us} & \N{D:op067:p99_us} & \N{D:op067:p999_us} & put\\
+075/-- & native/B & 64 & 16 & \N{D:op075:n} & 2 & \N{D:op075:mean_us} & \N{D:op075:p50_us} & \N{D:op075:p99_us} & \N{D:op075:p999_us} & put\\
+081/-- & native/B & 64 & 1 & \N{D:op081:n} & 2 & \N{D:op081:mean_us} & \N{D:op081:p50_us} & \N{D:op081:p99_us} & \N{D:op081:p999_us} & put\\
+082/-- & native/B & 1 & 16 & \N{D:op082:n} & 2 & \N{D:op082:mean_us} & \N{D:op082:p50_us} & \N{D:op082:p99_us} & \N{D:op082:p999_us} & put\\
+086/-- & native/B & 1 & 1 & \N{D:op086:n} & 2 & \N{D:op086:mean_us} & \N{D:op086:p50_us} & \N{D:op086:p99_us} & \N{D:op086:p999_us} & put\\
+\bottomrule\end{tabular}\end{center}
+Native barrier uses one process and one SSD against five owners. Its per-put file and directory fsync is not owner covering fdatasync. The c16 64 KiB result therefore is not a local-path latency lower bound.
+\clearpage\section{Durable scalar puts (continued)}
+Run 8, focused unified fleet. Each row is one CSV population, not pooled calls. API statistics are in \us. With two repetitions each cell is the median of per-repetition statistics. $n$ lists successful calls in each repetition; $r$ counts repetitions. B: native barrier; P: native page cache; S: owner synchronous; N: owner page cache. T: timeline; W: write profile; R: read profile; --: no profile. Row ids map to the zero-based row of \path{run8-ops_summary.csv}.
+\begin{center}\scriptsize\setlength{\tabcolsep}{3pt}
+\begin{tabular}{llrrrrrrrrr}\toprule
+Id/diag & Route/contract & KiB & $c$ & $n$ & $r$ & mean & p50 & p99 & p99.9 & State\\\midrule
+088/T & verbs/S & 1 & 16 & \N{D:op088:n} & 1 & \N{D:op088:mean_us} & \N{D:op088:p50_us} & \N{D:op088:p99_us} & \N{D:op088:p999_us} & put\\
+089/W & verbs/S & 1 & 16 & \N{D:op089:n} & 1 & \N{D:op089:mean_us} & \N{D:op089:p50_us} & \N{D:op089:p99_us} & \N{D:op089:p999_us} & put\\
+090/T & verbs/S & 1 & 16 & \N{D:op090:n} & 1 & \N{D:op090:mean_us} & \N{D:op090:p50_us} & \N{D:op090:p99_us} & \N{D:op090:p999_us} & put/new\\
+091/W & verbs/S & 1 & 16 & \N{D:op091:n} & 1 & \N{D:op091:mean_us} & \N{D:op091:p50_us} & \N{D:op091:p99_us} & \N{D:op091:p999_us} & put/new\\
+095/-- & verbs/S & 8 & 16 & \N{D:op095:n} & 2 & \N{D:op095:mean_us} & \N{D:op095:p50_us} & \N{D:op095:p99_us} & \N{D:op095:p999_us} & put\\
+096/-- & mTLS/S & 1 & 16 & \N{D:op096:n} & 2 & \N{D:op096:mean_us} & \N{D:op096:p50_us} & \N{D:op096:p99_us} & \N{D:op096:p999_us} & put\\
+097/-- & verbs/S & 64 & 1 & \N{D:op097:n} & 2 & \N{D:op097:mean_us} & \N{D:op097:p50_us} & \N{D:op097:p99_us} & \N{D:op097:p999_us} & put\\
+099/-- & mTLS/S & 64 & 1 & \N{D:op099:n} & 2 & \N{D:op099:mean_us} & \N{D:op099:p50_us} & \N{D:op099:p99_us} & \N{D:op099:p999_us} & put\\
+101/-- & TCP/S & 64 & 1 & \N{D:op101:n} & 2 & \N{D:op101:mean_us} & \N{D:op101:p50_us} & \N{D:op101:p99_us} & \N{D:op101:p999_us} & put\\
+102/-- & verbs/S & 1 & 16 & \N{D:op102:n} & 2 & \N{D:op102:mean_us} & \N{D:op102:p50_us} & \N{D:op102:p99_us} & \N{D:op102:p999_us} & put\\
+106/-- & mTLS/S & 1 & 1 & \N{D:op106:n} & 2 & \N{D:op106:mean_us} & \N{D:op106:p50_us} & \N{D:op106:p99_us} & \N{D:op106:p999_us} & put\\
+110/-- & verbs/S & 64 & 16 & \N{D:op110:n} & 2 & \N{D:op110:mean_us} & \N{D:op110:p50_us} & \N{D:op110:p99_us} & \N{D:op110:p999_us} & put\\
+111/-- & TCP/S & 1 & 16 & \N{D:op111:n} & 2 & \N{D:op111:mean_us} & \N{D:op111:p50_us} & \N{D:op111:p99_us} & \N{D:op111:p999_us} & put\\
+112/-- & mTLS/S & 64 & 16 & \N{D:op112:n} & 2 & \N{D:op112:mean_us} & \N{D:op112:p50_us} & \N{D:op112:p99_us} & \N{D:op112:p999_us} & put\\
+116/-- & TCP/S & 1 & 1 & \N{D:op116:n} & 2 & \N{D:op116:mean_us} & \N{D:op116:p50_us} & \N{D:op116:p99_us} & \N{D:op116:p999_us} & put\\
+121/-- & verbs/S & 1 & 1 & \N{D:op121:n} & 2 & \N{D:op121:mean_us} & \N{D:op121:p50_us} & \N{D:op121:p99_us} & \N{D:op121:p999_us} & put\\
+122/-- & TCP/S & 64 & 16 & \N{D:op122:n} & 2 & \N{D:op122:mean_us} & \N{D:op122:p50_us} & \N{D:op122:p99_us} & \N{D:op122:p999_us} & put\\
+125/-- & verbs/S & 8 & 1 & \N{D:op125:n} & 2 & \N{D:op125:mean_us} & \N{D:op125:p50_us} & \N{D:op125:p99_us} & \N{D:op125:p999_us} & put\\
+\bottomrule\end{tabular}\end{center}
+Native barrier uses one process and one SSD against five owners. Its per-put file and directory fsync is not owner covering fdatasync. The c16 64 KiB result therefore is not a local-path latency lower bound.
+\clearpage\section{Page-cache-acknowledged scalar puts}
+Run 8, focused unified fleet. Each row is one CSV population, not pooled calls. API statistics are in \us. With two repetitions each cell is the median of per-repetition statistics. $n$ lists successful calls in each repetition; $r$ counts repetitions. B: native barrier; P: native page cache; S: owner synchronous; N: owner page cache. T: timeline; W: write profile; R: read profile; --: no profile. Row ids map to the zero-based row of \path{run8-ops_summary.csv}.
+\begin{center}\scriptsize\setlength{\tabcolsep}{3pt}
+\begin{tabular}{llrrrrrrrrr}\toprule
+Id/diag & Route/contract & KiB & $c$ & $n$ & $r$ & mean & p50 & p99 & p99.9 & State\\\midrule
+035/T & verbs/N & 1 & 1 & \N{D:op035:n} & 1 & \N{D:op035:mean_us} & \N{D:op035:p50_us} & \N{D:op035:p99_us} & \N{D:op035:p999_us} & put\\
+043/W & native/P & 1 & 1 & \N{D:op043:n} & 1 & \N{D:op043:mean_us} & \N{D:op043:p50_us} & \N{D:op043:p99_us} & \N{D:op043:p999_us} & put\\
+069/-- & native/P & 64 & 16 & \N{D:op069:n} & 2 & \N{D:op069:mean_us} & \N{D:op069:p50_us} & \N{D:op069:p99_us} & \N{D:op069:p999_us} & put\\
+070/-- & native/P & 1 & 1 & \N{D:op070:n} & 2 & \N{D:op070:mean_us} & \N{D:op070:p50_us} & \N{D:op070:p99_us} & \N{D:op070:p999_us} & put\\
+071/-- & native/P & 8 & 16 & \N{D:op071:n} & 2 & \N{D:op071:mean_us} & \N{D:op071:p50_us} & \N{D:op071:p99_us} & \N{D:op071:p999_us} & put\\
+076/-- & native/P & 8 & 1 & \N{D:op076:n} & 2 & \N{D:op076:mean_us} & \N{D:op076:p50_us} & \N{D:op076:p99_us} & \N{D:op076:p999_us} & put\\
+077/-- & native/P & 1 & 16 & \N{D:op077:n} & 2 & \N{D:op077:mean_us} & \N{D:op077:p50_us} & \N{D:op077:p99_us} & \N{D:op077:p999_us} & put\\
+083/-- & native/P & 64 & 1 & \N{D:op083:n} & 2 & \N{D:op083:mean_us} & \N{D:op083:p50_us} & \N{D:op083:p99_us} & \N{D:op083:p999_us} & put\\
+092/-- & TCP/N & 64 & 1 & \N{D:op092:n} & 2 & \N{D:op092:mean_us} & \N{D:op092:p50_us} & \N{D:op092:p99_us} & \N{D:op092:p999_us} & put\\
+098/-- & TCP/N & 1 & 1 & \N{D:op098:n} & 2 & \N{D:op098:mean_us} & \N{D:op098:p50_us} & \N{D:op098:p99_us} & \N{D:op098:p999_us} & put\\
+100/-- & TCP/N & 64 & 16 & \N{D:op100:n} & 2 & \N{D:op100:mean_us} & \N{D:op100:p50_us} & \N{D:op100:p99_us} & \N{D:op100:p999_us} & put\\
+104/-- & verbs/N & 64 & 1 & \N{D:op104:n} & 2 & \N{D:op104:mean_us} & \N{D:op104:p50_us} & \N{D:op104:p99_us} & \N{D:op104:p999_us} & put\\
+105/-- & verbs/N & 8 & 1 & \N{D:op105:n} & 2 & \N{D:op105:mean_us} & \N{D:op105:p50_us} & \N{D:op105:p99_us} & \N{D:op105:p999_us} & put\\
+107/-- & verbs/N & 64 & 16 & \N{D:op107:n} & 2 & \N{D:op107:mean_us} & \N{D:op107:p50_us} & \N{D:op107:p99_us} & \N{D:op107:p999_us} & put\\
+119/-- & verbs/N & 1 & 16 & \N{D:op119:n} & 2 & \N{D:op119:mean_us} & \N{D:op119:p50_us} & \N{D:op119:p99_us} & \N{D:op119:p999_us} & put\\
+120/-- & verbs/N & 1 & 1 & \N{D:op120:n} & 2 & \N{D:op120:mean_us} & \N{D:op120:p50_us} & \N{D:op120:p99_us} & \N{D:op120:p999_us} & put\\
+124/-- & TCP/N & 1 & 16 & \N{D:op124:n} & 2 & \N{D:op124:mean_us} & \N{D:op124:p50_us} & \N{D:op124:p99_us} & \N{D:op124:p999_us} & put\\
+126/-- & verbs/N & 8 & 16 & \N{D:op126:n} & 2 & \N{D:op126:mean_us} & \N{D:op126:p50_us} & \N{D:op126:p99_us} & \N{D:op126:p999_us} & put\\
+\bottomrule\end{tabular}\end{center}
+\clearpage\section{Batch writes and deletes}
+Run 8, focused unified fleet. Each row is one CSV population, not pooled calls. API statistics are in \us. With two repetitions each cell is the median of per-repetition statistics. $n$ lists successful calls in each repetition; $r$ counts repetitions. B: native barrier; P: native page cache; S: owner synchronous; N: owner page cache. T: timeline; W: write profile; R: read profile; --: no profile. Row ids map to the zero-based row of \path{run8-ops_summary.csv}.
+\begin{center}\scriptsize\setlength{\tabcolsep}{3pt}
+\begin{tabular}{llrrrrrrrrr}\toprule
+Id/diag & Route/contract & KiB & $c$ & $n$ & $r$ & mean & p50 & p99 & p99.9 & State\\\midrule
+033/T & verbs/S & 8 & 1 & \N{D:op033:n} & 1 & \N{D:op033:mean_us} & \N{D:op033:p50_us} & \N{D:op033:p99_us} & \N{D:op033:p999_us} & batch\\
+034/T & verbs/S & 1 & 1 & \N{D:op034:n} & 1 & \N{D:op034:mean_us} & \N{D:op034:p50_us} & \N{D:op034:p99_us} & \N{D:op034:p999_us} & delete\\
+040/T & TCP/S & 1 & 1 & \N{D:op040:n} & 1 & \N{D:op040:mean_us} & \N{D:op040:p50_us} & \N{D:op040:p99_us} & \N{D:op040:p999_us} & delete\\
+041/W & native/B & 1 & 1 & \N{D:op041:n} & 1 & \N{D:op041:mean_us} & \N{D:op041:p50_us} & \N{D:op041:p99_us} & \N{D:op041:p999_us} & delete\\
+048/T & TCP/S & 8 & 1 & \N{D:op048:n} & 1 & \N{D:op048:mean_us} & \N{D:op048:p50_us} & \N{D:op048:p99_us} & \N{D:op048:p999_us} & batch\\
+065/-- & native/P & 8 & 1 & \N{D:op065:n} & 1 & \N{D:op065:mean_us} & \N{D:op065:p50_us} & \N{D:op065:p99_us} & \N{D:op065:p999_us} & batch\\
+066/-- & native/B & 1 & 1 & \N{D:op066:n} & 1 & \N{D:op066:mean_us} & \N{D:op066:p50_us} & \N{D:op066:p99_us} & \N{D:op066:p999_us} & batch\\
+068/-- & native/P & 1 & 1 & \N{D:op068:n} & 1 & \N{D:op068:mean_us} & \N{D:op068:p50_us} & \N{D:op068:p99_us} & \N{D:op068:p999_us} & batch\\
+072/-- & native/P & 8 & 16 & \N{D:op072:n} & 1 & \N{D:op072:mean_us} & \N{D:op072:p50_us} & \N{D:op072:p99_us} & \N{D:op072:p999_us} & batch\\
+073/-- & native/P & 1 & 1 & \N{D:op073:n} & 1 & \N{D:op073:mean_us} & \N{D:op073:p50_us} & \N{D:op073:p99_us} & \N{D:op073:p999_us} & delete\\
+074/-- & native/B & 1 & 16 & \N{D:op074:n} & 1 & \N{D:op074:mean_us} & \N{D:op074:p50_us} & \N{D:op074:p99_us} & \N{D:op074:p999_us} & batch\\
+078/-- & native/B & 1 & 16 & \N{D:op078:n} & 1 & \N{D:op078:mean_us} & \N{D:op078:p50_us} & \N{D:op078:p99_us} & \N{D:op078:p999_us} & delete\\
+079/-- & native/B & 8 & 1 & \N{D:op079:n} & 1 & \N{D:op079:mean_us} & \N{D:op079:p50_us} & \N{D:op079:p99_us} & \N{D:op079:p999_us} & batch\\
+080/-- & native/P & 1 & 16 & \N{D:op080:n} & 1 & \N{D:op080:mean_us} & \N{D:op080:p50_us} & \N{D:op080:p99_us} & \N{D:op080:p999_us} & delete\\
+084/-- & native/P & 1 & 16 & \N{D:op084:n} & 1 & \N{D:op084:mean_us} & \N{D:op084:p50_us} & \N{D:op084:p99_us} & \N{D:op084:p999_us} & batch\\
+085/-- & native/B & 8 & 16 & \N{D:op085:n} & 1 & \N{D:op085:mean_us} & \N{D:op085:p50_us} & \N{D:op085:p99_us} & \N{D:op085:p999_us} & batch\\
+087/-- & native/B & 1 & 1 & \N{D:op087:n} & 1 & \N{D:op087:mean_us} & \N{D:op087:p50_us} & \N{D:op087:p99_us} & \N{D:op087:p999_us} & delete\\
+093/-- & verbs/S & 8 & 16 & \N{D:op093:n} & 1 & \N{D:op093:mean_us} & \N{D:op093:p50_us} & \N{D:op093:p99_us} & \N{D:op093:p999_us} & batch\\
+094/-- & verbs/N & 1 & 1 & \N{D:op094:n} & 1 & \N{D:op094:mean_us} & \N{D:op094:p50_us} & \N{D:op094:p99_us} & \N{D:op094:p999_us} & batch\\
+103/-- & verbs/S & 1 & 16 & \N{D:op103:n} & 1 & \N{D:op103:mean_us} & \N{D:op103:p50_us} & \N{D:op103:p99_us} & \N{D:op103:p999_us} & delete\\
+108/-- & verbs/N & 1 & 16 & \N{D:op108:n} & 1 & \N{D:op108:mean_us} & \N{D:op108:p50_us} & \N{D:op108:p99_us} & \N{D:op108:p999_us} & delete\\
+109/-- & verbs/N & 8 & 1 & \N{D:op109:n} & 1 & \N{D:op109:mean_us} & \N{D:op109:p50_us} & \N{D:op109:p99_us} & \N{D:op109:p999_us} & batch\\
+113/-- & verbs/N & 1 & 1 & \N{D:op113:n} & 1 & \N{D:op113:mean_us} & \N{D:op113:p50_us} & \N{D:op113:p99_us} & \N{D:op113:p999_us} & delete\\
+114/-- & verbs/S & 1 & 1 & \N{D:op114:n} & 1 & \N{D:op114:mean_us} & \N{D:op114:p50_us} & \N{D:op114:p99_us} & \N{D:op114:p999_us} & batch\\
+115/-- & verbs/S & 8 & 1 & \N{D:op115:n} & 1 & \N{D:op115:mean_us} & \N{D:op115:p50_us} & \N{D:op115:p99_us} & \N{D:op115:p999_us} & batch\\
+117/-- & verbs/N & 1 & 16 & \N{D:op117:n} & 1 & \N{D:op117:mean_us} & \N{D:op117:p50_us} & \N{D:op117:p99_us} & \N{D:op117:p999_us} & batch\\
+118/-- & verbs/S & 1 & 1 & \N{D:op118:n} & 1 & \N{D:op118:mean_us} & \N{D:op118:p50_us} & \N{D:op118:p99_us} & \N{D:op118:p999_us} & delete\\
+123/-- & verbs/S & 1 & 16 & \N{D:op123:n} & 1 & \N{D:op123:mean_us} & \N{D:op123:p50_us} & \N{D:op123:p99_us} & \N{D:op123:p999_us} & batch\\
+127/-- & verbs/N & 8 & 16 & \N{D:op127:n} & 1 & \N{D:op127:mean_us} & \N{D:op127:p50_us} & \N{D:op127:p99_us} & \N{D:op127:p999_us} & batch\\
+\bottomrule\end{tabular}\end{center}
+\clearpage\section{Reads}
+Run 8, focused unified fleet. Each row is one CSV population, not pooled calls. API statistics are in \us. With two repetitions each cell is the median of per-repetition statistics. $n$ lists successful calls in each repetition; $r$ counts repetitions. B: native barrier; P: native page cache; S: owner synchronous; N: owner page cache. T: timeline; W: write profile; R: read profile; --: no profile. Row ids map to the zero-based row of \path{run8-ops_summary.csv}.
+\begin{center}\scriptsize\setlength{\tabcolsep}{3pt}
+\begin{tabular}{llrrrrrrrrr}\toprule
+Id/diag & Route/contract & KiB & $c$ & $n$ & $r$ & mean & p50 & p99 & p99.9 & State\\\midrule
+000/R & TCP/S & 64 & 1 & \N{D:op000:n} & 1 & \N{D:op000:mean_us} & \N{D:op000:p50_us} & \N{D:op000:p99_us} & \N{D:op000:p999_us} & cold\\
+001/R & verbs/S & 1 & 1 & \N{D:op001:n} & 1 & \N{D:op001:mean_us} & \N{D:op001:p50_us} & \N{D:op001:p99_us} & \N{D:op001:p999_us} & cold\\
+002/R & TCP/S & 1 & 16 & \N{D:op002:n} & 1 & \N{D:op002:mean_us} & \N{D:op002:p50_us} & \N{D:op002:p99_us} & \N{D:op002:p999_us} & cold\\
+003/R & SPDK/S & 64 & 1 & \N{D:op003:n} & 1 & \N{D:op003:mean_us} & \N{D:op003:p50_us} & \N{D:op003:p99_us} & \N{D:op003:p999_us} & cold\\
+004/R & kernel D/S & 1 & 1 & \N{D:op004:n} & 1 & \N{D:op004:mean_us} & \N{D:op004:p50_us} & \N{D:op004:p99_us} & \N{D:op004:p999_us} & cold\\
+005/R & verbs/S & 1 & 16 & \N{D:op005:n} & 1 & \N{D:op005:mean_us} & \N{D:op005:p50_us} & \N{D:op005:p99_us} & \N{D:op005:p999_us} & cold\\
+006/R & SPDK/S & 1 & 16 & \N{D:op006:n} & 1 & \N{D:op006:mean_us} & \N{D:op006:p50_us} & \N{D:op006:p99_us} & \N{D:op006:p999_us} & cold\\
+007/R & mTLS/S & 1 & 1 & \N{D:op007:n} & 1 & \N{D:op007:mean_us} & \N{D:op007:p50_us} & \N{D:op007:p99_us} & \N{D:op007:p999_us} & cold\\
+008/R & kernel D/S & 1 & 16 & \N{D:op008:n} & 1 & \N{D:op008:mean_us} & \N{D:op008:p50_us} & \N{D:op008:p99_us} & \N{D:op008:p999_us} & cold\\
+009/R & TCP/S & 1 & 1 & \N{D:op009:n} & 1 & \N{D:op009:mean_us} & \N{D:op009:p50_us} & \N{D:op009:p99_us} & \N{D:op009:p999_us} & cold\\
+010/R & verbs/S & 64 & 1 & \N{D:op010:n} & 1 & \N{D:op010:mean_us} & \N{D:op010:p50_us} & \N{D:op010:p99_us} & \N{D:op010:p999_us} & cold\\
+011/R & SPDK/S & 1 & 1 & \N{D:op011:n} & 1 & \N{D:op011:mean_us} & \N{D:op011:p50_us} & \N{D:op011:p99_us} & \N{D:op011:p999_us} & cold\\
+012/R & kernel D/S & 64 & 1 & \N{D:op012:n} & 1 & \N{D:op012:mean_us} & \N{D:op012:p50_us} & \N{D:op012:p99_us} & \N{D:op012:p999_us} & cold\\
+013/-- & native/B & 1 & 16 & \N{D:op013:n} & 1 & \N{D:op013:mean_us} & \N{D:op013:p50_us} & \N{D:op013:p99_us} & \N{D:op013:p999_us} & cold\\
+014/-- & native/B & 64 & 16 & \N{D:op014:n} & 1 & \N{D:op014:mean_us} & \N{D:op014:p50_us} & \N{D:op014:p99_us} & \N{D:op014:p999_us} & cold\\
+015/-- & native/B & 1 & 1 & \N{D:op015:n} & 2 & \N{D:op015:mean_us} & \N{D:op015:p50_us} & \N{D:op015:p99_us} & \N{D:op015:p999_us} & cold\\
+016/-- & native/B & 8 & 1 & \N{D:op016:n} & 2 & \N{D:op016:mean_us} & \N{D:op016:p50_us} & \N{D:op016:p99_us} & \N{D:op016:p999_us} & cold\\
+017/-- & native/B & 64 & 1 & \N{D:op017:n} & 2 & \N{D:op017:mean_us} & \N{D:op017:p50_us} & \N{D:op017:p99_us} & \N{D:op017:p999_us} & cold\\
+018/R & kernel B/S & 1 & 1 & \N{D:op018:n} & 1 & \N{D:op018:mean_us} & \N{D:op018:p50_us} & \N{D:op018:p99_us} & \N{D:op018:p999_us} & memory\\
+019/R & TCP/S & 64 & 1 & \N{D:op019:n} & 1 & \N{D:op019:mean_us} & \N{D:op019:p50_us} & \N{D:op019:p99_us} & \N{D:op019:p999_us} & memory\\
+020/R & verbs/S & 1 & 1 & \N{D:op020:n} & 1 & \N{D:op020:mean_us} & \N{D:op020:p50_us} & \N{D:op020:p99_us} & \N{D:op020:p999_us} & memory\\
+021/R & TCP/S & 1 & 16 & \N{D:op021:n} & 1 & \N{D:op021:mean_us} & \N{D:op021:p50_us} & \N{D:op021:p99_us} & \N{D:op021:p999_us} & memory\\
+022/R & kernel B/S & 64 & 1 & \N{D:op022:n} & 1 & \N{D:op022:mean_us} & \N{D:op022:p50_us} & \N{D:op022:p99_us} & \N{D:op022:p999_us} & memory\\
+023/R & mTLS/S & 1 & 1 & \N{D:op023:n} & 1 & \N{D:op023:mean_us} & \N{D:op023:p50_us} & \N{D:op023:p99_us} & \N{D:op023:p999_us} & memory\\
+024/R & verbs/S & 1 & 16 & \N{D:op024:n} & 1 & \N{D:op024:mean_us} & \N{D:op024:p50_us} & \N{D:op024:p99_us} & \N{D:op024:p999_us} & memory\\
+025/R & verbs/S & 64 & 1 & \N{D:op025:n} & 1 & \N{D:op025:mean_us} & \N{D:op025:p50_us} & \N{D:op025:p99_us} & \N{D:op025:p999_us} & memory\\
+026/R & TCP/S & 1 & 1 & \N{D:op026:n} & 1 & \N{D:op026:mean_us} & \N{D:op026:p50_us} & \N{D:op026:p99_us} & \N{D:op026:p999_us} & memory\\
+027/-- & native/B & 64 & 1 & \N{D:op027:n} & 2 & \N{D:op027:mean_us} & \N{D:op027:p50_us} & \N{D:op027:p99_us} & \N{D:op027:p999_us} & memory\\
+028/-- & native/B & 64 & 16 & \N{D:op028:n} & 2 & \N{D:op028:mean_us} & \N{D:op028:p50_us} & \N{D:op028:p99_us} & \N{D:op028:p999_us} & memory\\
+029/-- & native/B & 8 & 1 & \N{D:op029:n} & 2 & \N{D:op029:mean_us} & \N{D:op029:p50_us} & \N{D:op029:p99_us} & \N{D:op029:p999_us} & memory\\
+030/-- & native/B & 8 & 16 & \N{D:op030:n} & 2 & \N{D:op030:mean_us} & \N{D:op030:p50_us} & \N{D:op030:p99_us} & \N{D:op030:p999_us} & memory\\
+\bottomrule\end{tabular}\end{center}
+Unqualified native cold 1 KiB rows remain visible as n/c. Native cold 8 KiB rows pass the device-count gate but have mainly memory-like latency. Native cold 64 KiB rows meet case-level SSD-service qualification; counters do not prove individual-call NAND access.

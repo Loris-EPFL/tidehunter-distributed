@@ -1,9 +1,9 @@
 //! Native WAL-backed partition authority with bounded resident pending metadata.
 //!
-//! Completed receipts and descriptors use CRC-protected pageable disk history.
-//! Recovery permanently seals an old epoch and replays only its unrooted suffix.
-//! Whole-file retirement requires an explicit durable recovery/reachability
-//! decision; no live values move and physical addresses are never reused.
+//! WAL replay keeps a bounded retry window; legacy mode pages receipt history.
+//! Recovery permanently seals an old epoch and scans from its owner position.
+//! Whole-file retirement requires a durable recovery/reachability decision;
+//! no live values move and physical addresses are never reused.
 
 use super::codec::{BatchLimits, CodecError, CompleteBatch, Mutation};
 use super::group::{CompleteGroup, GROUP_HEADER_LEN, GroupError, GroupLimits};
@@ -25,7 +25,6 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-#[cfg(feature = "experimental-nvmeof")]
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -44,6 +43,10 @@ const LIVE_FRONTIER: &str = "partition-live-frontier-v1";
 
 pub(crate) mod file_inventory;
 pub(crate) mod history;
+pub use history::{HistoryPersistence, WAL_REPLAY_WINDOW_BATCHES};
+mod wal_replay;
+use wal_replay::WalRoot;
+pub use wal_replay::{DecodedGroup, ReplayPage};
 
 /// Full static inventory for one database epoch, copied durably to every node.
 /// The caller must hold the unique database authority; this is not a consensus
@@ -91,6 +94,12 @@ impl StaticInventory {
 
 pub use super::reference_directory::{AuthorityCacheStats, HistoryMaintenanceStats};
 pub use crate::wal::WalMemberReadPolicy;
+
+/// Original engine defaults (`Config::default()` in `config.rs`).
+pub const NATIVE_FRAGMENT_BYTES: u64 = 128 * 1024 * 1024;
+pub const NATIVE_WAL_FILE_BYTES: u64 = 10 * (1 << 30);
+const NATIVE_MAX_MAPS: usize = 16;
+const RESEARCH_MAX_MAPS: usize = 3;
 
 /// Explicit limits for this experimental log, separate from native Db limits.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -144,7 +153,11 @@ impl PartitionConfig {
         WalLayout {
             frag_size: self.fragment_bytes,
             wal_file_size: self.wal_file_bytes,
-            max_maps: 3,
+            max_maps: if self.fragment_bytes == NATIVE_FRAGMENT_BYTES {
+                NATIVE_MAX_MAPS
+            } else {
+                RESEARCH_MAX_MAPS
+            },
             direct_io: false,
             kind: WalKind::Replay,
         }
@@ -273,6 +286,59 @@ struct PendingLive {
     credit: super::reference_directory::MetadataCredit,
 }
 
+#[cfg(feature = "experimental-nvmeof")]
+struct OpenLiveExtent {
+    extent: super::nvmeof::live_storage::LiveWriteExtent,
+    allocation: crate::wal::ExternalWalAllocation,
+    adoption: super::nvmeof::live_storage::LiveAdoption,
+    closing: bool,
+    // Reused buffer: legal-frame bound for adoption, 1 MiB chunks for close.
+    buffer: Vec<u8>,
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+#[derive(Clone, Copy)]
+struct LiveFrameDemand {
+    batches: usize,
+    descriptors: usize,
+    bytes: u64,
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+impl LiveFrameDemand {
+    fn fits(self, state: &State, root_end: u64) -> bool {
+        state
+            .references
+            .check_capacity(self.batches, self.descriptors)
+            .is_ok()
+            && state.appended_end.saturating_sub(root_end) + self.bytes <= 64 * 1024 * 1024
+    }
+}
+
+#[cfg(feature = "experimental-nvmeof")]
+enum LiveFrameStep {
+    Adopted,
+    End,
+    Pressure(LiveFrameDemand),
+}
+
+#[cfg(all(test, feature = "experimental-nvmeof"))]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum LivePausePoint {
+    ScanSnapshot,
+    FrameProbe,
+    CloseSuffix,
+    AfterFrame,
+    PressureObserved,
+}
+
+#[cfg(all(test, feature = "experimental-nvmeof"))]
+type LivePauseHook = (
+    LivePausePoint,
+    std::sync::mpsc::SyncSender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum WriterPoison {
     // Validation failed before publication. Only the earlier appended prefix
@@ -287,7 +353,15 @@ struct State {
     #[cfg(feature = "experimental-nvmeof")]
     pending_live: Option<PendingLive>,
     #[cfg(feature = "experimental-nvmeof")]
+    open_live_extent: Option<OpenLiveExtent>,
+    #[cfg(feature = "experimental-nvmeof")]
+    next_live_extent: Option<OpenLiveExtent>,
+    #[cfg(feature = "experimental-nvmeof")]
+    last_live_adoption: Option<super::nvmeof::live_storage::LiveAdoption>,
+    #[cfg(feature = "experimental-nvmeof")]
     live: bool,
+    #[cfg(feature = "experimental-nvmeof")]
+    sealing: bool,
     #[cfg(feature = "experimental-nvmeof")]
     last_live_complete: Option<([u8; 16], usize, usize)>,
     #[cfg(feature = "experimental-nvmeof")]
@@ -295,6 +369,7 @@ struct State {
     // Writer drops before the directory lock. The experimental feature strictly
     // joins its native workers; shutdown can wait but cannot release a live path.
     writer: Option<WalWriter>,
+    wal_root: Option<WalRoot>,
     references: ReferenceDirectoryWriter,
     appended_end: u64,
     durable_end: u64,
@@ -707,6 +782,10 @@ pub struct PartitionLog {
     state: Mutex<State>,
     references: Arc<ReferenceDirectory>,
     durable_frontier: AtomicU64,
+    // A successful sealed-stream page proves its next cursor is a frame boundary.
+    replay_next: AtomicU64,
+    #[cfg(test)]
+    replay_decodes: AtomicU64,
     // Appended/synced frontier of the durability layer. Set once by the node's
     // control owner, which also owns the single syncer thread. Appends publish
     // into it under `state`, so the frontier follows WAL order exactly.
@@ -735,6 +814,10 @@ pub struct PartitionLog {
     #[cfg(test)]
     fail_inventory_witness: AtomicU8,
     #[cfg(test)]
+    fail_wal_root: AtomicU8,
+    #[cfg(test)]
+    fail_wal_retire: AtomicBool,
+    #[cfg(test)]
     before_persist: Mutex<
         Option<(
             std::sync::mpsc::SyncSender<()>,
@@ -747,6 +830,12 @@ pub struct PartitionLog {
     fail_namespace_persist: AtomicBool,
     #[cfg(all(test, feature = "experimental-nvmeof"))]
     fail_live_frontier: AtomicU8,
+    // Test handshake owner: the selected live operation; capacity one in each
+    // direction, blocking send/recv, dropping either peer unblocks shutdown.
+    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    live_pause: Mutex<Option<LivePauseHook>>,
+    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    fail_after_live_publish: AtomicBool,
     wal: Arc<Wal>,
     registration: Registration,
     shape: KeyShape,
@@ -832,23 +921,38 @@ impl PartitionLog {
         )?
         .sync_all()?;
         let lock = DbLock::acquire(&path, Duration::ZERO)?;
-        let (references, reference_writer) =
-            ReferenceDirectory::open(&path, &registration.config, true)?;
+        let (references, reference_writer) = ReferenceDirectory::open(
+            &path,
+            &registration.config,
+            true,
+            HistoryPersistence::default(),
+        )?;
         let wal = Wal::open(&path, registration.config.layout(), metrics)?;
         wal.persist_registered_files()?;
         install_metadata(&path, REGISTRATION, &metadata)?;
+        let wal_root = WalRoot::new(&registration.config);
+        wal_root.install(&path)?;
         let writer = wal.writer_after(None).map_err(StorageError::Wal)?;
         Ok(Self {
             state: Mutex::new(State {
                 #[cfg(feature = "experimental-nvmeof")]
                 pending_live: None,
                 #[cfg(feature = "experimental-nvmeof")]
+                open_live_extent: None,
+                #[cfg(feature = "experimental-nvmeof")]
+                next_live_extent: None,
+                #[cfg(feature = "experimental-nvmeof")]
+                last_live_adoption: None,
+                #[cfg(feature = "experimental-nvmeof")]
                 live: false,
+                #[cfg(feature = "experimental-nvmeof")]
+                sealing: false,
                 #[cfg(feature = "experimental-nvmeof")]
                 last_live_complete: None,
                 #[cfg(feature = "experimental-nvmeof")]
                 live_tail: None,
                 writer: Some(writer),
+                wal_root: Some(wal_root),
                 references: reference_writer,
                 appended_end: 0,
                 durable_end: 0,
@@ -859,6 +963,9 @@ impl PartitionLog {
             }),
             references,
             durable_frontier: AtomicU64::new(0),
+            replay_next: AtomicU64::new(u64::MAX),
+            #[cfg(test)]
+            replay_decodes: AtomicU64::new(0),
             frontier: std::sync::OnceLock::new(),
             sync_profile: Mutex::new(StorageWriteProfile::default()),
             serve_unsynced: AtomicBool::new(false),
@@ -874,6 +981,10 @@ impl PartitionLog {
             #[cfg(test)]
             fail_inventory_witness: AtomicU8::new(0),
             #[cfg(test)]
+            fail_wal_root: AtomicU8::new(0),
+            #[cfg(test)]
+            fail_wal_retire: AtomicBool::new(false),
+            #[cfg(test)]
             before_persist: Mutex::new(None),
             #[cfg(test)]
             fail_persist: AtomicBool::new(false),
@@ -881,6 +992,10 @@ impl PartitionLog {
             fail_namespace_persist: AtomicBool::new(false),
             #[cfg(all(test, feature = "experimental-nvmeof"))]
             fail_live_frontier: AtomicU8::new(0),
+            #[cfg(all(test, feature = "experimental-nvmeof"))]
+            live_pause: Mutex::new(None),
+            #[cfg(all(test, feature = "experimental-nvmeof"))]
+            fail_after_live_publish: AtomicBool::new(false),
             wal,
             registration,
             shape,
@@ -983,7 +1098,11 @@ impl PartitionLog {
         }
         let shape = KeyShape::from_yaml(&registration.shape_yaml)
             .map_err(|_| StorageError::Invalid("invalid stored key shape"))?;
-        let (references, mut reference_writer) = ReferenceDirectory::open(&path, expected, false)?;
+        if path.join(wal_replay::ROOT).exists() {
+            return Self::recover_wal_replay(path, registration, shape, lock, metrics, live);
+        }
+        let (references, mut reference_writer) =
+            ReferenceDirectory::open(&path, expected, false, HistoryPersistence::OnDisk)?;
         let root = references.root();
         let scan_end = validate_file_inventory(&path, expected, &references)?.max(root.end);
         let frontier = if live {
@@ -1310,12 +1429,21 @@ impl PartitionLog {
                 #[cfg(feature = "experimental-nvmeof")]
                 pending_live: None,
                 #[cfg(feature = "experimental-nvmeof")]
+                open_live_extent: None,
+                #[cfg(feature = "experimental-nvmeof")]
+                next_live_extent: None,
+                #[cfg(feature = "experimental-nvmeof")]
+                last_live_adoption: None,
+                #[cfg(feature = "experimental-nvmeof")]
                 live,
+                #[cfg(feature = "experimental-nvmeof")]
+                sealing: false,
                 #[cfg(feature = "experimental-nvmeof")]
                 last_live_complete: None,
                 #[cfg(feature = "experimental-nvmeof")]
                 live_tail: None,
                 writer: None,
+                wal_root: None,
                 references: reference_writer,
                 appended_end: physical_end,
                 durable_end: physical_end,
@@ -1326,6 +1454,9 @@ impl PartitionLog {
             }),
             references,
             durable_frontier: AtomicU64::new(physical_end),
+            replay_next: AtomicU64::new(u64::MAX),
+            #[cfg(test)]
+            replay_decodes: AtomicU64::new(0),
             frontier: std::sync::OnceLock::new(),
             sync_profile: Mutex::new(StorageWriteProfile::default()),
             serve_unsynced: AtomicBool::new(false),
@@ -1341,6 +1472,10 @@ impl PartitionLog {
             #[cfg(test)]
             fail_inventory_witness: AtomicU8::new(0),
             #[cfg(test)]
+            fail_wal_root: AtomicU8::new(0),
+            #[cfg(test)]
+            fail_wal_retire: AtomicBool::new(false),
+            #[cfg(test)]
             before_persist: Mutex::new(None),
             #[cfg(test)]
             fail_persist: AtomicBool::new(false),
@@ -1348,6 +1483,10 @@ impl PartitionLog {
             fail_namespace_persist: AtomicBool::new(false),
             #[cfg(all(test, feature = "experimental-nvmeof"))]
             fail_live_frontier: AtomicU8::new(0),
+            #[cfg(all(test, feature = "experimental-nvmeof"))]
+            live_pause: Mutex::new(None),
+            #[cfg(all(test, feature = "experimental-nvmeof"))]
+            fail_after_live_publish: AtomicBool::new(false),
             wal,
             registration,
             shape,
@@ -1368,10 +1507,17 @@ impl PartitionLog {
         evict: bool,
     ) -> std::io::Result<crate::read_probe::ReadEvidence> {
         #[cfg(feature = "experimental-nvmeof")]
-        if self.live_stream && !self.state.lock().sealed {
-            return Err(io::Error::other(
-                "mapped residency probe unavailable during live writes",
-            ));
+        if self.live_stream {
+            let state = self.state.lock();
+            if !state.sealed
+                && (state.open_live_extent.is_some()
+                    || state.next_live_extent.is_some()
+                    || state.pending_live.is_some())
+            {
+                return Err(io::Error::other(
+                    "mapped residency probe unavailable during live writes",
+                ));
+            }
         }
         self.wal.read_evidence_for_benchmark(evict)
     }
@@ -1435,6 +1581,17 @@ impl PartitionLog {
             return Err(StorageError::Poisoned);
         }
         if state
+            .open_live_extent
+            .as_ref()
+            .is_some_and(|open| open.extent.segment.file_index == file_index)
+            || state
+                .next_live_extent
+                .as_ref()
+                .is_some_and(|open| open.extent.segment.file_index == file_index)
+        {
+            return Ok(false);
+        }
+        if state
             .pending_live
             .as_ref()
             .is_some_and(|pending| pending.reservation.segment.file_index == file_index)
@@ -1445,6 +1602,795 @@ impl PartitionLog {
             Some(writer) => file_index < writer.position() / self.config().wal_file_bytes,
             None => state.sealed,
         })
+    }
+
+    /// Grant exactly one native fragment remainder to the single live writer.
+    #[cfg(feature = "experimental-nvmeof")]
+    pub fn lease_live_extent(
+        &self,
+        authority: RequestAuthority,
+    ) -> Result<
+        (
+            super::nvmeof::live_storage::LiveWriteExtent,
+            super::tcp::LeaseProfile,
+        ),
+        StorageError,
+    > {
+        self.lease_live_extent_impl(authority, None)
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    pub fn prelease_live_extent(
+        &self,
+        authority: RequestAuthority,
+        after: [u8; 16],
+    ) -> Result<
+        (
+            super::nvmeof::live_storage::LiveWriteExtent,
+            super::tcp::LeaseProfile,
+        ),
+        StorageError,
+    > {
+        self.lease_live_extent_impl(authority, Some(after))
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    fn lease_live_extent_impl(
+        &self,
+        authority: RequestAuthority,
+        after: Option<[u8; 16]>,
+    ) -> Result<
+        (
+            super::nvmeof::live_storage::LiveWriteExtent,
+            super::tcp::LeaseProfile,
+        ),
+        StorageError,
+    > {
+        use super::nvmeof::live_storage::{LiveAdoption, LiveWalSegment, LiveWriteExtent};
+        let config = self.config();
+        if authority.epoch != config.inventory.epoch {
+            return Err(StorageError::Fenced);
+        }
+        let _persistence = self.persistence.lock();
+        let mut state = self.state.lock();
+        if state.poison.is_some() || state.references.background_failed() {
+            return Err(StorageError::Poisoned);
+        }
+        if state.sealed {
+            return Err(StorageError::Sealed);
+        }
+        if state.sealing {
+            return Err(StorageError::Invalid("live stream is sealing"));
+        }
+        if !state.live {
+            return Err(StorageError::Invalid("not a live WAL stream"));
+        }
+        if state.pending_live.is_some() {
+            return Err(StorageError::Invalid(
+                "pending live reservation blocks lease",
+            ));
+        }
+        if let Some(token) = after {
+            if !state
+                .open_live_extent
+                .as_ref()
+                .is_some_and(|open| open.extent.token == token && !open.closing)
+            {
+                return Err(StorageError::Invalid(
+                    "prelease requires the open live extent",
+                ));
+            }
+            if state.next_live_extent.is_some() {
+                return Err(StorageError::Invalid("live extent already preleased"));
+            }
+        } else if state.open_live_extent.is_some() || state.next_live_extent.is_some() {
+            // A lost reply requires fencing/recovery, never a second grant.
+            return Err(StorageError::Invalid("live extent already open"));
+        }
+        let start = state
+            .writer
+            .as_ref()
+            .ok_or(StorageError::Sealed)?
+            .position();
+        let len = config.fragment_bytes - start % config.fragment_bytes;
+        if len >= 1 << 30 || !start.is_multiple_of(4096) || !len.is_multiple_of(4096) {
+            return Err(StorageError::Invalid("invalid live extent geometry"));
+        }
+        let end = start.checked_add(len).ok_or(StorageError::Capacity)?;
+        state.poison = Some(WriterPoison::Fatal);
+        let reserve_started = Instant::now();
+        let allocation = state
+            .writer
+            .as_ref()
+            .ok_or(StorageError::Sealed)?
+            .reserve_external(len as u32)
+            .map_err(|error| StorageError::Unknown(WalError::Io(error)))?;
+        let reserve_ns = duration_ns(reserve_started.elapsed());
+        let metadata = allocation
+            .file
+            .metadata()
+            .map_err(|error| StorageError::Unknown(WalError::Io(error)))?;
+        if metadata.len() != config.wal_file_bytes {
+            return Err(StorageError::Unknown(WalError::Io(io::Error::other(
+                "WAL file size changed",
+            ))));
+        }
+        let extent = LiveWriteExtent {
+            token: rand::random(),
+            segment: LiveWalSegment {
+                database: config.inventory.database,
+                partition: config.partition,
+                epoch: config.inventory.epoch,
+                generation: config.inventory.segment_generation,
+                file_index: start / config.wal_file_bytes,
+                path: allocation.path.clone(),
+                bytes: metadata.len(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                block_size: 4096,
+            },
+            start,
+            end,
+        };
+        let open = OpenLiveExtent {
+            adoption: LiveAdoption {
+                token: extent.token,
+                adopted_end: start,
+                receipt_count: 0,
+                receipt_digest: [0; 32],
+                closed: false,
+            },
+            extent: extent.clone(),
+            closing: false,
+            allocation,
+            buffer: Vec::new(),
+        };
+        if after.is_some() {
+            state.next_live_extent = Some(open);
+        } else {
+            state.open_live_extent = Some(open);
+        }
+        let previous_namespace = state.namespace_synced_file.map(|file| file.as_u64());
+        let last_file = extent.segment.file_index;
+        // Allocation succeeded and its range is pinned. Do not expose transient
+        // poison to a syncer validating its earlier prefix before it takes the
+        // persistence mutex. No lease/retry can return before this mutex drops.
+        state.poison = None;
+        drop(state);
+        let mut timing = WriteTiming::new(None, false);
+        let mut witnesses = 0;
+        let namespace_sync = previous_namespace.is_none_or(|file| last_file > file);
+        let namespace_started = Instant::now();
+        let result = (|| {
+            if namespace_sync {
+                #[cfg(test)]
+                if let Some((entered, resume)) = self.before_persist.lock().take() {
+                    let _ = entered.send(());
+                    let _ = resume.recv();
+                }
+                // No bytes have been granted yet. Persist preallocation and the
+                // final inode size before making its directory witness durable.
+                self.wal.persist_frame_file(WalPosition::new(start, 1))?;
+                self.persist_namespace_witnesses(
+                    last_file,
+                    previous_namespace,
+                    &mut timing,
+                    &mut witnesses,
+                )?;
+            }
+            Ok::<(), io::Error>(())
+        })();
+        let namespace_sync_ns = duration_ns(namespace_started.elapsed());
+        let mut state = self.state.lock();
+        state.stats.inventory_witnesses += witnesses;
+        result.map_err(|error| {
+            state.poison = Some(WriterPoison::Fatal);
+            StorageError::Unknown(WalError::Io(error))
+        })?;
+        if state.sealing || state.sealed {
+            return Err(StorageError::Invalid("live stream is sealing"));
+        }
+        if state.poison.is_some() || state.references.background_failed() {
+            return Err(StorageError::Poisoned);
+        }
+        if namespace_sync {
+            state.namespace_synced_file =
+                Some(crate::wal::position::WalFileId::from_u64(last_file));
+            state.stats.namespace_syncs += 1;
+        }
+        state.poison = None;
+        Ok((
+            extent,
+            super::tcp::LeaseProfile {
+                reserve_ns,
+                namespace_sync_ns,
+                publish_ns: 0,
+            },
+        ))
+    }
+
+    /// A failed declared frame fences writes while its earlier validated prefix
+    /// remains persistable. An opportunistic scan never declares torn bytes.
+    #[cfg(feature = "experimental-nvmeof")]
+    pub fn adopt_live_extent(
+        &self,
+        authority: RequestAuthority,
+        token: [u8; 16],
+        through: u64,
+        close: bool,
+    ) -> Result<
+        (
+            super::nvmeof::live_storage::LiveAdoption,
+            super::tcp::AdoptProfile,
+        ),
+        StorageError,
+    > {
+        self.adopt_live_extent_impl(authority, token, through, close, None)
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    pub fn self_adopt_live_extent(&self) -> Result<(), StorageError> {
+        if !self.live_stream {
+            return Ok(());
+        }
+        let pending = {
+            let state = self.state.lock();
+            if state.poison == Some(WriterPoison::IncompleteLiveFrame) {
+                return Ok(());
+            }
+            state
+                .open_live_extent
+                .as_ref()
+                .map(|open| (open.extent.token, open.extent.end, open.adoption.clone()))
+        };
+        #[cfg(test)]
+        self.pause_live_at(LivePausePoint::ScanSnapshot);
+        if let Some((token, end, observed)) = pending {
+            self.adopt_live_extent_impl(
+                RequestAuthority {
+                    epoch: self.config().inventory.epoch,
+                },
+                token,
+                end,
+                false,
+                Some(observed),
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    fn adopt_live_extent_impl(
+        &self,
+        authority: RequestAuthority,
+        token: [u8; 16],
+        through: u64,
+        close: bool,
+        opportunistic: Option<super::nvmeof::live_storage::LiveAdoption>,
+    ) -> Result<
+        (
+            super::nvmeof::live_storage::LiveAdoption,
+            super::tcp::AdoptProfile,
+        ),
+        StorageError,
+    > {
+        let started = Instant::now();
+        let mut profile = super::tcp::AdoptProfile::default();
+        let result = (|| {
+            if authority.epoch != self.config().inventory.epoch {
+                return Err(StorageError::Fenced);
+            }
+            // At most one frame per 4 KiB, plus two metadata drains per frame.
+            let steps = self.config().fragment_bytes / 4096 * 3 + 3;
+            for _ in 0..steps {
+                let mut state = self.state.lock();
+                if state.poison.is_some() || state.references.background_failed() {
+                    return Err(StorageError::Poisoned);
+                }
+                if state.sealing && opportunistic.is_none() {
+                    return Err(StorageError::Invalid("live stream is sealing"));
+                }
+                if let Some(observed) = &opportunistic {
+                    match state.open_live_extent.as_ref() {
+                        Some(open) if open.extent.token == token => {
+                            if open.closing {
+                                return Ok(open.adoption.clone());
+                            }
+                        }
+                        _ => return Ok(observed.clone()),
+                    }
+                }
+                if let Some(previous) = &state.last_live_adoption
+                    && previous.token == token
+                {
+                    return if through <= previous.adopted_end {
+                        Ok(previous.clone())
+                    } else {
+                        Err(StorageError::Invalid("closed live extent"))
+                    };
+                }
+                let open = state
+                    .open_live_extent
+                    .as_ref()
+                    .ok_or(StorageError::Invalid("no live extent"))?;
+                if open.extent.token != token {
+                    return Err(StorageError::Invalid("foreign live extent"));
+                }
+                if open.closing {
+                    return if close || through > open.adoption.adopted_end {
+                        Err(StorageError::Invalid("live extent is closing"))
+                    } else {
+                        Ok(open.adoption.clone())
+                    };
+                }
+                if through < open.extent.start || through > open.extent.end {
+                    return Err(StorageError::Invalid("adoption outside live extent"));
+                }
+                let mut open = state
+                    .open_live_extent
+                    .take()
+                    .ok_or(StorageError::Poisoned)?;
+                let result = self.adopt_live_frame(&mut state, &mut open, through);
+                match result {
+                    Ok(LiveFrameStep::Adopted) => {
+                        profile.frames += 1;
+                        state.open_live_extent = Some(open);
+                        drop(state);
+                        #[cfg(test)]
+                        self.pause_live_at(LivePausePoint::AfterFrame);
+                        continue;
+                    }
+                    Ok(LiveFrameStep::Pressure(demand)) => {
+                        let cursor = open.adoption.adopted_end;
+                        state.open_live_extent = Some(open);
+                        if state.references.windowed() {
+                            let files = state.appended_end.saturating_sub(1)
+                                / self.config().wal_file_bytes
+                                + 1;
+                            state.references.persist_pending(files)?;
+                            if !demand.fits(&state, self.references.root().end) {
+                                return Err(StorageError::Capacity);
+                            }
+                            continue;
+                        }
+                        #[cfg(test)]
+                        self.pause_live_at(LivePausePoint::PressureObserved);
+                        let old_root = self.references.root();
+                        drop(state);
+                        // Only the already validated prefix may sync here.
+                        self.persist_scope(PersistScope::Appended, None)?;
+                        let mut state = self.state.lock();
+                        let durable_end = state.durable_end;
+                        let files = durable_end.div_ceil(self.config().wal_file_bytes);
+                        if let Err(error) =
+                            state
+                                .references
+                                .start_background(durable_end, files, &self.path)
+                        {
+                            state.poison = Some(WriterPoison::Fatal);
+                            return Err(error);
+                        }
+                        drop(state);
+                        self.wait_history()?;
+                        let mut state = self.state.lock();
+                        // A concurrent adopter/close can obsolete this demand.
+                        // History drains without state; recheck this frame BEFORE
+                        // treating an unchanged root as a failed progress attempt.
+                        let same_frame = state.open_live_extent.as_ref().is_some_and(|open| {
+                            open.extent.token == token
+                                && !open.closing
+                                && open.adoption.adopted_end == cursor
+                        });
+                        let fits = demand.fits(&state, self.references.root().end);
+                        let root = self.references.root();
+                        if same_frame
+                            && !fits
+                            && root.count == old_root.count
+                            && root.end == old_root.end
+                        {
+                            state.poison = Some(WriterPoison::Fatal);
+                            return Err(StorageError::Capacity);
+                        }
+                        continue;
+                    }
+                    Err(StorageError::IncompleteLiveFrame) if opportunistic.is_some() => {}
+                    Err(error) => {
+                        state.open_live_extent = Some(open);
+                        state.poison =
+                            Some(if matches!(error, StorageError::IncompleteLiveFrame) {
+                                WriterPoison::IncompleteLiveFrame
+                            } else {
+                                WriterPoison::Fatal
+                            });
+                        return Err(error);
+                    }
+                    Ok(LiveFrameStep::End) => {}
+                }
+                let summary = open.adoption.clone();
+                state.open_live_extent = Some(open);
+                if close {
+                    drop(state);
+                    return self.close_live_extent(token, through, &mut profile);
+                }
+                return Ok(summary);
+            }
+            self.state.lock().poison = Some(WriterPoison::Fatal);
+            Err(StorageError::Invalid(
+                "live adoption exceeded bounded progress",
+            ))
+        })();
+        profile.adopt_ns = duration_ns(started.elapsed());
+        result.map(|adoption| (adoption, profile))
+    }
+
+    // Keep read/validate/publish atomic at the CURRENT cursor. Reserved
+    // completion already reads one frame under this lock; a leased stream has
+    // no concurrent appender, and registered reads never take this lock.
+    // Buffered-target frames are normally page-cached; eviction can require
+    // disk I/O. The bound is one frame (at most 64 MiB), not elapsed time.
+    // Atomic read/validate/publish makes concurrent adopters safe.
+    #[cfg(feature = "experimental-nvmeof")]
+    fn adopt_live_frame(
+        &self,
+        state: &mut State,
+        open: &mut OpenLiveExtent,
+        through: u64,
+    ) -> Result<LiveFrameStep, StorageError> {
+        use super::nvmeof::live_storage::extend_live_receipt_digest;
+        let start = open.adoption.adopted_end;
+        if through <= start {
+            return Ok(LiveFrameStep::End);
+        }
+        if through - start < 4096 || open.extent.end - start < 4096 {
+            return Err(StorageError::IncompleteLiveFrame);
+        }
+        // Keep the initialized high-water length. A smaller following frame
+        // must not make the next larger read zero-fill this buffer again.
+        if open.buffer.len() < 4096 {
+            open.buffer.resize(4096, 0);
+        }
+        let offset = start % open.extent.segment.bytes;
+        open.allocation
+            .file
+            .read_exact_at(&mut open.buffer[..4096], offset)
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::UnexpectedEof {
+                    StorageError::IncompleteLiveFrame
+                } else {
+                    StorageError::Io(error)
+                }
+            })?;
+        let len = u64::from(u32::from_be_bytes([
+            open.buffer[0],
+            open.buffer[1],
+            open.buffer[2],
+            open.buffer[3],
+        ])) + 8;
+        let max_frame =
+            (self.config().group_limits.max_encoded_bytes as u64 + 8).div_ceil(4096) * 4096;
+        if !len.is_multiple_of(4096)
+            || len > max_frame.min(64 * 1024 * 1024)
+            || len > through - start
+            || len > open.extent.end - start
+        {
+            return Err(StorageError::IncompleteLiveFrame);
+        }
+        #[cfg(test)]
+        self.pause_live_at(LivePausePoint::FrameProbe);
+        if open.buffer.len() < len as usize {
+            open.buffer.resize(len as usize, 0);
+        }
+        // The first block contains the complete header and often the entire
+        // frame. Read only the suffix of a larger frame, under the same lock.
+        if len > 4096 {
+            open.allocation
+                .file
+                .read_exact_at(&mut open.buffer[4096..len as usize], offset + 4096)
+                .map_err(|error| {
+                    if error.kind() == io::ErrorKind::UnexpectedEof {
+                        StorageError::IncompleteLiveFrame
+                    } else {
+                        StorageError::Io(error)
+                    }
+                })?;
+        }
+        let crc = u32::from_be_bytes([
+            open.buffer[4],
+            open.buffer[5],
+            open.buffer[6],
+            open.buffer[7],
+        ]);
+        let group = self.decode_live_frame(&open.buffer[..len as usize])?;
+        for batch in group.batches() {
+            if !matches!(
+                self.references.lookup_conflict(
+                    batch.id(),
+                    batch.version(),
+                    &mut LookupWork::default(),
+                )?,
+                ConflictLookup::Free
+            ) {
+                return Err(StorageError::IncompleteLiveFrame);
+            }
+        }
+        let count = group.batches().len();
+        let descriptors = group
+            .batches()
+            .iter()
+            .map(|batch| batch.record_descriptors().len())
+            .sum();
+        ReferenceDirectory::check_fresh_total_capacity(
+            self.config().max_batches.min(1024),
+            self.config().max_reference_metadata_bytes,
+            count,
+            descriptors,
+        )?;
+        // Only an already adopted backlog can be drained by persistence. The
+        // next frame may follow a valid skip region larger than this window;
+        // charging that physical gap before adopting its bridging frame would
+        // demand an impossible history-root advance and poison a legal layout.
+        let demand = LiveFrameDemand {
+            batches: count,
+            descriptors,
+            bytes: len,
+        };
+        if !demand.fits(state, self.references.root().end) {
+            return Ok(LiveFrameStep::Pressure(demand));
+        }
+        let mut credit = state.references.reserve_group(count, descriptors)?;
+        state.poison = Some(WriterPoison::Fatal);
+        let receipts = self.publish_live_group(
+            state,
+            &group,
+            WalPosition::new(start, len as u32),
+            crc,
+            &mut credit,
+        )?;
+        for receipt in receipts {
+            open.adoption.receipt_digest =
+                extend_live_receipt_digest(open.adoption.receipt_digest, receipt);
+            open.adoption.receipt_count += 1;
+        }
+        open.adoption.adopted_end = start + len;
+        state.poison = None;
+        Ok(LiveFrameStep::Adopted)
+    }
+
+    /// State owns the allocation guard throughout close. Lock order remains
+    /// persistence -> state where both are needed; close takes state only to
+    /// mark/revalidate ownership, never during suffix I/O. `closing` prevents
+    /// mutation or regrant while the local file pin and buffer are borrowed.
+    #[cfg(feature = "experimental-nvmeof")]
+    fn close_live_extent(
+        &self,
+        token: [u8; 16],
+        through: u64,
+        profile: &mut super::tcp::AdoptProfile,
+    ) -> Result<super::nvmeof::live_storage::LiveAdoption, StorageError> {
+        let (file, end, bytes, mut buffer) = {
+            let mut state = self.state.lock();
+            if state.poison.is_some() || state.references.background_failed() {
+                return Err(StorageError::Poisoned);
+            }
+            if state.sealing {
+                return Err(StorageError::Invalid("live stream is sealing"));
+            }
+            let open = state
+                .open_live_extent
+                .as_mut()
+                .ok_or(StorageError::Invalid("no live extent"))?;
+            if open.extent.token != token {
+                return Err(StorageError::Invalid("foreign live extent"));
+            }
+            if open.closing {
+                return Err(StorageError::Invalid("live extent is closing"));
+            }
+            if through != open.adoption.adopted_end {
+                state.poison = Some(WriterPoison::IncompleteLiveFrame);
+                return Err(StorageError::IncompleteLiveFrame);
+            }
+            open.closing = true;
+            // Shared ownership pins the final inode during unlocked close I/O;
+            // the state keeps its guard and cannot regrant this physical range.
+            (
+                Arc::clone(&open.allocation.file),
+                open.extent.end,
+                open.extent.segment.bytes,
+                std::mem::take(&mut open.buffer),
+            )
+        };
+        #[cfg(test)]
+        self.pause_live_at(LivePausePoint::CloseSuffix);
+        let scan_started = Instant::now();
+        let result = self.validate_live_extent_close(&file, &mut buffer, through, end, bytes);
+        profile.close_scan_ns = duration_ns(scan_started.elapsed());
+        profile.close_scan_bytes = end - through;
+        let mut state = self.state.lock();
+        let open = state
+            .open_live_extent
+            .as_mut()
+            .ok_or(StorageError::Poisoned)?;
+        if open.extent.token != token || !open.closing || open.adoption.adopted_end != through {
+            state.poison = Some(WriterPoison::Fatal);
+            return Err(StorageError::Poisoned);
+        }
+        open.closing = false;
+        open.buffer = buffer;
+        if let Err(error) = result {
+            if state.poison.is_none() {
+                state.poison = Some(if matches!(error, StorageError::IncompleteLiveFrame) {
+                    WriterPoison::IncompleteLiveFrame
+                } else {
+                    WriterPoison::Fatal
+                });
+            }
+            return Err(error);
+        }
+        if state.poison.is_some() || state.references.background_failed() {
+            return Err(StorageError::Poisoned);
+        }
+        let mut open = state
+            .open_live_extent
+            .take()
+            .ok_or(StorageError::Poisoned)?;
+        open.adoption.closed = true;
+        let summary = open.adoption;
+        state.poison = Some(WriterPoison::Fatal);
+        open.allocation
+            .guard
+            .release()
+            .map_err(|error| StorageError::Unknown(WalError::Io(io::Error::other(error))))?;
+        state.last_live_adoption = Some(summary.clone());
+        state.open_live_extent = state.next_live_extent.take();
+        state.poison = None;
+        Ok(summary)
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    fn validate_live_extent_close(
+        &self,
+        file: &File,
+        buffer: &mut Vec<u8>,
+        through: u64,
+        end: u64,
+        bytes: u64,
+    ) -> Result<(), StorageError> {
+        let mut cursor = through;
+        // At most ceil(extent remainder / 1 MiB) positional reads, with no
+        // partition lock held. An extent is strictly smaller than 1 GiB.
+        while cursor < end {
+            let len = (end - cursor).min(1024 * 1024) as usize;
+            buffer.resize(len, 0);
+            file.read_exact_at(buffer, cursor % bytes)?;
+            let first = cursor == through;
+            if (first && buffer[..8] != [255; 8])
+                || buffer[if first { 8 } else { 0 }..]
+                    .iter()
+                    .any(|byte| *byte != 0)
+            {
+                return Err(StorageError::IncompleteLiveFrame);
+            }
+            cursor += len as u64;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    pub(crate) fn pause_live(
+        &self,
+        point: LivePausePoint,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered, started) = std::sync::mpsc::sync_channel(1);
+        let (resume, released) = std::sync::mpsc::sync_channel(1);
+        *self.live_pause.lock() = Some((point, entered, released));
+        (started, resume)
+    }
+
+    #[cfg(all(test, feature = "experimental-nvmeof"))]
+    fn pause_live_at(&self, point: LivePausePoint) {
+        let hook = {
+            let mut slot = self.live_pause.lock();
+            if slot.as_ref().is_some_and(|hook| hook.0 == point) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, entered, resume)) = hook {
+            let _ = entered.send(());
+            let _ = resume.recv();
+        }
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    fn decode_live_frame(&self, frame: &[u8]) -> Result<CompleteGroup, StorageError> {
+        let payload =
+            CrcFrame::read_from_slice(frame, 0).map_err(|_| StorageError::IncompleteLiveFrame)?;
+        if payload.len() + 8 != frame.len() || payload.len() < 12 || payload[8..12] != [0, 3, 0, 12]
+        {
+            return Err(StorageError::IncompleteLiveFrame);
+        }
+        let group = CompleteGroup::decode_slice(
+            &self.shape,
+            payload,
+            self.config().batch_limits,
+            self.config().group_limits,
+        )
+        .map_err(|_| StorageError::IncompleteLiveFrame)?;
+        for batch in group.batches() {
+            validate_batch(self.config(), batch).map_err(|_| StorageError::IncompleteLiveFrame)?;
+        }
+        Ok(group)
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    fn publish_live_group(
+        &self,
+        state: &mut State,
+        group: &CompleteGroup,
+        position: WalPosition,
+        crc: u32,
+        credit: &mut super::reference_directory::MetadataCredit,
+    ) -> Result<Vec<AppendedBatch>, StorageError> {
+        let group_end = position.offset() + position.frame_len() as u64;
+        let mut receipts = Vec::with_capacity(group.batches().len());
+        let mut metadata = Vec::with_capacity(group.batches().len());
+        for (batch, offset) in group.batches().iter().zip(group.batch_offsets()) {
+            let receipt = receipt_for(
+                self.config(),
+                batch,
+                member_position(position, *offset, batch),
+            );
+            let descriptors: Box<[_]> = batch.record_descriptors().into();
+            let batch_credit = credit.take_batch(descriptors.len())?;
+            metadata.push(
+                RegisteredBatch::new(
+                    batch.id(),
+                    batch.version(),
+                    batch.digest(),
+                    receipt.address,
+                    descriptors,
+                    group_end,
+                )
+                .with_credit(batch_credit),
+            );
+            receipts.push(receipt);
+        }
+        state.references.publish_group(metadata)?;
+        #[cfg(test)]
+        // AcqRel consumes the one-shot test fault published by its Release store.
+        if self.fail_after_live_publish.swap(false, Ordering::AcqRel) {
+            return Err(StorageError::Unknown(WalError::Io(io::Error::other(
+                "injected crash after live reference publication",
+            ))));
+        }
+        state.appended_end = group_end;
+        // Adoption proves APPENDED bytes only. Synchronous reads and checkpoint
+        // proofs still require the owner's separate covering persistence barrier.
+        if let Some(frontier) = self.frontier.get() {
+            frontier
+                .publish_appended(group_end, group.batches().len() as u64)
+                .map_err(|_| StorageError::Invalid("durability frontier rejected a live group"))?;
+        }
+        let tail = group
+            .batches()
+            .last()
+            .ok_or(StorageError::Invalid("empty live group"))?;
+        state.live_tail = Some(LiveFrontierTail {
+            offset: position.offset(),
+            crc,
+            id: tail.id(),
+            version: tail.version(),
+            digest: tail.digest(),
+        });
+        state.stats.appended_groups += 1;
+        if state.references.background_failed() {
+            return Err(StorageError::Poisoned);
+        }
+        Ok(receipts)
     }
 
     /// Reserve the final native extent, or return the exact previously
@@ -1471,6 +2417,12 @@ impl PartitionLog {
         }
         if !state.live {
             return Err(StorageError::Invalid("not a live WAL stream"));
+        }
+        if state.sealing {
+            return Err(StorageError::Invalid("live stream is sealing"));
+        }
+        if state.open_live_extent.is_some() || state.next_live_extent.is_some() {
+            return Err(StorageError::Invalid("open live extent blocks reservation"));
         }
         if let Some(pending) = &state.pending_live {
             return if pending.descriptor == descriptor {
@@ -1522,10 +2474,12 @@ impl PartitionLog {
                 if receipt.version != batch.version || receipt.digest != batch.digest {
                     return Err(StorageError::IdentityConflict);
                 }
-                let registered = self
-                    .references
-                    .lookup(receipt.address)?
-                    .ok_or(StorageError::Invalid("missing existing batch authority"))?;
+                let registered = self.references.lookup(receipt.address)?;
+                let registered = match registered {
+                    Some(registered) => registered,
+                    None if state.wal_root.is_some() => self.member_authority(receipt.address)?,
+                    None => return Err(StorageError::Invalid("missing existing batch authority")),
+                };
                 if receipt.address.len != batch.encoded_len + 8
                     || registered.descriptors().len() != batch.descriptor_count as usize
                 {
@@ -1561,10 +2515,12 @@ impl PartitionLog {
                 .ok_or(StorageError::Capacity)?;
             let mut member_offset = start + (8 + GROUP_HEADER_LEN) as u64;
             for (receipt, summary) in previous.iter().zip(&descriptor.batches) {
-                let registered = self
-                    .references
-                    .lookup(receipt.address)?
-                    .ok_or(StorageError::Invalid("missing existing batch authority"))?;
+                let registered = self.references.lookup(receipt.address)?;
+                let registered = match registered {
+                    Some(registered) => registered,
+                    None if state.wal_root.is_some() => self.member_authority(receipt.address)?,
+                    None => return Err(StorageError::Invalid("missing existing batch authority")),
+                };
                 if receipt.address.offset != member_offset || registered.group_end() != end {
                     return Err(StorageError::IdentityConflict);
                 }
@@ -1617,26 +2573,36 @@ impl PartitionLog {
             .is_err()
             || predicted_end.saturating_sub(self.references.root().end) > 64 * 1024 * 1024
         {
-            if physical_end(&state) > state.durable_end {
+            if state.references.windowed() {
+                let files = state.appended_end.saturating_sub(1) / config.wal_file_bytes + 1;
+                state.references.persist_pending(files)?;
+                state.references.check_capacity(count, descriptor_count)?;
+                if predicted_end.saturating_sub(self.references.root().end) > 64 * 1024 * 1024 {
+                    return Err(StorageError::Capacity);
+                }
+            } else {
+                if physical_end(&state) > state.durable_end {
+                    return Err(StorageError::NeedsPersistence);
+                }
+                let old_root = self.references.root();
+                let durable_end = state.durable_end;
+                let files = durable_end.saturating_sub(1) / config.wal_file_bytes + 1;
+                if let Err(error) =
+                    state
+                        .references
+                        .start_background(durable_end, files, &self.path)
+                {
+                    state.poison = Some(WriterPoison::Fatal);
+                    return Err(error);
+                }
+                drop(state);
+                self.wait_history()?;
+                let new_root = self.references.root();
+                if new_root.count == old_root.count && new_root.end == old_root.end {
+                    return Err(StorageError::Capacity);
+                }
                 return Err(StorageError::NeedsPersistence);
             }
-            let old_root = self.references.root();
-            let durable_end = state.durable_end;
-            let files = durable_end.saturating_sub(1) / config.wal_file_bytes + 1;
-            if let Err(error) = state
-                .references
-                .start_background(durable_end, files, &self.path)
-            {
-                state.poison = Some(WriterPoison::Fatal);
-                return Err(error);
-            }
-            drop(state);
-            self.wait_history()?;
-            let new_root = self.references.root();
-            if new_root.count == old_root.count && new_root.end == old_root.end {
-                return Err(StorageError::Capacity);
-            }
-            return Err(StorageError::NeedsPersistence);
         }
         let credit = state.references.reserve_group(count, descriptor_count)?;
         // From this point an allocation failure is an unknown effect.
@@ -1753,30 +2719,15 @@ impl PartitionLog {
             let mut frame = vec![0; pending.reservation.frame_len as usize];
             let offset = pending.reservation.frame_offset % pending.reservation.segment.bytes;
             pending.allocation.file.read_exact_at(&mut frame, offset)?;
-            if u32::from_be_bytes(frame[0..4].try_into().unwrap()) as usize + 8 != frame.len()
-                || u32::from_be_bytes(frame[4..8].try_into().unwrap())
-                    != pending.descriptor.frame_crc
-            {
+            let crc = u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]);
+            if crc != pending.descriptor.frame_crc {
                 return Err(StorageError::IncompleteLiveFrame);
             }
-            let payload = CrcFrame::read_from_slice(&frame, 0)
-                .map_err(|_| StorageError::IncompleteLiveFrame)?;
-            if payload.len() < 12 || payload[8..12] != [0, 3, 0, 12] {
-                return Err(StorageError::IncompleteLiveFrame);
-            }
-            let group = CompleteGroup::decode(
-                &self.shape,
-                payload.to_vec().into(),
-                self.config().batch_limits,
-                self.config().group_limits,
-            )
-            .map_err(|_| StorageError::IncompleteLiveFrame)?;
+            let group = self.decode_live_frame(&frame)?;
             if group.batches().len() != pending.descriptor.batches.len() {
                 return Err(StorageError::IncompleteLiveFrame);
             }
             for (batch, summary) in group.batches().iter().zip(&pending.descriptor.batches) {
-                validate_batch(self.config(), batch)
-                    .map_err(|_| StorageError::IncompleteLiveFrame)?;
                 if batch.id() != summary.id
                     || batch.version() != summary.version
                     || batch.digest() != summary.digest
@@ -1787,56 +2738,13 @@ impl PartitionLog {
                 }
             }
             let validation_ns = started.map_or(0, |started| duration_ns(started.elapsed()));
-            let position = pending.allocation.position;
-            let group_end = position.offset() + position.frame_len() as u64;
-            let mut receipts = Vec::with_capacity(group.batches().len());
-            let mut metadata = Vec::with_capacity(group.batches().len());
-            for (batch, offset) in group.batches().iter().zip(group.batch_offsets()) {
-                let receipt = receipt_for(
-                    self.config(),
-                    batch,
-                    member_position(position, *offset, batch),
-                );
-                let descriptors: Box<[_]> = batch.record_descriptors().into();
-                let credit = pending.credit.take_batch(descriptors.len())?;
-                metadata.push(
-                    RegisteredBatch::new(
-                        batch.id(),
-                        batch.version(),
-                        batch.digest(),
-                        receipt.address,
-                        descriptors,
-                        group_end,
-                    )
-                    .with_credit(credit),
-                );
-                receipts.push(receipt);
-            }
-            state.references.publish_group(metadata)?;
-            state.appended_end = group_end;
-            if let Some(frontier) = self.frontier.get() {
-                frontier
-                    .publish_appended(group_end, group.batches().len() as u64)
-                    .map_err(|_| {
-                        StorageError::Invalid("durability frontier rejected a live group")
-                    })?;
-            }
-            let tail = pending
-                .descriptor
-                .batches
-                .last()
-                .ok_or(StorageError::Invalid("empty live group"))?;
-            state.live_tail = Some(LiveFrontierTail {
-                offset: position.offset(),
-                crc: pending.descriptor.frame_crc,
-                id: tail.id,
-                version: tail.version,
-                digest: tail.digest,
-            });
-            state.stats.appended_groups += 1;
-            if state.references.background_failed() {
-                return Err(StorageError::Poisoned);
-            }
+            let receipts = self.publish_live_group(
+                &mut state,
+                &group,
+                pending.allocation.position,
+                crc,
+                &mut pending.credit,
+            )?;
             Ok((receipts, validation_ns))
         })();
         match result {
@@ -2050,33 +2958,44 @@ impl PartitionLog {
                 .is_err()
                 || predicted_end.saturating_sub(rooted_end) > 64 * 1024 * 1024
             {
-                if physical_end(&state) > state.durable_end {
-                    return Err(StorageError::NeedsPersistence);
-                }
-                timing.stage(Some(WriteStage::AppendHistory));
-                let durable_end = state.durable_end;
-                let files = durable_end.saturating_sub(1) / config.wal_file_bytes + 1;
-                let old_root_count = self.references.root().count;
-                if let Err(error) =
+                if state.references.windowed() {
+                    let files = state.appended_end.saturating_sub(1) / config.wal_file_bytes + 1;
+                    state.references.persist_pending(files)?;
                     state
                         .references
-                        .start_background(durable_end, files, &self.path)
-                {
-                    state.poison = Some(WriterPoison::Fatal);
-                    return Err(error);
+                        .check_capacity(group.batches().len(), descriptor_count)?;
+                    if predicted_end.saturating_sub(self.references.root().end) > 64 * 1024 * 1024 {
+                        return Err(StorageError::Capacity);
+                    }
+                } else {
+                    if physical_end(&state) > state.durable_end {
+                        return Err(StorageError::NeedsPersistence);
+                    }
+                    timing.stage(Some(WriteStage::AppendHistory));
+                    let durable_end = state.durable_end;
+                    let files = durable_end.saturating_sub(1) / config.wal_file_bytes + 1;
+                    let old_root_count = self.references.root().count;
+                    if let Err(error) =
+                        state
+                            .references
+                            .start_background(durable_end, files, &self.path)
+                    {
+                        state.poison = Some(WriterPoison::Fatal);
+                        return Err(error);
+                    }
+                    drop(state);
+                    if !wait_history {
+                        return Err(StorageError::NeedsPersistence);
+                    }
+                    self.wait_history()?;
+                    if self.references.root().count == old_root_count
+                        && self.references.root().end == rooted_end
+                    {
+                        return Err(StorageError::Capacity);
+                    }
+                    timing.stage(Some(WriteStage::AppendLock));
+                    continue;
                 }
-                drop(state);
-                if !wait_history {
-                    return Err(StorageError::NeedsPersistence);
-                }
-                self.wait_history()?;
-                if self.references.root().count == old_root_count
-                    && self.references.root().end == rooted_end
-                {
-                    return Err(StorageError::Capacity);
-                }
-                timing.stage(Some(WriteStage::AppendLock));
-                continue;
             }
             state
                 .references
@@ -2087,29 +3006,38 @@ impl PartitionLog {
             {
                 Ok(credit) => credit,
                 Err(StorageError::Capacity) => {
-                    let durable_end = state.durable_end;
-                    let files = durable_end.saturating_sub(1) / config.wal_file_bytes + 1;
-                    if let Err(error) =
-                        state
-                            .references
-                            .start_background(durable_end, files, &self.path)
-                    {
-                        state.poison = Some(WriterPoison::Fatal);
-                        return Err(error);
-                    }
-                    if !state.references.background_active() {
+                    if state.references.windowed() {
+                        let files =
+                            state.appended_end.saturating_sub(1) / config.wal_file_bytes + 1;
+                        state.references.persist_pending(files)?;
                         state
                             .references
                             .reserve_group(group.batches().len(), descriptor_count)?
                     } else {
-                        drop(state);
-                        if !wait_history {
-                            return Err(StorageError::NeedsPersistence);
+                        let durable_end = state.durable_end;
+                        let files = durable_end.saturating_sub(1) / config.wal_file_bytes + 1;
+                        if let Err(error) =
+                            state
+                                .references
+                                .start_background(durable_end, files, &self.path)
+                        {
+                            state.poison = Some(WriterPoison::Fatal);
+                            return Err(error);
                         }
-                        timing.stage(Some(WriteStage::AppendHistory));
-                        self.wait_history()?;
-                        timing.stage(Some(WriteStage::AppendLock));
-                        continue;
+                        if !state.references.background_active() {
+                            state
+                                .references
+                                .reserve_group(group.batches().len(), descriptor_count)?
+                        } else {
+                            drop(state);
+                            if !wait_history {
+                                return Err(StorageError::NeedsPersistence);
+                            }
+                            timing.stage(Some(WriteStage::AppendHistory));
+                            self.wait_history()?;
+                            timing.stage(Some(WriteStage::AppendLock));
+                            continue;
+                        }
                     }
                 }
                 Err(error) => return Err(error),
@@ -2245,6 +3173,8 @@ impl PartitionLog {
     /// call makes every group appended before it captured the frontier durable.
     /// Returns the durable frontier after the call.
     pub fn persist_appended(&self) -> Result<u64, StorageError> {
+        #[cfg(feature = "experimental-nvmeof")]
+        self.self_adopt_live_extent()?;
         self.persist_scope(PersistScope::Appended, None)?;
         Ok(self.durable_frontier.load(Ordering::Acquire))
     }
@@ -2254,6 +3184,8 @@ impl PartitionLog {
         &self,
         profile: &mut StorageWriteProfile,
     ) -> Result<u64, StorageError> {
+        #[cfg(feature = "experimental-nvmeof")]
+        self.self_adopt_live_extent()?;
         self.persist_scope(PersistScope::Appended, Some(profile))?;
         Ok(self.durable_frontier.load(Ordering::Acquire))
     }
@@ -2343,6 +3275,52 @@ impl PartitionLog {
             self.fail_frontier(&format!("persistence failed: {error}"));
         }
         result
+    }
+
+    /// Persist the final names and inventory witnesses after their inodes have
+    /// been synced. Both leases and covering barriers use this same sequence.
+    fn persist_namespace_witnesses(
+        &self,
+        last_file: u64,
+        previous_namespace: Option<u64>,
+        timing: &mut WriteTiming<'_>,
+        witness_persisted: &mut u64,
+    ) -> io::Result<()> {
+        if previous_namespace.is_some_and(|file| file >= last_file) {
+            return Ok(());
+        }
+        timing.record(|profile| {
+            profile.namespace_persist_calls = profile.namespace_persist_calls.saturating_add(1);
+        });
+        timing.stage(Some(WriteStage::PersistNamespace));
+        #[cfg(test)]
+        if self.fail_namespace_persist.swap(false, Ordering::AcqRel) {
+            return Err(io::Error::other(
+                "injected namespace persistence failure after file sync",
+            ));
+        }
+        self.wal.persist_namespace()?;
+        timing.record(|profile| {
+            profile.namespace_persist_successes =
+                profile.namespace_persist_successes.saturating_add(1);
+        });
+        let witness_start = previous_namespace.map_or(0, |file| file + 1);
+        for file in witness_start..=last_file {
+            #[cfg(test)]
+            let fail_witness = self.fail_inventory_witness.swap(0, Ordering::AcqRel);
+            #[cfg(test)]
+            if fail_witness == 1 {
+                return Err(io::Error::other("injected crash before inventory witness"));
+            }
+            if file_inventory::persist(&self.path, self.config(), file, timing)? {
+                *witness_persisted += 1;
+            }
+            #[cfg(test)]
+            if fail_witness == 2 {
+                return Err(io::Error::other("injected crash after inventory witness"));
+            }
+        }
+        Ok(())
     }
 
     fn persist_scope_inner(
@@ -2458,40 +3436,12 @@ impl PartitionLog {
                         profile.file_persist_successes.saturating_add(1);
                 });
             }
-            if namespace_sync {
-                timing.record(|profile| {
-                    profile.namespace_persist_calls =
-                        profile.namespace_persist_calls.saturating_add(1);
-                });
-                timing.stage(Some(WriteStage::PersistNamespace));
-                #[cfg(test)]
-                if self.fail_namespace_persist.swap(false, Ordering::AcqRel) {
-                    return Err(io::Error::other(
-                        "injected namespace persistence failure after file sync",
-                    ));
-                }
-                self.wal.persist_namespace()?;
-                timing.record(|profile| {
-                    profile.namespace_persist_successes =
-                        profile.namespace_persist_successes.saturating_add(1);
-                });
-                let witness_start = previous_namespace.map_or(0, |file| file + 1);
-                for file in witness_start..=last_file {
-                    #[cfg(test)]
-                    let fail_witness = self.fail_inventory_witness.swap(0, Ordering::AcqRel);
-                    #[cfg(test)]
-                    if fail_witness == 1 {
-                        return Err(io::Error::other("injected crash before inventory witness"));
-                    }
-                    if file_inventory::persist(&self.path, self.config(), file, &mut timing)? {
-                        witness_persisted += 1;
-                    }
-                    #[cfg(test)]
-                    if fail_witness == 2 {
-                        return Err(io::Error::other("injected crash after inventory witness"));
-                    }
-                }
-            }
+            self.persist_namespace_witnesses(
+                last_file,
+                previous_namespace,
+                &mut timing,
+                &mut witness_persisted,
+            )?;
             #[cfg(feature = "experimental-nvmeof")]
             if let Some(frontier) = &live_frontier {
                 self.persist_live_frontier(frontier, &mut timing, &mut frontier_syncs)?;
@@ -2560,6 +3510,10 @@ impl PartitionLog {
                 )
             })
             .ok_or(StorageError::Invalid("unknown or foreign address"))?;
+        #[cfg(feature = "experimental-nvmeof")]
+        if self.live_stream && _authority.group_end() > self.readable_frontier() {
+            return Err(StorageError::NeedsPersistence);
+        }
         let _admission = self.read_admission()?;
         let position = WalPosition::new(appended.address.offset, appended.address.len);
         #[cfg(feature = "experimental-nvmeof")]
@@ -2627,6 +3581,71 @@ impl PartitionLog {
         address: PhysicalValueAddress,
     ) -> Result<Option<Arc<RegisteredBatch>>, StorageError> {
         match self.references.lookup(address) {
+            Ok(None) => {
+                #[cfg(feature = "experimental-nvmeof")]
+                if self.live_stream {
+                    let adopt_current =
+                        self.state
+                            .lock()
+                            .open_live_extent
+                            .as_ref()
+                            .is_some_and(|open| {
+                                !open.closing
+                                    && address.offset >= open.extent.start
+                                    && address
+                                        .offset
+                                        .checked_add(u64::from(address.len))
+                                        .is_some_and(|end| end <= open.extent.end)
+                            });
+                    if adopt_current {
+                        self.self_adopt_live_extent()?;
+                        if let Some(registered) = self.references.lookup(address)? {
+                            return Ok(Some(registered));
+                        }
+                    }
+                }
+                let fallback = {
+                    let state = self.state.lock();
+                    let replay = state.wal_root.is_some();
+                    let leased = Self::leased_address(&state, address);
+                    if replay || leased {
+                        let allocated = state
+                            .writer
+                            .as_ref()
+                            .map_or(state.appended_end, WalWriter::position);
+                        if address
+                            .offset
+                            .checked_add(u64::from(address.len))
+                            .is_none_or(|end| end > allocated)
+                            || state.wal_root.as_ref().is_some_and(|root| {
+                                root.retired
+                                    .binary_search(
+                                        &(address.offset / self.config().wal_file_bytes
+                                            * self.config().wal_file_bytes),
+                                    )
+                                    .is_ok()
+                            })
+                        {
+                            return Err(StorageError::Invalid(
+                                "WAL member differs from the reference",
+                            ));
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if fallback {
+                    let _admission = self.read_admission()?;
+                    return self.member_authority(address).map(Some);
+                }
+                #[cfg(feature = "experimental-nvmeof")]
+                if self.live_stream {
+                    self.self_adopt_live_extent()?;
+                    return self.references.lookup(address);
+                }
+                return Ok(None);
+            }
             Err(StorageError::Capacity) => {}
             result => return result,
         }
@@ -2675,7 +3694,15 @@ impl PartitionLog {
         }
         registered.validate_reference(reference)?;
         if registered.group_end() > self.readable_frontier() {
-            return Err(StorageError::NeedsPersistence);
+            // A native-tier caller may already have written a pre-leased frame
+            // while close of the old extent is pending. Its checked WAL member
+            // is readable without adoption, but never without a synchronous
+            // tier's durable frontier.
+            if !self.serve_unsynced.load(Ordering::Acquire)
+                || !Self::leased_address(&self.state.lock(), reference.batch_address)
+            {
+                return Err(StorageError::NeedsPersistence);
+            }
         }
         Ok(())
     }
@@ -2689,6 +3716,23 @@ impl PartitionLog {
             .ok_or(StorageError::Invalid("unknown record reference"))?;
         self.validate_record_authority(reference, &registered)?;
         Ok(registered)
+    }
+
+    /// Blocking owner-serving boundary. A live synchronous read may discover a
+    /// complete frame before adoption control; its own covering barrier must
+    /// finish before any record bytes or a namespace grant leave the owner.
+    fn load_serving_record_authority(
+        &self,
+        reference: &ValueRecordReference,
+    ) -> Result<Arc<RegisteredBatch>, StorageError> {
+        match self.load_durable_record_authority(reference) {
+            #[cfg(feature = "experimental-nvmeof")]
+            Err(StorageError::NeedsPersistence) if self.live_stream => {
+                self.persist_appended()?;
+                self.load_durable_record_authority(reference)
+            }
+            result => result,
+        }
     }
 
     /// Read one independently verified record, never a whole value batch.
@@ -2719,7 +3763,7 @@ impl PartitionLog {
         &self,
         reference: &ValueRecordReference,
     ) -> Result<(), StorageError> {
-        self.load_durable_record_authority(reference)?;
+        self.load_serving_record_authority(reference)?;
         Ok(())
     }
 
@@ -2741,8 +3785,13 @@ impl PartitionLog {
         let Some(registered) = self.references.lookup_resident(reference.batch_address) else {
             return Ok(None);
         };
-        self.plan_registered_record_read(reference, registered)
-            .map(Some)
+        let plan = self.plan_registered_record_read(reference, registered);
+        #[cfg(feature = "experimental-nvmeof")]
+        if self.live_stream && matches!(&plan, Err(StorageError::NeedsPersistence)) {
+            // The caller-inline path cannot perform an owner persistence barrier.
+            return Ok(None);
+        }
+        plan.map(Some)
     }
 
     /// Cold authority lookup is permitted only on a bounded blocking read worker.
@@ -2756,9 +3805,7 @@ impl PartitionLog {
             let _ = entered.send(());
             let _ = resume.recv();
         }
-        let registered = self
-            .load_authority(reference.batch_address)?
-            .ok_or(StorageError::Invalid("unknown record reference"))?;
+        let registered = self.load_serving_record_authority(reference)?;
         let _admission = self.read_admission()?;
         self.plan_registered_record_read(reference, registered)
     }
@@ -2793,7 +3840,7 @@ impl PartitionLog {
         self: &Arc<Self>,
         reference: &ValueRecordReference,
     ) -> Result<super::nvmeof::live_storage::LiveRecordLease, StorageError> {
-        let registered = self.load_durable_record_authority(reference)?;
+        let registered = self.load_serving_record_authority(reference)?;
         let _admission = self.read_admission()?;
         let plan = self.plan_registered_record_read(reference, registered)?;
         self.live_lease(plan, reference.batch_address.offset)
@@ -2841,39 +3888,63 @@ impl PartitionLog {
     }
 
     #[cfg(feature = "experimental-nvmeof")]
-    fn live_lease(
+    pub fn live_file_count(&self) -> Result<u64, StorageError> {
+        let state = self.state.lock();
+        if !state.live {
+            return Err(StorageError::Invalid("not a live WAL stream"));
+        }
+        Ok(state
+            .writer
+            .as_ref()
+            .ok_or(StorageError::Sealed)?
+            .position()
+            .div_ceil(self.config().wal_file_bytes))
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    pub fn live_segment(
         &self,
-        plan: RecordReadPlan,
-        global_offset: u64,
-    ) -> Result<super::nvmeof::live_storage::LiveRecordLease, StorageError> {
-        use super::nvmeof::live_storage::{LiveRecordLease, LiveWalSegment};
+        file_index: u64,
+    ) -> Result<super::nvmeof::live_storage::LiveWalSegment, StorageError> {
         let config = self.config();
-        let file_index = global_offset / config.wal_file_bytes;
-        let metadata = plan.member.file.metadata()?;
+        let path = config.layout().wal_file_name(
+            &self.path,
+            crate::wal::position::WalFileId::from_u64(file_index),
+        );
+        let metadata = fs::metadata(&path)?;
         if metadata.len() != config.wal_file_bytes || !metadata.len().is_multiple_of(4096) {
             return Err(StorageError::Invalid("invalid live namespace geometry"));
         }
-        let offset = plan.member.offset;
-        let len = u32::try_from(plan.member.len).map_err(|_| StorageError::Capacity)?;
-        let segment = LiveWalSegment {
+        Ok(super::nvmeof::live_storage::LiveWalSegment {
             database: config.inventory.database,
             partition: config.partition,
             epoch: config.inventory.epoch,
             generation: config.inventory.segment_generation,
             file_index,
-            path: config.layout().wal_file_name(
-                &self.path,
-                crate::wal::position::WalFileId::from_u64(file_index),
-            ),
+            path,
             bytes: metadata.len(),
             device: metadata.dev(),
             inode: metadata.ino(),
             block_size: 4096,
-        };
-        let named = fs::metadata(&segment.path)?;
-        if named.dev() != segment.device
-            || named.ino() != segment.inode
-            || named.len() != segment.bytes
+        })
+    }
+
+    #[cfg(feature = "experimental-nvmeof")]
+    fn live_lease(
+        &self,
+        plan: RecordReadPlan,
+        global_offset: u64,
+    ) -> Result<super::nvmeof::live_storage::LiveRecordLease, StorageError> {
+        use super::nvmeof::live_storage::LiveRecordLease;
+        let config = self.config();
+        let file_index = global_offset / config.wal_file_bytes;
+        let metadata = plan.member.file.metadata()?;
+        let offset = plan.member.offset;
+        let len = u32::try_from(plan.member.len).map_err(|_| StorageError::Capacity)?;
+        let segment = self.live_segment(file_index)?;
+        if metadata.dev() != segment.device
+            || metadata.ino() != segment.inode
+            || metadata.len() != segment.bytes
         {
             return Err(StorageError::Invalid(
                 "WAL pathname no longer names pinned inode",
@@ -3010,6 +4081,54 @@ impl PartitionLog {
         self.references.read_stats()
     }
 
+    /// Select receipt persistence before writing to this stream.
+    pub fn set_history_persistence(&self, mode: HistoryPersistence) -> Result<(), StorageError> {
+        let _persistence = self.persistence.lock();
+        let mut state = self.state.lock();
+        let stored = self.references.history_persistence();
+        #[cfg(feature = "test-utils")]
+        if (mode == HistoryPersistence::MemoryOnly || stored == HistoryPersistence::MemoryOnly)
+            && state.appended_end != 0
+        {
+            return Err(StorageError::Invalid(
+                "memory-only history does not support restart with data",
+            ));
+        }
+        if mode == stored {
+            return Ok(());
+        }
+        if state
+            .writer
+            .as_ref()
+            .map_or(state.appended_end, WalWriter::position)
+            != 0
+        {
+            return Err(StorageError::Invalid(
+                "history persistence differs from the stored partition",
+            ));
+        }
+        if mode == HistoryPersistence::WalReplay {
+            let root = WalRoot::new(self.config());
+            root.install(&self.path)?;
+            // Install replay authority before removing the old history. A
+            // crash at either side of the cutover can still recover the WAL.
+            state.references.set_history_persistence(mode)?;
+            state.wal_root = Some(root);
+        } else {
+            state.references.set_history_persistence(mode)?;
+            if self.path.join(wal_replay::ROOT).exists() {
+                fs::remove_file(self.path.join(wal_replay::ROOT))?;
+                File::open(&self.path)?.sync_all()?;
+            }
+            state.wal_root = None;
+        }
+        Ok(())
+    }
+
+    pub fn history_persistence(&self) -> HistoryPersistence {
+        self.references.history_persistence()
+    }
+
     /// Enable or disable per-maintenance clocks and counters for this handle.
     pub fn set_history_maintenance_diagnostics(&self, enabled: bool) {
         self.references.set_history_diagnostics(enabled);
@@ -3099,7 +4218,8 @@ impl PartitionLog {
             .store(if after { 2 } else { 1 }, Ordering::Release);
     }
 
-    /// Stable physical append ordinal; includes all pending groups.
+    /// Handle-local append count, including evicted replay-window receipts.
+    /// WAL replay restarts this count at the persisted scan position.
     pub fn receipt_count(&self) -> usize {
         self.references.len()
     }
@@ -3114,6 +4234,22 @@ impl PartitionLog {
     }
 
     pub fn checkpoint_prefix(&self, prefix: usize) -> Result<[u8; 32], StorageError> {
+        #[cfg(feature = "experimental-nvmeof")]
+        self.self_adopt_live_extent()?;
+        #[cfg(feature = "experimental-nvmeof")]
+        if self.live_stream && prefix != 0 {
+            let receipt = self
+                .references
+                .receipt_page(prefix - 1, 1)?
+                .into_iter()
+                .next()
+                .ok_or(StorageError::Invalid(
+                    "checkpoint prefix exceeds receipt authority",
+                ))?;
+            if pending_persistence(&self.state.lock(), receipt)?.is_some() {
+                return Err(StorageError::NeedsPersistence);
+            }
+        }
         self.references.checkpoint_prefix(
             prefix,
             self.config().inventory.database,
@@ -3139,9 +4275,7 @@ impl PartitionLog {
             let offset = id
                 .checked_mul(self.config().wal_file_bytes)
                 .ok_or(StorageError::Invalid("WAL offset overflow"))?;
-            if start_after.is_some_and(|after| offset <= after)
-                || self.references.is_retired(offset)?
-            {
+            if start_after.is_some_and(|after| offset <= after) || self.is_retired(offset)? {
                 continue;
             }
             match result.binary_search(&offset) {
@@ -3161,6 +4295,11 @@ impl PartitionLog {
     /// Authenticated authority has proved these sealed files wholly unreachable
     /// from its installed index, retained cuts and pins. No values are relocated.
     pub fn retire_files(&self, recovery_prefix: usize, files: &[u64]) -> Result<(), StorageError> {
+        if self.history_persistence() == HistoryPersistence::WalReplay {
+            return Err(StorageError::Invalid(
+                "retirement by receipt prefix requires on-disk history",
+            ));
+        }
         let _persistence = self.persistence.lock();
         let mut state = self.state.lock();
         if !state.sealed
@@ -3309,6 +4448,9 @@ impl PartitionLog {
         })
     }
 
+    /// The control service's exclusive FIFO barrier waits for stream requests,
+    /// so its seal cannot overlap close. Direct API callers get the same
+    /// exclusion from the state-owned sealing flag; closing is refused.
     #[cfg(feature = "experimental-nvmeof")]
     pub fn seal_live_epoch(
         &self,
@@ -3318,6 +4460,103 @@ impl PartitionLog {
         self.seal_epoch_impl(authority, revoke_and_drain)
     }
 
+    #[cfg(feature = "experimental-nvmeof")]
+    fn finish_live_extent_for_seal(&self) -> Result<(), StorageError> {
+        // Revocation has drained external writes. Each retry either discovers
+        // another frame or drains pressure; the finite extent bounds progress.
+        for _ in 0..2 * (self.config().fragment_bytes / 4096 + 2) {
+            self.self_adopt_live_extent()?;
+            self.persist_scope(PersistScope::Appended, None)?;
+            let _persistence = self.persistence.lock();
+            let mut state = self.state.lock();
+            if state.poison.is_some() || state.references.background_failed() {
+                return Err(StorageError::Poisoned);
+            }
+            let Some(mut open) = state.open_live_extent.take() else {
+                return Ok(());
+            };
+            if open.closing {
+                state.open_live_extent = Some(open);
+                return Err(StorageError::Invalid("live extent is closing"));
+            }
+            let end = open.extent.end;
+            match self.adopt_live_frame(&mut state, &mut open, end) {
+                Ok(LiveFrameStep::End) => {
+                    // Revocation has drained writes; a valid skip can bridge
+                    // the current extent into the already granted next one.
+                    drop(open);
+                    state.open_live_extent = state.next_live_extent.take();
+                    if state.open_live_extent.is_none() {
+                        return Ok(());
+                    }
+                }
+                Err(StorageError::IncompleteLiveFrame) => {
+                    if state.next_live_extent.is_some() {
+                        // Sealing excludes new writes/adoptions. The local
+                        // allocation pins the inode during unlocked suffix I/O.
+                        drop(state);
+                        let suffix = self.validate_live_extent_close(
+                            &open.allocation.file,
+                            &mut open.buffer,
+                            open.adoption.adopted_end,
+                            end,
+                            open.extent.segment.bytes,
+                        );
+                        let mut state = self.state.lock();
+                        match suffix {
+                            Ok(()) => {
+                                drop(open);
+                                state.open_live_extent = state.next_live_extent.take();
+                                continue;
+                            }
+                            Err(StorageError::IncompleteLiveFrame) => {
+                                let next = state
+                                    .next_live_extent
+                                    .as_ref()
+                                    .ok_or(StorageError::Poisoned)?;
+                                open.buffer.resize(4096, 0);
+                                if let Err(error) = next.allocation.file.read_exact_at(
+                                    &mut open.buffer,
+                                    next.extent.start % next.extent.segment.bytes,
+                                ) {
+                                    state.open_live_extent = Some(open);
+                                    state.poison = Some(WriterPoison::Fatal);
+                                    return Err(StorageError::Io(error));
+                                }
+                                if open.buffer.iter().any(|byte| *byte != 0) {
+                                    state.open_live_extent = Some(open);
+                                    state.poison = Some(WriterPoison::Fatal);
+                                    return Err(StorageError::Invalid(
+                                        "live frames beyond a torn extent tail",
+                                    ));
+                                }
+                            }
+                            Err(error) => {
+                                state.open_live_extent = Some(open);
+                                state.poison = Some(WriterPoison::Fatal);
+                                return Err(error);
+                            }
+                        }
+                        state.next_live_extent = None;
+                    }
+                    // An unwritten/torn tail with no later bytes is discarded.
+                    drop(open);
+                    return Ok(());
+                }
+                Ok(LiveFrameStep::Adopted | LiveFrameStep::Pressure(_)) => {
+                    state.open_live_extent = Some(open);
+                }
+                Err(error) => {
+                    state.open_live_extent = Some(open);
+                    state.poison = Some(WriterPoison::Fatal);
+                    return Err(error);
+                }
+            }
+        }
+        self.state.lock().poison = Some(WriterPoison::Fatal);
+        Err(StorageError::Invalid("live seal exceeded bounded progress"))
+    }
+
     fn seal_epoch_impl(
         &self,
         authority: RequestAuthority,
@@ -3325,6 +4564,57 @@ impl PartitionLog {
     ) -> Result<(), StorageError> {
         if authority.epoch != self.config().inventory.epoch {
             return Err(StorageError::Fenced);
+        }
+        #[cfg(feature = "experimental-nvmeof")]
+        let exclusive = {
+            let mut state = self.state.lock();
+            if state.live && !state.sealed {
+                if state.sealing {
+                    return Err(StorageError::Invalid("live stream is sealing"));
+                }
+                if state
+                    .open_live_extent
+                    .as_ref()
+                    .is_some_and(|open| open.closing)
+                    || state
+                        .next_live_extent
+                        .as_ref()
+                        .is_some_and(|open| open.closing)
+                {
+                    return Err(StorageError::Invalid("live extent is closing"));
+                }
+                state.sealing = true;
+                true
+            } else {
+                false
+            }
+        };
+        let result = self.seal_epoch_inner(authority, revoke_and_drain);
+        #[cfg(feature = "experimental-nvmeof")]
+        if exclusive {
+            self.state.lock().sealing = false;
+        }
+        result
+    }
+
+    fn seal_epoch_inner(
+        &self,
+        authority: RequestAuthority,
+        revoke_and_drain: impl FnOnce() -> Result<(), StorageError>,
+    ) -> Result<(), StorageError> {
+        #[cfg(feature = "experimental-nvmeof")]
+        let mut revoke_and_drain = Some(revoke_and_drain);
+        #[cfg(feature = "experimental-nvmeof")]
+        let has_extents = {
+            let state = self.state.lock();
+            state.open_live_extent.is_some() || state.next_live_extent.is_some()
+        };
+        #[cfg(feature = "experimental-nvmeof")]
+        if has_extents {
+            revoke_and_drain
+                .take()
+                .ok_or(StorageError::Invalid("missing live revocation"))?()?;
+            self.finish_live_extent_for_seal()?;
         }
         let _persistence = self.persistence.lock();
         let mut state = self.state.lock();
@@ -3337,7 +4627,9 @@ impl PartitionLog {
         }
         #[cfg(feature = "experimental-nvmeof")]
         if state.live {
-            revoke_and_drain()?;
+            if let Some(revoke_and_drain) = revoke_and_drain.take() {
+                revoke_and_drain()?;
+            }
             if state.pending_live.is_some() {
                 state.poison = Some(WriterPoison::Fatal);
                 return Err(StorageError::Invalid(
@@ -3357,6 +4649,10 @@ impl PartitionLog {
             return Err(StorageError::Poisoned);
         }
         // Stop writer workers while retaining exclusive ownership of the path.
+        #[cfg(feature = "experimental-nvmeof")]
+        drop(state.open_live_extent.take());
+        #[cfg(feature = "experimental-nvmeof")]
+        drop(state.next_live_extent.take());
         drop(state.writer.take());
         state.sealed = true; // I/O errors must never reopen this writer.
         if let Err(error) = self.wal.persist_registered_files() {
@@ -3375,6 +4671,13 @@ impl PartitionLog {
                 frame_count: self.references.len(),
                 physical_end: physical_end(&state),
             };
+            if let Some(root) = &mut state.wal_root {
+                root.generation = root
+                    .generation
+                    .checked_add(1)
+                    .ok_or(StorageError::Capacity)?;
+                root.install(&self.path)?;
+            }
             install_metadata(&self.path, SEAL, &encode_metadata(&end)?)?;
             Ok(end)
         })();
@@ -3410,6 +4713,11 @@ pub fn recover_inventory(
         .map(|(path, config)| PartitionLog::recover_sealed(path, config, metrics.clone()))
         .collect::<Result<_, _>>()?;
     for log in &logs {
+        if log.history_persistence() != HistoryPersistence::OnDisk {
+            return Err(StorageError::Invalid(
+                "inventory recovery requires on-disk history",
+            ));
+        }
         if log.registration.shape_yaml != logs[0].registration.shape_yaml {
             return Err(StorageError::Invalid(
                 "inconsistent database schema in registered inventory",
@@ -3443,7 +4751,11 @@ fn validate_batch(config: &PartitionConfig, batch: &CompleteBatch) -> Result<(),
     Ok(())
 }
 
-fn member_position(group: WalPosition, member_offset: u32, batch: &CompleteBatch) -> WalPosition {
+pub(crate) fn member_position(
+    group: WalPosition,
+    member_offset: u32,
+    batch: &CompleteBatch,
+) -> WalPosition {
     // CompleteGroup has validated bounds and alignment; native allocation fits
     // the outer frame inside one fragment, so every child shares that WAL file.
     WalPosition::new(
@@ -3452,7 +4764,11 @@ fn member_position(group: WalPosition, member_offset: u32, batch: &CompleteBatch
     )
 }
 
-fn receipt_for(config: &PartitionConfig, batch: &CompleteBatch, pos: WalPosition) -> AppendedBatch {
+pub(crate) fn receipt_for(
+    config: &PartitionConfig,
+    batch: &CompleteBatch,
+    pos: WalPosition,
+) -> AppendedBatch {
     AppendedBatch {
         id: batch.id(),
         version: batch.version(),
@@ -3467,7 +4783,18 @@ fn receipt_for(config: &PartitionConfig, batch: &CompleteBatch, pos: WalPosition
 }
 
 fn pending_persistence(state: &State, receipt: AppendedBatch) -> Result<Option<u64>, StorageError> {
-    let end = state.references.receipt_group_end(receipt)?;
+    let end = state
+        .references
+        .receipt_group_end(receipt)
+        .map_err(|error| {
+            if state.wal_root.is_some()
+                && matches!(error, StorageError::Invalid("receipt not from this log"))
+            {
+                StorageError::Invalid("receipt outside the replay window")
+            } else {
+                error
+            }
+        })?;
     if state.poison.is_some() || state.references.background_failed() {
         return Err(StorageError::Poisoned);
     }
@@ -3817,3 +5144,47 @@ impl std::error::Error for StorageError {}
 mod crash_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[test]
+fn native_layout_matches_the_original_engine_defaults() {
+    let native = crate::config::Config::default();
+    assert_eq!(
+        (
+            native.frag_size,
+            native.wal_file_size,
+            native.max_maps,
+            native.direct_io,
+        ),
+        (
+            NATIVE_FRAGMENT_BYTES,
+            NATIVE_WAL_FILE_BYTES,
+            NATIVE_MAX_MAPS,
+            false,
+        )
+    );
+    let mut config = PartitionConfig {
+        inventory: StaticInventory {
+            database: [1; 16],
+            epoch: 1,
+            segment_generation: 1,
+            partitions: vec![0],
+        },
+        partition: 0,
+        batch_limits: BatchLimits {
+            max_operations: 1,
+            max_encoded_bytes: 1024,
+        },
+        group_limits: GroupLimits {
+            max_batches: 1,
+            max_encoded_bytes: 2048,
+        },
+        fragment_bytes: NATIVE_FRAGMENT_BYTES,
+        wal_file_bytes: NATIVE_WAL_FILE_BYTES,
+        max_batches: 1024,
+        max_reference_metadata_bytes: 1024 * 1024,
+    };
+    assert_eq!(config.layout().max_maps, NATIVE_MAX_MAPS);
+    config.fragment_bytes = 4 * 1024 * 1024;
+    assert_eq!(config.layout().max_maps, RESEARCH_MAX_MAPS);
+}

@@ -488,6 +488,7 @@ impl LiveTargetManager {
             service: self.state.config.commissioning_service,
             transport: NvmeofTransport::Tcp,
             spdk: binding.spdk.clone(),
+            geometry: Default::default(),
         };
         let deadline = Instant::now() + Duration::from_secs(20);
         let access = if readonly {

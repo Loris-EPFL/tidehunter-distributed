@@ -1376,7 +1376,9 @@ struct Output {
     node_profiles: BufWriter<File>,
     read_io: BufWriter<File>,
     write_io: BufWriter<File>,
+    #[cfg(feature = "test-utils")]
     cold_probes: BufWriter<File>,
+    #[cfg(feature = "test-utils")]
     cold_group_probes: BufWriter<File>,
     read_path_evidence: BufWriter<File>,
     native_read_profiles: BufWriter<File>,
@@ -1407,7 +1409,9 @@ impl Output {
             node_profiles: create("node_profiles.yaml")?,
             read_io: create("read_io.csv")?,
             write_io: create("write_io.csv")?,
+            #[cfg(feature = "test-utils")]
             cold_probes: create("cold_probes.jsonl")?,
+            #[cfg(feature = "test-utils")]
             cold_group_probes: create("cold_group_probes.jsonl")?,
             read_path_evidence: create("read_path_evidence.csv")?,
             native_read_profiles: create("native_read_profiles.csv")?,

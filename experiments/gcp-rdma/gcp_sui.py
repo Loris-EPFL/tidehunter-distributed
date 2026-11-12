@@ -17,13 +17,15 @@ import subprocess
 import sys
 import tarfile
 import time
+import uuid
 
 from gcp_runtime import GUEST_PYTHON
 
 TIP = 1775
 CHECKPOINT = 'EhUPyfwLGDEKH5Ssg3nFbVAHwi4XA87xNKvnFEo3ZJb6'
 BINARIES = {'sui-node-native', 'sui-node-remote', 'storage-node', 'state-audit', 'rocksdb-audit', 'transport-floor'}
-TRANSPORTS = {'tcp', 'tidehunter_verbs', 'tidehunter_verbs_native'}
+TRANSPORTS = {'tcp', 'tidehunter_verbs', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma'}
+CELL_PATTERN = r'r0[1-4]-(?:tcp|tidehunter_verbs(?:_native)?|tidehunter_nvme_rdma)'
 
 
 def owner_deadline(fleet_deadline, now=None):
@@ -225,6 +227,54 @@ def selected_transports(spec):
         raise ValueError('unsupported Sui transport: remote software fabric, NVMe replay and EFA are unavailable on GCP')
     return choices
 
+def sui_cell_settings(spec):
+    defaults = dict(sui_contract='harness', sui_owner_tier=None, sui_owner_wal='harness',
+                    sui_live_export_mode='per_owner',
+                    sui_live_queue_geometry=dict(io_queues=1, queue_size=32, poll_queues=0))
+    values = {key: spec.get(key, default) for key, default in defaults.items()}
+    choices = dict(sui_contract=('harness', 'original_default'),
+                   sui_owner_tier=(None, 'native', 'synchronous'),
+                   sui_owner_wal=('harness', 'engine_default'),
+                   sui_live_export_mode=('per_owner', 'per_file', 'on_demand'))
+    for key, allowed in choices.items():
+        if values[key] not in allowed:
+            raise ValueError('invalid Sui cell setting: ' + key)
+    geometry = values['sui_live_queue_geometry']
+    if (not isinstance(geometry, dict) or set(geometry) != {'io_queues', 'queue_size', 'poll_queues'}
+            or any(type(value) is not int for value in geometry.values())):
+        raise ValueError('invalid Sui cell setting: sui_live_queue_geometry')
+    return values
+
+
+def sui_cells(spec):
+    if 'sui_cells' not in spec:
+        settings = sui_cell_settings(spec)
+        return [dict(transport=label, contract=settings['sui_contract'],
+                     owner_tier=settings['sui_owner_tier'], owner_wal=settings['sui_owner_wal'])
+                for label in selected_transports(spec)]
+    if any(key in spec for key in ('sui_transports', 'sui_contract', 'sui_owner_tier', 'sui_owner_wal')):
+        raise ValueError('sui_cells replaces the suite-level Sui keys')
+    cells = spec['sui_cells']
+    if (not isinstance(cells, list) or not 1 <= len(cells) <= 4
+            or any(not isinstance(cell, dict)
+                   or set(cell) != {'transport', 'contract', 'owner_tier', 'owner_wal'}
+                   or not isinstance(cell['transport'], str) or cell['transport'] not in TRANSPORTS
+                   or cell['contract'] not in ('harness', 'original_default')
+                   or cell['owner_tier'] not in (None, 'native', 'synchronous')
+                   or cell['owner_wal'] not in ('harness', 'engine_default')
+                   for cell in cells)):
+        raise ValueError('invalid Sui cell setting: sui_cells')
+    return [cell.copy() for cell in cells]
+
+
+def live_nvme_config(owner_hosts, settings):
+    identity = uuid.uuid4()
+    return dict(addresses=[host['rdma_ip'] for host in owner_hosts],
+                host_nqn='nqn.2014-08.org.nvmexpress:uuid:' + str(identity),
+                host_id=list(identity.bytes), queue_geometry=settings['sui_live_queue_geometry'],
+                export_mode=settings['sui_live_export_mode'])
+
+
 def check_receipt(receipt):
     if receipt.get('exit_code') != 0:
         raise RuntimeError('remote Sui operation failed: ' + str(receipt.get('stderr', ''))[-2048:])
@@ -239,7 +289,7 @@ def node_action(args):
     import gcp_api
     store = gcp_api.GoogleApi(args.project, token_provider=gcp_api.metadata_token).objects(args.bucket)
     base = storage_root(args.run_id) / 'checkpoint-cells' / args.cell / 'storage'
-    if not re.fullmatch(r'bench-[0-9a-f]{16}', args.run_id) or not re.fullmatch(r'r0[1-4]-(?:tcp|tidehunter_verbs(?:_native)?)', args.cell):
+    if not re.fullmatch(r'bench-[0-9a-f]{16}', args.run_id) or not re.fullmatch(CELL_PATTERN, args.cell):
         raise ValueError('invalid run/cell identity')
     if args.action == 'start':
         archive = base.parent / 'payload.tar.gz'
@@ -286,10 +336,12 @@ def node_action(args):
 
 def run_suite(config, mailbox, package, fixture, *, output_root):
     """Run paired native/distributed Sui cells; raise on any incomplete evidence."""
-    if len(config['fleet']) != 6:
-        raise ValueError('Sui suite requires five owner hosts')
+    if len(config['fleet']) not in (2, 6):
+        raise ValueError('Sui suite requires one or five owner hosts')
     spec, fleet, store = config['spec'], config['fleet'], mailbox.store
-    transports = selected_transports(spec)
+    cells = sui_cells(spec)
+    transports = [cell['transport'] for cell in cells]
+    settings = sui_cell_settings(spec)
     output = Path(output_root)
     output.mkdir(parents=True, exist_ok=False, mode=0o700)
     data_root = storage_root(config['run_id'])
@@ -322,12 +374,15 @@ def run_suite(config, mailbox, package, fixture, *, output_root):
     scripts = build_root / 'sources/tidehunter-sharded-wal/experiments/sui-checkpoint'
     sys.path.insert(0, str(scripts.parent))
     from portable_transport import transport_for_case, select_transports
+    if 'tidehunter_nvme_rdma' in transports and (not manifest.get('fabric') or manifest.get('nvmeof') is not True):
+        raise ValueError('selected NVMe-oF transport requires an NVMe-oF-enabled Sui build')
     if any(t != 'tcp' for t in transports) and not manifest.get('fabric'):
         raise ValueError('selected fabric transport requires a fabric-enabled Sui build')
     helper = Path(config['package_root']) / 'source/experiments/gcp-rdma/gcp_sui.py'
     base = data_root / 'checkpoint-cells'
     results = []
-    for number, label in enumerate(transports, 1):
+    for number, cell_settings in enumerate(cells, 1):
+        label = cell_settings['transport']
         cell = f'r0{number}-{label}'
         cell_root = base / cell
         cell_root.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -336,13 +391,14 @@ def run_suite(config, mailbox, package, fixture, *, output_root):
         replay = cell_root / 'replay'
         import yaml
         suffix = Path(yaml.safe_load((fixture_root / 'distributed.yaml').read_text())['db-path']).relative_to('distributed')
-        transport = transport_for_case(label)
+        owner_hosts = fleet[1:] if len(fleet) == 6 else fleet[1:] * 5
+        transport = transport_for_case('tidehunter_verbs_native' if label == 'tidehunter_nvme_rdma' else label)
         owners = select_transports(transport, None, 5)
-        if label.startswith('tidehunter_verbs'):
+        if label.startswith('tidehunter_verbs') or label == 'tidehunter_nvme_rdma':
             transport['fabric']['source_address'] = fleet[0]['rdma_ip']
-            for host, owner in zip(fleet[1:], owners):
+            for host, owner in zip(owner_hosts, owners):
                 owner['fabric']['source_address'] = host['rdma_ip']
-        hosts = [h['internal_ip'] for h in fleet[1:]]
+        hosts = [h['internal_ip'] for h in owner_hosts]
         save(cell_root / 'transport.json', transport)
         save(cell_root / 'owners.json', owners)
         cache = spec.get('sui_coordinator_cache_mib', 8)
@@ -350,15 +406,22 @@ def run_suite(config, mailbox, package, fixture, *, output_root):
         write_profile = spec.get('sui_write_profile_limit', 0)
         native_profile = spec.get('sui_native_write_profile_limit', 0)
         deployment = cell_root / 'deployment'
-        command([sys.executable, scripts / 'prepare_external.py', '--schema', verification / 'experiment/native-schema', '--build', build_root,
+        prepare_args = [sys.executable, scripts / 'prepare_external.py', '--schema', verification / 'experiment/native-schema', '--build', build_root,
                  '--output', deployment, '--db-root', replay / 'remote' / suffix, '--guest-root', cell_root / 'storage', '--hosts', ','.join(hosts),
                  '--transport-config', cell_root / 'transport.json', '--owner-transports', cell_root / 'owners.json', '--coordinator-cache-mib', cache,
-                 '--write-profile-limit', write_profile], 120)
+                 '--write-profile-limit', write_profile, '--owner-wal', cell_settings['owner_wal']]
+        if cell_settings['owner_tier'] is not None:
+            prepare_args += ['--owner-tier', cell_settings['owner_tier']]
+        if label == 'tidehunter_nvme_rdma':
+            live_path = cell_root / 'live-nvme.json'
+            save(live_path, live_nvme_config(owner_hosts, settings))
+            prepare_args += ['--live-nvme', live_path]
+        command(prepare_args, 120)
         external = load(deployment / 'external-manifest.json')
         if (external.get('config_sha256') != sha(deployment / 'config.json')
                 or external.get('build_manifest_sha256') != sha(build_root / 'build-manifest.json')
                 or external.get('storage_binary_sha256') != manifest['binaries']['storage-node']
-                or len(external.get('hosts', [])) != 5):
+                or len(external.get('hosts', [])) != len(set(hosts))):
             raise ValueError('prepared deployment provenance or host count differs')
         references = []
         stop_attempted = set()
@@ -369,7 +432,8 @@ def run_suite(config, mailbox, package, fixture, *, output_root):
             return mailbox.submit(index, argv, operation_id=f'sui-{cell}-{action}-{index}', timeout_seconds=timeout)
         try:
             for index, host in enumerate(external['hosts'], 1):
-                if host.get('partition') != index - 1 or host.get('host') != hosts[index - 1] or sha(host['archive']) != host['archive_sha256']:
+                if ((host.get('partitions') != list(range(5)) if len(fleet) == 2 else host.get('partition') != index - 1)
+                        or host.get('host') != hosts[index - 1] or sha(host['archive']) != host['archive_sha256']):
                     raise ValueError('prepared host payload identity differs')
                 payload = cell_root / f'payload-{index}'
                 extract(host['archive'], payload)
@@ -390,7 +454,7 @@ def run_suite(config, mailbox, package, fixture, *, output_root):
                 key = f'runs/{config["run_id"]}/sui/{cell}/payload-{index}.tar.gz'
                 meta = store.upload(key, archive, if_generation_match=0)
                 references.append(call(index, 'start', ('--key', key, '--generation', str(meta['generation']), '--sha256', sha(archive)), timeout=7200))
-            for index in range(1, 6):
+            for index in range(1, len(external['hosts']) + 1):
                 check_receipt(mailbox.wait(call(index, 'ready'), timeout_seconds=150))
             stages = cell_root / 'stages'
             stages.mkdir()
@@ -399,7 +463,7 @@ def run_suite(config, mailbox, package, fixture, *, output_root):
                     '--deadline', spec.get('sui_replay_deadline_seconds', 900), '--external-config', deployment / 'config.json',
                     '--external-resources', resources, '--external-stage-dir', stages, '--coordinator-cache-mib', cache,
                     '--read-profile-limit', read_profile, '--write-profile-limit', write_profile,
-                    '--native-write-profile-limit', native_profile]
+                    '--native-write-profile-limit', native_profile, '--contract', cell_settings['contract']]
             with (out / 'replay.log').open('wb') as log:
                 child = subprocess.Popen(list(map(str, args)), stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
                 try:
@@ -414,13 +478,13 @@ def run_suite(config, mailbox, package, fixture, *, output_root):
                     binding = dict(config_sha256=sha(deployment / 'config.json'), build_manifest_sha256=sha(build_root / 'build-manifest.json'), checkpoint_digest=CHECKPOINT)
                     if any(any(row.get(k) != v for k, v in binding.items()) or row.get('stage') != name for name, row in stage_rows.items()):
                         raise ValueError('stage provenance differs')
-                    for index in range(1, 6):
+                    for index in range(1, len(external['hosts']) + 1):
                         stop_attempted.add(index)
                         check_receipt(mailbox.wait(call(index, 'stop'), timeout_seconds=180))
                     for ref in references:
                         owner_completions.append(check_receipt(mailbox.wait(ref, timeout_seconds=180)))
                     host_resources = {}
-                    for index in range(1, 6):
+                    for index in range(1, len(external['hosts']) + 1):
                         rec = check_receipt(mailbox.wait(call(index, 'collect'), timeout_seconds=180))
                         desc = descriptor(json.loads(rec['stdout'].strip().splitlines()[-1]))
                         data = store.get(desc['key'], generation=desc['generation'], max_bytes=32 << 20)
@@ -451,7 +515,13 @@ def run_suite(config, mailbox, package, fixture, *, output_root):
                     or receipt.get('complete') is not True or sha(replay / 'evidence.tar.gz') != receipt.get('evidence_sha256')
                     or result.get('binaries') != manifest['binaries'] or result.get('checkpoint_digest') != CHECKPOINT):
                 raise ValueError('replay receipt or full-state audit failed')
-            results.append(dict(cell=cell, transport=label, receipt=receipt, owner_receipts=owner_completions))
+            cell_result = dict(cell=cell, transport=label, receipt=receipt, owner_receipts=owner_completions,
+                               contract=cell_settings['contract'], owner_tier=cell_settings['owner_tier'],
+                               owner_wal=cell_settings['owner_wal'])
+            if label == 'tidehunter_nvme_rdma':
+                cell_result.update(live_export_mode=settings['sui_live_export_mode'],
+                                   live_queue_geometry=settings['sui_live_queue_geometry'])
+            results.append(cell_result)
         finally:
             # run.py writes its failure receipt/evidence in its own finally.
             # Keep any completed files even when replay or qualification fails.

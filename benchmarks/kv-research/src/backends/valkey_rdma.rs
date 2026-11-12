@@ -1255,7 +1255,7 @@ impl KvBackend for ValkeyRdmaBackend {
     fn info(&self) -> BackendInfo {
         self.info.clone()
     }
-    fn read_observation(&self) -> Value {
+    fn read_observation(&self) -> BackendResult<Value> {
         // Valkey serves reads from RAM and exposes no storage read counters; only client pool
         // health is observed, so the generic read evidence stays unavailable.
         let sum = |counter: fn(&PoolHealth) -> &AtomicU64| -> u64 {
@@ -1264,7 +1264,7 @@ impl KvBackend for ValkeyRdmaBackend {
                 .map(|node| counter(&node.ctx.health).load(Ordering::Relaxed))
                 .fold(0, u64::saturating_add)
         };
-        json!({
+        Ok(json!({
             "available": false,
             "error": "Valkey exposes no storage read counters",
             "client_pool": {
@@ -1274,7 +1274,7 @@ impl KvBackend for ValkeyRdmaBackend {
                 "timeouts_before_send": sum(|h| &h.timeouts_before_send),
                 "pool_size_per_owner": POOL_SIZE,
             }
-        })
+        }))
     }
     fn arm_client_profile(&self, limit: usize) -> BackendResult<()> {
         Self::arm_client_profile(self, limit)

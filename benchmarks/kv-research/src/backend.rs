@@ -5,6 +5,18 @@ use tidehunter::minibytes::Bytes;
 
 pub type BackendResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// A live leased evidence boundary could not obtain a quiescent adoption cut.
+#[derive(Debug)]
+pub(crate) struct LiveAdoptionBoundaryError(pub(crate) &'static str);
+
+impl std::fmt::Display for LiveAdoptionBoundaryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for LiveAdoptionBoundaryError {}
+
 /// Keep the inherited engine API unchanged while retaining typed I/O causes.
 #[derive(Debug)]
 struct NativeError(tidehunter::db::DbError);
@@ -120,8 +132,10 @@ pub trait KvBackend: Send + Sync + 'static {
     }
 
     /// Observe read counters outside timed API calls. Unsupported backends report absence.
-    fn read_observation(&self) -> serde_json::Value {
-        serde_json::json!({"available": false, "error": "backend does not expose read observations"})
+    fn read_observation(&self) -> BackendResult<serde_json::Value> {
+        Ok(
+            serde_json::json!({"available": false, "error": "backend does not expose read observations"}),
+        )
     }
     /// Advisory mapped-WAL eviction outside timed operations, with evidence.
     fn evict_mapped_wal_before_measurement(&self) -> BackendResult<serde_json::Value> {

@@ -1,0 +1,3 @@
+{"excluded_from_final": false, "figure_points": 348, "figures": 5, "numbers": 360, "pages": null, "pass_check": true, "pdf_sha256": null, "synthetic": true, "tables": 6, "visual_inspection": "separate rendered-image review, not asserted by this checker"}
+
+{"excluded_from_final": false, "figure_points": 348, "figures": 5, "numbers": 360, "pages": 53, "pass_check": true, "pdf_sha256": "3bc46ef34fdedc81549a2c6ee6836fedda8bd4cc778bb8cb68708cb7b0bad3e6", "synthetic": true, "tables": 6, "visual_inspection": "separate rendered-image review, not asserted by this checker"}

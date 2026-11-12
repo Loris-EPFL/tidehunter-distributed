@@ -7,6 +7,8 @@ fn background_history_retains_prefix_and_bounds_tail_until_adoption() {
     config.max_batches = 4;
     let path = temp.path().join("stream");
     let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     log.set_history_maintenance_diagnostics(true);
     let old_reader = log.references.freeze_history();
     let (entered, resume) = log.references.pause_next_history();
@@ -69,6 +71,8 @@ fn background_root_install_failure_poisons_and_reopens_rooted_suffix() {
     config.max_batches = 2;
     let path = temp.path().join("stream");
     let log = Arc::new(PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap());
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     let notifications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let observed = notifications.clone();
     let weak = Arc::downgrade(&log);
@@ -147,6 +151,8 @@ fn history_budget_preflight_rejects_without_filesystem_mutation() {
     assert!(PartitionLog::create(&path, too_small.clone(), &shape(), metrics()).is_err());
     assert!(!path.exists());
     let log = PartitionLog::create(&path, config, &shape(), metrics()).unwrap();
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     drop(log);
     let root = fs::read(path.join("storage-history-root-v2")).unwrap();
     let registration = fs::read(path.join(REGISTRATION)).unwrap();
@@ -165,6 +171,8 @@ fn dropping_stream_joins_inflight_history_before_reopen() {
     config.max_batches = 2;
     let path = temp.path().join("stream");
     let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     let (entered, resume) = log.references.pause_next_history();
     let receipt = log
         .append_complete_batch(authority(&config), &batch(&config, 0))
@@ -200,6 +208,8 @@ fn completed_history_exceeds_resident_limit_with_stable_paged_retries_and_prefix
     config.max_batches = 2;
     let path = temp.path().join("stream");
     let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     let mut receipts = Vec::new();
     let mut proof = None;
     for n in 0..18 {
@@ -252,6 +262,8 @@ fn rooted_retirement_replays_before_or_after_interrupted_unlink() {
         let config = config(vec![3], 3);
         let path = temp.path().join("stream");
         let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+        log.set_history_persistence(HistoryPersistence::OnDisk)
+            .unwrap();
         let first = log
             .append_complete_batch(authority(&config), &batch(&config, 0))
             .unwrap();
@@ -286,6 +298,8 @@ fn sealed_empty_history_does_not_recreate_retired_wal_zero() {
     let config = config(vec![3], 3);
     let path = temp.path().join("stream");
     let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     log.seal_epoch(authority(&config)).unwrap();
     let files = log.wal_file_page(None, 256).unwrap();
     assert!(!files.is_empty());
@@ -305,6 +319,8 @@ fn in_flight_file_and_descriptor_owners_survive_retirement_but_new_reads_fail() 
     let config = config(vec![3], 3);
     let path = temp.path().join("stream");
     let log = Arc::new(PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap());
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     let receipt = log
         .append_complete_batch(authority(&config), &batch(&config, 0))
         .unwrap();
@@ -352,6 +368,8 @@ fn missing_or_corrupt_authority_and_unknown_missing_payload_fail_closed() {
         config.max_batches = 1;
         let path = temp.path().join("stream");
         let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+        log.set_history_persistence(HistoryPersistence::OnDisk)
+            .unwrap();
         let receipt = log
             .append_complete_batch(authority(&config), &batch(&config, 0))
             .unwrap();
@@ -377,6 +395,8 @@ fn retirement_rejects_unsealed_partial_prefix_and_unregistered_files() {
     let config = config(vec![3], 3);
     let path = temp.path().join("stream");
     let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     let receipt = log
         .append_complete_batch(authority(&config), &batch(&config, 0))
         .unwrap();
@@ -399,6 +419,8 @@ fn unadopted_history_pages_and_temporary_root_do_not_hide_durable_wal_suffix() {
     let config = config(vec![3], 3);
     let path = temp.path().join("stream");
     let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     let receipt = log
         .append_complete_batch(authority(&config), &batch(&config, 0))
         .unwrap();
@@ -424,6 +446,8 @@ fn corrupt_storage_root_is_not_replaced_by_wal_inference() {
     let config = config(vec![3], 3);
     let path = temp.path().join("stream");
     let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     let receipt = log
         .append_complete_batch(authority(&config), &batch(&config, 0))
         .unwrap();
@@ -444,6 +468,8 @@ fn extra_suffix_or_unfinished_retired_name_cannot_hide_missing_rooted_file() {
         let config = config(vec![3], 3);
         let path = temp.path().join("stream");
         let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+        log.set_history_persistence(HistoryPersistence::OnDisk)
+            .unwrap();
         for n in 0..8 {
             let receipt = log
                 .append_complete_batch(authority(&config), &batch(&config, n))
@@ -555,6 +581,8 @@ fn cold_old_authority_becomes_hot_without_lifetime_descriptor_residency() {
         )
         .unwrap(),
     );
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     let first = log
         .append_complete_batch(authority(&config), &batch(&config, 0))
         .unwrap();
@@ -755,6 +783,8 @@ fn file_witness_crash_cuts_do_not_turn_surviving_unacknowledged_groups_into_corr
         let config = config(vec![3], 3);
         let path = temp.path().join("stream");
         let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+        log.set_history_persistence(HistoryPersistence::OnDisk)
+            .unwrap();
         let pending = first_pending_batch_in_next_file(&log, &config);
         let file = pending.address().offset / config.wal_file_bytes;
         let witness = format!("partition-required-wal-v1-{file:016x}");
@@ -799,6 +829,8 @@ fn missing_highest_acknowledged_suffix_file_is_detected_without_later_wal_names(
     let config = config(vec![3], 3);
     let path = temp.path().join("stream");
     let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     let last = first_pending_batch_in_next_file(&log, &config);
     log.persist_through(last).unwrap();
     let last_file = last.address().offset / config.wal_file_bytes;
@@ -841,6 +873,8 @@ fn cold_authority_pressure_waits_for_background_window() {
         )
         .unwrap(),
     );
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     let first = log
         .append_complete_batch(authority(&config), &batch(&config, 0))
         .unwrap();
@@ -896,6 +930,8 @@ fn cold_pressure_never_reclaims_live_credit_or_repeats_an_empty_root() {
     config.max_reference_metadata_bytes = ReferenceDirectory::metadata_bytes(1, 2).unwrap();
     let path = temp.path().join("stream");
     let log = Arc::new(PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap());
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     let first = log
         .append_complete_batch(authority(&config), &batch(&config, 0))
         .unwrap();
@@ -931,6 +967,8 @@ fn background_root_io_error_closes_read_admission() {
     config.max_reference_metadata_bytes = ReferenceDirectory::metadata_bytes(1, 2).unwrap();
     let path = temp.path().join("stream");
     let log = Arc::new(PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap());
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     let first = log
         .append_complete_batch(authority(&config), &batch(&config, 0))
         .unwrap();
@@ -973,6 +1011,8 @@ fn pooled_history_has_constant_file_set_and_frozen_prefix_readers() {
     cfg.max_batches = 1;
     let path = temp.path().join("stream");
     let log = PartitionLog::create(&path, cfg.clone(), &shape(), metrics()).unwrap();
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     let first = batch(&cfg, 0);
     let receipt = log
         .append_complete_batch(authority(&cfg), &batch(&cfg, 0))
@@ -1018,6 +1058,8 @@ fn unadopted_partial_pooled_tails_are_not_promoted_by_empty_recovery() {
     let cfg = config(vec![3], 3);
     let path = temp.path().join("stream");
     let log = PartitionLog::create(&path, cfg.clone(), &shape(), metrics()).unwrap();
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     let first = batch(&cfg, 0);
     let receipt = log.append_complete_batch(authority(&cfg), &first).unwrap();
     log.persist_through(receipt).unwrap();
@@ -1055,6 +1097,8 @@ fn pooled_node_and_descriptor_corruption_fail_closed_on_cold_access() {
         let cfg = config(vec![3], 3);
         let path = temp.path().join("stream");
         let log = PartitionLog::create(&path, cfg.clone(), &shape(), metrics()).unwrap();
+        log.set_history_persistence(HistoryPersistence::OnDisk)
+            .unwrap();
         let first = batch(&cfg, 0);
         let receipt = log.append_complete_batch(authority(&cfg), &first).unwrap();
         log.persist_through(receipt).unwrap();
@@ -1090,6 +1134,8 @@ fn grouped_history_crosses_buffer_boundaries_and_reopens_with_exact_authority() 
     config.wal_file_bytes = 16384;
     let path = temp.path().join("stream");
     let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     let mut receipts = Vec::new();
     for group_index in 0..24 {
         let batches = (0..4)
@@ -1117,6 +1163,205 @@ fn grouped_history_crosses_buffer_boundaries_and_reopens_with_exact_authority() 
         assert_eq!(
             reopened.read_batch(*receipt).unwrap().mutations(),
             batch(&config, n as u64).mutations()
+        );
+    }
+}
+
+#[cfg(feature = "test-utils")]
+#[test]
+fn memory_only_history_preserves_receipts_without_history_io_or_sync() {
+    let temp = tempdir::TempDir::new("memory-history").unwrap();
+    let mut cfg = config(vec![3], 3);
+    cfg.fragment_bytes = 4 * 1024 * 1024;
+    cfg.wal_file_bytes = 16 * 1024 * 1024;
+    cfg.max_batches = 4096;
+    let path = temp.path().join("memory");
+    let log = PartitionLog::create(&path, cfg.clone(), &shape(), metrics()).unwrap();
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
+    log.set_history_persistence(HistoryPersistence::MemoryOnly)
+        .unwrap();
+    log.set_history_maintenance_diagnostics(true);
+    let disk =
+        PartitionLog::create(&temp.path().join("disk"), cfg.clone(), &shape(), metrics()).unwrap();
+    disk.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
+    let lengths = || {
+        ["nodes.pages", "receipts.pages", "descriptors.pages"].map(|name| {
+            fs::metadata(path.join("storage-history-v2").join(name))
+                .unwrap()
+                .len()
+        })
+    };
+    let before = lengths();
+    let root = fs::read(path.join("storage-history-root-v2")).unwrap();
+    let synced = log.synced_frontier();
+    let mut receipts = Vec::new();
+    for n in 0..3 * 1024 {
+        let item = batch(&cfg, n);
+        let receipt = log.append_complete_batch(authority(&cfg), &item).unwrap();
+        let other = disk.append_complete_batch(authority(&cfg), &item).unwrap();
+        disk.persist_through(other).unwrap();
+        assert_eq!(receipt, other);
+        receipts.push(receipt);
+    }
+    assert_eq!(lengths(), before);
+    assert_eq!(
+        fs::read(path.join("storage-history-root-v2")).unwrap(),
+        root
+    );
+    assert_eq!(log.synced_frontier(), synced);
+    assert_eq!(log.history_maintenance_stats().waits, 0);
+    assert_eq!(
+        log.receipt_page(0, 256).unwrap(),
+        disk.receipt_page(0, 256).unwrap()
+    );
+    for n in [1, 1024, 3 * 1024] {
+        assert_eq!(
+            log.checkpoint_prefix(n).unwrap(),
+            disk.checkpoint_prefix(n).unwrap()
+        );
+    }
+    let first = receipts[0];
+    assert!(
+        matches!(log.references.lookup_conflict(first.id(), first.version(), &mut LookupWork::default()).unwrap(),
+        ConflictLookup::Existing(receipt) if receipt == first)
+    );
+    assert!(matches!(
+        log.references
+            .lookup_conflict(
+                id_for(&cfg, 10000),
+                first.version(),
+                &mut LookupWork::default()
+            )
+            .unwrap(),
+        ConflictLookup::VersionTaken
+    ));
+    assert_eq!(
+        log.append_complete_batch(authority(&cfg), &batch(&cfg, 0))
+            .unwrap(),
+        first
+    );
+    let reader = log.references.freeze_history();
+    assert!(
+        reader
+            .lookup_address_page(first.address())
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        log.state.lock().references.retire(&[0]),
+        Err(StorageError::Invalid("history is memory-only"))
+    ));
+    assert!(matches!(
+        log.state
+            .lock()
+            .references
+            .set_history_persistence(HistoryPersistence::MemoryOnly),
+        Err(StorageError::Invalid(
+            "memory-only history does not support restart with data"
+        ))
+    ));
+    for mode in [HistoryPersistence::MemoryOnly, HistoryPersistence::OnDisk] {
+        assert!(matches!(
+            log.set_history_persistence(mode),
+            Err(StorageError::Invalid(
+                "memory-only history does not support restart with data"
+            ))
+        ));
+    }
+    assert!(matches!(
+        disk.set_history_persistence(HistoryPersistence::MemoryOnly),
+        Err(StorageError::Invalid(
+            "memory-only history does not support restart with data"
+        ))
+    ));
+}
+
+#[cfg(feature = "test-utils")]
+#[test]
+fn memory_only_history_refuses_nonempty_wal_with_empty_history_root() {
+    let temp = tempdir::TempDir::new("memory-history-restart").unwrap();
+    let cfg = config(vec![3], 3);
+    let log = PartitionLog::create(
+        &temp.path().join("stream"),
+        cfg.clone(),
+        &shape(),
+        metrics(),
+    )
+    .unwrap();
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
+    log.append_complete_batch(authority(&cfg), &batch(&cfg, 0))
+        .unwrap();
+    assert_eq!(log.references.root().count, 0);
+    assert!(matches!(
+        log.set_history_persistence(HistoryPersistence::MemoryOnly),
+        Err(StorageError::Invalid(
+            "memory-only history does not support restart with data"
+        ))
+    ));
+}
+
+#[cfg(feature = "test-utils")]
+#[test]
+fn memory_only_history_sync_does_not_start_background_spills() {
+    let temp = tempdir::TempDir::new("memory-history-sync").unwrap();
+    let mut cfg = config(vec![3], 3);
+    cfg.fragment_bytes = 4 * 1024 * 1024;
+    cfg.wal_file_bytes = 16 * 1024 * 1024;
+    cfg.max_batches = 4096;
+    let path = temp.path().join("stream");
+    let log = PartitionLog::create(&path, cfg.clone(), &shape(), metrics()).unwrap();
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
+    log.set_history_persistence(HistoryPersistence::MemoryOnly)
+        .unwrap();
+    log.set_history_maintenance_diagnostics(true);
+    let disk =
+        PartitionLog::create(&temp.path().join("disk"), cfg.clone(), &shape(), metrics()).unwrap();
+    disk.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
+    let lengths = || {
+        ["nodes.pages", "receipts.pages", "descriptors.pages"].map(|name| {
+            fs::metadata(path.join("storage-history-v2").join(name))
+                .unwrap()
+                .len()
+        })
+    };
+    let before = lengths();
+    let root = fs::read(path.join("storage-history-root-v2")).unwrap();
+    for n in 0..3 * 1024 {
+        let receipt = log
+            .append_complete_batch(authority(&cfg), &batch(&cfg, n))
+            .unwrap();
+        let disk_receipt = disk
+            .append_complete_batch(authority(&cfg), &batch(&cfg, n))
+            .unwrap();
+        disk.persist_through(disk_receipt).unwrap();
+        assert_eq!(receipt, disk_receipt);
+        if (n + 1) % 512 == 0 {
+            log.persist_through(receipt).unwrap();
+            log.wait_history().unwrap();
+        }
+    }
+    assert_eq!(log.receipt_count(), 3 * 1024);
+    let stats = log.history_maintenance_stats();
+    assert_eq!(stats.spills, 0);
+    assert_eq!(stats.waits, 0);
+    assert_eq!(lengths(), before);
+    assert_eq!(
+        fs::read(path.join("storage-history-root-v2")).unwrap(),
+        root
+    );
+    assert_eq!(
+        log.receipt_page(0, 256).unwrap(),
+        disk.receipt_page(0, 256).unwrap()
+    );
+    for n in [1, 1024, 3 * 1024] {
+        assert_eq!(
+            log.checkpoint_prefix(n).unwrap(),
+            disk.checkpoint_prefix(n).unwrap()
         );
     }
 }

@@ -1,0 +1,2830 @@
+{
+  "synthetic": true,
+  "data_directory": "rwc10/SYNTHETIC-data",
+  "sources": {
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/SYNTHETIC-provenance.json": "10f90e40f0057a0e0e987dd05191c500320697050162fc993a88a9c4fe15cd3a",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-rwcompact2/analysis2/floors.csv": "d9ad2ba8ee546009254b34a216427d2698054ac8b156a81fb4d809b46e71452f",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/matrix.json": "f347bd38c7acabfb474a3e099b82d0e4cd23eb1e63ca4a3ff65b6ea87f122837",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/comparison.json": "f29bd3b40edc98f0369f2697052f48ae2822e6d348f4f3981fcde4120165c855",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-8b40cca827fa6d4ba9da/receipt.json": "8e78cb0f6836c7fea310efc022032dd03b23465e17193d92695f80d5e73f0e85",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-8b40cca827fa6d4ba9da/resource-interval.json": "23a3e3d886a2c8f8e94272dd119f2fea41146cf941ec3b8e2429ead7e00770ab",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-8b40cca827fa6d4ba9da/result/manifest.json": "1f0f6d925ce17edba998e29b75a30949e578905fedb2875db91a44fd2fee74b8",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-730a3eb60d5124e24d23/receipt.json": "bb8a703d8b0dcaae19b8a503a84e7dcc9a5011168082577b2b8f1598fa5edf45",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-730a3eb60d5124e24d23/resource-interval.json": "9730389181a3893fb6aac7604927372643cc45fed9079d6a8f181181164488a3",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-730a3eb60d5124e24d23/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-842131c752e8dc7cdda0/receipt.json": "fa59f938ada7f3d28eb7ac9bebb005d9158d88b631b0fc2302a157a2c68b7924",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-842131c752e8dc7cdda0/resource-interval.json": "ecff58dd7aff6d49a498329d6eb3ca33c6e326f685f13d237b2c69656f726af0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-842131c752e8dc7cdda0/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-b030b6a479c78e3f3d7a/receipt.json": "60302009c641317c89912fb0ac9d9b3f693b2f1687180e3b2005eabbf9c9aec2",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-b030b6a479c78e3f3d7a/resource-interval.json": "57f6849af4b5b1f1ee241aa44a616dff24ce6f789f7f87939651f46b4b42ab74",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-b030b6a479c78e3f3d7a/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-b030b6a479c78e3f3d7a/result/measurement-read-evidence.json": "40b7a8dc6b29a491cd4d9c944ea5149c768007e818b3485775c80849da71afdb",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-54bb6ccf17ec29857e7e/receipt.json": "255da7d92422212c4c0f77452fe26daf74f024a83336842185b879d66b9e0e57",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-54bb6ccf17ec29857e7e/resource-interval.json": "ecff58dd7aff6d49a498329d6eb3ca33c6e326f685f13d237b2c69656f726af0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-54bb6ccf17ec29857e7e/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-54bb6ccf17ec29857e7e/result/measurement-read-evidence.json": "d4380a828df45539518b9381e8b3a865d5ae17a6c429eb18bf5efb859d0870bd",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-42f294e884050c1216ca/receipt.json": "5bc1cb8747d0da31e966ba328d91612307edcbc6e526e4eca3693b0594eb2676",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-42f294e884050c1216ca/resource-interval.json": "23a3e3d886a2c8f8e94272dd119f2fea41146cf941ec3b8e2429ead7e00770ab",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-42f294e884050c1216ca/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-3873f8b92a6fcc29c8e2/receipt.json": "f942f25b037c01074fbed0ffd425c890ffc44e8b21be95d9c0babe9cacce57ee",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-3873f8b92a6fcc29c8e2/resource-interval.json": "9730389181a3893fb6aac7604927372643cc45fed9079d6a8f181181164488a3",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-3873f8b92a6fcc29c8e2/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-3873f8b92a6fcc29c8e2/result/measurement-read-evidence.json": "54d4017d303c97ff242cb1378d746f74d56f61581ac59a65fff1f789ba1ebdd3",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-2e572c17818501749b43/receipt.json": "8fd147d5682206cc7437b8bfc90094d64f4f8c6af1137dd92d4a89542fd5c9b5",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-2e572c17818501749b43/resource-interval.json": "74c2ccf1ab9f6595d6a1828950b4bdb062ad35888ef02c7ee0ec4fd1a63443cd",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-2e572c17818501749b43/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-726b1c93a21300641d30/receipt.json": "7f19b20d05b03758963bbd114dd285f6229d26f5395c9bc0be0c0eff8746113c",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-726b1c93a21300641d30/resource-interval.json": "57f6849af4b5b1f1ee241aa44a616dff24ce6f789f7f87939651f46b4b42ab74",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-726b1c93a21300641d30/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-8a5a4fd513beed098857/receipt.json": "13c15aafbf4b72f9b43a832ca4a767cafae266c4f413c65d2aa48f36e830d2c9",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-8a5a4fd513beed098857/resource-interval.json": "f5f8a4617cca94efcffa2caba80dfae0dd1610c2f0321f5cbfec06dd453e4562",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-8a5a4fd513beed098857/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-46fd017f11936e6881a7/receipt.json": "12b34b2ab07223f56603e022307674037bf979231aa57aea07deb8ea748cfd80",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-46fd017f11936e6881a7/resource-interval.json": "5a32a4270ae0a4950ff7b2826d16c2aff314f1b838851e1d8432c21e8860bb05",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-46fd017f11936e6881a7/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-cde7182cf79f3a9f6979/receipt.json": "04ae99508e7ff906ec55d44182f076ba63baaf18a188a0721eeed18079c462f2",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-cde7182cf79f3a9f6979/resource-interval.json": "e8d4c0342cb54e0b4837210d962b098b2e0ad4ae854452b082cb6db256d6c9f1",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-cde7182cf79f3a9f6979/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-ff747ee9fe28c72f7e06/receipt.json": "603495a61f7e74dae20c9bd907299ba5aa657141da4a5f0455b0f4e01f19c6a3",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-ff747ee9fe28c72f7e06/resource-interval.json": "f0bbd1df1794b95985907972987fc1c84c84b93d9888691b446457a184ef80f3",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-ff747ee9fe28c72f7e06/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-6e5f4005b1b872d18a12/receipt.json": "e4a2f556a4e8835fa07920dd7e1290e79b24c0293ee169356ce67cec94f07ba5",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-6e5f4005b1b872d18a12/resource-interval.json": "d37d93b2d59ff7932844c4009b2289471ff3b4d85b469e4d25a3d6e8e38ca7cf",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-6e5f4005b1b872d18a12/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-60bc8cf914e17eff7cfd/receipt.json": "fda3488e3a87cc065426233019bd01d920f79846871781b048d46f2907cf657a",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-60bc8cf914e17eff7cfd/resource-interval.json": "d37d93b2d59ff7932844c4009b2289471ff3b4d85b469e4d25a3d6e8e38ca7cf",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-60bc8cf914e17eff7cfd/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-60bc8cf914e17eff7cfd/result/measurement-read-evidence.json": "d4380a828df45539518b9381e8b3a865d5ae17a6c429eb18bf5efb859d0870bd",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-1efdb9ddce5dbbc48149/receipt.json": "6e2c14322f505aa433c83358031be365b70a81647a547510259aeb57ad4c5b65",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-1efdb9ddce5dbbc48149/resource-interval.json": "e744fda1f214832d24ef2d4b8f6a8672b29609a5c1b8e860341b46ba9e857082",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-1efdb9ddce5dbbc48149/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-1efdb9ddce5dbbc48149/result/measurement-read-evidence.json": "d4380a828df45539518b9381e8b3a865d5ae17a6c429eb18bf5efb859d0870bd",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-ea17e3d14cc59a9a59fc/receipt.json": "335409ac88290ab3aef6dac831d21d698dee266603632d7d397c93b8cce13514",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-ea17e3d14cc59a9a59fc/resource-interval.json": "e8d4c0342cb54e0b4837210d962b098b2e0ad4ae854452b082cb6db256d6c9f1",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-ea17e3d14cc59a9a59fc/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-ea17e3d14cc59a9a59fc/result/measurement-read-evidence.json": "e360e340bbd4967d2bae29b0f340d6cee522ce4a211294136b32ae77e9417818",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-5684d4368c39a4f3c8ac/receipt.json": "ddf5c0f1f1b531a0241a7e57d1f8b179fddd2c1cba9ae3713d02cdb661ec2f24",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-5684d4368c39a4f3c8ac/resource-interval.json": "e744fda1f214832d24ef2d4b8f6a8672b29609a5c1b8e860341b46ba9e857082",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-5684d4368c39a4f3c8ac/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-941fd7f7c19203fb82b7/receipt.json": "f6975512cab3b6cbd94dbc0222d2a08bf2827724e617938de0304fce0b33bfd3",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-941fd7f7c19203fb82b7/resource-interval.json": "403da1efe9a8f6af71f0fc8ba7afcc6aef3d5511c477bc28bf3e1f07b3c46244",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-941fd7f7c19203fb82b7/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-4f19ee11ef91036c86d4/receipt.json": "31dfb46cde202d71074c6f4f911a7c47821258c8dee269f1938df1ece3068048",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-4f19ee11ef91036c86d4/resource-interval.json": "b79e340c9854c7e3920c50d89ccd91f95e794a58792d2ffab1b81e8b391eb3d9",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-4f19ee11ef91036c86d4/result/manifest.json": "1f0f6d925ce17edba998e29b75a30949e578905fedb2875db91a44fd2fee74b8",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-b31991c1d8a561bb7c1f/receipt.json": "9e4bf62be58360d919ce3474025a72cfb6523f58088e16fcd2e8cba30fbe5434",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-b31991c1d8a561bb7c1f/resource-interval.json": "b79e340c9854c7e3920c50d89ccd91f95e794a58792d2ffab1b81e8b391eb3d9",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-b31991c1d8a561bb7c1f/result/manifest.json": "1f0f6d925ce17edba998e29b75a30949e578905fedb2875db91a44fd2fee74b8",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-51a56a3de4ae4bde0ee2/receipt.json": "c31c7fec7519ea9ac7add509152ac0599efbc8f646b8b1addd028c9f71b51053",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-51a56a3de4ae4bde0ee2/resource-interval.json": "403da1efe9a8f6af71f0fc8ba7afcc6aef3d5511c477bc28bf3e1f07b3c46244",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-51a56a3de4ae4bde0ee2/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-b1f2c04abbf2599a5ff8/receipt.json": "80ee4a606cc9d4022c7714a387e607c80f2e1999bd113ee69164429f678fc1f7",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-b1f2c04abbf2599a5ff8/resource-interval.json": "d37d93b2d59ff7932844c4009b2289471ff3b4d85b469e4d25a3d6e8e38ca7cf",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-b1f2c04abbf2599a5ff8/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-d4eecbbc352231b65293/receipt.json": "e429a2f8fe29e25926c7989707ef7b74f7f7d00ada9e678cc37334d36c1cc0d4",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-d4eecbbc352231b65293/resource-interval.json": "e8d4c0342cb54e0b4837210d962b098b2e0ad4ae854452b082cb6db256d6c9f1",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-d4eecbbc352231b65293/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-d4eecbbc352231b65293/result/measurement-read-evidence.json": "40b7a8dc6b29a491cd4d9c944ea5149c768007e818b3485775c80849da71afdb",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-7683fdc355e70a4057e2/receipt.json": "5781c20303ecf3b6de672438a13e6e349ee0990350aab989e647a3ed485ef5a4",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-7683fdc355e70a4057e2/resource-interval.json": "d37d93b2d59ff7932844c4009b2289471ff3b4d85b469e4d25a3d6e8e38ca7cf",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-7683fdc355e70a4057e2/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-7683fdc355e70a4057e2/result/measurement-read-evidence.json": "d4380a828df45539518b9381e8b3a865d5ae17a6c429eb18bf5efb859d0870bd",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-9d04eb67d4058d535512/receipt.json": "ada3c11a2e3f4a57f83007c49db2e2ae7f82bbb630273a730ed61d5e843bd292",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-9d04eb67d4058d535512/resource-interval.json": "37ab5de04f1cd3e51495d593a5aa366244e4ef6d095ea05da817c80c247565dd",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-9d04eb67d4058d535512/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-9d04eb67d4058d535512/result/measurement-read-evidence.json": "d4380a828df45539518b9381e8b3a865d5ae17a6c429eb18bf5efb859d0870bd",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-ec60775e9d39767150c9/receipt.json": "9d2fd690ad50f46115cce6554fd1e14b0edcbd2e112bf11d7a23405f5cfcbbb7",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-ec60775e9d39767150c9/resource-interval.json": "10a8990b24aca5bd49c5f131242099bb68c2d72f0a6deabf84b19c093eaf644e",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-ec60775e9d39767150c9/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-ec60775e9d39767150c9/result/measurement-read-evidence.json": "e360e340bbd4967d2bae29b0f340d6cee522ce4a211294136b32ae77e9417818",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-d520deebac6cc1cea116/receipt.json": "c669ff0d16c881380b2565d4d0600190468a9b7dadc9175e1f7b3ab7cccb2436",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-d520deebac6cc1cea116/resource-interval.json": "37ab5de04f1cd3e51495d593a5aa366244e4ef6d095ea05da817c80c247565dd",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-d520deebac6cc1cea116/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-a0f23faaf185507f923b/receipt.json": "9d1bc84b773822c3e56d270855514a578f9fe6882b506e5ff94e1e18ff0dd00e",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-a0f23faaf185507f923b/resource-interval.json": "d03b6bde948d4721a6a37f71bc82adc63a08d2292f9be9cd010fdec2e1867be8",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-a0f23faaf185507f923b/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-1a921ed75c902ff3402b/receipt.json": "bb98524ac543b0702b3f18d1e1016231e916c64b4abd04f60ffe892fe3071b91",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-1a921ed75c902ff3402b/resource-interval.json": "a8d4e4d523c6f11e589e02ca2ee7b0208ce7407a2c9cdc209a13a67bca30e411",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-1a921ed75c902ff3402b/result/manifest.json": "1f0f6d925ce17edba998e29b75a30949e578905fedb2875db91a44fd2fee74b8",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-4337c8b13dfc6db2d3d5/receipt.json": "3f2e5c58d4d47e01941128e92beab16d2861f5bf49eb4b0a0bd505f6e61f8034",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-4337c8b13dfc6db2d3d5/resource-interval.json": "23a3e3d886a2c8f8e94272dd119f2fea41146cf941ec3b8e2429ead7e00770ab",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-4337c8b13dfc6db2d3d5/result/manifest.json": "1f0f6d925ce17edba998e29b75a30949e578905fedb2875db91a44fd2fee74b8",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-ad2d921e52d1a06169f9/receipt.json": "7c42d8c735103420429cecc11cb44e69188bb5bf2682cf1cdbd16c7b7f32b92b",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-ad2d921e52d1a06169f9/resource-interval.json": "9730389181a3893fb6aac7604927372643cc45fed9079d6a8f181181164488a3",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-ad2d921e52d1a06169f9/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-04d8515d437e04ada117/receipt.json": "cfbd60a565b62367d64f928451abd142ad914aff07a8f8442a169c4315bf39f0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-04d8515d437e04ada117/resource-interval.json": "ecff58dd7aff6d49a498329d6eb3ca33c6e326f685f13d237b2c69656f726af0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-04d8515d437e04ada117/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-a6d777cf6d80629d9288/receipt.json": "9a8807125d71b97fb8c6ef1239cab6c88e50f1e86133b2d305b4dca852e052b9",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-a6d777cf6d80629d9288/resource-interval.json": "57f6849af4b5b1f1ee241aa44a616dff24ce6f789f7f87939651f46b4b42ab74",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-a6d777cf6d80629d9288/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-a6d777cf6d80629d9288/result/measurement-read-evidence.json": "40b7a8dc6b29a491cd4d9c944ea5149c768007e818b3485775c80849da71afdb",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-d75034a11527d5c90ff3/receipt.json": "a5913d84a4769ac8dcae5b4c8928332aadfa9e74cd8730d3b3546672a2d1896d",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-d75034a11527d5c90ff3/resource-interval.json": "ecff58dd7aff6d49a498329d6eb3ca33c6e326f685f13d237b2c69656f726af0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-d75034a11527d5c90ff3/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-d75034a11527d5c90ff3/result/measurement-read-evidence.json": "d4380a828df45539518b9381e8b3a865d5ae17a6c429eb18bf5efb859d0870bd",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-c298f963f27ab8aa6969/receipt.json": "182bcf32a01afa9afe1c9dab89b5fd22b4505b5fd83d8fe0762377ecd5b1bbac",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-c298f963f27ab8aa6969/resource-interval.json": "e744fda1f214832d24ef2d4b8f6a8672b29609a5c1b8e860341b46ba9e857082",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-c298f963f27ab8aa6969/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-c298f963f27ab8aa6969/result/measurement-read-evidence.json": "d4380a828df45539518b9381e8b3a865d5ae17a6c429eb18bf5efb859d0870bd",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-846758bed5acf7c4b250/receipt.json": "942c06f7399cd332558a7eaf9b8670473c1af6c767c4622b5f75d6109caf7886",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-846758bed5acf7c4b250/resource-interval.json": "e8d4c0342cb54e0b4837210d962b098b2e0ad4ae854452b082cb6db256d6c9f1",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-846758bed5acf7c4b250/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-846758bed5acf7c4b250/result/measurement-read-evidence.json": "e360e340bbd4967d2bae29b0f340d6cee522ce4a211294136b32ae77e9417818",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-e94f2d05db7ca829d84f/receipt.json": "b82da2904cc3f381d42d62d0e9d2009d87e062e08fa7d5d62683cb106445cceb",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-e94f2d05db7ca829d84f/resource-interval.json": "e744fda1f214832d24ef2d4b8f6a8672b29609a5c1b8e860341b46ba9e857082",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-e94f2d05db7ca829d84f/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-773b3b74b380cec6ae8b/receipt.json": "d5c482924baf4fb24dfb67a3e9bbeac0126ea3505023c0bf500f32c4fd80c007",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-773b3b74b380cec6ae8b/resource-interval.json": "403da1efe9a8f6af71f0fc8ba7afcc6aef3d5511c477bc28bf3e1f07b3c46244",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-773b3b74b380cec6ae8b/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-c864b207aea02dee6951/receipt.json": "19e3060a980436704c38f083881dace8130957124c69284e0047dd5ebef992f3",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-c864b207aea02dee6951/resource-interval.json": "b79e340c9854c7e3920c50d89ccd91f95e794a58792d2ffab1b81e8b391eb3d9",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-c864b207aea02dee6951/result/manifest.json": "1f0f6d925ce17edba998e29b75a30949e578905fedb2875db91a44fd2fee74b8",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-b820a1b5b460a67aed04/receipt.json": "c5b62b52d4b95777cc0208de9c89fe38d2759b6b5c7f9ebaa8bf0ffd49c17c54",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-b820a1b5b460a67aed04/resource-interval.json": "b79e340c9854c7e3920c50d89ccd91f95e794a58792d2ffab1b81e8b391eb3d9",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-b820a1b5b460a67aed04/result/manifest.json": "1f0f6d925ce17edba998e29b75a30949e578905fedb2875db91a44fd2fee74b8",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-1458a7650c68369923b1/receipt.json": "e315cba2b1d97caa1efa393d8a97b1ad793a3420bfb4249b2125c4a754ff6e7e",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-1458a7650c68369923b1/resource-interval.json": "403da1efe9a8f6af71f0fc8ba7afcc6aef3d5511c477bc28bf3e1f07b3c46244",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-1458a7650c68369923b1/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-94167e0672bc0d32e5fe/receipt.json": "f6f89f0ed0b43745ae922de148cae46880db601d30d20589e356bfd33ba4895b",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-94167e0672bc0d32e5fe/resource-interval.json": "e8d4c0342cb54e0b4837210d962b098b2e0ad4ae854452b082cb6db256d6c9f1",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-94167e0672bc0d32e5fe/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r0-94167e0672bc0d32e5fe/result/measurement-read-evidence.json": "40b7a8dc6b29a491cd4d9c944ea5149c768007e818b3485775c80849da71afdb",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-8d6d479bedc16cef581f/receipt.json": "f87476c6c35954ae2daab99a7972a6d9644596b5fcc5f6b3d2a1afa208e924e1",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-8d6d479bedc16cef581f/resource-interval.json": "37ab5de04f1cd3e51495d593a5aa366244e4ef6d095ea05da817c80c247565dd",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-8d6d479bedc16cef581f/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-8d6d479bedc16cef581f/result/measurement-read-evidence.json": "d4380a828df45539518b9381e8b3a865d5ae17a6c429eb18bf5efb859d0870bd",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-a0bb63c41b3ea3fa5ac6/receipt.json": "985125e4707c441eda719282c32a30d6058a7d3c7ab73b904d7af50181999fde",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-a0bb63c41b3ea3fa5ac6/resource-interval.json": "10a8990b24aca5bd49c5f131242099bb68c2d72f0a6deabf84b19c093eaf644e",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-a0bb63c41b3ea3fa5ac6/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-a0bb63c41b3ea3fa5ac6/result/measurement-read-evidence.json": "e360e340bbd4967d2bae29b0f340d6cee522ce4a211294136b32ae77e9417818",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-759068e1738b94b3f98f/receipt.json": "03ec41908ad4273fa193dbe2bdbcdc1bfccbc323589229819081f839e19f662c",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-759068e1738b94b3f98f/resource-interval.json": "37ab5de04f1cd3e51495d593a5aa366244e4ef6d095ea05da817c80c247565dd",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-759068e1738b94b3f98f/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-fce3f254cc8ff975ce1b/receipt.json": "dc4bd589a43deccd4754f6d61fff6fe986133cd5892e1efa1e137adc740fa484",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-fce3f254cc8ff975ce1b/resource-interval.json": "d03b6bde948d4721a6a37f71bc82adc63a08d2292f9be9cd010fdec2e1867be8",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-fce3f254cc8ff975ce1b/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-fa656490b225907f0975/receipt.json": "b5127a98e90b01b1eee63148cd84c82a0fc9935acc89ef94a452f6ddce5e96fe",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-fa656490b225907f0975/resource-interval.json": "a8d4e4d523c6f11e589e02ca2ee7b0208ce7407a2c9cdc209a13a67bca30e411",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16P-r1-fa656490b225907f0975/result/manifest.json": "1f0f6d925ce17edba998e29b75a30949e578905fedb2875db91a44fd2fee74b8",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-a7e6e241b8a9ecf2045a/receipt.json": "17fbd52fffe8159dc257a9b60254d1fc46a9fd4995ddf0648810648f74b41831",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-a7e6e241b8a9ecf2045a/resource-interval.json": "403da1efe9a8f6af71f0fc8ba7afcc6aef3d5511c477bc28bf3e1f07b3c46244",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-a7e6e241b8a9ecf2045a/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-a7e6e241b8a9ecf2045a/result/measurement-read-evidence.json": "506dd4fbaff71deff18befd0c2e5311ebda2319e5d5e69bc2ced1ee81a754c41",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-6b1568f4d2aa00daab99/receipt.json": "fb0ce5b8b756a34b5266086f4534c0d1765368b9f0c38bf8a950872e7902b3bc",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-6b1568f4d2aa00daab99/resource-interval.json": "b79e340c9854c7e3920c50d89ccd91f95e794a58792d2ffab1b81e8b391eb3d9",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-6b1568f4d2aa00daab99/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-487b9c4b4d111cbfdc53/receipt.json": "cfaa606111e9ec4dabb6fcb8c636137fab70fbb005fe8753f00e79735bb71889",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-487b9c4b4d111cbfdc53/resource-interval.json": "b79e340c9854c7e3920c50d89ccd91f95e794a58792d2ffab1b81e8b391eb3d9",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-487b9c4b4d111cbfdc53/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-5bc250ca597211788a7e/receipt.json": "a45cd61df54c4905c09695407689b0a693673df0d5f95b1559685a01bbe9733c",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-5bc250ca597211788a7e/resource-interval.json": "403da1efe9a8f6af71f0fc8ba7afcc6aef3d5511c477bc28bf3e1f07b3c46244",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-5bc250ca597211788a7e/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-5bc250ca597211788a7e/result/measurement-read-evidence.json": "54d4017d303c97ff242cb1378d746f74d56f61581ac59a65fff1f789ba1ebdd3",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-604b7916abe47ed5698a/receipt.json": "61680adc6703c79545a78b963f80a093cad6367f90b043885b17af2b9999e775",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-604b7916abe47ed5698a/resource-interval.json": "d03b6bde948d4721a6a37f71bc82adc63a08d2292f9be9cd010fdec2e1867be8",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-604b7916abe47ed5698a/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-604b7916abe47ed5698a/result/measurement-read-evidence.json": "506dd4fbaff71deff18befd0c2e5311ebda2319e5d5e69bc2ced1ee81a754c41",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-5897c035d2596578e2cd/receipt.json": "cc66b18110deaf2d09a31ea5f54af276af146c5233afd29d3cc5c5dce8e981c2",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-5897c035d2596578e2cd/resource-interval.json": "a8d4e4d523c6f11e589e02ca2ee7b0208ce7407a2c9cdc209a13a67bca30e411",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-5897c035d2596578e2cd/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-af61cf045e89fac12b4e/receipt.json": "652c232f4e92ed91d0ddf09d980dbf0797e06927c831e20871ff96187ae8d2dd",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-af61cf045e89fac12b4e/resource-interval.json": "23a3e3d886a2c8f8e94272dd119f2fea41146cf941ec3b8e2429ead7e00770ab",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-af61cf045e89fac12b4e/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-823af5f08a0861c5b875/receipt.json": "ec7d61f8974caf043b3ef17759ada787123a8eca074c33647184b5604b0a343b",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-823af5f08a0861c5b875/resource-interval.json": "9730389181a3893fb6aac7604927372643cc45fed9079d6a8f181181164488a3",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-823af5f08a0861c5b875/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-823af5f08a0861c5b875/result/measurement-read-evidence.json": "fe8e8b17b80407c526f44174d6838e49a8b9b296dea5e4cd5e16a218dc9d451a",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-75b8c5e25b45cb6566f8/receipt.json": "9f8d9178ac7774594419f5ef952afb66c7d6947ab8aac26d1bf221ef145cbb60",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-75b8c5e25b45cb6566f8/resource-interval.json": "403da1efe9a8f6af71f0fc8ba7afcc6aef3d5511c477bc28bf3e1f07b3c46244",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-75b8c5e25b45cb6566f8/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-75b8c5e25b45cb6566f8/result/measurement-read-evidence.json": "f25a9282c8351952fb1647f0b07ff30150e7da525a29bebb930e22d0d7a9029f",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-658cfe4bb12354837609/receipt.json": "a51893aa5b74ad17968bdebea7ce099484e1ebf4efb89beee4f712e4efdc35b6",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-658cfe4bb12354837609/resource-interval.json": "b79e340c9854c7e3920c50d89ccd91f95e794a58792d2ffab1b81e8b391eb3d9",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-658cfe4bb12354837609/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-83aa66dec107d669448b/receipt.json": "8385c43ea37f77414e5d92d9a1e4d385f8d5a3e9bdaaf7f0c5b38c1ccdeff562",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-83aa66dec107d669448b/resource-interval.json": "b79e340c9854c7e3920c50d89ccd91f95e794a58792d2ffab1b81e8b391eb3d9",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-83aa66dec107d669448b/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-45ba27fd88281d705481/receipt.json": "7cb8caa77005da32df92d999ab44ea1c8dbb6cf5c9d4aa63fbc90ce6c216b100",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-45ba27fd88281d705481/resource-interval.json": "403da1efe9a8f6af71f0fc8ba7afcc6aef3d5511c477bc28bf3e1f07b3c46244",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-45ba27fd88281d705481/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-45ba27fd88281d705481/result/measurement-read-evidence.json": "fe8e8b17b80407c526f44174d6838e49a8b9b296dea5e4cd5e16a218dc9d451a",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-ba4afe6e697a7c6d6213/receipt.json": "c040f21b972053381b0f54ddf5c094b4de56efaa62c0dda8248be98d84c5fdb1",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-ba4afe6e697a7c6d6213/resource-interval.json": "d03b6bde948d4721a6a37f71bc82adc63a08d2292f9be9cd010fdec2e1867be8",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-ba4afe6e697a7c6d6213/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-ba4afe6e697a7c6d6213/result/measurement-read-evidence.json": "f25a9282c8351952fb1647f0b07ff30150e7da525a29bebb930e22d0d7a9029f",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-a5a8725fffd3203fc794/receipt.json": "3305407b1d8cea41f16a52cf7d573e805288e0e96f468b3f7950aa9e7e214c02",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-a5a8725fffd3203fc794/resource-interval.json": "a8d4e4d523c6f11e589e02ca2ee7b0208ce7407a2c9cdc209a13a67bca30e411",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-a5a8725fffd3203fc794/result/manifest.json": "34f505b4964095b47698530cac45d7710bff95d9f641e14f88100affbd69b9e0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-9674a111e7a60d3e3b60/receipt.json": "e47e88339ee91482078fe910397e961a28eeadcca50549ce0dcafa9dc02458f4",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-9674a111e7a60d3e3b60/resource-interval.json": "f0bbd1df1794b95985907972987fc1c84c84b93d9888691b446457a184ef80f3",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-9674a111e7a60d3e3b60/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-7d700582b6eece416ef5/receipt.json": "593e2b8cd07ed9ada46e8ba113762e46a4216935ef339803d45de9eefd5df729",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-7d700582b6eece416ef5/resource-interval.json": "e8d4c0342cb54e0b4837210d962b098b2e0ad4ae854452b082cb6db256d6c9f1",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-7d700582b6eece416ef5/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-8cde0d4e70533159b055/receipt.json": "fc61e3e4f989107bdf676d9a947cc0f8d012114854eba233ea227cdb521b2f50",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-8cde0d4e70533159b055/resource-interval.json": "5a32a4270ae0a4950ff7b2826d16c2aff314f1b838851e1d8432c21e8860bb05",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-8cde0d4e70533159b055/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-94705d80b2b6d5a5e353/receipt.json": "fbbe57e1825a61cbc3644518799b858c4589bf43ea600ceeceff9b90611d2cdc",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-94705d80b2b6d5a5e353/resource-interval.json": "5a32a4270ae0a4950ff7b2826d16c2aff314f1b838851e1d8432c21e8860bb05",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-94705d80b2b6d5a5e353/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-0ea713643f11bb6c3aa7/receipt.json": "205e74cf7358891209eb9f1585d37a40b40e5c444e8c42def7d0f4e9c47866be",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-0ea713643f11bb6c3aa7/resource-interval.json": "e8d4c0342cb54e0b4837210d962b098b2e0ad4ae854452b082cb6db256d6c9f1",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-0ea713643f11bb6c3aa7/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-149e0e5a2a0867f9d315/receipt.json": "32d1f3bcd021e90d290c2d5f32d26001d01fd74dedde386054924967386af684",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-149e0e5a2a0867f9d315/resource-interval.json": "f0bbd1df1794b95985907972987fc1c84c84b93d9888691b446457a184ef80f3",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-149e0e5a2a0867f9d315/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-c4309fa0faa814e37c31/receipt.json": "7d7a0ad63ce69139f1c9aea30bcdadcfc7df828c17f5e2cffc3dad2f180bf945",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-c4309fa0faa814e37c31/resource-interval.json": "c2a973953e3da50e6692a3bdfdf7b4b75634991075a9993ea059f7e0e0613912",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-c4309fa0faa814e37c31/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-c2f10cf83e47c152d70e/receipt.json": "4bc6ca83c108e5586c8b61b0a997e1ddc11b7f2577a7048d594070407d4c6b78",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-c2f10cf83e47c152d70e/resource-interval.json": "10a8990b24aca5bd49c5f131242099bb68c2d72f0a6deabf84b19c093eaf644e",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-c2f10cf83e47c152d70e/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-6337ef0a12e3a4b24ec1/receipt.json": "d6a8ec8a5075ed396d33733b8bc24887007e596f6ad8c8f818b7fd5afa8aefb8",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-6337ef0a12e3a4b24ec1/resource-interval.json": "e27bbfe9e94b8476c8c4513eca73801572db1f548e588663d90e59c646c1e788",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-6337ef0a12e3a4b24ec1/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-4b36a3b3723070683741/receipt.json": "354c18ff9c5091f47dd6d28eff25af1c621c9c4dad42d409e9e66d5362835cb7",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-4b36a3b3723070683741/resource-interval.json": "74c2ccf1ab9f6595d6a1828950b4bdb062ad35888ef02c7ee0ec4fd1a63443cd",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-4b36a3b3723070683741/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-39ae1d8bb2acba0b24db/receipt.json": "98eb2afbd2178cfa14bfd425fb2aadbe90d162987bfb56b09690a80085ad4dff",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-39ae1d8bb2acba0b24db/resource-interval.json": "57f6849af4b5b1f1ee241aa44a616dff24ce6f789f7f87939651f46b4b42ab74",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-39ae1d8bb2acba0b24db/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-efaa569fbbe034088a20/receipt.json": "cc343cb9b95abc5e6602e6e63694fc36dde21960cd07fa8ac7533ffe0d371624",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-efaa569fbbe034088a20/resource-interval.json": "f5f8a4617cca94efcffa2caba80dfae0dd1610c2f0321f5cbfec06dd453e4562",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r0-efaa569fbbe034088a20/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-0b951ed3800236d283f3/receipt.json": "ab000131026e48144e673c7d15e0f3a1933a16db35aa3d9bb717cc32c93e1cf4",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-0b951ed3800236d283f3/resource-interval.json": "f0bbd1df1794b95985907972987fc1c84c84b93d9888691b446457a184ef80f3",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-0b951ed3800236d283f3/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-a79f44fe20e2c88b0a22/receipt.json": "038bed3abfc94c5f21396ca0deb2259bf949416782d2e64020d5ad16af2eefd0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-a79f44fe20e2c88b0a22/resource-interval.json": "e8d4c0342cb54e0b4837210d962b098b2e0ad4ae854452b082cb6db256d6c9f1",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-a79f44fe20e2c88b0a22/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-1c133f7eb9080a8c1bb9/receipt.json": "0dcbd53d19f69c60df0e0b3b3f227f25c3fd95d5682993c2129b6271888c6ef3",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-1c133f7eb9080a8c1bb9/resource-interval.json": "5a32a4270ae0a4950ff7b2826d16c2aff314f1b838851e1d8432c21e8860bb05",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-1c133f7eb9080a8c1bb9/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-5a827e5bac4fac00f2ac/receipt.json": "3d738fb0d2730e577c93aa3db425514f94212cec3f0a005b487c5236079e32c1",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-5a827e5bac4fac00f2ac/resource-interval.json": "c2a973953e3da50e6692a3bdfdf7b4b75634991075a9993ea059f7e0e0613912",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-5a827e5bac4fac00f2ac/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-cfa0d226ed4629ef290e/receipt.json": "afd5f8dda748c41112bc07da4b754081224413d0aee05f6dcab1a97bb6dc4cae",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-cfa0d226ed4629ef290e/resource-interval.json": "10a8990b24aca5bd49c5f131242099bb68c2d72f0a6deabf84b19c093eaf644e",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-cfa0d226ed4629ef290e/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-622674bb3f898701823a/receipt.json": "3e67e4fe4720be698937451cae065d39cf44a834c9e4ecc5f28c5fbe3e6a0174",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-622674bb3f898701823a/resource-interval.json": "e27bbfe9e94b8476c8c4513eca73801572db1f548e588663d90e59c646c1e788",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/cases/G16C-r1-622674bb3f898701823a/result/manifest.json": "b63d80e44c0a240f658eb0ce3531d0b29d5bfc327bc0a0b65bd06fd8b51931da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-output/ab_warm.csv": "c0bb64f6df0ac8b24c649453e676b30aa72a42d2a4e0bf181c7860c9632f2a8f",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-output/ab_pairs.csv": "a7164eac1b4a00488469db067b010eb5e17ec29270a954810de1f5ee139ba304",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-output/cold_fabric.csv": "722c3e410388eb5d9a5217618ba3026971bfddbcccfd16a36a7f351321fd7603",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-output/cold_pairs.csv": "a06502062bdc4de9b50dc6506e4ddc75262cfb19b6593b112e44a487740280d1",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-output/parity_matrix.csv": "035025b9a2259171e3ea2315b9832afcf763eafe5d5466f906938e52721b79d8",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-output/fabric_ab.md": "1f4d6e19ee991711326df40736673aaea0f0bcd654ff4322544b44b2d455d334"
+  },
+  "outputs": {
+    "rwc10/SYNTHETIC-generated/tab-rwc10-arms.tex": "21015f485f10610908adc029bbec79450cc5f2860805350e265a113c098eabfd",
+    "rwc10/SYNTHETIC-generated/tab-rwc10-warm.tex": "778e46f1ddf2f39cb1293a084a1b22d00eaca3842ac7e2943bc7df0ee9692d60",
+    "rwc10/SYNTHETIC-generated/tab-rwc10-pairs.tex": "78ab77a9f6c4b8e1fb7779dc9c09c72d23113cc89d86b4e421651fc03df45866",
+    "rwc10/SYNTHETIC-generated/tab-rwc10-cpu.tex": "3799554a1b7b47f81be1723436bd7548b7156974dabb03634940d8f904dffe1b",
+    "rwc10/SYNTHETIC-generated/tab-rwc10-cold.tex": "ff3f0be47f77066289890a3aa564eae272775cd968226fa7de086eb54c2966c0",
+    "rwc10/SYNTHETIC-generated/tab-rwc10-ladder.tex": "3ae42576a5fb9f3804fe749fa0eeef15def2f18820ec724adae33910c22474c9",
+    "rwc10/SYNTHETIC-generated/rwc10-findings.tex": "41d72aef39fff1066dd9f620feed20ed8f89e9f5f3d4c608d8624e0f573efb1a",
+    "rwc10/SYNTHETIC-generated/rwc10-numbers.tex": "4a7f73bb0b7e8b66cfe9b165c883366e3186685297fb292d8f9fde05103a59e9",
+    "rwc10/SYNTHETIC-generated/rwc10-provenance.tex": "e35377fe94d6cb9603aab5e7009509ec726aa7de0ba434ba8bb83177b623d5d7",
+    "rwc10/SYNTHETIC-generated/rwc10-hooks.tex": "a82de4555994c7be811efaa0655d7045c07c3f0ab877c69e6ed062ffa144734a",
+    "rwc10/SYNTHETIC-data/parity_matrix.csv": "035025b9a2259171e3ea2315b9832afcf763eafe5d5466f906938e52721b79d8",
+    "rwc10/SYNTHETIC-data/ab_warm.csv": "c0bb64f6df0ac8b24c649453e676b30aa72a42d2a4e0bf181c7860c9632f2a8f",
+    "rwc10/SYNTHETIC-data/ab_pairs.csv": "a7164eac1b4a00488469db067b010eb5e17ec29270a954810de1f5ee139ba304",
+    "rwc10/SYNTHETIC-data/cold_pairs.csv": "a06502062bdc4de9b50dc6506e4ddc75262cfb19b6593b112e44a487740280d1",
+    "rwc10/SYNTHETIC-data/run9-floors.csv": "d9ad2ba8ee546009254b34a216427d2698054ac8b156a81fb4d809b46e71452f",
+    "rwc10/SYNTHETIC-data/cold_fabric.csv": "722c3e410388eb5d9a5217618ba3026971bfddbcccfd16a36a7f351321fd7603",
+    "rwc10/SYNTHETIC-data/campaign_cases.csv": "a0bb6e39db31c7f50ea587c43f49fd05475187249e9031b5e10269b2925227cd",
+    "rwc10/SYNTHETIC-data/fabric_ab.md": "1f4d6e19ee991711326df40736673aaea0f0bcd654ff4322544b44b2d455d334",
+    "rwc10/SYNTHETIC-generated/provenance.json": "10f90e40f0057a0e0e987dd05191c500320697050162fc993a88a9c4fe15cd3a",
+    "rwc10/SYNTHETIC-figures/rwc10-SYNTHETIC-warm.pdf": "0f23e7704ec141774415fa7056a6f1196027a11ac71513a801ecc13ab8c6fbf2",
+    "rwc10/SYNTHETIC-figures/rwc10-SYNTHETIC-gap.pdf": "1d9f333f525e82f22ee4fe51105cdb108d8436ab64922970113c8e6016eca489",
+    "rwc10/SYNTHETIC-figures/rwc10-SYNTHETIC-cpu.pdf": "afbd8cd2632041d9991025785cd3bed3646fa7a824c4a0916df9dc8106b2ff31",
+    "rwc10/SYNTHETIC-figures/rwc10-SYNTHETIC-cold.pdf": "9a464e0f54a64ff4f00a447065190018f5508600714f9300a53455e97239725f",
+    "rwc10/SYNTHETIC-figures/rwc10-SYNTHETIC-ladder.pdf": "3e2856b5b60412dd69afce1e2583fbbb437ea8885a9fdc3be44150fcc2928b5d",
+    "rwc10/SYNTHETIC-generated/figure-evidence.json": "8808642445537d84f68ed9018c27b45deb33ae1a7065050c827777388f6f4db3"
+  },
+  "number_sources": {
+    "F10:ab_warm:0:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 0,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:0:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 0,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:0:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 0,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:0:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 0,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:0:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 0,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:12:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 12,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:12:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 12,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:12:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 12,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:12:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 12,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:12:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 12,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:22:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 22,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:22:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 22,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:22:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 22,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:22:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 22,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:22:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 22,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:32:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 32,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:32:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 32,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:32:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 32,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:32:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 32,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:32:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 32,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:11:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 11,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:11:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 11,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:11:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 11,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:11:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 11,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:11:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 11,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:21:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 21,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:21:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 21,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:21:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 21,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:21:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 21,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:21:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 21,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:31:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 31,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:31:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 31,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:31:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 31,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:31:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 31,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:31:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 31,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:39:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 39,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:39:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 39,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:39:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 39,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:39:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 39,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:39:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 39,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:1:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 1,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:1:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 1,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:1:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 1,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:1:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 1,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:1:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 1,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:13:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 13,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:13:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 13,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:13:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 13,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:13:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 13,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:13:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 13,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:23:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 23,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:23:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 23,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:23:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 23,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:23:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 23,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:23:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 23,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:33:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 33,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:33:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 33,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:33:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 33,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:33:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 33,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:33:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 33,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:10:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 10,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:10:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 10,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:10:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 10,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:10:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 10,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:10:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 10,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:20:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 20,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:20:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 20,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:20:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 20,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:20:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 20,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:20:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 20,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:30:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 30,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:30:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 30,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:30:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 30,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:30:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 30,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:30:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 30,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:38:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 38,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:38:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 38,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:38:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 38,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:38:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 38,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:38:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 38,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:2:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 2,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:2:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 2,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:2:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 2,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:2:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 2,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:2:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 2,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:14:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 14,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:14:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 14,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:14:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 14,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:14:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 14,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:14:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 14,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:24:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 24,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:24:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 24,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:24:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 24,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:24:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 24,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:24:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 24,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:5:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 5,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:5:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 5,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:5:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 5,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:5:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 5,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:5:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 5,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:9:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 9,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:9:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 9,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:9:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 9,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:9:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 9,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:9:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 9,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:19:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 19,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:19:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 19,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:19:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 19,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:19:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 19,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:19:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 19,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:29:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 29,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:29:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 29,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:29:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 29,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:29:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 29,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:29:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 29,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:37:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 37,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:37:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 37,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:37:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 37,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:37:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 37,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:37:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 37,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:3:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 3,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:3:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 3,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:3:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 3,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:3:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 3,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:3:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 3,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:3:cq_idle_waits:1|.0f": {
+      "family": "ab_warm",
+      "row": 3,
+      "field": "cq_idle_waits",
+      "factor": 1,
+      "format": ".0f"
+    },
+    "F10:ab_warm:15:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 15,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:15:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 15,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:15:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 15,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:15:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 15,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:15:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 15,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:15:cq_idle_waits:1|.0f": {
+      "family": "ab_warm",
+      "row": 15,
+      "field": "cq_idle_waits",
+      "factor": 1,
+      "format": ".0f"
+    },
+    "F10:ab_warm:25:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 25,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:25:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 25,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:25:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 25,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:25:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 25,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:25:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 25,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:25:cq_idle_waits:1|.0f": {
+      "family": "ab_warm",
+      "row": 25,
+      "field": "cq_idle_waits",
+      "factor": 1,
+      "format": ".0f"
+    },
+    "F10:ab_warm:34:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 34,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:34:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 34,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:34:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 34,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:34:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 34,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:34:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 34,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:34:cq_idle_waits:1|.0f": {
+      "family": "ab_warm",
+      "row": 34,
+      "field": "cq_idle_waits",
+      "factor": 1,
+      "format": ".0f"
+    },
+    "F10:ab_warm:8:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 8,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:8:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 8,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:8:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 8,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:8:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 8,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:8:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 8,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:8:cq_idle_waits:1|.0f": {
+      "family": "ab_warm",
+      "row": 8,
+      "field": "cq_idle_waits",
+      "factor": 1,
+      "format": ".0f"
+    },
+    "F10:ab_warm:18:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 18,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:18:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 18,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:18:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 18,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:18:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 18,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:18:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 18,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:18:cq_idle_waits:1|.0f": {
+      "family": "ab_warm",
+      "row": 18,
+      "field": "cq_idle_waits",
+      "factor": 1,
+      "format": ".0f"
+    },
+    "F10:ab_warm:28:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 28,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:28:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 28,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:28:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 28,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:28:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 28,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:28:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 28,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:28:cq_idle_waits:1|.0f": {
+      "family": "ab_warm",
+      "row": 28,
+      "field": "cq_idle_waits",
+      "factor": 1,
+      "format": ".0f"
+    },
+    "F10:ab_warm:36:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 36,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:36:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 36,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:36:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 36,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:36:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 36,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:36:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 36,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:36:cq_idle_waits:1|.0f": {
+      "family": "ab_warm",
+      "row": 36,
+      "field": "cq_idle_waits",
+      "factor": 1,
+      "format": ".0f"
+    },
+    "F10:ab_warm:4:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 4,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:4:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 4,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:4:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 4,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:4:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 4,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:4:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 4,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:4:cq_idle_waits:1|.0f": {
+      "family": "ab_warm",
+      "row": 4,
+      "field": "cq_idle_waits",
+      "factor": 1,
+      "format": ".0f"
+    },
+    "F10:ab_warm:16:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 16,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:16:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 16,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:16:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 16,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:16:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 16,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:16:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 16,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:16:cq_idle_waits:1|.0f": {
+      "family": "ab_warm",
+      "row": 16,
+      "field": "cq_idle_waits",
+      "factor": 1,
+      "format": ".0f"
+    },
+    "F10:ab_warm:26:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 26,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:26:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 26,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:26:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 26,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:26:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 26,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:26:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 26,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:26:cq_idle_waits:1|.0f": {
+      "family": "ab_warm",
+      "row": 26,
+      "field": "cq_idle_waits",
+      "factor": 1,
+      "format": ".0f"
+    },
+    "F10:ab_warm:6:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 6,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:6:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 6,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:6:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 6,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:6:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 6,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:6:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 6,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:6:cq_idle_waits:1|.0f": {
+      "family": "ab_warm",
+      "row": 6,
+      "field": "cq_idle_waits",
+      "factor": 1,
+      "format": ".0f"
+    },
+    "F10:ab_warm:7:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 7,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:7:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 7,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:7:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 7,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:7:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 7,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:7:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 7,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:7:cq_idle_waits:1|.0f": {
+      "family": "ab_warm",
+      "row": 7,
+      "field": "cq_idle_waits",
+      "factor": 1,
+      "format": ".0f"
+    },
+    "F10:ab_warm:17:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 17,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:17:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 17,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:17:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 17,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:17:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 17,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:17:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 17,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:17:cq_idle_waits:1|.0f": {
+      "family": "ab_warm",
+      "row": 17,
+      "field": "cq_idle_waits",
+      "factor": 1,
+      "format": ".0f"
+    },
+    "F10:ab_warm:27:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 27,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:27:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 27,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:27:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 27,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:27:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 27,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:27:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 27,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:27:cq_idle_waits:1|.0f": {
+      "family": "ab_warm",
+      "row": 27,
+      "field": "cq_idle_waits",
+      "factor": 1,
+      "format": ".0f"
+    },
+    "F10:ab_warm:35:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 35,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:35:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 35,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:35:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 35,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:35:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 35,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:35:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 35,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:35:cq_idle_waits:1|.0f": {
+      "family": "ab_warm",
+      "row": 35,
+      "field": "cq_idle_waits",
+      "factor": 1,
+      "format": ".0f"
+    },
+    "F10:ab_pairs:0:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 0,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:10:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 10,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:20:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 20,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:30:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 30,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:5:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 5,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:15:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 15,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:25:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 25,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:35:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 35,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:1:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 1,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:11:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 11,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:21:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 21,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:31:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 31,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:6:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 6,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:16:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 16,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:26:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 26,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:36:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 36,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:2:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 2,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:12:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 12,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:22:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 22,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:32:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 32,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:7:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 7,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:17:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 17,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:27:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 27,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:37:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 37,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:3:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 3,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:13:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 13,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:23:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 23,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:33:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 33,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:8:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 8,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:18:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 18,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:28:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 28,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:38:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 38,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:4:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 4,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:14:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 14,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:24:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 24,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:34:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 34,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:9:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 9,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:19:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 19,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:29:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 29,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:39:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 39,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:0:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 0,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:0:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 0,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:10:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 10,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:10:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 10,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:14:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 14,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:14:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 14,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:18:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 18,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:18:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 18,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:9:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 9,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:9:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 9,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:13:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 13,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:13:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 13,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:17:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 17,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:17:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 17,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:21:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 21,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:21:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 21,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:1:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 1,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:1:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 1,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:11:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 11,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:11:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 11,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:15:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 15,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:15:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 15,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:19:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 19,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:19:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 19,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:8:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 8,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:8:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 8,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:12:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 12,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:12:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 12,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:16:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 16,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:16:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 16,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:20:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 20,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:20:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 20,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:2:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 2,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:2:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 2,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:25:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 25,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:25:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 25,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:31:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 31,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:31:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 31,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:5:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 5,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:5:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 5,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:24:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 24,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:24:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 24,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:30:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 30,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:30:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 30,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:36:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 36,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:36:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 36,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:39:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 39,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:39:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 39,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:3:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 3,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:3:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 3,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:26:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 26,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:26:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 26,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:32:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 32,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:32:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 32,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:6:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 6,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:6:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 6,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:23:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 23,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:23:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 23,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:29:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 29,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:29:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 29,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:35:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 35,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:35:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 35,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:38:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 38,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:4:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 4,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:4:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 4,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:27:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 27,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:27:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 27,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:33:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 33,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:33:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 33,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:7:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 7,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:7:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 7,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:22:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 22,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:22:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 22,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:28:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 28,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:28:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 28,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:34:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 34,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:34:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 34,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:37:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 37,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:37:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 37,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:run9-floors:17:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 17,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:155:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 155,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:223:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 223,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:51:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 51,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:159:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 159,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:227:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 227,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:55:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 55,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:163:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 163,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:231:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 231,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:9:mean_us:2|.1f": {
+      "family": "run9-floors",
+      "row": 9,
+      "field": "mean_us",
+      "factor": 2,
+      "format": ".1f"
+    },
+    "F10:run9-floors:119:mean_us:2|.1f": {
+      "family": "run9-floors",
+      "row": 119,
+      "field": "mean_us",
+      "factor": 2,
+      "format": ".1f"
+    },
+    "F10:run9-floors:187:mean_us:2|.1f": {
+      "family": "run9-floors",
+      "row": 187,
+      "field": "mean_us",
+      "factor": 2,
+      "format": ".1f"
+    },
+    "F10:run9-floors:23:mean_us:2|.1f": {
+      "family": "run9-floors",
+      "row": 23,
+      "field": "mean_us",
+      "factor": 2,
+      "format": ".1f"
+    },
+    "F10:run9-floors:123:mean_us:2|.1f": {
+      "family": "run9-floors",
+      "row": 123,
+      "field": "mean_us",
+      "factor": 2,
+      "format": ".1f"
+    },
+    "F10:run9-floors:191:mean_us:2|.1f": {
+      "family": "run9-floors",
+      "row": 191,
+      "field": "mean_us",
+      "factor": 2,
+      "format": ".1f"
+    },
+    "F10:run9-floors:35:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 35,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:135:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 135,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:203:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 203,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:13:mean_us:2|.1f": {
+      "family": "run9-floors",
+      "row": 13,
+      "field": "mean_us",
+      "factor": 2,
+      "format": ".1f"
+    },
+    "F10:run9-floors:143:mean_us:2|.1f": {
+      "family": "run9-floors",
+      "row": 143,
+      "field": "mean_us",
+      "factor": 2,
+      "format": ".1f"
+    },
+    "F10:run9-floors:211:mean_us:2|.1f": {
+      "family": "run9-floors",
+      "row": 211,
+      "field": "mean_us",
+      "factor": 2,
+      "format": ".1f"
+    },
+    "F10:count:cold-completed": {
+      "operation": "count",
+      "family": "cold_fabric",
+      "field": "status",
+      "value": "completed"
+    },
+    "F10:count:cold-unqualified": {
+      "operation": "count",
+      "family": "cold_fabric",
+      "field": "status",
+      "value": "unqualified"
+    },
+    "F10:count:cold-failed": {
+      "operation": "count",
+      "family": "cold_fabric",
+      "field": "status",
+      "value": "failed"
+    },
+    "F10:count:cold-not_run": {
+      "operation": "count",
+      "family": "cold_fabric",
+      "field": "status",
+      "value": "not_run"
+    }
+  },
+  "provenance": "rwc10/SYNTHETIC-generated/provenance.json",
+  "matrix_path": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/matrix.json",
+  "report_path": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/SYNTHETIC-export/comparison.json",
+  "report_complete": true,
+  "excluded_from_final": false
+}

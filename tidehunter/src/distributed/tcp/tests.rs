@@ -8,6 +8,8 @@ use std::process::Command;
 
 #[path = "reactor_tests.rs"]
 pub(in crate::distributed::tcp) mod multiplexed;
+#[path = "wal_replay_tests.rs"]
+mod wal_replay;
 #[test]
 fn structured_transport_identity_ignores_local_selectors_only() {
     let left = Transport::Ofi {
@@ -90,12 +92,32 @@ pub(super) fn config(root: &Path) -> NodeConfig {
     }
 }
 
+#[test]
+fn old_owner_launch_target_defaults_to_on_demand() {
+    let temp = tempdir::TempDir::new("old-live-launch").unwrap();
+    let config = config(&temp.path().join("node"));
+    let mut launch = serde_json::to_value(&config).unwrap();
+    launch["live_target"] = serde_json::json!({
+        "address": "127.0.0.1", "service": 4420, "transport": "tcp",
+        "host_nqn": "nqn.2026-01.test:host", "port_id": 42,
+        "state_dir": temp.path().join("target"), "commissioning_port_id": 43,
+        "commissioning_service": 4421
+    });
+    let serialized = serde_yaml::to_string(&launch).unwrap();
+    let restored: NodeConfig = serde_yaml::from_str(&serialized).unwrap();
+    assert_eq!(
+        restored.live_target.unwrap().export_mode,
+        LiveExportMode::OnDemand
+    );
+}
+
 #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
 #[test]
 fn unsupported_live_target_is_rejected_before_node_creation() {
     let temp = tempdir::TempDir::new("unsupported-live-target").unwrap();
     let mut config = config(&temp.path().join("node"));
     config.live_target = Some(crate::distributed::nvmeof::LiveTargetConfig {
+        export_mode: Default::default(),
         address: "127.0.0.1".into(),
         service: 4420,
         transport: crate::distributed::nvmeof::NvmeofTransport::Tcp,
@@ -346,6 +368,8 @@ fn node_restart_seals_replays_and_never_reactivates_old_epoch() {
     let temp = tempdir::TempDir::new("tcp-node-restart").unwrap();
     let config = config(&temp.path().join("node"));
     let node = StorageNode::open(config.clone(), metrics()).unwrap();
+    node.set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
+        .unwrap();
     assert_eq!(node.status().unwrap().active_epoch, None);
     node.inventory.lock().fence_to(7).unwrap();
     assert_eq!(
@@ -360,6 +384,8 @@ fn node_restart_seals_replays_and_never_reactivates_old_epoch() {
     );
     drop(node);
     let node = StorageNode::open(config.clone(), metrics()).unwrap();
+    node.set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
+        .unwrap();
     assert_eq!(
         node.status().unwrap().epochs,
         vec![NodeEpoch {
@@ -733,6 +759,8 @@ fn pending_checkpoint_does_not_hide_prior_durable_append_completion() {
     let tls = certificates(temp.path());
     let config = config(&temp.path().join("node"));
     let node = StorageNode::open(config.clone(), metrics()).unwrap();
+    node.set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
+        .unwrap();
     node.set_durability(crate::distributed::durability::DurabilityConfig::with_tier(
         crate::distributed::durability::DurabilityTier::Synchronous,
     ))
@@ -835,6 +863,8 @@ fn authenticated_roundtrip(transport: Transport) {
     tls.transport = transport.clone();
     let config = config(&temp.path().join("node"));
     let node = StorageNode::open(config.clone(), metrics()).unwrap();
+    node.set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
+        .unwrap();
     node.set_durability(crate::distributed::durability::DurabilityConfig::with_tier(
         crate::distributed::durability::DurabilityTier::Synchronous,
     ))
@@ -1186,6 +1216,8 @@ fn history_failure_fences_existing_reads_and_recovery_preserves_acknowledged_val
     let mut config = config(&temp.path().join("node"));
     config.partition.max_batches = 2;
     let node = StorageNode::open(config.clone(), metrics()).unwrap();
+    node.set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
+        .unwrap();
     node.set_history_maintenance_diagnostics(true);
     node.inventory.lock().fence_to(1).unwrap();
     let log = node.inventory.lock().active(1).unwrap();
@@ -1214,6 +1246,9 @@ fn history_failure_fences_existing_reads_and_recovery_preserves_acknowledged_val
     drop(node);
 
     let reopened = StorageNode::open(config, metrics()).unwrap();
+    reopened
+        .set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
+        .unwrap();
     reopened.inventory.lock().fence_to(2).unwrap();
     assert_eq!(read(&reopened, 2).unwrap(), batch.mutations()[0]);
 }
@@ -1251,4 +1286,65 @@ fn poison_rejects_reads_before_nvme_epoch_pin_drains() {
         Ok(Response::NvmeofEpochReleased)
     ));
     assert!(node.terminal.load(Ordering::Acquire));
+}
+
+#[cfg(feature = "test-utils")]
+#[test]
+fn memory_only_owner_rpc_accepts_4096_puts_and_checkpoint() {
+    let temp = tempdir::TempDir::new("memory-history-rpc").unwrap();
+    let mut config = config(&temp.path().join("node"));
+    config.partition.fragment_bytes = 4 * 1024 * 1024;
+    config.partition.wal_file_bytes = 16 * 1024 * 1024;
+    config.partition.max_batches = 4096;
+    config.partition.max_reference_metadata_bytes = 64 * 1024 * 1024;
+    let node = StorageNode::open(config.clone(), metrics()).unwrap();
+    node.set_history_persistence(crate::distributed::storage::HistoryPersistence::MemoryOnly)
+        .unwrap();
+    node.set_history_maintenance_diagnostics(true);
+    let tls = TlsFiles {
+        transport: Transport::TcpTrusted,
+        ca: Default::default(),
+        cert: Default::default(),
+        key: Default::default(),
+        server_name: "trusted-test-cluster".into(),
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = listener.local_addr().unwrap().to_string();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server = node.clone();
+    let stop = shutdown.clone();
+    let server_tls = tls.clone();
+    let server_thread = thread::spawn(move || {
+        server
+            .serve(listener, server_tls, TcpLimits::default(), stop)
+            .unwrap()
+    });
+    let mut client = Client::connect(
+        &endpoint,
+        &tls,
+        Duration::from_secs(10),
+        config.partition.clone(),
+        &shape(),
+    )
+    .unwrap();
+    client.fence_to(1).unwrap();
+    for sequence in 0..4096 {
+        client
+            .append_many(1, &[batch(&config, 1, sequence)])
+            .unwrap();
+    }
+    let proof = client.checkpoint(1, 1, 4096).unwrap();
+    assert_eq!(proof.prefix, 4096);
+    assert_eq!(
+        node.inventory
+            .lock()
+            .active(1)
+            .unwrap()
+            .history_maintenance_stats()
+            .waits,
+        0
+    );
+    drop(client);
+    shutdown.store(true, Ordering::Release);
+    server_thread.join().unwrap();
 }

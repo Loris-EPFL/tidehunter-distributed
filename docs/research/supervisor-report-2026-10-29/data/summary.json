@@ -1,0 +1,428 @@
+{
+  "run_id": "th-343ae02a3d9353ed",
+  "github_run": 40848651463,
+  "source_sha": "ba3a6a0194cca6f171e5916649e7f4eeba65aeb0",
+  "cases": 258,
+  "population_rows": 453,
+  "single_repetition": true,
+  "complete": true,
+  "closed": true,
+  "cohorts": {
+    "primary_rf1": 216,
+    "cold_os_cache": 9,
+    "registered_ram_configured": 2,
+    "coordinator_cache_configured": 8,
+    "owner_cache_configured": 8,
+    "write_stage_diagnostics": 5,
+    "native_pagecache": 10
+  },
+  "representative_rows": [
+    {
+      "backend": "native",
+      "write_1k": {
+        "case_id": "0178-native-1024-write-concurrent-primary_rf1-r0",
+        "operation": "put",
+        "n": 4096,
+        "p50_us": 702.187,
+        "p99_us": 3310.762,
+        "success_calls_per_second": 16214.157221953072,
+        "unsuccessful_calls": 0
+      },
+      "read_1k": {
+        "case_id": "0180-native-1024-read-concurrent-primary_rf1-r0",
+        "operation": "read",
+        "n": 8192,
+        "p50_us": 1.92,
+        "p99_us": 3.5,
+        "success_calls_per_second": 142711.89497895757,
+        "unsuccessful_calls": 0
+      },
+      "batch_read_8k": {
+        "case_id": "0167-native-8192-read-many32-primary_rf1-r0",
+        "operation": "get_many",
+        "n": 2048,
+        "p50_us": 133.593,
+        "p99_us": 259.956,
+        "success_calls_per_second": 47624.46140233901,
+        "unsuccessful_calls": 0
+      }
+    },
+    {
+      "backend": "tidehunter_tcp",
+      "write_1k": {
+        "case_id": "0214-tidehunter_tcp-1024-write-concurrent-primary_rf1-r0",
+        "operation": "put",
+        "n": 4096,
+        "p50_us": 818.988,
+        "p99_us": 8765.476,
+        "success_calls_per_second": 13710.545933353162,
+        "unsuccessful_calls": 0
+      },
+      "read_1k": {
+        "case_id": "0216-tidehunter_tcp-1024-read-concurrent-primary_rf1-r0",
+        "operation": "read",
+        "n": 8192,
+        "p50_us": 206.764,
+        "p99_us": 726.976,
+        "success_calls_per_second": 51161.136402003525,
+        "unsuccessful_calls": 0
+      },
+      "batch_read_8k": {
+        "case_id": "0203-tidehunter_tcp-8192-read-many32-primary_rf1-r0",
+        "operation": "get_many",
+        "n": 2048,
+        "p50_us": 4288.906,
+        "p99_us": 5940.443,
+        "success_calls_per_second": 3596.683986620167,
+        "unsuccessful_calls": 0
+      }
+    },
+    {
+      "backend": "tidehunter_efa",
+      "write_1k": {
+        "case_id": "0093-tidehunter_efa-1024-write-concurrent-primary_rf1-r0",
+        "operation": "put",
+        "n": 4096,
+        "p50_us": 683.386,
+        "p99_us": 14881.302,
+        "success_calls_per_second": 14332.004982275203,
+        "unsuccessful_calls": 0
+      },
+      "read_1k": {
+        "case_id": "0095-tidehunter_efa-1024-read-concurrent-primary_rf1-r0",
+        "operation": "read",
+        "n": 8192,
+        "p50_us": 120.153,
+        "p99_us": 398.0,
+        "success_calls_per_second": 91789.17483156513,
+        "unsuccessful_calls": 0
+      },
+      "batch_read_8k": {
+        "case_id": "0082-tidehunter_efa-8192-read-many32-primary_rf1-r0",
+        "operation": "get_many",
+        "n": 2048,
+        "p50_us": 3780.164,
+        "p99_us": 5521.173,
+        "success_calls_per_second": 4077.720938989305,
+        "unsuccessful_calls": 0
+      }
+    },
+    {
+      "backend": "tidehunter_efa_direct",
+      "write_1k": {
+        "case_id": "0148-tidehunter_efa_direct-1024-write-concurrent-primary_rf1-r0",
+        "operation": "put",
+        "n": 4096,
+        "p50_us": 675.505,
+        "p99_us": 14436.565,
+        "success_calls_per_second": 14175.32816940248,
+        "unsuccessful_calls": 0
+      },
+      "read_1k": {
+        "case_id": "0150-tidehunter_efa_direct-1024-read-concurrent-primary_rf1-r0",
+        "operation": "read",
+        "n": 8192,
+        "p50_us": 120.972,
+        "p99_us": 399.139,
+        "success_calls_per_second": 92941.31054622363,
+        "unsuccessful_calls": 0
+      },
+      "batch_read_8k": {
+        "case_id": "0137-tidehunter_efa_direct-8192-read-many32-primary_rf1-r0",
+        "operation": "get_many",
+        "n": 2048,
+        "p50_us": 4182.543,
+        "p99_us": 6244.24,
+        "success_calls_per_second": 3675.1005666685655,
+        "unsuccessful_calls": 0
+      }
+    },
+    {
+      "backend": "tidehunter_efa_native",
+      "write_1k": {
+        "case_id": "0061-tidehunter_efa_native-1024-write-concurrent-primary_rf1-r0",
+        "operation": "put",
+        "n": 4096,
+        "p50_us": 655.685,
+        "p99_us": 15073.793,
+        "success_calls_per_second": 14455.462566314478,
+        "unsuccessful_calls": 0
+      },
+      "read_1k": {
+        "case_id": "0063-tidehunter_efa_native-1024-read-concurrent-primary_rf1-r0",
+        "operation": "read",
+        "n": 8192,
+        "p50_us": 115.313,
+        "p99_us": 368.688,
+        "success_calls_per_second": 90664.0518705509,
+        "unsuccessful_calls": 0
+      },
+      "batch_read_8k": {
+        "case_id": "0050-tidehunter_efa_native-8192-read-many32-primary_rf1-r0",
+        "operation": "get_many",
+        "n": 2048,
+        "p50_us": 2850.163,
+        "p99_us": 4120.922,
+        "success_calls_per_second": 5315.757694163436,
+        "unsuccessful_calls": 0
+      }
+    },
+    {
+      "backend": "tikv",
+      "write_1k": {
+        "case_id": "0123-tikv-1024-write-concurrent-primary_rf1-r0",
+        "operation": "put",
+        "n": 4096,
+        "p50_us": 633.134,
+        "p99_us": 1135.075,
+        "success_calls_per_second": 23505.014779983136,
+        "unsuccessful_calls": 0
+      },
+      "read_1k": {
+        "case_id": "0125-tikv-1024-read-concurrent-primary_rf1-r0",
+        "operation": "read",
+        "n": 8192,
+        "p50_us": 376.349,
+        "p99_us": 611.074,
+        "success_calls_per_second": 38665.05134352558,
+        "unsuccessful_calls": 0
+      },
+      "batch_read_8k": {
+        "case_id": "0112-tikv-8192-read-many32-primary_rf1-r0",
+        "operation": "get_many",
+        "n": 2048,
+        "p50_us": 9670.475,
+        "p99_us": 14435.493,
+        "success_calls_per_second": 1623.2407764480895,
+        "unsuccessful_calls": 0
+      }
+    },
+    {
+      "backend": "cassandra",
+      "write_1k": {
+        "case_id": "0244-cassandra-1024-write-concurrent-primary_rf1-r0",
+        "operation": "put",
+        "n": 4096,
+        "p50_us": 510.442,
+        "p99_us": 1705.288,
+        "success_calls_per_second": 28449.415584687096,
+        "unsuccessful_calls": 0
+      },
+      "read_1k": {
+        "case_id": "0246-cassandra-1024-read-concurrent-primary_rf1-r0",
+        "operation": "read",
+        "n": 8192,
+        "p50_us": 235.405,
+        "p99_us": 349.348,
+        "success_calls_per_second": 57628.60039904289,
+        "unsuccessful_calls": 0
+      },
+      "batch_read_8k": {
+        "case_id": "0233-cassandra-8192-read-many32-primary_rf1-r0",
+        "operation": "get_many",
+        "n": 2048,
+        "p50_us": 4575.411,
+        "p99_us": 17433.515,
+        "success_calls_per_second": 2697.2941289235396,
+        "unsuccessful_calls": 0
+      }
+    },
+    {
+      "backend": "foundationdb",
+      "write_1k": {
+        "case_id": "0011-foundationdb-1024-write-concurrent-primary_rf1-r0",
+        "operation": "put",
+        "n": 4096,
+        "p50_us": 964.332,
+        "p99_us": 1564.124,
+        "success_calls_per_second": 15432.483907717122,
+        "unsuccessful_calls": 0
+      },
+      "read_1k": {
+        "case_id": "0013-foundationdb-1024-read-concurrent-primary_rf1-r0",
+        "operation": "read",
+        "n": 8192,
+        "p50_us": 592.943,
+        "p99_us": 844.498,
+        "success_calls_per_second": 25175.560505028134,
+        "unsuccessful_calls": 0
+      },
+      "batch_read_8k": {
+        "case_id": "0000-foundationdb-8192-read-many32-primary_rf1-r0",
+        "operation": "get_many",
+        "n": 2048,
+        "p50_us": 14174.11,
+        "p99_us": 17759.967,
+        "success_calls_per_second": 1108.0214265461207,
+        "unsuccessful_calls": 0
+      }
+    },
+    {
+      "backend": "valkey_tcp",
+      "write_1k": {
+        "case_id": "0036-valkey_tcp-1024-write-concurrent-primary_rf1-r0",
+        "operation": "put",
+        "n": 4096,
+        "p50_us": 494.34,
+        "p99_us": 931.811,
+        "success_calls_per_second": 29330.52258706237,
+        "unsuccessful_calls": 0
+      },
+      "read_1k": {
+        "case_id": "0038-valkey_tcp-1024-read-concurrent-primary_rf1-r0",
+        "operation": "read",
+        "n": 8192,
+        "p50_us": 215.405,
+        "p99_us": 377.798,
+        "success_calls_per_second": 62301.19865848301,
+        "unsuccessful_calls": 0
+      },
+      "batch_read_8k": {
+        "case_id": "0025-valkey_tcp-8192-read-many32-primary_rf1-r0",
+        "operation": "get_many",
+        "n": 2048,
+        "p50_us": 3388.983,
+        "p99_us": 11669.142,
+        "success_calls_per_second": 3880.758392661122,
+        "unsuccessful_calls": 0
+      }
+    }
+  ],
+  "registered_measurement_evidence": [
+    {
+      "case_id": "0074-tidehunter_efa_native-8192-registered-ram-registered_ram_configured-r0",
+      "value_size": 8192,
+      "calls": 8192,
+      "rma_hit_percent": 28.82080078125,
+      "rma_hits": 2361,
+      "rma_posts": 2361,
+      "rma_completions": 2361,
+      "rma_errors": 0,
+      "message_read_requests": 5831,
+      "grant_acquisitions": 1595
+    },
+    {
+      "case_id": "0077-tidehunter_efa_native-256-registered-ram-registered_ram_configured-r0",
+      "value_size": 256,
+      "calls": 8192,
+      "rma_hit_percent": 28.955078125,
+      "rma_hits": 2372,
+      "rma_posts": 2372,
+      "rma_completions": 2372,
+      "rma_errors": 0,
+      "message_read_requests": 5820,
+      "grant_acquisitions": 1593
+    }
+  ],
+  "unsuccessful_outcomes": [
+    {
+      "cohort": "primary_rf1",
+      "profile": "offered-50000",
+      "outcome": "rejected",
+      "count": 914680
+    },
+    {
+      "cohort": "primary_rf1",
+      "profile": "offered-10000",
+      "outcome": "rejected",
+      "count": 74
+    }
+  ],
+  "historical_write_comparison": [
+    {
+      "backend": "native",
+      "old_p50_ms": 0.6985159999999999,
+      "new_p50_ms": 0.702187,
+      "old_p99_ms": 3.317593,
+      "new_p99_ms": 3.310762,
+      "old_p99_div_new_p99": 1.0020632712348394
+    },
+    {
+      "backend": "tidehunter_tcp",
+      "old_p50_ms": 1.2967080000000002,
+      "new_p50_ms": 0.818988,
+      "old_p99_ms": 144.16263899999998,
+      "new_p99_ms": 8.765476000000001,
+      "old_p99_div_new_p99": 16.44664123203349
+    },
+    {
+      "backend": "tidehunter_efa",
+      "old_p50_ms": 0.95288,
+      "new_p50_ms": 0.6833859999999999,
+      "old_p99_ms": 142.792856,
+      "new_p99_ms": 14.881302,
+      "old_p99_div_new_p99": 9.595454483754176
+    },
+    {
+      "backend": "tidehunter_efa_direct",
+      "old_p50_ms": 0.92845,
+      "new_p50_ms": 0.675505,
+      "old_p99_ms": 142.883737,
+      "new_p99_ms": 14.436565,
+      "old_p99_div_new_p99": 9.897350027516932
+    },
+    {
+      "backend": "tidehunter_efa_native",
+      "old_p50_ms": 0.9422809999999999,
+      "new_p50_ms": 0.655685,
+      "old_p99_ms": 142.370794,
+      "new_p99_ms": 15.073793,
+      "old_p99_div_new_p99": 9.444921659730898
+    },
+    {
+      "backend": "tikv",
+      "old_p50_ms": 0.607464,
+      "new_p50_ms": 0.633134,
+      "old_p99_ms": 1.2708679999999999,
+      "new_p99_ms": 1.135075,
+      "old_p99_div_new_p99": 1.1196335043939827
+    },
+    {
+      "backend": "cassandra",
+      "old_p50_ms": 0.497351,
+      "new_p50_ms": 0.5104420000000001,
+      "old_p99_ms": 0.821028,
+      "new_p99_ms": 1.705288,
+      "old_p99_div_new_p99": 0.48146002317497105
+    },
+    {
+      "backend": "foundationdb",
+      "old_p50_ms": 0.959091,
+      "new_p50_ms": 0.964332,
+      "old_p99_ms": 1.475652,
+      "new_p99_ms": 1.564124,
+      "old_p99_div_new_p99": 0.9434367096214878
+    },
+    {
+      "backend": "valkey_tcp",
+      "old_p50_ms": 0.471171,
+      "new_p50_ms": 0.49434,
+      "old_p99_ms": 0.792188,
+      "new_p99_ms": 0.9318110000000001,
+      "old_p99_div_new_p99": 0.8501595280588016
+    }
+  ],
+  "modeled_costs_usd": {
+    "daily": "15.73",
+    "weekly": "39.43",
+    "monthly": "210.36",
+    "tracked_lifetime": "210.36",
+    "rolling_charge": "187.25",
+    "available": "42.75"
+  },
+  "comparison_sha256": "aa6a0d32a999d2dd1c1a38cc4573c0464a038ec9603a56e4672107e5d03cdfde",
+  "monitoring": {
+    "complete": true,
+    "events": 2854,
+    "placement": "controller-cohosted observer on root volume; capped, not proven non-perturbing",
+    "archive": "../aws-efa/validated-results/observability/monitoring.tar.gz"
+  },
+  "historical_coverage": {
+    "historical_populations": 460,
+    "current_populations": 453,
+    "old_only_populations": 10,
+    "new_only_populations": 3,
+    "comparison_rows": 463,
+    "missing_latency_policy": "blank, never zero-filled"
+  }
+}

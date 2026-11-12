@@ -1,0 +1,1001 @@
+//! Real TCP control and local-file io_uring tests for the leased owner worker.
+use super::*;
+use crate::distributed::durability::DurabilityTier;
+use crate::distributed::tcp::leased_tests::{Fixture, leased_latencies};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+fn worker(fixture: &Fixture, client: Client) -> (ClientWorker, Arc<AtomicBool>) {
+    worker_with_capacity(fixture, client, 16)
+}
+
+fn worker_with_capacity(
+    fixture: &Fixture,
+    client: Client,
+    capacity: usize,
+) -> (ClientWorker, Arc<AtomicBool>) {
+    worker_with_failure_context(
+        fixture,
+        client,
+        capacity,
+        Arc::new(std::sync::OnceLock::new()),
+    )
+}
+
+fn worker_with_failure_context(
+    fixture: &Fixture,
+    client: Client,
+    capacity: usize,
+    first_failure: Arc<std::sync::OnceLock<String>>,
+) -> (ClientWorker, Arc<AtomicBool>) {
+    let failure = Arc::new(AtomicBool::new(false));
+    let (wake, _) = mpsc::sync_channel(1);
+    let worker = ClientWorker::start(
+        client,
+        capacity,
+        wake,
+        failure.clone(),
+        WorkerDiagnostics {
+            write_profile_limit: 0,
+            write_profile: Arc::new(Mutex::new(WriteProfileSnapshot::default())),
+            write_timeline: Arc::new(WriteTimeline::default()),
+            first_failure,
+            partition: fixture.config.partition.partition,
+        },
+    )
+    .unwrap();
+    (worker, failure)
+}
+
+#[test]
+fn leased_worker_merges_ready_appends_and_splits_receipts_in_order() {
+    let fixture = Fixture::new(DurabilityTier::Synchronous, 16384);
+    let (worker, failure) = worker(&fixture, fixture.writer());
+    let batches: Vec<_> = (0..3).map(|n| fixture.batch(n)).collect();
+    let client = worker.client.lock();
+    let replies: Vec<_> = batches
+        .iter()
+        .map(|batch| worker.append(1, vec![batch.clone()]).unwrap())
+        .collect();
+    drop(client);
+    for (batch, reply) in batches.iter().zip(replies) {
+        let receipts = reply.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].appended().id(), batch.id());
+        assert_eq!(receipts[0].appended().version(), batch.version());
+    }
+    let counts = fixture.metrics.snapshot().counts;
+    assert_eq!((counts.leased_frames, counts.fua_writes), (1, 1));
+    let client = worker.client.clone();
+    drop(worker);
+    assert!(!client.lock().leased_test_frontier().1);
+    // Acquire observes the worker's fatal-outcome publication, if any.
+    assert!(!failure.load(Ordering::Acquire));
+}
+
+#[test]
+fn leased_worker_settles_checkpoint_and_closes_before_seal() {
+    let fixture = Fixture::new(DurabilityTier::Native, 16384);
+    fixture
+        .node
+        .set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
+        .unwrap();
+    let (worker, failure) = worker(&fixture, fixture.writer());
+    let receipt = receive(worker.append(1, vec![fixture.batch(0)]).unwrap()).unwrap()[0];
+    let (reply, checkpoint) = mpsc::sync_channel(1);
+    worker.send(Command::Checkpoint(1, 1, 1, reply)).unwrap();
+    let proof = checkpoint
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(proof.prefix, 1);
+    let (written, open, _) = worker.client.lock().leased_test_frontier();
+    assert!(open);
+    let log = fixture.node.log_for_test(1);
+    assert_eq!(log.appended_frontier(), written);
+    assert!(log.synced_frontier() >= written);
+    assert_eq!(fixture.metrics.snapshot().counts.leased_skip_markers, 0);
+    assert_eq!(fixture.metrics.snapshot().counts.adoption_settle_samples, 1);
+    assert_eq!(
+        fixture
+            .metrics
+            .snapshot()
+            .counts
+            .adoption_history_full_settles,
+        0
+    );
+    receive(worker.seal(1).unwrap()).unwrap();
+    assert!(!worker.client.lock().leased_test_frontier().1);
+    assert_eq!(fixture.metrics.snapshot().counts.adoption_settle_samples, 1);
+    assert_eq!(
+        fixture
+            .metrics
+            .snapshot()
+            .counts
+            .adoption_history_full_settles,
+        0
+    );
+    let reference = fixture
+        .batch(0)
+        .record_reference(receipt.appended().address(), 0)
+        .unwrap();
+    assert_eq!(
+        log.read_record(&reference).unwrap(),
+        fixture.batch(0).mutations()[0]
+    );
+    drop(worker);
+    // Acquire observes the worker's fatal-outcome publication, if any.
+    assert!(!failure.load(Ordering::Acquire));
+}
+
+#[test]
+fn leased_worker_clean_shutdown_closes_owner_allocation_guard() {
+    let fixture = Fixture::new(DurabilityTier::Native, 16384);
+    let (worker, failure) = worker(&fixture, fixture.writer_without_ahead());
+    receive(worker.append(1, vec![fixture.batch(0)]).unwrap()).unwrap();
+    let client = worker.client.clone();
+    drop(worker);
+    assert!(!client.lock().leased_test_frontier().1);
+    assert_eq!(fixture.metrics.snapshot().counts.leased_skip_markers, 1);
+    // A second real allocation succeeds only if the first guard was released.
+    let mut next = fixture.client();
+    let extent = next.lease_live_extent(1).unwrap();
+    assert_eq!(extent.extent.start, 16384);
+    // Acquire observes the worker's fatal-outcome publication, if any.
+    assert!(!failure.load(Ordering::Acquire));
+}
+
+#[test]
+fn leased_worker_unknown_write_poison_stops_queued_commands() {
+    for result in [Some(-libc::EIO), Some(2048), None] {
+        let fixture = Fixture::new(DurabilityTier::Native, 16384);
+        let mut client = fixture.writer();
+        if let Some(result) = result {
+            client.leased_test_fail_write(result);
+        } else {
+            client.leased_test_timeout_write();
+        }
+        let (worker, failure) = worker(&fixture, client);
+        let guard = worker.client.lock();
+        let first = worker.append(1, vec![fixture.batch(0)]).unwrap();
+        let (reply, checkpoint) = mpsc::sync_channel(1);
+        worker.send(Command::Checkpoint(1, 1, 1, reply)).unwrap();
+        let later = worker.append(1, vec![fixture.batch(1)]).unwrap();
+        drop(guard);
+        assert!(first.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
+        assert!(!matches!(
+            checkpoint.recv_timeout(Duration::from_secs(5)),
+            Ok(Ok(_))
+        ));
+        assert!(!matches!(
+            later.recv_timeout(Duration::from_secs(5)),
+            Ok(Ok(_))
+        ));
+        drop(worker);
+        // Acquire observes the worker's fatal-outcome publication.
+        assert!(failure.load(Ordering::Acquire));
+        assert_eq!(fixture.metrics.snapshot().counts.leased_frames, 0);
+        assert_eq!(fixture.metrics.snapshot().counts.unknown_writes, 1);
+    }
+}
+
+#[test]
+fn leased_worker_harvests_last_adoption_while_idle() {
+    let fixture = Fixture::new(DurabilityTier::Native, 16384);
+    let (worker, failure) = worker(&fixture, fixture.writer());
+    receive(worker.append(1, vec![fixture.batch(0)]).unwrap()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, _, pending) = worker.client.lock().leased_test_frontier();
+        if fixture.metrics.snapshot().counts.adoption_async_exchanges == 1 && !pending {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(fixture.node.log_for_test(1).appended_frontier(), 4096);
+    assert_eq!(fixture.metrics.snapshot().counts.adoption_async_samples, 1);
+    // Acquire observes the worker's fatal-outcome publication, if any.
+    assert!(!failure.load(Ordering::Acquire));
+}
+
+#[test]
+fn leased_worker_failed_adoption_and_digest_mismatch_poison_while_idle() {
+    for bad_token in [false, true] {
+        let fixture = Fixture::new(DurabilityTier::Native, 16384);
+        let mut client = fixture.writer();
+        client.leased_test_corrupt_adoption(bad_token);
+        let (mut worker, failure) = worker(&fixture, client);
+        receive(worker.append(1, vec![fixture.batch(0)]).unwrap()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // Failure publication precedes channel teardown. Join only after the
+        // actual worker exit, so append rejection does not race receiver drop.
+        while !failure.load(Ordering::Acquire) || !worker.thread.as_ref().unwrap().is_finished() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        worker.thread.take().unwrap().join().unwrap();
+        assert!(worker.append(1, vec![fixture.batch(1)]).is_err());
+        assert_eq!(fixture.metrics.snapshot().counts.leased_frames, 1);
+        let counts = fixture.metrics.snapshot().counts;
+        assert_eq!(counts.adoption_async_samples, 0);
+        assert_eq!(counts.adoption_settle_samples, 0);
+        drop(worker);
+    }
+}
+
+#[test]
+fn leased_worker_control_closes_extent_but_stats_does_not() {
+    let fixture = Fixture::new(DurabilityTier::Native, 16384);
+    let (worker, failure) = worker(&fixture, fixture.writer_without_ahead());
+    receive(worker.append(1, vec![fixture.batch(0)]).unwrap()).unwrap();
+    receive(worker.stats().unwrap()).unwrap();
+    assert!(worker.client.lock().leased_test_frontier().1);
+    assert_eq!(fixture.metrics.snapshot().counts.leased_skip_markers, 0);
+    worker.control(|client| client.stats()).unwrap();
+    assert!(!worker.client.lock().leased_test_frontier().1);
+    assert_eq!(fixture.metrics.snapshot().counts.leased_skip_markers, 1);
+    let receipt = receive(worker.append(1, vec![fixture.batch(1)]).unwrap()).unwrap()[0];
+    assert!(receipt.appended().address().offset >= 16384);
+    drop(worker);
+    // Acquire observes the worker's fatal-outcome publication, if any.
+    assert!(!failure.load(Ordering::Acquire));
+}
+
+#[test]
+fn leased_worker_queued_checkpoint_then_control_closes_at_dispatch() {
+    let fixture = Fixture::new(DurabilityTier::Native, 16384);
+    let (worker, failure) = worker(&fixture, fixture.writer_without_ahead());
+    let guard = worker.client.lock();
+    let append = worker.append(1, vec![fixture.batch(0)]).unwrap();
+    let (reply, checkpoint) = mpsc::sync_channel(1);
+    worker
+        .send(Command::CheckpointPosition(1, 1, 4096, reply))
+        .unwrap();
+    let (reply, control) = mpsc::sync_channel(1);
+    worker
+        .send(Command::Control(Box::new(move |client| {
+            let _ = reply.send(client.leased_test_frontier().1);
+        })))
+        .unwrap();
+    drop(guard);
+    receive(append).unwrap();
+    assert!(
+        checkpoint
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_ok()
+    );
+    assert!(!control.recv_timeout(Duration::from_secs(5)).unwrap());
+    assert_eq!(fixture.metrics.snapshot().counts.leased_skip_markers, 1);
+    drop(worker);
+    // Acquire observes a fatal outcome, if any, before accepting the test result.
+    assert!(!failure.load(Ordering::Acquire));
+}
+
+#[test]
+fn leased_worker_queued_checkpoint_then_seal_closes_at_dispatch() {
+    let fixture = Fixture::new(DurabilityTier::Native, 16384);
+    let (worker, failure) = worker(&fixture, fixture.writer_without_ahead());
+    let guard = worker.client.lock();
+    let append = worker.append(1, vec![fixture.batch(0)]).unwrap();
+    let (reply, checkpoint) = mpsc::sync_channel(1);
+    worker
+        .send(Command::CheckpointPosition(1, 1, 4096, reply))
+        .unwrap();
+    let sealed = worker.seal(1).unwrap();
+    drop(guard);
+    receive(append).unwrap();
+    assert!(
+        checkpoint
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_ok()
+    );
+    assert!(sealed.recv_timeout(Duration::from_secs(5)).unwrap().is_ok());
+    assert!(!worker.client.lock().leased_test_frontier().1);
+    assert_eq!(fixture.metrics.snapshot().counts.leased_skip_markers, 1);
+    drop(worker);
+    // Acquire observes a fatal outcome, if any, before accepting the test result.
+    assert!(!failure.load(Ordering::Acquire));
+}
+
+#[test]
+fn leased_worker_failed_checkpoint_never_dispatches_queued_stats_or_control() {
+    for control_first in [false, true] {
+        let fixture = Fixture::new(DurabilityTier::Native, 16384);
+        let (worker, failure) = worker(&fixture, fixture.writer());
+        let guard = worker.client.lock();
+        let append = worker.append(1, vec![fixture.batch(0)]).unwrap();
+        let (reply, checkpoint) = mpsc::sync_channel(1);
+        // Only one batch exists: the real owner must reject this proof request.
+        worker.send(Command::Checkpoint(1, 1, 2, reply)).unwrap();
+        let (reply, stats) = mpsc::sync_channel(1);
+        let stats_command = Command::Stats(reply);
+        let (reply, control) = mpsc::sync_channel(1);
+        let control_command = Command::Control(Box::new(move |_| {
+            let _ = reply.send(());
+        }));
+        let commands = if control_first {
+            [control_command, stats_command]
+        } else {
+            [stats_command, control_command]
+        };
+        for command in commands {
+            worker.send(command).unwrap();
+        }
+        let later = worker.append(1, vec![fixture.batch(1)]).unwrap();
+        drop(guard);
+        receive(append).unwrap();
+        assert!(
+            checkpoint
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .is_err()
+        );
+        drop(worker);
+        assert!(!matches!(
+            stats.recv_timeout(Duration::from_secs(5)),
+            Ok(Ok(_))
+        ));
+        assert!(control.recv_timeout(Duration::from_secs(5)).is_err());
+        assert!(!matches!(
+            later.recv_timeout(Duration::from_secs(5)),
+            Ok(Ok(_))
+        ));
+        // Acquire observes the failure recorded before dispatch was stopped.
+        assert!(failure.load(Ordering::Acquire));
+        assert_eq!(fixture.metrics.snapshot().counts.leased_frames, 1);
+        assert_eq!(fixture.metrics.snapshot().counts.leased_skip_markers, 0);
+    }
+}
+
+#[test]
+fn leased_worker_timeout_detaches_dma_before_blocking_drain() {
+    let fixture = Fixture::new(DurabilityTier::Native, 16384);
+    let mut client = fixture.writer();
+    client.leased_test_timeout_write();
+    let (entered, draining) = mpsc::sync_channel(1);
+    let (release, resume) = mpsc::sync_channel(1);
+    client.leased_test_pause_drain(entered, resume);
+    let (worker, failure) = worker(&fixture, client);
+    let reply = worker.append(1, vec![fixture.batch(0)]).unwrap();
+    assert!(reply.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
+    draining.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut guard = worker
+        .client
+        .try_lock_for(Duration::from_secs(1))
+        .expect("terminal drain must not hold the client mutex");
+    assert!(
+        guard.take_failed_live_writer().is_none(),
+        "worker must own the detached DMA queue"
+    );
+    guard.close_live_writer().unwrap();
+    assert_eq!(fixture.metrics.snapshot().counts.leased_write_samples, 0);
+    assert_eq!(fixture.metrics.snapshot().counts.adoption_sync_exchanges, 0);
+    drop(guard);
+    release.send(()).unwrap();
+    drop(worker);
+    // Acquire observes the failure delivered before the detached drain.
+    assert!(failure.load(Ordering::Acquire));
+    let counts = fixture.metrics.snapshot().counts;
+    assert_eq!(leased_latencies(&counts), [(0, 0); 5]);
+    assert_eq!(counts.completed_write_ops, 1);
+    assert_eq!(counts.completed_write_bytes, 4096);
+    assert_eq!((counts.failed_write_ops, counts.short_write_ops), (0, 0));
+}
+
+#[test]
+fn leased_worker_failed_merged_frame_marks_every_command_unknown() {
+    for result in [-libc::EIO, 2048] {
+        let fixture = Fixture::new(DurabilityTier::Native, 16384);
+        let mut client = fixture.writer();
+        client.leased_test_fail_write(result);
+        let (worker, failure) = worker(&fixture, client);
+        let guard = worker.client.lock();
+        let batches = [fixture.batch(0), fixture.batch(1), fixture.batch(2)];
+        let replies: Vec<_> = batches
+            .iter()
+            .map(|batch| worker.append(1, vec![batch.clone()]).unwrap())
+            .collect();
+        drop(guard);
+        for (batch, reply) in batches.iter().zip(replies) {
+            let error = reply
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.uncertain_version, Some(batch.version()));
+        }
+        drop(worker);
+        assert_eq!(fixture.metrics.snapshot().counts.unknown_writes, 1);
+        assert_eq!(fixture.metrics.snapshot().counts.leased_write_samples, 0);
+        // Acquire observes the failure of the one merged frame.
+        assert!(failure.load(Ordering::Acquire));
+    }
+}
+
+#[test]
+fn leased_worker_checkpoint_waits_for_adoption_without_holding_client_lock() {
+    use crate::distributed::storage::LivePausePoint;
+    let fixture = Fixture::new(DurabilityTier::Native, 16384);
+    fixture
+        .node
+        .set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
+        .unwrap();
+    let mut client = fixture.writer();
+    client
+        .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+        .unwrap();
+    let (entered, release) = fixture
+        .node
+        .log_for_test(1)
+        .pause_live(LivePausePoint::FrameProbe);
+    let (worker, failure) = worker_with_capacity(&fixture, client, 1);
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (reply, checkpoint) = mpsc::sync_channel(1);
+    worker.send(Command::Checkpoint(1, 1, 1, reply)).unwrap();
+    let stats = worker.stats().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let guard = worker
+            .client
+            .try_lock_for(Duration::from_millis(100))
+            .expect("queued checkpoint must park outside the client mutex");
+        if guard.leased_test_command_adoption_waits() != 0 {
+            assert!(guard.leased_test_frontier().2);
+            break;
+        }
+        drop(guard);
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(matches!(
+        checkpoint.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    release.send(()).unwrap();
+    assert_eq!(
+        checkpoint
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
+            .prefix,
+        1
+    );
+    assert!(stats.recv_timeout(Duration::from_secs(5)).unwrap().is_ok());
+    assert!(worker.client.lock().leased_test_frontier().1);
+    drop(worker);
+    // Acquire observes a fatal outcome, if any, before accepting the result.
+    assert!(!failure.load(Ordering::Acquire));
+}
+
+#[test]
+fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
+    use crate::distributed::tcp::{LiveClientConfig, LiveWriteMode};
+    for (result, already_poisoned) in [
+        (Some(-libc::EIO), false),
+        (Some(2048), false),
+        (None, false),
+        (None, true),
+    ] {
+        let fixture = Fixture::single_partition(DurabilityTier::Native, 16384);
+        let owner = &fixture.config.partition;
+        let root = tempdir::TempDir::new("leased-shutdown").unwrap();
+        let config = RemoteDatabaseConfig {
+            history_persistence: HistoryPersistence::default(),
+            storage: LocalInventoryConfig {
+                database: owner.inventory.database,
+                partitions: owner.inventory.partitions.clone(),
+                batch_limits: owner.batch_limits,
+                group_limits: owner.group_limits,
+                fragment_bytes: owner.fragment_bytes,
+                wal_file_bytes: owner.wal_file_bytes,
+                max_batches_per_partition: owner.max_batches,
+                max_reference_metadata_bytes: owner.max_reference_metadata_bytes,
+                max_epochs: fixture.config.max_epochs,
+            },
+            endpoints: vec![RemoteEndpoint {
+                partition: owner.partition,
+                address: fixture.endpoint.clone(),
+                server_name: fixture.tls.server_name.clone(),
+            }],
+            tls: fixture.tls.clone(),
+            timeout: Duration::from_secs(5),
+            max_admitted_batches: 16,
+            max_index_bytes: 1024 * 1024,
+            index_shards: 2,
+            max_pending_batches: 16,
+            max_pending_bytes: 4 * 1024 * 1024,
+            replay_limits: ReplayLimits {
+                max_batches: 4096,
+                max_encoded_bytes: 16 * 1024 * 1024,
+            },
+            owner_append_occupancy: 1,
+            pipelined_writes: true,
+            read_cache_bytes: 0,
+            read_memory_allowance_bytes: 64 * 1024 * 1024,
+            preparation_workers: 1,
+            scan_prefetch_pages: 1,
+            read_lanes: 1,
+            max_pending_reads: 4,
+            max_pending_read_bytes: 128 * 1024,
+            write_profile_limit: 0,
+            live_nvme: Some(LiveClientConfig {
+                lease_ahead: true,
+                polled_writes: false,
+                host_nqn: "nqn.2026-01.test:leased".into(),
+                host_id: [1; 16],
+                max_inflight_requests: 4,
+                max_inflight_bytes: 128 * 1024,
+                connect_timeout_ms: 1000,
+                io_timeout_ms: 1000,
+                write_mode: LiveWriteMode::Leased,
+                leased_durability: Some(DurabilityTier::Native),
+                inline_reads: true,
+                queue_geometry: Default::default(),
+                export_mode: Default::default(),
+            }),
+        };
+        let shape = KeyShape::from_yaml(&fixture.config.shape_yaml).unwrap();
+        let mut database = RemoteDatabase::open(
+            root.path(),
+            &shape,
+            config,
+            Metrics::new_in_enabled(&prometheus::Registry::new(), false),
+        )
+        .unwrap();
+        let client = database.clients[0].client.clone();
+        client.lock().bench_local_live_fixture(false);
+        let batch = fixture.batch(0);
+        database
+            .write_batch(batch.id().operation, batch.mutations().to_vec())
+            .unwrap();
+        let metrics = database.live_metrics.as_ref().unwrap().clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if metrics.snapshot().counts.adoption_async_exchanges == 1
+                && !client.lock().leased_adoption_pending()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        let before = metrics.snapshot().counts;
+        if already_poisoned {
+            database.healthy = false;
+            // Release publishes an existing authority failure before shutdown.
+            database.concurrent_failure.store(true, Ordering::Release);
+            assert!(
+                database
+                    .shutdown_with(|_| panic!("poison cannot seal"))
+                    .is_err()
+            );
+            let after = metrics.snapshot().counts;
+            assert_eq!(leased_latencies(&after), leased_latencies(&before));
+            assert_eq!(after.completed_write_ops, before.completed_write_ops);
+            assert_eq!(after.leased_skip_markers, 0);
+            assert_eq!(after.adoption_sync_exchanges, 0);
+            assert_eq!(after.metadata_requests, before.metadata_requests);
+            continue;
+        }
+        let (entered, draining) = mpsc::sync_channel(1);
+        let (release, resume) = mpsc::sync_channel(1);
+        {
+            let mut client = client.lock();
+            if let Some(result) = result {
+                client.leased_test_fail_write(result);
+            } else {
+                client.leased_test_timeout_write();
+            }
+            client.leased_test_pause_drain(entered, resume);
+        }
+        // Skip the ordinary checkpoint so shutdown itself initiates the first
+        // failing marker write while the healthy owner worker is idle.
+        database.healthy = false;
+        thread::scope(|scope| {
+            let shutdown =
+                scope.spawn(|| database.shutdown_with(|_| panic!("a failed close must not seal")));
+            draining.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mut guard = client
+                .try_lock_for(Duration::from_secs(1))
+                .expect("shutdown drain must release the client mutex");
+            assert!(guard.take_failed_live_writer().is_none());
+            guard.close_live_writer().unwrap();
+            assert_eq!(
+                leased_latencies(&metrics.snapshot().counts),
+                leased_latencies(&before)
+            );
+            drop(guard);
+            release.send(()).unwrap();
+            let error = shutdown.join().unwrap().unwrap_err();
+            assert!(error.to_string().contains("live writer drain failed"));
+        });
+        // Acquire observes shutdown's poison before any subsequent worker pass.
+        assert!(database.concurrent_failure.load(Ordering::Acquire));
+        let after = metrics.snapshot().counts;
+        assert_eq!(leased_latencies(&after), leased_latencies(&before));
+        assert_eq!(
+            after.completed_write_ops,
+            before.completed_write_ops + u64::from(result.is_none())
+        );
+        assert_eq!(
+            after.completed_write_bytes,
+            before.completed_write_bytes + if result.is_none() { 4096 } else { 0 }
+        );
+        assert_eq!(
+            after.failed_write_ops,
+            u64::from(result.is_some_and(|n| n < 0))
+        );
+        assert_eq!(after.short_write_ops, u64::from(result == Some(2048)));
+        assert_eq!(
+            after.short_write_bytes,
+            if result == Some(2048) { 2048 } else { 0 }
+        );
+        // A retry may find that the failed queue has already been taken; it must
+        // neither strand DMA nor double-publish the eventual terminal outcome.
+        assert!(
+            database
+                .shutdown_with(|_| panic!("poison cannot seal"))
+                .is_err()
+        );
+        let retried = metrics.snapshot().counts;
+        assert_eq!(leased_latencies(&retried), leased_latencies(&before));
+        assert_eq!(retried.completed_write_ops, after.completed_write_ops);
+        assert_eq!(retried.completed_write_bytes, after.completed_write_bytes);
+        assert_eq!(retried.failed_write_ops, after.failed_write_ops);
+        assert_eq!(retried.short_write_ops, after.short_write_ops);
+        assert_eq!(retried.short_write_bytes, after.short_write_bytes);
+    }
+}
+
+/// Local-file io_uring profile, not a hardware NVMe-oF measurement.
+#[test]
+#[ignore = "allocates a 10 GiB WAL file; requires at least 11 GiB free"]
+fn leased_rotation_profile_native_geometry() {
+    use crate::distributed::codec::Mutation;
+    use crate::key_shape::{KeyShape, KeySpace};
+
+    let fixture = Fixture::native_geometry();
+    println!(
+        "leased_rotation_profile geometry: fragment_bytes={}, wal_file_bytes={}, puts=8192, group_batches=16, value_bytes=65536, route=local_file_fixture, client_deadline_seconds=60, owner_io_timeout_seconds=60",
+        fixture.config.partition.fragment_bytes, fixture.config.partition.wal_file_bytes,
+    );
+    let shape = KeyShape::from_yaml(&fixture.config.shape_yaml).unwrap();
+    let first_failure = Arc::new(std::sync::OnceLock::new());
+    let (worker, failure) =
+        worker_with_failure_context(&fixture, fixture.writer(), 16, first_failure.clone());
+    let mut calls = Vec::with_capacity(8192);
+    for first in (0..8192).step_by(16) {
+        let batches: Vec<_> = (first..first + 16)
+            .map(|sequence| {
+                let original = fixture.batch(sequence);
+                CompleteBatch::new(
+                    &shape,
+                    original.id(),
+                    original.version(),
+                    vec![Mutation::Put {
+                        keyspace: KeySpace(0),
+                        key: b"key1"[..].into(),
+                        value: vec![sequence as u8; 64 * 1024].into(),
+                    }],
+                    fixture.config.partition.batch_limits,
+                )
+                .unwrap()
+            })
+            .collect();
+        // Hold the client only while enqueueing, so the actor sees one ready
+        // group of sixteen scalar puts. Capacity is exactly sixteen commands.
+        let client = worker.client.lock();
+        let replies: Vec<_> = batches
+            .into_iter()
+            .enumerate()
+            .map(|(member, batch)| {
+                let started = Instant::now();
+                let reply = worker.append(1, vec![batch]).unwrap_or_else(|error| {
+                    panic!(
+                        "profile enqueue failed: {error}; first_failure={:?}; counters={:#?}",
+                        first_failure.get(),
+                        fixture.metrics.snapshot().counts
+                    )
+                });
+                (first + member as u64, started, reply)
+            })
+            .collect();
+        drop(client);
+        for (sequence, started, reply) in replies {
+            let receipts = reply
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "profile reply timed out: {error}; first_failure={:?}; counters={:#?}",
+                        first_failure.get(),
+                        fixture.metrics.snapshot().counts
+                    )
+                })
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "profile append failed: {error}; first_failure={:?}; counters={:#?}",
+                        first_failure.get(),
+                        fixture.metrics.snapshot().counts
+                    )
+                });
+            assert_eq!(receipts.len(), 1);
+            calls.push((sequence, started.elapsed().as_nanos()));
+        }
+    }
+    // Capture put-path counters before shutdown adds a final close exchange.
+    let settled = worker.client.lock().settle_leased_extent();
+    settled.unwrap_or_else(|error| {
+        panic!(
+            "profile settle failed: {error}; first_failure={:?}; counters={:#?}",
+            first_failure.get(),
+            fixture.metrics.snapshot().counts
+        )
+    });
+    let counts = fixture.metrics.snapshot().counts;
+    println!(
+        "leased_rotation_profile extent_switch_samples={}",
+        counts.extent_switch_samples
+    );
+    println!("leased_rotation_profile counters: {counts:#?}");
+    let largest_close = worker.client.lock().leased_test_largest_close_profile();
+    println!(
+        "leased_rotation_profile largest_close: frames={}, adopt_ns={}",
+        largest_close.frames, largest_close.adopt_ns,
+    );
+    calls.sort_unstable_by_key(|(_, ns)| std::cmp::Reverse(*ns));
+    for (rank, (sequence, ns)) in calls.into_iter().take(20).enumerate() {
+        println!(
+            "leased_rotation_profile slow_call: rank={}, sequence={sequence}, api_ns={ns}",
+            rank + 1
+        );
+    }
+    assert_eq!(counts.leased_frames, 512);
+    assert!(counts.extent_switch_samples >= 3);
+    assert!(counts.lease_reserve_ns > 0);
+    assert!(counts.extent_preleases >= counts.extent_switch_samples);
+    // A debug owner can validate the old backlog more slowly than callers fill
+    // the next extent. Report waits rather than changing the approved driver.
+    assert_eq!(counts.adoption_sync_exchanges, 1);
+    drop(worker);
+    assert!(!failure.load(Ordering::Acquire));
+}
+
+#[test]
+fn leased_worker_closes_old_extent_and_preleases_while_appends_continue() {
+    use crate::distributed::storage::LivePausePoint;
+    let fixture = Fixture::new(DurabilityTier::Native, 16384);
+    let (worker, failure) = worker(&fixture, fixture.writer());
+    receive(worker.append(1, vec![fixture.batch(0)]).unwrap()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !worker.client.lock().leased_test_ahead_state().1 {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(1));
+    }
+    for sequence in 1..4 {
+        receive(worker.append(1, vec![fixture.batch(sequence)]).unwrap()).unwrap();
+    }
+    let log = fixture.node.log_for_test(1);
+    let (entered, resume) = log.pause_live(LivePausePoint::CloseSuffix);
+    let before = fixture.metrics.snapshot().counts.adoption_sync_exchanges;
+    receive(worker.append(1, vec![fixture.batch(4)]).unwrap()).unwrap();
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    // The old close holds no state lock or coordinator reply. New-extent data
+    // reaches its CQE while that close is deliberately blocked.
+    receive(worker.append(1, vec![fixture.batch(5)]).unwrap()).unwrap();
+    assert_eq!(
+        fixture.metrics.snapshot().counts.adoption_sync_exchanges,
+        before
+    );
+    assert!(worker.client.lock().leased_test_ahead_state().0);
+    resume.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let client = worker.client.lock();
+        let (closing, next) = client.leased_test_ahead_state();
+        let pending = client.leased_test_frontier().2;
+        drop(client);
+        if !closing && next && !pending {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(fixture.metrics.snapshot().counts.extent_preleases >= 2);
+    assert_eq!(fixture.metrics.snapshot().counts.extent_switch_waits, 0);
+    assert_eq!(log.receipt_count(), 6);
+    assert!(!failure.load(Ordering::Acquire));
+}
+
+#[test]
+fn wal_replay_leased_checkpoint_does_not_settle_the_extent() {
+    for pending_prelease in [false, true] {
+        let fixture = Fixture::new(DurabilityTier::Native, 128 * 1024);
+        let mut client = fixture.writer();
+        let receipt = client
+            .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+            .unwrap()[0];
+        let mut release_prelease = if pending_prelease {
+            let (entered, release) = fixture.node.pause_inventory();
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            client.submit_leased_adoption().unwrap();
+            assert!(client.leased_test_frontier().2);
+            assert_eq!(fixture.metrics.snapshot().counts.extent_preleases, 0);
+            Some(release)
+        } else {
+            None
+        };
+        let before = fixture.metrics.snapshot().counts.adoption_sync_exchanges;
+        let (worker, failure) = worker(&fixture, client);
+        let mut through =
+            receipt.appended().address().offset + u64::from(receipt.appended().address().len);
+        for n in 1..=8 {
+            let guard = worker.client.lock();
+            let append = worker.append(1, vec![fixture.batch(n)]).unwrap();
+            let (reply, checkpoint) = mpsc::sync_channel(1);
+            worker
+                .send(Command::CheckpointPosition(1, 1, through, reply))
+                .unwrap();
+            drop(guard);
+            // The prelease cannot finish before this checkpoint enters the FIFO.
+            if let Some(release) = release_prelease.take() {
+                release.send(()).unwrap();
+            }
+            let receipt = receive(append).unwrap()[0];
+            let proof = checkpoint
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            assert!(proof.durable_end >= through);
+            through =
+                receipt.appended().address().offset + u64::from(receipt.appended().address().len);
+            assert!(worker.client.lock().leased_test_frontier().1);
+            assert_eq!(
+                fixture.metrics.snapshot().counts.adoption_sync_exchanges,
+                before
+            );
+            assert_eq!(fixture.metrics.snapshot().counts.adoption_settle_samples, 0);
+        }
+        if pending_prelease {
+            assert!(fixture.metrics.snapshot().counts.extent_preleases > 0);
+        }
+        drop(worker);
+        assert!(!failure.load(Ordering::Acquire));
+    }
+}
+
+#[test]
+fn wal_replay_leased_appends_continue_while_position_sync_is_pending() {
+    let fixture = Fixture::new(DurabilityTier::Native, 128 * 1024);
+    let mut client = fixture.writer();
+    let first = client
+        .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+        .unwrap()[0];
+    // Finish initial prelease and adoption before holding the position sync.
+    for _ in 0..2 {
+        client.submit_leased_adoption().unwrap();
+        client.wait_leased_control().unwrap();
+    }
+    let before = fixture.metrics.snapshot().counts;
+    let through = first.appended().address().offset + u64::from(first.appended().address().len);
+    let (entered, release) = fixture.node.pause_next_persist(1).unwrap();
+    let (worker, failure) = worker(&fixture, client);
+    let (reply, checkpoint) = mpsc::sync_channel(1);
+    worker
+        .send(Command::CheckpointPosition(1, 1, through, reply))
+        .unwrap();
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let overlapping = (|| -> Result<Vec<DurableBatch>, String> {
+        let mut receipts = Vec::new();
+        for n in 1..=8 {
+            let append = worker
+                .append(1, vec![fixture.batch(n)])
+                .map_err(|error| error.to_string())?;
+            let result = append
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|error| error.to_string())?;
+            receipts.push(result.map_err(|error| error.to_string())?[0]);
+            if !matches!(checkpoint.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+                return Err("position sync completed while its owner was paused".into());
+            }
+        }
+        Ok(receipts)
+    })();
+    let pending = fixture.metrics.snapshot().counts;
+    // Release before any failure assertion, so teardown cannot wait on this hook.
+    release.send(()).unwrap();
+    let receipts = overlapping.expect("direct frames must not wait for the position sync");
+    assert_eq!(pending.leased_frames, before.leased_frames + 8);
+    assert_eq!(pending.adopt_profile_samples, before.adopt_profile_samples);
+    assert_eq!(pending.extent_preleases, before.extent_preleases);
+    assert_eq!(
+        pending.adoption_sync_exchanges,
+        before.adoption_sync_exchanges
+    );
+    let proof = checkpoint
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert!(proof.durable_end >= through);
+    // The durability record covers the captured cut, not these later frames.
+    assert!(
+        receipts
+            .iter()
+            .all(|receipt| receipt.appended().address().offset > proof.durable_end)
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fixture.metrics.snapshot().counts.adopt_profile_samples == before.adopt_profile_samples {
+        assert!(
+            Instant::now() < deadline,
+            "adoption driver did not resume after the position reply"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    let log = fixture.node.log_for_test(1);
+    for (n, receipt) in (1..=8).zip(receipts) {
+        let batch = fixture.batch(n);
+        let reference = batch
+            .record_reference(receipt.appended().address(), 0)
+            .unwrap();
+        assert_eq!(log.read_record(&reference).unwrap(), batch.mutations()[0]);
+    }
+    drop(worker);
+    assert!(!failure.load(Ordering::Acquire));
+}
+
+#[test]
+fn wal_replay_leased_append_that_needs_control_waits_for_position_reply() {
+    let fixture = Fixture::new(DurabilityTier::Native, 16384);
+    let mut client = fixture.writer_without_ahead();
+    let mut last = None;
+    for n in 0..4 {
+        last = Some(
+            client
+                .write_leased_group(1, vec![fixture.batch(n)], &WriteTimeline::default(), 2)
+                .unwrap()[0],
+        );
+    }
+    client.submit_leased_adoption().unwrap();
+    client.wait_leased_control().unwrap();
+    assert!(client.leased_append_needs_control());
+    assert_eq!(client.leased_test_frontier().0, 16384);
+    let last = last.unwrap().appended();
+    let through = last.address().offset + u64::from(last.address().len);
+    let (entered, release) = fixture.node.pause_next_persist(1).unwrap();
+    let (worker, failure) = worker(&fixture, client);
+    let (reply, checkpoint) = mpsc::sync_channel(1);
+    worker
+        .send(Command::CheckpointPosition(1, 1, through, reply))
+        .unwrap();
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let before = fixture.metrics.snapshot().counts;
+    let append = worker.append(1, vec![fixture.batch(4)]).unwrap();
+    let early = append.recv_timeout(Duration::from_millis(100));
+    let pending = fixture.metrics.snapshot().counts;
+    release.send(()).unwrap();
+    assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+    assert_eq!(pending.leased_frames, before.leased_frames);
+    checkpoint
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    let receipt = append
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap()[0];
+    assert!(receipt.appended().address().offset >= 16384);
+    let batch = fixture.batch(4);
+    let reference = batch
+        .record_reference(receipt.appended().address(), 0)
+        .unwrap();
+    assert_eq!(
+        fixture
+            .node
+            .log_for_test(1)
+            .read_record(&reference)
+            .unwrap(),
+        batch.mutations()[0]
+    );
+    drop(worker);
+    assert!(!failure.load(Ordering::Acquire));
+}

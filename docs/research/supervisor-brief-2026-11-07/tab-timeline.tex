@@ -1,0 +1,15 @@
+\small
+\begin{tabular}{lrr}\toprule
+Interval of one write call & mean \us & share\\\midrule
+Caller entry, validation, admission & 9.2 & 2\%\\
+\textbf{Wait in the command queue of the authority thread} & \textbf{63.5} & 17\%\\
+Prepare and admit & 15.0 & 4\%\\
+\textbf{Wait before append dispatch} & \textbf{65.5} & 17\%\\
+Dispatch and transmit & 6.8 & 2\%\\
+Append exchange with the owner & 105.3 & 27\%\\
+\textbf{Wait for durable observation} & \textbf{69.1} & 18\%\\
+Ordered publication & 24.7 & 6\%\\
+Reply to the caller & 23.9 & 6\%\\
+\midrule
+Caller span (sum) & 383.1 & 100\%\\
+\bottomrule\end{tabular}

@@ -133,6 +133,8 @@ fn append_checkpoint_seal_and_fence_keep_fifo_and_exact_durable_receipts() {
     let temp = tempdir::TempDir::new("control-fifo").unwrap();
     let config = config(&temp.path().join("node"));
     let node = open_synchronous(&config);
+    node.set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
+        .unwrap();
     node.inventory.lock().fence_to(1).unwrap();
     let log = node.inventory.lock().active(1).unwrap();
     let (entered, release) = log.pause_next_persist();
@@ -564,6 +566,8 @@ fn native_checkpoint_proof_is_issued_only_after_its_prefix_is_synced() {
     let temp = tempdir::TempDir::new("control-native-checkpoint").unwrap();
     let config = config(&temp.path().join("node"));
     let node = StorageNode::open(config.clone(), metrics()).unwrap();
+    node.set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
+        .unwrap();
     node.set_durability(DurabilityConfig::with_tier(DurabilityTier::Native))
         .unwrap();
     node.inventory.lock().fence_to(1).unwrap();
@@ -619,6 +623,14 @@ mod live_fencing {
     // Exercise the actual WAL/control lifecycle with the existing journal-only
     // target fixture. This is not evidence of kernel namespace I/O drain.
     fn open_live(root: &std::path::Path, tier: DurabilityTier) -> (NodeConfig, Arc<StorageNode>) {
+        open_live_mode(root, tier, LiveExportMode::OnDemand)
+    }
+
+    fn open_live_mode(
+        root: &std::path::Path,
+        tier: DurabilityTier,
+        mode: LiveExportMode,
+    ) -> (NodeConfig, Arc<StorageNode>) {
         let mut config = config(&root.join("node"));
         // A complete 4 KiB live group stays below the native fragment trigger.
         config.partition.fragment_bytes = 16 * 1024;
@@ -644,6 +656,7 @@ mod live_fencing {
                 commissioning_port_id: 43,
                 commissioning_service: 4421,
                 spdk: None,
+                export_mode: mode,
             },
             configfs,
         )
@@ -654,6 +667,222 @@ mod live_fencing {
             inventory.fence_to(1).unwrap();
         }
         (config, node)
+    }
+
+    #[test]
+    fn permanent_export_survives_read_pin_release_and_idle_reaping() {
+        let temp = tempdir::TempDir::new("permanent-pin").unwrap();
+        let (config, node) = open_live_mode(
+            temp.path(),
+            DurabilityTier::Native,
+            LiveExportMode::PerOwner,
+        );
+        let batch = batch(&config, 1, 0);
+        let group = CompleteGroup::new_live(
+            &node.control_context.append_shape,
+            vec![batch.clone()],
+            config.partition.batch_limits,
+            config.partition.group_limits,
+        )
+        .unwrap();
+        let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+        let Response::LiveLeased(leased) =
+            extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 })
+        else {
+            panic!("expected lease")
+        };
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&leased.extent.segment.path)
+            .unwrap()
+            .write_all_at(&frame, leased.extent.start % leased.extent.segment.bytes)
+            .unwrap();
+        let mut skip = [0; 4096];
+        skip[..8].copy_from_slice(crate::crc::CrcFrame::skip_marker().as_ref());
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&leased.extent.segment.path)
+            .unwrap()
+            .write_all_at(
+                &skip,
+                (leased.extent.start + frame.len() as u64) % leased.extent.segment.bytes,
+            )
+            .unwrap();
+        extent_exchange(
+            &node,
+            Request::AdoptLiveExtent {
+                epoch: 1,
+                token: leased.extent.token,
+                through: leased.extent.start + frame.len() as u64,
+                close: true,
+                lease_next: false,
+            },
+        );
+        let log = node.inventory.lock().active(1).unwrap();
+        let receipt = log.receipt_page(0, 1).unwrap()[0];
+        let reference = batch.record_reference(receipt.address(), 0).unwrap();
+        let lease = log.resolve_live_record(&reference).unwrap();
+        let token = [7; 16];
+        node.inventory
+            .lock()
+            .live_pins
+            .insert(token, (1, vec![lease]));
+        node.inventory.lock().release_live_pin(1, token).unwrap();
+        assert!(!node.inventory.lock().live_pins.contains_key(&token));
+        node.inventory.lock().reap_idle_live_segments(1).unwrap();
+        assert_eq!(
+            node.inventory
+                .lock()
+                .live_target
+                .as_ref()
+                .unwrap()
+                .stats()
+                .unwrap()
+                .owned_namespace_count,
+            1
+        );
+        shutdown(&node, 1);
+    }
+
+    #[test]
+    fn open_live_exports_default_is_empty_and_permanent_exports_are_idempotent() {
+        for mode in [
+            LiveExportMode::OnDemand,
+            LiveExportMode::PerFile,
+            LiveExportMode::PerOwner,
+        ] {
+            let temp = tempdir::TempDir::new("open-live-exports").unwrap();
+            let (_, node) = open_live_mode(temp.path(), DurabilityTier::Native, mode);
+            let Response::LiveLeased(leased) =
+                extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 })
+            else {
+                panic!("expected lease")
+            };
+            let permanent = mode != LiveExportMode::OnDemand;
+            let expected_namespaces = if permanent { 2 } else { 1 };
+            if permanent {
+                let mut current = leased.clone();
+                for _ in 0..2 {
+                    let mut skip = [0; 4096];
+                    skip[..8].copy_from_slice(crate::crc::CrcFrame::skip_marker().as_ref());
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(&current.extent.segment.path)
+                        .unwrap()
+                        .write_all_at(&skip, current.extent.start % current.extent.segment.bytes)
+                        .unwrap();
+                    let Response::LiveAdopted(adopted) = extent_exchange(
+                        &node,
+                        Request::AdoptLiveExtent {
+                            epoch: 1,
+                            token: current.extent.token,
+                            through: current.extent.start,
+                            close: true,
+                            lease_next: true,
+                        },
+                    ) else {
+                        panic!("expected next lease")
+                    };
+                    current = adopted.next.unwrap();
+                }
+                assert_eq!(current.extent.segment.file_index, 1);
+            }
+            for _ in 0..2 {
+                let Response::LiveExports(info) =
+                    extent_exchange(&node, Request::OpenLiveExports { authority_epoch: 1 })
+                else {
+                    panic!("expected exports")
+                };
+                assert_eq!(info.mode, mode);
+                assert_eq!(info.exported_files, if permanent { 2 } else { 0 });
+                assert_eq!(info.wal_file_bytes, 32768);
+                let inventory = node.inventory.lock();
+                assert_eq!(
+                    inventory
+                        .live_target
+                        .as_ref()
+                        .unwrap()
+                        .stats()
+                        .unwrap()
+                        .namespaces_exposed,
+                    expected_namespaces
+                );
+                assert_eq!(
+                    inventory
+                        .live_target
+                        .as_ref()
+                        .unwrap()
+                        .stats()
+                        .unwrap()
+                        .owned_namespace_count,
+                    expected_namespaces
+                );
+                assert_eq!(leased.binding.permanent, mode != LiveExportMode::OnDemand);
+            }
+            node.inventory.lock().reap_idle_live_segments(1).unwrap();
+            assert_eq!(
+                node.inventory
+                    .lock()
+                    .live_target
+                    .as_ref()
+                    .unwrap()
+                    .stats()
+                    .unwrap()
+                    .owned_namespace_count,
+                expected_namespaces
+            );
+            shutdown(&node, 1);
+        }
+    }
+
+    #[test]
+    fn permanent_owner_rejects_reserved_writes_and_active_record_resolution() {
+        let temp = tempdir::TempDir::new("permanent-controls").unwrap();
+        let (config, node) = open_live_mode(
+            temp.path(),
+            DurabilityTier::Native,
+            LiveExportMode::PerOwner,
+        );
+        let batch = batch(&config, 1, 0);
+        let group = CompleteGroup::new_live(
+            &node.control_context.append_shape,
+            vec![batch.clone()],
+            config.partition.batch_limits,
+            config.partition.group_limits,
+        )
+        .unwrap();
+        let (descriptor, _) = LiveGroupDescriptor::from_group(&group).unwrap();
+        let reference = batch
+            .record_reference(
+                PhysicalValueAddress {
+                    partition: config.partition.partition,
+                    segment_generation: 1,
+                    offset: 0,
+                    len: (batch.encoded().len() + 8) as u32,
+                },
+                0,
+            )
+            .unwrap();
+        for (request, message) in [
+            (
+                Request::ReserveLiveGroup {
+                    epoch: 1,
+                    descriptor,
+                },
+                "permanent live export requires leased write mode",
+            ),
+            (
+                Request::ResolveLiveRecords {
+                    authority_epoch: 1,
+                    references: vec![reference],
+                },
+                "live record resolution is disabled for the active epoch in permanent export mode",
+            ),
+        ] {
+            let error = node.handle(request, TcpLimits::default()).err().unwrap();
+            assert_eq!(error.to_string(), message);
+        }
+        shutdown(&node, 1);
     }
 
     fn reserve(
@@ -906,4 +1135,610 @@ mod live_fencing {
         assert!(node.inventory.lock().status().is_err());
         assert_eq!(retained.synced_frontier(), retained.appended_frontier());
     }
+    #[test]
+    fn leased_control_publishes_writable_binding_and_never_waits_for_adoption_sync() {
+        for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+            let temp = tempdir::TempDir::new("live-extent-control").unwrap();
+            let (config, node) = open_live(temp.path(), tier);
+            let (completed, completions) = mpsc::sync_channel(1);
+            let request = Request::LeaseLiveExtent { epoch: 1 };
+            assert!(is_stream_request(&request));
+            let encoded = wire_codec(HARD_FRAME_LIMIT).serialize(&request).unwrap();
+            let request: Request = wire_codec(HARD_FRAME_LIMIT).deserialize(&encoded).unwrap();
+            assert!(matches!(request, Request::LeaseLiveExtent { epoch: 1 }));
+            assert!(command(&node, 1, request, 4096, &completed).is_ok());
+            let response = receive(&completions, 1).response.unwrap();
+            let encoded = wire_codec(HARD_FRAME_LIMIT).serialize(&response).unwrap();
+            let Response::LiveLeased(leased) =
+                wire_codec(HARD_FRAME_LIMIT).deserialize(&encoded).unwrap()
+            else {
+                panic!("expected leased extent")
+            };
+            assert!(!leased.binding.readonly);
+            assert_eq!(leased.tier, tier);
+            assert_eq!(
+                leased.extent.end - leased.extent.start,
+                config.partition.fragment_bytes
+            );
+            let group = CompleteGroup::new_live(
+                &node.control_context.append_shape,
+                vec![batch(&config, 1, 0)],
+                config.partition.batch_limits,
+                config.partition.group_limits,
+            )
+            .unwrap();
+            let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&leased.extent.segment.path)
+                .unwrap()
+                .write_all_at(&frame, leased.extent.start % leased.extent.segment.bytes)
+                .unwrap();
+            let log = node.log_for_test(1);
+            let (entered, resume) = log.pause_next_persist();
+            let request = Request::AdoptLiveExtent {
+                epoch: 1,
+                token: leased.extent.token,
+                through: leased.extent.start + frame.len() as u64,
+                close: false,
+                lease_next: false,
+            };
+            assert!(is_stream_request(&request));
+            let encoded = wire_codec(HARD_FRAME_LIMIT).serialize(&request).unwrap();
+            let request = wire_codec(HARD_FRAME_LIMIT).deserialize(&encoded).unwrap();
+            assert!(command(&node, 2, request, 4096, &completed).is_ok());
+            // This receive must finish even when the owner's barrier is paused.
+            let response = receive(&completions, 2).response.unwrap();
+            let encoded = wire_codec(HARD_FRAME_LIMIT).serialize(&response).unwrap();
+            let Response::LiveAdopted(reply) =
+                wire_codec(HARD_FRAME_LIMIT).deserialize(&encoded).unwrap()
+            else {
+                panic!("expected adoption proof")
+            };
+            assert_eq!(reply.adoption.receipt_count, 1);
+            assert_eq!(reply.adoption.token, leased.extent.token);
+            assert!(reply.next.is_none());
+            if tier == DurabilityTier::Synchronous {
+                entered.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert_eq!(log.frontier().unwrap().stats().flush_requests, 1);
+                assert_eq!(log.synced_frontier(), 0);
+                resume.send(()).unwrap();
+            } else {
+                assert_eq!(log.frontier().unwrap().stats().flush_requests, 0);
+                assert_eq!(log.stats().persistence_barriers, 0);
+            }
+            let mut skip = [0; 4096];
+            skip[..8].copy_from_slice(crate::crc::CrcFrame::skip_marker().as_ref());
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&leased.extent.segment.path)
+                .unwrap()
+                .write_all_at(&skip, frame.len() as u64)
+                .unwrap();
+            let request = Request::AdoptLiveExtent {
+                epoch: 1,
+                token: leased.extent.token,
+                through: frame.len() as u64,
+                close: true,
+                lease_next: true,
+            };
+            assert!(command(&node, 3, request, 4096, &completed).is_ok());
+            let Response::LiveAdopted(closed) = receive(&completions, 3).response.unwrap() else {
+                panic!("expected close and next extent")
+            };
+            assert!(closed.adoption.closed);
+            assert_eq!(closed.adoption.adopted_end, frame.len() as u64);
+            let next = closed.next.unwrap();
+            assert_eq!(next.extent.start, leased.extent.end);
+            assert_eq!(next.tier, tier);
+            if tier == DurabilityTier::Native {
+                entered.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert_eq!(log.frontier().unwrap().stats().flush_requests, 1);
+                assert_eq!(log.synced_frontier(), 0);
+                resume.send(()).unwrap();
+            }
+            drop(log);
+            shutdown(&node, 1);
+        }
+    }
+    #[test]
+    fn leased_native_adoptions_defer_explicit_sync_until_extent_close() {
+        let temp = tempdir::TempDir::new("live-native-adoption-policy").unwrap();
+        let (config, node) = open_live(temp.path(), DurabilityTier::Native);
+        let Response::LiveLeased(leased) =
+            extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 })
+        else {
+            panic!("expected native extent")
+        };
+        let log = node.log_for_test(1);
+        let frontier = log.frontier().unwrap();
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&leased.extent.segment.path)
+            .unwrap();
+        for sequence in 0..3 {
+            let group = CompleteGroup::new_live(
+                &node.control_context.append_shape,
+                vec![batch(&config, 1, sequence)],
+                config.partition.batch_limits,
+                config.partition.group_limits,
+            )
+            .unwrap();
+            let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+            file.write_all_at(&frame, sequence * 4096).unwrap();
+            let Response::LiveAdopted(reply) = extent_exchange(
+                &node,
+                Request::AdoptLiveExtent {
+                    epoch: 1,
+                    token: leased.extent.token,
+                    through: (sequence + 1) * 4096,
+                    close: false,
+                    lease_next: false,
+                },
+            ) else {
+                panic!("expected native adoption")
+            };
+            assert_eq!(reply.adoption.receipt_count, sequence + 1);
+            assert_eq!(frontier.stats().flush_requests, 0);
+            assert_eq!(frontier.stats().fsync_calls, 0);
+            assert_eq!(log.stats().persistence_barriers, 0);
+            assert_eq!(log.synced_frontier(), 0);
+        }
+        let mut marker = [0; 4096];
+        marker[..8].copy_from_slice(crate::crc::CrcFrame::skip_marker().as_ref());
+        file.write_all_at(&marker, 3 * 4096).unwrap();
+        let (entered, resume) = log.pause_next_persist();
+        let Response::LiveAdopted(closed) = extent_exchange(
+            &node,
+            Request::AdoptLiveExtent {
+                epoch: 1,
+                token: leased.extent.token,
+                through: 3 * 4096,
+                close: true,
+                lease_next: false,
+            },
+        ) else {
+            panic!("expected native close")
+        };
+        assert!(closed.adoption.closed);
+        assert_eq!(frontier.stats().flush_requests, 1);
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(log.stats().persistence_barriers, 0);
+        resume.send(()).unwrap();
+        frontier
+            .wait_synced(3 * 4096, Some(Instant::now() + Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(frontier.stats().flush_requests, 1);
+        assert_eq!(log.stats().persistence_barriers, 1);
+        drop(log);
+        shutdown(&node, 1);
+    }
+
+    fn extent_exchange(node: &StorageNode, request: Request) -> Response {
+        let (completed, completions) = mpsc::sync_channel(1);
+        assert!(command(node, 1, request, 4096, &completed).is_ok());
+        receive(&completions, 1).response.unwrap()
+    }
+
+    #[test]
+    fn leased_checkpoint_and_grants_tail_frames_but_recovery_stays_immutable() {
+        for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+            let temp = tempdir::TempDir::new("live-extent-tail-controls").unwrap();
+            let (config, node) = open_live(temp.path(), tier);
+            node.set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
+                .unwrap();
+            let Response::LiveLeased(leased) =
+                extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 })
+            else {
+                panic!("expected extent")
+            };
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(&leased.extent.segment.path)
+                .unwrap();
+            let mut groups = Vec::new();
+            for n in 0..3 {
+                let group = CompleteGroup::new_live(
+                    &node.control_context.append_shape,
+                    vec![batch(&config, 1, n)],
+                    config.partition.batch_limits,
+                    config.partition.group_limits,
+                )
+                .unwrap();
+                let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+                if n < 2 {
+                    file.write_all_at(&frame, n * 4096).unwrap();
+                }
+                groups.push((group, frame));
+            }
+            let (completed, completions) = mpsc::sync_channel(1);
+            assert!(
+                command(
+                    &node,
+                    1,
+                    Request::RecoverLiveMetadata {
+                        authority_epoch: 1,
+                        source_epoch: 1,
+                        cursor: 0,
+                        limit: 2,
+                    },
+                    4096,
+                    &completed
+                )
+                .is_ok()
+            );
+            let error = receive(&completions, 1).response.err().unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("recovery requires sealed immutable epoch")
+            );
+            let Response::Checkpoint(proof) = extent_exchange(
+                &node,
+                Request::Checkpoint {
+                    authority_epoch: 1,
+                    epoch: 1,
+                    prefix: 2,
+                },
+            ) else {
+                panic!("expected checkpoint proof")
+            };
+            assert_eq!(proof.retained, 2);
+            assert_eq!(proof.prefix, 2);
+            let log = node.log_for_test(1);
+            assert_eq!(log.synced_frontier(), 8192);
+            // The next grant must discover a frame written after the proof.
+            file.write_all_at(&groups[2].1, 8192).unwrap();
+            let item = &groups[2].0.batches()[0];
+            let receipt = crate::distributed::storage::receipt_for(
+                log.config(),
+                item,
+                crate::distributed::storage::member_position(
+                    crate::WalPosition::new(8192, groups[2].1.len() as u32),
+                    groups[2].0.batch_offsets()[0],
+                    item,
+                ),
+            );
+            let reference = item.record_reference(receipt.address(), 0).unwrap();
+            let Response::LiveRecords(locations) = extent_exchange(
+                &node,
+                Request::ResolveLiveRecords {
+                    authority_epoch: 1,
+                    references: vec![reference],
+                },
+            ) else {
+                panic!("expected read grant")
+            };
+            assert_eq!(locations.entries.len(), 1);
+            assert_eq!(locations.entries[0].reference, reference);
+            assert_eq!(log.synced_frontier(), 12288);
+            extent_exchange(
+                &node,
+                Request::ReleaseLiveEpochPin {
+                    epoch: 1,
+                    token: locations.epoch_pin_token,
+                },
+            );
+            drop(log);
+            shutdown(&node, 1);
+        }
+    }
+
+    #[test]
+    fn leased_fence_recovers_only_after_revocation_and_never_regrants_old_generation() {
+        let temp = tempdir::TempDir::new("live-extent-fence").unwrap();
+        let (config, node) = open_live(temp.path(), DurabilityTier::Synchronous);
+        let Response::LiveLeased(old) =
+            extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 })
+        else {
+            panic!("expected first extent")
+        };
+        let group = CompleteGroup::new_live(
+            &node.control_context.append_shape,
+            vec![batch(&config, 1, 0)],
+            config.partition.batch_limits,
+            config.partition.group_limits,
+        )
+        .unwrap();
+        let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&old.extent.segment.path)
+            .unwrap()
+            .write_all_at(&frame, 0)
+            .unwrap();
+        let Response::Status(status) = fence(&node, 2).unwrap() else {
+            panic!("expected fenced authority")
+        };
+        assert_eq!(status.active_epoch, Some(2));
+        let Response::LiveLeased(next) =
+            extent_exchange(&node, Request::LeaseLiveExtent { epoch: 2 })
+        else {
+            panic!("expected new epoch extent")
+        };
+        assert_ne!(
+            next.extent.segment.generation,
+            old.extent.segment.generation
+        );
+        assert_ne!(next.extent.segment.path, old.extent.segment.path);
+        assert_ne!(next.binding.uuid, old.binding.uuid);
+        shutdown(&node, 2);
+    }
+    #[test]
+    fn leased_pregrant_persistence_does_not_hold_inventory_ownership() {
+        let temp = tempdir::TempDir::new("live-lease-unlocked-inventory").unwrap();
+        let (_config, node) = open_live(temp.path(), DurabilityTier::Synchronous);
+        let log = node.log_for_test(1);
+        let (entered, resume) = log.pause_next_persist();
+        let (completed, completions) = mpsc::sync_channel(1);
+        assert!(
+            command(
+                &node,
+                1,
+                Request::LeaseLiveExtent { epoch: 1 },
+                4096,
+                &completed
+            )
+            .is_ok()
+        );
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The lookup worker owns the capacity-one reply; dropping either end
+        // unblocks shutdown. It must finish before pre-grant I/O is released.
+        let (sent, received) = mpsc::sync_channel(1);
+        let lookup = node.clone();
+        let reader = thread::spawn(move || {
+            let status = lookup.status().unwrap();
+            let epoch = lookup
+                .inventory
+                .lock()
+                .active(1)
+                .unwrap()
+                .config()
+                .inventory
+                .epoch;
+            sent.send((status.active_epoch, epoch)).unwrap();
+        });
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(5)).unwrap(),
+            (Some(1), 1)
+        );
+        reader.join().unwrap();
+        assert!(matches!(
+            completions.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        resume.send(()).unwrap();
+        assert!(matches!(
+            receive(&completions, 1).response.unwrap(),
+            Response::LiveLeased(_)
+        ));
+        drop(log);
+        shutdown(&node, 1);
+    }
+    #[test]
+    fn leased_reply_freezes_policy_after_a_prelease_tier_change() {
+        let temp = tempdir::TempDir::new("live-lease-policy").unwrap();
+        let (_config, node) = open_live(temp.path(), DurabilityTier::Native);
+        assert_eq!(node.durability().tier, DurabilityTier::Native);
+        node.set_durability(DurabilityConfig::with_tier(DurabilityTier::Synchronous))
+            .unwrap();
+        let Response::LiveLeased(leased) =
+            extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 })
+        else {
+            panic!("expected lease policy")
+        };
+        assert_eq!(leased.tier, DurabilityTier::Synchronous);
+        assert!(
+            node.set_durability(DurabilityConfig::with_tier(DurabilityTier::Native))
+                .is_err()
+        );
+        node.set_durability(DurabilityConfig::with_tier(DurabilityTier::Synchronous))
+            .unwrap();
+        let mut marker = [0; 4096];
+        marker[..8].copy_from_slice(crate::crc::CrcFrame::skip_marker().as_ref());
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&leased.extent.segment.path)
+            .unwrap()
+            .write_all_at(&marker, leased.extent.start % leased.extent.segment.bytes)
+            .unwrap();
+        let Response::LiveAdopted(adopted) = extent_exchange(
+            &node,
+            Request::AdoptLiveExtent {
+                epoch: 1,
+                token: leased.extent.token,
+                through: leased.extent.start,
+                close: true,
+                lease_next: true,
+            },
+        ) else {
+            panic!("expected next lease policy")
+        };
+        assert_eq!(adopted.next.unwrap().tier, DurabilityTier::Synchronous);
+        shutdown(&node, 1);
+    }
+    #[test]
+    fn leased_concurrent_requests_grant_one_extent_and_keep_its_writer_valid() {
+        let temp = tempdir::TempDir::new("live-exclusive-lease").unwrap();
+        let (config, node) = open_live(temp.path(), DurabilityTier::Native);
+        let log = node.log_for_test(1);
+        let (entered, resume) = log.pause_next_persist();
+        let (completed, completions) = mpsc::sync_channel(1);
+        assert!(
+            command(
+                &node,
+                101,
+                Request::LeaseLiveExtent { epoch: 1 },
+                4096,
+                &completed
+            )
+            .is_ok()
+        );
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (second_done, second_result) = mpsc::sync_channel(1);
+        assert!(
+            command(
+                &node,
+                102,
+                Request::LeaseLiveExtent { epoch: 1 },
+                4096,
+                &second_done
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            second_result.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        resume.send(()).unwrap();
+        let Response::LiveLeased(first) = receive(&completions, 101).response.unwrap() else {
+            panic!("expected the sole granted extent")
+        };
+        let error = receive(&second_result, 102).response.err().unwrap();
+        assert!(error.to_string().contains("live extent already open"));
+        let group = CompleteGroup::new_live(
+            &node.control_context.append_shape,
+            vec![batch(&config, 1, 0)],
+            config.partition.batch_limits,
+            config.partition.group_limits,
+        )
+        .unwrap();
+        let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&first.extent.segment.path)
+            .unwrap();
+        file.write_all_at(&frame, first.extent.start % first.extent.segment.bytes)
+            .unwrap();
+        let mut marker = [0; 4096];
+        marker[..8].copy_from_slice(crate::crc::CrcFrame::skip_marker().as_ref());
+        file.write_all_at(
+            &marker,
+            (first.extent.start + 4096) % first.extent.segment.bytes,
+        )
+        .unwrap();
+        let Response::LiveAdopted(closed) = extent_exchange(
+            &node,
+            Request::AdoptLiveExtent {
+                epoch: 1,
+                token: first.extent.token,
+                through: first.extent.start + 4096,
+                close: true,
+                lease_next: true,
+            },
+        ) else {
+            panic!("expected current writer's next extent")
+        };
+        let next = closed.next.unwrap();
+        assert_eq!(next.extent.start, first.extent.end);
+        // Acquire observes any terminal failure published by either worker.
+        assert!(!node.control_context.poison_pending.load(Ordering::Acquire));
+        assert!(node.status().unwrap().healthy);
+        let group = CompleteGroup::new_live(
+            &node.control_context.append_shape,
+            vec![batch(&config, 1, 1)],
+            config.partition.batch_limits,
+            config.partition.group_limits,
+        )
+        .unwrap();
+        let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&next.extent.segment.path)
+            .unwrap()
+            .write_all_at(&frame, next.extent.start % next.extent.segment.bytes)
+            .unwrap();
+        let Response::LiveAdopted(reply) = extent_exchange(
+            &node,
+            Request::AdoptLiveExtent {
+                epoch: 1,
+                token: next.extent.token,
+                through: next.extent.start + 4096,
+                close: false,
+                lease_next: false,
+            },
+        ) else {
+            panic!("current writer must remain valid")
+        };
+        assert_eq!(reply.adoption.receipt_count, 1);
+        assert_eq!(log.receipt_count(), 2);
+        drop(log);
+        shutdown(&node, 1);
+    }
+    #[test]
+    fn leased_lost_reply_recovery_fences_an_unreported_written_prefix() {
+        let temp = tempdir::TempDir::new("live-lost-lease-reply").unwrap();
+        let (config, node) = open_live(temp.path(), DurabilityTier::Synchronous);
+        let Response::LiveLeased(granted) =
+            extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 })
+        else {
+            panic!("expected the sole extent")
+        };
+        // The fault harness retains the write address only. There is no lease
+        // retry or adoption/control reply after these complete direct writes.
+        let segment = granted.extent.segment;
+        let start = granted.extent.start;
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&segment.path)
+            .unwrap();
+        for sequence in 0..3 {
+            let group = CompleteGroup::new_live(
+                &node.control_context.append_shape,
+                vec![batch(&config, 1, sequence)],
+                config.partition.batch_limits,
+                config.partition.group_limits,
+            )
+            .unwrap();
+            let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+            file.write_all_at(&frame, (start + sequence * 4096) % segment.bytes)
+                .unwrap();
+        }
+        // Real file data sync models the synchronous target's completed writes,
+        // not a hardware FUA qualification or an owner frontier barrier.
+        file.sync_data().unwrap();
+        drop(file);
+        assert_eq!(node.log_for_test(1).receipt_count(), 0);
+        assert_eq!(node.log_for_test(1).synced_frontier(), 0);
+        assert!(matches!(fence(&node, 2).unwrap(), Response::Status(_)));
+        let recovered = node
+            .inventory
+            .lock()
+            .live_recovery_log(2, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.receipt_count(), 3);
+        assert_eq!(recovered.synced_frontier(), start + 3 * 4096);
+        for (sequence, receipt) in recovered
+            .receipt_page(0, 3)
+            .unwrap()
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(receipt.version().sequence, sequence as u64);
+            assert_eq!(
+                recovered.read_batch(receipt).unwrap().id(),
+                batch(&config, 1, sequence as u64).id()
+            );
+        }
+        drop(recovered);
+        let Response::LiveLeased(next) =
+            extent_exchange(&node, Request::LeaseLiveExtent { epoch: 2 })
+        else {
+            panic!("expected a new stream, never a repeated old grant")
+        };
+        assert_ne!(next.extent.segment.generation, segment.generation);
+        assert_ne!(next.extent.segment.path, segment.path);
+        shutdown(&node, 2);
+    }
+}
+
+#[test]
+fn leased_protocol_rejects_the_previous_version() {
+    let mut preface = std::io::Cursor::new(Vec::new());
+    write_transport_mode(&mut preface, &Transport::TcpTrusted).unwrap();
+    let mut preface = preface.into_inner();
+    assert_eq!(PROTOCOL, 24);
+    preface[4..6].copy_from_slice(&23u16.to_be_bytes());
+    assert!(read_transport_mode(&mut &preface[..], &Transport::TcpTrusted).is_err());
 }

@@ -60,7 +60,42 @@ def _focused_text(value):
         raise ValueError("missing focused artifact identity")
 
 
+def successful_read_keys(samples, batch_size):
+    return sum((1 if row["operation"] == "read" else batch_size if row["operation"] == "get_many" else 0)
+               for row in samples if row["outcome"] in ("ok", "success"))
+
+
 def _validate_focused_artifact(name, data, job, receipt):
+    if name == "device_counters":
+        _focused_object(data, "before after")
+        rows = []
+        for boundary in ("before", "after"):
+            values = data[boundary]
+            if not isinstance(values, list) or not values:
+                raise ValueError("invalid device counters")
+            indexed = {}
+            for row in values:
+                _focused_object(row, "owner_index major minor read_ops read_sectors write_ops write_sectors")
+                index = row["owner_index"]
+                if job.get("backend") == "native":
+                    if type(index) is not int or index != -1:
+                        raise ValueError("invalid client device index")
+                else:
+                    _focused_uint(index)
+                    if index >= job.get("owner_count", 5):
+                        raise ValueError("owner device index outside active owners")
+                for key in ("major", "minor", "read_ops", "read_sectors", "write_ops", "write_sectors"):
+                    _focused_uint(row[key])
+                identity = (index, row["major"], row["minor"])
+                if identity in indexed:
+                    raise ValueError("duplicate device counter")
+                indexed[identity] = row
+            rows.append(indexed)
+        if rows[0].keys() != rows[1].keys() or any(
+                rows[1][identity][counter] < rows[0][identity][counter]
+                for identity in rows[0] for counter in ("read_ops", "read_sectors", "write_ops", "write_sectors")):
+            raise ValueError("device counter identity changed or decreased")
+        return
     schemas = {
         "media_evidence": "schema_version case_id expected status reason_codes measurement_drained owner_devices successful_reads read_ops_per_success history_loads_before history_loads_after history_prewarm_verified",
         "fio_result": _FIO_FIELDS,
@@ -74,6 +109,10 @@ def _validate_focused_artifact(name, data, job, receipt):
     }
     if name == "media_evidence" and job.get("case_kind") == "native_media_read":
         schemas[name] = schemas[name].replace("owner_devices", "client_devices")
+    if name == "media_evidence" and data.get("schema_version") == 2:
+        schemas[name] += " device_bytes_per_read"
+    if name == "ssd_floor_result" and "host" in job.get("ssd", {}):
+        schemas[name] += " host_index"
     if name == "ssd_write_floor_result":
         spec = job.get("ssd_write", {})
         if spec.get("mode") in floors.APPEND_MODES:
@@ -81,7 +120,9 @@ def _validate_focused_artifact(name, data, job, receipt):
         elif "host" in spec:
             schemas[name] += " host_index"
     _focused_object(data, schemas[name])
-    if type(data["schema_version"]) is not int or data["schema_version"] != 1 or data["case_id"] != job.get("case_id"):
+    if (type(data["schema_version"]) is not int
+            or data["schema_version"] not in ((1, 2) if name == "media_evidence" else (1,))
+            or data["case_id"] != job.get("case_id")):
         raise ValueError("focused artifact schema or case identity mismatch")
     if name == "ssd_write_floor_result":
         spec = job.get("ssd_write", {})
@@ -106,6 +147,11 @@ def _validate_focused_artifact(name, data, job, receipt):
         ssd = job.get("ssd", {})
         if any(data[key] != ssd.get(key) for key in ("state", "age_seconds", "region_bytes", "block_bytes")):
             raise ValueError("SSD dimensions differ from job")
+        if "host" in ssd:
+            host_index = {"client": -1, "owner0": 0}.get(ssd["host"])
+            if (host_index is None or type(data["host_index"]) is not int or data["host_index"] != host_index
+                    or type(receipt.get("host_index")) is not int or receipt["host_index"] != host_index):
+                raise ValueError("SSD floor host differs from job or receipt")
         fio_data = {key: data[key] for key in _FIO_FIELDS.split()}
         fio_job = {**job, "fio": {"location": "local_file", "block_bytes": ssd.get("block_bytes"),
                                   "queue_depth": ssd.get("queue_depth")}}
@@ -176,8 +222,11 @@ def _validate_focused_artifact(name, data, job, receipt):
         if not isinstance(data[field], list) or (client and len(data[field]) > 1):
             raise ValueError("invalid media device list")
         devices, delta, counters_complete = set(), 0, True
+        sectors_delta, sectors_complete = 0, True
+        counters = ("read_ops",) if data["schema_version"] == 1 else ("read_ops", "read_sectors", "write_ops", "write_sectors")
         for device in data[field]:
-            _focused_object(device, index_field + " major minor read_ops_before read_ops_after")
+            _focused_object(device, index_field + " major minor " + " ".join(
+                f"{counter}_{boundary}" for counter in counters for boundary in ("before", "after")))
             if client:
                 if type(device[index_field]) is not int or device[index_field] != -1:
                     raise ValueError("invalid client device index")
@@ -187,8 +236,16 @@ def _validate_focused_artifact(name, data, job, receipt):
                     raise ValueError("owner device index outside active owners")
             for key in ("major", "minor"):
                 _focused_uint(device[key])
-            for key in ("read_ops_before", "read_ops_after"):
-                _focused_uint(device[key], nullable=True)
+            for counter in counters:
+                for boundary in ("before", "after"):
+                    _focused_uint(device[f"{counter}_{boundary}"], nullable=True)
+                first, last = device[f"{counter}_before"], device[f"{counter}_after"]
+                if first is not None and last is not None and last < first:
+                    raise ValueError("decreasing owner device counter")
+                if first is None or last is None:
+                    sectors_complete = False
+                elif counter == "read_sectors":
+                    sectors_delta += last - first
             identity = (device[index_field], device["major"], device["minor"])
             if identity in devices:
                 raise ValueError("duplicate owner device counter")
@@ -203,6 +260,11 @@ def _validate_focused_artifact(name, data, job, receipt):
         ratio = delta / data["successful_reads"] if devices and counters_complete and data["successful_reads"] else None
         if data["read_ops_per_success"] != ratio:
             raise ValueError("media ratio differs from observed counters")
+        if data["schema_version"] == 2:
+            _focused_number(data["device_bytes_per_read"], nullable=True)
+            expected_bytes = 512 * sectors_delta / delta if devices and counters_complete and sectors_complete and delta else None
+            if data["device_bytes_per_read"] != expected_bytes:
+                raise ValueError("media bytes per read differs from observed counters")
         gate = receipt.get("measurement_evidence", {})
         if data["status"] == "qualified":
             if (data["reason_codes"] or not data["measurement_drained"] or ratio is None
@@ -507,13 +569,15 @@ def _verify_media_snapshots(root, receipt, evidence):
             raise ValueError("measurement client boot identity changed")
     for device in devices:
         owner = device["client_index"] if client else device["owner_index"]
-        for hosts, field in zip(frames, ("read_ops_before", "read_ops_after")):
+        for hosts, boundary in zip(frames, ("before", "after")):
+            counters = {"read_ops": 3} if evidence.get("schema_version", 1) == 1 else {
+                "read_ops": 3, "read_sectors": 5, "write_ops": 7, "write_sectors": 9}
             if owner + 1 >= len(hosts) or not isinstance(hosts[owner + 1], dict):
                 raise ValueError("measurement snapshot host missing")
             host = hosts[owner + 1]
             if client:
                 expected = {"owner_index": -1, "major": device["major"], "minor": device["minor"],
-                            "read_ops": device[field]}
+                            **{counter: device[f"{counter}_{boundary}"] for counter in counters}}
                 if host.get("media_device") != expected:
                     raise ValueError("client backing device observation differs")
             diskstats = host.get("diskstats")
@@ -522,12 +586,13 @@ def _verify_media_snapshots(root, receipt, evidence):
             matches = []
             for line in diskstats.splitlines():
                 fields = line.split()
-                if len(fields) >= 4 and fields[0].isdigit() and fields[1].isdigit():
+                if len(fields) > max(counters.values()) and fields[0].isdigit() and fields[1].isdigit():
                     if (int(fields[0]), int(fields[1])) == (device["major"], device["minor"]):
-                        if not fields[3].isdigit():
-                            raise ValueError("invalid diskstats read counter")
-                        matches.append(int(fields[3]))
-            if len(matches) != 1 or matches[0] != device[field]:
+                        if any(not fields[index].isdigit() for index in counters.values()):
+                            raise ValueError("invalid diskstats counter")
+                        matches.append({counter: int(fields[index]) for counter, index in counters.items()})
+            expected_counters = {counter: device[f"{counter}_{boundary}"] for counter in counters}
+            if len(matches) != 1 or matches[0] != expected_counters:
                 raise ValueError("measurement snapshot device identity or counter mismatch")
 
 
@@ -658,9 +723,13 @@ def admit_focused_artifacts(directory, job, receipt, *, completed):
     kind = job.get("case_kind")
     if kind in _FOCUSED_ARTIFACTS and (kind != "write_wait_diagnostic" or job.get("write_wait_diagnostics", {}).get("enabled") is True):
         required.add(_FOCUSED_ARTIFACTS[kind])
+    if kind == "live_read" and isinstance(job.get("media"), dict):
+        required.add("media_evidence")
+    if job.get("device_counters"):
+        required.add("device_counters")
     if kind == "write_wait_diagnostic" and job.get("write_wait_diagnostics", {}).get("enabled") is False and receipt.get("write_wait_metrics") is not None:
         raise ValueError("disabled write wait diagnostics cannot export counters")
-    names = set(_FOCUSED_ARTIFACTS.values()) | {"phase_timing"}
+    names = set(_FOCUSED_ARTIFACTS.values()) | {"phase_timing", "device_counters"}
     result = {}
     root = Path(directory).resolve()
     if kind == "ssd_write_floor" and (completed or receipt.get("ssd_write_command") is not None):

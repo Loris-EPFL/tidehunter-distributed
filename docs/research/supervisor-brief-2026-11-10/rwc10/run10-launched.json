@@ -1,0 +1,36 @@
+{
+  "status": "Historical launch notification; completed attempt-two receipt-backed provenance and acceptance are in run10-provenance.json and REAL-ACCEPTANCE10.json",
+  "synthetic": false,
+  "selection": "fabric_ab_compact",
+  "planned_cases": 80,
+  "run_id": "bench-afdfe33817034a7c",
+  "parent_run_id": "bench-38b1466b6b0e4e1e",
+  "vm_names": [
+    "bench-afdfe33817034a7c-0",
+    "bench-afdfe33817034a7c-1"
+  ],
+  "vm_roles": [
+    "coordinator",
+    "owner"
+  ],
+  "creation_time_description": "about 21:55 UTC on 2026-11-10; exact final receipt pending",
+  "machine_type": "z4m-highmem-16",
+  "zone": "us-central1-a",
+  "placement": "compact",
+  "package_sha256": "66ace73b57835ba97bced258aa39363d8bd878abaeb9af97b683c53772df3661",
+  "manifest_sha256": "bfd46dafd0a26dc118bcae9e0f577d23bed74fd4c466904859a29f2e21ca0f30",
+  "source_tree_sha256": "665d535ba531828278079d8fd77569a40ddb44a25dfc991d57cbf959aa8d874f",
+  "binary_sha256": "aca3d64bd1b55e115425fdd8702e7391421feb6dfa7822faa2197006ba848551",
+  "matrix_sha256": "8e12ba4352dc461680565b3bfaef5db705e702e03bce986323cc1e31ae9bde6e",
+  "source_revision": "0d9bd94f1bb371296437dc5ec3e2090edf7ac473",
+  "source_dirty": true,
+  "excluded_attempt": {
+    "run_id": "bench-9dc7f51e57e9449f",
+    "parent_run_id": "bench-3309de6a3c344e0f",
+    "reason": "monitoring exporter assumed five owner rows for sealed SPDK target metrics; fixed",
+    "duration": "about 14 minutes",
+    "cost_estimate_usd": 1.5,
+    "results_used": false
+  },
+  "source": "Main launch-2-started message; not final provenance or outcome"
+}

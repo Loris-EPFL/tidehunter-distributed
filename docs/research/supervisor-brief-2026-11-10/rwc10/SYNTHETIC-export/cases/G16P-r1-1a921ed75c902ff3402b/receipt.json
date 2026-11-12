@@ -1,0 +1,61 @@
+{
+  "synthetic": true,
+  "case_id": "G16P-r1-1a921ed75c902ff3402b",
+  "job": {
+    "case_kind": "sealed_knee",
+    "selection": "fabric_ab_compact",
+    "group": "G16P",
+    "backend": "tidehunter_tcp",
+    "repeat": 1,
+    "profile": "G16P-read-c16-repeat_read",
+    "cohort": "sealed_read",
+    "value_size": 1024,
+    "keys": 4096,
+    "mix": {
+      "read": 100,
+      "put": 0,
+      "delete": 0,
+      "missing_read": 0,
+      "get_many": 0,
+      "put_batch": 0
+    },
+    "concurrency": 16,
+    "read_lanes": 4,
+    "measurement_operations": 8192,
+    "warmup_operations": 4096,
+    "offered_ops_per_second": null,
+    "distribution": "uniform",
+    "coordinator_cache_bytes": 0,
+    "drop_os_caches": false,
+    "native_durability": "value_wal_barrier",
+    "durability_tier": "synchronous",
+    "target_io": "not_applicable",
+    "execution": {
+      "queue_capacity": 128
+    },
+    "media": {
+      "expected": "memory",
+      "history": "normal",
+      "wal_eviction": "none"
+    },
+    "warmup_key_sweep": true,
+    "owner_count": 1,
+    "owner_polling": "adaptive",
+    "case_id": "G16P-r1-1a921ed75c902ff3402b",
+    "sealed_dataset": {
+      "source_id": "focused-r1-tidehunter_tcp-s1024-seed1775-repeat_read-1a921ed75c902ff3402b",
+      "data_id": "focused-r1-s1024-seed1775",
+      "seed": 1775,
+      "tier": "repeat_read",
+      "profiled": false,
+      "instrumentation": "none",
+      "page_cache_policy": "not_dropped",
+      "mapped_wal_eviction": "not_requested",
+      "directness": "buffered_WAL_pagecache_or_device",
+      "cold_claim": "first touch does not establish per-call device reads",
+      "target_cache": "not_applicable"
+    },
+    "measurement_key_sweep": false
+  },
+  "owner_transport_security_label": "mutual_tls"
+}

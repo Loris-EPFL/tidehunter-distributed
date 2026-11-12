@@ -21,6 +21,37 @@ impl Client {
         cursor: usize,
         limit: usize,
     ) -> Result<RecoveryPage, TcpError> {
+        self.recover_live_page_inner(authority_epoch, source_epoch, cursor, limit, None)
+    }
+
+    /// Replay whole WAL groups. `next` is a WAL byte offset, not a receipt ordinal.
+    pub fn replay_live_wal_page(
+        &mut self,
+        authority_epoch: u64,
+        source_epoch: u64,
+        from: u64,
+        limit: usize,
+        require_end: u64,
+    ) -> Result<RecoveryPage, TcpError> {
+        let cursor = usize::try_from(from)
+            .map_err(|_| TcpError::new("replay offset exceeds address space"))?;
+        self.recover_live_page_inner(
+            authority_epoch,
+            source_epoch,
+            cursor,
+            limit,
+            Some(require_end),
+        )
+    }
+
+    fn recover_live_page_inner(
+        &mut self,
+        authority_epoch: u64,
+        source_epoch: u64,
+        cursor: usize,
+        limit: usize,
+        require_end: Option<u64>,
+    ) -> Result<RecoveryPage, TcpError> {
         if limit == 0 || limit > 1024 {
             return Err(TcpError::new("invalid recovery page limit"));
         }
@@ -49,7 +80,27 @@ impl Client {
         }
         let page = {
             let _control = LiveReadTiming::start(&self.live_counters, LiveTimingStage::Control);
-            self.recover_live_metadata(authority_epoch, source_epoch, cursor, page_limit)?
+            if let Some(require_end) = require_end {
+                let from = u64::try_from(cursor)
+                    .map_err(|_| TcpError::new("replay offset exceeds address space"))?;
+                let response = self.request(super::Request::ReplayLiveWal {
+                    authority_epoch,
+                    source_epoch,
+                    from,
+                    limit: page_limit,
+                    require_end,
+                })?;
+                self.validate_live_recovery_page(
+                    response,
+                    authority_epoch,
+                    source_epoch,
+                    cursor,
+                    page_limit,
+                    true,
+                )?
+            } else {
+                self.recover_live_metadata(authority_epoch, source_epoch, cursor, page_limit)?
+            }
         };
         let token = page.epoch_pin_token;
         let result = (|| {
@@ -68,12 +119,25 @@ impl Client {
                     service: binding.service,
                     transport: binding.transport,
                     spdk: binding.spdk.clone(),
+                    geometry: config.queue_geometry,
                 };
                 let access = if binding.readonly {
                     LiveNamespaceAccess::ReadOnly
                 } else {
                     LiveNamespaceAccess::ReadWrite
                 };
+                #[cfg(test)]
+                if self.live_write_local_fixture {
+                    // Use the real namespace I/O and CRC checks without a kernel target.
+                    pool.cache_local_namespace(
+                        &target,
+                        &config.host_nqn,
+                        config.host_id,
+                        access,
+                        &first.segment.path,
+                    )
+                    .map_err(TcpError::component)?;
+                }
                 let setup =
                     LiveReadTiming::start(&self.live_counters, LiveTimingStage::NamespaceSetup);
                 let (lease, acquisition) = pool
@@ -125,6 +189,7 @@ impl Client {
                     namespace,
                     config.max_inflight_requests,
                     config.max_inflight_bytes,
+                    false,
                 )
                 .map_err(TcpError::component)?;
                 while index < page.entries.len() && page.entries[index].binding == *binding {
@@ -241,6 +306,7 @@ impl Client {
                             lease.open_namespace().map_err(TcpError::component)?,
                             config.max_inflight_requests,
                             config.max_inflight_bytes,
+                            false,
                         )
                         .map_err(TcpError::component)?;
                         drop(setup);

@@ -1,0 +1,12 @@
+label,value
+value_ops,234412
+api_calls,212007
+deletes,19708
+ge64_value_ops,8
+ge64_value_pct,0.00341279456683105
+ge64_api_calls,6
+ge64_api_pct,0.0028300952327045804
+typical_low_kib,0.1
+typical_high_kib,10
+full_low_kib,8
+full_high_kib,12

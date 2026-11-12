@@ -1,0 +1,18 @@
+\small\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrr}\toprule
+Component, mean \us & Verbs & TCP & Verbs mTLS & Kernel buffered\\\midrule
+Owner append-persist (includes software) & \N{C:mem1v:persist} & \N{C:mem1t:persist} & \N{C:mem1m:persist} & \N{C:mem1k:persist}\\
+Network (stacks, TLS, dispatch included) & \N{C:mem1v:network} & \N{C:mem1t:network} & \N{C:mem1m:network} & \N{C:mem1k:network}\\
+Coordinator / native library insert$^{a}$ & \N{C:mem1v:coordinator} & \N{C:mem1t:coordinator} & \N{C:mem1m:coordinator} & \N{C:mem1k:coordinator}\\
+Owner software & \N{C:mem1v:owner} & \N{C:mem1t:owner} & \N{C:mem1m:owner} & \N{C:mem1k:owner}\\
+Durable wait / native file sync$^{a}$ & \N{C:mem1v:durable} & \N{C:mem1t:durable} & \N{C:mem1m:durable} & \N{C:mem1k:durable}\\
+Waiting and coalescing & \N{C:mem1v:coalescing} & \N{C:mem1t:coalescing} & \N{C:mem1m:coalescing} & \N{C:mem1k:coalescing}\\
+Client queueing and wake-up & \N{C:mem1v:queue} & \N{C:mem1t:queue} & \N{C:mem1m:queue} & \N{C:mem1k:queue}\\
+Residual & \N{C:mem1v:residual} & \N{C:mem1t:residual} & \N{C:mem1m:residual} & \N{C:mem1k:residual}\\
+Client encode, decode, verify & \N{C:mem1v:messaging} & \N{C:mem1t:messaging} & \N{C:mem1m:messaging} & \N{C:mem1k:messaging}\\
+SSD device & \N{C:mem1v:device} & \N{C:mem1t:device} & \N{C:mem1m:device} & \N{C:mem1k:device}\\
+Device + fabric + stack (unsplit) & \N{C:mem1v:combined} & \N{C:mem1t:combined} & \N{C:mem1m:combined} & \N{C:mem1k:combined}\\
+Owner + network exchange (unsplit) & \N{C:mem1v:exchange} & \N{C:mem1t:exchange} & \N{C:mem1m:exchange} & \N{C:mem1k:exchange}\\
+\textbf{TOTAL: same-case API mean} & \N{D:mem1v:mean_us} & \N{D:mem1t:mean_us} & \N{D:mem1m:mean_us} & \N{D:mem1k:mean_us}\\
+API p50 & \N{D:mem1v:p50_us} & \N{D:mem1t:p50_us} & \N{D:mem1m:p50_us} & \N{D:mem1k:p50_us}\\
+\bottomrule\end{tabular}

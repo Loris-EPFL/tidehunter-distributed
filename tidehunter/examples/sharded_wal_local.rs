@@ -137,9 +137,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let logs: Vec<_> = entries
         .iter()
         .map(|(path, config)| {
-            PartitionLog::create(path, config.clone(), &shape, metrics.clone()).map(Arc::new)
+            let log = PartitionLog::create(path, config.clone(), &shape, metrics.clone())?;
+            log.set_history_persistence(
+                tidehunter::distributed::storage::HistoryPersistence::OnDisk,
+            )?;
+            Ok(Arc::new(log))
         })
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<_, tidehunter::distributed::storage::StorageError>>()?;
     let mut workers: Vec<_> = logs
         .iter()
         .map(|log| {

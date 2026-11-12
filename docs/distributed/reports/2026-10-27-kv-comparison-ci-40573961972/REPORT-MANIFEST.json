@@ -1,0 +1,170 @@
+{
+  "run_id": "th-6449c7068670440c",
+  "source_commit": "87465ef68abb6fa9b7b9cb27224281a7c4994e6d",
+  "verified_at_utc": "2026-10-27T22:26:35.796004+00:00",
+  "complete_cases": 258,
+  "backend_variants": 9,
+  "population_rows": 460,
+  "one_repetition": true,
+  "error_bars": false,
+  "current_plot_input_hash_matches": true,
+  "local_relative_links_checked": 61,
+  "report_files": {
+    "REPORT.md": {
+      "bytes": 13186,
+      "sha256": "d6b0ef1efaa5bb9f7a476c971ac2ddfc0b5fe438aa681c155c3c70e58aa82062"
+    },
+    "EVIDENCE.md": {
+      "bytes": 7359,
+      "sha256": "3d91fd5be43fc82214b383bb2a50b3f65216349457a59da91586944b0dc9b8ae"
+    },
+    "TABLES.md": {
+      "bytes": 89881,
+      "sha256": "ffce193047ed3f09d34c7864f022323b5bcdccf83824bfeb62ae6f2d171ab2e0"
+    },
+    "OBSERVABILITY.md": {
+      "bytes": 16789,
+      "sha256": "3c0f286f82763e5fccc2e826f832855a691f3ece23e6a791c392119d9734260f"
+    },
+    "INTEGRITY.json": {
+      "bytes": 2129,
+      "sha256": "0de9509cb05ba797800ca76e64a0b155049e2dcd61113c3c44a9ad25a3314451"
+    },
+    "CLOSURE.json": {
+      "bytes": 1841,
+      "sha256": "f00007cf4481dde1963aa6680174a385b412e0d9cfaedff078427587b5d5456d"
+    },
+    "COSTS.json": {
+      "bytes": 1798,
+      "sha256": "0b5f91495ff08be0cd6c4ac07c3c97828f6904d3af323c860fcdf5b62623b1cd"
+    },
+    "metrics-analysis.json": {
+      "bytes": 934249,
+      "sha256": "c46e39b03e8b283ae1065b07154b6b3d8a80c9496c1c5778a4e1d401c68c7019"
+    },
+    "telemetry-summary.json": {
+      "bytes": 9540,
+      "sha256": "39b2c9c2687e440160dda6c2f38134c1b25972d8ec653bf2fa90079c26569995"
+    },
+    "all-results.csv": {
+      "bytes": 4417352,
+      "sha256": "3691608bfdd4667f4ec6befbf9128c084646e1f426f47f195f244e0ce6baed4e"
+    },
+    "historical-comparison.csv": {
+      "bytes": 2067235,
+      "sha256": "a57f62eac442409609fa6cc36172ebfb703ecabaae10ab327034d4ac76474f9a"
+    },
+    "plots/plots.json": {
+      "bytes": 2247604,
+      "sha256": "c8d6b1517c6804962b579dad401e1301005ac2a129aa579056f5c0d40f5fba87"
+    },
+    "plots/plot-data.csv": {
+      "bytes": 891901,
+      "sha256": "e1cb428a89501c63c93cf0a2e1a9873907d99779adf76f2617a4859878605ecd"
+    },
+    "plots/coverage.png": {
+      "bytes": 253675,
+      "sha256": "bcc28ed09f711487c5ea5e7e81734ae4dfe8bdd819a57b299df65f97b690a6e6"
+    },
+    "plots/coverage.pdf": {
+      "bytes": 22663,
+      "sha256": "1ed9851bb5e767948a59a4ccd44fd26c23f188710f665d68e0152d32e34ee79e"
+    },
+    "plots/primary-read-concurrent.png": {
+      "bytes": 597882,
+      "sha256": "ddd5ecfaf5369bbb16ddf7bf397c63cc9b5e54d90c12ba7bba09cf2f7c923ae6"
+    },
+    "plots/primary-read-concurrent.pdf": {
+      "bytes": 45472,
+      "sha256": "1da171e0435abd7170e48c26a3df6f902772de3ba39eca66b05ae61725ce13c7"
+    },
+    "plots/primary-write-concurrent.png": {
+      "bytes": 646193,
+      "sha256": "2bf8e260fc981a2b473d68fa96305268185955cd3404a455b74b572dcca70ce0"
+    },
+    "plots/primary-write-concurrent.pdf": {
+      "bytes": 45475,
+      "sha256": "933d2d6956d9ec4999b9e4e9e5725795b9a17384be33bf9df5279e10f381771c"
+    },
+    "plots/primary-read-many32.png": {
+      "bytes": 670278,
+      "sha256": "da0898393e8d34d4f4e00e63aee22ffca2cb00f5ead223f722f94cb8375c4fe5"
+    },
+    "plots/primary-read-many32.pdf": {
+      "bytes": 45816,
+      "sha256": "8371c31fd78b7de51a87bd93189a5edcaba8d9c137413e87f53d460b58c9bfee"
+    },
+    "plots/primary-point-mixed-latency.png": {
+      "bytes": 751480,
+      "sha256": "b547e2510cb432697cbdaa7c29a71715358d6257f8625efad6b6df9efeda9c9f"
+    },
+    "plots/primary-point-mixed-latency.pdf": {
+      "bytes": 52898,
+      "sha256": "a8b6e8091595de3a7ae975518ed119230a085be642776109040d2177e2ec0ab0"
+    },
+    "plots/primary-point-mixed-goodput.png": {
+      "bytes": 462239,
+      "sha256": "eac300e381cf424c95eebd231587b9125c0a87da0f4b707bf8a5693a8bbf4691"
+    },
+    "plots/primary-point-mixed-goodput.pdf": {
+      "bytes": 34509,
+      "sha256": "7e863512c3b67ebc1bc6f2104615c839f6f0f1e46f773ac30fa1c113b52cfda0"
+    },
+    "plots/offered-load-accounting.png": {
+      "bytes": 424724,
+      "sha256": "b3bfc1f0492d6e6183295e54b10cc1598b00e6add95ccf9964a9805d95972e57"
+    },
+    "plots/offered-load-accounting.pdf": {
+      "bytes": 36733,
+      "sha256": "e50f7bdd3de13485eaede9806990512d1a195b1be08ce5448665449479975462"
+    },
+    "plots/offered-load-tails.png": {
+      "bytes": 617188,
+      "sha256": "f338d7fc736205b6bd1f1bca50d0509ef0fa7da8fdd35dc1cbce60fb4bab4e10"
+    },
+    "plots/offered-load-tails.pdf": {
+      "bytes": 47037,
+      "sha256": "98d30beaab2a2c8f5395270540f245e263f6eef9df9bbbf8e43c3880d0a47afe"
+    },
+    "plots/zipf-versus-uniform.png": {
+      "bytes": 318824,
+      "sha256": "915f22b5684a62f80363b50249eacc7b74d8a5fd9dc2774be9dcca4585fced14"
+    },
+    "plots/zipf-versus-uniform.pdf": {
+      "bytes": 30859,
+      "sha256": "2cd2cda7ee892f0a9069874870034018321828d916bba9b99e48fc22b20f6318"
+    },
+    "plots/cache-cohorts.png": {
+      "bytes": 647653,
+      "sha256": "117bfd9281955ac86c9c9f309fe37db5a2e5b65574bebe99b177151305a14ed5"
+    },
+    "plots/cache-cohorts.pdf": {
+      "bytes": 28719,
+      "sha256": "6067b2969dd9b9242ae49118ffbf599996e54d7fc6f796ffd37e2b3a5530239d"
+    },
+    "plots/cold-os-cache.png": {
+      "bytes": 421519,
+      "sha256": "d377f3c1fe04f3b9440c24ae1b730753047fd7c07ed5622fc3a1f1a09ec05636"
+    },
+    "plots/cold-os-cache.pdf": {
+      "bytes": 30223,
+      "sha256": "13a4ef0b7ebabbc6739db3eed86d778e156b5ffe1e78e0a4579150edf815ab97"
+    },
+    "plots/native-pagecache-latency.png": {
+      "bytes": 636769,
+      "sha256": "b06eb90e7a146862fd460f33652b8d67b225f8b1b8f3c306864aa63e4e3103bd"
+    },
+    "plots/native-pagecache-latency.pdf": {
+      "bytes": 34562,
+      "sha256": "c4c67333c3872609f74ae1860e9f2ae6f4068f1839d02b04f2c8b309bb99a84b"
+    },
+    "plots/native-pagecache-goodput.png": {
+      "bytes": 348707,
+      "sha256": "07e8d8bf668671c28986e3bdfd71440066a1df993f2a41211f3c3a126c60a34d"
+    },
+    "plots/native-pagecache-goodput.pdf": {
+      "bytes": 28864,
+      "sha256": "cbff3d1bac7c98f19b451d655c2ebe86370d35afefd1753688a7586be4d277ec"
+    }
+  }
+}

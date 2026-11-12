@@ -1,0 +1,9 @@
+\small\setlength{\tabcolsep}{3pt}
+\begin{tabular}{L{.08\linewidth}L{.07\linewidth}L{.28\linewidth}L{.47\linewidth}}\toprule
+Group & Cases & Arm / total writers & What stays unmatched\\\midrule
+G14N & \N{B:fair-native-plan:G14N:cases|.0f} & One Native Db; writers \N{B:fair-native-plan:G14N:writer0|.0f}, \N{B:fair-native-plan:G14N:writer1|.0f}, \N{B:fair-native-plan:G14N:writer2|.0f} & Db/owner instances and hosts differ; one SSD versus the multi-owner arm; no network; Native sync calls; key routing.\\
+G14S & \N{B:fair-native-plan:G14S:cases|.0f} & Five Native Db, one process/SSD; writers \N{B:fair-native-plan:G14S:writer0|.0f}, \N{B:fair-native-plan:G14S:writer1|.0f} & Db instances share one SSD; no network; Native sync calls; key routing versus owner operation-ID routing.\\
+G14O1 & \N{B:fair-native-plan:G14O1:cases|.0f} & One active owner; writers \N{B:fair-native-plan:G14O1:writer0|.0f}, \N{B:fair-native-plan:G14O1:writer1|.0f}, \N{B:fair-native-plan:G14O1:writer2|.0f} & Remote owner instance/host and network remain; owner covering sync and operation-ID routing differ from Native.\\
+G14O5 & \N{B:fair-native-plan:G14O5:cases|.0f} & Five active owners; writers \N{B:fair-native-plan:G14O5:writer0|.0f}, \N{B:fair-native-plan:G14O5:writer1|.0f}, \N{B:fair-native-plan:G14O5:writer2|.0f} & Separate owner instances and five SSDs versus one Native SSD; network, covering sync and operation-ID routing remain.\\
+G14P & \N{B:fair-native-plan:G14P:cases|.0f} & Separate Native/owner profiles; writers \N{B:fair-native-plan:G14P:writer0|.0f}, \N{B:fair-native-plan:G14P:writer1|.0f} & Each source arm retains its instance, SSD, network, sync and routing differences; diagnostics are not unprofiled controls.\\
+\bottomrule\end{tabular}

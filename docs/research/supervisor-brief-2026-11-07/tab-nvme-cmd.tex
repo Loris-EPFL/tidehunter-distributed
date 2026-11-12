@@ -1,0 +1,11 @@
+\scriptsize
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{rrr|rrrr|rrrrr}\toprule
+& \multicolumn{2}{c|}{Initiator} & \multicolumn{4}{c|}{Kernel target (buffered file)} & \multicolumn{5}{c}{SPDK target (O\_DIRECT file AIO)}\\
+Value B & B/call & $\times$ & p50 & p99 & cmd \us & dev/call & p50 & p99 & cmd \us & dev/call & dev \us\\\midrule
+64 & 4{,}192 & 65.5 & 36.1 & 50.7 & 24.2 & 0.006 & 54.3 & 70.1 & 40.9 & 1.011 & 25.0\\
+256 & 4{,}384 & 17.1 & 35.0 & 45.5 & 23.2 & 0.011 & 55.2 & 75.4 & 41.5 & 1.013 & 24.8\\
+1{,}024 & 5{,}152 & 5.0 & 36.5 & 56.9 & 23.8 & 0.025 & 59.2 & 128 & 48.7 & 1.043 & 43.2\\
+8{,}192 & 12{,}322 & 1.5 & 40.2 & 154 & 26.1 & 0.094 & 99.7 & 222 & 79.5 & 1.045 & 68.1\\
+65{,}536 & 69{,}632 & 1.1 & 54.3 & 357 & 53.0 & 1.008 & 132 & 257 & 113.6 & 1.013 & 87.2\\
+\bottomrule\end{tabular}}

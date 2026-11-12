@@ -63,7 +63,9 @@ impl HistoryReader {
     fn node(&self, pointer: NodePointer, end: u64) -> Result<Node, StorageError> {
         check_node_pointer(pointer, end)?;
         let mut slot = [0; SLOT_BYTES];
-        self.nodes.read_exact_at(&mut slot, pointer.offset)?;
+        self.files()?
+            .nodes
+            .read_exact_at(&mut slot, pointer.offset)?;
         decode_node(pointer, &slot)
     }
 
@@ -92,7 +94,7 @@ impl HistoryReader {
 impl History {
     pub(super) fn flush_nodes(&mut self) -> Result<(), StorageError> {
         if self.node_buffer_len != 0 {
-            self.reader.nodes.write_all_at(
+            self.reader.files()?.nodes.write_all_at(
                 &self.node_buffer[..self.node_buffer_len],
                 self.node_buffer_start,
             )?;
@@ -151,12 +153,24 @@ impl History {
         let Some(root) = root else {
             return Ok(Some(leaf));
         };
-        let (old_key, _) = walk_leaf(root, key, |pointer| self.node(pointer))?;
+        // History has the sole append capability under the history mutex.
+        // Slots are immutable. Keep the nodes verified by this walk instead
+        // of reading and checking the same prefix again during reconstruction.
+        let mut path = [None; 129];
+        let mut depth = 0;
+        let (old_key, _) = walk_leaf(root, key, |pointer| {
+            let node = self.node(pointer)?;
+            *path.get_mut(depth).ok_or(StorageError::Invalid(
+                "history radix walk exceeds key width",
+            ))? = Some(node);
+            depth += 1;
+            Ok(node)
+        })?;
         if old_key == key {
             return Err(StorageError::Invalid("duplicate history radix authority"));
         }
         let bit = (old_key ^ key).leading_zeros() as u8;
-        Ok(Some(self.insert_branch(root, key, bit, leaf, 0)?))
+        Ok(Some(self.insert_branch(root, key, bit, leaf, 0, &path)?))
     }
 
     fn insert_branch(
@@ -166,22 +180,24 @@ impl History {
         split: u8,
         leaf: NodePointer,
         depth: usize,
+        path: &[Option<Node>; 129],
     ) -> Result<NodePointer, StorageError> {
         if depth > 128 {
             return Err(StorageError::Invalid(
                 "history radix insert exceeds key width",
             ));
         }
-        match self.node(root)? {
+        let node = path[depth].ok_or(StorageError::Invalid("missing history radix path"))?;
+        match node {
             Node::Branch {
                 bit,
                 mut zero,
                 mut one,
             } if bit < split => {
                 if direction(key, bit) {
-                    one = self.insert_branch(one, key, split, leaf, depth + 1)?;
+                    one = self.insert_branch(one, key, split, leaf, depth + 1, path)?;
                 } else {
-                    zero = self.insert_branch(zero, key, split, leaf, depth + 1)?;
+                    zero = self.insert_branch(zero, key, split, leaf, depth + 1, path)?;
                 }
                 self.put_node(&Node::Branch { bit, zero, one })
             }
@@ -205,8 +221,7 @@ impl History {
 mod tests {
     use super::*;
 
-    #[test]
-    fn buffered_nodes_check_digest_bounds_and_survive_flush() {
+    fn fixture() -> (tempdir::TempDir, History) {
         let temp = tempdir::TempDir::new("history-buffered-node").unwrap();
         let config = PartitionConfig {
             inventory: StaticInventory {
@@ -229,7 +244,13 @@ mod tests {
             max_batches: 1,
             max_reference_metadata_bytes: 64 * 1024,
         };
-        let mut history = History::create(temp.path(), &config).unwrap();
+        let history = History::create(temp.path(), &config).unwrap();
+        (temp, history)
+    }
+
+    #[test]
+    fn buffered_nodes_check_digest_bounds_and_survive_flush() {
+        let (_temp, mut history) = fixture();
         let pointer = history
             .put_node(&Node::Leaf {
                 key: 42,
@@ -279,5 +300,164 @@ mod tests {
             Node::Leaf { key: 42, .. }
         ));
         assert!(matches!(history.node(last).unwrap(), Node::Leaf { .. }));
+    }
+
+    // The pre-path-reuse algorithm is a compatibility oracle for all appended
+    // bytes, including unreachable copy-on-write nodes and failed duplicates.
+    fn reference_insert(
+        history: &mut History,
+        root: Option<NodePointer>,
+        key: u128,
+        pointer: Pointer,
+    ) -> Result<Option<NodePointer>, StorageError> {
+        let leaf = history.put_node(&Node::Leaf { key, pointer })?;
+        let Some(root) = root else {
+            return Ok(Some(leaf));
+        };
+        let (old_key, _) = walk_leaf(root, key, |pointer| history.node(pointer))?;
+        if old_key == key {
+            return Err(StorageError::Invalid("duplicate history radix authority"));
+        }
+        let bit = (old_key ^ key).leading_zeros() as u8;
+        Ok(Some(reference_branch(history, root, key, bit, leaf, 0)?))
+    }
+
+    fn reference_branch(
+        history: &mut History,
+        root: NodePointer,
+        key: u128,
+        split: u8,
+        leaf: NodePointer,
+        depth: usize,
+    ) -> Result<NodePointer, StorageError> {
+        if depth > 128 {
+            return Err(StorageError::Invalid(
+                "history radix insert exceeds key width",
+            ));
+        }
+        match history.node(root)? {
+            Node::Branch {
+                bit,
+                mut zero,
+                mut one,
+            } if bit < split => {
+                if direction(key, bit) {
+                    one = reference_branch(history, one, key, split, leaf, depth + 1)?;
+                } else {
+                    zero = reference_branch(history, zero, key, split, leaf, depth + 1)?;
+                }
+                history.put_node(&Node::Branch { bit, zero, one })
+            }
+            _ => {
+                let (zero, one) = if direction(key, split) {
+                    (root, leaf)
+                } else {
+                    (leaf, root)
+                };
+                history.put_node(&Node::Branch {
+                    bit: split,
+                    zero,
+                    one,
+                })
+            }
+        }
+    }
+
+    fn assert_same_slots(
+        actual: &mut History,
+        expected: &mut History,
+        actual_root: Option<NodePointer>,
+        expected_root: Option<NodePointer>,
+    ) {
+        actual.flush_nodes().unwrap();
+        expected.flush_nodes().unwrap();
+        assert_eq!(actual_root, expected_root);
+        assert_eq!(actual.node_append, expected.node_append);
+        let mut actual_bytes = vec![0; actual.node_append as usize];
+        let mut expected_bytes = vec![0; expected.node_append as usize];
+        actual
+            .reader
+            .files()
+            .unwrap()
+            .nodes
+            .read_exact_at(&mut actual_bytes, 0)
+            .unwrap();
+        expected
+            .reader
+            .files()
+            .unwrap()
+            .nodes
+            .read_exact_at(&mut expected_bytes, 0)
+            .unwrap();
+        assert_eq!(actual_bytes, expected_bytes);
+    }
+
+    #[test]
+    fn radix_path_reuse_preserves_every_slot_and_root_across_spills() {
+        let mut random = u128::MAX;
+        let random_keys: Vec<_> = (0..512)
+            .map(|_| {
+                random ^= random << 13;
+                random ^= random >> 17;
+                random ^= random << 43;
+                random
+            })
+            .collect();
+        let mut deep = vec![0];
+        deep.extend((0..128).map(|bit| 1u128 << bit));
+        deep.extend([0, 1, u128::MAX, u128::MAX]);
+        let mut reversed = deep.clone();
+        reversed.reverse();
+        let shared_prefix = (0..512).map(|key| (u128::MAX << 16) | key).collect();
+        for keys in [
+            vec![],
+            vec![0, 0],
+            deep,
+            reversed,
+            shared_prefix,
+            random_keys,
+        ] {
+            let (_actual_dir, mut actual) = fixture();
+            let (_expected_dir, mut expected) = fixture();
+            let mut actual_root = None;
+            let mut expected_root = None;
+            let mut admitted = std::collections::BTreeMap::new();
+            for (ordinal, key) in keys.into_iter().enumerate() {
+                let pointer = Pointer {
+                    ordinal,
+                    digest: [7; 32],
+                };
+                let result = actual.index_insert(actual_root, key, pointer);
+                let reference = reference_insert(&mut expected, expected_root, key, pointer);
+                match (result, reference) {
+                    (Ok(next), Ok(reference)) => {
+                        actual_root = next;
+                        expected_root = reference;
+                        assert!(admitted.insert(key, ordinal).is_none());
+                    }
+                    (Err(actual), Err(expected)) => {
+                        assert_eq!(actual.to_string(), expected.to_string());
+                    }
+                    _ => panic!("radix writer differs from reference"),
+                }
+                assert_eq!(actual_root, expected_root);
+                // Force several spill boundaries; later inserts traverse slots
+                // on disk and a tail in the existing bounded node buffer.
+                if ordinal % 31 == 0 {
+                    assert_same_slots(&mut actual, &mut expected, actual_root, expected_root);
+                }
+            }
+            assert_same_slots(&mut actual, &mut expected, actual_root, expected_root);
+            actual.reader.root.nodes_end = actual.node_append;
+            for (key, ordinal) in admitted {
+                let found = actual
+                    .reader
+                    .index_lookup(actual_root, key)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(found.ordinal, ordinal);
+                assert_eq!(found.digest, [7; 32]);
+            }
+        }
     }
 }

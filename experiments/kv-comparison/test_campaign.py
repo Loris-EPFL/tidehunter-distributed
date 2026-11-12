@@ -104,7 +104,7 @@ class AdmissionTests(unittest.TestCase):
     def test_local_rust_runtime_maps_all_transport_case_ids(self):
         base = {"dataset": {"keys": 1}, "phases": {"preload": False, "warmup_operations": 0,
                 "aging_operations": 0, "measurement_operations": 1}, "execution": {}, "limits": {}}
-        for label in ("tidehunter_tcp", "tidehunter_efa", "tidehunter_efa_direct",
+        for label in ("tidehunter_tcp", "tidehunter_tcp_trusted", "tidehunter_efa", "tidehunter_efa_direct",
                       "tidehunter_efa_native", "tidehunter_efa_trusted", "tidehunter_verbs",
                       "tidehunter_verbs_native", "tidehunter_software_tcp",
                       "tidehunter_software_tcp_native"):
@@ -113,10 +113,10 @@ class AdmissionTests(unittest.TestCase):
                 config = campaign.build_config(base, job, None, Path("/tmp/unused"), 17, False)
                 self.assertEqual(config["backend"]["kind"], "tidehunter")
                 self.assertIn("transport", config["backend"]["options"])
-        spec = self.spec() | {"backends": list(campaign.CASE_TRANSPORTS), "max_runs": 72}
+        spec = self.spec() | {"backends": list(campaign.CASE_TRANSPORTS), "max_runs": 80}
         jobs = campaign.matrix(spec)
         self.assertEqual({job["backend"] for job in jobs}, set(campaign.CASE_TRANSPORTS))
-        self.assertEqual(len(jobs), 72)
+        self.assertEqual(len(jobs), 80)
 
 
     def test_valkey_local_qualification_and_five_primary_cluster_options(self):

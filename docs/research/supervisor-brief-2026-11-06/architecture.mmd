@@ -1,0 +1,14 @@
+# Topology and write path
+
+```mermaid
+flowchart LR
+  C[Client] -->|batch| A[Authority: order, index, publication]
+  A -->|whole batch| O1[Owner 1: native Value WAL]
+  A -->|whole batch| O2[Owner 2: native Value WAL]
+  A -->|whole batch| ON[Owner N: native Value WAL]
+  O1 -->|durable receipt| A
+  O2 -->|durable receipt| A
+  ON -->|durable receipt| A
+  A -->|dependency-ready publication and reply| C
+```
+

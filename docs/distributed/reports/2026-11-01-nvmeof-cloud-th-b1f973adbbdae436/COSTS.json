@@ -1,0 +1,33 @@
+{
+  "currency": "USD",
+  "basis": "Conservative ledger estimates, not AWS invoices or measured tag-attributed billing; discounts, taxes and billing lag unknown",
+  "run_id": "th-b1f973adbbdae436",
+  "run_estimate": "19.45",
+  "run_compute_upper_bound": "11.8338",
+  "ancillary_estimate_scope": "EBS and IPv4 through later termination observation, plus intentionally budgeted S3 storage, request and transfer allowances; not measured billed quantities",
+  "related_attempts": [
+    {"run_id": "th-79da9cae47c0914b", "estimate": "10.65", "outcome": "incomplete"},
+    {"run_id": "th-7b5bbd983fa7e383", "estimate": "11.53", "outcome": "incomplete"},
+    {"run_id": "th-8a20aa7414c7f555", "estimate": "12.59", "outcome": "incomplete"},
+    {"run_id": "th-b1f973adbbdae436", "estimate": "19.45", "outcome": "all125benchmarkcasescomplete; monitoringincomplete"}
+  ],
+  "related_attempts_total": "54.22",
+  "authoritative_ledger_revision": 115,
+  "aggregate_period_attribution": "UTC settlement date, not original EC2 launch date",
+  "all_time_estimates": "357.725577301106",
+  "calendar_week_start_utc": "2026-10-26",
+  "calendar_week_estimates": "186.801092370604",
+  "calendar_month_utc": "2026-11",
+  "calendar_month_estimates": "19.45",
+  "calendar_day_utc": "2026-11-01",
+  "calendar_day_estimates": "19.45",
+  "rolling_seven_day_charge": "268.516859591215",
+  "editable_weekly_budget": "400",
+  "rolling_budget_available": "131.483140408785",
+  "active_reservations": "0",
+  "protected_shared_published_report": "stale; IAM user cannot publish to protected report prefix, no bypass attempted; numbers here derived from current authoritative ledger",
+  "private_cost_receipt": "s3://tidehunter-ci-354775971805-us-east-1/th-b1f973adbbdae436/results/operator-cost-settlement.json",
+  "private_cost_receipt_bytes": 12651,
+  "private_cost_receipt_sha256": "91b492a5e2f1771447cee06ff793d07509fed67d53e10629645f567b762bd517",
+  "remaining_chargeable_storage": "Benchmark S3 results retained; compute termination does not eliminate retained S3 charges"
+}

@@ -1,13 +1,20 @@
+import json
+import tempfile
+from pathlib import Path
+
 import unittest
 
 from portable_transport import (
     is_software,
+    is_trusted,
+    metadata_transport_label,
     protocol_key,
     runtime_backend,
     select_backends,
     select_transports,
     transport_for_case,
     validate_transport,
+    write_transport_config,
 )
 
 
@@ -15,6 +22,7 @@ class PortableTransportTests(unittest.TestCase):
     def test_research_labels_map_to_canonical_transport_and_runtime_kind(self):
         expected = {
             'tidehunter_tcp': {'kind': 'tcp'},
+            'tidehunter_tcp_trusted': {'kind': 'tcp-trusted'},
             'tidehunter_efa': {'kind': 'ofi', 'fabric': {'backend': 'efa'}, 'security': 'mutual-tls'},
             'tidehunter_efa_direct': {'kind': 'ofi', 'fabric': {'backend': 'efa-direct'}, 'security': 'mutual-tls'},
             'tidehunter_efa_native': {'kind': 'ofi', 'fabric': {'backend': 'efa-direct'}, 'security': 'trusted'},
@@ -27,6 +35,30 @@ class PortableTransportTests(unittest.TestCase):
                 self.assertEqual(runtime_backend(label), 'tidehunter')
         self.assertEqual(transport_for_case('fabric-tcp')['fabric']['backend'], 'software-tcp')
         self.assertEqual(runtime_backend('rocksdb'), 'rocksdb')
+
+    def test_trusted_tcp_serialization_admission_and_roundtrip(self):
+        trusted = {'kind': 'tcp-trusted'}
+        tcp = {'kind': 'tcp'}
+        self.assertEqual(validate_transport(trusted), trusted)
+        self.assertEqual(protocol_key(trusted), ('tcp-trusted',))
+        self.assertEqual(metadata_transport_label('tidehunter_tcp_trusted'), 'tcp-trusted')
+        self.assertEqual(metadata_transport_label(trusted), 'tcp-trusted')
+        self.assertTrue(is_trusted(trusted))
+        self.assertFalse(is_trusted(tcp))
+        self.assertFalse(is_software(trusted))
+        self.assertEqual(select_transports(trusted, None, 2), [trusted, trusted])
+        self.assertEqual(select_transports(trusted, [trusted], 1), [trusted])
+        with self.assertRaises(ValueError):
+            select_transports(trusted, [tcp], 1)
+        with self.assertRaises(ValueError):
+            select_transports(tcp, [trusted], 1)
+        with self.assertRaises(ValueError):
+            validate_transport({'kind': 'tcp-trusted', 'security': 'trusted'})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'transport.json'
+            self.assertEqual(write_transport_config(path, trusted), str(path))
+            self.assertEqual(path.read_text(), '{\n  "kind": "tcp-trusted"\n}\n')
+            self.assertEqual(transport_for_case(json.loads(path.read_text())), trusted)
 
     def test_explicit_transport_preserves_peer_local_selectors(self):
         client = {'kind': 'ofi', 'fabric': {'backend': 'verbs', 'domain': 'mlx5_0',

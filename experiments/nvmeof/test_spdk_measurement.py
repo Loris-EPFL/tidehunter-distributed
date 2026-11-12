@@ -45,6 +45,46 @@ class SpdkMeasurementTests(unittest.TestCase):
         self.assertAlmostEqual(observed["mean_read_completion_us"], 70)
         self.assertEqual([row["read_ops"] for row in observed["owners"]], [2, 3, 4, 5, 6])
 
+    def test_explicit_owner_counts(self):
+        for count in (1, 5):
+            with self.subTest(count=count):
+                original_start, original_end = self.start, self.end
+                self.start, self.end = original_start[:count], original_end[:count]
+                result = spdk_measurement.admit(self.directory, self.bind(), owner_count=count)
+                self.assertEqual([row["index"] for row in result["owners"]], list(range(count)))
+                self.start, self.end = original_start, original_end
+
+    def test_invalid_owner_count_is_rejected(self):
+        binding = self.bind()
+        for count in (True, False, 0, 6, "1", 1.0):
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                spdk_measurement.admit(self.directory, binding, owner_count=count)
+            with self.subTest(snapshot_count=count), self.assertRaises(ValueError):
+                spdk_measurement._snapshot(self.directory, binding["start"], "start", owner_count=count)
+
+    def test_boundary_owner_cardinality_and_indices(self):
+        for boundary in ("start", "end"):
+            for count in (1, 5):
+                for mutation in ("missing", "extra", "duplicate", "noncontiguous"):
+                    with self.subTest(boundary=boundary, count=count, mutation=mutation):
+                        start, end = self.start, self.end
+                        self.start, self.end = copy.deepcopy(start[:count]), copy.deepcopy(end[:count])
+                        rows = getattr(self, boundary)
+                        if mutation == "missing":
+                            rows.pop()
+                        elif mutation == "extra":
+                            rows.append(copy.deepcopy(rows[0]))
+                        elif mutation == "duplicate":
+                            if count == 1:
+                                rows.append(copy.deepcopy(rows[0]))
+                            else:
+                                rows[-1]["index"] = 0
+                        else:
+                            rows[-1]["index"] = count
+                        with self.assertRaises(ValueError):
+                            spdk_measurement.admit(self.directory, self.bind(), owner_count=count)
+                        self.start, self.end = start, end
+
     def test_zero_reads_allowed_only_for_write_only_control(self):
         for start, end in zip(self.start, self.end):
             end["target"]["bdev_iostat"]["bdevs"] = copy.deepcopy(start["target"]["bdev_iostat"]["bdevs"])

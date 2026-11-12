@@ -1,0 +1,15 @@
+\clearpage
+\section{Run 9: cold qualification}\label{app:rwc-qualification}
+\input{rwc/generated/tab-rwc-cold-qualification.tex}
+\RWCFINDING{qualification}
+
+\RWCFINDING{cold}
+
+The six analyzer CSVs expose verdicts but omit device ratios. The source-checked local \texttt{cold\_qualification.csv} indexes the copied \texttt{remote\_rw.md} table, retaining case IDs, ratios and reason codes. Every Native unqualified cell is 1 KiB, c1/c5/c16, r0/r1, with reason \texttt{cold\_read\_ratio\_below\_threshold}. A cache drop or a memory-speed p50 is not evidence of physical SSD service. Native uses recent mapped fragments and older positional reads; \textbf{[INFERENCE]} kernel readahead can contribute to mixed memory/device populations, but these counters do not identify each call's path.
+
+\clearpage
+\section{Run 9: floors and provenance}\label{app:rwc-floors}
+\input{rwc/generated/tab-rwc-floors.tex}
+\input{rwc/generated/rwc-failures.tex}
+\par\smallskip
+\input{rwc/generated/rwc-provenance.tex}

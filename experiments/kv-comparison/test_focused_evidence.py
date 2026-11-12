@@ -60,6 +60,21 @@ class FocusedEvidenceTests(unittest.TestCase):
                 "successful_reads": count, "read_ops_per_success": delta / count,
                 "history_loads_before": None, "history_loads_after": None,
                 "history_prewarm_verified": None}
+    def test_live_read_requires_and_admits_media_evidence(self):
+        self.job.update(case_kind="live_read")
+        with self.assertRaisesRegex(ValueError, "completed case lacks requested media_evidence"):
+            self.admit()
+        self.bind("media_evidence", self.media())
+        self.assertEqual(self.admit()["media_evidence"]["status"], "qualified")
+
+    def test_put_admits_bound_device_counters(self):
+        self.job = {"case_id": "case", "case_kind": "remote_put", "backend": "tidehunter_verbs_native",
+                    "owner_count": 1, "device_counters": True}
+        row = {"owner_index": 0, "major": 259, "minor": 3, "read_ops": 1,
+               "read_sectors": 2, "write_ops": 3, "write_sectors": 4}
+        self.bind("device_counters", {"before": [row], "after": [{**row, "write_sectors": 8}]})
+        self.assertEqual(self.admit()["device_counters"]["after"][0]["write_sectors"], 8)
+
     def test_completed_device_artifacts_accept_read_and_put(self):
         jobs = cloud_campaign.make_focused_matrix("device")
         for kind in ("media_read", "remote_put"):

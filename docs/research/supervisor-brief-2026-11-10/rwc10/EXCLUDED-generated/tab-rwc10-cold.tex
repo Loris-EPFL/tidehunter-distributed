@@ -1,0 +1,16 @@
+\begin{table}[H]\centering\small\setlength{\tabcolsep}{3pt}
+\begin{tabular}{llllll}\toprule
+Arm & Rep. & 1 KiB c1 & 1 KiB c16 & 64 KiB c1 & 64 KiB c16\\\midrule
+O-T & r0 & \N{F10:cold_fabric:0:mean_us:1|.1f}; \N{F10:cold_fabric:0:device_reads_per_call:1|.2f} & not run; NR & not run; NR & not run; NR\\
+O-T & r1 & not run; NR & not run; NR & not run; NR & not run; NR\\
+O-V & r0 & \N{F10:cold_fabric:1:mean_us:1|.1f}; \N{F10:cold_fabric:1:device_reads_per_call:1|.2f} & not run; NR & not run; NR & not run; NR\\
+O-V & r1 & not run; NR & not run; NR & not run; NR & not run; NR\\
+K-R & r0 & \N{F10:cold_fabric:2:mean_us:1|.1f}; \N{F10:cold_fabric:2:device_reads_per_call:1|.2f} & not run; NR & not run; NR & not run; NR\\
+K-R & r1 & not run; NR & not run; NR & not run; NR & not run; NR\\
+S-R & r0 & \N{F10:cold_fabric:3:mean_us:1|.1f}; \N{F10:cold_fabric:3:device_reads_per_call:1|.2f} & not run; NR & not run; NR & not run; NR\\
+S-R & r1 & not run; NR & not run; NR & not run; NR & not run; NR\\
+K-T & r0 & not run; NR & not run; NR & not run; NR & not run; NR\\
+K-T & r1 & not run; NR & not run; NR & not run; NR & not run; NR\\
+\bottomrule\end{tabular}
+\caption{\textbf{EXCLUDED ABORTED ATTEMPT --- layout test only, never final results.} Each cell: qualified mean API latency (\us{}); device reads per successful call. Completed cold rows require the qualified media receipt and ratio >=0.9; NVMe-oF also requires path and sealed-accounting qualification. Unqualified latency remains unavailable; its device ratio/reasons remain in the CSV. Counts do not prove every call reached NAND. Owner RPC is buffered/exact-range; namespace controls use kernel direct or SPDK file AIO and a kernel initiator. Coordinator cache off; lanes one at c1, four at c16; r0/r1 separate. Busy spins owner and coordinator read driver, not kernel busy poll. Unmatched dimensions: TLS/security, polling, RPC/direct I/O; NVMe control is verbs trusted Adaptive.}
+\end{table}

@@ -1,0 +1,97 @@
+\begin{thebibliography}{10}
+
+\bibitem{awsefa}
+{Amazon Web Services}.
+\newblock Elastic fabric adapter for ai/ml and hpc workloads on amazon ec2.
+\newblock Official documentation, accessed 29 October 2026. \url{https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa.html}.
+
+\bibitem{cassandraconfig509}
+{Apache Cassandra}.
+\newblock Cassandra configuration.
+\newblock Source tag cassandra-5.0.9. \url{https://github.com/apache/cassandra/blob/cassandra-5.0.9/conf/cassandra.yaml}.
+
+\bibitem{cassandraengine}
+{Apache Cassandra}.
+\newblock Storage engine.
+\newblock Cassandra 5.0 documentation, accessed 29 October 2026. \url{https://cassandra.apache.org/doc/stable/cassandra/architecture/storage-engine.html}.
+
+\bibitem{tidehunter2026}
+Andrey Chursin, Lefteris Kokoris-Kogias, Alex Orlov, Alberto Sonnino, and Igor Zablotchi.
+\newblock Tidehunter: Large-value storage with minimal data relocation, 2026.
+\newblock Version 2, 3 February 2026. \url{https://arxiv.org/abs/2602.01873v2}.
+
+\bibitem{scalog2020}
+Cong Ding, David Chu, Evan Zhao, Xiang Li, Lorenzo Alvisi, and Robbert van Renesse.
+\newblock Scalog: Seamless reconfiguration and total order in a scalable shared log.
+\newblock In {\em 17th USENIX Symposium on Networked Systems Design and Implementation}, 2020.
+\newblock \url{https://www.usenix.org/conference/nsdi20/presentation/ding}.
+
+\bibitem{distributednote2026}
+{Distributed Tidehunter project}.
+\newblock Distributed tidehunter, 2026.
+\newblock June design note, local project copy; Igor Zablotchi and Alberto Sonnino listed as contacts.
+
+\bibitem{measuredcode2026}
+{Distributed Tidehunter project}.
+\newblock Tidehunter distributed source, measured revision, 2026.
+\newblock Commit ba3a6a0194cca6f171e5916649e7f4eeba65aeb0. \url{https://github.com/Loris-EPFL/tidehunter-distributed/tree/ba3a6a0194cca6f171e5916649e7f4eeba65aeb0}.
+
+\bibitem{farm2014}
+Aleksandar Dragojevi{\'c}, Dushyanth Narayanan, Orion Hodson, and Miguel Castro.
+\newblock {FaRM}: Fast remote memory.
+\newblock In {\em 11th USENIX Symposium on Networked Systems Design and Implementation}, 2014.
+\newblock \url{https://www.usenix.org/conference/nsdi14/technical-sessions/presentation/dragojevic}.
+
+\bibitem{fdbarchitecture}
+{FoundationDB contributors}.
+\newblock Architecture.
+\newblock FoundationDB architecture documentation; page labels itself 8.0 and includes historical engine text. \url{https://apple.github.io/foundationdb/architecture.html}.
+
+\bibitem{fdbconfig7377}
+{FoundationDB contributors}.
+\newblock Database configuration parser.
+\newblock Source tag 7.3.77. \url{https://github.com/apple/foundationdb/blob/7.3.77/fdbclient/ManagementAPI.actor.cpp}.
+
+\bibitem{erpc2019}
+Anuj Kalia, Michael Kaminsky, and David~G. Andersen.
+\newblock Datacenter rpcs can be general and fast.
+\newblock In {\em 16th USENIX Symposium on Networked Systems Design and Implementation}, 2019.
+\newblock \url{https://www.usenix.org/conference/nsdi19/presentation/kalia}.
+
+\bibitem{wisckey2016}
+Lanyue Lu, Thanumalayan~Sankaranarayana Pillai, Andrea~C. Arpaci-Dusseau, and Remzi~H. Arpaci-Dusseau.
+\newblock {WiscKey}: Separating keys from values in ssd-conscious storage.
+\newblock In {\em 14th USENIX Conference on File and Storage Technologies}, 2016.
+\newblock \url{https://www.usenix.org/conference/fast16/technical-sessions/presentation/lu}.
+
+\bibitem{libfabricefa}
+{OpenFabrics Interfaces Working Group}.
+\newblock fi\_efa(7): The amazon elastic fabric adapter provider.
+\newblock Current provider manual; capabilities depend on provider version, device and negotiation. \url{https://ofiwg.github.io/libfabric/main/man/fi_efa.7.html}.
+
+\bibitem{tikvstorage}
+{PingCAP}.
+\newblock {TiDB} storage.
+\newblock TiDB 8.5 documentation, accessed 29 October 2026. \url{https://docs.pingcap.com/tidb/stable/tidb-storage/}.
+
+\bibitem{tikvwrite854}
+{TiKV Project}.
+\newblock Asynchronous raftstore write worker.
+\newblock Source tag v8.5.4. \url{https://github.com/tikv/tikv/blob/v8.5.4/components/raftstore/src/store/async_io/write.rs}.
+
+\bibitem{valkeycluster}
+{Valkey contributors}.
+\newblock Cluster tutorial.
+\newblock Official documentation, accessed 29 October 2026. \url{https://valkey.io/topics/cluster-tutorial/}.
+
+\bibitem{valkeypersistence}
+{Valkey contributors}.
+\newblock Persistence.
+\newblock Official documentation, accessed 29 October 2026. \url{https://valkey.io/topics/persistence/}.
+
+\bibitem{valkeypipeline}
+{Valkey contributors}.
+\newblock Pipelining.
+\newblock Official documentation, accessed 29 October 2026. \url{https://valkey.io/topics/pipelining/}.
+
+\end{thebibliography}

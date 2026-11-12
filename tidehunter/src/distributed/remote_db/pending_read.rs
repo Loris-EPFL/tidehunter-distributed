@@ -23,6 +23,10 @@ struct PlannedMember {
 #[cfg(test)]
 mod kv_capture_tests;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+mod live_inline;
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+mod live_inline_tests;
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
 mod live_lane;
 mod read_trace;
 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -679,6 +683,13 @@ read_diagnostics!(
     live_lane_depth_max,
     live_lane_pending_max,
     live_pending_wait_ns,
+    live_inline,
+    live_inline_fallback_drain,
+    live_inline_fallback_busy,
+    live_inline_fallback_grant,
+    live_inline_fallback_credit,
+    live_inline_fallback_paused,
+    live_inline_fallback_coalesced,
 );
 impl ReadDiagnostics {
     fn add_wal(&self, wal: super::super::tcp::WalReadProfile) {
@@ -1124,6 +1135,11 @@ struct State {
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_reads: bool,
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    live_inline_reads: bool,
+    /// Drain commands accepted by live workers and not yet completed.
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    live_drains: AtomicUsize,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     live_unreleased: Mutex<Vec<UnreleasedLiveGrant>>,
     stopped: AtomicBool,
     retained: Mutex<(usize, usize)>,
@@ -1154,6 +1170,12 @@ struct State {
     nvme_shutdown_ready: AtomicUsize,
     #[cfg(test)]
     peak_connection_reads: AtomicUsize,
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    inline_mutex_fallbacks: AtomicUsize,
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    inline_result_copies: AtomicUsize,
+    #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+    inline_retirement_pause: ReactorPause,
     #[cfg(test)]
     inline_pause: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
     #[cfg(test)]
@@ -1445,7 +1467,7 @@ struct ReadFlight {
     references: Vec<ValueRecordReference>,
     slot: usize,
     grouped_inline: AtomicBool,
-    completion: Arc<FlightCompletion>,
+    completion: FlightCompletion,
     _pin: Option<IndexReadPin>,
     // Keep retained-result credit while any caller can consume the flight.
     _credit: Arc<Credit>,
@@ -1488,6 +1510,8 @@ struct InflightRead {
     request: Request,
     started: Option<Instant>,
 }
+// Live processing takes `driver` before `client`. Callers try both locks;
+// the live endpoint actor uses neither, so one inline I/O cannot stall it.
 struct ReactorLane {
     client: Arc<Mutex<Client>>,
     /// Endpoint whose reactor drives this lane. It selects the only sealed
@@ -1497,6 +1521,8 @@ struct ReactorLane {
     queued: VecDeque<Request>,
     active: HashMap<u64, InflightRead>,
     profiling: bool,
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    live_cache: Option<super::super::tcp::live_read::LiveReadCache>,
 }
 /// Harvest completions of `node`'s sealed readers. Each reader has its own
 /// mutex, held only across its ring submit and CQ harvest; record verification
@@ -2088,11 +2114,15 @@ fn drive_live_reads(
             ReadCommand::Wake => state.wake_pending[node].store(false, Ordering::Release),
             ReadCommand::DrainLive(reply) => {
                 for lane in &inboxes {
+                    // Release: publish the drain before the worker can receive it.
+                    state.live_drains.fetch_add(1, Ordering::Release);
                     if lane
                         .sender
                         .try_send(LiveLaneCommand::Drain(reply.clone()))
                         .is_err()
                     {
+                        // Release: this lane did not accept the published drain.
+                        state.live_drains.fetch_sub(1, Ordering::Release);
                         let _ = reply.send(Err("live read lane drain admission failed".into()));
                     }
                 }
@@ -2544,6 +2574,13 @@ impl ReadService {
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_reads,
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            live_inline_reads: config
+                .live_nvme
+                .as_ref()
+                .is_none_or(|live| live.inline_reads),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            live_drains: AtomicUsize::new(0),
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             live_unreleased: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
             retained: Mutex::new((0, 0)),
@@ -2581,6 +2618,12 @@ impl ReadService {
             nvme_shutdown_ready: AtomicUsize::new(0),
             #[cfg(test)]
             peak_connection_reads: AtomicUsize::new(0),
+            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            inline_mutex_fallbacks: AtomicUsize::new(0),
+            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            inline_result_copies: AtomicUsize::new(0),
+            #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+            inline_retirement_pause: Mutex::new(None),
             #[cfg(test)]
             inline_pause: Mutex::new(None),
             #[cfg(test)]
@@ -2640,6 +2683,9 @@ impl ReadService {
                     queued: VecDeque::new(),
                     active: HashMap::new(),
                     profiling: false,
+                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                    live_cache: live_reads
+                        .then(super::super::tcp::live_read::LiveReadCache::default),
                 }));
                 let lane = Lane {
                     index,
@@ -3260,7 +3306,10 @@ impl ReadService {
         }
         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
         if self.state.live_reads {
-            return Ok(None);
+            if !self.state.live_inline_reads {
+                return Ok(None);
+            }
+            return self.read_live_inline(node, epoch, reference, extra_bytes, pin, trace);
         }
         let bytes = member_charge(reference)?
             .checked_add(extra_bytes)
@@ -3342,7 +3391,7 @@ impl ReadService {
             references: vec![*reference],
             slot: flight_slot,
             grouped_inline: AtomicBool::new(false),
-            completion: Arc::new(FlightCompletion::new()),
+            completion: FlightCompletion::new(),
             _pin: pin,
             _credit: credit,
         });
@@ -3686,7 +3735,7 @@ impl ReadService {
                 references: missing.clone(),
                 slot,
                 grouped_inline: AtomicBool::new(false),
-                completion: Arc::new(FlightCompletion::new()),
+                completion: FlightCompletion::new(),
                 _pin: pin,
                 _credit: credit.clone(),
             });

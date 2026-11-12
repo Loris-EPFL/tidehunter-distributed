@@ -1,0 +1,18 @@
+\small\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrr}\toprule
+Component, mean \us & Verbs & TCP & Native\\\midrule
+Owner append-persist (includes software) & \N{C:p16v:persist} & \N{C:p16t:persist} & \N{C:p16n:persist}\\
+Network (stacks, TLS, dispatch included) & \N{C:p16v:network} & \N{C:p16t:network} & \N{C:p16n:network}\\
+Coordinator / native library insert$^{a}$ & \N{C:p16v:coordinator} & \N{C:p16t:coordinator} & \N{C:p16n:coordinator}\\
+Owner software & \N{C:p16v:owner} & \N{C:p16t:owner} & \N{C:p16n:owner}\\
+Durable wait / native file sync$^{a}$ & \N{C:p16v:durable} & \N{C:p16t:durable} & \N{C:p16n:durable}\\
+Waiting and coalescing & \N{C:p16v:coalescing} & \N{C:p16t:coalescing} & \N{C:p16n:coalescing}\\
+Client queueing and wake-up & \N{C:p16v:queue} & \N{C:p16t:queue} & \N{C:p16n:queue}\\
+Residual & \N{C:p16v:residual} & \N{C:p16t:residual} & \N{C:p16n:residual}\\
+Client encode, decode, verify & \N{C:p16v:messaging} & \N{C:p16t:messaging} & \N{C:p16n:messaging}\\
+SSD device & \N{C:p16v:device} & \N{C:p16t:device} & \N{C:p16n:device}\\
+Device + fabric + stack (unsplit) & \N{C:p16v:combined} & \N{C:p16t:combined} & \N{C:p16n:combined}\\
+Owner + network exchange (unsplit) & \N{C:p16v:exchange} & \N{C:p16t:exchange} & \N{C:p16n:exchange}\\
+\textbf{TOTAL: same-case API mean} & \N{D:p16v:mean_us} & \N{D:p16t:mean_us} & \N{D:p16n:mean_us}\\
+API p50 & \N{D:p16v:p50_us} & \N{D:p16t:p50_us} & \N{D:p16n:p50_us}\\
+\bottomrule\end{tabular}

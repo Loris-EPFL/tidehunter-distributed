@@ -253,6 +253,19 @@ and “no locks anywhere” are different claims.
   Profile-control exchanges are excluded from client request counts. The
   diagnostic collection itself still has overhead; clean runs disable both
   read and write sampling.
+* In `PartitionLog::append_group_impl`, `append_validation_ns` is the inclusive
+  sum of five exclusive local elapsed stages: `append_basic_validation_ns`
+  (authority, state, schema and per-batch checks), `append_conflict_lookup_ns`
+  (receipt/version lookup and retry decisions), `append_geometry_capacity_ns`
+  (counts, fresh-capacity and frame geometry), `append_metadata_reservation_ns`
+  (resident capacity and credit reservation, including maintenance initiation on
+  reservation failure), and `append_descriptor_preparation_ns` (descriptor
+  copies and prepared native write). The stages can alternate across group
+  members and admission retries; errors and unwinds close the active stage.
+  Existing history, lock, WAL and publication stages remain separate. These are
+  monotonic elapsed sums, not CPU or device timings; a zero is not proof a stage
+  was reached. Older serialized profiles lack the five child counters, which
+  deserialize as zero rather than reconstructing the historical breakdown.
 * File-sync means use `write_profile_storage_file_persist_calls`; namespace-sync
   means use `write_profile_storage_namespace_persist_calls`. Do not divide these
   stages by all appends. `append_inventory_residence_ns` covers the guarded

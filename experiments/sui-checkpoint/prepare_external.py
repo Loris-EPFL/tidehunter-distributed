@@ -26,12 +26,15 @@ def main():
     parser.add_argument('--coordinator-cache-mib',type=int,default=8)
     parser.add_argument('--write-profile-limit',type=int,default=0,
                         help='maximum profiled append RPCs per owning connection, 0 disables diagnostics')
+    parser.add_argument('--owner-tier')
+    parser.add_argument('--owner-wal',default='harness')
+    parser.add_argument('--live-nvme',type=Path)
     args=parser.parse_args()
     transport=deployment.validate_transport(json.loads(args.transport_config.read_text()))
     owners=deployment.select_owner_transports(transport,
         json.loads(args.owner_transports.read_text()) if args.owner_transports else None,5)
     hosts=args.hosts.split(',')
-    if len(set(hosts))!=5 or not args.guest_root.is_absolute() or not args.db_root.is_absolute():
+    if len(hosts)!=5 or len(set(hosts)) not in (1,5) or not args.guest_root.is_absolute() or not args.db_root.is_absolute():
         raise ValueError('five distinct hosts and absolute owned roots required')
     if not 1024<=args.port<=65000 or not 0<=args.coordinator_cache_mib<=128:
         raise ValueError('port/cache outside bounded limits')
@@ -49,25 +52,34 @@ def main():
     config,nodes=deployment.prepare(output,schema,args.db_root,
         shape_yamls={name:(args.schema/name/'shape.yaml').read_text() for name in schema},hosts=hosts,port=args.port,
         transport=transport,owner_transports=owners,coordinator_cache=args.coordinator_cache_mib*deployment.MIB,
-        guest_root=args.guest_root,write_profile_limit=args.write_profile_limit)
+        guest_root=args.guest_root,write_profile_limit=args.write_profile_limit,
+        owner_tier=args.owner_tier, owner_wal=args.owner_wal,
+        live_nvme=json.loads(args.live_nvme.read_text()) if args.live_nvme else None)
     host_records=[]
-    for partition,host in enumerate(hosts):
-        selected=[node for node in nodes if node['partition']==partition]
+    grouped = len(set(hosts)) == 1
+    if grouped and any(owner != owners[0] for owner in owners):
+        raise ValueError('owner transports differ on one host')
+    groups = [(hosts[0], list(range(5)))] if grouped else [(host, [p]) for p, host in enumerate(hosts)]
+    for host, partitions in groups:
+        partition = partitions[0]
+        selected=[node for node in nodes if node['partition'] in partitions]
         archive_path=output/f'host-{partition}.tar.gz'
         with tarfile.open(archive_path,'w:gz') as archive:
             archive.add(binary,arcname='storage-node')
             if not deployment.is_trusted(transport):
-                for name in ('ca.der',f'node-{partition}.der',f'node-{partition}.pk8'):
-                    archive.add(output/'tls'/name,arcname='tls/'+name)
+                archive.add(output/'tls'/'ca.der',arcname='tls/ca.der')
+                for p in partitions:
+                    for name in (f'node-{p}.der', f'node-{p}.pk8'):
+                        archive.add(output/'tls'/name,arcname='tls/'+name)
             for node in selected:
                 path=Path(node['launch'])
                 archive.add(path,arcname=str(path.relative_to(output)))
-        host_records.append(dict(host=host,partition=partition,transport=owners[partition],archive=str(archive_path),
+        host_records.append(dict(host=host,**({'partitions': partitions} if grouped else {'partition': partition}),transport=owners[partition],archive=str(archive_path),
             archive_sha256=build.digest(archive_path),guest_root=str(args.guest_root),
             commands=[[str(args.guest_root/'storage-node'),'--experimental-storage-node',
                        str(args.guest_root/Path(n['launch']).relative_to(output))] for n in selected],
             ready_files=[n['ready'] for n in selected],stop_files=[n['stop'] for n in selected]))
-    build.save(output/'external-manifest.json',dict(schema=2,protocol=manifest['protocol'],transport=transport,owner_transports=owners,
+    build.save(output/'external-manifest.json',dict(schema=3 if grouped else 2,protocol=manifest['protocol'],transport=transport,owner_transports=owners,
         config_sha256=build.digest(output/'config.json'),build_manifest_sha256=build.digest(args.build/'build-manifest.json'),
         source_archive_sha256=manifest['source_archive_sha256'],storage_binary_sha256=manifest['binaries']['storage-node'],
         write_profile_limit=args.write_profile_limit,hosts=host_records,

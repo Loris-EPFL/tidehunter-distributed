@@ -1,0 +1,77 @@
+\appendix
+\section{Full value-size tables}
+Each entry is API p50/p99 in \us\ followed by successful calls/s. Primary live, native and Valkey cells are concurrency 16, RF1: scalar read $n=8{,}192$, scalar write $n=4{,}096$, 32-key calls $n=2{,}048$. Sealed rows are the first-touch c16 read cases; their media state differs from the live rows (Table~\ref{tab:media}). Sealed c16 cases exist for 1 KiB and 8 KiB only. A dash means no case, not zero. $^{*}$: the case ran, but its SPDK target counters are not admitted; the API latency is kept. One repetition.
+\begin{table}[H]\centering\scriptsize\renewcommand{\arraystretch}{.88}\captionsetup{skip=1pt}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lrrrr}\toprule
+Backend & Scalar read & Scalar write & Read-many32 & Write-batch32\\\midrule
+Native & 1.32/1.98/279{,}446 & 74.3/213/153{,}827 & 52.9/72.3/123{,}088 & 185/409/58{,}414\\
+TH TCP & 57.2/210/176{,}727 & 323/536/48{,}408 & 808/1{,}945/18{,}061 & 1{,}488/2{,}204/10{,}219\\
+TH verbs & 46.0/175/223{,}875 & 234/561/56{,}993 & 701/1{,}808/20{,}907 & 1{,}302/2{,}173/11{,}344\\
+NVMe-oF kernel live & 56.2/253/165{,}298 & 646/1{,}216/24{,}264 & 644/3{,}000/18{,}291 & 1{,}701/2{,}698/8{,}968\\
+NVMe-oF SPDK live & 75.0/157/146{,}998 & 697/1{,}382/22{,}430 & 644/2{,}718/18{,}600 & 1{,}818/2{,}818/8{,}599\\
+Valkey TCP & 49.5/103/193{,}628 & 164/458/80{,}717 & 336/685/35{,}482 & --\\
+Valkey RDMA & 44.1/89.2/211{,}858 & 152/357/86{,}852 & 283/819/40{,}614 & --\\
+\bottomrule\end{tabular}}
+\caption{64 B values: API p50/p99 (\us) / successful calls/s.}
+\end{table}
+\begin{table}[H]\centering\scriptsize\renewcommand{\arraystretch}{.88}\captionsetup{skip=1pt}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lrrrr}\toprule
+Backend & Scalar read & Scalar write & Read-many32 & Write-batch32\\\midrule
+Native & 1.19/1.82/286{,}437 & 72.3/185/157{,}422 & 52.4/128/143{,}865 & 380/572/34{,}774\\
+TH TCP & 60.4/213/169{,}009 & 321/540/47{,}723 & 797/1{,}956/18{,}111 & 1{,}683/2{,}647/9{,}297\\
+TH verbs & 41.6/184/220{,}730 & 280/476/54{,}122 & 700/1{,}668/21{,}130 & 1{,}481/2{,}433/10{,}386\\
+NVMe-oF kernel live & 49.4/195/144{,}489 & 647/1{,}344/23{,}890 & 634/2{,}926/18{,}328 & 1{,}728/2{,}885/8{,}464\\
+NVMe-oF SPDK live & 69.4/150/145{,}562 & 703/1{,}266/22{,}293 & 661/2{,}597/18{,}537 & 2{,}116/3{,}097/7{,}566\\
+Valkey TCP & 52.0/103/192{,}026 & 173/439/78{,}863 & 376/784/32{,}058 & --\\
+Valkey RDMA & 42.5/87.4/165{,}415 & 158/359/87{,}818 & 291/806/39{,}895 & --\\
+\bottomrule\end{tabular}}
+\caption{256 B values: API p50/p99 (\us) / successful calls/s.}
+\end{table}
+\begin{table}[H]\centering\scriptsize\renewcommand{\arraystretch}{.88}\captionsetup{skip=1pt}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lrrrr}\toprule
+Backend & Scalar read & Scalar write & Read-many32 & Write-batch32\\\midrule
+Native & 1.37/2.18/277{,}534 & 63.8/168/168{,}290 & 55.3/113/110{,}340 & 1{,}047/1{,}247/13{,}901\\
+TH TCP & 60.1/209/172{,}074 & 322/506/47{,}427 & 840/2{,}418/16{,}895 & 2{,}554/3{,}576/6{,}363\\
+TH verbs & 45.0/176/220{,}750 & 295/575/51{,}467 & 688/1{,}723/19{,}913 & 2{,}256/3{,}212/7{,}191\\
+NVMe-oF kernel live & 55.9/242/181{,}799 & 657/1{,}206/23{,}841 & 641/2{,}846/18{,}272 & 2{,}421/3{,}810/6{,}322\\
+NVMe-oF kernel sealed & 98.1/267/136{,}837 & -- & 558/1{,}347/25{,}693 & --\\
+NVMe-oF SPDK live & 71.7/156/147{,}290 & 702/1{,}248/22{,}172 & 642/2{,}740/18{,}391 & 2{,}253/4{,}030/6{,}405\\
+NVMe-oF SPDK sealed & 116/173/123{,}479 & -- & 567/1{,}104/25{,}664 & --\\
+Valkey TCP & 53.4/113/188{,}256 & 183/469/73{,}443 & 389/807/29{,}860 & --\\
+Valkey RDMA & 43.1/92.5/165{,}026 & 173/410/80{,}146 & 321/803/35{,}821 & --\\
+\bottomrule\end{tabular}}
+\caption{1 KiB values: API p50/p99 (\us) / successful calls/s.}
+\end{table}
+\begin{table}[H]\centering\scriptsize\renewcommand{\arraystretch}{.88}\captionsetup{skip=1pt}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lrrrr}\toprule
+Backend & Scalar read & Scalar write & Read-many32 & Write-batch32\\\midrule
+Native & 2.55/4.01/267{,}273 & 208/380/67{,}505 & 72.1/266/52{,}852 & 10{,}807/12{,}943/1{,}506\\
+TH TCP & 77.6/260/135{,}957 & 474/1{,}120/30{,}822 & 874/1{,}728/14{,}522 & 7{,}387/14{,}042/2{,}006\\
+TH verbs & 47.9/163/201{,}670 & 473/1{,}012/31{,}152 & 595/1{,}586/19{,}090 & 7{,}654/12{,}549/2{,}066\\
+NVMe-oF kernel live & 60.7/211/140{,}976 & 888/1{,}779/17{,}294 & 630/2{,}228/17{,}072 & 6{,}358/12{,}856/2{,}338\\
+NVMe-oF kernel sealed & 102/482/121{,}803 & -- & 451/1{,}142/23{,}612 & --\\
+NVMe-oF SPDK live & 112/162/127{,}916 & 971/1{,}972/15{,}680 & 639/2{,}055/17{,}064 & 7{,}777/16{,}285/1{,}850\\
+NVMe-oF SPDK sealed & 129/300/106{,}573 & -- & 492/1{,}044/22{,}895 & --\\
+Valkey TCP & 67.1/149/149{,}011 & 229/575/59{,}373 & 512/202{,}686/2{,}926 & --\\
+Valkey RDMA & 45.9/82.0/142{,}170 & 217/521/63{,}414 & 375/1{,}149/21{,}097 & --\\
+\bottomrule\end{tabular}}
+\caption{8 KiB values: API p50/p99 (\us) / successful calls/s.}
+\end{table}
+\begin{table}[H]\centering\scriptsize\renewcommand{\arraystretch}{.88}\captionsetup{skip=1pt}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lrrrr}\toprule
+Backend & Scalar read & Scalar write & Read-many32 & Write-batch32\\\midrule
+Native & 14.8/24.7/226{,}188 & 2{,}714/3{,}337/6{,}102 & 1{,}145/45{,}168/2{,}915 & 57{,}850/68{,}469/269\\
+TH TCP & 165/641/60{,}472 & 1{,}611/3{,}321/9{,}093 & 5{,}737/209{,}166/949 & 36{,}579/55{,}357/444\\
+TH verbs & 83.1/290/102{,}653 & 1{,}463/3{,}984/9{,}937 & 1{,}524/33{,}235/3{,}927 & 34{,}144/49{,}677/476\\
+NVMe-oF kernel live & 76.5/150/110{,}105 & 1{,}802/5{,}023/7{,}588 & 1{,}262/31{,}236/4{,}498 & 46{,}208/282{,}869/265\\
+NVMe-oF SPDK live & 147/218/83{,}412 & 2{,}146/6{,}429/6{,}284 & 1{,}278/29{,}600/4{,}872 & 59{,}404/551{,}174/180\\
+Valkey TCP & 157/657/53{,}251 & 455/1{,}256/28{,}957 & 4{,}265/213{,}368/265 & --\\
+Valkey RDMA & 116/276/72{,}961 & 419/1{,}120/31{,}902 & 1{,}440/43{,}334/2{,}159 & --\\
+\bottomrule\end{tabular}}
+\caption{64 KiB values: API p50/p99 (\us) / successful calls/s.}
+\end{table}

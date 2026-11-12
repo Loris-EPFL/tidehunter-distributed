@@ -1,0 +1,86 @@
+[
+  {
+    "boot_id": "5dbbbc35-3345-45ee-acbd-1daa66abe85d",
+    "host_index": -1,
+    "processes": [
+      {
+        "available": true,
+        "cgroup": "/system.slice/kvcloud-bench-803a8577c33a4d82-95c6f6e10c4d1ca6-client.service",
+        "cpu": {
+          "burst_usec": 0,
+          "core_sched.force_idle_usec": 0,
+          "nice_usec": 0,
+          "nr_bursts": 0,
+          "nr_periods": 60,
+          "nr_throttled": 0,
+          "system_usec": 3285813,
+          "throttled_usec": 0,
+          "usage_usec": 12032024,
+          "user_usec": 8746211
+        },
+        "inode": 8541,
+        "io_devices": {
+          "259:3": {
+            "dbytes": 0,
+            "dios": 0,
+            "rbytes": 0,
+            "rios": 0,
+            "wbytes": 11608064,
+            "wios": 103
+          }
+        },
+        "memory_current_bytes": 12398592,
+        "memory_peak_bytes": 27725824,
+        "monotonic_ns": 868823873006,
+        "process_role": "client"
+      }
+    ],
+    "schema_version": 1
+  },
+  {
+    "boot_id": "5dbbbc35-3345-45ee-acbd-1daa66abe85d",
+    "host_index": -1,
+    "processes": [
+      {
+        "available": true,
+        "cgroup": "/system.slice/kvcloud-bench-803a8577c33a4d82-95c6f6e10c4d1ca6-client.service",
+        "cpu": {
+          "burst_usec": 0,
+          "core_sched.force_idle_usec": 0,
+          "nice_usec": 0,
+          "nr_bursts": 0,
+          "nr_periods": 68,
+          "nr_throttled": 0,
+          "system_usec": 3626864,
+          "throttled_usec": 0,
+          "usage_usec": 12702128,
+          "user_usec": 9075264
+        },
+        "inode": 8541,
+        "io_devices": {
+          "259:0": {
+            "dbytes": 0,
+            "dios": 0,
+            "rbytes": 3342336,
+            "rios": 17,
+            "wbytes": 0,
+            "wios": 0
+          },
+          "259:3": {
+            "dbytes": 0,
+            "dios": 0,
+            "rbytes": 4096,
+            "rios": 1,
+            "wbytes": 11636736,
+            "wios": 105
+          }
+        },
+        "memory_current_bytes": 19963904,
+        "memory_peak_bytes": 27725824,
+        "monotonic_ns": 877413953558,
+        "process_role": "client"
+      }
+    ],
+    "schema_version": 1
+  }
+]

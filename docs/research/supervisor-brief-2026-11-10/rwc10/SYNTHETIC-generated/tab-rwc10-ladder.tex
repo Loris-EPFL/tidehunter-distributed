@@ -1,0 +1,13 @@
+\begin{table}[H]\centering\small\setlength{\tabcolsep}{3pt}
+\begin{tabular}{llll}\toprule
+Run-9 network tool & r0 mean & r1 mean & r2 mean\\\midrule
+TCP blocking & \N{F10:run9-floors:17:mean_us:1|.1f} & \N{F10:run9-floors:155:mean_us:1|.1f} & \N{F10:run9-floors:223:mean_us:1|.1f}\\
+TCP user spin & \N{F10:run9-floors:51:mean_us:1|.1f} & \N{F10:run9-floors:159:mean_us:1|.1f} & \N{F10:run9-floors:227:mean_us:1|.1f}\\
+TCP SO\_BUSY\_POLL & \N{F10:run9-floors:55:mean_us:1|.1f} & \N{F10:run9-floors:163:mean_us:1|.1f} & \N{F10:run9-floors:231:mean_us:1|.1f}\\
+RDMA SEND polled & \N{F10:run9-floors:9:mean_us:2|.1f} & \N{F10:run9-floors:119:mean_us:2|.1f} & \N{F10:run9-floors:187:mean_us:2|.1f}\\
+RDMA SEND event & \N{F10:run9-floors:23:mean_us:2|.1f} & \N{F10:run9-floors:123:mean_us:2|.1f} & \N{F10:run9-floors:191:mean_us:2|.1f}\\
+RDMA READ polled & \N{F10:run9-floors:35:mean_us:1|.1f} & \N{F10:run9-floors:135:mean_us:1|.1f} & \N{F10:run9-floors:203:mean_us:1|.1f}\\
+verbs;ofi\_rxm & \N{F10:run9-floors:13:mean_us:2|.1f} & \N{F10:run9-floors:143:mean_us:2|.1f} & \N{F10:run9-floors:211:mean_us:2|.1f}\\
+\bottomrule\end{tabular}
+\caption{\textbf{SYNTHETIC run-10 layout; these run-9 floors are real measurements.} Standalone run-9 1-KiB round-trip means (\us{}), CROSS-FLEET context, not run-10 stage timers. eth0 TCP blocking/spin/SO\_BUSY\_POLL; RDMA SEND polled/event, READ polled, RDM verbs;ofi\_rxm. Half-RTT values are doubled only where their receipt says so. All three repetitions remain separate. Never subtract these from engine means. Coordinator cache off; lanes one at c1, four at c16; r0/r1 separate. Busy spins owner and coordinator read driver, not kernel busy poll. Unmatched dimensions: TLS/security, polling, RPC/direct I/O; NVMe control is verbs trusted Adaptive.}
+\end{table}

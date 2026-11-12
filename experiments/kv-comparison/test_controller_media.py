@@ -12,7 +12,19 @@ import cloud_controller as controller
 
 class MediaEvidenceTests(unittest.TestCase):
     def setUp(self):
-        self.row = {"owner_index": 0, "major": 259, "minor": 1, "read_ops": 100}
+        self.row = {"owner_index": 0, "major": 259, "minor": 1, "read_ops": 100,
+                    "read_sectors": 0, "write_ops": 0, "write_sectors": 0}
+    def test_diskstats_four_counters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            (path / "device").mkdir()
+            (path / "device/model").write_text("local")
+            with patch("cold_device_trace.resolve_device", return_value={"sysfs_path": str(path), "device": "259:1"}), \
+                 patch.object(controller.physical_storage, "admitted_model", return_value=True):
+                result = controller.media_device_snapshot(path, 0, "259 1 nvme0n1 10 0 20 0 30 0 40 0")
+            self.assertEqual([result[k] for k in ("read_ops", "read_sectors", "write_ops", "write_sectors")],
+                             [10, 20, 30, 40])
+
 
     def evidence(self, expected, after, reads=100, drained=True, history="normal"):
         return controller.qualify_media_evidence(

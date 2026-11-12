@@ -6,6 +6,7 @@ import importlib.util
 import json
 import re
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -284,6 +285,17 @@ class CaseIdentityTests(unittest.TestCase):
         self.assertIn('scope="node_lifetime",boundary="end",peak="lane_inflight_request_max"} 5', text)
         self.assertNotIn('peak="lane_inflight_op_max"', text)
         self.assertIn('counter="connections_replaced"} 1', text)
+        counters.update(lease_exchanges=2, adoption_history_full_settles=1,
+                        adoption_async_ns=0, adoption_async_samples=0,
+                        adoption_settle_ns=30, adoption_settle_samples=3)
+        text = campaign.measurement_read_metrics(evidence, {})
+        self.assertIn('counter="lease_exchanges"} 2', text)
+        self.assertNotIn('stage="adoption_async",statistic="sum"', text)
+        self.assertIn('stage="adoption_settle",statistic="sum"} 3e-08', text)
+        counters["unknown_leased_counter"] = 0
+        with self.assertRaises(ValueError):
+            campaign.measurement_read_metrics(evidence, {})
+        del counters["unknown_leased_counter"]
         del counters["delivery_samples"]
         with self.assertRaisesRegex(ValueError, "incomplete live"):
             campaign.measurement_read_metrics(evidence, {})
@@ -330,6 +342,24 @@ class CaseIdentityTests(unittest.TestCase):
         self.assertIn('counter="copy_bytes_avoided"} 128', text)
         self.assertIn('stage="delivery_ns"} 9e-09', text)
         self.assertNotIn('stage="controller_connect_ns"', text)
+
+    def test_leased_fields_are_strict_and_zero_stages_unavailable(self):
+        evidence = live_write_diagnostics()
+        counters = evidence["profile"]["stages"]["live_nvmeof"]
+        counters.update(lease_exchanges=2, leased_frames=3, adoption_history_full_settles=1,
+                        adoption_async_ns=0, adoption_async_samples=0,
+                        adoption_settle_ns=20, adoption_settle_samples=2)
+        text = campaign.write_diagnostic_metrics(evidence, {})
+        self.assertIn('counter="lease_exchanges"} 2', text)
+        self.assertNotIn('stage="adoption_async_ns"', text)
+        self.assertIn('stage="adoption_settle_ns"} 2e-08', text)
+        counters["unrecognized"] = 0
+        with self.assertRaises(ValueError):
+            campaign.write_diagnostic_metrics(evidence, {})
+        del counters["unrecognized"]
+        del counters["adoption_async_samples"]
+        with self.assertRaises(ValueError):
+            campaign.write_diagnostic_metrics(evidence, {})
 
     def test_nvme_reader_exports_transport_and_unavailable_stages(self):
         row = {"available": True, "identity": {"partition": 0, "transport": "rdma"},
@@ -1279,7 +1309,100 @@ class CorrelatedTimingTests(unittest.TestCase):
             campaign.correlated_timing_metrics([bad], {})
 
 
+class SealedSpdkExporterTests(unittest.TestCase):
+    def test_owner_counts_match_fleet_layout(self):
+        with patch.object(sys, "path", [str(Path(__file__).resolve().parent.parent), *sys.path]):
+            import cloud_layout
+            self.assertEqual(campaign.SEALED_OWNER_COUNTS, cloud_layout.OWNER_HOST_COUNTS)
+
+    def evidence(self, count=1):
+        # Run 10 compact SPDK canary, trimmed to exporter fields.
+        row = {"index": 0, "read_ops": 2048, "read_bytes": 10670080,
+               "mean_read_completion_us": 75.01668017578125}
+        return {"available": True, "read_ops": 2048, "read_bytes": 10670080,
+                "mean_read_completion_us": 75.01668017578125,
+                "owners": [row | {"index": i} for i in range(count)]}
+
+    def test_compact_and_five_owner_samples(self):
+        for count in (1, 5):
+            with self.subTest(count=count):
+                text = campaign.spdk_target_metrics(self.evidence(count), {})
+                self.assertIn('target_owner="all"} 2048', text)
+                for i in range(count):
+                    self.assertIn(f'target_owner="{i}"' + '} 2048', text)
+                self.assertNotIn(f'target_owner="{count}"', text)
+
+    def test_rejects_bad_owner_counts_and_indices(self):
+        for count in (0, 2, 3, 4, 6):
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                campaign.spdk_target_metrics(self.evidence(count), {})
+        for indices in ([0, 1, 2, 3, 3], [0, 1, 2, 3, 5], [1],
+                        [True], ["0"], [None], [0, 1, 2, 3], [0, 1, 2, 3, 4, 5]):
+            value = self.evidence(len(indices))
+            for row, index in zip(value["owners"], indices):
+                row["index"] = index
+            with self.subTest(indices=indices), self.assertRaises(ValueError):
+                campaign.spdk_target_metrics(value, {})
+        value = self.evidence()
+        value["owners"] = [None]
+        with self.assertRaises(ValueError):
+            campaign.spdk_target_metrics(value, {})
+
+    def test_five_tcp_readers_on_one_owner(self):
+        readers = {str(i): {"available": True, "identity": {"partition": 0, "transport": "tcp"},
+                            "counters": {"available": True, "counters": {"io_completions": 1}},
+                            "stages": {}} for i in range(5)}
+        text = campaign.nvmeof_reader_metrics({"available": True, "readers": readers}, {})
+        self.assertEqual(text.count('partition="0",transport="tcp",counter="io_completions"} 1'), 5)
+
+    def test_compact_nvme_contexts_and_idle_selection(self):
+        for backend, target in (("tidehunter_nvme_rdma", "kernel"),
+                                ("tidehunter_nvme_rdma", "spdk"),
+                                ("tidehunter_nvme_tcp", "kernel")):
+            selected = job() | {"backend": backend, "cohort": "sealed_read",
+                                "owner_count": 1, "nvmeof_route": "sealed_read", "nvmeof_target": target}
+            labels = campaign.context("run", selected)
+            self.assertEqual(labels["requested_nvmeof_target"], target)
+            self.assertEqual(labels["requested_nvmeof_route"], "sealed_read")
+        idle = campaign.benchmark_payload({"run_id": "run", "stale_seconds": 30},
+                                          {"job": None, "results": None, "terminal": None})
+        self.assertIn(b'case_id="idle"', idle)
+    def test_compact_live_read_requires_primary_cohort(self):
+        selected = job() | {"backend": "tidehunter_nvme_rdma", "cohort": "primary_rf1",
+                            "selection": "leased_ab_compact", "group": "G17R", "case_kind": "live_read",
+                            "nvmeof_route": "live", "nvmeof_target": "kernel"}
+        self.assertEqual(campaign.context("run", selected)["requested_nvmeof_route"], "live")
+        with self.assertRaises(ValueError):
+            campaign.context("run", selected | {"cohort": "sealed_read"})
+
+    def test_nvmeof_path_backend_contexts(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        import cloud_campaign
+        for selection in cloud_campaign.NVMEOF_PATH_SELECTIONS:
+            for backend in ("native", "tidehunter_verbs_native", "tidehunter_nvme_rdma"):
+                selected = job() | {"backend": backend, "cohort": "primary_rf1",
+                                    "selection": selection, "group": "G18R",
+                                    "case_kind": "live_read", "owner_count": 1}
+                if backend == "tidehunter_nvme_rdma":
+                    selected.update(nvmeof_route="live", nvmeof_target="kernel")
+                labels = campaign.context("run", selected)
+                self.assertEqual(labels["requested_backend"], backend)
+                if backend == "tidehunter_nvme_rdma":
+                    self.assertEqual(labels["requested_nvmeof_route"], "live")
+                    self.assertEqual(labels["requested_nvmeof_target"], "kernel")
+                    with self.assertRaises(ValueError):
+                        campaign.context("run", selected | {"cohort": "sealed_read"})
+                else:
+                    self.assertNotIn("requested_nvmeof_route", labels)
+
+
+
 class LiveSpdkExporterTests(unittest.TestCase):
+    def test_live_truncated_five_owner_evidence_is_rejected(self):
+        row = {"index": 0, "available": False}
+        with self.assertRaises(ValueError):
+            campaign.spdk_live_target_metrics({"available": False, "owners": [row]}, {})
+
     def test_live_read_and_write_selections_render_admitted_intervals(self):
         path = Path(__file__).resolve().parents[2] / "nvmeof" / "spdk_measurement.py"
         spec = importlib.util.spec_from_file_location("spdk_measurement", path)

@@ -1,4 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import http.client
 import io
 import json
 from pathlib import Path
@@ -60,6 +62,19 @@ class DelegatedArtifactsTest(TestCase):
             store.head('runs/a')
         self.assertEqual(observed, ['Bearer token-one', 'Bearer token-one'])
         spawn.assert_called_once()
+
+    def test_get_retries_connection_closed_before_response(self):
+        attempts = []
+        def open_request(request, timeout):
+            attempts.append(request.get_method())
+            if len(attempts) == 1:
+                raise http.client.RemoteDisconnected('Remote end closed connection without response')
+            return Response(b'{"name":"runs/a","generation":"1","size":"0"}')
+        with mock.patch('gcp_manual_storage.subprocess.Popen', return_value=Process(b'token-one')), \
+                mock.patch('gcp_api.time.sleep'):
+            store = DelegatedArtifacts(deadline=time.time() + 60, opener=open_request)
+            self.assertEqual(store.head('runs/a')['generation'], '1')
+        self.assertEqual(attempts, ['GET', 'GET'])
 
     def test_concurrent_requests_singleflight_token_refresh(self):
         started = threading.Event()
@@ -193,6 +208,26 @@ class DelegatedArtifactsTest(TestCase):
             store = DelegatedArtifacts(deadline=time.time() + 60, opener=open_request)
             with self.assertRaisesRegex(ValueError, 'declared size'):
                 store.get('runs/a', generation='1', max_bytes=3)
+
+    def test_streamed_upload_gets_the_upload_socket_bound_and_other_requests_the_short_bound(self):
+        payload = b'x' * 4096
+        seen = []
+        def open_request(request, timeout):
+            seen.append((request.get_method(), timeout))
+            if request.get_method() == 'POST':
+                b''.join(request.data)
+                return Response(json.dumps({'name': 'runs/a', 'generation': '1', 'size': str(len(payload)),
+                                            'metadata': {'sha256': hashlib.sha256(payload).hexdigest()}}).encode())
+            return Response(b'{"name":"runs/a","generation":"1","size":"0"}')
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch('gcp_manual_storage.subprocess.Popen', side_effect=lambda *a, **k: Process(b'token')):
+            path = Path(directory) / 'package.tar'
+            path.write_bytes(payload)
+            store = DelegatedArtifacts(deadline=time.time() + 3600, opener=open_request)
+            store.upload('runs/a', path, if_generation_match=0)
+            store.head('runs/a')
+        self.assertEqual(seen, [('POST', gcp_manual_storage.UPLOAD_SOCKET_SECONDS),
+                                ('GET', gcp_manual_storage.SOCKET_SECONDS)])
 
     def test_unbounded_json_read_has_size_limit(self):
         response = gcp_manual_storage._DeadlineResponse(Response(b'01234'), lambda: 30, max_json_bytes=4)

@@ -1,0 +1,51 @@
+--- a/verify_brief.py
++++ b/verify_brief.py
+@@ -60,7 +60,7 @@
+     text = subprocess.check_output(['pdftotext', '-layout', str(HERE / 'main.pdf'), '-'], text=True)
+     (HERE / 'main.txt').write_text(text)
+     pages = [p for p in text.split('\f') if p.strip()]
+-    assert len(pages) <= 48, len(pages)
++    assert len(pages) <= 56, len(pages)
+     def page_for(heading):
+         pattern = re.compile(r'(?:\d+(?:\.\d+)*|[A-Z])\s+' + re.escape(heading))
+         found = [i+1 for i,p in enumerate(pages) if any(pattern.fullmatch(line.strip())
+@@ -304,8 +304,9 @@
+         if sizes:
+             figure_font_sizes[page.attrib['id']] = min(sizes)
+     rwc_evidence = json.loads((HERE / 'rwc/generated/figure-evidence.json').read_text()) if 'rwc' in manifest else {'figures': {}}
++    rwc10_evidence = json.loads((HERE / manifest['rwc10']['manifest']).parent.joinpath('figure-evidence.json').read_text()) if 'rwc10' in manifest else {'figures': {}}
+     assert len(evidence['figures']) == 14
+-    assert len(figure_font_sizes) == len(evidence['figures']) + len(rwc_evidence['figures'])
++    assert len(figure_font_sizes) == len(evidence['figures']) + len(rwc_evidence['figures']) + len(rwc10_evidence['figures'])
+     assert min(figure_font_sizes.values()) >= 7, figure_font_sizes
+     for figure in evidence['figures'].values():
+         assert figure['text_size']['printed_min_pt'] >= 7
+@@ -347,8 +348,8 @@
+         'inputs': {'outputs_hashed': len(manifest['outputs']), 'sources': source_checks,
+                    'copied_full_matrix': 'seven byte-identical CSV inputs; unavailable export not required',
+                    'run8_operation_rows': len(operations), 'appendix_rows': len(row_ids)},
+-        'figures': {'count': len(evidence['figures']) + len(rwc_evidence['figures']),
+-                    'files': list(evidence['figures']) + list(rwc_evidence['figures']),
++        'figures': {'count': len(evidence['figures']) + len(rwc_evidence['figures']) + len(rwc10_evidence['figures']),
++                    'files': list(evidence['figures']) + list(rwc_evidence['figures']) + list(rwc10_evidence['figures']),
+                     'point_case_ids': 'checked for every plotted point', 'carried_forward': unchanged,
+                     'printed_font_minima_pt': figure_font_sizes,
+                     'minimum_figure_font_pt': min(figure_font_sizes.values()),
+@@ -405,7 +406,7 @@
+                    'Run-9 G13W completed; independent floors do not identify the old owner sync-step gap',
+                    'Put stall phase, hybrid residual and constant non-API kernel reads remain unattributed',
+                    'Device counters are window-wide; some read components are derived means with unproved population identity',
+-                   'No saturation, measured CPU-cost, physical NAND or failover result; Sui capture adds sizes only, not replay performance'],
++                   'No saturation, per-call CPU attribution, physical NAND or failover result; run 10 records process/cgroup CPU evidence; Sui capture adds sizes only, not replay performance'],
+         'coherence_corrections': {'sustained_complete_bucket_checks': sustained_checks, 'network_semantics_checks': network_checks,
+                                   'wording_contradictions': curve_checks['contradictions'],
+                                   'unverified': ['Native 64 KiB root cause, queue depth, page-fault/allocation/journal attribution',
+@@ -415,7 +416,7 @@
+                                                  'Cassandra, TiKV and FoundationDB device persistence',
+                                                  'Power-loss survival and Garnet stall cause',
+                                                  'Paper-matched sustained throughput; paper client count']},
+-        'not_done': ['No infrastructure launched by document generation; authorized run-9 results imported',
++        'not_done': ['No infrastructure launched by document generation; selected second-attempt run-9 and run-10 results imported; aborted attempts excluded',
+                      'No repository test suite run; only document build and requested acceptance checks',
+                      'Original full-matrix extraction not rerun: 12 GB export unavailable; versioned inputs preserved']}
+     (HERE / 'validation.json').write_text(json.dumps(validation, indent=2) + '\n')

@@ -62,6 +62,99 @@ pub struct CompleteGroup {
     encoded: Bytes,
 }
 
+/// Validated live members without an intermediate encoded payload.
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+pub(crate) struct LiveFrame {
+    batches: Vec<CompleteBatch>,
+    len: usize,
+}
+
+#[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+impl LiveFrame {
+    pub(crate) fn new(
+        shape: &KeyShape,
+        batches: Vec<CompleteBatch>,
+        batch_limits: BatchLimits,
+        limits: GroupLimits,
+    ) -> Result<Self, GroupError> {
+        limits.validate()?;
+        batch_limits.validate()?;
+        check_count(batches.len(), limits)?;
+        if CompleteGroup::encoded_len_for_batches(&batches)? > limits.max_encoded_bytes {
+            return Err(GroupError::TooLarge);
+        }
+        for batch in &batches {
+            batch.validate_for(shape, batch_limits)?;
+        }
+        check_members(&batches)?;
+        let len = Self::frame_len_for_batches(&batches)?;
+        Ok(Self { batches, len })
+    }
+
+    /// Exact physical length, including the outer header and v3 zero tail.
+    pub(crate) fn frame_len_for_batches(batches: &[CompleteBatch]) -> Result<usize, GroupError> {
+        let len = CompleteGroup::encoded_len_for_batches(batches)?
+            .checked_add(FRAME_HEADER_LEN)
+            .and_then(|n| n.checked_add(LIVE_BLOCK_SIZE - 1))
+            .map(|n| n & !(LIVE_BLOCK_SIZE - 1))
+            .ok_or(GroupError::TooLarge)?;
+        if len >= NATIVE_FRAME_MAX_EXCLUSIVE {
+            return Err(GroupError::TooLarge);
+        }
+        Ok(len)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn batches(&self) -> &[CompleteBatch] {
+        &self.batches
+    }
+
+    /// Same payload-relative offsets as CompleteGroup, without an offset Vec.
+    pub(crate) fn batch_offsets(&self) -> impl Iterator<Item = u32> + '_ {
+        self.batches.iter().scan(GROUP_HEADER_LEN, |offset, batch| {
+            let current = *offset as u32;
+            // Construction checked all lengths and their sum.
+            *offset += (batch.encoded().len() + FRAME_HEADER_LEN + 7) & !7;
+            Some(current)
+        })
+    }
+
+    /// Fully initializes the destination, including both kinds of padding.
+    /// Each immutable batch encoding is copied directly to its final position.
+    pub(crate) fn encode_into(&self, frame: &mut [u8]) -> Result<(), GroupError> {
+        if frame.len() != self.len {
+            return Err(GroupError::InvalidFormat);
+        }
+        let payload = &mut frame[FRAME_HEADER_LEN..];
+        payload[..8].copy_from_slice(MAGIC);
+        payload[8..10].copy_from_slice(&LIVE_FORMAT_VERSION.to_be_bytes());
+        payload[10..12].copy_from_slice(&LIVE_BLOCK_SHIFT.to_be_bytes());
+        payload[12..16].copy_from_slice(&(self.batches.len() as u32).to_be_bytes());
+        let mut end = GROUP_HEADER_LEN;
+        for (batch, offset) in self.batches.iter().zip(self.batch_offsets()) {
+            let offset = offset as usize;
+            let encoded = batch.encoded();
+            payload[offset..offset + 4].copy_from_slice(&(encoded.len() as u32).to_be_bytes());
+            payload[offset + 4..offset + 8]
+                .copy_from_slice(&crc32fast::hash(encoded).to_be_bytes());
+            payload[offset + FRAME_HEADER_LEN..offset + FRAME_HEADER_LEN + encoded.len()]
+                .copy_from_slice(encoded);
+            end = offset + FRAME_HEADER_LEN + encoded.len();
+            let padded = (end + 7) & !7;
+            payload[end..padded].fill(0);
+            end = padded;
+        }
+        payload[end..].fill(0);
+        let crc = crc32fast::hash(payload);
+        frame[..4].copy_from_slice(&((self.len - FRAME_HEADER_LEN) as u32).to_be_bytes());
+        frame[4..8].copy_from_slice(&crc.to_be_bytes());
+        Ok(())
+    }
+}
+
 impl CompleteGroup {
     /// Recheck the storage schema/limits for an immutable validated group.
     /// External bytes must pass `decode` before reaching this private fast path.
@@ -183,6 +276,16 @@ impl CompleteGroup {
         batch_limits: BatchLimits,
         limits: GroupLimits,
     ) -> Result<Self, GroupError> {
+        Self::decode_slice(shape, &encoded, batch_limits, limits)
+    }
+
+    /// Detach a borrowed payload once before validating its stable bytes.
+    pub(crate) fn decode_slice(
+        shape: &KeyShape,
+        encoded: &[u8],
+        batch_limits: BatchLimits,
+        limits: GroupLimits,
+    ) -> Result<Self, GroupError> {
         limits.validate()?;
         batch_limits.validate()?;
         if encoded.len() > limits.max_encoded_bytes.saturating_add(LIVE_BLOCK_SIZE - 1) {
@@ -191,9 +294,16 @@ impl CompleteGroup {
         if encoded.len() < GROUP_HEADER_LEN {
             return Err(GroupError::Truncated);
         }
-        // CRC/member validation below must describe bytes that cannot change
-        // after decode. Arbitrary input may be a mutable file-backed mapping.
-        let encoded: Bytes = encoded.as_ref().to_vec().into_boxed_slice().into();
+        Self::decode_owned(shape, Bytes::copy_from_slice(encoded), batch_limits, limits)
+    }
+
+    /// Decode stable, owned bytes without a second whole-group copy.
+    fn decode_owned(
+        shape: &KeyShape,
+        encoded: Bytes,
+        batch_limits: BatchLimits,
+        limits: GroupLimits,
+    ) -> Result<Self, GroupError> {
         let version = u16::from_be_bytes(encoded[8..10].try_into().unwrap());
         let flags = u16::from_be_bytes(encoded[10..12].try_into().unwrap());
         if &encoded[..8] != MAGIC
@@ -324,6 +434,10 @@ fn check_count(count: usize, limits: GroupLimits) -> Result<(), GroupError> {
 }
 
 fn check_members(batches: &[CompleteBatch]) -> Result<(), GroupError> {
+    // A singleton has no cross-member identity or authority conflict.
+    if batches.len() == 1 {
+        return Ok(());
+    }
     let first = &batches[0]; // caller has already checked a nonzero bounded count
     let mut identities = BTreeSet::new();
     let mut versions = BTreeSet::new();
@@ -379,6 +493,101 @@ mod tests {
     use crate::distributed::codec::Mutation;
     use crate::distributed::types::{BatchId, BatchVersion};
     use crate::key_shape::KeyType;
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    #[test]
+    fn live_in_place_encoder_matches_canonical_frames_for_group_shapes() {
+        let sizes = [0, 1, 7, 8, 1024, 4088, 4089, 65536];
+        let bl = BatchLimits {
+            max_operations: 16,
+            max_encoded_bytes: 128 * 1024,
+        };
+        let gl = GroupLimits {
+            max_batches: 31,
+            max_encoded_bytes: 4 * 1024 * 1024,
+        };
+        let shape = shape();
+        let keyspace = shape.iter_ks().next().unwrap().id();
+        for count in [1, 2, 31] {
+            // Each uniform size plus one mixed-size group.
+            for variant in 0..=sizes.len() {
+                let batches: Vec<_> = (0..count)
+                    .map(|index| {
+                        let size = sizes[if variant == sizes.len() {
+                            index % sizes.len()
+                        } else {
+                            variant
+                        }];
+                        CompleteBatch::new(
+                            &shape,
+                            BatchId {
+                                database: [1; 16],
+                                operation: [index as u8; 16],
+                            },
+                            BatchVersion {
+                                epoch: 2,
+                                sequence: index as u64,
+                            },
+                            vec![Mutation::Put {
+                                keyspace,
+                                key: Bytes::from(vec![index as u8; 32]),
+                                value: Bytes::from(vec![index as u8; size]),
+                            }],
+                            bl,
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                let canonical = CompleteGroup::new_live(&shape, batches.clone(), bl, gl).unwrap();
+                let frame = LiveFrame::new(&shape, batches, bl, gl).unwrap();
+                let mut encoded = vec![0xa5; frame.len()];
+                frame.encode_into(&mut encoded).unwrap();
+                assert_eq!(
+                    encoded,
+                    canonical.live_frame().unwrap(),
+                    "count={count} variant={variant}"
+                );
+                assert_eq!(
+                    frame.batch_offsets().collect::<Vec<_>>(),
+                    canonical.batch_offsets()
+                );
+                let payload = CrcFrame::read_from_slice(&encoded, 0).unwrap();
+                let decoded = CompleteGroup::decode_slice(&shape, payload, bl, gl).unwrap();
+                assert_eq!(decoded.batch_offsets(), canonical.batch_offsets());
+                assert_eq!(decoded.batches().len(), count);
+            }
+        }
+    }
+
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    #[test]
+    fn live_in_place_validates_without_taking_an_encoding_buffer() {
+        let (bl, gl) = limits();
+        let shape = shape();
+        let a = batch(1, 1);
+        assert!(matches!(
+            LiveFrame::new(&shape, vec![a.clone(), a.clone()], bl, gl),
+            Err(GroupError::DuplicateIdentity)
+        ));
+        assert!(matches!(
+            LiveFrame::new(&shape, vec![a.clone(), batch(2, 1)], bl, gl),
+            Err(GroupError::DuplicateVersion)
+        ));
+        assert!(matches!(
+            LiveFrame::new(
+                &shape,
+                vec![a.clone()],
+                bl,
+                GroupLimits {
+                    max_encoded_bytes: GROUP_HEADER_LEN + 16,
+                    ..gl
+                }
+            ),
+            Err(GroupError::TooLarge)
+        ));
+        let frame = LiveFrame::new(&shape, vec![a], bl, gl).unwrap();
+        assert_eq!(frame.encode_into(&mut []), Err(GroupError::InvalidFormat));
+    }
 
     fn shape() -> KeyShape {
         KeyShape::new_single(32, 1, KeyType::uniform(1))
@@ -744,6 +953,35 @@ mod tests {
             CompleteGroup::decode(&shape(), Bytes::from(trailing), bl, gl).unwrap_err(),
             GroupError::TrailingBytes
         );
+    }
+
+    #[test]
+    fn borrowed_and_owned_group_decoders_enforce_identical_validation() {
+        let (bl, gl) = limits();
+        let group = CompleteGroup::new_live(&shape(), vec![batch(1, 1)], bl, gl).unwrap();
+        let valid = group.encoded().to_vec();
+        let mut bad_crc = valid.clone();
+        bad_crc[GROUP_HEADER_LEN + 8] ^= 1;
+        let mut bad_padding = valid.clone();
+        *bad_padding.last_mut().unwrap() = 1;
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        for (bytes, error) in [
+            (valid, None),
+            (bad_crc, Some(GroupError::InvalidMemberFrame)),
+            (bad_padding, Some(GroupError::InvalidPadding)),
+            (trailing, Some(GroupError::TrailingBytes)),
+        ] {
+            let borrowed = CompleteGroup::decode_slice(&shape(), &bytes, bl, gl);
+            let owned = CompleteGroup::decode(&shape(), Bytes::from(bytes), bl, gl);
+            match error {
+                Some(error) => {
+                    assert_eq!(borrowed.unwrap_err(), error);
+                    assert_eq!(owned.unwrap_err(), error);
+                }
+                None => assert_eq!(borrowed.unwrap().encoded(), owned.unwrap().encoded()),
+            }
+        }
     }
 
     #[test]

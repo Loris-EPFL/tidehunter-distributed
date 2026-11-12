@@ -1,0 +1,12 @@
+{
+  "pass_check": true,
+  "numbers": 65,
+  "tables": 6,
+  "figure_points": 63,
+  "figures": 5,
+  "synthetic": false,
+  "excluded_from_final": true,
+  "pages": null,
+  "pdf_sha256": null,
+  "visual_inspection": "separate rendered-image review, not asserted by this checker"
+}

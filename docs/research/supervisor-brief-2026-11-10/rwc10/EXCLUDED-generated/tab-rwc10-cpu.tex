@@ -1,0 +1,16 @@
+\begin{table}[H]\centering\small\setlength{\tabcolsep}{3pt}
+\begin{tabular}{llllll}\toprule
+Arm & Rep. & 1 KiB c1 & 1 KiB c16 & 64 KiB c1 & 64 KiB c16\\\midrule
+TM-A & r0 & \N{F10:ab_warm:0:client_cores:1|.2f}/\N{F10:ab_warm:0:owner_cores:1|.2f}; NR & not run & not run & not run\\
+TM-A & r1 & not run & not run & not run & not run\\
+TT-A & r0 & \N{F10:ab_warm:1:client_cores:1|.2f}/\N{F10:ab_warm:1:owner_cores:1|.2f}; NR & not run & not run & not run\\
+TT-A & r1 & not run & not run & not run & not run\\
+TT-B & r0 & \N{F10:ab_warm:2:client_cores:1|.2f}/\N{F10:ab_warm:2:owner_cores:1|.2f}; NR & not run & not run & not run\\
+TT-B & r1 & not run & not run & not run & not run\\
+V-A & r0 & \N{F10:ab_warm:3:client_cores:1|.2f}/\N{F10:ab_warm:3:owner_cores:1|.2f}; \N{F10:ab_warm:3:cq_idle_waits:1|.0f} & not run & not run & not run\\
+V-A & r1 & not run & not run & not run & not run\\
+V-B & r0 & \N{F10:ab_warm:4:client_cores:1|.2f}/\N{F10:ab_warm:4:owner_cores:1|.2f}; \N{F10:ab_warm:4:cq_idle_waits:1|.0f} & not run & not run & not run\\
+V-B & r1 & not run & not run & not run & not run\\
+\bottomrule\end{tabular}
+\caption{\textbf{EXCLUDED ABORTED ATTEMPT --- layout test only, never final results.} Client/owner process cores; CQ idle-wait count. Cores = CPU seconds / elapsed host-gate seconds, not per-call attribution. TCP CQ = NR, not zero. NVMe kernel workers are outside the owner cgroup. CPU and CQ counts are evidence, not proof of policy. Coordinator cache off; lanes one at c1, four at c16; r0/r1 separate. Busy spins owner and coordinator read driver, not kernel busy poll. Unmatched dimensions: TLS/security, polling, RPC/direct I/O; NVMe control is verbs trusted Adaptive.}
+\end{table}

@@ -1,0 +1,370 @@
+\relax 
+\providecommand\babel@aux[2]{}
+\@nameuse{bbl@beforestart}
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\babel@aux{english}{}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Executive overview}{3}{section.1}\protected@file@percent }
+\newlabel{sec:overview}{{1}{3}{Executive overview}{section.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {2}Scope, evidence and terminology}{3}{section.2}\protected@file@percent }
+\newlabel{sec:scope}{{2}{3}{Scope, evidence and terminology}{section.2}{}}
+\citation{tidehunter2026}
+\citation{distributednote2026}
+\citation{tidehunter2026}
+\@writefile{toc}{\contentsline {section}{\numberline {3}Native foundations and design alternatives}{4}{section.3}\protected@file@percent }
+\newlabel{sec:foundations}{{3}{4}{Native foundations and design alternatives}{section.3}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Three distinct implementation contexts. The current authority uses owner WAL machinery; archive middleware is not an active runtime dependency.}}{4}{figure.1}\protected@file@percent }
+\newlabel{fig:contexts}{{1}{4}{Three distinct implementation contexts. The current authority uses owner WAL machinery; archive middleware is not an active runtime dependency}{figure.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Native DB, index and WAL in detail}{4}{subsection.3.1}\protected@file@percent }
+\newlabel{sec:native-detail}{{3.1}{4}{Native DB, index and WAL in detail}{subsection.3.1}{}}
+\citation{tidehunter2026}
+\citation{measuredcode2026}
+\@writefile{toc}{\contentsline {section}{\numberline {4}Topology and implementation map}{5}{section.4}\protected@file@percent }
+\newlabel{sec:topology}{{4}{5}{Topology and implementation map}{section.4}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Logical topology; the measured fleet had five storage hosts and one controller. Lines represent transport interaction, not replication.}}{6}{figure.2}\protected@file@percent }
+\newlabel{fig:topology}{{2}{6}{Logical topology; the measured fleet had five storage hosts and one controller. Lines represent transport interaction, not replication}{figure.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Write, visibility and read paths}{6}{section.5}\protected@file@percent }
+\newlabel{sec:paths}{{5}{6}{Write, visibility and read paths}{section.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Logical ordering is not a global physical WAL}{6}{subsection.5.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Record identity and address example}{6}{subsection.5.2}\protected@file@percent }
+\newlabel{sec:record-example}{{5.2}{6}{Record identity and address example}{subsection.5.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Ownership, worker and admission sequence}{6}{subsection.5.3}\protected@file@percent }
+\newlabel{sec:worker-flow}{{5.3}{6}{Ownership, worker and admission sequence}{subsection.5.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.4}Read and recovery algorithms}{7}{subsection.5.4}\protected@file@percent }
+\newlabel{sec:algorithm-detail}{{5.4}{7}{Read and recovery algorithms}{subsection.5.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.5}Sparse live publication and stable prefixes}{8}{subsection.5.5}\protected@file@percent }
+\newlabel{sec:publication}{{5.5}{8}{Sparse live publication and stable prefixes}{subsection.5.5}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces The durable receipt is necessary but independent-key publication need not wait for an unrelated gap; stable checkpoint coverage remains contiguous.}}{8}{figure.3}\protected@file@percent }
+\newlabel{fig:write}{{3}{8}{The durable receipt is necessary but independent-key publication need not wait for an unrelated gap; stable checkpoint coverage remains contiguous}{figure.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.6}Reads, caching and grants}{8}{subsection.5.6}\protected@file@percent }
+\newlabel{sec:reads}{{5.6}{8}{Reads, caching and grants}{subsection.5.6}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Read tiers are distinct. Registered-memory access applies only to eligible resident values; fallback is retained.}}{9}{figure.4}\protected@file@percent }
+\newlabel{fig:read}{{4}{9}{Read tiers are distinct. Registered-memory access applies only to eligible resident values; fallback is retained}{figure.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {6}Maintenance, recovery and boundaries}{9}{section.6}\protected@file@percent }
+\newlabel{sec:recovery}{{6}{9}{Maintenance, recovery and boundaries}{section.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Live and stable views: an illustrative cut}{9}{subsection.6.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {5}{\ignorespaces Illustrative independent batches: 2 may be published despite gap 1, but the stable prefix does not advance across 1. A frozen cut retains exclusions and their required history.}}{9}{figure.5}\protected@file@percent }
+\newlabel{fig:frontier}{{5}{9}{Illustrative independent batches: 2 may be published despite gap 1, but the stable prefix does not advance across 1. A frozen cut retains exclusions and their required history}{figure.5}{}}
+\citation{tikvstorage}
+\citation{cassandraengine}
+\citation{fdbarchitecture}
+\citation{valkeypersistence}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Checkpoint and recovery lifecycle}{10}{subsection.6.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {6}{\ignorespaces Stable checkpoint coverage does not permit prematurely discarding live sparse suffixes or pinned history. Recovery reconciles uncertain operations after fencing.}}{10}{figure.6}\protected@file@percent }
+\newlabel{fig:lifecycle}{{6}{10}{Stable checkpoint coverage does not permit prematurely discarding live sparse suffixes or pinned history. Recovery reconciles uncertain operations after fencing}{figure.6}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {7}Comparison systems and experimental design}{10}{section.7}\protected@file@percent }
+\newlabel{sec:method}{{7}{10}{Comparison systems and experimental design}{section.7}{}}
+\citation{tikvstorage}
+\citation{tikvwrite854}
+\citation{cassandraengine}
+\citation{cassandraconfig509}
+\citation{fdbarchitecture}
+\citation{fdbconfig7377}
+\citation{valkeycluster}
+\citation{valkeypersistence}
+\citation{valkeypipeline}
+\citation{awsefa}
+\citation{libfabricefa}
+\citation{erpc2019}
+\citation{farm2014}
+\citation{wisckey2016}
+\citation{scalog2020}
+\citation{tikvstorage}
+\citation{tikvwrite854}
+\citation{cassandraengine}
+\citation{cassandraconfig509}
+\citation{fdbarchitecture}
+\citation{fdbconfig7377}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}Reference design versus deployed adapter}{11}{subsection.7.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}TiKV: range regions, Raft and RawKV}{11}{subsection.7.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.3}Cassandra: partitioned log and LSM}{11}{subsection.7.3}\protected@file@percent }
+\citation{valkeycluster}
+\citation{valkeypersistence}
+\citation{valkeypipeline}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.4}FoundationDB: transactional ordering and conflict checks}{12}{subsection.7.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.5}Valkey: in-memory keyspace and append-only persistence}{12}{subsection.7.5}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Qualitative design and experiment comparison. Configuration is not a power-loss equivalence test; see Table~\ref {data-backend-contracts} for observed details and unknown settings.}}{12}{table.1}\protected@file@percent }
+\newlabel{tab:architecture-comparison}{{1}{12}{Qualitative design and experiment comparison. Configuration is not a power-loss equivalence test; see Table~\ref {data-backend-contracts} for observed details and unknown settings}{table.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {8}Results and interpretation}{12}{section.8}\protected@file@percent }
+\newlabel{sec:results}{{8}{12}{Results and interpretation}{section.8}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {7}{\ignorespaces Coarse system-specific read and write paths, not a claim of equal semantics or physical fsync behavior. The tested deployments are RF1; FoundationDB reads and commit processing use distinct service paths. Refer to the system subsections and Table~\ref {data-backend-contracts} for adapter and configuration limits.}}{13}{figure.7}\protected@file@percent }
+\newlabel{fig:comparison-lens}{{7}{13}{Coarse system-specific read and write paths, not a claim of equal semantics or physical fsync behavior. The tested deployments are RF1; FoundationDB reads and commit processing use distinct service paths. Refer to the system subsections and Table~\ref {data-backend-contracts} for adapter and configuration limits}{figure.7}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Selected API p50/p99, one repetition, different service contracts; source: retained campaign analysis.}}{13}{table.2}\protected@file@percent }
+\newlabel{tab:representative}{{2}{13}{Selected API p50/p99, one repetition, different service contracts; source: retained campaign analysis}{table.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.1}Representative empirical latency distributions}{14}{subsection.8.1}\protected@file@percent }
+\newlabel{sec:ecdf}{{8.1}{14}{Representative empirical latency distributions}{subsection.8.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {9}Observability, cache provenance and bottleneck limits}{14}{section.9}\protected@file@percent }
+\newlabel{obs-observability}{{9}{14}{Observability, cache provenance and bottleneck limits}{section.9}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.1}Coverage and offline verification}{14}{subsection.9.1}\protected@file@percent }
+\newlabel{obs-coverage}{{9.1}{14}{Coverage and offline verification}{subsection.9.1}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {8}{\ignorespaces Empirical API-latency CDF, primary 1 KiB C16 successful scalar reads, 8,192 calls per system; one independent repetition, no pooling. Warm OS cache is possible.}}{15}{figure.8}\protected@file@percent }
+\newlabel{fig:ecdf-read}{{8}{15}{Empirical API-latency CDF, primary 1 KiB C16 successful scalar reads, 8,192 calls per system; one independent repetition, no pooling. Warm OS cache is possible}{figure.8}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {9}{\ignorespaces Empirical API-latency CDF, primary 1 KiB C16 successful scalar writes, 4,096 calls per system; one independent repetition, no pooling. Durability and security contracts differ.}}{16}{figure.9}\protected@file@percent }
+\newlabel{fig:ecdf-put}{{9}{16}{Empirical API-latency CDF, primary 1 KiB C16 successful scalar writes, 4,096 calls per system; one independent repetition, no pooling. Durability and security contracts differ}{figure.9}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.2}What measured write stages can localize}{17}{subsection.9.2}\protected@file@percent }
+\newlabel{obs-stages}{{9.2}{17}{What measured write stages can localize}{subsection.9.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.3}Read-path provenance and physical-I/O boundaries}{17}{subsection.9.3}\protected@file@percent }
+\newlabel{obs-cache}{{9.3}{17}{Read-path provenance and physical-I/O boundaries}{subsection.9.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.4}Resource signals and cautious interpretation}{18}{subsection.9.4}\protected@file@percent }
+\newlabel{obs-resource}{{9.4}{18}{Resource signals and cautious interpretation}{subsection.9.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {10}Cost, provenance and closure}{18}{section.10}\protected@file@percent }
+\newlabel{sec:provenance}{{10}{18}{Cost, provenance and closure}{section.10}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {11}Limitations and next research questions}{19}{section.11}\protected@file@percent }
+\newlabel{sec:limitations}{{11}{19}{Limitations and next research questions}{section.11}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {A}Evaluation figures}{19}{appendix.A}\protected@file@percent }
+\newlabel{app:figures}{{A}{19}{Evaluation figures}{appendix.A}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {10}{\ignorespaces API p50. Primary concurrent scalar reads; latency comparisons are API populations with warm operating-system cache possible. One independent repetition per case; units and workload dimensions are shown in the plot.}}{20}{figure.10}\protected@file@percent }
+\newlabel{fig:eval-primary-read-concurrent-1}{{10}{20}{API p50. Primary concurrent scalar reads; latency comparisons are API populations with warm operating-system cache possible. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.10}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {11}{\ignorespaces API p99. Primary concurrent scalar reads; latency comparisons are API populations with warm operating-system cache possible. One independent repetition per case; units and workload dimensions are shown in the plot.}}{21}{figure.11}\protected@file@percent }
+\newlabel{fig:eval-primary-read-concurrent-2}{{11}{21}{API p99. Primary concurrent scalar reads; latency comparisons are API populations with warm operating-system cache possible. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.11}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {12}{\ignorespaces Response p99. Primary concurrent scalar reads; latency comparisons are API populations with warm operating-system cache possible. One independent repetition per case; units and workload dimensions are shown in the plot.}}{22}{figure.12}\protected@file@percent }
+\newlabel{fig:eval-primary-read-concurrent-3}{{12}{22}{Response p99. Primary concurrent scalar reads; latency comparisons are API populations with warm operating-system cache possible. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.12}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {13}{\ignorespaces Whole-workload successful calls. Primary concurrent scalar reads; latency comparisons are API populations with warm operating-system cache possible. One independent repetition per case; units and workload dimensions are shown in the plot.}}{23}{figure.13}\protected@file@percent }
+\newlabel{fig:eval-primary-read-concurrent-4}{{13}{23}{Whole-workload successful calls. Primary concurrent scalar reads; latency comparisons are API populations with warm operating-system cache possible. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.13}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {14}{\ignorespaces Successful logical keys. Primary concurrent scalar reads; latency comparisons are API populations with warm operating-system cache possible. One independent repetition per case; units and workload dimensions are shown in the plot.}}{24}{figure.14}\protected@file@percent }
+\newlabel{fig:eval-primary-read-concurrent-5}{{14}{24}{Successful logical keys. Primary concurrent scalar reads; latency comparisons are API populations with warm operating-system cache possible. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.14}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {15}{\ignorespaces Successful value payload. Primary concurrent scalar reads; latency comparisons are API populations with warm operating-system cache possible. One independent repetition per case; units and workload dimensions are shown in the plot.}}{25}{figure.15}\protected@file@percent }
+\newlabel{fig:eval-primary-read-concurrent-6}{{15}{25}{Successful value payload. Primary concurrent scalar reads; latency comparisons are API populations with warm operating-system cache possible. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.15}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {16}{\ignorespaces API p50. Primary concurrent scalar writes; native uses the explicit Value-WAL barrier. One independent repetition per case; units and workload dimensions are shown in the plot.}}{26}{figure.16}\protected@file@percent }
+\newlabel{fig:eval-primary-write-concurrent-1}{{16}{26}{API p50. Primary concurrent scalar writes; native uses the explicit Value-WAL barrier. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.16}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {17}{\ignorespaces API p99. Primary concurrent scalar writes; native uses the explicit Value-WAL barrier. One independent repetition per case; units and workload dimensions are shown in the plot.}}{27}{figure.17}\protected@file@percent }
+\newlabel{fig:eval-primary-write-concurrent-2}{{17}{27}{API p99. Primary concurrent scalar writes; native uses the explicit Value-WAL barrier. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.17}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {18}{\ignorespaces Response p99. Primary concurrent scalar writes; native uses the explicit Value-WAL barrier. One independent repetition per case; units and workload dimensions are shown in the plot.}}{28}{figure.18}\protected@file@percent }
+\newlabel{fig:eval-primary-write-concurrent-3}{{18}{28}{Response p99. Primary concurrent scalar writes; native uses the explicit Value-WAL barrier. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.18}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {19}{\ignorespaces Whole-workload successful calls. Primary concurrent scalar writes; native uses the explicit Value-WAL barrier. One independent repetition per case; units and workload dimensions are shown in the plot.}}{29}{figure.19}\protected@file@percent }
+\newlabel{fig:eval-primary-write-concurrent-4}{{19}{29}{Whole-workload successful calls. Primary concurrent scalar writes; native uses the explicit Value-WAL barrier. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.19}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {20}{\ignorespaces Successful logical keys. Primary concurrent scalar writes; native uses the explicit Value-WAL barrier. One independent repetition per case; units and workload dimensions are shown in the plot.}}{30}{figure.20}\protected@file@percent }
+\newlabel{fig:eval-primary-write-concurrent-5}{{20}{30}{Successful logical keys. Primary concurrent scalar writes; native uses the explicit Value-WAL barrier. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.20}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {21}{\ignorespaces Successful value payload. Primary concurrent scalar writes; native uses the explicit Value-WAL barrier. One independent repetition per case; units and workload dimensions are shown in the plot.}}{31}{figure.21}\protected@file@percent }
+\newlabel{fig:eval-primary-write-concurrent-6}{{21}{31}{Successful value payload. Primary concurrent scalar writes; native uses the explicit Value-WAL barrier. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.21}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {22}{\ignorespaces API p50. Primary 32-key read calls; batch latency is per call and adapters use different get-many implementations. One independent repetition per case; units and workload dimensions are shown in the plot.}}{32}{figure.22}\protected@file@percent }
+\newlabel{fig:eval-primary-read-many32-1}{{22}{32}{API p50. Primary 32-key read calls; batch latency is per call and adapters use different get-many implementations. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.22}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {23}{\ignorespaces API p99. Primary 32-key read calls; batch latency is per call and adapters use different get-many implementations. One independent repetition per case; units and workload dimensions are shown in the plot.}}{33}{figure.23}\protected@file@percent }
+\newlabel{fig:eval-primary-read-many32-2}{{23}{33}{API p99. Primary 32-key read calls; batch latency is per call and adapters use different get-many implementations. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.23}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {24}{\ignorespaces Response p99. Primary 32-key read calls; batch latency is per call and adapters use different get-many implementations. One independent repetition per case; units and workload dimensions are shown in the plot.}}{34}{figure.24}\protected@file@percent }
+\newlabel{fig:eval-primary-read-many32-3}{{24}{34}{Response p99. Primary 32-key read calls; batch latency is per call and adapters use different get-many implementations. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.24}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {25}{\ignorespaces Whole-workload successful calls. Primary 32-key read calls; batch latency is per call and adapters use different get-many implementations. One independent repetition per case; units and workload dimensions are shown in the plot.}}{35}{figure.25}\protected@file@percent }
+\newlabel{fig:eval-primary-read-many32-4}{{25}{35}{Whole-workload successful calls. Primary 32-key read calls; batch latency is per call and adapters use different get-many implementations. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.25}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {26}{\ignorespaces Successful logical keys. Primary 32-key read calls; batch latency is per call and adapters use different get-many implementations. One independent repetition per case; units and workload dimensions are shown in the plot.}}{36}{figure.26}\protected@file@percent }
+\newlabel{fig:eval-primary-read-many32-5}{{26}{36}{Successful logical keys. Primary 32-key read calls; batch latency is per call and adapters use different get-many implementations. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.26}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {27}{\ignorespaces Successful value payload. Primary 32-key read calls; batch latency is per call and adapters use different get-many implementations. One independent repetition per case; units and workload dimensions are shown in the plot.}}{37}{figure.27}\protected@file@percent }
+\newlabel{fig:eval-primary-read-many32-6}{{27}{37}{Successful value payload. Primary 32-key read calls; batch latency is per call and adapters use different get-many implementations. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.27}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {28}{\ignorespaces read API p50. Primary point-mixed latency, retaining separate operation populations. One independent repetition per case; units and workload dimensions are shown in the plot.}}{38}{figure.28}\protected@file@percent }
+\newlabel{fig:eval-primary-point-mixed-latency-1}{{28}{38}{read API p50. Primary point-mixed latency, retaining separate operation populations. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.28}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {29}{\ignorespaces put API p50. Primary point-mixed latency, retaining separate operation populations. One independent repetition per case; units and workload dimensions are shown in the plot.}}{39}{figure.29}\protected@file@percent }
+\newlabel{fig:eval-primary-point-mixed-latency-2}{{29}{39}{put API p50. Primary point-mixed latency, retaining separate operation populations. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.29}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {30}{\ignorespaces delete API p50. Primary point-mixed latency, retaining separate operation populations. One independent repetition per case; units and workload dimensions are shown in the plot.}}{40}{figure.30}\protected@file@percent }
+\newlabel{fig:eval-primary-point-mixed-latency-3}{{30}{40}{delete API p50. Primary point-mixed latency, retaining separate operation populations. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.30}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {31}{\ignorespaces missing\_read API p50. Primary point-mixed latency, retaining separate operation populations. One independent repetition per case; units and workload dimensions are shown in the plot.}}{41}{figure.31}\protected@file@percent }
+\newlabel{fig:eval-primary-point-mixed-latency-4}{{31}{41}{missing\_read API p50. Primary point-mixed latency, retaining separate operation populations. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.31}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {32}{\ignorespaces read API p99. Primary point-mixed latency, retaining separate operation populations. One independent repetition per case; units and workload dimensions are shown in the plot.}}{42}{figure.32}\protected@file@percent }
+\newlabel{fig:eval-primary-point-mixed-latency-5}{{32}{42}{read API p99. Primary point-mixed latency, retaining separate operation populations. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.32}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {33}{\ignorespaces put API p99. Primary point-mixed latency, retaining separate operation populations. One independent repetition per case; units and workload dimensions are shown in the plot.}}{43}{figure.33}\protected@file@percent }
+\newlabel{fig:eval-primary-point-mixed-latency-6}{{33}{43}{put API p99. Primary point-mixed latency, retaining separate operation populations. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.33}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {34}{\ignorespaces delete API p99. Primary point-mixed latency, retaining separate operation populations. One independent repetition per case; units and workload dimensions are shown in the plot.}}{44}{figure.34}\protected@file@percent }
+\newlabel{fig:eval-primary-point-mixed-latency-7}{{34}{44}{delete API p99. Primary point-mixed latency, retaining separate operation populations. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.34}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {35}{\ignorespaces missing\_read API p99. Primary point-mixed latency, retaining separate operation populations. One independent repetition per case; units and workload dimensions are shown in the plot.}}{45}{figure.35}\protected@file@percent }
+\newlabel{fig:eval-primary-point-mixed-latency-8}{{35}{45}{missing\_read API p99. Primary point-mixed latency, retaining separate operation populations. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.35}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {36}{\ignorespaces Whole-workload successful calls. Primary point-mixed achieved goodput, not offered rate. One independent repetition per case; units and workload dimensions are shown in the plot.}}{46}{figure.36}\protected@file@percent }
+\newlabel{fig:eval-primary-point-mixed-goodput-1}{{36}{46}{Whole-workload successful calls. Primary point-mixed achieved goodput, not offered rate. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.36}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {37}{\ignorespaces Successful logical keys. Primary point-mixed achieved goodput, not offered rate. One independent repetition per case; units and workload dimensions are shown in the plot.}}{47}{figure.37}\protected@file@percent }
+\newlabel{fig:eval-primary-point-mixed-goodput-2}{{37}{47}{Successful logical keys. Primary point-mixed achieved goodput, not offered rate. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.37}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {38}{\ignorespaces Successful value payload. Primary point-mixed achieved goodput, not offered rate. One independent repetition per case; units and workload dimensions are shown in the plot.}}{48}{figure.38}\protected@file@percent }
+\newlabel{fig:eval-primary-point-mixed-goodput-3}{{38}{48}{Successful value payload. Primary point-mixed achieved goodput, not offered rate. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.38}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {39}{\ignorespaces Whole-workload successful calls. Offered-load successes and rejections; case completion does not imply universal admission. One independent repetition per case; units and workload dimensions are shown in the plot.}}{49}{figure.39}\protected@file@percent }
+\newlabel{fig:eval-offered-load-accounting-1}{{39}{49}{Whole-workload successful calls. Offered-load successes and rejections; case completion does not imply universal admission. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.39}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {40}{\ignorespaces Successful logical keys. Offered-load successes and rejections; case completion does not imply universal admission. One independent repetition per case; units and workload dimensions are shown in the plot.}}{50}{figure.40}\protected@file@percent }
+\newlabel{fig:eval-offered-load-accounting-2}{{40}{50}{Successful logical keys. Offered-load successes and rejections; case completion does not imply universal admission. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.40}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {41}{\ignorespaces Successful value payload. Offered-load successes and rejections; case completion does not imply universal admission. One independent repetition per case; units and workload dimensions are shown in the plot.}}{51}{figure.41}\protected@file@percent }
+\newlabel{fig:eval-offered-load-accounting-3}{{41}{51}{Successful value payload. Offered-load successes and rejections; case completion does not imply universal admission. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.41}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {42}{\ignorespaces Rejected arrivals / offered arrivals. Offered-load successes and rejections; case completion does not imply universal admission. One independent repetition per case; units and workload dimensions are shown in the plot.}}{52}{figure.42}\protected@file@percent }
+\newlabel{fig:eval-offered-load-accounting-4}{{42}{52}{Rejected arrivals / offered arrivals. Offered-load successes and rejections; case completion does not imply universal admission. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.42}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {43}{\ignorespaces read api p99 / success. Offered-load latency tails by outcome; do not combine successful and rejected calls. One independent repetition per case; units and workload dimensions are shown in the plot.}}{53}{figure.43}\protected@file@percent }
+\newlabel{fig:eval-offered-load-tails-1}{{43}{53}{read api p99 / success. Offered-load latency tails by outcome; do not combine successful and rejected calls. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.43}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {44}{\ignorespaces read response p99 / success. Offered-load latency tails by outcome; do not combine successful and rejected calls. One independent repetition per case; units and workload dimensions are shown in the plot.}}{54}{figure.44}\protected@file@percent }
+\newlabel{fig:eval-offered-load-tails-2}{{44}{54}{read response p99 / success. Offered-load latency tails by outcome; do not combine successful and rejected calls. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.44}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {45}{\ignorespaces read scheduling p99 / success. Offered-load latency tails by outcome; do not combine successful and rejected calls. One independent repetition per case; units and workload dimensions are shown in the plot.}}{55}{figure.45}\protected@file@percent }
+\newlabel{fig:eval-offered-load-tails-3}{{45}{55}{read scheduling p99 / success. Offered-load latency tails by outcome; do not combine successful and rejected calls. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.45}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {46}{\ignorespaces put api p99 / success. Offered-load latency tails by outcome; do not combine successful and rejected calls. One independent repetition per case; units and workload dimensions are shown in the plot.}}{56}{figure.46}\protected@file@percent }
+\newlabel{fig:eval-offered-load-tails-4}{{46}{56}{put api p99 / success. Offered-load latency tails by outcome; do not combine successful and rejected calls. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.46}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {47}{\ignorespaces put response p99 / success. Offered-load latency tails by outcome; do not combine successful and rejected calls. One independent repetition per case; units and workload dimensions are shown in the plot.}}{57}{figure.47}\protected@file@percent }
+\newlabel{fig:eval-offered-load-tails-5}{{47}{57}{put response p99 / success. Offered-load latency tails by outcome; do not combine successful and rejected calls. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.47}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {48}{\ignorespaces put scheduling p99 / success. Offered-load latency tails by outcome; do not combine successful and rejected calls. One independent repetition per case; units and workload dimensions are shown in the plot.}}{58}{figure.48}\protected@file@percent }
+\newlabel{fig:eval-offered-load-tails-6}{{48}{58}{put scheduling p99 / success. Offered-load latency tails by outcome; do not combine successful and rejected calls. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.48}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {49}{\ignorespaces read response p99 / rejected. Offered-load latency tails by outcome; do not combine successful and rejected calls. One independent repetition per case; units and workload dimensions are shown in the plot.}}{59}{figure.49}\protected@file@percent }
+\newlabel{fig:eval-offered-load-tails-7}{{49}{59}{read response p99 / rejected. Offered-load latency tails by outcome; do not combine successful and rejected calls. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.49}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {50}{\ignorespaces put response p99 / rejected. Offered-load latency tails by outcome; do not combine successful and rejected calls. One independent repetition per case; units and workload dimensions are shown in the plot.}}{60}{figure.50}\protected@file@percent }
+\newlabel{fig:eval-offered-load-tails-8}{{50}{60}{put response p99 / rejected. Offered-load latency tails by outcome; do not combine successful and rejected calls. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.50}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {51}{\ignorespaces API p50. Zipf and uniform read observations remain separate workloads. One independent repetition per case; units and workload dimensions are shown in the plot.}}{61}{figure.51}\protected@file@percent }
+\newlabel{fig:eval-zipf-versus-uniform-1}{{51}{61}{API p50. Zipf and uniform read observations remain separate workloads. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.51}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {52}{\ignorespaces API p99. Zipf and uniform read observations remain separate workloads. One independent repetition per case; units and workload dimensions are shown in the plot.}}{62}{figure.52}\protected@file@percent }
+\newlabel{fig:eval-zipf-versus-uniform-2}{{52}{62}{API p99. Zipf and uniform read observations remain separate workloads. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.52}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {53}{\ignorespaces Successful calls. Zipf and uniform read observations remain separate workloads. One independent repetition per case; units and workload dimensions are shown in the plot.}}{63}{figure.53}\protected@file@percent }
+\newlabel{fig:eval-zipf-versus-uniform-3}{{53}{63}{Successful calls. Zipf and uniform read observations remain separate workloads. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.53}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {54}{\ignorespaces Coordinator cache: API p50. Configured cache cohorts; registered-RAM observations mix RMA completions and message fallbacks. One independent repetition per case; units and workload dimensions are shown in the plot.}}{64}{figure.54}\protected@file@percent }
+\newlabel{fig:eval-cache-cohorts-1}{{54}{64}{Coordinator cache: API p50. Configured cache cohorts; registered-RAM observations mix RMA completions and message fallbacks. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.54}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {55}{\ignorespaces Coordinator cache: API p99. Configured cache cohorts; registered-RAM observations mix RMA completions and message fallbacks. One independent repetition per case; units and workload dimensions are shown in the plot.}}{65}{figure.55}\protected@file@percent }
+\newlabel{fig:eval-cache-cohorts-2}{{55}{65}{Coordinator cache: API p99. Configured cache cohorts; registered-RAM observations mix RMA completions and message fallbacks. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.55}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {56}{\ignorespaces Coordinator cache: successful calls. Configured cache cohorts; registered-RAM observations mix RMA completions and message fallbacks. One independent repetition per case; units and workload dimensions are shown in the plot.}}{66}{figure.56}\protected@file@percent }
+\newlabel{fig:eval-cache-cohorts-3}{{56}{66}{Coordinator cache: successful calls. Configured cache cohorts; registered-RAM observations mix RMA completions and message fallbacks. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.56}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {57}{\ignorespaces Owner cache: API p50. Configured cache cohorts; registered-RAM observations mix RMA completions and message fallbacks. One independent repetition per case; units and workload dimensions are shown in the plot.}}{67}{figure.57}\protected@file@percent }
+\newlabel{fig:eval-cache-cohorts-4}{{57}{67}{Owner cache: API p50. Configured cache cohorts; registered-RAM observations mix RMA completions and message fallbacks. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.57}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {58}{\ignorespaces Owner cache: API p99. Configured cache cohorts; registered-RAM observations mix RMA completions and message fallbacks. One independent repetition per case; units and workload dimensions are shown in the plot.}}{68}{figure.58}\protected@file@percent }
+\newlabel{fig:eval-cache-cohorts-5}{{58}{68}{Owner cache: API p99. Configured cache cohorts; registered-RAM observations mix RMA completions and message fallbacks. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.58}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {59}{\ignorespaces Owner cache: successful calls. Configured cache cohorts; registered-RAM observations mix RMA completions and message fallbacks. One independent repetition per case; units and workload dimensions are shown in the plot.}}{69}{figure.59}\protected@file@percent }
+\newlabel{fig:eval-cache-cohorts-6}{{59}{69}{Owner cache: successful calls. Configured cache cohorts; registered-RAM observations mix RMA completions and message fallbacks. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.59}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {60}{\ignorespaces Registered RAM: API p50. Configured cache cohorts; registered-RAM observations mix RMA completions and message fallbacks. One independent repetition per case; units and workload dimensions are shown in the plot.}}{70}{figure.60}\protected@file@percent }
+\newlabel{fig:eval-cache-cohorts-7}{{60}{70}{Registered RAM: API p50. Configured cache cohorts; registered-RAM observations mix RMA completions and message fallbacks. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.60}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {61}{\ignorespaces Registered RAM: API p99. Configured cache cohorts; registered-RAM observations mix RMA completions and message fallbacks. One independent repetition per case; units and workload dimensions are shown in the plot.}}{71}{figure.61}\protected@file@percent }
+\newlabel{fig:eval-cache-cohorts-8}{{61}{71}{Registered RAM: API p99. Configured cache cohorts; registered-RAM observations mix RMA completions and message fallbacks. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.61}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {62}{\ignorespaces Registered RAM: successful calls. Configured cache cohorts; registered-RAM observations mix RMA completions and message fallbacks. One independent repetition per case; units and workload dimensions are shown in the plot.}}{72}{figure.62}\protected@file@percent }
+\newlabel{fig:eval-cache-cohorts-9}{{62}{72}{Registered RAM: successful calls. Configured cache cohorts; registered-RAM observations mix RMA completions and message fallbacks. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.62}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {63}{\ignorespaces API p50. OS-cache-drop cohort; user-space caches and RAM datasets can remain resident. One independent repetition per case; units and workload dimensions are shown in the plot.}}{73}{figure.63}\protected@file@percent }
+\newlabel{fig:eval-cold-os-cache-1}{{63}{73}{API p50. OS-cache-drop cohort; user-space caches and RAM datasets can remain resident. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.63}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {64}{\ignorespaces API p99. OS-cache-drop cohort; user-space caches and RAM datasets can remain resident. One independent repetition per case; units and workload dimensions are shown in the plot.}}{74}{figure.64}\protected@file@percent }
+\newlabel{fig:eval-cold-os-cache-2}{{64}{74}{API p99. OS-cache-drop cohort; user-space caches and RAM datasets can remain resident. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.64}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {65}{\ignorespaces Whole-workload successful calls. OS-cache-drop cohort; user-space caches and RAM datasets can remain resident. One independent repetition per case; units and workload dimensions are shown in the plot.}}{75}{figure.65}\protected@file@percent }
+\newlabel{fig:eval-cold-os-cache-3}{{65}{75}{Whole-workload successful calls. OS-cache-drop cohort; user-space caches and RAM datasets can remain resident. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.65}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {66}{\ignorespaces Successful logical keys. OS-cache-drop cohort; user-space caches and RAM datasets can remain resident. One independent repetition per case; units and workload dimensions are shown in the plot.}}{76}{figure.66}\protected@file@percent }
+\newlabel{fig:eval-cold-os-cache-4}{{66}{76}{Successful logical keys. OS-cache-drop cohort; user-space caches and RAM datasets can remain resident. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.66}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {67}{\ignorespaces Successful value payload. OS-cache-drop cohort; user-space caches and RAM datasets can remain resident. One independent repetition per case; units and workload dimensions are shown in the plot.}}{77}{figure.67}\protected@file@percent }
+\newlabel{fig:eval-cold-os-cache-5}{{67}{77}{Successful value payload. OS-cache-drop cohort; user-space caches and RAM datasets can remain resident. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.67}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {68}{\ignorespaces read API p50. Native page-cache acknowledgment cohort latency; not the primary Value-WAL-barrier durability tier. One independent repetition per case; units and workload dimensions are shown in the plot.}}{78}{figure.68}\protected@file@percent }
+\newlabel{fig:eval-native-pagecache-latency-1}{{68}{78}{read API p50. Native page-cache acknowledgment cohort latency; not the primary Value-WAL-barrier durability tier. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.68}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {69}{\ignorespaces put API p50. Native page-cache acknowledgment cohort latency; not the primary Value-WAL-barrier durability tier. One independent repetition per case; units and workload dimensions are shown in the plot.}}{79}{figure.69}\protected@file@percent }
+\newlabel{fig:eval-native-pagecache-latency-2}{{69}{79}{put API p50. Native page-cache acknowledgment cohort latency; not the primary Value-WAL-barrier durability tier. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.69}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {70}{\ignorespaces delete API p50. Native page-cache acknowledgment cohort latency; not the primary Value-WAL-barrier durability tier. One independent repetition per case; units and workload dimensions are shown in the plot.}}{80}{figure.70}\protected@file@percent }
+\newlabel{fig:eval-native-pagecache-latency-3}{{70}{80}{delete API p50. Native page-cache acknowledgment cohort latency; not the primary Value-WAL-barrier durability tier. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.70}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {71}{\ignorespaces missing\_read API p50. Native page-cache acknowledgment cohort latency; not the primary Value-WAL-barrier durability tier. One independent repetition per case; units and workload dimensions are shown in the plot.}}{81}{figure.71}\protected@file@percent }
+\newlabel{fig:eval-native-pagecache-latency-4}{{71}{81}{missing\_read API p50. Native page-cache acknowledgment cohort latency; not the primary Value-WAL-barrier durability tier. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.71}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {72}{\ignorespaces get\_many API p50. Native page-cache acknowledgment cohort latency; not the primary Value-WAL-barrier durability tier. One independent repetition per case; units and workload dimensions are shown in the plot.}}{82}{figure.72}\protected@file@percent }
+\newlabel{fig:eval-native-pagecache-latency-5}{{72}{82}{get\_many API p50. Native page-cache acknowledgment cohort latency; not the primary Value-WAL-barrier durability tier. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.72}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {73}{\ignorespaces read API p99. Native page-cache acknowledgment cohort latency; not the primary Value-WAL-barrier durability tier. One independent repetition per case; units and workload dimensions are shown in the plot.}}{83}{figure.73}\protected@file@percent }
+\newlabel{fig:eval-native-pagecache-latency-6}{{73}{83}{read API p99. Native page-cache acknowledgment cohort latency; not the primary Value-WAL-barrier durability tier. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.73}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {74}{\ignorespaces put API p99. Native page-cache acknowledgment cohort latency; not the primary Value-WAL-barrier durability tier. One independent repetition per case; units and workload dimensions are shown in the plot.}}{84}{figure.74}\protected@file@percent }
+\newlabel{fig:eval-native-pagecache-latency-7}{{74}{84}{put API p99. Native page-cache acknowledgment cohort latency; not the primary Value-WAL-barrier durability tier. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.74}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {75}{\ignorespaces delete API p99. Native page-cache acknowledgment cohort latency; not the primary Value-WAL-barrier durability tier. One independent repetition per case; units and workload dimensions are shown in the plot.}}{85}{figure.75}\protected@file@percent }
+\newlabel{fig:eval-native-pagecache-latency-8}{{75}{85}{delete API p99. Native page-cache acknowledgment cohort latency; not the primary Value-WAL-barrier durability tier. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.75}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {76}{\ignorespaces missing\_read API p99. Native page-cache acknowledgment cohort latency; not the primary Value-WAL-barrier durability tier. One independent repetition per case; units and workload dimensions are shown in the plot.}}{86}{figure.76}\protected@file@percent }
+\newlabel{fig:eval-native-pagecache-latency-9}{{76}{86}{missing\_read API p99. Native page-cache acknowledgment cohort latency; not the primary Value-WAL-barrier durability tier. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.76}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {77}{\ignorespaces get\_many API p99. Native page-cache acknowledgment cohort latency; not the primary Value-WAL-barrier durability tier. One independent repetition per case; units and workload dimensions are shown in the plot.}}{87}{figure.77}\protected@file@percent }
+\newlabel{fig:eval-native-pagecache-latency-10}{{77}{87}{get\_many API p99. Native page-cache acknowledgment cohort latency; not the primary Value-WAL-barrier durability tier. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.77}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {78}{\ignorespaces Whole-workload successful calls. Native page-cache cohort goodput; do not equate its acknowledgment with the primary barrier. One independent repetition per case; units and workload dimensions are shown in the plot.}}{88}{figure.78}\protected@file@percent }
+\newlabel{fig:eval-native-pagecache-goodput-1}{{78}{88}{Whole-workload successful calls. Native page-cache cohort goodput; do not equate its acknowledgment with the primary barrier. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.78}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {79}{\ignorespaces Successful logical keys. Native page-cache cohort goodput; do not equate its acknowledgment with the primary barrier. One independent repetition per case; units and workload dimensions are shown in the plot.}}{89}{figure.79}\protected@file@percent }
+\newlabel{fig:eval-native-pagecache-goodput-2}{{79}{89}{Successful logical keys. Native page-cache cohort goodput; do not equate its acknowledgment with the primary barrier. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.79}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {80}{\ignorespaces Successful value payload. Native page-cache cohort goodput; do not equate its acknowledgment with the primary barrier. One independent repetition per case; units and workload dimensions are shown in the plot.}}{90}{figure.80}\protected@file@percent }
+\newlabel{fig:eval-native-pagecache-goodput-3}{{80}{90}{Successful value payload. Native page-cache cohort goodput; do not equate its acknowledgment with the primary barrier. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.80}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {81}{\ignorespaces Historical 1 KiB write p99: prior Frankfurt versus current North Virginia; changed region and source, not a controlled code-only comparison. One independent repetition per case; units and workload dimensions are shown in the plot.}}{91}{figure.81}\protected@file@percent }
+\newlabel{fig:eval-historical-write-p99}{{81}{91}{Historical 1 KiB write p99: prior Frankfurt versus current North Virginia; changed region and source, not a controlled code-only comparison. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.81}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {82}{\ignorespaces case status by backend.. Case coverage overview, not a complete Cartesian product of configurations. One independent repetition per case; units and workload dimensions are shown in the plot.}}{92}{figure.82}\protected@file@percent }
+\newlabel{fig:eval-coverage-1}{{82}{92}{case status by backend.. Case coverage overview, not a complete Cartesian product of configurations. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.82}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {83}{\ignorespaces case status by cohort.. Case coverage overview, not a complete Cartesian product of configurations. One independent repetition per case; units and workload dimensions are shown in the plot.}}{93}{figure.83}\protected@file@percent }
+\newlabel{fig:eval-coverage-2}{{83}{93}{case status by cohort.. Case coverage overview, not a complete Cartesian product of configurations. One independent repetition per case; units and workload dimensions are shown in the plot}{figure.83}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {B}Supplementary clock-statistic panels}{94}{appendix.B}\protected@file@percent }
+\newlabel{app:supplemental}{{B}{94}{Supplementary clock-statistic panels}{appendix.B}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {84}{\ignorespaces API clock, concurrent put; one repetition, success-only primary cohort. Mean, within-case SD, minimum, p50, p95, p99, p99.9 and maximum are separate panels. Sparse tails are descriptive; see Table~\ref {data-latencies} for counts.}}{95}{figure.84}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {85}{\ignorespaces API clock, concurrent scalar read; one repetition, success-only primary cohort. Mean, within-case SD, minimum, p50, p95, p99, p99.9 and maximum are separate panels. Sparse tails are descriptive; see Table~\ref {data-latencies} for counts.}}{96}{figure.85}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {86}{\ignorespaces API clock, concurrent 32-key get-many; one repetition, success-only primary cohort. Mean, within-case SD, minimum, p50, p95, p99, p99.9 and maximum are separate panels. Sparse tails are descriptive; see Table~\ref {data-latencies} for counts.}}{97}{figure.86}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {87}{\ignorespaces API clock, mixed read; one repetition, success-only primary cohort. Mean, within-case SD, minimum, p50, p95, p99, p99.9 and maximum are separate panels. Sparse tails are descriptive; see Table~\ref {data-latencies} for counts.}}{98}{figure.87}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {88}{\ignorespaces API clock, mixed put; one repetition, success-only primary cohort. Mean, within-case SD, minimum, p50, p95, p99, p99.9 and maximum are separate panels. Sparse tails are descriptive; see Table~\ref {data-latencies} for counts.}}{99}{figure.88}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {89}{\ignorespaces API clock, mixed delete; one repetition, success-only primary cohort. Mean, within-case SD, minimum, p50, p95, p99, p99.9 and maximum are separate panels. Sparse tails are descriptive; see Table~\ref {data-latencies} for counts.}}{100}{figure.89}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {90}{\ignorespaces API clock, mixed missing-read; one repetition, success-only primary cohort. Mean, within-case SD, minimum, p50, p95, p99, p99.9 and maximum are separate panels. Sparse tails are descriptive; see Table~\ref {data-latencies} for counts.}}{101}{figure.90}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {91}{\ignorespaces SCHEDULING clock, concurrent put; one repetition, success-only primary cohort. Mean, within-case SD, minimum, p50, p95, p99, p99.9 and maximum are separate panels. Sparse tails are descriptive; see Table~\ref {data-latencies} for counts.}}{102}{figure.91}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {92}{\ignorespaces SCHEDULING clock, concurrent scalar read; one repetition, success-only primary cohort. Mean, within-case SD, minimum, p50, p95, p99, p99.9 and maximum are separate panels. Sparse tails are descriptive; see Table~\ref {data-latencies} for counts.}}{103}{figure.92}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {93}{\ignorespaces SCHEDULING clock, concurrent 32-key get-many; one repetition, success-only primary cohort. Mean, within-case SD, minimum, p50, p95, p99, p99.9 and maximum are separate panels. Sparse tails are descriptive; see Table~\ref {data-latencies} for counts.}}{104}{figure.93}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {94}{\ignorespaces SCHEDULING clock, mixed read; one repetition, success-only primary cohort. Mean, within-case SD, minimum, p50, p95, p99, p99.9 and maximum are separate panels. Sparse tails are descriptive; see Table~\ref {data-latencies} for counts.}}{105}{figure.94}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {95}{\ignorespaces SCHEDULING clock, mixed put; one repetition, success-only primary cohort. Mean, within-case SD, minimum, p50, p95, p99, p99.9 and maximum are separate panels. Sparse tails are descriptive; see Table~\ref {data-latencies} for counts.}}{106}{figure.95}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {96}{\ignorespaces SCHEDULING clock, mixed delete; one repetition, success-only primary cohort. Mean, within-case SD, minimum, p50, p95, p99, p99.9 and maximum are separate panels. Sparse tails are descriptive; see Table~\ref {data-latencies} for counts.}}{107}{figure.96}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {97}{\ignorespaces SCHEDULING clock, mixed missing-read; one repetition, success-only primary cohort. Mean, within-case SD, minimum, p50, p95, p99, p99.9 and maximum are separate panels. Sparse tails are descriptive; see Table~\ref {data-latencies} for counts.}}{108}{figure.97}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {98}{\ignorespaces RESPONSE clock, concurrent put; one repetition, success-only primary cohort. Mean, within-case SD, minimum, p50, p95, p99, p99.9 and maximum are separate panels. Sparse tails are descriptive; see Table~\ref {data-latencies} for counts.}}{109}{figure.98}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {99}{\ignorespaces RESPONSE clock, concurrent scalar read; one repetition, success-only primary cohort. Mean, within-case SD, minimum, p50, p95, p99, p99.9 and maximum are separate panels. Sparse tails are descriptive; see Table~\ref {data-latencies} for counts.}}{110}{figure.99}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {100}{\ignorespaces RESPONSE clock, concurrent 32-key get-many; one repetition, success-only primary cohort. Mean, within-case SD, minimum, p50, p95, p99, p99.9 and maximum are separate panels. Sparse tails are descriptive; see Table~\ref {data-latencies} for counts.}}{111}{figure.100}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {101}{\ignorespaces RESPONSE clock, mixed read; one repetition, success-only primary cohort. Mean, within-case SD, minimum, p50, p95, p99, p99.9 and maximum are separate panels. Sparse tails are descriptive; see Table~\ref {data-latencies} for counts.}}{112}{figure.101}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {102}{\ignorespaces RESPONSE clock, mixed put; one repetition, success-only primary cohort. Mean, within-case SD, minimum, p50, p95, p99, p99.9 and maximum are separate panels. Sparse tails are descriptive; see Table~\ref {data-latencies} for counts.}}{113}{figure.102}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {103}{\ignorespaces RESPONSE clock, mixed delete; one repetition, success-only primary cohort. Mean, within-case SD, minimum, p50, p95, p99, p99.9 and maximum are separate panels. Sparse tails are descriptive; see Table~\ref {data-latencies} for counts.}}{114}{figure.103}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {104}{\ignorespaces RESPONSE clock, mixed missing-read; one repetition, success-only primary cohort. Mean, within-case SD, minimum, p50, p95, p99, p99.9 and maximum are separate panels. Sparse tails are descriptive; see Table~\ref {data-latencies} for counts.}}{115}{figure.104}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {C}Experimental matrix and backend contracts}{116}{appendix.C}\protected@file@percent }
+\newlabel{app:matrix}{{C}{116}{Experimental matrix and backend contracts}{appendix.C}{}}
+\gdef \LT@i {\LT@entry 
+    {1}{89.35826pt}\LT@entry 
+    {1}{75.13188pt}\LT@entry 
+    {1}{92.2037pt}\LT@entry 
+    {4}{12.50002pt}\LT@entry 
+    {1}{38.76334pt}\LT@entry 
+    {1}{24.87302pt}\LT@entry 
+    {1}{203.16928pt}}
+\@writefile{lot}{\contentsline {table}{\numberline {3}{Exact case matrix: 258 cases, one repetition each; key counts are in the case index. TCP/EFA/Direct/EFAnative denote Tidehunter variants; FDB denotes FoundationDB; Valkey denotes Valkey TCP. Backend names and values refer to observed cases, not a claim of every possible combination.}}{117}{table.3}\protected@file@percent }
+\newlabel{data-matrix}{{3}{117}{Exact case matrix: 258 cases, one repetition each; key counts are in the case index. TCP/EFA/Direct/EFAnative denote Tidehunter variants; FDB denotes FoundationDB; Valkey denotes Valkey TCP. Backend names and values refer to observed cases, not a claim of every possible combination}{table.3}{}}
+\gdef \LT@ii {\LT@entry 
+    {1}{60.9055pt}\LT@entry 
+    {1}{146.26378pt}\LT@entry 
+    {1}{129.19194pt}\LT@entry 
+    {1}{146.26378pt}\LT@entry 
+    {1}{60.9055pt}}
+\@writefile{lot}{\contentsline {table}{\numberline {4}{Observed primary RF1 backend contracts from comparison.json; device persistence and security settings are not inferred. TCP/EFA/Direct/EFAnative denote Tidehunter variants; FDB denotes FoundationDB; Valkey denotes Valkey TCP. Atomicity describes adapter metadata, not a measured batch-write benchmark. Full configuration and version evidence are in data/backend-contracts.json and data/comparison.json.}}{118}{table.4}\protected@file@percent }
+\newlabel{data-backend-contracts}{{4}{118}{Observed primary RF1 backend contracts from comparison.json; device persistence and security settings are not inferred. TCP/EFA/Direct/EFAnative denote Tidehunter variants; FDB denotes FoundationDB; Valkey denotes Valkey TCP. Atomicity describes adapter metadata, not a measured batch-write benchmark. Full configuration and version evidence are in data/backend-contracts.json and data/comparison.json}{table.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {D}Case index and throughput}{120}{appendix.D}\protected@file@percent }
+\newlabel{app:cases}{{D}{120}{Case index and throughput}{appendix.D}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {5}{Case index and whole-case throughput. Backend abbreviations: TCP/EFA/Direct/EFAnative denote Tidehunter variants; FDB denotes FoundationDB; Valkey denotes Valkey TCP. Cohorts P, Cold, Coord, Owner, RMA, Page and Diag denote primary RF1, cold OS cache, coordinator cache, owner cache, registered RAM, native page cache and write diagnostics respectively. Profiles Write, Read, Batch32, Mixed, Zipf and Load denote concurrent write, concurrent read, 32-key read, point mixed, Zipf read and offered-load cases; Cold, Coord, Owner and RMA denote the matching cohort profiles. C denotes concurrency; offered rate is blank for closed-loop cases. MiB/s is successful value bandwidth. Full case IDs and unrounded precision are in data/all-results.csv.}}{121}{table.5}\protected@file@percent }
+\newlabel{data-cases}{{5}{121}{Case index and whole-case throughput. Backend abbreviations: TCP/EFA/Direct/EFAnative denote Tidehunter variants; FDB denotes FoundationDB; Valkey denotes Valkey TCP. Cohorts P, Cold, Coord, Owner, RMA, Page and Diag denote primary RF1, cold OS cache, coordinator cache, owner cache, registered RAM, native page cache and write diagnostics respectively. Profiles Write, Read, Batch32, Mixed, Zipf and Load denote concurrent write, concurrent read, 32-key read, point mixed, Zipf read and offered-load cases; Cold, Coord, Owner and RMA denote the matching cohort profiles. C denotes concurrency; offered rate is blank for closed-loop cases. MiB/s is successful value bandwidth. Full case IDs and unrounded precision are in data/all-results.csv}{table.5}{}}
+\gdef \LT@iii {\LT@entry 
+    {4}{27.13902pt}\LT@entry 
+    {4}{43.4146pt}\LT@entry 
+    {1}{29.97952pt}\LT@entry 
+    {4}{35.51668pt}\LT@entry 
+    {4}{25.25002pt}\LT@entry 
+    {4}{29.50002pt}\LT@entry 
+    {4}{12.50002pt}\LT@entry 
+    {1}{38.76334pt}\LT@entry 
+    {4}{29.50002pt}\LT@entry 
+    {4}{29.50002pt}\LT@entry 
+    {4}{29.50002pt}\LT@entry 
+    {4}{36.11118pt}\LT@entry 
+    {4}{46.50017pt}\LT@entry 
+    {4}{46.50017pt}\LT@entry 
+    {4}{36.11118pt}}
+\@writefile{toc}{\contentsline {section}{\numberline {E}All operation and outcome populations}{127}{appendix.E}\protected@file@percent }
+\newlabel{app:latencies}{{E}{127}{All operation and outcome populations}{appendix.E}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {6}{All operation/outcome populations and clock summaries in microseconds; each population has three rows. n is clock sample count; -- means unobserved, not zero. SD is within-case. Tails are descriptive for n below 10,000 (p99) or 100,000 (p99.9); producer quantiles are retained. Full precision is in data/all-results.csv.}}{128}{table.6}\protected@file@percent }
+\newlabel{data-latencies}{{6}{128}{All operation/outcome populations and clock summaries in microseconds; each population has three rows. n is clock sample count; -- means unobserved, not zero. SD is within-case. Tails are descriptive for n below 10,000 (p99) or 100,000 (p99.9); producer quantiles are retained. Full precision is in data/all-results.csv}{table.6}{}}
+\gdef \LT@iv {\LT@entry 
+    {4}{27.13902pt}\LT@entry 
+    {4}{53.914pt}\LT@entry 
+    {1}{37.5285pt}\LT@entry 
+    {4}{42.53456pt}\LT@entry 
+    {4}{29.50002pt}\LT@entry 
+    {4}{29.50002pt}\LT@entry 
+    {4}{29.50002pt}\LT@entry 
+    {6}{31.86118pt}\LT@entry 
+    {5}{31.86118pt}\LT@entry 
+    {4}{27.61118pt}\LT@entry 
+    {4}{27.61118pt}\LT@entry 
+    {4}{27.61118pt}\LT@entry 
+    {4}{27.61118pt}\LT@entry 
+    {4}{27.61118pt}\LT@entry 
+    {6}{46.50017pt}}
+\bibstyle{plain}
+\bibdata{references}
+\bibcite{awsefa}{1}
+\bibcite{cassandraconfig509}{2}
+\bibcite{cassandraengine}{3}
+\bibcite{tidehunter2026}{4}
+\bibcite{scalog2020}{5}
+\bibcite{distributednote2026}{6}
+\bibcite{measuredcode2026}{7}
+\bibcite{farm2014}{8}
+\@writefile{toc}{\contentsline {section}{\numberline {F}Pinned implementation source map}{159}{appendix.F}\protected@file@percent }
+\newlabel{app:source}{{F}{159}{Pinned implementation source map}{appendix.F}{}}
+\bibcite{fdbarchitecture}{9}
+\bibcite{fdbconfig7377}{10}
+\bibcite{erpc2019}{11}
+\bibcite{wisckey2016}{12}
+\bibcite{libfabricefa}{13}
+\bibcite{tikvstorage}{14}
+\bibcite{tikvwrite854}{15}
+\bibcite{valkeycluster}{16}
+\bibcite{valkeypersistence}{17}
+\bibcite{valkeypipeline}{18}
+\gdef \@abspage@last{160}

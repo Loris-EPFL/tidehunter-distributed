@@ -1,0 +1,15 @@
+{
+  "synthetic": true,
+  "run_id": "SYNTHETIC-run10",
+  "parent_run_id": "SYNTHETIC-parent",
+  "package_sha256": "0cec22fb940f0ed0f401f87acd03b4f508238654d4e96f0f30995ce9a55984cc",
+  "source_revision": "SYNTHETIC-not-a-revision",
+  "source_dirty": true,
+  "launch_time": "SYNTHETIC-not-launched",
+  "vm_names": [
+    "SYNTHETIC-coordinator",
+    "SYNTHETIC-owner"
+  ],
+  "machine_type": "z4m-highmem-16",
+  "matrix_sha256": "8e12ba4352dc461680565b3bfaef5db705e702e03bce986323cc1e31ae9bde6e"
+}

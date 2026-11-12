@@ -27,16 +27,17 @@ use super::live_control::LiveRecordLocation;
 use super::{Client, CompleteBatch, Mutation, TcpError, ValueRecordReference};
 use crate::distributed::nvmeof::live_connect::LiveConnectTarget;
 use crate::distributed::nvmeof::live_io::{
-    LiveCompletion, LiveIo, LiveIoResult, LiveIoStats, LiveSubmitOutcome,
+    LiveCompletion, LiveIo, LiveIoResult, LiveIoStats, LiveSubmitOutcome, NamespaceSlot,
 };
 use crate::distributed::nvmeof::live_metrics::{
     LiveNamespaceIdentity, LiveNvmeCounters, LiveRouteEvidence, LiveTimingStage,
 };
 use crate::distributed::nvmeof::live_namespace::LiveNamespaceAccess;
 use crate::distributed::nvmeof::live_pool::{LiveControllerLease, LivePoolAcquisition};
-use crate::distributed::nvmeof::live_storage::LiveWalSegment;
+use crate::distributed::nvmeof::live_storage::{LiveWalSegment, wal_export_name};
 use crate::distributed::remote_db::ReadTraceChild;
-use std::collections::{BTreeMap, HashMap};
+use smallvec::SmallVec;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -290,18 +291,91 @@ fn wait_ready<'a>(
 
 struct Grant {
     id: u64,
-    location: LiveRecordLocation,
-    token: [u8; 16],
+    scope: GrantScope,
+    token: Option<[u8; 16]>,
     io: LiveIo,
+    inline_io: Option<LiveIo>,
+    inline_recorded: LiveIoStats,
     /// Statistics already folded into the lane counters.
     recorded: LiveIoStats,
     /// Lane clock value at the last use; the smallest is evicted first.
     last_used: u64,
     /// Its ring failed: never submit again, retire when drained.
     broken: bool,
-    // `io` drops first: the controller lease outlives every descriptor on it.
+    // Both rings drop first: the lease outlives every descriptor on it.
     // `None` only for grants over local files in tests.
-    _lease: Option<Arc<LiveControllerLease>>,
+    lease: Option<Arc<LiveControllerLease>>,
+}
+
+// Keep the existing file grant inline; boxing adds an allocation at grant open.
+#[allow(clippy::large_enum_variant)]
+enum GrantScope {
+    File(LiveRecordLocation),
+    Subsystem {
+        epoch: u64,
+        partition: u32,
+        subsystem: u64,
+        files_per_subsystem: u64,
+        file_bytes: u64,
+        slots: Vec<Option<NamespaceSlot>>,
+    },
+}
+
+impl GrantScope {
+    fn file_bytes(&self) -> u64 {
+        match self {
+            Self::File(location) => location.segment.bytes,
+            Self::Subsystem { file_bytes, .. } => *file_bytes,
+        }
+    }
+    fn covers(&self, reference: &ValueRecordReference) -> bool {
+        match self {
+            Self::File(location) => grant_matches(&location.segment, reference),
+            Self::Subsystem {
+                epoch,
+                partition,
+                subsystem,
+                files_per_subsystem,
+                file_bytes,
+                ..
+            } => {
+                reference.batch_version.epoch == *epoch
+                    && reference.batch_address.partition == *partition
+                    && reference.batch_address.offset / file_bytes / files_per_subsystem
+                        == *subsystem
+            }
+        }
+    }
+    fn slot(&self, reference: &ValueRecordReference) -> Option<NamespaceSlot> {
+        match self {
+            Self::File(_) => None,
+            Self::Subsystem {
+                files_per_subsystem,
+                file_bytes,
+                slots,
+                ..
+            } => {
+                slots[(reference.batch_address.offset / file_bytes % files_per_subsystem) as usize]
+            }
+        }
+    }
+    fn ready(&self, reference: &ValueRecordReference) -> bool {
+        self.covers(reference) && (matches!(self, Self::File(_)) || self.slot(reference).is_some())
+    }
+}
+
+impl Grant {
+    fn inline_io(&self) -> &LiveIo {
+        self.inline_io.as_ref().unwrap_or(&self.io)
+    }
+
+    fn inline_io_mut(&mut self) -> &mut LiveIo {
+        self.inline_io.as_mut().unwrap_or(&mut self.io)
+    }
+
+    fn outstanding(&self) -> usize {
+        self.io.outstanding() + self.inline_io.as_ref().map_or(0, LiveIo::outstanding)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -314,7 +388,7 @@ enum Slot {
 struct Flight {
     token: LiveReadToken,
     grant: u64,
-    positions: Vec<usize>,
+    positions: SmallVec<[usize; 1]>,
 }
 
 struct InFlightRequest {
@@ -387,15 +461,71 @@ fn fold_stats(counters: Option<&LiveNvmeCounters>, grant: &mut Grant) {
         record_read_io_stats(counters, &grant.recorded, &after, false);
     }
     grant.recorded = after;
+    if let Some(io) = &grant.inline_io {
+        let after = io.stats();
+        if let Some(counters) = counters {
+            record_read_io_stats(counters, &grant.inline_recorded, &after, false);
+        }
+        grant.inline_recorded = after;
+    }
+}
+
+fn drain_failed_io(grant: &mut Grant) {
+    let _ = grant.io.shutdown();
+    if let Some(io) = &mut grant.inline_io {
+        let _ = io.shutdown();
+    }
+    // Index/file pins may retire only after all terminal CQEs. A failed drain
+    // with outstanding DMA cannot return safely; match LiveIo's fail-stop rule.
+    if grant.outstanding() != 0 {
+        std::process::abort();
+    }
+}
+
+fn member_range(
+    client: &Client,
+    grant: &Grant,
+    reference: &ValueRecordReference,
+) -> Result<(u64, usize), TcpError> {
+    let bytes = grant.scope.file_bytes();
+    let offset = (reference.batch_address.offset % bytes)
+        .checked_add(8)
+        .and_then(|n| n.checked_add(u64::from(reference.descriptor.offset)))
+        .ok_or_else(|| TcpError::new("live record offset overflow"))?;
+    let valid = match &grant.scope {
+        GrantScope::File(location) => client.valid_live_record_geometry(
+            &location.segment,
+            &location.binding,
+            reference,
+            offset,
+            u64::from(reference.descriptor.len),
+        ),
+        GrantScope::Subsystem { epoch, .. } => {
+            reference.batch_version.epoch == *epoch
+                && client.valid_record_range(
+                    bytes,
+                    reference,
+                    offset,
+                    u64::from(reference.descriptor.len),
+                )
+        }
+    };
+    if !valid {
+        return Err(TcpError::new("invalid cached live record geometry"));
+    }
+    Ok((offset, reference.descriptor.len as usize))
 }
 
 /// Lane state: file grants, requests in flight and unreleased owner pins.
 ///
-/// Owner: one lane worker thread, which alone calls these methods. Bounds:
-/// `max_requests` requests, `LIVE_READ_CACHE_CAPACITY` grants, and the
-/// `LiveIo` credit of each grant. A full lane returns the request to the caller.
+/// Owner: the lane's driver lock, borrowed by its worker or an idle caller.
+/// Bounds: `max_requests` requests, `LIVE_READ_CACHE_CAPACITY` grants and each
+/// grant's `LiveIo` credit. A full lane returns the request to the caller.
 pub(crate) struct LiveReadCache {
     grants: Vec<Grant>,
+    // At most one entry per failed subsystem of the current authority epoch.
+    // New authority drops old entries; database reopen creates a new lane.
+    failed_subsystems: HashSet<(u64, u64)>,
     // A release error is ambiguous: owner revoke can fail while retaining the
     // pin, or a successful response can be lost. Never discard that token.
     unreleased: Vec<[u8; 16]>,
@@ -411,6 +541,13 @@ pub(crate) struct LiveReadCache {
     clock: u64,
     waker: Option<LiveReadWaker>,
     scratch: Vec<LiveReadToken>,
+    #[cfg(test)]
+    inline_submitted_pause: Option<(
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+    #[cfg(test)]
+    fail_inline_wait: bool,
 }
 impl Default for LiveReadCache {
     fn default() -> Self {
@@ -422,6 +559,7 @@ impl LiveReadCache {
     pub(crate) fn with_max_requests(max_requests: usize) -> Self {
         Self {
             grants: Vec::with_capacity(LIVE_READ_CACHE_CAPACITY),
+            failed_subsystems: HashSet::new(),
             unreleased: Vec::new(),
             requests: BTreeMap::new(),
             flights: HashMap::new(),
@@ -433,12 +571,220 @@ impl LiveReadCache {
             clock: 0,
             waker: None,
             scratch: Vec::with_capacity(max_requests),
+            #[cfg(test)]
+            inline_submitted_pause: None,
+            #[cfg(test)]
+            fail_inline_wait: false,
         }
     }
 
     /// Requests admitted and not yet returned by `poll`.
     pub(crate) fn in_flight(&self) -> usize {
         self.requests.len()
+    }
+
+    /// Only an exclusive idle lane may borrow its cached grant. No control
+    /// exchange, controller setup, eviction or pin release runs on this path.
+    pub(crate) fn inline_ready(&self, reference: &ValueRecordReference) -> bool {
+        self.requests.is_empty()
+            && self.unreleased.is_empty()
+            && self.grants.iter().all(|grant| grant.outstanding() == 0)
+            && self.find_grant(reference).is_some()
+    }
+
+    pub(crate) fn inline_credit(&self, reference: &ValueRecordReference) -> bool {
+        let Some(index) = self.find_grant(reference) else {
+            return false;
+        };
+        let grant = &self.grants[index];
+        let Some(offset) = (reference.batch_address.offset % grant.scope.file_bytes())
+            .checked_add(8)
+            .and_then(|n| n.checked_add(u64::from(reference.descriptor.offset)))
+        else {
+            return false;
+        };
+        let io = grant.inline_io();
+        let (slots, bytes) = io.credit();
+        let charge = match grant.scope.slot(reference) {
+            Some(slot) => {
+                io.read_request_charge_at(slot, &[(offset, reference.descriptor.len as usize)])
+            }
+            None => io.read_request_charge(&[(offset, reference.descriptor.len as usize)]),
+        };
+        charge.is_ok_and(|(needed_slots, charge)| needed_slots <= slots && charge <= bytes)
+    }
+
+    /// Read one member under the lane's exclusive driver/client ownership.
+    /// The cached grant retains the file pin through every terminal CQE,
+    /// including deadline and wait failures. The caller poisons on any error.
+    pub(crate) fn read_inline_cached(
+        &mut self,
+        client: &Client,
+        reference: &ValueRecordReference,
+        deadline: Instant,
+        trace: Option<&ReadTraceChild>,
+    ) -> Result<Vec<Mutation>, TcpError> {
+        let result = self.read_inline_cached_inner(client, reference, deadline, trace);
+        if result.is_err()
+            && let Some(counters) = &client.live_counters
+        {
+            counters.record_error();
+        }
+        result
+    }
+
+    fn read_inline_cached_inner(
+        &mut self,
+        client: &Client,
+        reference: &ValueRecordReference,
+        deadline: Instant,
+        trace: Option<&ReadTraceChild>,
+    ) -> Result<Vec<Mutation>, TcpError> {
+        let index = self
+            .find_grant(reference)
+            .ok_or_else(|| TcpError::new("inline live grant disappeared"))?;
+        let config = client
+            .live_config
+            .as_ref()
+            .ok_or_else(|| TcpError::new("live NVMe is not configured"))?;
+        let deadline = deadline.min(Instant::now() + Duration::from_millis(config.io_timeout_ms));
+        self.clock += 1;
+        let grant = &mut self.grants[index];
+        grant.last_used = self.clock;
+        let ranges = {
+            let _validation =
+                LiveReadTiming::start(&client.live_counters, LiveTimingStage::Validation);
+            [member_range(client, grant, reference)?]
+        };
+        let flight = self.next_flight;
+        self.next_flight += 1;
+        let _io = LiveReadTiming::start(&client.live_counters, LiveTimingStage::ReadIo);
+        let slot = grant.scope.slot(reference);
+        let result = match slot {
+            Some(slot) => grant
+                .inline_io_mut()
+                .submit_reads_at(flight, slot, &ranges, deadline, trace),
+            None => grant
+                .inline_io_mut()
+                .submit_reads_traced(flight, &ranges, deadline, trace),
+        };
+        match result.map_err(TcpError::component)? {
+            LiveSubmitOutcome::Submitted => {}
+            LiveSubmitOutcome::Full => return Err(TcpError::new("inline live credit disappeared")),
+        }
+        if let Some(counters) = &client.live_counters {
+            counters.record_grant_hit();
+            counters.record_lane_inflight(1, grant.outstanding() as u64);
+        }
+        // Past the deadline, retain ownership until the terminal CQE.
+        // LiveIo bounds both polled waits and terminal retirement.
+        let bound = deadline + DRAIN_BOUND;
+        #[cfg(test)]
+        if let Some((entered, resume)) = self.inline_submitted_pause.take() {
+            entered.send(()).unwrap();
+            resume.recv().unwrap();
+        }
+        while Instant::now() < bound {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let timeout = if remaining.is_zero() {
+                Duration::from_millis(100)
+            } else {
+                remaining
+            };
+            #[cfg(test)]
+            let waited = if std::mem::take(&mut self.fail_inline_wait) {
+                Err(crate::distributed::nvmeof::live_io::LiveIoError::Invalid(
+                    "injected inline wait failure",
+                ))
+            } else {
+                grant.inline_io_mut().wait(timeout)
+            };
+            #[cfg(not(test))]
+            let waited = grant.inline_io_mut().wait(timeout);
+            if let Err(error) = waited {
+                drain_failed_io(grant);
+                grant.broken = true;
+                if let GrantScope::Subsystem {
+                    epoch, subsystem, ..
+                } = &grant.scope
+                {
+                    self.failed_subsystems.insert((*epoch, *subsystem));
+                }
+                fold_stats(client.live_counters.as_deref(), grant);
+                return Err(TcpError::component(error));
+            }
+            let completions = match grant.inline_io_mut().progress() {
+                Ok(completions) => completions,
+                Err(error) => {
+                    drain_failed_io(grant);
+                    grant.broken = true;
+                    if let GrantScope::Subsystem {
+                        epoch, subsystem, ..
+                    } = &grant.scope
+                    {
+                        self.failed_subsystems.insert((*epoch, *subsystem));
+                    }
+                    fold_stats(client.live_counters.as_deref(), grant);
+                    return Err(TcpError::component(error));
+                }
+            };
+            fold_stats(client.live_counters.as_deref(), grant);
+            if let Some(completion) = completions.into_iter().next() {
+                let _delivery = client
+                    .live_counters
+                    .as_ref()
+                    .map(|counters| LiveReadTiming {
+                        counters: counters.clone(),
+                        stage: LiveTimingStage::Delivery,
+                        started: completion.completed_at,
+                    });
+                if completion.id != flight {
+                    return Err(TcpError::new("unexpected inline live completion"));
+                }
+                let result = match completion.result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        if matches!(
+                            error,
+                            crate::distributed::nvmeof::live_io::LiveIoError::Io(_)
+                        ) && let GrantScope::Subsystem {
+                            epoch, subsystem, ..
+                        } = &grant.scope
+                        {
+                            grant.broken = true;
+                            self.failed_subsystems.insert((*epoch, *subsystem));
+                        }
+                        return Err(TcpError::component(error));
+                    }
+                };
+                let LiveIoResult::Reads(mut records) = result else {
+                    return Err(TcpError::new("unexpected live write completion"));
+                };
+                if records.len() != 1 {
+                    return Err(TcpError::new("live read count mismatch"));
+                }
+                let bytes = records
+                    .pop()
+                    .ok_or_else(|| TcpError::new("missing live read result"))?;
+                let _validation =
+                    LiveReadTiming::start(&client.live_counters, LiveTimingStage::Validation);
+                let value = CompleteBatch::decode_record(&client.shape, reference, bytes)
+                    .map_err(TcpError::component)?;
+                if let Some(trace) = trace {
+                    trace.event("live_validation_completed");
+                }
+                return Ok(vec![value]);
+            }
+        }
+        drain_failed_io(grant);
+        grant.broken = true;
+        if let GrantScope::Subsystem {
+            epoch, subsystem, ..
+        } = &grant.scope
+        {
+            self.failed_subsystems.insert((*epoch, *subsystem));
+        }
+        Err(TcpError::new("inline live read did not retire"))
     }
 
     /// The lane's waker. Create it once; every clone wakes `wait`.
@@ -611,10 +957,14 @@ impl LiveReadCache {
         if !self.requests.is_empty() {
             return Err(TcpError::new("live read lane has requests in flight"));
         }
-        for grant in self.grants.drain(..) {
+        for mut grant in self.grants.drain(..) {
+            drain_failed_io(&mut grant);
+            fold_stats(client.live_counters.as_deref(), &mut grant);
             let token = grant.token;
             drop(grant);
-            self.unreleased.push(token);
+            if let Some(token) = token {
+                self.unreleased.push(token);
+            }
         }
         self.release_pending(client, epoch)
     }
@@ -624,12 +974,25 @@ impl LiveReadCache {
     }
 
     fn retire(&mut self, client: &mut Client, epoch: u64, index: usize) -> Result<(), TcpError> {
-        let grant = self.grants.remove(index);
+        if self.grants[index].outstanding() != 0 {
+            return Err(TcpError::new("live read grant has I/O in flight"));
+        }
+        let mut grant = self.grants.remove(index);
+        if grant.broken
+            && let GrantScope::Subsystem {
+                epoch, subsystem, ..
+            } = &grant.scope
+        {
+            self.failed_subsystems.insert((*epoch, *subsystem));
+        }
+        fold_stats(client.live_counters.as_deref(), &mut grant);
         let token = grant.token;
         // No operation remains: only drained grants are retired, and a drained
         // ring has returned every CQE.
         drop(grant);
-        self.unreleased.push(token);
+        if let Some(token) = token {
+            self.unreleased.push(token);
+        }
         self.release_pending(client, epoch)
     }
     fn release_pending(&mut self, client: &mut Client, epoch: u64) -> Result<(), TcpError> {
@@ -661,7 +1024,7 @@ impl LiveReadCache {
     fn find_grant(&self, reference: &ValueRecordReference) -> Option<usize> {
         self.grants
             .iter()
-            .position(|grant| !grant.broken && grant_matches(&grant.location.segment, reference))
+            .position(|grant| !grant.broken && grant.scope.ready(reference))
     }
 
     /// Starts as many of the request's pending members as credit allows. A
@@ -769,11 +1132,19 @@ impl LiveReadCache {
         position: usize,
         connect_timeout: Duration,
     ) -> Result<Opened, TcpError> {
+        if client
+            .live_config
+            .as_ref()
+            .is_some_and(|config| config.export_mode.files_per_subsystem().is_some())
+            && state.references[position].batch_version.epoch == epoch
+        {
+            return self.open_permanent(client, epoch, state, position, connect_timeout);
+        }
         if self.grants.len() >= LIVE_READ_CACHE_CAPACITY {
             let victim = lru_victim(self.grants.iter().enumerate().map(|(index, grant)| {
                 (
                     index,
-                    !grant.broken && grant.io.outstanding() == 0,
+                    !grant.broken && grant.outstanding() == 0,
                     grant.last_used,
                 )
             }));
@@ -835,6 +1206,169 @@ impl LiveReadCache {
         }
     }
 
+    fn open_permanent(
+        &mut self,
+        client: &mut Client,
+        epoch: u64,
+        state: &mut InFlightRequest,
+        position: usize,
+        connect_timeout: Duration,
+    ) -> Result<Opened, TcpError> {
+        let reference = &state.references[position];
+        let file_bytes = client.expected.wal_file_bytes;
+        let file = reference.batch_address.offset / file_bytes;
+        let files = client
+            .live_config
+            .as_ref()
+            .and_then(|config| config.export_mode.files_per_subsystem())
+            .ok_or_else(|| TcpError::new("permanent live export is not configured"))?;
+        self.failed_subsystems
+            .retain(|(current, _)| *current == epoch);
+        if self.failed_subsystems.contains(&(epoch, file / files)) {
+            return Err(TcpError::new("live subsystem failed; reopen the database"));
+        }
+        if client
+            .live_exports
+            .as_ref()
+            .is_none_or(|(current, _, count)| *current != epoch || file >= *count)
+            && let Err(error) = client.open_live_exports(epoch)
+        {
+            self.failed_subsystems.insert((epoch, file / files));
+            return Err(error);
+        }
+        let (_, info, count) = client
+            .live_exports
+            .as_ref()
+            .ok_or_else(|| TcpError::new("live exports unavailable"))?;
+        if file >= *count {
+            return Err(TcpError::new("live WAL file is not exported"));
+        }
+        let config = client
+            .live_config
+            .as_ref()
+            .ok_or_else(|| TcpError::new("live NVMe is not configured"))?;
+        let name = wal_export_name(
+            files,
+            client.expected.inventory.database,
+            client.expected.partition,
+            epoch,
+            file,
+        );
+        let since = *state.connect_since.get_or_insert_with(Instant::now);
+        let deadline = state.deadline.min(since + connect_timeout);
+        if let Some(index) = self
+            .grants
+            .iter()
+            .position(|grant| !grant.broken && grant.scope.covers(reference))
+        {
+            let grant = &mut self.grants[index];
+            let _setup =
+                LiveReadTiming::start(&client.live_counters, LiveTimingStage::NamespaceSetup);
+            let attached = (|| {
+                let handle = grant
+                    .lease
+                    .as_ref()
+                    .ok_or_else(|| TcpError::new("live controller lease unavailable"))?
+                    .namespace(
+                        name.nsid,
+                        name.uuid,
+                        LiveNamespaceAccess::ReadShared,
+                        deadline,
+                    )
+                    .map_err(TcpError::component)?;
+                let slot = grant
+                    .io
+                    .attach(handle.clone())
+                    .map_err(TcpError::component)?;
+                if let Some(inline) = &mut grant.inline_io
+                    && inline.attach(handle).map_err(TcpError::component)? != slot
+                {
+                    return Err(TcpError::new("inline queue slot differs"));
+                }
+                if let GrantScope::Subsystem { slots, .. } = &mut grant.scope {
+                    slots[(file % files) as usize] = Some(slot);
+                }
+                Ok::<(), TcpError>(())
+            })();
+            if let Err(error) = attached {
+                self.fail_grant(client, index, &error);
+                return Err(error);
+            }
+            if let Some(counters) = &client.live_counters {
+                counters.record_grant_miss();
+            }
+            state.connect_since = None;
+            return Ok(Opened::Grant(index));
+        }
+        let target = LiveConnectTarget {
+            nqn: name.nqn,
+            uuid: name.uuid,
+            nsid: name.nsid,
+            bytes: file_bytes,
+            block_size: 4096,
+            address: info.address.clone(),
+            service: info.service,
+            transport: info.transport,
+            spdk: None,
+            geometry: config.queue_geometry,
+        };
+        if self.grants.len() >= LIVE_READ_CACHE_CAPACITY {
+            let victim = lru_victim(self.grants.iter().enumerate().map(|(index, grant)| {
+                (
+                    index,
+                    !grant.broken && grant.outstanding() == 0,
+                    grant.last_used,
+                )
+            }));
+            let Some(victim) = victim else {
+                return Ok(Opened::NoCapacity);
+            };
+            self.retire(client, epoch, victim)?;
+            if let Some(counters) = &client.live_counters {
+                counters.record_grant_eviction();
+            }
+        }
+        let scope = GrantScope::Subsystem {
+            epoch,
+            partition: client.expected.partition,
+            subsystem: name.subsystem,
+            files_per_subsystem: files,
+            file_bytes,
+            slots: vec![None; files as usize],
+        };
+        match Self::connect_scope(
+            client,
+            target,
+            scope,
+            None,
+            self.next_grant,
+            LiveNamespaceAccess::ReadShared,
+            deadline,
+            true,
+        ) {
+            Ok(mut grant) => {
+                self.next_grant += 1;
+                self.clock += 1;
+                grant.last_used = self.clock;
+                state.connect_since = None;
+                if let Some(counters) = &client.live_counters {
+                    counters.record_grant_miss();
+                }
+                self.grants.push(grant);
+                Ok(Opened::Grant(self.grants.len() - 1))
+            }
+            Err(ConnectError::PoolFull(_)) if Instant::now() < deadline => {
+                state.retry_at = Some(Instant::now() + POOL_RETRY);
+                Ok(Opened::Retry)
+            }
+            Err(ConnectError::PoolFull(error)) => Err(TcpError::component(error)),
+            Err(ConnectError::Failed(error)) => {
+                self.failed_subsystems.insert((epoch, name.subsystem));
+                Err(error)
+            }
+        }
+    }
+
     fn connect_grant(
         client: &Client,
         location: LiveRecordLocation,
@@ -842,7 +1376,7 @@ impl LiveReadCache {
         id: u64,
         connect_deadline: Instant,
     ) -> Result<Grant, ConnectError> {
-        let (Some(config), Some(pool)) = (&client.live_config, &client.live_pool) else {
+        let Some(config) = &client.live_config else {
             return Err(ConnectError::Failed(TcpError::new(
                 "live controller pool unavailable",
             )));
@@ -858,29 +1392,73 @@ impl LiveReadCache {
             service: binding.service,
             transport: binding.transport,
             spdk: binding.spdk.clone(),
+            geometry: config.queue_geometry,
         };
         let access = if binding.readonly {
             LiveNamespaceAccess::ReadOnly
         } else {
             LiveNamespaceAccess::ReadWrite
         };
+        Self::connect_scope(
+            client,
+            target,
+            GrantScope::File(location),
+            Some(token),
+            id,
+            access,
+            connect_deadline,
+            false,
+        )
+    }
+
+    // One setup path for file grants and subsystem grants. Each argument is a
+    // distinct input of the two callers; a parameter struct would only rename them.
+    #[allow(clippy::too_many_arguments)]
+    fn connect_scope(
+        client: &Client,
+        target: LiveConnectTarget,
+        mut scope: GrantScope,
+        token: Option<[u8; 16]>,
+        id: u64,
+        access: LiveNamespaceAccess,
+        connect_deadline: Instant,
+        shared: bool,
+    ) -> Result<Grant, ConnectError> {
+        let (Some(config), Some(pool)) = (&client.live_config, &client.live_pool) else {
+            return Err(failed("live controller pool unavailable"));
+        };
         let setup = LiveReadTiming::start(&client.live_counters, LiveTimingStage::NamespaceSetup);
-        let (lease, acquisition, timings) = pool
-            .acquire(
+        let acquisition = if shared {
+            pool.acquire_shared(
                 &target,
                 &config.host_nqn,
                 config.host_id,
                 access,
                 connect_deadline,
             )
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::WouldBlock {
-                    ConnectError::PoolFull(error)
-                } else {
-                    ConnectError::Failed(TcpError::component(error))
-                }
-            })?;
-        let namespace = lease.open_namespace().map_err(failed)?;
+        } else {
+            pool.acquire(
+                &target,
+                &config.host_nqn,
+                config.host_id,
+                access,
+                connect_deadline,
+            )
+        };
+        let (lease, acquisition, timings) = acquisition.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                ConnectError::PoolFull(error)
+            } else {
+                ConnectError::Failed(TcpError::component(error))
+            }
+        })?;
+        let namespace = if shared {
+            lease
+                .namespace(target.nsid, target.uuid, access, connect_deadline)
+                .map_err(failed)?
+        } else {
+            Arc::new(lease.open_namespace().map_err(failed)?)
+        };
         drop(setup);
         if let Some(counters) = &client.live_counters {
             let ns = |d: Duration| d.as_nanos().min(u128::from(u64::MAX)) as u64;
@@ -898,8 +1476,8 @@ impl LiveReadCache {
             let observed = lease.binding();
             metrics.record_route(LiveRouteEvidence {
                 transport: observed.transport,
-                address: binding.address.clone(),
-                service: binding.service,
+                address: target.address.clone(),
+                service: target.service,
                 host_nqn: config.host_nqn.clone(),
                 host_id: config.host_id,
                 target_implementation:
@@ -921,22 +1499,47 @@ impl LiveReadCache {
                 },
             });
         }
-        let io = LiveIo::new(
-            namespace,
+        let mut io = LiveIo::new(
+            namespace.clone(),
             config.max_inflight_requests,
             config.max_inflight_bytes,
+            false,
         )
         .map_err(failed)?;
         let recorded = io.stats();
+        let mut inline_io = if config.queue_geometry.poll_queues > 0 {
+            Some(
+                LiveIo::new(
+                    namespace.clone(),
+                    config.max_inflight_requests,
+                    config.max_inflight_bytes,
+                    true,
+                )
+                .map_err(failed)?,
+            )
+        } else {
+            None
+        };
+        if let GrantScope::Subsystem { slots, .. } = &mut scope {
+            let slot = io.attach(namespace.clone()).map_err(failed)?;
+            if let Some(inline) = &mut inline_io
+                && inline.attach(namespace).map_err(failed)? != slot
+            {
+                return Err(failed("inline queue slot differs"));
+            }
+            slots[(target.nsid - 1) as usize] = Some(slot);
+        }
         Ok(Grant {
             id,
-            location,
+            scope,
             token,
             io,
+            inline_io,
+            inline_recorded: LiveIoStats::default(),
             recorded,
             last_used: 0,
             broken: false,
-            _lease: Some(lease),
+            lease: Some(lease),
         })
     }
 
@@ -958,10 +1561,9 @@ impl LiveReadCache {
             return Ok(Group::Blocked);
         }
         let (slot_capacity, byte_capacity) = grant.io.capacity();
-        let segment = &grant.location.segment;
-        let mut selected = Vec::new();
-        let mut ranges = Vec::new();
-        let mut charge = 0usize;
+        let mut selected_file = None;
+        let mut selected = SmallVec::<[usize; 1]>::new();
+        let mut ranges = SmallVec::<[(u64, usize); 1]>::new();
         {
             let _validation =
                 LiveReadTiming::start(&client.live_counters, LiveTimingStage::Validation);
@@ -970,37 +1572,35 @@ impl LiveReadCache {
                     continue;
                 }
                 let reference = &state.references[position];
-                if !grant_matches(segment, reference) {
+                let file = reference.batch_address.offset / grant.scope.file_bytes();
+                if !grant.scope.ready(reference) || selected_file.is_some_and(|first| first != file)
+                {
                     continue;
                 }
-                let offset = (reference.batch_address.offset % segment.bytes)
-                    .checked_add(8)
-                    .and_then(|n| n.checked_add(u64::from(reference.descriptor.offset)))
-                    .ok_or_else(|| TcpError::new("live record offset overflow"))?;
-                if !client.valid_live_record_geometry(
-                    segment,
-                    &grant.location.binding,
-                    reference,
-                    offset,
-                    u64::from(reference.descriptor.len),
-                ) {
-                    return Err(TcpError::new("invalid cached live record geometry"));
-                }
-                let len = reference.descriptor.len as usize;
-                let cost = grant
-                    .io
-                    .read_charge(offset, len)
-                    .map_err(TcpError::component)?;
-                let Some(next) = charge.checked_add(cost) else {
-                    return Err(TcpError::new("live read charge overflow"));
-                };
-                if selected.len() == free_slots || next > free_bytes {
+                selected_file = Some(file);
+                let (offset, len) = member_range(client, grant, reference)?;
+                if selected.len() == 32 {
                     break;
                 }
-                charge = next;
                 selected.push(position);
                 ranges.push((offset, len));
             }
+        }
+        // Usually the full group fits and needs one plan. Under pressure,
+        // shorten at most 32 times. Do not binary-search: a later bridging
+        // range can reduce the SQE count of an earlier prefix.
+        for _ in 0..ranges.len() {
+            let slot = grant.scope.slot(&state.references[selected[0]]);
+            let charge = match slot {
+                Some(slot) => grant.io.read_request_charge_at(slot, &ranges),
+                None => grant.io.read_request_charge(&ranges),
+            };
+            let (operations, bytes) = charge.map_err(TcpError::component)?;
+            if operations <= free_slots && bytes <= free_bytes {
+                break;
+            }
+            ranges.pop();
+            selected.pop();
         }
         if ranges.is_empty() {
             if free_slots == slot_capacity && free_bytes == byte_capacity {
@@ -1010,11 +1610,18 @@ impl LiveReadCache {
         }
         let flight = self.next_flight;
         let deadline = state.deadline.min(Instant::now() + io_timeout);
-        match grant
-            .io
-            .submit_reads_traced(flight, &ranges, deadline, state.trace.as_ref())
-            .map_err(TcpError::component)?
-        {
+        let slot = grant.scope.slot(&state.references[selected[0]]);
+        let submitted = match slot {
+            Some(slot) => {
+                grant
+                    .io
+                    .submit_reads_at(flight, slot, &ranges, deadline, state.trace.as_ref())
+            }
+            None => grant
+                .io
+                .submit_reads_traced(flight, &ranges, deadline, state.trace.as_ref()),
+        };
+        match submitted.map_err(TcpError::component)? {
             LiveSubmitOutcome::Submitted => {}
             LiveSubmitOutcome::Full => return Ok(Group::Blocked),
         }
@@ -1043,7 +1650,7 @@ impl LiveReadCache {
             },
         );
         if let Some(counters) = &client.live_counters {
-            let operations: usize = self.grants.iter().map(|g| g.io.outstanding()).sum();
+            let operations: usize = self.grants.iter().map(Grant::outstanding).sum();
             counters.record_lane_inflight(self.active_requests as u64, operations as u64);
         }
         Ok(Group::Submitted)
@@ -1084,6 +1691,7 @@ impl LiveReadCache {
         };
         state.last_cqe = Some(completion.completed_at);
         let mut cancel = false;
+        let mut failed_io = false;
         match completion.result {
             Ok(LiveIoResult::Reads(records)) => {
                 if state.error.is_none()
@@ -1099,12 +1707,31 @@ impl LiveReadCache {
                 cancel = true;
             }
             Err(error) => {
+                failed_io = matches!(
+                    error,
+                    crate::distributed::nvmeof::live_io::LiveIoError::Io(_)
+                );
                 cancel = state.error.is_none();
                 state.fail(TcpError::component(error));
             }
         }
         if cancel {
             self.cancel_flights(flight.token);
+        }
+        if failed_io
+            && let Some(grant) = self.grants.iter_mut().find(|grant| {
+                grant.id == flight.grant && matches!(grant.scope, GrantScope::Subsystem { .. })
+            })
+        {
+            // Other CQEs can already be in this poll's completion list. Keep
+            // their flight records until that list and the ring are drained.
+            grant.broken = true;
+            if let GrantScope::Subsystem {
+                epoch, subsystem, ..
+            } = &grant.scope
+            {
+                self.failed_subsystems.insert((*epoch, *subsystem));
+            }
         }
         Ok(())
     }
@@ -1137,9 +1764,15 @@ impl LiveReadCache {
         let message = error.to_string();
         let grant = &mut self.grants[index];
         // Drained completions are dropped: every flight on this grant fails.
-        // If the drain itself fails the grant stays, undroppable work and all.
-        let _ = grant.io.shutdown();
+        // Do not release any flight's index pin until its terminal CQE retired.
+        drain_failed_io(grant);
         grant.broken = true;
+        if let GrantScope::Subsystem {
+            epoch, subsystem, ..
+        } = &grant.scope
+        {
+            self.failed_subsystems.insert((*epoch, *subsystem));
+        }
         fold_stats(client.live_counters.as_deref(), grant);
         let id = grant.id;
         let failed: Vec<u64> = self
@@ -1163,7 +1796,7 @@ impl LiveReadCache {
     fn retire_broken(&mut self, client: &mut Client, epoch: u64) {
         for index in (0..self.grants.len()).rev() {
             let grant = &self.grants[index];
-            if grant.broken && grant.io.outstanding() == 0 {
+            if grant.broken && grant.outstanding() == 0 {
                 let _ = self.retire(client, epoch, index);
             }
         }
@@ -1244,11 +1877,291 @@ impl Client {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::distributed::nvmeof::live_namespace::LiveNamespace;
     use crate::distributed::types::PhysicalValueAddress;
     use std::io::{Seek, SeekFrom, Write};
+
+    pub(crate) fn pause_inline_submitted(
+        cache: &mut LiveReadCache,
+        entered: std::sync::mpsc::SyncSender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        cache.inline_submitted_pause = Some((entered, resume));
+    }
+
+    pub(crate) fn override_inline_completion(cache: &mut LiveReadCache, result: i32) {
+        cache.grants[0]
+            .inline_io_mut()
+            .override_next_completion_result(result);
+    }
+
+    pub(crate) fn fail_inline_wait(cache: &mut LiveReadCache) {
+        cache.fail_inline_wait = true;
+    }
+
+    #[test]
+    fn failed_grant_drains_error_cqe_before_releasing_flights() {
+        let mut lane = lane(4);
+        let namespace = LiveNamespace::open_local_file(
+            &lane._dir.path().join("wal-0"),
+            8192,
+            4096,
+            LiveNamespaceAccess::ReadOnly,
+        )
+        .unwrap();
+        let mut inline = LiveIo::new(namespace, 4, 65536, false).unwrap();
+        inline
+            .submit_reads(99, &[(0, 1)], Instant::now() + Duration::from_secs(10))
+            .unwrap();
+        lane.cache.grants[0].inline_io = Some(inline);
+        assert!(!lane.cache.inline_ready(&lane.a));
+        let token = lane.submit(vec![lane.a]);
+        assert_eq!(lane.cache.grants[0].io.outstanding(), 1);
+        lane.cache.grants[0]
+            .io
+            .override_next_completion_result(-libc::EIO);
+        lane.cache
+            .fail_grant(&lane.client, 0, &TcpError::new("injected ring failure"));
+        assert_eq!(lane.cache.grants[0].io.outstanding(), 0);
+        assert_eq!(lane.cache.grants[0].outstanding(), 0);
+        assert_eq!(lane.cache.grants[0].inline_recorded.read_requests, 1);
+        assert!(lane.cache.grants[0].broken);
+        assert_eq!(lane.cache.active_requests, 0);
+        let state = lane.cache.requests.remove(&token).unwrap();
+        assert_eq!(state.flights, 0);
+        let done = LiveReadCache::finish(&lane.client, token, state);
+        assert!(done.result.is_err());
+    }
+
+    pub(crate) fn configure_local_client(client: &mut Client) {
+        client.live_config = Some(super::super::live_client::LiveClientConfig {
+            lease_ahead: true,
+            polled_writes: false,
+            export_mode: Default::default(),
+            host_nqn: "nqn.2026-01.test:inline".into(),
+            host_id: [1; 16],
+            max_inflight_requests: 4,
+            max_inflight_bytes: 65536,
+            connect_timeout_ms: 1000,
+            io_timeout_ms: 10_000,
+            write_mode: super::super::LiveWriteMode::Reserved,
+            leased_durability: None,
+            inline_reads: true,
+            queue_geometry: Default::default(),
+        });
+    }
+
+    /// Pin the owner's real WAL inode and open it as a local namespace. Only
+    /// target/controller setup is replaced; validation and pin release are real.
+    pub(crate) fn install_owner_local(
+        cache: &mut LiveReadCache,
+        node: &super::super::StorageNode,
+        reference: ValueRecordReference,
+    ) -> std::path::PathBuf {
+        use crate::distributed::nvmeof::live_target::LiveTargetBinding;
+        let mut inventory = node.inventory.lock();
+        let lease = inventory
+            .active(reference.batch_version.epoch)
+            .unwrap()
+            .resolve_live_record(&reference)
+            .unwrap();
+        let segment = lease.segment.clone();
+        let path = segment.path.clone();
+        let location = LiveRecordLocation {
+            reference,
+            offset: lease.offset,
+            len: u64::from(lease.len),
+            binding: LiveTargetBinding {
+                nqn: "nqn.2026-01.test:wal".into(),
+                uuid: [1; 16],
+                nsid: 1,
+                bytes: segment.bytes,
+                block_size: segment.block_size,
+                address: "127.0.0.1".into(),
+                service: 4420,
+                transport: crate::distributed::nvmeof::NvmeofTransport::Tcp,
+                readonly: true,
+                spdk: None,
+                permanent: false,
+            },
+            segment,
+        };
+        let token = [42; 16];
+        assert!(
+            inventory
+                .live_pins
+                .insert(token, (reference.batch_version.epoch, vec![lease]))
+                .is_none()
+        );
+        drop(inventory);
+        install_existing_local(cache, location, token);
+        path
+    }
+
+    pub(crate) fn owner_local_pin_count(node: &super::super::StorageNode) -> usize {
+        node.inventory.lock().live_pins.len()
+    }
+
+    pub(crate) fn install_existing_local(
+        cache: &mut LiveReadCache,
+        location: LiveRecordLocation,
+        token: [u8; 16],
+    ) {
+        let segment = &location.segment;
+        let namespace = LiveNamespace::open_local_file(
+            &segment.path,
+            segment.bytes,
+            segment.block_size,
+            LiveNamespaceAccess::ReadOnly,
+        )
+        .unwrap();
+        let io = LiveIo::new(namespace, 4, 65536, false).unwrap();
+        let recorded = io.stats();
+        cache.grants.push(Grant {
+            id: cache.next_grant,
+            scope: GrantScope::File(location),
+            token: Some(token),
+            io,
+            inline_io: None,
+            inline_recorded: LiveIoStats::default(),
+            recorded,
+            last_used: 0,
+            broken: false,
+            lease: None,
+        });
+        cache.next_grant += 1;
+    }
+
+    #[test]
+    fn cached_scalar_matches_lane_and_preserves_grant_credit() {
+        let mut lane = lane(4);
+        let before = local_snapshot(&lane.cache);
+        assert!(lane.cache.inline_ready(&lane.a));
+        assert!(lane.cache.inline_credit(&lane.a));
+        let inline = lane
+            .cache
+            .read_inline_cached(
+                &lane.client,
+                &lane.a,
+                Instant::now() + Duration::from_secs(10),
+                None,
+            )
+            .unwrap();
+        assert_eq!(local_snapshot(&lane.cache), before);
+        let token = lane.submit(vec![lane.a]);
+        assert!(!lane.cache.inline_ready(&lane.a));
+        let mut done = lane.collect(1);
+        assert_eq!(done[0].token, token);
+        assert_eq!(done.pop().unwrap().result.unwrap(), inline);
+        assert_eq!(local_snapshot(&lane.cache), before);
+    }
+
+    #[test]
+    fn cached_scalar_uses_separate_inline_queue_and_folds_stats() {
+        let mut lane = lane(4);
+        let namespace = LiveNamespace::open_local_file(
+            &lane._dir.path().join("wal-0"),
+            8192,
+            4096,
+            LiveNamespaceAccess::ReadOnly,
+        )
+        .unwrap();
+        // An interrupt fixture exercises the same ring selection on filesystems
+        // that reject IOPOLL. The LiveIo test probes IOPOLL itself.
+        lane.cache.grants[0].inline_io = Some(LiveIo::new(namespace, 1, 8191, false).unwrap());
+        assert!(lane.cache.inline_ready(&lane.a));
+        assert!(lane.cache.inline_credit(&lane.a));
+        let inline = lane
+            .cache
+            .read_inline_cached(
+                &lane.client,
+                &lane.a,
+                Instant::now() + Duration::from_secs(10),
+                None,
+            )
+            .unwrap();
+        let grant = &lane.cache.grants[0];
+        assert_eq!(grant.io.stats().read_requests, 0);
+        assert_eq!(grant.inline_recorded.read_requests, 1);
+        assert_eq!(grant.outstanding(), 0);
+        lane.submit(vec![lane.a]);
+        let mut done = lane.collect(1);
+        assert_eq!(done.pop().unwrap().result.unwrap(), inline);
+        let grant = &lane.cache.grants[0];
+        assert_eq!(grant.recorded.read_requests, 1);
+        assert_eq!(grant.inline_recorded.read_requests, 1);
+    }
+
+    #[test]
+    fn cached_scalar_corruption_returns_credit_and_records_error() {
+        let mut lane = lane(4);
+        let before = local_snapshot(&lane.cache);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(lane._dir.path().join("wal-0"))
+            .unwrap();
+        let offset = 8 + u64::from(lane.a.descriptor.offset) + u64::from(lane.a.descriptor.len) - 1;
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&[0xff]).unwrap();
+        assert!(
+            lane.cache
+                .read_inline_cached(
+                    &lane.client,
+                    &lane.a,
+                    Instant::now() + Duration::from_secs(10),
+                    None
+                )
+                .is_err()
+        );
+        assert_eq!(local_snapshot(&lane.cache), before);
+        assert_eq!(lane.metrics.snapshot().counts.errors, 1);
+    }
+
+    #[test]
+    fn cached_scalar_expired_deadline_does_not_submit_or_drop_pin() {
+        let mut lane = lane(4);
+        let before = local_snapshot(&lane.cache);
+        assert!(
+            lane.cache
+                .read_inline_cached(&lane.client, &lane.a, Instant::now(), None)
+                .is_err()
+        );
+        assert_eq!(local_snapshot(&lane.cache), before);
+        assert_eq!(lane.metrics.snapshot().counts.completed_read_ops, 0);
+    }
+
+    #[test]
+    fn cached_scalar_deadline_holds_credit_until_terminal_cqe() {
+        let mut lane = lane(4);
+        let before = local_snapshot(&lane.cache);
+        let (entered, waiting) = std::sync::mpsc::sync_channel(1);
+        let (release, resume) = std::sync::mpsc::sync_channel(1);
+        lane.cache.inline_submitted_pause = Some((entered, resume));
+        let worker = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(20);
+            let result = lane
+                .cache
+                .read_inline_cached(&lane.client, &lane.a, deadline, None);
+            (lane, result)
+        });
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        release.send(()).unwrap();
+        let (lane, result) = worker.join().unwrap();
+        assert!(result.is_err());
+        assert_eq!(local_snapshot(&lane.cache), before);
+        assert_eq!(lane.cache.grants[0].io.stats().timeouts, 1);
+    }
+
+    pub(crate) fn local_snapshot(cache: &LiveReadCache) -> (usize, usize, usize) {
+        (
+            cache.grants.len(),
+            cache.grants.iter().map(|g| g.io.credit().1).sum(),
+            cache.grants.iter().map(|g| g.io.outstanding()).sum(),
+        )
+    }
 
     #[test]
     fn local_file_reads_decode_order_duplicates_and_corruption() {
@@ -1276,7 +2189,7 @@ mod tests {
         let namespace =
             LiveNamespace::open_local_file(&path, 8192, 4096, LiveNamespaceAccess::ReadOnly)
                 .unwrap();
-        let mut io = LiveIo::new(namespace, 4, 65536).unwrap();
+        let mut io = LiveIo::new(namespace, 4, 65536, false).unwrap();
         let refs = [b, a, b];
         let ranges: Vec<_> = refs
             .iter()
@@ -1417,12 +2330,19 @@ mod tests {
         let metrics = LiveNvmeMetrics::new();
         client.live_counters = Some(metrics.register().unwrap());
         client.live_config = Some(super::super::live_client::LiveClientConfig {
+            lease_ahead: true,
+            polled_writes: false,
+            export_mode: Default::default(),
             host_nqn: "nqn.2026-01.test:host".into(),
             host_id: [1; 16],
             max_inflight_requests: slots,
             max_inflight_bytes: 16 * (4096 + 4095),
             connect_timeout_ms: 1000,
             io_timeout_ms: 10_000,
+            write_mode: super::super::LiveWriteMode::Reserved,
+            leased_durability: None,
+            inline_reads: true,
+            queue_geometry: Default::default(),
         });
         let mut cache = LiveReadCache::with_max_requests(4);
         for (file, (batch, reference)) in [(&first, a), (&second, b)].into_iter().enumerate() {
@@ -1446,6 +2366,7 @@ mod tests {
                 transport: NvmeofTransport::Tcp,
                 readonly: true,
                 spdk: None,
+                permanent: false,
             };
             let segment = LiveWalSegment {
                 database: [51; 16],
@@ -1459,23 +2380,25 @@ mod tests {
                 inode: 0,
                 block_size: 4096,
             };
-            let io = LiveIo::new(namespace, slots, 16 * (4096 + 4095)).unwrap();
+            let io = LiveIo::new(namespace, slots, 16 * (4096 + 4095), false).unwrap();
             let recorded = io.stats();
             cache.grants.push(Grant {
                 id: file as u64 + 1,
-                location: LiveRecordLocation {
+                scope: GrantScope::File(LiveRecordLocation {
                     reference,
                     segment,
                     binding,
                     offset: 0,
                     len: 0,
-                },
-                token: [file as u8; 16],
+                }),
+                token: Some([file as u8; 16]),
                 io,
+                inline_io: None,
+                inline_recorded: LiveIoStats::default(),
                 recorded,
                 last_used: 0,
                 broken: false,
-                _lease: None,
+                lease: None,
             });
         }
         Lane {
@@ -1489,6 +2412,329 @@ mod tests {
             b,
             _running: running,
         }
+    }
+
+    #[test]
+    fn subsystem_timeout_cancel_and_decode_errors_do_not_quarantine() {
+        let mut lane = subsystem_lane();
+        let expired = Instant::now() - Duration::from_secs(1);
+        assert!(
+            lane.cache
+                .read_inline_cached(&lane.client, &lane.a, expired, None)
+                .is_err()
+        );
+        assert!(lane.cache.failed_subsystems.is_empty());
+        let a = lane.a;
+        let token = lane.submit(vec![a]);
+        lane.cache.cancel_flights(token);
+        assert!(lane.collect(1)[0].result.is_err());
+        assert!(lane.cache.failed_subsystems.is_empty());
+        assert!(!lane.cache.grants[0].broken);
+        // The real ring returns corrupt fixture bytes. The existing CRC check
+        // must reject them without a controller quarantine.
+        use std::os::unix::fs::FileExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(lane._dir.path().join("wal-0"))
+            .unwrap()
+            .write_all_at(
+                &vec![0; a.descriptor.len as usize],
+                8 + u64::from(a.descriptor.offset),
+            )
+            .unwrap();
+        assert!(
+            lane.cache
+                .read_inline_cached(
+                    &lane.client,
+                    &a,
+                    Instant::now() + Duration::from_secs(1),
+                    None
+                )
+                .is_err()
+        );
+        assert!(lane.cache.failed_subsystems.is_empty());
+        assert!(!lane.cache.grants[0].broken);
+    }
+
+    #[test]
+    fn subsystem_io_errors_quarantine_inline_and_lane_reads() {
+        for inline in [false, true] {
+            let mut lane = subsystem_lane();
+            lane.cache.grants[0]
+                .io
+                .override_next_completion_result(-libc::EIO);
+            let a = lane.a;
+            if inline {
+                assert!(
+                    lane.cache
+                        .read_inline_cached(
+                            &lane.client,
+                            &a,
+                            Instant::now() + Duration::from_secs(1),
+                            None
+                        )
+                        .is_err()
+                );
+            } else {
+                let b = lane.b;
+                lane.submit(vec![a, b]);
+                assert!(lane.collect(1)[0].result.is_err());
+            }
+            assert!(lane.cache.failed_subsystems.contains(&(1, 0)));
+            assert_eq!(lane.metrics.snapshot().counts.metadata_requests, 0);
+        }
+    }
+
+    fn subsystem_lane() -> Lane {
+        let mut lane = lane(4);
+        lane.cache.grants.clear();
+        let mut handles = Vec::new();
+        for file in 0..2 {
+            handles.push(Arc::new(
+                LiveNamespace::open_local_file(
+                    &lane._dir.path().join(format!("wal-{file}")),
+                    8192,
+                    4096,
+                    LiveNamespaceAccess::ReadShared,
+                )
+                .unwrap(),
+            ));
+        }
+        let mut io = LiveIo::new(handles[0].clone(), 4, 65536, false).unwrap();
+        let mut slots = vec![None; 1024];
+        for (file, handle) in handles.into_iter().enumerate() {
+            slots[file] = Some(io.attach(handle).unwrap());
+        }
+        lane.cache.grants.push(Grant {
+            id: 1,
+            scope: GrantScope::Subsystem {
+                epoch: 1,
+                partition: 2,
+                subsystem: 0,
+                files_per_subsystem: 1024,
+                file_bytes: 8192,
+                slots,
+            },
+            token: None,
+            io,
+            inline_io: None,
+            inline_recorded: LiveIoStats::default(),
+            recorded: LiveIoStats::default(),
+            last_used: 0,
+            broken: false,
+            lease: None,
+        });
+        lane.client.expected.wal_file_bytes = 8192;
+        let config = lane.client.live_config.as_mut().unwrap();
+        config.export_mode = super::super::LiveExportMode::PerOwner;
+        config.write_mode = super::super::LiveWriteMode::Leased;
+        config.leased_durability = Some(crate::distributed::durability::DurabilityTier::Native);
+        lane
+    }
+
+    #[test]
+    fn subsystem_grant_reads_two_files_as_two_flights_and_checks_epoch() {
+        let mut lane = subsystem_lane();
+        assert!(lane.cache.inline_ready(&lane.a));
+        assert!(lane.cache.inline_ready(&lane.b));
+        let mut unattached = lane.a;
+        unattached.batch_address.offset += 2 * 8192;
+        assert!(!lane.cache.inline_ready(&unattached));
+        let mut other_epoch = lane.a;
+        other_epoch.batch_version.epoch = 2;
+        assert_eq!(
+            member_range(&lane.client, &lane.cache.grants[0], &other_epoch)
+                .unwrap_err()
+                .to_string(),
+            "invalid cached live record geometry"
+        );
+        let (a, b) = (lane.a, lane.b);
+        let token = lane.submit(vec![a, b, a]);
+        assert_eq!(lane.cache.flights.len(), 2);
+        let done = lane.collect(1);
+        assert_eq!(done[0].token, token);
+        assert_eq!(
+            done[0].result.as_ref().unwrap(),
+            &vec![
+                lane.first.mutations()[0].clone(),
+                lane.second.mutations()[0].clone(),
+                lane.first.mutations()[0].clone()
+            ]
+        );
+        assert_eq!(lane.metrics.snapshot().counts.completed_read_ops, 2);
+        assert_eq!(lane.metrics.snapshot().counts.metadata_requests, 0);
+        lane.cache.close(&mut lane.client, 1).unwrap();
+        assert!(lane.cache.unreleased.is_empty());
+    }
+
+    #[test]
+    fn failed_subsystem_is_not_reopened_and_new_epoch_drops_old_failures() {
+        let mut lane = subsystem_lane();
+        lane.cache.fail_grant(&lane.client, 0, &"test I/O failure");
+        lane.cache.retire_broken(&mut lane.client, 1);
+        assert!(lane.cache.grants.is_empty());
+        assert!(lane.cache.failed_subsystems.contains(&(1, 0)));
+        let before = lane.metrics.snapshot().counts;
+        let a = lane.a;
+        let token = lane.submit(vec![a]);
+        let done = lane.collect(1);
+        assert_eq!(done[0].token, token);
+        assert_eq!(
+            done[0].result.as_ref().unwrap_err().to_string(),
+            "live subsystem failed; reopen the database"
+        );
+        let after = lane.metrics.snapshot().counts;
+        assert_eq!(after.metadata_requests, before.metadata_requests);
+        assert_eq!(after.namespace_connects, before.namespace_connects);
+        let mut state = InFlightRequest {
+            references: vec![a],
+            deadline: Instant::now() + Duration::from_secs(1),
+            trace: None,
+            slots: vec![Slot::Pending],
+            output: vec![None],
+            pending: 1,
+            first_pending: 0,
+            flights: 0,
+            error: None,
+            submitted_at: None,
+            last_cqe: None,
+            retry_at: None,
+            connect_since: None,
+        };
+        state.references[0].batch_version.epoch = 2;
+        let _ =
+            lane.cache
+                .open_permanent(&mut lane.client, 2, &mut state, 0, Duration::from_secs(1));
+        assert!(
+            !lane
+                .cache
+                .failed_subsystems
+                .iter()
+                .any(|(epoch, _)| *epoch == 1)
+        );
+    }
+
+    #[test]
+    fn healthy_subsystem_retirement_does_not_block_later_use() {
+        let mut lane = subsystem_lane();
+        lane.cache.retire(&mut lane.client, 1, 0).unwrap();
+        assert!(lane.cache.failed_subsystems.is_empty());
+        assert!(lane.cache.unreleased.is_empty());
+        use crate::distributed::nvmeof::{
+            NvmeofTransport, live_connect::LiveConnectionRegistry, live_pool::LiveControllerPool,
+        };
+        let registry = LiveConnectionRegistry::open(&lane._dir.path().join("registry")).unwrap();
+        let pool = Arc::new(LiveControllerPool::new(registry, 8, 4).unwrap());
+        let config = lane.client.live_config.as_ref().unwrap();
+        let name = wal_export_name(1024, lane.client.expected.inventory.database, 2, 1, 0);
+        let target = LiveConnectTarget {
+            nqn: name.nqn,
+            uuid: name.uuid,
+            nsid: name.nsid,
+            bytes: 8192,
+            block_size: 4096,
+            address: "127.0.0.1".into(),
+            service: 4420,
+            transport: NvmeofTransport::Tcp,
+            spdk: None,
+            geometry: config.queue_geometry,
+        };
+        pool.cache_local_shared_namespace(
+            &target,
+            &config.host_nqn,
+            config.host_id,
+            &lane._dir.path().join("wal-0"),
+        )
+        .unwrap();
+        let mut second = target.clone();
+        second.nsid = 2;
+        second.uuid = wal_export_name(1024, lane.client.expected.inventory.database, 2, 1, 1).uuid;
+        pool.cache_local_shared_namespace(
+            &second,
+            &config.host_nqn,
+            config.host_id,
+            &lane._dir.path().join("wal-1"),
+        )
+        .unwrap();
+        lane.client.live_pool = Some(pool.clone());
+        lane.client.live_exports = Some((
+            1,
+            super::super::live_control::LiveExportInfo {
+                mode: super::super::LiveExportMode::PerOwner,
+                address: target.address.clone(),
+                service: target.service,
+                transport: target.transport,
+                wal_file_bytes: 8192,
+                block_size: 4096,
+                exported_files: 2,
+            },
+            2,
+        ));
+        for _ in 0..2 {
+            let a = lane.a;
+            lane.submit(vec![a]);
+            let done = lane.collect(1);
+            assert_eq!(done[0].result.as_ref().unwrap(), lane.first.mutations());
+            assert!(!lane.cache.inline_ready(&lane.b));
+            let b = lane.b;
+            lane.submit(vec![b]);
+            let done = lane.collect(1);
+            assert_eq!(done[0].result.as_ref().unwrap(), lane.second.mutations());
+            assert!(lane.cache.inline_ready(&lane.b));
+            lane.cache.retire(&mut lane.client, 1, 0).unwrap();
+            assert!(lane.cache.failed_subsystems.is_empty());
+        }
+        let counts = lane.metrics.snapshot().counts;
+        assert_eq!(counts.grant_misses, 4);
+        assert_eq!(counts.namespace_connects, 0);
+        assert_eq!(counts.metadata_requests, 0);
+        lane.client.live_pool = None;
+        pool.shutdown(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+    }
+
+    #[test]
+    fn open_live_exports_checks_owner_mode_before_pool_access() {
+        use crate::distributed::nvmeof::{
+            LiveTargetConfig, NvmeofTransport, live_target::LiveTargetManager,
+        };
+        let mut lane = lane(4);
+        let root = lane._dir.path();
+        let state = root.join("target");
+        let configfs = root.join("configfs");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::create_dir(&configfs).unwrap();
+        for directory in ["hosts", "ports", "subsystems"] {
+            std::fs::create_dir(configfs.join(directory)).unwrap();
+        }
+        let target = LiveTargetManager::open_fixture(
+            LiveTargetConfig {
+                address: "127.0.0.1".into(),
+                service: 4420,
+                transport: NvmeofTransport::Tcp,
+                host_nqn: "nqn.2026-01.test:host".into(),
+                port_id: 42,
+                state_dir: state,
+                commissioning_port_id: 43,
+                commissioning_service: 4421,
+                spdk: None,
+                export_mode: super::super::LiveExportMode::OnDemand,
+            },
+            configfs,
+        )
+        .unwrap();
+        lane._running.node.inventory.lock().live_target = Some(target);
+        lane.client.fence_to(1).unwrap();
+        lane.client.open_live_exports(1).unwrap();
+        assert_eq!(lane.client.live_exports.as_ref().unwrap().2, 0);
+        lane.client.live_config.as_mut().unwrap().export_mode =
+            super::super::LiveExportMode::PerOwner;
+        assert_eq!(
+            lane.client.open_live_exports(1).unwrap_err().to_string(),
+            "live export mode differs between owner and coordinator"
+        );
+        assert!(lane.client.broken);
+        assert_eq!(lane.metrics.snapshot().counts.metadata_requests, 2);
     }
 
     impl Lane {
@@ -1526,10 +2772,10 @@ mod tests {
         assert_eq!(lane.cache.in_flight(), 2);
         assert_eq!(lane.cache.active_requests, 2);
         assert_eq!(lane.cache.grants[0].io.outstanding(), 2);
-        assert_eq!(lane.cache.grants[1].io.outstanding(), 2);
+        assert_eq!(lane.cache.grants[1].io.outstanding(), 1);
         let counts = lane.metrics.snapshot().counts;
         assert_eq!(counts.lane_inflight_request_max, 2);
-        assert_eq!(counts.lane_inflight_op_max, 4);
+        assert_eq!(counts.lane_inflight_op_max, 3);
 
         let done = lane.collect(2);
         let result = |token| {
@@ -1545,7 +2791,7 @@ mod tests {
         assert_eq!(lane.cache.in_flight(), 0);
         assert_eq!(lane.cache.active_requests, 0);
         let counts = lane.metrics.snapshot().counts;
-        assert_eq!(counts.completed_read_ops, 4);
+        assert_eq!(counts.completed_read_ops, 3);
         assert_eq!((counts.grant_hits, counts.grant_misses), (3, 0));
         assert_eq!(counts.delivery_samples, 2);
         assert!(counts.copy_bytes_avoided > 0);
@@ -1559,12 +2805,12 @@ mod tests {
 
     #[test]
     fn lane_admits_a_request_larger_than_the_grant_credit_in_waves() {
-        let mut lane = lane(4);
+        let mut lane = lane(1);
         let a = lane.a;
-        let token = lane.submit(vec![a; 6]);
+        let token = lane.submit(vec![a; 65]);
         let state = &lane.cache.requests[&token];
-        // Four member slots: one flight now, two members parked.
-        assert_eq!((state.flights, state.pending), (1, 2));
+        // One SQE fits 32 duplicate members; 33 remain for later waves.
+        assert_eq!((state.flights, state.pending), (1, 33));
         // A second request on the full grant parks without failing.
         let other = lane.submit(vec![a]);
         assert_eq!(lane.cache.requests[&other].pending, 1);
@@ -1573,10 +2819,39 @@ mod tests {
         for finished in &done {
             let values = finished.result.as_ref().ok().unwrap();
             assert!(values.iter().all(|value| *value == one));
-            assert_eq!(values.len(), if finished.token == token { 6 } else { 1 });
+            assert_eq!(values.len(), if finished.token == token { 65 } else { 1 });
         }
         assert_eq!(lane.cache.grants[0].io.outstanding(), 0);
         assert!(lane.cache.grants[0].io.stats().read_requests >= 3);
+    }
+
+    #[test]
+    fn lane_merged_members_fit_one_block_budget() {
+        let mut lane = lane(1);
+        let grant = &mut lane.cache.grants[0];
+        let namespace = LiveNamespace::open_local_file(
+            &match &grant.scope {
+                GrantScope::File(location) => location.segment.path.clone(),
+                _ => unreachable!(),
+            },
+            8192,
+            4096,
+            LiveNamespaceAccess::ReadOnly,
+        )
+        .unwrap();
+        grant.io = LiveIo::new(namespace, 1, 4096 + 4095, false).unwrap();
+        grant.recorded = grant.io.stats();
+        let token = lane.submit(vec![lane.a; 8]);
+        let request = &lane.cache.requests[&token];
+        assert_eq!((request.pending, request.flights), (0, 1));
+        assert_eq!(lane.cache.grants[0].io.outstanding(), 1);
+        let mut done = lane.collect(1);
+        assert_eq!(
+            done.pop().unwrap().result.unwrap(),
+            vec![lane.first.mutations()[0].clone(); 8]
+        );
+        assert_eq!(lane.cache.grants[0].io.stats().completed_read_ops, 1);
+        assert_eq!(lane.cache.grants[0].io.credit(), (1, 4096 + 4095));
     }
 
     #[test]
@@ -1761,7 +3036,22 @@ mod tests {
             .record_reference(receipts[0].appended().address(), 0)
             .unwrap();
         let log = running.node.inventory.lock().active(1).unwrap();
-        let lease = log.resolve_live_record(&reference).unwrap();
+        // The native WAL mapper extends the file to its final size on its own
+        // thread, and a live lease requires the final size. Wait for that
+        // condition instead of assuming the mapper already ran.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let lease = loop {
+            match log.resolve_live_record(&reference) {
+                Ok(lease) => break lease,
+                Err(crate::distributed::storage::StorageError::Invalid(message))
+                    if message == "invalid live namespace geometry"
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("live record did not resolve: {error:?}"),
+            }
+        };
         let token = [43; 16];
         running
             .node

@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "run_id": "th-6449c7068670440c",
+  "source_commit": "87465ef68abb6fa9b7b9cb27224281a7c4994e6d",
+  "github_run_id": 40573961972,
+  "github_conclusion": "success",
+  "results_secured_locally": true,
+  "reported_at_utc": "2026-10-27T22:21:44.613715+00:00",
+  "account": "354775971805",
+  "selected_region": "eu-central-1",
+  "availability_zone": "eu-central-1c",
+  "placement_strategy": "cluster",
+  "parent_independent_mcp": {
+    "operation": "ec2:DescribeInstances",
+    "instances": {
+      "i-09fb59838bec9844a": "terminated",
+      "i-041a7e968f5f1a8fe": "terminated",
+      "i-0db41462e305fa0e8": "terminated",
+      "i-0db71ad7bc27fc2bb": "terminated",
+      "i-09691824104225b79": "terminated",
+      "i-0561b1d4efb8499c5": "terminated"
+    }
+  },
+  "ops_mcp_cross_region": {
+    "agent": "CloudCampaignOps-11",
+    "enabled_regions_scanned": 23,
+    "exact_runid_only_volume_and_eni_queries": true,
+    "inventory_errors": [],
+    "remaining_volumes": 0,
+    "remaining_enis": 0,
+    "remaining_elastic_ips": 0,
+    "remaining_security_groups": 0,
+    "remaining_placement_groups": 0,
+    "remaining_run_prefixed_iam_roles": 0,
+    "remaining_run_prefixed_instance_profiles": 0,
+    "remaining_run_prefixed_policies": 0,
+    "explicit_security_group_not_found": "sg-040118f75306ae160",
+    "explicit_placement_group_not_found": "th-6449c7068670440c"
+  },
+  "cleanup_mutation_by_parent_or_ops_agent": false,
+  "cleanup_performed_by": "branch workflow automatically",
+  "new_fleets_or_reruns_after_user_prohibition": 0,
+  "retained_s3_results_prefix": "s3://tidehunter-ci-354775971805-us-east-1/th-6449c7068670440c/results/",
+  "retained_s3_expiration_days": 30,
+  "retained_storage_is_not_zero_cost": true,
+  "github_cleanup_verification_sha256": "18e2995ee9aebc161c58aea1402bf265edcdece8b39767fe173e93414927835a"
+}

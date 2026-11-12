@@ -115,6 +115,160 @@ class WriteFloorTests(unittest.TestCase):
                 finally:
                     proc.kill(); proc.communicate()
 
+    def test_fd_guard_retries_unstable_and_rejects_persistent_inspection_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scratch = root / 'scratch'
+            scratch.write_bytes(b'x')
+            case = root / 'case'
+            case.mkdir()
+            script = ('import os,time,sys; os.open(sys.argv[1],os.O_WRONLY); '
+                      'print("ready",flush=True); time.sleep(30)')
+            proc = subprocess.Popen([sys.executable, '-B', '-c', script, str(scratch)],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                self.assertEqual(proc.stdout.readline(), b'ready\n')
+                st = scratch.stat()
+                pipes = {os.fstat(proc.stdout.fileno()).st_ino, os.fstat(proc.stderr.fileno()).st_ino}
+                info_path = Path('/proc') / str(proc.pid) / 'fdinfo' / '3'
+                original = Path.read_text
+                attempts = []
+                def transient(path, *args, **kwargs):
+                    if path == info_path:
+                        attempts.append(path)
+                        if len(attempts) == 1:
+                            raise FileNotFoundError('reopened descriptor')
+                    return original(path, *args, **kwargs)
+                with patch.object(Path, 'read_text', transient), patch.object(controller.time, 'sleep'):
+                    self.assertEqual(controller.write_fio_flags(proc.pid, st.st_dev, st.st_ino, case, pipes),
+                                     {'direct': False})
+                self.assertEqual(len(attempts), 3)
+                attempts.clear()
+                def changed_inode(path, *args, **kwargs):
+                    text = original(path, *args, **kwargs)
+                    if path == info_path:
+                        attempts.append(path)
+                        if len(attempts) == 1:
+                            return '\n'.join('ino:\t0' if line.startswith('ino:') else line
+                                             for line in text.splitlines())
+                    return text
+                with patch.object(Path, 'read_text', changed_inode), patch.object(controller.time, 'sleep'):
+                    self.assertEqual(controller.write_fio_flags(proc.pid, st.st_dev, st.st_ino, case, pipes),
+                                     {'direct': False})
+                self.assertEqual(len(attempts), 4)
+                attempts.clear()
+                def without_inode(path, *args, **kwargs):
+                    text = original(path, *args, **kwargs)
+                    if path.parent.name == 'fdinfo':
+                        text = '\n'.join(line for line in text.splitlines() if not line.startswith('ino:'))
+                    if path == info_path:
+                        attempts.append(path)
+                    return text
+                with patch.object(Path, 'read_text', without_inode):
+                    self.assertEqual(controller.write_fio_flags(proc.pid, st.st_dev, st.st_ino, case, pipes),
+                                     {'direct': False})
+                self.assertEqual(len(attempts), 2)
+                attempts.clear()
+                def changed_flags_without_inode(path, *args, **kwargs):
+                    text = without_inode(path, *args, **kwargs)
+                    if path == info_path and len(attempts) == 1:
+                        text = '\n'.join('flags:\t0' if line.startswith('flags:') else line
+                                         for line in text.splitlines())
+                    return text
+                with patch.object(Path, 'read_text', changed_flags_without_inode), patch.object(controller.time, 'sleep'):
+                    self.assertEqual(controller.write_fio_flags(proc.pid, st.st_dev, st.st_ino, case, pipes),
+                                     {'direct': False})
+                self.assertEqual(len(attempts), 4)
+                attempts.clear()
+                def missing_flags_without_inode(path, *args, **kwargs):
+                    text = without_inode(path, *args, **kwargs)
+                    return '\n'.join(line for line in text.splitlines() if not line.startswith('flags:')) if path == info_path else text
+                with patch.object(Path, 'read_text', missing_flags_without_inode), patch.object(controller.time, 'sleep'):
+                    with self.assertRaisesRegex(controller.SafetyError, 'cannot inspect writable fd 3'):
+                        controller.write_fio_flags(proc.pid, st.st_dev, st.st_ino, case, pipes)
+                self.assertEqual(len(attempts), 32)
+                attempts.clear()
+                def persistent(path, *args, **kwargs):
+                    if path == info_path:
+                        attempts.append(path)
+                        raise PermissionError('uninspectable descriptor')
+                    return original(path, *args, **kwargs)
+                with patch.object(Path, 'read_text', persistent), patch.object(controller.time, 'sleep') as sleep:
+                    with self.assertRaisesRegex(controller.SafetyError, 'cannot inspect writable fd 3'):
+                        controller.write_fio_flags(proc.pid, st.st_dev, st.st_ino, case, pipes)
+                self.assertEqual(len(attempts), 32)
+                self.assertEqual(sleep.call_count, 31)
+            finally:
+                proc.kill()
+                proc.communicate()
+
+    def test_fd_guard_skips_a_vanished_descriptor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scratch = root / 'scratch'
+            scratch.write_bytes(b'x')
+            case = root / 'case'
+            case.mkdir()
+            script = ('import os,time,sys; os.open(sys.argv[1],os.O_WRONLY); '
+                      'print("ready",flush=True); time.sleep(30)')
+            proc = subprocess.Popen([sys.executable, '-B', '-c', script, str(scratch)],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                self.assertEqual(proc.stdout.readline(), b'ready\n')
+                st = scratch.stat()
+                pipes = {os.fstat(proc.stdout.fileno()).st_ino, os.fstat(proc.stderr.fileno()).st_ino}
+                directory = Path('/proc') / str(proc.pid) / 'fd'
+                original = Path.iterdir
+                def entries(path):
+                    rows = list(original(path))
+                    return iter(rows + [directory / '999999']) if path == directory else iter(rows)
+                with patch.object(Path, 'iterdir', entries):
+                    self.assertEqual(controller.write_fio_flags(proc.pid, st.st_dev, st.st_ino, case, pipes),
+                                     {'direct': False})
+            finally:
+                proc.kill()
+                proc.communicate()
+
+    def test_readonly_fd_guard_rejects_mixed_identity_and_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / 'target'
+            target.write_bytes(b'x')
+            log = root / 'log'
+            log.touch()
+            script = ('import os,time,sys; os.open(sys.argv[1],int(sys.argv[3])); '
+                      'os.open(sys.argv[2],os.O_WRONLY); print("ready",flush=True); time.sleep(30)')
+            for mode in (os.O_RDONLY, os.O_WRONLY):
+                with self.subTest(mode=mode):
+                    proc = subprocess.Popen([sys.executable, '-B', '-c', script, str(target), str(log), str(mode)],
+                                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    try:
+                        self.assertEqual(proc.stdout.readline(), b'ready\n')
+                        st = target.stat()
+                        expected = {'read_only': mode == os.O_RDONLY, 'direct': False}
+                        self.assertEqual(controller.fio_open_flags(proc.pid, st.st_dev, st.st_ino), expected)
+                        original = Path.read_text
+                        def no_inode(path, *args, **kwargs):
+                            text = original(path, *args, **kwargs)
+                            return '\n'.join(line for line in text.splitlines() if not line.startswith('ino:'))
+                        with patch.object(Path, 'read_text', no_inode):
+                            self.assertEqual(controller.fio_open_flags(proc.pid, st.st_dev, st.st_ino), expected)
+                        if mode == os.O_RDONLY:
+                            info = Path('/proc') / str(proc.pid) / 'fdinfo'
+                            original = Path.read_text
+                            swapped = [False]
+                            def read_text(path, *args, **kwargs):
+                                if path == info / '3' and not swapped[0]:
+                                    swapped[0] = True
+                                    return original(info / '4', *args, **kwargs)
+                                return original(path, *args, **kwargs)
+                            with patch.object(Path, 'read_text', read_text), patch.object(controller.time, 'sleep'):
+                                self.assertEqual(controller.fio_open_flags(proc.pid, st.st_dev, st.st_ino), expected)
+                            self.assertTrue(swapped[0])
+                    finally:
+                        proc.kill()
+                        proc.communicate()
+
     def test_guard_requires_observation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); scratch = root / 'fio-scratch'; scratch.mkdir()

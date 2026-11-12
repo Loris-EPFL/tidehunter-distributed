@@ -1,0 +1,55 @@
+\clearpage
+\section{Two-VM remote reads and writes (run 9)}\label{sec:rwc}
+\textbf{\RWCstate} \RWCFINDING{parity}
+
+\textbf{Topology and parity.} Selection \texttt{remote\_rw\_compact} uses one coordinator and one remote shard-WAL VM, both \texttt{z4m-highmem-16}, in \texttt{us-central1-a} with compact placement. Native runs in process on the coordinator SSD; owner TCP/verbs use the remote owner SSD. Workloads match size, caller count and repetition; read arms also match keys/order, geometry, distribution, operation/warmup counts, mix, read tier and zero coordinator-cache bytes within each temperature. Network/security, index/history, routing and host SSD remain different. Run-9 TCP used mutual TLS and verbs trusted/no TLS, so their ratios include the security difference; run 10 adds trusted TCP rather than treating run 9 as like-for-like transport evidence.
+
+\textbf{Lanes and acknowledgement.} Native has zero remote-read lanes (in-process). Each owner uses one lane at c1/c5 and four at c16. Thus c5 owner reads are lane-limited, \emph{not a transport limit or a basis to rank transports}. Native page cache is not durable; Native per-put file/directory fsync, grouped Native barrier and owner covering file fdatasync remain distinct. Similar durable intent does not establish equal crash recovery; RF1 is not failover.
+
+Cold eligibility requires a qualified receipt and at least 0.9 device reads per successful call, not a cache drop alone. This is a case-level proxy, not every-call NAND proof. Native 1 KiB is unqualified at all reader counts and both repetitions; Native 8/64 KiB and every owner cold cell qualify. Warm reads prewarm the serving-node page cache, not the coordinator cache. Cold/warm geometry differs; their contrast is descriptive. No calls, repetitions or fleets are pooled.
+\begin{figure}[H]\centering\RWCfigure{parity}
+\caption{Run-9 availability: pairs in the first two columns, distinct main-grid cases in the last three. Failed network floors are separate from KV cases. Each owner write has three Native acknowledgement controls, not three equivalent durability contracts.}
+\end{figure}
+\input{rwc/generated/tab-rwc-parity.tex}
+
+\clearpage
+\subsection{Matched writes: size and acknowledgement}
+\begin{figure}[H]\centering\RWCfigure{write-latency}
+\caption{Equal writers within each panel; p50 lines and p99 crosses, repetitions separate. Native page cache is non-durable context; other arms wait for per-put, grouped or covering sync. One data SSD per arm, on different hosts.}
+\end{figure}
+\input{rwc/generated/tab-rwc-write.tex}
+\RWCFINDING{writes}
+
+\clearpage
+\subsection{Matched reads: device-qualified and prewarmed}
+\begin{figure}[H]\centering\RWCfigure{read-latency}
+\caption{Matched readers, sizes and repetitions; coordinator cache off. Unqualified Native cold 1 KiB has no latency marker. Native is in process; owners use one lane at c1, four at c16. Appendix~\ref{app:rwc-qualification} retains every verdict and device ratio, including c5.}
+\end{figure}
+\input{rwc/generated/tab-rwc-read-cold.tex}
+\RWCFINDING{cold-populations}
+
+\clearpage
+\subsection{Warm reads and the cache contrast}
+\input{rwc/generated/tab-rwc-read-warm.tex}
+\begin{figure}[H]\centering\RWCfigure{cold-warm}
+\caption{Cold versus prewarmed whole-call means at one reader. Each point joins arm, size and repetition, but dataset geometry and operation counts differ. Shape identifies size; filled/open means r0/r1. No subtraction identifies SSD service.}
+\end{figure}
+\RWCFINDING{warm}
+
+\clearpage
+\subsection{Finite-case rates and the read-lane limit}
+\begin{figure}[H]\centering\RWCfigure{throughput}
+\caption{Successful API calls/s, not production capacity. c5 owner read points are shaded and lane-limited: one owner lane at c1/c5, four at c16; Native is in process. Do not rank transports on c5 cells. Write acknowledgement and cold/warm read contracts remain separate. Per-case in-flight, offered and unsuccessful counts remain in the CSV and figure evidence; missing occupancy is not zero.}
+\end{figure}
+\RWCFINDING{lanes}
+
+\clearpage
+\subsection{Floors, not an additive decomposition}
+\begin{figure}[H]\centering\RWCfigure{floors}
+\caption{Client/owner SSD and network floor means beside owner whole-call means, not a latency stack. Half RTT is doubled only where the receipt specifies it. Failed \texttt{ib\_write\_lat} event controls are unavailable, not zero; see Appendix~\ref{app:rwc-floors}.}
+\end{figure}
+\textbf{[INFERENCE]} Floors motivate hardware/software hypotheses but do not identify additive overhead. An exact partition needs disjoint, call-linked intervals from the same population; these independent controls do not supply them. No software remainder is computed.
+
+Compare the \emph{same kind of call}: Native all-file fsync plus directory differs from owner one-file fdatasync. Append controls include fresh allocation; overwrite-fdatasync does not. Direct QD1 random reads differ from Native mapped/positional reads and owner exact-range buffered reads. Network tools do not include full RPC/security processing. Both host floors matter; equal VM class is not identical hardware.
+
+\textbf{Limits.} One fleet and r0/r1 do not establish fleet spread or significance. Read/network floors have r0--r2; append controls r0/r1; three diagnostic profiles run once and remain separate. This run does not test five owners, NVMe-oF reads, Spot/other machine types, Sui replay, production capacity or failover. Three event-write floor failures are tool/mode failures, not system failures. The terminal report marks the campaign incomplete because of those failures; all planned cases have terminal receipts. No first-attempt result is used.

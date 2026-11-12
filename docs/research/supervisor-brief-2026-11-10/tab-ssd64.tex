@@ -1,0 +1,18 @@
+\small\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrrr}\toprule
+Component, mean \us & Verbs & TCP & Kernel direct & SPDK & Native\\\midrule
+Owner append-persist (includes software) & \N{C:ssd64v:persist} & \N{C:ssd64t:persist} & \N{C:ssd64k:persist} & \N{C:ssd64s:persist} & \N{C:ssd64n:persist}\\
+Network (stacks, TLS, dispatch included) & \N{C:ssd64v:network} & \N{C:ssd64t:network} & \N{C:ssd64k:network} & \N{C:ssd64s:network} & \N{C:ssd64n:network}\\
+Coordinator / native library insert$^{a}$ & \N{C:ssd64v:coordinator} & \N{C:ssd64t:coordinator} & \N{C:ssd64k:coordinator} & \N{C:ssd64s:coordinator} & \N{C:ssd64n:coordinator}\\
+Owner software & \N{C:ssd64v:owner} & \N{C:ssd64t:owner} & \N{C:ssd64k:owner} & \N{C:ssd64s:owner} & \N{C:ssd64n:owner}\\
+Durable wait / native file sync$^{a}$ & \N{C:ssd64v:durable} & \N{C:ssd64t:durable} & \N{C:ssd64k:durable} & \N{C:ssd64s:durable} & \N{C:ssd64n:durable}\\
+Waiting and coalescing & \N{C:ssd64v:coalescing} & \N{C:ssd64t:coalescing} & \N{C:ssd64k:coalescing} & \N{C:ssd64s:coalescing} & \N{C:ssd64n:coalescing}\\
+Client queueing and wake-up & \N{C:ssd64v:queue} & \N{C:ssd64t:queue} & \N{C:ssd64k:queue} & \N{C:ssd64s:queue} & \N{C:ssd64n:queue}\\
+Residual & \N{C:ssd64v:residual} & \N{C:ssd64t:residual} & \N{C:ssd64k:residual} & \N{C:ssd64s:residual} & \N{C:ssd64n:residual}\\
+Client encode, decode, verify & \N{C:ssd64v:messaging} & \N{C:ssd64t:messaging} & \N{C:ssd64k:messaging} & \N{C:ssd64s:messaging} & \N{C:ssd64n:messaging}\\
+SSD device & \N{C:ssd64v:device} & \N{C:ssd64t:device} & \N{C:ssd64k:device} & \N{C:ssd64s:device} & \N{C:ssd64n:device}\\
+Device + fabric + stack (unsplit) & \N{C:ssd64v:combined} & \N{C:ssd64t:combined} & \N{C:ssd64k:combined} & \N{C:ssd64s:combined} & \N{C:ssd64n:combined}\\
+Owner + network exchange (unsplit) & \N{C:ssd64v:exchange} & \N{C:ssd64t:exchange} & \N{C:ssd64k:exchange} & \N{C:ssd64s:exchange} & \N{C:ssd64n:exchange}\\
+\textbf{TOTAL: same-case API mean} & \N{D:ssd64v:mean_us} & \N{D:ssd64t:mean_us} & \N{D:ssd64k:mean_us} & \N{D:ssd64s:mean_us} & \N{D:ssd64n:mean_us}\\
+API p50 & \N{D:ssd64v:p50_us} & \N{D:ssd64t:p50_us} & \N{D:ssd64k:p50_us} & \N{D:ssd64s:p50_us} & \N{D:ssd64n:p50_us}\\
+\bottomrule\end{tabular}

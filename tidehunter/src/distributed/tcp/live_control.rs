@@ -2,9 +2,54 @@
 
 use super::*;
 use crate::distributed::nvmeof::live_storage::{
-    LiveGroupDescriptor, LiveWalSegment, LiveWriteReservation,
+    LiveAdoption, LiveGroupDescriptor, LiveWalSegment, LiveWriteExtent, LiveWriteReservation,
 };
 use crate::distributed::nvmeof::live_target::LiveTargetBinding;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LiveExportInfo {
+    pub mode: LiveExportMode,
+    pub address: String,
+    pub service: u16,
+    pub transport: super::super::nvmeof::NvmeofTransport,
+    pub wal_file_bytes: u64,
+    pub block_size: u32,
+    pub exported_files: u64,
+}
+
+/// Writable binding for one fragment remainder; never a durability proof.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LiveLeased {
+    pub extent: LiveWriteExtent,
+    pub binding: LiveTargetBinding,
+    /// Authoritative, immutable policy of the stream whose frontier is started.
+    pub tier: crate::distributed::durability::DurabilityTier,
+    pub profile: LeaseProfile,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LiveAdopted {
+    pub adoption: LiveAdoption,
+    pub next: Option<LiveLeased>,
+    pub profile: AdoptProfile,
+}
+
+/// Owner-local intervals; they must not be subtracted from coordinator clocks.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct LeaseProfile {
+    pub reserve_ns: u64,
+    pub namespace_sync_ns: u64,
+    pub publish_ns: u64,
+}
+
+/// Adoption time includes close scanning. Frames counts only newly adopted frames.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct AdoptProfile {
+    pub frames: u64,
+    pub adopt_ns: u64,
+    pub close_scan_ns: u64,
+    pub close_scan_bytes: u64,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LiveReserved {
@@ -84,6 +129,196 @@ pub(super) struct LiveRecoveryWire {
 }
 
 impl Client {
+    pub(crate) fn open_live_exports(&mut self, authority_epoch: u64) -> Result<(), TcpError> {
+        use super::super::nvmeof::live_metrics::LiveTimingStage;
+        let started = Instant::now();
+        if let Some(counters) = &self.live_counters {
+            counters.record_metadata_request();
+        }
+        let response = self.request(Request::OpenLiveExports { authority_epoch });
+        if let Some(counters) = &self.live_counters {
+            counters.record_timing(
+                LiveTimingStage::Control,
+                started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                1,
+            );
+        }
+        let Response::LiveExports(info) = response? else {
+            return self.wrong_response();
+        };
+        if self
+            .live_config
+            .as_ref()
+            .is_none_or(|config| info.mode != config.export_mode)
+        {
+            self.broken = true;
+            return Err(TcpError::new(
+                "live export mode differs between owner and coordinator",
+            ));
+        }
+        if info.wal_file_bytes != self.expected.wal_file_bytes {
+            self.broken = true;
+            return Err(TcpError::new(
+                "live WAL file size differs between owner and coordinator",
+            ));
+        }
+        if info.block_size != 4096
+            || info.service == 0
+            || info.address.parse::<std::net::IpAddr>().is_err()
+        {
+            return self.wrong_response();
+        }
+        let count = info.exported_files;
+        self.live_exports = Some((authority_epoch, info, count));
+        Ok(())
+    }
+
+    /// Validate extent authority and geometry. The caller must compare `tier`
+    /// with its required write policy before issuing any namespace write.
+    pub fn lease_live_extent(&mut self, epoch: u64) -> Result<LiveLeased, TcpError> {
+        match self.request(Request::LeaseLiveExtent { epoch })? {
+            Response::LiveLeased(leased) if self.valid_live_extent(&leased, epoch) => Ok(leased),
+            _ => self.wrong_response(),
+        }
+    }
+
+    pub(crate) fn submit_prelease_live_extent(
+        &mut self,
+        epoch: u64,
+        after: [u8; 16],
+        deadline: Instant,
+    ) -> Result<bool, TcpError> {
+        self.submit_control(&Request::PreleaseLiveExtent { epoch, after }, deadline)
+    }
+
+    pub(crate) fn take_prelease_live_extent(
+        &mut self,
+        epoch: u64,
+    ) -> Option<Result<LiveLeased, TcpError>> {
+        self.take_control().map(|response| match response? {
+            Response::LiveLeased(leased) if self.valid_live_extent(&leased, epoch) => Ok(leased),
+            _ => self.wrong_response(),
+        })
+    }
+
+    pub(super) fn valid_live_extent(&self, leased: &LiveLeased, epoch: u64) -> bool {
+        let extent = &leased.extent;
+        let fragment = self.expected.fragment_bytes;
+        self.valid_live_segment(&extent.segment, &leased.binding, epoch, extent.start)
+            && self
+                .live_config
+                .as_ref()
+                .and_then(|config| config.export_mode.files_per_subsystem())
+                .is_none_or(|files| {
+                    let name = super::super::nvmeof::live_storage::wal_export_name(
+                        files,
+                        extent.segment.database,
+                        extent.segment.partition,
+                        epoch,
+                        extent.segment.file_index,
+                    );
+                    leased.binding.permanent
+                        && leased.binding.nqn == name.nqn
+                        && leased.binding.nsid == name.nsid
+                        && leased.binding.uuid == name.uuid
+                })
+            && extent.token != [0; 16]
+            && !leased.binding.readonly
+            && extent.segment.block_size == 4096
+            && extent.start.is_multiple_of(4096)
+            && extent.end.is_multiple_of(4096)
+            && extent.end > extent.start
+            && extent.end - extent.start < 1 << 30
+            && fragment != 0
+            && extent.end - extent.start == fragment - extent.start % fragment
+            && (extent.start % extent.segment.bytes)
+                .checked_add(extent.end - extent.start)
+                .is_some_and(|end| end <= extent.segment.bytes)
+    }
+
+    /// Return the cumulative adoption proof and, when requested, the next lease
+    /// with its frozen tier. Policy comparison belongs to the coordinator.
+    pub fn adopt_live_extent(
+        &mut self,
+        epoch: u64,
+        token: [u8; 16],
+        through: u64,
+        close: bool,
+        lease_next: bool,
+    ) -> Result<LiveAdopted, TcpError> {
+        let response = self.request(Request::AdoptLiveExtent {
+            epoch,
+            token,
+            through,
+            close,
+            lease_next,
+        })?;
+        self.validate_live_adoption(response, epoch, token, through, close, lease_next)
+    }
+
+    pub(crate) fn submit_adopt_live_extent(
+        &mut self,
+        epoch: u64,
+        token: [u8; 16],
+        through: u64,
+        close: bool,
+        lease_next: bool,
+        deadline: Instant,
+    ) -> Result<bool, TcpError> {
+        self.submit_control(
+            &Request::AdoptLiveExtent {
+                epoch,
+                token,
+                through,
+                close,
+                lease_next,
+            },
+            deadline,
+        )
+    }
+
+    pub(crate) fn take_adopt_live_extent(
+        &mut self,
+        epoch: u64,
+        token: [u8; 16],
+        through: u64,
+        close: bool,
+        lease_next: bool,
+    ) -> Option<Result<LiveAdopted, TcpError>> {
+        self.take_control().map(|response| {
+            self.validate_live_adoption(response?, epoch, token, through, close, lease_next)
+        })
+    }
+
+    fn validate_live_adoption(
+        &mut self,
+        response: Response,
+        epoch: u64,
+        token: [u8; 16],
+        through: u64,
+        close: bool,
+        lease_next: bool,
+    ) -> Result<LiveAdopted, TcpError> {
+        match response {
+            Response::LiveAdopted(reply)
+                if reply.adoption.token == token
+                    && reply.adoption.adopted_end >= through
+                    && reply.adoption.adopted_end.is_multiple_of(4096)
+                    && (!close || reply.adoption.adopted_end == through)
+                    && reply.adoption.closed == close
+                    && reply.next.is_some() == lease_next
+                    && (!lease_next || close)
+                    && reply
+                        .next
+                        .as_ref()
+                        .is_none_or(|next| self.valid_live_extent(next, epoch)) =>
+            {
+                Ok(reply)
+            }
+            _ => self.wrong_response(),
+        }
+    }
+
     /// Release a live grant only after the caller has retired all associated I/O.
     pub fn release_live_epoch_pin(&mut self, epoch: u64, token: [u8; 16]) -> Result<(), TcpError> {
         match self.request(Request::ReleaseLiveEpochPin { epoch, token })? {
@@ -159,7 +394,17 @@ impl Client {
             binding,
             reference.batch_version.epoch,
             reference.batch_address.offset,
-        ) && reference.batch_id.database == self.expected.inventory.database
+        ) && self.valid_record_range(segment.bytes, reference, offset, len)
+    }
+
+    pub(super) fn valid_record_range(
+        &self,
+        file_bytes: u64,
+        reference: &ValueRecordReference,
+        offset: u64,
+        len: u64,
+    ) -> bool {
+        reference.batch_id.database == self.expected.inventory.database
             && self
                 .expected
                 .inventory
@@ -180,13 +425,11 @@ impl Client {
                         .is_some_and(|end| end <= len)
                 })
             && len == u64::from(reference.descriptor.len)
-            && (reference.batch_address.offset % segment.bytes)
+            && (reference.batch_address.offset % file_bytes)
                 .checked_add(8)
                 .and_then(|offset| offset.checked_add(u64::from(reference.descriptor.offset)))
                 == Some(offset)
-            && offset
-                .checked_add(len)
-                .is_some_and(|end| end <= segment.bytes)
+            && offset.checked_add(len).is_some_and(|end| end <= file_bytes)
     }
 
     pub fn reserve_live_group(
@@ -350,18 +593,47 @@ impl Client {
         if limit == 0 || limit > self.page_limit {
             return Err(TcpError::new("invalid live recovery page limit"));
         }
-        match self.request(Request::RecoverLiveMetadata {
+        let response = self.request(Request::RecoverLiveMetadata {
             authority_epoch,
             source_epoch,
             cursor,
             limit: limit.min(256),
-        })? {
+        })?;
+        self.validate_live_recovery_page(
+            response,
+            authority_epoch,
+            source_epoch,
+            cursor,
+            limit,
+            false,
+        )
+    }
+
+    pub(super) fn validate_live_recovery_page(
+        &mut self,
+        response: Response,
+        authority_epoch: u64,
+        source_epoch: u64,
+        cursor: usize,
+        limit: usize,
+        replay: bool,
+    ) -> Result<LiveRecoveryPage, TcpError> {
+        match response {
             Response::LiveRecovery(page) => {
                 if page.epoch_pin_token == [0; 16]
-                    || page.entries.len() > limit.min(256)
+                    || page.entries.len()
+                        > if replay {
+                            limit.max(self.expected.group_limits.max_batches as usize)
+                        } else {
+                            limit.min(256)
+                        }
                     || !page.next.is_none_or(|next| {
                         !page.entries.is_empty()
-                            && cursor.checked_add(page.entries.len()) == Some(next)
+                            && if replay {
+                                next > cursor
+                            } else {
+                                cursor.checked_add(page.entries.len()) == Some(next)
+                            }
                     })
                 {
                     return self.invalid_live_metadata(authority_epoch, Some(page.epoch_pin_token));

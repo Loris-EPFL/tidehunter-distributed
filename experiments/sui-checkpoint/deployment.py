@@ -73,7 +73,29 @@ def schemas(directory, expected_backend=None):
     return result
 
 
-def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, coordinator_cache, guest_root=None, write_profile_limit=0, owner_transports=None):
+def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, coordinator_cache, guest_root=None, write_profile_limit=0, owner_transports=None, owner_tier=None, owner_wal="harness", live_nvme=None):
+    if owner_tier not in (None, 'native', 'synchronous'):
+        raise ValueError('owner tier must be native or synchronous')
+    if owner_wal not in ('harness', 'engine_default'):
+        raise ValueError('owner WAL layout must be harness or engine_default')
+    if live_nvme is not None:
+        valid = isinstance(live_nvme, dict)
+        if valid:
+            addresses = live_nvme.get('addresses')
+            host_id = live_nvme.get('host_id')
+            nqn = live_nvme.get('host_nqn')
+            geometry = live_nvme.get('queue_geometry')
+            valid = (isinstance(addresses, list) and len(addresses) == 5
+                     and all(isinstance(x, str) and x for x in addresses)
+                     and isinstance(host_id, list) and len(host_id) == 16
+                     and all(type(x) is int and 0 <= x <= 255 for x in host_id)
+                     and any(host_id) and isinstance(nqn, str) and nqn.startswith('nqn.')
+                     and live_nvme.get('export_mode') in ('on_demand', 'per_file', 'per_owner')
+                     and isinstance(geometry, dict)
+                     and set(geometry) == {'io_queues', 'queue_size', 'poll_queues'}
+                     and all(type(x) is int for x in geometry.values()))
+        if not valid:
+            raise ValueError('invalid live NVMe-oF deployment')
     if type(write_profile_limit) is not int or not 0 <= write_profile_limit <= 65536:
         raise ValueError('write profile limit must be an integer 0..65536')
     transport = validate_transport(transport)
@@ -103,7 +125,8 @@ def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, 
         storage = dict(database=identity, partitions=list(range(5)),
             batch_limits=dict(max_operations=65536, max_encoded_bytes=8*MIB),
             group_limits=dict(max_batches=64, max_encoded_bytes=12*MIB),
-            fragment_bytes=16*MIB, wal_file_bytes=256*MIB, max_batches_per_partition=1000000,
+            fragment_bytes=(128 if owner_wal == 'engine_default' else 16)*MIB,
+            wal_file_bytes=(10240 if owner_wal == 'engine_default' else 256)*MIB, max_batches_per_partition=1000000,
             max_reference_metadata_bytes=256*MIB, max_epochs=32)
         endpoints = []
         for partition, host in enumerate(hosts):
@@ -121,13 +144,21 @@ def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, 
                 wal_member_read='async', read_resident_first=True,
                 read_memory_allowance_bytes=128*MIB,
                 read_max_inflight_requests=32, read_max_inflight_bytes=64*MIB, read_max_device_reads=128)
+            if live_nvme is not None:
+                k = number * 5 + partition
+                node['live_target'] = dict(address=addresses[partition], service=4420 + 2*k,
+                    transport='rdma', host_nqn=nqn, port_id=1000 + 2*k,
+                    state_dir=str(runtime_node / 'live-nvmeof'), commissioning_port_id=1001 + 2*k,
+                    commissioning_service=4421 + 2*k, export_mode=live_nvme['export_mode'])
             # Adaptive parks drained TCP on readiness and keeps fabric CQ
             # progress live; neither transport uses periodic idle sleeps.
-            launch = dict(node=node, tls=tls(f'node-{partition}', tls_root, owners[partition]),
+            launch = dict(history_persistence="wal_replay", node=node, tls=tls(f'node-{partition}', tls_root, owners[partition]),
                 limits=dict(max_frame_bytes=16*MIB, max_connections=16, max_reads=256,
                     recovery_page_batches=128, io_timeout=dict(secs=60, nanos=0), polling='adaptive'),
                 listen=address, ready_file=str(runtime_node / 'ready'), stop_file=str(runtime_node / 'stop'),
                 drop_first_append_response=False)
+            if owner_tier is not None:
+                launch['durability'] = dict(tier=owner_tier)
             dump(node_dir / 'launch.yaml', launch)
             nodes.append(dict(namespace=namespace, partition=partition, host=host,
                 launch=str(node_dir / 'launch.yaml'), ready=str(runtime_node / 'ready'), stop=str(runtime_node / 'stop')))
@@ -136,7 +167,7 @@ def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, 
         client_tls = tls('authority', directory / 'tls', transport)
         # Retained epoch history is not the in-flight window: acknowledged
         # identities remain necessary for exact retries and crash recovery.
-        databases[namespace] = dict(storage=storage, endpoints=endpoints, tls=client_tls,
+        databases[namespace] = dict(history_persistence="wal_replay", storage=storage, endpoints=endpoints, tls=client_tls,
             timeout=dict(secs=30, nanos=0), max_admitted_batches=storage['max_batches_per_partition'],
             max_index_bytes=512*MIB,
             max_pending_batches=128, max_pending_bytes=128*MIB, pipelined_writes=True,
@@ -144,6 +175,11 @@ def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, 
             read_cache_bytes=coordinator_cache, read_memory_allowance_bytes=128*MIB+2*coordinator_cache,
             preparation_workers=2, scan_prefetch_pages=2, read_lanes=2,
             max_pending_reads=256, max_pending_read_bytes=64*MIB)
+        if live_nvme is not None:
+            databases[namespace]['live_nvme'] = dict(host_nqn=nqn, host_id=host_id,
+                max_inflight_requests=32, max_inflight_bytes=16*MIB, connect_timeout_ms=30000,
+                io_timeout_ms=30000, write_mode='leased', leased_durability=owner_tier or 'native',
+                inline_reads=True, queue_geometry=geometry, export_mode=live_nvme['export_mode'])
     config = dict(root=str(db_root), databases=databases)
     (directory / 'config.json').write_text(json.dumps(config, indent=2)+'\n')
     (directory / 'nodes.json').write_text(json.dumps(nodes, indent=2)+'\n')

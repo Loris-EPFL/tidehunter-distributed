@@ -219,7 +219,10 @@ pub async fn run<B: KvBackend>(
         }
         if fatal_reason.is_none()
             && config.diagnostics.write_profile_limit > 0
-            && let Err(error) = backend.arm_write_profile(config.diagnostics.write_profile_limit)
+            && let Err(error) = boundary_on_worker(&backend, move |backend| {
+                backend.arm_write_profile(config.diagnostics.write_profile_limit)
+            })
+            .await
         {
             failed = true;
             let reason = format!("measurement write profile arm failed: {error}");
@@ -262,9 +265,17 @@ pub async fn run<B: KvBackend>(
             }
         }
         if fatal_reason.is_none() {
+            match boundary_on_worker(&backend, KvBackend::read_observation).await {
+                Ok(snapshot) => read_start = snapshot,
+                Err(error) => {
+                    failed = true;
+                    fatal_reason = Some(format!("measurement start boundary failed: {error}"));
+                }
+            }
+        }
+        if fatal_reason.is_none() {
             measurement_attempted = true;
             reporter.set_phase("measurement");
-            read_start = backend.read_observation();
             let phase_result = if config.execution.mode == ExecutionMode::Interference {
                 let (result, phase_result) = run_interference_phase(
                     &backend,
@@ -301,10 +312,21 @@ pub async fn run<B: KvBackend>(
                 .await
             };
             measurement_drained = phase_result.is_ok();
-            read_end = backend.read_observation();
             if let Err(error) = phase_result {
                 failed = true;
                 fatal_reason = Some(format!("measurement phase stopped: {error}"));
+            }
+            match boundary_on_worker(&backend, KvBackend::read_observation).await {
+                Ok(snapshot) => read_end = snapshot,
+                Err(error) => {
+                    measurement_drained = false;
+                    failed = true;
+                    let reason = format!("measurement end boundary failed: {error}");
+                    fatal_reason = Some(fatal_reason.map_or_else(
+                        || reason.clone(),
+                        |previous| format!("{previous}; {reason}"),
+                    ));
+                }
             }
             reporter.snapshot()?;
         }
@@ -361,10 +383,22 @@ pub async fn run<B: KvBackend>(
     let write_pre_gate = if config.diagnostics.write_profile_limit == 0 {
         None
     } else if measurement_attempted && profile_arm_error.is_none() {
-        Some(match backend.snapshot_write_profile() {
-            Ok(snapshot) => snapshot,
-            Err(error) => serde_json::json!({"available": false, "reason": error.to_string()}),
-        })
+        Some(
+            match boundary_on_worker(&backend, KvBackend::snapshot_write_profile).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    if error.is::<crate::backend::LiveAdoptionBoundaryError>() {
+                        failed = true;
+                        let reason = format!("measurement write profile boundary failed: {error}");
+                        fatal_reason = Some(fatal_reason.map_or_else(
+                            || reason.clone(),
+                            |previous| format!("{previous}; {reason}"),
+                        ));
+                    }
+                    serde_json::json!({"available": false, "reason": error.to_string()})
+                }
+            },
+        )
     } else {
         Some(
             serde_json::json!({"available": false, "reason": "write profile not armed for measurement"}),
@@ -536,11 +570,17 @@ pub async fn run<B: KvBackend>(
         fatal_reason =
             Some("global deadline expired before post-workload qualification".to_owned());
     }
-    let client_pool_final = backend
-        .read_observation()
-        .get("client_pool")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
+    let client_pool_final = match boundary_on_worker(&backend, KvBackend::read_observation).await {
+        Ok(snapshot) => snapshot
+            .get("client_pool")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        Err(error) => {
+            failed = true;
+            fatal_reason.get_or_insert_with(|| format!("final read boundary failed: {error}"));
+            serde_json::Value::Null
+        }
+    };
     if let Err(error) = shutdown_on_worker(
         backend,
         deadline,
@@ -897,6 +937,13 @@ fn measurement_read_evidence(
         "bypass_eviction_limit",
         "admitted_bytes",
         "served_bytes",
+        "read_profile_live_inline",
+        "read_profile_live_inline_fallback_drain",
+        "read_profile_live_inline_fallback_busy",
+        "read_profile_live_inline_fallback_grant",
+        "read_profile_live_inline_fallback_credit",
+        "read_profile_live_inline_fallback_paused",
+        "read_profile_live_inline_fallback_coalesced",
     ];
     const OWNER: &[&str] = &[
         "wal_reads",
@@ -1006,6 +1053,42 @@ fn measurement_read_evidence(
                 "grant_misses",
                 "grant_evictions",
                 "copy_bytes_avoided",
+                "reserve_exchanges",
+                "complete_exchanges",
+                "lease_exchanges",
+                "leased_frames",
+                "leased_bytes",
+                "leased_skip_markers",
+                "extents_leased",
+                "adoption_async_exchanges",
+                "adoption_sync_exchanges",
+                "adoption_async_ns",
+                "adoption_async_samples",
+                "adoption_settle_ns",
+                "adoption_settle_samples",
+                "adoption_history_full_settles",
+                "fua_writes",
+                "leased_write_ns",
+                "leased_write_samples",
+                "extent_switch_ns",
+                "extent_switch_samples",
+                "lease_reserve_ns",
+                "lease_namespace_sync_ns",
+                "lease_publish_ns",
+                "lease_profile_samples",
+                "adopt_owner_ns",
+                "adopt_close_scan_ns",
+                "adopt_close_scan_bytes",
+                "adopt_profile_samples",
+                "extent_preleases",
+                "extent_switch_waits",
+                "leased_failed_writes",
+                "leased_short_writes",
+                "leased_timed_out_writes",
+                "leased_full_writes",
+                "failed_write_ops",
+                "short_write_ops",
+                "short_write_bytes",
             ],
         )
     } else {
@@ -1281,6 +1364,14 @@ async fn qualify<B: KvBackend>(
     .await?;
     Ok(())
 }
+async fn boundary_on_worker<B: KvBackend, T: Send + 'static>(
+    backend: &Arc<B>,
+    capture: impl FnOnce(&B) -> BackendResult<T> + Send + 'static,
+) -> BackendResult<T> {
+    let worker = Arc::clone(backend);
+    tokio::task::spawn_blocking(move || capture(&worker)).await?
+}
+
 async fn qualify_on_worker<B: KvBackend>(
     backend: Arc<B>,
     namespace: [u8; 16],
@@ -3676,6 +3767,38 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    #[tokio::test]
+    async fn failed_read_boundaries_fail_case_and_preserve_terminal_evidence() {
+        for boundary in [0, 1] {
+            let directory = result_directory(&format!("read-boundary-error-{boundary}"));
+            let output = directory.join("result");
+            let mut backend = MemoryBackend::new(false, false);
+            backend.observation_failure_at = Some(boundary);
+            let mut config = read_test_config();
+            config.phases.preload = true;
+            config.phases.measurement_operations = 2;
+            let error = run(backend, config, &output, prometheus::Registry::new())
+                .await
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains(if boundary == 0 {
+                "measurement start boundary failed"
+            } else {
+                "measurement end boundary failed"
+            }));
+            assert!(error.contains("adoption boundary did not quiesce"));
+            let evidence: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(output.join("measurement-read-evidence.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(evidence["measurement_attempted"], boundary == 1);
+            assert_eq!(evidence["measurement_drained"], false);
+            assert!(output.join("manifest.json").exists());
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
     struct MemoryBackend {
         data: Arc<Mutex<HashMap<Vec<u8>, Bytes>>>,
         corrupt_reads: bool,
@@ -3690,6 +3813,9 @@ mod tests {
         write_snapshot_calls: Arc<AtomicUsize>,
         write_finish_calls: Arc<AtomicUsize>,
         write_snapshot_error: bool,
+        write_snapshot_boundary_error: bool,
+        observation_failure_at: Option<usize>,
+        observation_calls: AtomicUsize,
         eviction_supported: bool,
     }
 
@@ -3710,6 +3836,9 @@ mod tests {
                 write_snapshot_calls: Arc::new(AtomicUsize::new(0)),
                 write_finish_calls: Arc::new(AtomicUsize::new(0)),
                 write_snapshot_error: false,
+                write_snapshot_boundary_error: false,
+                observation_failure_at: None,
+                observation_calls: AtomicUsize::new(0),
             }
         }
 
@@ -3751,15 +3880,26 @@ mod tests {
                 configuration: serde_json::json!({"durability_tier": "native"}),
             }
         }
-        fn read_observation(&self) -> serde_json::Value {
+        fn read_observation(&self) -> BackendResult<serde_json::Value> {
+            let boundary = self.observation_calls.fetch_add(1, Ordering::Relaxed);
+            if self.observation_failure_at == Some(boundary) {
+                return Err(invalid("leased adoption boundary did not quiesce"));
+            }
             let reads = self.read_count.load(Ordering::Relaxed);
-            serde_json::json!({"available": true, "coordinator": {
+            Ok(serde_json::json!({"available": true, "coordinator": {
                 "read_rpc_count": 0, "hits": reads, "misses": 0, "inserts": 0,
                 "evictions": 0, "rejected_oversize": 0, "rejected_mismatch": 0,
                 "bypass_disabled": 0, "bypass_admission": 0, "bypass_eviction_limit": 0,
-                "admitted_bytes": 0, "served_bytes": 0},
+                "admitted_bytes": 0, "served_bytes": 0,
+                "read_profile_live_inline": 0,
+                "read_profile_live_inline_fallback_drain": 0,
+                "read_profile_live_inline_fallback_busy": 0,
+                "read_profile_live_inline_fallback_grant": 0,
+                "read_profile_live_inline_fallback_credit": 0,
+                "read_profile_live_inline_fallback_paused": 0,
+                "read_profile_live_inline_fallback_coalesced": 0},
                 "owner_executor": {"available": false, "error": "test unavailable"},
-                "client_resident": {"available": false, "error": "test unavailable"}})
+                "client_resident": {"available": false, "error": "test unavailable"}}))
         }
         fn arm_write_profile(&self, _limit: usize) -> BackendResult<()> {
             if self.write_gate_counter.is_none() {
@@ -3775,6 +3915,11 @@ mod tests {
                 return Err(invalid("write profile is not armed"));
             }
             if self.write_snapshot_error {
+                if self.write_snapshot_boundary_error {
+                    return Err(Box::new(crate::backend::LiveAdoptionBoundaryError(
+                        "snapshot unavailable",
+                    )));
+                }
                 return Err(invalid("snapshot unavailable"));
             }
             let counter = self
@@ -4037,7 +4182,7 @@ mod tests {
             slow_started: Mutex::new(None),
             slow_release: Mutex::new(None),
         };
-        let snapshot = peer.read_observation();
+        let snapshot = peer.read_observation().unwrap();
         let evidence = measurement_read_evidence(&snapshot, &snapshot, true, true);
         assert_eq!(evidence["deltas"]["available"], false);
         assert!(snapshot["error"].as_str().is_some());
@@ -5703,32 +5848,45 @@ mod tests {
 
     #[tokio::test]
     async fn write_snapshot_error_is_unavailable_but_profile_still_finishes() {
-        let directory = result_directory("write-snapshot-error");
-        let output = directory.join("result");
-        let mut backend = MemoryBackend::new(false, false);
-        backend.write_gate_counter = Some(Arc::new(AtomicUsize::new(7)));
-        backend.write_snapshot_error = true;
-        let snapshots = Arc::clone(&backend.write_snapshot_calls);
-        let finishes = Arc::clone(&backend.write_finish_calls);
-        let mut config = read_test_config();
-        config.diagnostics.write_profile_limit = 1;
-        run(backend, config, &output, prometheus::Registry::new())
-            .await
+        for adoption_boundary in [false, true] {
+            let directory = result_directory(&format!("write-snapshot-error-{adoption_boundary}"));
+            let output = directory.join("result");
+            let mut backend = MemoryBackend::new(false, false);
+            backend.write_gate_counter = Some(Arc::new(AtomicUsize::new(7)));
+            backend.write_snapshot_error = true;
+            backend.write_snapshot_boundary_error = adoption_boundary;
+            let snapshots = Arc::clone(&backend.write_snapshot_calls);
+            let finishes = Arc::clone(&backend.write_finish_calls);
+            let mut config = read_test_config();
+            config.diagnostics.write_profile_limit = 1;
+            let result = run(backend, config, &output, prometheus::Registry::new()).await;
+            if adoption_boundary {
+                assert!(
+                    result
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("measurement write profile boundary failed")
+                );
+            } else {
+                result.unwrap();
+            }
+            let evidence: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(output.join("write-diagnostics.json")).unwrap(),
+            )
             .unwrap();
-        let evidence: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(output.join("write-diagnostics.json")).unwrap())
-                .unwrap();
-        assert_eq!(snapshots.load(Ordering::Relaxed), 1);
-        assert_eq!(finishes.load(Ordering::Relaxed), 1);
-        assert_eq!(evidence["pre_completion_gate"]["available"], false);
-        assert!(
-            evidence["pre_completion_gate"]["reason"]
-                .as_str()
-                .unwrap()
-                .contains("snapshot unavailable")
-        );
-        assert_eq!(evidence["profile"]["post_gate_value"], 7);
-        std::fs::remove_dir_all(directory).unwrap();
+            assert_eq!(snapshots.load(Ordering::Relaxed), 1);
+            assert_eq!(finishes.load(Ordering::Relaxed), 1);
+            assert_eq!(evidence["pre_completion_gate"]["available"], false);
+            assert!(
+                evidence["pre_completion_gate"]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("snapshot unavailable")
+            );
+            assert_eq!(evidence["profile"]["post_gate_value"], 7);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -5907,6 +6065,34 @@ mod tests {
             "grant_misses",
             "grant_evictions",
             "copy_bytes_avoided",
+            "reserve_exchanges",
+            "complete_exchanges",
+            "lease_exchanges",
+            "leased_frames",
+            "leased_bytes",
+            "leased_skip_markers",
+            "extents_leased",
+            "adoption_async_exchanges",
+            "adoption_sync_exchanges",
+            "adoption_history_full_settles",
+            "fua_writes",
+            "leased_failed_writes",
+            "leased_short_writes",
+            "leased_timed_out_writes",
+            "leased_full_writes",
+            "failed_write_ops",
+            "short_write_ops",
+            "short_write_bytes",
+            "lease_reserve_ns",
+            "lease_namespace_sync_ns",
+            "lease_publish_ns",
+            "lease_profile_samples",
+            "adopt_owner_ns",
+            "adopt_close_scan_ns",
+            "adopt_close_scan_bytes",
+            "adopt_profile_samples",
+            "extent_preleases",
+            "extent_switch_waits",
         ] {
             stats[name] = serde_json::json!(0);
         }
@@ -5916,6 +6102,10 @@ mod tests {
             "wal_namespace",
             "frontier_file",
             "frontier_namespace",
+            "adoption_async",
+            "adoption_settle",
+            "leased_write",
+            "extent_switch",
         ] {
             stats[format!("{stage}_ns")] = serde_json::json!(10);
             stats[format!("{stage}_samples")] = serde_json::json!(1);
@@ -5929,6 +6119,32 @@ mod tests {
             evidence["live_nvmeof"]["counters"]["completed_write_ops"],
             2
         );
+        for name in [
+            "lease_reserve_ns",
+            "lease_namespace_sync_ns",
+            "lease_publish_ns",
+            "lease_profile_samples",
+            "adopt_owner_ns",
+            "adopt_close_scan_ns",
+            "adopt_close_scan_bytes",
+            "adopt_profile_samples",
+            "extent_preleases",
+            "extent_switch_waits",
+        ] {
+            let mut measured = end.clone();
+            measured["live_nvmeof"][name] = serde_json::json!(7);
+            let delta = measurement_read_evidence(&start, &measured, true, true);
+            assert_eq!(delta["live_nvmeof"]["counters"][name], 7, "{name}");
+            measured["live_nvmeof"]
+                .as_object_mut()
+                .unwrap()
+                .remove(name);
+            assert_eq!(
+                measurement_read_evidence(&start, &measured, true, true)["live_nvmeof"]["available"],
+                false,
+                "{name}",
+            );
+        }
         for stage in [
             "owner_completion",
             "wal_persistence",
@@ -6069,6 +6285,13 @@ mod tests {
             "bypass_eviction_limit",
             "admitted_bytes",
             "served_bytes",
+            "read_profile_live_inline",
+            "read_profile_live_inline_fallback_drain",
+            "read_profile_live_inline_fallback_busy",
+            "read_profile_live_inline_fallback_grant",
+            "read_profile_live_inline_fallback_credit",
+            "read_profile_live_inline_fallback_paused",
+            "read_profile_live_inline_fallback_coalesced",
         ]
         .into_iter()
         .map(|name| (name.to_owned(), serde_json::json!(0)))
@@ -6077,6 +6300,26 @@ mod tests {
             "available": true, "coordinator": coordinator,
             "owner_executor": owner_executor, "nvmeof": nvmeof
         })
+    }
+
+    #[test]
+    fn live_inline_boundaries_require_complete_monotone_route_counts() {
+        let start = read_boundary(&serde_json::Value::Null, &serde_json::Value::Null);
+        let mut end = start.clone();
+        end["coordinator"]["read_profile_live_inline"] = serde_json::json!(7);
+        let measured = measurement_read_evidence(&start, &end, true, true);
+        assert_eq!(
+            measured["deltas"]["coordinator"]["counters"]["read_profile_live_inline"],
+            7
+        );
+        let reset = measurement_read_evidence(&end, &start, true, true);
+        assert_eq!(reset["deltas"]["coordinator"]["available"], false);
+        end["coordinator"]
+            .as_object_mut()
+            .unwrap()
+            .remove("read_profile_live_inline_fallback_grant");
+        let missing = measurement_read_evidence(&start, &end, true, true);
+        assert_eq!(missing["deltas"]["coordinator"]["available"], false);
     }
 
     #[test]

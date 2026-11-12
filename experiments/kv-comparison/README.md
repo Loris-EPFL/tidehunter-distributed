@@ -36,6 +36,68 @@ intact. Neither setting proves per-call RAM or SSD service. Transport and target
 policy receipts, boundary counters and scoped device observations remain distinct.
 See the [current implementation and hardware qualification limits](../../docs/distributed/LINUX_NVME_OF_READ_BACKEND_2026-10-31.md#current-linux-page-cache-branch).
 
+The historical `standard-with-nvmeof` matrix is a sealed-read experiment.
+`standard-with-live-nvmeof` is a distinct combined plan that also schedules
+live NVMe cases with the same primary workloads as TCP. Sealed first-touch and
+repeat-read controls remain separate and cannot establish live write behavior.
+Live admission requires physical write/read/fence/recovery qualification and
+per-route I/O evidence; it currently fails closed until that evidence and the
+live runtime interface are available. See [manual GCP campaign](../gcp-rdma/setup.md)
+for the bounded fleet and cost policy.
+
+
+## Remote read and write analysis
+
+`remote_rw.py` reports Native and one-owner TCP and verbs read/write cases,
+device qualification, and separate network and SSD floors for one export.
+From the repository root, run:
+
+```sh
+python -B experiments/kv-comparison/remote_rw.py --export EXPORT --report REPORT --output OUTPUT
+```
+
+`EXPORT` contains `matrix.json` and the exported case artifacts; `REPORT`
+contains the `comparison.json` produced by analysis. The output directory
+contains `remote_rw.md` and `latency_vs_size.csv`, `latency_vs_concurrency.csv`,
+`throughput_vs_concurrency.csv`, `cold_vs_warm.csv`, `floors.csv`, and
+`parity_matrix.csv`. Each CSV has columns `case_id`, `arm`, `transport`, `group`,
+`size_bytes`, `readers`, `writers`, `repetition`, `n`, `mean_us`, `p50_us`,
+`p99_us`, `calls_per_second`, `mean_inflight_calls`, `offered_calls`,
+`unsuccessful_calls`, `floor_contract`, `status`, `error`, `read_lanes`,
+`native_shards`, `durability_tier`, and `native_durability`.
+
+The parity gate checks the workload and full grid using the campaign validator;
+it does not emit a ratio for an unmatched pair. Cold cases require a qualified
+receipt and at least 0.9 device reads per successful call; this is a proxy, not
+proof of device service. Repetitions are not pooled, and separately sampled
+floors are not subtracted from API latency.
+
+## Compact fabric A/B analysis
+
+`fabric_ab.py` reports per-case warm transport and polling comparisons and cold
+owner-RPC versus NVMe-oF reads from one compact campaign export. Run from the
+repository root:
+
+```sh
+python -B experiments/kv-comparison/fabric_ab.py --export EXPORT --report REPORT --output OUTPUT
+```
+
+`EXPORT` supplies `matrix.json` and case artifacts; `REPORT` supplies the
+`comparison.json` analysis. The output contains `fabric_ab.md`, `ab_warm.csv`,
+`ab_pairs.csv`, `cold_fabric.csv`, `cold_pairs.csv` and `parity_matrix.csv`.
+Case tables include the arm, security and polling policy, size, readers,
+repetition, latency, throughput, client and owner CPU cores, CQ idle-wait
+delta, device-read qualification and status. Pair tables include the matched
+case identities, mean ratio and both CPU values and differences. The campaign
+validator gates ratios on matching workload cells. Cold cases require qualified
+device evidence and at least 0.9 device reads per successful call; NVMe-oF
+also requires qualified route and sealed-read accounting. Missing evidence is
+not zero and repetitions are not pooled.
+
+Busy denotes user-space spinning, not kernel busy poll; the coordinator read
+driver also spins. CPU cores are process-cgroup CPU seconds divided by elapsed
+seconds: the hosts are sampled separately and the intervals include gate
+overlap. Owner cores may exclude kernel nvmet workers outside the cgroup.
 
 ## Measurement read evidence
 
@@ -180,6 +242,83 @@ python3 experiments/kv-comparison/local.py export --state /tmp/kv-tikv --output 
 python3 experiments/kv-comparison/local.py stop --state /tmp/kv-tikv
 ```
 
+TiKV local readiness and the cloud coordinator's post-initialization admission
+require healthy requested regions plus no PD running **or waiting** operators,
+and the same region IDs, ranges, epochs, peers and leaders over at least five
+seconds of repeated observations. `deployment.json` retains the first and last
+region/operator observations; `probe-attempt.json` retains the latest attempt.
+Errors and transitions restart the window; the existing readiness deadline still
+applies. This is sampled control-plane evidence, not an atomic snapshot or a
+promise that scheduling cannot occur later. Schedulers remain enabled, and no
+client retries, persistence settings, workload counts or timed samples change.
+The previous cloud admission could accept five-store coverage while scatter
+operators were still active. The retained historical receipts did not capture
+those operators, so they cannot establish whether this caused the 400 ms pause.
+
+PD 8.5.4's [operator API](https://github.com/tikv/pd/blob/v8.5.4/server/api/operator.go)
+lists running operators by default and supports the separate waiting kind through
+its [handler](https://github.com/tikv/pd/blob/v8.5.4/pkg/schedule/handler/handler.go);
+the [region API](https://github.com/tikv/pd/blob/v8.5.4/pkg/response/region.go)
+exposes the routing metadata compared here. `tikv-client` 0.4.0 uses a
+[2 ms exponential region backoff capped at 500 ms](https://docs.rs/crate/tikv-client/0.4.0/source/src/backoff.rs)
+and [invalidates/retries region routes on relevant errors](https://docs.rs/crate/tikv-client/0.4.0/source/src/request/plan.rs).
+That path is a possible mechanism, not evidence that the historical calls retried.
+
+To qualify the real local RF1 API path after building the TiKV-enabled binary:
+
+```sh
+python3 experiments/kv-comparison/campaign.py --manifest experiments/kv-comparison/ci.json \
+  --backends tikv --binary target/debug/kv-research --qualification --output /tmp/kv-tikv-qualification-new
+```
+
+The local qualification shares one host and SSD and does not establish cloud
+performance or eliminate the historical event. The standalone lifecycle above
+uses the distributed local layout (RF3); use `--layout qualification` for RF1.
+
+The expanded local dry-run uses the real controller and fixture-scoped
+resources on one shared kernel. Launch it from the checkout root with absolute
+paths for the final release binary, its matching runtime and admitted libraries,
+and the matching expanded matrix specification and order:
+
+```sh
+repo="$(pwd)"
+docker run --rm --privileged --network=host --pid=host --cgroupns=host \
+  --entrypoint nsenter \
+  sha256:bc4b6f355966c200c7088d8a494b04cf162cd346542b89db6262d0794ca507ed \
+  --target 1 --mount --root --wd -- \
+  python3 -B "$repo/experiments/kv-comparison/local_dry_run.py" \
+  --binary "$BINARY" --runtime "$RUNTIME" --libs "$LIBS" \
+  --source-revision "$SOURCE_REVISION" --spec "$SPEC" --order "$ORDER"
+```
+
+This enters the host mount namespace without bind-mounting the host root and
+uses the host cgroup namespace for exact Docker process admission. It requires
+the fixture's Soft-RoCE setup, the pinned images and the packaged SPDK and
+Valkey runtimes. It never drops global caches or traces physical devices;
+physical tracing is not started and its receipt explicitly reports unavailable.
+The five cohosted live kernel owners are skipped; a separate single-owner kernel
+qualification exercises native and synchronous tiers. Soft-RoCE is not hardware
+RDMA qualification, and the local run is not a cloud performance comparison.
+Any unconfirmed teardown retains the fixture for proof-driven recovery.
+Local Valkey port preflight permits reusable TCP TIME_WAIT sockets from a
+previous owned cluster, but still rejects active listeners and verifies each
+endpoint's process identity before issuing commands.
+Local Tidehunter units set `FI_UNIVERSE_SIZE=6` for the six logical hosts.
+Libfabric RxM otherwise sizes its internal completion queue for 1024 peers,
+which exceeds Soft-RoCE's 32767-entry CQ limit. This local setting does not
+change cloud provider configuration. The local library directory must contain
+a verbs-enabled libfabric and an rdma-core ABI that matches the host's RXE
+provider; a TCP-only build library is not sufficient.
+Five local live SPDK daemons use disjoint two-CPU pairs, so this route requires
+at least ten CPUs in the runner's affinity. A daemon startup failure quarantines
+the run immediately; it cannot continue to later cases with retained daemons.
+Sealed local SPDK targets also use disjoint CPU pairs. A failed owner teardown
+quarantines the run before another case can replace its ownership state.
+RXE can fail large registrations because its metadata needs contiguous kernel
+memory. Such failures are local emulation limits, not cloud qualification failures;
+the runner does not reduce SPDK memory or buffer pools to bypass them.
+
+
 Replace `tikv` with `cassandra` or `foundationdb` for individual server reruns.
 Use fresh state paths for fresh deployments; an existing stopped state is not
 silently repurposed. `stop` removes only that receipt's Compose project containers
@@ -235,9 +374,11 @@ as the servers, not packages downloaded at runtime.
 
 The fleet JSON uses `schema_version: 1`, a safe `run_id`, `region`,
 `data_root: "/mnt/tidehunter-kv-comparison/<run_id>"`, `replication_factor: 1`,
-`coordinator: {"instance_id": "...", "address": "10.x.x.x"}`, and exactly five
-ordered `nodes: [{"index": 0, "instance_id": "...", "address": "10.x.x.x"}, ...]`.
-All six addresses and machine IDs must be distinct; physical addresses must be
+`coordinator: {"instance_id": "...", "address": "10.x.x.x"}`, and five
+ordered `nodes: [{"index": 0, "instance_id": "...", "address": "10.x.x.x"}, ...]`,
+or one node for the compact focused layout. Five-node comparator builders
+still require five nodes.
+All host addresses and machine IDs must be distinct; physical addresses must be
 RFC1918 IPv4. Declare `server_cpus`, `server_memory_mib`, `client_cpus` and
 `client_memory_mib` (minimum 2 CPU/2048 MiB storage, 2 CPU/4096 MiB coordinator).
 No credentials belong in this file. Each storage server receives the identical
@@ -1056,12 +1197,17 @@ covered without the native dependency.
 
 Development campaigns use **one independent repetition**, not fewer measurements
 within each case. The eleven selected AWS backend/transport variants receive
-293 ordinary cases. The default adds five write diagnostics and twelve read
-diagnostics, for 310 cases. Both diagnostic limits zero retain 293 cases;
-write-only diagnostics retain 298. Three repetitions give 930, 879 and 894 cases,
-respectively; `max_cases=1200` admits an explicit publication/reproducibility
+298 ordinary cases, including five separately labeled native async write references.
+The default adds five write diagnostics and twelve read diagnostics, for 315
+cases. Both diagnostic limits zero retain 298 cases; write-only diagnostics
+retain 303. Three repetitions give 945, 894 and 909 cases, respectively;
+`max_cases=1200` admits an explicit publication/reproducibility
 setting. Multiple repetitions do not by themselves justify confidence or
 significance claims.
+The reviewed AWS raw export limit and corresponding result-storage cost
+reservation are 33 GiB; the GCP collector allows 34 GiB per compressed result
+object and retains its separate 256 GiB aggregate limit. These are admission
+bounds, not estimates of actual exported bytes.
 
 The one-repetition default preserves the selected systems, five sizes,
 workloads, concurrency and offered-load levels, cache/registered-RAM/cold-storage
@@ -1078,8 +1224,40 @@ warnings remain.
 
 `cloud-campaign.json` sets `diagnostics.read_profile_limit=256` and retains
 `write_profile_limit=256`. The read sampler is global to the database's selected
-remote flights; the write cap is per append-owning connection. Neither cap
-changes measurement operations or sampling inside the ordinary cases.
+remote flights; for RPC append profiles the write cap is per append-owning
+connection. For live NVMe, a nonzero write limit instead enables a full
+measurement-phase client I/O counter window; it does not cap the I/O population.
+Neither setting changes measurement operations in ordinary cases. NVMe I/O
+frames are not necessarily logical writes. Clock sums have separate sample
+counts, overlap, and do not isolate wire, device or CPU time; see
+`experiments/nvmeof/LIVE_WAL.md` for the underlying path.
+
+Write diagnostics include a non-destructive coordinator counter snapshot after
+measurement and before the completion gate, when supported. The profile remains
+armed until the existing post-gate finalization; its separate coordinator
+interval may include gate-time background work. Missing snapshots are explicitly
+unavailable. Snapshot `available` records collection success, not measurement
+qualification: an explicitly undrained phase remains unqualified even if partial
+counters were collected. A later connection-profile finalization error does not
+invalidate an independently collected, drained coordinator snapshot.
+Completion-charged checkpoint counters can straddle the measurement boundary.
+The aggregate write-completion wait has no per-call denominator or
+request join; mixed connection, storage and checkpoint populations overlap and
+cannot explain an individual API p99 by addition or subtraction. The report
+shows observed transport security and acknowledgement for diagnostic cases;
+compare TCP and verbs only with matching security, acknowledgement and workload.
+When present, sampled checkpoint-control wait runs from submission to response
+retirement and includes server/flusher wait; its denominator is completed sampled
+controls including errors, not completed application writes. Admission stalls
+count failed control output-admission polls, and append completions count replies
+delivered while sampled control is pending. The per-connection control sample
+cap and explicit availability must be observed; absent counters are not zeros.
+The sampled run is perturbative: reaching the per-connection append sample cap
+can block further append submission while in-flight appends drain and any pending
+checkpoint control finishes, before the synchronous profile-stop RPC. This
+preserves the bounded sample and control ordering but can add write/checkpoint
+interference to the diagnostic run. Profiling disabled (limit zero) does not
+introduce that gate; profiled API latencies are not primary comparison latencies.
 
 Read diagnostic twins cover the four distributed transports' 1 KiB scalar and
 8 KiB x 32 batch reads, their 8 KiB coordinator/owner cache controls, and the
@@ -1256,6 +1434,20 @@ outside the benchmark data mount; failure cleanup stops exact-owned collectors
 before another case can start. Native device-traced references are explicitly
 labelled: read-profile-off does not mean observer-free.
 
+On failed NVMe cases, before reader teardown the controller retains
+`nvme-initiator-failure.json` and its receipt hash alongside the existing client
+unit journal and exact-owner failure proofs. After verifying the coordinator's
+fleet identity, it captures a bounded case-window kernel journal filtered for
+NVMe/RDMA drivers; this is host-wide context, not proof that a message belongs
+to the case. For sealed sessions, at most five controllers are selected only
+from connected host receipts and rechecked against their sysfs inode, NQN,
+transport and address before read-only Identify and error-log requests. Outputs
+are bounded to 32 KiB each and 16 error-log entries; omitted controllers,
+unsupported tools, identity mismatches and live sessions without sealed host
+receipts are explicitly reported as unavailable or omitted, never zero.
+Capture failures do not replace the original case failure. Ordinary successful
+case sampling is unchanged.
+
 `comparison.json`, Markdown/CSV, diagnostic figures and Prometheus/Grafana
 retain tier settings, availability and qualification. Raw API/scheduling/response
 samples retain their existing percentile definitions and tail warnings.
@@ -1331,7 +1523,7 @@ The manual cloud path is separate from the existing local/CI campaign:
 
 | File | Responsibility |
 |---|---|
-| `cloud-campaign.json` | One development repetition, five value sizes, eleven backends: 293 ordinary, five write diagnostics and twelve read diagnostics, totaling 310 cases. Three repetitions give 930 cases; the 1200-case admission cap allows them without changing the 10,800-second absolute bound or 600-second export reserve. |
+| `cloud-campaign.json` | One development repetition, five value sizes, eleven backends: 298 ordinary, five write diagnostics and twelve read diagnostics, totaling 315 cases. Three repetitions give 945 cases; the 1200-case admission cap allows them without changing the 10,800-second absolute bound or 600-second export reserve. |
 | `cloud_campaign.py` | Identical common profile order per repetition, typed configurations and JSON/CSV/Markdown raw-sample reports. |
 | `cloud_package.py` | Dirty-source snapshot, frozen generic-x86 release build, exact hashes and immutable runtime archive. |
 | `cloud_bootstrap.py` | Creation-only termination timer before installation, pinned EFA/runtime admission, ready markers and automatic controller startup. |
@@ -1436,6 +1628,31 @@ host-local monotonic elapsed time and nondecreasing counters are required.
 The legacy through-process-exit snapshot remains a separate, broader window.
 These windows include driver/oracle/background and gate/control overlap; neither
 is pure engine CPU or an API latency decomposition.
+
+Each host's gated frame also records `rdma_diagnostics`, a read-only sysfs
+snapshot of device/port `counters` and `hw_counters`, with per-field
+availability, device GUID where available, and UTC/monotonic collection times.
+At most 128 attributes per host are read, each at most 128 bytes; discovery
+limits and truncation are reported. Missing hardware and unreadable or
+non-numeric attributes are unavailable, not zero. These are device-wide,
+potentially shared counters, not per-QP or per-request evidence; their names
+are retained without assuming vendor-specific meanings. Compare only matching
+devices and counters from the same boot, allowing for resets and gate overlap.
+
+For TiKV cases only, those host frames include `tikv_diagnostics`: bounded
+before/end snapshots of selected raw TiKV Raft, engine, storage, gRPC, thread
+and RocksDB metrics, plus PD's replication configuration and actual region/peer
+listing on the coordinator. The end frame also requests at most 1,000 Docker
+log lines between each host's pre-measurement UTC receipt and its end capture;
+a full tail is marked possibly truncated. Each host records UTC and monotonic
+start/end times, and the surrounding frame retains boot identity. Snapshots
+occur while the measurement gates hold the workload, not during timed calls;
+the non-atomic, broader intervals can contain background activity and cannot
+attribute a counter or peer to a particular operation. HTTP and logs have finite
+timeouts and byte bounds; unavailable observations remain unavailable, never
+zero. The client library does not expose per-request retry counts, so that
+field is explicitly unavailable. These diagnostics do not retroactively alter
+previous campaign artifacts.
 Optional OS-cache eviction occurs while the pre-measurement gate holds work.
 Engine caches remain: cold-OS is **not** isolated NVMe latency.
 Passive owner/RMA samples still retain generation, age, availability and their
@@ -1451,9 +1668,29 @@ native/Tidehunter cells open fresh engine state. Preload restores logical
 values, not identical physical history, compaction or engine-cache state.
 These are finite API comparisons, not steady-state or equal-HA claims.
 
-Native `value_wal_barrier` is primary; `page_cache` controls stay separate. RF1
-does not equalize transaction semantics, FDB's log/storage architecture or
-encrypted/plaintext transport. Report these contracts with the figures.
+Cloud native primary uses `native_default` geometry and a `value_wal_barrier`
+per mutation. `native_async_write` uses the same pure-write workload and geometry
+but returns at the native foreground `page_cache` boundary without that barrier;
+it is a separate reference, not a durable-primary result. Existing
+`native_pagecache` mixed/read controls remain separate. Local performance
+campaigns explicitly use `native_default` and retain their existing `page_cache`
+acknowledgement; local qualification uses `small` geometry. Native-default
+uses production `Config::default()` maintenance and WAL geometry: 128 MiB
+fragments, 10 GiB files and 16 maps (a 2 GiB configured mapping window, not
+necessarily resident memory). Other named geometries are explicit interventions.
+`small` selects only the historical WAL geometry, not the
+full historical `Config::small()` maintenance preset; reproducing that old
+configuration requires the frozen historical binary. Intermediate `owner_matched`
+cases are distinct too. Use fresh paths and do not pool different preset,
+geometry or acknowledgement populations. RF1 does not
+equalize transaction semantics, FDB's log/storage architecture or encrypted/plaintext
+transport. Report these contracts with the figures.
+Report admission checks explicit planned native durability and geometry against
+the normalized executed configuration; older plans without a geometry field
+are not assigned one retroactively.
+Plot aggregation also rejects differing observed native base presets across
+repetitions of a cell, including known versus missing metadata. Historical
+repetitions with all preset metadata missing remain unknown, not verified equal.
 CPU/memory caps include control roles; quotas are not dedicated cores. Local
 qualification shares one SSD and cannot predict cloud network/disk scaling.
 
@@ -1808,3 +2045,200 @@ Primary sources: [Garnet configuration](https://microsoft.github.io/garnet/docs/
 [Kvrocks pinned configuration](https://github.com/apache/kvrocks/blob/v2.17.0/kvrocks.conf)
 and [Kvrocks cluster](https://kvrocks.apache.org/docs/cluster).
 
+## Valkey RDMA measurements and the RAM/disk comparison
+
+The [official Valkey RDMA guide](https://valkey.io/topics/RDMA/) reports roughly
+twice the QPS in its example, but does not give a fully matched durable-storage
+experiment. A [published Valkey 8.0.1 test](https://zenn.dev/colincollapsed/articles/f45eb5304bcc98)
+uses 512-byte values, 30 clients, eight threads, ten million operations and
+ConnectX hardware:
+
+| Observation | TCP | RDMA |
+|---|---:|---:|
+| GET p50 | 151 µs | 71 µs |
+| GET p99 | 287 µs | 103 µs |
+| GET throughput | 183,163.59 calls/s | 424,826.91 calls/s |
+| SET p50 | 159 µs | 71 µs |
+| SET p99 | 295 µs | 127 µs |
+| SET throughput | 175,116.02 calls/s | 395,335.03 calls/s |
+
+These are not our results or a transport-only baseline. The published commands
+disable AOF and use different random key ranges: one million for RDMA versus one
+billion for TCP. Their hit rates and working sets need not match. Its RDMA GET
+maximum is also worse than TCP's; lower central latency does not establish lower
+latency at every percentile. Do not compare its SET result with our durable
+acknowledgments as if persistence were equal.
+
+Valkey's server database is RAM-resident, not an optional cache above its AOF.
+[Persistence](https://valkey.io/topics/persistence/) rebuilds that database after
+restart; GET does not fetch a missing value from the AOF.
+[Client-side caching](https://valkey.io/topics/client-side-caching/) is a separate
+feature. Turning off client tracking, setting an eviction policy, or dropping
+Linux page cache cannot turn Valkey GET into a disk-backed lookup. Eviction can
+remove keys; `noeviction` can reject writes at a memory limit. Neither is a valid
+“Valkey cache disabled” storage cohort.
+
+Keep Valkey labeled as a RAM database with the recorded AOF acknowledgment policy.
+Compare its reads with a correctly labeled RAM-resident Tidehunter cohort. Use
+the disk-backed engines for cold-storage comparisons, and require actual target
+block/cache evidence before calling a Tidehunter observation a cold SSD read.
+
+### Correlated diagnostics in the next manual campaign
+
+`diagnostics.valkey_profile_limit` caps retained **owner-pipeline records**, not
+API calls; one cross-owner MGET can produce several records. The manual GCP
+specification enables a limit of 256 and appends twelve separate diagnostic
+cases: TCP and RDMA, 1/8 KiB, concurrent scalar reads/writes and MGET32. The
+previous 461 cases, their IDs/namespaces and operation counts remain unchanged;
+the new total is 473. These twins use the same pinned libvalkey client on both
+transports. Primary Valkey TCP cases retain their existing redis-rs client.
+
+Both GCP client-preparation paths now request `--cq-diagnostics`. The pinned
+server and CLI are built before the exact client-only CQ patch; only the
+standalone client archive is rebuilt afterward. Source/archives are hashed and
+the package admits only that exact pinned patch. A changed upstream source or
+an unrelated dirty native checkout is rejected. An offline source clone can use
+`prepare_valkey_rdma.py --source PINNED_CHECKOUT --output FRESH_PATH --cq-diagnostics`.
+
+`valkey-timings.json` joins each retained pipeline to its raw measurement caller
+ID and records mutex acquisition, blocking-task dispatch, command encoding,
+transport plus parsing, reply decoding and return-to-executor delay. RDMA adds
+CQ polling and poll-return-to-CQ observations; TCP reports CQ evidence unavailable.
+Poll wait includes waiting for a response and scheduling. It is not pure wire
+time, and poll-return-to-CQ is not interrupt-to-scheduler latency.
+
+Caller IDs are measurement identities, not dense sampler ordinals. Mixed
+read/write diagnostics retain the original IDs and validate every sampled
+mutation against its own raw row; unrelated and unprofiled raw calls do not
+invalidate a bounded write sample. Foreign IDs, duplicate IDs, non-mutation
+joins and invalid integer ranges still fail admission.
+
+Local software-RoCE validation exercised the actual patched client against
+Valkey 9.0.7 with `appendonly yes`, `appendfsync always` and `noeviction`: 128
+scalar RDMA records, 64 MGET RDMA records and 128 matched TCP records passed
+strict provenance/raw-caller admission. Both RDMA cohorts reported real CQ
+completions with no missing records or clock failures; TCP correctly had no CQ
+measurements. This validates functionality, not Falcon/ConnectX latency or a
+cloud performance comparison.
+
+### Separate upstream-style Valkey reproduction
+
+`valkey-public-reproduction.json` and `valkey_reproduction.py` prepare a separate
+native `valkey-benchmark` experiment. They do not change the durable comparison,
+its case counts, its clients, or its persistence settings.
+
+Both profiles retain 512-byte values, 30 clients, eight threads, pipeline one,
+keepalive and ten million requests per selected test (`ping,set,get`):
+
+- `published-as-written` retains the article's different TCP/RDMA random key
+  ranges and its default RDB schedule. AOF is disabled, but snapshots are not.
+  This reproduces the stated configuration, not a fair transport isolation.
+- `matched-ram` sequentially prefills one million keys on a fresh server, uses
+  that same range and seed on both transports, and disables both AOF and RDB.
+  This is an explicitly non-durable RAM transport control, not a replacement
+  for the durable SET comparison.
+
+The pinned version is Valkey 9.0.7, commit
+`fe8d406c0b5a64ec897f6455e4de684629883764`, with its own native RDMA benchmark.
+The article used Valkey 8.0.1 and an unpinned separate Redis benchmark fork.
+Version, CPU, NIC, placement and affinity differences prevent an exact numerical
+reproduction claim. LPUSH/LRANGE are outside this KV subset. Native benchmark
+histograms are not our per-operation API/scheduling/response observations.
+
+Generate the full TCP/RDMA command plan without starting anything:
+
+```sh
+python3 experiments/kv-comparison/valkey_reproduction.py plan \
+  --source /path/to/pinned/valkey --profile matched-ram \
+  --host 10.20.0.8 --tcp-port 6379 --rdma-port 6380 \
+  --output /path/to/fresh/reproduction
+```
+
+Each transport requires its own fresh server/database. Both planned servers
+enable the same TCP/RDMA listeners; only the client's selected transport differs.
+Each prefill and measurement command has a 900-second deadline. The cloud
+server receives a bounded systemd lifetime of up to 1,860 seconds, also capped
+by the remaining campaign time, and stops immediately after its case.
+These process bounds do not replace VM deletion and campaign cleanup.
+
+Selecting `valkey_reproduction_profiles` wires four isolated native controls
+through `valkey_cloud.py`: each selected profile runs over TCP and Falcon RDMA
+on a fresh standalone dual-listener server. TCP management uses the default NIC;
+RDMA measurements use the Falcon NIC. Native `valkey-benchmark`, server and CLI
+hashes are bound into the packaged runtime. Effective settings, process identity,
+GET hit/miss/error/eviction counters, full native histograms and owned-server
+shutdown receipts are retained under `valkey-native/`.
+
+The manual campaign requires all requested native controls as well as every API
+case to finish; its terminal result forwards both sets of receipts. These native
+histograms remain separate from the research suite's per-operation API,
+scheduling and response samples. Native stdout does not provide an exact
+per-operation CSV, population standard deviation or exact p99.9; none are
+invented. The standalone libvalkey hooks time the Rust adapter, not these native
+client histograms: the build prepares native programs before installing those
+adapter hooks.
+
+The selected plan includes the API matrix plus four separate native Valkey
+controls. Obtain the current case count from the generated plan rather than
+using a historical count. SPDK sealed reads use `tidehunter_spdk_rdma`;
+live read, write and mixed twins use `tidehunter_spdk_live_rdma`. They cannot
+overwrite or pool the Linux NVMe/RDMA series despite the shared runtime
+initiator. The live target uses direct-file I/O, not a target page-cache-hit
+claim; the sealed protection remains independently read-only.
+
+Run the bounded local TCP-only functional qualification:
+
+```sh
+python3 experiments/kv-comparison/valkey_reproduction.py qualify-local \
+  --source /path/to/pinned/valkey --tcp-port 17379 \
+  --output /path/to/fresh/qualification
+```
+
+The executed 2,000-request qualification recorded zero GET hits and 2,000 misses
+for `published-as-written`, versus 2,000 hits and zero misses for `matched-ram`.
+Both had zero error replies/evictions and both owned servers stopped. This
+demonstrates the hit-population confound at qualification scale; it is not the
+ten-million-request experiment or physical RDMA performance evidence.
+The full plans retain the original ten-million-request counts.
+Local binary hashes, effective configuration, native output and termination
+receipts are under
+`checkpoint-work/valkey-public-reproduction-20261105/qualification-final/`
+in the parent workspace.
+
+## Tidehunter durability tier
+
+Every Tidehunter case (`cloud_campaign.TRANSPORTS`) carries `durability_tier`: `synchronous`
+(default; ack after the covering WAL barrier; matches native `value_wal_barrier` and Valkey
+`appendfsync always`) or `native` (ack after the WAL page-cache write; matches only native
+`page_cache`). Tiers are never mixed in one comparison; the plots treat the tier as part of a
+backend's implementation contract, so a tier change between repeats is rejected.
+
+The controller writes the tier into the prepare input and a fresh `launch_nonce` into each owner
+launch file (omitted tier means native). The owner process applies the tier and publishes a
+receipt to `<ready_file>.durability.json` (temporary file, fsync, rename, directory fsync) before
+the ready file. The receipt names the owner (partition, database, address), its process (pid,
+boot id, start time), the nonce and an explicit tier. `tide_start` returns it; the controller
+requires partition, nonce and tier to match, copies the five receipts to
+`<case>/owner-durability/node-<i>.durability.json` with the same publish rule, and passes them to
+the runner as `external_owner_durability_receipts`. After `nvme_owner_restart` each owner returns
+its new process's receipt, which must be a later start of the same owner and launch; the copies
+are replaced. A missing, foreign or stale receipt fails the case. A shared sealed-dataset owner
+set is replaced when the next case plans another tier.
+
+Admission treats a missing executed `durability_tier` as native and never infers it from the plan;
+a job that carries a planned tier also needs the manifest's `durability.confirmed_by_backend_receipt`
+to equal it. A job record with no tier predates tiers and is native. The plot dataset refuses a
+backend that changes tier and exports `durability_tier` in `plot-data.csv` and `plots.json`.
+
+
+## Compact leased A/B report
+
+For a completed `leased_ab_compact` export and its generated comparison report:
+
+```sh
+python3 experiments/kv-comparison/leased_ab.py --export /path/to/export --report /path/to/report --output /path/to/leased-report
+```
+
+The report keeps repetitions separate and labels cache and acknowledgement contracts.
+Synchronous leased acknowledgement does not wait for owner root adoption.
+The generic comparison plot does not support this selection; use this report instead.

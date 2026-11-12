@@ -1,0 +1,16 @@
+# Final review corrections; compiler diagnostics are in main.log.
+$ latexmk -pdf -interaction=nonstopmode -halt-on-error main.tex
+Rc files read:
+  /etc/LatexMk
+Latexmk: This is Latexmk, John Collins, 31 Jan. 2024. Version 4.83.
+Latexmk: Nothing to do for 'main.tex'.
+Latexmk: All targets (main.pdf) are up-to-date
+
+
+
+$ /home/hybr1d/Desktop/PDM/TideHunter/.venv/bin/python -B verify_brief.py
+PASS: 47 pages; 82 existing PDF number checks; 1235 curve values; 79 curve number keys; 33 raw owner-stage checks; 14 vector figures.
+
+
+$ /home/hybr1d/Desktop/PDM/TideHunter/.venv/bin/python -B rwc/verify_rwc.py --pdf
+{"controller_completed": 339, "failed_cases": 3, "figure_points": 512, "figures": 6, "numbers": 577, "pages": 47, "pass_check": true, "pdf_sha256": "73c2eb5f90c1edaf84e42ca9c2fddea3695a80312dbd068f29296c1529e8426f", "synthetic": false, "tables": 6, "visual_inspection": "separate image inspection; not asserted by this checker"}

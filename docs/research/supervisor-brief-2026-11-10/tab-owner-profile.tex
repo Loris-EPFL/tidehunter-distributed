@@ -1,0 +1,20 @@
+\small\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrr}\toprule
+Separate 1 KiB write-profile copy & Denominator & Mean \us\\\midrule
+connection\_handler\_ns & \N{P:connection_handler_ns:n|.0f} & \N{P:connection_handler_ns:mean_us|.2f}\\
+connection\_control\_queue\_ns & \N{P:connection_control_queue_ns:n|.0f} & \N{P:connection_control_queue_ns:mean_us|.2f}\\
+connection\_request\_decode\_ns & \N{P:connection_request_decode_ns:n|.0f} & \N{P:connection_request_decode_ns:mean_us|.2f}\\
+connection\_append\_decode\_ns & \N{P:connection_append_decode_ns:n|.0f} & \N{P:connection_append_decode_ns:mean_us|.2f}\\
+connection\_append\_group\_build\_ns & \N{P:connection_append_group_build_ns:n|.0f} & \N{P:connection_append_group_build_ns:mean_us|.2f}\\
+connection\_append\_wal\_ns & \N{P:connection_append_wal_ns:n|.0f} & \N{P:connection_append_wal_ns:mean_us|.2f}\\
+connection\_append\_persist\_ns & \N{P:connection_append_persist_ns:n|.0f} & \N{P:connection_append_persist_ns:mean_us|.2f}\\
+connection\_response\_encode\_ns & \N{P:connection_response_encode_ns:n|.0f} & \N{P:connection_response_encode_ns:mean_us|.2f}\\
+storage\_persist\_total\_ns & \N{P:storage_persist_total_ns:n|.0f} & \N{P:storage_persist_total_ns:mean_us|.2f}\\
+storage\_persist\_wal\_file\_ns & \N{P:storage_persist_wal_file_ns:n|.0f} & \N{P:storage_persist_wal_file_ns:mean_us|.2f}\\
+storage\_persist\_publication\_ns & \N{P:storage_persist_publication_ns:n|.0f} & \N{P:storage_persist_publication_ns:mean_us|.2f}\\
+storage\_persist\_serialization\_lock\_wait\_ns & \N{P:storage_persist_serialization_lock_wait_ns:n|.0f} & \N{P:storage_persist_serialization_lock_wait_ns:mean_us|.2f}\\
+storage\_persist\_state\_lock\_wait\_ns & \N{P:storage_persist_state_lock_wait_ns:n|.0f} & \N{P:storage_persist_state_lock_wait_ns:mean_us|.2f}\\
+storage\_persist\_validation\_ns & \N{P:storage_persist_validation_ns:n|.0f} & \N{P:storage_persist_validation_ns:mean_us|.2f}\\
+codec\_sum\_ns & \N{P:codec_sum_ns:n|.0f} & \N{P:codec_sum_ns:mean_us|.2f}\\
+locks\_publication\_sum\_ns & \N{P:locks_publication_sum_ns:n|.0f} & \N{P:locks_publication_sum_ns:mean_us|.2f}\\
+\bottomrule\end{tabular}

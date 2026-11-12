@@ -476,6 +476,64 @@ def validate_checkpoint_diagnostics(counters, write_limit):
                 raise ValueError('checkpoint history IO counter unavailable or malformed: ' + counter)
 
 
+def replay_environment(source, contract, read_profile_limit, native_write_profile_limit):
+    env = {k: v for k, v in source.items() if not k.startswith(
+        ('TH_', 'SUI_SHARDED_WAL_', 'SUI_DISTRIBUTED_', 'DISTRIBUTED_TIDEHUNTER_', 'TIDEHUNTER_'))}
+    env.update(RUST_LOG='info', TOKIO_WORKER_THREADS='4', USE_TIDEHUNTER='1',
+               TH_SYNC_WRITES='true' if contract == 'harness' else 'false',
+               SUI_TH_READ_PROFILE_LIMIT=str(read_profile_limit),
+               SUI_TH_NATIVE_WRITE_PROFILE_LIMIT=str(native_write_profile_limit))
+    if contract == 'harness':
+        env.update(TH_FRAG_SIZE=str(8*deployment.MIB), TH_MAX_MAPS='3', TH_MAX_INDEX_MAPS='3',
+                   TH_DEFAULT_MUTEX_COUNT='1', TH_DEFAULT_MAX_DIRTY_KEYS='128',
+                   TH_DEFAULT_VALUE_CACHE_SIZE='1000')
+    return env
+
+
+def owner_durability(nodes):
+    tiers = {yaml.safe_load(Path(node['launch']).read_text()).get('durability', {}).get('tier', 'native')
+             for node in nodes}
+    if len(tiers) != 1:
+        raise ValueError('owner durability tiers differ')
+    tier = next(iter(tiers))
+    if tier not in ('native', 'synchronous'):
+        raise ValueError('invalid owner durability tier')
+    return tier
+
+
+def validate_external_hosts(manifest, config, coordinator_cache):
+    if manifest.get('schema') not in (2, 3):
+        raise ValueError('external deployment manifest schema differs from structured transports')
+    client = deployment.validate_transport(manifest['transport'])
+    owners = deployment.select_owner_transports(client, manifest.get('owner_transports'), 5)
+    records = manifest.get('hosts')
+    if (not isinstance(records, list) or not records
+            or any(not isinstance(row, dict) or not isinstance(row.get('host'), str) for row in records)
+            or len({row['host'] for row in records}) != len(records)):
+        raise ValueError('external host/data-NIC transport inventory differs')
+    partitions = []
+    for row in records:
+        parts = [row.get('partition')] if manifest['schema'] == 2 else row.get('partitions')
+        if (not isinstance(parts, list) or not parts
+                or any(type(p) is not int or p not in range(5) for p in parts)
+                or any(deployment.validate_transport(row.get('transport')) != owners[p] for p in parts)):
+            raise ValueError('external host/data-NIC transport inventory differs')
+        partitions.extend(parts)
+    if sorted(partitions) != list(range(5)) or (manifest['schema'] == 2 and len(records) != 5):
+        raise ValueError('external host/data-NIC transport inventory differs')
+    hosts = {row['host'] for row in records}
+    for database in config['databases'].values():
+        if deployment.validate_transport(database['tls']['transport']) != client:
+            raise ValueError('external client transport differs from prepared manifest')
+        if deployment.is_software(client):
+            raise ValueError('external software fabric is loopback-only in the native engine')
+        endpoints = database['endpoints']
+        if len(endpoints) != 5 or {row['address'].rsplit(':', 1)[0] for row in endpoints} != hosts:
+            raise ValueError('external control endpoints differ from five prepared storage hosts')
+        if database['read_cache_bytes'] != coordinator_cache:
+            raise ValueError('external coordinator cache differs')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', type=Path, required=True)
@@ -483,6 +541,7 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--deadline', type=int, default=900)
     parser.add_argument('--port', type=int, default=24000)
+    parser.add_argument('--contract', choices=('harness', 'original_default'), default='harness')
     parser.add_argument('--coordinator-cache-mib', type=int, default=8)
     parser.add_argument('--transport-config', type=Path,
                         help='canonical client Transport JSON for local/manual replay; defaults to TCP')
@@ -578,16 +637,11 @@ def main():
         configs[mode]=config
         (root/f'{mode}.yaml').write_text(yaml.dump(config,Dumper=checkpoint.ExperimentDumper))
     native_root,remote_root=(Path(configs[m]['db-path']) for m in ('native','remote'))
-    env={k:v for k,v in os.environ.items() if not k.startswith(('TH_', 'SUI_SHARDED_WAL_', 'SUI_DISTRIBUTED_', 'DISTRIBUTED_TIDEHUNTER_', 'TIDEHUNTER_'))}
-    env.update(RUST_LOG='info', TOKIO_WORKER_THREADS='4', USE_TIDEHUNTER='1',
-               TH_SYNC_WRITES='true', TH_FRAG_SIZE=str(8*deployment.MIB), TH_MAX_MAPS='3', TH_MAX_INDEX_MAPS='3',
-               TH_DEFAULT_MUTEX_COUNT='1', TH_DEFAULT_MAX_DIRTY_KEYS='128', TH_DEFAULT_VALUE_CACHE_SIZE='1000',
-               SUI_TH_READ_PROFILE_LIMIT=str(args.read_profile_limit),
-               SUI_TH_NATIVE_WRITE_PROFILE_LIMIT=str(args.native_write_profile_limit))
+    env = replay_environment(os.environ, args.contract, args.read_profile_limit, args.native_write_profile_limit)
     env = deployment.process_environment(env, transport={'kind': 'tcp'} if args.external_config else local_transport)
     owned=Owned(output,env)
     producer_env = checkpoint.source_environment(prior)
-    result=dict(schema=1,metrics_schema=3,protocol=manifest['protocol'],backend='tidehunter-sharded-wal',durability='synchronous durable whole-batch publication',
+    result=dict(schema=1,metrics_schema=3,protocol=manifest['protocol'],backend='tidehunter-sharded-wal',contract=args.contract,
         fixture=str(fixture),fixture_files=fixture_files,checkpoint_limit=tip,checkpoint_digest=expected_digest,
         build_manifest_sha256=build.digest(build_root/'build-manifest.json'),source_archive_sha256=manifest['source_archive_sha256'],
         binaries=manifest['binaries'],configurations=configs,
@@ -621,36 +675,12 @@ def main():
             if Path(config['root']) != remote_root or set(config['databases']) != set(schema):
                 raise ValueError('external namespace/root coverage differs')
             external_manifest=read_json(config_path.parent/'external-manifest.json')
-            if external_manifest.get('schema') != 2:
-                raise ValueError('external deployment manifest schema differs from structured transports')
-            client_transport = deployment.validate_transport(external_manifest['transport'])
-            expected_owners = deployment.select_owner_transports(
-                client_transport, external_manifest.get('owner_transports'), 5)
-            host_records = external_manifest.get('hosts')
-            if (not isinstance(host_records, list) or len(host_records) != 5
-                    or any(not isinstance(row, dict) for row in host_records)
-                    or any(type(row.get('partition')) is not int for row in host_records)
-                    or {row['partition'] for row in host_records} != set(range(5))
-                    or any(not isinstance(row.get('host'), str) for row in host_records)
-                    or len({row['host'] for row in host_records}) != 5
-                    or any(deployment.validate_transport(row.get('transport')) != expected_owners[row['partition']]
-                           for row in host_records)):
-                raise ValueError('external host/data-NIC transport inventory differs')
-            control_hosts = {row['host'] for row in host_records}
-            for database in config['databases'].values():
-                if deployment.validate_transport(database['tls']['transport']) != client_transport:
-                    raise ValueError('external client transport differs from prepared manifest')
-                if deployment.is_software(client_transport):
-                    raise ValueError('external software fabric is loopback-only in the native engine')
-                endpoint_hosts = {endpoint['address'].rsplit(':', 1)[0] for endpoint in database['endpoints']}
-                if len(database['endpoints']) != 5 or endpoint_hosts != control_hosts:
-                    raise ValueError('external control endpoints differ from five prepared storage hosts')
-                if database['read_cache_bytes'] != result['cache']['coordinator_bytes']:
-                    raise ValueError('external coordinator cache differs')
+            validate_external_hosts(external_manifest, config, result['cache']['coordinator_bytes'])
             if (external_manifest['config_sha256'] != build.digest(config_path)
                     or external_manifest['build_manifest_sha256'] != result['build_manifest_sha256']):
                 raise ValueError('external storage source/config binding differs')
             result['external_manifest']=external_manifest
+            nodes=read_json(config_path.parent/'nodes.json')
         else:
             config_path=output/'deployment/config.json'
             config,nodes=deployment.prepare(config_path.parent,schema,remote_root,
@@ -665,6 +695,8 @@ def main():
                     if child.poll() is not None or time.monotonic()>end:
                         raise RuntimeError('storage process failed readiness')
                     time.sleep(.05)
+        result['durability'] = dict(contract=args.contract, native_sync_writes=args.contract == 'harness',
+                                    owner_tier=owner_durability(nodes))
         if any(database.get('write_profile_limit', 0) != args.write_profile_limit
                for database in config['databases'].values()):
             raise ValueError('prepared write profiling differs from requested population')

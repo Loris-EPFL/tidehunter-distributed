@@ -121,6 +121,12 @@ class ImageAdmissionTests(unittest.TestCase):
             record['outputs']['nvme_modules'].update(nvme_tcp='modinfo', nvmet_tcp='modinfo')
         gcp_image.admit_nvme_transports(qualification, ['tidehunter_nvme_rdma'], live=True)
         gcp_image.admit_nvme_transports(qualification, ['tidehunter_nvme_rdma', 'tidehunter_nvme_tcp'])
+        for record in records:
+            for name in ('nvme_tcp', 'nvmet_tcp'):
+                value = record['outputs']['nvme_modules'].pop(name)
+                with self.assertRaisesRegex(ValueError, 'NVMe transport modules'):
+                    gcp_image.admit_nvme_transports(qualification, ['tidehunter_nvme_rdma', 'tidehunter_nvme_tcp'])
+                record['outputs']['nvme_modules'][name] = value
         del records[0]['outputs']['nvme_modules']['nvme_fabrics']
         with self.assertRaisesRegex(ValueError, 'NVMe transport modules'):
             gcp_image.admit_nvme_transports(qualification, ['tidehunter_nvme_rdma'])

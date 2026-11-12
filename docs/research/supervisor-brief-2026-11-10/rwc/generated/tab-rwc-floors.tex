@@ -1,0 +1,30 @@
+\begin{table}[H]\centering\small\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lrrrr}\toprule
+Standalone control & Transfer & r0 mean & r1 mean & r2 mean\\\midrule
+ib\_send\_lat polled & 8 B & \N{RWC:floors:8:mean_us:2|.1f} & \N{RWC:floors:118:mean_us:2|.1f} & \N{RWC:floors:186:mean_us:2|.1f}\\
+ib\_send\_lat polled & 1024 B & \N{RWC:floors:9:mean_us:2|.1f} & \N{RWC:floors:119:mean_us:2|.1f} & \N{RWC:floors:187:mean_us:2|.1f}\\
+ib\_send\_lat polled & 4096 B & \N{RWC:floors:10:mean_us:2|.1f} & \N{RWC:floors:120:mean_us:2|.1f} & \N{RWC:floors:188:mean_us:2|.1f}\\
+ib\_send\_lat polled & 65536 B & \N{RWC:floors:11:mean_us:2|.1f} & \N{RWC:floors:121:mean_us:2|.1f} & \N{RWC:floors:189:mean_us:2|.1f}\\
+tcp\_rtt block & 8 B & \N{RWC:floors:16:mean_us:1|.1f} & \N{RWC:floors:154:mean_us:1|.1f} & \N{RWC:floors:222:mean_us:1|.1f}\\
+tcp\_rtt block & 1024 B & \N{RWC:floors:17:mean_us:1|.1f} & \N{RWC:floors:155:mean_us:1|.1f} & \N{RWC:floors:223:mean_us:1|.1f}\\
+tcp\_rtt block & 4096 B & \N{RWC:floors:18:mean_us:1|.1f} & \N{RWC:floors:156:mean_us:1|.1f} & \N{RWC:floors:224:mean_us:1|.1f}\\
+tcp\_rtt block & 65536 B & \N{RWC:floors:19:mean_us:1|.1f} & \N{RWC:floors:157:mean_us:1|.1f} & \N{RWC:floors:225:mean_us:1|.1f}\\
+owner 0 direct fresh 2 GiB & 4096 B & \N{RWC:floors:114:mean_us:1|.1f} & \N{RWC:floors:180:mean_us:1|.1f} & \N{RWC:floors:248:mean_us:1|.1f}\\
+owner 0 direct fresh 2 GiB & 65536 B & \N{RWC:floors:20:mean_us:1|.1f} & \N{RWC:floors:184:mean_us:1|.1f} & \N{RWC:floors:252:mean_us:1|.1f}\\
+client append\_mmap\_fsync & 1024 B & \N{RWC:floors:84:mean_us:1|.1f} & \N{RWC:floors:87:mean_us:1|.1f} & --\\
+client append\_mmap\_fsync & 8192 B & \N{RWC:floors:100:mean_us:1|.1f} & \N{RWC:floors:103:mean_us:1|.1f} & --\\
+client append\_mmap\_fsync & 65536 B & \N{RWC:floors:6:mean_us:1|.1f} & \N{RWC:floors:111:mean_us:1|.1f} & --\\
+client append\_pwrite & 1024 B & \N{RWC:floors:77:mean_us:1|.1f} & \N{RWC:floors:80:mean_us:1|.1f} & --\\
+client append\_pwrite & 8192 B & \N{RWC:floors:92:mean_us:1|.1f} & \N{RWC:floors:95:mean_us:1|.1f} & --\\
+client append\_pwrite & 65536 B & \N{RWC:floors:3:mean_us:1|.1f} & \N{RWC:floors:107:mean_us:1|.1f} & --\\
+owner 0 append\_mmap\_fsync & 1024 B & \N{RWC:floors:85:mean_us:1|.1f} & \N{RWC:floors:86:mean_us:1|.1f} & --\\
+owner 0 append\_mmap\_fsync & 8192 B & \N{RWC:floors:101:mean_us:1|.1f} & \N{RWC:floors:102:mean_us:1|.1f} & --\\
+owner 0 append\_mmap\_fsync & 65536 B & \N{RWC:floors:7:mean_us:1|.1f} & \N{RWC:floors:110:mean_us:1|.1f} & --\\
+owner 0 append\_pwrite & 1024 B & \N{RWC:floors:78:mean_us:1|.1f} & \N{RWC:floors:79:mean_us:1|.1f} & --\\
+owner 0 append\_pwrite & 8192 B & \N{RWC:floors:93:mean_us:1|.1f} & \N{RWC:floors:94:mean_us:1|.1f} & --\\
+owner 0 append\_pwrite & 65536 B & \N{RWC:floors:4:mean_us:1|.1f} & \N{RWC:floors:106:mean_us:1|.1f} & --\\
+client direct fresh 2 GiB & 4096 B & \N{RWC:floors:256:mean_us:1|.1f} & \N{RWC:floors:262:mean_us:1|.1f} & \N{RWC:floors:270:mean_us:1|.1f}\\
+client direct fresh 2 GiB & 65536 B & \N{RWC:floors:70:mean_us:1|.1f} & \N{RWC:floors:266:mean_us:1|.1f} & \N{RWC:floors:274:mean_us:1|.1f}\\
+\bottomrule\end{tabular}
+\caption{Independent floors (\us), not additive stages. QD1 append-pwrite/fdatasync and mmap/fsync on both hosts; direct random reads: fresh 2 GiB. Network: blocking eth0 TCP RTT and polled ib\_send\_lat (half RTT doubled). Append controls have r0/r1; network/read floors also r2. No 8 KiB network or 1/8 KiB SSD-read floor; no interpolation. Other modes/regions remain in floors.csv. Failed event-write controls are listed below. Unmatched dimensions: sync/grouping, RPC/security, index/routing, and host SSD (Native coordinator SSD versus owner SSD). Read lanes: Native 0, owner 1 at c1/c5 and 4 at c16; c5 owner reads are lane-limited, not a transport ranking. Floors are separate populations.}
+\end{table}

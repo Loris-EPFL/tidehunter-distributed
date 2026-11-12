@@ -43,9 +43,9 @@ Hardware qualification remains pending until actual device evidence and
 parent-reviewed measurements are available. See the [fabric design](../../tidehunter-fabric/DESIGN.md#portable-transport-boundary-27-october-2026)
 for implementation symbols and primary OFI, Falcon, and native-paper sources.
 
-The current engine uses wire protocol 15. The build plan records
-it; external deployment and replay results copy the frozen build manifest's
-protocol rather than inventing a new value. Rebuild all participants and
+The build plan derives the wire protocol from the exact staged engine source
+(`tcp.rs`), not a separately maintained version in the Python builder.
+External deployment and replay results copy that frozen manifest identity. Rebuild all participants and
 regenerate configurations together. Old string-transport deployments cannot
 mix with these endpoints. Local transport checks and their hardware limits are
 recorded in the [27 October qualification](../../tidehunter-fabric/DESIGN.md#local-qualification-27-october-2026);
@@ -280,6 +280,7 @@ python3 tidehunter-sharded-wal/experiments/sui-checkpoint/build.py build \
 ```
 
 Add `--fabric` to `prepare` for `sharded-wal-fabric`/`experimental-fabric` builds.
+Add `--nvmeof` with `--fabric` to build the NVMe-oF data path and state audit.
 Preparation snapshots the exact tracked and nonignored untracked working files,
 including dirty edits and tracked deletions. It refuses escaping symlinks and
 source mutation during copying. Cargo metadata resolves the new local dependency
@@ -747,7 +748,7 @@ exported before the exact-owned fleet termination attempt.
 * Every foreground sample records owned-PID RSS/high-water/swap and physical
   `/proc/PID/io` plus host swap/diskstats/meminfo. Host counters include desktop
   noise; OS read/write charges differ from logical WAL bytes and mapped reads.
-* Transport protocol is **15**, incompatible with prior endpoints. The current
+* Transport identity comes from the frozen engine and is incompatible with older endpoints after a wire-format change. The current
   experimental member format is batch v3 with CRC32/IEEE; whole-batch BLAKE2b,
   sealed-file retirement and separate inventory-witness counters remain.
   Response recheck wait/work/deferrals and output queue/submit/retire spans are monotonic

@@ -105,6 +105,42 @@ counter_fields!(
     completed_read_bytes,
     completed_write_ops,
     completed_write_bytes,
+    failed_write_ops,
+    short_write_ops,
+    short_write_bytes,
+    reserve_exchanges,
+    complete_exchanges,
+    lease_exchanges,
+    leased_frames,
+    leased_bytes,
+    leased_skip_markers,
+    extents_leased,
+    adoption_async_exchanges,
+    adoption_sync_exchanges,
+    adoption_history_full_settles,
+    adoption_async_ns,
+    adoption_async_samples,
+    adoption_settle_ns,
+    adoption_settle_samples,
+    fua_writes,
+    leased_write_ns,
+    leased_write_samples,
+    extent_switch_ns,
+    extent_switch_samples,
+    lease_reserve_ns,
+    lease_namespace_sync_ns,
+    lease_publish_ns,
+    lease_profile_samples,
+    adopt_owner_ns,
+    adopt_close_scan_ns,
+    adopt_close_scan_bytes,
+    adopt_profile_samples,
+    extent_preleases,
+    extent_switch_waits,
+    leased_failed_writes,
+    leased_short_writes,
+    leased_timed_out_writes,
+    leased_full_writes,
     recovery_read_ops,
     recovery_read_bytes,
     metadata_requests,
@@ -199,9 +235,104 @@ pub enum LiveTimingStage {
     Delivery,
     ControllerConnect,
     ControllerDisconnect,
+    LeasedWrite,
+    ExtentSwitch,
+    AdoptionAsync,
+    AdoptionSettle,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum LiveWriteFailure {
+    Failed,
+    Short,
+    TimedOut,
+    Full,
 }
 
 impl LiveNvmeCounters {
+    pub(crate) fn record_lease_profile(&self, profile: super::super::tcp::LeaseProfile) {
+        // Relaxed: owner-local timing evidence publishes no stream state.
+        self.lease_reserve_ns
+            .fetch_add(profile.reserve_ns, Ordering::Relaxed);
+        self.lease_namespace_sync_ns
+            .fetch_add(profile.namespace_sync_ns, Ordering::Relaxed);
+        self.lease_publish_ns
+            .fetch_add(profile.publish_ns, Ordering::Relaxed);
+        self.lease_profile_samples.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_adopt_profile(&self, profile: super::super::tcp::AdoptProfile) {
+        // Relaxed: owner-local timing evidence publishes no stream state.
+        self.adopt_owner_ns
+            .fetch_add(profile.adopt_ns, Ordering::Relaxed);
+        self.adopt_close_scan_ns
+            .fetch_add(profile.close_scan_ns, Ordering::Relaxed);
+        self.adopt_close_scan_bytes
+            .fetch_add(profile.close_scan_bytes, Ordering::Relaxed);
+        self.adopt_profile_samples.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_leased_write_failure(&self, failure: LiveWriteFailure) {
+        let counter = match failure {
+            LiveWriteFailure::Failed => &self.leased_failed_writes,
+            LiveWriteFailure::Short => &self.leased_short_writes,
+            LiveWriteFailure::TimedOut => &self.leased_timed_out_writes,
+            LiveWriteFailure::Full => &self.leased_full_writes,
+        };
+        // Relaxed: independent failure evidence, not DMA ownership publication.
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_reserve_exchange(&self) {
+        // Relaxed: evidence only, not control-slot synchronization.
+        self.reserve_exchanges.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_complete_exchange(&self) {
+        // Relaxed: evidence only, not control-slot synchronization.
+        self.complete_exchanges.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_lease_exchange(&self) {
+        // Relaxed: evidence only, not control-slot synchronization.
+        self.lease_exchanges.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_leased_frame(&self, bytes: u64) {
+        // Relaxed: these independent evidence counters publish no stream state.
+        self.leased_frames.fetch_add(1, Ordering::Relaxed);
+        self.leased_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+    pub fn record_leased_skip(&self) {
+        // Relaxed: evidence only, not a stream ordering barrier.
+        self.leased_skip_markers.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_extent_lease(&self) {
+        // Relaxed: evidence only, not an allocation publication.
+        self.extents_leased.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn record_extent_prelease(&self) {
+        // Relaxed: grant evidence, not publication of the writer state.
+        self.extent_preleases.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn record_extent_switch_wait(&self) {
+        // Relaxed: independent stall evidence, not control-slot synchronization.
+        self.extent_switch_waits.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_adoption(&self, synchronous: bool) {
+        let counter = if synchronous {
+            &self.adoption_sync_exchanges
+        } else {
+            &self.adoption_async_exchanges
+        };
+        // Relaxed: evidence only, not control-slot synchronization.
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_adoption_history_full_settle(&self) {
+        // Relaxed: success evidence only, not prefix-history publication.
+        self.adoption_history_full_settles
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_fua_write(&self) {
+        // Relaxed: evidence only; the CQE establishes completion.
+        self.fua_writes.fetch_add(1, Ordering::Relaxed);
+    }
     pub fn record_read(&self, operations: u64, bytes: u64) {
         self.completed_read_ops
             .fetch_add(operations, Ordering::Relaxed);
@@ -213,6 +344,16 @@ impl LiveNvmeCounters {
             .fetch_add(operations, Ordering::Relaxed);
         self.completed_write_bytes
             .fetch_add(bytes, Ordering::Relaxed);
+    }
+    /// Terminal CQE evidence, independent of the coordinator's earlier timeout.
+    pub(crate) fn record_terminal_write_outcomes(&self, failed: u64, short: u64, short_bytes: u64) {
+        // Relaxed: terminal event counts are evidence, not CQE publication.
+        self.failed_write_ops.fetch_add(failed, Ordering::Relaxed);
+        // Relaxed: terminal event counts are evidence, not CQE publication.
+        self.short_write_ops.fetch_add(short, Ordering::Relaxed);
+        // Relaxed: byte counts are evidence, not DMA ownership transfer.
+        self.short_write_bytes
+            .fetch_add(short_bytes, Ordering::Relaxed);
     }
     pub fn record_recovery_read(&self, operations: u64, bytes: u64) {
         self.recovery_read_ops
@@ -261,6 +402,14 @@ impl LiveNvmeCounters {
     }
     pub fn record_timing(&self, stage: LiveTimingStage, nanoseconds: u64, samples: u64) {
         let (sum, count) = match stage {
+            LiveTimingStage::LeasedWrite => (&self.leased_write_ns, &self.leased_write_samples),
+            LiveTimingStage::ExtentSwitch => (&self.extent_switch_ns, &self.extent_switch_samples),
+            LiveTimingStage::AdoptionAsync => {
+                (&self.adoption_async_ns, &self.adoption_async_samples)
+            }
+            LiveTimingStage::AdoptionSettle => {
+                (&self.adoption_settle_ns, &self.adoption_settle_samples)
+            }
             LiveTimingStage::Queue => (&self.queue_ns, &self.queue_samples),
             LiveTimingStage::Submit => (&self.submit_ns, &self.submit_samples),
             LiveTimingStage::Completion => (&self.cq_ns, &self.cq_samples),

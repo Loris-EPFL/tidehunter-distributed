@@ -1,0 +1,33 @@
+\begin{table}[H]\centering\small\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lrrrrr}\toprule
+Size / readers & Arm & r0 verdict & r0 reads/call & r1 verdict & r1 reads/call\\\midrule
+1 KiB / c1 & Native & unqualified & \N{RWC:cold_qualification:0:device_reads_per_call:1|.2f} & unqualified & \N{RWC:cold_qualification:8:device_reads_per_call:1|.2f}\\
+1 KiB / c1 & Owner TCP & completed & \N{RWC:cold_qualification:1:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:7:device_reads_per_call:1|.2f}\\
+1 KiB / c1 & Owner verbs & completed & \N{RWC:cold_qualification:2:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:6:device_reads_per_call:1|.2f}\\
+1 KiB / c5 & Native & unqualified & \N{RWC:cold_qualification:9:device_reads_per_call:1|.2f} & unqualified & \N{RWC:cold_qualification:14:device_reads_per_call:1|.2f}\\
+1 KiB / c5 & Owner TCP & completed & \N{RWC:cold_qualification:10:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:13:device_reads_per_call:1|.2f}\\
+1 KiB / c5 & Owner verbs & completed & \N{RWC:cold_qualification:11:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:12:device_reads_per_call:1|.2f}\\
+1 KiB / c16 & Native & unqualified & \N{RWC:cold_qualification:15:device_reads_per_call:1|.2f} & unqualified & \N{RWC:cold_qualification:20:device_reads_per_call:1|.2f}\\
+1 KiB / c16 & Owner TCP & completed & \N{RWC:cold_qualification:16:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:19:device_reads_per_call:1|.2f}\\
+1 KiB / c16 & Owner verbs & completed & \N{RWC:cold_qualification:17:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:18:device_reads_per_call:1|.2f}\\
+8 KiB / c1 & Native & completed & \N{RWC:cold_qualification:21:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:26:device_reads_per_call:1|.2f}\\
+8 KiB / c1 & Owner TCP & completed & \N{RWC:cold_qualification:22:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:25:device_reads_per_call:1|.2f}\\
+8 KiB / c1 & Owner verbs & completed & \N{RWC:cold_qualification:23:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:24:device_reads_per_call:1|.2f}\\
+8 KiB / c5 & Native & completed & \N{RWC:cold_qualification:27:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:32:device_reads_per_call:1|.2f}\\
+8 KiB / c5 & Owner TCP & completed & \N{RWC:cold_qualification:28:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:31:device_reads_per_call:1|.2f}\\
+8 KiB / c5 & Owner verbs & completed & \N{RWC:cold_qualification:29:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:30:device_reads_per_call:1|.2f}\\
+8 KiB / c16 & Native & completed & \N{RWC:cold_qualification:33:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:38:device_reads_per_call:1|.2f}\\
+8 KiB / c16 & Owner TCP & completed & \N{RWC:cold_qualification:34:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:37:device_reads_per_call:1|.2f}\\
+8 KiB / c16 & Owner verbs & completed & \N{RWC:cold_qualification:35:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:36:device_reads_per_call:1|.2f}\\
+64 KiB / c1 & Native & completed & \N{RWC:cold_qualification:39:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:44:device_reads_per_call:1|.2f}\\
+64 KiB / c1 & Owner TCP & completed & \N{RWC:cold_qualification:40:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:43:device_reads_per_call:1|.2f}\\
+64 KiB / c1 & Owner verbs & completed & \N{RWC:cold_qualification:41:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:42:device_reads_per_call:1|.2f}\\
+64 KiB / c5 & Native & completed & \N{RWC:cold_qualification:45:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:50:device_reads_per_call:1|.2f}\\
+64 KiB / c5 & Owner TCP & completed & \N{RWC:cold_qualification:46:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:49:device_reads_per_call:1|.2f}\\
+64 KiB / c5 & Owner verbs & completed & \N{RWC:cold_qualification:47:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:48:device_reads_per_call:1|.2f}\\
+64 KiB / c16 & Native & completed & \N{RWC:cold_qualification:3:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:53:device_reads_per_call:1|.2f}\\
+64 KiB / c16 & Owner TCP & completed & \N{RWC:cold_qualification:4:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:52:device_reads_per_call:1|.2f}\\
+64 KiB / c16 & Owner verbs & completed & \N{RWC:cold_qualification:5:device_reads_per_call:1|.2f} & completed & \N{RWC:cold_qualification:51:device_reads_per_call:1|.2f}\\
+\bottomrule\end{tabular}
+\caption{Cold device qualification per case. Completed requires a qualified receipt and device reads per success at least 0.9; this is not per-call NAND proof. Ratios/reasons are indexed from remote\_rw.md into cold\_qualification.csv. Owner c5 uses one lane and is lane-limited; no transport ranking follows. Unmatched dimensions: sync/grouping, RPC/security, index/routing, and host SSD (Native coordinator SSD versus owner SSD). Read lanes: Native 0, owner 1 at c1/c5 and 4 at c16; c5 owner reads are lane-limited, not a transport ranking. Floors are separate populations.}
+\end{table}

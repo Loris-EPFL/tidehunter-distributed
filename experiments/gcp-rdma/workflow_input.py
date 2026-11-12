@@ -12,7 +12,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'kv-comparison'))
 import cloud_campaign
 
-BACKENDS = {'native', 'tidehunter_tcp', 'tidehunter_verbs', 'tidehunter_verbs_native',
+BACKENDS = {'native', 'tidehunter_tcp', 'tidehunter_tcp_trusted', 'tidehunter_verbs', 'tidehunter_verbs_native',
             'tidehunter_nvme_tcp', 'tidehunter_nvme_rdma',
             'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'valkey_rdma', 'garnet', 'kvrocks'}
 FIXTURE_SHA = '7eb43b71435547939760598e541d13b9a77f722c5a9d0f8c8ee5bd583b751f15'

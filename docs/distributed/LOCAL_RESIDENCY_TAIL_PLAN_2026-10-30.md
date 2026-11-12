@@ -232,3 +232,370 @@ The targeted residency and acquisition mechanisms work and improve the measured 
 Remaining qualification: matched native/TCP/EFA/EFA-direct hardware runs with frozen cases and explicit cache/path labels; P4 worker/flight/write-clock coverage; P5 measurement-scoped actual-miss/native attribution; and the isolated NVMe-oF matrix only after its safety/provider gates. Retained cache credits still participate in the existing budget-pressure spill heuristic, so high-occupancy/small-pending-tail settings also need qualification;15-spill local cases do not prove unchanged spill frequency for all workloads.
 
 No benchmark-branch publication, AWS run or transport/storage rewrite is included in this local delivery. The project-referenced`kvstore-*` skill directory is absent, so no in-repo skill could be updated; the changed accounting/profiling rules are documented here and in`ADAPTERS.md`.
+
+## 10. Valkey-informed follow-up, 3 November 2026
+
+Implementation branch: `feat/valkey-inspired-wal-batching`. This is a local
+follow-up to the completed GCP comparison, not a new cloud result. The coordinator
+index, whole-batch owner placement, independent owner Value WALs, durable receipts
+and snapshot/recovery model remain unchanged. No Sui repository or middleware
+change is required.
+
+### 10.1 Mechanisms and source mapping
+
+| Measured or source-proven cost | Implemented change | Source |
+|---|---|---|
+| The writer actor could wait for checkpoint admission instead of returning already-durable replies | Keep one prepared FIFO head without allocating a logical version; progress persistence and deliver published replies while capacity clears | `remote_db/concurrent.rs`: `DeferredWrite`, `drive_owner`; `remote_db.rs`: `prepared_pressure`, `admit_prepared_with_progress` |
+| A checkpoint starting halfway through the bounded tail had limited suffix headroom | Start background capture at one-quarter of the existing tail batch/byte limits; retain all hard bounds and index/identity pressure checks | `remote_db/checkpoint_lifecycle.rs`: `checkpoint_due` |
+| Read-flight sharing scanned live flights and their members under one mutex | Fixed-capacity exact `(owner, full immutable reference)` hash index under the existing mutex; reclaim entries with retired slots and charge index storage at startup | `remote_db/pending_read.rs`: `FlightRegistry` |
+| Warm owner values still entered asynchronous I/O completion handling in ordinary comparison cases | Use the existing bounded Linux NOWAIT resident-first path; retain partial/miss/unsupported/budget fallback to async reads | `backends/tidehunter.rs`: `Options`, `prepare_external_case_file`, `open_for`; `cloud_campaign.py`: standard cohorts; `cloud_controller.py`: `prepare_tide` |
+| Adjacent members could need separate asynchronous operations and completion bookkeeping | Coalesce only ascending, gap-free, same-file/log authorized ranges, at most 32 input members and 64 KiB; scatter duplicates and original slots; use bounded stack scratch | `tcp/read_executor.rs`: `read_run_end`, submission and completion |
+| Response data must outlive kernel completion and caller cancellation | Every scalar/resident/coalesced response owner retains complete file/log/authority plans through the final `Bytes` clone; late CQEs retain ownership | `ReadBuffer`; `RecordReadPlan` and `WalMemberReadPlan` clone shared pins, not value buffers |
+
+Paths in the table are below `tidehunter/src/distributed/` unless explicitly
+named otherwise; native `WalMemberReadPlan` is in `tidehunter/src/wal/mod.rs`.
+The benchmark adapter is under `benchmarks/kv-research/src/backends/`, and cloud
+planning is under `experiments/kv-comparison/`.
+
+No native mutex is removed and no new global production mutex is introduced.
+The flight registry reuses its existing mutex; the writer head is actor-owned;
+owner reads reuse the existing admission/pool guards. Fixed registry storage
+reduces the payload allowance available under small read budgets, and too-small
+configurations now reject explicitly. Snapshot capture/install locking remains:
+removing it without changing capture and read-lease contracts would be unsafe.
+
+The earlier capture threshold can increase checkpoint I/O. Coalescing has no
+benefit for nonadjacent ranges or differently ordered inputs; it does not sort
+random requests or read unrequested gaps. These are bounded mechanisms, not a
+promise that every workload improves.
+
+### 10.2 What is adapted from Valkey
+
+Pinned reference: Valkey 9.0.7,
+`fe8d406c0b5a64ec897f6455e4de684629883764`.
+
+- [`t_string.c`, GET/MGET](https://github.com/valkey-io/valkey/blob/fe8d406c0b5a64ec897f6455e4de684629883764/src/t_string.c#L282-L297):
+  keep the resident command path short and amortize grouped work. Tidehunter
+  already groups misses by owner; this patch optimizes execution inside that
+  path instead of adding another routing layer.
+- [`aof.c`, persistence](https://github.com/valkey-io/valkey/blob/fe8d406c0b5a64ec897f6455e4de684629883764/src/aof.c#L1034-L1040)
+  and [`server.c`, reply ordering](https://github.com/valkey-io/valkey/blob/fe8d406c0b5a64ec897f6455e4de684629883764/src/server.c#L1894-L1917):
+  preserve persistence-before-acknowledgment while separating maintenance and
+  progress. Tidehunter already shares persistence prefixes; the patch does not
+  remove fsync, add a second log, or invent group commit.
+- [Native Tidehunter v2](https://arxiv.org/html/2602.01873v2), §§3–4:
+  resolve the exact Value-WAL position, preserve whole-batch replay and pinned
+  immutable storage, and distinguish Linux-resident data from device I/O.
+  The new owner path adds no application value cache.
+- [eRPC](https://www.usenix.org/conference/nsdi19/presentation/kalia):
+  bound short-path work and keep progress from waiting behind maintenance.
+  Its RAM-RPC latency is not a guarantee for this WAL-backed implementation.
+
+No Valkey source is copied. Its RAM dictionary, AOF rewrite and RC stream are
+not replacements for Tidehunter's WAL-as-values storage or reference validation.
+
+### 10.3 Qualification boundaries
+
+The benchmark already runs synchronous backend operations on dedicated OS
+workers (`runner.rs`: `WorkerPool::new`). An intermediate extra CPU semaphore
+and in-place blocking boundary increased native cache-hit overhead and was
+removed before the final candidate. Its raw results are retained separately;
+they are not pooled with the final measurements or used to claim a speedup.
+The existing workload concurrency, operation counts, worker queues, durability
+barriers, clocks and percentile definitions remain intact.
+
+New diagnostic counters `write_concurrent_checkpoint_deferrals` and
+`write_concurrent_checkpoint_wait_ns` are exported through both Sui metric
+visitors, the measurement-window write profile and the Prometheus diagnostic
+allowlist. They describe deferred admission, which can include other capacity
+pressure; they are not pure checkpoint I/O time.
+
+Normal cloud cohorts explicitly request resident-first, cold standard cohorts
+explicitly disable it, and focused diagnostic controls retain their policies.
+The adapter checks the actual owner policy against the requested one. Owner
+logical-member counters and asynchronous operation counts are separate now that
+one I/O can cover multiple members; neither proves a physical NVMe access.
+
+Local evidence is retained under
+`checkpoint-work/valkey-inspired-local-20261103/`: frozen old binary, new binary
+identity, complete configs, raw samples, outcome counts, nearest-rank API,
+scheduling and response distributions, and qualification logs. One shared
+laptop SSD and loopback TCP do not reproduce five independent NVMe drives or
+hardware RDMA. The completed GCP report remains the cluster comparison until a
+new hardware campaign is authorized and completed.
+
+### 10.4 Final local measurements and remaining work
+
+One independent repetition per workload and binary. Five loopback TCP owners
+share this laptop's SSD. Coordinator value cache is disabled; Linux page cache
+is not cleared. The old owners force async reads; the final normal owners use
+resident-first. These combined changes do not isolate an individual mechanism.
+Batch times cover the complete 32-value call, not one value.
+
+| C16 API, µs | Old p50 | Final p50 | Old p99 | Final p99 |
+|---|---:|---:|---:|---:|
+| Native, 1 KiB read | 1.388 | 1.498 | 2.416 | 4.269 |
+| Native, 8 KiB read-32 | 92.881 | 102.065 | 197.002 | 208.074 |
+| Native, 1 KiB durable write | 4463.903 | 4443.166 | 6545.708 | 6882.843 |
+| Distributed TCP, 1 KiB read | 77.956 | 54.093 | 381.936 | 364.573 |
+| Distributed TCP, 8 KiB read-32 | 2266.419 | 2574.643 | 5924.537 | 6525.542 |
+| Distributed TCP, 1 KiB durable write | 2387.564 | 2437.439 | 10834.189 | 10211.082 |
+
+The point-read median fell by 30.6% in this run. **The batch median did not
+improve: it was 13.6% slower.** The write median was 2.1% slower; its tail moved
+in the other direction. These results do not establish improved batch/write
+performance or cloud parity. The next cluster comparison must retain point
+controls and investigate batch coordination/completion and write-tail pressure,
+not assume fewer owner I/O submissions solve the complete API path.
+
+All 57,344 measured calls across old/final binaries succeeded. Per case:
+8,192 scalar reads, 2,048 read-32 calls, or 4,096 writes, with unchanged preload
+and 512 warm-up calls. Raw API/scheduling/response samples, nearest-rank
+p50/p95/p99/p99.9, mean, population standard deviation, maximum, throughput and
+zero observed rejection/error counts are in `final-matched-summary.json`.
+p99.9 has fewer than ten expected observations above its quantile for these
+sample counts. No confidence interval, significance claim or run-to-run error
+bar is warranted.
+
+The predeclared relative tail trigger flagged native point reads. The absolute
+p99 difference is 1.853 µs; native execution code is unchanged apart from two
+measurement-description strings. No native-tail non-regression claim is made.
+An extra repetition cannot change the stated few-microsecond native versus
+tens-of-microseconds remote and millisecond batch conclusions, so no repetition
+was added merely to narrow that variation.
+
+The final point-read interval recorded 8,161 NOWAIT successes and four async
+submissions across 8,165 logical owner reads. The batch interval recorded
+60,557 NOWAIT successes across 62,042 logical reads, with 1,485 async
+submissions. Both had zero owner errors/cancellations. This proves the resident
+path was exercised, not physical-NVMe or RDMA latency. Shared fills explain why
+logical owner reads need not equal API member counts.
+
+Separate diagnostic controls captured 320 sampled owner append requests
+(64 per connection) and 256 completed physical read flights. Their new
+deferred-admission counters and read decomposition passed the existing
+diagnostic formatter and typed Prometheus parsing/cardinality validation.
+The write control observed zero foreground checkpoints and zero admission
+deferrals; the paused-checkpoint regressions separately exercise deferral and
+failure. These diagnostic samples are not pooled with unprofiled API timings.
+Host-boundary counters observed zero swap-in and zero swap-out pages during the
+final six-case run; this is not a per-process peak-memory claim.
+
+Qualification:
+
+- Standard distributed engine: 862 passed, seven ignored.
+- Distributed engine with fabric, NVMe-oF and test utilities: 878 passed,
+  21 ignored; ignored cases do not establish hardware coverage.
+- Final owner-executor check after replacing scatter heap scratch: 36 passed.
+- All enabled comparison-adapter library tests: 70 passed.
+- Comparison orchestration: 420 passed, four skipped; observability: 107 passed.
+- Standard Clippy with `-D warnings` and formatting passed. The broader
+  optional-surface pedantic invocation still reports inherited diagnostics
+  (30 library / 34 library-test errors), including old Valkey FFI casts and
+  unmodified control/runner code. It was not silenced; source provenance is
+  retained in `lint-source-provenance.json`.
+- Existing diagnostic families lack optional Prometheus HELP descriptions, so
+  strict style lint is not clean. Production metric types and real diagnostic
+  values passed parsing/cardinality validation; that is not a full style-lint
+  or new live Grafana-dashboard claim.
+- The current `ci_prepare.run_tcp_diagnostic` completed with five real external
+  owners, admitted its integrity-bound proof and recorded five zero exit codes.
+  No GitHub dispatch or cloud allocation was performed.
+
+The exact final executable is retained as `bin/kv-research` with SHA-256
+`f7d4c34d298af1dcdbe1c74663f3a4d12639cd79b591d25a7d25bf8d82e58248`.
+Hardware TCP/verbs/EFA, independent-SSD scaling and the effect on the GCP Valkey
+comparison remain unmeasured for this revision. No project skill files were
+present to update. No commit or push was made.
+
+### 10.5 Exact-input concurrent-write diagnosis
+
+The C16 1 KiB write diagnostic for the retained binary is in
+`checkpoint-work/valkey-local-comparison-20261103T140423Z/exact-input-diagnostics/write1k-c16/result/write-diagnostics.json`
+in the parent workspace. It sampled 2,210 owner append requests covering 4,096
+receipts: 2,180 file persistence calls and 30 persistence no-ops. Summed owner
+file-persistence time was 2.602 seconds; these overlapping cumulative clocks
+are not an end-to-end latency decomposition or evidence of physical device I/O.
+The coordinator interval recorded 11 background checkpoint starts, 70.5 ms of
+capture/install clock, and no checkpoint admission deferrals. This single
+diagnostic does not establish whether a different checkpoint threshold improves
+tail latency or justify changing the hard suffix bounds.
+
+The storage persistence operation already captures the complete appended prefix
+at its serialization boundary, not just the receipts in the invoking request.
+Draining already queued requests into one call would not cover groups appended
+after that capture; the 30 no-ops do not establish that such a drain would
+materially reduce the observed file syncs. The five measured storage nodes are
+independent processes, each with its own active log and persistence owner.
+Adding parallel per-log flushers on one node is therefore not evidence-based for
+this measured configuration. Neither change was made on the basis of this
+diagnostic.
+
+The pinned Valkey source writes the accumulated AOF buffer and, under
+`appendfsync always`, synchronously calls `fdatasync` before serving pending
+replies (`src/aof.c:1112–1124,1238–1257`, `src/server.c:1894–1917`).
+Commands already processed in an event-loop turn can share that barrier; this
+does not imply an intentional batching delay. Tidehunter's existing prefix
+capture likewise shares a barrier among complete groups already appended,
+while allowing later groups to append during an in-progress sync.
+
+Matched-input C1 diagnostic twins are retained under
+`checkpoint-work/valkey-local-comparison-20261103T140423Z/corrections/exact-input-diagnostics/`
+as `write1k-c1-before` and `write1k-c1-new`. Each selected 4,096 append
+requests and recorded 4,096 successful file persistence calls. The experimental
+`70eb` TCP completion-parking candidate reduced server polling but its mean
+file-sync elapsed time rose from approximately 325 to 964 µs, while profiled
+API p50 rose from approximately 471 to 1,482 µs. Client socket read calls
+rose from 2.95 million to 8.11 million. These are two single-run observations:
+the cause of the slower sync is not isolated, and nested clocks are not additive.
+The prototype was **rejected and removed**; its retained artifacts are not the
+current implementation. Neither this result nor the source comparison establishes
+a complete fix for concurrent write latency.
+
+### 10.6 Owner-scoped coordinator read progress
+
+The next local diagnostic found a separate client-side serialization point.
+With the rejected `70eb` executable, 242 of the first 256 physical 8 KiB
+read-32 flights ran through the single coordinator read actor. Mean actor
+service was 1,447 µs per flight; owner handler mean was 30 µs per flight.
+The independent 256-API resolution prefix recorded 2,536 µs mean batch wait,
+1 µs post-read cache accounting, and 3.6 µs result materialization. These
+independent populations and overlapping clocks are not an additive latency
+decomposition. They rule out post-read cache accounting as the millisecond
+cost in this diagnostic, not every possible cache-contention problem.
+
+The read service now has one persistent progress actor per owner endpoint,
+rather than one actor for all owners. Each actor advances only its owner's
+lanes, so a held driver or expensive response on another owner cannot block
+its progress loop. Global flight, request and retained-byte credits remain
+shared. Each bounded command channel can hold `flight_slots + 1` commands;
+fixed channel metadata therefore scales with the configured owner count and
+is separate from the existing retained-read-byte allowance.
+
+Grouped lane reservations identify the caller that drives a connection, not
+exclusive request admission. Compatible requests may join that lane under the
+existing credits. Scalar synchronous reservations remain exclusive. An owner
+batch with no admitted reads releases its reservations before waiting for its
+next byte-credit wave; otherwise foreign accepted work could hold the credits
+while neither actor nor caller drives it. Shutdown drops all owner senders and
+drains accepted work. Shared NVMe-oF reader shutdown also waits for each actor
+to submit or fail its queued work before closing reader admission; terminal
+completion and pinned-memory retirement remain required.
+
+Code map:
+
+- `tidehunter/src/distributed/remote_db/pending_read.rs`: owner actor channels,
+  lane routing, progress ownership, finite credits and shutdown.
+- `pending_read/tests.rs` and `pending_read/locality_tests.rs`: joined requests,
+  byte-wave handback, cancellation, cross-owner isolation and shared-reader
+  shutdown regressions.
+- `remote_db/read_cache.rs` and `pending_read/concurrent.rs`: bounded
+  disabled-cache accounting and selected batch-wait/fill/materialization clocks.
+- `remote_db/coordinator_profile.rs` and
+  `benchmarks/kv-research/src/backends/tidehunter.rs`: snapshot and JSON stages.
+- `experiments/kv-comparison/observability/campaign_exporter.py`: exports the
+  new clocks while retaining historical evidence without inventing missing
+  zero-duration observations.
+
+This follows exclusive progress ownership from eRPC and the already examined
+Valkey event-loop design; it does not copy their transport or replace native
+WAL recovery. Native Tidehunter, the wire protocol, owner Value-WAL durability,
+batch boundaries and fencing are unchanged. No native storage mutex was
+removed. This is not yet evidence of hardware RDMA or independent-NVMe speed.
+
+### 10.7 Targeted completion wakes and current local qualification
+
+Batch completion previously used the global admission condition variable.
+Every physical reply could wake unrelated batches, although their own values
+were not ready. `FlightSignal` now registers batch-local signals under its
+existing wait lock. Each `ReadRequest` removes its subscriptions before its
+flight references and credits are released. The common one-consumer case uses
+inline `SmallVec` storage. Overflow capacity is charged and shrunk on removal;
+retirement frees the old subscriber list. Poison and shutdown wake waiters but
+do not mark unfinished reads ready. No new global mutex was added.
+
+Retirement holds the flight lock before publishing readiness and through the
+subscriber drain. This prevents the retiring generation from consuming a new
+generation's subscribers. The tests cover this race, completion before
+registration, unrelated-waiter isolation, canceled coalesced consumers,
+poison/stop wakeups, byte-credit waves and exact result ordering.
+
+A busy grouped lane also asks its caller to hand progress back to the owning
+actor. The caller releases its actual reservation; the actor does not steal
+the guard. Scalar synchronous reservations remain exclusive. Diagnostic
+`grouped_inline` classes identify **admission origin**, not which thread
+eventually completes the flight. Their elapsed clocks are not CPU time.
+
+Current executable SHA-256:
+`b1d766ea44265677a8dabeb1a48f541856163c8dd2d494913a64c3e78874ed31`.
+Evidence is in the parent workspace under
+`checkpoint-work/valkey-local-comparison-20261103T140423Z/targeted-wakes/`
+and `targeted-wakes-write-controls/`. Both passes use this same executable.
+`all-current-source-comparison.json` links the two passes; `all-metrics.csv`
+contains every case's separate API, scheduling and response distributions,
+p50/p95/p99/p99.9, mean, population standard deviation, maximum, throughput,
+rejection counts and sample-count warnings.
+
+One independent repetition per case; timings below are **µs per API call**,
+not per member of a read-32 call:
+
+| Case | Earlier Tidehunter p50 | Current Tidehunter p50 | Paired Valkey p50 | Current Tidehunter p99 | Paired Valkey p99 |
+|---|---:|---:|---:|---:|---:|
+| 1 KiB read, C1 | 15.813 | 14.641 | 37.558 | 56.728 | 171.920 |
+| 1 KiB read, C16 | 55.260 | 53.119 | 48.977 | 239.827 | 217.184 |
+| 1 KiB read-32, C16 | 2232.671 | 1110.595 | 313.069 | 3682.621 | 728.555 |
+| 8 KiB read-32, C16 | 2323.854 | 1246.531 | 520.404 | 3617.636 | 1204.564 |
+| 1 KiB durable write, C1 | 476.450 | 516.720 | 931.989 | 13180.491 | 1968.195 |
+| 1 KiB durable write, C16 | 6843.308 | 7968.080 | 2396.493 | 34934.841 | 5470.015 |
+
+The earlier column uses the frozen `f7d4c34d` executable. The targeted-wake
+read experiment also passed its predeclared threshold against the intermediate
+`9b309b29` owner-actor executable: batch medians fell by 22.4% and 23.6%,
+without a 20% scalar-median regression. This is not a confidence or
+statistical-significance claim. No populations or repetitions were pooled.
+The p99.9 sample-count warnings still apply.
+
+All 57,344 current-source measured calls returned correct results, with no
+rejections or unknown mutations. Valkey used five real primaries, the pinned
+9.0.7 server, and the paired libvalkey TCP client. Both stores acknowledged RF1
+durable writes; Tidehunter used its Value-WAL barriers, Valkey AOF `always`.
+Tidehunter used mutual TLS and Valkey plaintext TCP, so this is not a pure
+transport-cost comparison. Tidehunter's coordinator cache was disabled; owner
+reads used Linux's page cache, while Valkey values remained in its heap.
+There was no application value cache on Tidehunter owners.
+
+The batch-read gap remains about 2.4-3.5x. The write tail remains unresolved:
+the intermediate owner-actor run had a 2.404 ms C16 write median, whereas the
+current run had 7.968 ms. The recorded writer, checkpoint and persistence
+source hashes did not change between those executables. That does not prove
+the new reader has no indirect effect, nor isolate SSD or scheduler variation.
+Do not claim write parity from the faster intermediate run.
+
+A separate current-source write diagnostic sampled 2,206 append requests:
+WAL file-persistence time averaged 1.145 ms per sampled append, append work
+132 µs per sampled append, and client exchange 2.069 ms per connection request
+(2,261 requests, including controls). It observed no foreground checkpoints
+or checkpoint-admission deferrals. These nested, differently counted clocks
+are not additive and do not establish isolated device latency.
+
+Final read diagnostics put mean batch wait at 1.155 ms and 1.262 ms for the
+1 KiB and 8 KiB cases. Post-read fill/accounting was below 1.1 µs per selected
+API; result materialization was below 3.9 µs. Owner handler means were about
+23 µs and 44 µs per sampled physical flight. Independent API and physical-flight
+prefixes must not be subtracted as a measured network latency.
+
+The host recorded zero swap-in and swap-out page deltas during these passes.
+All local benchmark containers exited; no unrelated container was removed.
+The engine suite passed 891 tests with 21 ignored, adapter tests passed 70,
+and observability tests passed 107. Both scoped Clippy checks with
+`-D warnings`, formatting, and the release build passed. Real diagnostic
+export passed the retained Prometheus parser/cardinality check. Existing
+missing HELP descriptions still fail optional full metrics style lint.
+
+These results qualify the code locally, not hardware RDMA performance. The
+next bounded GCP campaign must use rebuilt, source-bound artifacts and keep
+Valkey RDMA and Tidehunter native verbs separate from these TCP results.
+The 56-case matrix retains all workloads and counts with one repetition.
+Its `cold_os_cache` action does not evict Valkey heap values; those rows are
+not a matched physical-NVMe comparison. Independent owner SSDs are required
+to resolve the remaining storage and tail-latency questions.

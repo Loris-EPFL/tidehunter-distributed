@@ -162,6 +162,8 @@ pub enum WriteTimelineStage {
     WorkerDequeued,
     LiveGroupBuildStarted,
     LiveGroupBuilt,
+    LiveExtentSwitchStarted,
+    LiveExtentSwitchCompleted,
     LiveReserveStarted,
     LiveReserveCompleted,
     LiveNamespaceSetupStarted,

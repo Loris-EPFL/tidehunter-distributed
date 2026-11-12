@@ -1,0 +1,17 @@
+{
+  "synthetic": true,
+  "processes": [
+    {
+      "process_role": "client",
+      "available": true,
+      "cpu_seconds": 0.35200000000000004,
+      "elapsed_seconds": 3.2
+    },
+    {
+      "process_role": "storage-0",
+      "available": true,
+      "cpu_seconds": 0.38079999999999997,
+      "elapsed_seconds": 3.4
+    }
+  ]
+}

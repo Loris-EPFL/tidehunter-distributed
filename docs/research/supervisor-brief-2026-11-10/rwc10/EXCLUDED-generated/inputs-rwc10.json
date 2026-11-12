@@ -1,0 +1,545 @@
+{
+  "synthetic": false,
+  "data_directory": "rwc10/EXCLUDED-data",
+  "sources": {
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/EXCLUDED-attempt1-provenance.json": "b5af758f7d528b16a87d5b4634481a6459ee92e7d0a3d4a2b08321daef06ab8e",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-rwcompact2/analysis2/floors.csv": "d9ad2ba8ee546009254b34a216427d2698054ac8b156a81fb4d809b46e71452f",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/fleet-output/state.json": "5bc34c4c54c916661a5cd503f66e46a157d0ab4e9c202c9463daca4b25524ba5",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/fleet-output/campaign-receipt.json": "4bd9cd570a315d3dc98cd83f9489a2bc680efea403ebf9aa14a6260c3c2a7aa1",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/package-root/package-receipt.json": "d74b681925c4eb673fa2be83a8b51e85efc8af3861139250f15d9605a87f04f0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/controller-outcome.json": "c40e66f10d8cab26d0edc2bd08cb2f7ab74ff466b6a6d694d7d5fd83f961cce9",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/matrix.json": "7d9a23bd4b44b230a4abed60f8dd46d1218f887571190c6e567147c16131a2e3",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/comparison.json": "63e4687742508ba914a5ded1afdfe94f074411db78439cb431854e8b392b6570",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16P-r0-8b40cca827fa6d4ba9da/receipt.json": "6da73d519a90725c46349a71b6c45aff18b10c948ad11dc6a26be7d08b23f353",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16P-r0-8b40cca827fa6d4ba9da/resource-interval.json": "a2ef8b888c7a6b3f2d6e9deb1b3308ce23b04dee054156383f31297dd654ece1",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16P-r0-8b40cca827fa6d4ba9da/result/manifest.json": "cc158f74dbd5ecc50739ddf1f4d86c6b9e7272b0d3bd90b408ada7e3e3d2d6e5",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16P-r0-8b40cca827fa6d4ba9da/result/measurement-read-evidence.json": "77666c8f0da3a636bcd69b8009a4d84828fddd41bad4ec70be972b420fcb2b95",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16P-r0-730a3eb60d5124e24d23/receipt.json": "a6be34e5efb87b7dd1632c5e3d0a589599f41a57da91298abf9a7d77664363da",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16P-r0-730a3eb60d5124e24d23/resource-interval.json": "02eef5aa5e8e57701394164bc18f243613cea3a2f015978cab9e952222a6cd31",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16P-r0-730a3eb60d5124e24d23/result/manifest.json": "889d6c8968b915f0b7fdc356cf0dc4fa99d88e6d071926dce396bbce1cb1a6c7",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16P-r0-730a3eb60d5124e24d23/result/measurement-read-evidence.json": "60268903e82faae8b37f53da370c9d0a3d0976430ff33d6c49b5a89221c53a17",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16P-r0-842131c752e8dc7cdda0/receipt.json": "65bc11dd5d7fea9eb7d2f4ba45f0848366ae3f33790246a637535f64c0091ccd",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16P-r0-842131c752e8dc7cdda0/resource-interval.json": "9715b8adedf2c82200c05dc83bd8f634780d878e2dfb0b7bad2337361ee1d8cc",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16P-r0-842131c752e8dc7cdda0/result/manifest.json": "00071242282d8cf248eb2f458b3319969e2bca60cb5367ce8bfa6dd5ea419f87",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16P-r0-842131c752e8dc7cdda0/result/measurement-read-evidence.json": "5baf7d0855e0ab566ed84da4585f16b082397b99c18de89f72267f478517b670",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16P-r0-b030b6a479c78e3f3d7a/receipt.json": "00cb9492ec838aa4531af8204017662a9cfb4a453fd3705152030819d180dfcc",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16P-r0-b030b6a479c78e3f3d7a/resource-interval.json": "0af48071adbec6bcae155ef416fa93938ddc2ac5d8a11f35639ef7bcc460b3a1",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16P-r0-b030b6a479c78e3f3d7a/result/manifest.json": "f3b3a0d7db709204b31b7e2214a99b59bdb420c77a6f47caedd5a00ee6e720f1",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16P-r0-b030b6a479c78e3f3d7a/result/measurement-read-evidence.json": "3bfe11d019d61359b3c967a62dcb2d07c673de4cec13786bfd39f9a44bbc1dbb",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16P-r0-54bb6ccf17ec29857e7e/receipt.json": "4d1b043969c87a15fdb53316e1e99542d992930f1ff0b5426f593c315a1f0573",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16P-r0-54bb6ccf17ec29857e7e/resource-interval.json": "5fc901a99af5098aadf3f4ac429c0c4c9a0020655509ee65de5d06b2f9bfea84",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16P-r0-54bb6ccf17ec29857e7e/result/manifest.json": "a555a892560391a4e576aa3182925e083a56169c01e449c45a2354bb81330880",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16P-r0-54bb6ccf17ec29857e7e/result/measurement-read-evidence.json": "ebf9233184c8ebcc9d13e0553d261a3da3b84a62830c0486e5c92dd82757465f",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16C-r0-42f294e884050c1216ca/receipt.json": "9df0c0259c8384936a2ee428fcf5f8ccd6eafac05af87229e2d6732d7fffab9e",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16C-r0-42f294e884050c1216ca/resource-interval.json": "5a9f4b0f12f39bc1e8775ca8b0e3f81a1023c9e199fb30a11d767fd38757f429",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16C-r0-42f294e884050c1216ca/media_evidence.json": "e368dfa0d54d3a814e7577fd1586eefc348bd861a26b988813169870311be1ff",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16C-r0-42f294e884050c1216ca/result/manifest.json": "19129ba77da4aa817e2e4aa0fb80b5bdfc9a71cc9998b5fdfd9bc16c8096fb50",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16C-r0-42f294e884050c1216ca/result/measurement-read-evidence.json": "17b10467f0b2c6801244f41e7e1a65a1b5116da03c1430f5596f7aa88031a6e3",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16C-r0-3873f8b92a6fcc29c8e2/receipt.json": "e0db53de96fe8156ebb7244c579407440cdef6e47a89a01ed06e945cfd97c584",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16C-r0-3873f8b92a6fcc29c8e2/resource-interval.json": "aef9faa85d4e4f8a1362ed910e8296b0f919303a2cc6b42053fb45852d8b98f7",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16C-r0-3873f8b92a6fcc29c8e2/media_evidence.json": "b27842202e9e3a9b56e6fe092ca0c77bd514dd11ca037d833047aef608ab2651",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16C-r0-3873f8b92a6fcc29c8e2/result/manifest.json": "78ed8eb9d9c6f70421daa3d6220238233c40ee631063e97d3b2849ab8ac546a5",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16C-r0-3873f8b92a6fcc29c8e2/result/measurement-read-evidence.json": "5bde3b73e48619e241cb234576b9d985012d1b5d731896d57bebd8d3efc0a1a7",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16C-r0-2e572c17818501749b43/receipt.json": "671514c0fb3f7d74728cfe75bf0cc979c41d2365c4ee2a730dac96db4b412c9a",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16C-r0-2e572c17818501749b43/resource-interval.json": "efcec2a59f06defeba7e180724c03d01208fd6bafa9a81758754774ce0a09a5d",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16C-r0-2e572c17818501749b43/media_evidence.json": "cb935dfa751dc3f868ee8ba9ccaf2bb0c1386846ba4f53902020872246c8232d",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16C-r0-2e572c17818501749b43/result/manifest.json": "6e4a9dbf43d71bf33749199120598a75f5ad498fbbe7c030e4ac1f5ad0e96b7c",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16C-r0-2e572c17818501749b43/result/measurement-read-evidence.json": "99b3d0bf171d822404e2426a9cd5ea89f604aa7c77efcb815488ca7bda489e10",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16C-r0-726b1c93a21300641d30/receipt.json": "0482188cae4e302b0bf50ddb8648d77c2733cfe043ff6b7eb1d1fc5ada33b952",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16C-r0-726b1c93a21300641d30/resource-interval.json": "fde88c62f0dfcff17e711d915fb91b0b0febd559640cb8ceca513aae4605c291",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16C-r0-726b1c93a21300641d30/media_evidence.json": "35282132731c954643935d5ce140dcf319ddaf8135e812661d2e859d8111d634",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16C-r0-726b1c93a21300641d30/result/manifest.json": "1fa326abc98186ad72dbb362412cca3a6a93495686f96d553f53372e2ffb74eb",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/cases/G16C-r0-726b1c93a21300641d30/result/measurement-read-evidence.json": "5b46e0a676cdf3ec647c79743e0e8e8fc373a978458360437d162b501bd4bb25",
+    "/tmp/f10-partial/ab_warm.csv": "f88ffa17c536557fd47352731b746b7452f0b68a863a2329eeb5614b48dc7a9a",
+    "/tmp/f10-partial/ab_pairs.csv": "19a8c37970c46db7b7c533ce8b2b001c4eb72e6b04a005bb853f03483f0dbfc4",
+    "/tmp/f10-partial/cold_fabric.csv": "7718bee1c1b71a67ccf9926ca2b1293ae725b0ffa2e149e1f577bbe675b8e9be",
+    "/tmp/f10-partial/cold_pairs.csv": "85e5a6317cb68471e94ab017c30511df4642e16830d396df352f1fe312957ad9",
+    "/tmp/f10-partial/parity_matrix.csv": "16458e89fcd6ebc392b854006386a19a349e34b85b457b4dec5adc29c428a8cd",
+    "/tmp/f10-partial/fabric_ab.md": "a2dee078771778ba7b00c38a94913249e8ebd1c48cffbc0cee7d116c77ef9887"
+  },
+  "outputs": {
+    "rwc10/EXCLUDED-generated/tab-rwc10-arms.tex": "c7067d9335236696f83eb98311b5dfd249b7d674b67287488f9bbcbe45120660",
+    "rwc10/EXCLUDED-generated/tab-rwc10-warm.tex": "9e64c3c6cb449d339bdcd94eb508086b9cd1ca446d817938e5715dcc7ac99b17",
+    "rwc10/EXCLUDED-generated/tab-rwc10-pairs.tex": "bc75f2bf4c570867e2d557bdd61c7284fbae57c6ed89f67bf91d016d88147fa8",
+    "rwc10/EXCLUDED-generated/tab-rwc10-cpu.tex": "97da4bc8e4bd87fbb79342e2dc3f050d622f188dbfd36f42f61ca618e93c95e9",
+    "rwc10/EXCLUDED-generated/tab-rwc10-cold.tex": "c93775c400d5102fe2587fcbe2d20ba1882a8c4e0f56f783ffc46e8a73be0084",
+    "rwc10/EXCLUDED-generated/tab-rwc10-ladder.tex": "c17fda85296acdb00aa9a196822760966611262a40486fbb66502a02145f4efc",
+    "rwc10/EXCLUDED-generated/rwc10-findings.tex": "b266df29031ca39e07d3352ed1a360e295376075582ba21a8d9b2a9da224190a",
+    "rwc10/EXCLUDED-generated/rwc10-numbers.tex": "1633c24390b2c68ecb746ddeac8532d37626454bc27b227be0504d109eddf6cc",
+    "rwc10/EXCLUDED-generated/rwc10-provenance.tex": "2ee14c65cd52908596fe8b4bd39f95167b8eaae3457d663dfc6f00de1f976b16",
+    "rwc10/EXCLUDED-generated/rwc10-hooks.tex": "d829cff1b79d8e02f41529c666ddc6ac0a5b1d424478adccb3affe892268a483",
+    "rwc10/EXCLUDED-data/parity_matrix.csv": "16458e89fcd6ebc392b854006386a19a349e34b85b457b4dec5adc29c428a8cd",
+    "rwc10/EXCLUDED-data/ab_warm.csv": "f88ffa17c536557fd47352731b746b7452f0b68a863a2329eeb5614b48dc7a9a",
+    "rwc10/EXCLUDED-data/ab_pairs.csv": "19a8c37970c46db7b7c533ce8b2b001c4eb72e6b04a005bb853f03483f0dbfc4",
+    "rwc10/EXCLUDED-data/cold_pairs.csv": "85e5a6317cb68471e94ab017c30511df4642e16830d396df352f1fe312957ad9",
+    "rwc10/EXCLUDED-data/run9-floors.csv": "d9ad2ba8ee546009254b34a216427d2698054ac8b156a81fb4d809b46e71452f",
+    "rwc10/EXCLUDED-data/cold_fabric.csv": "7718bee1c1b71a67ccf9926ca2b1293ae725b0ffa2e149e1f577bbe675b8e9be",
+    "rwc10/EXCLUDED-data/campaign_cases.csv": "a062fd484e4b16895f9f161c660e0d998d1173960eafa5bdab3c00a3fa4c8038",
+    "rwc10/EXCLUDED-data/fabric_ab.md": "a2dee078771778ba7b00c38a94913249e8ebd1c48cffbc0cee7d116c77ef9887",
+    "rwc10/EXCLUDED-generated/provenance.json": "b5af758f7d528b16a87d5b4634481a6459ee92e7d0a3d4a2b08321daef06ab8e",
+    "rwc10/EXCLUDED-figures/rwc10-EXCLUDED-warm.pdf": "93a0bc2688ff29528aee81f94d763997b59e4348afd3616eec1b609d8ea52891",
+    "rwc10/EXCLUDED-figures/rwc10-EXCLUDED-gap.pdf": "d5546334f4c79d384dd2d081984e0fd331c9504aab5f287b5ff5bc393370e25e",
+    "rwc10/EXCLUDED-figures/rwc10-EXCLUDED-cpu.pdf": "71882ad050758f438fe1175497165e5fc89d1d03f44d40cd7397519c5362c505",
+    "rwc10/EXCLUDED-figures/rwc10-EXCLUDED-cold.pdf": "998386f4989877f0af63138eedb94df7bbe69ff093e5b80167116589b8db026a",
+    "rwc10/EXCLUDED-figures/rwc10-EXCLUDED-ladder.pdf": "de6b9fa22deb18268cf72bd251d3e96293e6ecfc421d666d78bed5f822c63d06",
+    "rwc10/EXCLUDED-generated/figure-evidence.json": "3da6f12b373c0020aac09052a8203d6494778dea10a808eae5fe366595745123"
+  },
+  "number_sources": {
+    "F10:ab_warm:0:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 0,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:0:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 0,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:0:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 0,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:0:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 0,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:0:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 0,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:1:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 1,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:1:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 1,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:1:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 1,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:1:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 1,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:1:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 1,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:2:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 2,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:2:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 2,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:2:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 2,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:2:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 2,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:2:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 2,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:3:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 3,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:3:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 3,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:3:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 3,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:3:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 3,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:3:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 3,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:3:cq_idle_waits:1|.0f": {
+      "family": "ab_warm",
+      "row": 3,
+      "field": "cq_idle_waits",
+      "factor": 1,
+      "format": ".0f"
+    },
+    "F10:ab_warm:4:mean_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 4,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:4:p50_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 4,
+      "field": "p50_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:4:p99_us:1|.1f": {
+      "family": "ab_warm",
+      "row": 4,
+      "field": "p99_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:ab_warm:4:client_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 4,
+      "field": "client_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:4:owner_cores:1|.2f": {
+      "family": "ab_warm",
+      "row": 4,
+      "field": "owner_cores",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_warm:4:cq_idle_waits:1|.0f": {
+      "family": "ab_warm",
+      "row": 4,
+      "field": "cq_idle_waits",
+      "factor": 1,
+      "format": ".0f"
+    },
+    "F10:ab_pairs:0:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 0,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:1:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 1,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:2:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 2,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:3:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 3,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:ab_pairs:4:mean_ratio_a_over_b:1|.2f": {
+      "family": "ab_pairs",
+      "row": 4,
+      "field": "mean_ratio_a_over_b",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:0:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 0,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:0:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 0,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:1:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 1,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:1:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 1,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:2:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 2,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:2:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 2,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:cold_fabric:3:mean_us:1|.1f": {
+      "family": "cold_fabric",
+      "row": 3,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:cold_fabric:3:device_reads_per_call:1|.2f": {
+      "family": "cold_fabric",
+      "row": 3,
+      "field": "device_reads_per_call",
+      "factor": 1,
+      "format": ".2f"
+    },
+    "F10:run9-floors:17:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 17,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:155:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 155,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:223:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 223,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:51:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 51,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:159:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 159,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:227:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 227,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:55:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 55,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:163:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 163,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:231:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 231,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:9:mean_us:2|.1f": {
+      "family": "run9-floors",
+      "row": 9,
+      "field": "mean_us",
+      "factor": 2,
+      "format": ".1f"
+    },
+    "F10:run9-floors:119:mean_us:2|.1f": {
+      "family": "run9-floors",
+      "row": 119,
+      "field": "mean_us",
+      "factor": 2,
+      "format": ".1f"
+    },
+    "F10:run9-floors:187:mean_us:2|.1f": {
+      "family": "run9-floors",
+      "row": 187,
+      "field": "mean_us",
+      "factor": 2,
+      "format": ".1f"
+    },
+    "F10:run9-floors:23:mean_us:2|.1f": {
+      "family": "run9-floors",
+      "row": 23,
+      "field": "mean_us",
+      "factor": 2,
+      "format": ".1f"
+    },
+    "F10:run9-floors:123:mean_us:2|.1f": {
+      "family": "run9-floors",
+      "row": 123,
+      "field": "mean_us",
+      "factor": 2,
+      "format": ".1f"
+    },
+    "F10:run9-floors:191:mean_us:2|.1f": {
+      "family": "run9-floors",
+      "row": 191,
+      "field": "mean_us",
+      "factor": 2,
+      "format": ".1f"
+    },
+    "F10:run9-floors:35:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 35,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:135:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 135,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:203:mean_us:1|.1f": {
+      "family": "run9-floors",
+      "row": 203,
+      "field": "mean_us",
+      "factor": 1,
+      "format": ".1f"
+    },
+    "F10:run9-floors:13:mean_us:2|.1f": {
+      "family": "run9-floors",
+      "row": 13,
+      "field": "mean_us",
+      "factor": 2,
+      "format": ".1f"
+    },
+    "F10:run9-floors:143:mean_us:2|.1f": {
+      "family": "run9-floors",
+      "row": 143,
+      "field": "mean_us",
+      "factor": 2,
+      "format": ".1f"
+    },
+    "F10:run9-floors:211:mean_us:2|.1f": {
+      "family": "run9-floors",
+      "row": 211,
+      "field": "mean_us",
+      "factor": 2,
+      "format": ".1f"
+    },
+    "F10:count:cold-completed": {
+      "operation": "count",
+      "family": "cold_fabric",
+      "field": "status",
+      "value": "completed"
+    },
+    "F10:count:cold-unqualified": {
+      "operation": "count",
+      "family": "cold_fabric",
+      "field": "status",
+      "value": "unqualified"
+    },
+    "F10:count:cold-failed": {
+      "operation": "count",
+      "family": "cold_fabric",
+      "field": "status",
+      "value": "failed"
+    },
+    "F10:count:cold-not_run": {
+      "operation": "count",
+      "family": "cold_fabric",
+      "field": "status",
+      "value": "not_run"
+    }
+  },
+  "provenance": "rwc10/EXCLUDED-generated/provenance.json",
+  "matrix_path": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/matrix.json",
+  "report_path": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab1/export/comparison.json",
+  "report_complete": false,
+  "excluded_from_final": true
+}

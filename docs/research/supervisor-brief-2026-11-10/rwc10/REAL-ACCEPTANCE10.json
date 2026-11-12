@@ -1,0 +1,192 @@
+{
+  "status": "ACCEPTED measured selected second attempt; no synthetic or aborted-attempt measurements",
+  "synthetic": false,
+  "selection": "fabric_ab_compact",
+  "run_id": "bench-afdfe33817034a7c",
+  "parent_run_id": "bench-38b1466b6b0e4e1e",
+  "pdf": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/main.pdf",
+  "pdf_sha256": "334745e1e45c96414fcc67a99652c77fc04d266417f4a1de8d046b714b770350",
+  "pages": 54,
+  "page_cap": 56,
+  "tables_added": 6,
+  "figures_added": 5,
+  "number_macros": 390,
+  "traced_plot_values": 349,
+  "controller_completed_cases": 80,
+  "planned_cases": 80,
+  "cold_qualified_cases": 40,
+  "controller_exit_code": 0,
+  "cleanup_verified": true,
+  "source_export": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab2/export",
+  "source_report": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab2/export",
+  "analysis_output": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/run10-output",
+  "provenance": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/run10-provenance.json",
+  "inputs_manifest": "rwc10/generated/inputs-rwc10.json",
+  "independent_validation": {
+    "excluded_from_final": false,
+    "figure_points": 349,
+    "figures": 5,
+    "numbers": 390,
+    "pages": 54,
+    "pass_check": true,
+    "pdf_sha256": "334745e1e45c96414fcc67a99652c77fc04d266417f4a1de8d046b714b770350",
+    "synthetic": false,
+    "tables": 6,
+    "visual_inspection": "separate rendered-image review, not asserted by this checker"
+  },
+  "visual_inspection": {
+    "performed": true,
+    "pdf_sha256": "334745e1e45c96414fcc67a99652c77fc04d266417f4a1de8d046b714b770350",
+    "figure_dpi": 180,
+    "page_dpi": 150,
+    "full_resolution_reviewed": [
+      1,
+      2,
+      20
+    ],
+    "standalone_figures_reviewed": [
+      "warm",
+      "gap",
+      "cpu",
+      "cold",
+      "ladder"
+    ],
+    "minimum_figure_font_pt": 7.3603498,
+    "observations": [
+      "Correction to the earlier acceptance: Main found that the cold figure SPDK legend entry collided with the top-left panel title. My earlier no-overlap visual statement missed this real defect.",
+      "Fixed only the cold figure layout: dedicated top legend band (top=.70), larger inter-row spacing (hspace=1.25); figure text and measured values unchanged.",
+      "Re-rendered and visually checked all five run-10 figures at 180 dpi: legends, titles, tick labels, units, footers and annotations have no observed text overlap. Separate repetition and CPU-role markers retained.",
+      "Added renderer checks for legend/title, x-label/title and footer/label intersections; all five figures passed. These checks supplement the visual review.",
+      "Re-rendered and inspected brief pages 1, 2 and 20 at 150 dpi. All twelve findings stay on page 1; the new run-10 row, table width convention and footnote format are preserved. Cold Figure 12 now has clear legend/title separation."
+    ],
+    "prior_full_document_review": {
+      "pdf_sha256": "3b465d834c60b062c5c43438f423ddb05458db95ed43965acb3f61017430788a",
+      "all_54_pages_reviewed": true,
+      "note": "Historical review; the cold legend defect was subsequently identified and is corrected in this current review."
+    },
+    "directory": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/real-renders"
+  },
+  "checks": {
+    "analyzer": {
+      "exit_code": 0,
+      "command": [
+        "/home/hybr1d/Desktop/PDM/TideHunter/.venv/bin/python",
+        "-B",
+        "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/experiments/kv-comparison/fabric_ab.py",
+        "--export",
+        "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab2/export",
+        "--report",
+        "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab2/export",
+        "--output",
+        "rwc10/run10-output"
+      ]
+    },
+    "patches": {
+      "dry_runs": "all three passed",
+      "applied_once": true,
+      "backup": "main.tex.pre-run10",
+      "synthetic_patch_applied": false
+    },
+    "latexmk": 0,
+    "rwc10_pdf_verifier": 0,
+    "rwc9_pdf_verifier": 0,
+    "verify_brief": 0,
+    "verify_curves": 0,
+    "pdfinfo": 0,
+    "figure_count_checked": 25,
+    "minimum_figure_font_pt": 7.3603498,
+    "mcp_validation": "Include-unaware: reports input-defined references undefined and section wrappers missing; local compiler is definitive and passes."
+  },
+  "deviations_from_runbook": [
+    "Refreshed documented historical input pipeline because the historical FOCUSED_CAMPAIGN_2026-11-07.md source hash was stale; historical numbers.tex remained byte-identical. Registered run 9 and run 10 afterwards, in that order.",
+    "Raised retained run-9 PDF-checker cap to the same integrated 56-page limit.",
+    "Used exact coordinator creation 2026-11-10T21:56:35.352Z as launch_time; distinguished actual 23:07 receipt timestamps from later monitor observations.",
+    "Added a local main.tex page break before the provenance Limits paragraph after visual review, avoiding a one-line paragraph fragment.",
+    "Fixed tuple/list cohort filtering; independent direct membership checks now require completed namespace spans to be numeric.",
+    "Retained main/verifier patches were refreshed to include final corrective page break and accurate run-10 CPU/provenance metadata; temporary-baseline dry runs reproduce final sources byte for byte. No real patch was reapplied.",
+    "Main review identified an overlap missed by the earlier visual acceptance; reserved the cold legend band, re-reviewed all five figures at 180 dpi, and added the requested front-page result summaries. Kept all twelve findings on page 1 using a local 9-pt list with 1-pt item spacing; no command changes."
+  ],
+  "interpretation_corrections": {
+    "rdma_namespace_relative_to_owner_verbs_percent": [
+      -7.553224211624054,
+      9.618972024649475
+    ],
+    "warm64k16_trusted_rate_range_calls_per_second": [
+      52281.8243316279,
+      60559.678473053944
+    ],
+    "owner_busy_minus_adaptive_c16_core_range": [
+      5.7456660247216815,
+      5.954861579625225
+    ],
+    "notes": "Use ratios with explicit numerator/denominator; do not conflate percent speedup and percent latency reduction. Verbs p99 is not uniformly near 780 us: Adaptive r0 is 438.7; Busy is 789.6/808.5."
+  },
+  "non_csv_statements": [
+    "Topology, polling/security configuration and engine RMA limitations are implementation/design contracts, not latency deductions.",
+    "Routing/framing/validation work and a shared 64-KiB ceiling are explicitly labeled INFERENCE; the bottleneck and additive remainder remain unmeasured.",
+    "Launched identities/outcome/cleanup come from receipts. Monitor observations and independent cleanup listing are attributed to Main; create-operation times are derived. Costs are attributed list-price estimates, not invoices."
+  ],
+  "untraceable_numeric_performance_claims": [],
+  "historical_number_language_sha256": "278855f98aaa6b53aea2e83e354c041a10c089b5b55d4975de7dfc4b5476407c",
+  "real_data_exclusions": [
+    "SYNTHETIC-* fixture trees",
+    "EXCLUDED-* aborted-attempt layout-test trees",
+    "Every attempt-one measurement"
+  ],
+  "no_cloud_actions": true,
+  "no_rust_edits": true,
+  "no_commits": true,
+  "command_log": "rwc10/run10-verification-output.txt",
+  "historical_refresh_log": "rwc10/run10-historical-refresh-output.txt",
+  "compiler_log": "build-output.txt",
+  "patch_reproduction": {
+    "all_dry_runs_pass": true,
+    "exact_final_source_match": true,
+    "proof": [
+      {
+        "patch": "main-tex-run10.patch",
+        "dry_run_exit_code": 0
+      },
+      {
+        "patch": "run9-security-run10.patch",
+        "dry_run_exit_code": 0
+      },
+      {
+        "patch": "verify-brief-run10.patch",
+        "dry_run_exit_code": 0
+      }
+    ],
+    "real_patches_reapplied": false
+  },
+  "review_corrections": {
+    "changed_figure_layouts": [
+      "rwc10-cold.pdf"
+    ],
+    "all_five_regenerated_and_reviewed": true,
+    "front_page_changes": [
+      "Run-10 fleet row",
+      "Finding 3: completed user-space Busy A/B; kernel variant unrun",
+      "Finding 11: mTLS/trusted ratios and run-9 security correction",
+      "Finding 12: namespace ratios and slowest NVMe/TCP case"
+    ],
+    "line_references": {
+      "main.tex": [
+        "54-55",
+        "60-61",
+        "64",
+        "75"
+      ],
+      "rwc10/build_rwc10_inputs.py": [
+        "243-249"
+      ],
+      "rwc10/plot_rwc10.py": [
+        "51-60",
+        "148-149"
+      ],
+      "rwc10/prepare_patches.py": [
+        "30-38"
+      ]
+    },
+    "commands_unchanged": true
+  }
+}

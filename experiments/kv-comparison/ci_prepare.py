@@ -230,6 +230,7 @@ def run_tcp_diagnostic(binary, work, proof, source_revision, deadline, environme
             sockets.append(listener)
         addresses = [f'127.0.0.1:{listener.getsockname()[1]}' for listener in sockets]
         preparation = {'guest_root': str(guest), 'addresses': addresses, 'transport': {'kind': 'tcp'},
+            'owner_wal_geometry': 'research',
             'max_batches_per_partition': 16384, 'max_admitted_batches': 16384,
             'max_index_bytes': 128 * 1024**2, 'coordinator_cache_bytes': 0,
             'owner_read_workers': 2, 'owner_wal_member_read': 'async',

@@ -1,0 +1,905 @@
+//! Owner positions are durable only after the WAL barrier and atomic root install.
+use super::*;
+use bincode::Options;
+
+pub(super) const ROOT: &str = "partition-wal-root-v1";
+const MEMBER_MISMATCH: &str = "WAL member differs from the reference";
+const FRAME_BOUNDARY: &str = "replay position is not a frame boundary";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct WalRoot {
+    format: u32,
+    database: [u8; 16],
+    partition: u32,
+    epoch: u64,
+    pub(super) generation: u64,
+    pub(super) scan_from: u64,
+    pub(super) synced_end: u64,
+    pub(super) retired: Vec<u64>,
+}
+
+impl WalRoot {
+    pub(super) fn new(config: &PartitionConfig) -> Self {
+        Self {
+            format: 1,
+            database: config.inventory.database,
+            partition: config.partition,
+            epoch: config.inventory.epoch,
+            generation: 1,
+            scan_from: 0,
+            synced_end: 0,
+            retired: Vec::new(),
+        }
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, StorageError> {
+        let mut bytes = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .serialize(self)
+            .map_err(|_| StorageError::Invalid("WAL root serialization failed"))?;
+        bytes.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
+        Ok(bytes)
+    }
+
+    pub(super) fn install(&self, path: &Path) -> Result<(), StorageError> {
+        install_metadata(path, ROOT, &self.encode()?)?;
+        Ok(())
+    }
+
+    fn open(path: &Path, config: &PartitionConfig) -> Result<Self, StorageError> {
+        let bytes = fs::read(path.join(ROOT))?;
+        let body_len = bytes
+            .len()
+            .checked_sub(4)
+            .ok_or(StorageError::Invalid("invalid WAL root CRC"))?;
+        if bytes[body_len..] != crc32fast::hash(&bytes[..body_len]).to_le_bytes() {
+            return Err(StorageError::Invalid("invalid WAL root CRC"));
+        }
+        let root: Self = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(body_len as u64)
+            .reject_trailing_bytes()
+            .deserialize(&bytes[..body_len])
+            .map_err(|_| StorageError::Invalid("invalid WAL root format"))?;
+        if root.format != 1
+            || root.database != config.inventory.database
+            || root.partition != config.partition
+            || root.epoch != config.inventory.epoch
+            || root.generation == 0
+            || root.synced_end < root.scan_from
+            || !root.scan_from.is_multiple_of(config.fragment_bytes)
+            || root.retired.windows(2).any(|pair| pair[0] >= pair[1])
+            || root
+                .retired
+                .iter()
+                .any(|offset| !offset.is_multiple_of(config.wal_file_bytes))
+        {
+            return Err(StorageError::Invalid(
+                "WAL root differs from registered stream",
+            ));
+        }
+        Ok(root)
+    }
+}
+
+/// A whole checked outer frame. Member offsets and lengths are in `receipts`.
+#[derive(Clone, Debug)]
+pub struct DecodedGroup {
+    pub group: CompleteGroup,
+    pub receipts: Vec<AppendedBatch>,
+    pub position: WalPosition,
+    pub frame_end: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReplayPage {
+    pub groups: Vec<DecodedGroup>,
+    pub next: Option<u64>,
+}
+
+impl PartitionLog {
+    pub(super) fn is_retired(&self, offset: u64) -> Result<bool, StorageError> {
+        let state = self.state.lock();
+        if let Some(root) = &state.wal_root {
+            return Ok(root.retired.binary_search(&offset).is_ok());
+        }
+        drop(state);
+        self.references.is_retired(offset)
+    }
+
+    /// Sync bytes without adoption or receipt metadata. Persistence serializes
+    /// root changes; no state guard spans a file or directory barrier.
+    pub fn persist_wal_through(&self, through: u64) -> Result<u64, StorageError> {
+        let _persistence = self.persistence.lock();
+        let mut root = {
+            let state = self.state.lock();
+            let allocated = state
+                .writer
+                .as_ref()
+                .map_or(state.appended_end, WalWriter::position);
+            if through > allocated {
+                return Err(StorageError::Invalid(
+                    "checkpoint position beyond allocated WAL",
+                ));
+            }
+            state
+                .wal_root
+                .clone()
+                .ok_or(StorageError::Invalid("request requires WAL replay history"))?
+        };
+        #[cfg(test)]
+        if let Some((entered, resume)) = self.before_persist.lock().take() {
+            let _ = entered.send(());
+            let _ = resume.recv();
+        }
+        let size = self.config().wal_file_bytes;
+        if through > root.scan_from {
+            for id in root.scan_from / size..=through.saturating_sub(1) / size {
+                let start = id * size;
+                if root.retired.binary_search(&start).is_err() {
+                    self.wal.persist_frame_file(WalPosition::new(start, 1))?;
+                }
+            }
+            self.wal.persist_namespace()?;
+        }
+        let scan_from =
+            through.saturating_sub(1) / self.config().fragment_bytes * self.config().fragment_bytes;
+        if through > root.synced_end || scan_from > root.scan_from {
+            root.synced_end = root.synced_end.max(through);
+            root.scan_from = root.scan_from.max(scan_from);
+            root.generation = root
+                .generation
+                .checked_add(1)
+                .ok_or(StorageError::Capacity)?;
+            self.install_wal_root(&root)?;
+            let synced_end = root.synced_end;
+            self.state.lock().wal_root = Some(root);
+            return Ok(synced_end);
+        }
+        Ok(root.synced_end)
+    }
+
+    fn install_wal_root(&self, root: &WalRoot) -> Result<(), StorageError> {
+        #[cfg(test)]
+        {
+            let fail = self.fail_wal_root.swap(0, Ordering::AcqRel);
+            if fail == 1 {
+                return Err(StorageError::Invalid(
+                    "injected crash before WAL root write",
+                ));
+            }
+            if fail == 2 || fail == 3 {
+                let temporary = self.path.join(format!(".{ROOT}.pending"));
+                let mut file = File::create(&temporary)?;
+                file.write_all(&root.encode()?)?;
+                file.sync_all()?;
+                if fail == 3 {
+                    fs::rename(temporary, self.path.join(ROOT))?;
+                }
+                return Err(StorageError::Invalid(
+                    "injected crash during WAL root rename",
+                ));
+            }
+        }
+        root.install(&self.path)
+    }
+
+    pub fn retire_wal_files(&self, files: &[u64]) -> Result<(), StorageError> {
+        let _persistence = self.persistence.lock();
+        let mut state = self.state.lock();
+        if !state.sealed
+            || state.writer.is_some()
+            || state.poison.is_some()
+            || state.references.background_failed()
+        {
+            return Err(StorageError::Invalid(
+                "retirement requires healthy sealed storage",
+            ));
+        }
+        if files.len() > 256 || files.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(StorageError::Invalid(
+                "retirement differs from complete durable prefix",
+            ));
+        }
+        let mut root = state
+            .wal_root
+            .clone()
+            .ok_or(StorageError::Invalid("request requires WAL replay history"))?;
+        if files.is_empty() {
+            return Ok(());
+        }
+        let size = self.config().wal_file_bytes;
+        let inventory_end = highest_wal_end(&self.path, self.config())?
+            .max(root.retired.last().map_or(0, |offset| offset + size));
+        let mut ids = Vec::with_capacity(files.len());
+        for &offset in files {
+            if !offset.is_multiple_of(size) || offset >= inventory_end {
+                return Err(StorageError::Invalid(
+                    "retirement outside registered WAL inventory",
+                ));
+            }
+            let id = crate::wal::position::WalFileId::from_u64(offset / size);
+            if !self
+                .config()
+                .layout()
+                .wal_file_name(&self.path, id)
+                .is_file()
+                && root.retired.binary_search(&offset).is_err()
+            {
+                return Err(StorageError::Invalid("unexplained missing WAL file"));
+            }
+            ids.push(id);
+        }
+        let mut admission = self.read_admission.write();
+        #[cfg(feature = "experimental-nvmeof")]
+        if self.live_read_pins.load(Ordering::Acquire) != 0 {
+            return Err(StorageError::Invalid(
+                "live namespace or read pin prevents retirement",
+            ));
+        }
+        *admission = false;
+        root.retired.extend_from_slice(files);
+        root.retired.sort_unstable();
+        root.retired.dedup();
+        root.generation = root
+            .generation
+            .checked_add(1)
+            .ok_or(StorageError::Capacity)?;
+        self.install_wal_root(&root)?;
+        state.wal_root = Some(root);
+        #[cfg(test)]
+        if self.fail_wal_retire.swap(false, Ordering::AcqRel) {
+            return Err(StorageError::Invalid("injected crash before WAL unlink"));
+        }
+        self.wal.retire_files(&ids)?;
+        *admission = true;
+        Ok(())
+    }
+
+    fn open_replay_file(&self, offset: u64) -> Result<File, StorageError> {
+        let id = crate::wal::position::WalFileId::from_u64(offset / self.config().wal_file_bytes);
+        Ok(File::open(
+            self.config().layout().wal_file_name(&self.path, id),
+        )?)
+    }
+
+    fn replay_file<'a>(
+        &self,
+        cached: &'a mut Option<(u64, File)>,
+        offset: u64,
+    ) -> Result<&'a File, StorageError> {
+        let id = offset / self.config().wal_file_bytes;
+        if cached.as_ref().is_none_or(|(previous, _)| *previous != id) {
+            *cached = Some((id, self.open_replay_file(offset)?));
+        }
+        Ok(&cached.as_ref().expect("file installed above").1)
+    }
+
+    fn frame_header(&self, file: &File, offset: u64) -> Result<[u8; 8], StorageError> {
+        let mut header = [0; 8];
+        file.read_exact_at(&mut header, offset % self.config().wal_file_bytes)?;
+        Ok(header)
+    }
+
+    /// Decode one complete, CRC-checked group at an exact WAL frame boundary.
+    pub fn decode_group_at(&self, offset: u64) -> Result<DecodedGroup, StorageError> {
+        let file = self.open_replay_file(offset)?;
+        self.decode_group_from_file(&file, offset)
+    }
+
+    fn decode_group_from_file(
+        &self,
+        file: &File,
+        offset: u64,
+    ) -> Result<DecodedGroup, StorageError> {
+        let header = self.frame_header(file, offset)?;
+        let len = u32::from_be_bytes(
+            header[..4]
+                .try_into()
+                .map_err(|_| StorageError::Invalid(FRAME_BOUNDARY))?,
+        ) as usize;
+        let frame_len = len.checked_add(8).ok_or(StorageError::Capacity)?;
+        if len == 0
+            || frame_len > self.config().group_limits.max_encoded_bytes + 4096
+            || offset % self.config().fragment_bytes + frame_len as u64
+                > self.config().fragment_bytes
+        {
+            return Err(StorageError::Invalid(FRAME_BOUNDARY));
+        }
+        let bytes = self.read_checked_frame(file, offset, frame_len)?;
+        let group = CompleteGroup::decode(
+            &self.shape,
+            bytes,
+            self.config().batch_limits,
+            self.config().group_limits,
+        )?;
+        let position = WalPosition::new(offset, frame_len as u32);
+        let mut receipts = Vec::with_capacity(group.batches().len());
+        for (batch, member) in group.batches().iter().zip(group.batch_offsets()) {
+            validate_batch(self.config(), batch)?;
+            receipts.push(receipt_for(
+                self.config(),
+                batch,
+                member_position(position, *member, batch),
+            ));
+        }
+        #[cfg(test)]
+        self.replay_decodes.fetch_add(1, Ordering::Relaxed);
+        Ok(DecodedGroup {
+            group,
+            receipts,
+            position,
+            frame_end: offset + frame_len as u64,
+        })
+    }
+
+    fn read_checked_frame(
+        &self,
+        file: &File,
+        offset: u64,
+        frame_len: usize,
+    ) -> Result<minibytes::Bytes, StorageError> {
+        let mut frame = vec![0; frame_len];
+        file.read_exact_at(&mut frame, offset % self.config().wal_file_bytes)?;
+        let bytes: minibytes::Bytes = frame.into();
+        let payload = CrcFrame::read_from_bytes(&bytes, 0)
+            .map_err(|_| StorageError::Invalid(FRAME_BOUNDARY))?;
+        if payload.len() + 8 != frame_len {
+            return Err(StorageError::Invalid(FRAME_BOUNDARY));
+        }
+        Ok(payload)
+    }
+
+    pub(super) fn leased_address(state: &State, address: PhysicalValueAddress) -> bool {
+        #[cfg(feature = "experimental-nvmeof")]
+        if let Some(open) = &state.open_live_extent {
+            let end = state
+                .next_live_extent
+                .as_ref()
+                .map_or(open.extent.end, |next| next.extent.end);
+            return address.offset >= open.extent.start
+                && address
+                    .offset
+                    .checked_add(u64::from(address.len))
+                    .is_some_and(|at| at <= end);
+        }
+        let _ = (state, address);
+        false
+    }
+
+    pub(super) fn member_authority(
+        &self,
+        address: PhysicalValueAddress,
+    ) -> Result<Arc<RegisteredBatch>, StorageError> {
+        let invalid = || StorageError::Invalid(MEMBER_MISMATCH);
+        let end = address
+            .offset
+            .checked_add(u64::from(address.len))
+            .ok_or_else(invalid)?;
+        if address.partition != self.config().partition
+            || address.segment_generation != self.config().inventory.segment_generation
+            || address.len <= 8
+            || address.len as usize > self.config().batch_limits.max_encoded_bytes + 8
+            || address.offset % self.config().fragment_bytes + u64::from(address.len)
+                > self.config().fragment_bytes
+        {
+            return Err(invalid());
+        }
+        let bytes = self
+            .open_replay_file(address.offset)
+            .and_then(|file| self.read_checked_frame(&file, address.offset, address.len as usize))
+            .map_err(|_| invalid())?;
+        let batch = CompleteBatch::decode(&self.shape, bytes, self.config().batch_limits)
+            .map_err(|_| invalid())?;
+        validate_batch(self.config(), &batch).map_err(|_| invalid())?;
+        let receipt = receipt_for(
+            self.config(),
+            &batch,
+            WalPosition::new(address.offset, address.len),
+        );
+        self.references.cache_registered(RegisteredBatch::new(
+            batch.id(),
+            batch.version(),
+            batch.digest(),
+            receipt.address(),
+            batch.record_descriptors().into(),
+            end,
+        ))
+    }
+
+    /// Replay whole groups. The cursor is a WAL offset, never a receipt ordinal.
+    /// `max_bytes` bounds the sum of member frame lengths plus 256 bytes per
+    /// receipt. A first group larger than either page bound is returned whole.
+    pub fn replay_page(
+        &self,
+        from: u64,
+        limit: usize,
+        max_bytes: usize,
+        require_end: u64,
+    ) -> Result<ReplayPage, StorageError> {
+        let (end, retired, live, strict_end) = {
+            let state = self.state.lock();
+            if !state.sealed || state.writer.is_some() {
+                return Err(StorageError::Invalid(
+                    "replay requires sealed immutable epoch",
+                ));
+            }
+            #[cfg(feature = "experimental-nvmeof")]
+            let live = state.live;
+            #[cfg(not(feature = "experimental-nvmeof"))]
+            let live = false;
+            (
+                state.appended_end,
+                state.wal_root.as_ref().map(|root| root.retired.clone()),
+                live,
+                state.wal_root.as_ref().map_or(0, |root| root.synced_end),
+            )
+        };
+        if end < require_end {
+            return Err(StorageError::Invalid(
+                "sealed WAL ends below the required position",
+            ));
+        }
+        if limit == 0 || limit > 256 {
+            return Err(StorageError::Invalid("receipt page limit must be 1..=256"));
+        }
+        if !from.is_multiple_of(8) || from > end {
+            return Err(StorageError::Invalid(FRAME_BOUNDARY));
+        }
+        let _admission = self.read_admission()?;
+        let mut file = None;
+        // A zero tail is a legal cursor only at a boundary reached from the
+        // fragment's first outer frame, not inside an inner member's zero data.
+        let mut boundary = from / self.config().fragment_bytes * self.config().fragment_bytes;
+        // Relaxed is sufficient: this caches a scalar proof about immutable bytes.
+        if self.replay_next.load(Ordering::Relaxed) == from {
+            boundary = from;
+        }
+        while boundary < from {
+            let decoded = self
+                .replay_file(&mut file, boundary)
+                .and_then(|file| self.decode_group_from_file(file, boundary))
+                .map_err(|_| StorageError::Invalid(FRAME_BOUNDARY))?;
+            boundary = decoded
+                .frame_end
+                .checked_add(7)
+                .ok_or(StorageError::Capacity)?
+                & !7;
+            if boundary > from {
+                return Err(StorageError::Invalid(FRAME_BOUNDARY));
+            }
+        }
+        let mut cursor = from;
+        let mut count = 0;
+        let mut bytes = 0usize;
+        let mut groups = Vec::new();
+        while cursor < end {
+            let file_start = cursor / self.config().wal_file_bytes * self.config().wal_file_bytes;
+            if match &retired {
+                Some(retired) => retired.binary_search(&file_start).is_ok(),
+                None => self.references.is_retired(file_start)?,
+            } {
+                cursor = (file_start + self.config().wal_file_bytes).min(end);
+                continue;
+            }
+            let fragment_end =
+                (cursor / self.config().fragment_bytes + 1) * self.config().fragment_bytes;
+            let current_file = self
+                .replay_file(&mut file, cursor)
+                .map_err(|_| StorageError::Invalid(FRAME_BOUNDARY))?;
+            let header = self
+                .frame_header(current_file, cursor)
+                .map_err(|_| StorageError::Invalid(FRAME_BOUNDARY))?;
+            if header == [0xff; 8] {
+                self.validate_skip_suffix(current_file, cursor, fragment_end)
+                    .map_err(|_| StorageError::Invalid(FRAME_BOUNDARY))?;
+                cursor = fragment_end.min(end);
+                continue;
+            }
+            let decoded = match self.decode_group_from_file(current_file, cursor) {
+                Ok(decoded) => decoded,
+                Err(_) if !live && cursor >= strict_end => {
+                    cursor = fragment_end.min(end);
+                    continue;
+                }
+                Err(_) => return Err(StorageError::Invalid(FRAME_BOUNDARY)),
+            };
+            if decoded.frame_end > end {
+                return Err(StorageError::Invalid(FRAME_BOUNDARY));
+            }
+            let group_bytes = decoded.receipts.iter().try_fold(0usize, |bytes, receipt| {
+                bytes
+                    .checked_add(receipt.address().len as usize + 256)
+                    .ok_or(StorageError::Capacity)
+            })?;
+            let next_bytes = bytes
+                .checked_add(group_bytes)
+                .ok_or(StorageError::Capacity)?;
+            if count != 0 && (count + decoded.receipts.len() > limit || next_bytes > max_bytes) {
+                break;
+            }
+            cursor = decoded
+                .frame_end
+                .checked_add(7)
+                .ok_or(StorageError::Capacity)?
+                & !7;
+            count += decoded.receipts.len();
+            bytes = next_bytes;
+            groups.push(decoded);
+            if count >= limit || bytes >= max_bytes {
+                break;
+            }
+        }
+        let next = (cursor < end).then_some(cursor);
+        // This is only a boundary hint; no mutable data is published with it.
+        self.replay_next
+            .store(next.unwrap_or(u64::MAX), Ordering::Relaxed);
+        Ok(ReplayPage { groups, next })
+    }
+
+    fn validate_skip_suffix(&self, file: &File, offset: u64, end: u64) -> Result<(), StorageError> {
+        let mut cursor = offset + 8;
+        let mut buffer = [0; 65536];
+        while cursor < end {
+            let count = (end - cursor).min(buffer.len() as u64) as usize;
+            file.read_exact_at(&mut buffer[..count], cursor % self.config().wal_file_bytes)?;
+            if buffer[..count].iter().any(|byte| *byte != 0) {
+                return Err(StorageError::Invalid(FRAME_BOUNDARY));
+            }
+            cursor += count as u64;
+        }
+        Ok(())
+    }
+}
+
+impl PartitionLog {
+    pub(super) fn recover_wal_replay(
+        path: PathBuf,
+        registration: Registration,
+        shape: KeyShape,
+        lock: DbLock,
+        metrics: Arc<Metrics>,
+        live: bool,
+    ) -> Result<Self, StorageError> {
+        let expected = &registration.config;
+        let root = WalRoot::open(&path, expected)?;
+        let mut inventory = std::collections::BTreeMap::new();
+        for entry in fs::read_dir(&path)? {
+            if let Some((id, len)) = wal_file_entry(&entry?, expected)? {
+                let offset = id * expected.wal_file_bytes;
+                if root.retired.binary_search(&offset).is_err() {
+                    inventory.insert(offset, len);
+                }
+            }
+        }
+        if let (Some((&first, _)), Some((&last, _))) =
+            (inventory.first_key_value(), inventory.last_key_value())
+        {
+            let mut offset = first;
+            while offset < last {
+                if !inventory.contains_key(&offset) && root.retired.binary_search(&offset).is_err()
+                {
+                    return Err(StorageError::Invalid("unexplained missing WAL file"));
+                }
+                offset = offset
+                    .checked_add(expected.wal_file_bytes)
+                    .ok_or(StorageError::Capacity)?;
+            }
+        }
+        let scan_end = inventory
+            .last_key_value()
+            .map_or(root.scan_from, |(offset, len)| offset + len);
+        let frontier = if live {
+            let frontier: LiveFrontier = read_metadata(&path.join(LIVE_FRONTIER))?;
+            let identity = LiveFrontier::new(expected);
+            if frontier.database != identity.database
+                || frontier.partition != identity.partition
+                || frontier.epoch != identity.epoch
+                || frontier.generation != identity.generation
+                || (frontier.end == 0) != frontier.tail.is_none()
+                || !frontier.end.is_multiple_of(4096)
+                || frontier.tail.as_ref().is_some_and(|tail| {
+                    !tail.offset.is_multiple_of(4096)
+                        || tail.offset >= frontier.end
+                        || tail.id.database != identity.database
+                        || tail.version.epoch != identity.epoch
+                })
+            {
+                return Err(StorageError::Invalid("invalid live durable frontier"));
+            }
+            Some(frontier)
+        } else {
+            None
+        };
+        let strict_end = root
+            .synced_end
+            .max(frontier.as_ref().map_or(0, |frontier| frontier.end));
+        let recorded = if path.join(SEAL).exists() {
+            Some(read_metadata::<SealedEnd>(&path.join(SEAL))?)
+        } else {
+            None
+        };
+        let mut physical_end = root.scan_from;
+        if let Some(sealed) = &recorded {
+            if sealed.format != 5
+                || sealed.epoch != expected.inventory.epoch
+                || sealed.generation != expected.inventory.segment_generation
+            {
+                return Err(StorageError::Invalid(
+                    "sealed inventory no longer matches surviving frames",
+                ));
+            }
+            let last_file = sealed.physical_end.saturating_sub(1) / expected.wal_file_bytes
+                * expected.wal_file_bytes;
+            if root.retired.binary_search(&last_file).is_ok() {
+                physical_end = sealed.physical_end;
+            }
+        }
+        let (references, reference_writer) =
+            ReferenceDirectory::open(&path, expected, false, HistoryPersistence::WalReplay)?;
+        let wal = Wal::open_retained(&path, expected.layout(), metrics)?;
+        let retired = root
+            .retired
+            .iter()
+            .map(|offset| {
+                crate::wal::position::WalFileId::from_u64(offset / expected.wal_file_bytes)
+            })
+            .collect::<Vec<_>>();
+        wal.retire_files(&retired)?;
+        let log = Self {
+            state: Mutex::new(State {
+                #[cfg(feature = "experimental-nvmeof")]
+                pending_live: None,
+                #[cfg(feature = "experimental-nvmeof")]
+                open_live_extent: None,
+                #[cfg(feature = "experimental-nvmeof")]
+                next_live_extent: None,
+                #[cfg(feature = "experimental-nvmeof")]
+                last_live_adoption: None,
+                #[cfg(feature = "experimental-nvmeof")]
+                live,
+                #[cfg(feature = "experimental-nvmeof")]
+                sealing: false,
+                #[cfg(feature = "experimental-nvmeof")]
+                last_live_complete: None,
+                #[cfg(feature = "experimental-nvmeof")]
+                live_tail: None,
+                writer: None,
+                wal_root: Some(root.clone()),
+                references: reference_writer,
+                appended_end: physical_end,
+                durable_end: physical_end,
+                namespace_synced_file: None,
+                poison: None,
+                sealed: true,
+                stats: PartitionStats::default(),
+            }),
+            references,
+            durable_frontier: AtomicU64::new(physical_end),
+            replay_next: AtomicU64::new(u64::MAX),
+            #[cfg(test)]
+            replay_decodes: AtomicU64::new(0),
+            frontier: std::sync::OnceLock::new(),
+            sync_profile: Mutex::new(StorageWriteProfile::default()),
+            serve_unsynced: AtomicBool::new(false),
+            worker_claimed: AtomicBool::new(false),
+            persistence: Mutex::new(()),
+            read_admission: parking_lot::RwLock::new(true),
+            #[cfg(feature = "experimental-nvmeof")]
+            live_read_pins: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "experimental-nvmeof")]
+            live_stream: live,
+            #[cfg(test)]
+            before_authority_load: Mutex::new(None),
+            #[cfg(test)]
+            fail_inventory_witness: AtomicU8::new(0),
+            #[cfg(test)]
+            fail_wal_root: AtomicU8::new(0),
+            #[cfg(test)]
+            fail_wal_retire: AtomicBool::new(false),
+            #[cfg(test)]
+            before_persist: Mutex::new(None),
+            #[cfg(test)]
+            fail_persist: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_namespace_persist: AtomicBool::new(false),
+            #[cfg(all(test, feature = "experimental-nvmeof"))]
+            fail_live_frontier: AtomicU8::new(0),
+            #[cfg(all(test, feature = "experimental-nvmeof"))]
+            live_pause: Mutex::new(None),
+            #[cfg(all(test, feature = "experimental-nvmeof"))]
+            fail_after_live_publish: AtomicBool::new(false),
+            wal,
+            registration,
+            shape,
+            device: fs::metadata(&path)?.dev(),
+            path,
+            _lock: lock,
+            _local_authority: None,
+        };
+        let expected = log.config();
+        let mut cursor = root.scan_from;
+        let mut tail_seen = frontier
+            .as_ref()
+            .and_then(|frontier| frontier.tail.as_ref())
+            .is_none_or(|tail| {
+                tail.offset < root.scan_from
+                    || root
+                        .retired
+                        .binary_search(
+                            &(tail.offset / expected.wal_file_bytes * expected.wal_file_bytes),
+                        )
+                        .is_ok()
+            });
+        let mut last_tail = None;
+        let mut file = None;
+        // Live streams stop globally at an invalid tail. Ordinary owner-RPC
+        // streams scan fragments independently, including after a lost skip.
+        // In both cases only present WAL files bound the uncheckpointed suffix.
+        while cursor < scan_end.max(strict_end) {
+            let file_start = cursor / expected.wal_file_bytes * expected.wal_file_bytes;
+            if root.retired.binary_search(&file_start).is_ok() {
+                cursor = file_start
+                    .checked_add(expected.wal_file_bytes)
+                    .ok_or(StorageError::Capacity)?;
+                continue;
+            }
+            let fragment_end = (cursor / expected.fragment_bytes + 1) * expected.fragment_bytes;
+            let current_file = log.replay_file(&mut file, cursor);
+            let header = current_file
+                .as_ref()
+                .map_err(|_| StorageError::Invalid(FRAME_BOUNDARY))
+                .and_then(|file| log.frame_header(file, cursor));
+            if header.as_ref().is_ok_and(|header| *header == [0xff; 8]) {
+                if let Err(error) = log.validate_skip_suffix(
+                    current_file.as_ref().expect("header read file"),
+                    cursor,
+                    fragment_end,
+                ) {
+                    if cursor < strict_end {
+                        return Err(error);
+                    }
+                    if live {
+                        break;
+                    }
+                }
+                cursor = fragment_end;
+                continue;
+            }
+            let decoded =
+                match current_file.and_then(|file| log.decode_group_from_file(file, cursor)) {
+                    Ok(decoded) => decoded,
+                    Err(error) if cursor < strict_end => return Err(error),
+                    Err(_) if live => break,
+                    Err(_) => {
+                        cursor = fragment_end;
+                        continue;
+                    }
+                };
+            if live
+                && (!cursor.is_multiple_of(4096)
+                    || !decoded.position.frame_len().is_multiple_of(4096)
+                    || decoded.group.encoded()[8..12] != [0, 3, 0, 12])
+            {
+                if cursor < strict_end {
+                    return Err(StorageError::Invalid(
+                        "invalid live recovery frame geometry",
+                    ));
+                }
+                break;
+            }
+            if let Some(frontier) = &frontier {
+                if cursor < frontier.end && decoded.frame_end > frontier.end {
+                    return Err(StorageError::Invalid("live frame crosses durable frontier"));
+                }
+                if decoded.frame_end == frontier.end {
+                    let tail = frontier
+                        .tail
+                        .as_ref()
+                        .ok_or(StorageError::Invalid("missing frontier tail"))?;
+                    let last = decoded
+                        .group
+                        .batches()
+                        .last()
+                        .ok_or(StorageError::Invalid("empty live group"))?;
+                    if tail.offset != cursor
+                        || tail.crc != crc32fast::hash(decoded.group.encoded())
+                        || tail.id != last.id()
+                        || tail.version != last.version()
+                        || tail.digest != last.digest()
+                    {
+                        return Err(StorageError::Invalid("live frontier tail mismatch"));
+                    }
+                    tail_seen = true;
+                }
+            }
+            let duplicate = decoded.group.batches().iter().try_fold(
+                false,
+                |found, batch| -> Result<bool, StorageError> {
+                    Ok(found
+                        || log.references.lookup_id(batch.id())?.is_some()
+                        || log.references.lookup_version(batch.version())?.is_some())
+                },
+            )?;
+            if duplicate {
+                if cursor >= strict_end && live {
+                    break;
+                }
+                return Err(StorageError::Invalid(
+                    "duplicate identity or version in replay suffix",
+                ));
+            }
+            if let Some(batch) = decoded.group.batches().last() {
+                last_tail = Some(LiveFrontierTail {
+                    offset: cursor,
+                    crc: crc32fast::hash(decoded.group.encoded()),
+                    id: batch.id(),
+                    version: batch.version(),
+                    digest: batch.digest(),
+                });
+            }
+            let metadata = decoded
+                .group
+                .batches()
+                .iter()
+                .zip(&decoded.receipts)
+                .map(|(batch, receipt)| {
+                    RegisteredBatch::new(
+                        batch.id(),
+                        batch.version(),
+                        batch.digest(),
+                        receipt.address(),
+                        batch.record_descriptors().into(),
+                        decoded.frame_end,
+                    )
+                })
+                .collect();
+            log.state.lock().references.publish_group(metadata)?;
+            physical_end = physical_end.max(decoded.frame_end);
+            cursor = decoded
+                .frame_end
+                .checked_add(7)
+                .ok_or(StorageError::Capacity)?
+                & !7;
+        }
+        if cursor < strict_end {
+            return Err(StorageError::Invalid("corrupt durable WAL frame"));
+        }
+        if !tail_seen {
+            return Err(StorageError::Invalid("missing live durable frontier tail"));
+        }
+        log.wal.persist_registered_files()?;
+        if live
+            && physical_end > frontier.as_ref().map_or(0, |frontier| frontier.end)
+            && let Some(tail) = last_tail
+        {
+            let mut adopted = LiveFrontier::new(expected);
+            adopted.end = physical_end;
+            adopted.tail = Some(tail);
+            install_metadata(&log.path, LIVE_FRONTIER, &encode_metadata(&adopted)?)?;
+        }
+        if recorded
+            .as_ref()
+            .is_some_and(|sealed| sealed.physical_end != physical_end)
+        {
+            return Err(StorageError::Invalid(
+                "sealed inventory no longer matches surviving frames",
+            ));
+        }
+        let end = SealedEnd {
+            format: 5,
+            epoch: expected.inventory.epoch,
+            generation: expected.inventory.segment_generation,
+            frame_count: log.receipt_count(),
+            physical_end,
+        };
+        install_metadata(&log.path, SEAL, &encode_metadata(&end)?)?;
+        {
+            let mut state = log.state.lock();
+            state.appended_end = physical_end;
+            state.durable_end = physical_end;
+        }
+        log.durable_frontier.store(physical_end, Ordering::Release);
+        Ok(log)
+    }
+}

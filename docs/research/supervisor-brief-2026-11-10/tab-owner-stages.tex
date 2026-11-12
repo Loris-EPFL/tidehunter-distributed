@@ -1,0 +1,15 @@
+\small\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrr}\toprule
+Stage mean/p50, \us & Verbs 1 KiB & TCP 1 KiB & Verbs 64 KiB\\\midrule
+Handler (inclusive; annotations are not additive) & \N{A:v1:handler_ns:mean_us}/\N{A:v1:handler_ns:p50_us} & \N{A:t1:handler_ns:mean_us}/\N{A:t1:handler_ns:p50_us} & \N{A:v64:handler_ns:mean_us}/\N{A:v64:handler_ns:p50_us}\\
+Control queue (includes the next two rows) & \N{A:v1:control_queue_ns:mean_us}/\N{A:v1:control_queue_ns:p50_us} & \N{A:t1:control_queue_ns:mean_us}/\N{A:t1:control_queue_ns:p50_us} & \N{A:v64:control_queue_ns:mean_us}/\N{A:v64:control_queue_ns:p50_us}\\
+Appender queue (before handler) & \N{A:v1:appender_queue_ns:mean_us}/\N{A:v1:appender_queue_ns:p50_us} & \N{A:t1:appender_queue_ns:mean_us}/\N{A:t1:appender_queue_ns:p50_us} & \N{A:v64:appender_queue_ns:mean_us}/\N{A:v64:appender_queue_ns:p50_us}\\
+Flusher queue (inside handler) & \N{A:v1:flusher_queue_ns:mean_us}/\N{A:v1:flusher_queue_ns:p50_us} & \N{A:t1:flusher_queue_ns:mean_us}/\N{A:t1:flusher_queue_ns:p50_us} & \N{A:v64:flusher_queue_ns:mean_us}/\N{A:v64:flusher_queue_ns:p50_us}\\
+Append WAL (includes validation/preparation) & \N{A:v1:append_wal_ns:mean_us}/\N{A:v1:append_wal_ns:p50_us} & \N{A:t1:append_wal_ns:mean_us}/\N{A:t1:append_wal_ns:p50_us} & \N{A:v64:append_wal_ns:mean_us}/\N{A:v64:append_wal_ns:p50_us}\\
+Validation (nested) & \N{A:v1:append_validation_ns:mean_us}/\N{A:v1:append_validation_ns:p50_us} & \N{A:t1:append_validation_ns:mean_us}/\N{A:t1:append_validation_ns:p50_us} & \N{A:v64:append_validation_ns:mean_us}/\N{A:v64:append_validation_ns:p50_us}\\
+Descriptor preparation (nested) & \N{A:v1:append_descriptor_preparation_ns:mean_us}/\N{A:v1:append_descriptor_preparation_ns:p50_us} & \N{A:t1:append_descriptor_preparation_ns:mean_us}/\N{A:t1:append_descriptor_preparation_ns:p50_us} & \N{A:v64:append_descriptor_preparation_ns:mean_us}/\N{A:v64:append_descriptor_preparation_ns:p50_us}\\
+Append-persist (inclusive) & \N{A:v1:append_persist_ns:mean_us}/\N{A:v1:append_persist_ns:p50_us} & \N{A:t1:append_persist_ns:mean_us}/\N{A:t1:append_persist_ns:p50_us} & \N{A:v64:append_persist_ns:mean_us}/\N{A:v64:append_persist_ns:p50_us}\\
+File fdatasync (inside append-persist) & \N{A:v1:wal_file_persist_ns:mean_us}/\N{A:v1:wal_file_persist_ns:p50_us} & \N{A:t1:wal_file_persist_ns:mean_us}/\N{A:t1:wal_file_persist_ns:p50_us} & \N{A:v64:wal_file_persist_ns:mean_us}/\N{A:v64:wal_file_persist_ns:p50_us}\\
+Append-persist minus own fdatasync & \N{A:v1:persist_software_ns:mean_us}/\N{A:v1:persist_software_ns:p50_us} & \N{A:t1:persist_software_ns:mean_us}/\N{A:t1:persist_software_ns:p50_us} & \N{A:v64:persist_software_ns:mean_us}/\N{A:v64:persist_software_ns:p50_us}\\
+Unassigned owner time (append decode, group build, other) & \N{A:v1:handler_remainder_ns:mean_us}/\N{A:v1:handler_remainder_ns:p50_us} & \N{A:t1:handler_remainder_ns:mean_us}/\N{A:t1:handler_remainder_ns:p50_us} & \N{A:v64:handler_remainder_ns:mean_us}/\N{A:v64:handler_remainder_ns:p50_us}\\
+\bottomrule\end{tabular}

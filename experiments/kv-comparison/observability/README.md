@@ -18,6 +18,36 @@ The Prometheus `write_out_of_prefix_published_batches` and
 `write_dependency_wait_batches` counts diagnose publication activity; they are
 not latency percentiles.
 
+When supplied, `requested_nvmeof_route` distinguishes the planned `live` and
+`sealed_read` populations on exported series. It is a request label, not proof
+that any I/O used that route. Measurement-boundary NVMe reader counters and
+stage sums are emitted only when present and available; unavailable or absent
+evidence is not zero and sealed-reader counters do not prove a live WAL path.
+Stage sums and counts are not per-call quantiles or isolated wire latency.
+The separate `kv_live_nvmeof_evidence_available`, `kv_live_nvmeof_events`,
+and `kv_live_nvmeof_bytes` series expose the live measurement-boundary delta
+only when the runner reports it available. Event and byte counters are distinct;
+recovery, metadata, payload-RPC, errors and dropped evidence remain separate.
+`kv_live_nvmeof_stage_samples` and `kv_live_nvmeof_stage_seconds` expose
+measurement-boundary stage counts and sums for queue, submission, completion,
+control, validation, allocation, publication, namespace setup, read I/O and
+persistence, owner completion, WAL persistence and namespace, and frontier
+file and namespace stages. A zero sample count is unavailable, not zero latency.
+These potentially overlapping clocks are not per-call quantiles,
+additive latency, isolated wire time or proof of physical-media service.
+
+Live SPDK target intervals use `kv_spdk_live_target_*`, separate from the
+sealed read-only `kv_spdk_target_*` series. They report read/write bdev
+completions, bytes and count-weighted completion means per available owner;
+the all-owner total exists only when every owner is available. Changed bdev
+inventory or backing identity (including WAL file rotation) makes that owner
+unavailable rather than subtracting unrelated counter lifetimes. Missing
+`io_error` objects leave error evidence unavailable, not zero. These are
+boundary observations; they cannot detect an unobserved rotation that leaves
+identical identities at both boundaries, or establish per-API or media latency.
+Sealed SPDK metrics require all active owners: one on a compact fleet or five
+on the full fleet. Live SPDK metrics retain their five-owner requirement.
+
 Neither mode changes Tidehunter, Sui, database durability or workload semantics.
 These tools observe the generic KV comparison harness; adding this integration
 does not automatically add monitoring to the separate Sui checkpoint runner.
@@ -148,16 +178,32 @@ durability contracts, cache cohorts, repeats or backends.
   background work; it is **not** pure per-operation CPU or measurement-only stage
   time. The controller checks same boot/cgroup inode and nonnegative deltas.
   IO byte totals cover all owned-cgroup devices (raw frames retain devices).
+  If IO device membership changes, an IO counter resets, or IO is ambiguous at a
+  boundary, IO totals are unknown, not zero: `available=false` and
+  `core_available=true` preserve independently validated CPU and end-memory
+  values with a reason. Same boot and inode do not establish a zero baseline
+  for an absent device. Linux's cgroup IO statistics flush rstat but do not
+  provide an atomic global device-population boundary; see the
+  [cgroup v2 IO interface](https://docs.kernel.org/admin-guide/cgroup-v2.html#io-interface-files)
+  and [Linux v7.0 blk-cgroup implementation](https://github.com/torvalds/linux/blob/v7.0/block/blk-cgroup.c).
   Memory current is an end-boundary gauge; memory peak is cgroup-lifetime, not a
-  measurement-only maximum. Missing fields remain missing. Unavailable/replaced/
-  reset rows export availability=0 but no numerical resource fields.
+  measurement-only maximum. Missing fields remain missing. Core identity, CPU
+  resets or invalid core counters make the entire row unavailable.
+  The resource receipt reports `core_complete`, `io_complete`, and full
+  `complete` separately. Monitoring admission requires core completion and
+  operational observer readiness, not full IO coverage; the monitoring receipt's
+  `resource_io_complete` and resource event retain the IO gap. That aggregate is
+  null until a resource interval has been observed.
 
 The bounded terminal object is schema version 1 with
 `scope="measurement_boundary_interval"` and a `processes` list (at most 16 unique
 `host_index,process_role` identities). Host index is an integer -1 through 4;
 roles use the existing bounded metric token syntax. Each row requires boolean
-`available`. Unavailable rows contain only identity, availability and a nonblank
-`reason` of at most 512 characters. Available rows require finite positive
+`available`. Fully unavailable rows contain only identity, availability and a nonblank
+`reason` of at most 512 characters. IO-only partial rows additionally have
+`core_available=true`, positive `elapsed_seconds`, and `cpu_seconds`, may have
+the other validated CPU and memory fields, and must not contain IO totals.
+Available rows require finite positive
 `elapsed_seconds`; optional `cpu_seconds,cpu_throttled_seconds` are finite
 nonnegative seconds and `cpu_periods,cpu_throttled_periods,io_read_bytes,
 io_write_bytes,memory_current_bytes,memory_peak_bytes` are nonnegative integers.
@@ -197,7 +243,34 @@ fractions**, pure network time or zero-overhead instrumentation. Exact policy,
 clock descriptions, unsupported stages and errors remain in the admitted
 artifact. Absence remains No data; unavailable prefix profiles expose no
 sampled-prefix stage gauges.
+For the exact `tidehunter_live_nvmeof` backend and
+`live_nvmeof_phase_counters` mode, the separate scope
+`measurement_nvme_io_cumulative_delta` publishes checked client-side NVMe
+counter deltas from arm through the pre-completion-gate snapshot. The requested
+limit enables the window; it does not select or cap a first-N prefix. Its
+`completed_write_ops` population counts I/O frames, not necessarily logical
+keys or API calls. Timer sums retain their own sample counts; a clock with zero
+samples is unavailable. These clocks can overlap and are neither pure wire,
+device or CPU time nor per-stage percentiles. Error, unknown-write, metadata and
+payload-RPC counters remain actual observations; missing fields are not zeros.
+The independently scoped coordinator snapshots are not NVMe samples. See
+`experiments/nvmeof/LIVE_WAL.md` for the live write and persistence path.
+
 The page/hash capture includes every new diagnostic metric family.
+Correlated measurement diagnostics are exported as terminal gauges
+`kv_case_correlated_stage_seconds_sum` and `kv_case_correlated_stage_samples`
+and retained by the bounded historical query. The dashboard keeps backend,
+scope, population and stage distinct: these are sampled diagnostic cohorts,
+not necessarily the whole workload, and each stage has its own observed
+denominator. Nested timings can overlap; do not add them or pool population
+means. Retained raw records, not these totals, describe correlations and tails.
+Valkey CQ poll-wait and wake-to-CQ measure local polling and wakeup intervals,
+not pure wire or device time. `kv_case_valkey_cq_availability` distinguishes
+available, unavailable and profile-unavailable evidence;
+`kv_case_valkey_diagnostic_observations` reports separate unfinished-worker,
+missing-CQ-record and clock-failure populations. CQ timing excludes records with
+clock failures. Missing evidence remains unknown / No data, not zero.
+
 
 The full current TCP profile has 268 stage fields plus the separate coordinator
 window; the former 256-field limit rejected a valid real artifact. The 512-field
@@ -235,6 +308,8 @@ write_checkpoint_ns
 write_checkpoint_count
 write_foreground_checkpoint_ns
 write_foreground_checkpoint_count
+write_concurrent_checkpoint_deferrals
+write_concurrent_checkpoint_wait_ns
 write_background_checkpoint_ns
 write_background_checkpoint_suffix_batches
 write_durable_receipt_publication_blocked_ns
@@ -255,6 +330,13 @@ optional interval evidence exports no coordinator values. The dashboard labels
 both populations explicitly. Do not add their overlapping stage totals,
 normalize full-window coordinator counters by prefix sample counts, infer
 per-operation percentiles, or turn the populations into latency fractions.
+
+`write_concurrent_checkpoint_deferrals` counts FIFO-head admissions retained at
+checkpoint or admission-capacity pressure. `write_concurrent_checkpoint_wait_ns`
+is their accumulated elapsed wait until admission or rejection. Pending-window,
+index and owner-reference capacity can contribute; this is not a pure checkpoint
+I/O timer. Published durable replies can progress while that head is deferred.
+The counters do not change the required owner persistence or publication rules.
 
 Normal runs remain unprofiled; diagnostic runs are a separate observation mode.
 The dashboard still cannot supply unmeasured TLS/fsync/coordination breakdowns,
@@ -323,6 +405,38 @@ Zero counts and unknown observations differ. No raw events enter Prometheus.
 These request populations are neither per-API latency nor pure NVMe/NAND time;
 do not add them to API stages or pool them across hosts.
 
+
+## GCP identity and local stack qualification
+
+Campaign observer IDs admit the existing safe `th-*` form and the GCP form
+`bench-` followed by exactly 16 lowercase hexadecimal characters. This does not
+relax the six-private-host cloud contract, run-owned state path, or exact
+session-spec and container-owner checks.
+
+After integrating changes, run the real bounded stack qualification from the
+repository root with a **new** absolute output directory on the root filesystem:
+
+```bash
+python3 experiments/kv-comparison/observability/qualify_gcp_identity.py \
+  --output /tmp/kv-observer-gcp-qualification-$(date +%s)
+```
+
+It starts six logical loopback hosts and the actual pinned exporter, Prometheus
+and Grafana containers; selects one explicitly failed fixture (no fabricated
+benchmark measurements); verifies target health, authenticated datasource and
+dashboard queries and the case identity; snapshots and retains the capture;
+stops the live stack; then restores and verifies the original samples offline.
+It retains the archive, receipt and online/offline verification JSON under the
+output directory and attempts exact-owner cleanup on failure as well as success.
+The 15-minute session deadline bounds operations, not a daemon shutdown
+scheduler; inspect cleanup errors and retained state if the process is interrupted.
+
+Prerequisites: a usable Linux Docker daemon, cached exact image digests in
+`images.lock.json` (no implicit pulls), at least 6 GiB free on the root
+filesystem, free live ports 19090/13000/19899/19100/19898 and replay ports
+29090/23000, and six available loopback addresses. This is a local shared-kernel
+functional check, not a real workload, Sui replay, six physical hosts, network
+performance, or assurance that future cloud monitoring cannot fail.
 
 ## Retain and replay offline
 

@@ -207,6 +207,38 @@ def finalize_standalone_trace(directory, receipt):
     receipt["raw_artifacts_validated"] = False
 
 
+def inspect_process_fd(directory, entry, *, strict):
+    """Read a bounded, self-consistent descriptor observation."""
+    def descriptor_info():
+        info = (directory.parent / "fdinfo" / entry.name).read_text()
+        fields = dict(line.split(":", 1) for line in info.splitlines() if ":" in line)
+        return int(fields["flags"].strip(), 8), (int(fields["ino"].strip()) if "ino" in fields else None)
+
+    for attempt in range(32):
+        try:
+            flags, fd_inode = descriptor_info()
+            identity = entry.stat()
+            target = os.readlink(entry)
+            final_flags, final_inode = descriptor_info()
+            final_identity = entry.stat()
+            final_target = os.readlink(entry)
+            if (flags != final_flags or fd_inode != final_inode
+                    or (fd_inode is not None and fd_inode != identity.st_ino)
+                    or (identity.st_dev, identity.st_ino) != (final_identity.st_dev, final_identity.st_ino)
+                    or target != final_target):
+                raise ValueError("descriptor changed during inspection")
+            return flags, identity, target
+        except (OSError, ValueError, KeyError) as exc:
+            if not os.path.lexists(entry):
+                return None
+            if attempt == 31:
+                if strict:
+                    raise SafetyError(f"cannot inspect writable fd {entry.name}: {exc}") from exc
+                return None
+            time.sleep(.001)
+    return None
+
+
 def fio_open_flags(pid, device, inode):
     """Read the fio process fd flags for the exact opened target inode."""
     directory = Path("/proc") / str(pid) / "fd"
@@ -220,13 +252,15 @@ def fio_open_flags(pid, device, inode):
     for entry in entries:
         try:
             identity = entry.stat()
-            if (identity.st_dev, identity.st_ino) != (device, inode):
-                continue
-            info = (directory.parent / "fdinfo" / entry.name).read_text()
-            line = next(line for line in info.splitlines() if line.startswith("flags:"))
-            flags.append(int(line.split()[1], 8))
-        except (OSError, ValueError, StopIteration):
+        except OSError:
             continue
+        if (identity.st_dev, identity.st_ino) != (device, inode):
+            continue
+        observed = inspect_process_fd(directory, entry, strict=False)
+        if observed is not None:
+            value, identity, _ = observed
+            if (identity.st_dev, identity.st_ino) == (device, inode):
+                flags.append(value)
     if not flags:
         return None
     return {"read_only": all(value & os.O_ACCMODE == os.O_RDONLY for value in flags),
@@ -374,15 +408,10 @@ def write_fio_flags(pid, device, inode, case_root, pipe_inodes):
         raise SafetyError("too many fio descriptors")
     observed = None
     for entry in entries:
-        try:
-            info = (directory.parent / "fdinfo" / entry.name).read_text()
-            flags = int(next(line for line in info.splitlines() if line.startswith("flags:")).split()[1], 8)
-            identity = entry.stat()
-            target = os.readlink(entry)
-        except (OSError, ValueError, StopIteration) as exc:
-            if os.path.lexists(entry):
-                raise SafetyError(f"cannot inspect writable fd {entry.name}: {exc}") from exc
+        inspection = inspect_process_fd(directory, entry, strict=True)
+        if inspection is None:
             continue
+        flags, identity, target = inspection
         if flags & os.O_ACCMODE == os.O_RDONLY:
             continue
         if stat.S_ISREG(identity.st_mode) and (identity.st_dev, identity.st_ino) == (device, inode):
@@ -502,11 +531,12 @@ def media_device_snapshot(root, owner_index, diskstats):
     matches = []
     for line in diskstats.splitlines():
         fields = line.split()
-        if len(fields) >= 4 and fields[0] == str(major) and fields[1] == str(minor):
-            matches.append(int(fields[3]))
-    if len(matches) != 1 or matches[0] < 0:
-        raise ValueError("physical read counter unavailable")
-    return {"owner_index": owner_index, "major": major, "minor": minor, "read_ops": matches[0]}
+        if len(fields) >= 10 and fields[0] == str(major) and fields[1] == str(minor):
+            matches.append(tuple(int(fields[index]) for index in (3, 5, 7, 9)))
+    if len(matches) != 1 or any(value < 0 for value in matches[0]):
+        raise ValueError("physical device counters unavailable")
+    return dict(zip(("owner_index", "major", "minor", "read_ops", "read_sectors", "write_ops", "write_sectors"),
+                    (owner_index, major, minor, *matches[0])))
 
 
 def qualify_media_evidence(case_id, media, before, after, successful_reads, drained,
@@ -515,6 +545,8 @@ def qualify_media_evidence(case_id, media, before, after, successful_reads, drai
     reasons = []
     rows = []
     ratio = None
+    bytes_per_read = None
+    counters = ("read_ops", "read_sectors", "write_ops", "write_sectors")
     if drained is not True:
         reasons.append("measurement_not_drained")
     valid_count = type(successful_reads) is int and 0 < successful_reads <= 2**64 - 1
@@ -525,17 +557,17 @@ def qualify_media_evidence(case_id, media, before, after, successful_reads, drai
             raise ValueError("missing_devices")
         result = {}
         for row in values:
-            if not isinstance(row, dict) or set(row) != {"owner_index", "major", "minor", "read_ops"}:
+            if not isinstance(row, dict) or set(row) != {"owner_index", "major", "minor", *counters}:
                 raise ValueError("invalid_device_counter")
             if (type(row["owner_index"]) is not int
                     or (row["owner_index"] != -1 if client else not 0 <= row["owner_index"] <= 2**64 - 1)
                     or any(type(row[key]) is not int or not 0 <= row[key] <= 2**64 - 1
-                           for key in ("major", "minor", "read_ops"))):
+                           for key in ("major", "minor", *counters))):
                 raise ValueError("invalid_device_counter")
             identity = (row["owner_index"], row["major"], row["minor"])
             if identity in result:
                 raise ValueError("duplicate_device")
-            result[identity] = row["read_ops"]
+            result[identity] = row
         if client and len(result) != 1:
             raise ValueError("invalid_client_device_count")
         return result
@@ -543,14 +575,17 @@ def qualify_media_evidence(case_id, media, before, after, successful_reads, drai
         first, last = indexed(before), indexed(after)
         if first.keys() != last.keys():
             raise ValueError("device_identity_mismatch")
-        if any(last[key] < first[key] for key in first):
+        if any(last[key][counter] < first[key][counter] for key in first for counter in counters):
             raise ValueError("device_counter_decreased")
         rows = [{"owner_index": owner, "major": major, "minor": minor,
-                 "read_ops_before": first[(owner, major, minor)],
-                 "read_ops_after": last[(owner, major, minor)]}
+                 **{f"{counter}_{boundary}": source[(owner, major, minor)][counter]
+                    for counter in counters for boundary, source in (("before", first), ("after", last))}}
                 for owner, major, minor in sorted(first)]
         if valid_count:
             ratio = sum(row["read_ops_after"] - row["read_ops_before"] for row in rows) / successful_reads
+        read_ops = sum(row["read_ops_after"] - row["read_ops_before"] for row in rows)
+        if read_ops:
+            bytes_per_read = 512 * sum(row["read_sectors_after"] - row["read_sectors_before"] for row in rows) / read_ops
     except ValueError as exc:
         reasons.append(str(exc))
     if ratio is not None:
@@ -565,10 +600,10 @@ def qualify_media_evidence(case_id, media, before, after, successful_reads, drai
         history_before = history_after = None
         if media.get("history") == "prewarm":
             reasons.append("history_counter_unavailable")
-    evidence = {"schema_version": 1, "case_id": case_id, "expected": media["expected"],
+    evidence = {"schema_version": 2, "case_id": case_id, "expected": media["expected"],
                 "status": "unqualified" if reasons else "qualified", "reason_codes": reasons,
                 "measurement_drained": drained is True, "successful_reads": successful_reads if valid_count else 0,
-                "read_ops_per_success": ratio, "history_loads_before": history_before,
+                "read_ops_per_success": ratio, "device_bytes_per_read": bytes_per_read, "history_loads_before": history_before,
                 "history_loads_after": history_after, "history_prewarm_verified": prewarm_verified}
     if client:
         evidence["client_devices"] = [{"client_index": row["owner_index"], **{key: value for key, value in row.items()
@@ -576,6 +611,31 @@ def qualify_media_evidence(case_id, media, before, after, successful_reads, drai
     else:
         evidence["owner_devices"] = rows
     return evidence
+
+def store_measurement_device_evidence(directory, receipt, job, media, before, after, owner_count):
+    if media is not None:
+        path = directory / "media_evidence.json"
+        dump(path, media)
+        receipt["media_evidence"] = {"path": path.name, "sha256": digest(path)}
+    if job.get("device_counters"):
+        native = job.get("backend") == "native"
+        count = 1 if native else owner_count
+        start = 0 if native else 1
+        try:
+            counters = {
+                "before": [host["media_device"] for host in before[start:start + count]],
+                "after": [host["media_device"] for host in after[start:start + count]],
+            }
+            if len(counters["before"]) != count or len(counters["after"]) != count:
+                raise KeyError("missing device snapshot")
+        except (KeyError, TypeError) as exc:
+            raise SafetyError("client device counters unavailable" if native else "owner device counters unavailable") from exc
+        path = directory / "device_counters.json"
+        dump(path, counters)
+        receipt["device_counters"] = {"path": path.name, "sha256": digest(path)}
+    if job.get("require_media_qualified") and (not media or media["status"] != "qualified"):
+        raise SafetyError("required cold canary is not device-served")
+
 
 
 def owner_history_boundaries(evidence, owner_count=5):
@@ -604,19 +664,42 @@ def owner_history_boundaries(evidence, owner_count=5):
         return None, None
 
 
+def measurement_media_evidence(job, samples, batch_size, before, ended, host_count, owner_count, drained, read_interval):
+    native = job["case_kind"] == "native_media_read"
+    history = owner_history_boundaries(read_interval["observed"] if read_interval else {}, owner_count)
+    try:
+        if len(before) != host_count + 1 or len(ended) != host_count + 1:
+            raise ValueError("missing host snapshots")
+        first_hosts = before[:1] if native else before[1:1 + owner_count]
+        last_hosts = ended[:1] if native else ended[1:1 + owner_count]
+        for first, last in zip(first_hosts, last_hosts):
+            boot = first["nvme"]["host_identity"]["boot_id"]
+            if not isinstance(boot, str) or not boot or boot != last["nvme"]["host_identity"]["boot_id"]:
+                raise ValueError("media host boot identity changed")
+        first_devices = [host["media_device"] for host in first_hosts]
+        last_devices = [host["media_device"] for host in last_hosts]
+    except (ValueError, KeyError, TypeError):
+        first_devices = last_devices = None
+    successful = analyze.successful_read_keys(samples, batch_size)
+    return qualify_media_evidence(job["case_id"], job["media"], first_devices, last_devices,
+                                  successful, drained, *history, client=native)
+
+
 def require_supported_nvme_route(job):
     """Keep immutable sealed reads separate from live writable namespaces."""
     route = job.get("nvmeof_route")
     target = job.get("nvmeof_target", "kernel")
     if job.get("target_io") == "direct":
-        cold_read = (job.get("case_kind") == "media_read" and job.get("group") in ("G1", "G10R", "G12D")
+        cold_read = (job.get("case_kind") == "media_read" and job.get("group") in ("G1", "G10R", "G12D", "G16C")
                      and job.get("media", {}).get("expected") == "cold"
                      and job.get("mix") == cloud_campaign.mix(read=100))
         hybrid_write = (job.get("case_kind") == "hybrid_put" and job.get("group") in ("G12H", "G12D")
                         and job.get("mix") == cloud_campaign.mix(put=100))
-        if (job.get("backend") != "tidehunter_nvme_rdma" or route != "sealed_read" or target != "kernel"
-                or not (cold_read or hybrid_write)):
-            raise SafetyError("direct target I/O requires a reviewed sealed kernel RDMA case")
+        tcp_direct = (job.get("backend") == "tidehunter_nvme_tcp"
+                      and job.get("selection") == "fabric_ab_compact" and job.get("group") == "G16C")
+        if ((job.get("backend") != "tidehunter_nvme_rdma" and not tcp_direct)
+                or route != "sealed_read" or target != "kernel" or not (cold_read or hybrid_write)):
+            raise SafetyError("direct target I/O requires a reviewed sealed kernel case")
     if target not in ("kernel", "spdk") or target == "spdk" and (
             route not in ("sealed_read", "live") or job.get("backend") != "tidehunter_nvme_rdma"):
         raise SafetyError("SPDK requires explicit sealed or live RDMA selection")
@@ -1203,7 +1286,7 @@ def unit_name(config, case, role):
     return f"kvcloud-{config['prefix']}-{hashlib.sha256(case.encode()).hexdigest()[:16]}-{role}"
 
 
-def systemd_argv(config, case, role, cpus, memory, seconds, executable):
+def systemd_argv(config, case, role, cpus, memory, seconds, executable, setenv=None):
     if seconds < 1 or cpus <= 0 or memory <= 0:
         raise DeadlineError("no admitted runtime/budget remains")
     env = environment(config)
@@ -1215,6 +1298,7 @@ def systemd_argv(config, case, role, cpus, memory, seconds, executable):
             "--property=CPUAccounting=yes", "--property=MemoryAccounting=yes", "--property=IOAccounting=yes",
             "--property=WorkingDirectory=" + config["repository_root"],
             *["--setenv=" + key + "=" + env[key] for key in ("LD_LIBRARY_PATH", "FDB_CLIENT_LIB_DIR", "FDB_CLIENT_LIB_PATH", "FI_EFA_USE_DEVICE_RDMA") if key in env],
+            *["--setenv=" + key + "=" + str(value) for key, value in (setenv or {}).items()],
             "--", *map(str, executable)]
 
 
@@ -1521,8 +1605,40 @@ def safe_extract_capsule(archive, destination, expected):
             target.chmod(0o600)
 
 
+def require_zero_owner_history_waits(directory, owner_count):
+    """A6 diagnostic cases require every stopped owner's epoch wait evidence."""
+    for index in range(owner_count):
+        path = directory / "owner-durability" / f"node-{index}.history-maintenance.json"
+        try:
+            evidence = json.loads(path.read_text())
+            epochs = evidence["epoch_stats"]
+            if evidence.get("schema_version") != 1 or not isinstance(epochs, list) or not epochs:
+                raise ValueError("missing epoch history statistics")
+            for epoch in epochs:
+                if (not isinstance(epoch, list) or len(epoch) != 2 or type(epoch[0]) is not int
+                        or not isinstance(epoch[1], dict) or type(epoch[1].get("waits")) is not int
+                        or epoch[1]["waits"] < 0):
+                    raise ValueError("invalid epoch history wait counter")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError("owner history diagnostics missing or invalid") from exc
+        if any(stats["waits"] != 0 for _, stats in epochs):
+            raise RuntimeError("memory-only owner waited for history")
+
+
+def admitted_live_campaign(config, case):
+    spec = config["spec"]
+    if spec.get("mode") == "standard-with-live-nvmeof":
+        return True
+    if (spec.get("mode") != "focused"
+            or not (spec.get("selection") == "leased_ab_compact"
+                    or spec.get("selection") in cloud_campaign.NVMEOF_PATH_SELECTIONS)):
+        return False
+    return any(job["case_id"] == case and job.get("nvmeof_route") == "live"
+               for job in cloud_campaign.make_focused_matrix(spec["selection"]))
+
+
 def live_nvme_preparation(config, case, transport):
-    if (config["spec"].get("mode") != "standard-with-live-nvmeof"
+    if (not admitted_live_campaign(config, case)
             or transport not in ("tcp", "rdma")
             or "tidehunter_nvme_" + transport not in config["spec"]["backends"]):
         raise SafetyError("live NVMe transport is not admitted by the campaign")
@@ -1547,7 +1663,26 @@ def live_host_identity(host_nqn):
     return list(identity.bytes)
 
 
-def live_target_for_owner(config, case, index, transport, host_nqn, target="kernel"):
+def admit_prepared_live_client(live_client, prep, tier):
+    if not isinstance(live_client, dict):
+        raise SafetyError("prepared live client is missing")
+    host_nqn = live_client.get("host_nqn")
+    host_id = live_host_identity(host_nqn)
+    expected = {key: prep[key] for key in
+                ("max_inflight_requests", "max_inflight_bytes", "connect_timeout_ms", "io_timeout_ms")}
+    expected.update(host_nqn=host_nqn, host_id=host_id, write_mode=prep["write_mode"],
+                    leased_durability=tier if prep["write_mode"] == "leased" else None,
+                    inline_reads=prep["inline_reads"], queue_geometry=prep["queue_geometry"],
+                    export_mode=prep["export_mode"])
+    for key, default in (("lease_ahead", True), ("polled_writes", False)):
+        if key in live_client or key in prep:
+            expected[key] = prep.get(key, default)
+    if live_client != expected:
+        raise SafetyError("prepared live client differs from admitted configuration")
+    return host_nqn
+
+
+def live_target_for_owner(config, case, index, transport, host_nqn, target="kernel", export_mode="on_demand"):
     prep = live_nvme_preparation(config, case, transport)
     live_host_identity(host_nqn)
     result = {"address": prep["addresses"][index], "service": prep["service"],
@@ -1556,7 +1691,7 @@ def live_target_for_owner(config, case, index, transport, host_nqn, target="kern
             "state_dir": str(Path(config["fleet"]["data_root"]) / "cells" / case
                              / f"node-{index}" / "live-nvmeof"),
             "commissioning_port_id": prep["commissioning_port_id"],
-            "commissioning_service": prep["commissioning_service"]}
+            "commissioning_service": prep["commissioning_service"], "export_mode": export_mode}
     if target == "spdk":
         if transport != "rdma" or config["spec"].get("spdk_comparison") is not True:
             raise SafetyError("live SPDK requires explicitly admitted RDMA comparison")
@@ -1568,9 +1703,11 @@ def live_target_for_owner(config, case, index, transport, host_nqn, target="kern
     return result
 
 
-def validate_launch(config, launch, case, index):
+def validate_launch(config, launch, case, index, polling=None):
     root = Path(config["fleet"]["data_root"]) / "cells" / case
     node = root / f"node-{index}"
+    if polling is not None and launch.get("limits", {}).get("polling") != polling:
+        raise SafetyError("typed launch polling differs from requested owner policy")
     expected = {"ready_file": node / "ready", "stop_file": node / "stop"}
     for field, path in expected.items():
         if launch.get(field) != str(path):
@@ -1585,7 +1722,8 @@ def validate_launch(config, launch, case, index):
             raise SafetyError("invalid live target launch configuration")
         expected_target = live_target_for_owner(config, case, index, live_target.get("transport"),
                                                 live_target.get("host_nqn"),
-                                                "spdk" if live_target.get("spdk") is not None else "kernel")
+                                                "spdk" if live_target.get("spdk") is not None else "kernel",
+                                                live_target.get("export_mode", "on_demand"))
         actual_target = {key: value for key, value in live_target.items() if key != "spdk" or value is not None}
         if actual_target != expected_target:
             raise SafetyError("live target differs from exact owner campaign configuration")
@@ -2189,11 +2327,14 @@ def guest_operation(config, request, clients, *, local_mode=None):
                 raise InfrastructureError("SSD write floor cleanup unconfirmed: " + repr(exc)) from exc
     if action == "ssd_floor":
         job = request.get("job")
-        if (local_mode is not None or index != 0 or config["spec"].get("mode") != "focused"
+        ssd = job.get("ssd", {}) if isinstance(job, dict) else {}
+        expected_index = {"client": -1, "owner0": 0}.get(ssd.get("host", "owner0"))
+        if (local_mode is not None or expected_index is None or index != expected_index
+                or config["spec"].get("mode") != "focused"
                 or not isinstance(job, dict) or job.get("case_kind") != "ssd_floor"
                 or request.get("quiescent") is not True or job.get("case_id") != request.get("case_id")
                 or set(request) != {"index", "action", "case_id", "job", "quiescent", "timeout"}):
-            raise SafetyError("SSD floor requires an owned quiescent focused owner")
+            raise SafetyError("SSD floor requires an owned quiescent focused host")
         cloud_campaign.validate_focused_job(job)
         duration = request["timeout"]
         if type(duration) is not int or not 15 <= duration <= 600:
@@ -2231,7 +2372,8 @@ def guest_operation(config, request, clients, *, local_mode=None):
             return {"raw_base64": base64.b64encode(raw).decode("ascii"),
                     "lat_base64": base64.b64encode(data).decode("ascii"), "argv": argv,
                     "device_identity": f"{device['major']}:{device['minor']}", "scratch": identity,
-                    "opened_read_only": flags["read_only"], "actual_direct": flags["direct"]}
+                    "opened_read_only": flags["read_only"], "actual_direct": flags["direct"],
+                    **({"host_index": index} if "host" in ssd else {})}
         except FioFailure as exc:
             return {"fio_failed": str(exc)[:4096]}
         finally:
@@ -2291,7 +2433,10 @@ def guest_operation(config, request, clients, *, local_mode=None):
                     status.get("ActiveState") not in ("inactive", "failed") or status.get("MainPID") != "0"):
                 raise SafetyError("inactive owner host has a running case owner")
             observed["owner_activity"] = {"active": False, "unit": status}
-        if (index >= 0 and isinstance(resource_job, dict) and resource_job.get("case_kind") == "media_read"
+        if (index >= 0 and isinstance(resource_job, dict)
+                and (resource_job.get("case_kind") == "media_read"
+                     or (resource_job.get("case_kind") == "live_read" and isinstance(resource_job.get("media"), dict))
+                     or (resource_job.get("device_counters") and resource_job.get("backend") in cloud_campaign.TRANSPORTS))
                 and index < resource_job.get("owner_count", len(config["fleet"]["nodes"]))):
             try:
                 owner_case = request.get("resource_owner_case", resource_job["case_id"])
@@ -2299,12 +2444,23 @@ def guest_operation(config, request, clients, *, local_mode=None):
                 observed["media_device"] = media_device_snapshot(owner_root, index, observed["diskstats"])
             except (OSError, ValueError, KeyError) as exc:
                 observed["media_device_error"] = type(exc).__name__ + ": " + str(exc)
+        if (index == -1 and isinstance(resource_job, dict) and resource_job.get("backend") == "native"
+                and resource_job.get("device_counters")):
+            try:
+                native_root = guarded(root / "results" / "cases" / resource_job["case_id"] / "database",
+                                      root, must_exist=True)
+                observed["media_device"] = media_device_snapshot(native_root, index, observed["diskstats"])
+            except (OSError, ValueError, KeyError) as exc:
+                observed["media_device_error"] = type(exc).__name__ + ": " + str(exc)
         if index == -1 and isinstance(resource_job, dict) and resource_job.get("case_kind") == "native_media_read":
             try:
                 cloud_campaign.validate_focused_job(resource_job)
-                source = resource_job["sealed_dataset"]["source_id"]
-                native_root = guarded(root / "results" / "datasets" / (source + "-native") / "database",
-                                      root, must_exist=True)
+                if "sealed_dataset" in resource_job:
+                    source = resource_job["sealed_dataset"]["source_id"]
+                    native_root = root / "results" / "datasets" / (source + "-native") / "database"
+                else:
+                    native_root = root / "results" / "cases" / resource_job["case_id"] / "database"
+                native_root = guarded(native_root, root, must_exist=True)
                 observed["media_device"] = media_device_snapshot(native_root, index, observed["diskstats"])
             except (OSError, ValueError, KeyError) as exc:
                 observed["media_device_error"] = type(exc).__name__ + ": " + str(exc)
@@ -2391,7 +2547,7 @@ def guest_operation(config, request, clients, *, local_mode=None):
     guest_root = guarded(root / "cells" / case, root)
     capsule_root = guarded(guest_root / ("node-" + str(index)), root)
     if action == "live_spdk_snapshot":
-        if index < 0 or config["spec"].get("mode") != "standard-with-live-nvmeof":
+        if index < 0 or not admitted_live_campaign(config, case):
             raise SafetyError("live SPDK snapshot requires an admitted owner")
         import yaml
         launch = yaml.safe_load((capsule_root / "launch.yaml").read_text())
@@ -2430,7 +2586,7 @@ def guest_operation(config, request, clients, *, local_mode=None):
                     "truncated": capture["truncated"], "records": facts,
                     "scope": "exact owner session journal through collection; may include earlier shared-owner cases"}
         if action == "live_case_snapshot":
-            if config["spec"].get("mode") != "standard-with-live-nvmeof":
+            if not admitted_live_campaign(config, case):
                 raise SafetyError("live boundary observation requires live campaign")
             if index >= 0 and launch["node"].get("live_target") is None:
                 raise SafetyError("live boundary requires exact live owner")
@@ -2518,7 +2674,8 @@ def guest_operation(config, request, clients, *, local_mode=None):
         seconds = min(request["timeout"], int((timestamp(config["deadline_utc"]) - utc()).total_seconds()))
         command(systemd_argv(config, case, "storage-" + str(index), config["fleet"]["server_cpus"],
                              config["fleet"]["server_memory_mib"], seconds,
-                             [config["binary"], "--experimental-storage-node", capsule_root / "launch.yaml"]), timeout=20)
+                             [config["binary"], "--experimental-storage-node", capsule_root / "launch.yaml"],
+                             setenv={"TIDEHUNTER_HISTORY_DIAGNOSTICS": "1"} if request.get("owner_history_diagnostics") else None), timeout=20)
         deadline = time.monotonic() + min(90, seconds)
         while time.monotonic() < deadline:
             ready = Path(launch["ready_file"])
@@ -2566,6 +2723,9 @@ def guest_operation(config, request, clients, *, local_mode=None):
             raise InfrastructureError("owned storage cgroup remains populated after stop")
         result = {"before": status, "after": after, "logs": logs,
                   "stop_command_completed": True, "cgroup_events_after_stop": cgroup_events}
+        if request.get("owner_history_diagnostics"):
+            history_path = (capsule_root / "launch.yaml").with_suffix(".history-maintenance.json")
+            result["history_maintenance"] = json.loads(guarded(history_path, guest_root, must_exist=True).read_text())
         if launch["node"].get("live_target") is not None:
             import nvme_campaign_owner
             try:
@@ -3113,27 +3273,48 @@ class Controller:
         import yaml
         case = job["case_id"]
         guest_root = str(Path(self.config["fleet"]["data_root"]) / "cells" / case)
+        if job.get("history_persistence", "on_disk") not in ("on_disk", "memory_only", "wal_replay"):
+            raise SafetyError("unknown owner history persistence")
+        if (job.get("history_persistence") == "memory_only"
+                and any(job.get("mix", {}).get(kind, 0) for kind in ("read", "get_many"))
+                and (job.get("nvmeof_route") != "live"
+                     or job.get("live_export_mode", "on_demand") not in ("per_owner", "per_file"))):
+            raise SafetyError("memory-only history admits reads only with permanent live export")
         allowance = job.get("owner_read_memory_allowance_bytes",
             min(512 * 1024**2, int(self.config["fleet"]["server_memory_mib"] * 1024**2 // 4)))
         owner_count = job.get("owner_count", len(self.config["fleet"]["nodes"]))
+        polling = job.get("owner_polling", "adaptive")
+        if polling not in ("adaptive", "busy"):
+            raise ValueError("owner_polling must be adaptive or busy")
         prep = {"guest_root": guest_root, "addresses": [h["address"] + ":9400" for h in self.config["fleet"]["nodes"][:owner_count]],
                 "transport": cloud_campaign.TRANSPORTS[
                     "tidehunter_verbs_native" if job.get("case_kind") and
-                    job["backend"] == "tidehunter_nvme_rdma" and
-                    job.get("nvmeof_route") == "sealed_read" else job["backend"]],
+                    job["backend"] in cloud_campaign.NVME_BACKENDS and
+                    (job.get("nvmeof_route") == "sealed_read" or
+                     job.get("selection") == "leased_ab_compact" or
+                     job.get("selection") in cloud_campaign.NVMEOF_PATH_SELECTIONS) else job["backend"]],
                 "max_batches_per_partition": max(16384, job["keys"] + job["warmup_operations"] + job["measurement_operations"]),
                 "max_admitted_batches": 1_000_000, "max_index_bytes": 512 * 1024**2,
                 "coordinator_cache_bytes": job["coordinator_cache_bytes"], "owner_read_workers": 4,
                 "owner_wal_member_read": "async",
                 "owner_read_resident_first": job.get("owner_read_resident_first", False),
                 "owner_read_memory_allowance_bytes": allowance,
-                "polling": "adaptive"}
+                "polling": polling, "owner_wal_geometry": job.get("owner_wal_geometry", "research"),
+                "history_persistence": job.get("history_persistence", "on_disk")}
         tier = cloud_campaign.durability_tier(job)
         prep["durability_tier"] = tier
         receipts, nonces = {}, {}
         if job.get("nvmeof_route") == "live":
             live_transport = {"tidehunter_nvme_tcp": "tcp", "tidehunter_nvme_rdma": "rdma"}.get(job["backend"])
             prep["live_nvmeof"] = live_nvme_preparation(self.config, case, live_transport)
+            prep["live_nvmeof"].update(write_mode=job.get("live_write_mode", "reserved"),
+                                       inline_reads=job.get("live_inline_reads", True),
+                                       export_mode=job.get("live_export_mode", "on_demand"),
+                                       lease_ahead=job.get("live_lease_ahead", True),
+                                       polled_writes=job.get("live_polled_writes", False),
+                                       queue_geometry={"io_queues": job.get("live_io_queues", 1),
+                                                       "queue_size": job.get("live_io_queue_size", 32),
+                                                       "poll_queues": job.get("live_poll_queues", 0)})
         if "sealed_dataset" in job:
             # Preparation and each planned reader consume one retained epoch.
             source = job["sealed_dataset"]["source_id"]
@@ -3148,19 +3329,19 @@ class Controller:
         prepared = directory / "prepared"
         command([self.config["binary"], "--prepare-external-case", directory / "prepare-input.json", "--output", prepared],
                 timeout=min(60, self.remaining()), env=environment(self.config))
+        geometry = {"native_default": (134217728, 10737418240), "research": (4194304, 1073741824),
+                    "sui_harness": (16777216, 268435456)}.get(prep["owner_wal_geometry"])
+        for index in range(owner_count):
+            launch = yaml.safe_load((prepared / f"node-{index}" / "launch.yaml").read_text())
+            partition = (launch or {}).get("node", {}).get("partition", {})
+            if geometry is None or (partition.get("fragment_bytes"), partition.get("wal_file_bytes")) != geometry:
+                raise SafetyError("prepared owner WAL geometry differs from the planned case")
+            if (launch or {}).get("history_persistence", "on_disk") != job.get("history_persistence", "on_disk"):
+                raise SafetyError("prepared owner history persistence differs from the planned case")
         self.active_tide = (job, directory, [])
         remote = json.loads((prepared / "remote.json").read_text())
         if job.get("nvmeof_route") == "live":
-            live_client = remote.get("live_nvme")
-            if not isinstance(live_client, dict):
-                raise SafetyError("prepared live client is missing")
-            host_nqn = live_client.get("host_nqn")
-            host_id = live_host_identity(host_nqn)
-            expected_client = {key: prep["live_nvmeof"][key] for key in
-                ("max_inflight_requests", "max_inflight_bytes", "connect_timeout_ms", "io_timeout_ms")}
-            expected_client.update(host_nqn=host_nqn, host_id=host_id)
-            if live_client != expected_client:
-                raise SafetyError("prepared live client differs from admitted configuration")
+            host_nqn = admit_prepared_live_client(remote.get("live_nvme"), prep["live_nvmeof"], tier)
         elif remote.get("live_nvme") is not None:
             raise SafetyError("unexpected live client in non-live campaign case")
         if "read_lanes" in job:
@@ -3180,16 +3361,17 @@ class Controller:
             launch_path = prepared / f"node-{index}" / "launch.yaml"
             launch = yaml.safe_load(launch_path.read_text())
             if job.get("nvmeof_route") == "live" and job.get("nvmeof_target") == "spdk":
-                validate_launch(self.config, launch, case, index)
-                expected = live_target_for_owner(self.config, case, index, live_transport, host_nqn, "spdk")
+                validate_launch(self.config, launch, case, index, polling)
+                expected = live_target_for_owner(self.config, case, index, live_transport, host_nqn, "spdk", job.get("live_export_mode", "on_demand"))
                 launch["node"]["live_target"]["spdk"] = expected["spdk"]
                 launch_path.write_text(yaml.safe_dump(launch, sort_keys=False))
-            validate_launch(self.config, launch, case, index)
+            validate_launch(self.config, launch, case, index, polling)
             if job.get("nvmeof_route") == "live":
                 selected = launch.get("node", {}).get("live_target") or {}
                 selected = {key: value for key, value in selected.items() if key != "spdk" or value is not None}
                 if selected != live_target_for_owner(
-                        self.config, case, index, live_transport, host_nqn, job.get("nvmeof_target", "kernel")):
+                        self.config, case, index, live_transport, host_nqn, job.get("nvmeof_target", "kernel"),
+                        job.get("live_export_mode", "on_demand")):
                     raise SafetyError("prepared live target is missing or differs from selected transport")
             elif launch.get("node", {}).get("live_target") is not None:
                 raise SafetyError("unexpected live target in non-live campaign case")
@@ -3219,7 +3401,8 @@ class Controller:
                 min(int(self.remaining()), max(self.config["spec"]["case_deadline_seconds"],
                     600 if job["keys"] > 65536 else 0) + 300))
             proof = self.request(index, {"action": "tide_start", "case_id": case, "key": key,
-                "sha256": digest(archive), "files": list(files), "timeout": service_seconds}, case=case, timeout=120)
+                "sha256": digest(archive), "files": list(files), "timeout": service_seconds,
+                "owner_history_diagnostics": job.get("owner_history_diagnostics", False)}, case=case, timeout=120)
             dump(directory / "server-proofs" / f"start-{index}.json", proof)
             receipts[index] = confirm_owner_durability(proof, tier, index, nonces[index])
         with ThreadPoolExecutor(max_workers=5) as pool:
@@ -3257,9 +3440,12 @@ class Controller:
         deadline = self.cleanup_deadline()
         def stop(index):
             result = self.request(index, {"action": "tide_stop", "case_id": job["case_id"],
-                                          "initiator_drained": True},
+                                          "initiator_drained": True,
+                                          "owner_history_diagnostics": job.get("owner_history_diagnostics", False)},
                                   case=job["case_id"], timeout=self.cleanup_timeout(deadline), export=True)
             dump(directory / "server-proofs" / f"stop-{index}.json", result)
+            if job.get("owner_history_diagnostics"):
+                dump(directory / "owner-durability" / f"node-{index}.history-maintenance.json", result["history_maintenance"])
 
         with ThreadPoolExecutor(max_workers=5) as pool:
             futures = [pool.submit(stop, index) for index in indices]
@@ -3357,19 +3543,25 @@ class Controller:
 
     def prepared_tide_options(self, job, directory, spans=None):
         source = job["sealed_dataset"]["source_id"]
-        focused_hybrid = (job.get("case_kind") is not None and job["backend"] == "tidehunter_nvme_rdma"
+        focused_hybrid = (job.get("case_kind") is not None and job["backend"] in cloud_campaign.NVME_BACKENDS
                           and job.get("nvmeof_route") == "sealed_read")
         transport = ("tidehunter_verbs_native" if focused_hybrid else
                      "tcp" if job["backend"] == "tidehunter_tcp" or job["backend"] in cloud_campaign.NVME_BACKENDS
                      else job["backend"])
-        identity = (source, transport, cloud_campaign.durability_tier(job))
+        polling = job.get("owner_polling", "adaptive")
+        if polling not in ("adaptive", "busy"):
+            raise ValueError("owner_polling must be adaptive or busy")
+        identity = (source, transport, cloud_campaign.durability_tier(job), polling)
         if self.shared_tide is not None and self.shared_tide["identity"] != identity:
             if self.active_nvme is not None:
                 raise SafetyError("cannot replace a dataset with outstanding NVMe namespaces")
             self.stop_tide()
             self.shared_tide = None
         if self.shared_tide is None:
-            block = guarded(self.root / "datasets" / (source + "-" + transport + "-" + identity[2]), self.root)
+            name = "-".join(identity[:3])
+            if job.get("selection") == "fabric_ab_compact":
+                name += "-" + polling + "-" + job["case_id"]
+            block = guarded(self.root / "datasets" / name, self.root)
             block.mkdir(parents=True, exist_ok=False)
             options = record_phase_span(spans, "backend_deploy", self.prepare_tide, job, block)
             prep_config = cloud_campaign.make_run_config(job, block, options, self.config["source_revision"],
@@ -3622,8 +3814,16 @@ class Controller:
             guarded(host["ready_path"], control, must_exist=True).unlink()
             guarded(host["target_path"], control, must_exist=True).unlink()
             return result
+        errors = []
         with ThreadPoolExecutor(max_workers=5) as pool:
-            list(pool.map(disconnect, active["hosts"]))
+            futures = [pool.submit(disconnect, host) for host in active["hosts"]]
+            for future in futures:
+                try:
+                    future.result()
+                except Exception as exc:
+                    errors.append(exc)
+        if errors:
+            raise InfrastructureError("NVMe target cleanup incomplete: " + "; ".join(map(str, errors))) from errors[0]
         self.active_nvme = None
 
     def failure_owner_evidence(self, directory):
@@ -3871,9 +4071,10 @@ class Controller:
                 dump(result_path, evidence)
                 receipt["ssd_write_floor_result"] = {"path": result_path.name, "sha256": digest(result_path)}
             elif job["case_kind"] == "ssd_floor":
-                # Measure owner 0's Local SSD; the client runs the controller and monitoring.
+                ssd = job["ssd"]
+                host_index = {"client": -1, "owner0": 0}[ssd.get("host", "owner0")]
                 try:
-                    result = self.request(0, {**request, "action": "ssd_floor"}, case=job["case_id"], timeout=timeout)
+                    result = self.request(host_index, {**request, "action": "ssd_floor"}, case=job["case_id"], timeout=timeout)
                 except Exception as exc:
                     raise InfrastructureError("SSD floor outcome or cleanup is uncertain: " + repr(exc)) from exc
                 if "fio_failed" in result:
@@ -3881,6 +4082,10 @@ class Controller:
                     if not isinstance(message, str) or len(message) > 4096:
                         raise SafetyError("invalid SSD floor failure receipt")
                     raise FioFailure(message)
+                if "host" in ssd and (type(result.get("host_index")) is not int or result["host_index"] != host_index):
+                    raise SafetyError("SSD floor host identity differs")
+                if "host" in ssd:
+                    receipt["host_index"] = host_index
                 raw = base64.b64decode(result["raw_base64"], validate=True)
                 log = base64.b64decode(result["lat_base64"], validate=True)
                 ssd = job["ssd"]
@@ -3903,6 +4108,8 @@ class Controller:
                 evidence.update(state=ssd["state"], age_seconds=ssd["age_seconds"],
                     lat_log={**receipt["ssd_floor_lat_log"], "rows": len(rows),
                              "columns": ["time_ms", "latency_ns", "direction", "block_bytes", "offset"]})
+                if "host" in ssd:
+                    evidence["host_index"] = host_index
                 result_path = directory / "ssd_floor_result.json"
                 dump(result_path, evidence)
                 receipt["ssd_floor_result"] = {"path": result_path.name, "sha256": digest(result_path)}
@@ -3982,8 +4189,29 @@ class Controller:
                 raise ValueError("case is not in the reviewed compact selection")
         if type(owner_count) is not int or owner_count not in cloud_layout.OWNER_HOST_COUNTS:
             raise ValueError("owner_count must be 1 or 5")
+        read_case = (host_count == 1 and self.config["spec"].get("selection") == "remote_rw_compact"
+                     and job.get("case_kind") in ("media_read", "sealed_knee")
+                     and job.get("backend") in ("tidehunter_tcp", "tidehunter_verbs_native")
+                     and job.get("durability_tier") == "synchronous"
+                     and "sealed_dataset" in job and "nvmeof_route" not in job)
+        fabric_read = (host_count == 1 and self.config["spec"].get("selection") == "fabric_ab_compact"
+                       and job.get("selection") == "fabric_ab_compact"
+                       and job.get("case_kind") in ("media_read", "sealed_knee")
+                       and job.get("durability_tier") == "synchronous" and "sealed_dataset" in job
+                       and ((job.get("backend") in ("tidehunter_tcp", "tidehunter_tcp_trusted", "tidehunter_verbs_native")
+                             and "nvmeof_route" not in job)
+                            or (job.get("case_kind") == "media_read" and job.get("nvmeof_route") == "sealed_read"
+                                and ((job.get("backend") == "tidehunter_nvme_rdma"
+                                      and job.get("nvmeof_target") in ("kernel", "spdk"))
+                                     or (job.get("backend") == "tidehunter_nvme_tcp"
+                                         and job.get("nvmeof_target") == "kernel")))))
         if owner_count == 1 and ("owner_count" in job or
-                (job.get("backend") in cloud_campaign.TRANSPORTS and job.get("case_kind") != "ssd_write_floor")) and (
+                (job.get("backend") in cloud_campaign.TRANSPORTS and job.get("case_kind") not in
+                 ("ssd_write_floor", "ssd_floor", "net_floor"))) and not (read_case or fabric_read or (
+                     host_count == 1 and (
+                         self.config["spec"].get("selection") == "leased_ab_compact"
+                         or self.config["spec"].get("selection") in cloud_campaign.NVMEOF_PATH_SELECTIONS)
+                     and job.get("selection") == self.config["spec"].get("selection"))) and (
                 job.get("case_kind") not in cloud_campaign.ONE_OWNER_CASE_KINDS
                 or job.get("backend") not in ("tidehunter_tcp", "tidehunter_verbs_native")
                 or job.get("durability_tier") != "synchronous"
@@ -3999,6 +4227,18 @@ class Controller:
         receipt = {"job": job, "status": "failed", "binary_blake2b512": self.config["binary_blake2b512"],
                    "artifacts_sha256": {}, "measurement_evidence": {}, "counter_evidence": {},
                    "raw_artifacts_validated": False}
+        if job.get("backend") in cloud_campaign.TRANSPORTS:
+            control_backend = ("tidehunter_verbs_native" if job.get("case_kind") is not None
+                               and job.get("backend") in cloud_campaign.NVME_BACKENDS
+                               and (job.get("nvmeof_route") == "sealed_read" or
+                                    job.get("selection") == "leased_ab_compact" or
+                                    job.get("selection") in cloud_campaign.NVMEOF_PATH_SELECTIONS) else job["backend"])
+            transport = cloud_campaign.TRANSPORTS[control_backend]
+            receipt["owner_polling"] = job.get("owner_polling", "adaptive")
+            receipt["owner_control_backend"] = control_backend
+            receipt["owner_transport"] = copy.deepcopy(transport)
+            receipt["owner_transport_security_label"] = (
+                "trusted_network_no_tls" if is_trusted(transport) else "mutual_tls")
         client = unit_name(self.config, job["case_id"], "client")
         started = False
         client_quiesced = False
@@ -4456,6 +4696,7 @@ class Controller:
             elif backend in cloud_campaign.NVME_BACKENDS and job.get("nvmeof_route") == "live":
                 qualification = cloud_campaign.qualify_live_nvme_route(
                     read_interval["observed"] if read_interval is not None else None, job, live_expected)
+                cloud_campaign.admit_live_write_contract(job, summary["backend"])
                 receipt["live_nvme_measurement_qualification"] = qualification
                 if not qualification["qualified"]:
                     qualification_error = "live NVMe measurement path was not qualified: " + "; ".join(qualification["reasons"])
@@ -4508,30 +4749,13 @@ class Controller:
                 raise SafetyError("completed core does not contain every planned raw timing row")
             if counters_missing:
                 raise RuntimeError("coordinator actual cache/RPC evidence missing")
-            if job.get("case_kind") in ("media_read", "native_media_read"):
+            media = None
+            if (job.get("case_kind") in ("media_read", "native_media_read")
+                    or (job.get("case_kind") == "live_read" and isinstance(job.get("media"), dict))):
                 samples = analyze.read_samples(directory / "result" / "samples.csv")
-                successful = sum(row["operation"] == "read" and row["outcome"] == "success" for row in samples)
-                native_media = job["case_kind"] == "native_media_read"
-                history = owner_history_boundaries(read_interval["observed"] if read_interval else {}, owner_count)
-                try:
-                    if len(before) != host_count + 1 or len(ended) != host_count + 1:
-                        raise ValueError("missing host snapshots")
-                    first_hosts = before[:1] if native_media else before[1:1 + owner_count]
-                    last_hosts = ended[:1] if native_media else ended[1:1 + owner_count]
-                    for first, last in zip(first_hosts, last_hosts):
-                        boot = first["nvme"]["host_identity"]["boot_id"]
-                        if ((native_media and (not isinstance(boot, str) or not boot))
-                                or boot != last["nvme"]["host_identity"]["boot_id"]):
-                            raise ValueError("media host boot identity changed")
-                    first_devices = [host["media_device"] for host in first_hosts]
-                    last_devices = [host["media_device"] for host in last_hosts]
-                except (ValueError, KeyError, TypeError):
-                    first_devices = last_devices = None
-                media = qualify_media_evidence(job["case_id"], job["media"], first_devices, last_devices,
-                                               successful, drain_proved, *history, client=native_media)
-                path = directory / "media_evidence.json"
-                dump(path, media)
-                receipt["media_evidence"] = {"path": path.name, "sha256": digest(path)}
+                media = measurement_media_evidence(job, samples, config["workload"]["batch_size"],
+                                                   before, ended, host_count, owner_count, drain_proved, read_interval)
+            store_measurement_device_evidence(directory, receipt, job, media, before, ended, owner_count)
             if job.get("case_kind") == "block_trace":
                 evidence = block_trace_evidence(job["case_id"], job["trace"]["scope"],
                                                 receipt.get("cold_device_evidence"), owner_count)
@@ -4730,6 +4954,14 @@ class Controller:
                     self.stop_tide()
             except Exception as exc:
                 record_cleanup_error("owner_storage", exc)
+            if (job.get("selection") in cloud_campaign.NVMEOF_PATH_SELECTIONS
+                    and job.get("owner_history_diagnostics")):
+                try:
+                    require_zero_owner_history_waits(directory, owner_count)
+                except RuntimeError as exc:
+                    receipt["owner_history_error"] = str(exc)
+                    if failure is None:
+                        failure = exc
             if not tracer_clean and not isinstance(failure, InfrastructureError):
                 record_cleanup_error("tracer", InfrastructureError("exact-owned trace cleanup unconfirmed; refusing next case"))
             if (job.get("case_kind") == "block_trace" and receipt["status"] == "completed"

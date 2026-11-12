@@ -1,0 +1,15 @@
+label,cases,writer0,writer1,writer2,matrix_sha256,source,method
+G14N,54,1,5,16,fcfb4e2765baed55c376373ac0ab80830a576cf3eb9ee5a1073408a711830ecd,tidehunter-sharded-wal/experiments/kv-comparison/cloud_campaign.py,cloud_campaign.make_focused_matrix; read-only generation
+G14S,36,5,16,,3795dce0b22ee77111d4e6e088d5d6fc067b1732188a82ee748dd5265ee33449,tidehunter-sharded-wal/experiments/kv-comparison/cloud_campaign.py,cloud_campaign.make_focused_matrix; read-only generation
+G14O1,36,1,5,16,8267a76ac52f68aac9250e9e19ee3419be89d0153f002f141e278a912d9ebd63,tidehunter-sharded-wal/experiments/kv-comparison/cloud_campaign.py,cloud_campaign.make_focused_matrix; read-only generation
+G14O5,36,1,5,16,18cda1e00deee9088c323242d7cbe324d86cf7ad51ffe594ef0bf0225166d9d4,tidehunter-sharded-wal/experiments/kv-comparison/cloud_campaign.py,cloud_campaign.make_focused_matrix; read-only generation
+G14P,6,1,16,,0e1a169f0c6732d1cf09f4a8b2fc03fe04761735c2266af402b52e3527b79b2b,tidehunter-sharded-wal/experiments/kv-comparison/cloud_campaign.py,cloud_campaign.make_focused_matrix; read-only generation
+fair_native,168,1,5,16,f0ec35e392031f36ef17e043b1ecbbbdb89655ff04ba864f482c77ad3eb7cb2a,tidehunter-sharded-wal/experiments/kv-comparison/cloud_campaign.py,cloud_campaign.make_focused_matrix; read-only generation
+parity,216,1,5,16,df1e709c632473264a4c42c3a75f3cd826ec3ef46ac125fc049a4331d3def1e3,tidehunter-sharded-wal/experiments/kv-comparison/cloud_campaign.py,cloud_campaign.make_focused_matrix; read-only generation
+G13W,48,1,,,06481d44e99acf1514a4aa1710b04ab0425eb44eae2547dbb04ade617dc98ccd,tidehunter-sharded-wal/experiments/kv-comparison/cloud_campaign.py,cloud_campaign.make_focused_matrix; read-only generation
+frozen_recommended,279,1,2,4,cdc1fe273f4ee6a4d42e7dfe275b34f242780b6b1fd1ad6c9e481ef86f7d10e4,tidehunter-sharded-wal/experiments/kv-comparison/cloud_campaign.py,cloud_campaign.make_focused_matrix; read-only generation
+frozen_full,333,1,2,4,cfdf55691fad2197dfc8c4780f750f56dfd9007cbfe1105a206a519a973ff91b,tidehunter-sharded-wal/experiments/kv-comparison/cloud_campaign.py,cloud_campaign.make_focused_matrix; read-only generation
+frozen_device,120,1,16,,c86f2b30da37579f76fd68118a0958c266d55c2b9e067190a6203533d09a8f45,tidehunter-sharded-wal/experiments/kv-comparison/cloud_campaign.py,cloud_campaign.make_focused_matrix; read-only generation
+frozen_floors,69,1,,,f0eff60033db57546f758b330c5d13bd26f8c4f63e796545fadd9e3e2f69d97a,tidehunter-sharded-wal/experiments/kv-comparison/cloud_campaign.py,cloud_campaign.make_focused_matrix; read-only generation
+frozen_stages,183,1,16,,daecc1d6e93e31f5151d445099d7883b36780a3c0a9c30a2e656c35a9b974fe9,tidehunter-sharded-wal/experiments/kv-comparison/cloud_campaign.py,cloud_campaign.make_focused_matrix; read-only generation
+frozen_unified,270,1,16,,42cdb0759fd8c4030a3650bb8b5f9acc8e90ad9261a28b6fbfcb805b4de45ca2,tidehunter-sharded-wal/experiments/kv-comparison/cloud_campaign.py,cloud_campaign.make_focused_matrix; read-only generation

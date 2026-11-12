@@ -2,12 +2,85 @@
 //!
 //! These messages are not authorization or durability proofs. The owner must
 //! validate them under the partition lock before allocating any bytes.
+//!
+//! Leased writes acknowledge page-cache completion in the native tier; an owner
+//! kernel or power failure can lose its unsynced suffix. Synchronous leased
+//! writes acknowledge a successful Data/FUA completion on the final WAL inode,
+//! after the lease made its preallocation, name and inventory witness durable.
+//! Neither completion implies that the owner's frontier root has caught up.
+//! Adoption publishes only APPENDED authority. Synchronous adoption requests a
+//! later root sync without waiting. Native adoption requests no per-frame sync:
+//! it keeps fragment-boundary (extent-close) and on-demand persistence.
+//! Synchronous serving and checkpoint proofs still require a covering owner
+//! barrier. Recovery scans the complete valid prefix beyond the root: it cannot
+//! distinguish corruption of acknowledged data there from a torn tail. A live
+//! coordinator must fail stop on a receipt mismatch or adopted-prefix shortfall.
+//! Alignment is not a power-fail atomicity guarantee.
 
 use crate::distributed::group::{CompleteGroup, GroupError};
 use crate::distributed::storage::AppendedBatch;
 use crate::distributed::types::{BatchId, BatchVersion, PayloadDigest};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+/// Deterministic active-epoch subsystem and namespace identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WalExportName {
+    pub subsystem: u64,
+    pub subsystem_id: [u8; 16],
+    pub nqn: String,
+    pub nsid: u32,
+    pub uuid: [u8; 16],
+}
+
+pub fn wal_export_name(
+    files_per_subsystem: u64,
+    database: [u8; 16],
+    partition: u32,
+    epoch: u64,
+    file_index: u64,
+) -> WalExportName {
+    let subsystem = file_index / files_per_subsystem;
+    let digest = |domain: &[u8], index: u64| {
+        let mut hash = blake2b_simd::Params::new().hash_length(16).to_state();
+        hash.update(domain);
+        hash.update(&database);
+        hash.update(&partition.to_be_bytes());
+        hash.update(&epoch.to_be_bytes());
+        hash.update(&index.to_be_bytes());
+        let mut id = [0; 16];
+        id.copy_from_slice(hash.finalize().as_bytes());
+        id
+    };
+    let subsystem_id = digest(b"tidehunter-live-sub-v1", subsystem);
+    let id = subsystem_id;
+    let text = format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        id[0],
+        id[1],
+        id[2],
+        id[3],
+        id[4],
+        id[5],
+        id[6],
+        id[7],
+        id[8],
+        id[9],
+        id[10],
+        id[11],
+        id[12],
+        id[13],
+        id[14],
+        id[15]
+    );
+    WalExportName {
+        subsystem,
+        subsystem_id,
+        nqn: format!("nqn.2026-01.local.tidehunter:sub-{text}"),
+        nsid: (file_index % files_per_subsystem) as u32 + 1,
+        uuid: digest(b"tidehunter-live-wal-v1", file_index),
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LiveBatchSummary {
@@ -99,4 +172,72 @@ pub struct LiveWriteReservation {
 pub enum LiveReserveResult {
     Existing(Vec<AppendedBatch>),
     Reserved(LiveWriteReservation),
+}
+
+/// One fragment remainder granted to a single writer. Offsets are global WAL
+/// offsets; the final inode remains pinned until close or fenced recovery.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LiveWriteExtent {
+    pub token: [u8; 16],
+    pub segment: LiveWalSegment,
+    pub start: u64,
+    pub end: u64,
+}
+
+/// Cumulative adoption proof for one extent, not a persisted-root proof.
+/// Summaries include opportunistically adopted frames. Compare the cumulative
+/// count and digest at `adopted_end`, not merely at the requested lower bound.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LiveAdoption {
+    pub token: [u8; 16],
+    pub adopted_end: u64,
+    pub receipt_count: u64,
+    pub receipt_digest: [u8; 32],
+    pub closed: bool,
+}
+
+/// Extend the bounded I5 proof in physical receipt order. The fixed-width
+/// fields below are exactly AppendedBatch's little-endian bincode encoding.
+pub fn extend_live_receipt_digest(previous: [u8; 32], receipt: AppendedBatch) -> [u8; 32] {
+    use blake2::{Blake2b, Digest, digest::consts::U32};
+    let mut hash = Blake2b::<U32>::new();
+    hash.update(b"tidehunter-live-extent-receipt-v1");
+    hash.update(previous);
+    hash.update(receipt.id().database);
+    hash.update(receipt.id().operation);
+    hash.update(receipt.version().epoch.to_le_bytes());
+    hash.update(receipt.version().sequence.to_le_bytes());
+    hash.update(receipt.digest().0);
+    hash.update(receipt.address().partition.to_le_bytes());
+    hash.update(receipt.address().segment_generation.to_le_bytes());
+    hash.update(receipt.address().offset.to_le_bytes());
+    hash.update(receipt.address().len.to_le_bytes());
+    hash.finalize().into()
+}
+
+#[cfg(test)]
+mod export_name_tests {
+    use super::*;
+
+    #[test]
+    fn wal_export_names_are_stable_and_cover_subsystem_boundaries() {
+        for (file, subsystem, nsid) in [(0, 0, 1), (1, 0, 2), (1023, 0, 1024), (1024, 1, 1)] {
+            let name = wal_export_name(1024, [1; 16], 2, 3, file);
+            assert_eq!((name.subsystem, name.nsid), (subsystem, nsid));
+            assert_eq!(name, wal_export_name(1024, [1; 16], 2, 3, file));
+            let one = wal_export_name(1, [1; 16], 2, 3, file);
+            assert_eq!((one.subsystem, one.nsid), (file, 1));
+        }
+        let base = wal_export_name(1024, [1; 16], 2, 3, 0);
+        assert_eq!(base.nqn, wal_export_name(1024, [1; 16], 2, 3, 1).nqn);
+        for changed in [
+            wal_export_name(1024, [2; 16], 2, 3, 0),
+            wal_export_name(1024, [1; 16], 4, 3, 0),
+            wal_export_name(1024, [1; 16], 2, 4, 0),
+            wal_export_name(1024, [1; 16], 2, 3, 1),
+        ] {
+            assert_ne!(base.uuid, changed.uuid);
+        }
+        assert_ne!(base.nqn, wal_export_name(1024, [1; 16], 2, 3, 1024).nqn);
+    }
 }

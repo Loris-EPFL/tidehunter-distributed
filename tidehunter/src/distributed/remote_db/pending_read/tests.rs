@@ -1992,7 +1992,7 @@ fn published_result_stays_unavailable_until_credit_retirement() {
         references: Vec::new(),
         slot: 0,
         grouped_inline: AtomicBool::new(false),
-        completion: Arc::new(FlightCompletion::new()),
+        completion: FlightCompletion::new(),
         _pin: None,
         _credit: credit.clone(),
     });

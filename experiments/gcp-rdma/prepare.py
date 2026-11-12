@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'experiments/kv-comparison'))
 import cloud_package
 import ci_prepare
+import gcp_runtime
 
 
 def checkout(repo, revision, allow_dirty=False):
@@ -39,12 +40,14 @@ def admit_selected_features(spec, manifest):
     if not required <= set(manifest.get('features', [])):
         raise ValueError('packaged binary lacks selected industry backend features')
     artifacts = set()
+    if gcp_runtime.live_mode(spec):
+        artifacts.add('source/experiments/kv-comparison/nvme_campaign_owner.py')
     if spec.get('spdk_comparison'):
         artifacts |= {'runtime/spdk/spdk.json', 'runtime/spdk/bin/nvmf_tgt',
                       'source/experiments/nvmeof/spdk_targets.py',
                       'source/experiments/nvmeof/spdk_artifacts.py',
                       'source/experiments/nvmeof/spdk_measurement.py'}
-        if spec.get('mode') == 'standard-with-live-nvmeof':
+        if gcp_runtime.live_mode(spec):
             artifacts |= {'source/experiments/nvmeof/live_spdk_daemon.py',
                           'source/experiments/kv-comparison/nvme_campaign_owner.py'}
     if spec.get('valkey_reproduction_profiles'):
@@ -133,7 +136,8 @@ def prepare(engine, output, revision, fabric, deadline_seconds, spec_path=None, 
         except ValueError as exc:
             raise ValueError('manual dirty preparation requires the exact reviewed manual spec') from exc
     spec = json.loads(Path(spec_path).read_text()) if spec_path is not None else {}
-    focused = spec.get('mode') == 'focused'
+    import manual_sui
+    focused = manual_sui.focused_qualification(spec)
     if focused:
         import manual_campaign
         manual_campaign._reviewed_jobs(spec)
@@ -301,7 +305,7 @@ def admit_sui_archives(bundle, verification):
 
 
 
-def prepare_sui(output, sui, revision, fixture, target, deadline_seconds):
+def prepare_sui(output, sui, revision, fixture, target, deadline_seconds, nvmeof=False):
     output = Path(output).resolve(strict=True)
     sui = Path(sui).resolve(strict=True)
     checkout(ROOT, json.loads((output / 'package-receipt.json').read_text())['source_revision'])
@@ -331,6 +335,8 @@ def prepare_sui(output, sui, revision, fixture, target, deadline_seconds):
         [sys.executable, ROOT / 'experiments/sui-checkpoint/run.py', '--build', build, '--fixture', admitted_fixture,
          '--output', replay, '--deadline', '900', '--transport-config', transport_config],
     ]
+    if nvmeof:
+        commands[0].append('--nvmeof')
     for command in commands:
         ci_prepare.bounded(command, deadline)
     verification = ci.verification_bundle(replay, work / 'verification', transport)
@@ -408,6 +414,7 @@ def main():
     parser.add_argument('--spdk-prefix', type=Path, help='locally built and qualified SPDK target prefix')
     parser.add_argument('--nvmet-fix-prefix', type=Path, help='statically admitted nvmet kernel fix prefix')
     parser.add_argument('--sui', type=Path)
+    parser.add_argument('--sui-nvmeof', action='store_true')
     parser.add_argument('--fixture', type=Path)
     parser.add_argument('--target', type=Path)
     parser.add_argument('--admit-transfer', action='store_true')
@@ -423,7 +430,7 @@ def main():
     elif args.sui:
         if not args.fixture or not args.target:
             parser.error('--sui requires --fixture and --target')
-        result = prepare_sui(args.output, args.sui, args.revision, args.fixture, args.target, args.deadline)
+        result = prepare_sui(args.output, args.sui, args.revision, args.fixture, args.target, args.deadline, nvmeof=args.sui_nvmeof)
     else:
         if bool(args.fabric_prefix) == bool(args.build_container):
             parser.error('KV preparation requires exactly one of --fabric-prefix and --build-container')

@@ -104,6 +104,9 @@ class FloorsEvidenceTest(unittest.TestCase):
                 analyze.admit_focused_artifacts(self.root, job, bad, completed=True)
 
     def test_controller_receipts_are_admitted_and_hash_bound(self):
+        jobs = cloud_campaign.make_focused_matrix('nvmeof_path_core')
+        self.net = next(job for job in jobs if job['case_kind'] == 'net_floor')
+        self.ssd = next(job for job in jobs if job['case_kind'] == 'ssd_floor')
         instance = cloud_controller.Controller.__new__(cloud_controller.Controller)
         instance.root = self.root
         instance.config = {'binary_blake2b512': 'a' * 128,
@@ -136,7 +139,7 @@ class FloorsEvidenceTest(unittest.TestCase):
                 '--numjobs=1', '--name=read']
         instance.request = MagicMock(return_value={'raw_base64': base64.b64encode(raw).decode(),
             'lat_base64': base64.b64encode(log).decode(), 'argv': argv, 'device_identity': '259:0',
-            'opened_read_only': True, 'actual_direct': True})
+            'opened_read_only': True, 'actual_direct': True, 'host_index': 0})
         ssd_receipt = instance.run_floor_case(self.ssd)
 
         for job, receipt, stem in ((self.net, net_receipt, 'net_floor_result'),
@@ -145,6 +148,7 @@ class FloorsEvidenceTest(unittest.TestCase):
                 self.assertEqual(receipt['status'], 'completed')
                 directory = self.root / 'cases' / job['case_id']
                 self.assertIn(stem, analyze.admit_focused_artifacts(directory, job, receipt, completed=True))
+                self.assertEqual(cloud_campaign.summarize_case(directory)['status'], 'completed')
                 tampered = copy.deepcopy(receipt)
                 tampered[stem]['sha256'] = '0' * 64
                 with self.assertRaises(ValueError):

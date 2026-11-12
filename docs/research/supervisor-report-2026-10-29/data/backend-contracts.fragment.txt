@@ -1,0 +1,28 @@
+\begin{landscape}
+\scriptsize
+\setlength{\tabcolsep}{2pt}
+\sloppy
+\begin{longtable}{p{2cm}p{5cm}p{4.4cm}p{5cm}p{2cm}}
+\caption{Observed primary RF1 backend contracts from comparison.json; device persistence and security settings are not inferred. TCP/EFA/Direct/EFAnative denote Tidehunter variants; FDB denotes FoundationDB; Valkey denotes Valkey TCP. Atomicity describes adapter metadata, not a measured batch-write benchmark. Full configuration and version evidence are in data/backend-contracts.json and data/comparison.json.}\label{data-backend-contracts}\\
+\toprule
+Backend & Acknowledgement & Consistency & get-many implementation & Batch atomicity\\
+\midrule
+\endfirsthead
+\toprule
+Backend & Acknowledgement & Consistency & get-many implementation & Batch atomicity\\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+Cassandra & CQL write acknowledged at Quorum; durable\_\allowbreak{}writes=true observed; commitlog fsync policy and physical device persistence not verified & Quorum configured on each prepared read/write/delete and logged batch & bounded per-key prepared-query fanout (limit 16); no native CQL batch GET & crash\_\allowbreak{}recovery\\
+FDB & successful FDB transaction commit using the observed cluster storage-replication configuration; physical device fsync policy not independently verified & FoundationDB serializable transaction semantics & one serializable transaction, sequential native transaction gets, exact caller order & serializable\_\allowbreak{}transaction\\
+Native & native write acknowledgement followed by explicit Value-WAL file persistence barrier & native Tidehunter Db keyspace semantics & ordered scalar Db::get calls; returned Bytes retained without copying & crash\_\allowbreak{}recovery\\
+EFA & RF1 complete Value-WAL batch persisted on the configured owner; no replication & single coordinator NativeIndex with complete-batch owner allocation; RF1; no replication, serializable multi-key transaction, or failover & distributed ordered grouped reads; one result per caller key & crash\_\allowbreak{}recovery\\
+Direct & RF1 complete Value-WAL batch persisted on the configured owner; no replication & single coordinator NativeIndex with complete-batch owner allocation; RF1; no replication, serializable multi-key transaction, or failover & distributed ordered grouped reads; one result per caller key & crash\_\allowbreak{}recovery\\
+EFAnative & RF1 complete Value-WAL batch persisted on the configured owner; no replication & single coordinator NativeIndex with complete-batch owner allocation; RF1; no replication, serializable multi-key transaction, or failover & distributed ordered grouped reads; one result per caller key & crash\_\allowbreak{}recovery\\
+TCP & RF1 complete Value-WAL batch persisted on the configured owner; no replication & single coordinator NativeIndex with complete-batch owner allocation; RF1; no replication, serializable multi-key transaction, or failover & distributed ordered grouped reads; one result per caller key & crash\_\allowbreak{}recovery\\
+TiKV & RawKV request success; TiKV/PD acknowledgement policy is server-defined; device fsync is not independently verified & TiKV RawKV single-key semantics; no transaction isolation; batch commands are non-atomic & TiKV native RawKV batch\_\allowbreak{}get; missing keys are restored as None and results reordered to caller order & unsupported\\
+Valkey & SET success reply; primary appendonly=yes, appendfsync=always, no-appendfsync-on-rewrite=no observed at admission; Valkey AOF fsyncs before replying; no replica acknowledgement & primary-routed reads/writes; RF1, no replica reads & one MGET through redis-rs; client splits by slot and reassembles input order, duplicates and nil misses & unsupported\\
+\end{longtable}
+\normalsize
+\end{landscape}

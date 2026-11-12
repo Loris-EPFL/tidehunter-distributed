@@ -1,0 +1,230 @@
+{
+  "schema_version": 2,
+  "audit_kind": "read_only_results_and_frozen_source_stage_and_residency_audit",
+  "run_id": "th-38c2508272a57587",
+  "github_run": 41109588049,
+  "engine_commit": "d34022d18aed2e1b7b029d595f43992868453b28",
+  "result_root": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/aws-ci-runs/2026-10-30-owner-authority-campaign/extracted-th-38c2508272a57587",
+  "previous_result_root": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/aws-ci-runs/2026-10-30-read-tier-publication/controller-partial",
+  "markdown_artifact": "local://cloud-th38-stage-review.md",
+  "source_provenance": {
+    "inspected_checkout_head": "44a7effd2a4dea5589f9015b7c29dca39cd5d9b4",
+    "tracked_diff_empty_when_scoped": true,
+    "exact_commit_object_available_locally": false,
+    "full_source_verification": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/aws-ci-runs/2026-10-30-owner-authority-campaign/fresh-d340-input/independent-full-source-verification.json",
+    "full_source_verification_observed": {"workflow_run":41109588049,"source_commit":"d34022d18aed2e1b7b029d595f43992868453b28","files_compared":497,"mismatches":[]},
+    "binding": "All497 regular frozen source files bytehash-match the current checkout. All source/config/runner/native/distributed line mappings in this audit are bound to frozen d340 content despite differing local commit metadata and absent local d340 object.",
+    "earlier_verification": "fresh-d340-input/independent-verification.json",
+    "source_sha256": "fc0ff1834f358501558e131548d88eff58eec6b2172f418fb129c6db4037245f",
+    "binary_sha256": "4251a024b5f3b0f40855af16287e67c8866470c629652be6042191411f1c7b49",
+    "archive_and_inventory_integrity": "parent-supplied sealed verification reused, not recomputed"
+  },
+  "coverage": {"planned_cases":196,"completed_cases":196,"released_and_observed_completion_gates":196,"attempted_and_drained_read_evidence_boundaries":196,"monitoring_complete":true,"independent_repetitions":1},
+  "hardware": {"instances":6,"instance_type":"c6id.32xlarge","availability_zone":"eu-west-1c","placement":"mandatory cluster","roles":"controller plus five distinct local-NVMe owners","before_after_confound":"prior cloud used G6 in us-east-1; no causal total-speed attribution"},
+  "measurement_contract": {
+    "reporting_reuse":"Maintained comparison.json and per-case diagnostics/manifests; no replacement analysis or plot implementation",
+    "api_quantile":"nearest rank ceil(p*n)-1, conditional on operation/outcome/timed samples",
+    "tail_warning":"p99 descriptive below10000 calls; p999 descriptive below100000 calls",
+    "stage_mean":"sum_ns/count using each stage's own population",
+    "stage_max_null":"unavailable, not zero",
+    "overlap":"stage clocks overlap and may nest; means/percentiles are not additive",
+    "api_resolution_selection":"independent first N point/bulk API resolution attempts",
+    "remote_selection":"first N newly admitted remote physical flights; excludes coordinator hits/index misses/coalesced followers",
+    "read_counter_boundary":"after warmup/aging/gate before run_phase; end after measurement worker drain, before completion gate/profile finalization/postqualification",
+    "resource_boundary":"quiescent gate release through process exit including checks/drain",
+    "snapshot_semantics":"sequential components/owners, not globally atomic; lifetime maxima cannot be differenced into measurement maxima",
+    "forbidden_interpretations":["run-to-run error bars","statistical significance/confidence or repeatability claim","pure wire latency from exchange residual","FI_READ span as isolated NIC/wire service","async/WAL counters as physical IOPS","pure NAND time from block intervals","RF1 as equivalent guarantees across stores"]
+  },
+  "conclusions":[
+    {"id":"warm_authority_residency","status":"supported_counter_outcome","text":"All32 warm-WAL cases have zero authority-history load delta; all16 C1 cases qualify, totaling131072 WAL/NOWAIT-success members, no explicit value-cache hits and no async submissions."},
+    {"id":"primary_authority_first_use","status":"measured_boundary_deltas","text":"Primary EFA-native0063 has1937 and TCP0216 has1936 history-load attempts during measurement, despite8192-entry capacity and low occupancy. Their latency gap to warm controls cannot be assigned to metadata alone because lanes/resident-first/warmup/key count differ and primary has no selected stage diagnostics."},
+    {"id":"spill_residency","status":"source_supported_optimization_opportunity","text":"Successful durable history adoption drains pending and drops captured Arcs without LRU insertion. Bounded carry-over of validated immutable descriptors can avoid first-use history lookup where retained, but its exact benefit is unmeasured and all limits/credits/fencing/pins/durability must remain."},
+    {"id":"batch_regressions","status":"observed_not_causally_attributed","text":"Qualified8KiB x32 C16 owner-hit millisecond means/tails remain; unprofiled throughput is lower than prior cloud on all4 transports, but hardware/region changed."},
+    {"id":"fast_return","status":"implemented_benefit_not_isolated","text":"All-resolved executor return precedes device-count scan with correctness ownership intact.0115 planning/handler means decrease while executor residence increases; isolated gain not established."},
+    {"id":"registered_purity","status":"supported","text":"Eight handle-headroom C1 cases have8192 posts/completions each with zero fallback; ordinary C1 cases retain46 message/WAL/missing-grant fallbacks each; C16 cases remain mixed."},
+    {"id":"cold_device","status":"wider_window_activity_only","text":"Distributed cold cases each have6998 actual matched block requests over wider windows, not8192 per-API device samples; all8 case-level cold qualifications fail measurement-window attribution. Native nominal cold controls have1/0 matched requests."},
+    {"id":"write_costs","status":"measured_distinct_populations","text":"Append validation/persistence/control queues/local CQ retirement are measured; exact ready-group distributions and publication-to-caller delivery remain missing. Existing dispatch flushes ready tails without artificial batching wait."}
+  ],
+  "qualification_summary":[
+    {"cohort":"coordinator_hit","cases":32,"qualified":22},
+    {"cohort":"owner_hit","cases":32,"qualified":32},
+    {"cohort":"wal_warm","cases":32,"qualified":23,"authority_history_load_delta":0},
+    {"cohort":"registered_ordinary_C1","cases":8,"qualified":0},
+    {"cohort":"registered_mixed_C16","cases":8,"qualified":0},
+    {"cohort":"registered_handle_headroom_C1","cases":8,"qualified":8},
+    {"cohort":"remote","cases":32,"qualified":0},
+    {"cohort":"cold_device","cases":8,"qualified":0},
+    {"cohort":"native_hot_wal_lru0_pagecache","cases":2,"qualified":0},
+    {"cohort":"native_cold_os_lru0","cases":2,"qualified":0}
+  ],
+  "authority_before_after": {
+    "case_id":"0157-tidehunter_efa_direct-256-wal_warm-profiled-r0",
+    "operation":"read","outcome":"success","api_sample_count":8192,"remote_stage_sample_count":256,
+    "before":{"capacity_per_owner":1024,"entries_per_owner":[1024,1024,1024,1024,1024],"history_load_deltas_per_owner":[528,518,483,507,511],"history_load_delta":2547,"contention_delta":0,"planning_sum_ns":5820821,"planning_max_ns":100112,"handler_sum_ns":6673519,"exchange_sum_ns":19070213,"api_mean_ns":67459.5078125,"api_p50_ns":47031,"api_p99_ns":227195,"api_max_ns":326878},
+    "after":{"capacity_per_owner":8192,"entries_per_owner":[1535,1535,1534,1534,1534],"history_start_equals_end_per_owner":[1535,1535,1534,1534,1534],"history_load_deltas_per_owner":[0,0,0,0,0],"history_load_delta":0,"resident_hit_deltas_per_owner":[1699,1644,1627,1624,1598],"contention_delta":0,"planning_mean_ns":876.328125,"planning_max_ns":10054,"handler_mean_ns":2885.70703125,"exchange_mean_ns":49422.20703125,"api_mean_ns":43882.635009765625,"api_p50_ns":43223,"api_p99_ns":103960,"api_max_ns":173790},
+    "caveat":"Metadata-residency outcome and lower observed planning supported; different hardware/region prevent causal total-speed claim. Lifetime history counts are nonzero and must be differenced."
+  },
+  "primary_vs_warm_scalar": {
+    "population":"unprofiled C16 1KiB read/success,8192 API samples each",
+    "evidence":"per-case result/measurement-read-evidence.json raw start/end; result/manifest.json run.config; comparison.json effective backend configurations",
+    "history_loads_are":"measured end-start attempts, not lifetime counts, unique batches or physical NVMe misses",
+    "shared_configuration":{"concurrency":16,"measurement_operations":8192,"closed_loop":true,"queue_capacity":128,"request_timeout_ms":10000,"owner_metadata_budget_bytes":67108864,"coordinator_value_cache_bytes":0,"owner_value_cache_bytes":0,"owner_workers":4,"owner_max_inflight_requests":32,"owner_max_device_reads":128,"owner_max_inflight_bytes":67108864,"read_profile_limit":0,"aging_operations":0,"measurement_key_sweep":false,"os_caches_dropped":false},
+    "primary_configuration":{"dataset_keys":4096,"warmup_operations":512,"warmup_key_sweep":false,"read_lanes":2,"owner_read_resident_first":false,"retained_history_capacity_batches_per_partition":16384},
+    "warm_configuration":{"dataset_keys":8192,"warmup_operations":8192,"warmup_key_sweep":true,"read_lanes":4,"owner_read_resident_first":true,"retained_history_capacity_batches_per_partition":24576},
+    "security":"EFA-native trusted-network/no-TLS in both cohorts; TCP mutualTLS in both",
+    "cases":[
+      {
+        "case_id":"0063-tidehunter_efa_native-1024-read-concurrent-primary_rf1-r0","cohort":"primary_rf1","api_mean_ns":735380.0451660156,"api_p50_ns":244941,"api_p99_ns":5345960,"api_max_ns":12855715,"case_read_tier_qualification":null,
+        "authority_capacity_per_owner":[8192,8192,8192,8192,8192],"authority_table_bytes_per_owner":524288,
+        "start_history_and_entries_per_owner":[66,57,54,62,63],"end_history_and_entries_per_owner":[449,455,441,439,455],
+        "history_load_deltas_per_owner":[383,398,387,377,392],"history_load_delta":1937,
+        "resident_miss_deltas_per_owner":[383,399,390,377,392],"resident_miss_delta":1941,"resident_hit_delta":6219,"contention_deltas_per_owner":[1,3,5,0,2],"contention_delta":11,
+        "wal_and_async_deltas_per_owner":[1613,1712,1618,1594,1623],"wal_reads":8160,"async_submissions":8160,"nowait_attempts":0,"nowait_successes":0,"owner_value_cache_hits":0,"coord_hits":0,"coord_misses":17682,"rpc":8160,"selected_stage_diagnostics_available":false
+      },
+      {
+        "case_id":"0180-tidehunter_efa_native-1024-wal_warm-read-tier-c16-scalar-baseline-r0","cohort":"read_tier_wal_warm","api_mean_ns":58718.09631347656,"api_p50_ns":50546,"api_p99_ns":161926,"api_max_ns":1733364,"case_read_tier_qualified":true,
+        "authority_capacity_per_owner":[8192,8192,8192,8192,8192],"start_equals_end_entries_per_owner":[1538,1532,1538,1538,1540],"start_equals_end_history_loads_per_owner":[1538,1532,1538,1538,1540],"history_load_delta":0,"wal_reads":8179,"async_submissions":0,"nowait_successes":8179,"coord_hits":0,"coord_misses":9836,"rpc":8179,"owner_value_cache_hits":0,"selected_stage_diagnostics_available":false,
+        "caveat":"Zero history loads does not mean zero contended-resident misses or worker handoff."
+      },
+      {
+        "case_id":"0216-tidehunter_tcp-1024-read-concurrent-primary_rf1-r0","cohort":"primary_rf1","api_mean_ns":2255505.966064453,"api_p50_ns":1872878,"api_p99_ns":8246021,"api_max_ns":14917711,"case_read_tier_qualification":null,
+        "authority_capacity_per_owner":[8192,8192,8192,8192,8192],"authority_table_bytes_per_owner":524288,
+        "start_history_and_entries_per_owner":[74,53,59,55,62],"end_history_and_entries_per_owner":[453,444,442,450,450],
+        "history_load_deltas_per_owner":[379,391,383,395,388],"history_load_delta":1936,
+        "resident_miss_deltas_per_owner":[379,392,383,396,388],"resident_miss_delta":1938,"resident_hit_delta":6234,"contention_deltas_per_owner":[4,4,0,5,5],"contention_delta":18,
+        "wal_and_async_deltas_per_owner":[1640,1626,1619,1582,1705],"wal_reads":8172,"async_submissions":8172,"nowait_attempts":0,"nowait_successes":0,"owner_value_cache_hits":0,"coord_hits":0,"coord_misses":13749,"rpc":8172,"selected_stage_diagnostics_available":false
+      },
+      {
+        "case_id":"0168-tidehunter_tcp-1024-wal_warm-read-tier-c16-scalar-baseline-r0","cohort":"read_tier_wal_warm","api_mean_ns":1164961.3425292969,"api_p50_ns":782537,"api_p99_ns":4447885,"api_max_ns":8410529,"case_read_tier_qualified":true,
+        "authority_capacity_per_owner":[8192,8192,8192,8192,8192],"start_equals_end_entries_per_owner":[1539,1539,1535,1537,1540],"history_load_delta":0,"resident_miss_deltas_per_owner":[20,6,5,7,11],"contention_deltas_per_owner":[22,7,6,7,15],"wal_reads":8182,"async_submissions":0,"nowait_successes":8182,"coord_hits":0,"coord_misses":8582,"rpc":8182,"owner_value_cache_hits":0,"selected_stage_diagnostics_available":false
+      }
+    ],
+    "supported_interpretation":"Primary measurement includes extra authority-history lookup attempts and async value-read submissions; warm controls have no history-load delta and successful resident-first NOWAIT value reads. Primary occupancy remains far below8192-entry capacity.",
+    "unsupported_interpretation":"The p50/mean/tail difference cannot be apportioned to cold metadata alone: controls also vary warmup,key count,lanes,resident-first policy and have no selected primary stage diagnostics."
+  },
+  "authority_spill_residency": {
+    "source_binding":"Frozen d340 byte-matched source",
+    "current_flow":[
+      {"source":"tidehunter/src/distributed/reference_directory.rs:875-947","behavior":"publish_group validates descriptors,extends pending with Arc<RegisteredBatch>,does not populate history LRU"},
+      {"source":"tidehunter/src/distributed/reference_directory.rs:951-1018","behavior":"background worker captures durable pending prefix and persists immutable history"},
+      {"source":"tidehunter/src/distributed/reference_directory.rs:1044-1061","behavior":"after persistence installs history root,drains pending prefix,drops captured Arcs; no LRU insertion"},
+      {"source":"tidehunter/src/distributed/reference_directory.rs:605-669","behavior":"lookup checks LRU/pending,then increments history_loads,looks up page,reserves credit,reads/decodes descriptors and inserts cacheable batch"},
+      {"source":"tidehunter/src/distributed/storage.rs:1576-1613","behavior":"resident miss/contended authority takes bounded blocking planning worker"},
+      {"source":"tidehunter/src/distributed/storage/history.rs:480-502,570-622","behavior":"file-backed lookup/read_exact_at may hit Linux page cache; history_loads are not physical misses"}
+    ],
+    "conclusion":"Spilled batches not otherwise cached/pending must regain directory-searchable residency through immutable-history lookup. Active plan pins can keep Arcs alive but are not lookup cache entries.",
+    "recommended_evaluation":"At successful durable-root adoption,preserve eligible existing validated immutable Arcs in the existing bounded authority cache rather than unconditional loss of lookup residency.",
+    "constraints":["entry and metadata-byte limits","retain existing descriptor credits and charge added cache-entry overhead/table space","reuse Arcs,no descriptor copying/redecode to warm cache","lock ordering and no new foreground durability/admission dependency","evict under pressure,do not retain all history unconditionally","pin/CQ ownership and credit lifetime","generation/address validation and final authority recheck","unchanged durable-root adoption,recovery and publication"],
+    "native_analogy":{"source":"tidehunter/src/large_table.rs:2535-2625","qualification":"Native loaded state can remain under non-unload/unloading-disabled policy,but ordinary async completion can explicitly unload processed data. Principle is budgeted useful lookup residency separate from persistence,not universal retention of all flushed native metadata."},
+    "unmeasured":["retention-only matched control","spill/adoption-to-first-read correlation","saved worker queue/load/return residence","exact number of distinct batch or physical IO misses eliminated","write-adoption/cache pressure tradeoffs"]
+  },
+  "counter_examples":[
+    {"case_id":"0043-tidehunter_tcp-8192-coordinator_hit-profiled-r0","api_calls":8192,"logical_keys":8192,"coord_hits":8192,"coord_misses":0,"rpc":0,"owner_hits":0,"owner_misses":0,"wal_reads":0,"async":0,"qualified":true},
+    {"case_id":"0053-tidehunter_efa_direct-256-coordinator_hit-profiled-r0","api_calls":8192,"logical_keys":8192,"coord_hits":8191,"coord_misses":1,"rpc":1,"owner_hits":0,"owner_misses":1,"wal_reads":1,"async":1,"qualified":false},
+    {"case_id":"0075-tidehunter_efa_direct-8192-coordinator_hit-read-tier-c16-batch32-profiled-r0","api_calls":2048,"logical_keys":65536,"coord_hits":65536,"coord_misses":0,"rpc":0,"owner_hits":0,"owner_misses":0,"wal_reads":0,"async":0,"qualified":true},
+    {"case_id":"0115-tidehunter_efa_direct-8192-owner_hit-read-tier-c16-batch32-profiled-r0","api_calls":2048,"logical_keys":65536,"coord_hits":0,"coord_misses":65536,"rpc":10227,"owner_hits":64629,"owner_misses":0,"wal_reads":0,"async":0,"qualified":true},
+    {"case_id":"0178-tidehunter_efa_direct-1024-wal_warm-read-tier-c16-scalar-profiled-r0","api_calls":8192,"logical_keys":8192,"coord_hits":0,"coord_misses":9818,"rpc":8180,"owner_hits":0,"owner_misses":8180,"wal_reads":8180,"async":0,"qualified":true},
+    {"case_id":"0179-tidehunter_efa_direct-8192-wal_warm-read-tier-c16-batch32-profiled-r0","api_calls":2048,"logical_keys":65536,"coord_hits":0,"coord_misses":65536,"rpc":10230,"owner_hits":0,"owner_misses":64472,"wal_reads":64472,"async":244,"qualified":false}
+  ],
+  "registered": {
+    "all_24_cases":{"rma_errors":0,"fallback_capacity":0,"fallback_oversize":0,"fallback_stale":0,"fallback_unsupported":0},
+    "ordinary_C1_per_case":{"api_calls":8192,"posts":8146,"completions":8146,"message_reads":46,"fallback_missing":46,"wal_reads":46,"async":0,"grant_acquisitions":0,"qualified":false},
+    "headroom_C1_per_case":{"api_calls":8192,"posts":8192,"completions":8192,"message_reads":0,"fallback_missing":0,"wal_reads":0,"async":0,"grant_acquisitions":0,"qualified":true},
+    "headroom_case_ids":["0120-tidehunter_efa_native-256-registered_steady-baseline-r0-handle-headroom","0121-tidehunter_efa_native-256-registered_steady-profiled-r0-handle-headroom","0122-tidehunter_efa_native-8192-registered_steady-baseline-r0-handle-headroom","0123-tidehunter_efa_native-8192-registered_steady-profiled-r0-handle-headroom","0136-tidehunter_efa_native-256-registered_reuse-baseline-r0-handle-headroom","0137-tidehunter_efa_native-256-registered_reuse-profiled-r0-handle-headroom","0138-tidehunter_efa_native-8192-registered_reuse-baseline-r0-handle-headroom","0139-tidehunter_efa_native-8192-registered_reuse-profiled-r0-handle-headroom"],
+    "handle_limit":{"ordinary":8192,"headroom":40960},
+    "headroom_fi_read":{"case_id":"0139-tidehunter_efa_native-8192-registered_reuse-profiled-r0-handle-headroom","count":256,"mean_us":46.49551171875,"max_us":62.09,"owner_profiled_responses":0,"semantics":"accepted post to locally observed completion/progress residence; NOT isolated NIC service or wire latency"},
+    "mixed_examples":[
+      {"case_id":"0126-tidehunter_efa_native-1024-registered_steady_c16_mixed_acquisition_reuse-read-tier-c16-scalar-profiled-r0","api_calls":8192,"posts":2076,"completions":2076,"message_reads":6104,"fallback_missing":5988,"wal_reads":6104,"async":0,"grant_acquisitions":66,"qualified":false},
+      {"case_id":"0127-tidehunter_efa_native-8192-registered_steady_c16_mixed_acquisition_reuse-read-tier-c16-batch32-profiled-r0","api_calls":2048,"posts":18744,"completions":18744,"message_reads":10150,"fallback_missing":45220,"wal_reads":45892,"async":151,"grant_acquisitions":0,"qualified":false},
+      {"case_id":"0143-tidehunter_efa_native-8192-registered_reuse_c16_mixed_acquisition_reuse-read-tier-c16-batch32-profiled-r0","api_calls":2048,"posts":19974,"completions":19974,"message_reads":10153,"fallback_missing":44357,"wal_reads":44694,"async":48,"grant_acquisitions":0,"qualified":false}
+    ]
+  },
+  "selected_read_stage_examples":[
+    {"case_id":"0145-tidehunter_tcp-256-wal_warm-profiled-r0","stages":[{"name":"exchange","count":256,"mean_us":508.5210390625,"max_us":null},{"name":"server_handler","count":256,"mean_us":22.2150234375,"max_us":null},{"name":"server_planning","count":256,"mean_us":4.49181640625,"max_us":57.511}]},
+    {"case_id":"0157-tidehunter_efa_direct-256-wal_warm-profiled-r0","stages":[{"name":"exchange","count":256,"mean_us":49.42220703125,"max_us":null},{"name":"server_handler","count":256,"mean_us":2.88570703125,"max_us":null},{"name":"server_planning","count":256,"mean_us":0.876328125,"max_us":10.054},{"name":"server_nowait","count":256,"mean_us":0.77994140625,"max_us":2.931}]},
+    {"case_id":"0115-tidehunter_efa_direct-8192-owner_hit-read-tier-c16-batch32-profiled-r0","stages":[{"name":"exchange","count":256,"mean_us":1419.18012109375,"max_us":null},{"name":"server_handler","count":256,"mean_us":19.15426953125,"max_us":null},{"name":"server_planning","count":256,"mean_us":8.42326953125,"max_us":234.021},{"name":"server_cache_resolution","count":256,"mean_us":8.30882421875,"max_us":69.359},{"name":"server_executor_residence","count":256,"mean_us":8.77455859375,"max_us":70.637},{"name":"actor_queue","count":15,"mean_us":454.6603333333333,"max_us":null},{"name":"actor_service","count":15,"mean_us":1023.6040666666667,"max_us":null},{"name":"inline","count":241,"mean_us":2295.700253112033,"max_us":null},{"name":"transport_output_retire","count":256,"mean_us":135.51799609375,"max_us":null}]},
+    {"case_id":"0179-tidehunter_efa_direct-8192-wal_warm-read-tier-c16-batch32-profiled-r0","stages":[{"name":"exchange","count":256,"mean_us":812.169796875,"max_us":null},{"name":"server_handler","count":256,"mean_us":32.01772265625,"max_us":null},{"name":"server_planning","count":256,"mean_us":9.40208984375,"max_us":196.959},{"name":"server_nowait","count":1603,"mean_us":1.9154204616344355,"max_us":13.829},{"name":"server_async","count":26,"mean_us":88.8266153846154,"max_us":196.781}]},
+    {"case_id":"0203-tidehunter_efa_direct-256-cold_device-profiled-r0","stages":[{"name":"exchange","count":256,"mean_us":1329.648046875,"max_us":null},{"name":"server_handler","count":256,"mean_us":1277.99507421875,"max_us":null},{"name":"server_planning","count":256,"mean_us":1153.89206640625,"max_us":3399.468},{"name":"server_async","count":256,"mean_us":121.21433203125,"max_us":222.472}]},
+    {"case_id":"0139-tidehunter_efa_native-8192-registered_reuse-profiled-r0-handle-headroom","profiled_owner_responses":0,"stages":[{"name":"exchange","count":256,"mean_us":50.7601796875,"max_us":null},{"name":"client_fi_read","count":256,"mean_us":46.49551171875,"max_us":62.09}]}
+  ],
+  "coordinator_lock_example":{"case_id":"0075-tidehunter_efa_direct-8192-coordinator_hit-read-tier-c16-batch32-profiled-r0","selected_bulk_api_resolutions":256,"logical_members":8192,"selected_remote_flights":0,"cache_lock_wait":{"count":8192,"sum_ns":79041663,"max_ns":349193},"cache_lookup":{"count":8192,"sum_ns":3109576,"max_ns":16178},"index_lookup":{"count":8192,"sum_ns":4000776,"max_ns":21740}},
+  "owner_batch_before_after": {
+    "population":"unprofiled C16 get_many/success,2048 API calls/65536 logical keys per case; current owner-hit cases qualified",
+    "causal_attribution":false,
+    "rows":[
+      {"case_id":"0105-tidehunter_tcp-8192-owner_hit-read-tier-c16-batch32-baseline-r0","before_calls_s":6472.1935571677,"after_calls_s":4384.78949751794,"before_p50_us":2200.221,"after_p50_us":3135.003,"before_p99_us":11725.215,"after_p99_us":5017.849,"after_mean_us":3199.164776855469,"after_max_us":8408.185},
+      {"case_id":"0109-tidehunter_efa-8192-owner_hit-read-tier-c16-batch32-baseline-r0","before_calls_s":7979.630465884685,"after_calls_s":6383.362324645017,"before_p50_us":1587.35,"after_p50_us":1040.958,"before_p99_us":14487.562,"after_p99_us":15337.943,"after_mean_us":2045.1363984375,"after_max_us":29308.705},
+      {"case_id":"0113-tidehunter_efa_direct-8192-owner_hit-read-tier-c16-batch32-baseline-r0","before_calls_s":7550.607931224933,"after_calls_s":5709.916910922907,"before_p50_us":1652.07,"after_p50_us":1224.536,"before_p99_us":12896.191,"after_p99_us":15364.231,"after_mean_us":2327.6293701171876,"after_max_us":27239.041},
+      {"case_id":"0117-tidehunter_efa_native-8192-owner_hit-read-tier-c16-batch32-baseline-r0","before_calls_s":9059.770873970881,"after_calls_s":6865.051986997284,"before_p50_us":1412.863,"after_p50_us":949.433,"before_p99_us":3901.554,"after_p99_us":11671.873,"after_mean_us":1871.1237709960938,"after_max_us":21428.748}
+    ],
+    "0115_selected_stage_comparison":{"count_each":256,"before_executor_mean_us":3.9817421875,"after_executor_mean_us":8.77455859375,"before_cache_resolution_mean_us":3.215546875,"after_cache_resolution_mean_us":8.30882421875,"before_planning_mean_us":86.120546875,"after_planning_mean_us":8.42326953125,"before_handler_mean_us":91.82580859375,"after_handler_mean_us":19.15426953125,"isolated_fast_return_benefit_established":false}
+  },
+  "cold_device": {
+    "case_level_qualified":false,
+    "scope":"device-wide request-identity issue-to-completion over windows wider than measurement,including metadata/background/gate overlap; not per-API NAND latency",
+    "per_distributed_case":{"logical_wal_reads":8192,"async_submissions":8192,"authority_history_load_delta":4860,"actual_matched_block_requests":6998,"owner_collectors":5,"all_owner_trace_summaries_qualified":true},
+    "rows":[
+      {"case_id":"0190-tidehunter_tcp-256-cold_device-baseline-r0","weighted_mean_us":283.1636153186625,"max_us":559.582},
+      {"case_id":"0191-tidehunter_tcp-256-cold_device-profiled-r0","weighted_mean_us":272.7911368962561,"max_us":579.547},
+      {"case_id":"0196-tidehunter_efa-256-cold_device-baseline-r0","weighted_mean_us":273.56390825950274,"max_us":867.534},
+      {"case_id":"0197-tidehunter_efa-256-cold_device-profiled-r0","weighted_mean_us":259.6342422120606,"max_us":1012.341},
+      {"case_id":"0202-tidehunter_efa_direct-256-cold_device-baseline-r0","weighted_mean_us":250.8405655901686,"max_us":787.748},
+      {"case_id":"0203-tidehunter_efa_direct-256-cold_device-profiled-r0","weighted_mean_us":245.96538939697058,"max_us":524.311,"counts_per_owner":[1446,1407,1398,1340,1407],"p50_us_per_owner":[314.386,187.655,201.019,312.095,240.188]},
+      {"case_id":"0208-tidehunter_efa_native-256-cold_device-baseline-r0","weighted_mean_us":257.275740354387,"max_us":542.739},
+      {"case_id":"0209-tidehunter_efa_native-256-cold_device-profiled-r0","weighted_mean_us":250.8432985138611,"max_us":520.652}
+    ],
+    "native_controls":[
+      {"case_id":"0184-native-256-native_hot_wal_lru0_pagecache-baseline-r0","matched_reads":0,"device_mean_ns":null},
+      {"case_id":"0185-native-1024-native_hot_wal_lru0_pagecache-baseline-r0","matched_reads":0,"device_mean_ns":null},
+      {"case_id":"0214-native-256-native_cold_os_lru0-baseline-r0","matched_reads":1,"device_mean_ns":262209,"all_trace_tail_warnings":true,"pure_cold_device_qualified":false},
+      {"case_id":"0215-native-1024-native_cold_os_lru0-baseline-r0","matched_reads":0,"device_mean_ns":null,"pure_cold_device_qualified":false}
+    ]
+  },
+  "write_diagnostics": {
+    "population":"C16 1KiB scalar put/success,4096 API calls; distributed first256 append requests per5 connections,native first256 accepted scalar operations",
+    "stage_maxima_and_percentiles_exported":false,
+    "distributed":[
+      {"case_id":"0080-tidehunter_efa_native-1024-write-concurrent-write_stage_diagnostics-r0","api_mean_ns":1495076.9143066406,"api_p50_ns":1367802,"api_p99_ns":4774404,"api_max_ns":5780597,"interval_append_requests":2066,"sampled_append_requests":1280,"connection_client_requests":1300,"appended_receipts":2394,"persist_calls":1280,"persist_noops":205,"file_persist_calls":1075,"append_total_ns":87573178,"append_validation_ns":69722527,"persist_total_ns":328340168,"persist_wal_file_ns":305057862,"blocked_publication_batches":1945,"blocked_publication_ns":23530636,"dependency_wait_batches":0},
+      {"case_id":"0110-tidehunter_efa-1024-write-concurrent-write_stage_diagnostics-r0","api_mean_ns":1304158.8813476562,"api_p50_ns":1168316,"api_p99_ns":4693036,"api_max_ns":5743900,"interval_append_requests":2304,"sampled_append_requests":1280,"connection_client_requests":1296,"appended_receipts":2166,"persist_calls":1280,"persist_noops":210,"file_persist_calls":1070,"append_total_ns":81264390,"append_validation_ns":64291976,"persist_total_ns":303127357,"persist_wal_file_ns":278758829,"blocked_publication_batches":1921,"blocked_publication_ns":18479442,"dependency_wait_batches":2},
+      {"case_id":"0165-tidehunter_efa_direct-1024-write-concurrent-write_stage_diagnostics-r0","api_mean_ns":1505521.8254394531,"api_p50_ns":1400207,"api_p99_ns":4611611,"api_max_ns":5936829,"interval_append_requests":2054,"sampled_append_requests":1280,"connection_client_requests":1300,"appended_receipts":2443,"persist_calls":1280,"persist_noops":175,"file_persist_calls":1105,"append_total_ns":89692025,"append_validation_ns":70803052,"persist_total_ns":326854593,"persist_wal_file_ns":303520744,"blocked_publication_batches":1884,"blocked_publication_ns":24155322,"dependency_wait_batches":4},
+      {"case_id":"0231-tidehunter_tcp-1024-write-concurrent-write_stage_diagnostics-r0","api_mean_ns":2096216.4626464844,"api_p50_ns":1939514,"api_p99_ns":5313681,"api_max_ns":6840824,"interval_append_requests":2233,"sampled_append_requests":1280,"connection_client_requests":1299,"appended_receipts":2201,"persist_calls":1280,"persist_noops":276,"file_persist_calls":1004,"append_total_ns":163004825,"append_validation_ns":131607325,"persist_total_ns":314574027,"persist_wal_file_ns":274180014,"blocked_publication_batches":1969,"blocked_publication_ns":25983834,"dependency_wait_batches":2}
+    ],
+    "0080_stage_means_us":[{"name":"storage_append","count":1280,"mean":68.4165453125},{"name":"storage_append_validation","count":1280,"mean":54.47072421875},{"name":"storage_persist","count":1280,"mean":256.51575625},{"name":"file_persist","count":1075,"mean":283.77475534883723},{"name":"client_exchange","count":1300,"mean":693.3587815384616},{"name":"owner_control_queue","count":1300,"mean":307.33339923076926},{"name":"owner_control_execution","count":1300,"mean":337.82545},{"name":"client_output_retire","count":1310,"mean":32.24898854961832},{"name":"owner_output_retire","count":1315,"mean":31.163193155893534}],
+    "0080_cq":{"client_polls":1108036,"client_provider_call_sum_ns":45393676,"client_poll_gap_max_ns":12839152,"owner_polls":3979345,"owner_provider_call_sum_ns":158553993,"owner_poll_gap_max_ns":409363},
+    "native":{"case_id":"0201-native-1024-write-concurrent-write_stage_diagnostics-r0","api_calls":4096,"api_mean_ns":3778912.5095214844,"api_p99_ns":12854234,"api_max_ns":24522215,"selected_operations":256,"wal_append_ns":519864181,"index_apply_ns":1001195,"profiled_barriers":256,"file_calls":512,"file_ns":456692314,"namespace_calls":256,"namespace_ns":47627236,"errors":0,"contract":"post-operation barrier over all registered Value-WAL files and directory; not default native page-cache acknowledgement or per-owner group sync"}
+  },
+  "frozen_source_map":[
+    {"topic":"read selection/coordinator stages","paths":["tidehunter/src/distributed/remote_db/coordinator_profile.rs:1-30,118-210","tidehunter/src/distributed/remote_db/pending_read.rs:555-570,1890-1938,2142-2168"]},
+    {"topic":"native whole CRC/copy vs member authority plan","paths":["tidehunter/src/wal/mod.rs:379-467","tidehunter/src/distributed/storage.rs:1576-1638"]},
+    {"topic":"authority capacity/credit/cache/spill","paths":["tidehunter/src/distributed/reference_directory.rs:24-31,123-190,605-669,875-1061"]},
+    {"topic":"native flush retain/unload policy","paths":["tidehunter/src/large_table.rs:2535-2625"]},
+    {"topic":"cold planning worker/epoch recheck","paths":["tidehunter/src/distributed/tcp/reactor.rs:3208-3243,3821-3902"]},
+    {"topic":"all-resolved return/consumer dispatch","paths":["tidehunter/src/distributed/tcp/read_executor.rs:680-800,926-986","tidehunter/src/distributed/tcp/reactor.rs:3894-3969"]},
+    {"topic":"registered completion/mixed fallback ordering","paths":["tidehunter/src/distributed/tcp/reactor.rs:1950-2005,2490-2905"]},
+    {"topic":"per-member coordinator cache mutex","paths":["tidehunter/src/distributed/remote_db/pending_read/concurrent.rs:89-201"]},
+    {"topic":"ready-group dispatch","paths":["tidehunter/src/distributed/remote_db/concurrent.rs:677-809","tidehunter/src/distributed/remote_db.rs:2682-2816"]},
+    {"topic":"synced receipts/dependency publication","paths":["tidehunter/src/distributed/tcp/control.rs:185-213,375-445,550-625","tidehunter/src/distributed/storage.rs:278-346,1250-1320","tidehunter/src/distributed/remote_db.rs:2648-2679,2843-3019"]},
+    {"topic":"native persistence barrier","paths":["tidehunter/src/db.rs:1368-1401","benchmarks/kv-research/src/backends/native.rs:100-116,239-305"]}
+  ],
+  "paper_and_plan_review": {
+    "plan":"docs/distributed/REMOTE_READ_LATENCY_AND_TRANSPORT_PLAN_2026-10-29.md:998-1087",
+    "tidehunter_qmd":{"file":"tidehunter-papers/tidehunter-2026-v2.md","sections":["3.1","3.2","3.4","4.2"],"note":"relevant prose read; section3.1 trailing embedded image/base64 truncated by retrieval limit; native cache/persistence analogy is policy-qualified"},
+    "erpc_qmd":{"file":"tidehunter-papers/erpc-2019.md","sections":["3.2","4.2","6.1"],"arxiv":"https://arxiv.org/abs/1806.00680","boundary":"2.3us is32B two-node CX5 RPC,not EFA/TLS/durable/cold-read target; retain queued/DMA buffer ownership"},
+    "valkey":"already-linked pending commands/AOF-before-reply and always-sync/rewrite qualifications are scheduling analogies,not guarantee equivalence",
+    "tikv_raft_engine":"already-linked ready writers/shared sync and immediate empty leader; no unsafe-barrier copy or replication/publication conflation"
+  },
+  "concrete_next_steps":[
+    "Evaluate bounded existing-Arc authority cache carry-over after successful spill adoption with all metadata/entry charges,pin lifetime,fencing and durable-root semantics preserved.",
+    "Isolate authority worker queue/load/return and spill-to-first-read costs with matched counts; primary history-load counts do not apportion latency or establish physical NVMe misses.",
+    "Measure same-hardware all-hit executor change instead of attributing total change to already-removed device scan.",
+    "Evaluate bounded32-key coordinator cache access with fewer mutex acquisitions,retaining LRU/accounting/reference checks/lock order; measure C1 hold-time tradeoffs.",
+    "Match resolution/flight/member/message/frame/actor/caller populations and export coalescing/admission-recheck counters; correlate C16 tails with CQ gaps before scheduling changes.",
+    "Keep registered handle-headroom pure C1 and ordinary/C16 mixed populations separate; retain grant epoch checks,DMA completion ownership and FI_READ span qualifications.",
+    "Obtain exact measurement-window block attribution and native effective-cache/miss evidence before cold-NVMe claims.",
+    "Measure ready-group sizes/bytes/singletons/dispatch reasons,requests per sync and receipt-to-publication-to-caller stages before group scheduling changes.",
+    "Attribute response/TLS/copy/registration/local retirement costs before transport changes; no architecture rewrite from residuals."
+  ],
+  "missing_measurements":["same-hardware independent repetitions","retention-only matched comparison","spill/adoption-to-first-read correlation","primary selected planning/worker timings","authority worker queue vs load vs return","isolated all-hit fast-return benefit","per-API pure cold-device/NAND distribution","native effective-cache/actual-miss observations","exact group-size/singleton distributions","general receipt-to-publication distribution","publication-to-caller resume","write stage maxima/percentiles","native put_batch append/index","peer-arrival/wire timestamps","multiplexed per-request send/header/body"],
+  "actions":{"code_edits":false,"aws_calls":false,"benchmark_reruns":false,"builds":false,"tests":false,"linters":false,"formatters":false,"shared_report_edits":false,"written_artifacts":["local://cloud-th38-stage-review.md","local://cloud-th38-stage-review.json"],"provenance_upgrade":"Read saved parent full-source verification; no source verification rerun"},
+  "patch_review":{"findings":[],"explanation":"Tracked diff empty when scoped; no patch-introduced defect asserted. Evidence-qualified completed-run/frozen-source audit,not an engine correctness certification."}
+}

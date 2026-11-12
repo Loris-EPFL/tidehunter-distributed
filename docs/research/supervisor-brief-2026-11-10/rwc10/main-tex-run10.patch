@@ -1,0 +1,117 @@
+--- a/main.tex
++++ b/main.tex
+@@ -21,6 +21,15 @@
+ \input{rwc/generated/rwc-numbers.tex}
+ \input{rwc/generated/rwc-findings.tex}
+ \input{rwc/generated/rwc-figure-hooks.tex}
++\ifdefined\RWCtenSynthetic
++\input{rwc10/SYNTHETIC-generated/rwc10-numbers.tex}
++\input{rwc10/SYNTHETIC-generated/rwc10-findings.tex}
++\input{rwc10/SYNTHETIC-generated/rwc10-hooks.tex}
++\else
++\input{rwc10/generated/rwc10-numbers.tex}
++\input{rwc10/generated/rwc10-findings.tex}
++\input{rwc10/generated/rwc10-hooks.tex}
++\fi
+ \newsavebox{\tablebox}
+ \newcommand{\fitinput}[1]{\sbox{\tablebox}{\input{#1}}\ifdim\wd\tablebox>\linewidth\resizebox{\linewidth}{!}{\usebox{\tablebox}}\else\usebox{\tablebox}\fi}
+ \newcommand{\runs}{Native and Tidehunter: one run on the full-matrix fleet; other stores: median over \N{S:ext_runs_min} to \N{S:ext_runs_max} GCP runs (different fleets, days, binaries)}
+@@ -34,7 +43,7 @@
+ 10 November 2026
+ \end{center}
+ \section{Scope and findings}
+-This brief reports measured key--value workloads and separate Sui value sizes, not Sui replay performance. Run 9 adds a compact two-VM read/write campaign; earlier fleets remain separate. Closed-loop concurrency $c$ counts workers that wait for one call before starting the next (c1, c5, c16). A route connects caller and value. An owner holds one shard's Value WAL; the coordinator holds the distributed index and publishes completed writes. Native runs in process, without a coordinator or network hop.
++This brief reports measured key--value workloads and separate Sui value sizes, not Sui replay performance. Runs 9 and 10 add separate compact two-VM read/write and fabric A/B campaigns; earlier fleets remain separate. Closed-loop concurrency $c$ counts workers that wait for one call before starting the next (c1, c5, c16). A route connects caller and value. An owner holds one shard's Value WAL; the coordinator holds the distributed index and publishes completed writes. Native runs in process, without a coordinator or network hop.
+ 
+ \begin{center}\small
+ \begin{tabular}{lp{.52\linewidth}p{.22\linewidth}}\toprule
+@@ -42,15 +51,17 @@
+ Cross-store & Native/TH: \texttt{bench-0d99e8256fff4891}, 6--7 November. External stores span GCP fleets, days and binaries. & TH/native: 1; others: \N{S:ext_runs_min}--\N{S:ext_runs_max}\\
+ Run 7, device & \texttt{bench-6e40ca83d74146cf}; 9 November. SSD-served reads and puts. & 3\\
+ Run 8, unified & \texttt{bench-0a8a6af114a64287}; 9 November. Stages, floors and native controls. & 1 or 2$^{a}$\\
+-Run 9, compact & \texttt{bench-41ecdf3f69fb47ec}; 10 November. One coordinator, one shard-WAL owner. & r0/r1; read/network floors also r2\\\bottomrule
++Run 9, compact & \texttt{bench-41ecdf3f69fb47ec}; 10 November. One coordinator, one shard-WAL owner. & r0/r1; read/network floors also r2\\
++Run 10, compact & \texttt{bench-afdfe33817034a7c}; 10 November. One coordinator, one shard-WAL owner; warm security and polling controls, cold owner and NVMe-oF reads. & r0/r1\\\bottomrule
+ \end{tabular}
+ \end{center}
+ $^{a}$ Profiled copies run once. Network and SSD read floors run three times; write floors run twice. Run 8 completed \N{Q:run-summary:0:completed|.0f} of \N{Q:run-summary:0:planned|.0f} cases; \N{Q:run-summary:0:failed|.0f} failed. \N{Q:run-summary:0:unqualified|.0f} native cold 1 KiB cases are unqualified. Run 7 completed all \N{Q:run-summary:1:completed|.0f} cases. Fleets, workloads and repetitions differ; the example in Section~\ref{sec:native-gap} shows why times must stay separate.
+ 
+-\begin{enumerate}
++\begingroup\small
++\begin{enumerate}[itemsep=1pt]
+ \item \textbf{Small durable puts: software and waits matter.} Run 8, owner \texttt{synchronous}, 1 KiB c1: verbs has API mean \N{D:p1v:mean_us}~\us. Its network component is \N{C:p1v:network}~\us; owner append-persist is \N{C:p1v:persist}~\us, including software. Native barrier mean is \N{D:p1n:mean_us}~\us.
+ \item \textbf{Check hardware parity before judging software.} Run 8 in-process sync means at 1 KiB c1: TCP \N{Y:t:1024:1:mean_us}, verbs \N{Y:v:1024:1:mean_us}, native file plus directory \N{Y:n:1024:1:mean_us}~\us. Verbs carries a tail (p99 \N{Y:v:1024:1:p99_us}~\us). At 64 KiB the owner verbs mean is \N{Y:v:65536:1:mean_us}~\us, versus native \N{Y:n:65536:1:mean_us}~\us. The cause is open.
+-\item \textbf{A memory read still pays for completion.} Run 8, owner-memory 1 KiB c1 read: verbs mean \N{D:mem1v:mean_us}~\us, of which network and both stacks take \N{C:mem1v:network}~\us. This is not an isolated wire measurement. A busy-poll A/B run must test the wake-up hypothesis.
++\item \textbf{A memory read still pays for completion.} Run 8, owner-memory 1 KiB c1 read: verbs mean \N{D:mem1v:mean_us}~\us, of which network and both stacks take \N{C:mem1v:network}~\us. This is not an isolated wire measurement. Run 10 ran the user-space Busy A/B; no isolated wake-up timer or kernel \texttt{SO\_BUSY\_POLL} test.
+ \item \textbf{The owner SSD read is near the device floor.} Run 8, cold 1 KiB c1 verbs read: device component \N{C:ssd1v:device}~\us; API mean \N{D:ssd1v:mean_us}~\us. Native 1 and 8 KiB cold requests do not establish cold latency. Native 64 KiB has whole-call p50 \N{D:ssd64n:p50_us}~\us; its device split is not computed.
+ \item \textbf{Waits grow at c16.} Run 8, verbs synchronous 1 KiB timeline: mean \N{D:p16v:mean_us}~\us, with durable wait \N{C:p16v:durable}, coalescing \N{C:p16v:coalescing} and queueing \N{C:p16v:queue}~\us. These are means of same-call event intervals.
+ \item \textbf{Long put runs stall.} Run 8, synchronous verbs 1 KiB c16: timeline copies show \N{Q:run8-stall-fits:0:stalls|.0f} stalls in \N{Q:run8-stall-fits:0:completions|.0f} puts for overwrite and for new keys. Duration grows with cumulative puts; this does not prove which checkpoint phase causes it.
+@@ -58,7 +69,10 @@
+ \item \textbf{Cross-store results stay separate.} Retained c16 1 KiB puts: owner verbs synchronous p50 \WC{p50}{th_verbs}{1024}~\us; historical Valkey RDMA AOF-always p50 \WC{p50}{valkey_rdma}{1024}~\us. The contracts and fleets differ. New runs do not replace these values.
+ \item \textbf{Run 9, two-VM parity.} \RWCFINDING{parity}
+ \item \textbf{Run 9, remote reads and writes.} \RWCFINDING{results}
++\item \textbf{Run 10, warm transport controls.} \RWCtenFinding{scopewarm}
++\item \textbf{Run 10, cold fabric controls.} \RWCtenFinding{scopecold}
+ \end{enumerate}
++\endgroup
+ 
+ \clearpage
+ \section{Method and contracts}\label{sec:method}
+@@ -88,9 +102,11 @@
+ \end{center}
+ \textbf{Device-counter correction (one definition for this brief).} \texttt{/proc/diskstats} deltas cover the gate-to-gate window (3--10 s), while a case runs 0.5--2 s. They include background writeback of dirty owner history files: about 15 KiB dirtied per put; idle owners still wrote 13--15 operations/s of 41--45 KiB. A per-operation device latency from these counters is not valid for a native-versus-owner write comparison. Use the system call timed inside each system. A pre-window \texttt{sync} and dirty-page drain is a future controller change, not a property of run 8.
+ 
+-\textbf{Security and routes.} TCP owner RPC uses mutual TLS (mTLS). Owner verbs and both hybrid arms use trusted transport without TLS. Run 8 verbs mTLS isolates the security choice. TCP-versus-trusted-verbs includes TLS, not just transport. Hybrid reads use NVMe over Fabrics (NVMe-oF) over RDMA, with the kernel initiator. The kernel buffered target serves memory; kernel direct and SPDK file AIO bypass the target page cache. Both hybrid write routes use owner verbs. Replication factor one (RF1) means one durable owner, not failover.
++\textbf{Security and routes (runs 7--9).} TCP owner RPC uses mutual TLS (mTLS). Owner verbs and both hybrid arms use trusted transport without TLS. Run 8 verbs mTLS isolates the security choice. TCP-versus-trusted-verbs includes TLS, not just transport. Hybrid reads use NVMe over Fabrics (NVMe-oF) over RDMA, with the kernel initiator. The kernel buffered target serves memory; kernel direct and SPDK file AIO bypass the target page cache. Both hybrid write routes use owner verbs. Replication factor one (RF1) means one durable owner, not failover.
+ 
+ \textbf{Run-9 compact topology.} Two \texttt{z4m-highmem-16} VMs: Native uses the coordinator SSD, owner RPC the remote owner SSD; coordinator cache off. Native has zero remote-read lanes, owners one at c1/c5 and four at c16. c5 owner reads are lane-limited, not a transport ranking (Section~\ref{sec:rwc}).
++
++\textbf{Run-10 arms.} Warm owner reads separate TCP mutual TLS Adaptive, TCP trusted Adaptive/Busy and verbs trusted Adaptive/Busy. Cold owner RPC is compared with direct kernel NVMe/RDMA, SPDK NVMe/RDMA and kernel NVMe/TCP. Busy spins in user space on both owner and coordinator; it is not kernel busy poll. Full contracts and run-9 security correction are in Section~\ref{sec:rwc10}.
+ 
+ \textbf{Not measured in runs 7 and 8.} Native read decomposition; batch reads; unprofiled batch components on TCP and hybrid; deletes on hybrid and verbs mTLS. Profiled copies carry profiling cost. The appendix separates profiles from controls. ``n/c'' means not computed, never zero.
+ 
+@@ -193,6 +209,7 @@
+ The owner device component is \N{C:ssd1v:device}~\us\ at 1 KiB and \N{C:ssd64v:device}~\us\ at 64 KiB, near the measured read floors. Native and owner device \emph{operations} differ in size and count; compare API calls, not device latency per operation. c16 read profiles cover only part of the reads and stay unsplit; the appendix gives their whole calls.
+ 
+ \input{rwc/section-rwc.tex}
++\input{rwc10/section-rwc10.tex}
+ 
+ \clearpage
+ \section{Hardware parity}\label{sec:parity}
+@@ -324,7 +341,7 @@
+ \begin{tabular}{L{.05\linewidth}L{.14\linewidth}L{.24\linewidth}L{.16\linewidth}L{.18\linewidth}L{.10\linewidth}}\toprule
+ Rank & Item & Measured basis & Expected effect & How to verify & Decision\\\midrule
+ 0 & Hardware parity & Run 8 64 KiB c1 sync means: TCP \N{Y:t:65536:1:mean_us}, verbs \N{Y:v:65536:1:mean_us}, native file+directory \N{Y:n:65536:1:mean_us}~\us. Native cold \N{D:ssd64n:device_reads_per_call|.2f} device ops/call. & \inference\ Separate VM, SSD and allocation hypotheses from owner software, not an additive residual. & Run-9 G13W and both-host read floors are collected (Appendix~\ref{app:rwc-floors}). Match size, host and sync call. Keep Native's mapped/positional read paths unchanged. & Controls collected; no Native rewrite.\\[8pt]
+-1 & Completion wake-up and network at c1 & Run 8 verbs memory read network \N{C:mem1v:network}~\us; durable put network \N{C:p1v:network}~\us. Run-9 cold/warm calls and successful network controls are separate populations. & \inference\ Reduce completion/stack delay, at a possible CPU cost; not API minus independent floors. & Busy-poll versus adaptive A/B, same fleet/contract, CPU and tails. Failed event-write floors are unavailable. c5 reads are lane-limited, not transport limits. & A/B remains unmeasured.\\[8pt]
++1 & Completion wake-up and network at c1 & Run 8 verbs memory read network \N{C:mem1v:network}~\us; durable put network \N{C:p1v:network}~\us. Run-9 cold/warm calls and successful network controls are separate populations. & \inference\ Reduce completion/stack delay, at a possible CPU cost; not API minus independent floors. & Run-10 trusted TCP/verbs Adaptive/Busy controls; inspect CPU, tails and CQ evidence. Busy also changes client progress, not kernel busy poll. Failed event-write floors stay unavailable. & Run-10 matched ratios/CPU guide policy; no isolated wake-up timer.\\[8pt]
+ 2 & Owner persist and flusher hand-offs at c1 & Run 8 verbs flusher queue mean \N{A:v1:flusher_queue_ns:mean_us}~\us; append-persist exceeds its own fdatasync by \N{A:v1:persist_software_ns:mean_us}~\us. Separate profile: locks+publication \N{P:locks_publication_sum_ns:mean_us|.2f}~\us. Coordinator waits \N{C:p1v:durable}/\N{C:p1v:coalescing}/\N{C:p1v:queue}~\us. & \inference\ Reduce flusher/frontier hand-off and wake-up, not locks. Keep durability. & Time append-persist and storage persist in the same population. Trace flusher and frontier wakes. Do not add nested queue counters. & No durability change.\\[8pt]
+ 3 & Software that grows with value size & Run 8 verbs append-WAL mean \N{A:v1:append_wal_ns:mean_us} to \N{A:v64:append_wal_ns:mean_us}~\us. Unassigned owner mean at 64 KiB: \N{A:v64:handler_remainder_ns:mean_us|.2f}~\us. Coordinator \N{C:p1v:coordinator} to \N{C:p64v:coordinator}~\us. & \inference\ Decode and BLAKE2b verification are candidates, not isolated measured costs. & Run 9 adds one 64 KiB c16 verbs profile; c1 TCP/verbs profile copies remain needed. Time decode, group build and record digest separately. & Ask before digest change: wire and persisted format.\\\bottomrule
+ \end{tabular}
+@@ -338,7 +355,7 @@
+ 4 & Coordinator pipeline waits at c16 & Run 8 verbs timeline: queue \N{C:p16v:queue}, coalescing \N{C:p16v:coalescing}, durable wait \N{C:p16v:durable} of \N{D:p16v:mean_us}~\us\ TOTAL (\N{W:p16v|.1f} percent together). & \inference\ Reduce time between ready work and the next stage. & Trace waits with a tracing-off control at c1 and c16. Report shares of the same-case timeline, not a mixed profile. & Keep bounded queues and group commit.\\[8pt]
+ 5 & Put stall & Run 8 overwrite/new timeline slope \N{Q:run8-stall-fits:0:slope_us_per_put|.3f}/\N{Q:run8-stall-fits:1:slope_us_per_put|.3f}~\us/put; mean spacing \N{Q:run8-stall-fits:0:spacing|.0f}/\N{Q:run8-stall-fits:1:spacing|.0f} puts; median spacing \N{Q:run8-stall-fits:0:median_spacing|.0f}/\N{Q:run8-stall-fits:1:median_spacing|.0f} puts. Run 7 sustained rates fall late. & \inference\ Bound checkpoint work that grows with cumulative puts. & Correlate checkpoint events, stall intervals and cumulative puts; repeat overwrite and new keys. & Identify phase before changing it.\\[8pt]
+ 6 & Batch writes & Run 8 c1, 32$\times$1 KiB p50: native barrier \N{D:batch1n:p50_us}, verbs sync \N{D:batch1v:p50_us}~\us. At 32$\times$8 KiB: \N{D:batch8n:p50_us}/\N{D:ubatch8v:p50_us}~\us. & \inference\ Amortize software without changing the batch contract. & Compare same-shape native and verbs controls. Use batch owner-software and coordinator timers; add repeated controls. & Native batch profiler needed for attribution.\\[8pt]
+-7 & Hybrid client residual on reads & Run 8 kernel-buffered memory 1 KiB residual \N{C:mem1k:residual}~\us; kernel-direct cold residual \N{C:ssd1k:residual}~\us. & \inference\ Remove client work outside the reader leaves if linked tracing identifies it. & Add dispatch and completion timestamps to the same calls; verify the residual shrinks without moving cost outside the clock. & No storage-path rewrite yet.\\\bottomrule
++7 & Hybrid client residual on reads & Run 8 kernel-buffered memory 1 KiB residual \N{C:mem1k:residual}~\us; kernel-direct cold residual \N{C:ssd1k:residual}~\us. & \inference\ Remove client work outside the reader leaves if linked tracing identifies it. & Add dispatch and completion timestamps to the same calls; verify the residual shrinks without moving cost outside the clock. & Run-10 cold controls do not supply linked residual timers.\\\bottomrule
+ \end{tabular}
+ \normalsize
+ 
+@@ -347,7 +364,9 @@
+ \textbf{Evidence gaps.} Runs 7/8 lack Native read/batch-write profiles and focused batch reads. Their unprofiled TCP/hybrid batches and hybrid/mTLS deletes are absent; profiles run once. Run 9 completes G13W and the three separate 64 KiB diagnostics (Native c1/c16, owner verbs c16), not c1 TCP/verbs decode/group-build attribution. The old 64 KiB sync gap, stall phase, hybrid residual and excess device reads remain unattributed. No saturation or measured CPU cost supports production capacity.
+ 
+ \clearpage
+-\section{Provenance and limits}
++\section{Provenance and limits}\label{sec:provenance}
++\RWCtenProvenance
++
+ Run 9 uses parent \texttt{bench-bb40628be5664257}, fleet \texttt{bench-41ecdf3f69fb47ec}. Exact launched-package hashes, dirty revision, VM names, UTC times, cleanup and estimated costs are in Appendix~\ref{app:rwc-floors}. The aborted first attempt contributes no results. No historical population is replaced; \path{rwc/generated/inputs-rwc.json} registers the real CSVs, number selectors and per-marker evidence, independently checked by \path{rwc/verify_rwc.py}.
+ 
+ \textbf{Reproduction.} \path{build_run8_inputs.py} copies small CSV tables and derives the flat stall and sustained-rate extracts. It never reads the large decomposition export or summary JSON. \path{inputs.json} stores source and output SHA-256 hashes. \path{data.py} extends the original number language. \path{make_tables.py} resolves all \texttt{\textbackslash N\{key\}} values and stops on an unknown or ambiguous selection. \path{plot_final.py} makes vector PDFs. \path{evidence.json} records each point's case id, source values, run, fleet, contract and repetitions. The appendix lists every operation population of run 8, including diagnostic copies.
+@@ -360,6 +379,7 @@
+ 
+ The run-7 report and \path{APPLES-TO-APPLES.md} subtract run-6 memory timings from run-7 SSD timings. We do not carry that cross-fleet subtraction forward. Their observations do not create a measured component. The earlier brief's late-rate estimate included a partial final bucket and was biased low. The corrected \path{analysis-final-v2/output/} uses the last five complete one-second buckets and agrees in range with the report headline. The focused campaign's historical ``Deferred'' paragraph predates the successful direct-kernel fleet runs; later launch history supersedes it.
+ 
++\clearpage
+ \textbf{Limits.} Runs 7 and 8 each have one client and five owners of the same VM class and region; equal class is not hardware parity. The run-7 random dataset has 65,536 keys. It does not cover authority-history misses. Small SSD-read populations are bimodal. Their p50 can change while their means remain similar. Profiles perturb calls, and some exported leaves are derived means with only count equality, not a proved per-call join. Their additive arithmetic is bookkeeping, not an exact physical partition. Native whole-call means in the read figure aggregate two per-repetition means; they are not one profiled call population. Full case metadata stays in the copied tables.
+ 
+ No claim establishes physical NAND service per call, isolated wire time, significance, serializable transactions, permanent-loss tolerance, failover or production capacity. The authorized run-9 campaign supplied new measurements; document generation launches nothing. Native remains unchanged. Its six unqualified cold cases and the three failed event-write floor controls are retained, not hidden or zeroed. Preserve durability and security contracts.

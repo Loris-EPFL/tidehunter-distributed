@@ -453,6 +453,42 @@ class MailboxTests(unittest.TestCase):
         with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'invalid matrix mode'):
             runtime.validate_runtime(config)
 
+    def test_compact_live_requires_pair_bound_to_fleet(self):
+        import manual_campaign
+        run = 'bench-aaaaaaaaaaaaaaaa'
+        hosts = [{**host, 'name': f'{run}-{i}'} for i, host in enumerate(fleet()[:2])]
+        config = {'project_id': 'project', 'project_number': '123', 'bucket': 'bucket',
+                  'machine_type': 'z4m-highmem-16', 'run_id': run, 'fleet': hosts,
+                  'source_sha256': 'a' * 64, 'deadline_utc': deadline(),
+                  'campaign_deadline_utc': (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat(),
+                  'package_root': f'/mnt/tidehunter/{run}/package',
+                  'package': {'source_sha256': 'a' * 64, 'source_revision': 'b' * 40,
+                              'object_key': f'runs/{run}/package.tar', 'generation': '1', 'sha256': 'c' * 64},
+                  'spec': manual_campaign.REVIEWED_SPECS['leased_ab_compact']}
+        with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'live pair qualification'):
+            runtime.validate_runtime(config)
+        config['live_qualification'] = {
+            'image': 'projects/project/global/images/qualified',
+            'image_qualification': {'bucket': 'bucket', 'object': f'runs/{run}/qualification/image-receipt.json',
+                                    'generation': '1', 'sha256': 'd' * 64},
+            'pair_hosts': [{k: h[k] for k in ('name', 'id', 'zone', 'internal_ip', 'rdma_ip')} for h in hosts],
+            'rdma_device': 'irdma0', 'service_account': 'guest@example.test'}
+        self.assertIs(runtime.validate_runtime(config), config)
+        config['live_qualification']['pair_hosts'][0]['id'] = '999'
+        with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'match the campaign fleet'):
+            runtime.validate_runtime(config)
+        config['fleet'] = fleet()
+        with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'fleet size'):
+            runtime.validate_runtime(config)
+
+    def test_nvmeof_path_requires_live_qualification(self):
+        import workflow_input
+        for selection in workflow_input.cloud_campaign.NVMEOF_PATH_SELECTIONS:
+            with self.subTest(selection=selection):
+                self.assertTrue(runtime.live_mode({'mode': 'focused', 'selection': selection}))
+                self.assertFalse(runtime.live_mode({'mode': 'standard', 'selection': selection}))
+        self.assertFalse(runtime.live_mode({'mode': 'focused', 'selection': 'fabric_ab_compact'}))
+
     def test_industry_stores_do_not_request_rdma(self):
         config = {'spec': {'backends': ['garnet', 'kvrocks']}}
         with patch('subprocess.run') as run, patch('subprocess.check_output') as output:
@@ -521,6 +557,82 @@ class MailboxTests(unittest.TestCase):
                         runtime.admit_guest_unit(config, -1)
                 self.assertEqual(run.call_args.args[0], ['systemctl', 'stop',
                     cloud_controller.unit_name(config, 'startup-runtime-admission', 'client')])
+
+
+
+
+class ReviewedSuiRuntimeTests(unittest.TestCase):
+    def config(self):
+        import copy
+        import manual_sui
+        run = 'bench-aaaaaaaaaaaaaaaa'
+        hosts = [{**host, 'name': f'{run}-{i}'} for i, host in enumerate(fleet()[:2])]
+        spec = copy.deepcopy(manual_sui.REVIEWED_SUI_SPECS['sui_nvmeof_compact'])
+        spec['sui_fixture'].update(key='fixture', generation='1')
+        spec['sui_verification'] = dict(key='proof', generation='2', sha256='f'*64)
+        return dict(project_id='project', project_number='123', bucket='bucket',
+            machine_type='z4m-highmem-16', run_id=run, fleet=hosts,
+            source_sha256='a'*64, deadline_utc=deadline(),
+            campaign_deadline_utc=(datetime.now(timezone.utc)+timedelta(minutes=2)).isoformat(),
+            package_root=f'/mnt/tidehunter/{run}/package',
+            package=dict(source_sha256='a'*64, source_revision='b'*40,
+                object_key=f'runs/{run}/package.tar', generation='1', sha256='c'*64), spec=spec,
+            live_qualification=dict(image='projects/project/global/images/qualified',
+                image_qualification=dict(bucket='bucket', object=f'runs/{run}/qualification/image-receipt.json',
+                                         generation='1', sha256='d'*64),
+                pair_hosts=[{k: h[k] for k in ('name','id','zone','internal_ip','rdma_ip')} for h in hosts],
+                rdma_device='irdma0', service_account='guest@example.test'))
+
+    def test_reviewed_compact_sui_requires_live_pair_bound_to_fleet(self):
+        config = self.config()
+        self.assertTrue(runtime.live_mode(config['spec']))
+        self.assertIs(runtime.validate_runtime(config), config)
+        config['live_qualification']['pair_hosts'][0]['id'] = '999'
+        with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'match the campaign fleet'):
+            runtime.validate_runtime(config)
+        config = self.config()
+        config.pop('live_qualification')
+        with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'live pair qualification'):
+            runtime.validate_runtime(config)
+        config = self.config()
+        config['spec']['sui_cells'][0]['owner_tier'] = 'synchronous'
+        with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'compact fleet'):
+            runtime.validate_runtime(config)
+
+    def test_sui_worker_admits_nvme_cells_and_live_proof_before_storage(self):
+        import gcp_worker
+        config = self.config()
+        host = config['fleet'][1]
+        with patch.object(runtime, 'validate_runtime'), \
+             patch.object(gcp_worker, 'identify', return_value=host), \
+             patch.object(gcp_worker.cloud_package, 'verify_directory', return_value={'source_sha256': 'a'*64}), \
+             patch.object(runtime, 'verify_fleet'), patch.object(runtime, 'admit_nvmet_fix'), \
+             patch.object(runtime, 'admit_fabrics') as fabrics, \
+             patch.object(runtime, 'admit_live_qualification') as proof, \
+             patch.object(gcp_worker, 'prepare_storage', side_effect=RuntimeError('storage boundary')):
+            with self.assertRaisesRegex(RuntimeError, 'storage boundary'):
+                gcp_worker.serve(config, api=object())
+        self.assertEqual(fabrics.call_args.args[0]['spec']['backends'], ['tidehunter_nvme_rdma'])
+        proof.assert_called_once_with(config)
+
+    def test_sui_guest_revalidates_focused_live_image_receipt(self):
+        import gcp_api
+        import gcp_image
+        import manual_campaign
+        config = self.config()
+        config['package']['manifest_sha256'] = 'e'*64
+        hosts = config['live_qualification']['pair_hosts']
+        records = [dict(instance_id=host['id'], peer_instance_id=hosts[1-i]['id'],
+                        local_rdma=host['rdma_ip'], peer=hosts[1-i]['rdma_ip'])
+                   for i, host in enumerate(hosts)]
+        qualification = dict(runtime_sha256='e'*64, _records=records)
+        api = SimpleNamespace(request=lambda *args: {'id': '1'})
+        with patch.object(gcp_api, 'GoogleApi', return_value=api), \
+             patch.object(gcp_image, 'admit_image', return_value=qualification) as image, \
+             patch.object(gcp_image, 'admit_nvme_transports'), \
+             patch.object(manual_campaign, '_admit_live_pair'):
+            runtime.admit_live_qualification(config)
+        self.assertEqual(image.call_args.args[1]['qualification_profile'], 'focused')
 
 
 if __name__ == '__main__':

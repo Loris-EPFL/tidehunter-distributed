@@ -1,0 +1,62 @@
+{
+  "synthetic": true,
+  "case_id": "G16C-r1-7d700582b6eece416ef5",
+  "job": {
+    "case_kind": "media_read",
+    "selection": "fabric_ab_compact",
+    "group": "G16C",
+    "backend": "tidehunter_nvme_rdma",
+    "repeat": 1,
+    "profile": "G16C-read-c1-first_touch",
+    "cohort": "sealed_read",
+    "value_size": 1024,
+    "keys": 65536,
+    "mix": {
+      "read": 100,
+      "put": 0,
+      "delete": 0,
+      "missing_read": 0,
+      "get_many": 0,
+      "put_batch": 0
+    },
+    "concurrency": 1,
+    "read_lanes": 1,
+    "measurement_operations": 2048,
+    "warmup_operations": 0,
+    "offered_ops_per_second": null,
+    "distribution": "uniform",
+    "coordinator_cache_bytes": 0,
+    "drop_os_caches": true,
+    "native_durability": "value_wal_barrier",
+    "durability_tier": "synchronous",
+    "target_io": "spdk_direct",
+    "execution": {
+      "queue_capacity": 128
+    },
+    "nvmeof_route": "sealed_read",
+    "nvmeof_target": "spdk",
+    "media": {
+      "expected": "cold",
+      "history": "normal",
+      "wal_eviction": "none"
+    },
+    "owner_count": 1,
+    "key_order": "random_with_replacement",
+    "case_id": "G16C-r1-7d700582b6eece416ef5",
+    "sealed_dataset": {
+      "source_id": "focused-r1-tidehunter_nvme_rdma-spdk-s1024-seed1775-first_touch-7d700582b6eece416ef5",
+      "data_id": "focused-r1-s1024-seed1775",
+      "seed": 1775,
+      "tier": "first_touch",
+      "profiled": false,
+      "instrumentation": "none",
+      "page_cache_policy": "drop_at_measurement_gate",
+      "mapped_wal_eviction": "not_requested",
+      "directness": "initiator_O_DIRECT_target_file_O_DIRECT",
+      "cold_claim": "first touch does not establish per-call device reads",
+      "target_cache": "direct_file_bdev_no_OS_pagecache"
+    },
+    "measurement_key_sweep": false
+  },
+  "owner_transport_security_label": "trusted_network_no_tls"
+}

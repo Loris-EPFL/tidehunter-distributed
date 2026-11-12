@@ -1,6 +1,7 @@
 //! Owned Linux fabrics connections. The caller must drain and close every
 //! namespace I/O handle before disconnecting the controller. A connection is
 //! not a durability or authorization receipt.
+pub use super::LiveQueueGeometry;
 use super::NvmeofTransport;
 use super::live_namespace::{LiveNamespace, LiveNamespaceAccess, LiveNamespaceBinding};
 use std::fs::{File, OpenOptions};
@@ -14,9 +15,6 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
-// Keep per-controller RDMA registration resources bounded independently of CPU count.
-const IO_QUEUES: u32 = 1;
-const IO_QUEUE_SIZE: u32 = 32;
 
 /// A sysfs attribute read during controller teardown can return ENODEV, which
 /// Rust does not map to NotFound. Keep each call site's existing NotFound
@@ -25,7 +23,8 @@ fn vanished(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ENODEV)
 }
 
-fn verify_queue_geometry(path: &Path) -> io::Result<()> {
+fn verify_queue_geometry(path: &Path, geometry: LiveQueueGeometry) -> io::Result<()> {
+    geometry.validate().map_err(invalid)?;
     let count_path = path.join("queue_count");
     let size_path = path.join("sqsize");
     let count = attr(&count_path)
@@ -39,7 +38,7 @@ fn verify_queue_geometry(path: &Path) -> io::Result<()> {
         .parse::<u32>()
         .map_err(|_| invalid("invalid controller queue size"))?;
     // queue_count includes the admin queue; sqsize is zero-based.
-    if count != IO_QUEUES + 1 || size != IO_QUEUE_SIZE - 1 {
+    if count != geometry.io_queues + geometry.poll_queues + 1 || size != geometry.queue_size - 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unexpected controller queue geometry: queue_count={count}, sqsize={size}"),
@@ -137,6 +136,27 @@ pub struct LiveConnectTarget {
     pub transport: NvmeofTransport,
     #[serde(default)]
     pub spdk: Option<std::sync::Arc<super::SpdkTarget>>,
+    #[serde(default)]
+    pub geometry: LiveQueueGeometry,
+}
+
+fn connect_options(target: &LiveConnectTarget, host_nqn: &str, host_id: [u8; 16]) -> String {
+    let geometry = target.geometry;
+    let mut options = format!(
+        "nqn={},transport={},traddr={},trsvcid={},hostnqn={},hostid={},duplicate_connect,ctrl_loss_tmo=0,nr_io_queues={},queue_size={}",
+        target.nqn,
+        transport(target.transport),
+        target.address,
+        target.service,
+        host_nqn,
+        uuid_string(host_id),
+        geometry.io_queues,
+        geometry.queue_size
+    );
+    if geometry.poll_queues > 0 {
+        options.push_str(&format!(",nr_poll_queues={}", geometry.poll_queues));
+    }
+    options
 }
 
 fn invalid(s: &'static str) -> io::Error {
@@ -405,14 +425,16 @@ impl LiveConnectionRegistry {
                     .and_then(|s| s.parse().ok())
                     .ok_or_else(|| invalid("invalid controller instance"))?;
                 let mut owned = LiveController {
-                    target: intent.target.clone(),
-                    host_nqn: intent.host_nqn.clone(),
-                    host_id: intent.host_id,
+                    resolver: Arc::new(LiveNamespaceResolver {
+                        target: intent.target.clone(),
+                        host_nqn: intent.host_nqn.clone(),
+                        host_id: intent.host_id,
+                        name: name.to_owned(),
+                        directory,
+                        inode: metadata.ino(),
+                        device: metadata.dev(),
+                    }),
                     instance,
-                    name: name.to_owned(),
-                    directory,
-                    inode: metadata.ino(),
-                    device: metadata.dev(),
                     deletion: DeletionState::NotStarted,
                     registry: self.clone(),
                     intent_path: entry.path(),
@@ -527,17 +549,21 @@ impl LiveConnectionRegistry {
 /// Holds the exact controller returned by the fabrics control device. The
 /// pinned sysfs directory prevents a reused nvme number from being deleted.
 pub struct LiveController {
+    resolver: Arc<LiveNamespaceResolver>,
+    instance: u32,
+    deletion: DeletionState,
+    registry: LiveConnectionRegistry,
+    intent_path: PathBuf,
+}
+
+pub(crate) struct LiveNamespaceResolver {
     target: LiveConnectTarget,
     host_nqn: String,
     host_id: [u8; 16],
-    instance: u32,
     name: String,
     directory: File,
     inode: u64,
     device: u64,
-    deletion: DeletionState,
-    registry: LiveConnectionRegistry,
-    intent_path: PathBuf,
 }
 impl LiveController {
     /// Controller instance returned by the Linux fabrics control response.
@@ -554,6 +580,7 @@ impl LiveController {
         access: LiveNamespaceAccess,
         deadline: Instant,
     ) -> io::Result<(Self, LiveNamespaceBinding)> {
+        target.geometry.validate().map_err(invalid)?;
         if !valid_nqn(&target.nqn)
             || !valid_nqn(host_nqn)
             || host_id == [0; 16]
@@ -622,15 +649,7 @@ impl LiveController {
                     error,
                 )
             })?;
-        let options = format!(
-            "nqn={},transport={},traddr={},trsvcid={},hostnqn={},hostid={},duplicate_connect,ctrl_loss_tmo=0,nr_io_queues={IO_QUEUES},queue_size={IO_QUEUE_SIZE}",
-            target.nqn,
-            transport(target.transport),
-            target.address,
-            target.service,
-            host_nqn,
-            uuid_string(host_id)
-        );
+        let options = connect_options(&target, &host_nqn, host_id);
         control.write_all(options.as_bytes()).map_err(|error| {
             with_context(
                 "connect fabrics control",
@@ -660,14 +679,16 @@ impl LiveController {
         })?;
         let metadata = directory.metadata()?;
         let controller = Self {
-            target,
-            host_nqn,
-            host_id,
+            resolver: Arc::new(LiveNamespaceResolver {
+                target,
+                host_nqn,
+                host_id,
+                name,
+                directory,
+                inode: metadata.ino(),
+                device: metadata.dev(),
+            }),
             instance,
-            name,
-            directory,
-            inode: metadata.ino(),
-            device: metadata.dev(),
             deletion: DeletionState::NotStarted,
             registry,
             intent_path,
@@ -682,6 +703,8 @@ impl LiveController {
         }
         Ok(controller)
     }
+}
+impl LiveNamespaceResolver {
     fn pinned(&self) -> PathBuf {
         PathBuf::from(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
     }
@@ -724,16 +747,13 @@ impl LiveController {
         }
         Ok(())
     }
-    fn verify_queue_geometry(&self) -> io::Result<()> {
-        self.verify()?;
-        verify_queue_geometry(&self.pinned())?;
-        self.verify()
-    }
 
     /// Resolve the single namespace owned by this controller, then perform the
     /// block, NVMe identity, geometry, access and transport verification.
-    pub fn resolve_verified(
-        &mut self,
+    pub(crate) fn resolve_namespace(
+        &self,
+        expected_nsid: u32,
+        expected_uuid: [u8; 16],
         access: LiveNamespaceAccess,
         deadline: Instant,
     ) -> io::Result<LiveNamespaceBinding> {
@@ -795,7 +815,7 @@ impl LiveController {
                 let nsid = nsid
                     .parse::<u32>()
                     .map_err(|_| invalid("invalid namespace id"))?;
-                if nsid != self.target.nsid {
+                if nsid != expected_nsid {
                     continue;
                 }
                 let Some(actual_uuid) = scan_attribute(&p.join("uuid"))? else {
@@ -804,7 +824,7 @@ impl LiveController {
                 let Some(wwid) = scan_attribute(&p.join("wwid"))? else {
                     continue;
                 };
-                let uuid = uuid_string(self.target.uuid);
+                let uuid = uuid_string(expected_uuid);
                 if actual_uuid != uuid || wwid != format!("uuid.{uuid}") {
                     return Err(invalid("namespace UUID mismatch"));
                 }
@@ -843,8 +863,8 @@ impl LiveController {
                     namespace_path: path,
                     transport: self.target.transport,
                     nqn: self.target.nqn.clone(),
-                    uuid: self.target.uuid,
-                    nsid: self.target.nsid,
+                    uuid: expected_uuid,
+                    nsid: expected_nsid,
                     bytes: self.target.bytes,
                     block_size: self.target.block_size,
                     spdk: self.target.spdk.clone(),
@@ -866,17 +886,45 @@ impl LiveController {
             std::thread::sleep(remaining(deadline)?.min(Duration::from_millis(20)));
         }
     }
+}
+impl LiveController {
+    fn pinned(&self) -> PathBuf {
+        self.resolver.pinned()
+    }
+    fn verify(&self) -> io::Result<()> {
+        self.resolver.verify()
+    }
+    pub(crate) fn resolver(&self) -> Arc<LiveNamespaceResolver> {
+        self.resolver.clone()
+    }
+    pub fn resolve_verified(
+        &mut self,
+        access: LiveNamespaceAccess,
+        deadline: Instant,
+    ) -> io::Result<LiveNamespaceBinding> {
+        self.resolver.resolve_namespace(
+            self.resolver.target.nsid,
+            self.resolver.target.uuid,
+            access,
+            deadline,
+        )
+    }
+    fn verify_queue_geometry(&self) -> io::Result<()> {
+        self.verify()?;
+        verify_queue_geometry(&self.pinned(), self.resolver.target.geometry)?;
+        self.verify()
+    }
     /// Set and read back namespace write protection on the owned controller.
     /// This is a point-in-time guard under the trusted-initiator assumption.
     pub fn set_read_only(&mut self, nsid: u32, deadline: Instant) -> io::Result<()> {
-        if nsid != self.target.nsid {
+        if nsid != self.resolver.target.nsid {
             return Err(invalid("namespace id mismatch"));
         }
-        if self.target.spdk.is_some() {
+        if self.resolver.target.spdk.is_some() {
             remaining(deadline)?;
             return self.verify();
         }
-        let controller_path = Path::new("/dev").join(&self.name);
+        let controller_path = Path::new("/dev").join(&self.resolver.name);
         let file = wait_for_device(
             "open controller admin device",
             &controller_path,
@@ -930,14 +978,14 @@ impl LiveController {
         self.disconnect_inner(deadline)
     }
     fn delete_owned(&mut self, deadline: Instant) -> io::Result<()> {
-        let controller_path = Path::new("/sys/class/nvme").join(&self.name);
+        let controller_path = Path::new("/sys/class/nvme").join(&self.resolver.name);
         let delete_path = self.pinned().join("delete_controller");
         let mut state = self.deletion;
         let result = retire_controller(
             &mut state,
             &controller_path,
-            self.device,
-            self.inode,
+            self.resolver.device,
+            self.resolver.inode,
             deadline,
             || self.verify(),
             || {
@@ -971,14 +1019,16 @@ impl LiveController {
         let directory = File::open(sysfs_stand_in)?;
         let metadata = directory.metadata()?;
         Ok(Self {
-            target: target.clone(),
-            host_nqn: "nqn.2026-01.test:host".into(),
-            host_id: [2; 16],
+            resolver: Arc::new(LiveNamespaceResolver {
+                target: target.clone(),
+                host_nqn: "nqn.2026-01.test:host".into(),
+                host_id: [2; 16],
+                name: "nvme-test".into(),
+                inode: metadata.ino(),
+                device: metadata.dev(),
+                directory,
+            }),
             instance: 0,
-            name: "nvme-test".into(),
-            inode: metadata.ino(),
-            device: metadata.dev(),
-            directory,
             deletion: DeletionState::Gone,
             registry: registry.clone(),
             intent_path: sysfs_stand_in.join("no-intent"),
@@ -1013,6 +1063,84 @@ mod tests {
     use super::*;
 
     #[test]
+    fn live_queue_geometry_validates_all_bounds() {
+        assert!(LiveQueueGeometry::default().validate().is_ok());
+        for io_queues in [1, 16] {
+            for queue_size in [16, 128] {
+                for poll_queues in [0, 4] {
+                    assert!(
+                        LiveQueueGeometry {
+                            io_queues,
+                            queue_size,
+                            poll_queues
+                        }
+                        .validate()
+                        .is_ok()
+                    );
+                }
+            }
+        }
+        for geometry in [
+            LiveQueueGeometry {
+                io_queues: 0,
+                ..Default::default()
+            },
+            LiveQueueGeometry {
+                io_queues: 17,
+                ..Default::default()
+            },
+            LiveQueueGeometry {
+                queue_size: 15,
+                ..Default::default()
+            },
+            LiveQueueGeometry {
+                queue_size: 129,
+                ..Default::default()
+            },
+            LiveQueueGeometry {
+                poll_queues: 5,
+                ..Default::default()
+            },
+        ] {
+            assert!(geometry.validate().is_err());
+        }
+        assert!(
+            serde_json::from_value::<LiveQueueGeometry>(serde_json::json!({
+                "io_queues": 1, "queue_size": 32, "poll_queues": 0, "unknown": 0
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn old_connect_target_defaults_geometry_and_pins_connect_options() {
+        let mut target: LiveConnectTarget = serde_json::from_value(serde_json::json!({
+            "nqn": "nqn.2026-01.test:wal", "uuid": vec![1; 16], "nsid": 1,
+            "bytes": 4096, "block_size": 4096, "address": "127.0.0.1",
+            "service": 4420, "transport": "tcp"
+        }))
+        .unwrap();
+        assert_eq!(target.geometry, LiveQueueGeometry::default());
+        let expected = "nqn=nqn.2026-01.test:wal,transport=tcp,traddr=127.0.0.1,trsvcid=4420,hostnqn=nqn.2026-01.test:host,hostid=02020202-0202-0202-0202-020202020202,duplicate_connect,ctrl_loss_tmo=0,nr_io_queues=1,queue_size=32";
+        assert_eq!(
+            connect_options(&target, "nqn.2026-01.test:host", [2; 16]),
+            expected
+        );
+        target.geometry = LiveQueueGeometry {
+            io_queues: 4,
+            queue_size: 128,
+            poll_queues: 1,
+        };
+        assert_eq!(
+            connect_options(&target, "nqn.2026-01.test:host", [2; 16]),
+            expected.replace(
+                "nr_io_queues=1,queue_size=32",
+                "nr_io_queues=4,queue_size=128,nr_poll_queues=1"
+            )
+        );
+    }
+
+    #[test]
     fn vanished_accepts_only_missing_or_torn_down_devices() {
         assert!(vanished(&io::Error::from(io::ErrorKind::NotFound)));
         assert!(vanished(&io::Error::from_raw_os_error(libc::ENOENT)));
@@ -1037,27 +1165,58 @@ mod tests {
         let path = temp.path();
         std::fs::write(path.join("queue_count"), "2\n").unwrap();
         std::fs::write(path.join("sqsize"), "31\n").unwrap();
-        verify_queue_geometry(path).unwrap();
+        verify_queue_geometry(path, LiveQueueGeometry::default()).unwrap();
+        for (geometry, count, size) in [
+            (
+                LiveQueueGeometry {
+                    io_queues: 4,
+                    queue_size: 128,
+                    poll_queues: 0,
+                },
+                "5",
+                "127",
+            ),
+            (
+                LiveQueueGeometry {
+                    poll_queues: 1,
+                    ..Default::default()
+                },
+                "3",
+                "31",
+            ),
+        ] {
+            std::fs::write(path.join("queue_count"), count).unwrap();
+            std::fs::write(path.join("sqsize"), size).unwrap();
+            verify_queue_geometry(path, geometry).unwrap();
+        }
 
         std::fs::write(path.join("queue_count"), "17\n").unwrap();
         assert_eq!(
-            verify_queue_geometry(path).unwrap_err().kind(),
+            verify_queue_geometry(path, LiveQueueGeometry::default())
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidData
         );
         std::fs::write(path.join("queue_count"), "2\n").unwrap();
         std::fs::write(path.join("sqsize"), "127\n").unwrap();
         assert_eq!(
-            verify_queue_geometry(path).unwrap_err().kind(),
+            verify_queue_geometry(path, LiveQueueGeometry::default())
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidData
         );
         std::fs::write(path.join("sqsize"), "not-a-number\n").unwrap();
         assert_eq!(
-            verify_queue_geometry(path).unwrap_err().kind(),
+            verify_queue_geometry(path, LiveQueueGeometry::default())
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidData
         );
         std::fs::remove_file(path.join("sqsize")).unwrap();
         assert_eq!(
-            verify_queue_geometry(path).unwrap_err().kind(),
+            verify_queue_geometry(path, LiveQueueGeometry::default())
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::NotFound
         );
     }
@@ -1079,6 +1238,7 @@ mod tests {
                 service: 4420,
                 transport: NvmeofTransport::Tcp,
                 spdk: None,
+                geometry: Default::default(),
             },
             host_nqn: "nqn.2026-01.test:host".into(),
             host_id: [2; 16],

@@ -1,0 +1,761 @@
+{
+  "schema_version": 1,
+  "input": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/aws-ci-runs/2026-10-30-owner-authority-campaign/extracted-th-38c2508272a57587/comparison.json",
+  "input_sha256": "3e963fa576f634e22dd0bf8d6405748ebefe0141f8449f4579046d55ab328140",
+  "repetition_mode": "single",
+  "planned_backends": [
+    "cassandra",
+    "foundationdb",
+    "native",
+    "tidehunter_efa",
+    "tidehunter_efa_direct",
+    "tidehunter_efa_native",
+    "tidehunter_tcp",
+    "tikv",
+    "valkey_tcp"
+  ],
+  "current_backend_coverage": true,
+  "planned_repeats": [
+    0
+  ],
+  "minimum_common_repeats": 1,
+  "run_to_run_errorbars": false,
+  "aggregation": "one independent repetition; source scalar metrics/conditional quantiles, never pooled samples",
+  "variation": "no run-to-run variability estimate; no between-run errorbars; no confidence/significance claim",
+  "repeat_policy": "intersection of completed repeat identities across EVERY cell in each figure; minimum one only when ALL planned cases have one repeat identity; otherwise minimum two; no one-repeat fallback",
+  "units": "plot-data.csv retains exact source ns; latency figures convert ns / 1000 to \u00b5s; MiB = 2^20 bytes",
+  "figures": [],
+  "omitted_figures": [
+    {
+      "figure": "read_tier_cold_device-read-tier-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_cold_device-read-tier-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_cold_device-read-tier-c16-scalar-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_cold_device-read-tier-c16-scalar-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_cold_device-read-tier-c16-batch32-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_cold_device-read-tier-c16-batch32-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_coordinator_hit-read-tier-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_coordinator_hit-read-tier-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_coordinator_hit-read-tier-c16-scalar-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_coordinator_hit-read-tier-c16-scalar-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_coordinator_hit-read-tier-c16-batch32-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_coordinator_hit-read-tier-c16-batch32-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_native_cold_os_lru0-read-tier-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_native_cold_os_lru0-read-tier-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_native_cold_os_lru0-read-tier-c16-scalar-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_native_cold_os_lru0-read-tier-c16-scalar-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_native_cold_os_lru0-read-tier-c16-batch32-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_native_cold_os_lru0-read-tier-c16-batch32-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_native_hot_wal_lru0_pagecache-read-tier-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_native_hot_wal_lru0_pagecache-read-tier-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_native_hot_wal_lru0_pagecache-read-tier-c16-scalar-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_native_hot_wal_lru0_pagecache-read-tier-c16-scalar-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_native_hot_wal_lru0_pagecache-read-tier-c16-batch32-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_native_hot_wal_lru0_pagecache-read-tier-c16-batch32-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_owner_hit-read-tier-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_owner_hit-read-tier-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_owner_hit-read-tier-c16-scalar-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_owner_hit-read-tier-c16-scalar-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_owner_hit-read-tier-c16-batch32-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_owner_hit-read-tier-c16-batch32-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_reuse-read-tier-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_reuse-read-tier-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_reuse-read-tier-c16-scalar-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_reuse-read-tier-c16-scalar-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_reuse-read-tier-c16-batch32-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_reuse-read-tier-c16-batch32-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_reuse_c16_mixed_acquisition_reuse-read-tier-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_reuse_c16_mixed_acquisition_reuse-read-tier-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_reuse_c16_mixed_acquisition_reuse-read-tier-c16-scalar-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_reuse_c16_mixed_acquisition_reuse-read-tier-c16-scalar-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_reuse_c16_mixed_acquisition_reuse-read-tier-c16-batch32-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_reuse_c16_mixed_acquisition_reuse-read-tier-c16-batch32-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_reuse_handle_headroom-read-tier-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_reuse_handle_headroom-read-tier-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_reuse_handle_headroom-read-tier-c16-scalar-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_reuse_handle_headroom-read-tier-c16-scalar-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_reuse_handle_headroom-read-tier-c16-batch32-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_reuse_handle_headroom-read-tier-c16-batch32-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_steady_c16_mixed_acquisition_reuse-read-tier-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_steady_c16_mixed_acquisition_reuse-read-tier-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_steady_c16_mixed_acquisition_reuse-read-tier-c16-scalar-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_steady_c16_mixed_acquisition_reuse-read-tier-c16-scalar-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_steady_c16_mixed_acquisition_reuse-read-tier-c16-batch32-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_steady_c16_mixed_acquisition_reuse-read-tier-c16-batch32-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_steady_handle_headroom-read-tier-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_steady_handle_headroom-read-tier-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_steady_handle_headroom-read-tier-c16-scalar-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_steady_handle_headroom-read-tier-c16-scalar-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_steady_handle_headroom-read-tier-c16-batch32-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_registered_steady_handle_headroom-read-tier-c16-batch32-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_remote-read-tier-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_remote-read-tier-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_remote-read-tier-c16-scalar-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_remote-read-tier-c16-scalar-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_remote-read-tier-c16-batch32-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_remote-read-tier-c16-batch32-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_wal_warm-read-tier-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_wal_warm-read-tier-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_wal_warm-read-tier-c16-scalar-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_wal_warm-read-tier-c16-scalar-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_wal_warm-read-tier-c16-batch32-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "read_tier_wal_warm-read-tier-c16-batch32-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "registered_ram_fullset_control-read-tier-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "registered_ram_fullset_control-read-tier-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "registered_ram_fullset_control-read-tier-c16-scalar-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "registered_ram_fullset_control-read-tier-c16-scalar-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "registered_ram_fullset_control-read-tier-c16-batch32-baseline",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "registered_ram_fullset_control-read-tier-c16-batch32-profiled",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "primary-read-concurrent",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "primary-write-concurrent",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "primary-read-many32",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "primary-point-mixed-latency",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "primary-point-mixed-goodput",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "offered-load-accounting",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "offered-load-tails",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "zipf-versus-uniform",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "cache-cohorts",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "registered-fullset-registered-scalar",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "registered-fullset-registered-many32",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "cold-os-cache",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted",
+      "unavailable_systems": [
+        {
+          "backend": "native",
+          "reason": "Fewer than 1 completed cold-OS repeats required by planned mode",
+          "case_ids": []
+        },
+        {
+          "backend": "tidehunter_tcp",
+          "reason": "Fewer than 1 completed cold-OS repeats required by planned mode",
+          "case_ids": []
+        },
+        {
+          "backend": "tidehunter_efa",
+          "reason": "Fewer than 1 completed cold-OS repeats required by planned mode",
+          "case_ids": []
+        },
+        {
+          "backend": "tidehunter_efa_direct",
+          "reason": "Fewer than 1 completed cold-OS repeats required by planned mode",
+          "case_ids": []
+        },
+        {
+          "backend": "tidehunter_efa_native",
+          "reason": "Fewer than 1 completed cold-OS repeats required by planned mode",
+          "case_ids": []
+        },
+        {
+          "backend": "tikv",
+          "reason": "Fewer than 1 completed cold-OS repeats required by planned mode",
+          "case_ids": []
+        },
+        {
+          "backend": "cassandra",
+          "reason": "Fewer than 1 completed cold-OS repeats required by planned mode",
+          "case_ids": []
+        },
+        {
+          "backend": "foundationdb",
+          "reason": "Fewer than 1 completed cold-OS repeats required by planned mode",
+          "case_ids": []
+        },
+        {
+          "backend": "valkey_tcp",
+          "reason": "Fewer than 1 completed cold-OS repeats required by planned mode",
+          "case_ids": []
+        }
+      ]
+    },
+    {
+      "figure": "native-pagecache-latency",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    },
+    {
+      "figure": "native-pagecache-goodput",
+      "reason": "fewer than one common completed repeats across every requested cell; figure omitted"
+    }
+  ],
+  "coverage": {
+    "total": {
+      "completed": 196
+    },
+    "by_backend": {
+      "cassandra": {
+        "completed": 3
+      },
+      "foundationdb": {
+        "completed": 3
+      },
+      "native": {
+        "completed": 8
+      },
+      "tidehunter_efa": {
+        "completed": 38
+      },
+      "tidehunter_efa_direct": {
+        "completed": 38
+      },
+      "tidehunter_efa_native": {
+        "completed": 62
+      },
+      "tidehunter_tcp": {
+        "completed": 38
+      },
+      "tikv": {
+        "completed": 3
+      },
+      "valkey_tcp": {
+        "completed": 3
+      }
+    },
+    "by_cohort": {
+      "primary_rf1": {
+        "completed": 27
+      },
+      "read_tier_cold_device": {
+        "completed": 8
+      },
+      "read_tier_coordinator_hit": {
+        "completed": 32
+      },
+      "read_tier_native_cold_os_lru0": {
+        "completed": 2
+      },
+      "read_tier_native_hot_wal_lru0_pagecache": {
+        "completed": 2
+      },
+      "read_tier_owner_hit": {
+        "completed": 32
+      },
+      "read_tier_registered_reuse": {
+        "completed": 4
+      },
+      "read_tier_registered_reuse_c16_mixed_acquisition_reuse": {
+        "completed": 4
+      },
+      "read_tier_registered_reuse_handle_headroom": {
+        "completed": 4
+      },
+      "read_tier_registered_steady_c16_mixed_acquisition_reuse": {
+        "completed": 4
+      },
+      "read_tier_registered_steady_handle_headroom": {
+        "completed": 4
+      },
+      "read_tier_remote": {
+        "completed": 32
+      },
+      "read_tier_wal_warm": {
+        "completed": 32
+      },
+      "registered_ram_fullset_control": {
+        "completed": 4
+      },
+      "write_stage_diagnostics": {
+        "completed": 5
+      }
+    },
+    "repetition_mode": "single",
+    "planned_backends": [
+      "cassandra",
+      "foundationdb",
+      "native",
+      "tidehunter_efa",
+      "tidehunter_efa_direct",
+      "tidehunter_efa_native",
+      "tidehunter_tcp",
+      "tikv",
+      "valkey_tcp"
+    ],
+    "current_backend_coverage": true,
+    "planned_repeats": [
+      0
+    ],
+    "minimum_common_repeats": 1,
+    "run_to_run_errorbars": false,
+    "aggregation": "one independent repetition; source scalar metrics/conditional quantiles, never pooled samples",
+    "variation": "no run-to-run variability estimate; no between-run errorbars; no confidence/significance claim",
+    "repeat_policy": "intersection of completed repeat identities across EVERY cell in each figure; minimum one only when ALL planned cases have one repeat identity; otherwise minimum two; no one-repeat fallback",
+    "title": "Campaign coverage \u2014 one planned independent repetition\nNo run-to-run variability estimate",
+    "caption": "Coverage counts are not performance zeros. Performance figures use only their stated common complete repetition identities. Completed/failed/not_run are original campaign states, not reconstructed successes; no new runs or Sui replay. One independent repetition; no run-to-run variability estimate or between-run errorbars."
+  },
+  "coverage_figure": {
+    "files": [
+      "coverage.png",
+      "coverage.pdf"
+    ],
+    "title": "Campaign coverage \u2014 one planned independent repetition\nNo run-to-run variability estimate",
+    "caption": "Coverage counts are not performance zeros. Performance figures use only their stated common complete repetition identities. Completed/failed/not_run are original campaign states, not reconstructed successes; no new runs or Sui replay. One independent repetition; no run-to-run variability estimate or between-run errorbars."
+  },
+  "completed_cases_not_in_figures": [
+    "0184-native-256-native_hot_wal_lru0_pagecache-baseline-r0",
+    "0185-native-1024-native_hot_wal_lru0_pagecache-baseline-r0",
+    "0190-tidehunter_tcp-256-cold_device-baseline-r0",
+    "0191-tidehunter_tcp-256-cold_device-profiled-r0",
+    "0196-tidehunter_efa-256-cold_device-baseline-r0",
+    "0197-tidehunter_efa-256-cold_device-profiled-r0",
+    "0202-tidehunter_efa_direct-256-cold_device-baseline-r0",
+    "0203-tidehunter_efa_direct-256-cold_device-profiled-r0",
+    "0208-tidehunter_efa_native-256-cold_device-baseline-r0",
+    "0209-tidehunter_efa_native-256-cold_device-profiled-r0",
+    "0214-native-256-native_cold_os_lru0-baseline-r0",
+    "0215-native-1024-native_cold_os_lru0-baseline-r0",
+    "0000-foundationdb-8192-read-many32-primary_rf1-r0",
+    "0011-foundationdb-1024-write-concurrent-primary_rf1-r0",
+    "0013-foundationdb-1024-read-concurrent-primary_rf1-r0",
+    "0025-valkey_tcp-8192-read-many32-primary_rf1-r0",
+    "0036-valkey_tcp-1024-write-concurrent-primary_rf1-r0",
+    "0038-valkey_tcp-1024-read-concurrent-primary_rf1-r0",
+    "0050-tidehunter_efa_native-8192-read-many32-primary_rf1-r0",
+    "0061-tidehunter_efa_native-1024-write-concurrent-primary_rf1-r0",
+    "0063-tidehunter_efa_native-1024-read-concurrent-primary_rf1-r0",
+    "0082-tidehunter_efa-8192-read-many32-primary_rf1-r0",
+    "0093-tidehunter_efa-1024-write-concurrent-primary_rf1-r0",
+    "0095-tidehunter_efa-1024-read-concurrent-primary_rf1-r0",
+    "0112-tikv-8192-read-many32-primary_rf1-r0",
+    "0123-tikv-1024-write-concurrent-primary_rf1-r0",
+    "0125-tikv-1024-read-concurrent-primary_rf1-r0",
+    "0137-tidehunter_efa_direct-8192-read-many32-primary_rf1-r0",
+    "0148-tidehunter_efa_direct-1024-write-concurrent-primary_rf1-r0",
+    "0150-tidehunter_efa_direct-1024-read-concurrent-primary_rf1-r0",
+    "0167-native-8192-read-many32-primary_rf1-r0",
+    "0178-native-1024-write-concurrent-primary_rf1-r0",
+    "0180-native-1024-read-concurrent-primary_rf1-r0",
+    "0203-tidehunter_tcp-8192-read-many32-primary_rf1-r0",
+    "0214-tidehunter_tcp-1024-write-concurrent-primary_rf1-r0",
+    "0216-tidehunter_tcp-1024-read-concurrent-primary_rf1-r0",
+    "0233-cassandra-8192-read-many32-primary_rf1-r0",
+    "0244-cassandra-1024-write-concurrent-primary_rf1-r0",
+    "0246-cassandra-1024-read-concurrent-primary_rf1-r0",
+    "0080-tidehunter_efa_native-1024-write-concurrent-write_stage_diagnostics-r0",
+    "0110-tidehunter_efa-1024-write-concurrent-write_stage_diagnostics-r0",
+    "0165-tidehunter_efa_direct-1024-write-concurrent-write_stage_diagnostics-r0",
+    "0201-native-1024-write-concurrent-write_stage_diagnostics-r0",
+    "0231-tidehunter_tcp-1024-write-concurrent-write_stage_diagnostics-r0",
+    "0120-tidehunter_efa_native-256-registered_steady-baseline-r0-handle-headroom",
+    "0121-tidehunter_efa_native-256-registered_steady-profiled-r0-handle-headroom",
+    "0122-tidehunter_efa_native-8192-registered_steady-baseline-r0-handle-headroom",
+    "0123-tidehunter_efa_native-8192-registered_steady-profiled-r0-handle-headroom",
+    "0136-tidehunter_efa_native-256-registered_reuse-baseline-r0-handle-headroom",
+    "0137-tidehunter_efa_native-256-registered_reuse-profiled-r0-handle-headroom",
+    "0138-tidehunter_efa_native-8192-registered_reuse-baseline-r0-handle-headroom",
+    "0139-tidehunter_efa_native-8192-registered_reuse-profiled-r0-handle-headroom",
+    "0000-tidehunter_tcp-256-remote-baseline-r0",
+    "0001-tidehunter_tcp-256-remote-profiled-r0",
+    "0002-tidehunter_tcp-8192-remote-baseline-r0",
+    "0003-tidehunter_tcp-8192-remote-profiled-r0",
+    "0006-tidehunter_efa-256-remote-baseline-r0",
+    "0007-tidehunter_efa-256-remote-profiled-r0",
+    "0008-tidehunter_efa-8192-remote-baseline-r0",
+    "0009-tidehunter_efa-8192-remote-profiled-r0",
+    "0012-tidehunter_efa_direct-256-remote-baseline-r0",
+    "0013-tidehunter_efa_direct-256-remote-profiled-r0",
+    "0014-tidehunter_efa_direct-8192-remote-baseline-r0",
+    "0015-tidehunter_efa_direct-8192-remote-profiled-r0",
+    "0018-tidehunter_efa_native-256-remote-baseline-r0",
+    "0019-tidehunter_efa_native-256-remote-profiled-r0",
+    "0020-tidehunter_efa_native-8192-remote-baseline-r0",
+    "0021-tidehunter_efa_native-8192-remote-profiled-r0",
+    "0024-tidehunter_tcp-1024-remote-read-tier-c16-scalar-baseline-r0",
+    "0025-tidehunter_tcp-8192-remote-read-tier-c16-batch32-baseline-r0",
+    "0026-tidehunter_tcp-1024-remote-read-tier-c16-scalar-profiled-r0",
+    "0027-tidehunter_tcp-8192-remote-read-tier-c16-batch32-profiled-r0",
+    "0028-tidehunter_efa-1024-remote-read-tier-c16-scalar-baseline-r0",
+    "0029-tidehunter_efa-8192-remote-read-tier-c16-batch32-baseline-r0",
+    "0030-tidehunter_efa-1024-remote-read-tier-c16-scalar-profiled-r0",
+    "0031-tidehunter_efa-8192-remote-read-tier-c16-batch32-profiled-r0",
+    "0032-tidehunter_efa_direct-1024-remote-read-tier-c16-scalar-baseline-r0",
+    "0033-tidehunter_efa_direct-8192-remote-read-tier-c16-batch32-baseline-r0",
+    "0034-tidehunter_efa_direct-1024-remote-read-tier-c16-scalar-profiled-r0",
+    "0035-tidehunter_efa_direct-8192-remote-read-tier-c16-batch32-profiled-r0",
+    "0036-tidehunter_efa_native-1024-remote-read-tier-c16-scalar-baseline-r0",
+    "0037-tidehunter_efa_native-8192-remote-read-tier-c16-batch32-baseline-r0",
+    "0038-tidehunter_efa_native-1024-remote-read-tier-c16-scalar-profiled-r0",
+    "0039-tidehunter_efa_native-8192-remote-read-tier-c16-batch32-profiled-r0",
+    "0040-tidehunter_tcp-256-coordinator_hit-baseline-r0",
+    "0041-tidehunter_tcp-256-coordinator_hit-profiled-r0",
+    "0042-tidehunter_tcp-8192-coordinator_hit-baseline-r0",
+    "0043-tidehunter_tcp-8192-coordinator_hit-profiled-r0",
+    "0046-tidehunter_efa-256-coordinator_hit-baseline-r0",
+    "0047-tidehunter_efa-256-coordinator_hit-profiled-r0",
+    "0048-tidehunter_efa-8192-coordinator_hit-baseline-r0",
+    "0049-tidehunter_efa-8192-coordinator_hit-profiled-r0",
+    "0052-tidehunter_efa_direct-256-coordinator_hit-baseline-r0",
+    "0053-tidehunter_efa_direct-256-coordinator_hit-profiled-r0",
+    "0054-tidehunter_efa_direct-8192-coordinator_hit-baseline-r0",
+    "0055-tidehunter_efa_direct-8192-coordinator_hit-profiled-r0",
+    "0058-tidehunter_efa_native-256-coordinator_hit-baseline-r0",
+    "0059-tidehunter_efa_native-256-coordinator_hit-profiled-r0",
+    "0060-tidehunter_efa_native-8192-coordinator_hit-baseline-r0",
+    "0061-tidehunter_efa_native-8192-coordinator_hit-profiled-r0",
+    "0064-tidehunter_tcp-1024-coordinator_hit-read-tier-c16-scalar-baseline-r0",
+    "0065-tidehunter_tcp-8192-coordinator_hit-read-tier-c16-batch32-baseline-r0",
+    "0066-tidehunter_tcp-1024-coordinator_hit-read-tier-c16-scalar-profiled-r0",
+    "0067-tidehunter_tcp-8192-coordinator_hit-read-tier-c16-batch32-profiled-r0",
+    "0068-tidehunter_efa-1024-coordinator_hit-read-tier-c16-scalar-baseline-r0",
+    "0069-tidehunter_efa-8192-coordinator_hit-read-tier-c16-batch32-baseline-r0",
+    "0070-tidehunter_efa-1024-coordinator_hit-read-tier-c16-scalar-profiled-r0",
+    "0071-tidehunter_efa-8192-coordinator_hit-read-tier-c16-batch32-profiled-r0",
+    "0072-tidehunter_efa_direct-1024-coordinator_hit-read-tier-c16-scalar-baseline-r0",
+    "0073-tidehunter_efa_direct-8192-coordinator_hit-read-tier-c16-batch32-baseline-r0",
+    "0074-tidehunter_efa_direct-1024-coordinator_hit-read-tier-c16-scalar-profiled-r0",
+    "0075-tidehunter_efa_direct-8192-coordinator_hit-read-tier-c16-batch32-profiled-r0",
+    "0076-tidehunter_efa_native-1024-coordinator_hit-read-tier-c16-scalar-baseline-r0",
+    "0077-tidehunter_efa_native-8192-coordinator_hit-read-tier-c16-batch32-baseline-r0",
+    "0078-tidehunter_efa_native-1024-coordinator_hit-read-tier-c16-scalar-profiled-r0",
+    "0079-tidehunter_efa_native-8192-coordinator_hit-read-tier-c16-batch32-profiled-r0",
+    "0080-tidehunter_tcp-256-owner_hit-baseline-r0",
+    "0081-tidehunter_tcp-256-owner_hit-profiled-r0",
+    "0082-tidehunter_tcp-8192-owner_hit-baseline-r0",
+    "0083-tidehunter_tcp-8192-owner_hit-profiled-r0",
+    "0086-tidehunter_efa-256-owner_hit-baseline-r0",
+    "0087-tidehunter_efa-256-owner_hit-profiled-r0",
+    "0088-tidehunter_efa-8192-owner_hit-baseline-r0",
+    "0089-tidehunter_efa-8192-owner_hit-profiled-r0",
+    "0092-tidehunter_efa_direct-256-owner_hit-baseline-r0",
+    "0093-tidehunter_efa_direct-256-owner_hit-profiled-r0",
+    "0094-tidehunter_efa_direct-8192-owner_hit-baseline-r0",
+    "0095-tidehunter_efa_direct-8192-owner_hit-profiled-r0",
+    "0098-tidehunter_efa_native-256-owner_hit-baseline-r0",
+    "0099-tidehunter_efa_native-256-owner_hit-profiled-r0",
+    "0100-tidehunter_efa_native-8192-owner_hit-baseline-r0",
+    "0101-tidehunter_efa_native-8192-owner_hit-profiled-r0",
+    "0104-tidehunter_tcp-1024-owner_hit-read-tier-c16-scalar-baseline-r0",
+    "0105-tidehunter_tcp-8192-owner_hit-read-tier-c16-batch32-baseline-r0",
+    "0106-tidehunter_tcp-1024-owner_hit-read-tier-c16-scalar-profiled-r0",
+    "0107-tidehunter_tcp-8192-owner_hit-read-tier-c16-batch32-profiled-r0",
+    "0108-tidehunter_efa-1024-owner_hit-read-tier-c16-scalar-baseline-r0",
+    "0109-tidehunter_efa-8192-owner_hit-read-tier-c16-batch32-baseline-r0",
+    "0110-tidehunter_efa-1024-owner_hit-read-tier-c16-scalar-profiled-r0",
+    "0111-tidehunter_efa-8192-owner_hit-read-tier-c16-batch32-profiled-r0",
+    "0112-tidehunter_efa_direct-1024-owner_hit-read-tier-c16-scalar-baseline-r0",
+    "0113-tidehunter_efa_direct-8192-owner_hit-read-tier-c16-batch32-baseline-r0",
+    "0114-tidehunter_efa_direct-1024-owner_hit-read-tier-c16-scalar-profiled-r0",
+    "0115-tidehunter_efa_direct-8192-owner_hit-read-tier-c16-batch32-profiled-r0",
+    "0116-tidehunter_efa_native-1024-owner_hit-read-tier-c16-scalar-baseline-r0",
+    "0117-tidehunter_efa_native-8192-owner_hit-read-tier-c16-batch32-baseline-r0",
+    "0118-tidehunter_efa_native-1024-owner_hit-read-tier-c16-scalar-profiled-r0",
+    "0119-tidehunter_efa_native-8192-owner_hit-read-tier-c16-batch32-profiled-r0",
+    "0120-tidehunter_efa_native-256-registered_steady-baseline-r0",
+    "0121-tidehunter_efa_native-256-registered_steady-profiled-r0",
+    "0122-tidehunter_efa_native-8192-registered_steady-baseline-r0",
+    "0123-tidehunter_efa_native-8192-registered_steady-profiled-r0",
+    "0124-tidehunter_efa_native-1024-registered_steady_c16_mixed_acquisition_reuse-read-tier-c16-scalar-baseline-r0",
+    "0125-tidehunter_efa_native-8192-registered_steady_c16_mixed_acquisition_reuse-read-tier-c16-batch32-baseline-r0",
+    "0126-tidehunter_efa_native-1024-registered_steady_c16_mixed_acquisition_reuse-read-tier-c16-scalar-profiled-r0",
+    "0127-tidehunter_efa_native-8192-registered_steady_c16_mixed_acquisition_reuse-read-tier-c16-batch32-profiled-r0",
+    "0136-tidehunter_efa_native-256-registered_reuse-baseline-r0",
+    "0137-tidehunter_efa_native-256-registered_reuse-profiled-r0",
+    "0138-tidehunter_efa_native-8192-registered_reuse-baseline-r0",
+    "0139-tidehunter_efa_native-8192-registered_reuse-profiled-r0",
+    "0140-tidehunter_efa_native-1024-registered_reuse_c16_mixed_acquisition_reuse-read-tier-c16-scalar-baseline-r0",
+    "0141-tidehunter_efa_native-8192-registered_reuse_c16_mixed_acquisition_reuse-read-tier-c16-batch32-baseline-r0",
+    "0142-tidehunter_efa_native-1024-registered_reuse_c16_mixed_acquisition_reuse-read-tier-c16-scalar-profiled-r0",
+    "0143-tidehunter_efa_native-8192-registered_reuse_c16_mixed_acquisition_reuse-read-tier-c16-batch32-profiled-r0",
+    "0144-tidehunter_tcp-256-wal_warm-baseline-r0",
+    "0145-tidehunter_tcp-256-wal_warm-profiled-r0",
+    "0146-tidehunter_tcp-8192-wal_warm-baseline-r0",
+    "0147-tidehunter_tcp-8192-wal_warm-profiled-r0",
+    "0150-tidehunter_efa-256-wal_warm-baseline-r0",
+    "0151-tidehunter_efa-256-wal_warm-profiled-r0",
+    "0152-tidehunter_efa-8192-wal_warm-baseline-r0",
+    "0153-tidehunter_efa-8192-wal_warm-profiled-r0",
+    "0156-tidehunter_efa_direct-256-wal_warm-baseline-r0",
+    "0157-tidehunter_efa_direct-256-wal_warm-profiled-r0",
+    "0158-tidehunter_efa_direct-8192-wal_warm-baseline-r0",
+    "0159-tidehunter_efa_direct-8192-wal_warm-profiled-r0",
+    "0162-tidehunter_efa_native-256-wal_warm-baseline-r0",
+    "0163-tidehunter_efa_native-256-wal_warm-profiled-r0",
+    "0164-tidehunter_efa_native-8192-wal_warm-baseline-r0",
+    "0165-tidehunter_efa_native-8192-wal_warm-profiled-r0",
+    "0168-tidehunter_tcp-1024-wal_warm-read-tier-c16-scalar-baseline-r0",
+    "0169-tidehunter_tcp-8192-wal_warm-read-tier-c16-batch32-baseline-r0",
+    "0170-tidehunter_tcp-1024-wal_warm-read-tier-c16-scalar-profiled-r0",
+    "0171-tidehunter_tcp-8192-wal_warm-read-tier-c16-batch32-profiled-r0",
+    "0172-tidehunter_efa-1024-wal_warm-read-tier-c16-scalar-baseline-r0",
+    "0173-tidehunter_efa-8192-wal_warm-read-tier-c16-batch32-baseline-r0",
+    "0174-tidehunter_efa-1024-wal_warm-read-tier-c16-scalar-profiled-r0",
+    "0175-tidehunter_efa-8192-wal_warm-read-tier-c16-batch32-profiled-r0",
+    "0176-tidehunter_efa_direct-1024-wal_warm-read-tier-c16-scalar-baseline-r0",
+    "0177-tidehunter_efa_direct-8192-wal_warm-read-tier-c16-batch32-baseline-r0",
+    "0178-tidehunter_efa_direct-1024-wal_warm-read-tier-c16-scalar-profiled-r0",
+    "0179-tidehunter_efa_direct-8192-wal_warm-read-tier-c16-batch32-profiled-r0",
+    "0180-tidehunter_efa_native-1024-wal_warm-read-tier-c16-scalar-baseline-r0",
+    "0181-tidehunter_efa_native-8192-wal_warm-read-tier-c16-batch32-baseline-r0",
+    "0182-tidehunter_efa_native-1024-wal_warm-read-tier-c16-scalar-profiled-r0",
+    "0183-tidehunter_efa_native-8192-wal_warm-read-tier-c16-batch32-profiled-r0"
+  ],
+  "limitations": [
+    "Unmatched repetitions remain in the raw appendix and are not pooled into matched curves.",
+    "No raw-sample verification or independence proof beyond exported case/repeat identity; source receipts remain authoritative.",
+    "No rejection API/scheduling latency: undispatched arrivals have no such clocks.",
+    "No Sui checkpoint replay, isolated disk/RDMA microbenchmark, or confidence inference; rendering is offline."
+  ]
+}

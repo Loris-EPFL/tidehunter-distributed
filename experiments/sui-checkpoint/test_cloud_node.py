@@ -97,6 +97,52 @@ class CloudNodeContract(unittest.TestCase):
         self.assertEqual(cfg['storage_binary_sha256'], cloud_node.sha256(self.binary))
         self.assertEqual(cfg['cell_id'], 'r04-tcp')
 
+    def test_bench_nvme_target_validation(self):
+        old_root = self.root
+        self.run_id = 'bench-0123456789abcdef'
+        self.root = self.base / self.run_id / 'checkpoint-cells/r02-tidehunter_nvme_rdma/storage'
+        self.root.parent.mkdir(parents=True)
+        old_root.rename(self.root)
+        self.config_path = self.root / 'node-config.json'
+        self.binary = self.root / 'storage-node'
+        self.cfg = json.loads(json.dumps(self.cfg).replace(str(old_root), str(self.root)))
+        trusted = {'kind': 'ofi', 'fabric': {'backend': 'verbs'}, 'security': 'trusted'}
+        self.cfg.update(run_id=self.run_id, cell_id='r02-tidehunter_nvme_rdma',
+                        transport='tidehunter_nvme_rdma', client_transport=trusted, owner_transport=trusted)
+        launch = Path(self.cfg['commands'][0][2])
+        value = json.loads(launch.read_text().replace(str(old_root), str(self.root)))
+        value['tls'] = dict(transport=trusted, ca='', cert='', key='')
+        value['node']['live_target'] = dict(state_dir=str(launch.parent/'live-nvmeof'), export_mode='per_owner')
+        value['durability'] = dict(tier='native')
+        launch.write_text(json.dumps(value))
+        self.assertEqual(self.validate()['run_id'], self.run_id)
+        for target in (None, 'bad'):
+            value['node']['live_target'] = target
+            launch.write_text(json.dumps(value))
+            with self.assertRaisesRegex(ValueError, 'NVMe-oF cell requires a live target'):
+                self.validate()
+        value['node']['live_target'] = dict(state_dir=str(launch.parent/'wrong'))
+        launch.write_text(json.dumps(value))
+        with self.assertRaisesRegex(ValueError, 'live target state directory differs from launch'):
+            self.validate()
+        value['node']['live_target'] = dict(state_dir=str(launch.parent/'live-nvmeof'), export_mode='bad')
+        launch.write_text(json.dumps(value))
+        with self.assertRaisesRegex(ValueError, 'invalid live export mode'):
+            self.validate()
+        value['node']['live_target']['export_mode'] = 'per_file'
+        value['durability'] = {'tier': 'bad'}
+        launch.write_text(json.dumps(value))
+        with self.assertRaisesRegex(ValueError, 'invalid owner durability tier'):
+            self.validate()
+
+    def test_live_target_rejected_for_non_nvme_cell(self):
+        launch = Path(self.cfg['commands'][0][2])
+        value = json.loads(launch.read_text())
+        value['node']['live_target'] = {}
+        launch.write_text(json.dumps(value))
+        with self.assertRaisesRegex(ValueError, 'live target requires the NVMe-oF cell'):
+            self.validate()
+
     def test_verbs_transport_accepts_host_selector_and_rejects_fallback(self):
         old_root = self.root
         self.root = old_root.parent.parent / 'r04-tidehunter_verbs/storage'

@@ -84,6 +84,59 @@ pub struct LiveSpdkConfig {
     pub executable: std::path::PathBuf,
 }
 
+/// Bounded live controller queues; defaults preserve the original connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveQueueGeometry {
+    pub io_queues: u32,
+    pub queue_size: u32,
+    pub poll_queues: u32,
+}
+
+impl Default for LiveQueueGeometry {
+    fn default() -> Self {
+        Self {
+            io_queues: 1,
+            queue_size: 32,
+            poll_queues: 0,
+        }
+    }
+}
+
+impl LiveQueueGeometry {
+    pub fn validate(self) -> Result<(), &'static str> {
+        if !(1..=16).contains(&self.io_queues)
+            || !(16..=128).contains(&self.queue_size)
+            || self.poll_queues > 4
+        {
+            return Err("invalid live queue geometry");
+        }
+        Ok(())
+    }
+}
+
+/// Live WAL export scope. Permanent modes cover only the active epoch.
+/// `OnDemand` keeps file grants. `PerFile` and `PerOwner` export active-epoch
+/// files until seal, fencing, or retirement. Sealed reads still use grants.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveExportMode {
+    #[default]
+    OnDemand,
+    PerFile,
+    PerOwner,
+}
+
+impl LiveExportMode {
+    pub const fn files_per_subsystem(self) -> Option<u64> {
+        match self {
+            Self::OnDemand => None,
+            Self::PerFile => Some(1),
+            Self::PerOwner => Some(1024),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LiveTargetConfig {
@@ -97,6 +150,9 @@ pub struct LiveTargetConfig {
     pub commissioning_service: u16,
     #[serde(default)]
     pub spdk: Option<LiveSpdkConfig>,
+    #[serde(default)]
+    /// Permanent modes require the kernel target and leased coordinator writes.
+    pub export_mode: LiveExportMode,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

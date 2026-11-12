@@ -1,0 +1,72 @@
+{
+  "algorithm": "sha256",
+  "phase": "measurement",
+  "outcome": "success",
+  "dispatch_observed": true,
+  "operation_by_profile": {
+    "read-concurrent": "read",
+    "write-concurrent": "put"
+  },
+  "cases": [
+    {
+      "case_id": "0180-native-1024-read-concurrent-primary_rf1-r0",
+      "measurement_success_dispatched_rows": 8192,
+      "source": "aws-efa/validated-results/cases/0180-native-1024-read-concurrent-primary_rf1-r0/result/samples.csv",
+      "sha256": "0e14d35f9761f8dcd439d9cfb68521886f8cddaf283879e36a2c64ab3e12bc74"
+    },
+    {
+      "case_id": "0216-tidehunter_tcp-1024-read-concurrent-primary_rf1-r0",
+      "measurement_success_dispatched_rows": 8192,
+      "source": "aws-efa/validated-results/cases/0216-tidehunter_tcp-1024-read-concurrent-primary_rf1-r0/result/samples.csv",
+      "sha256": "d8aa42c25a54540327ca54fced8afd292a8360cf7a98ff17e894b240ead69ff8"
+    },
+    {
+      "case_id": "0095-tidehunter_efa-1024-read-concurrent-primary_rf1-r0",
+      "measurement_success_dispatched_rows": 8192,
+      "source": "aws-efa/validated-results/cases/0095-tidehunter_efa-1024-read-concurrent-primary_rf1-r0/result/samples.csv",
+      "sha256": "4fc99d4439c1bcede5591d3b6fbd773ba2a3ca5f6366b6487ec94d23ceebb954"
+    },
+    {
+      "case_id": "0150-tidehunter_efa_direct-1024-read-concurrent-primary_rf1-r0",
+      "measurement_success_dispatched_rows": 8192,
+      "source": "aws-efa/validated-results/cases/0150-tidehunter_efa_direct-1024-read-concurrent-primary_rf1-r0/result/samples.csv",
+      "sha256": "e6f38916a233a65c15748d18949c913946c92a5b30df8d0c77f55ceb1ec26cec"
+    },
+    {
+      "case_id": "0063-tidehunter_efa_native-1024-read-concurrent-primary_rf1-r0",
+      "measurement_success_dispatched_rows": 8192,
+      "source": "aws-efa/validated-results/cases/0063-tidehunter_efa_native-1024-read-concurrent-primary_rf1-r0/result/samples.csv",
+      "sha256": "12012fa1fc2f33642965dcdb0493fa9208d8014f44e56c409e077691fca0f8f6"
+    },
+    {
+      "case_id": "0178-native-1024-write-concurrent-primary_rf1-r0",
+      "measurement_success_dispatched_rows": 4096,
+      "source": "aws-efa/validated-results/cases/0178-native-1024-write-concurrent-primary_rf1-r0/result/samples.csv",
+      "sha256": "46d247211693b7b8951b3641d072cfdfa47f77ec4c9c052dc7be65f9712c5989"
+    },
+    {
+      "case_id": "0214-tidehunter_tcp-1024-write-concurrent-primary_rf1-r0",
+      "measurement_success_dispatched_rows": 4096,
+      "source": "aws-efa/validated-results/cases/0214-tidehunter_tcp-1024-write-concurrent-primary_rf1-r0/result/samples.csv",
+      "sha256": "57d577fc0073e77a1dd7f0b739b7187013d9beb9e049406fc110e94e62df7768"
+    },
+    {
+      "case_id": "0093-tidehunter_efa-1024-write-concurrent-primary_rf1-r0",
+      "measurement_success_dispatched_rows": 4096,
+      "source": "aws-efa/validated-results/cases/0093-tidehunter_efa-1024-write-concurrent-primary_rf1-r0/result/samples.csv",
+      "sha256": "0c9e53b1fd787cdea12c4b083743cdd3ee7187feae7743e72747e6a59e66d449"
+    },
+    {
+      "case_id": "0148-tidehunter_efa_direct-1024-write-concurrent-primary_rf1-r0",
+      "measurement_success_dispatched_rows": 4096,
+      "source": "aws-efa/validated-results/cases/0148-tidehunter_efa_direct-1024-write-concurrent-primary_rf1-r0/result/samples.csv",
+      "sha256": "fabb239831a339c869c540e6a5230e20476ee4804e7cb165bc3b6a31b02510fd"
+    },
+    {
+      "case_id": "0061-tidehunter_efa_native-1024-write-concurrent-primary_rf1-r0",
+      "measurement_success_dispatched_rows": 4096,
+      "source": "aws-efa/validated-results/cases/0061-tidehunter_efa_native-1024-write-concurrent-primary_rf1-r0/result/samples.csv",
+      "sha256": "fb940b9654950fc9a41d9ea2e10f992722de75a4eed8b6279f60386d9778006e"
+    }
+  ]
+}

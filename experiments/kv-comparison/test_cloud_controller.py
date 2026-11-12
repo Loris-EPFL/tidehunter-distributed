@@ -203,6 +203,7 @@ class OwnerCountTests(unittest.TestCase):
                 directory = Path(tmp)
                 def prepare(argv, **kwargs):
                     prep = json.loads((directory / "prepare-input.json").read_text())
+                    self.assertEqual(prep["owner_wal_geometry"], "research")
                     self.assertEqual(prep["addresses"], [
                         host["address"] + ":9400" for host in config["fleet"]["nodes"][:count]])
                     prepared = directory / "prepared"
@@ -212,7 +213,7 @@ class OwnerCountTests(unittest.TestCase):
                     for index in range(count):
                         node = prepared / f"node-{index}"
                         node.mkdir()
-                        (node / "launch.yaml").write_text(yaml.safe_dump({"tls": {}}))
+                        (node / "launch.yaml").write_text(yaml.safe_dump({"tls": {}, "node": {"partition": {"fragment_bytes": 4194304, "wal_file_bytes": 1073741824}}}))
                 with patch.object(controller, "command", side_effect=prepare), \
                      patch.object(controller, "validate_launch"), \
                      patch.object(controller, "upload_object"), \
@@ -721,6 +722,9 @@ class ConfigTests(unittest.TestCase):
                          "--property=RemainAfterExit=yes", "--property=CPUAccounting=yes", "--property=MemoryAccounting=yes"):
             self.assertIn(expected, argv)
         self.assertNotIn("--scope", argv)  # The service manager, not SSM, is the long-lived parent.
+        argv = controller.systemd_argv(config, "0000-test", "storage-0", 4, 8192, 60, ["node"],
+                                      setenv={"TIDEHUNTER_HISTORY_DIAGNOSTICS": "1"})
+        self.assertIn("--setenv=TIDEHUNTER_HISTORY_DIAGNOSTICS=1", argv)
 
 
 class FabricAdmissionTests(unittest.TestCase):

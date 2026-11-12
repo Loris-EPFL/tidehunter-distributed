@@ -17,6 +17,59 @@ const SLOT_BYTES: usize = 256;
 const DESCRIPTOR_BYTES: usize = 80;
 const NODE_BUFFER_BYTES: usize = 32 * SLOT_BYTES;
 
+/// Owner receipt persistence. WAL replay retains only a recent retry window.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryPersistence {
+    OnDisk,
+    #[default]
+    WalReplay,
+    #[cfg(feature = "test-utils")]
+    MemoryOnly,
+}
+
+impl HistoryPersistence {
+    /// Documents without a persistence setting predate WAL replay.
+    pub const fn legacy() -> Self {
+        Self::OnDisk
+    }
+}
+
+pub const WAL_REPLAY_WINDOW_BATCHES: usize = 4096;
+
+struct MemoryEntry {
+    receipt: AppendedBatch,
+    group_end: u64,
+    prefix_state: [u8; 32],
+}
+
+// Lock order: state, authority, memory history. No I/O under the memory-history lock.
+#[derive(Default)]
+struct MemoryHistory {
+    entries: std::collections::VecDeque<MemoryEntry>,
+    ids: std::collections::HashMap<u128, usize>,
+    versions: std::collections::HashMap<u128, usize>,
+    base: usize,
+}
+
+impl MemoryHistory {
+    fn new(mode: HistoryPersistence) -> Self {
+        if mode == HistoryPersistence::WalReplay {
+            Self {
+                entries: std::collections::VecDeque::with_capacity(WAL_REPLAY_WINDOW_BATCHES),
+                ids: std::collections::HashMap::with_capacity(WAL_REPLAY_WINDOW_BATCHES),
+                versions: std::collections::HashMap::with_capacity(WAL_REPLAY_WINDOW_BATCHES),
+                base: 0,
+            }
+        } else {
+            Self::default()
+        }
+    }
+}
+
+#[cfg(feature = "test-utils")]
+const MEMORY_HISTORY_MAX_BATCHES: usize = 1 << 21;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 struct NodePointer {
     offset: u64,
@@ -86,11 +139,17 @@ struct Retirement {
 #[derive(Clone)]
 pub(crate) struct HistoryReader {
     root: HistoryRoot,
+    files: Option<Arc<HistoryFiles>>,
+    max_metadata_bytes: usize,
+    persistence: HistoryPersistence,
+    memory: Option<Arc<parking_lot::RwLock<MemoryHistory>>>,
+}
+
+struct HistoryFiles {
     nodes: Arc<File>,
     receipts: Arc<File>,
     descriptors: Arc<File>,
     retired: Arc<File>,
-    max_metadata_bytes: usize,
 }
 
 /// Sole append capability, serialized between the history worker and lifecycle owner.
@@ -169,17 +228,6 @@ fn append_offset(file: &File, alignment: usize) -> Result<u64, StorageError> {
 
 impl History {
     pub(crate) fn create(path: &Path, config: &PartitionConfig) -> Result<Self, StorageError> {
-        let directory = path.join(DIRECTORY);
-        fs::create_dir(&directory)?;
-        let open = |name: &str| -> Result<Arc<File>, StorageError> {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(directory.join(name))?;
-            file.sync_all()?;
-            Ok(Arc::new(file))
-        };
         let root = HistoryRoot {
             format: 2,
             database: config.inventory.database,
@@ -199,13 +247,36 @@ impl History {
             nodes_end: 0,
             descriptors_end: 0,
         };
+        Self::create_disk(path, root, config.max_reference_metadata_bytes)
+    }
+
+    fn create_disk(
+        path: &Path,
+        root: HistoryRoot,
+        max_metadata_bytes: usize,
+    ) -> Result<Self, StorageError> {
+        let directory = path.join(DIRECTORY);
+        fs::create_dir(&directory)?;
+        let open = |name: &str| -> Result<Arc<File>, StorageError> {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(directory.join(name))?;
+            file.sync_all()?;
+            Ok(Arc::new(file))
+        };
         let reader = HistoryReader {
             root,
-            nodes: open("nodes.pages")?,
-            receipts: open("receipts.pages")?,
-            descriptors: open("descriptors.pages")?,
-            retired: open("retired.pages")?,
-            max_metadata_bytes: config.max_reference_metadata_bytes,
+            files: Some(Arc::new(HistoryFiles {
+                nodes: open("nodes.pages")?,
+                receipts: open("receipts.pages")?,
+                descriptors: open("descriptors.pages")?,
+                retired: open("retired.pages")?,
+            })),
+            max_metadata_bytes,
+            persistence: HistoryPersistence::OnDisk,
+            memory: None,
         };
         File::open(&directory)?.sync_all()?;
         install_metadata(path, ROOT, &encode_metadata(&root)?)?;
@@ -218,6 +289,47 @@ impl History {
             node_buffer_start: 0,
             descriptor_append: 0,
         })
+    }
+
+    pub(crate) fn windowed(
+        path: &Path,
+        config: &PartitionConfig,
+        mode: HistoryPersistence,
+    ) -> Self {
+        let root = HistoryRoot {
+            format: 2,
+            database: config.inventory.database,
+            epoch: config.inventory.epoch,
+            partition: config.partition,
+            generation: config.inventory.segment_generation,
+            count: 0,
+            end: 0,
+            file_count: 1,
+            prefix_state: None,
+            identities: None,
+            versions: None,
+            addresses: None,
+            ordinals: None,
+            retired_count: 0,
+            retired_index: None,
+            nodes_end: 0,
+            descriptors_end: 0,
+        };
+        Self {
+            path: path.to_path_buf(),
+            reader: HistoryReader {
+                root,
+                files: None,
+                max_metadata_bytes: config.max_reference_metadata_bytes,
+                persistence: mode,
+                memory: Some(Arc::new(parking_lot::RwLock::new(MemoryHistory::new(mode)))),
+            },
+            node_append: 0,
+            node_buffer: [0; NODE_BUFFER_BYTES],
+            node_buffer_len: 0,
+            node_buffer_start: 0,
+            descriptor_append: 0,
+        }
     }
 
     pub(crate) fn open(path: &Path, config: &PartitionConfig) -> Result<Self, StorageError> {
@@ -245,16 +357,20 @@ impl History {
         };
         let reader = HistoryReader {
             root,
-            nodes: open("nodes.pages")?,
-            receipts: open("receipts.pages")?,
-            descriptors: open("descriptors.pages")?,
-            retired: open("retired.pages")?,
+            files: Some(Arc::new(HistoryFiles {
+                nodes: open("nodes.pages")?,
+                receipts: open("receipts.pages")?,
+                descriptors: open("descriptors.pages")?,
+                retired: open("retired.pages")?,
+            })),
             max_metadata_bytes: config.max_reference_metadata_bytes,
+            persistence: HistoryPersistence::OnDisk,
+            memory: None,
         };
         reader.validate_root()?;
         // Immutable node/descriptor positions never reuse even unadopted tails.
-        let node_append = append_offset(&reader.nodes, SLOT_BYTES)?;
-        let descriptor_append = append_offset(&reader.descriptors, DESCRIPTOR_BYTES)?;
+        let node_append = append_offset(&reader.files()?.nodes, SLOT_BYTES)?;
+        let descriptor_append = append_offset(&reader.files()?.descriptors, DESCRIPTOR_BYTES)?;
         Ok(Self {
             path: path.to_path_buf(),
             reader,
@@ -270,11 +386,123 @@ impl History {
         self.reader.clone()
     }
 
+    pub(crate) fn set_persistence(&mut self, mode: HistoryPersistence) -> Result<(), StorageError> {
+        #[cfg(feature = "test-utils")]
+        if (mode == HistoryPersistence::MemoryOnly
+            || self.reader.persistence == HistoryPersistence::MemoryOnly)
+            && (self.reader.root.count != 0 || self.reader.root.retired_count != 0)
+        {
+            return Err(StorageError::Invalid(
+                "memory-only history does not support restart with data",
+            ));
+        }
+        if self.reader.persistence == mode {
+            return Ok(());
+        }
+        if self.reader.root.count != 0 || self.reader.root.retired_count != 0 {
+            return Err(StorageError::Invalid(
+                "history persistence differs from the stored partition",
+            ));
+        }
+        #[cfg(feature = "test-utils")]
+        if mode == HistoryPersistence::MemoryOnly {
+            if self.reader.files.is_none() {
+                *self = Self::create_disk(
+                    &self.path,
+                    self.reader.root,
+                    self.reader.max_metadata_bytes,
+                )?;
+            }
+            self.reader.memory = Some(Arc::new(parking_lot::RwLock::new(MemoryHistory::default())));
+            self.reader.persistence = mode;
+            return Ok(());
+        }
+        if mode == HistoryPersistence::OnDisk {
+            if self.reader.files.is_some() {
+                self.reader.memory = None;
+                self.reader.persistence = mode;
+            } else {
+                *self = Self::create_disk(
+                    &self.path,
+                    self.reader.root,
+                    self.reader.max_metadata_bytes,
+                )?;
+            }
+        } else {
+            self.reader.files = None;
+            self.reader.memory = Some(Arc::new(parking_lot::RwLock::new(MemoryHistory::new(mode))));
+            self.reader.persistence = mode;
+            if self.path.join(ROOT).exists() {
+                fs::remove_file(self.path.join(ROOT))?;
+                fs::remove_dir_all(self.path.join(DIRECTORY))?;
+                File::open(&self.path)?.sync_all()?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn append(
         &mut self,
         batches: &[Arc<RegisteredBatch>],
         file_count: u64,
     ) -> Result<(), StorageError> {
+        if let Some(memory) = &self.reader.memory {
+            let mut memory = memory.write();
+            #[cfg(feature = "test-utils")]
+            if self.reader.persistence == HistoryPersistence::MemoryOnly
+                && batches.len() > MEMORY_HISTORY_MAX_BATCHES.saturating_sub(memory.entries.len())
+            {
+                return Err(StorageError::Capacity);
+            }
+            for batch in batches {
+                let receipt = batch.receipt();
+                if memory
+                    .ids
+                    .contains_key(&u128::from_be_bytes(receipt.id().operation))
+                    || memory
+                        .versions
+                        .contains_key(&u128::from(receipt.version().sequence))
+                {
+                    return Err(StorageError::Invalid("duplicate history radix authority"));
+                }
+            }
+            let mut root = self.reader.root;
+            let mut prefix = root
+                .prefix_state
+                .map(|state| PrefixDigest::from_state(root.count, state))
+                .unwrap_or_else(|| PrefixDigest::new(root.database, root.partition, root.epoch, 0));
+            for batch in batches {
+                let receipt = batch.receipt();
+                let id = u128::from_be_bytes(receipt.id().operation);
+                let version = u128::from(receipt.version().sequence);
+                if self.reader.persistence == HistoryPersistence::WalReplay
+                    && memory.entries.len() == WAL_REPLAY_WINDOW_BATCHES
+                    && let Some(oldest) = memory.entries.pop_front()
+                {
+                    memory
+                        .ids
+                        .remove(&u128::from_be_bytes(oldest.receipt.id().operation));
+                    memory
+                        .versions
+                        .remove(&u128::from(oldest.receipt.version().sequence));
+                    memory.base += 1;
+                }
+                prefix.push(CheckpointReceipt::from(receipt));
+                memory.ids.insert(id, root.count);
+                memory.versions.insert(version, root.count);
+                memory.entries.push_back(MemoryEntry {
+                    receipt,
+                    group_end: batch.group_end(),
+                    prefix_state: prefix.state(),
+                });
+                root.count += 1;
+                root.end = batch.group_end();
+                root.prefix_state = Some(prefix.state());
+            }
+            root.file_count = root.file_count.max(file_count);
+            self.reader.root = root;
+            return Ok(());
+        }
         let mut root = self.reader.root;
         let mut prefix = root
             .prefix_state
@@ -298,6 +526,7 @@ impl History {
                 }
                 let bytes = &buffer[..chunk.len() * DESCRIPTOR_BYTES];
                 self.reader
+                    .files()?
                     .descriptors
                     .write_all_at(bytes, self.descriptor_append)?;
                 self.descriptor_append = self
@@ -322,6 +551,7 @@ impl History {
             // Only the unadopted next ordinal can be repaired after interruption.
             // A frozen old root never grants authority for this slot.
             self.reader
+                .files()?
                 .receipts
                 .write_all_at(&slot, slot_offset(root.count)?)?;
             let pointer = Pointer {
@@ -352,10 +582,10 @@ impl History {
         if !batches.is_empty() {
             root.nodes_end = self.node_append;
             root.descriptors_end = self.descriptor_append;
-            self.reader.descriptors.sync_all()?;
-            self.reader.receipts.sync_all()?;
+            self.reader.files()?.descriptors.sync_all()?;
+            self.reader.files()?.receipts.sync_all()?;
             self.flush_nodes()?;
-            self.reader.nodes.sync_all()?;
+            self.reader.files()?.nodes.sync_all()?;
         }
         install_metadata(&self.path, ROOT, &encode_metadata(&root)?)?;
         self.reader.root = root;
@@ -363,6 +593,9 @@ impl History {
     }
 
     pub(crate) fn retire(&mut self, offsets: &[u64]) -> Result<(), StorageError> {
+        if self.reader.windowed() {
+            return Err(StorageError::Invalid("history is memory-only"));
+        }
         let mut root = self.reader.root;
         let mut changed = false;
         for &offset in offsets {
@@ -376,6 +609,7 @@ impl History {
             };
             let slot = encode_slot::<SLOT_BYTES>(&retired)?;
             self.reader
+                .files()?
                 .retired
                 .write_all_at(&slot, slot_offset(root.retired_count)?)?;
             root.retired_index = self.index_insert(
@@ -396,9 +630,9 @@ impl History {
             return Ok(());
         }
         root.nodes_end = self.node_append;
-        self.reader.retired.sync_all()?;
+        self.reader.files()?.retired.sync_all()?;
         self.flush_nodes()?;
-        self.reader.nodes.sync_all()?;
+        self.reader.files()?.nodes.sync_all()?;
         install_metadata(&self.path, ROOT, &encode_metadata(&root)?)?;
         self.reader.root = root;
         Ok(())
@@ -406,6 +640,24 @@ impl History {
 }
 
 impl HistoryReader {
+    fn files(&self) -> Result<&HistoryFiles, StorageError> {
+        self.files
+            .as_deref()
+            .ok_or(StorageError::Invalid("history is windowed"))
+    }
+
+    pub(crate) fn windowed(&self) -> bool {
+        self.memory.is_some()
+    }
+
+    pub(crate) fn persistence(&self) -> HistoryPersistence {
+        self.persistence
+    }
+
+    pub(crate) fn base(&self) -> usize {
+        self.memory.as_ref().map_or(0, |memory| memory.read().base)
+    }
+
     pub(crate) fn root(&self) -> &HistoryRoot {
         &self.root
     }
@@ -416,10 +668,10 @@ impl HistoryReader {
                 .root
                 .descriptors_end
                 .is_multiple_of(DESCRIPTOR_BYTES as u64)
-            || self.nodes.metadata()?.len() < self.root.nodes_end
-            || self.descriptors.metadata()?.len() < self.root.descriptors_end
-            || self.receipts.metadata()?.len() < slot_offset(self.root.count)?
-            || self.retired.metadata()?.len() < slot_offset(self.root.retired_count)?
+            || self.files()?.nodes.metadata()?.len() < self.root.nodes_end
+            || self.files()?.descriptors.metadata()?.len() < self.root.descriptors_end
+            || self.files()?.receipts.metadata()?.len() < slot_offset(self.root.count)?
+            || self.files()?.retired.metadata()?.len() < slot_offset(self.root.retired_count)?
         {
             return Err(StorageError::Invalid("history root backing is truncated"));
         }
@@ -462,7 +714,8 @@ impl HistoryReader {
         } else {
             let ordinal = self.root.retired_count - 1;
             let mut slot = [0; SLOT_BYTES];
-            self.retired
+            self.files()?
+                .retired
                 .read_exact_at(&mut slot, slot_offset(ordinal)?)?;
             let retired: Retirement = decode_slot(&slot)?;
             if retired.ordinal != ordinal
@@ -482,7 +735,8 @@ impl HistoryReader {
             return Err(StorageError::Invalid("receipt ordinal exceeds root"));
         }
         let mut slot = [0; SLOT_BYTES];
-        self.receipts
+        self.files()?
+            .receipts
             .read_exact_at(&mut slot, slot_offset(pointer.ordinal)?)?;
         if hash(&slot) != pointer.digest {
             return Err(StorageError::Invalid(
@@ -504,6 +758,28 @@ impl HistoryReader {
     }
 
     fn page(&self, ordinal: usize) -> Result<ReceiptPage, StorageError> {
+        if let Some(memory) = &self.memory {
+            let memory = memory.read();
+            let index = ordinal
+                .checked_sub(memory.base)
+                .ok_or(StorageError::Invalid(
+                    "receipt ordinal outside the replay window",
+                ))?;
+            let entry = memory
+                .entries
+                .get(index)
+                .filter(|_| ordinal < self.root.count)
+                .ok_or(StorageError::Invalid("missing receipt ordinal authority"))?;
+            return Ok(ReceiptPage {
+                ordinal,
+                receipt: entry.receipt,
+                group_end: entry.group_end,
+                prefix_state: entry.prefix_state,
+                descriptor_offset: 0,
+                descriptor_count: 0,
+                descriptor_digest: [0; 32],
+            });
+        }
         let pointer = self
             .index_lookup(self.root.ordinals, ordinal as u128)?
             .ok_or(StorageError::Invalid("missing receipt ordinal authority"))?;
@@ -541,6 +817,14 @@ impl HistoryReader {
         Ok(Some(page))
     }
     pub(crate) fn lookup(&self, id: BatchId) -> Result<Option<HistoryRecord>, StorageError> {
+        if let Some(memory) = &self.memory {
+            return self.memory_lookup(
+                memory,
+                u128::from_be_bytes(id.operation),
+                false,
+                |receipt| receipt.id() == id,
+            );
+        }
         Ok(self
             .find(
                 self.root.identities,
@@ -556,6 +840,11 @@ impl HistoryReader {
         &self,
         version: BatchVersion,
     ) -> Result<Option<HistoryRecord>, StorageError> {
+        if let Some(memory) = &self.memory {
+            return self.memory_lookup(memory, u128::from(version.sequence), true, |receipt| {
+                receipt.version() == version
+            });
+        }
         Ok(self
             .find(
                 self.root.versions,
@@ -567,10 +856,49 @@ impl HistoryReader {
                 group_end: page.group_end,
             }))
     }
+
+    fn memory_lookup(
+        &self,
+        memory: &parking_lot::RwLock<MemoryHistory>,
+        key: u128,
+        version: bool,
+        matches: impl Fn(AppendedBatch) -> bool,
+    ) -> Result<Option<HistoryRecord>, StorageError> {
+        let memory = memory.read();
+        let index = if version {
+            &memory.versions
+        } else {
+            &memory.ids
+        };
+        let Some(&ordinal) = index.get(&key) else {
+            return Ok(None);
+        };
+        if ordinal >= self.root.count {
+            return Ok(None);
+        }
+        let Some(entry) = ordinal
+            .checked_sub(memory.base)
+            .and_then(|index| memory.entries.get(index))
+        else {
+            return Ok(None);
+        };
+        if !matches(entry.receipt) {
+            return Err(StorageError::Invalid(
+                "receipt lookup differs from rooted key",
+            ));
+        }
+        Ok(Some(HistoryRecord {
+            receipt: entry.receipt,
+            group_end: entry.group_end,
+        }))
+    }
     pub(crate) fn lookup_address_page(
         &self,
         address: PhysicalValueAddress,
     ) -> Result<Option<ReceiptPage>, StorageError> {
+        if self.windowed() {
+            return Ok(None);
+        }
         self.find(self.root.addresses, u128::from(address.offset), |receipt| {
             receipt.address() == address
         })
@@ -609,7 +937,7 @@ impl HistoryReader {
             let mut buffer = [0; DESCRIPTOR_BYTES * 32];
             let chunk_count = (count - start).min(32);
             let bytes = &mut buffer[..chunk_count * DESCRIPTOR_BYTES];
-            self.descriptors.read_exact_at(
+            self.files()?.descriptors.read_exact_at(
                 bytes,
                 page.descriptor_offset + start as u64 * DESCRIPTOR_BYTES as u64,
             )?;
@@ -642,6 +970,9 @@ impl HistoryReader {
     }
 
     pub(crate) fn is_retired(&self, offset: u64) -> Result<bool, StorageError> {
+        if self.windowed() {
+            return Ok(false);
+        }
         let Some(pointer) = self.index_lookup(self.root.retired_index, u128::from(offset))? else {
             return Ok(false);
         };
@@ -649,7 +980,8 @@ impl HistoryReader {
             return Err(StorageError::Invalid("retirement ordinal exceeds root"));
         }
         let mut slot = [0; SLOT_BYTES];
-        self.retired
+        self.files()?
+            .retired
             .read_exact_at(&mut slot, slot_offset(pointer.ordinal)?)?;
         if hash(&slot) != pointer.digest {
             return Err(StorageError::Invalid("retirement digest differs from root"));

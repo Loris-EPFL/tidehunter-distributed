@@ -1,0 +1,26 @@
+{
+  "phase": "final brief: figures, Valkey comparison, remote NVMe reads, coherence, bottlenecks and next work",
+  "inputs": "build_inputs.py wrote 901 population rows (from the strict report that the fixed report code regenerates: 548 completed, 1 failed, 103 not run), 562 previous-campaign rows and 548 device rows with read, write and flush counters. Completed rows of the six other stores carry the median over all GCP runs that completed the population (fixes/external-store-medians.csv: 301 populations; all 301 completed final-run external rows matched, join keys unique); raw_api_p50_us keeps the final-run p50. external-spread.csv holds the run-to-run p50 spread. It checked per case that the Local SSD is /dev/nvme0n1 on all six hosts. The controller archive SHA-256 matched the controller receipt before extraction.",
+  "figures": "plot_final.py wrote 11 vector PDFs and evidence.json (case ids and values of every plotted point). The cross-campaign figure uses the raw final-run p50 of every store, not the medians. Page 1 of the 16-page PDF was rendered with pdftoppm and inspected after the medians change; the text of pages 1 to 4 was re-read from the PDF after the change; the other pages were inspected after the first build and were not re-inspected.",
+  "numbers": "make_tables.py resolved 290 number keys against the CSV tables. An unknown or ambiguous key stops the build. The prose contains no measured number outside these keys except the native valkey-benchmark controls (extract/valkey-native/report.json), file and line references, the launcher margin and export timings (30, 15 and 12.5 minutes; 120 s), the 10^-14 us summation difference, and arithmetic on code constants (128 MiB / 1 KiB = 131,072; 64 B and 256 B payload shares 6 and 25 percent).",
+  "hand_checked_claims": [
+    "13 verbs-over-TCP pairs without device-read differences have a higher verbs p99: 2 first-touch reads (2.05 and 2.28) and 11 put, delete, missing-read or cache-hit populations (1.00 to 1.34).",
+    "9 of 80 Tidehunter pairs have a higher verbs p50: 6 first-touch pairs with device reads per call differing by more than 0.1, and 3 ties (1.00, 1.01, 1.04).",
+    "TCP, verbs and kernel paths read no SSD in any repeat-pass case (maximum device reads per call 0.0).",
+    "Offered-load rejections at 1,000, 10,000 and 50,000 operations per second match the text.",
+    "Case counts: 548 completed, 1 failed, 103 not run (25 native_write_regression, 12 valkey_client_diagnostics, 6 write_timeline_diagnostics, 60 durability-native primaries).",
+    "27 matched verbs-over-TCP read pairs read memory on both sides (at most 0.06 device reads per call): median verbs p50 is 25 percent lower (0.50 to 1.01 of TCP). One read pair reads the SSD alike (cold 64 KiB, c16). Computed in data.py build_stats and re-derived by an independent script.",
+    "Device writes of a 1 KiB put at c16 (Table 10) were re-derived by an independent script from measurement-before.json and measurement-end.json: native 1.9, owner RPC 17.7, live NVMe-oF 49.0 to 49.9 KiB per put; every flush counter is 0.",
+    "Authority history loads of the cold 64 KiB cases (2,760 verbs, 2,757 TCP, 11 kernel, 11 SPDK) were read from result/measurement-read-evidence.json by build_inputs.py and checked by the cold-read analysis agent."
+  ],
+  "stage_evidence_checks": "The write timeline spans (case 0491) and the 32-key read trace table (cases 0474, 0483, 0093, 0095) are computed from the raw JSON by build_inputs.py. Seven stage means from the stage report were recomputed from the raw JSON: write exchange per request (0282), preparation admission per batch (0282), publication-blocked batches (0282), live control, persistence, frontier file and CQ means (0346).",
+  "code_checks": "live_connect.rs:18-19 (1 queue, depth 32) also in the campaign package; live_io.rs:1-3 and 59 (no barrier issued by the live queue); read_executor.rs:828-836 (one io_uring read per member); wal/mod.rs:408-431 (POSIX_FADV_RANDOM on the WAL fd); read_cache.rs:78,83,422-425 (WAYS 4, MIN_PAYLOAD_PER_SLOT 1024); remote_db/concurrent.rs:1211-1217,1441 (authority intake and pipeline turn); storage/history.rs:15-18,202-207,480-503,581-615 (history file reads); reference_directory.rs:26-29 (authority cache entries).",
+  "latexmk": {
+    "success": true,
+    "command": "latexmk -pdf -interaction=nonstopmode -halt-on-error main.tex",
+    "pages": 16,
+    "appendix_pages": 1,
+    "log_check": "No Overfull, Underfull, undefined, LaTeX Warning, Missing character or Missing number lines."
+  },
+  "limits": "One repetition per Tidehunter and Native case. The other stores are medians of per-run quantiles over runs on different fleets and days; the median of per-run quantiles is not a pooled quantile, and Tidehunter ratios to them carry at least the run-to-run spread in external-spread.csv. The twin-run noise estimate is two executions on one fleet. The causes of the verbs first-touch device reads, the file attribution of the extra owner cold reads, the NVMe-oF cold stalls, the c1 to c16 first-touch rise and the c16 read tails are not determined. Stage clocks overlap, so stage shares are indicative. No Sui trace, no NVMe/TCP, no concurrency above 32, no saturation test. The local intake-bound experiment is not part of the campaign data."
+}

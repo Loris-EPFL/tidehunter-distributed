@@ -76,7 +76,10 @@ impl RemoteDatabase {
             )
             .map_err(LocalDbError::component)?;
             let encoded = validated.encoded_len();
-            if planned.contains_key(&id) && encoded > self.config.replay_limits.max_encoded_bytes {
+            if self.config.history_persistence != HistoryPersistence::WalReplay
+                && planned.contains_key(&id)
+                && encoded > self.config.replay_limits.max_encoded_bytes
+            {
                 return Err(LocalDbError::new(
                     "batch exceeds checkpoint tail byte bound",
                 ));

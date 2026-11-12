@@ -1,0 +1,8 @@
+{
+  "synthetic": true,
+  "backend_info": {
+    "configuration": {
+      "transport": "ofi-verbs-trusted"
+    }
+  }
+}

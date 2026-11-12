@@ -62,7 +62,7 @@ Correctness jobs check out the immutable event SHA unless a manual
    the generic runtime's H4D support is not permission to launch it from CI.
    Keep the exact guest image empty until its drivers, kernel, complete binary
    ABI, tools and cached images are qualified. Blank means launch is blocked.
-   The editable weekly reservation is $100; each run reserves $90 for at most
+   Set the editable weekly reservation limit in `budget.json`; each CI run reserves $90 for at most
    four hours. Six hosts at the reviewed $3.287109973 hourly rate cost at most
    $78.90 rounded up for compute and mandatory Local SSD, leaving $11.10 for
    expected ancillary charges. This is not a project-wide spending cap.
@@ -91,7 +91,9 @@ The administrator restricts GitHub federation to this repository, branch and
 environment. The launcher and recovery use `bench-` plus 16 hex digits; each
 VM and its explicitly named boot disk start with that identity. Admission
 requires the exact guest account. Our maximum absolute DELETE lifetime is
-four hours, below the administrator's independent six-hour `bench-*` reaper.
+four hours for GitHub or six hours for the reviewed manual fleet. The
+administrator's independent six-hour `bench-*` reaper remains a backstop;
+it can race the manual deadline rather than leaving additional slack.
 Workflow concurrency prevents overlapping runs from this workflow/ref. A second
 generation-CAS lease at `lifecycle/active-run.json` serializes campaigns sharing
 the artifact bucket, including other runners. Neither is a project-wide limit.
@@ -130,6 +132,44 @@ probe. Valkey's selected RDMA arm has real RDMA PING/SET/GET/DEL admission.
 Hardware evidence must distinguish these paths; neither a backend label nor a
 local TCP qualification establishes an executed Falcon transfer.
 
+#### Two-host live NVMe/RDMA counter admission
+
+Two Falcon qualification pairs connected using RC send/read and loaded the Linux
+NVMe/RDMA modules, but neither admitted the fleet. The first collector encountered
+`EINVAL` on an unmapped `gid_attrs/ndevs` slot; only that slot is skipped, and
+the routed interface must still map to exactly one ACTIVE port. The second
+encountered missing `counters/port_xmit_data`. The classic InfiniBand PMA
+`counters` directory is not universal: Linux creates it only when the provider
+supplies `process_mad` ([sysfs implementation](https://github.com/torvalds/linux/blob/v7.0/drivers/infiniband/core/sysfs.c)).
+Missing PMA does not itself establish an absent or broken RDMA route.
+
+For the exact mapped port, the collector discovers the fixed pairs independently:
+PMA `counters/port_xmit_data` and `port_rcv_data` (units of four octets);
+IRDMA `hw_counters/ip4OutOctets` and `ip4InOctets` (octets); and
+`hw_counters/OutRdmaSends` and `InRdmaSends` (operations). The latter names are
+Linux IRDMA driver candidates, not a claim that the deployed Google provider
+exposes or advances them ([driver source](https://github.com/torvalds/linux/blob/v7.0/drivers/infiniband/hw/irdma/verbs.c);
+[Google IRDMA documentation](https://docs.cloud.google.com/compute/docs/networking/using-irdma)).
+Both missing attributes mean an unavailable family; a partial pair, malformed
+value, access error, changed port identity or counter reset is a failure.
+The route snapshot also records a bounded raw listing of the port's `counters`
+and `hw_counters` filenames for provider ABI discovery. Unknown names in that
+listing are diagnostics only: their presence or change is not counter evidence
+and cannot authorize admission.
+All supported pairs retain their paths and units. Full admission requires at
+least one *same* family advancing in both directions on both hosts, in addition
+to the actual kernel namespace, route, operation completions, data integrity,
+recovery, cache, fencing, shutdown and no-payload-RPC checks. Shared port
+counters are independent route evidence, not attribution to a particular QP.
+If counters are unavailable, bounded kernel/progress diagnostics may still be
+captured, explicitly partial and non-admitted; they cannot authorize the fleet.
+Optional partial exports are admitted conservatively as whole operations only
+when enough time remains for the trusted GCS/local-token 30-second and POST
+30-second caps, plus a margin and the final-status reserve. The reserve is
+checked before each optional export; it is not an absolute HTTP wall-clock
+clamp. The VM DELETE deadline and systemd maximum runtime remain independent
+hard limits.
+
 ### Bounded lifecycle and recovery
 
 The launcher persists each create intent and request ID before calling Compute.
@@ -152,8 +192,38 @@ The independent Actions cleanup job uses `recover-cleanup --terminal-workflow`
 after its campaign job is terminal. Recovery validates the workflow branch, job,
 run/attempt-derived identity, lease and durable state before reconciling ambiguous
 creates. Ordinary recovery refuses an unexpired run. If both runners disappear,
-Compute's absolute four-hour DELETE deadline remains active; the administrator's
+Compute's absolute workflow-specific DELETE deadline remains active; the administrator's
 six-hour reaper is a further backstop. Boot disks use `autoDelete`.
+
+After the fleet campaign controller returns, its coordinator publishes a terminal
+record only after the campaign response and the exports for every started suite
+have generation and SHA-256 bindings in GCS. The record identifies each owner
+and its required suite exports, or says no owner artifacts were required because
+no suite started. KV requires a complete monitoring export; a started but failed
+Sui suite lacks complete owner-export proof and therefore defers poweroff. Each
+owner checks its own provenance and the bound objects using its metadata
+service-account credentials. The coordinator also checks the bound objects. It waits ten
+minutes from terminal publication and, if no operator takeover object exists,
+requests `systemctl poweroff`. A valid takeover defers shutdown to 60 minutes
+after terminal publication; an explicit `extend_until_utc` can extend that cap.
+The runtime accepts `poweroff_grace_seconds` and `poweroff_hard_cap_seconds` in
+the launch configuration (defaults 600 and 3600; cap at most 21600 seconds).
+Active requests, missing or changed exports, invalid acknowledgement data, API
+errors and ambiguous controller termination prevent guest poweroff. Decisions
+are written as small per-guest objects under `runs/RUN/poweroff/decisions/`.
+The manual operator acknowledges takeover only after verifying terminal exports.
+Compute's absolute DELETE deadline and operator deletion/absence verification
+remain required; powering off does not delete a VM or its boot disk. This
+reduces idle compute cost when the workstation loses credentials after a run;
+it does not replace the deadline for failures before durable export.
+
+The pre-suite headroom probe creates 45 writable disposable sparse-file
+namespaces on each of five owners, with unique NQNs and host ACLs. The coordinator
+requests 1x32 queues, checks sysfs 2/31, and samples MR/QP/CQ/PD every 15
+connections, up to 225 or 120 seconds in the connect loop. Fewer than 135 aborts;
+a failed connection at or above 135 is reported. Unknown or failed cleanup
+aborts. Target setup, sampling and retirement add overhead beyond the 120-second
+connect loop. This probe does not validate WAL data.
 
 Guest workers inherit unlimited MEMLOCK for RDMA, stop at the absolute deadline,
 and bound both concurrent and total mailbox requests. Per-key SQLite transactions
@@ -239,6 +309,17 @@ Guest Python is `/opt/tidehunter-python/bin/python3`; the operating system's
 Python is unchanged. Bootstrap and mailbox commands use that same interpreter
 and an explicit PATH selecting the prepared `/usr/local/bin/fi_info`, not the
 provider image's older libfabric tools.
+Image admission now requires two fresh, source-bound qualification diagnostics
+that record this exact interpreter, functional PyYAML 6.0.2 and a hard NOFILE
+limit of at least 524288; older diagnostics lacking those fields do not qualify.
+Before allocation, preflight validates the sealed observer renderer and validator
+with the actual run ID and deadline and representative private addresses. These
+addresses are not fleet evidence: the allocated fleet's actual rendered config
+and observer readiness are separately checked before workloads. Each guest also
+proves the benchmark transient unit actually runs the admitted Python with both
+NOFILE limits at 524288; its process and systemd properties are retained in
+bootstrap evidence. A low inherited soft limit is not itself proof of the unit's
+effective limit.
 
 The standard comparison retains its 273 cases. It covers all selected engines,
 but has no dedicated common atomic batch-write workload: several adapters do
@@ -274,6 +355,315 @@ The guest's project permission test returned `SERVICE_DISABLED`, although its
 actual Compute reads and GCS access worked. The connected user cannot enable
 the API. An administrator must enable it before the current branch preflight
 can pass. Do not remove that check or launch a fleet that is known to fail it.
+
+The separate manual campaign path does not claim that the disabled guest CRM
+project-level permission test passed. It tests the caller's management and
+service-account delegation permissions, then checks guest access to the exact
+new policy, instances, and boot disks before releasing the startup gates. It
+retains the automated GitHub path's existing preflight unchanged.
+
+The Python entrypoint is `await manual_campaign.run(config, ..., execute=...)`;
+`execute` supplies the MCP gcloud callback. The inputs include the locally
+admitted sealed package and revision, the exact reviewed specification and
+preparation wheels, the pinned base image path and numeric ID, a candidate RDMA
+device, an output directory, and an explicit non-compute cost quote. Recovery
+uses `await manual_campaign.recover_cleanup(config, run_id=..., state_path=...,
+execute=...)` with the persisted parent identity. It does not require a GitHub
+terminal workflow. An exclusive GCS lease covers one admitted fleet throughout
+preparation, physical qualification and benchmarking; failure does not start a
+replacement campaign.
+
+Read-only Compute descriptions and lists retry actual callback timeouts at most
+three times with identical arguments and the original phase/cleanup deadline.
+Invalid responses, permission errors and identity mismatches are not retried.
+A timed-out recorded delete intent is observed for absence, not submitted again;
+unresolved observations never become successful cleanup.
+Lifecycle state writes retry rate limits and transient server errors with bounded
+backoff and the same generation precondition. A failed intent save does not
+authorize a delete; recovery must reconcile any uncertain committed write.
+
+The manual launcher waits on the exact coordinator's request-bound mailbox
+response, not a possibly provisional controller receipt, without repeatedly
+downloading the result prefix. The worker publishes that response after the
+coordinator exits; complete and incomplete terminal exports must pin the source-
+and binary-bound final receipt and the GCS generations, sizes and SHA-256
+metadata of its controller archive and inventory. Failed or unknown outcomes
+remain failures; already published partial objects are retained.
+If delegated mailbox reads encounter a token timeout or a transport-only GET
+failure, the launcher continues observing the same immutable request until the
+original deadline. It does not resubmit the command or change credentials.
+Certificate, authentication, authorization, integrity and source failures remain
+errors. This retry does not establish whether the workload itself succeeded.
+
+When that terminal export is validated, the launcher reconciles the exact-owned
+compute, disks and policy and releases the lease only after absence is
+verified, before downloading qualification and result objects locally. If the
+terminal outcome or durable export is missing, provisional or corrupt, it
+instead attempts the prior best-effort partial collection before cleanup;
+collection failure never skips cleanup. Cleanup dispatches up to six
+independent VM records concurrently under one shared 600-second budget; an
+acknowledgement or lost response is not proof of deletion. Name-based deletion
+still has the documented describe/delete TOCTOU window. Local downloads are
+generation- and SHA-256-checked, and collection errors preserve any original
+campaign or cleanup errors. A failed download does not erase the durable GCS
+objects; retain them and the state/inventory for recovery.
+
+The historical `standard-with-nvmeof` plan contains 409 cases and uses NVMe-oF
+only for sealed reads. The distinct `standard-with-live-nvmeof` plan adds 32
+live NVMe/RDMA cases and 20 matched atomic batch-write cases (five per native,
+TCP, verbs-native and live NVMe backend), for 461 cases with the reviewed
+backend and diagnostic selection. Its 29 primary NVMe cases match TCP's workload
+mix, sizes, concurrency, warmup and operation counts; additional cache, cold and
+diagnostic cases are separate. External stores without atomic batches do not
+join that batch-write cohort. The 26 sealed NVMe read controls remain distinct
+and do not demonstrate live writes. All cases are planned for one six-host
+fleet, one development repetition and five value sizes. The reviewed manual
+fleet has a six-hour deadline, with export and teardown reserves kept intact.
+Historical matched partial timings plus phase allowances imply roughly four hours
+and 32 minutes, leaving insufficiently robust slack under the former five-hour
+limit. Deadline exhaustion still exports partial results, never false completion.
+Dropping an OS cache is not proof of a NAND read. Keep raw results, Prometheus
+and Grafana artifacts, and do not pool sealed and live populations.
+
+Live mode requires a newly source-frozen package and a successful reciprocal
+physical live NVMe write, read, fence and recovery qualification with route and
+counter evidence on the first two members of the allocated fleet before suite
+admission. An older sealed-read qualification does not satisfy this requirement.
+If the live qualification implementation or its evidence is unavailable, admission
+fails closed; no RPC fallback is a valid NVMe result.
+
+One placement policy and exactly six VMs use the pinned base image. Each VM has
+the same absolute 21600-second DELETE expiry, covering preparation, pair
+qualification, suite and export; preparation and pair waits are additionally
+bounded to 900 and 1200 seconds respectively. The suite reserves 900 seconds
+for controller export. No transition resets the lifetime. The $3.287109973
+per-host-hour quote gives a rounded-up $118.34 compute estimate for six six-hour
+VMs. The $145 aggregate ceiling leaves at most $26.66 for the caller's explicit
+non-compute quote covering disks, storage, requests and transfers. These are
+estimates, not a billing guarantee or a project-wide limit; an incomplete
+campaign exports partial results and is not silently relaunched.
+
+The reviewed focused `parity_compact` and `remote_rw_compact` selections derive
+a two-VM fleet (one coordinator and one owner) from their pinned specs; `fair_five_owner` and
+the existing selections retain six VMs. Sui and CI remain five-owner only.
+The same six-hour expiry applies. [INFERENCE] At the reviewed per-host price,
+the compact compute reservation is $39.45 and the proportional aggregate
+ceiling is $48.34, leaving at most $8.89 for the explicit non-compute quote.
+These are estimates, not actual spend or a billing guarantee.
+
+Run 10's reviewed `fabric_ab_compact` selection contains 80 focused jobs on
+the compact two-VM layout: one coordinator and one owner. It has no
+five-owner mode.
+
+Every admitted guest prepares the pinned runtime in place; its individual evidence
+binds the preparation manifest, wheel, source and guest identity. The first two
+also execute reciprocal physical qualification and clean up its services,
+controllers and owned data before suite admission. The image receipt identifies
+the actual base image and the observed post-preparation runtime on these guests;
+it does not claim the newly installed software was baked into the base image.
+For focused specifications, the pair receipt lists the exact runtime, ABI,
+NVMe, io_uring, libfabric, reciprocal RDMA and monitoring proofs. This profile
+uses only the fabric, nvmeof and test-utils build features. It does not stage
+FoundationDB or Valkey runtimes and does not inspect external-store images.
+The original full-matrix profile retains its Valkey qualification.
+After publishing the suite runtime, the controller waits at most 180 seconds
+for all six actual workers to finish package, fleet and local-storage admission.
+Each immutable readiness record binds the source, manifest, VM name, numeric ID
+and original deadline. A startup error, missing readiness or replaced identity
+blocks campaign submission and enters owned-resource cleanup.
+The historical image qualification lacks direct `nvmet` and `nvme_fabrics`
+evidence and has older recipe hashes, so it is not admitted for this campaign.
+Local package preparation itself does not allocate any cloud VM.
+
+The reviewed matrix retains the existing cases and four separately executed
+Valkey reproduction controls, and adds the standard profiles for TiKV,
+Cassandra, FoundationDB, Kvrocks and Garnet. `native_durability_cohort` is
+explicitly enabled only in this reviewed specification: its TideHunter twins
+use native page-cache acknowledgement with background fragment fsync, while
+the original synchronous owner-barrier cases remain unchanged. Sealed twins
+use separate physical source identities but the same logical data and are
+read-only. Do not compare native-tier writes to Valkey's synchronous AOF
+writes; check acknowledgement and cache contracts for every comparison.
+
+The expanded campaign has no measured full-fleet runtime. The earlier 411-case
+run took approximately 3.79 hours; five additional stores and the native-tier
+twins add substantial unmeasured startup and case time. It is not established
+that the complete matrix fits the six-hour deadline or the $145 ceiling including
+non-compute costs. The existing deadline, export reserve and ceiling remain
+hard bounds; partial results are not a complete comparison.
+
+Generate a fresh risk-first permutation for the exact reviewed matrix (the
+output must not already exist), then validate it before local qualification:
+
+```sh
+python3 experiments/gcp-rdma/risk_order.py /absolute/path/risk-first-order.json --generate
+python3 experiments/gcp-rdma/risk_order.py /absolute/path/risk-first-order.json
+```
+The order is matrix-hash-bound and keeps each sealed physical source and
+durability tier contiguous, without changing its internal read order.
+
+Print the current focused matrix counts and SHA-256 values with one command:
+
+```sh
+python3 -c 'import sys,json,hashlib; sys.path.insert(0,"experiments/kv-comparison"); import cloud_campaign as c; [(print(s,len(j),hashlib.sha256(json.dumps(j,sort_keys=True,separators=(",",":")).encode()).hexdigest())) for s in c.FOCUSED_SELECTIONS for j in [c.make_focused_matrix(s)]]'
+```
+
+### Leased A/B compact campaign (run 11, 11 November 2026)
+
+This manual-only selection uses two hosts, 72 cases, kernel NVMe/RDMA and
+no SPDK. It reserves $48.34, including $39.45 rounded compute for six hours.
+The fleet's first two hosts qualify both native and synchronous live tiers
+before the suite. The immutable image receipt binds those same host identities.
+The 21600-second expiry and 900-second export reserve remain in force.
+
+Before seeking launch approval, verify the exact image name and numeric ID,
+its focused qualification record and live proofs, quota, compact placement
+policy, and remaining weekly capacity in the shared cloud budget ledger.
+Generate the exact spec and order offline:
+
+```sh
+python3 -c 'import json,sys; sys.path.insert(0,"experiments/gcp-rdma"); import manual_campaign as m; json.dump(m.REVIEWED_SPECS["leased_ab_compact"],open(sys.argv[1],"x"),sort_keys=True,indent=2)' /absolute/path/leased-spec.json
+python3 experiments/gcp-rdma/risk_order.py /absolute/path/leased-order.json --selection leased_ab_compact --generate
+python3 experiments/gcp-rdma/risk_order.py /absolute/path/leased-order.json --selection leased_ab_compact
+```
+
+Seal the focused package using the preparation command below with this spec,
+review its receipt and observer proof, then obtain explicit user approval.
+Only the manual launcher may allocate this compact fleet; CI rejects it.
+
+### NVMe-oF data path compact campaigns (`nvmeof_path_core`, `nvmeof_path_compact`)
+
+These manual-only selections use the same two hosts, the `native` backend,
+owner RPC over trusted verbs, and the live kernel NVMe/RDMA route with
+permanent per-owner export. They have no SPDK target. `nvmeof_path_compact` is
+the full selection (157 cases). `nvmeof_path_core` is its launched subset
+(66 cases, same settings; run 12). The reservation, the pair qualification of
+both live tiers, the expiry and the export reserve are the same as for the
+leased A/B campaign. In the full selection the first 12 cases are canaries and
+the seventh stops the run when its cold read is not served from the device.
+In `nvmeof_path_core` three cases run first: the native 1 KiB put, the 64 KiB
+cold live read that stops the run when it is not device-served, and the
+native cold `get_many`; the other ten canaries follow.
+
+Generate the exact spec, the order and the settings table offline (replace
+`SELECTION` with one of the two names). The settings table is part of the
+launch request:
+
+```sh
+python3 -c 'import json,sys; sys.path.insert(0,"experiments/gcp-rdma"); import manual_campaign as m; json.dump(m.REVIEWED_SPECS[sys.argv[2]],open(sys.argv[1],"x"),sort_keys=True,indent=2)' /absolute/path/nvmeof-path-spec.json SELECTION
+python3 experiments/gcp-rdma/risk_order.py /absolute/path/nvmeof-path-order.json --selection SELECTION --generate
+python3 experiments/gcp-rdma/risk_order.py /absolute/path/nvmeof-path-order.json --selection SELECTION
+python3 -c 'import json,sys; sys.path.insert(0,"experiments/kv-comparison"); import cloud_campaign as c; json.dump(c.make_focused_matrix(sys.argv[2]),open(sys.argv[1],"x"),sort_keys=True,separators=(",",":"))' /absolute/path/nvmeof-path-matrix.json SELECTION
+python3 experiments/kv-comparison/nvmeof_path.py --settings-only --matrix /absolute/path/nvmeof-path-matrix.json --output /absolute/path/nvmeof-path-settings
+```
+
+Seal and approval follow the leased A/B rules above. If the many-files canary
+(G18X) fails because a namespace does not appear on the coordinator, set
+`live_export_mode: "per_file"` in each live job, generate the matrix again and
+seal again. A new launch needs a new approval.
+
+`nvmeof_path_fix` (37 cases, run 13) is the confirmation selection for the `wal_replay` owner history,
+lease-ahead and polled writes. It uses the same hosts, reservation, expiry and commands (`SELECTION` =
+`nvmeof_path_fix`). Its first 8 cases are canaries; the fourth stops the run when its cold read is not
+device-served.
+
+### Sui replay over NVMe-oF on the compact fleet (`sui_nvmeof_compact`, manual only)
+
+The manual launcher admits one reviewed Sui specification (`manual_sui.REVIEWED_SUI_SPECS`): two hosts,
+four cells (owner RPC verbs and live NVMe/RDMA, each with the `original_default` and the `harness`
+contract), `per_owner` export, default queue geometry, owner history `wal_replay`. The package is the
+focused KV package plus the Sui archive and the verification archive. Seal order: stage 1 (KV build),
+stage 2 (KV package and qualification), stage 3 (`prepare.py --sui ... --sui-nvmeof`, in the build image
+with the host Cargo and rustup homes, offline; it needs a clean engine checkout at the sealed revision).
+The launcher uploads the fixture (`checkpoint-fixtures/sui-genesis-1775/fixture.tar.gz`, SHA-256
+`7eb43b71435547939760598e541d13b9a77f722c5a9d0f8c8ee5bd583b751f15`) at staging and pins its generation
+in the runtime copy of the specification. Both guests load the NVMe and RDMA modules and revalidate the
+live pair proof before a replay. The result object is `<fleet run id>/results/sui-results.tar.gz`.
+
+For an explicitly manual dirty checkout, keep preparation output and the
+specification outside the checkout. Generate the exact reviewed specification,
+then build the image and seal the package (replace both absolute paths):
+
+```sh
+python3 -c 'import json,sys; sys.path.insert(0,"experiments/gcp-rdma"); import manual_campaign; json.dump(manual_campaign.REVIEWED_SPEC,open(sys.argv[1],"x"),sort_keys=True,indent=2)' /absolute/path/manual-spec.json
+docker build -f experiments/gcp-rdma/Dockerfile.build -t tidehunter-gcp-build experiments/gcp-rdma
+python3 experiments/gcp-rdma/prepare.py --engine "$PWD" \
+  --revision "$(git rev-parse HEAD)" --output /absolute/path/new-manual-package \
+  --spec /absolute/path/manual-spec.json --deadline 14400 \
+  --build-container tidehunter-gcp-build --manual-allow-dirty
+cp /absolute/path/manual-spec.json /absolute/path/new-manual-package/spec.json
+```
+The preparation deadline bounds the local build and qualification. Its accepted
+range is 1800–14400 seconds. The manual fleet expiry remains 21600 seconds.
+
+An existing pinned build image and verified native dependencies can be reused.
+For a direct `cloud_package.py build`, `--target-dir` selects an existing Cargo
+cache directory. Cargo still builds the frozen sources with the required
+features and flags; the cache does not replace source or binary qualification.
+
+
+The opt-in is restricted to this exact manual spec. The package records dirty
+status, revision and the complete frozen source inventory; preparation and
+launch reject an altered checkout. The default and GitHub transfer path remain
+clean-source only. Review the package receipt, frozen inventory, ABI and
+qualification before use. The async `execute` callback accepts gcloud argument
+lists without the `gcloud` executable and must invoke the GCloud MCP tool.
+The callback must stop on cancellation or tolerate overlapping read-only
+observations. An await timeout cannot forcibly stop a callback that suppresses
+cancellation; its local clamp is cooperative, not a hard VM-lifetime guarantee.
+The `wheels` entries are local `{path, sha256}` PyYAML 6.0.2 wheel descriptors;
+the base image must be the reviewed project-local image path and numeric ID.
+Permission, network, wheel, image and RDMA-device prerequisites must be checked
+fresh. All-host runtime preparation, reciprocal physical RDMA qualification and
+selected NVMe module/tool admission remain mandatory; these instructions do not
+establish cloud hardware readiness.
+
+All six VMs receive an initial startup gate at creation, rather than relying on
+changing metadata to rerun startup. After exact guest resource and base-image
+admission, an immutable per-host GCS descriptor binds the instance ID, source,
+deadline and script checksum. Only after every guest has prepared, both physical
+proofs pass, and qualification cleanup succeeds is the suite runtime published.
+The same six identities run the suite. Evidence contains actual reciprocal
+peer operations and generation-pinned hashes; image readiness alone is not
+qualification.
+
+Fresh preflight must establish required effective permissions; no IAM or API
+change is made by this path. Current hosts' RDMA-CM device and peer visibility
+remain unproven until a newly authorized physical qualification succeeds.
+
+For manual artifact bytes, the MCP sandbox cannot access workstation files.
+The manual transport uses the existing GCS JSON object client with a
+SDK-delegated guest credential cached only in memory for at most 60 seconds
+from refresh start. Concurrent transfers share one refresh. Cache hits, lock
+waits and refreshes check the current store deadline, including its permitted
+post-deletion extension. The SDK token's actual expiry is opaque; this cache
+does not guarantee validity or retry HTTP authorization errors. Compute
+lifecycle mutations remain on MCP, except the separately recorded exact-argv
+fallback for the MCP's malformed JSON-description invocation.
+Before an HTTP request, a token subprocess timeout is retried up to three
+total attempts, each limited to 30 seconds or the remaining store deadline.
+Timed-out process groups are killed and reaped; nonzero SDK exits report
+only exit status, are not retried, and never expose token output or stderr.
+No artifact mutation is replayed by this token retry. Transfer timeouts and
+chunk checks are cooperative: DNS, response headers, and a stalled read can
+exceed the local deadline.
+They are not a substitute for each VM's verified platform DELETE expiry and
+boot-disk autoDelete. Resource deletion is name-based; even after checking
+the exact numeric ID and owner nonce there is a residual describe/delete race.
+The ownership model assumes a single lease holder and no malicious replacement.
+
+The reviewed manual reservation is an estimate, not a project-wide billing
+cap. Allocation requires current user authorization, local validation and a
+fresh source-bound package; this document alone does not authorize a launch.
+
+The 3 November manual-runner verification passed 189 GCP safety tests, 420
+comparison tests (four additional tests skipped), and 107 observability tests.
+Comparison checks used the existing workspace `.venv`, which contains the
+required AWS SDK and plotting dependencies. The image regression exercised
+lost stop/create replies, exact-owned reconciliation and subsequent deletion;
+the historical orchestration fixture exercised the former separate bake, pair
+and fleet transitions without cloud resources. Those checks do not qualify an image or demonstrate
+hardware RDMA. The following older counts refer to an earlier source snapshot.
 
 ### Verification of this preparation pass
 
@@ -541,12 +931,28 @@ concurrency, offered loads, operation counts and raw API, scheduling and
 response timings are unchanged. `tidehunter_verbs` is an additional
 TLS-protected verbs option. EFA remains on AWS, not renamed as Falcon. No GCP
 backend may silently fall back to TCP.
+Sui verbs selections also require an active RDMA link bound to each admitted
+IRDMA address on every host; worker startup checks this even for Sui-only runs.
 
-`nvmeof-focused` remains a separate selectable experiment: it requires
-`native`, `tidehunter_tcp`, and `tidehunter_nvme_tcp`, and additionally permits
-`tidehunter_nvme_rdma`. It excludes unrelated KV backends rather than calling
-Valkey's RAM reads cold NVMe reads. Sui has no NVMe-oF or Valkey reader; its real
-checkpoint replay remains native versus the selected Tidehunter transports.
+`nvmeof-focused` requires `native`, `tidehunter_tcp` and at least one of
+`tidehunter_nvme_rdma` or `tidehunter_nvme_tcp`; portable verbs can also be
+selected. For the portable RDMA comparison include `tidehunter_verbs_native`
+and `tidehunter_nvme_rdma`; NVMe/TCP is an optional additional arm. Standard
+mode rejects NVMe backends and GCP never offers EFA. NVMe/RDMA reads the independently
+copied sealed export image, not the original WAL, and must not be labelled as
+native NVMe or as proven NAND reads. Sui has no Valkey reader. The Sui replay
+harness has a live NVMe-oF cell (`tidehunter_nvme_rdma` in `sui_cells`, built
+with `experiments/sui-checkpoint/build.py prepare --fabric --nvmeof`), but the
+workflow and the manual launcher do not admit a Sui specification with that
+cell yet; a launched Sui replay remains native versus owner RPC transports.
+Before allocation the exact qualified image must show the selected initiator
+and target transport modules on both qualification guests. The existing
+cross-host RDMA-CM perftests demonstrate the underlying fabric only; they do
+not prove that NVMe/RDMA discovery, connection or reads work. On every campaign
+host, runtime admission loads the selected modules, requires `nvme-cli`, the
+initiator character device and nvmet configfs, and binds RDMA to the active
+admitted IRDMA NIC. The actual target/controller connection and namespace
+admission must still succeed, and scoped teardown remains mandatory.
 Both suites run sequentially on the same fleet; the launcher owns final
 deletion. Preparation must qualify the software-backed adapters and exact Sui
 checkpoint replay/audits before allocation; those checks cannot qualify GCP
@@ -656,9 +1062,10 @@ These amounts book the complete quoted upper bound before allocation. They are
 conservative reservations, not measured spend or Google invoices; they are not
 automatically refunded when a run finishes early or fails. Do not describe
 their totals as actual billed costs. Retained GCS artifacts can remain chargeable
-after VMs are deleted. The configured $90 reservation is a conservative estimate
-for the restricted US Z4M policy, not an invoice or a guarantee against unrelated
-project spending. The weekly limit applies to this CI ledger, not manual runs.
+after VMs are deleted. The configured $90 CI reservation and $145 six-host or
+$48.34 compact manual reservation are conservative estimates for the restricted US Z4M policy, not
+invoices or guarantees against unrelated project spending. The weekly limit
+applies to the shared CI and manual ledger.
 
 ## Local qualification
 
@@ -772,3 +1179,159 @@ changed. No campaign, GCP VM, physical RDMA peer transfer, active native systemd
 Valkey service or cloud release-package qualification ran in this integration.
 The image/ABI, permissions/network, budget and publication prerequisites above
 remain required before launch.
+
+### Monitoring and startup regression qualification, 2026-11-03
+
+The observer admits exact GCP `bench-<16 lowercase hex>` identities as well as
+the existing AWS `th-*` identities. Startup validates the actual rendered
+configuration before guest work. Host-exporter or Prometheus/Grafana readiness
+failure stops the campaign before measurement; later observer failure stops
+the next case, while raw-result export and exact-owned cleanup remain active.
+The GCP safety workflow also runs controller and observer regression suites.
+
+The real local qualification is
+`experiments/kv-comparison/observability/qualify_gcp_identity.py`. It starts six
+logical loopback hosts, verifies live targets and Grafana queries, captures
+the session, verifies offline replay and stops its owned containers. Its
+deliberately failed fixture tests observation, not benchmark performance.
+The local run at `/tmp/tidehunter-gcp-observer-20261103-validation` passed with
+no live or replay gaps; the retained evidence is
+`checkpoint-work/2026-11-03-monitoring-hardening-validation.json` in the parent
+workspace. This does not supply the missing monitoring data for the completed
+GCP campaign or qualify current changes on GCP hardware.
+
+Benchmark services explicitly set `LimitNOFILE=524288`. Guest admission uses
+the prepared Python and checks effective limits in a real retained transient
+unit before cases. It must not use `systemd-run --wait` with
+`RemainAfterExit=yes`: an exited retained unit remains active. Admission instead
+polls its bounded state, validates its owned output and stops that exact unit.
+
+### Single-fleet qualification failure, 2026-11-05
+
+The one authorized six-host GCP fleet completed software preparation but failed
+pair qualification before physical qualification or any of the planned 411 API
+cases and four native Valkey controls. Runtime linkage inspection incorrectly
+applied the portable Ubuntu 24 ABI ceiling to the guest's host OpenSSL library.
+The fleet, boot disks and placement policy were deleted; retained evidence and
+the distinction from local SPDK functional proof are documented in
+`checkpoint-work/spdk-matched-storage-20261105T004442Z/single-fleet-campaign-report.md`
+in the parent workspace. This run provides no cloud performance conclusion.
+The local correction retains strict portable-artifact checks while validating
+host dependency version closure; compiled ELF regressions passed, as did the
+pinned SPDK target and private libaio on a local OpenSSL 3.5.8 runtime. This is
+not guest or physical RDMA qualification; no cloud relaunch occurred.
+
+### Buffered Linux NVMe target repair, 2026-11-05
+
+The repeated failure at sealed-read case 0034 was not a build or capacity
+failure. The preserved cloud completion was owner 0, `-EREMOTEIO`, 8192 bytes
+at offset 380928; its NVMe controller reported INTERNAL with DNR. This status
+alone does not prove the target's internal cause. A separate local reproduction
+traced `nvmet_file_submit_bvec` returning only 4096 bytes for an 8192-byte
+`IOCB_NOWAIT` read. The target treated that positive short read as an I/O error.
+
+`experiments/nvmeof/patches/linux-nvmet-file-short-nowait-read.patch` routes
+only positive short nonblocking reads through the existing blocking workqueue.
+The sealed image is immutable, so repeating the full read is safe. Writes,
+flush/FUA, direct I/O, page-cache policy and SPDK behavior are unchanged.
+This is not a retry of a reported I/O error.
+
+For the exact CIQ `5.14.0-687.49.1+2.1.el9_8_ciq.x86_64` guest, prepare an
+external prefix containing `nvmet.ko`, `abi-admission.json`, `source.json` and
+`partial-nowait-read.patch`; supply `--nvmet-fix-prefix /absolute/prefix`
+to `prepare.py` or `cloud_package.py stage`. No module binary belongs in Git.
+The reviewed module, source RPM, devel RPM, patch and ABI identities are pinned
+by `experiments/nvmeof/kernel_fix.py`. Another kernel requires a new build and
+admission; this asset is not a generic kernel override.
+
+All six owned guests must load and report the exact candidate before physical
+qualification and worker readiness. Admission checks live sysfs build IDs and
+source versions, not just `modinfo` of an unloaded file. The installer preserves
+normal signature/Secure Boot/lockdown enforcement and never changes the Falcon
+provider drivers or physical NVMe driver. A prohibited unsigned module stops
+preparation; no forced loading or security-policy change is permitted.
+
+The actual local buffered-kernel qualification completed 65,536 verification
+reads and 2,048 batch-32/C16 measurements without error. All five targets and
+controllers were removed and the original local module was restored. This is
+functional evidence on a shared SSD, not cloud RDMA performance or physical
+NAND proof. Its retained proof is under the parent workspace's
+`checkpoint-work/spdk-matched-storage-20261105T004442Z/kernel-nvmet-partial-read-fix/qualification-20261105T193521Z-2512060/out`.
+
+The failure-only initiator collector now retains bounded command stderr and
+exit status, and uses explicit UTC journal bounds. An unavailable diagnostic
+remains unavailable; it must not replace the original owner/completion error.
+
+Result retrieval retains every object and its exact generation, byte count and
+SHA-256. At most eight immutable objects transfer concurrently; mutable
+startup/progress/receipt objects refresh serially. Aggregate limits reserve
+in-flight bytes, and successful siblings remain in the local inventory when
+another object fails. A verified deleted fleet may have up to two hours of
+offline transfer grace. This cannot extend VM lifetime or allocate a fleet.
+
+### Full observer-matrix admission, 2026-11-06
+
+The next GCP attempt loaded the reviewed kernel module on all six hosts under
+their existing security settings. The formerly failing cold batch-32/C16 case
+completed 65,536 verification reads and all 2,048 measured calls without error.
+The campaign completed 284 API cases and four native Valkey controls, then
+stopped before case 284's core workload: the observer still allowed SPDK only
+for sealed reads and rejected a valid live-SPDK job. Its complete partial
+archive was retrieved and all six VMs, boot disks and placement were deleted.
+This partial run is not a complete SPDK comparison or a transport failure.
+
+Observer labels now distinguish `tidehunter_spdk_live_rdma` from sealed
+`tidehunter_spdk_rdma`. Valid live SPDK remains restricted to the RDMA backend;
+invalid route/backend/target combinations are still rejected. Existing live
+SPDK read/write interval rendering retains unavailable-owner semantics.
+
+`qualify_observer_matrix.py` checks every generated job through the actual
+observer's selection validation and waiting-state metric renderer. Manual
+campaign admission runs the script from the admitted frozen package before
+cloud preflight or allocation, and compares its count and canonical matrix
+digest with the executing checkout. It does not run benchmark workloads,
+fabricate measurements or replace hardware qualification. Local qualification
+of the unchanged 411-job matrix passed.
+
+The original failure-only journal command used an unsupported `--kernel`
+option. It now uses `journalctl -k`; the actual local UTC-bounded command
+completed successfully. Diagnostic failures retain their bounded stderr and
+exit status rather than becoming an unexplained `RuntimeError`.
+
+### Bounded live NVMe initiator queues, 2026-11-06
+
+The next attempt completed 347 API cases and four native Valkey controls before
+case `0347-tidehunter_nvme_rdma-65536-cold-os-large-cold_os_cache-r0`
+failed to connect a historical WAL namespace. The original owner error was
+`/dev/nvme-fabrics: Cannot allocate memory`; the preserved kernel journal records
+failure to initialize a 128-entry MR pool for I/O queue 14. All six VMs, disks
+and placement were deleted after export. The terminal archive and its 12,374
+inventory entries were retrieved and verified. This remains a partial campaign.
+
+The initiator previously omitted queue controls and the guest created 16 I/O
+queues of depth 128 per controller. The client had a 16-GiB memory limit, peaked
+near 738 MiB and reported no memory-limit or OOM events. These observations do
+not establish host-memory exhaustion. The five retained end-of-case controllers
+were rollover writers; the empty begin snapshot does not show a prior-case leak.
+
+`tidehunter/src/distributed/nvmeof/live_connect.rs` now requests
+`nr_io_queues=1,queue_size=32` on the shared kernel initiator path used with both
+kernel and SPDK targets. Before namespace binding it verifies the exact owned
+controller's `queue_count=2` (including admin) and `sqsize=31` (zero-based).
+Failed admission uses existing disconnect/quarantine handling. Pool capacity,
+pinning, read/write/flush semantics and workload sizes are unchanged.
+
+The exact CIQ non-PI allocation model is `32 + Q × D` ordinary pool MRs per
+controller. The existing 135-entry bound therefore changes from 280,800 to 8,640
+modeled MRs, plus control-plane and provider headroom. This is not a guarantee
+of hardware capacity. The apparent 16K ceiling inferred from the failure is
+unmeasured; PBLE allocation can fail below advertised MR limits. Likewise,
+`max_cqe` is a per-CQ limit, not an aggregate reservation limit.
+
+Physical guest qualification now records `ibv_devinfo -v` capabilities and
+kernel-reported `rdma -j resource show` summaries. Live-case begin/end snapshots
+record the same evidence outside API measurement, not in periodic sampling or
+per operation. Missing counts stay unavailable, not zero. These boundaries
+are not a continuous resource-peak measurement. Local Linux NVMe/TCP can
+qualify effective queues and functional recovery; physical Falcon resource
+headroom and performance still require the bounded, single-fleet cloud run.

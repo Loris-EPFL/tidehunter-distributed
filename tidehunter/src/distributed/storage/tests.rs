@@ -1417,6 +1417,8 @@ fn retries_are_idempotent_and_conflicts_reject_before_authority() {
         metrics(),
     )
     .unwrap();
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     let first = batch(&config, 0);
     let receipt = log
         .append_complete_batch(authority(&config), &first)
@@ -1527,7 +1529,11 @@ fn recovery_requires_every_partition_and_does_not_confuse_global_versions_with_o
     let p1 = temp.path().join("one");
     let clock = LogicalClock::new_fenced_epoch(5);
     let a = PartitionLog::create(&p0, c0.clone(), &shape(), metrics()).unwrap();
+    a.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     let b = PartitionLog::create(&p1, c1.clone(), &shape(), metrics()).unwrap();
+    b.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     let v0 = clock.allocate().unwrap();
     let v1 = clock.allocate().unwrap();
     let first = a
@@ -1591,6 +1597,8 @@ fn sealed_history_corruption_missing_files_and_competing_open_fail_closed() {
     let config = config(vec![3], 3);
     let path = temp.path().join("stream");
     let log = PartitionLog::create(&path, config.clone(), &shape(), metrics()).unwrap();
+    log.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     assert!(PartitionLog::create(&path, config.clone(), &shape(), metrics()).is_err());
     assert!(PartitionLog::recover_sealed(&path, &config, metrics()).is_err());
     let receipt = log
@@ -2346,4 +2354,7 @@ fn missing_live_registration_cannot_downgrade_frontier_recovery() {
 mod conflict_index;
 mod history;
 #[cfg(feature = "experimental-nvmeof")]
+mod live_extent;
+#[cfg(feature = "experimental-nvmeof")]
 mod live_native;
+mod wal_replay;

@@ -273,8 +273,13 @@ fn inventory_recovery_rejects_a_logical_version_reused_on_another_partition() {
     let left_path = temp.path().join("left");
     let right_path = temp.path().join("right");
     let left = PartitionLog::create(&left_path, left_config.clone(), &shape(), metrics()).unwrap();
+    left.set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     let right =
         PartitionLog::create(&right_path, right_config.clone(), &shape(), metrics()).unwrap();
+    right
+        .set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
     let l = left
         .append_complete_batch(authority(&left_config), &batch(&left_config, 0, 7))
         .unwrap();

@@ -1,0 +1,45 @@
+{
+  "run_id": "th-6449c7068670440c",
+  "source_commit": "87465ef68abb6fa9b7b9cb27224281a7c4994e6d",
+  "verified_at_utc": "2026-10-27T22:16:38.237095+00:00",
+  "github_artifacts": [
+    {
+      "artifact_id": 12774736566,
+      "name": "aws-efa-40573961972-1",
+      "sha256": "510f2caa391a09df86b907d3738838ec2738f60a8f1d8a7d28173cd258661416",
+      "archive_bytes": 466460212,
+      "files": 23763,
+      "extracted_bytes": 1191043626,
+      "destination": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/checkpoint-work/kv-comparison/cloud-ops/th-6449c7068670440c/github/extracted/aws-efa-40573961972-1"
+    },
+    {
+      "artifact_id": 12774591742,
+      "name": "aws-costs-40573961972-1",
+      "sha256": "c1d0d3f979163a00b0c7a91efb4ae5b8b621c0ba3c6fd225b8097154078099f4",
+      "archive_bytes": 124857,
+      "files": 2,
+      "extracted_bytes": 1056800,
+      "destination": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/checkpoint-work/kv-comparison/cloud-ops/th-6449c7068670440c/github/extracted/aws-costs-40573961972-1"
+    },
+    {
+      "artifact_id": 12767831119,
+      "name": "campaign-inputs-40573961972-1",
+      "sha256": "93429ec98f855144ccc5e8dc2d1441dd1d3ad7290242c762f0da1698649e6162",
+      "archive_bytes": 23353193,
+      "files": 1,
+      "extracted_bytes": 23353035,
+      "destination": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/checkpoint-work/kv-comparison/cloud-ops/th-6449c7068670440c/github/extracted/campaign-inputs-40573961972-1"
+    }
+  ],
+  "s3_files": 5865,
+  "s3_bytes": 273259979,
+  "archived_controller_files": 17885,
+  "archived_controller_bytes": 912670772,
+  "controller_archive_sha256": "33dcdb37734c2b77520d8766647695e0e6795c69e938fa85d404e85d996a33ca",
+  "controller_inventory_sha256": "f63ace789d2d479e70384772abc900ddd1e559f9b82731dc33d580e95e0694bc",
+  "all_archived_and_s3_hashes_match": true,
+  "derived_overwrites": {
+    "comparison.json": "CI validation regenerates summary without monitoring_complete; all other keys and every case are identical to archived original"
+  },
+  "all_other_validated_controller_hashes_match": true
+}

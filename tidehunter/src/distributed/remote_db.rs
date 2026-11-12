@@ -21,10 +21,10 @@ use super::publication::PublicationTracker;
 use super::reference_directory::ReferenceDirectory;
 use super::sequence::LogicalClock;
 use super::storage::{
-    AppendedBatch, DurableBatch, PartitionConfig, PartitionStats, StaticInventory, encode_metadata,
-    install_metadata, read_metadata,
+    AppendedBatch, DurableBatch, HistoryPersistence, PartitionConfig, PartitionStats,
+    StaticInventory, WAL_REPLAY_WINDOW_BATCHES, encode_metadata, install_metadata, read_metadata,
 };
-use super::tcp::checkpoint::{CheckpointProof, CheckpointReceipt};
+use super::tcp::checkpoint::{CheckpointPositionProof, CheckpointProof, CheckpointReceipt};
 use super::tcp::{Client, TlsFiles};
 use super::types::{BatchId, BatchVersion, MutationVersion, ValueRecordReference};
 use super::write_timeline::{
@@ -40,7 +40,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -386,11 +386,13 @@ pub struct RemoteEndpoint {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RemoteDatabaseConfig {
     pub storage: LocalInventoryConfig,
+    #[serde(default = "HistoryPersistence::legacy")]
+    pub history_persistence: HistoryPersistence,
     pub endpoints: Vec<RemoteEndpoint>,
     pub tls: TlsFiles,
     pub timeout: Duration,
-    /// Resident ordering/outcome slots, not a lifetime per-epoch write limit.
-    /// Completed outcomes spill to immutable pages before this budget is full.
+    /// Resident suffix identities and ordering slots, not a lifetime write limit.
+    /// Checkpoints move completed identities into the selected retry history.
     pub max_admitted_batches: usize,
     pub max_index_bytes: usize,
     /// Lock shards of the coordinator index; a power of two. In memory only, so
@@ -399,7 +401,7 @@ pub struct RemoteDatabaseConfig {
     pub index_shards: usize,
     pub max_pending_batches: usize,
     pub max_pending_bytes: usize,
-    /// Finite durable suffix admitted after the last committed checkpoint.
+    /// Background checkpoint trigger; hard suffix bounds apply only to legacy modes.
     #[serde(default)]
     pub replay_limits: ReplayLimits,
     /// Queued and active append commands per owner; one transport slot is reserved for control.
@@ -533,6 +535,13 @@ impl RemoteDatabaseConfig {
             ));
             #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
             {
+                if live.write_mode == super::tcp::LiveWriteMode::Leased
+                    && self.storage.fragment_bytes >= 1 << 30
+                {
+                    return Err(LocalDbError::new(
+                        "leased live extents must be smaller than 1 GiB",
+                    ));
+                }
                 let write_frame = self
                     .storage
                     .group_limits
@@ -633,6 +642,18 @@ impl RemoteDatabaseConfig {
     }
 
     fn recovery_page_limit(&self) -> Result<usize, LocalDbError> {
+        if self.history_persistence == HistoryPersistence::WalReplay
+            && self
+                .storage
+                .group_limits
+                .max_encoded_bytes
+                .checked_mul(self.endpoints.len())
+                .is_none_or(|bytes| bytes > self.max_pending_bytes)
+        {
+            return Err(LocalDbError::new(
+                "pending byte budget is below one replay group per owner",
+            ));
+        }
         let metadata = (self.storage.batch_limits.max_operations as usize)
             .checked_mul(
                 std::mem::size_of::<Mutation>()
@@ -671,6 +692,8 @@ struct AuthorityEpoch {
 struct AuthorityManifest {
     format: u32,
     storage: LocalInventoryConfig,
+    #[serde(default = "HistoryPersistence::legacy")]
+    history_persistence: HistoryPersistence,
     endpoints: Vec<RemoteEndpoint>,
     shape_yaml: String,
     #[serde(default = "ReplayLimits::legacy")]
@@ -746,6 +769,38 @@ struct CheckpointImage {
 struct CheckpointStream {
     proof: CheckpointProof,
     state: [u8; 32],
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StreamPosition {
+    partition: u32,
+    epoch: u64,
+    replay_from: u64,
+    last_offset: Option<u64>,
+    durable_end: u64,
+    complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct RecentReceipt {
+    id: BatchId,
+    version: BatchVersion,
+    digest: super::types::PayloadDigest,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CheckpointImageV3 {
+    format: u32,
+    database: [u8; 16],
+    shape_yaml: String,
+    authority_epoch: u64,
+    generation: u64,
+    cut: Option<MutationVersion>,
+    published_next: u64,
+    index_bytes: u64,
+    index_digest: [u8; 32],
+    positions: Vec<StreamPosition>,
+    recent: Vec<RecentReceipt>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -887,6 +942,8 @@ enum OpenInterruption {
     AfterFences(usize),
     #[cfg(test)]
     AfterReadSetup,
+    #[cfg(test)]
+    DuringReplay,
 }
 
 #[derive(Clone, Copy)]
@@ -1304,7 +1361,12 @@ pub struct RemoteDatabase {
     partition_indexes: HashMap<u32, usize>,
     inventory: StaticInventory,
     known: HashMap<BatchId, AppendedBatch>,
-    receipt_history: ReceiptHistory,
+    receipt_history: Option<ReceiptHistory>,
+    stream_last: BTreeMap<(u32, u64), (u64, u32)>,
+    positions: BTreeMap<(u32, u64), StreamPosition>,
+    committed_complete: BTreeSet<(u32, u64)>,
+    recent: VecDeque<RecentReceipt>,
+    recent_ids: HashMap<BatchId, (BatchVersion, super::types::PayloadDigest)>,
     active_identities: HashMap<BatchId, usize>,
     pending_writers: HashMap<KeySpace, HashMap<DependencyKey, u64>>,
     predecessor_marks: Vec<u64>,
@@ -1464,7 +1526,13 @@ impl RemoteDatabase {
                 })
                 .sum::<usize>()
             + self.publication.resident_metadata_bytes()
-            + self.receipt_history.cached_metadata_bytes()
+            + self
+                .receipt_history
+                .as_ref()
+                .map_or(0, ReceiptHistory::cached_metadata_bytes)
+            + self.recent.capacity() * std::mem::size_of::<RecentReceipt>()
+            + self.recent_ids.capacity()
+                * std::mem::size_of::<(BatchId, (BatchVersion, super::types::PayloadDigest))>()
     }
 
     pub fn retention_floor(&self) -> IndexReadCut {
@@ -1606,8 +1674,9 @@ impl RemoteDatabase {
                 }
             }
             let manifest = AuthorityManifest {
-                format: 3,
+                format: 4,
                 storage: config.storage.clone(),
+                history_persistence: config.history_persistence,
                 endpoints: config.endpoints.clone(),
                 shape_yaml: shape_yaml.clone(),
                 replay_limits: config.replay_limits,
@@ -1623,7 +1692,12 @@ impl RemoteDatabase {
             persist_manifest(&path, &manifest)?;
             manifest
         };
-        if !matches!(manifest.format, 2 | 3)
+        if manifest.history_persistence != config.history_persistence {
+            return Err(LocalDbError::new(
+                "authority manifest history persistence differs",
+            ));
+        }
+        if !matches!(manifest.format, 2..=4)
             || manifest.storage != config.storage
             || manifest.endpoints != config.endpoints
             || manifest.shape_yaml != shape_yaml
@@ -1650,7 +1724,9 @@ impl RemoteDatabase {
             .replay_limits
             .validate()
             .map_err(LocalDbError::new)?;
-        if !config.replay_limits.covers(manifest.replay_limits) {
+        if config.history_persistence != HistoryPersistence::WalReplay
+            && !config.replay_limits.covers(manifest.replay_limits)
+        {
             return Err(LocalDbError::new(
                 "replay limits cannot shrink below the recorded recovery bound on open",
             ));
@@ -1735,6 +1811,11 @@ impl RemoteDatabase {
         let mut clients = connected.clients;
         for client in &clients {
             let status = client.connected_status();
+            if status.history_persistence != config.history_persistence {
+                return Err(LocalDbError::new(
+                    "owner history persistence differs from the coordinator",
+                ));
+            }
             if status.max_epochs != config.storage.max_epochs
                 || status
                     .epochs
@@ -1814,7 +1895,19 @@ impl RemoteDatabase {
         // substitute for complete inventory or evidence of absent records.
         recovery_stats.fencing_ns = elapsed(fencing_started);
         let mut known = HashMap::new();
-        let mut receipt_history = ReceiptHistory::open(&path, config.storage.database)?;
+        let mut receipt_history = if config.history_persistence == HistoryPersistence::WalReplay {
+            None
+        } else {
+            Some(ReceiptHistory::open(&path, config.storage.database)?)
+        };
+        let mut positions = BTreeMap::new();
+        let retry_window = if config.history_persistence == HistoryPersistence::WalReplay {
+            WAL_REPLAY_WINDOW_BATCHES
+        } else {
+            0
+        };
+        let mut recent = VecDeque::with_capacity(retry_window);
+        let mut recent_ids = HashMap::with_capacity(retry_window);
         let mut latest = None;
         let mut cursors = HashMap::new();
         if let Some(checkpoint) = &manifest.checkpoint {
@@ -1831,9 +1924,16 @@ impl RemoteDatabase {
                 &mut receipt_history,
                 &mut latest,
                 &mut cursors,
+                &mut positions,
+                &mut recent,
+                &mut recent_ids,
                 &mut recovery_stats,
             )?;
         }
+        let committed_complete = positions
+            .iter()
+            .filter_map(|(key, position)| position.complete.then_some(*key))
+            .collect();
         let replay_started = Instant::now();
         replay_history(
             &mut clients,
@@ -1845,9 +1945,13 @@ impl RemoteDatabase {
             &mut index,
             &mut known,
             &receipt_history,
+            &recent_ids,
             &mut latest,
             &cursors,
+            &mut positions,
             &mut recovery_stats,
+            #[cfg(test)]
+            interruption,
         )?;
         recovery_stats.tail_replay_ns = elapsed(replay_started);
         // Current checkpoint/proofs and the complete tail have now validated.
@@ -1907,7 +2011,7 @@ impl RemoteDatabase {
         manifest.epochs.last_mut().unwrap().active = true;
         // Old suffixes validated against their original durable bound. Only a
         // fully recovered, not-yet-serving epoch may activate a larger bound.
-        manifest.format = 3;
+        manifest.format = 4;
         manifest.replay_limits = config.replay_limits;
         persist_manifest(&path, &manifest)?;
         let count = workers.len();
@@ -1950,6 +2054,11 @@ impl RemoteDatabase {
             partition_indexes,
             known,
             receipt_history,
+            stream_last: BTreeMap::new(),
+            positions,
+            committed_complete,
+            recent,
+            recent_ids,
             active_identities: HashMap::new(),
             pending_writers: HashMap::new(),
             predecessor_marks: Vec::new(),
@@ -2238,6 +2347,11 @@ impl RemoteDatabase {
             .checked_add(self.active_identities.len())
             .and_then(|count| count.checked_add(additional_identities))
             .ok_or_else(|| LocalDbError::new("checkpoint receipt admission count overflow"))?;
+        let receipts = if self.config.history_persistence == HistoryPersistence::WalReplay {
+            receipts.min(WAL_REPLAY_WINDOW_BATCHES)
+        } else {
+            receipts
+        };
         let fits = checkpoint_metadata_fits(&self.config, receipts);
         // Exercise the same admission boundary without constructing a million
         // metadata entries merely to reach the production byte ceiling.
@@ -2261,18 +2375,28 @@ impl RemoteDatabase {
         if let Some(receipt) = self.known.get(&id).copied() {
             return Ok(Some((receipt.version(), receipt.digest())));
         }
-        if let Some(receipt) = self.receipt_history.lookup(id).inspect_err(|error| {
-            record_first_failure(
-                &self.first_failure,
-                None,
-                None,
-                "receipt_history_lookup",
-                error,
-            );
-            self.concurrent_failure
-                .store(true, std::sync::atomic::Ordering::Release);
-            self.reads.poison();
-        })? {
+        if let Some(identity) = self.recent_ids.get(&id) {
+            return Ok(Some(*identity));
+        }
+        if let Some(receipt) = self
+            .receipt_history
+            .as_ref()
+            .map(|history| history.lookup(id))
+            .transpose()
+            .inspect_err(|error| {
+                record_first_failure(
+                    &self.first_failure,
+                    None,
+                    None,
+                    "receipt_history_lookup",
+                    error,
+                );
+                self.concurrent_failure
+                    .store(true, std::sync::atomic::Ordering::Release);
+                self.reads.poison();
+            })?
+            .flatten()
+        {
             return Ok(Some((receipt.version(), receipt.digest())));
         }
         Ok(self.active_identities.get(&id).map(|i| {
@@ -2357,16 +2481,18 @@ impl RemoteDatabase {
                 encoded_bytes,
                 identity,
             } => {
-                !self.config.replay_limits.requires_flush(
-                    self.checkpoint_tail_batches,
-                    self.checkpoint_tail_bytes,
-                    encoded_bytes,
-                ) && (!identity
-                    || self
-                        .known
-                        .len()
-                        .saturating_add(self.active_identities.len())
-                        < self.config.max_admitted_batches)
+                (self.config.history_persistence == HistoryPersistence::WalReplay
+                    || !self.config.replay_limits.requires_flush(
+                        self.checkpoint_tail_batches,
+                        self.checkpoint_tail_bytes,
+                        encoded_bytes,
+                    ))
+                    && (!identity
+                        || self
+                            .known
+                            .len()
+                            .saturating_add(self.active_identities.len())
+                            < self.config.max_admitted_batches)
             }
             AdmissionPressure::Partition { partition, records } => self
                 .check_storage_group_capacity(
@@ -2434,7 +2560,8 @@ impl RemoteDatabase {
     ) -> Result<(), LocalDbError> {
         match pressure {
             AdmissionPressure::Tail { encoded_bytes, .. }
-                if encoded_bytes > self.config.replay_limits.max_encoded_bytes =>
+                if self.config.history_persistence != HistoryPersistence::WalReplay
+                    && encoded_bytes > self.config.replay_limits.max_encoded_bytes =>
             {
                 return Err(LocalDbError::new(
                     "batch exceeds checkpoint tail byte bound",
@@ -4015,13 +4142,49 @@ impl RemoteDatabase {
         if self.live_pool.is_some() {
             let mut drain_failed = false;
             for worker in &self.clients {
-                // The worker may already have exited after an unknown write.
-                // The client mutex still owns its queue and serializes any
-                // surviving worker until all accepted CQEs have retired.
-                if let Err(error) = worker.client.lock().close_live_writer() {
+                // The thread observing a failed close owns its DMA retirement;
+                // an idle worker may already be asleep in receiver.recv().
+                let (closed, failed_writer) = {
+                    let mut client = worker.client.lock();
+                    // Acquire observes any earlier owner failure. Poisoned
+                    // authority can retire DMA, but cannot close/adopt extents.
+                    if self
+                        .concurrent_failure
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        client.record_live_write_error();
+                    }
+                    let closed = client.close_live_writer();
+                    let failed_writer = if closed.is_err() {
+                        client.take_failed_live_writer()
+                    } else {
+                        None
+                    };
+                    (closed, failed_writer)
+                };
+                let closed = closed.map_err(LocalDbError::component);
+                if closed.is_err() {
+                    // Release publishes poison before the potentially slow drain.
+                    self.concurrent_failure
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                let closed = if let Some(mut writer) = failed_writer {
+                    match writer.drain_failed() {
+                        Ok(()) => closed,
+                        Err(error) => Err(match closed {
+                            Ok(()) => LocalDbError::component(error),
+                            Err(primary) => LocalDbError::new(format!(
+                                "{primary}; detached live writer drain failed: {error}",
+                            )),
+                        }),
+                    }
+                } else {
+                    closed
+                };
+                if let Err(error) = closed {
                     drain_failed = true;
                     result = Err(match result {
-                        Ok(()) => LocalDbError::component(error),
+                        Ok(()) => error,
                         Err(primary) => LocalDbError::new(format!(
                             "{primary}; live writer drain failed: {error}",
                         )),
@@ -4029,8 +4192,8 @@ impl RemoteDatabase {
                 }
             }
             if drain_failed {
-                // Keep clients, queue buffers, namespace handles and the pool
-                // owned so a later shutdown attempt can retry the drain.
+                // Retain poisoned clients and the pool for recovery. A failed
+                // retirement remains owned by its queue's fail-stop Drop.
                 self.healthy = false;
                 self.concurrent_failure
                     .store(true, std::sync::atomic::Ordering::Release);
@@ -4107,6 +4270,9 @@ struct ReplayPage {
     batches: VecDeque<(CompleteBatch, DurableBatch)>,
     next: Option<usize>,
     last: Option<BatchVersion>,
+    position: Option<StreamPosition>,
+    replayed_end: u64,
+    replay_last: Option<(u64, u32)>,
 }
 
 fn fill_replay_page(
@@ -4117,25 +4283,77 @@ fn fill_replay_page(
     cursor: usize,
     limit: usize,
 ) -> Result<(), LocalDbError> {
+    let replay = state.position.as_ref();
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
-    let page = if client.live_nvme_configured() {
-        client.recover_live_page(authority_epoch, epoch, cursor, limit)
+    let live = client.live_nvme_configured();
+    #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+    let live = false;
+    let mut page = if let Some(position) = replay {
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if live {
+            client.replay_live_wal_page(
+                authority_epoch,
+                epoch,
+                cursor as u64,
+                limit,
+                position.durable_end,
+            )
+        } else {
+            client.replay_wal_page(
+                authority_epoch,
+                epoch,
+                cursor as u64,
+                limit,
+                position.durable_end,
+            )
+        }
+        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+        client.replay_wal_page(
+            authority_epoch,
+            epoch,
+            cursor as u64,
+            limit,
+            position.durable_end,
+        )
     } else {
-        client.recovery_page(epoch, cursor, limit)
+        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+        if live {
+            client.recover_live_page(authority_epoch, epoch, cursor, limit)
+        } else {
+            client.recovery_page(epoch, cursor, limit)
+        }
+        #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
+        {
+            let _ = live;
+            client.recovery_page(epoch, cursor, limit)
+        }
     }
     .map_err(LocalDbError::component)?;
-    #[cfg(not(all(feature = "experimental-nvmeof", target_os = "linux")))]
-    let page = {
-        let _ = authority_epoch;
-        client
-            .recovery_page(epoch, cursor, limit)
-            .map_err(LocalDbError::component)?
-    };
     let end = cursor
         .checked_add(page.batches.len())
         .ok_or_else(|| LocalDbError::new("recovery cursor overflow"))?;
-    if page.batches.len() > limit || page.next.is_some_and(|next| next != end || next <= cursor) {
+    if page.batches.len() > limit
+        || page
+            .next
+            .is_some_and(|next| next <= cursor || (replay.is_none() && next != end))
+    {
         return Err(LocalDbError::new("invalid bounded recovery page"));
+    }
+    if let Some(position) = replay {
+        if let Some((_, receipt)) = page.batches.last() {
+            state.replay_last = Some((
+                receipt.appended().address().offset,
+                receipt.appended().address().len,
+            ));
+            state.replayed_end = state.replayed_end.max(
+                receipt.appended().address().offset + u64::from(receipt.appended().address().len),
+            );
+        }
+        page.batches.retain(|(_, receipt)| {
+            position
+                .last_offset
+                .is_none_or(|last| receipt.appended().address().offset > last)
+        });
     }
     for (batch, _) in &page.batches {
         if batch.version().epoch != epoch || state.last.is_some_and(|last| last >= batch.version())
@@ -4175,13 +4393,23 @@ fn replay_history(
     shape: &KeyShape,
     index: &mut NativeIndex,
     known: &mut HashMap<BatchId, AppendedBatch>,
-    receipt_history: &ReceiptHistory,
+    receipt_history: &Option<ReceiptHistory>,
+    recent_ids: &HashMap<BatchId, (BatchVersion, super::types::PayloadDigest)>,
     latest: &mut Option<MutationVersion>,
     cursors: &HashMap<(usize, u64), (usize, usize)>,
+    positions: &mut BTreeMap<(u32, u64), StreamPosition>,
     stats: &mut RecoveryStats,
+    #[cfg(test)] interruption: Option<OpenInterruption>,
 ) -> Result<(), LocalDbError> {
     let mut index = index.writer();
-    let page_limit = config.recovery_page_limit()?;
+    let replay = config.history_persistence == HistoryPersistence::WalReplay;
+    let page_limit = if replay {
+        config
+            .recovery_page_limit()?
+            .max(config.storage.group_limits.max_batches as usize)
+    } else {
+        config.recovery_page_limit()?
+    };
     let mut previous = latest.map(|cut| cut.batch);
     for epoch in 1..current_epoch {
         let mut pages = endpoint_map(clients, |node, client| {
@@ -4189,13 +4417,49 @@ fn replay_history(
                 batches: VecDeque::new(),
                 next: None,
                 last: None,
+                position: replay.then(|| {
+                    positions
+                        .get(&(config.endpoints[node].partition, epoch))
+                        .cloned()
+                        .unwrap_or(StreamPosition {
+                            partition: config.endpoints[node].partition,
+                            epoch,
+                            replay_from: 0,
+                            last_offset: None,
+                            durable_end: 0,
+                            complete: false,
+                        })
+                }),
+                replayed_end: 0,
+                replay_last: None,
             };
             let (cursor, retained) = cursors
                 .get(&(node, epoch))
                 .copied()
                 .unwrap_or((0, usize::MAX));
-            if histories[node].contains(&epoch) && cursor != retained {
-                fill_replay_page(client, &mut page, epoch, current_epoch, cursor, page_limit)?;
+            if histories[node].contains(&epoch) {
+                if let Some(position) = &page.position {
+                    if !position.complete {
+                        let mut cursor = usize::try_from(position.replay_from)
+                            .map_err(LocalDbError::component)?;
+                        loop {
+                            fill_replay_page(
+                                client,
+                                &mut page,
+                                epoch,
+                                current_epoch,
+                                cursor,
+                                page_limit,
+                            )?;
+                            if !page.batches.is_empty() || page.next.is_none() {
+                                break;
+                            }
+                            cursor = page.next.unwrap();
+                        }
+                    }
+                } else if cursor != retained {
+                    fill_replay_page(client, &mut page, epoch, current_epoch, cursor, page_limit)?;
+                }
             }
             Ok(page)
         })?;
@@ -4209,7 +4473,13 @@ fn replay_history(
             let (batch, durable) = pages[node].batches.pop_front().unwrap();
             if previous.is_some_and(|old| old >= version)
                 || known.contains_key(&batch.id())
-                || receipt_history.lookup(batch.id())?.is_some()
+                || recent_ids.contains_key(&batch.id())
+                || receipt_history
+                    .as_ref()
+                    .map(|history| history.lookup(batch.id()))
+                    .transpose()?
+                    .flatten()
+                    .is_some()
             {
                 return Err(LocalDbError::new(
                     "duplicate authoritative identity or logical version",
@@ -4239,8 +4509,13 @@ fn replay_history(
             known.insert(batch.id(), durable.appended());
             stats.tail_batches += 1;
             stats.tail_bytes += batch.encoded().len() as u64;
-            if stats.tail_batches > replay_limits.max_batches as u64
-                || stats.tail_bytes > replay_limits.max_encoded_bytes as u64
+            #[cfg(test)]
+            if matches!(interruption, Some(OpenInterruption::DuringReplay)) {
+                return Err(LocalDbError::new("injected interruption during WAL replay"));
+            }
+            if !replay
+                && (stats.tail_batches > replay_limits.max_batches as u64
+                    || stats.tail_bytes > replay_limits.max_encoded_bytes as u64)
             {
                 return Err(LocalDbError::new(
                     "retained tail exceeds committed admission bound",
@@ -4253,8 +4528,11 @@ fn replay_history(
                 // each node retains at most page_limit complete batches in total.
                 let mut streams: Vec<_> = clients.iter_mut().zip(pages.iter_mut()).collect();
                 endpoint_map(&mut streams, |_, (client, page)| {
-                    if page.batches.len() <= page_limit / 2
-                        && let Some(next) = page.next
+                    if (if replay {
+                        page.batches.is_empty()
+                    } else {
+                        page.batches.len() <= page_limit / 2
+                    }) && let Some(next) = page.next
                     {
                         let available = page_limit - page.batches.len();
                         fill_replay_page(client, page, epoch, current_epoch, next, available)?;
@@ -4266,11 +4544,24 @@ fn replay_history(
                 ready.push(Reverse((batch.version(), node)));
             }
         }
+        if replay {
+            for page in pages {
+                if let Some(mut position) = page.position {
+                    if let Some((offset, _)) = page.replay_last {
+                        position.replay_from = offset - offset % config.storage.fragment_bytes;
+                        position.last_offset = Some(offset);
+                    }
+                    position.durable_end = position.durable_end.max(page.replayed_end);
+                    position.complete = true;
+                    positions.insert((position.partition, epoch), position);
+                }
+            }
+        }
     }
     Ok(())
 }
 
-fn encode_checkpoint(image: &CheckpointImage) -> Result<Vec<u8>, LocalDbError> {
+fn encode_checkpoint(image: &impl Serialize) -> Result<Vec<u8>, LocalDbError> {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .with_limit(MAX_CHECKPOINT_METADATA_BYTES)
@@ -4278,7 +4569,7 @@ fn encode_checkpoint(image: &CheckpointImage) -> Result<Vec<u8>, LocalDbError> {
         .map_err(LocalDbError::component)
 }
 
-fn read_checkpoint(path: &Path) -> Result<CheckpointImage, LocalDbError> {
+fn read_checkpoint<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, LocalDbError> {
     let file = File::open(path).map_err(LocalDbError::component)?;
     if file.metadata().map_err(LocalDbError::component)?.len() > MAX_CHECKPOINT_METADATA_BYTES {
         return Err(LocalDbError::new(
@@ -4336,9 +4627,12 @@ fn load_checkpoint(
     histories: &[Vec<u64>],
     authority_epoch: u64,
     index: &mut NativeIndex,
-    receipt_history: &mut ReceiptHistory,
+    receipt_history: &mut Option<ReceiptHistory>,
     latest: &mut Option<MutationVersion>,
     cursors: &mut HashMap<(usize, u64), (usize, usize)>,
+    positions: &mut BTreeMap<(u32, u64), StreamPosition>,
+    recent: &mut VecDeque<RecentReceipt>,
+    recent_ids: &mut HashMap<BatchId, (BatchVersion, super::types::PayloadDigest)>,
     stats: &mut RecoveryStats,
 ) -> Result<(), LocalDbError> {
     let started = Instant::now();
@@ -4362,8 +4656,76 @@ fn load_checkpoint(
             "committed checkpoint metadata digest differs",
         ));
     }
-    let image = read_checkpoint(&metadata_path)?;
-    if image.format != 2
+    let mut header = [0; 4];
+    File::open(&metadata_path)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header))
+        .map_err(LocalDbError::component)?;
+    let format: u32 = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .deserialize(&header)
+        .map_err(LocalDbError::component)?;
+    let replay = config.history_persistence == HistoryPersistence::WalReplay;
+    if format != if replay { 3 } else { 2 } {
+        return Err(LocalDbError::new(
+            "checkpoint image format differs from the history persistence",
+        ));
+    }
+    let image: CheckpointImage = if replay {
+        let image: CheckpointImageV3 = read_checkpoint(&metadata_path)?;
+        for position in image.positions {
+            if !config.storage.partitions.contains(&position.partition)
+                || !histories[config
+                    .endpoints
+                    .iter()
+                    .position(|endpoint| endpoint.partition == position.partition)
+                    .unwrap()]
+                .contains(&position.epoch)
+                || position.epoch > commit.epoch
+                || position.replay_from % config.storage.fragment_bytes != 0
+                || position.last_offset.is_some_and(|offset| {
+                    offset < position.replay_from || offset >= position.durable_end
+                })
+                || positions
+                    .insert((position.partition, position.epoch), position)
+                    .is_some()
+            {
+                return Err(LocalDbError::new("invalid checkpoint WAL position"));
+            }
+        }
+        if image.recent.len() > WAL_REPLAY_WINDOW_BATCHES {
+            return Err(LocalDbError::new("checkpoint retry window exceeds bound"));
+        }
+        for receipt in image.recent {
+            if receipt.id.database != config.storage.database
+                || image.cut.is_none_or(|cut| receipt.version > cut.batch)
+                || recent
+                    .back()
+                    .is_some_and(|last| last.version >= receipt.version)
+                || recent_ids
+                    .insert(receipt.id, (receipt.version, receipt.digest))
+                    .is_some()
+            {
+                return Err(LocalDbError::new("invalid checkpoint retry identity"));
+            }
+            recent.push_back(receipt);
+        }
+        CheckpointImage {
+            format: 3,
+            database: image.database,
+            shape_yaml: image.shape_yaml,
+            authority_epoch: image.authority_epoch,
+            generation: image.generation,
+            cut: image.cut,
+            published_next: image.published_next,
+            index_bytes: image.index_bytes,
+            index_digest: image.index_digest,
+            streams: Vec::new(),
+            history_root: None,
+        }
+    } else {
+        read_checkpoint(&metadata_path)?
+    };
+    if image.format != format
         || image.database != config.storage.database
         || image.shape_yaml != manifest.shape_yaml
         || image.authority_epoch != commit.epoch
@@ -4408,6 +4770,15 @@ fn load_checkpoint(
     }
     stats.checkpoint_load_ns = elapsed(started);
     let started = Instant::now();
+    if replay {
+        *index = restored;
+        *latest = image.cut;
+        stats.checkpoint_loaded = true;
+        return Ok(());
+    }
+    let receipt_history = receipt_history
+        .as_mut()
+        .expect("legacy history selected at open");
     receipt_history.root = image.history_root;
     let mut streams: BTreeMap<_, _> = BTreeMap::new();
     for stream in image.streams {
@@ -4719,6 +5090,7 @@ enum Command {
         usize,
         Reply<super::tcp::checkpoint::CheckpointProof>,
     ),
+    CheckpointPosition(u64, u64, u64, Reply<CheckpointPositionProof>),
     Stats(Reply<PartitionStats>),
     Seal(u64, Reply<()>),
     ArmProfile(usize, Reply<()>),
@@ -4849,7 +5221,46 @@ impl ClientWorker {
                     usize,
                     Reply<super::tcp::checkpoint::CheckpointProof>,
                 )> = None;
+                let mut position: Option<(u64, u64, Reply<CheckpointPositionProof>)> = None;
                 let mut disconnected = false;
+                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                let mut leased_members = Vec::new();
+                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                let prepare_leased_command = |client: &mut Client, command: &Command| {
+                    if !client.live_leased_mode() {
+                        return true;
+                    }
+                    // Acquire observes a fatal checkpoint or another owner's
+                    // failure immediately before dispatching another command.
+                    if failure.load(std::sync::atomic::Ordering::Acquire) {
+                        client.record_live_write_error();
+                        return false;
+                    }
+                    let result = match command {
+                        Command::Checkpoint(..) => client.settle_leased_extent(),
+                        Command::CheckpointPosition(..) => client.wait_leased_control(),
+                        Command::Seal(..) | Command::Control(_) => client.close_leased_extent(),
+                        Command::Stats(_) | Command::ArmProfile(..) | Command::FinishProfile(_) => {
+                            client.wait_leased_control()
+                        }
+                        Command::Append(..) => Ok(()),
+                    };
+                    if let Err(error) = result {
+                        client.record_live_write_error();
+                        record_first_failure(
+                            &first_failure,
+                            Some(partition),
+                            None,
+                            "leased_command",
+                            &error,
+                        );
+                        // Release publishes the failure before any queued command runs.
+                        failure.store(true, std::sync::atomic::Ordering::Release);
+                        let _ = wake.try_send(());
+                        return false;
+                    }
+                    true
+                };
                 loop {
                     let mut client = worker_client.lock();
                     while !disconnected && queued.len() < queue_capacity {
@@ -4860,6 +5271,72 @@ impl ClientWorker {
                             }
                             Err(mpsc::TryRecvError::Empty) => break,
                             Err(mpsc::TryRecvError::Disconnected) => disconnected = true,
+                        }
+                    }
+                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                    if client.live_leased_mode() {
+                        // Acquire observes authority failure before another control
+                        // exchange or write can be admitted by this worker.
+                        if failure.load(std::sync::atomic::Ordering::Acquire) {
+                            client.record_live_write_error();
+                            break;
+                        }
+                        let result = (|| {
+                            if client.leased_adoption_pending() {
+                                client.progress_appends()?;
+                                client.harvest_leased_adoption()?;
+                            }
+                            if appends.is_empty()
+                                && checkpoint.is_none()
+                                && position.is_none()
+                                && matches!(queued.front(), Some(Command::Append(..)) | None)
+                            {
+                                client.submit_leased_adoption()?;
+                            }
+                            Ok::<(), super::tcp::TcpError>(())
+                        })();
+                        if let Err(error) = result {
+                            client.record_live_write_error();
+                            record_first_failure(
+                                &first_failure,
+                                Some(partition),
+                                None,
+                                "leased_adoption",
+                                &error,
+                            );
+                            // Release publishes the fatal outcome to the authority.
+                            failure.store(true, std::sync::atomic::Ordering::Release);
+                            let _ = wake.try_send(());
+                            break;
+                        }
+                        if checkpoint.is_none()
+                            && position.is_none()
+                            && client.leased_adoption_pending()
+                            && !matches!(queued.front(), Some(Command::Append(..)))
+                        {
+                            // The control slot progresses only on this thread. Do
+                            // not park forever on the command channel or spin on
+                            // an adoption: wake within 1 ms to drive its deadline.
+                            #[cfg(test)]
+                            if !queued.is_empty() {
+                                client.leased_test_note_command_adoption_wait();
+                            }
+                            drop(client);
+                            if disconnected || queued.len() == queue_capacity {
+                                // Keep the bounded FIFO intact while a command
+                                // waits for the adoption slot, without a CQ spin.
+                                thread::park_timeout(Duration::from_millis(1));
+                                continue;
+                            }
+                            match receiver.recv_timeout(Duration::from_millis(1)) {
+                                Ok(command) => {
+                                    trace_worker_dequeue(&write_timeline, partition, &command);
+                                    queued.push_back(command);
+                                }
+                                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                                Err(mpsc::RecvTimeoutError::Disconnected) => disconnected = true,
+                            }
+                            continue;
                         }
                     }
 
@@ -4887,6 +5364,8 @@ impl ClientWorker {
                     if client.live_nvme_configured()
                         && appends.is_empty()
                         && checkpoint.is_none()
+                        && (position.is_none()
+                            || (client.live_leased_mode() && !client.leased_append_needs_control()))
                         && let Some(Command::Append(epoch, _, _)) = queued.front()
                     {
                         let epoch = *epoch;
@@ -4916,28 +5395,51 @@ impl ClientWorker {
                                 None => break,
                             }
                         }
-                        let mut merged = Vec::with_capacity(count.max(1));
+                        let leased = client.live_leased_mode();
+                        let mut merged = if leased {
+                            Vec::new()
+                        } else {
+                            Vec::with_capacity(count.max(1))
+                        };
                         let mut members: Vec<(BatchVersion, usize, Reply<Vec<DurableBatch>>)> =
-                            Vec::with_capacity(take);
+                            if leased {
+                                std::mem::take(&mut leased_members)
+                            } else {
+                                Vec::with_capacity(take)
+                            };
                         for _ in 0..take {
                             let Some(Command::Append(_, batches, reply)) = queued.pop_front()
                             else {
                                 unreachable!("append queue front changed");
                             };
                             members.push((batches[0].version(), batches.len(), reply));
-                            merged.extend(batches);
+                            if leased && merged.is_empty() {
+                                // Transfer the first command's allocation with its batches.
+                                merged = batches;
+                            } else {
+                                merged.extend(batches);
+                            }
                         }
                         let first = members[0].0;
-                        let result =
-                            client.write_live_group(epoch, &merged, &write_timeline, partition);
+                        let result = if leased {
+                            client.write_leased_group(epoch, merged, &write_timeline, partition)
+                        } else {
+                            client.write_live_group(epoch, &merged, &write_timeline, partition)
+                        };
                         let failed = result.is_err();
                         match result {
                             Ok(receipts) => {
-                                let mut receipts = receipts.into_iter();
-                                for (_, len, reply) in members {
-                                    let own: Vec<DurableBatch> =
-                                        receipts.by_ref().take(len).collect();
-                                    let _ = reply.send(Ok(own));
+                                if leased && members.len() == 1 {
+                                    if let Some((_, _, reply)) = members.pop() {
+                                        let _ = reply.send(Ok(receipts));
+                                    }
+                                } else {
+                                    let mut receipts = receipts.into_iter();
+                                    for (_, len, reply) in members.drain(..) {
+                                        let own: Vec<DurableBatch> =
+                                            receipts.by_ref().take(len).collect();
+                                        let _ = reply.send(Ok(own));
+                                    }
                                 }
                             }
                             Err(error) => {
@@ -4950,16 +5452,40 @@ impl ClientWorker {
                                     &error,
                                 );
                                 failure.store(true, std::sync::atomic::Ordering::Release);
-                                for (version, _, reply) in members {
+                                for (version, _, reply) in members.drain(..) {
                                     let _ = reply.send(Err(LocalDbError::unknown(version, &error)));
                                 }
                             }
+                        }
+                        if leased {
+                            leased_members = members;
                         }
                         let _ = wake.try_send(());
                         if failed {
                             break;
                         }
-                        continue;
+                        if client.live_leased_mode()
+                            && position.is_none()
+                            && let Err(error) = client.submit_leased_adoption()
+                        {
+                            client.record_live_write_error();
+                            record_first_failure(
+                                &first_failure,
+                                Some(partition),
+                                Some(first),
+                                "leased_adoption_submit",
+                                &error,
+                            );
+                            // Release publishes the fatal outcome to the authority.
+                            failure.store(true, std::sync::atomic::Ordering::Release);
+                            let _ = wake.try_send(());
+                            break;
+                        }
+                        // While a proof is pending, also drive its reply/deadline
+                        // after each direct frame. A full append FIFO cannot starve it.
+                        if position.is_none() {
+                            continue;
+                        }
                     }
 
                     let mut progressed = false;
@@ -4975,6 +5501,7 @@ impl ClientWorker {
                             && !profile_attempted
                             && appends.is_empty()
                             && checkpoint.is_none()
+                            && position.is_none()
                         {
                             profile_attempted = true;
                             match client.connection_profile(true, false) {
@@ -5029,9 +5556,16 @@ impl ClientWorker {
                         }
                     }
                     if checkpoint.is_none()
+                        && position.is_none()
                         && let Some(Command::Checkpoint(authority, epoch, prefix, _)) =
                             queued.front()
                     {
+                        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                        if let Some(command) = queued.front()
+                            && !prepare_leased_command(&mut client, command)
+                        {
+                            break;
+                        }
                         let deadline = *checkpoint_admission_deadline
                             .get_or_insert_with(|| client.checkpoint_deadline());
                         match client.submit_checkpoint(*authority, *epoch, *prefix, deadline) {
@@ -5089,6 +5623,74 @@ impl ClientWorker {
                         }
                     }
 
+                    if checkpoint.is_none()
+                        && position.is_none()
+                        && let Some(Command::CheckpointPosition(authority, epoch, through, _)) =
+                            queued.front()
+                    {
+                        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                        if let Some(command) = queued.front()
+                            && !prepare_leased_command(&mut client, command)
+                        {
+                            break;
+                        }
+                        let deadline = *checkpoint_admission_deadline
+                            .get_or_insert_with(|| client.checkpoint_deadline());
+                        match client
+                            .submit_checkpoint_position(*authority, *epoch, *through, deadline)
+                        {
+                            Ok(true) => {
+                                let Some(Command::CheckpointPosition(_, epoch, through, reply)) =
+                                    queued.pop_front()
+                                else {
+                                    unreachable!()
+                                };
+                                write_timeline.checkpoint(
+                                    "control_submit",
+                                    Some(partition),
+                                    epoch,
+                                    None,
+                                );
+                                checkpoint_admission_deadline = None;
+                                if checkpoint_samples < write_profile_limit {
+                                    checkpoint_samples += 1;
+                                    checkpoint_started = Some(Instant::now());
+                                    let mut profile = write_profile.lock();
+                                    profile.checkpoint_requests += 1;
+                                    profile.checkpoint_admission_stalls = profile
+                                        .checkpoint_admission_stalls
+                                        .saturating_add(checkpoint_stalls);
+                                }
+                                checkpoint_stalls = 0;
+                                position = Some((epoch, through, reply));
+                                progressed = true;
+                            }
+                            Ok(false) => {
+                                if checkpoint_samples < write_profile_limit {
+                                    checkpoint_stalls = checkpoint_stalls.saturating_add(1);
+                                }
+                            }
+                            Err(error) => {
+                                let Some(Command::CheckpointPosition(_, _, _, reply)) =
+                                    queued.pop_front()
+                                else {
+                                    unreachable!()
+                                };
+                                checkpoint_admission_deadline = None;
+                                record_first_failure(
+                                    &first_failure,
+                                    Some(partition),
+                                    None,
+                                    "checkpoint_position_submit",
+                                    &error,
+                                );
+                                failure.store(true, std::sync::atomic::Ordering::Release);
+                                let _ = reply.send(Err(LocalDbError::component(error)));
+                                let _ = wake.try_send(());
+                                progressed = true;
+                            }
+                        }
+                    }
                     if !appends.is_empty() || client.has_pending_io() {
                         match client.progress_appends() {
                             Ok(completions) => {
@@ -5134,6 +5736,43 @@ impl ClientWorker {
                                             ));
                                         }
                                     }
+                                }
+                                if let Some((epoch, through, _)) = position.as_ref()
+                                    && let Some(result) =
+                                        client.take_checkpoint_position(*epoch, *through)
+                                {
+                                    write_timeline.checkpoint(
+                                        "control_retire",
+                                        Some(partition),
+                                        *epoch,
+                                        None,
+                                    );
+                                    if let Some(started) = checkpoint_started.take() {
+                                        let mut profile = write_profile.lock();
+                                        profile.checkpoint_completed += 1;
+                                        profile.checkpoint_wait_ns = profile
+                                            .checkpoint_wait_ns
+                                            .saturating_add(elapsed(started));
+                                        profile.checkpoint_append_completions = profile
+                                            .checkpoint_append_completions
+                                            .saturating_add(checkpoint_append_completions);
+                                        checkpoint_append_completions = 0;
+                                    }
+                                    let (_, _, reply) = position.take().expect("position exists");
+                                    let result = result.map_err(LocalDbError::component);
+                                    if let Err(error) = &result {
+                                        record_first_failure(
+                                            &first_failure,
+                                            Some(partition),
+                                            None,
+                                            "checkpoint_position_completion",
+                                            error,
+                                        );
+                                        failure.store(true, std::sync::atomic::Ordering::Release);
+                                    }
+                                    let _ = reply.send(result);
+                                    let _ = wake.try_send(());
+                                    progressed = true;
                                 }
                                 if let Some((epoch, prefix, _)) = checkpoint.as_ref()
                                     && let Some(result) = client.take_checkpoint(*epoch, *prefix)
@@ -5200,6 +5839,10 @@ impl ClientWorker {
                                     let _ = reply.send(Err(LocalDbError::new(error.to_string())));
                                     let _ = wake.try_send(());
                                 }
+                                if let Some((_, _, reply)) = position.take() {
+                                    let _ = reply.send(Err(LocalDbError::new(error.to_string())));
+                                    let _ = wake.try_send(());
+                                }
                                 let message = error.to_string();
                                 for command in queued.drain(..) {
                                     match command {
@@ -5210,6 +5853,9 @@ impl ClientWorker {
                                             let _ = wake.try_send(());
                                         }
                                         Command::Stats(reply) => {
+                                            let _ = reply.send(Err(LocalDbError::new(&message)));
+                                        }
+                                        Command::CheckpointPosition(_, _, _, reply) => {
                                             let _ = reply.send(Err(LocalDbError::new(&message)));
                                         }
                                         Command::Checkpoint(_, _, _, reply) => {
@@ -5227,11 +5873,21 @@ impl ClientWorker {
                             }
                         }
                     }
+                    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                    // Acquire observes checkpoint submission/completion failure in
+                    // this pass before profile control, queued commands or close.
+                    if client.live_leased_mode()
+                        && failure.load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        client.record_live_write_error();
+                        break;
+                    }
 
                     if profile_enabled
                         && profile_requests >= write_profile_limit
                         && appends.is_empty()
                         && checkpoint.is_none()
+                        && position.is_none()
                     {
                         match client.connection_profile(false, false) {
                             Ok(profile) => capture_write_profile(&write_profile, profile),
@@ -5241,13 +5897,19 @@ impl ClientWorker {
                         progressed = true;
                     }
 
-                    if appends.is_empty() && checkpoint.is_none() {
+                    if appends.is_empty() && checkpoint.is_none() && position.is_none() {
                         match queued.front() {
                             Some(Command::Stats(_))
                             | Some(Command::Seal(_, _))
                             | Some(Command::ArmProfile(_, _))
                             | Some(Command::FinishProfile(_))
                             | Some(Command::Control(_)) => {
+                                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                                if let Some(command) = queued.front()
+                                    && !prepare_leased_command(&mut client, command)
+                                {
+                                    break;
+                                }
                                 match queued.pop_front().expect("front control exists") {
                                     Command::Control(operation) => operation(&mut client),
                                     Command::Stats(reply) => {
@@ -5299,7 +5961,9 @@ impl ClientWorker {
                                         };
                                         let _ = reply.send(result);
                                     }
-                                    Command::Append(..) | Command::Checkpoint(..) => unreachable!(),
+                                    Command::Append(..)
+                                    | Command::Checkpoint(..)
+                                    | Command::CheckpointPosition(..) => unreachable!(),
                                 }
                                 progressed = true;
                             }
@@ -5310,7 +5974,24 @@ impl ClientWorker {
                         && queued.is_empty()
                         && appends.is_empty()
                         && checkpoint.is_none()
+                        && position.is_none()
                     {
+                        #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                        if client.live_leased_mode()
+                            && let Err(error) = client.close_leased_extent()
+                        {
+                            client.record_live_write_error();
+                            record_first_failure(
+                                &first_failure,
+                                Some(partition),
+                                None,
+                                "leased_close",
+                                &error,
+                            );
+                            // Release publishes the fatal outcome to the authority.
+                            failure.store(true, std::sync::atomic::Ordering::Release);
+                            let _ = wake.try_send(());
+                        }
                         break;
                     }
                     drop(client);
@@ -5318,7 +5999,28 @@ impl ClientWorker {
                         thread::yield_now();
                     }
                 }
-                if profile_enabled {
+                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                {
+                    // Take only ownership under the lock. Terminal DMA drain
+                    // stays on this worker, outside the mutex needed by shutdown.
+                    let failed_writer = worker_client.lock().take_failed_live_writer();
+                    if let Some(mut writer) = failed_writer
+                        && let Err(error) = writer.drain_failed()
+                    {
+                        record_first_failure(
+                            &first_failure,
+                            Some(partition),
+                            None,
+                            "leased_drain",
+                            &error,
+                        );
+                        // Release publishes drain failure without returning DMA.
+                        failure.store(true, std::sync::atomic::Ordering::Release);
+                        let _ = wake.try_send(());
+                    }
+                }
+                // Acquire keeps profile control off a failed authority.
+                if profile_enabled && !failure.load(std::sync::atomic::Ordering::Acquire) {
                     let mut client = worker_client.lock();
                     match client.connection_profile(false, false) {
                         Ok(profile) => capture_write_profile(&write_profile, profile),
@@ -5405,8 +6107,15 @@ fn add_tcp_profile(total: &mut super::tcp::TcpReadProfile, next: super::tcp::Tcp
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+mod leased_tests;
+#[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
+mod live_bench_tests;
+
 #[cfg(test)]
 mod pipeline_tests;
 
 #[cfg(test)]
 mod lifecycle_tests;
+#[cfg(test)]
+mod wal_replay_tests;

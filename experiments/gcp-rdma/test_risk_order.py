@@ -59,6 +59,41 @@ class RiskOrderTests(unittest.TestCase):
                 self.assertEqual(order['case_ids'], [job['case_id'] for job in jobs])
                 self.assertTrue(risk_order.validate_order(jobs, order))
 
+    def test_fabric_ab_preserves_reviewed_order(self):
+        jobs = risk_order.cloud_campaign.make_focused_matrix('fabric_ab_compact')
+        self.assertEqual(len(jobs), 80)
+        order = risk_order.generate_order(jobs)
+        self.assertEqual(order['case_ids'], [job['case_id'] for job in jobs])
+        self.assertTrue(risk_order.validate_order(jobs, order))
+        order['case_ids'][0], order['case_ids'][1] = order['case_ids'][1], order['case_ids'][0]
+        with self.assertRaisesRegex(ValueError, 'reviewed matrix'):
+            risk_order.validate_order(jobs, order)
+
+    def test_leased_ab_preserves_reviewed_order(self):
+        jobs = risk_order.cloud_campaign.make_focused_matrix('leased_ab_compact')
+        order = risk_order.generate_order(jobs)
+        self.assertEqual(order['case_ids'], [job['case_id'] for job in jobs])
+        order['case_ids'][0], order['case_ids'][1] = order['case_ids'][1], order['case_ids'][0]
+        with self.assertRaisesRegex(ValueError, 'reviewed matrix'):
+            risk_order.validate_order(jobs, order)
+    def test_nvmeof_path_preserves_canaries_and_group_order(self):
+        for selection in risk_order.cloud_campaign.NVMEOF_PATH_SELECTIONS:
+            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37}[selection]
+            with self.subTest(selection=selection):
+                jobs = risk_order.cloud_campaign.make_focused_matrix(selection)
+                self.assertEqual(len(jobs), expected_count)
+                original = [job['case_id'] for job in jobs]
+                order = risk_order.generate_order(jobs)
+                self.assertEqual(order['case_ids'][:12], original[:12])
+                self.assertEqual(order['case_ids'], original)
+                for left, right in ((0, 1), (12, 13), (len(jobs) - 2, len(jobs) - 1)):
+                    changed = dict(order, case_ids=list(original))
+                    changed['case_ids'][left], changed['case_ids'][right] = (
+                        changed['case_ids'][right], changed['case_ids'][left])
+                    with self.subTest(left=left, right=right), self.assertRaisesRegex(ValueError, 'reviewed matrix'):
+                        risk_order.validate_order(jobs, changed)
+
+
     def test_fair_native_canary_cannot_move(self):
         for selection in ('fair_native', 'parity'):
             jobs = risk_order.cloud_campaign.make_focused_matrix(selection)

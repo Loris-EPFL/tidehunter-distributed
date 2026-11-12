@@ -1,0 +1,16 @@
+\small\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrr}\toprule
+System call; one selected repetition & Records & Mean \us & p50 \us & p99 \us\\\midrule
+owner0 overwrite floor, 64 KiB c1 & \N{Q:run8-sync_step:6:n} & \N{Q:run8-sync_step:6:mean_us} & \N{Q:run8-sync_step:6:p50_us} & \N{Q:run8-sync_step:6:p99_us}\\
+owner0 overwrite floor, 1 KiB c1 & \N{Q:run8-sync_step:7:n} & \N{Q:run8-sync_step:7:mean_us} & \N{Q:run8-sync_step:7:p50_us} & \N{Q:run8-sync_step:7:p99_us}\\
+owner0 overwrite floor, 8 KiB c1 & \N{Q:run8-sync_step:8:n} & \N{Q:run8-sync_step:8:mean_us} & \N{Q:run8-sync_step:8:p50_us} & \N{Q:run8-sync_step:8:p99_us}\\
+owner verbs, 1 KiB c1 & \N{Q:run8-sync_step:12:n} & \N{Q:run8-sync_step:12:mean_us} & \N{Q:run8-sync_step:12:p50_us} & \N{Q:run8-sync_step:12:p99_us}\\
+native, 64 KiB c1 & \N{Q:run8-sync_step:14:n} & \N{Q:run8-sync_step:14:mean_us} & \N{Q:run8-sync_step:14:p50_us} & \N{Q:run8-sync_step:14:p99_us}\\
+owner TCP, 1 KiB c16 & \N{Q:run8-sync_step:15:n} & \N{Q:run8-sync_step:15:mean_us} & \N{Q:run8-sync_step:15:p50_us} & \N{Q:run8-sync_step:15:p99_us}\\
+owner verbs, 1 KiB c16 & \N{Q:run8-sync_step:19:n} & \N{Q:run8-sync_step:19:mean_us} & \N{Q:run8-sync_step:19:p50_us} & \N{Q:run8-sync_step:19:p99_us}\\
+owner TCP, 1 KiB c1 & \N{Q:run8-sync_step:21:n} & \N{Q:run8-sync_step:21:mean_us} & \N{Q:run8-sync_step:21:p50_us} & \N{Q:run8-sync_step:21:p99_us}\\
+owner verbs, 64 KiB c1 & \N{Q:run8-sync_step:23:n} & \N{Q:run8-sync_step:23:mean_us} & \N{Q:run8-sync_step:23:p50_us} & \N{Q:run8-sync_step:23:p99_us}\\
+native, 1 KiB c1 & \N{Q:run8-sync_step:25:n} & \N{Q:run8-sync_step:25:mean_us} & \N{Q:run8-sync_step:25:p50_us} & \N{Q:run8-sync_step:25:p99_us}\\
+native, 1 KiB c16 & \N{Q:run8-sync_step:28:n} & \N{Q:run8-sync_step:28:mean_us} & \N{Q:run8-sync_step:28:p50_us} & \N{Q:run8-sync_step:28:p99_us}\\
+owner TCP, 64 KiB c1 & \N{Q:run8-sync_step:29:n} & \N{Q:run8-sync_step:29:mean_us} & \N{Q:run8-sync_step:29:p50_us} & \N{Q:run8-sync_step:29:p99_us}\\
+\bottomrule\end{tabular}

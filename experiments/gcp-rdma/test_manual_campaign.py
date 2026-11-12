@@ -3,6 +3,7 @@ from collections import Counter
 import copy
 from decimal import Decimal
 import hashlib
+import http.client
 import json
 import shutil
 import ssl
@@ -103,6 +104,22 @@ def publish_export(store, state, status='incomplete'):
 
 
 class ManualCampaignTest(unittest.TestCase):
+    def test_nvmeof_path_reviewed_spec_is_bounded(self):
+        for selection in manual.NVMEOF_PATH_SELECTIONS:
+            expected_count = {'nvmeof_path_compact': 157, 'nvmeof_path_core': 66, 'nvmeof_path_fix': 37}[selection]
+            with self.subTest(selection=selection):
+                spec = manual.REVIEWED_SPECS[selection]
+                self.assertEqual(spec['max_cases'], expected_count)
+                self.assertEqual(spec['backends'],
+                                 ['native', 'tidehunter_verbs_native', 'tidehunter_nvme_rdma'])
+                self.assertFalse(spec['spdk_comparison'])
+                self.assertEqual(spec['matrix_sha256'], manual.FOCUSED_MATRIX_SHA256[selection])
+                self.assertEqual(spec['matrix_sha256'], {
+                    'nvmeof_path_compact': '8da5d9479b5fc470ff90c21211b3c3510a66d15bd3f03e520c9eefe38b7b2036',
+                    'nvmeof_path_core': 'f286ce6c7255d21f98c9cef8b334b3d6540b1cc84005bc265e0f39751225ff55',
+                    'nvmeof_path_fix': 'aa94a3842d196bd9cdb486b0c746e9939455b25d4d152e8127c1aba51f9ef606',
+                }[selection])
+
     def test_state_save_retries_transient_with_original_generation(self):
         for status in (429, 500, 502, 503, 504):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
@@ -960,6 +977,11 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
                             raise urllib.error.URLError(TimeoutError('GET timed out'))
                         except urllib.error.URLError as cause:
                             raise ApiError(None, 'GET timed out') from cause
+                    if self.error_kind == 'disconnect':
+                        try:
+                            raise http.client.RemoteDisconnected('Remote end closed connection without response')
+                        except ConnectionError as cause:
+                            raise ApiError(None, 'closed') from cause
                     if self.error_kind == 'certificate':
                         try:
                             raise urllib.error.URLError(ssl.SSLCertVerificationError('untrusted certificate'))
@@ -980,7 +1002,7 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
                   'internal_ip': '10.0.0.' + str(i + 1), 'rdma_ip': '10.1.0.' + str(i + 1)}
                  for i in range(6)]
         for error_kind, deadline_expired in (('token', False), ('token', True),
-                                             ('network', False), ('network', True),
+                                             ('network', False), ('network', True), ('disconnect', False),
                                              ('permission', False), ('no_cause', False),
                                              ('certificate', False)):
             with self.subTest(error_kind=error_kind, deadline_expired=deadline_expired), tempfile.TemporaryDirectory() as tmp:
@@ -1809,6 +1831,304 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue((root / 'out/results/controller.tar.gz').exists())
             self.assertTrue(json.loads((root / 'out/state.json').read_text())['cleanup_verified'])
             self.assertIsNone(gcp_lease.read(store))
+
+
+
+
+class ManualSuiTests(unittest.TestCase):
+    def setUp(self):
+        import manual_sui
+        self.sui = manual_sui
+        self.spec = copy.deepcopy(manual_sui.REVIEWED_SUI_SPECS['sui_nvmeof_compact'])
+
+    def test_reviewed_sui_exact_and_each_field_mutation(self):
+        self.assertEqual(manual._reviewed_jobs(self.spec), [])
+        manual._check_config(CONFIG, self.spec, 0)
+        self.assertTrue(self.sui.focused_qualification(self.spec))
+        self.assertEqual(manual._qualify_observer('/unused', self.spec),
+                         {'skipped': 'sui suite has no KV matrix'})
+        for key in self.spec:
+            changed = copy.deepcopy(self.spec)
+            changed[key] = None
+            with self.subTest(key=key):
+                self.assertFalse(self.sui.reviewed_sui_spec(changed))
+                with self.assertRaises(ValueError):
+                    manual._reviewed_jobs(changed)
+        for i in range(4):
+            for key in self.spec['sui_cells'][i]:
+                changed = copy.deepcopy(self.spec)
+                changed['sui_cells'][i][key] = 'bad'
+                self.assertFalse(self.sui.reviewed_sui_spec(changed))
+
+    def test_sui_package_requires_archives_revision_digests_and_abi(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'sui'
+            root.mkdir()
+            receipt = dict(sui_sha256=hashlib.sha256(b'sui').hexdigest(),
+                           verification_sha256=hashlib.sha256(b'proof').hexdigest(),
+                           sui_revision=self.sui.SUI_REVISION, sui_abi={'sealed': True})
+            for field in receipt:
+                changed = dict(receipt)
+                changed.pop(field)
+                with self.assertRaisesRegex(ValueError, 'Sui package is missing'):
+                    self.sui.admit_sui_package(tmp, changed)
+            with self.assertRaisesRegex(ValueError, 'Sui package is missing'):
+                self.sui.admit_sui_package(tmp, receipt)
+            (root / 'sui-package.tar.gz').write_bytes(b'sui')
+            (root / 'verification.tar.gz').write_bytes(b'proof')
+            with patch.object(manual.prepare, 'admit_sui_archives', return_value={'sealed': True}):
+                self.sui.admit_sui_package(tmp, receipt)
+                for field, value, error in [('sui_revision', 'bad', 'revision'),
+                        ('sui_sha256', '0'*64, 'digest'), ('sui_abi', {'bad': True}, 'ABI')]:
+                    with self.subTest(field=field), self.assertRaisesRegex(ValueError, error):
+                        self.sui.admit_sui_package(tmp, dict(receipt, **{field: value}))
+
+    def test_stage_sui_three_objects_and_reviewed_runtime_part(self):
+        receipt = dict(archive_path='runtime', sha256='a'*64, sui_archive_path='sui', sui_sha256='b'*64,
+                       verification_archive_path='proof', verification_sha256='c'*64)
+        with patch.object(self.sui.campaign, 'upload_file', return_value='42') as upload, \
+             patch.object(self.sui.campaign, 'file_sha256', return_value=self.sui.FIXTURE_SHA256):
+            package, _ = manual._stage(Store(), 'bucket', {'run_id': 'run'}, receipt,
+                                       spec=self.spec, fixture='fixture')
+        self.assertEqual(upload.call_count, 4)
+        self.assertEqual(package['sui_object_key'], 'runs/run/sui-package.tar')
+        self.assertEqual(self.spec['sui_verification']['generation'], '42')
+        self.assertEqual(self.spec['sui_fixture']['key'], 'runs/run/sui-fixture.tar.gz')
+        self.assertTrue(self.sui.reviewed_sui_spec(self.sui.reviewed_part(self.spec)))
+        self.assertEqual(manual._reviewed_jobs(self.spec), [])
+        with self.assertRaisesRegex(ValueError, 'requires a fixture path'):
+            self.sui.stage_sui(None, '', receipt, None)
+
+    def test_sui_completion_and_terminal_export(self):
+        store = Store()
+        key = 'run/results/sui-results.tar.gz'
+        meta = store.put(key, b'archive')
+        result = dict(sui=dict(complete=True, cells=copy.deepcopy(self.spec['sui_cells'])),
+                      sui_archive=dict(key=key, generation=meta['generation'], sha256=hashlib.sha256(b'archive').hexdigest()))
+        self.assertTrue(self.sui.sui_complete(result, self.spec))
+        self.assertIn(key, manual._terminal_export(store, {'run_id': 'run'}, {}, result=result))
+        for path, value in [('complete', False), ('cells', self.spec['sui_cells'][:-1]),
+                            ('cells', list(reversed(self.spec['sui_cells'])))]:
+            changed = copy.deepcopy(result)
+            changed['sui'][path] = value
+            self.assertFalse(self.sui.sui_complete(changed, self.spec))
+        for field in result['sui_archive']:
+            changed = copy.deepcopy(result)
+            changed['sui_archive'].pop(field)
+            self.assertFalse(self.sui.sui_complete(changed, self.spec))
+            with self.assertRaises(ValueError):
+                self.sui.terminal_export_sui(store, {'run_id': 'run'}, changed)
+        result['sui_archive']['generation'] = '999'
+        with self.assertRaisesRegex(ValueError, 'durably bound'):
+            self.sui.terminal_export_sui(store, {'run_id': 'run'}, result)
+
+    def test_manual_sui_package_uses_focused_build_and_sui_admission(self):
+        verified = dict(source_sha256='a'*64, binary_sha256='b'*64, binary_blake2b512='c'*128,
+                        manifest_sha256='d'*64, abi={}, build_profile='focused')
+        revision = 'e'*40
+        proof = dict(engine_sha=revision, binary_sha256=verified['binary_sha256'],
+                     binary_blake2b512=verified['binary_blake2b512'])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'package'
+            root.mkdir()
+            (root/'bundle.tar.gz').write_bytes(b'archive')
+            (root/'manifest.json').write_text(json.dumps(dict(build_profile='focused',
+                    features=manual.prepare.cloud_package.FOCUSED_FEATURES, files={})))
+            receipt = dict(verified, source_revision=revision, qualification=proof,
+                           sha256=hashlib.sha256(b'archive').hexdigest())
+            (Path(tmp)/'package-receipt.json').write_text(json.dumps(receipt))
+            package = manual.prepare.cloud_package
+            with patch.object(package, 'verify_directory', return_value=verified), \
+                 patch.object(package, 'verify_archive', return_value=verified), \
+                 patch.object(package, 'admit_source', return_value={}), \
+                 patch.object(manual, '_check_snapshot'), \
+                 patch.object(manual.prepare.ci_prepare, 'admit_qualification') as qualification:
+                with self.assertRaisesRegex(ValueError, 'Sui package is missing'):
+                    manual._admit_package(tmp, revision, self.spec)
+                with patch.object(self.sui, 'admit_sui_package') as admit:
+                    manual._admit_package(tmp, revision, self.spec)
+                    admit.assert_called_once()
+                    self.assertTrue(qualification.call_args.kwargs['focused'])
+
+class ManualSuiSuiteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_compact_sui_mailbox_completion_and_incomplete_forms(self):
+        import manual_sui
+        from unittest.mock import Mock
+        spec = copy.deepcopy(manual_sui.REVIEWED_SUI_SPECS['sui_nvmeof_compact'])
+        for form in ('complete', 'flag', 'missing_cell', 'wrong_cell', 'missing_archive'):
+            with self.subTest(form=form), tempfile.TemporaryDirectory() as tmp:
+                store = Store()
+                state = parent()
+                state['policy'] = dict(name='policy', id='1')
+                package = dict(manifest_sha256='d'*64)
+                key = state['run_id'] + '/results/sui-results.tar.gz'
+                meta = store.put(key, b'archive')
+                result = dict(sui=dict(complete=True, cells=copy.deepcopy(spec['sui_cells'])),
+                    sui_archive=dict(key=key, generation=meta['generation'], sha256=hashlib.sha256(b'archive').hexdigest()))
+                if form == 'flag':
+                    result['sui']['complete'] = False
+                elif form == 'missing_cell':
+                    result['sui']['cells'].pop()
+                elif form == 'wrong_cell':
+                    result['sui']['cells'][0]['owner_tier'] = 'synchronous'
+                elif form == 'missing_archive':
+                    result.pop('sui_archive')
+                terminal = dict(exit_code=0, stdout=json.dumps(result))
+                mailbox = Mock()
+                mailbox.wait.return_value = terminal
+                fleet = [dict(name='coordinator', id='1'), dict(name='owner', id='2')]
+                readiness = dict(_reference=dict(object='ready', generation='1', sha256='e'*64))
+                with patch.object(manual.gcp_runtime, 'build_runtime_config', return_value={'package_root': '/package'}), \
+                     patch.object(manual.gcp_runtime, 'RemoteMailbox', return_value=mailbox), \
+                     patch.object(manual.campaign, 'save'), \
+                     patch.object(manual, '_wait_status', return_value=readiness), \
+                     patch.object(manual, '_admit_nvmet_proof'):
+                    if form == 'complete':
+                        observed = await manual._suite(store, CONFIG, state, Path(tmp)/'state.json', fleet,
+                                                       package, spec, tmp, 'irdma0')
+                        self.assertEqual(observed, terminal)
+                        self.assertIn(key, state['terminal_export'])
+                    else:
+                        with self.assertRaises((RuntimeError, BaseExceptionGroup)):
+                            await manual._suite(store, CONFIG, state, Path(tmp)/'state.json', fleet,
+                                                package, spec, tmp, 'irdma0')
+                mailbox.submit.assert_called_once()
+
+    async def test_sui_run_requires_fixture_before_allocation(self):
+        import manual_sui
+        with self.assertRaisesRegex(ValueError, 'Sui suite requires a fixture path'):
+            await manual.run(CONFIG, package_dir='unused', revision='a'*40,
+                spec=manual_sui.REVIEWED_SUI_SPECS['sui_nvmeof_compact'], wheels=[], base_image='unused',
+                base_image_id='1', rdma_device='irdma0', output='unused', execute=None, surcharge_cents=0)
+
+    def test_direct_prepare_admits_reviewed_sui_as_focused(self):
+        import manual_sui
+        with tempfile.TemporaryDirectory() as tmp:
+            spec_path = Path(tmp)/'spec.json'
+            spec_path.write_text(json.dumps(manual_sui.REVIEWED_SUI_SPECS['sui_nvmeof_compact']))
+            with patch.object(manual.prepare, 'checkout'), \
+                 patch.object(manual.prepare.cloud_package, 'inventory', return_value={}), \
+                 patch.object(manual, '_reviewed_jobs', wraps=manual._reviewed_jobs) as reviewed:
+                with self.assertRaisesRegex(ValueError, 'deadline must be'):
+                    manual.prepare.prepare(manual.prepare.ROOT, Path(tmp)/'out', 'a'*40, None, 0,
+                                           spec_path=spec_path)
+                reviewed.assert_called_once_with(manual_sui.REVIEWED_SUI_SPECS['sui_nvmeof_compact'])
+
+
+
+class SuiFailedExportTests(unittest.TestCase):
+    def test_complete_failed_with_object_and_failed_without_object(self):
+        import manual_sui
+        store = Store()
+        state = {'run_id': 'run'}
+        key = 'run/results/sui-results.tar.gz'
+        self.assertEqual(manual._terminal_export(store, state, {}, result={}, require_complete=False), {})
+        with self.assertRaisesRegex(ValueError, 'descriptor invalid'):
+            manual_sui.terminal_export_sui(store, state, {})
+        meta = store.put(key, b'archive')
+        references = manual._terminal_export(store, state, {}, result={}, require_complete=False)
+        self.assertEqual(references[key]['descriptor'], 'object_metadata')
+        result = dict(sui_archive=dict(key=key, generation=meta['generation'],
+                                      sha256=hashlib.sha256(b'archive').hexdigest()))
+        references = manual._terminal_export(store, state, {}, result=result)
+        self.assertEqual(references[key]['descriptor'], 'coordinator')
+        result['sui_archive']['generation'] = '999'
+        with self.assertRaises(ValueError):
+            manual_sui.terminal_export_sui(store, state, result, require_complete=False)
+
+    def test_failed_export_rejects_bad_metadata_and_propagates_access_error(self):
+        import manual_sui
+        from unittest.mock import Mock
+        state = {'run_id': 'run'}
+        head = dict(name='run/results/sui-results.tar.gz', generation='1', size=1, metadata={'sha256': 'a'*64})
+        for field, value in [('generation', 'bad'), ('size', 0), ('size', 4*1024**3+1),
+                             ('metadata', {'sha256': 'bad'})]:
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                manual_sui.terminal_export_sui(Mock(head=Mock(return_value={**head, field:value})),
+                                               state, {}, require_complete=False)
+        with self.assertRaises(ApiError):
+            manual_sui.terminal_export_sui(Mock(head=Mock(side_effect=ApiError(403, 'denied'))),
+                                           state, {}, require_complete=False)
+
+
+
+class SuiRunGateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_forwards_staged_copy_focused_spec_and_both_abis(self):
+        from contextlib import ExitStack
+        from unittest.mock import AsyncMock, Mock
+        import manual_sui
+        spec = copy.deepcopy(manual_sui.REVIEWED_SUI_SPECS['sui_nvmeof_compact'])
+        original = copy.deepcopy(spec)
+        image = 'projects/mysten-research/global/images/base-image'
+        receipt = dict(source_revision='a'*40, source_sha256='b'*64, manifest_sha256='c'*64,
+                       sha256='d'*64, abi={'engine': True}, sui_abi={'sui': True})
+        hosts = [dict(name=f'host-{i}', id=str(i+1), zone='us-central1-a',
+                      internal_ip=f'10.0.0.{i+1}', rdma_ip=f'10.1.0.{i+1}') for i in range(2)]
+        instance = Mock()
+        instance.create_policy = AsyncMock()
+        instance.create_vm = AsyncMock(side_effect=hosts)
+        instance.admit_guests = AsyncMock(return_value=hosts)
+        staged = {}
+        def stage(store, bucket, state, rec, wheels, **kwargs):
+            self.assertIsNot(kwargs['spec'], spec)
+            self.assertEqual(kwargs['fixture'], 'fixture')
+            staged.update(kwargs['spec'])
+            staged['sui_fixture'] = dict(staged['sui_fixture'], key='fixture-key', generation='42')
+            staged['sui_verification'] = dict(key='verification-key', generation='43', sha256='e'*64)
+            kwargs['spec'].update(staged)
+            return receipt, 'f'*64
+        async def status(store, state, name, manifest, **kwargs):
+            return dict(complete=True, cleanup_complete=True, pair=True,
+                _reference=dict(object='status', generation='1', sha256='a'*64),
+                proof=dict(kind='bake-software-diagnostic', source_sha256=receipt['source_sha256'],
+                    manifest_sha256=manifest, preparation_sha256='f'*64, wheel_sha256='a'*64))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root/'spec.json').write_text(json.dumps(spec))
+            def evidence(store, bucket, state, name, output):
+                i = 0 if name == hosts[0]['name'] else 1
+                record = dict(instance_id=hosts[i]['id'], peer_instance_id=hosts[1-i]['id'],
+                              local_rdma=hosts[i]['rdma_ip'], peer=hosts[1-i]['rdma_ip'])
+                path = root/(name+'.json')
+                path.write_text(json.dumps(record))
+                return dict(file=str(path), object=name, generation='1', sha256='a'*64)
+            async def finish(*args):
+                if args[-1] is not None:
+                    raise args[-1]
+            with ExitStack() as stack:
+                patches = [patch.object(manual, '_admit_package', return_value=(receipt,dict(tree_sha256='a'*64,dirty=True))),
+                    patch.object(manual, '_check_snapshot'), patch.object(manual, '_stage', side_effect=stage),
+                    patch.object(manual, '_start_lease'), patch.object(manual, '_lease_owned'),
+                    patch.object(manual, '_gate', return_value='gate'), patch.object(manual, '_release_gate'),
+                    patch.object(manual, '_wait_status', side_effect=status), patch.object(manual, '_evidence', side_effect=evidence),
+                    patch.object(manual, '_admit_nvmet_proof'), patch.object(manual, '_admit_live_pair'),
+                    patch.object(manual, '_admit_boot_images', new_callable=AsyncMock),
+                    patch.object(manual, '_finish_campaign', side_effect=finish),
+                    patch.object(manual.gcp_manual_preflight, 'permission_preflight'),
+                    patch.object(manual.gcp_manual_preflight, 'infrastructure_preflight', new_callable=AsyncMock,
+                                 return_value=dict(id='42',status='READY',selfLink='https://example/'+image)),
+                    patch.object(manual.gcp_budget, 'reserve', return_value={}),
+                    patch.object(manual.gcp_image_receipt, 'make_receipt', return_value={}),
+                    patch.object(manual.gcp_image, 'admit_image', return_value={'qualified': True}),
+                    patch.object(manual.gcp_image, 'admit_nvme_transports'),
+                    patch.object(manual.gcp_image, 'admit_spdk'),
+                    patch('gcp_manual_compute.Compute', return_value=instance)]
+                for item in patches:
+                    stack.enter_context(item)
+                abi = stack.enter_context(patch.object(manual.gcp_image, 'admit_abi'))
+                script = stack.enter_context(patch.object(manual.qualify, 'fleet_startup_script', return_value='script'))
+                suite = stack.enter_context(patch.object(manual, '_suite', new_callable=AsyncMock, return_value={'exit_code':0}))
+                await manual.run(CONFIG, package_dir=root, revision='a'*40, spec=spec,
+                    wheels=[dict(path='wheel',sha256='a'*64)], base_image=image, base_image_id='42',
+                    rdma_device='irdma0', output=root/'out', execute=AsyncMock(return_value={}),
+                    artifacts=Store(), surcharge_cents=0, fixture='fixture')
+                self.assertEqual([call.args[1] for call in abi.call_args_list], [receipt['abi'],receipt['sui_abi']])
+                self.assertEqual(script.call_args.kwargs['qualification_profile'], 'focused')
+                self.assertEqual(script.call_args.kwargs['suite_spec'], original)
+                self.assertEqual(suite.call_args.args[6], staged)
+                self.assertEqual(suite.call_args.args[1]['qualification_profile'], 'focused')
+        self.assertEqual(spec, original)
+        self.assertTrue(manual_sui.reviewed_sui_spec(spec))
 
 
 if __name__ == '__main__':

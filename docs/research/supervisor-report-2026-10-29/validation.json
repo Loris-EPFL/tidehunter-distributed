@@ -1,0 +1,68 @@
+{
+  "schema": 1,
+  "checked_utc": "2026-10-29T13:17:21.769663+00:00",
+  "evidence_cut": "2026-10-29",
+  "pdf_pages": 160,
+  "figure_environments": 104,
+  "cases": 258,
+  "operation_outcome_populations": 453,
+  "clock_summary_rows": 1359,
+  "clock_statistic_cells_verified_against_source_csv": 10872,
+  "case_numeric_fields_verified_against_source_csv": 2838,
+  "numeric_table_mismatches": 0,
+  "compiler": "pdfLaTeX via LaTeX MCP; BibTeX integration; clean source-bundle latexmk verification",
+  "final_compiler_problems": [],
+  "portable_rebuild": {
+    "status": "passed",
+    "offline_figure_regeneration_scripts": [
+      "correct_legacy_figures.py",
+      "report_size_plots.py",
+      "supplemental_charts.py",
+      "historical_plot.py",
+      "generate_ecdf.py"
+    ],
+    "clean_latex_build": "latexmk -pdf -g -interaction=nonstopmode -halt-on-error main.tex",
+    "pdf_pages": 160,
+    "source_main_tex_hash_matches": true,
+    "external_pythonpath_unset": true
+  },
+  "visual_review": {
+    "all_pages_rendered": 160,
+    "all_page_contact_sheets_reviewed": 8,
+    "representative_full_resolution_review": true,
+    "scope": "All-page layout thumbnails plus detailed architecture, comparative-flow, numeric-table and statistical-panel pages; not a line-by-line reading of every rendered numeric row."
+  },
+  "latex_mcp_validator_limitation": "Four data-* references are reported undefined because labels are in included table fragments; actual final compiler logs and aux labels resolve all four. The issue was reported to tool QA.",
+  "archive_initial_crc_check": "passed",
+  "credential_pattern_scan": "No PEM private keys, AWS access-key patterns or presigned signature/token patterns found in bundled textual source/data files. This is a pattern scan, not a comprehensive security audit.",
+  "independent_repetitions": 1,
+  "new_benchmarks_or_aws_resources": false,
+  "runtime_engine_or_sui_code_changed": false,
+  "artifacts": [
+    {
+      "file": "main.tex",
+      "bytes": 91336,
+      "sha256": "5d29679784622edaf18284218f58a153fa0ade5ab3eb8f1de7332e5be5e3fcd2"
+    },
+    {
+      "file": "main.pdf",
+      "bytes": 2378936,
+      "sha256": "bf35d8a9bb35ae6dfcf5d53b058425e8600cf6b4043a4c7a81279d131d9f134a"
+    },
+    {
+      "file": "references.bib",
+      "bytes": 8792,
+      "sha256": "bff8665e14e164ccfb42696cafd5123d477d4de87e90d9aebb232804d62462c7"
+    },
+    {
+      "file": "data/comparison.json",
+      "bytes": 13662168,
+      "sha256": "aa6a0d32a999d2dd1c1a38cc4573c0464a038ec9603a56e4672107e5d03cdfde"
+    },
+    {
+      "file": "data/all-results.csv",
+      "bytes": 413532,
+      "sha256": "c556830d65498424f220c66da9010fbb951f2346880f4923c10e514b8cfe34ea"
+    }
+  ]
+}

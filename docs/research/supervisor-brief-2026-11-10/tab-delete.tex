@@ -1,0 +1,18 @@
+\small\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrr}\toprule
+Component, mean \us & Verbs & TCP & Native\\\midrule
+Owner append-persist (includes software) & \N{C:delv:persist} & \N{C:delt:persist} & \N{C:deln:persist}\\
+Network (stacks, TLS, dispatch included) & \N{C:delv:network} & \N{C:delt:network} & \N{C:deln:network}\\
+Coordinator / native library insert$^{a}$ & \N{C:delv:coordinator} & \N{C:delt:coordinator} & \N{C:deln:coordinator}\\
+Owner software & \N{C:delv:owner} & \N{C:delt:owner} & \N{C:deln:owner}\\
+Durable wait / native file sync$^{a}$ & \N{C:delv:durable} & \N{C:delt:durable} & \N{C:deln:durable}\\
+Waiting and coalescing & \N{C:delv:coalescing} & \N{C:delt:coalescing} & \N{C:deln:coalescing}\\
+Client queueing and wake-up & \N{C:delv:queue} & \N{C:delt:queue} & \N{C:deln:queue}\\
+Residual & \N{C:delv:residual} & \N{C:delt:residual} & \N{C:deln:residual}\\
+Client encode, decode, verify & \N{C:delv:messaging} & \N{C:delt:messaging} & \N{C:deln:messaging}\\
+SSD device & \N{C:delv:device} & \N{C:delt:device} & \N{C:deln:device}\\
+Device + fabric + stack (unsplit) & \N{C:delv:combined} & \N{C:delt:combined} & \N{C:deln:combined}\\
+Owner + network exchange (unsplit) & \N{C:delv:exchange} & \N{C:delt:exchange} & \N{C:deln:exchange}\\
+\textbf{TOTAL: same-case API mean} & \N{D:delv:mean_us} & \N{D:delt:mean_us} & \N{D:deln:mean_us}\\
+API p50 & \N{D:delv:p50_us} & \N{D:delt:p50_us} & \N{D:deln:p50_us}\\
+\bottomrule\end{tabular}

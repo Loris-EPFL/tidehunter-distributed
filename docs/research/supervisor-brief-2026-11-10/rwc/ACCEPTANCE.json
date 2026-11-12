@@ -1,0 +1,54 @@
+{
+  "purpose": "Pre-result run-9 document pipeline validation; all run-9 timings are SYNTHETIC.",
+  "reviewed_matrix_jobs": 342,
+  "full_fixture": {
+    "pass_check": true,
+    "numbers": 417,
+    "tables": 6,
+    "figure_points": 528,
+    "figures": 6,
+    "pages": 48,
+    "synthetic": true,
+    "pdf_sha256": "a5e5a4c75ad1627d7139d3eb959ec26f7936eb7121320c6e030a46976a0ae8fd",
+    "visual_inspection": "separate manual image inspection; not asserted by this checker"
+  },
+  "unavailable_case_fixture": {
+    "pass_check": true,
+    "numbers": 409,
+    "tables": 6,
+    "figure_points": 518,
+    "figures": 6,
+    "pages": 48,
+    "synthetic": true,
+    "pdf_sha256": "eca8dd3d5b2873222e69d9196c1c845564f40d297b7aea5f1116879833cfb3e9",
+    "visual_inspection": "separate manual image inspection; not asserted by this checker"
+  },
+  "final_pdf": "/tmp/rwc-build/main.pdf",
+  "new_section_pages": [
+    10,
+    17
+  ],
+  "compiler": "latexmk -pdf -interaction=nonstopmode -halt-on-error main.tex; pdfLaTeX",
+  "mcp_limit": "LaTeX MCP refuses /tmp/rwc-build outside its workspace; supported latexmk fallback used.",
+  "launch_seal": "No tracked file edited. Real main.tex and inputs.json not patched or registered; integration only in scratch.",
+  "visual_inspection": {
+    "pdf_sha256": "a5e5a4c75ad1627d7139d3eb959ec26f7936eb7121320c6e030a46976a0ae8fd",
+    "inspected": "All six figure PDF images; section layouts, updated opening/method/provenance pages; unqualified ratio and failure heat-table images. Corrected throughput legend explicitly distinguishes Native reads from Native write barriers.",
+    "result": "No overlapping labels observed after layout corrections; units, readable legends, synthetic stamps/watermarks and case/repetition markers checked.",
+    "renders": "rwc/rendered/SYNTHETIC-*.png"
+  },
+  "figure_sha256": {
+    "rwc-SYNTHETIC-write-latency.pdf": "0cde118c6ad0a1fa32f2ab90022d6d8bbd3cf31f97c5d55e0d2e2640ab8addbb",
+    "rwc-SYNTHETIC-read-latency.pdf": "bfd7dc8e8f162900d9a19384127efefa8d1070adb1d1e5abd8f3de9adc1dd876",
+    "rwc-SYNTHETIC-throughput.pdf": "5ccdb73b54b6d323d736580f002dc973452f62a66f9728c7f4708ee89d0be2f0",
+    "rwc-SYNTHETIC-cold-warm.pdf": "36ee56c8e5f61be27a81cc3eb095ddfd973da2a3563bd58a501f1937a456d389",
+    "rwc-SYNTHETIC-floors.pdf": "51014eb0d81ec1f42ed2a35f6a9557e28159927b1cd64f160e3edc56e5448924",
+    "rwc-SYNTHETIC-parity.pdf": "ae4398f245768260d5d239db9d90cb7ac32fff5486f85e2a6191924b3fdab17b"
+  },
+  "remaining_inputs": [
+    "Retrieved real export/comparison report",
+    "Exact launched-package provenance: run id, package hash, revision, dirty flag, launch timestamp and two VM names"
+  ],
+  "runbook": "rwc/RUNBOOK.md",
+  "compiler_evidence": "rwc/acceptance-build-output.txt"
+}

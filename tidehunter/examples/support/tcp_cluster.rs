@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tidehunter::distributed::durability::{DurabilityConfig, DurabilityTier};
 use tidehunter::distributed::local_inventory::LocalInventoryConfig;
 use tidehunter::distributed::remote_db::{RemoteDatabaseConfig, RemoteEndpoint};
+use tidehunter::distributed::storage::HistoryPersistence;
 use tidehunter::distributed::storage::{PartitionConfig, StaticInventory};
 use tidehunter::distributed::tcp::{
     NodeConfig, PollingPolicy, StorageNode, TcpLimits, TlsFiles, Transport,
@@ -195,6 +196,7 @@ pub fn prepare_external_case_with_durability(
             stop_file: node_root.join("stop"),
             drop_first_append_response: false,
             durability,
+            history_persistence: HistoryPersistence::default(),
             launch_nonce: String::new(),
         };
         fs::write(
@@ -225,6 +227,7 @@ pub fn prepare_external_case_with_durability(
         }
     };
     let config = RemoteDatabaseConfig {
+        history_persistence: HistoryPersistence::default(),
         storage,
         endpoints,
         tls: client_tls,
@@ -272,6 +275,8 @@ struct NodeLaunch {
     /// Absent in older launch files: the native tier, the engine default.
     #[serde(default)]
     durability: DurabilityConfig,
+    #[serde(default = "HistoryPersistence::legacy")]
+    history_persistence: HistoryPersistence,
     /// Fresh per start; the owner echoes it in its receipt so a stale receipt is recognizable.
     #[serde(default)]
     launch_nonce: String,
@@ -352,6 +357,8 @@ pub struct OwnerReceipt {
     pub boot_id: String,
     pub started_unix_ns: u64,
     pub durability: ReceiptDurability,
+    #[serde(default = "HistoryPersistence::legacy")]
+    pub history_persistence: HistoryPersistence,
 }
 
 /// Owner receipt from `path`. A missing, unreadable or incomplete file is an error: a tier the
@@ -464,6 +471,7 @@ pub fn maybe_run_storage_node() -> Result<bool> {
     let node = StorageNode::open(config.node, metrics)?;
     // Applied before the listener exists, so no client request can see another tier.
     node.set_durability(config.durability)?;
+    node.set_history_persistence(config.history_persistence)?;
     let effective = node.durability();
     println!("durability_tier={}", effective.tier);
     let history_diagnostics =
@@ -497,6 +505,7 @@ pub fn maybe_run_storage_node() -> Result<bool> {
         boot_id,
         started_unix_ns: u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?,
         durability: ReceiptDurability::of(effective),
+        history_persistence: config.history_persistence,
     };
     publish_synced(
         &durability_file(&config.ready_file),
@@ -904,6 +913,7 @@ impl LoopbackCluster {
                 stop_file: node_data.join("stop"),
                 drop_first_append_response: drop_first_on_partition == Some(partition),
                 durability,
+                history_persistence: HistoryPersistence::default(),
                 launch_nonce: String::new(),
             };
             let mut node = ManagedNode {
@@ -941,6 +951,7 @@ impl LoopbackCluster {
             }
         };
         let config = RemoteDatabaseConfig {
+            history_persistence: HistoryPersistence::default(),
             storage,
             endpoints,
             tls: client_tls,
@@ -1082,8 +1093,8 @@ impl LoopbackCluster {
 #[cfg(test)]
 mod durability_receipt_tests {
     use super::{
-        DurabilityConfig, OwnerReceipt, ReceiptDurability, durability_file, publish_synced,
-        read_owner_receipt,
+        DurabilityConfig, HistoryPersistence, OwnerReceipt, ReceiptDurability, durability_file,
+        publish_synced, read_owner_receipt,
     };
     use tidehunter::distributed::durability::DurabilityTier;
 
@@ -1100,6 +1111,42 @@ mod durability_receipt_tests {
         path
     }
 
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn history_persistence_defaults_preserve_launch_and_receipt_documents() {
+        let mut value = serde_json::to_value(receipt(0, DurabilityTier::Native)).unwrap();
+        assert_eq!(value["history_persistence"], "wal_replay");
+        value.as_object_mut().unwrap().remove("history_persistence");
+        assert_eq!(
+            serde_json::from_value::<OwnerReceipt>(value)
+                .unwrap()
+                .history_persistence,
+            HistoryPersistence::OnDisk
+        );
+        let launch = serde_json::json!({
+            "node": {
+                "root": "/tmp/owner", "shape_yaml": "", "max_epochs": 8,
+                "partition": {
+                    "inventory": { "database": vec![0; 16], "epoch": 1, "segment_generation": 1, "partitions": [0] },
+                    "partition": 0, "batch_limits": { "max_operations": 8, "max_encoded_bytes": 2048 },
+                    "group_limits": { "max_batches": 8, "max_encoded_bytes": 4088 },
+                    "fragment_bytes": 4096, "wal_file_bytes": 8192, "max_batches": 64,
+                    "max_reference_metadata_bytes": 1048576
+                }
+            },
+            "tls": { "transport": { "kind": "tcp" }, "ca": "", "cert": "", "key": "", "server_name": "test" },
+            "limits": super::TcpLimits::default(),
+            "listen": "127.0.0.1:9400", "ready_file": "/tmp/ready", "stop_file": "/tmp/stop",
+            "drop_first_append_response": false
+        });
+        let parsed: super::NodeLaunch = serde_json::from_value(launch).unwrap();
+        assert_eq!(parsed.history_persistence, HistoryPersistence::OnDisk);
+        assert_eq!(
+            serde_json::to_value(parsed).unwrap()["history_persistence"],
+            "on_disk"
+        );
+    }
+
     fn receipt(partition: u32, tier: DurabilityTier) -> OwnerReceipt {
         OwnerReceipt {
             partition,
@@ -1110,6 +1157,7 @@ mod durability_receipt_tests {
             boot_id: "boot".to_owned(),
             started_unix_ns: 5,
             durability: ReceiptDurability::of(DurabilityConfig::with_tier(tier)),
+            history_persistence: HistoryPersistence::default(),
         }
     }
 

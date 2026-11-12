@@ -1,0 +1,14 @@
+case_ids,route,size_bytes,repeat,cold_case_id,resident_case_id,cold_p50_us,resident_p50_us,cold_verdict,resident_verdict,cold_over_resident_p50
+"[""G12D-r0-25b3b0b71b73950ff12b"",""G12D-r0-680caf9e9ea2297754ee""]",owner TCP,65536,0,G12D-r0-25b3b0b71b73950ff12b,G12D-r0-680caf9e9ea2297754ee,207.112,109.187,qualified,qualified,1.8968558528029893
+"[""G12D-r0-321ba7273072eec9f5f4"",""G12D-r0-85bb4645de9ec6ac2c6b""]",owner verbs,1024,0,G12D-r0-321ba7273072eec9f5f4,G12D-r0-85bb4645de9ec6ac2c6b,115.962,37.531,qualified,qualified,3.0897657936106153
+"[""G12D-r0-44955ac13d9c876d7e43"",""G12D-r0-f9afdb4474380265a761""]",owner TCP,1024,0,G12D-r0-44955ac13d9c876d7e43,G12D-r0-f9afdb4474380265a761,142.367,46.471,qualified,qualified,3.063566525359902
+"[""G12D-r0-51ce1f1a650ef6f7cb2a""]",hybrid SPDK,65536,0,G12D-r0-51ce1f1a650ef6f7cb2a,missing,140.648,missing,qualified,missing,missing
+"[""G12D-r0-6c4d9d94da989fe10037""]",hybrid kernel DIRECT,1024,0,G12D-r0-6c4d9d94da989fe10037,missing,120.414,missing,qualified,missing,missing
+"[""G12D-r0-715e771584ac07ecd4dd"",""G12D-r0-85bb4645de9ec6ac2c6b""]",owner verbs,1024,0,G12D-r0-715e771584ac07ecd4dd,G12D-r0-85bb4645de9ec6ac2c6b,124.801,37.531,qualified,qualified,3.325277770376489
+"[""G12D-r0-94efa733eb5acc17b813""]",hybrid SPDK,1024,0,G12D-r0-94efa733eb5acc17b813,missing,114.865,missing,qualified,missing,missing
+"[""G12D-r0-a2dfb7244367ba447ecf"",""G12D-r0-c43d911a13fcb571c6dc""]",tidehunter_verbs,1024,0,G12D-r0-a2dfb7244367ba447ecf,G12D-r0-c43d911a13fcb571c6dc,115.962,37.42,qualified,qualified,3.0989310529128806
+"[""G12D-r0-e5d843928c49911c6e12""]",hybrid kernel DIRECT,1024,0,G12D-r0-e5d843928c49911c6e12,missing,117.714,missing,qualified,missing,missing
+"[""G12D-r0-f3e5e748b856e9aafc6a"",""G12D-r0-f9afdb4474380265a761""]",owner TCP,1024,0,G12D-r0-f3e5e748b856e9aafc6a,G12D-r0-f9afdb4474380265a761,122.55,46.471,qualified,qualified,2.6371285317725035
+"[""G12D-r0-f77fd377f6fb79ae8ec4"",""G12D-r0-ea307ca09176802afb52""]",owner verbs,65536,0,G12D-r0-f77fd377f6fb79ae8ec4,G12D-r0-ea307ca09176802afb52,161.436,68.006,qualified,qualified,2.3738493662323914
+"[""G12D-r0-fdfd5c02439e7284baef""]",hybrid SPDK,1024,0,G12D-r0-fdfd5c02439e7284baef,missing,108.885,missing,qualified,missing,missing
+"[""G12D-r0-ff2dc0eb7327c48c5b06""]",hybrid kernel DIRECT,65536,0,G12D-r0-ff2dc0eb7327c48c5b06,missing,147.333,missing,qualified,missing,missing

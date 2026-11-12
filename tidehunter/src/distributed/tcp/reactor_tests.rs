@@ -4,13 +4,15 @@ use crate::distributed::tcp::reactor::Envelope;
 use std::sync::mpsc;
 
 pub(in crate::distributed::tcp) struct Running {
-    _temp: tempdir::TempDir,
     pub(in crate::distributed::tcp) config: NodeConfig,
     tls: TlsFiles,
     pub(in crate::distributed::tcp) node: Arc<StorageNode>,
     endpoint: String,
     shutdown: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
+    // Fields drop in declaration order. The directory must outlive `node`:
+    // the WAL mapper thread of the node can still create the next WAL file.
+    _temp: tempdir::TempDir,
 }
 impl Running {
     pub(in crate::distributed::tcp) fn new(
@@ -42,7 +44,7 @@ impl Running {
             },
         )
     }
-    fn with_limits(
+    pub(in crate::distributed::tcp) fn with_limits(
         transport: Transport,
         policy: WalMemberReadPolicy,
         bytes: usize,
@@ -1282,6 +1284,10 @@ fn cold_authority_does_not_move_hot_reads_to_the_pool(transport: Transport, fenc
             config.partition.group_limits.max_batches = 1;
         },
     );
+    server
+        .node
+        .set_history_persistence(crate::distributed::storage::HistoryPersistence::OnDisk)
+        .unwrap();
     let mut client = server.client();
     client.fence_to(1).unwrap();
     let batches = [batch(&server.config, 1, 0), batch(&server.config, 1, 1)];
