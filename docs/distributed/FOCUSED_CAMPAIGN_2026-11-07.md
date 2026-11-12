@@ -1260,3 +1260,21 @@ Reads did not change against run 12, as expected: `wal_replay` changes owner his
 Publication of a pre-leased extent on the kernel target; lease-ahead over 18 WAL files (G19X); polled writes on `nvme-rdma`; `CheckpointPosition` under leased writes; owner RPC read from WAL bytes; sealed-dataset export by WAL offset; owner restart with data; coordinator reopen with `ReplayWal`.
 
 Not assessed: owner or coordinator crash on hardware, power loss, connection loss, `ReplayLiveWal` after a coordinator loss with an open extent, more than one owner.
+
+## Sui replay over NVMe-oF (`sui_nvmeof_compact`): launch failed before the suite, no result
+
+Package: revision `0bdcba39`, protocol 25, Sui revision `ef670191`. The local package verification passed (workstation container, software-tcp fabric, `wal_replay`, 1,776 checkpoints: `native` and remote checkpoint digests equal, state audit equal). This is a functional check, not a performance result.
+
+| Step | Result |
+|---|---|
+| First package (revision `3d5c0f79`), local verification | Failed: `fabric control peer closed` at database open. Cause 1 (workstation only): the verification container had the default seccomp profile, which denies `io_uring_setup`; the owner closed the control connection without a message. Cause 2 (product defect, found in the same review): `Request` and `Response` had `test-utils` variants before production variants, so `CheckpointPosition`, `ReplayWal` and `RetireWalFiles` had different tags in the Sui client (no `test-utils`) and in the storage node. Fix: gated variants last, protocol 25, tag test for both feature sets, owner prints the close reason. Commit `0bdcba39` |
+| Launch, fleet `bench-97b6da75196d4a9e`, 20:06:31 to 20:13:55 UTC, at most `$0.79` of compute (estimate) | Pair qualification passed. The launcher then stopped before the suite: `required SONAMEs absent from qualified guest: libstdc++.so.6` (`gcp_image.admit_abi`). Instances, disks and placement policy verified absent |
+
+Cause: the Sui launch path uses the focused package (TideHunter only). The guest proves only the libraries of that package: `libc`, `libm`, `libgcc_s`, `libfabric`, `libibverbs`, `librdmacm`, `libnl`, `libhwloc`. The Sui executables also need `libstdc++.so.6` (RocksDB). No earlier check compares the Sui library list with the list that a focused guest can prove; the 11 launcher gates use synthetic ABI records. The run cannot pass in this form.
+
+Candidate fixes (not done; each needs a new package and a new launch authorization):
+
+1. The guest resolves the Sui library list during qualification (the package carries the list; the guest records path, digest and version definitions of each library) and `admit_abi` uses that proof. Smallest change to the cost of the run.
+2. Use the full package (with Valkey, which links `libstdc++`) and full qualification for the Sui run. No new guest code; longer build and qualification.
+
+Also add a local gate that fails at seal time when the Sui library list is not a subset of the libraries the selected package profile can prove.
