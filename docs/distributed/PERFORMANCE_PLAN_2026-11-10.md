@@ -903,7 +903,7 @@ Goal: puts and reads of the distributed store use NVMe-oF as the data path, with
 
 **Ask before:** a change of the default queue geometry, of the default export mode or of the durability contract.
 
-## Recovery model and stall fixes (implemented 13 November 2026; run 13 pending)
+## Recovery model and stall fixes (implemented 12 November 2026; run 13 on hardware)
 
 Source of each problem: run 12 (`FOCUSED_CAMPAIGN_2026-11-07.md`, "Run 12 results"). Paper: A. Chursin et al., arXiv:2602.01873v2.
 
@@ -919,6 +919,28 @@ Source of each problem: run 12 (`FOCUSED_CAMPAIGN_2026-11-07.md`, "Run 12 result
 Not changed: batch preparation (12.4 µs) stays on the `wal-write-owner` thread, because the member checksum includes the batch version and that thread assigns versions in order.
 
 Rule for the sustained case after run 13: if calls labelled `checkpoint:capture_start`, `checkpoint:freeze` or `checkpoint:live_install_start` hold more than 20% of the time of calls above 5 ms, the capture and install step size goes from 32 to 4. No other change without new evidence.
+
+### Run 13 results (12 November 2026, one fleet, 37 of 37 cases)
+
+Tables and evidence: `FOCUSED_CAMPAIGN_2026-11-07.md`, "Run 13 results".
+
+| Problem | Result | Status |
+|---|---|---|
+| Owner history on the put path | Sustained 200,000 puts, same fleet: `wal_replay` 82,338 puts/s, p99.9 1.37 ms, 16 calls above 5 ms; `on_disk` 9,531 puts/s, p99.9 174.6 ms, 1,824 calls | Confirmed |
+| Checkpoint settle | `CheckpointPosition` ran under leased writes in each case; 2 synchronous adoptions for each case against 99 with `on_disk` | Confirmed |
+| Admission at the replay limit | No admission block seen in 200,000 puts. Recovery time against suffix length was not measured | Partly confirmed |
+| Extent switch | 2 switches cost 0.09 ms with lease-ahead and 35 to 37 ms without it (same fleet). p99 at 64 KiB with 16 writers does not change (2 switches are below 1% of 4,096 calls); throughput +4% to +5% | Confirmed for the switch cost; no p99 effect in this workload |
+| p99 of 17.28 ms at 64 KiB with 16 writers (run 12) | Came from `memory_only`: same-fleet arm 16.9 ms against 3.9 to 4.0 ms with `wal_replay` | Cause corrected |
+| Pauses without attribution | One group remains: the first put after a close (31 to 33 ms). 16 calls overlap the position proof exchange in the 64 KiB timeline case | Open, see below |
+| Polled writes | p50 at 1 KiB with 1 writer 39.6 µs against 46.6 to 46.9 µs. No effect shown at 64 KiB with 16 writers | Confirmed at 1 KiB only (one repetition) |
+
+The step-size rule above did not apply: no slow call has one of the three labels.
+
+Open after run 13:
+
+1. First put after a close: initial lease and pre-lease cost 15 to 24 ms each (`reserve_external`). `wal_replay` adds one close before the first measured put (probable cause: a control command at the measurement gate; not confirmed). Candidate: no close for control commands that do not need it, or pre-lease at close.
+2. The remote small put is 20 to 25 times the `native` p50 (46.6 µs against 1.9 µs) and the 64 KiB put with 16 writers is 11 times. `wal_replay` removed the stalls, not the per-call cost of the network and the device.
+3. Recovery was executed (owner restart with data, coordinator reopen) but not timed. Crash tests on hardware were not done.
 
 ## Regression reference
 Compare each new run against this table and investigate a regression. Match fleet, route, workload, size, concurrency, cache and durability. Fleet-to-fleet spread is about 13%; do not subtract separate fleets.

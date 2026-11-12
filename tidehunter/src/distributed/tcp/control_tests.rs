@@ -1734,11 +1734,11 @@ mod live_fencing {
 }
 
 #[test]
-fn leased_protocol_rejects_the_previous_version() {
+fn protocol_rejects_the_previous_version() {
     let mut preface = std::io::Cursor::new(Vec::new());
     write_transport_mode(&mut preface, &Transport::TcpTrusted).unwrap();
     let mut preface = preface.into_inner();
-    assert_eq!(PROTOCOL, 24);
-    preface[4..6].copy_from_slice(&23u16.to_be_bytes());
+    assert_eq!(PROTOCOL, 25);
+    preface[4..6].copy_from_slice(&24u16.to_be_bytes());
     assert!(read_transport_mode(&mut &preface[..], &Transport::TcpTrusted).is_err());
 }

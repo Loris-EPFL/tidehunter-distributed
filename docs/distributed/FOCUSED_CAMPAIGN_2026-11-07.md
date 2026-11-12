@@ -1173,3 +1173,90 @@ The first 8 cases are canaries: native put, leased 64 KiB put with 16 writers, o
 New evidence per case: owner lease and adoption profiles (`lease_reserve_ns`, `lease_namespace_sync_ns`, `lease_publish_ns`, `adopt_owner_ns`, `adopt_close_scan_ns`), `extent_preleases`, `extent_switch_waits`, and `stalls.csv` (each call above 5 ms labelled `extent_switch`, `checkpoint:<stage>` or `unattributed`; only for cases with a write timeline).
 
 Not possible on the workstation: the publication of a pre-leased extent on the kernel target, polled writes on `nvme-rdma`, `ReplayLiveWal`, and `fdatasync` of a WAL file under concurrent NVMe-oF writes.
+
+### Launch history (12 November 2026, run 13)
+
+| Launch | Stopped at | Cause | Fix |
+|---|---|---|---|
+| Revision `4c7b0ff9`, fleet `bench-5fcb8a94c8184574` | Case 2 of 37 (canary rule), about 9 minutes, at most `$0.89` of compute (estimate) | Harness defect: `observability/campaign_exporter.py` rejected the 10 new live counters (`incomplete live NVMe-oF measurement counters`). The case had completed its 4,096 puts | Counters admitted. The two extent-switch stages admitted in `analyze.admit_write_timeline` (same class of defect, found by review). Commit `7b276de1` |
+| Revision `7b276de1` | Not launched | Review before the launch: `kv-research export-nvmeof-dataset` and `nvmeof-check` listed a sealed owner log by receipt ordinal. `wal_replay` keeps no stable ordinal after an owner restart | Both list by WAL offset in `wal_replay`. Commit `3d5c0f79` |
+| Revision `3d5c0f79`, binary `437c767d...`, fleet `bench-c1dce8770c684804`, 18:43:56 to 19:08:12 UTC | Completed: 37 of 37 cases, 551,552 measured calls, none unsuccessful. At most `$2.63` of compute (estimate) | — | — |
+
+Instances, disks and the placement policy of each fleet were verified absent. Outputs: `checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/`.
+
+### Run 13 results
+
+One fleet, one or two repetitions for each cell. Run 12 used another fleet and binary: a comparison with run 12 is context, not a controlled test. The controlled comparisons are the arms inside run 13. All times are in µs unless a unit is given.
+
+#### Sustained puts: the stalls of run 12 are gone with `wal_replay`
+
+200,000 leased puts, 1 KiB, 16 writers, native tier.
+
+| Arm | p50 | p99 | p99.9 | Puts/s | Calls above 5 ms | Synchronous adoptions |
+|---|---:|---:|---:|---:|---:|---:|
+| `wal_replay` (run 13) | 155.7 | 417.3 | 1,371.8 | 82,338 | 16 | 2 |
+| `on_disk` (run 13, same fleet) | 517.4 | 704.5 | 174,632 | 9,531 | 1,824 | 99 |
+| `memory_only` (run 12, other fleet) | 561.9 | 750.8 | 102,323 | 14,812 | 1,504 | not recorded |
+
+With `on_disk` the owner spent 14.8 s in adoption exchanges (5,019 exchanges); with `wal_replay` 0.84 s (11,147 exchanges). The 16 slow calls of the `wal_replay` arm are one group at the first measured put (see "Remaining pause").
+
+#### Leased 64 KiB puts with 16 writers
+
+| Arm | Repetitions | p50 | p99 | p99.9 | Puts/s | Calls above 5 ms | Time of 2 extent switches |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `wal_replay`, lease-ahead on | 2 | 1,747 to 1,752 | 3,945 to 3,983 | 31,236 to 31,424 | 7,899 to 7,996 | 32 | 0.09 ms |
+| `wal_replay`, lease-ahead off | 2 | 1,750 to 1,766 | 3,909 to 4,474 | 34,779 to 36,363 | 7,593 to 7,617 | 32 | 35.1 to 36.6 ms |
+| `memory_only`, lease-ahead on | 1 | 1,889 | 16,933 | 31,313 | 6,825 | 80 | 0.09 ms |
+| `wal_replay`, lease-ahead on, polled writes | 1 | 1,752 | 2,835 | 32,249 | 7,870 | 32 | 0.11 ms |
+| `wal_replay`, lease-ahead on, write timeline | 1 | 1,788 | 2,883 | 30,381 | 7,884 | 32 | 0.10 ms |
+| Owner RPC, `wal_replay` | 1 | 2,974 | 35,156 | 37,464 | 4,494 | 64 | — |
+| `native`, page cache, coordinator VM | 2 | 155 to 161 | 258 to 308 | 377 to 469 | 55,009 to 55,958 | 0 | — |
+
+- Lease-ahead removes the switch time from the put path (about 18 ms for each switch without it; `extent_switch_waits` is 0 in every case). Two switches touch 32 of 4,096 calls, less than 1%, so p99 does not change. Throughput is 4% to 5% higher and p99.9 is 3 to 5 ms lower.
+- The p99 of 17.28 ms in run 12 came mainly from `memory_only`, not from the switch: the `memory_only` arm of run 13 repeats it (16.9 ms, 80 slow calls, 6 synchronous adoptions) with lease-ahead on.
+- p99 with polled writes (2,835) is equal to p99 of the timeline copy without polled writes (2,883). No effect of polled writes at 64 KiB is shown.
+- The leased route is 11 times the `native` p50 at this size and concurrency.
+
+#### Small puts
+
+| Cell (native tier, 1 KiB) | p50 | p99 | p99.9 | Puts/s | Run 12 p50 |
+|---|---:|---:|---:|---:|---:|
+| Leased, 1 writer (2 repetitions) | 46.6 to 46.9 | 82.2 to 85.0 | 380 to 575 | 14,870 to 15,192 | 54.9 to 56.6 |
+| Leased, 1 writer, polled writes | 39.6 | 72.5 | 605 | 16,913 | no cell |
+| Owner RPC, 1 writer (2 repetitions) | 50.0 to 50.1 | 87.6 to 90.3 | 480 to 696 | 15,998 to 16,043 | 58.4 to 59 |
+| Leased, 16 writers, 4,096 puts (2 repetitions) | 126.7 to 129.2 | 596 to 692 | 32,984 to 33,909 | 52,880 to 53,013 | 330 |
+| Leased, 1 writer, synchronous tier | 137.5 | 179.0 | 466 | 6,245 | 143.2 |
+| Owner RPC, 1 writer, synchronous tier | 90.5 | 119.0 | 392 | 9,676 | 98.4 |
+| `native`, page cache, 1 writer | 1.9 | 3.3 to 3.4 | 7.5 to 7.8 | 96,420 to 98,563 | 1.9 to 2.0 |
+
+Polled writes lower the leased p50 by 15% at 1 writer (39.6 against 46.6 to 46.9, same fleet, one repetition). The leased route stays 20 to 25 times the `native` p50.
+
+Regression: the short case with 16 writers has p99.9 of 33 ms (run 12: 1.6 ms) because of the pause below.
+
+#### Remaining pause: first put after a close
+
+Each leased put case of run 13 has one group of slow calls at the first measured put (31 to 33 ms; one call for each writer). Run 12 did not have it (first measured put 0.28 ms in the cell with 1 KiB and 1 writer). Evidence: `leased_skip_markers` is 2 in run 13 and 1 in run 12 for that cell; the owner profile shows 2 leases at the start (initial lease and pre-lease), 15 to 24 ms each (`lease_reserve_ns`). The reserve cost is not new (`reserve_external`; 17.6 ms for each lease in run 12). New is one more close of the extent before the first measured put. Probable cause (not confirmed): a control command that `wal_replay` sends at the measurement gate; each control command closes the leased extent (`remote_db.rs`, `Command::Control`). Candidate fix: do not close the extent for control commands that do not need it, or pre-lease at close.
+
+`stalls.csv` (the two write-timeline cases): 64 KiB with 16 writers has 16 calls without label (the first group, 486 ms summed) and 16 calls that overlap `checkpoint:control_enqueue` (147 ms summed). 1 KiB with 1 writer has 2 calls without label. No call has the label `checkpoint:capture_start`, `checkpoint:freeze` or `checkpoint:live_install_start`, so the step-size rule of the plan does not apply. The sustained case has no write timeline; its 16 slow calls are the first group.
+
+#### Reads
+
+| Cell (1 reader unless stated) | p50 | p99 | p99.9 | Device reads for each read | Run 12 p50 |
+|---|---:|---:|---:|---:|---:|
+| Live cold, 1 KiB | 105.1 | 120.1 | 271 | 0.988 | 104.6 |
+| Live cold, 64 KiB | 145.3 | 220.4 | 370 | 0.972 | 141.3 |
+| Live cold, 1 KiB, 16 readers (99,850 reads/s) | 127.9 | 197.5 | 2,991 | 0.955 | 129.2 |
+| Live cold, 64 KiB, 18 WAL files | 143.6 | 167.7 | 1,076 | 0.979 | 141.3 (1 file) |
+| Live warm | 28.9 | 35.0 | 37.9 | 0 | 28 |
+| Live warm, poll queue | 22.2 | 27.6 | 30.8 | 0 | 22.2 |
+| Owner RPC cold, 1 KiB, sealed dataset | 103.3 | 156.3 | 205 | 0.948 | no cell |
+| Owner RPC warm | 27.4 | 33.2 | 36.4 | — | no cell |
+| `native` memory read | 1.2 | 1.7 | 7.2 | — | 1.0 |
+
+Reads did not change against run 12, as expected: `wal_replay` changes owner history, not the read path. The owner RPC read with `wal_replay` (the owner decodes the reference from WAL bytes) has the same p50 as the live read.
+
+#### First hardware execution, all passed
+
+Publication of a pre-leased extent on the kernel target; lease-ahead over 18 WAL files (G19X); polled writes on `nvme-rdma`; `CheckpointPosition` under leased writes; owner RPC read from WAL bytes; sealed-dataset export by WAL offset; owner restart with data; coordinator reopen with `ReplayWal`.
+
+Not assessed: owner or coordinator crash on hardware, power loss, connection loss, `ReplayLiveWal` after a coordinator loss with an open extent, more than one owner.

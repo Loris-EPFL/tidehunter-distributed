@@ -93,7 +93,8 @@ pub use inventory::SealedOwnerExport;
 /// Wire protocol version. 22 adds leased live WAL extents and adoption proofs.
 /// 23 adds OpenLiveExports for permanent live export.
 /// 24 adds lease profiles, PreleaseLiveExtent, CheckpointPosition, ReplayWal, ReplayLiveWal and RetireWalFiles.
-const PROTOCOL: u32 = 24;
+/// 25 gives production requests and replies feature-stable tags before NVMe-oF and test-only variants.
+const PROTOCOL: u32 = 25;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
 /// Leave one protocol request slot available for ordered checkpoint control.
 pub(super) const APPEND_COMMAND_WINDOW: usize = reactor::SESSION_REQUESTS - 1;
@@ -469,6 +470,8 @@ impl From<io::Error> for TcpError {
     }
 }
 
+// Bincode tags follow declaration order. Keep ungated production variants first,
+// then NVMe-oF variants, then test-only variants, in both Request and Response.
 #[derive(Serialize, Deserialize)]
 enum Request {
     Checkpoint {
@@ -524,21 +527,29 @@ enum Request {
     },
     /// Nonblocking operational snapshot; not a durability barrier or evidence cut.
     OperationalReadIoStats,
-    #[cfg(all(target_os = "linux", feature = "test-utils"))]
-    ReadEvidence {
+    OwnerTimelineArm {
+        limit: usize,
+    },
+    OwnerTimelineFetch {
+        offset: usize,
+    },
+    CheckpointPosition {
+        authority_epoch: u64,
         epoch: u64,
-        evict: bool,
+        through: u64,
     },
-    #[cfg(all(target_os = "linux", feature = "test-utils"))]
-    ProcessResources {
+    ReplayWal {
+        authority_epoch: u64,
+        source_epoch: u64,
+        from: u64,
+        limit: usize,
+        require_end: u64,
+    },
+    RetireWalFiles {
+        authority_epoch: u64,
         epoch: u64,
+        files: Vec<u64>,
     },
-    #[cfg(feature = "test-utils")]
-    PrepareRamProbe {
-        value_bytes: usize,
-    },
-    #[cfg(feature = "test-utils")]
-    ReadRamProbe,
     #[cfg(feature = "experimental-nvmeof")]
     ValidateRecordReferences {
         epoch: u64,
@@ -597,12 +608,6 @@ enum Request {
     ShutdownLiveTarget {
         epoch: u64,
     },
-    OwnerTimelineArm {
-        limit: usize,
-    },
-    OwnerTimelineFetch {
-        offset: usize,
-    },
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     LeaseLiveExtent {
         epoch: u64,
@@ -624,18 +629,6 @@ enum Request {
         epoch: u64,
         after: [u8; 16],
     },
-    CheckpointPosition {
-        authority_epoch: u64,
-        epoch: u64,
-        through: u64,
-    },
-    ReplayWal {
-        authority_epoch: u64,
-        source_epoch: u64,
-        from: u64,
-        limit: usize,
-        require_end: u64,
-    },
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     ReplayLiveWal {
         authority_epoch: u64,
@@ -644,11 +637,21 @@ enum Request {
         limit: usize,
         require_end: u64,
     },
-    RetireWalFiles {
-        authority_epoch: u64,
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    ReadEvidence {
         epoch: u64,
-        files: Vec<u64>,
+        evict: bool,
     },
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    ProcessResources {
+        epoch: u64,
+    },
+    #[cfg(feature = "test-utils")]
+    PrepareRamProbe {
+        value_bytes: usize,
+    },
+    #[cfg(feature = "test-utils")]
+    ReadRamProbe,
 }
 impl Request {
     fn is_measurement_control(&self) -> bool {
@@ -738,14 +741,13 @@ enum Response {
         message: String,
         profile: Box<ServerReadProfile>,
     },
-    #[cfg(all(target_os = "linux", feature = "test-utils"))]
-    ReadEvidence(crate::read_probe::ReadEvidence),
-    #[cfg(all(target_os = "linux", feature = "test-utils"))]
-    ProcessResources(crate::read_probe::ProcessResources),
-    #[cfg(feature = "test-utils")]
-    RamProbePrepared,
-    #[cfg(feature = "test-utils")]
-    RamProbe(WireBytes),
+    OwnerTimelineArmed,
+    OwnerTimelinePage {
+        records: Vec<super::write_timeline::OwnerTimelineRecord>,
+        dropped: u64,
+        incomplete: u64,
+        more: bool,
+    },
     #[cfg(feature = "experimental-nvmeof")]
     ValidatedRecordReferences(Vec<ValidatedRecordLocation>),
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
@@ -766,19 +768,20 @@ enum Response {
     LiveRecovery(live_control::LiveRecoveryWire),
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     LiveTargetStats(super::nvmeof::LiveTargetStats),
-    OwnerTimelineArmed,
-    OwnerTimelinePage {
-        records: Vec<super::write_timeline::OwnerTimelineRecord>,
-        dropped: u64,
-        incomplete: u64,
-        more: bool,
-    },
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     LiveLeased(LiveLeased),
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     LiveAdopted(LiveAdopted),
     #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
     LiveExports(live_control::LiveExportInfo),
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    ReadEvidence(crate::read_probe::ReadEvidence),
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    ProcessResources(crate::read_probe::ProcessResources),
+    #[cfg(feature = "test-utils")]
+    RamProbePrepared,
+    #[cfg(feature = "test-utils")]
+    RamProbe(WireBytes),
 }
 
 /// Authenticated owner metadata for an exact, durable member of a sealed WAL.
@@ -1170,13 +1173,15 @@ impl StorageNode {
                                     if shutdown.load(Ordering::Acquire) {
                                         continue;
                                     }
-                                    let _ = node.connection(
+                                    if let Err(error) = node.connection(
                                         socket,
                                         server.clone(),
                                         limits,
                                         &shutdown,
                                         &transport,
-                                    );
+                                    ) {
+                                        eprintln!("storage control connection closed: {error}");
+                                    }
                                 }
                             }) {
                             Ok(handle) => threads.push(handle),

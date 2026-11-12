@@ -10,6 +10,96 @@ use std::process::Command;
 pub(in crate::distributed::tcp) mod multiplexed;
 #[path = "wal_replay_tests.rs"]
 mod wal_replay;
+
+#[test]
+fn production_wire_variant_tags_do_not_depend_on_features() {
+    fn tag(value: &impl Serialize) -> u32 {
+        let bytes = wire_codec(HARD_FRAME_LIMIT).serialize(value).unwrap();
+        u32::from_le_bytes(bytes[..4].try_into().unwrap())
+    }
+    assert_eq!(
+        tag(&Request::Checkpoint {
+            authority_epoch: 0,
+            epoch: 0,
+            prefix: 0
+        }),
+        0
+    );
+    assert_eq!(
+        tag(&Request::CheckpointPosition {
+            authority_epoch: 0,
+            epoch: 0,
+            through: 0
+        }),
+        17
+    );
+    assert_eq!(
+        tag(&Request::ReplayWal {
+            authority_epoch: 0,
+            source_epoch: 0,
+            from: 0,
+            limit: 0,
+            require_end: 0,
+        }),
+        18
+    );
+    assert_eq!(
+        tag(&Request::RetireWalFiles {
+            authority_epoch: 0,
+            epoch: 0,
+            files: Vec::new()
+        }),
+        19
+    );
+    assert_eq!(
+        tag(&Response::Checkpoint(checkpoint::CheckpointProof {
+            database: [0; 16],
+            partition: 0,
+            epoch: 0,
+            prefix: 0,
+            retained: 0,
+            digest: [0; 32],
+        })),
+        0
+    );
+    assert_eq!(
+        tag(&Response::OwnerTimelinePage {
+            records: Vec::new(),
+            dropped: 0,
+            incomplete: 0,
+            more: false,
+        }),
+        18
+    );
+    #[cfg(feature = "experimental-nvmeof")]
+    assert_eq!(tag(&Response::ValidatedRecordReferences(Vec::new())), 19);
+    #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+    {
+        assert_eq!(
+            tag(&Request::ReplayLiveWal {
+                authority_epoch: 0,
+                source_epoch: 0,
+                from: 0,
+                limit: 0,
+                require_end: 0,
+            }),
+            36
+        );
+        assert_eq!(
+            tag(&Response::LiveExports(live_control::LiveExportInfo {
+                mode: LiveExportMode::OnDemand,
+                address: String::new(),
+                service: 0,
+                transport: super::super::nvmeof::NvmeofTransport::Tcp,
+                wal_file_bytes: 0,
+                block_size: 0,
+                exported_files: 0,
+            })),
+            31
+        );
+    }
+}
+
 #[test]
 fn structured_transport_identity_ignores_local_selectors_only() {
     let left = Transport::Ofi {

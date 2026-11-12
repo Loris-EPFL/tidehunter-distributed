@@ -467,9 +467,11 @@ comparison-tool paths are relative to `experiments/kv-comparison/`.
 | Kernel/target | `experiments/nvmeof/collect.py` and comparison `rdma_diagnostics.py`: begin/end target file/block/controller/provider evidence, including preload, missing counters, resets and identity changes |
 | Admission and display | Comparison `cloud_campaign.py`, `analyze.py`, `observability/campaign_{exporter,monitor}.py` and `observability/dashboards/campaign.json`: validate raw caller joins, export bounded sums/counts and availability, retain them in historical/offline capture |
 
-The owner timing record changes the wire format: protocol 19 requires rebuilding
-**both coordinator and owners**. It does not change the inherited native WAL
-format or require a Sui checkout change.
+Protocol 19 introduced the owner timing record. Current protocol 25 keeps
+ungated production request and reply tags before NVMe-oF and test-only variants,
+so enabling `test-utils` does not change production tags. Rebuild **both
+coordinator and owners**; version 24 peers are rejected. This does not change
+the inherited native WAL format or require a Sui checkout change.
 
 ### Interpretation rules
 
