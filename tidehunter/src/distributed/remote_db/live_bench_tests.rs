@@ -73,6 +73,29 @@ struct Fixture {
 }
 impl Fixture {
     fn new(base: &Path, case: &str, tier: DurabilityTier, arm: &str) -> Self {
+        Self::with_limits(
+            base,
+            case,
+            tier,
+            arm,
+            128 * MIB as u64,
+            256 * MIB as u64,
+            ReplayLimits {
+                max_batches: 65536,
+                max_encoded_bytes: 1024 * MIB,
+            },
+        )
+    }
+
+    fn with_limits(
+        base: &Path,
+        case: &str,
+        tier: DurabilityTier,
+        arm: &str,
+        fragment_bytes: u64,
+        wal_file_bytes: u64,
+        replay_limits: ReplayLimits,
+    ) -> Self {
         let directory = tempdir::TempDir::new_in(base, case).unwrap();
         let root = directory.path();
         let shape = KeyShape::new_single(32, 1, KeyType::uniform(1));
@@ -96,8 +119,8 @@ impl Fixture {
                     max_batches: 32,
                     max_encoded_bytes: 2 * MIB,
                 },
-                fragment_bytes: 128 * MIB as u64,
-                wal_file_bytes: 256 * MIB as u64,
+                fragment_bytes,
+                wal_file_bytes,
                 max_batches_per_partition: 8192,
                 max_reference_metadata_bytes: 64 * MIB,
                 max_epochs: 8,
@@ -110,10 +133,7 @@ impl Fixture {
             index_shards: 64,
             max_pending_batches: 64,
             max_pending_bytes: 32 * MIB,
-            replay_limits: ReplayLimits {
-                max_batches: 65536,
-                max_encoded_bytes: 1024 * MIB,
-            },
+            replay_limits,
             owner_append_occupancy: 16,
             pipelined_writes: true,
             read_cache_bytes: 0,
@@ -1203,4 +1223,101 @@ fn live_bench_closed_loop() {
     fs::write(output.join("results.md"), markdown(&rows, &env)).unwrap();
     fs::remove_dir(&base).unwrap();
     println!("live_bench completed: {}", output.display());
+}
+
+#[test]
+#[ignore = "explicit workstation checkpoint-tail comparison"]
+fn leased_checkpoint_tail_workstation() {
+    let setting = |name: &str, default: usize| {
+        std::env::var(name)
+            .map(|value| value.parse::<usize>().unwrap())
+            .unwrap_or(default)
+    };
+    let calls = setting("TH_TAIL_CALLS", 4096);
+    let fragment_bytes = setting("TH_TAIL_FRAGMENT_BYTES", 8 * MIB);
+    let wal_file_bytes = setting("TH_TAIL_WAL_FILE_BYTES", 256 * MIB);
+    let replay_max_batches = setting("TH_TAIL_REPLAY_MAX_BATCHES", 256);
+    let replay_max_bytes = setting("TH_TAIL_REPLAY_MAX_BYTES", 16 * MIB);
+    let default_geometry = calls == 4096
+        && fragment_bytes == 8 * MIB
+        && wal_file_bytes == 256 * MIB
+        && replay_max_batches == 256
+        && replay_max_bytes == 16 * MIB;
+    let base = tempdir::TempDir::new("leased-checkpoint-tail").unwrap();
+    let value: Bytes = vec![0x5a; 65536].into();
+    for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+        let mut fixture = Fixture::with_limits(
+            base.path(),
+            "tail",
+            tier,
+            "C-buf",
+            fragment_bytes as u64,
+            wal_file_bytes as u64,
+            ReplayLimits {
+                max_batches: replay_max_batches,
+                max_encoded_bytes: replay_max_bytes,
+            },
+        );
+        fixture.config.preparation_workers = 8;
+        let db = ConcurrentRemoteDatabase::new(fixture.open("C-buf")).unwrap();
+        let (samples, elapsed) = write_phase(&db, 16, 0, calls, &value);
+        let counts = fixture.live.snapshot().counts;
+        let manifest: AuthorityManifest =
+            read_metadata(&fixture.root.path().join("authority").join(MANIFEST)).unwrap();
+        let checkpoints = manifest
+            .checkpoint
+            .map_or(0, |checkpoint| checkpoint.generation);
+        if default_geometry {
+            assert!(
+                checkpoints >= 3,
+                "must cross at least three committed checkpoints"
+            );
+            assert!(
+                counts.extent_switch_samples >= 2,
+                "must cross at least two extent boundaries"
+            );
+        }
+        let mut checkpoint_started = 0;
+        let mut completed_checkpoint_lifetime_ns = 0;
+        db.visit_write_metrics(|metrics| {
+            checkpoint_started = metrics.authority.checkpoint_count;
+            completed_checkpoint_lifetime_ns = metrics.authority.background_checkpoint_ns;
+        });
+        let slow = samples.iter().filter(|ns| **ns >= 5_000_000).count();
+        let maximum = samples.iter().max().copied().unwrap();
+        let mut sorted = samples.clone();
+        sorted.sort_unstable();
+        let quantile = |p: usize, scale: usize| sorted[(p * sorted.len()).div_ceil(scale) - 1];
+        println!(
+            "checkpoint_tail_workstation {}",
+            json!({
+                "tier": tier.to_string(), "calls": samples.len(), "writers": 16, "value_bytes": 65536,
+                "slow_calls_ge_5ms": slow, "max_api_ns": maximum, "elapsed_ns": elapsed.as_nanos(),
+                "checkpoints": checkpoints, "extent_switches": counts.extent_switch_samples,
+                "extent_switch_waits": counts.extent_switch_waits,
+                "checkpoint_started": checkpoint_started,
+                "completed_checkpoint_lifetime_ns": completed_checkpoint_lifetime_ns,
+                "timeline_enabled": false,
+                "fragment_bytes": fragment_bytes, "wal_file_bytes": wal_file_bytes,
+                "replay_max_batches": replay_max_batches, "replay_max_bytes": replay_max_bytes,
+                "p50_ns": quantile(50, 100), "p99_ns": quantile(99, 100),
+                "p999_ns": quantile(999, 1000),
+                "largest_five_ns": sorted.iter().rev().take(5).copied().collect::<Vec<_>>(),
+                "api_ns": samples,
+                "scope": "workstation local-file io_uring; not remote hardware performance"
+            })
+        );
+        // Verify the coordinator index against the real owner's final WAL after
+        // an explicit barrier, without asking a workstation for a fabrics device.
+        db.flush_durable().unwrap();
+        let log = fixture.node.log_for_test(1);
+        for sequence in 0..calls {
+            let reference = db
+                .index_reference(KeySpace(0), &key(sequence), IndexReadCut::Latest)
+                .unwrap()
+                .unwrap();
+            assert_eq!(log.read_record(&reference).unwrap(), put(sequence, &value));
+        }
+        db.shutdown().unwrap();
+    }
 }
