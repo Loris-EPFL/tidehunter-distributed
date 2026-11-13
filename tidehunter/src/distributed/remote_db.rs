@@ -5241,7 +5241,7 @@ struct WorkerDiagnostics {
 }
 impl ClientWorker {
     fn start(
-        client: Client,
+        mut client: Client,
         queue_capacity: usize,
         wake: mpsc::SyncSender<()>,
         failure: Arc<std::sync::atomic::AtomicBool>,
@@ -5254,6 +5254,7 @@ impl ClientWorker {
             first_failure,
             partition,
         } = diagnostics;
+        client.trace_controls(Arc::clone(&write_timeline), partition);
         let client = Arc::new(Mutex::new(client));
         let worker_client = Arc::clone(&client);
         let (sender, receiver) = mpsc::sync_channel(queue_capacity);
@@ -5270,6 +5271,10 @@ impl ClientWorker {
                 let mut checkpoint_admission_deadline: Option<Instant> = None;
                 let mut checkpoint_append_completions = 0u64;
                 let mut queued = VecDeque::new();
+                // One fixed-cut proof may wait outside the append FIFO. Later
+                // non-append commands never pass it. Earlier covered appends
+                // have already run; passing appends have later WAL positions.
+                let mut parked_checkpoint: Option<Command> = None;
                 let mut appends: HashMap<u64, (BatchVersion, Reply<Vec<DurableBatch>>)> =
                     HashMap::new();
                 let mut checkpoint: Option<(
@@ -5345,9 +5350,34 @@ impl ClientWorker {
                                 client.progress_appends()?;
                                 client.harvest_leased_adoption()?;
                             }
+                            if parked_checkpoint.is_none()
+                                && checkpoint.is_none()
+                                && position.is_none()
+                                && matches!(
+                                    queued.front(),
+                                    Some(Command::CheckpointPosition(..) | Command::Checkpoint(..))
+                                )
+                            {
+                                parked_checkpoint = queued.pop_front();
+                            }
+                            if let Some(command) = parked_checkpoint.as_ref() {
+                                let ready = if matches!(command, Command::CheckpointPosition(..)) {
+                                    client.prepare_leased_position()?
+                                } else {
+                                    !client.leased_adoption_pending()
+                                };
+                                if ready {
+                                    // Fixed through/prefix proofs tolerate later appends:
+                                    // position persistence validates its captured offset;
+                                    // on-disk receipt history retains the exact prefix.
+                                    // Checkpoint still settles its extent before submission.
+                                    queued.push_front(parked_checkpoint.take().unwrap());
+                                }
+                            }
                             if appends.is_empty()
                                 && checkpoint.is_none()
                                 && position.is_none()
+                                && parked_checkpoint.is_none()
                                 && matches!(queued.front(), Some(Command::Append(..)) | None)
                             {
                                 client.submit_leased_adoption()?;
@@ -5401,6 +5431,7 @@ impl ClientWorker {
 
                     if !disconnected
                         && queued.is_empty()
+                        && parked_checkpoint.is_none()
                         && appends.is_empty()
                         && !client.has_pending_io()
                     {
@@ -5423,8 +5454,7 @@ impl ClientWorker {
                     if client.live_nvme_configured()
                         && appends.is_empty()
                         && checkpoint.is_none()
-                        && (position.is_none()
-                            || (client.live_leased_mode() && !client.leased_append_needs_control()))
+                        && (position.is_none() || client.live_leased_mode())
                         && let Some(Command::Append(epoch, _, _)) = queued.front()
                     {
                         let epoch = *epoch;
@@ -5441,6 +5471,14 @@ impl ClientWorker {
                             }
                             match budget.extend(count, payload, batches) {
                                 Some((next_count, next_payload)) => {
+                                    let frame = (next_payload + 8 + 4095) & !4095;
+                                    if (position.is_some()
+                                        || (parked_checkpoint.is_some()
+                                            && client.leased_adoption_pending()))
+                                        && client.leased_append_needs_control(Some(frame))
+                                    {
+                                        break;
+                                    }
                                     count = next_count;
                                     payload = next_payload;
                                     take += 1;
@@ -5448,102 +5486,112 @@ impl ClientWorker {
                                 // The first group is sent alone even if it exceeds the
                                 // budget, so the owner reports the real limit error.
                                 None if take == 0 => {
-                                    take = 1;
+                                    if (position.is_none()
+                                        && (parked_checkpoint.is_none()
+                                            || !client.leased_adoption_pending()))
+                                        || !client.leased_append_needs_control(None)
+                                    {
+                                        take = 1;
+                                    }
                                     break;
                                 }
                                 None => break,
                             }
                         }
-                        let leased = client.live_leased_mode();
-                        let mut merged = if leased {
-                            Vec::new()
-                        } else {
-                            Vec::with_capacity(count.max(1))
-                        };
-                        let mut members: Vec<(BatchVersion, usize, Reply<Vec<DurableBatch>>)> =
-                            if leased {
-                                std::mem::take(&mut leased_members)
+                        if take != 0 {
+                            let leased = client.live_leased_mode();
+                            let mut merged = if leased {
+                                Vec::new()
                             } else {
-                                Vec::with_capacity(take)
+                                Vec::with_capacity(count.max(1))
                             };
-                        for _ in 0..take {
-                            let Some(Command::Append(_, batches, reply)) = queued.pop_front()
-                            else {
-                                unreachable!("append queue front changed");
-                            };
-                            members.push((batches[0].version(), batches.len(), reply));
-                            if leased && merged.is_empty() {
-                                // Transfer the first command's allocation with its batches.
-                                merged = batches;
-                            } else {
-                                merged.extend(batches);
-                            }
-                        }
-                        let first = members[0].0;
-                        let result = if leased {
-                            client.write_leased_group(epoch, merged, &write_timeline, partition)
-                        } else {
-                            client.write_live_group(epoch, &merged, &write_timeline, partition)
-                        };
-                        let failed = result.is_err();
-                        match result {
-                            Ok(receipts) => {
-                                if leased && members.len() == 1 {
-                                    if let Some((_, _, reply)) = members.pop() {
-                                        let _ = reply.send(Ok(receipts));
-                                    }
+                            let mut members: Vec<(BatchVersion, usize, Reply<Vec<DurableBatch>>)> =
+                                if leased {
+                                    std::mem::take(&mut leased_members)
                                 } else {
-                                    let mut receipts = receipts.into_iter();
-                                    for (_, len, reply) in members.drain(..) {
-                                        let own: Vec<DurableBatch> =
-                                            receipts.by_ref().take(len).collect();
-                                        let _ = reply.send(Ok(own));
+                                    Vec::with_capacity(take)
+                                };
+                            for _ in 0..take {
+                                let Some(Command::Append(_, batches, reply)) = queued.pop_front()
+                                else {
+                                    unreachable!("append queue front changed");
+                                };
+                                members.push((batches[0].version(), batches.len(), reply));
+                                if leased && merged.is_empty() {
+                                    // Transfer the first command's allocation with its batches.
+                                    merged = batches;
+                                } else {
+                                    merged.extend(batches);
+                                }
+                            }
+                            let first = members[0].0;
+                            let result = if leased {
+                                client.write_leased_group(epoch, merged, &write_timeline, partition)
+                            } else {
+                                client.write_live_group(epoch, &merged, &write_timeline, partition)
+                            };
+                            let failed = result.is_err();
+                            match result {
+                                Ok(receipts) => {
+                                    if leased && members.len() == 1 {
+                                        if let Some((_, _, reply)) = members.pop() {
+                                            let _ = reply.send(Ok(receipts));
+                                        }
+                                    } else {
+                                        let mut receipts = receipts.into_iter();
+                                        for (_, len, reply) in members.drain(..) {
+                                            let own: Vec<DurableBatch> =
+                                                receipts.by_ref().take(len).collect();
+                                            let _ = reply.send(Ok(own));
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    client.record_live_write_error();
+                                    record_first_failure(
+                                        &first_failure,
+                                        Some(partition),
+                                        Some(first),
+                                        "live_group",
+                                        &error,
+                                    );
+                                    failure.store(true, std::sync::atomic::Ordering::Release);
+                                    for (version, _, reply) in members.drain(..) {
+                                        let _ =
+                                            reply.send(Err(LocalDbError::unknown(version, &error)));
                                     }
                                 }
                             }
-                            Err(error) => {
+                            if leased {
+                                leased_members = members;
+                            }
+                            let _ = wake.try_send(());
+                            if failed {
+                                break;
+                            }
+                            if client.live_leased_mode()
+                                && position.is_none()
+                                && parked_checkpoint.is_none()
+                                && let Err(error) = client.submit_leased_adoption()
+                            {
                                 client.record_live_write_error();
                                 record_first_failure(
                                     &first_failure,
                                     Some(partition),
                                     Some(first),
-                                    "live_group",
+                                    "leased_adoption_submit",
                                     &error,
                                 );
+                                // Release publishes the fatal outcome to the authority.
                                 failure.store(true, std::sync::atomic::Ordering::Release);
-                                for (version, _, reply) in members.drain(..) {
-                                    let _ = reply.send(Err(LocalDbError::unknown(version, &error)));
-                                }
+                                let _ = wake.try_send(());
+                                break;
                             }
-                        }
-                        if leased {
-                            leased_members = members;
-                        }
-                        let _ = wake.try_send(());
-                        if failed {
-                            break;
-                        }
-                        if client.live_leased_mode()
-                            && position.is_none()
-                            && let Err(error) = client.submit_leased_adoption()
-                        {
-                            client.record_live_write_error();
-                            record_first_failure(
-                                &first_failure,
-                                Some(partition),
-                                Some(first),
-                                "leased_adoption_submit",
-                                &error,
-                            );
-                            // Release publishes the fatal outcome to the authority.
-                            failure.store(true, std::sync::atomic::Ordering::Release);
-                            let _ = wake.try_send(());
-                            break;
-                        }
-                        // While a proof is pending, also drive its reply/deadline
-                        // after each direct frame. A full append FIFO cannot starve it.
-                        if position.is_none() {
-                            continue;
+                            // While a proof is pending, also drive its reply/deadline
+                            // after each direct frame. A full append FIFO cannot starve it.
+                            if position.is_none() {
+                                continue;
+                            }
                         }
                     }
 
@@ -5615,6 +5663,7 @@ impl ClientWorker {
                         }
                     }
                     if checkpoint.is_none()
+                        && parked_checkpoint.is_none()
                         && position.is_none()
                         && let Some(Command::Checkpoint(authority, epoch, prefix, _)) =
                             queued.front()
@@ -5683,6 +5732,7 @@ impl ClientWorker {
                     }
 
                     if checkpoint.is_none()
+                        && parked_checkpoint.is_none()
                         && position.is_none()
                         && let Some(Command::CheckpointPosition(authority, epoch, through, _)) =
                             queued.front()
@@ -5960,7 +6010,11 @@ impl ClientWorker {
                         progressed = true;
                     }
 
-                    if appends.is_empty() && checkpoint.is_none() && position.is_none() {
+                    if appends.is_empty()
+                        && checkpoint.is_none()
+                        && position.is_none()
+                        && parked_checkpoint.is_none()
+                    {
                         match queued.front() {
                             Some(Command::Stats(_))
                             | Some(Command::ReadIoStats(_))
@@ -6052,6 +6106,7 @@ impl ClientWorker {
                         && appends.is_empty()
                         && checkpoint.is_none()
                         && position.is_none()
+                        && parked_checkpoint.is_none()
                     {
                         #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
                         if client.live_leased_mode()
@@ -6074,6 +6129,21 @@ impl ClientWorker {
                     drop(client);
                     if !progressed {
                         thread::yield_now();
+                    }
+                }
+                if let Some(command) = parked_checkpoint.take() {
+                    let message = failure_context(
+                        &first_failure,
+                        "TCP worker stopped before proof submission",
+                    );
+                    match command {
+                        Command::CheckpointPosition(_, _, _, reply) => {
+                            let _ = reply.send(Err(LocalDbError::new(message)));
+                        }
+                        Command::Checkpoint(_, _, _, reply) => {
+                            let _ = reply.send(Err(LocalDbError::new(message)));
+                        }
+                        _ => unreachable!("only fixed-cut proofs may be parked"),
                     }
                 }
                 #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]

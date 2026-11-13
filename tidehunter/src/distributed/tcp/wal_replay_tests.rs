@@ -44,13 +44,13 @@ fn checkpoint_position_syncs_and_advances_owner_root() {
     let proof = node
         .inventory
         .lock()
-        .checkpoint_position(1, 1, through)
+        .checkpoint_position(1, 1, through, None)
         .unwrap();
     assert_eq!(proof.durable_end, through);
     assert_eq!(
         node.inventory
             .lock()
-            .checkpoint_position(1, 1, 0)
+            .checkpoint_position(1, 1, 0, None)
             .unwrap()
             .durable_end,
         through
@@ -65,7 +65,10 @@ fn checkpoint_position_syncs_and_advances_owner_root() {
     let node = StorageNode::open(config, metrics()).unwrap();
     node.inventory.lock().fence_to(2).unwrap();
     assert_eq!(
-        node.inventory.lock().checkpoint_position(2, 1, 0).unwrap(),
+        node.inventory
+            .lock()
+            .checkpoint_position(2, 1, 0, None)
+            .unwrap(),
         proof
     );
 }

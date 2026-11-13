@@ -217,6 +217,26 @@ pub struct CheckpointTimelineEvent {
     pub pressure: Option<CheckpointPressure>,
 }
 
+/// JSON-only control diagnostics. This type is not part of the owner wire format.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct ControlTimelineTarget {
+    pub kind: &'static str,
+    pub epoch: u64,
+    pub extent: Option<[u8; 16]>,
+    pub through: Option<u64>,
+    pub prefix: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ControlTimelineEvent {
+    pub stage: &'static str,
+    pub elapsed_ns: u64,
+    pub owner: u32,
+    pub envelope_id: u64,
+    pub target: ControlTimelineTarget,
+    pub success: Option<bool>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CheckpointPressure {
     pub reason: &'static str,
@@ -302,6 +322,8 @@ pub struct WriteTimelineExport {
     pub owner_storage_durations_available: bool,
     pub checkpoint_events: Vec<CheckpointTimelineEvent>,
     pub dropped_checkpoint_events: u64,
+    pub control_events: Vec<ControlTimelineEvent>,
+    pub dropped_control_events: u64,
     pub owner_records: Vec<OwnerTimelineRecord>,
     pub live_groups: Vec<LiveGroupTimeline>,
     pub dropped_live_groups: u64,
@@ -390,6 +412,8 @@ impl WriteTimeline {
                     owner_storage_durations_available: false,
                     checkpoint_events: Vec::new(),
                     dropped_checkpoint_events: 0,
+                    control_events: Vec::new(),
+                    dropped_control_events: 0,
                     owner_records: Vec::new(),
                     live_groups: Vec::new(),
                     dropped_live_groups: 0,
@@ -603,6 +627,35 @@ impl WriteTimeline {
             Self::push(s, index, stage, None, None);
         }
     }
+    pub(crate) fn control_event(
+        &self,
+        stage: &'static str,
+        owner: u32,
+        envelope_id: u64,
+        target: ControlTimelineTarget,
+        success: Option<bool>,
+    ) {
+        if !self.enabled() {
+            return;
+        }
+        let mut guard = self.session.lock();
+        if let Some(s) = guard.as_mut() {
+            // At most eight control events per sampled call; overflow is counted.
+            if s.export.control_events.len() >= s.export.limit.saturating_mul(8) {
+                s.export.dropped_control_events += 1;
+            } else {
+                s.export.control_events.push(ControlTimelineEvent {
+                    stage,
+                    elapsed_ns: s.origin.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    owner,
+                    envelope_id,
+                    target,
+                    success,
+                });
+            }
+        }
+    }
+
     pub fn checkpoint(
         &self,
         stage: &'static str,
@@ -1194,6 +1247,28 @@ mod tests {
                 .iter()
                 .all(|event| event.generation == Some(9))
         );
+    }
+
+    #[test]
+    fn control_events_are_bounded_and_keep_request_identity() {
+        let timeline = WriteTimeline::default();
+        let target = ControlTimelineTarget {
+            kind: "position",
+            epoch: 1,
+            extent: None,
+            through: Some(1234),
+            prefix: None,
+        };
+        timeline.control_event("submit", 2, 7, target, None);
+        timeline.arm(1).unwrap();
+        for id in 0..9 {
+            timeline.control_event("submit", 2, id, target, None);
+        }
+        let export = timeline.finish().unwrap();
+        assert_eq!(export.control_events.len(), 8);
+        assert_eq!(export.dropped_control_events, 1);
+        assert_eq!(export.control_events[7].envelope_id, 7);
+        assert_eq!(export.control_events[7].target.through, Some(1234));
     }
 
     #[test]

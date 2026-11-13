@@ -110,7 +110,18 @@ impl PartitionLog {
     /// Sync bytes without adoption or receipt metadata. Persistence serializes
     /// root changes; no state guard spans a file or directory barrier.
     pub fn persist_wal_through(&self, through: u64) -> Result<u64, StorageError> {
+        self.persist_wal_through_profiled(through, None)
+    }
+
+    pub(crate) fn persist_wal_through_profiled(
+        &self,
+        through: u64,
+        profile: Option<&mut StorageWriteProfile>,
+    ) -> Result<u64, StorageError> {
+        let mut timing = WriteTiming::new(profile, false);
+        timing.stage(Some(WriteStage::PersistSerializationLock));
         let _persistence = self.persistence.lock();
+        timing.stage(Some(WriteStage::PersistValidation));
         let mut root = {
             let state = self.state.lock();
             let allocated = state
@@ -137,10 +148,18 @@ impl PartitionLog {
             for id in root.scan_from / size..=through.saturating_sub(1) / size {
                 let start = id * size;
                 if root.retired.binary_search(&start).is_err() {
+                    timing.stage(Some(WriteStage::PersistFile));
+                    timing.record(|profile| profile.file_persist_calls += 1);
                     self.wal.persist_frame_file(WalPosition::new(start, 1))?;
+                    timing.record(|profile| profile.file_persist_successes += 1);
+                    timing.stage(None);
                 }
             }
+            timing.stage(Some(WriteStage::PersistNamespace));
+            timing.record(|profile| profile.namespace_persist_calls += 1);
             self.wal.persist_namespace()?;
+            timing.record(|profile| profile.namespace_persist_successes += 1);
+            timing.stage(None);
         }
         let scan_from =
             through.saturating_sub(1) / self.config().fragment_bytes * self.config().fragment_bytes;
@@ -151,11 +170,14 @@ impl PartitionLog {
                 .generation
                 .checked_add(1)
                 .ok_or(StorageError::Capacity)?;
+            timing.stage(Some(WriteStage::PersistPublication));
             self.install_wal_root(&root)?;
             let synced_end = root.synced_end;
             self.state.lock().wal_root = Some(root);
+            timing.success(0);
             return Ok(synced_end);
         }
+        timing.success(0);
         Ok(root.synced_end)
     }
 

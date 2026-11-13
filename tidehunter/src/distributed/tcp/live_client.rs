@@ -480,24 +480,42 @@ impl super::Client {
     }
 
     /// A position proof occupies the control slot, not the direct write queue.
-    /// Use the configured maximum frame as a conservative admission bound.
-    pub(crate) fn leased_append_needs_control(&self) -> bool {
+    /// Use the next frame's exact aligned size, or the maximum when not known.
+    pub(crate) fn leased_append_needs_control(&self, frame_len: Option<usize>) -> bool {
         let Some(current) = &self.live_leased.current else {
             return true;
         };
         if current.prefixes.len() >= 1024 {
             return true;
         }
-        let frame = self
-            .expected
-            .group_limits
-            .max_encoded_bytes
-            .saturating_add(8 + 4095)
-            & !4095;
+        let frame = frame_len.unwrap_or_else(|| {
+            self.expected
+                .group_limits
+                .max_encoded_bytes
+                .saturating_add(8 + 4095)
+                & !4095
+        });
         frame as u64 > current.lease.extent.end - current.cursor
             && (!self.lease_ahead()
                 || self.live_leased.closing.is_some()
                 || self.live_leased.next.is_none())
+    }
+
+    /// Reserve the next extent before a position proof takes the control slot.
+    /// The worker parks only the proof; appends retain the current lease runway.
+    pub(crate) fn prepare_leased_position(&mut self) -> Result<bool, super::TcpError> {
+        self.ensure_leased_healthy()?;
+        if self.live_leased.pending.is_some() {
+            return Ok(false);
+        }
+        if self.lease_ahead()
+            && self.live_leased.current.is_some()
+            && (self.live_leased.closing.is_some() || self.live_leased.next.is_none())
+        {
+            self.submit_leased_adoption()?;
+            return Ok(false);
+        }
+        Ok(true)
     }
 }
 
@@ -4002,6 +4020,63 @@ pub(crate) mod leased_tests {
         );
         client.close_leased_extent().unwrap();
     }
+
+    #[test]
+    fn control_timeline_captures_leased_requests_and_owner_position_phases() {
+        let fixture = Fixture::new(DurabilityTier::Native, 128 * 1024);
+        let mut client = fixture.writer();
+        let timeline = Arc::new(WriteTimeline::default());
+        client.trace_controls(timeline.clone(), 2);
+        client.owner_timeline_arm(32).unwrap();
+        timeline.arm(32).unwrap();
+        let first = client
+            .write_leased_group(1, vec![fixture.batch(0)], &timeline, 2)
+            .unwrap()[0];
+        client.wait_leased_control().unwrap();
+        client.submit_leased_adoption().unwrap();
+        client.wait_leased_control().unwrap();
+        let through = first.appended().address().offset + u64::from(first.appended().address().len);
+        client.checkpoint_position(1, 1, through).unwrap();
+        client.close_leased_extent().unwrap();
+        let (records, dropped, incomplete, error) = client.owner_timeline_fetch_partial();
+        assert!(error.is_none());
+        assert_eq!((dropped, incomplete), (0, 0));
+        let export = timeline.finish().unwrap();
+        for kind in [
+            "lease",
+            "prelease",
+            "adoption",
+            "closing_adoption",
+            "position",
+        ] {
+            let submitted = export
+                .control_events
+                .iter()
+                .find(|event| event.target.kind == kind && event.stage == "submit")
+                .unwrap();
+            let completed = export
+                .control_events
+                .iter()
+                .find(|event| {
+                    event.envelope_id == submitted.envelope_id && event.stage == "complete"
+                })
+                .unwrap();
+            assert_eq!(completed.success, Some(true));
+            assert!(completed.elapsed_ns >= submitted.elapsed_ns);
+            let owner = records
+                .iter()
+                .find(|record| record.envelope_id == submitted.envelope_id)
+                .unwrap();
+            assert!(owner.control_queue_ns.is_some());
+            assert!(owner.handler_ns.is_some());
+            if kind == "position" {
+                assert_eq!(submitted.target.through, Some(through));
+                assert!(owner.wal_file_persist_ns.is_some());
+                assert!(owner.namespace_persist_ns.is_some());
+                assert!(owner.append_persist_ns.is_some());
+            }
+        }
+    }
 }
 
 #[cfg(all(test, feature = "experimental-nvmeof", target_os = "linux"))]
@@ -4026,6 +4101,9 @@ impl super::Client {
             self.live_leased.closing.is_some(),
             self.live_leased.next.is_some(),
         )
+    }
+    pub(crate) fn leased_test_enable_ahead(&mut self) {
+        self.live_config.as_mut().unwrap().lease_ahead = true;
     }
     pub(crate) fn leased_test_largest_close_profile(&self) -> super::live_control::AdoptProfile {
         self.live_leased.largest_close_profile

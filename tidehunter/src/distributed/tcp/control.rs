@@ -2257,16 +2257,30 @@ impl ControlContext {
                 authority_epoch,
                 epoch,
                 through,
-            } => self
-                .inventory
-                .lock()
-                .checkpoint_position(authority_epoch, epoch, through)
-                .map(|proof| Response::CheckpointPosition {
-                    database: proof.database,
-                    partition: proof.partition,
-                    epoch: proof.epoch,
-                    durable_end: proof.durable_end,
-                }),
+            } => {
+                let mut measured = profile.as_deref_mut();
+                let result = self
+                    .inventory
+                    .lock()
+                    .checkpoint_position(
+                        authority_epoch,
+                        epoch,
+                        through,
+                        measured
+                            .as_deref_mut()
+                            .map(|profile| &mut profile.storage_write),
+                    )
+                    .map(|proof| Response::CheckpointPosition {
+                        database: proof.database,
+                        partition: proof.partition,
+                        epoch: proof.epoch,
+                        durable_end: proof.durable_end,
+                    });
+                if let Some(profile) = measured {
+                    profile.append_persist_ns = profile.storage_write.persist_total_ns;
+                }
+                result
+            }
             Request::ReplayWal {
                 authority_epoch,
                 source_epoch,

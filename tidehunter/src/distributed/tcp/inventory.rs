@@ -1415,6 +1415,7 @@ impl NodeInventory {
         authority_epoch: u64,
         epoch: u64,
         through: u64,
+        profile: Option<&mut super::super::storage::StorageWriteProfile>,
     ) -> Result<checkpoint::CheckpointPositionProof, TcpError> {
         self.require_history(true)?;
         self.active(authority_epoch)?;
@@ -1429,7 +1430,7 @@ impl NodeInventory {
                 .logs
                 .get(&epoch)
                 .ok_or_else(|| TcpError::new("checkpoint stream absent"))?
-                .persist_wal_through(through)
+                .persist_wal_through_profiled(through, profile)
                 .map_err(TcpError::component)?,
             EpochState::Abandoned => 0,
             EpochState::Preparing => return Err(TcpError::new("checkpoint epoch incomplete")),

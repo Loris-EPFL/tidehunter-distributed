@@ -1431,6 +1431,11 @@ pub(super) struct ClientState {
     control_result: Option<Response>,
     control_decode_ns: u64,
     control_profiled: bool,
+    control_timeline: Option<(
+        std::sync::Arc<super::super::write_timeline::WriteTimeline>,
+        u32,
+    )>,
+    control_target: Option<super::super::write_timeline::ControlTimelineTarget>,
     message_read_requests: u64,
     progressed: bool,
 }
@@ -1463,6 +1468,82 @@ fn read_charge(references: &[ValueRecordReference]) -> Result<usize, TcpError> {
     })
 }
 impl Client {
+    pub(crate) fn trace_controls(
+        &mut self,
+        timeline: std::sync::Arc<super::super::write_timeline::WriteTimeline>,
+        owner: u32,
+    ) {
+        self.reactor.control_timeline = Some((timeline, owner));
+    }
+
+    fn trace_control_submit(&mut self, id: u64, request: &Request) {
+        use super::super::write_timeline::ControlTimelineTarget;
+        let Some((timeline, owner)) = self.reactor.control_timeline.as_ref() else {
+            return;
+        };
+        if !timeline.enabled() {
+            return;
+        }
+        let mut target = ControlTimelineTarget {
+            kind: "",
+            epoch: 0,
+            extent: None,
+            through: None,
+            prefix: None,
+        };
+        match request {
+            Request::Checkpoint { epoch, prefix, .. } => {
+                target.kind = "checkpoint";
+                target.epoch = *epoch;
+                target.prefix = Some(*prefix);
+            }
+            Request::CheckpointPosition { epoch, through, .. } => {
+                target.kind = "position";
+                target.epoch = *epoch;
+                target.through = Some(*through);
+            }
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            Request::AdoptLiveExtent {
+                epoch,
+                token,
+                through,
+                close,
+                ..
+            } => {
+                target.kind = if *close {
+                    "closing_adoption"
+                } else {
+                    "adoption"
+                };
+                target.epoch = *epoch;
+                target.extent = Some(*token);
+                target.through = Some(*through);
+            }
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            Request::PreleaseLiveExtent { epoch, after } => {
+                target.kind = "prelease";
+                target.epoch = *epoch;
+                target.extent = Some(*after);
+            }
+            #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+            Request::LeaseLiveExtent { epoch } => {
+                target.kind = "lease";
+                target.epoch = *epoch;
+            }
+            _ => return,
+        }
+        timeline.control_event("submit", *owner, id, target, None);
+        self.reactor.control_target = Some(target);
+    }
+
+    fn trace_control_complete(&mut self, id: u64, success: bool) {
+        if let Some(target) = self.reactor.control_target.take()
+            && let Some((timeline, owner)) = self.reactor.control_timeline.as_ref()
+        {
+            timeline.control_event("complete", *owner, id, target, Some(success));
+        }
+    }
+
     pub(crate) fn message_read_requests(&self) -> u64 {
         self.reactor.message_read_requests
     }
@@ -1586,6 +1667,9 @@ impl Client {
         }
     }
     fn fail_connection(&mut self) {
+        if let Some((id, _)) = self.reactor.control {
+            self.trace_control_complete(id, false);
+        }
         self.broken = true;
         self.stream.abort();
         self.reactor.reads.clear();
@@ -2212,6 +2296,7 @@ impl Client {
         self.reactor.control = Some((id, deadline));
         self.reactor.control_decode_ns = 0;
         self.reactor.control_profiled = false;
+        self.trace_control_submit(id, request);
         Ok(true)
     }
 
@@ -2221,6 +2306,7 @@ impl Client {
             return None;
         }
         let response = self.reactor.control_result.take()?;
+        self.trace_control_complete(id, !matches!(&response, Response::Error(_)));
         self.reactor.control = None;
         self.reactor.control_profiled = false;
         self.reactor.control_decode_ns = 0;
@@ -2271,6 +2357,7 @@ impl Client {
         self.reactor.control = Some((id, deadline));
         self.reactor.control_decode_ns = 0;
         self.reactor.control_profiled = profile.is_some();
+        self.trace_control_submit(id, request);
         let began = profile.as_ref().map(|_| Instant::now());
         loop {
             if let Err(error) = self.progress_correlated() {
@@ -2279,6 +2366,7 @@ impl Client {
             }
             if self.reactor.control_result.is_some() && !self.stream.output_pending(id) {
                 let response = self.reactor.control_result.take().unwrap();
+                self.trace_control_complete(id, !matches!(&response, Response::Error(_)));
                 self.reactor.control = None;
                 self.reactor.control_profiled = false;
                 if let Some(profile) = profile.as_deref_mut() {
@@ -2828,23 +2916,36 @@ pub(super) fn serve_session(
                 last_id = envelope.id;
                 initialized = true;
                 retained_bytes += charge;
-                let owner_trace = if matches!(&envelope.body, Request::Append { .. }) {
-                    if let Some(timeline) =
-                        owner_timeline.as_mut().filter(|timeline| timeline.active)
-                    {
-                        if timeline.selected < timeline.limit {
-                            timeline.selected += 1;
-                            true
+                let trace_control = matches!(
+                    &envelope.body,
+                    Request::Checkpoint { .. } | Request::CheckpointPosition { .. }
+                );
+                #[cfg(all(feature = "experimental-nvmeof", target_os = "linux"))]
+                let trace_control = trace_control
+                    || matches!(
+                        &envelope.body,
+                        Request::AdoptLiveExtent { .. }
+                            | Request::PreleaseLiveExtent { .. }
+                            | Request::LeaseLiveExtent { .. }
+                    );
+                let owner_trace =
+                    if trace_control || matches!(&envelope.body, Request::Append { .. }) {
+                        if let Some(timeline) =
+                            owner_timeline.as_mut().filter(|timeline| timeline.active)
+                        {
+                            if timeline.selected < timeline.limit {
+                                timeline.selected += 1;
+                                true
+                            } else {
+                                timeline.dropped += 1;
+                                false
+                            }
                         } else {
-                            timeline.dropped += 1;
                             false
                         }
                     } else {
                         false
-                    }
-                } else {
-                    false
-                };
+                    };
                 let owner_trace_shape = if owner_timeline
                     .as_ref()
                     .is_some_and(|timeline| timeline.active)

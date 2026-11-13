@@ -1073,7 +1073,7 @@ fn wal_replay_leased_append_that_needs_control_waits_for_position_reply() {
     }
     client.submit_leased_adoption().unwrap();
     client.wait_leased_control().unwrap();
-    assert!(client.leased_append_needs_control());
+    assert!(client.leased_append_needs_control(None));
     assert_eq!(client.leased_test_frontier().0, 16384);
     let last = last.unwrap().appended();
     let through = last.address().offset + u64::from(last.address().len);
@@ -1112,6 +1112,243 @@ fn wal_replay_leased_append_that_needs_control_waits_for_position_reply() {
             .unwrap(),
         batch.mutations()[0]
     );
+    drop(worker);
+    assert!(!failure.load(Ordering::Acquire));
+}
+
+#[test]
+fn parked_position_allows_appends_during_adoption_and_preserves_control_order() {
+    use crate::distributed::storage::LivePausePoint;
+    for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+        let fixture = Fixture::new(tier, 128 * 1024);
+        let mut client = fixture.writer();
+        let first = client
+            .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+            .unwrap()[0];
+        client.wait_leased_control().unwrap(); // Initial prelease.
+        let log = fixture.node.log_for_test(1);
+        let (entered, release) = log.pause_live(LivePausePoint::FrameProbe);
+        client.submit_leased_adoption().unwrap();
+        let (worker, failure) = worker(&fixture, client);
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let through = first.appended().address().offset + u64::from(first.appended().address().len);
+        let guard = worker.client.lock();
+        let (reply, proof) = mpsc::sync_channel(1);
+        worker
+            .send(Command::CheckpointPosition(1, 1, through, reply))
+            .unwrap();
+        let passing = worker.append(1, vec![fixture.batch(1)]).unwrap();
+        let (reply, control) = mpsc::sync_channel(1);
+        worker
+            .send(Command::Control(Box::new(move |client| {
+                let _ = reply.send(client.leased_test_frontier().1);
+            })))
+            .unwrap();
+        let later = worker.append(1, vec![fixture.batch(2)]).unwrap();
+        drop(guard);
+        let passed = passing.recv_timeout(Duration::from_secs(5));
+        let proof_pending = matches!(proof.try_recv(), Err(mpsc::TryRecvError::Empty));
+        let control_pending = matches!(control.try_recv(), Err(mpsc::TryRecvError::Empty));
+        let later_pending = matches!(later.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release.send(()).unwrap();
+        let passed = passed.unwrap().unwrap()[0];
+        assert!(proof_pending && control_pending && later_pending);
+        assert!(passed.appended().address().offset > through);
+        assert!(
+            proof
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .durable_end
+                >= through
+        );
+        let source = fixture.config.root.join("epoch_0000000000000001");
+        let captured_root = std::fs::read(source.join("partition-wal-root-v1")).unwrap();
+        assert!(!control.recv_timeout(Duration::from_secs(5)).unwrap());
+        let later = later.recv_timeout(Duration::from_secs(5)).unwrap().unwrap()[0];
+        assert!(later.appended().address().offset >= 128 * 1024);
+        receive(worker.seal(1).unwrap()).unwrap();
+        for (n, receipt) in [(0, first), (1, passed), (2, later)] {
+            let batch = fixture.batch(n);
+            let reference = batch
+                .record_reference(receipt.appended().address(), 0)
+                .unwrap();
+            assert_eq!(log.read_record(&reference).unwrap(), batch.mutations()[0]);
+        }
+        // Recover a real persisted checkpoint root plus its later durable suffix.
+        // The owner is sealed before copying; no metadata writer races this image.
+        let image = tempdir::TempDir::new("parked-position-recovery").unwrap();
+        for entry in std::fs::read_dir(&source).unwrap() {
+            let entry = entry.unwrap();
+            assert!(entry.file_type().unwrap().is_file());
+            std::fs::copy(entry.path(), image.path().join(entry.file_name())).unwrap();
+        }
+        std::fs::write(image.path().join("partition-wal-root-v1"), captured_root).unwrap();
+        let recovered = crate::distributed::storage::PartitionLog::recover_live_sealed(
+            image.path(),
+            &fixture.config.partition,
+            Metrics::new_in_enabled(&prometheus::Registry::new(), false),
+            // These copied inodes have never been exported to a writable target.
+            || Ok(()),
+        )
+        .unwrap();
+        for (n, receipt) in [(0, first), (1, passed), (2, later)] {
+            let batch = fixture.batch(n);
+            let reference = batch
+                .record_reference(receipt.appended().address(), 0)
+                .unwrap();
+            assert_eq!(
+                recovered.read_record(&reference).unwrap(),
+                batch.mutations()[0]
+            );
+        }
+        drop(worker);
+        assert!(!failure.load(Ordering::Acquire));
+    }
+}
+
+#[test]
+fn parked_position_requests_prelease_without_blocking_appends_or_shutdown() {
+    for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+        let fixture = Fixture::new(tier, 128 * 1024);
+        let mut client = fixture.writer_without_ahead();
+        let first = client
+            .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+            .unwrap()[0];
+        client.leased_test_enable_ahead();
+        let (entered, release) = fixture.node.pause_inventory();
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let through = first.appended().address().offset + u64::from(first.appended().address().len);
+        let (mut worker, failure) = worker(&fixture, client);
+        let guard = worker.client.lock();
+        let (reply, proof) = mpsc::sync_channel(1);
+        worker
+            .send(Command::CheckpointPosition(1, 1, through, reply))
+            .unwrap();
+        let append = worker.append(1, vec![fixture.batch(1)]).unwrap();
+        drop(guard);
+        let passed = append.recv_timeout(Duration::from_secs(5));
+        let proof_pending = matches!(proof.try_recv(), Err(mpsc::TryRecvError::Empty));
+        // Closing the sender must drain the parked proof, not discard it.
+        worker.sender.take();
+        release.send(()).unwrap();
+        let passed = passed.unwrap().unwrap()[0];
+        assert!(proof_pending);
+        assert!(passed.appended().address().offset > through);
+        assert!(
+            proof
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .durable_end
+                >= through
+        );
+        drop(worker);
+        assert!(fixture.metrics.snapshot().counts.extent_preleases >= 1);
+        assert!(!failure.load(Ordering::Acquire));
+    }
+}
+
+#[test]
+fn parked_receipt_checkpoint_keeps_its_captured_prefix() {
+    use crate::distributed::storage::{HistoryPersistence, LivePausePoint};
+    let fixture = Fixture::new(DurabilityTier::Native, 128 * 1024);
+    fixture
+        .node
+        .set_history_persistence(HistoryPersistence::OnDisk)
+        .unwrap();
+    let mut client = fixture.writer();
+    let first = client
+        .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+        .unwrap()[0];
+    client.wait_leased_control().unwrap();
+    let log = fixture.node.log_for_test(1);
+    let (entered, release) = log.pause_live(LivePausePoint::FrameProbe);
+    client.submit_leased_adoption().unwrap();
+    let (worker, failure) = worker(&fixture, client);
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let guard = worker.client.lock();
+    let (reply, proof) = mpsc::sync_channel(1);
+    worker.send(Command::Checkpoint(1, 1, 1, reply)).unwrap();
+    let append = worker.append(1, vec![fixture.batch(1)]).unwrap();
+    drop(guard);
+    let passed = append.recv_timeout(Duration::from_secs(5));
+    release.send(()).unwrap();
+    let passed = passed.unwrap().unwrap()[0];
+    let proof = proof.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+    assert_eq!(proof.prefix, 1);
+    assert_eq!(proof.digest, log.checkpoint_prefix(1).unwrap());
+    assert!(passed.appended().address().offset > first.appended().address().offset);
+    drop(worker);
+    assert!(!failure.load(Ordering::Acquire));
+}
+
+#[test]
+fn failed_append_poison_replies_to_parked_position() {
+    use crate::distributed::storage::LivePausePoint;
+    let fixture = Fixture::new(DurabilityTier::Native, 128 * 1024);
+    let mut client = fixture.writer();
+    let first = client
+        .write_leased_group(1, vec![fixture.batch(0)], &WriteTimeline::default(), 2)
+        .unwrap()[0];
+    client.wait_leased_control().unwrap();
+    let (entered, release) = fixture
+        .node
+        .log_for_test(1)
+        .pause_live(LivePausePoint::FrameProbe);
+    client.submit_leased_adoption().unwrap();
+    client.leased_test_fail_write(-libc::EIO);
+    let (worker, failure) = worker(&fixture, client);
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let through = first.appended().address().offset + u64::from(first.appended().address().len);
+    let guard = worker.client.lock();
+    let (reply, proof) = mpsc::sync_channel(1);
+    worker
+        .send(Command::CheckpointPosition(1, 1, through, reply))
+        .unwrap();
+    let append = worker.append(1, vec![fixture.batch(1)]).unwrap();
+    drop(guard);
+    let result = append.recv_timeout(Duration::from_secs(5));
+    let proof_result = proof.recv_timeout(Duration::from_secs(5));
+    release.send(()).unwrap();
+    assert!(result.unwrap().is_err());
+    assert!(proof_result.unwrap().is_err());
+    drop(worker);
+    assert!(failure.load(Ordering::Acquire));
+}
+
+#[test]
+fn actual_frame_can_use_runway_smaller_than_the_maximum_frame() {
+    let fixture = Fixture::new(DurabilityTier::Native, 16384);
+    let mut client = fixture.writer_without_ahead();
+    let mut first = None;
+    for n in 0..2 {
+        first = Some(
+            client
+                .write_leased_group(1, vec![fixture.batch(n)], &WriteTimeline::default(), 2)
+                .unwrap()[0],
+        );
+    }
+    client.submit_leased_adoption().unwrap();
+    client.wait_leased_control().unwrap();
+    assert!(client.leased_append_needs_control(None));
+    assert!(!client.leased_append_needs_control(Some(4096)));
+    let last = first.unwrap().appended();
+    let through = last.address().offset + u64::from(last.address().len);
+    let (entered, release) = fixture.node.pause_next_persist(1).unwrap();
+    let (worker, failure) = worker(&fixture, client);
+    let (reply, proof) = mpsc::sync_channel(1);
+    worker
+        .send(Command::CheckpointPosition(1, 1, through, reply))
+        .unwrap();
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let append = worker.append(1, vec![fixture.batch(2)]).unwrap();
+    let result = append.recv_timeout(Duration::from_secs(5));
+    let pending = matches!(proof.try_recv(), Err(mpsc::TryRecvError::Empty));
+    release.send(()).unwrap();
+    assert!(result.unwrap().is_ok());
+    assert!(pending);
+    assert!(proof.recv_timeout(Duration::from_secs(5)).unwrap().is_ok());
     drop(worker);
     assert!(!failure.load(Ordering::Acquire));
 }
