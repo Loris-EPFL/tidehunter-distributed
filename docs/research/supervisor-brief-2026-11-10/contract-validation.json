@@ -1,0 +1,697 @@
+{
+  "pass_check": true,
+  "numeric_occurrences": 113,
+  "source_linked_values": 101,
+  "sources": 8,
+  "claims": [
+    {
+      "key": "B:contract-values:combined-cases:value|,.0f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/combined-kv-evidence.json",
+      "column": "cases",
+      "case_id": ""
+    },
+    {
+      "key": "B:contract-values:combined-measured_calls:value|,.0f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/combined-kv-evidence.json",
+      "column": "measured_calls",
+      "case_id": ""
+    },
+    {
+      "key": "B:contract-values:run13-compared_cells:value|,.0f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/run13-evidence.json",
+      "column": "compared_cells",
+      "case_id": ""
+    },
+    {
+      "key": "B:contract-values:sustained-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G20W-r0-a0badc095191e0cad124"
+    },
+    {
+      "key": "B:contract-values:sustained-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "p99_us",
+      "case_id": "G20W-r0-a0badc095191e0cad124"
+    },
+    {
+      "key": "B:contract-values:sustained-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "p999_us",
+      "case_id": "G20W-r0-a0badc095191e0cad124"
+    },
+    {
+      "key": "B:contract-values:sustained-calls_per_second:value|,.0f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "calls_per_second",
+      "case_id": "G20W-r0-a0badc095191e0cad124"
+    },
+    {
+      "key": "B:contract-values:sustained-mean_inflight_calls:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "mean_inflight_calls",
+      "case_id": "G20W-r0-a0badc095191e0cad124"
+    },
+    {
+      "key": "B:contract-values:sustained-calls_ge_5ms:value|,.0f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "calls_ge_5ms",
+      "case_id": "G20W-r0-a0badc095191e0cad124"
+    },
+    {
+      "key": "B:contract-values:first-run13_first_call_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/run13-comparison.csv",
+      "column": "run13_first_call_us",
+      "case_id": "G20W-r0-8231343f2a568c3c567f"
+    },
+    {
+      "key": "B:contract-values:first-first_call_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/run13-comparison.csv",
+      "column": "first_call_us",
+      "case_id": "G20W-r0-8231343f2a568c3c567f"
+    },
+    {
+      "key": "B:contract-values:G20W-r0-8231343f2a568c3c567f-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G20W-r0-8231343f2a568c3c567f"
+    },
+    {
+      "key": "B:contract-values:G20W-r0-8231343f2a568c3c567f-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "p99_us",
+      "case_id": "G20W-r0-8231343f2a568c3c567f"
+    },
+    {
+      "key": "B:contract-values:G20W-r0-8231343f2a568c3c567f-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "p999_us",
+      "case_id": "G20W-r0-8231343f2a568c3c567f"
+    },
+    {
+      "key": "B:contract-values:G20N-r0-f2aea9d6e14426870fed-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G20N-r0-f2aea9d6e14426870fed"
+    },
+    {
+      "key": "B:contract-values:G20N-r0-f2aea9d6e14426870fed-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "p99_us",
+      "case_id": "G20N-r0-f2aea9d6e14426870fed"
+    },
+    {
+      "key": "B:contract-values:G20N-r0-f2aea9d6e14426870fed-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "p999_us",
+      "case_id": "G20N-r0-f2aea9d6e14426870fed"
+    },
+    {
+      "key": "B:contract-values:G20W-r0-7f53e3ae326ecfc3c606-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G20W-r0-7f53e3ae326ecfc3c606"
+    },
+    {
+      "key": "B:contract-values:G20W-r0-7f53e3ae326ecfc3c606-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "p99_us",
+      "case_id": "G20W-r0-7f53e3ae326ecfc3c606"
+    },
+    {
+      "key": "B:contract-values:G20W-r0-7f53e3ae326ecfc3c606-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "p999_us",
+      "case_id": "G20W-r0-7f53e3ae326ecfc3c606"
+    },
+    {
+      "key": "B:contract-values:G20N-r0-8d9fb99cee3dceff4e9f-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G20N-r0-8d9fb99cee3dceff4e9f"
+    },
+    {
+      "key": "B:contract-values:G20N-r0-8d9fb99cee3dceff4e9f-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "p99_us",
+      "case_id": "G20N-r0-8d9fb99cee3dceff4e9f"
+    },
+    {
+      "key": "B:contract-values:G20N-r0-8d9fb99cee3dceff4e9f-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "p999_us",
+      "case_id": "G20N-r0-8d9fb99cee3dceff4e9f"
+    },
+    {
+      "key": "B:contract-values:G19W-r0-b7a318911354ba036075-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G19W-r0-b7a318911354ba036075"
+    },
+    {
+      "key": "B:contract-values:G19W-r0-b7a318911354ba036075-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p99_us",
+      "case_id": "G19W-r0-b7a318911354ba036075"
+    },
+    {
+      "key": "B:contract-values:G19W-r0-b7a318911354ba036075-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p999_us",
+      "case_id": "G19W-r0-b7a318911354ba036075"
+    },
+    {
+      "key": "B:contract-values:G19N-r0-ff5f9867bacc3caa45fb-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G19N-r0-ff5f9867bacc3caa45fb"
+    },
+    {
+      "key": "B:contract-values:G19N-r0-ff5f9867bacc3caa45fb-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p99_us",
+      "case_id": "G19N-r0-ff5f9867bacc3caa45fb"
+    },
+    {
+      "key": "B:contract-values:G19N-r0-ff5f9867bacc3caa45fb-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p999_us",
+      "case_id": "G19N-r0-ff5f9867bacc3caa45fb"
+    },
+    {
+      "key": "B:contract-values:G19W-r1-d7d09867c5660edf8fd4-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G19W-r1-d7d09867c5660edf8fd4"
+    },
+    {
+      "key": "B:contract-values:G19W-r1-d7d09867c5660edf8fd4-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p99_us",
+      "case_id": "G19W-r1-d7d09867c5660edf8fd4"
+    },
+    {
+      "key": "B:contract-values:G19W-r1-d7d09867c5660edf8fd4-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p999_us",
+      "case_id": "G19W-r1-d7d09867c5660edf8fd4"
+    },
+    {
+      "key": "B:contract-values:G19N-r1-d2188c7e8e6a9e41a7e5-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G19N-r1-d2188c7e8e6a9e41a7e5"
+    },
+    {
+      "key": "B:contract-values:G19N-r1-d2188c7e8e6a9e41a7e5-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p99_us",
+      "case_id": "G19N-r1-d2188c7e8e6a9e41a7e5"
+    },
+    {
+      "key": "B:contract-values:G19N-r1-d2188c7e8e6a9e41a7e5-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p999_us",
+      "case_id": "G19N-r1-d2188c7e8e6a9e41a7e5"
+    },
+    {
+      "key": "B:contract-values:G19W-r0-a8a58a1edc3c1ff444a5-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G19W-r0-a8a58a1edc3c1ff444a5"
+    },
+    {
+      "key": "B:contract-values:G19W-r0-a8a58a1edc3c1ff444a5-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p99_us",
+      "case_id": "G19W-r0-a8a58a1edc3c1ff444a5"
+    },
+    {
+      "key": "B:contract-values:G19W-r0-a8a58a1edc3c1ff444a5-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p999_us",
+      "case_id": "G19W-r0-a8a58a1edc3c1ff444a5"
+    },
+    {
+      "key": "B:contract-values:G19N-r0-92068587167e8922a687-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G19N-r0-92068587167e8922a687"
+    },
+    {
+      "key": "B:contract-values:G19N-r0-92068587167e8922a687-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p99_us",
+      "case_id": "G19N-r0-92068587167e8922a687"
+    },
+    {
+      "key": "B:contract-values:G19N-r0-92068587167e8922a687-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p999_us",
+      "case_id": "G19N-r0-92068587167e8922a687"
+    },
+    {
+      "key": "B:contract-values:G19W-r0-772bb60128cc251af6b6-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G19W-r0-772bb60128cc251af6b6"
+    },
+    {
+      "key": "B:contract-values:G19W-r0-772bb60128cc251af6b6-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p99_us",
+      "case_id": "G19W-r0-772bb60128cc251af6b6"
+    },
+    {
+      "key": "B:contract-values:G19W-r0-772bb60128cc251af6b6-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p999_us",
+      "case_id": "G19W-r0-772bb60128cc251af6b6"
+    },
+    {
+      "key": "B:contract-values:G19N-r0-f2c3d71c157b439af5d6-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G19N-r0-f2c3d71c157b439af5d6"
+    },
+    {
+      "key": "B:contract-values:G19N-r0-f2c3d71c157b439af5d6-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p99_us",
+      "case_id": "G19N-r0-f2c3d71c157b439af5d6"
+    },
+    {
+      "key": "B:contract-values:G19N-r0-f2c3d71c157b439af5d6-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p999_us",
+      "case_id": "G19N-r0-f2c3d71c157b439af5d6"
+    },
+    {
+      "key": "B:contract-values:G19W-r0-887f03d0d8d8f45cff94-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G19W-r0-887f03d0d8d8f45cff94"
+    },
+    {
+      "key": "B:contract-values:G19W-r0-887f03d0d8d8f45cff94-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p99_us",
+      "case_id": "G19W-r0-887f03d0d8d8f45cff94"
+    },
+    {
+      "key": "B:contract-values:G19W-r0-887f03d0d8d8f45cff94-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p999_us",
+      "case_id": "G19W-r0-887f03d0d8d8f45cff94"
+    },
+    {
+      "key": "B:contract-values:G19N-r0-b0331240997a379d6c85-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G19N-r0-b0331240997a379d6c85"
+    },
+    {
+      "key": "B:contract-values:G19N-r0-b0331240997a379d6c85-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p99_us",
+      "case_id": "G19N-r0-b0331240997a379d6c85"
+    },
+    {
+      "key": "B:contract-values:G19N-r0-b0331240997a379d6c85-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p999_us",
+      "case_id": "G19N-r0-b0331240997a379d6c85"
+    },
+    {
+      "key": "B:contract-values:G19W-r1-edc0dd941f80ad3e10fe-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G19W-r1-edc0dd941f80ad3e10fe"
+    },
+    {
+      "key": "B:contract-values:G19W-r1-edc0dd941f80ad3e10fe-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p99_us",
+      "case_id": "G19W-r1-edc0dd941f80ad3e10fe"
+    },
+    {
+      "key": "B:contract-values:G19W-r1-edc0dd941f80ad3e10fe-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p999_us",
+      "case_id": "G19W-r1-edc0dd941f80ad3e10fe"
+    },
+    {
+      "key": "B:contract-values:G19N-r1-fa11ba68fbdf3f484757-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G19N-r1-fa11ba68fbdf3f484757"
+    },
+    {
+      "key": "B:contract-values:G19N-r1-fa11ba68fbdf3f484757-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p99_us",
+      "case_id": "G19N-r1-fa11ba68fbdf3f484757"
+    },
+    {
+      "key": "B:contract-values:G19N-r1-fa11ba68fbdf3f484757-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p999_us",
+      "case_id": "G19N-r1-fa11ba68fbdf3f484757"
+    },
+    {
+      "key": "B:contract-values:G19W-r0-c06459d77e52516b53ba-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G19W-r0-c06459d77e52516b53ba"
+    },
+    {
+      "key": "B:contract-values:G19W-r0-c06459d77e52516b53ba-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p99_us",
+      "case_id": "G19W-r0-c06459d77e52516b53ba"
+    },
+    {
+      "key": "B:contract-values:G19W-r0-c06459d77e52516b53ba-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p999_us",
+      "case_id": "G19W-r0-c06459d77e52516b53ba"
+    },
+    {
+      "key": "B:contract-values:G19W-r0-4492454d4c36cacd3f74-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G19W-r0-4492454d4c36cacd3f74"
+    },
+    {
+      "key": "B:contract-values:G19W-r0-4492454d4c36cacd3f74-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p99_us",
+      "case_id": "G19W-r0-4492454d4c36cacd3f74"
+    },
+    {
+      "key": "B:contract-values:G19W-r0-4492454d4c36cacd3f74-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p999_us",
+      "case_id": "G19W-r0-4492454d4c36cacd3f74"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-f33d98a668f0ce648742-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p50_us",
+      "case_id": "G19R-r0-f33d98a668f0ce648742"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-f33d98a668f0ce648742-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p99_us",
+      "case_id": "G19R-r0-f33d98a668f0ce648742"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-f33d98a668f0ce648742-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p999_us",
+      "case_id": "G19R-r0-f33d98a668f0ce648742"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-b36c3b48418ee8225b3a-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p50_us",
+      "case_id": "G19R-r0-b36c3b48418ee8225b3a"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-b36c3b48418ee8225b3a-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p99_us",
+      "case_id": "G19R-r0-b36c3b48418ee8225b3a"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-b36c3b48418ee8225b3a-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p999_us",
+      "case_id": "G19R-r0-b36c3b48418ee8225b3a"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-2f756c11ec1013fce1e1-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p50_us",
+      "case_id": "G19R-r0-2f756c11ec1013fce1e1"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-2f756c11ec1013fce1e1-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p99_us",
+      "case_id": "G19R-r0-2f756c11ec1013fce1e1"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-2f756c11ec1013fce1e1-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p999_us",
+      "case_id": "G19R-r0-2f756c11ec1013fce1e1"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-96d28dff2514d2bb19e6-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p50_us",
+      "case_id": "G19R-r0-96d28dff2514d2bb19e6"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-96d28dff2514d2bb19e6-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p99_us",
+      "case_id": "G19R-r0-96d28dff2514d2bb19e6"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-96d28dff2514d2bb19e6-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p999_us",
+      "case_id": "G19R-r0-96d28dff2514d2bb19e6"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-f348d9f68461e8f6c8ed-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p50_us",
+      "case_id": "G19R-r0-f348d9f68461e8f6c8ed"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-f348d9f68461e8f6c8ed-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p99_us",
+      "case_id": "G19R-r0-f348d9f68461e8f6c8ed"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-f348d9f68461e8f6c8ed-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p999_us",
+      "case_id": "G19R-r0-f348d9f68461e8f6c8ed"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-c52fd3fdf7a4a94e2e67-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p50_us",
+      "case_id": "G19R-r0-c52fd3fdf7a4a94e2e67"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-c52fd3fdf7a4a94e2e67-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p99_us",
+      "case_id": "G19R-r0-c52fd3fdf7a4a94e2e67"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-c52fd3fdf7a4a94e2e67-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p999_us",
+      "case_id": "G19R-r0-c52fd3fdf7a4a94e2e67"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-a4a0650e35a3dc6a6113-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p50_us",
+      "case_id": "G19R-r0-a4a0650e35a3dc6a6113"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-a4a0650e35a3dc6a6113-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p99_us",
+      "case_id": "G19R-r0-a4a0650e35a3dc6a6113"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-a4a0650e35a3dc6a6113-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p999_us",
+      "case_id": "G19R-r0-a4a0650e35a3dc6a6113"
+    },
+    {
+      "key": "B:contract-values:G19N-r0-bad6ac58440aa1315f0e-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p50_us",
+      "case_id": "G19N-r0-bad6ac58440aa1315f0e"
+    },
+    {
+      "key": "B:contract-values:G19N-r0-bad6ac58440aa1315f0e-p99_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p99_us",
+      "case_id": "G19N-r0-bad6ac58440aa1315f0e"
+    },
+    {
+      "key": "B:contract-values:G19N-r0-bad6ac58440aa1315f0e-p999_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p999_us",
+      "case_id": "G19N-r0-bad6ac58440aa1315f0e"
+    },
+    {
+      "key": "B:contract-values:G20W-r0-8231343f2a568c3c567f-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G20W-r0-8231343f2a568c3c567f"
+    },
+    {
+      "key": "B:contract-values:G20W-r1-946f816574d064a48c1b-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G20W-r1-946f816574d064a48c1b"
+    },
+    {
+      "key": "B:contract-values:historical-0191-valkey_rdma-1024-point-mixed-primary_rf1-r0-put-api_p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
+      "column": "api_p50_us",
+      "case_id": "0191-valkey_rdma-1024-point-mixed-primary_rf1-r0"
+    },
+    {
+      "key": "B:contract-values:G20W-r0-756eecca68a6748678fe-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G20W-r0-756eecca68a6748678fe"
+    },
+    {
+      "key": "B:contract-values:G20W-r1-97f92503bd32d71c6b12-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G20W-r1-97f92503bd32d71c6b12"
+    },
+    {
+      "key": "B:contract-values:historical-0187-valkey_rdma-1024-write-concurrent-primary_rf1-r0-put-api_p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
+      "column": "api_p50_us",
+      "case_id": "0187-valkey_rdma-1024-write-concurrent-primary_rf1-r0"
+    },
+    {
+      "key": "B:contract-values:G19W-r0-772bb60128cc251af6b6-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G19W-r0-772bb60128cc251af6b6"
+    },
+    {
+      "key": "B:contract-values:historical-0190-valkey_rdma-65536-point-mixed-primary_rf1-r0-put-api_p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
+      "column": "api_p50_us",
+      "case_id": "0190-valkey_rdma-65536-point-mixed-primary_rf1-r0"
+    },
+    {
+      "key": "B:contract-values:G20W-r0-7f53e3ae326ecfc3c606-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G20W-r0-7f53e3ae326ecfc3c606"
+    },
+    {
+      "key": "B:contract-values:G20W-r1-8efdbf191f6ae8ec1996-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+      "column": "p50_us",
+      "case_id": "G20W-r1-8efdbf191f6ae8ec1996"
+    },
+    {
+      "key": "B:contract-values:historical-0181-valkey_rdma-65536-write-concurrent-primary_rf1-r0-put-api_p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
+      "column": "api_p50_us",
+      "case_id": "0181-valkey_rdma-65536-write-concurrent-primary_rf1-r0"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-2f756c11ec1013fce1e1-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p50_us",
+      "case_id": "G19R-r0-2f756c11ec1013fce1e1"
+    },
+    {
+      "key": "B:contract-values:historical-0191-valkey_rdma-1024-point-mixed-primary_rf1-r0-read-api_p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
+      "column": "api_p50_us",
+      "case_id": "0191-valkey_rdma-1024-point-mixed-primary_rf1-r0"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-f33d98a668f0ce648742-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p50_us",
+      "case_id": "G19R-r0-f33d98a668f0ce648742"
+    },
+    {
+      "key": "B:contract-values:historical-0191-valkey_rdma-1024-point-mixed-primary_rf1-r0-read-api_p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
+      "column": "api_p50_us",
+      "case_id": "0191-valkey_rdma-1024-point-mixed-primary_rf1-r0"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-b36c3b48418ee8225b3a-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p50_us",
+      "case_id": "G19R-r0-b36c3b48418ee8225b3a"
+    },
+    {
+      "key": "B:contract-values:historical-0191-valkey_rdma-1024-point-mixed-primary_rf1-r0-read-api_p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
+      "column": "api_p50_us",
+      "case_id": "0191-valkey_rdma-1024-point-mixed-primary_rf1-r0"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-a4a0650e35a3dc6a6113-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p50_us",
+      "case_id": "G19R-r0-a4a0650e35a3dc6a6113"
+    },
+    {
+      "key": "B:contract-values:historical-0191-valkey_rdma-1024-point-mixed-primary_rf1-r0-read-api_p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
+      "column": "api_p50_us",
+      "case_id": "0191-valkey_rdma-1024-point-mixed-primary_rf1-r0"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-96d28dff2514d2bb19e6-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p50_us",
+      "case_id": "G19R-r0-96d28dff2514d2bb19e6"
+    },
+    {
+      "key": "B:contract-values:historical-0189-valkey_rdma-1024-read-concurrent-primary_rf1-r0-read-api_p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
+      "column": "api_p50_us",
+      "case_id": "0189-valkey_rdma-1024-read-concurrent-primary_rf1-r0"
+    },
+    {
+      "key": "B:contract-values:G19R-r0-f348d9f68461e8f6c8ed-p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+      "column": "p50_us",
+      "case_id": "G19R-r0-f348d9f68461e8f6c8ed"
+    },
+    {
+      "key": "B:contract-values:historical-0190-valkey_rdma-65536-point-mixed-primary_rf1-r0-read-api_p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
+      "column": "api_p50_us",
+      "case_id": "0190-valkey_rdma-65536-point-mixed-primary_rf1-r0"
+    },
+    {
+      "key": "B:contract-values:historical-0179-valkey_rdma-65536-read-concurrent-primary_rf1-r0-read-api_p50_us:value|.1f",
+      "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
+      "column": "api_p50_us",
+      "case_id": "0179-valkey_rdma-65536-read-concurrent-primary_rf1-r0"
+    }
+  ],
+  "scope": "same-fleet Class A pairs; separate B controls; one explicitly non-ranking historical scale table",
+  "pdf_sha256": "51760763c59926b4d0f6bb7d551efc75086fd91827c585e5719757846d3812fc",
+  "pages": 56,
+  "visual_inspection": {
+    "pdf_sha256": "51760763c59926b4d0f6bb7d551efc75086fd91827c585e5719757846d3812fc",
+    "pages": [
+      29
+    ],
+    "method": "Assistant inspected rendered/contracts-29.png after the final rebuild",
+    "result": "Three memory rows and retained device rows are legible; no clipping. Pages 2, 28 and 49 were inspected in the preceding build."
+  }
+}

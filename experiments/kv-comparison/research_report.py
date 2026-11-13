@@ -10,6 +10,7 @@ import random
 import statistics
 import sys
 
+import ack_contract
 import analyze
 import local
 
@@ -161,6 +162,7 @@ def rows(report):
     for cohort in report["cohorts"]:
         boundary = cohort["boundary"]
         backend = boundary["backend"]
+        contract = ack_contract.selected(backend["name"], backend.get("ack_contract", "synced"))
         workload = boundary["workload"]
         means = cohort["uncertainty"]["throughput_mean_calls_per_second"]
         case = hashlib.sha256(analyze.canonical(workload).encode()).hexdigest()[:12]
@@ -169,7 +171,8 @@ def rows(report):
         for population in cohort["statistics"]["populations"]:
             yield {"cohort": cohort["cohort"], "case": case, "backend": backend["name"],
                    "tier": "Embedded references" if embedded else "Distributed application APIs",
-                   "boundary": backend["measurement_boundary"], "acknowledgement": backend["acknowledgement"],
+                   "boundary": backend["measurement_boundary"], "ack_contract": contract,
+                   "acknowledgement": backend["acknowledgement"],
                    "consistency": backend["consistency"], "replication_factor": backend["replication_factor"],
                    "batch_atomicity": backend["batch_atomicity"], "get_many_strategy": backend["get_many_strategy"],
                    "server_roles": analyze.canonical((boundary.get("deployment") or {}).get("roles", {})),
@@ -215,10 +218,10 @@ def markdown(report, csv_rows):
             if row["tier"] == tier and row["cohort"] not in emitted:
                 emitted.add(row["cohort"])
                 rate = row["offered_ops_per_second"] if row["execution_mode"] == "open_loop" else f"{row['concurrency']} closed-loop workers"
-                lines.append(f"- Case `{row['case']}`, cohort `{row['cohort'][:12]}`, {row['backend']}: {row['value_bytes']} B values, {row['dataset_keys']} keys, {rate} offered calls/s, {row['aging_operations']} aging calls, CPU ceiling {row['allocated_cpu_ceiling']}. Ack `{row['acknowledgement']}`; consistency `{row['consistency']}`; atomic batch `{row['batch_atomicity']}`; GET-many `{row['get_many_strategy']}`. Boundary: {row['boundary']}.")
+                lines.append(f"- Case `{row['case']}`, cohort `{row['cohort'][:12]}`, {row['backend']}: {row['value_bytes']} B values, {row['dataset_keys']} keys, {rate} offered calls/s, {row['aging_operations']} aging calls, CPU ceiling {row['allocated_cpu_ceiling']}. Selected ack_contract `{row['ack_contract']}`; ack `{row['acknowledgement']}`; consistency `{row['consistency']}`; atomic batch `{row['batch_atomicity']}`; GET-many `{row['get_many_strategy']}`. Boundary: {row['boundary']}.")
     lines.extend(["", "## Interpretation", "",
                   "Raw pooled quantiles are not averages of run p99 values. JSON retains per-run throughput and conditional tail variability. Confidence intervals require at least five independent runs; high tails also require a declared sample-count threshold. Missing intervals are not zero uncertainty.", "",
-                  "Valkey TCP and RDMA use RF1 AOF appendfsync always for write acknowledgment, not a value-WAL-backed read path. GET remains RAM-resident even in an OS-cache-drop cohort; no cross-shard atomic PUT-batch guarantee is implied.", "",
+                  "Valkey TCP and RDMA use RF1 AOF for write acknowledgment, not a value-WAL-backed read path. Synced uses appendfsync always; periodic_sync uses everysec; os_buffered uses no. Neither relaxed mode proves a per-case page-cache write; Valkey page_cache is unsupported. These contracts remain separate. GET remains RAM-resident even in an OS-cache-drop cohort; no cross-shard atomic PUT-batch guarantee is implied.", "",
                   "Garnet's SSD-tiered hybrid log is a value storage tier, separate from its AOF write-ahead log; the AOF is not itself the read backing store. Kvrocks uses RocksDB WAL and SST files, with compaction and engine caching affecting I/O. Neither configuration proves that an individual API call accessed SSD; unavailable per-API incidence is unknown, not zero. See [Garnet v2.2.5 configuration](https://github.com/microsoft/garnet/blob/v2.2.5/website/docs/getting-started/configuration.md) and [Kvrocks v2.17.0 configuration](https://github.com/apache/kvrocks/blob/v2.17.0/kvrocks.conf).", "",
                   "A batch's elapsed time is not individual-key latency. Failure/rejection populations remain visible. Qualification-only runs deliberately contribute no performance samples. Sampled aggregate RSS can double-count shared pages and is not total physical memory/cache usage.", ""])
     return "\n".join(lines)
@@ -234,10 +237,17 @@ def slo_frontier(report, p99_us, minimum_success, operation):
             continue
         # A rate sweep changes only offered rate; never pool its raw latencies.
         case = json.loads(analyze.canonical(boundary))
+        contract = ack_contract.selected(case["backend"]["name"], case["backend"].get("ack_contract", "synced"))
+        if contract != "synced":
+            case["backend"]["ack_contract"] = contract
+        else:
+            case["backend"].pop("ack_contract", None)
         case["workload"]["execution"].pop("offered_ops_per_second", None)
         identity = hashlib.sha256(analyze.canonical(case).encode()).hexdigest()
         group = groups.setdefault(identity, {"backend": boundary["backend"]["name"],
-            "acknowledgement": boundary["backend"]["acknowledgement"], "rates": []})
+            "ack_contract": contract,
+            "acknowledgement": boundary["backend"]["acknowledgement"],
+            "rates": []})
         tails = [row for row in cohort["uncertainty"]["latency_between_run_variation"]
                  if row["operation"] == operation and row["outcome"] == "success"
                  and row["metric"] == "response_ns" and row["percentile"] == .99]

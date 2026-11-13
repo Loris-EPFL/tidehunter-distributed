@@ -17,6 +17,7 @@ from pathlib import Path
 
 from verify_curves import check_curves
 from verify_size_spike import check_sizes_spike
+from verify_contracts import check_contracts
 HERE = Path(__file__).resolve().parent
 WORKSPACE = HERE.parents[3]
 RUN8 = WORKSPACE / 'checkpoint-work/focused-launch-20261109-unified2/analysis'
@@ -319,10 +320,13 @@ def main():
 
     curve_checks = check_curves(pages)
     size_spike_checks = check_sizes_spike(pages, definitions)
+    contract_checks = check_contracts(text)
     curve_pages = [figure['page'] for figure in curve_checks['figures'].values()]
     renders = sorted({1, 2, 8, 9, 10, 11, 12, 13} | set(curve_pages)
                      | {i+1 for i, page in enumerate(pages) if any(term in page for term in
                         ('Topology, contracts and the Native result', 'Where Valkey is ahead',
+                         'Acknowledgement contracts', 'page-cache acknowledgement,',
+                         'Separate Class B controls', 'Order of magnitude only',
                          'Agreement with the Tidehunter paper', 'Unexplained features',
                          'points are reproducible', 'Where 64 KiB values occur',
                          'Local structure test', 'Fair Native comparison', 'Two-VM remote reads and writes',
@@ -345,6 +349,7 @@ def main():
         visual = {}  # A prior PDF's visual inspection is not evidence for this PDF.
     validation = {
         'phase': '10 November supervisor brief: final acceptance',
+        'acknowledgement_contracts': contract_checks,
         'inputs': {'outputs_hashed': len(manifest['outputs']), 'sources': source_checks,
                    'copied_full_matrix': 'seven byte-identical CSV inputs; unavailable export not required',
                    'run8_operation_rows': len(operations), 'appendix_rows': len(row_ids)},

@@ -8,14 +8,14 @@
 
 Cold eligibility requires a qualified receipt and at least 0.9 device reads per successful call, not a cache drop alone. This is a case-level proxy, not every-call NAND proof. Native 1 KiB is unqualified at all reader counts and both repetitions; Native 8/64 KiB and every owner cold cell qualify. Warm reads prewarm the serving-node page cache, not the coordinator cache. Cold/warm geometry differs; their contrast is descriptive. No calls, repetitions or fleets are pooled.
 \begin{figure}[H]\centering\RWCfigure{parity}
-\caption{Run-9 availability: pairs in the first two columns, distinct main-grid cases in the last three. Failed network floors are separate from KV cases. Each owner write has three Native acknowledgement controls, not three equivalent durability contracts.}
+\caption{Separate Class A page-cache and Class B synced controls; no cross-class ranking. Run-9 availability: pairs in the first two columns, distinct main-grid cases in the last three. Failed network floors are separate from KV cases. Each owner write has three Native acknowledgement controls, not three equivalent durability contracts.}
 \end{figure}
 \input{rwc/generated/tab-rwc-parity.tex}
 
 \clearpage
 \subsection{Matched writes: size and acknowledgement}
 \begin{figure}[H]\centering\RWCfigure{write-latency}
-\caption{Equal writers within each panel; p50 lines and p99 crosses, repetitions separate. Native page cache is non-durable context; other arms wait for per-put, grouped or covering sync. One data SSD per arm, on different hosts.}
+\caption{Class A: Native page cache. Class B: Native per-put/grouped barriers and owner covering sync. No cross-class ranking. Matched writers; p50 lines, p99 crosses; repetitions separate. One data SSD per arm, on different hosts.}
 \end{figure}
 \input{rwc/generated/tab-rwc-write.tex}
 \RWCFINDING{writes}
@@ -23,7 +23,7 @@ Cold eligibility requires a qualified receipt and at least 0.9 device reads per 
 \clearpage
 \subsection{Matched reads: device-qualified and prewarmed}
 \begin{figure}[H]\centering\RWCfigure{read-latency}
-\caption{Matched readers, sizes and repetitions; coordinator cache off. Unqualified Native cold 1 KiB has no latency marker. Native is in process; owners use one lane at c1, four at c16. Appendix~\ref{app:rwc-qualification} retains every verdict and device ratio, including c5.}
+\caption{Read preparation: Class B. Matched readers, sizes and repetitions; coordinator cache off. Unqualified Native cold 1 KiB has no marker. Native is in process; owners use one lane at c1, four at c16. Appendix~\ref{app:rwc-qualification} retains all verdicts and device ratios, including c5.}
 \end{figure}
 \input{rwc/generated/tab-rwc-read-cold.tex}
 \RWCFINDING{cold-populations}
@@ -32,14 +32,14 @@ Cold eligibility requires a qualified receipt and at least 0.9 device reads per 
 \subsection{Warm reads and the cache contrast}
 \input{rwc/generated/tab-rwc-read-warm.tex}
 \begin{figure}[H]\centering\RWCfigure{cold-warm}
-\caption{Cold versus prewarmed whole-call means at one reader. Each point joins arm, size and repetition, but dataset geometry and operation counts differ. Shape identifies size; filled/open means r0/r1. No subtraction identifies SSD service.}
+\caption{Read preparation: Class B. Cold versus prewarmed whole-call means at one reader. Each point joins arm, size and repetition, but dataset geometry and operation counts differ. Shape identifies size; filled/open means r0/r1. No subtraction identifies SSD service.}
 \end{figure}
 \RWCFINDING{warm}
 
 \clearpage
 \subsection{Finite-case rates and the read-lane limit}
 \begin{figure}[H]\centering\RWCfigure{throughput}
-\caption{Successful API calls/s, not production capacity. c5 owner read points are shaded and lane-limited: one owner lane at c1/c5, four at c16; Native is in process. Do not rank transports on c5 cells. Write acknowledgement and cold/warm read contracts remain separate. Per-case in-flight, offered and unsuccessful counts remain in the CSV and figure evidence; missing occupancy is not zero.}
+\caption{Writes: separate Class A page cache and Class B sync controls; reads: Class B preparation. No cross-class ranking. Successful API calls/s, not production capacity. c5 owner read points are shaded and lane-limited: one owner lane at c1/c5, four at c16; Native is in process. Do not rank transports on c5 cells. Write acknowledgement and cold/warm read contracts remain separate. Per-case in-flight, offered and unsuccessful counts remain in the CSV and figure evidence; missing occupancy is not zero.}
 \end{figure}
 \RWCFINDING{lanes}
 

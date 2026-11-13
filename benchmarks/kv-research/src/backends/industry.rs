@@ -1,7 +1,8 @@
 //! Redis-cluster protocol clients for Garnet and Apache Kvrocks, with store-specific admission.
 
 use crate::backend::{
-    BackendInfo, BackendResult, BackendTransportError, BatchAtomicity, KvBackend, unsupported,
+    AckContract, BackendInfo, BackendResult, BackendTransportError, BatchAtomicity, KvBackend,
+    unsupported,
 };
 use redis::{aio::MultiplexedConnection, cluster::ClusterClient, cluster_async::ClusterConnection};
 use serde::Deserialize;
@@ -72,10 +73,13 @@ struct Options {
     required_replication_factor: usize,
     required_primary_nodes: usize,
     request_timeout_ms: u64,
+    #[serde(default)]
+    ack_contract: AckContract,
 }
 impl Options {
-    fn parse(value: &Value) -> BackendResult<Self> {
+    fn parse(value: &Value, store: Store) -> BackendResult<Self> {
         let o = Self::deserialize(value)?;
+        o.ack_contract.validate_for(store.name())?;
         if !o.cluster
             || o.nodes.len() != 5
             || o.required_primary_nodes != 5
@@ -106,8 +110,8 @@ impl Options {
         Ok(o)
     }
 }
-pub fn validate_options(value: &Value) -> BackendResult<()> {
-    Options::parse(value).map(|_| ())
+pub fn validate_options(value: &Value, store: Store) -> BackendResult<()> {
+    Options::parse(value, store).map(|_| ())
 }
 fn invalid(message: &str) -> Box<dyn std::error::Error + Send + Sync> {
     io::Error::new(io::ErrorKind::InvalidInput, message.to_owned()).into()
@@ -147,7 +151,12 @@ fn fields(info: &str) -> BTreeMap<&str, &str> {
         .filter_map(|line| line.trim().split_once(':'))
         .collect()
 }
-fn check_config(store: Store, config: &BTreeMap<String, String>) -> BackendResult<()> {
+fn check_config(
+    store: Store,
+    config: &BTreeMap<String, String>,
+    ack_contract: AckContract,
+) -> BackendResult<()> {
+    ack_contract.validate_for(store.name())?;
     let required: &[(&str, &str)] = match store {
         Store::Garnet => &[
             ("appendonly", "yes"),
@@ -156,7 +165,14 @@ fn check_config(store: Store, config: &BTreeMap<String, String>) -> BackendResul
             ("aof-null-device", "no"),
         ],
         Store::Kvrocks => &[
-            ("rocksdb.write_options.sync", "yes"),
+            (
+                "rocksdb.write_options.sync",
+                if ack_contract == AckContract::PageCache {
+                    "no"
+                } else {
+                    "yes"
+                },
+            ),
             ("rocksdb.write_options.disable_wal", "no"),
             ("rocksdb.disable_auto_compactions", "no"),
             ("cluster-enabled", "yes"),
@@ -165,8 +181,9 @@ fn check_config(store: Store, config: &BTreeMap<String, String>) -> BackendResul
     for &(key, expected) in required {
         if config.get(key).map(String::as_str) != Some(expected) {
             return Err(invalid(&format!(
-                "{} requires CONFIG {key}={expected}; observed {:?}",
+                "{} ack_contract={} requires CONFIG {key}={expected}; observed {:?}",
                 store.name(),
+                ack_contract.as_str(),
                 config.get(key)
             )));
         }
@@ -252,7 +269,7 @@ pub struct IndustryBackend {
 }
 impl IndustryBackend {
     pub async fn open(value: &Value, store: Store) -> BackendResult<Self> {
-        let options = Options::parse(value)?;
+        let options = Options::parse(value, store)?;
         let duration = Duration::from_millis(options.request_timeout_ms);
         let mut node_info = Vec::new();
         let mut node_config = Vec::new();
@@ -315,7 +332,7 @@ impl IndustryBackend {
                     return Err(invalid("CONFIG GET returned an invalid response"));
                 }
             }
-            check_config(store, &config)?;
+            check_config(store, &config, options.ack_contract)?;
             let cluster_info: String =
                 direct(&mut conn, duration, redis::cmd("CLUSTER").arg("INFO")).await?;
             let state = fields(&cluster_info);
@@ -362,7 +379,7 @@ impl IndustryBackend {
                 "SET/DEL reply after AOF commit; CONFIG appendonly=yes, aof-commit-freq=0, aof-commit-wait=yes, aof-null-device=no observed on every primary"
             }
             Store::Kvrocks => {
-                "SET/DEL reply with RocksDB WAL enabled and write_options.sync=yes observed on every primary"
+                options.ack_contract.acknowledgement().unwrap_or("SET/DEL reply with RocksDB WAL enabled and write_options.sync=yes observed on every primary")
             }
         };
         let tier = match store {
@@ -382,7 +399,7 @@ impl IndustryBackend {
             get_many_strategy: "native MGET through redis-rs cross-slot splitter and ordered response combiner; preserves duplicates and nil misses; not atomic".into(),
             batch_atomicity: BatchAtomicity::Unsupported,
             topology: json!({"cluster":true,"primary_count":5,"slot_count":16384,"primaries":primaries,"routing":"redis-rs cluster slot routing and MOVED/ASK"}),
-            configuration: json!({"transport":"plain TCP", "request_timeout_ms":options.request_timeout_ms,"required_replication_factor":1,"node_config":node_config,"node_info":node_info,"storage_tier_evidence":tier,"replica_reads":false,"client_retries":2,"mutation_uncertainty":"transport failures or timeouts can leave mutation outcome unknown; retries may replay SET/DEL"}),
+            configuration: json!({"ack_contract":options.ack_contract,"transport":"plain TCP", "request_timeout_ms":options.request_timeout_ms,"required_replication_factor":1,"node_config":node_config,"node_info":node_info,"storage_tier_evidence":tier,"replica_reads":false,"client_retries":2,"mutation_uncertainty":"transport failures or timeouts can leave mutation outcome unknown; retries may replay SET/DEL"}),
         };
         Ok(Self {
             connection,
@@ -455,18 +472,89 @@ mod tests {
             ("rocksdb.disable_auto_compactions".into(), "no".into()),
             ("cluster-enabled".into(), "yes".into()),
         ]);
-        assert!(check_config(Store::Kvrocks, &c).is_ok());
+        assert!(check_config(Store::Kvrocks, &c, AckContract::default()).is_ok());
         c.insert("rocksdb.write_options.disable_wal".into(), "yes".into());
-        assert!(check_config(Store::Kvrocks, &c).is_err());
+        assert!(check_config(Store::Kvrocks, &c, AckContract::default()).is_err());
         let mut c = BTreeMap::from([
             ("appendonly".into(), "yes".into()),
             ("aof-commit-freq".into(), "0".into()),
             ("aof-commit-wait".into(), "yes".into()),
             ("aof-null-device".into(), "no".into()),
         ]);
-        assert!(check_config(Store::Garnet, &c).is_ok());
+        assert!(check_config(Store::Garnet, &c, AckContract::default()).is_ok());
         c.insert("aof-commit-wait".into(), "no".into());
-        assert!(check_config(Store::Garnet, &c).is_err());
+        assert!(check_config(Store::Garnet, &c, AckContract::default()).is_err());
+    }
+    #[test]
+    fn acknowledgement_contract_is_checked_for_the_selected_store() {
+        let mut input = json!({"nodes":["a:6379","b:6379","c:6379","d:6379","e:6379"],
+            "cluster":true,"required_replication_factor":1,"required_primary_nodes":5,"request_timeout_ms":1000});
+        for store in [Store::Garnet, Store::Kvrocks] {
+            assert_eq!(
+                Options::parse(&input, store).unwrap().ack_contract,
+                AckContract::Synced
+            );
+        }
+        for contract in [
+            AckContract::Synced,
+            AckContract::OsBuffered,
+            AckContract::PeriodicSync,
+            AckContract::PageCache,
+        ] {
+            input["ack_contract"] = json!(contract);
+            assert_eq!(
+                validate_options(&input, Store::Garnet).is_ok(),
+                contract == AckContract::Synced
+            );
+            assert_eq!(
+                validate_options(&input, Store::Kvrocks).is_ok(),
+                matches!(contract, AckContract::Synced | AckContract::PageCache)
+            );
+            #[cfg(feature = "garnet")]
+            assert_eq!(
+                crate::backends::validate_options("garnet", &input).is_ok(),
+                contract == AckContract::Synced
+            );
+            #[cfg(feature = "kvrocks")]
+            assert_eq!(
+                crate::backends::validate_options("kvrocks", &input).is_ok(),
+                matches!(contract, AckContract::Synced | AckContract::PageCache)
+            );
+        }
+        input["ack_contract"] = json!("invalid");
+        assert!(validate_options(&input, Store::Kvrocks).is_err());
+        assert!(validate_options(&input, Store::Garnet).is_err());
+    }
+
+    #[test]
+    fn kvrocks_page_cache_requires_wal_and_non_sync_writes() {
+        for contract in [AckContract::Synced, AckContract::PageCache] {
+            for sync in ["yes", "no"] {
+                let mut config = BTreeMap::from([
+                    ("rocksdb.write_options.sync".into(), sync.into()),
+                    ("rocksdb.write_options.disable_wal".into(), "no".into()),
+                    ("rocksdb.disable_auto_compactions".into(), "no".into()),
+                    ("cluster-enabled".into(), "yes".into()),
+                ]);
+                let result = check_config(Store::Kvrocks, &config, contract);
+                assert_eq!(
+                    result.is_ok(),
+                    (sync == "no") == (contract == AckContract::PageCache)
+                );
+                if let Err(error) = result {
+                    assert!(error.to_string().contains(contract.as_str()));
+                }
+                for (key, value) in [
+                    ("rocksdb.write_options.disable_wal", "yes"),
+                    ("rocksdb.disable_auto_compactions", "yes"),
+                    ("cluster-enabled", "no"),
+                ] {
+                    let previous = config.insert(key.into(), value.into()).unwrap();
+                    assert!(check_config(Store::Kvrocks, &config, contract).is_err());
+                    config.insert(key.into(), previous);
+                }
+            }
+        }
     }
     #[test]
     fn topology_rejects_holes_overlap_and_replicas() {

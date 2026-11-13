@@ -9,7 +9,8 @@ use tidehunter::minibytes::Bytes;
 use tokio::time::timeout;
 
 use crate::backend::{
-    BackendInfo, BackendResult, BackendTransportError, BatchAtomicity, KvBackend, unsupported,
+    AckContract, BackendInfo, BackendResult, BackendTransportError, BatchAtomicity, KvBackend,
+    unsupported,
 };
 
 #[derive(Clone, Debug, Deserialize)]
@@ -20,11 +21,14 @@ struct Options {
     required_replication_factor: usize,
     required_primary_nodes: usize,
     request_timeout_ms: u64,
+    #[serde(default)]
+    ack_contract: AckContract,
 }
 
 impl Options {
     fn parse(value: &JsonValue) -> BackendResult<Self> {
         let options = Self::deserialize(value)?;
+        options.ack_contract.validate_for("valkey_tcp")?;
         if options.nodes.is_empty() {
             return Err(invalid("nodes must contain at least one host:port"));
         }
@@ -203,7 +207,10 @@ fn fields(info: &str) -> BTreeMap<&str, &str> {
         .collect()
 }
 
-fn parse_config(values: &[String]) -> BackendResult<BTreeMap<&str, &str>> {
+fn parse_config(
+    values: &[String],
+    ack_contract: AckContract,
+) -> BackendResult<BTreeMap<&str, &str>> {
     if !values.len().is_multiple_of(2) {
         return Err(invalid(
             "Valkey CONFIG GET returned an incomplete key/value list",
@@ -215,13 +222,14 @@ fn parse_config(values: &[String]) -> BackendResult<BTreeMap<&str, &str>> {
     }
     for (key, expected) in [
         ("appendonly", "yes"),
-        ("appendfsync", "always"),
+        ("appendfsync", ack_contract.valkey_appendfsync()?),
         ("no-appendfsync-on-rewrite", "no"),
         ("maxmemory-policy", "noeviction"),
     ] {
         if config.get(key).copied() != Some(expected) {
             return Err(invalid(&format!(
-                "Valkey requires CONFIG {key}={expected}; observed {:?}",
+                "Valkey ack_contract={} requires CONFIG {key}={expected}; observed {:?}",
+                ack_contract.as_str(),
                 config.get(key)
             )));
         }
@@ -338,7 +346,7 @@ impl ValkeyTcpBackend {
                 ));
             }
             cluster_modes.push(cluster_enabled);
-            configs.push(parse_config(config)?);
+            configs.push(parse_config(config, options.ack_contract)?);
             persistence.push(fields(persistence_info));
         }
         let topology = if options.cluster {
@@ -413,7 +421,7 @@ impl ValkeyTcpBackend {
             name: "valkey_tcp".to_owned(),
             server_version: version,
             client_version: "redis-rs 1.8.0 (BSD-3-Clause)".to_owned(),
-            acknowledgement: "SET success reply; primary appendonly=yes, appendfsync=always, no-appendfsync-on-rewrite=no observed at admission; Valkey AOF fsyncs before replying; no replica acknowledgement".to_owned(),
+            acknowledgement: options.ack_contract.acknowledgement().unwrap_or("SET success reply; primary appendonly=yes, appendfsync=always, no-appendfsync-on-rewrite=no observed at admission; Valkey AOF fsyncs before replying; no replica acknowledgement").to_owned(),
             consistency: "primary-routed reads/writes; RF1, no replica reads".to_owned(),
             replication_factor: 1,
             measurement_boundary: "redis-rs async command through fully materialized response; Valkey GET reads RAM-resident values (not NVMe cold reads)".to_owned(),
@@ -425,6 +433,7 @@ impl ValkeyTcpBackend {
             batch_atomicity: BatchAtomicity::Unsupported,
             topology: json!({"cluster": options.cluster, "required_primary_nodes": options.required_primary_nodes, "observed_primary_nodes": topology["primary_count"], "slot_count": topology["slot_count"], "cluster_state": topology.get("cluster_state"), "primaries": topology["primaries"], "routing": if options.cluster { "redis-rs CLUSTER SLOTS slot map; MOVED/ASK redirect handling" } else { "direct standalone TCP connection" }}),
             configuration: json!({
+                "ack_contract": options.ack_contract,
                 "transport": "plain TCP",
                 "request_timeout_ms": options.request_timeout_ms,
                 "cluster_enabled": cluster_modes,
@@ -524,7 +533,7 @@ mod tests {
         .map(str::to_owned)
         .collect();
         assert_eq!(
-            serde_json::to_value(parse_config(&values).unwrap()).unwrap(),
+            serde_json::to_value(parse_config(&values, AckContract::default()).unwrap()).unwrap(),
             json!({
                 "appendonly": "yes",
                 "appendfsync": "always",
@@ -533,8 +542,55 @@ mod tests {
             })
         );
         values[3] = "everysec".to_owned();
-        assert!(parse_config(&values).is_err());
+        assert!(parse_config(&values, AckContract::default()).is_err());
         values.pop();
-        assert!(parse_config(&values).is_err());
+        assert!(parse_config(&values, AckContract::default()).is_err());
+    }
+
+    #[test]
+    fn acknowledgement_contract_defaults_and_live_settings_are_exact() {
+        let mut input = json!({"nodes":["127.0.0.1:6379"],"cluster":false,
+            "required_replication_factor":1,"required_primary_nodes":1,"request_timeout_ms":1000});
+        assert_eq!(
+            Options::parse(&input).unwrap().ack_contract,
+            AckContract::Synced
+        );
+        for (contract, fsync) in [
+            (AckContract::Synced, "always"),
+            (AckContract::OsBuffered, "no"),
+            (AckContract::PeriodicSync, "everysec"),
+        ] {
+            input["ack_contract"] = json!(contract);
+            assert_eq!(Options::parse(&input).unwrap().ack_contract, contract);
+            for actual in ["always", "no", "everysec"] {
+                let mut values: Vec<String> = [
+                    "appendonly",
+                    "yes",
+                    "appendfsync",
+                    actual,
+                    "no-appendfsync-on-rewrite",
+                    "no",
+                    "maxmemory-policy",
+                    "noeviction",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+                let result = parse_config(&values, contract);
+                assert_eq!(result.is_ok(), actual == fsync);
+                if let Err(error) = result {
+                    assert!(error.to_string().contains(contract.as_str()));
+                }
+                for index in [1, 5, 7] {
+                    let previous = std::mem::replace(&mut values[index], "invalid".into());
+                    assert!(parse_config(&values, contract).is_err());
+                    values[index] = previous;
+                }
+            }
+        }
+        for invalid_contract in ["page_cache", "invalid"] {
+            input["ack_contract"] = json!(invalid_contract);
+            assert!(Options::parse(&input).is_err());
+        }
     }
 }

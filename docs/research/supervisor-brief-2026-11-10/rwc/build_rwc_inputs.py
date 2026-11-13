@@ -125,6 +125,10 @@ def main():
         path = generated / name; path.write_text(text + '\n'); generated_files.append(path)
 
     def table(name, headers, rows, caption):
+        if name in ('tab-rwc-write.tex', 'tab-rwc-parity.tex'):
+            caption = 'Separate controls: Class A Native page cache; Class B Native barriers and owner sync. No cross-class ranking. ' + caption
+        elif name in ('tab-rwc-read-cold.tex', 'tab-rwc-read-warm.tex', 'tab-rwc-qualification.tex'):
+            caption = 'Read preparation: Class B write settings, not a read durability guarantee. ' + caption
         banner = r'\textbf{SYNTHETIC --- layout test, not measurements.} ' if synthetic else ''
         text = (r'\begin{table}[H]\centering\small\setlength{\tabcolsep}{3pt}' + '\n' +
                 r'\begin{tabular}{' + 'l' + 'r' * (len(headers)-1) + r'}\toprule' + '\n' +
@@ -152,10 +156,9 @@ def main():
                         values.append(number('latency_vs_size',i,field,fmt))
                     cells.append('/'.join(values))
                 rows.append([f'{int(size)//1024} KiB', LABELS[label], 'r'+str(rep), *cells])
-        caption = (title + r'; successful API p50/p99 (\us{}), one row per repetition, never pooled. '
-                   'All three caller counts are shown. Values below 10 use two decimals, below 100 one, otherwise whole microseconds. ')
-        caption += ('Native page-cache writes are not durable; barrier/grouped/covering sync remain distinct.' if name == 'write' else
-                    'Coordinator cache off. Unqualified cold cells have no latency.')
+        caption = title + r'; successful API p50/p99 (\us{}), repetitions separate; c1/c5/c16. '
+        if name != 'write':
+            caption += 'Coordinator cache off. Unqualified cold cells have no latency.'
         table('tab-rwc-'+name+'.tex', ['Size','Arm','Rep.','c1','c5*' if name != 'write' else 'c5','c16'], rows, caption)
 
     qrows = []

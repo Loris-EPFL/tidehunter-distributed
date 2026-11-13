@@ -130,6 +130,7 @@ class IndustryComparatorReporting(unittest.TestCase):
         self.assertTrue(all(row["samples"] == 7 and row["independent_runs"] == 2 for row in rows))
         self.assertTrue(all(row["throughput_ci95_low"] is None for row in rows))
         self.assertEqual({row["operation"] for row in rows}, {"read"})
+        self.assertEqual({row["ack_contract"] for row in rows}, {"synced"})
         text = research_report.markdown(report, rows)
         self.assertIn("Garnet's SSD-tiered hybrid log", text)
         self.assertIn("separate from its AOF", text)
@@ -138,6 +139,12 @@ class IndustryComparatorReporting(unittest.TestCase):
         self.assertIn("unknown, not zero", text)
         self.assertIn("v2.2.5", text)
         self.assertIn("v2.17.0", text)
+        cohorts[1]["boundary"]["backend"]["ack_contract"] = "page_cache"
+        relaxed = next(row for row in research_report.rows(report) if row["backend"] == "kvrocks")
+        self.assertEqual(relaxed["ack_contract"], "page_cache")
+        self.assertEqual(relaxed["acknowledgement"], "configured")
+        self.assertIn("Selected ack_contract `page_cache`",
+                      research_report.markdown(report, list(research_report.rows(report))))
 
 
 class RateSweepEvidence(unittest.TestCase):
@@ -171,6 +178,29 @@ class RateSweepEvidence(unittest.TestCase):
         for bound in (0, float('nan'), float('inf')):
             with self.assertRaises(ValueError):
                 research_report.slo_frontier(report, bound, .999, 'read')
+
+    def test_external_ack_contracts_form_distinct_rate_sweep_groups(self):
+        cohorts = []
+        for index, contract in enumerate(("synced", "page_cache", "periodic_sync", "os_buffered")):
+            cohort = self.cohort(1000, 900 - index)
+            cohort["cohort"] = contract
+            cohort["boundary"]["backend"].update(
+                name="kvrocks" if contract == "page_cache" else "valkey_tcp", ack_contract=contract)
+            cohorts.append(cohort)
+        # Legacy absence and explicit synced are the same selected contract.
+        legacy = self.cohort(2000, 950)
+        legacy["boundary"]["backend"]["name"] = "valkey_tcp"
+        cohorts.append(legacy)
+        report = {"cohorts": cohorts}
+        original = json.dumps(report, sort_keys=True)
+        groups = research_report.slo_frontier(report, 100, .999, "read")["groups"].values()
+        by_contract = {group["ack_contract"]: group for group in groups}
+        self.assertEqual(set(by_contract), {"synced", "page_cache", "periodic_sync", "os_buffered"})
+        self.assertEqual(len(by_contract["synced"]["rates"]), 2)
+        self.assertEqual(len(by_contract["page_cache"]["rates"]), 1)
+        self.assertEqual(len(by_contract["periodic_sync"]["rates"]), 1)
+        self.assertEqual(len(by_contract["os_buffered"]["rates"]), 1)
+        self.assertEqual(json.dumps(report, sort_keys=True), original)
 
 
 if __name__ == '__main__':

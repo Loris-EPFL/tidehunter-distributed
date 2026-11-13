@@ -1,0 +1,67 @@
+\section{Acknowledgement contracts}\label{sec:ack}
+\textbf{Read the acknowledgement class before comparing stores.} The original
+Tidehunter paper, \href{https://arxiv.org/abs/2602.01873v2}{arXiv:2602.01873v2},
+Section 3.1, states: ``Writes complete without waiting for fsync''.
+The write reaches the operating-system page cache and survives an application
+crash. An acknowledgement does not establish survival of a kernel crash or
+power loss. The paper relies on background fsync for kernel-crash durability;
+applications that need a stronger guarantee can call explicit flush.
+
+\begin{description}
+\item[Class A: page-cache acknowledgement.] No sync is required before the
+reply. This is the paper's default contract. In these benchmarks, it is
+Native \texttt{page\_cache} and owner \texttt{native}, including the new leased
+NVMe-oF route. The owner tier name \texttt{native} does not mean the in-process
+Native backend. \texttt{wal\_replay} selects recovery history; it does not
+change the acknowledgement class.
+\item[Class B: synced before acknowledgement.] The reply waits for the
+configured sync or commit barrier. Benchmarked settings are Tidehunter
+\texttt{synchronous} (covering fdatasync), Native
+\texttt{value\_wal\_barrier} (per-put file and directory fsync), Native grouped
+barrier, Valkey \texttt{appendfsync always}, Kvrocks synced WAL, and Garnet
+commit-wait. Sync scope and sharing still differ. This class records the
+acknowledgement setting, not a proof of equal crash recovery or power-loss
+survival.
+\item[Device sync not verified.] Cassandra, TiKV and FoundationDB retain this
+status. They are not verified Class B members and must not be used to infer
+Class A performance either.
+\end{description}
+
+\textbf{Coverage.} The retained cross-store comparisons use Class B settings
+where verified. Class A cross-store data for external stores does not exist
+yet. The grey Native Class A curves and historical page-cache rows are
+separate references, not Class B competitors; their values are retained for
+continuity. Never infer a ranking by comparing the two classes. The one
+indicative scale table in Section~\ref{sec:indicative} is explicitly not a
+fair comparison.
+
+\textbf{External settings are not a binary switch.} Valkey has three relevant
+settings: synced \texttt{always} (measured); periodic sync
+\texttt{everysec} (not measured); and OS-buffered, no fsync
+(\texttt{appendfsync no}, not measured). Neither of the latter settings
+is an exact page-cache equivalent; both are weaker than Tidehunter's
+process-crash contract. Periodic sync can retain AOF writes in user space
+while a background fsync runs
+(\href{https://valkey.io/topics/latency/}{Valkey latency documentation}).
+The pinned Valkey source also does not guarantee AOF write completion before
+every reply in \texttt{no} mode: write errors are not fatal outside
+\texttt{always}, and later replies in the same loop are not covered.
+Source: Valkey commit \texttt{fe8d406c}, \texttt{server.c:1898--1928} and
+\texttt{aof.c:1194--1218}. Kvrocks \texttt{rocksdb.write\_options.sync no}
+is source-confirmed as a page-cache acknowledgement, but not measured.
+Kvrocks keeps RocksDB's default \texttt{manual\_wal\_flush=false}; non-sync
+WAL writes reach the OS buffer before return. See RocksDB's
+\href{https://github.com/facebook/rocksdb/wiki/Basic-Operations}{Basic Operations},
+``Non-sync Writes''. There is still no external Class A performance data.
+
+\textbf{Reads.} A read has no write acknowledgement. A read caption's class
+names the database's write/preparation setting only. Cache state, read route
+and device qualification remain separate requirements. In particular, Valkey
+GET reads RAM. A Class B setup does not make a read SSD-served.
+
+\textbf{Current evidence gaps.} No Sui replay result completed on hardware.
+The new design has no synchronous-tier put result at sixteen callers and no
+five-owner run. No external-store Class A arm was measured. Laptop checks
+are functional evidence only, not performance evidence. Later one-owner
+results below do not replace the historical cross-store values or prove
+five-owner scale-out.

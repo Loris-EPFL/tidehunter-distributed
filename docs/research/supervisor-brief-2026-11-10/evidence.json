@@ -1,7 +1,7 @@
 {
   "figures": {
     "scoreboard.pdf": {
-      "sha256": "54bb115894003e286233f44a6b3bd4d52bf5a61806c9b6db4658b6a9b1d10f97",
+      "sha256": "1b2c56cbd0ac14c936a85c7a88bd3477f52b3996f54bc614e3efac12c4536b79",
       "note": "Success-only quantiles. TH: one full-matrix run; Valkey: medians over historical GCP fleets, days and binaries. Contracts differ.",
       "points": [
         {
@@ -916,7 +916,7 @@
       "repetitions": "Native/TH: one run; external: medians over 2 to 6 runs, different fleets/days/binaries"
     },
     "others.pdf": {
-      "sha256": "bfe8f08e86d712ea3fd2a1e1baa81b269ab1770101307cd52b9b564f926f39c8",
+      "sha256": "1391f55331e0830e4ce7fbd0e2067ea7cf0819082ef529d8b37e8a2f8c05d58a",
       "note": "Native/TH: one full-matrix run; others: historical GCP per-run medians across fleets, days and binaries. Hollow put p50: device persistence unverified.",
       "points": [
         {
@@ -1435,7 +1435,7 @@
       "repetitions": "Native/TH: one run; external: medians over 2 to 6 runs, different fleets/days/binaries"
     },
     "coherence.pdf": {
-      "sha256": "920c1059a9965413da9b4bbbf3db3c3a7844a08c7960b9c8afb1b56ec647c21f",
+      "sha256": "3aba6f4f505cb97eac077aa8829e25e42f112c8e9ffd94ed54cf7ee6343261d3",
       "note": "Workload-matched populations. TH pairs: full-matrix fleet; Valkey: ratios of historical per-run medians; pair-level same-fleet provenance not established.",
       "points": [
         {
@@ -2311,7 +2311,7 @@
       "repetitions": "Native/TH: one run; external: medians over 2 to 6 runs, different fleets/days/binaries"
     },
     "durable-components.pdf": {
-      "sha256": "0369999fab1ce86d1712927888b41be9fdaf5237b901ab3892a34e459fe003e2",
+      "sha256": "76c87c0243c859161498b21e51389489f79cdd5444617c3fc97a6597c7b8c6c1",
       "note": "Focused unified fleet; one profiled repetition per case; synchronous owner or native barrier. Native file sync is in durable, not owner persist.",
       "points": [
         {
@@ -2919,7 +2919,7 @@
       }
     },
     "read-components.pdf": {
-      "sha256": "af93645b31af10b2445c9921f0875f1f3b7e62d1d2abdcf3534e8b829e5b99e5",
+      "sha256": "0b541dd3610f60df923525487db8c3d0e8aaead77dd969815f0c6e4fd01d9594",
       "note": "Focused unified fleet; owner/hybrid: one profiled repetition. Native: whole-call median of two repetition statistics, hatched and unsplit. Memory is serving-node memory, not coordinator-cache hits.",
       "points": [
         {
@@ -4050,7 +4050,7 @@
       }
     },
     "sync-step.pdf": {
-      "sha256": "329f25d558a7b475048d0ca7c4cf154d3d1863c5825699b57a92f596dddad79f",
+      "sha256": "3f5fb8a4fde1c4df19296b84b3ed28d4e9f07488c53e66757470cf808485cf26",
       "note": "Focused unified fleet; r0 selected. Owner fdatasync per retained record; native file+directory fsync per API put. Overwrite is a pre-written file, not an append reference.",
       "points": [
         {
@@ -4238,7 +4238,7 @@
       }
     },
     "put-stall.pdf": {
-      "sha256": "36612a82dd3e3c68e79bf3124c821a48bcaa2078446c5f47a9d05144cf4dd0de",
+      "sha256": "c58b3bc6fc5e5c462368b1ae49909ae9aa6fbfd592b2ef1cdca7b231a8a74adb",
       "note": "Focused unified fleet; owner verbs synchronous, 1 KiB c16, one repetition per policy and instrument.",
       "points": [
         {
@@ -8122,7 +8122,7 @@
       }
     },
     "run7-reads.pdf": {
-      "sha256": "55cddc6ef36e26b6c81d7a0ca96bf758dafccd0f4d2d8d05deb259cb791a5834",
+      "sha256": "f95266e912eac2dc6f6cadb460cf74da61d85cb27067dfb64c159cc22003c426",
       "note": "Focused device fleet; 3 repetitions; error bars = min to max, not confidence intervals. V verbs, T TCP mTLS, K kernel direct, S SPDK. P = page-cache acknowledgement; other puts synchronous.",
       "points": [
         {
@@ -8534,7 +8534,7 @@
       }
     },
     "run7-puts.pdf": {
-      "sha256": "035a96580700baba523cc85f4a623d53f6c3829d1b8f5820f2458311fcb2b924",
+      "sha256": "7aa39e74449dba56590f29df25c28bd510d9c399248c9a59d466c90fa21b5ca7",
       "note": "Focused device fleet; 3 repetitions; error bars = min to max, not confidence intervals. V verbs, T TCP mTLS, K kernel direct, S SPDK. P = page-cache acknowledgement; other puts synchronous.",
       "points": [
         {
@@ -8866,7 +8866,7 @@
       }
     },
     "curves-write-c16.pdf": {
-      "sha256": "8b1e046d5d0ea70b078a08c25b8cf44878f6aaf8302e508c24499a920b8fd039",
+      "sha256": "52752d4c6837654a5c5134c73a9537fbd729d2f3fd735471adf93875f319fa3c",
       "note": "Native/TH: one full-matrix run; others: median over 2\u20136 GCP runs (different fleets, days, binaries); hardware/configuration not fully matched. Native: 1 process / 1 SSD. Tidehunter: 5 configured owners. Other external contributors record five configured or observed storage nodes; Cassandra's 3 November run records five contacts, not a verified five-node ring. Five storage-host SSD mounts attested only for inspected 4 November/final deployments. FoundationDB has a separate log/coordinator host. Even spread is not measured. 4,096 successful puts/point/run; finite exposure, not sustained capacity. X: K = 1024 bytes. Y: k = 1000, M = 10\u2076. Cache paths differ; no SSD-read claim. Native: per-put file + directory fsync; TH: covering fdatasync; Valkey: AOF always. Kvrocks: synced WAL; Garnet: AOF commit. Hollow: Cassandra/FDB/TiKV persistence unverified.",
       "points": [
         {
@@ -19157,7 +19157,7 @@
       "contracts": "Native per-put all-file/directory fsync; TH covering fdatasync; Valkey AOF always; Kvrocks synced WAL; Garnet AOF commit; Cassandra/FDB/TiKV device persistence unverified. Native resident-oriented read workload; recent mapped and older positional-read paths may both serve values; per-call source not established. Valkey RAM GET; owner cache off at coordinator; hybrid target cache contracts differ; owner TCP mTLS versus trusted verbs."
     },
     "curves-read-c16.pdf": {
-      "sha256": "c2569f930ffa037e65a2744e85ff8063d20890264995df1b26126b71606c8ca5",
+      "sha256": "52bb207b5417ffd12c5c03bdbc0f7531251ebc14757b89cf4ebca6077c7591ca",
       "note": "Native/TH: one full-matrix run; others: median over 2\u20136 GCP runs (different fleets, days, binaries); hardware/configuration not fully matched. Native: 1 process / 1 SSD. Tidehunter: 5 configured owners. Other external contributors record five configured or observed storage nodes; Cassandra's 3 November run records five contacts, not a verified five-node ring. Five storage-host SSD mounts attested only for inspected 4 November/final deployments. FoundationDB has a separate log/coordinator host. Even spread is not measured. 8,192 successful reads/point/run; finite exposure, not sustained capacity. X: K = 1024 bytes. Y: k = 1000, M = 10\u2076. Cache paths differ; no SSD-read claim.",
       "points": [
         {
@@ -29011,7 +29011,7 @@
       "contracts": "Native per-put all-file/directory fsync; TH covering fdatasync; Valkey AOF always; Kvrocks synced WAL; Garnet AOF commit; Cassandra/FDB/TiKV device persistence unverified. Native resident-oriented read workload; recent mapped and older positional-read paths may both serve values; per-call source not established. Valkey RAM GET; owner cache off at coordinator; hybrid target cache contracts differ; owner TCP mTLS versus trusted verbs."
     },
     "curves-read32-c16.pdf": {
-      "sha256": "eb1f10a862b70058f354ccce30deeed95994c53b6fbd27bfb2a7bea3fae7422f",
+      "sha256": "1cfe3ce748d74ac4b6dac473a349a668ba59f7089fb9ceb3835e7e83f118c04e",
       "note": "Native/TH: one full-matrix run; others: median over 2\u20136 GCP runs (different fleets, days, binaries); hardware/configuration not fully matched. Native: 1 process / 1 SSD. Tidehunter: 5 configured owners. Other external contributors record five configured or observed storage nodes; Cassandra's 3 November run records five contacts, not a verified five-node ring. Five storage-host SSD mounts attested only for inspected 4 November/final deployments. FoundationDB has a separate log/coordinator host. Even spread is not measured. 2,048 successful 32-key calls/point/run; finite exposure, not sustained capacity. X: K = 1024 bytes. Y: k = 1000, M = 10\u2076. Cache paths differ; no SSD-read claim.",
       "points": [
         {
@@ -38863,7 +38863,7 @@
       "contracts": "Native per-put all-file/directory fsync; TH covering fdatasync; Valkey AOF always; Kvrocks synced WAL; Garnet AOF commit; Cassandra/FDB/TiKV device persistence unverified. Native resident-oriented read workload; recent mapped and older positional-read paths may both serve values; per-call source not established. Valkey RAM GET; owner cache off at coordinator; hybrid target cache contracts differ; owner TCP mTLS versus trusted verbs."
     },
     "curves-point-read-c1.pdf": {
-      "sha256": "74ae57fcbd55328f5d9646348191f9ea24755e295db43a434200f0f4aff290be",
+      "sha256": "dd165319647c97872cafb19d7e44af97d5e2fff33155ad5cc13837c14fbbc48f",
       "note": "Native/TH: one full-matrix run; others: median over 2\u20136 GCP runs (different fleets, days, binaries); hardware/configuration not fully matched. Native: 1 process / 1 SSD. Tidehunter: 5 configured owners. Other external contributors record five configured or observed storage nodes; Cassandra's 3 November run records five contacts, not a verified five-node ring. Five storage-host SSD mounts attested only for inspected 4 November/final deployments. FoundationDB has a separate log/coordinator host. Even spread is not measured. 3,621 successful reads/point/run; finite exposure, not sustained capacity. X: K = 1024 bytes. Y: k = 1000, M = 10\u2076. Cache paths differ; no SSD-read claim.",
       "points": [
         {
@@ -48713,7 +48713,7 @@
       "contracts": "Native per-put all-file/directory fsync; TH covering fdatasync; Valkey AOF always; Kvrocks synced WAL; Garnet AOF commit; Cassandra/FDB/TiKV device persistence unverified. Native resident-oriented read workload; recent mapped and older positional-read paths may both serve values; per-call source not established. Valkey RAM GET; owner cache off at coordinator; hybrid target cache contracts differ; owner TCP mTLS versus trusted verbs."
     },
     "curves-point-put-c1.pdf": {
-      "sha256": "69139cc787ab84ddceec9ec91a1a3b26be29b8a56260218ff4be68fb2b8f3269",
+      "sha256": "93900327b9e2e1b7ac980e7993b7dfe1c5ef65231e184fce364e33b9e8ffe87b",
       "note": "Native/TH: one full-matrix run; others: median over 2\u20136 GCP runs (different fleets, days, binaries); hardware/configuration not fully matched. Native: 1 process / 1 SSD. Tidehunter: 5 configured owners. Other external contributors record five configured or observed storage nodes; Cassandra's 3 November run records five contacts, not a verified five-node ring. Five storage-host SSD mounts attested only for inspected 4 November/final deployments. FoundationDB has a separate log/coordinator host. Even spread is not measured. 3,775 successful puts/point/run; finite exposure, not sustained capacity. X: K = 1024 bytes. Y: k = 1000, M = 10\u2076. Cache paths differ; no SSD-read claim. Native: per-put file + directory fsync; TH: covering fdatasync; Valkey: AOF always. Kvrocks: synced WAL; Garnet: AOF commit. Hollow: Cassandra/FDB/TiKV persistence unverified.",
       "points": [
         {

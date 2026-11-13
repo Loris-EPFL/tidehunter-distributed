@@ -4,10 +4,10 @@
   "tables": 6,
   "figure_points": 512,
   "figures": 6,
-  "pages": 54,
+  "pages": 56,
   "synthetic": false,
   "controller_completed": 339,
   "failed_cases": 3,
-  "pdf_sha256": "334745e1e45c96414fcc67a99652c77fc04d266417f4a1de8d046b714b770350",
+  "pdf_sha256": "51760763c59926b4d0f6bb7d551efc75086fd91827c585e5719757846d3812fc",
   "visual_inspection": "separate image inspection; not asserted by this checker"
 }

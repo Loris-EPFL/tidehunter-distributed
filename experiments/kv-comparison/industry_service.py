@@ -33,14 +33,16 @@ def garnet_args(address, port, memory_mib):
             "--metrics-sampling-freq", "1"]
 
 
-def kvrocks_config(address, port, memory_mib):
+def kvrocks_config(address, port, memory_mib, ack_contract="synced"):
+    import ack_contract as contracts
+    sync = "yes" if contracts.selected("kvrocks", ack_contract) == "synced" else "no"
     return (f"bind {address}\nport {port}\ndir /data\ncluster-enabled yes\n"
             "persist-cluster-nodes-enabled yes\nworkers 2\n"
             f"rocksdb.block_cache_size {memory_mib // 4}\n"
             "rocksdb.subkey_block_cache_size 128\nrocksdb.metadata_block_cache_size 128\n"
             "rocksdb.disable_auto_compactions no\n"
             "rocksdb.write_buffer_size 32\nrocksdb.max_write_buffer_number 2\n"
-            "rocksdb.max_background_jobs 2\nrocksdb.write_options.sync yes\n"
+            f"rocksdb.max_background_jobs 2\nrocksdb.write_options.sync {sync}\n"
             "rocksdb.write_options.disable_wal no\n")
 
 
@@ -156,7 +158,7 @@ def admit_runtime(backend, runtime, config):
     if not any(x.get("Type") == "bind" and x.get("Source") == source and x.get("Destination") == "/data" and x.get("RW") for x in item.get("mounts", [])):
         raise RuntimeError("industry data bind escapes the owned directory")
     if backend == "kvrocks":
-        if (item.get("config_text") != kvrocks_config(address, 6379, memory) or
+        if (item.get("config_text") != kvrocks_config(address, 6379, memory, config.get("ack_contract", "synced")) or
                 not any(x.get("Type") == "bind" and x.get("Source") == config["directory"] + "/kvrocks.conf" and
                         x.get("Destination") == "/config/kvrocks.conf" and not x.get("RW") for x in item.get("mounts", []))):
             raise RuntimeError("Kvrocks effective configuration bind differs")
@@ -190,7 +192,7 @@ def admit_local_runtime(backend, runtime, state):
             raise RuntimeError("local industry data volume is not exact-owned")
         if backend == "kvrocks":
             config_path = state["directory"] + "/" + name + ".conf"
-            if (item.get("config_text") != kvrocks_config(f"127.0.0.{31+index}", 6379, 1536) or
+            if (item.get("config_text") != kvrocks_config(f"127.0.0.{31+index}", 6379, 1536, state.get("ack_contract", "synced")) or
                     not any(x.get("Type") == "bind" and x.get("Source") == config_path and
                             x.get("Destination") == "/config/kvrocks.conf" and not x.get("RW") for x in item.get("mounts", []))):
                 raise RuntimeError("local Kvrocks configuration bind mismatch")
@@ -198,7 +200,9 @@ def admit_local_runtime(backend, runtime, state):
             "storage_tier_evidence": "observed pinned container argv and exact-owned data volumes"}
 
 
-def admit(backend, nodes, endpoints, complete=True):
+def admit(backend, nodes, endpoints, complete=True, ack_contract="synced"):
+    import ack_contract as contracts
+    sync = "yes" if contracts.selected(backend, ack_contract) == "synced" else "no"
     expected = set(endpoints)
     if len(nodes) != len(expected) or {n.get("endpoint") for n in nodes} != expected or len(expected) != (5 if complete else 1):
         raise RuntimeError("industry primary endpoint inventory mismatch")
@@ -206,7 +210,7 @@ def admit(backend, nodes, endpoints, complete=True):
     for node in nodes:
         config = node["effective_config"]
         required = ({"appendonly": "yes", "aof-commit-freq": "0", "aof-commit-wait": "yes", "logdir": "/data", "cluster-enabled": "yes"} if backend == "garnet" else
-                    {"dir": "/data", "cluster-enabled": "yes", "persist-cluster-nodes-enabled": "yes", "rocksdb.write_options.sync": "yes", "rocksdb.write_options.disable_wal": "no", "rocksdb.disable_auto_compactions": "no", "rocksdb.write_buffer_size": "32", "rocksdb.max_write_buffer_number": "2", "rocksdb.max_background_jobs": "2", "rocksdb.subkey_block_cache_size": "128", "rocksdb.metadata_block_cache_size": "128"})
+                    {"dir": "/data", "cluster-enabled": "yes", "persist-cluster-nodes-enabled": "yes", "rocksdb.write_options.sync": sync, "rocksdb.write_options.disable_wal": "no", "rocksdb.disable_auto_compactions": "no", "rocksdb.write_buffer_size": "32", "rocksdb.max_write_buffer_number": "2", "rocksdb.max_background_jobs": "2", "rocksdb.subkey_block_cache_size": "128", "rocksdb.metadata_block_cache_size": "128"})
         if any(str(config.get(k)) != v for k, v in required.items()):
             raise RuntimeError("industry effective durability, data path or cluster setting mismatch")
         if backend == "kvrocks" and not 0 < int(config.get("rocksdb.block_cache_size", "0")) <= 262144:
@@ -282,7 +286,7 @@ def admit(backend, nodes, endpoints, complete=True):
     return {"required_primary_nodes": 5, "replication_factor": 1, "replica_count": 0,
             "primary_endpoints": sorted(expected), "slot_count": 16384 if complete else None,
             "primary_ids": views[0][1] if complete else {},
-            "durability": "AOF commit per operation and commit-wait" if backend == "garnet" else "RocksDB WAL enabled and write_options.sync=yes"}
+            "durability": "AOF commit per operation and commit-wait" if backend == "garnet" else f"RocksDB WAL enabled and write_options.sync={sync}"}
 
 
 def initialize(backend, endpoints, owner, timeout):

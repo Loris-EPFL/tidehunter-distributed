@@ -83,6 +83,117 @@ pub enum BatchAtomicity {
     SerializableTransaction,
 }
 
+/// Requested acknowledgement contract; admission must verify the live server.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AckContract {
+    #[default]
+    Synced,
+    OsBuffered,
+    PeriodicSync,
+    PageCache,
+}
+
+impl Serialize for AckContract {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AckContract {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ContractVisitor;
+        impl<'de> serde::de::Visitor<'de> for ContractVisitor {
+            type Value = AckContract;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(
+                    "a string ack_contract (synced, os_buffered, periodic_sync or page_cache)",
+                )
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                match value {
+                    "synced" => Ok(AckContract::Synced),
+                    "os_buffered" => Ok(AckContract::OsBuffered),
+                    "periodic_sync" => Ok(AckContract::PeriodicSync),
+                    "page_cache" => Ok(AckContract::PageCache),
+                    _ => Err(E::unknown_variant(
+                        value,
+                        &["synced", "os_buffered", "periodic_sync", "page_cache"],
+                    )),
+                }
+            }
+        }
+        // A derived unit enum also accepts {"synced": null}; this option must
+        // be a string. The visitor borrows input without allocating a String.
+        deserializer.deserialize_str(ContractVisitor)
+    }
+}
+
+impl AckContract {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Synced => "synced",
+            Self::OsBuffered => "os_buffered",
+            Self::PeriodicSync => "periodic_sync",
+            Self::PageCache => "page_cache",
+        }
+    }
+
+    pub fn validate_for(self, backend: &str) -> BackendResult<()> {
+        if self == Self::Synced
+            || matches!(
+                (backend, self),
+                (
+                    "valkey_tcp" | "valkey_rdma",
+                    Self::OsBuffered | Self::PeriodicSync
+                ) | ("kvrocks", Self::PageCache)
+            )
+        {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "ack_contract {} is not supported for {backend}",
+                    self.as_str()
+                ),
+            )
+            .into())
+        }
+    }
+
+    pub fn valkey_appendfsync(self) -> BackendResult<&'static str> {
+        match self {
+            Self::Synced => Ok("always"),
+            Self::OsBuffered => Ok("no"),
+            Self::PeriodicSync => Ok("everysec"),
+            Self::PageCache => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ack_contract page_cache is not supported for Valkey",
+            )
+            .into()),
+        }
+    }
+
+    /// Relaxed receipts use the same text as the external campaign controller.
+    /// Synced receipts retain each adapter's existing observed-setting text.
+    pub const fn acknowledgement(self) -> Option<&'static str> {
+        match self {
+            Self::Synced => None,
+            Self::OsBuffered => Some(
+                "AOF write issued to OS in event loop before queued replies in normal path; failed/short write not fatal and replies still go out; replies from later I/O step same loop not covered; Valkey issues no fsync",
+            ),
+            Self::PeriodicSync => Some(
+                "AOF enabled; reply after the AOF buffer write is scheduled; fsync once per second (appendfsync everysec); writes can remain in user space for up to two seconds during fsync; neither OS-page-cache-before-reply nor synced-before-acknowledgement is guaranteed",
+            ),
+            Self::PageCache => Some(
+                "RocksDB WAL enabled; write_options.sync=no; acknowledgement without WAL fsync (OS page cache); no power-loss durability guarantee",
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BackendInfo {
     pub name: String,
@@ -268,4 +379,63 @@ pub fn unsupported(operation: &str) -> Box<dyn std::error::Error + Send + Sync> 
         format!("unsupported backend operation: {operation}"),
     )
     .into()
+}
+
+#[cfg(test)]
+mod ack_contract_tests {
+    use super::*;
+
+    #[test]
+    fn contracts_serialize_and_reject_unsupported_stores() {
+        assert_eq!(AckContract::default(), AckContract::Synced);
+        for contract in [
+            AckContract::Synced,
+            AckContract::OsBuffered,
+            AckContract::PeriodicSync,
+            AckContract::PageCache,
+        ] {
+            let encoded = serde_json::to_value(contract).unwrap();
+            assert_eq!(encoded, contract.as_str());
+            assert_eq!(
+                serde_json::from_value::<AckContract>(encoded).unwrap(),
+                contract
+            );
+            for store in ["valkey_tcp", "valkey_rdma", "kvrocks", "garnet"] {
+                let expected = contract == AckContract::Synced
+                    || matches!(
+                        (store, contract),
+                        (
+                            "valkey_tcp" | "valkey_rdma",
+                            AckContract::OsBuffered | AckContract::PeriodicSync
+                        ) | ("kvrocks", AckContract::PageCache)
+                    );
+                assert_eq!(contract.validate_for(store).is_ok(), expected);
+            }
+        }
+        assert!(serde_json::from_value::<AckContract>(serde_json::json!("unknown")).is_err());
+        for invalid in [
+            serde_json::json!({"synced": null}),
+            serde_json::json!(null),
+            serde_json::json!(1),
+            serde_json::json!(false),
+        ] {
+            assert!(serde_json::from_value::<AckContract>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn relaxed_acknowledgements_match_the_campaign_contract() {
+        assert_eq!(AckContract::Synced.acknowledgement(), None);
+        for contract in [
+            AckContract::OsBuffered,
+            AckContract::PeriodicSync,
+            AckContract::PageCache,
+        ] {
+            // These strings are a cross-language admission contract, not a
+            // durability inference made by the benchmark client.
+            let text = contract.acknowledgement().unwrap();
+            let python = include_str!("../../../experiments/kv-comparison/ack_contract.py");
+            assert!(python.contains(&format!("return \"{text}\"")));
+        }
+    }
 }

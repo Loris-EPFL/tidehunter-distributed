@@ -1,5 +1,692 @@
 {
   "phase": "10 November supervisor brief: final acceptance",
+  "acknowledgement_contracts": {
+    "pass_check": true,
+    "numeric_occurrences": 113,
+    "source_linked_values": 101,
+    "sources": 8,
+    "claims": [
+      {
+        "key": "B:contract-values:combined-cases:value|,.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/combined-kv-evidence.json",
+        "column": "cases",
+        "case_id": ""
+      },
+      {
+        "key": "B:contract-values:combined-measured_calls:value|,.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/combined-kv-evidence.json",
+        "column": "measured_calls",
+        "case_id": ""
+      },
+      {
+        "key": "B:contract-values:run13-compared_cells:value|,.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/run13-evidence.json",
+        "column": "compared_cells",
+        "case_id": ""
+      },
+      {
+        "key": "B:contract-values:sustained-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G20W-r0-a0badc095191e0cad124"
+      },
+      {
+        "key": "B:contract-values:sustained-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "p99_us",
+        "case_id": "G20W-r0-a0badc095191e0cad124"
+      },
+      {
+        "key": "B:contract-values:sustained-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "p999_us",
+        "case_id": "G20W-r0-a0badc095191e0cad124"
+      },
+      {
+        "key": "B:contract-values:sustained-calls_per_second:value|,.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "calls_per_second",
+        "case_id": "G20W-r0-a0badc095191e0cad124"
+      },
+      {
+        "key": "B:contract-values:sustained-mean_inflight_calls:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "mean_inflight_calls",
+        "case_id": "G20W-r0-a0badc095191e0cad124"
+      },
+      {
+        "key": "B:contract-values:sustained-calls_ge_5ms:value|,.0f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "calls_ge_5ms",
+        "case_id": "G20W-r0-a0badc095191e0cad124"
+      },
+      {
+        "key": "B:contract-values:first-run13_first_call_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/run13-comparison.csv",
+        "column": "run13_first_call_us",
+        "case_id": "G20W-r0-8231343f2a568c3c567f"
+      },
+      {
+        "key": "B:contract-values:first-first_call_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/run13-comparison.csv",
+        "column": "first_call_us",
+        "case_id": "G20W-r0-8231343f2a568c3c567f"
+      },
+      {
+        "key": "B:contract-values:G20W-r0-8231343f2a568c3c567f-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G20W-r0-8231343f2a568c3c567f"
+      },
+      {
+        "key": "B:contract-values:G20W-r0-8231343f2a568c3c567f-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "p99_us",
+        "case_id": "G20W-r0-8231343f2a568c3c567f"
+      },
+      {
+        "key": "B:contract-values:G20W-r0-8231343f2a568c3c567f-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "p999_us",
+        "case_id": "G20W-r0-8231343f2a568c3c567f"
+      },
+      {
+        "key": "B:contract-values:G20N-r0-f2aea9d6e14426870fed-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G20N-r0-f2aea9d6e14426870fed"
+      },
+      {
+        "key": "B:contract-values:G20N-r0-f2aea9d6e14426870fed-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "p99_us",
+        "case_id": "G20N-r0-f2aea9d6e14426870fed"
+      },
+      {
+        "key": "B:contract-values:G20N-r0-f2aea9d6e14426870fed-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "p999_us",
+        "case_id": "G20N-r0-f2aea9d6e14426870fed"
+      },
+      {
+        "key": "B:contract-values:G20W-r0-7f53e3ae326ecfc3c606-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G20W-r0-7f53e3ae326ecfc3c606"
+      },
+      {
+        "key": "B:contract-values:G20W-r0-7f53e3ae326ecfc3c606-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "p99_us",
+        "case_id": "G20W-r0-7f53e3ae326ecfc3c606"
+      },
+      {
+        "key": "B:contract-values:G20W-r0-7f53e3ae326ecfc3c606-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "p999_us",
+        "case_id": "G20W-r0-7f53e3ae326ecfc3c606"
+      },
+      {
+        "key": "B:contract-values:G20N-r0-8d9fb99cee3dceff4e9f-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G20N-r0-8d9fb99cee3dceff4e9f"
+      },
+      {
+        "key": "B:contract-values:G20N-r0-8d9fb99cee3dceff4e9f-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "p99_us",
+        "case_id": "G20N-r0-8d9fb99cee3dceff4e9f"
+      },
+      {
+        "key": "B:contract-values:G20N-r0-8d9fb99cee3dceff4e9f-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "p999_us",
+        "case_id": "G20N-r0-8d9fb99cee3dceff4e9f"
+      },
+      {
+        "key": "B:contract-values:G19W-r0-b7a318911354ba036075-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G19W-r0-b7a318911354ba036075"
+      },
+      {
+        "key": "B:contract-values:G19W-r0-b7a318911354ba036075-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p99_us",
+        "case_id": "G19W-r0-b7a318911354ba036075"
+      },
+      {
+        "key": "B:contract-values:G19W-r0-b7a318911354ba036075-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p999_us",
+        "case_id": "G19W-r0-b7a318911354ba036075"
+      },
+      {
+        "key": "B:contract-values:G19N-r0-ff5f9867bacc3caa45fb-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G19N-r0-ff5f9867bacc3caa45fb"
+      },
+      {
+        "key": "B:contract-values:G19N-r0-ff5f9867bacc3caa45fb-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p99_us",
+        "case_id": "G19N-r0-ff5f9867bacc3caa45fb"
+      },
+      {
+        "key": "B:contract-values:G19N-r0-ff5f9867bacc3caa45fb-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p999_us",
+        "case_id": "G19N-r0-ff5f9867bacc3caa45fb"
+      },
+      {
+        "key": "B:contract-values:G19W-r1-d7d09867c5660edf8fd4-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G19W-r1-d7d09867c5660edf8fd4"
+      },
+      {
+        "key": "B:contract-values:G19W-r1-d7d09867c5660edf8fd4-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p99_us",
+        "case_id": "G19W-r1-d7d09867c5660edf8fd4"
+      },
+      {
+        "key": "B:contract-values:G19W-r1-d7d09867c5660edf8fd4-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p999_us",
+        "case_id": "G19W-r1-d7d09867c5660edf8fd4"
+      },
+      {
+        "key": "B:contract-values:G19N-r1-d2188c7e8e6a9e41a7e5-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G19N-r1-d2188c7e8e6a9e41a7e5"
+      },
+      {
+        "key": "B:contract-values:G19N-r1-d2188c7e8e6a9e41a7e5-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p99_us",
+        "case_id": "G19N-r1-d2188c7e8e6a9e41a7e5"
+      },
+      {
+        "key": "B:contract-values:G19N-r1-d2188c7e8e6a9e41a7e5-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p999_us",
+        "case_id": "G19N-r1-d2188c7e8e6a9e41a7e5"
+      },
+      {
+        "key": "B:contract-values:G19W-r0-a8a58a1edc3c1ff444a5-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G19W-r0-a8a58a1edc3c1ff444a5"
+      },
+      {
+        "key": "B:contract-values:G19W-r0-a8a58a1edc3c1ff444a5-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p99_us",
+        "case_id": "G19W-r0-a8a58a1edc3c1ff444a5"
+      },
+      {
+        "key": "B:contract-values:G19W-r0-a8a58a1edc3c1ff444a5-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p999_us",
+        "case_id": "G19W-r0-a8a58a1edc3c1ff444a5"
+      },
+      {
+        "key": "B:contract-values:G19N-r0-92068587167e8922a687-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G19N-r0-92068587167e8922a687"
+      },
+      {
+        "key": "B:contract-values:G19N-r0-92068587167e8922a687-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p99_us",
+        "case_id": "G19N-r0-92068587167e8922a687"
+      },
+      {
+        "key": "B:contract-values:G19N-r0-92068587167e8922a687-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p999_us",
+        "case_id": "G19N-r0-92068587167e8922a687"
+      },
+      {
+        "key": "B:contract-values:G19W-r0-772bb60128cc251af6b6-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G19W-r0-772bb60128cc251af6b6"
+      },
+      {
+        "key": "B:contract-values:G19W-r0-772bb60128cc251af6b6-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p99_us",
+        "case_id": "G19W-r0-772bb60128cc251af6b6"
+      },
+      {
+        "key": "B:contract-values:G19W-r0-772bb60128cc251af6b6-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p999_us",
+        "case_id": "G19W-r0-772bb60128cc251af6b6"
+      },
+      {
+        "key": "B:contract-values:G19N-r0-f2c3d71c157b439af5d6-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G19N-r0-f2c3d71c157b439af5d6"
+      },
+      {
+        "key": "B:contract-values:G19N-r0-f2c3d71c157b439af5d6-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p99_us",
+        "case_id": "G19N-r0-f2c3d71c157b439af5d6"
+      },
+      {
+        "key": "B:contract-values:G19N-r0-f2c3d71c157b439af5d6-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p999_us",
+        "case_id": "G19N-r0-f2c3d71c157b439af5d6"
+      },
+      {
+        "key": "B:contract-values:G19W-r0-887f03d0d8d8f45cff94-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G19W-r0-887f03d0d8d8f45cff94"
+      },
+      {
+        "key": "B:contract-values:G19W-r0-887f03d0d8d8f45cff94-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p99_us",
+        "case_id": "G19W-r0-887f03d0d8d8f45cff94"
+      },
+      {
+        "key": "B:contract-values:G19W-r0-887f03d0d8d8f45cff94-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p999_us",
+        "case_id": "G19W-r0-887f03d0d8d8f45cff94"
+      },
+      {
+        "key": "B:contract-values:G19N-r0-b0331240997a379d6c85-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G19N-r0-b0331240997a379d6c85"
+      },
+      {
+        "key": "B:contract-values:G19N-r0-b0331240997a379d6c85-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p99_us",
+        "case_id": "G19N-r0-b0331240997a379d6c85"
+      },
+      {
+        "key": "B:contract-values:G19N-r0-b0331240997a379d6c85-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p999_us",
+        "case_id": "G19N-r0-b0331240997a379d6c85"
+      },
+      {
+        "key": "B:contract-values:G19W-r1-edc0dd941f80ad3e10fe-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G19W-r1-edc0dd941f80ad3e10fe"
+      },
+      {
+        "key": "B:contract-values:G19W-r1-edc0dd941f80ad3e10fe-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p99_us",
+        "case_id": "G19W-r1-edc0dd941f80ad3e10fe"
+      },
+      {
+        "key": "B:contract-values:G19W-r1-edc0dd941f80ad3e10fe-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p999_us",
+        "case_id": "G19W-r1-edc0dd941f80ad3e10fe"
+      },
+      {
+        "key": "B:contract-values:G19N-r1-fa11ba68fbdf3f484757-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G19N-r1-fa11ba68fbdf3f484757"
+      },
+      {
+        "key": "B:contract-values:G19N-r1-fa11ba68fbdf3f484757-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p99_us",
+        "case_id": "G19N-r1-fa11ba68fbdf3f484757"
+      },
+      {
+        "key": "B:contract-values:G19N-r1-fa11ba68fbdf3f484757-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p999_us",
+        "case_id": "G19N-r1-fa11ba68fbdf3f484757"
+      },
+      {
+        "key": "B:contract-values:G19W-r0-c06459d77e52516b53ba-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G19W-r0-c06459d77e52516b53ba"
+      },
+      {
+        "key": "B:contract-values:G19W-r0-c06459d77e52516b53ba-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p99_us",
+        "case_id": "G19W-r0-c06459d77e52516b53ba"
+      },
+      {
+        "key": "B:contract-values:G19W-r0-c06459d77e52516b53ba-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p999_us",
+        "case_id": "G19W-r0-c06459d77e52516b53ba"
+      },
+      {
+        "key": "B:contract-values:G19W-r0-4492454d4c36cacd3f74-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G19W-r0-4492454d4c36cacd3f74"
+      },
+      {
+        "key": "B:contract-values:G19W-r0-4492454d4c36cacd3f74-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p99_us",
+        "case_id": "G19W-r0-4492454d4c36cacd3f74"
+      },
+      {
+        "key": "B:contract-values:G19W-r0-4492454d4c36cacd3f74-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p999_us",
+        "case_id": "G19W-r0-4492454d4c36cacd3f74"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-f33d98a668f0ce648742-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p50_us",
+        "case_id": "G19R-r0-f33d98a668f0ce648742"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-f33d98a668f0ce648742-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p99_us",
+        "case_id": "G19R-r0-f33d98a668f0ce648742"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-f33d98a668f0ce648742-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p999_us",
+        "case_id": "G19R-r0-f33d98a668f0ce648742"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-b36c3b48418ee8225b3a-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p50_us",
+        "case_id": "G19R-r0-b36c3b48418ee8225b3a"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-b36c3b48418ee8225b3a-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p99_us",
+        "case_id": "G19R-r0-b36c3b48418ee8225b3a"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-b36c3b48418ee8225b3a-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p999_us",
+        "case_id": "G19R-r0-b36c3b48418ee8225b3a"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-2f756c11ec1013fce1e1-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p50_us",
+        "case_id": "G19R-r0-2f756c11ec1013fce1e1"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-2f756c11ec1013fce1e1-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p99_us",
+        "case_id": "G19R-r0-2f756c11ec1013fce1e1"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-2f756c11ec1013fce1e1-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p999_us",
+        "case_id": "G19R-r0-2f756c11ec1013fce1e1"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-96d28dff2514d2bb19e6-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p50_us",
+        "case_id": "G19R-r0-96d28dff2514d2bb19e6"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-96d28dff2514d2bb19e6-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p99_us",
+        "case_id": "G19R-r0-96d28dff2514d2bb19e6"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-96d28dff2514d2bb19e6-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p999_us",
+        "case_id": "G19R-r0-96d28dff2514d2bb19e6"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-f348d9f68461e8f6c8ed-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p50_us",
+        "case_id": "G19R-r0-f348d9f68461e8f6c8ed"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-f348d9f68461e8f6c8ed-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p99_us",
+        "case_id": "G19R-r0-f348d9f68461e8f6c8ed"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-f348d9f68461e8f6c8ed-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p999_us",
+        "case_id": "G19R-r0-f348d9f68461e8f6c8ed"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-c52fd3fdf7a4a94e2e67-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p50_us",
+        "case_id": "G19R-r0-c52fd3fdf7a4a94e2e67"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-c52fd3fdf7a4a94e2e67-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p99_us",
+        "case_id": "G19R-r0-c52fd3fdf7a4a94e2e67"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-c52fd3fdf7a4a94e2e67-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p999_us",
+        "case_id": "G19R-r0-c52fd3fdf7a4a94e2e67"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-a4a0650e35a3dc6a6113-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p50_us",
+        "case_id": "G19R-r0-a4a0650e35a3dc6a6113"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-a4a0650e35a3dc6a6113-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p99_us",
+        "case_id": "G19R-r0-a4a0650e35a3dc6a6113"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-a4a0650e35a3dc6a6113-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p999_us",
+        "case_id": "G19R-r0-a4a0650e35a3dc6a6113"
+      },
+      {
+        "key": "B:contract-values:G19N-r0-bad6ac58440aa1315f0e-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p50_us",
+        "case_id": "G19N-r0-bad6ac58440aa1315f0e"
+      },
+      {
+        "key": "B:contract-values:G19N-r0-bad6ac58440aa1315f0e-p99_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p99_us",
+        "case_id": "G19N-r0-bad6ac58440aa1315f0e"
+      },
+      {
+        "key": "B:contract-values:G19N-r0-bad6ac58440aa1315f0e-p999_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p999_us",
+        "case_id": "G19N-r0-bad6ac58440aa1315f0e"
+      },
+      {
+        "key": "B:contract-values:G20W-r0-8231343f2a568c3c567f-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G20W-r0-8231343f2a568c3c567f"
+      },
+      {
+        "key": "B:contract-values:G20W-r1-946f816574d064a48c1b-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G20W-r1-946f816574d064a48c1b"
+      },
+      {
+        "key": "B:contract-values:historical-0191-valkey_rdma-1024-point-mixed-primary_rf1-r0-put-api_p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
+        "column": "api_p50_us",
+        "case_id": "0191-valkey_rdma-1024-point-mixed-primary_rf1-r0"
+      },
+      {
+        "key": "B:contract-values:G20W-r0-756eecca68a6748678fe-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G20W-r0-756eecca68a6748678fe"
+      },
+      {
+        "key": "B:contract-values:G20W-r1-97f92503bd32d71c6b12-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G20W-r1-97f92503bd32d71c6b12"
+      },
+      {
+        "key": "B:contract-values:historical-0187-valkey_rdma-1024-write-concurrent-primary_rf1-r0-put-api_p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
+        "column": "api_p50_us",
+        "case_id": "0187-valkey_rdma-1024-write-concurrent-primary_rf1-r0"
+      },
+      {
+        "key": "B:contract-values:G19W-r0-772bb60128cc251af6b6-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G19W-r0-772bb60128cc251af6b6"
+      },
+      {
+        "key": "B:contract-values:historical-0190-valkey_rdma-65536-point-mixed-primary_rf1-r0-put-api_p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
+        "column": "api_p50_us",
+        "case_id": "0190-valkey_rdma-65536-point-mixed-primary_rf1-r0"
+      },
+      {
+        "key": "B:contract-values:G20W-r0-7f53e3ae326ecfc3c606-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G20W-r0-7f53e3ae326ecfc3c606"
+      },
+      {
+        "key": "B:contract-values:G20W-r1-8efdbf191f6ae8ec1996-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv",
+        "column": "p50_us",
+        "case_id": "G20W-r1-8efdbf191f6ae8ec1996"
+      },
+      {
+        "key": "B:contract-values:historical-0181-valkey_rdma-65536-write-concurrent-primary_rf1-r0-put-api_p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
+        "column": "api_p50_us",
+        "case_id": "0181-valkey_rdma-65536-write-concurrent-primary_rf1-r0"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-2f756c11ec1013fce1e1-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p50_us",
+        "case_id": "G19R-r0-2f756c11ec1013fce1e1"
+      },
+      {
+        "key": "B:contract-values:historical-0191-valkey_rdma-1024-point-mixed-primary_rf1-r0-read-api_p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
+        "column": "api_p50_us",
+        "case_id": "0191-valkey_rdma-1024-point-mixed-primary_rf1-r0"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-f33d98a668f0ce648742-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p50_us",
+        "case_id": "G19R-r0-f33d98a668f0ce648742"
+      },
+      {
+        "key": "B:contract-values:historical-0191-valkey_rdma-1024-point-mixed-primary_rf1-r0-read-api_p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
+        "column": "api_p50_us",
+        "case_id": "0191-valkey_rdma-1024-point-mixed-primary_rf1-r0"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-b36c3b48418ee8225b3a-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p50_us",
+        "case_id": "G19R-r0-b36c3b48418ee8225b3a"
+      },
+      {
+        "key": "B:contract-values:historical-0191-valkey_rdma-1024-point-mixed-primary_rf1-r0-read-api_p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
+        "column": "api_p50_us",
+        "case_id": "0191-valkey_rdma-1024-point-mixed-primary_rf1-r0"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-a4a0650e35a3dc6a6113-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p50_us",
+        "case_id": "G19R-r0-a4a0650e35a3dc6a6113"
+      },
+      {
+        "key": "B:contract-values:historical-0191-valkey_rdma-1024-point-mixed-primary_rf1-r0-read-api_p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
+        "column": "api_p50_us",
+        "case_id": "0191-valkey_rdma-1024-point-mixed-primary_rf1-r0"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-96d28dff2514d2bb19e6-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p50_us",
+        "case_id": "G19R-r0-96d28dff2514d2bb19e6"
+      },
+      {
+        "key": "B:contract-values:historical-0189-valkey_rdma-1024-read-concurrent-primary_rf1-r0-read-api_p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
+        "column": "api_p50_us",
+        "case_id": "0189-valkey_rdma-1024-read-concurrent-primary_rf1-r0"
+      },
+      {
+        "key": "B:contract-values:G19R-r0-f348d9f68461e8f6c8ed-p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv",
+        "column": "p50_us",
+        "case_id": "G19R-r0-f348d9f68461e8f6c8ed"
+      },
+      {
+        "key": "B:contract-values:historical-0190-valkey_rdma-65536-point-mixed-primary_rf1-r0-read-api_p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
+        "column": "api_p50_us",
+        "case_id": "0190-valkey_rdma-65536-point-mixed-primary_rf1-r0"
+      },
+      {
+        "key": "B:contract-values:historical-0179-valkey_rdma-65536-read-concurrent-primary_rf1-r0-read-api_p50_us:value|.1f",
+        "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv",
+        "column": "api_p50_us",
+        "case_id": "0179-valkey_rdma-65536-read-concurrent-primary_rf1-r0"
+      }
+    ],
+    "scope": "same-fleet Class A pairs; separate B controls; one explicitly non-ranking historical scale table"
+  },
   "inputs": {
     "outputs_hashed": 98,
     "sources": {
@@ -61,46 +748,46 @@
       "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/spdk-matched-storage-20261105T004442Z/analysis/gcp-full-matrix-2026-11-07/report-fixed/cases/0181-valkey_rdma-65536-write-concurrent-primary_rf1-r0/measurement-end.json": "hash verified",
       "/home/hybr1d/Desktop/PDM/TideHunter/papers/parsed/Tidehunter-2026-v2.md": "hash verified",
       "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/spdk-matched-storage-20261105T004442Z/analysis/gcp-full-matrix-2026-11-07/report-fixed/cases/0357-garnet-64-write-concurrent-primary_rf1-r0/result/samples.csv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-unified2/analysis/report-root/cases/G12W-r0-abf4811f0c83f4c6ebdd/result/samples.csv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/local-structure-test.csv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-unified2/analysis/report-root/cases/G12N-r1-9b63b51292e26b74aa86/result/samples.csv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/spdk-matched-storage-20261105T004442Z/gcp-queue-bounded-campaign-20261106T032027Z/final-retrieval/terminal-controller.tar.gz": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/curve-runs.csv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/gcp-manual-nvme-diag-prep-20261104/manual-live-nvmeof-delete-observed-20261104T181245Z/canonical-terminal/expanded/cases/0129-tidehunter_verbs_native-65536-write-concurrent-primary_rf1-r0/result/samples.csv": "hash verified",
       "/home/hybr1d/Desktop/PDM/TideHunter/sui/crates/sui-protocol-config/src/lib.rs": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-unified2/analysis/report-root/cases/G12N-r1-71d612a2e157e9bae6ba/result/samples.csv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-unified2/analysis/report-root/cases/G12K-r1-024b5f3589ec79ed859d/result/samples.csv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/experiments/sui-checkpoint/trace_summary.py": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-unified2/analysis/report-root/cases/G12K-r0-fc2fd2a25da56cb25569/result/samples.csv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/gcp-manual-run-b35a62e24b47faaf/priority-exports/nofile-recovery-2/controller.tar.gz": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-g10b/analysis-final/report-root/cases/G10W-r1-540b3a35836db0587bbb/result/samples.csv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/gcp-manual-combined-prep-20261104/manual-live-nvmeof-read-observation-20261104T142730Z/canonical-terminal/expanded/cases/0129-tidehunter_verbs_native-65536-write-concurrent-primary_rf1-r0/result/samples.csv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/gcp-manual-combined-prep-20261104/manual-live-nvmeof-read-observation-20261104T142730Z/canonical-terminal/expanded/cases/0030-valkey_rdma-65536-write-concurrent-primary_rf1-r0/result/samples.csv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-unified2/analysis/report-root/cases/G12K-r1-ff2de7cf08a231dcedc2/result/samples.csv": "hash verified",
       "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-unified2/analysis/report-root/comparison.csv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/sui-kv-trace-20261107/captures-corrected/remote/db-11029599254156052252.tsv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/tidehunter/src/db.rs": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/spdk-matched-storage-20261105T004442Z/analysis/gcp-full-matrix-2026-11-07/report-fixed/cases/0181-valkey_rdma-65536-write-concurrent-primary_rf1-r0/result/samples.csv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/benchmarks/kv-research/src/backends/native.rs": "hash verified",
       "/home/hybr1d/.omp/agent/sessions/-Desktop-PDM-TideHunter/2026-11-06T09-38-13-397Z_01a1b039-1515-7107-8399-311b4ae17312/local/report-spike.md": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/experiments/kv-comparison/cloud_campaign.py": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/sui-kv-trace-20261107/captures-corrected/remote/events.tsv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-g10b/analysis-final/report-root/cases/G10W-r2-9ac8a0d6d54950733150/result/samples.csv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-g10b/analysis-final/report-root/comparison.csv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/sui-kv-trace-20261107/captures-corrected/remote/db-12534962989784026424.tsv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/spdk-matched-storage-20261105T004442Z/analysis/gcp-full-matrix-2026-11-07/report-fixed/cases/0255-tidehunter_verbs_native-65536-write-concurrent-primary_rf1-r0/result/samples.csv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/spdk-matched-storage-20261105T004442Z/analysis/gcp-full-matrix-2026-11-07/report-fixed/cases/0379-native-65536-write-concurrent-primary_rf1-r0/result/samples.csv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-g10b/analysis-final/report-root/cases/G10W-r0-f61d36513a35dafa578e/result/samples.csv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-unified2/analysis/report-root/cases/G12N-r0-145004c113c28107cf7a/result/samples.csv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/benchmarks/kv-research/src/runner.rs": "hash verified",
       "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-unified2/analysis/report-root/cases/G12N-r0-429695ee4a54fcf877ee/result/samples.csv": "hash verified",
       "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/gcp-kv-comparison-2026-11-03-b35a62e24b47faaf/metrics-all-populations.csv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-unified2/analysis/report-root/cases/G12W-r1-08aed061df7032af3ba6/result/samples.csv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/tidehunter/src/crc.rs": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/sui-kv-trace-20261107/captures-corrected/remote/db-10474212795664931731.tsv": "hash verified",
-      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/gcp-manual-nvme-diag-prep-20261104/manual-live-nvmeof-delete-observed-20261104T181245Z/canonical-terminal/expanded/cases/0030-valkey_rdma-65536-write-concurrent-primary_rf1-r0/result/samples.csv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/experiments/kv-comparison/cloud_campaign.py": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/curve-runs.csv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/sui-kv-trace-20261107/captures-corrected/remote/db-12534962989784026424.tsv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-unified2/analysis/report-root/cases/G12K-r0-fc2fd2a25da56cb25569/result/samples.csv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-unified2/analysis/report-root/cases/G12N-r1-9b63b51292e26b74aa86/result/samples.csv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-g10b/analysis-final/report-root/cases/G10W-r0-f61d36513a35dafa578e/result/samples.csv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-unified2/analysis/report-root/cases/G12N-r0-145004c113c28107cf7a/result/samples.csv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/spdk-matched-storage-20261105T004442Z/analysis/gcp-full-matrix-2026-11-07/report-fixed/cases/0181-valkey_rdma-65536-write-concurrent-primary_rf1-r0/result/samples.csv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/sui-kv-trace-20261107/captures-corrected/remote/events.tsv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/tidehunter/src/db.rs": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/local-structure-test.csv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-g10b/analysis-final/report-root/comparison.csv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/gcp-manual-combined-prep-20261104/manual-live-nvmeof-read-observation-20261104T142730Z/canonical-terminal/expanded/cases/0129-tidehunter_verbs_native-65536-write-concurrent-primary_rf1-r0/result/samples.csv": "hash verified",
       "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-unified2/analysis/report-root/cases/G12K-r0-e2bac9cb674080bed584/result/samples.csv": "hash verified",
       "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/spdk-matched-storage-20261105T004442Z/analysis/gcp-full-matrix-2026-11-07/report-fixed/cases/0490-native-65536-write-concurrent-native_async_write-r0/result/samples.csv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/gcp-manual-combined-prep-20261104/manual-live-nvmeof-read-observation-20261104T142730Z/canonical-terminal/expanded/cases/0030-valkey_rdma-65536-write-concurrent-primary_rf1-r0/result/samples.csv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-unified2/analysis/report-root/cases/G12K-r1-ff2de7cf08a231dcedc2/result/samples.csv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-g10b/analysis-final/report-root/cases/G10W-r2-9ac8a0d6d54950733150/result/samples.csv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-unified2/analysis/report-root/cases/G12N-r1-71d612a2e157e9bae6ba/result/samples.csv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-g10b/analysis-final/report-root/cases/G10W-r1-540b3a35836db0587bbb/result/samples.csv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/gcp-manual-nvme-diag-prep-20261104/manual-live-nvmeof-delete-observed-20261104T181245Z/canonical-terminal/expanded/cases/0129-tidehunter_verbs_native-65536-write-concurrent-primary_rf1-r0/result/samples.csv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/benchmarks/kv-research/src/runner.rs": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/gcp-manual-run-b35a62e24b47faaf/priority-exports/nofile-recovery-2/controller.tar.gz": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/gcp-manual-nvme-diag-prep-20261104/manual-live-nvmeof-delete-observed-20261104T181245Z/canonical-terminal/expanded/cases/0030-valkey_rdma-65536-write-concurrent-primary_rf1-r0/result/samples.csv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/spdk-matched-storage-20261105T004442Z/gcp-queue-bounded-campaign-20261106T032027Z/final-retrieval/terminal-controller.tar.gz": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/sui-kv-trace-20261107/captures-corrected/remote/db-10474212795664931731.tsv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-unified2/analysis/report-root/cases/G12K-r1-024b5f3589ec79ed859d/result/samples.csv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/tidehunter/src/crc.rs": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-unified2/analysis/report-root/cases/G12W-r1-08aed061df7032af3ba6/result/samples.csv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/spdk-matched-storage-20261105T004442Z/analysis/gcp-full-matrix-2026-11-07/report-fixed/cases/0255-tidehunter_verbs_native-65536-write-concurrent-primary_rf1-r0/result/samples.csv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/spdk-matched-storage-20261105T004442Z/analysis/gcp-full-matrix-2026-11-07/report-fixed/cases/0379-native-65536-write-concurrent-primary_rf1-r0/result/samples.csv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/sui-kv-trace-20261107/captures-corrected/remote/db-11029599254156052252.tsv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/experiments/sui-checkpoint/trace_summary.py": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261109-unified2/analysis/report-root/cases/G12W-r0-abf4811f0c83f4c6ebdd/result/samples.csv": "hash verified",
+      "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/benchmarks/kv-research/src/backends/native.rs": "hash verified",
       "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-rwcompact2/analysis2/latency_vs_size.csv": "hash verified",
       "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-rwcompact2/analysis2/latency_vs_concurrency.csv": "hash verified",
       "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-rwcompact2/analysis2/throughput_vs_concurrency.csv": "hash verified",
@@ -540,31 +1227,31 @@
       "coherence.pdf": "all source cases and plotted values identical"
     },
     "printed_font_minima_pt": {
-      "page3": 9.133585,
-      "page7": 9.11734,
-      "page10": 7.73472,
+      "page4": 9.133585,
+      "page8": 9.11734,
       "page11": 7.73472,
       "page12": 7.73472,
       "page13": 7.73472,
       "page14": 7.73472,
       "page15": 7.73472,
-      "page17": 7.73472,
+      "page16": 7.73472,
       "page18": 7.73472,
       "page19": 7.73472,
       "page20": 7.73472,
       "page21": 7.73472,
-      "page23": 7.8840506,
-      "page24": 9.186595,
-      "page25": 9.162275,
+      "page22": 7.73472,
+      "page24": 7.8840506,
+      "page25": 9.186595,
       "page26": 9.162275,
-      "page32": 7.3603498,
-      "page33": 7.4388,
-      "page34": 7.3603498,
-      "page35": 7.4388,
+      "page27": 9.162275,
+      "page35": 7.3603498,
       "page36": 7.4388,
-      "page40": 7.95336,
-      "page42": 8.65659,
-      "page43": 9.18441
+      "page37": 7.3603498,
+      "page38": 7.4388,
+      "page39": 7.4388,
+      "page43": 7.95336,
+      "page45": 8.65659,
+      "page46": 9.18441
     },
     "minimum_figure_font_pt": 7.3603498,
     "accessibility": "Blue/neutral/vermilion scoreboard. Stall policies use blue circles/solid fit and vermilion triangles/dashed fit. Other plots use named rows, marker shapes, hatches or named multi-component legends; red/green is not the sole distinction.",
@@ -572,35 +1259,31 @@
       "definition": "Unused lower body below the last content text block, excluding 54 pt margins and page number; not white pixel area or space inside plots.",
       "pages_over_40_percent_blank": [
         {
-          "page": 31,
+          "page": 34,
           "unused_lower_body_fraction": 0.5418561637302594
         },
         {
-          "page": 39,
+          "page": 42,
           "unused_lower_body_fraction": 0.6958642848383273
         },
         {
-          "page": 47,
-          "unused_lower_body_fraction": 0.7598561092261783
-        },
-        {
-          "page": 48,
+          "page": 50,
           "unused_lower_body_fraction": 0.46099662074697845
         },
         {
-          "page": 49,
+          "page": 51,
           "unused_lower_body_fraction": 0.6119511098393492
         },
         {
-          "page": 50,
+          "page": 52,
           "unused_lower_body_fraction": 0.6641704478872855
         },
         {
-          "page": 51,
+          "page": 53,
           "unused_lower_body_fraction": 0.5447098611508536
         },
         {
-          "page": 52,
+          "page": 54,
           "unused_lower_body_fraction": 0.454736827044925
         }
       ]
@@ -614,7 +1297,6 @@
       11,
       12,
       13,
-      27,
       28,
       29,
       30,
@@ -628,50 +1310,29 @@
       38,
       39,
       40,
+      41,
       42,
       43,
+      45,
       46,
-      48,
       49,
-      52,
-      53,
-      54
+      50,
+      51,
+      54,
+      55,
+      56
     ],
     "visual_inspection": {
-      "performed": true,
-      "pdf_sha256": "334745e1e45c96414fcc67a99652c77fc04d266417f4a1de8d046b714b770350",
-      "figure_dpi": 180,
-      "page_dpi": 150,
-      "full_resolution_reviewed": [
-        1,
-        2,
-        20
+      "pdf_sha256": "51760763c59926b4d0f6bb7d551efc75086fd91827c585e5719757846d3812fc",
+      "pages": [
+        29
       ],
-      "standalone_figures_reviewed": [
-        "warm",
-        "gap",
-        "cpu",
-        "cold",
-        "ladder"
-      ],
-      "minimum_figure_font_pt": 7.3603498,
-      "observations": [
-        "Correction to the earlier acceptance: Main found that the cold figure SPDK legend entry collided with the top-left panel title. My earlier no-overlap visual statement missed this real defect.",
-        "Fixed only the cold figure layout: dedicated top legend band (top=.70), larger inter-row spacing (hspace=1.25); figure text and measured values unchanged.",
-        "Re-rendered and visually checked all five run-10 figures at 180 dpi: legends, titles, tick labels, units, footers and annotations have no observed text overlap. Separate repetition and CPU-role markers retained.",
-        "Added renderer checks for legend/title, x-label/title and footer/label intersections; all five figures passed. These checks supplement the visual review.",
-        "Re-rendered and inspected brief pages 1, 2 and 20 at 150 dpi. All twelve findings stay on page 1; the new run-10 row, table width convention and footnote format are preserved. Cold Figure 12 now has clear legend/title separation."
-      ],
-      "prior_full_document_review": {
-        "pdf_sha256": "3b465d834c60b062c5c43438f423ddb05458db95ed43965acb3f61017430788a",
-        "all_54_pages_reviewed": true,
-        "note": "Historical review; the cold legend defect was subsequently identified and is corrected in this current review."
-      },
-      "directory": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/rwc10/real-renders"
+      "method": "Assistant inspected rendered/contracts-29.png after the final rebuild",
+      "result": "Three memory rows and retained device rows are legible; no clipping. Pages 2, 28 and 49 were inspected in the preceding build."
     }
   },
   "numbers": {
-    "resolved_keys": 2185,
+    "resolved_keys": 2286,
     "independent_pdf_checks": 82,
     "changed_keys": {
       "Q:run7-sustained-extract:0:late_puts_s|.0f": {
@@ -727,6 +1388,107 @@
     "added_keys": [
       "B:chart-anomalies:garnet:stall_max_ms|.0f",
       "B:chart-anomalies:garnet:stall_min_ms|.0f",
+      "B:contract-values:G19N-r0-92068587167e8922a687-p50_us:value|.1f",
+      "B:contract-values:G19N-r0-92068587167e8922a687-p999_us:value|.1f",
+      "B:contract-values:G19N-r0-92068587167e8922a687-p99_us:value|.1f",
+      "B:contract-values:G19N-r0-b0331240997a379d6c85-p50_us:value|.1f",
+      "B:contract-values:G19N-r0-b0331240997a379d6c85-p999_us:value|.1f",
+      "B:contract-values:G19N-r0-b0331240997a379d6c85-p99_us:value|.1f",
+      "B:contract-values:G19N-r0-bad6ac58440aa1315f0e-p50_us:value|.1f",
+      "B:contract-values:G19N-r0-bad6ac58440aa1315f0e-p999_us:value|.1f",
+      "B:contract-values:G19N-r0-bad6ac58440aa1315f0e-p99_us:value|.1f",
+      "B:contract-values:G19N-r0-f2c3d71c157b439af5d6-p50_us:value|.1f",
+      "B:contract-values:G19N-r0-f2c3d71c157b439af5d6-p999_us:value|.1f",
+      "B:contract-values:G19N-r0-f2c3d71c157b439af5d6-p99_us:value|.1f",
+      "B:contract-values:G19N-r0-ff5f9867bacc3caa45fb-p50_us:value|.1f",
+      "B:contract-values:G19N-r0-ff5f9867bacc3caa45fb-p999_us:value|.1f",
+      "B:contract-values:G19N-r0-ff5f9867bacc3caa45fb-p99_us:value|.1f",
+      "B:contract-values:G19N-r1-d2188c7e8e6a9e41a7e5-p50_us:value|.1f",
+      "B:contract-values:G19N-r1-d2188c7e8e6a9e41a7e5-p999_us:value|.1f",
+      "B:contract-values:G19N-r1-d2188c7e8e6a9e41a7e5-p99_us:value|.1f",
+      "B:contract-values:G19N-r1-fa11ba68fbdf3f484757-p50_us:value|.1f",
+      "B:contract-values:G19N-r1-fa11ba68fbdf3f484757-p999_us:value|.1f",
+      "B:contract-values:G19N-r1-fa11ba68fbdf3f484757-p99_us:value|.1f",
+      "B:contract-values:G19R-r0-2f756c11ec1013fce1e1-p50_us:value|.1f",
+      "B:contract-values:G19R-r0-2f756c11ec1013fce1e1-p999_us:value|.1f",
+      "B:contract-values:G19R-r0-2f756c11ec1013fce1e1-p99_us:value|.1f",
+      "B:contract-values:G19R-r0-96d28dff2514d2bb19e6-p50_us:value|.1f",
+      "B:contract-values:G19R-r0-96d28dff2514d2bb19e6-p999_us:value|.1f",
+      "B:contract-values:G19R-r0-96d28dff2514d2bb19e6-p99_us:value|.1f",
+      "B:contract-values:G19R-r0-a4a0650e35a3dc6a6113-p50_us:value|.1f",
+      "B:contract-values:G19R-r0-a4a0650e35a3dc6a6113-p999_us:value|.1f",
+      "B:contract-values:G19R-r0-a4a0650e35a3dc6a6113-p99_us:value|.1f",
+      "B:contract-values:G19R-r0-b36c3b48418ee8225b3a-p50_us:value|.1f",
+      "B:contract-values:G19R-r0-b36c3b48418ee8225b3a-p999_us:value|.1f",
+      "B:contract-values:G19R-r0-b36c3b48418ee8225b3a-p99_us:value|.1f",
+      "B:contract-values:G19R-r0-c52fd3fdf7a4a94e2e67-p50_us:value|.1f",
+      "B:contract-values:G19R-r0-c52fd3fdf7a4a94e2e67-p999_us:value|.1f",
+      "B:contract-values:G19R-r0-c52fd3fdf7a4a94e2e67-p99_us:value|.1f",
+      "B:contract-values:G19R-r0-f33d98a668f0ce648742-p50_us:value|.1f",
+      "B:contract-values:G19R-r0-f33d98a668f0ce648742-p999_us:value|.1f",
+      "B:contract-values:G19R-r0-f33d98a668f0ce648742-p99_us:value|.1f",
+      "B:contract-values:G19R-r0-f348d9f68461e8f6c8ed-p50_us:value|.1f",
+      "B:contract-values:G19R-r0-f348d9f68461e8f6c8ed-p999_us:value|.1f",
+      "B:contract-values:G19R-r0-f348d9f68461e8f6c8ed-p99_us:value|.1f",
+      "B:contract-values:G19W-r0-4492454d4c36cacd3f74-p50_us:value|.1f",
+      "B:contract-values:G19W-r0-4492454d4c36cacd3f74-p999_us:value|.1f",
+      "B:contract-values:G19W-r0-4492454d4c36cacd3f74-p99_us:value|.1f",
+      "B:contract-values:G19W-r0-772bb60128cc251af6b6-p50_us:value|.1f",
+      "B:contract-values:G19W-r0-772bb60128cc251af6b6-p999_us:value|.1f",
+      "B:contract-values:G19W-r0-772bb60128cc251af6b6-p99_us:value|.1f",
+      "B:contract-values:G19W-r0-887f03d0d8d8f45cff94-p50_us:value|.1f",
+      "B:contract-values:G19W-r0-887f03d0d8d8f45cff94-p999_us:value|.1f",
+      "B:contract-values:G19W-r0-887f03d0d8d8f45cff94-p99_us:value|.1f",
+      "B:contract-values:G19W-r0-a8a58a1edc3c1ff444a5-p50_us:value|.1f",
+      "B:contract-values:G19W-r0-a8a58a1edc3c1ff444a5-p999_us:value|.1f",
+      "B:contract-values:G19W-r0-a8a58a1edc3c1ff444a5-p99_us:value|.1f",
+      "B:contract-values:G19W-r0-b7a318911354ba036075-p50_us:value|.1f",
+      "B:contract-values:G19W-r0-b7a318911354ba036075-p999_us:value|.1f",
+      "B:contract-values:G19W-r0-b7a318911354ba036075-p99_us:value|.1f",
+      "B:contract-values:G19W-r0-c06459d77e52516b53ba-p50_us:value|.1f",
+      "B:contract-values:G19W-r0-c06459d77e52516b53ba-p999_us:value|.1f",
+      "B:contract-values:G19W-r0-c06459d77e52516b53ba-p99_us:value|.1f",
+      "B:contract-values:G19W-r1-d7d09867c5660edf8fd4-p50_us:value|.1f",
+      "B:contract-values:G19W-r1-d7d09867c5660edf8fd4-p999_us:value|.1f",
+      "B:contract-values:G19W-r1-d7d09867c5660edf8fd4-p99_us:value|.1f",
+      "B:contract-values:G19W-r1-edc0dd941f80ad3e10fe-p50_us:value|.1f",
+      "B:contract-values:G19W-r1-edc0dd941f80ad3e10fe-p999_us:value|.1f",
+      "B:contract-values:G19W-r1-edc0dd941f80ad3e10fe-p99_us:value|.1f",
+      "B:contract-values:G20N-r0-8d9fb99cee3dceff4e9f-p50_us:value|.1f",
+      "B:contract-values:G20N-r0-8d9fb99cee3dceff4e9f-p999_us:value|.1f",
+      "B:contract-values:G20N-r0-8d9fb99cee3dceff4e9f-p99_us:value|.1f",
+      "B:contract-values:G20N-r0-f2aea9d6e14426870fed-p50_us:value|.1f",
+      "B:contract-values:G20N-r0-f2aea9d6e14426870fed-p999_us:value|.1f",
+      "B:contract-values:G20N-r0-f2aea9d6e14426870fed-p99_us:value|.1f",
+      "B:contract-values:G20W-r0-756eecca68a6748678fe-p50_us:value|.1f",
+      "B:contract-values:G20W-r0-7f53e3ae326ecfc3c606-p50_us:value|.1f",
+      "B:contract-values:G20W-r0-7f53e3ae326ecfc3c606-p999_us:value|.1f",
+      "B:contract-values:G20W-r0-7f53e3ae326ecfc3c606-p99_us:value|.1f",
+      "B:contract-values:G20W-r0-8231343f2a568c3c567f-p50_us:value|.1f",
+      "B:contract-values:G20W-r0-8231343f2a568c3c567f-p999_us:value|.1f",
+      "B:contract-values:G20W-r0-8231343f2a568c3c567f-p99_us:value|.1f",
+      "B:contract-values:G20W-r1-8efdbf191f6ae8ec1996-p50_us:value|.1f",
+      "B:contract-values:G20W-r1-946f816574d064a48c1b-p50_us:value|.1f",
+      "B:contract-values:G20W-r1-97f92503bd32d71c6b12-p50_us:value|.1f",
+      "B:contract-values:combined-cases:value|,.0f",
+      "B:contract-values:combined-measured_calls:value|,.0f",
+      "B:contract-values:first-first_call_us:value|.1f",
+      "B:contract-values:first-run13_first_call_us:value|.1f",
+      "B:contract-values:historical-0179-valkey_rdma-65536-read-concurrent-primary_rf1-r0-read-api_p50_us:value|.1f",
+      "B:contract-values:historical-0181-valkey_rdma-65536-write-concurrent-primary_rf1-r0-put-api_p50_us:value|.1f",
+      "B:contract-values:historical-0187-valkey_rdma-1024-write-concurrent-primary_rf1-r0-put-api_p50_us:value|.1f",
+      "B:contract-values:historical-0189-valkey_rdma-1024-read-concurrent-primary_rf1-r0-read-api_p50_us:value|.1f",
+      "B:contract-values:historical-0190-valkey_rdma-65536-point-mixed-primary_rf1-r0-put-api_p50_us:value|.1f",
+      "B:contract-values:historical-0190-valkey_rdma-65536-point-mixed-primary_rf1-r0-read-api_p50_us:value|.1f",
+      "B:contract-values:historical-0191-valkey_rdma-1024-point-mixed-primary_rf1-r0-put-api_p50_us:value|.1f",
+      "B:contract-values:historical-0191-valkey_rdma-1024-point-mixed-primary_rf1-r0-read-api_p50_us:value|.1f",
+      "B:contract-values:run13-compared_cells:value|,.0f",
+      "B:contract-values:sustained-calls_ge_5ms:value|,.0f",
+      "B:contract-values:sustained-calls_per_second:value|,.0f",
+      "B:contract-values:sustained-mean_inflight_calls:value|.1f",
+      "B:contract-values:sustained-p50_us:value|.1f",
+      "B:contract-values:sustained-p999_us:value|.1f",
+      "B:contract-values:sustained-p99_us:value|.1f",
       "B:device-write-spread:th_verbs:maximum|,.0f",
       "B:device-write-spread:th_verbs:minimum|,.0f",
       "B:device-write-spread:th_verbs:ratio|.2f",
@@ -1326,7 +2088,7 @@
     "figures": {
       "curves-write-c16.pdf": {
         "values_checked": 255,
-        "page": 32,
+        "page": 35,
         "fourth_panel": "case_success_calls_per_second",
         "native_pagecache_points": 15,
         "hollow_write_markers": [
@@ -1337,28 +2099,28 @@
       },
       "curves-read-c16.pdf": {
         "values_checked": 240,
-        "page": 33,
+        "page": 36,
         "fourth_panel": "mean_inflight_calls",
         "native_pagecache_points": 0,
         "hollow_write_markers": []
       },
       "curves-read32-c16.pdf": {
         "values_checked": 240,
-        "page": 34,
+        "page": 37,
         "fourth_panel": "mean_inflight_calls",
         "native_pagecache_points": 0,
         "hollow_write_markers": []
       },
       "curves-point-read-c1.pdf": {
         "values_checked": 240,
-        "page": 35,
+        "page": 38,
         "fourth_panel": "api_mean_us",
         "native_pagecache_points": 0,
         "hollow_write_markers": []
       },
       "curves-point-put-c1.pdf": {
         "values_checked": 260,
-        "page": 36,
+        "page": 39,
         "fourth_panel": "api_mean_us",
         "native_pagecache_points": 20,
         "hollow_write_markers": [
@@ -1376,243 +2138,189 @@
         "key": "curve:write-concurrent:put:calls",
         "source_value": 4096,
         "pdf_value": "4,096",
-        "page": 32,
+        "page": 35,
         "pass_check": true
       },
       {
         "key": "p50:th_verbs:primary_rf1:write-concurrent:put:1024|.1f",
         "source_value": 295.32,
         "pdf_value": "295.3",
-        "page": 32,
+        "page": 35,
         "pass_check": true
       },
       {
         "key": "p50:valkey_rdma:primary_rf1:write-concurrent:put:1024|.1f",
         "source_value": 172.923,
         "pdf_value": "172.9",
-        "page": 32,
+        "page": 35,
         "pass_check": true
       },
       {
         "key": "p50:native:primary_rf1:write-concurrent:put:65536|.1f",
         "source_value": 2713.716,
         "pdf_value": "2713.7",
-        "page": 32,
+        "page": 35,
         "pass_check": true
       },
       {
         "key": "p50:th_verbs:primary_rf1:write-concurrent:put:65536|.1f",
         "source_value": 1462.669,
         "pdf_value": "1462.7",
-        "page": 32,
+        "page": 35,
         "pass_check": true
       },
       {
         "key": "curve:read-concurrent:read:calls",
         "source_value": 8192,
         "pdf_value": "8,192",
-        "page": 33,
+        "page": 36,
         "pass_check": true
       },
       {
         "key": "p50:th_verbs:primary_rf1:read-concurrent:read:65536|.1f",
         "source_value": 83.124,
         "pdf_value": "83.1",
-        "page": 33,
+        "page": 36,
         "pass_check": true
       },
       {
         "key": "p50:valkey_rdma:primary_rf1:read-concurrent:read:65536|.1f",
         "source_value": 116.335,
         "pdf_value": "116.3",
-        "page": 33,
+        "page": 36,
         "pass_check": true
       },
       {
         "key": "p50:native:primary_rf1:read-concurrent:read:65536|.1f",
         "source_value": 14.846,
         "pdf_value": "14.8",
-        "page": 33,
+        "page": 36,
         "pass_check": true
       },
       {
         "key": "curve:read-many32:get_many:calls",
         "source_value": 2048,
         "pdf_value": "2,048",
-        "page": 34,
+        "page": 37,
         "pass_check": true
       },
       {
         "key": "p50:th_verbs:primary_rf1:read-many32:get_many:1024|.1f",
         "source_value": 688.245,
         "pdf_value": "688.2",
-        "page": 34,
+        "page": 37,
         "pass_check": true
       },
       {
         "key": "p50:valkey_rdma:primary_rf1:read-many32:get_many:1024|.1f",
         "source_value": 320.673,
         "pdf_value": "320.7",
-        "page": 34,
+        "page": 37,
         "pass_check": true
       },
       {
         "key": "p99ms:th_verbs:primary_rf1:read-many32:get_many:65536|.1f",
         "source_value": 33.234527,
         "pdf_value": "33.2",
-        "page": 34,
+        "page": 37,
         "pass_check": true
       },
       {
         "key": "p99ms:valkey_rdma:primary_rf1:read-many32:get_many:65536|.1f",
         "source_value": 43.334103999999996,
         "pdf_value": "43.3",
-        "page": 34,
+        "page": 37,
         "pass_check": true
       },
       {
         "key": "curve:point-mixed:read:calls",
         "source_value": 3621,
         "pdf_value": "3,621",
-        "page": 35,
+        "page": 38,
         "pass_check": true
       },
       {
         "key": "curve:point-mixed:read:case_calls",
         "source_value": 8192,
         "pdf_value": "8,192",
-        "page": 35,
+        "page": 38,
         "pass_check": true
       },
       {
         "key": "p50:th_verbs:primary_rf1:point-mixed:read:1024|.1f",
         "source_value": 32.0,
         "pdf_value": "32.0",
-        "page": 35,
+        "page": 38,
         "pass_check": true
       },
       {
         "key": "p50:valkey_rdma:primary_rf1:point-mixed:read:1024|.1f",
         "source_value": 43.243,
         "pdf_value": "43.2",
-        "page": 35,
+        "page": 38,
         "pass_check": true
       },
       {
         "key": "p50:th_verbs:primary_rf1:point-mixed:read:65536|.1f",
         "source_value": 66.92,
         "pdf_value": "66.9",
-        "page": 35,
+        "page": 38,
         "pass_check": true
       },
       {
         "key": "p50:valkey_rdma:primary_rf1:point-mixed:read:65536|.1f",
         "source_value": 78.69,
         "pdf_value": "78.7",
-        "page": 35,
+        "page": 38,
         "pass_check": true
       },
       {
         "key": "curve:point-mixed:put:calls",
         "source_value": 3775,
         "pdf_value": "3,775",
-        "page": 36,
+        "page": 39,
         "pass_check": true
       },
       {
         "key": "curve:point-mixed:put:case_calls",
         "source_value": 8192,
         "pdf_value": "8,192",
-        "page": 36,
+        "page": 39,
         "pass_check": true
       },
       {
         "key": "p50:th_verbs:primary_rf1:point-mixed:put:1024|.1f",
         "source_value": 108.837,
         "pdf_value": "108.8",
-        "page": 36,
+        "page": 39,
         "pass_check": true
       },
       {
         "key": "p50:valkey_rdma:primary_rf1:point-mixed:put:1024|.1f",
         "source_value": 126.798,
         "pdf_value": "126.8",
-        "page": 36,
+        "page": 39,
         "pass_check": true
       },
       {
         "key": "p50:th_verbs:primary_rf1:point-mixed:put:65536|.1f",
         "source_value": 396.97,
         "pdf_value": "397.0",
-        "page": 36,
+        "page": 39,
         "pass_check": true
       },
       {
         "key": "p50:valkey_rdma:primary_rf1:point-mixed:put:65536|.1f",
         "source_value": 250.72,
         "pdf_value": "250.7",
-        "page": 36,
+        "page": 39,
         "pass_check": true
       },
       {
         "key": "p50:native:primary_rf1:point-mixed:put:65536|.1f",
         "source_value": 154.121,
         "pdf_value": "154.1",
-        "page": 36,
-        "pass_check": true
-      },
-      {
-        "key": "p50:native:primary_rf1:write-concurrent:put:256|.1f",
-        "source_value": 72.334,
-        "pdf_value": "72.3",
-        "pass_check": true
-      },
-      {
-        "key": "J:native_reciprocal|,.0f",
-        "source_value": 6396.033972330279,
-        "pdf_value": "6,396",
-        "pass_check": true
-      },
-      {
-        "key": "B:paper-context:uniform_get_ops_s:value|,.0f",
-        "source_value": 392000.0,
-        "pdf_value": "392,000",
-        "pass_check": true
-      },
-      {
-        "key": "J:native_reciprocal_pct|.0f",
-        "source_value": 95.40576331753779,
-        "pdf_value": "95",
-        "pass_check": true
-      },
-      {
-        "key": "p50:cassandra:primary_rf1:write-concurrent:put:256|.0f",
-        "source_value": 164.0745,
-        "pdf_value": "164",
-        "pass_check": true
-      },
-      {
-        "key": "J:owner64_software_pct|.0f",
-        "source_value": 47.442630000843344,
-        "pdf_value": "47",
-        "pass_check": true
-      },
-      {
-        "key": "B:device-write-spread:th_verbs:minimum|,.0f",
-        "source_value": 1553.0,
-        "pdf_value": "1,553",
-        "pass_check": true
-      },
-      {
-        "key": "p50:native:primary_rf1:read-concurrent:read:1024|.2f",
-        "source_value": 1.368,
-        "pdf_value": "1.37",
-        "pass_check": true
-      },
-      {
-        "key": "p50:th_verbs:primary_rf1:read-concurrent:read:1024|.1f",
-        "source_value": 45.025,
-        "pdf_value": "45.0",
+        "page": 39,
         "pass_check": true
       },
       {
@@ -1622,93 +2330,15 @@
         "pass_check": true
       },
       {
-        "key": "p50:th_verbs:primary_rf1:point-mixed:put:1024|.1f",
-        "source_value": 108.837,
-        "pdf_value": "108.8",
+        "key": "D:p64v:mean_us",
+        "source_value": 462.4866848144531,
+        "pdf_value": "462.5",
         "pass_check": true
       },
       {
-        "key": "B:device-write-spread:valkey_rdma:minimum|,.0f",
-        "source_value": 1847.0,
-        "pdf_value": "1,847",
-        "pass_check": true
-      },
-      {
-        "key": "J:pagecache_c1_64",
-        "source_value": 37.896,
-        "pdf_value": "37.9",
-        "pass_check": true
-      },
-      {
-        "key": "B:device-write-spread:valkey_rdma:ratio|.2f",
-        "source_value": 1.3584190579317812,
-        "pdf_value": "1.36",
-        "pass_check": true
-      },
-      {
-        "key": "J:native_mean_ratio",
-        "source_value": 16.212045382833818,
-        "pdf_value": "16.2",
-        "pass_check": true
-      },
-      {
-        "key": "mean:th_verbs:primary_rf1:point-mixed:put:1024|.1f",
-        "source_value": 112.44008344370862,
-        "pdf_value": "112.4",
-        "pass_check": true
-      },
-      {
-        "key": "B:paper-context:skew_get_ops_s:value|,.0f",
-        "source_value": 3980000.0,
-        "pdf_value": "3,980,000",
-        "pass_check": true
-      },
-      {
-        "key": "C:p16v:coalescing",
-        "source_value": 80.97995947265625,
-        "pdf_value": "81.0",
-        "pass_check": true
-      },
-      {
-        "key": "B:paper-context:write_ops_s:value|,.0f",
-        "source_value": 830000.0,
-        "pdf_value": "830,000",
-        "pass_check": true
-      },
-      {
-        "key": "D:p16v:mean_us",
-        "source_value": 420.8671442871094,
-        "pdf_value": "420.9",
-        "pass_check": true
-      },
-      {
-        "key": "mean:native:primary_rf1:point-mixed:put:65536|.1f",
-        "source_value": 156.34688688741724,
-        "pdf_value": "156.3",
-        "pass_check": true
-      },
-      {
-        "key": "C:p16v:durable",
-        "source_value": 105.24902905273437,
-        "pdf_value": "105.2",
-        "pass_check": true
-      },
-      {
-        "key": "cps:native:primary_rf1:read-concurrent:read:1024|,.0f",
-        "source_value": 277534.0489930938,
-        "pdf_value": "277,534",
-        "pass_check": true
-      },
-      {
-        "key": "p50:cassandra:primary_rf1:write-concurrent:put:1024|.0f",
-        "source_value": 263.3355,
-        "pdf_value": "263",
-        "pass_check": true
-      },
-      {
-        "key": "B:per-node-64k:native:mean_inflight_calls",
-        "source_value": 15.467225646878244,
-        "pdf_value": "15.5",
+        "key": "p50:foundationdb:primary_rf1:write-concurrent:put:8192|.0f",
+        "source_value": 631.9214999999999,
+        "pdf_value": "632",
         "pass_check": true
       },
       {
@@ -1718,99 +2348,15 @@
         "pass_check": true
       },
       {
-        "key": "B:per-node-64k:native:mean_us",
-        "source_value": 2534.702825683594,
-        "pdf_value": "2534.7",
+        "key": "B:paper-context:skew_get_ops_s:value|,.0f",
+        "source_value": 3980000.0,
+        "pdf_value": "3,980,000",
         "pass_check": true
       },
       {
-        "key": "p99ms:garnet:primary_rf1:write-concurrent:put:1024|.1f",
-        "source_value": 66.735745,
-        "pdf_value": "66.7",
-        "pass_check": true
-      },
-      {
-        "key": "B:per-node-64k:native:puts_s|,.0f",
-        "source_value": 6102.1850333507355,
-        "pdf_value": "6,102",
-        "pass_check": true
-      },
-      {
-        "key": "B:chart-anomalies:garnet:stall_max_ms|.0f",
-        "source_value": 90.487694,
-        "pdf_value": "90",
-        "pass_check": true
-      },
-      {
-        "key": "J:pagecache_ms",
-        "source_value": 15.237582,
-        "pdf_value": "15.2",
-        "pass_check": true
-      },
-      {
-        "key": "B:per-node-64k:native:p50_us",
-        "source_value": 2713.716,
-        "pdf_value": "2713.7",
-        "pass_check": true
-      },
-      {
-        "key": "B:device-write-spread:valkey_rdma:maximum|,.0f",
-        "source_value": 2509.0,
-        "pdf_value": "2,509",
-        "pass_check": true
-      },
-      {
-        "key": "p99ms:garnet:primary_rf1:write-concurrent:put:256|.1f",
-        "source_value": 69.579177,
-        "pdf_value": "69.6",
-        "pass_check": true
-      },
-      {
-        "key": "B:per-node-64k:valkey_rdma:puts_s_node|,.0f",
-        "source_value": 6380.479918638912,
-        "pdf_value": "6,380",
-        "pass_check": true
-      },
-      {
-        "key": "C:p64v:owner",
-        "source_value": 127.53080810546876,
-        "pdf_value": "127.5",
-        "pass_check": true
-      },
-      {
-        "key": "p50:valkey_rdma:primary_rf1:read-concurrent:read:1024|.1f",
-        "source_value": 43.051,
-        "pdf_value": "43.1",
-        "pass_check": true
-      },
-      {
-        "key": "J:pagecache64",
-        "source_value": 181.715,
-        "pdf_value": "181.7",
-        "pass_check": true
-      },
-      {
-        "key": "W:p16v|.0f",
-        "source_value": 60.89112020946351,
-        "pdf_value": "61",
-        "pass_check": true
-      },
-      {
-        "key": "B:chart-anomalies:garnet:stall_min_ms|.0f",
-        "source_value": 60.028398,
-        "pdf_value": "60",
-        "pass_check": true
-      },
-      {
-        "key": "D:uput1v:p50_us",
-        "source_value": 121.4785,
-        "pdf_value": "121.5",
-        "pass_check": true
-      },
-      {
-        "key": "J:pagecache_jump",
-        "source_value": 47.8575190940216,
-        "pdf_value": "47.9",
+        "key": "B:device-write-spread:valkey_rdma:ratio|.2f",
+        "source_value": 1.3584190579317812,
+        "pdf_value": "1.36",
         "pass_check": true
       },
       {
@@ -1826,15 +2372,9 @@
         "pass_check": true
       },
       {
-        "key": "p50:native:primary_rf1:write-concurrent:put:1024|.1f",
-        "source_value": 63.798,
-        "pdf_value": "63.8",
-        "pass_check": true
-      },
-      {
-        "key": "D:p64v:mean_us",
-        "source_value": 462.4866848144531,
-        "pdf_value": "462.5",
+        "key": "D:p16v:mean_us",
+        "source_value": 420.8671442871094,
+        "pdf_value": "420.9",
         "pass_check": true
       },
       {
@@ -1844,27 +2384,51 @@
         "pass_check": true
       },
       {
-        "key": "B:device-write-spread:th_verbs:maximum|,.0f",
-        "source_value": 1660.0,
-        "pdf_value": "1,660",
+        "key": "J:native_mean_ratio",
+        "source_value": 16.212045382833818,
+        "pdf_value": "16.2",
         "pass_check": true
       },
       {
-        "key": "B:per-node-64k:native:puts_s_node|,.0f",
+        "key": "C:p16v:coalescing",
+        "source_value": 80.97995947265625,
+        "pdf_value": "81.0",
+        "pass_check": true
+      },
+      {
+        "key": "B:per-node-64k:native:puts_s|,.0f",
         "source_value": 6102.1850333507355,
         "pdf_value": "6,102",
         "pass_check": true
       },
       {
-        "key": "C:p64v:coordinator",
-        "source_value": 91.88503857421875,
-        "pdf_value": "91.9",
+        "key": "W:p16v|.0f",
+        "source_value": 60.89112020946351,
+        "pdf_value": "61",
         "pass_check": true
       },
       {
-        "key": "p50:foundationdb:primary_rf1:write-concurrent:put:8192|.0f",
-        "source_value": 631.9214999999999,
-        "pdf_value": "632",
+        "key": "J:pagecache_ms",
+        "source_value": 15.237582,
+        "pdf_value": "15.2",
+        "pass_check": true
+      },
+      {
+        "key": "p50:native:primary_rf1:write-concurrent:put:256|.1f",
+        "source_value": 72.334,
+        "pdf_value": "72.3",
+        "pass_check": true
+      },
+      {
+        "key": "B:device-write-spread:valkey_rdma:minimum|,.0f",
+        "source_value": 1847.0,
+        "pdf_value": "1,847",
+        "pass_check": true
+      },
+      {
+        "key": "J:native_reciprocal|,.0f",
+        "source_value": 6396.033972330279,
+        "pdf_value": "6,396",
         "pass_check": true
       },
       {
@@ -1874,15 +2438,213 @@
         "pass_check": true
       },
       {
+        "key": "D:uput1v:p50_us",
+        "source_value": 121.4785,
+        "pdf_value": "121.5",
+        "pass_check": true
+      },
+      {
+        "key": "mean:th_verbs:primary_rf1:point-mixed:put:1024|.1f",
+        "source_value": 112.44008344370862,
+        "pdf_value": "112.4",
+        "pass_check": true
+      },
+      {
+        "key": "B:per-node-64k:native:mean_us",
+        "source_value": 2534.702825683594,
+        "pdf_value": "2534.7",
+        "pass_check": true
+      },
+      {
+        "key": "J:native_reciprocal_pct|.0f",
+        "source_value": 95.40576331753779,
+        "pdf_value": "95",
+        "pass_check": true
+      },
+      {
+        "key": "B:per-node-64k:valkey_rdma:puts_s_node|,.0f",
+        "source_value": 6380.479918638912,
+        "pdf_value": "6,380",
+        "pass_check": true
+      },
+      {
+        "key": "p50:cassandra:primary_rf1:write-concurrent:put:1024|.0f",
+        "source_value": 263.3355,
+        "pdf_value": "263",
+        "pass_check": true
+      },
+      {
+        "key": "p99ms:garnet:primary_rf1:write-concurrent:put:1024|.1f",
+        "source_value": 66.735745,
+        "pdf_value": "66.7",
+        "pass_check": true
+      },
+      {
+        "key": "p50:native:primary_rf1:read-concurrent:read:1024|.2f",
+        "source_value": 1.368,
+        "pdf_value": "1.37",
+        "pass_check": true
+      },
+      {
+        "key": "p50:th_verbs:primary_rf1:point-mixed:put:1024|.1f",
+        "source_value": 108.837,
+        "pdf_value": "108.8",
+        "pass_check": true
+      },
+      {
+        "key": "B:per-node-64k:native:mean_inflight_calls",
+        "source_value": 15.467225646878244,
+        "pdf_value": "15.5",
+        "pass_check": true
+      },
+      {
+        "key": "B:paper-context:uniform_get_ops_s:value|,.0f",
+        "source_value": 392000.0,
+        "pdf_value": "392,000",
+        "pass_check": true
+      },
+      {
+        "key": "B:device-write-spread:th_verbs:maximum|,.0f",
+        "source_value": 1660.0,
+        "pdf_value": "1,660",
+        "pass_check": true
+      },
+      {
+        "key": "C:p16v:durable",
+        "source_value": 105.24902905273437,
+        "pdf_value": "105.2",
+        "pass_check": true
+      },
+      {
+        "key": "p50:th_verbs:primary_rf1:read-concurrent:read:1024|.1f",
+        "source_value": 45.025,
+        "pdf_value": "45.0",
+        "pass_check": true
+      },
+      {
+        "key": "J:pagecache_c1_64",
+        "source_value": 37.896,
+        "pdf_value": "37.9",
+        "pass_check": true
+      },
+      {
+        "key": "p99ms:garnet:primary_rf1:write-concurrent:put:256|.1f",
+        "source_value": 69.579177,
+        "pdf_value": "69.6",
+        "pass_check": true
+      },
+      {
         "key": "B:per-node-64k:th_verbs:puts_s_node|,.0f",
         "source_value": 1987.322772934948,
         "pdf_value": "1,987",
         "pass_check": true
       },
       {
+        "key": "B:per-node-64k:native:p50_us",
+        "source_value": 2713.716,
+        "pdf_value": "2713.7",
+        "pass_check": true
+      },
+      {
+        "key": "p50:native:primary_rf1:write-concurrent:put:1024|.1f",
+        "source_value": 63.798,
+        "pdf_value": "63.8",
+        "pass_check": true
+      },
+      {
         "key": "C:p16v:queue",
         "source_value": 70.04173022460938,
         "pdf_value": "70.0",
+        "pass_check": true
+      },
+      {
+        "key": "J:owner64_software_pct|.0f",
+        "source_value": 47.442630000843344,
+        "pdf_value": "47",
+        "pass_check": true
+      },
+      {
+        "key": "mean:native:primary_rf1:point-mixed:put:65536|.1f",
+        "source_value": 156.34688688741724,
+        "pdf_value": "156.3",
+        "pass_check": true
+      },
+      {
+        "key": "B:per-node-64k:native:puts_s_node|,.0f",
+        "source_value": 6102.1850333507355,
+        "pdf_value": "6,102",
+        "pass_check": true
+      },
+      {
+        "key": "B:chart-anomalies:garnet:stall_max_ms|.0f",
+        "source_value": 90.487694,
+        "pdf_value": "90",
+        "pass_check": true
+      },
+      {
+        "key": "B:chart-anomalies:garnet:stall_min_ms|.0f",
+        "source_value": 60.028398,
+        "pdf_value": "60",
+        "pass_check": true
+      },
+      {
+        "key": "p50:valkey_rdma:primary_rf1:read-concurrent:read:1024|.1f",
+        "source_value": 43.051,
+        "pdf_value": "43.1",
+        "pass_check": true
+      },
+      {
+        "key": "B:device-write-spread:th_verbs:minimum|,.0f",
+        "source_value": 1553.0,
+        "pdf_value": "1,553",
+        "pass_check": true
+      },
+      {
+        "key": "J:pagecache64",
+        "source_value": 181.715,
+        "pdf_value": "181.7",
+        "pass_check": true
+      },
+      {
+        "key": "p50:cassandra:primary_rf1:write-concurrent:put:256|.0f",
+        "source_value": 164.0745,
+        "pdf_value": "164",
+        "pass_check": true
+      },
+      {
+        "key": "C:p64v:owner",
+        "source_value": 127.53080810546876,
+        "pdf_value": "127.5",
+        "pass_check": true
+      },
+      {
+        "key": "C:p64v:coordinator",
+        "source_value": 91.88503857421875,
+        "pdf_value": "91.9",
+        "pass_check": true
+      },
+      {
+        "key": "B:device-write-spread:valkey_rdma:maximum|,.0f",
+        "source_value": 2509.0,
+        "pdf_value": "2,509",
+        "pass_check": true
+      },
+      {
+        "key": "cps:native:primary_rf1:read-concurrent:read:1024|,.0f",
+        "source_value": 277534.0489930938,
+        "pdf_value": "277,534",
+        "pass_check": true
+      },
+      {
+        "key": "B:paper-context:write_ops_s:value|,.0f",
+        "source_value": 830000.0,
+        "pdf_value": "830,000",
+        "pass_check": true
+      },
+      {
+        "key": "J:pagecache_jump",
+        "source_value": 47.8575190940216,
+        "pdf_value": "47.9",
         "pass_check": true
       }
     ],
@@ -12607,7 +13369,7 @@
       "case_id": "G12D-r0-08a9a20ff91943a18559",
       "source_value": 134.06147534179686,
       "pdf_value": "134.1",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12616,7 +13378,7 @@
       "case_id": "G12D-r0-08a9a20ff91943a18559",
       "source_value": 125.549,
       "pdf_value": "125.5",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12625,7 +13387,7 @@
       "case_id": "G12D-r0-946e08ec43aceab58b29",
       "source_value": 144.32554467773437,
       "pdf_value": "144.3",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12634,7 +13396,7 @@
       "case_id": "G12D-r0-946e08ec43aceab58b29",
       "source_value": 139.009,
       "pdf_value": "139.0",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12643,7 +13405,7 @@
       "case_id": "G12D-r0-5ac5e1c809e1545074bf",
       "source_value": 132.924306640625,
       "pdf_value": "132.9",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12652,7 +13414,7 @@
       "case_id": "G12D-r0-5ac5e1c809e1545074bf",
       "source_value": 130.539,
       "pdf_value": "130.5",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12661,7 +13423,7 @@
       "case_id": "G12D-r0-ca7078fc585acc3331ce",
       "source_value": 132.83715209960937,
       "pdf_value": "132.8",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12670,7 +13432,7 @@
       "case_id": "G12D-r0-ca7078fc585acc3331ce",
       "source_value": 128.169,
       "pdf_value": "128.2",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12679,7 +13441,7 @@
       "case_id": "G12D-r0-f154e627c9d924039b33",
       "source_value": 130.7703806152344,
       "pdf_value": "130.8",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12688,7 +13450,7 @@
       "case_id": "G12D-r0-f154e627c9d924039b33",
       "source_value": 125.336,
       "pdf_value": "125.3",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12697,7 +13459,7 @@
       "case_id": "G12D-r0-be14bc607d9e72aafdea",
       "source_value": 31.641135986328123,
       "pdf_value": "31.6",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12706,7 +13468,7 @@
       "case_id": "G12D-r0-be14bc607d9e72aafdea",
       "source_value": 27.68,
       "pdf_value": "27.7",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12715,7 +13477,7 @@
       "case_id": "G12D-r0-08a9a20ff91943a18559",
       "source_value": 31.9272939453125,
       "pdf_value": "31.9",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12724,7 +13486,7 @@
       "case_id": "G12D-r0-946e08ec43aceab58b29",
       "source_value": 43.154562255859375,
       "pdf_value": "43.2",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12733,7 +13495,7 @@
       "case_id": "G12D-r0-5ac5e1c809e1545074bf",
       "source_value": 34.484730712890624,
       "pdf_value": "34.5",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12742,7 +13504,7 @@
       "case_id": "G12D-r0-ca7078fc585acc3331ce",
       "source_value": 31.774134033203126,
       "pdf_value": "31.8",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12751,7 +13513,7 @@
       "case_id": "G12D-r0-f154e627c9d924039b33",
       "source_value": 31.858831787109374,
       "pdf_value": "31.9",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12760,7 +13522,7 @@
       "case_id": "G12D-r0-08a9a20ff91943a18559",
       "source_value": 44.19433203125,
       "pdf_value": "44.2",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12769,7 +13531,7 @@
       "case_id": "G12D-r0-946e08ec43aceab58b29",
       "source_value": 38.33852465820313,
       "pdf_value": "38.3",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12778,7 +13540,7 @@
       "case_id": "G12D-r0-5ac5e1c809e1545074bf",
       "source_value": 38.30061279296875,
       "pdf_value": "38.3",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12787,7 +13549,7 @@
       "case_id": "G12D-r0-ca7078fc585acc3331ce",
       "source_value": 38.84041162109375,
       "pdf_value": "38.8",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12796,7 +13558,7 @@
       "case_id": "G12D-r0-f154e627c9d924039b33",
       "source_value": 38.48952587890625,
       "pdf_value": "38.5",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12805,7 +13567,7 @@
       "case_id": "G12D-r0-08a9a20ff91943a18559",
       "source_value": 20.085104248046875,
       "pdf_value": "20.1",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12814,7 +13576,7 @@
       "case_id": "G12D-r0-946e08ec43aceab58b29",
       "source_value": 23.088493896484376,
       "pdf_value": "23.1",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12823,7 +13585,7 @@
       "case_id": "G12D-r0-5ac5e1c809e1545074bf",
       "source_value": 21.622433349609373,
       "pdf_value": "21.6",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12832,7 +13594,7 @@
       "case_id": "G12D-r0-ca7078fc585acc3331ce",
       "source_value": 22.46848046875,
       "pdf_value": "22.5",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12841,7 +13603,7 @@
       "case_id": "G12D-r0-f154e627c9d924039b33",
       "source_value": 21.996085205078124,
       "pdf_value": "22.0",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12850,7 +13612,7 @@
       "case_id": "G12D-r0-be14bc607d9e72aafdea",
       "source_value": 3.513634765625,
       "pdf_value": "3.5",
-      "page": 3,
+      "page": 4,
       "pass_check": true
     },
     {
@@ -12860,7 +13622,7 @@
       "metric": "mean_us",
       "source_value": 462.4866848144531,
       "pdf_value": "462.5",
-      "page": 4,
+      "page": 5,
       "pass_check": true
     },
     {
@@ -12870,7 +13632,7 @@
       "metric": "mean_us",
       "source_value": 499.8661779785156,
       "pdf_value": "499.9",
-      "page": 4,
+      "page": 5,
       "pass_check": true
     },
     {
@@ -12880,7 +13642,7 @@
       "metric": "mean_us",
       "source_value": 159.50032739257813,
       "pdf_value": "159.5",
-      "page": 4,
+      "page": 5,
       "pass_check": true
     },
     {
@@ -12890,7 +13652,7 @@
       "metric": "mean_us",
       "source_value": 38.14155151367188,
       "pdf_value": "38.1",
-      "page": 8,
+      "page": 9,
       "pass_check": true
     },
     {
@@ -12900,7 +13662,7 @@
       "metric": "mean_us",
       "source_value": 46.75141528320312,
       "pdf_value": "46.8",
-      "page": 8,
+      "page": 9,
       "pass_check": true
     },
     {
@@ -12910,7 +13672,7 @@
       "metric": "mean_us",
       "source_value": 38.35097119140625,
       "pdf_value": "38.4",
-      "page": 8,
+      "page": 9,
       "pass_check": true
     },
     {
@@ -12920,7 +13682,7 @@
       "metric": "mean_us",
       "source_value": 42.61194018554688,
       "pdf_value": "42.6",
-      "page": 8,
+      "page": 9,
       "pass_check": true
     },
     {
@@ -12930,7 +13692,7 @@
       "metric": "mean_us",
       "source_value": 109.30912939453125,
       "pdf_value": "109.3",
-      "page": 9,
+      "page": 10,
       "pass_check": true
     },
     {
@@ -12940,7 +13702,7 @@
       "metric": "mean_us",
       "source_value": 115.83646728515625,
       "pdf_value": "115.8",
-      "page": 9,
+      "page": 10,
       "pass_check": true
     },
     {
@@ -12950,7 +13712,7 @@
       "metric": "mean_us",
       "source_value": 109.8399326171875,
       "pdf_value": "109.8",
-      "page": 9,
+      "page": 10,
       "pass_check": true
     },
     {
@@ -12960,7 +13722,7 @@
       "metric": "mean_us",
       "source_value": 112.6805791015625,
       "pdf_value": "112.7",
-      "page": 9,
+      "page": 10,
       "pass_check": true
     },
     {
@@ -12970,7 +13732,7 @@
       "metric": "mean_us",
       "source_value": 101.9141689453125,
       "pdf_value": "101.9",
-      "page": 9,
+      "page": 10,
       "pass_check": true
     },
     {
@@ -12979,7 +13741,7 @@
       "case_id": "G12D-r0-946e08ec43aceab58b29",
       "source_value": 28.6911748046875,
       "pdf_value": "28.7",
-      "page": 23,
+      "page": 24,
       "pass_check": true
     },
     {
@@ -12988,7 +13750,7 @@
       "case_id": "G12D-r0-946e08ec43aceab58b29",
       "source_value": 26.237,
       "pdf_value": "26.2",
-      "page": 23,
+      "page": 24,
       "pass_check": true
     },
     {
@@ -12997,7 +13759,7 @@
       "case_id": "G12D-r0-946e08ec43aceab58b29",
       "source_value": 56.949,
       "pdf_value": "56.9",
-      "page": 23,
+      "page": 24,
       "pass_check": true
     },
     {
@@ -13006,7 +13768,7 @@
       "case_id": "G12D-r0-08a9a20ff91943a18559",
       "source_value": 34.02788623046875,
       "pdf_value": "34.0",
-      "page": 23,
+      "page": 24,
       "pass_check": true
     },
     {
@@ -13015,7 +13777,7 @@
       "case_id": "G12D-r0-08a9a20ff91943a18559",
       "source_value": 27.081,
       "pdf_value": "27.1",
-      "page": 23,
+      "page": 24,
       "pass_check": true
     },
     {
@@ -13024,7 +13786,7 @@
       "case_id": "G12D-r0-08a9a20ff91943a18559",
       "source_value": 184.042,
       "pdf_value": "184.0",
-      "page": 23,
+      "page": 24,
       "pass_check": true
     },
     {
@@ -13033,7 +13795,7 @@
       "case_id": "G12D-r0-be14bc607d9e72aafdea",
       "source_value": 27.34134814453125,
       "pdf_value": "27.3",
-      "page": 23,
+      "page": 24,
       "pass_check": true
     },
     {
@@ -13042,7 +13804,7 @@
       "case_id": "G12D-r0-e44182bb7585ecb016b5",
       "source_value": 152.2178203125,
       "pdf_value": "152.2",
-      "page": 23,
+      "page": 24,
       "pass_check": true
     },
     {
@@ -13051,7 +13813,7 @@
       "case_id": "G12D-r0-e44182bb7585ecb016b5",
       "source_value": 149.684,
       "pdf_value": "149.7",
-      "page": 23,
+      "page": 24,
       "pass_check": true
     },
     {
@@ -13060,7 +13822,7 @@
       "case_id": "G12D-r0-e44182bb7585ecb016b5",
       "source_value": 206.256,
       "pdf_value": "206.3",
-      "page": 23,
+      "page": 24,
       "pass_check": true
     },
     {
@@ -13069,7 +13831,7 @@
       "case_id": "G12D-r0-9eaa39f00ad063fef4cf",
       "source_value": 159.40827954101562,
       "pdf_value": "159.4",
-      "page": 23,
+      "page": 24,
       "pass_check": true
     },
     {
@@ -13078,7 +13840,7 @@
       "case_id": "G12D-r0-9eaa39f00ad063fef4cf",
       "source_value": 150.433,
       "pdf_value": "150.4",
-      "page": 23,
+      "page": 24,
       "pass_check": true
     },
     {
@@ -13087,7 +13849,7 @@
       "case_id": "G12D-r0-9eaa39f00ad063fef4cf",
       "source_value": 384.369,
       "pdf_value": "384.4",
-      "page": 23,
+      "page": 24,
       "pass_check": true
     },
     {
@@ -13096,7 +13858,7 @@
       "case_id": "G12D-r0-2d96d2b8eeab0e23aab1",
       "source_value": 114.75011401367188,
       "pdf_value": "114.8",
-      "page": 23,
+      "page": 24,
       "pass_check": true
     },
     {
@@ -13105,7 +13867,7 @@
       "case_id": "G12D-r0-0ce5f8eaa8fde37f6566",
       "source_value": 58.5891015625,
       "pdf_value": "58.59",
-      "page": 5,
+      "page": 6,
       "pass_check": true
     },
     {
@@ -13114,7 +13876,7 @@
       "case_id": "G12D-r0-0ce5f8eaa8fde37f6566",
       "source_value": 10.716566326530613,
       "pdf_value": "10.72",
-      "page": 5,
+      "page": 6,
       "pass_check": true
     },
     {
@@ -13123,7 +13885,7 @@
       "case_id": "G12D-r0-0ce5f8eaa8fde37f6566",
       "source_value": 0.67041162109375,
       "pdf_value": "0.67",
-      "page": 5,
+      "page": 6,
       "pass_check": true
     },
     {
@@ -13132,7 +13894,7 @@
       "case_id": "G12D-r0-0ce5f8eaa8fde37f6566",
       "source_value": 2.52692041015625,
       "pdf_value": "2.53",
-      "page": 5,
+      "page": 6,
       "pass_check": true
     },
     {
@@ -13141,7 +13903,7 @@
       "case_id": "G12D-r0-0ce5f8eaa8fde37f6566",
       "source_value": 1.016054931640625,
       "pdf_value": "1.02",
-      "page": 5,
+      "page": 6,
       "pass_check": true
     },
     {
@@ -13150,7 +13912,7 @@
       "case_id": "G12D-r0-0ce5f8eaa8fde37f6566",
       "source_value": 8.64915576171875,
       "pdf_value": "8.65",
-      "page": 5,
+      "page": 6,
       "pass_check": true
     },
     {
@@ -13159,7 +13921,7 @@
       "case_id": "G12D-r0-0ce5f8eaa8fde37f6566",
       "source_value": 39.04155200195312,
       "pdf_value": "39.04",
-      "page": 5,
+      "page": 6,
       "pass_check": true
     },
     {
@@ -13168,7 +13930,7 @@
       "case_id": "G12D-r0-0ce5f8eaa8fde37f6566",
       "source_value": 0.67484912109375,
       "pdf_value": "0.67",
-      "page": 5,
+      "page": 6,
       "pass_check": true
     },
     {
@@ -13177,7 +13939,7 @@
       "case_id": "G12D-r0-0ce5f8eaa8fde37f6566",
       "source_value": 29.047328125,
       "pdf_value": "29.05",
-      "page": 5,
+      "page": 6,
       "pass_check": true
     },
     {
@@ -13186,7 +13948,7 @@
       "case_id": "G12D-r0-0ce5f8eaa8fde37f6566",
       "source_value": 28.062938720703126,
       "pdf_value": "28.06",
-      "page": 5,
+      "page": 6,
       "pass_check": true
     },
     {
@@ -13195,7 +13957,7 @@
       "case_id": "G12D-r0-0ce5f8eaa8fde37f6566",
       "source_value": 0.261970458984375,
       "pdf_value": "0.26",
-      "page": 5,
+      "page": 6,
       "pass_check": true
     },
     {
@@ -13204,7 +13966,7 @@
       "case_id": "G12D-r0-0ce5f8eaa8fde37f6566",
       "source_value": 0.111865478515625,
       "pdf_value": "0.11",
-      "page": 5,
+      "page": 6,
       "pass_check": true
     },
     {
@@ -13213,7 +13975,7 @@
       "case_id": "G12D-r0-0ce5f8eaa8fde37f6566",
       "source_value": 0.22195556640625,
       "pdf_value": "0.22",
-      "page": 5,
+      "page": 6,
       "pass_check": true
     },
     {
@@ -13222,7 +13984,7 @@
       "case_id": "G12D-r0-0ce5f8eaa8fde37f6566",
       "source_value": 0.220186279296875,
       "pdf_value": "0.22",
-      "page": 5,
+      "page": 6,
       "pass_check": true
     },
     {
@@ -13231,7 +13993,7 @@
       "case_id": "G12D-r0-0ce5f8eaa8fde37f6566",
       "source_value": 4.888236083984375,
       "pdf_value": "4.89",
-      "page": 5,
+      "page": 6,
       "pass_check": true
     },
     {
@@ -13240,14 +14002,14 @@
       "case_id": "G12D-r0-0ce5f8eaa8fde37f6566",
       "source_value": 0.59579150390625,
       "pdf_value": "0.60",
-      "page": 5,
+      "page": 6,
       "pass_check": true
     },
     {
       "claim": "profile_persist_gap; descriptive comparison, not a component",
       "source_value": 9.994223876953122,
       "pdf_value": "10",
-      "page": 5,
+      "page": 6,
       "pass_check": true,
       "source": "owner-profile.csv"
     },
@@ -13255,7 +14017,7 @@
       "claim": "native_read_floor_gap; descriptive comparison, not a component",
       "source_value": 16.956000000000003,
       "pdf_value": "17",
-      "page": 9,
+      "page": 10,
       "pass_check": true,
       "source": "run8-ops_summary.csv + run8-ssd_floor.csv"
     },
@@ -13263,7 +14025,7 @@
       "claim": "run7_put1_gap; descriptive comparison, not a component",
       "source_value": 49.431,
       "pdf_value": "49",
-      "page": 26,
+      "page": 27,
       "pass_check": true,
       "source": "run7-device_put_spread.csv"
     },
@@ -13271,7 +14033,7 @@
       "claim": "run7_put64_gap; descriptive comparison, not a component",
       "source_value": 173.45399999999995,
       "pdf_value": "173",
-      "page": 26,
+      "page": 27,
       "pass_check": true,
       "source": "run7-device_put_spread.csv"
     },
@@ -13281,7 +14043,7 @@
       "case_id": "G12S-r0-08dd9c45f89e566a1471",
       "source_value": 2062.2258064516127,
       "pdf_value": "2062",
-      "page": 24,
+      "page": 25,
       "pass_check": true
     },
     {
@@ -13290,7 +14052,7 @@
       "case_id": "G12S-r0-08dd9c45f89e566a1471",
       "source_value": 2049.0,
       "pdf_value": "2049",
-      "page": 24,
+      "page": 25,
       "pass_check": true
     },
     {
@@ -13299,7 +14061,7 @@
       "case_id": "G12S-r0-48d3c0ba8811ca5525fb",
       "source_value": 2069.8602150537636,
       "pdf_value": "2070",
-      "page": 24,
+      "page": 25,
       "pass_check": true
     },
     {
@@ -13308,7 +14070,7 @@
       "case_id": "G12S-r0-48d3c0ba8811ca5525fb",
       "source_value": 2064.0,
       "pdf_value": "2064",
-      "page": 24,
+      "page": 25,
       "pass_check": true
     },
     {
@@ -13317,7 +14079,7 @@
       "case_id": "G12S-r0-0c6b896872f4b75c615a",
       "source_value": 2062.2340425531916,
       "pdf_value": "2062",
-      "page": 24,
+      "page": 25,
       "pass_check": true
     },
     {
@@ -13326,7 +14088,7 @@
       "case_id": "G12S-r0-0c6b896872f4b75c615a",
       "source_value": 2058.0,
       "pdf_value": "2058",
-      "page": 24,
+      "page": 25,
       "pass_check": true
     },
     {
@@ -13335,7 +14097,7 @@
       "case_id": "G12S-r0-5c51f229bf73f13e4b74",
       "source_value": 2069.531914893617,
       "pdf_value": "2070",
-      "page": 24,
+      "page": 25,
       "pass_check": true
     },
     {
@@ -13344,7 +14106,7 @@
       "case_id": "G12S-r0-5c51f229bf73f13e4b74",
       "source_value": 2068.0,
       "pdf_value": "2068",
-      "page": 24,
+      "page": 25,
       "pass_check": true
     }
   ],
@@ -13655,7 +14417,7 @@
   "latexmk": {
     "success": true,
     "command": "latexmk -pdf -interaction=nonstopmode -halt-on-error main.tex",
-    "pages": 54,
+    "pages": 56,
     "appendix_pages": 7,
     "log_check": "No Overfull, Underfull, undefined reference, Missing number, Missing character or LaTeX Warning lines.",
     "section_order": [
@@ -13664,7 +14426,7 @@
       "Agreement with the Tidehunter paper",
       "Where 64 KiB values occur"
     ],
-    "pdf_sha256": "334745e1e45c96414fcc67a99652c77fc04d266417f4a1de8d046b714b770350"
+    "pdf_sha256": "51760763c59926b4d0f6bb7d551efc75086fd91827c585e5719757846d3812fc"
   },
   "source_defects": [
     {

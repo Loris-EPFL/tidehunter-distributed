@@ -153,6 +153,57 @@ class NativeWriteBoundaries(unittest.TestCase):
             dataset(items + [legacy])
 
 
+class ExternalAcknowledgementContracts(unittest.TestCase):
+    def test_default_and_explicit_synced_share_one_unmodified_contract(self):
+        items = [case("valkey_tcp", repeat) for repeat in (0, 1)]
+        items[1]["job"]["ack_contract"] = "synced"
+        original = copy.deepcopy(items)
+        data = dataset(items)
+        cell = ("valkey_tcp", "primary_rf1", "read-concurrent", 64)
+        self.assertEqual(data.matched_repeats([cell]), [0, 1])
+        self.assertEqual(data.ack_contracts, {"valkey_tcp": "synced"})
+        point, reason = plots.aggregate_point(data, cell, [0, 1], "api_ns", "read")
+        self.assertIsNone(reason)
+        self.assertEqual(point["ack_contract"], "synced")
+        self.assertTrue(all(row["ack_contract"] == "synced" for row in point["observations"]))
+        self.assertEqual(items, original)
+
+    def test_mixed_external_contracts_cannot_form_one_series(self):
+        for backend, contract in (("valkey_tcp", "periodic_sync"), ("valkey_tcp", "os_buffered"),
+                                  ("valkey_rdma", "periodic_sync"), ("valkey_rdma", "os_buffered"),
+                                  ("kvrocks", "page_cache")):
+            items = [case(backend, repeat) for repeat in (0, 1)]
+            items[1]["job"]["ack_contract"] = contract
+            with self.subTest(backend=backend), self.assertRaisesRegex(ValueError, "ack_contract changes"):
+                dataset(items)
+        invalid = case("garnet")
+        invalid["job"]["ack_contract"] = "page_cache"
+        with self.assertRaises(ValueError):
+            dataset([invalid])
+
+    def test_relaxed_plots_and_csv_name_the_selected_contract(self):
+        items = [item for item in full_matrix_cases() if item["job"]["backend"] == "valkey_tcp"]
+        for item in items:
+            item["job"]["ack_contract"] = "os_buffered"
+        original = copy.deepcopy(items)
+        data = dataset(items)
+        figures, _ = plots.build_figures(data)
+        primary = next(row for row in figures if row["name"] == "primary-read-concurrent")
+        series = primary["panels"][0]["series"][0]
+        self.assertIn("os_buffered", series["label"])
+        self.assertEqual(series["ack_contract"], "os_buffered")
+        self.assertIn("valkey_tcp=os_buffered", primary["caption"])
+        self.assertEqual(plots.evidence_appendix(data)[0]["ack_contract"], "os_buffered")
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            plots.export_data(figures, plots.coverage(data), output)
+            with (output / "plot-data.csv").open() as stream:
+                rows = [row for row in csv.DictReader(stream) if row["metric"] != "case_count"]
+            self.assertTrue(rows)
+            self.assertEqual({row["ack_contract"] for row in rows}, {"os_buffered"})
+        self.assertEqual(items, original)
+
+
 class IndustryComparatorEvidence(unittest.TestCase):
     def test_cold_figures_keep_comparator_labels_repeats_and_caveats(self):
         items = []

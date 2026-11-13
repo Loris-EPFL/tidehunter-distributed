@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exact-owned, Linux-only local comparator lifecycle; no cloud dependencies."""
+import ack_contract
 import argparse
 import hashlib
 import json
@@ -111,10 +112,12 @@ def load(directory):
     return state
 
 
-def valkey_server_args(address, port, bus_port, cluster, maxmemory_mib):
+def valkey_server_args(address, port, bus_port, cluster, maxmemory_mib, ack_contract="synced"):
+    import ack_contract as contracts
+    fsync = contracts.valkey_fsync(ack_contract)
     # Keep Valkey's snapshot/rewrite maintenance defaults; never substitute a cache.
     args = ["valkey-server", "--bind", address, "--port", str(port), "--protected-mode", "no",
-            "--dir", "/data", "--appendonly", "yes", "--appendfsync", "always",
+            "--dir", "/data", "--appendonly", "yes", "--appendfsync", fsync,
             "--no-appendfsync-on-rewrite", "no", "--maxmemory-policy", "noeviction",
             "--maxmemory", str(maxmemory_mib * 1024**2)]
     if cluster:
@@ -165,7 +168,9 @@ def valkey_evidence(run, endpoints, cluster):
             "image": IMAGES["valkey_tcp"]}
 
 
-def admit_valkey(nodes, endpoints, cluster, complete=True, data_dir="/data"):
+def admit_valkey(nodes, endpoints, cluster, complete=True, data_dir="/data", ack_contract="synced"):
+    import ack_contract as contracts
+    fsync = contracts.valkey_fsync(ack_contract)
     expected = set(endpoints)
     if len(nodes) != len(expected) or len(expected) != (5 if cluster and complete else 1) or {x["endpoint"] for x in nodes} != expected:
         raise RuntimeError("Valkey requested primary endpoint inventory mismatch")
@@ -173,7 +178,7 @@ def admit_valkey(nodes, endpoints, cluster, complete=True, data_dir="/data"):
     for node in nodes:
         config, server = node["effective_config"], node["info_server"]
         persistence, replication = node["info_persistence"], node["info_replication"]
-        required = {"appendonly": "yes", "appendfsync": "always", "no-appendfsync-on-rewrite": "no",
+        required = {"appendonly": "yes", "appendfsync": fsync, "no-appendfsync-on-rewrite": "no",
                     "maxmemory-policy": "noeviction",
                     "dir": data_dir[node["endpoint"]] if isinstance(data_dir, dict) else data_dir,
                     "cluster-enabled": "yes" if cluster else "no"}
@@ -248,7 +253,7 @@ def admit_valkey(nodes, endpoints, cluster, complete=True, data_dir="/data"):
         raise RuntimeError("Valkey primary views disagree about identities or slot ownership")
     return {"required_primary_nodes": 5 if cluster else 1, "replication_factor": 1, "replica_count": 0,
             "primary_endpoints": sorted(expected), "slot_count": (16384 if cluster else 0) if complete else None,
-            "primary_ids": identities, "durability": "AOF appendfsync always; no-appendfsync-on-rewrite no"}
+            "primary_ids": identities, "durability": f"AOF appendfsync {fsync}; no-appendfsync-on-rewrite no"}
 
 
 def initialize_valkey(run, endpoints, directory, timeout):
@@ -275,8 +280,10 @@ def initialize_valkey(run, endpoints, directory, timeout):
     return evidence
 
 
-def topology(backend, layout, directory, owner):
+def topology(backend, layout, directory, owner, ack_contract="synced"):
     """Compose limits are hard cgroup budgets, not reserved physical resources."""
+    import ack_contract as contracts
+    contracts.selected(backend, ack_contract)
     count = 5 if backend in ("garnet", "kvrocks") else (1 if layout == "qualification" else (5 if backend == "valkey_tcp" else 3))
     services, volumes = {}, {}
 
@@ -336,7 +343,7 @@ def topology(backend, layout, directory, owner):
     elif backend == "valkey_tcp":
         for i in range(count):
             add(f"valkey{i}", "valkey_tcp", 2.0, "1536m",
-                valkey_server_args(f"127.0.0.{21+i}", 6379+i, 16379+i, count > 1, 1024))
+                valkey_server_args(f"127.0.0.{21+i}", 6379+i, 16379+i, count > 1, 1024, ack_contract))
     elif backend in ("garnet", "kvrocks"):
         import industry_service
         for i in range(count):
@@ -415,7 +422,7 @@ def probe(state):
         proof = industry_service.evidence(backend, endpoints)
         proof["runtime"] = runtime
         dump(Path(state["directory"]) / "probe-attempt.json", proof)
-        proof["coverage"] = industry_service.admit(backend, proof["nodes"], endpoints)
+        proof["coverage"] = industry_service.admit(backend, proof["nodes"], endpoints, ack_contract=state.get("ack_contract", "synced"))
         return proof
     if backend == "tikv":
         stores = http("/pd/api/v1/stores")
@@ -462,7 +469,7 @@ def probe(state):
                              "memory_bytes": item["HostConfig"]["Memory"], "nano_cpus": item["HostConfig"]["NanoCpus"],
                              "runtime_configuration_sha256": runtime_configuration_hash(item)} for item in items]
         dump(Path(state["directory"]) / "probe-attempt.json", proof)
-        proof["coverage"] = admit_valkey(proof["nodes"], endpoints, count > 1)
+        proof["coverage"] = admit_valkey(proof["nodes"], endpoints, count > 1, ack_contract=state.get("ack_contract", "synced"))
         return proof
     text = execute(state, "fdb0", "/usr/bin/fdbcli", "-C", "/config/fdb.cluster", "--timeout", "8", "--exec", "status json")
     status = json.loads(text)
@@ -556,6 +563,7 @@ def stop(state):
 
 
 def start(args):
+    contract = ack_contract.selected(args.backend, getattr(args, "ack_contract", "synced"))
     if args.backend == "valkey_rdma" or (args.backend == "valkey_tcp" and getattr(args, "paired_valkey", False)):
         import local_valkey_rdma
         return local_valkey_rdma.start(args)
@@ -564,7 +572,7 @@ def start(args):
     directory = args.state.resolve()
     if (directory / "owner.json").exists():
         state = load(directory)
-        if state["backend"] != args.backend or state["layout"] != args.layout:
+        if state["backend"] != args.backend or state["layout"] != args.layout or state.get("ack_contract", "synced") != contract:
             raise RuntimeError("existing state backend/layout mismatch")
         ready(state, args.timeout)
         return
@@ -574,7 +582,7 @@ def start(args):
     if shutil.disk_usage(directory).free < 4 * 1024**3:
         raise RuntimeError("at least 4 GiB free disk required before image/data allocation")
     owner = uuid.uuid4().hex
-    spec, count = topology(args.backend, args.layout, directory, owner)
+    spec, count = topology(args.backend, args.layout, directory, owner, contract)
     if args.backend == "tikv":
         addresses = [("127.0.0.1", p) for p in [2379, 2380] + [20160+i for i in range(count)] + [20180+i for i in range(count)]]
     elif args.backend == "cassandra":
@@ -598,6 +606,8 @@ def start(args):
              "compose_file": str(directory / "compose.json"), "physical_hosts": 1, "independent_disks": False,
              "placement": "all local processes share host SSD; logical zones are not failure domains",
              "created_at_unix": time.time()}
+    if contract != "synced":
+        state["ack_contract"] = contract
     if args.backend == "valkey_tcp":
         state["backend_options"] = {"nodes": [f"127.0.0.{21+i}:{6379+i}" for i in range(count)],
                                     "cluster": count > 1, "required_replication_factor": 1,
@@ -608,7 +618,7 @@ def start(args):
         state["spec"] = spec
         if args.backend == "kvrocks":
             for i in range(5):
-                (directory / f"kvrocks{i}.conf").write_text(industry_service.kvrocks_config(f"127.0.0.{31+i}", 6379, 1536))
+                (directory / f"kvrocks{i}.conf").write_text(industry_service.kvrocks_config(f"127.0.0.{31+i}", 6379, 1536, contract))
     dump(directory / "owner.json", state)
     dump(directory / "compose.json", spec)
     (directory / "pd.toml").write_text(f'[replication]\nmax-replicas = {count}\nlocation-labels = ["zone"]\n')
@@ -713,6 +723,7 @@ def main():
             p.add_argument("--output", type=Path, required=True)
     p = sub.add_parser("prepare-fdb")
     p.add_argument("--prefix", type=Path, required=True)
+    sub.choices["start"].add_argument("--ack-contract", choices=("synced", "page_cache", "os_buffered", "periodic_sync"), default="synced")
     args = parser.parse_args()
     if args.action == "start":
         start(args)

@@ -1,0 +1,29 @@
+{
+  "pass_check": true,
+  "source": "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/experiments/kv-comparison/cloud_campaign.py",
+  "source_sha256": "5503ebfd3babbe2ff42a7c7b982ffc0a8b9acd0629cdef66b773db5697969157",
+  "check": "verify_size_spike.check_local_fair",
+  "result": {
+    "transcribed_ieee_rows": 40,
+    "raw_local_samples": "not retained; transcription checked against audit report",
+    "matrix_counts": {
+      "G14N": 54,
+      "G14S": 36,
+      "G14O1": 36,
+      "G14O5": 36,
+      "G14P": 6,
+      "fair_native": 168,
+      "parity": 216,
+      "G13W": 48,
+      "frozen_recommended": 279,
+      "frozen_full": 333,
+      "frozen_device": 120,
+      "frozen_floors": 69,
+      "frozen_stages": 183,
+      "frozen_unified": 270
+    },
+    "status": "planned, not run; read-only make_focused_matrix calls; no launch"
+  },
+  "conclusion": "All retained fair-native case/writer counts and matrix digests equal current source generation; no numeric change needed",
+  "repinned": false
+}

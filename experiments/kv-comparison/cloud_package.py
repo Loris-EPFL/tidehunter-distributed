@@ -32,6 +32,7 @@ FOCUSED_SOURCE_CLOSURE = frozenset({
     "experiments/gcp-rdma/prepare.py", "experiments/gcp-rdma/build-container.sh",
     "experiments/kv-comparison/cloud_package.py", "experiments/kv-comparison/ci_prepare.py",
     "experiments/kv-comparison/cloud_controller.py",
+    "experiments/kv-comparison/ack_contract.py",
 })
 VALKEY_COMMIT = "fe8d406c0b5a64ec897f6455e4de684629883764"
 VALKEY_ARTIFACTS = ("src/valkey-server", "src/valkey-cli", "src/valkey-benchmark",
@@ -64,6 +65,7 @@ REQUIRED = {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.to
             "experiments/kv-comparison/cloud_package.py", "experiments/kv-comparison/cloud_controller.py",
             "experiments/kv-comparison/cloud_campaign.py", "experiments/kv-comparison/cloud_layout.py",
             "experiments/kv-comparison/analyze.py", "experiments/kv-comparison/campaign.py",
+            "experiments/kv-comparison/ack_contract.py",
             "experiments/kv-comparison/physical_storage.py",
             "experiments/kv-comparison/cloud-campaign.json", "experiments/kv-comparison/local.py",
             "experiments/kv-comparison/resource_accounting.py",

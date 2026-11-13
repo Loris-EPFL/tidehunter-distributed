@@ -673,15 +673,40 @@ pub async fn run<B: KvBackend>(
     Ok(())
 }
 
-/// Durability contract and matched comparison cohort of this run, copied into summary and manifest.
-/// Tiers are never mixed in one comparison: `native` pairs only with native `page_cache`;
-/// `synchronous` pairs with both native Value-WAL barrier modes and Valkey `appendfsync always`.
+/// Durability contract and matched comparison cohort, copied into summary and manifest.
+/// Native page-cache includes Kvrocks non-sync WAL writes. Synchronous includes
+/// native WAL barriers and Valkey AOF always. Valkey no-fsync and everysec use
+/// their own os_buffered and periodic_sync cohorts, never native page-cache.
 fn durability_receipt(config: &RunConfig, info: &BackendInfo) -> serde_json::Value {
     if let Ok(Some(tier)) = config.durability_tier() {
         return serde_json::json!({
             "system": "tidehunter", "tier": tier.as_str(),
             "comparison_cohort": tier.comparison_cohort(),
             "confirmed_by_backend_receipt": info.configuration.get("durability_tier"),
+        });
+    }
+    let ack_contract = info.configuration.get("ack_contract");
+    let relaxed = match (
+        info.name.as_str(),
+        ack_contract
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("synced"),
+    ) {
+        (name, "os_buffered") if name.starts_with("valkey") => {
+            Some(("appendfsync_no", "os_buffered"))
+        }
+        (name, "periodic_sync") if name.starts_with("valkey") => {
+            Some(("appendfsync_everysec", "periodic_sync"))
+        }
+        ("kvrocks", "page_cache") => {
+            Some(("wal_sync_no", DurabilityTier::Native.comparison_cohort()))
+        }
+        _ => None,
+    };
+    if let Some((tier, cohort)) = relaxed {
+        return serde_json::json!({
+            "system": info.name, "tier": tier, "comparison_cohort": cohort,
+            "confirmed_by_backend_receipt": ack_contract,
         });
     }
     let (tier, cohort) = if info.name.starts_with("valkey") {
@@ -3470,6 +3495,60 @@ mod tests {
         );
         backend.shutdown().await.unwrap();
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn external_acknowledgement_receipts_preserve_defaults_and_classify_relaxed_contracts() {
+        let mut config = read_test_config();
+        for name in ["valkey_tcp", "valkey_rdma", "kvrocks", "garnet"] {
+            config.backend.kind = name.into();
+            let mut info = BackendInfo {
+                name: name.into(),
+                server_version: String::new(),
+                client_version: String::new(),
+                acknowledgement: String::new(),
+                consistency: String::new(),
+                replication_factor: 1,
+                measurement_boundary: String::new(),
+                get_many_strategy: String::new(),
+                batch_atomicity: crate::backend::BatchAtomicity::Unsupported,
+                topology: serde_json::json!({}),
+                configuration: serde_json::json!({}),
+            };
+            let expected = if name.starts_with("valkey") {
+                serde_json::json!({"system":name,"tier":"appendfsync_always",
+                    "comparison_cohort":DurabilityTier::Synchronous.comparison_cohort()})
+            } else {
+                serde_json::json!({"system":name,"tier":"unclassified","comparison_cohort":"none"})
+            };
+            assert_eq!(durability_receipt(&config, &info), expected);
+            info.configuration["ack_contract"] = serde_json::json!("synced");
+            assert_eq!(durability_receipt(&config, &info), expected);
+            let cases = if name.starts_with("valkey") {
+                vec![
+                    ("os_buffered", "appendfsync_no", "os_buffered"),
+                    ("periodic_sync", "appendfsync_everysec", "periodic_sync"),
+                ]
+            } else if name == "kvrocks" {
+                vec![(
+                    "page_cache",
+                    "wal_sync_no",
+                    DurabilityTier::Native.comparison_cohort(),
+                )]
+            } else {
+                Vec::new()
+            };
+            for (contract, tier, cohort) in cases {
+                info.configuration["ack_contract"] = serde_json::json!(contract);
+                assert_eq!(
+                    durability_receipt(&config, &info),
+                    serde_json::json!({
+                        "system":name,"tier":tier,"comparison_cohort":cohort,
+                        "confirmed_by_backend_receipt":contract,
+                    })
+                );
+            }
+        }
     }
 
     #[tokio::test]

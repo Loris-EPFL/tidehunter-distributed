@@ -1549,6 +1549,81 @@ class CloudReports(unittest.TestCase):
                 self.assertEqual(json.loads(item["effective_configuration"]), row["backend"]["configuration"])
                 self.assertEqual(json.loads(item["resource_evidence"]), row["resource_evidence"])
 
+    def test_csv_exports_selected_external_ack_contract_without_changing_jobs(self):
+        for backend in ("valkey_tcp", "valkey_rdma", "kvrocks"):
+            contracts = ("synced", "periodic_sync", "os_buffered") if backend != "kvrocks" else ("synced", "page_cache")
+            for contract in contracts:
+                with self.subTest(backend=backend, contract=contract), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    directory, _ = self.failure_fixture(root)
+                    row = cloud.summarize_case(directory)
+                    row["job"]["backend"] = backend
+                    if contract != "synced":
+                        row["job"]["ack_contract"] = contract
+                    row["backend"] = {"acknowledgement": "observed strict boundary"}
+                    if contract != "synced":
+                        row["backend"]["configuration"] = {"ack_contract": contract}
+                    original = copy.deepcopy(row["job"])
+                    cloud.write_csv_report(root, [row])
+                    with (root / "comparison.csv").open() as stream:
+                        exported = list(csv.DictReader(stream))
+                    self.assertTrue(exported)
+                    for item in exported:
+                        self.assertEqual(item["ack_contract"], contract)
+                        self.assertEqual(item["acknowledgement"], row["backend"]["acknowledgement"])
+                    self.assertEqual(row["job"], original)
+
+    def test_run_config_binds_only_explicit_nondefault_ack_contract(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory, receipt = self.failure_fixture(Path(temporary))
+            for kind, contract in (("valkey_tcp", "synced"), ("valkey_tcp", "periodic_sync"),
+                                   ("valkey_rdma", "os_buffered"), ("kvrocks", "page_cache")):
+                job = dict(receipt["job"], backend=kind)
+                if contract != "synced":
+                    job["ack_contract"] = contract
+                original = copy.deepcopy(job)
+                config = cloud.make_run_config(job, directory, {}, None)
+                self.assertEqual(config["backend"]["options"].get("ack_contract", "synced"), contract)
+                self.assertEqual("ack_contract" in config["backend"]["options"], contract != "synced")
+                self.assertEqual(job, original)
+                different = "periodic_sync" if kind.startswith("valkey") and contract == "synced" else "synced"
+                with self.assertRaisesRegex(ValueError, "ack_contract"):
+                    cloud.make_run_config(job, directory, {"ack_contract": different}, None)
+
+    def test_case_summary_requires_reported_and_executed_ack_contract_match(self):
+        cases = (("periodic_sync", None, "periodic_sync", False),
+                 ("synced", "periodic_sync", "synced", False),
+                 ("periodic_sync", "periodic_sync", None, False),
+                 ("periodic_sync", "periodic_sync", "periodic_sync", True),
+                 ("os_buffered", "os_buffered", "os_buffered", True),
+                 ("page_cache", "page_cache", "page_cache", True))
+        for selected, reported, executed, admitted in cases:
+            with self.subTest(selected=selected, reported=reported, executed=executed), tempfile.TemporaryDirectory() as temporary:
+                directory, receipt = self.failure_fixture(Path(temporary))
+                kind = "kvrocks" if selected == "page_cache" else "valkey_tcp"
+                receipt["job"].update(backend=kind, ack_contract=selected)
+                config = json.loads((directory / "config.json").read_text())
+                config["backend"] = {"kind": kind, "options": {}}
+                if executed is not None:
+                    config["backend"]["options"]["ack_contract"] = executed
+                for filename in ("config.json", "normalized-config.json"):
+                    (directory / filename).write_text(json.dumps(config))
+                for filename, field in (("manifest.json", "backend_info"), ("summary.json", "backend")):
+                    path = directory / "result" / filename
+                    data = json.loads(path.read_text())
+                    data[field]["name"] = kind
+                    data[field]["configuration"] = {} if reported is None else {"ack_contract": reported}
+                    if filename == "manifest.json":
+                        data["run"]["config"] = config
+                    path.write_text(json.dumps(data))
+                    receipt["artifacts_sha256"][filename] = hashlib.sha256(path.read_bytes()).hexdigest()
+                (directory / "receipt.json").write_text(json.dumps(receipt))
+                if admitted:
+                    self.assertEqual(cloud.summarize_case(directory)["ack_contract"], reported)
+                else:
+                    with self.assertRaisesRegex(ValueError, "ack_contract"):
+                        cloud.summarize_case(directory)
+
     def test_undispatched_rejection_retains_response_statistics_without_api_clocks(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory, receipt = self.failure_fixture(Path(temporary))

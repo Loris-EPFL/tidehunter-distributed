@@ -3,7 +3,7 @@
 Run 9 measures the one-Db Native and one-owner TCP/verbs subset at equal total writers \N{B:fair-native-plan:G14N:writer0|.0f}, \N{B:fair-native-plan:G14N:writer1|.0f} and \N{B:fair-native-plan:G14N:writer2|.0f}. Native page-cache, per-put barrier and grouped barrier remain distinct from owner covering persistence (Section~\ref{sec:rwc}). The five-Db Native and five-owner rows below remain unmeasured design inventory; page-cache acknowledgement is not durable.
 
 \begin{table}[H]\centering\fitinput{tab-fair-native.tex}
-\caption{Frozen design inventory, not counts of completed run-9 cases. Run 9 includes G14N/G14O1 and three separate G14P diagnostics; G14S and G14O5 were not run. Instances, SSD location/count, network/security, sync scope and routing remain unmatched.}\label{tab:fair-native}
+\caption{Frozen design inventory, not completed counts. Class A: Native page cache. Class B: Native per-put/grouped barrier and owner covering sync. No cross-class ranking. Run 9 includes G14N/G14O1 and three G14P diagnostics; G14S/G14O5 did not run. Instances, SSD location/count, network/security, sync scope and routing remain unmatched.}\label{tab:fair-native}
 \end{table}
 
 \texttt{fair\_native} has \N{B:fair-native-plan:fair_native:cases|.0f} designed cases; \texttt{parity} has \N{B:fair-native-plan:parity:cases|.0f}, including \N{B:fair-native-plan:G13W:cases|.0f} G13W floors. Run 9 executed the authorized \texttt{remote\_rw\_compact} subset, not either entire larger selection. Frozen digests in \texttt{fair-native-plan.csv} remain unchanged. A five-SSD Native arm remains unimplemented; further launches need separate approval.

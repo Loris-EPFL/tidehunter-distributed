@@ -36,6 +36,8 @@
 \newcommand{\rEight}{Run 8, focused unified fleet (six \texttt{z4m-highmem-16} VMs, Local SSD, RDMA)}
 \newcommand{\rSeven}{Run 7, focused device fleet (six \texttt{z4m-highmem-16} VMs, Local SSD, RDMA)}
 \newcommand{\carried}{Retained cross-store data, unchanged}
+\newcommand{\ackB}{Verified cross-store series: Class B (synced before acknowledgement). Read classes name write/preparation settings.}
+\newcommand{\ackUnknown}{Cassandra, TiKV and FoundationDB: device sync not verified.}
 \begin{document}
 \begin{center}
 {\LARGE\bfseries Distributed Tidehunter}\\[3pt]
@@ -75,17 +77,19 @@ $^{a}$ Profiled copies run once. Network and SSD read floors run three times; wr
 \endgroup
 
 \clearpage
+\input{acknowledgement-contracts.tex}
+\clearpage
 \section{Method and contracts}\label{sec:method}
 API time is completion minus dispatch. Response time is completion minus schedule time in the closed-loop harness; it includes scheduling and admission. Latency uses successful calls only. Rejected calls have no API latency. Quantiles use exact nearest rank within each operation and outcome. No samples or fleets are pooled. A median across runs is a median of per-run statistics, not a quantile of pooled calls. A range is minimum to maximum, not a confidence interval. One profiled repetition gives no confidence interval or significance claim.
 
 \begin{center}\small
 \begin{tabular}{lp{.68\linewidth}}\toprule
 Backend and tier & Acknowledgement contract\\\midrule
-Native \texttt{value\_wal\_barrier} & Durable: \texttt{fsync} of the Value-WAL files and the directory after every put.\\
-Native \texttt{page\_cache} & Returns after the page-cache write. Does not wait for fsync.\\
-Native grouped barrier & Shared covering Native file/directory barrier; not per-put sync.\\
-Owner \texttt{synchronous} & Returns after the covering Value-WAL \texttt{fdatasync}. Several puts can share it.\\
-Owner \texttt{native} & Page-cache acknowledgement. This tier has no relation to the native backend.\\\bottomrule
+Native \texttt{value\_wal\_barrier} & Class B: \texttt{fsync} of the Value-WAL files and the directory after every put.\\
+Native \texttt{page\_cache} & Class A: returns after the page-cache write. Does not wait for fsync.\\
+Native grouped barrier & Class B: shared covering Native file/directory barrier; not per-put sync.\\
+Owner \texttt{synchronous} & Class B: returns after the covering Value-WAL \texttt{fdatasync}. Several puts can share it.\\
+Owner \texttt{native} & Class A: page-cache acknowledgement. This tier has no relation to the native backend.\\\bottomrule
 \end{tabular}
 \end{center}
 The paper's default acknowledgement does not wait for fsync (Section 3.1, Durability Guarantees). Our native barrier tier is stricter. It matches the durable intent of owner synchronous and Valkey AOF \texttt{appendfsync=always}; it is not the paper's latency contract.
@@ -280,6 +284,7 @@ The acknowledgement-contract difference includes waiting for persistence, softwa
 
 The TCP-verbs difference includes mTLS. Three repetitions give an observed spread, not a significance claim. Do not combine run-7 unprofiled calls with run-8 profiles to claim profiling overhead or a performance change: the fleets differ. Hybrid direct arms gain relative to the owner paths with larger values and c16; their cache contracts remain explicit.
 
+\input{contract-results.tex}
 \clearpage
 \section{Cross-store comparison: carried forward}\label{sec:cross}
 \textbf{\carried.} Native and Tidehunter use fleet \texttt{bench-0d99e8256fff4891}, six \texttt{z4m-highmem-16} VMs in \texttt{us-central1-a}, RDMA and Local SSD. External-store statistics span other GCP fleets, days and binaries. These are not run-7, run-8 or run-9 measurements. Coordinator cache is off. API quantiles are success-only. Native waits for its own per-put Value-WAL file and directory fsync; owner synchronous waits for a covering fdatasync, which can serve several puts. Valkey uses AOF \texttt{appendfsync=always}. Similar durable intent does not prove equal persistence mechanics.
@@ -294,17 +299,17 @@ The TCP-verbs difference includes mTLS. Three repetitions give an observed sprea
 \subsection{The unchanged scoreboard}
 
 \begin{figure}[H]\centering\includegraphics[width=\linewidth]{figures/scoreboard.pdf}
-\caption{\carried. Tidehunter/Valkey success-only API p50 (top) and p99 (bottom). Values below one favour Tidehunter. The c1 rows are mixed point operations; other rows are primary c16 cases. \runs. Same CSV inputs and ratios as the 7 November brief.}
+\caption{\carried. \ackB\  Tidehunter/Valkey success-only API p50 (top) and p99 (bottom). Values below one favour Tidehunter. The c1 rows are mixed point operations; other rows are primary c16 cases. \runs. Same CSV inputs and ratios as the 7 November brief.}
 \end{figure}
 The other stores were not rerun. Each of their cells is the median of per-run quantiles from all GCP runs that completed that population. There are \N{S:ext_pops} such populations and \N{S:ext_runs_min} to \N{S:ext_runs_max} runs per cell. They span fleets, days and sometimes binaries. Their p50 slowest/fastest ratio has median \N{S:ext_spread_med|.2f}, 90th percentile \N{S:ext_spread_p90|.2f}, and maximum \N{S:ext_spread_max|.2f}. This is not a pooled quantile or a matched new-fleet comparison.
 
 \clearpage
 \subsection{The unchanged 1 KiB tables}
 \begin{table}[H]\centering\fitinput{tab-onekib-1.tex}
-\caption{\carried. Scalar calls at c16, success-only API p50 and p99 in \us, successful calls/s. \runs. These tables retain their original keys and CSV inputs.}
+\caption{\carried. \ackB\  Scalar calls at c16, success-only API p50 and p99 in \us, successful calls/s. \runs. These tables retain their original keys and CSV inputs.}
 \end{table}
 \begin{table}[H]\centering\fitinput{tab-onekib-2.tex}
-\caption{\carried. 32-key calls at c16; API p50/p99 in \us\ and successful calls/s. One call covers 32 values. \runs. Valkey has no batch-write case; a dash is not zero.}
+\caption{\carried. \ackB\  32-key calls at c16; API p50/p99 in \us\ and successful calls/s. One call covers 32 values. \runs. Valkey has no batch-write case; a dash is not zero.}
 \end{table}
 Matched cases have the same cohort, workload, value size, concurrency, operation, key count and offered rate. Concurrency-1 reads use mixed point operations. c16 reads and writes use separate read-only and write-only populations. Do not infer concurrency scaling by treating them as the same mixed workload.
 
@@ -313,22 +318,22 @@ The full-matrix native, Tidehunter and Valkey acknowledgement settings are obser
 \clearpage
 \subsection{Other stores, unchanged}
 \begin{figure}[H]\centering\includegraphics[width=\linewidth]{figures/others.pdf}
-\caption{\carried. All stores, 1 KiB c16, sorted by p50. Dots: API p50; crosses: p99. A hollow put dot means device fsync unverified (Cassandra, FoundationDB, TiKV). \runs.}
+\caption{\carried. \ackB\  \ackUnknown\ All stores, 1 KiB c16, sorted by p50. Dots: API p50; crosses: p99. A hollow put dot means device fsync unverified (Cassandra, FoundationDB, TiKV). \runs.}
 \end{figure}
 \begin{table}[H]\centering\fitinput{tab-stores.tex}
-\caption{\carried. API p50/p99 in \us. c1 cells are mixed point operations. \runs. Contracts differ as described above.}
+\caption{\carried. \ackB\  \ackUnknown\ API p50/p99 in \us. c1 cells are mixed point operations. \runs. Contracts differ as described above.}
 \end{table}
 These unchanged data give cross-store context for the retained populations, not a matched-fleet ranking. They do not establish the effect of any later software change. The new stage evidence replaces the old bottleneck interpretation, not these cells.
 
 \clearpage
 \subsection{RDMA against TCP and the cache estimate, unchanged}
 \begin{figure}[H]\centering\includegraphics[width=\linewidth]{figures/coherence.pdf}
-\caption{\carried. RDMA/TCP API p50 ratios for \N{S:th_pairs} Tidehunter and \N{S:vk_pairs} Valkey workload-matched pairs. Open diamonds mark Tidehunter pairs whose device reads/call differ by more than 0.1. Grey: durability-twin p50 range on the full-matrix fleet. \runs. Tidehunter pairs share that fleet; Valkey ratios divide separate historical medians. Pair-level same-fleet provenance is not established for Valkey.}
+\caption{\carried. \ackB\  RDMA/TCP API p50 ratios for \N{S:th_pairs} Tidehunter and \N{S:vk_pairs} Valkey workload-matched pairs. Open diamonds mark Tidehunter pairs whose device reads/call differ by more than 0.1. Grey: separate Class A durability-twin p50 context, not a Class B ranking range on the full-matrix fleet. \runs. Tidehunter pairs share that fleet; Valkey ratios divide separate historical medians. Pair-level same-fleet provenance is not established for Valkey.}
 \end{figure}
 With device-read differences excluded, verbs has the lower p50 in \N{S:th_matched_p50_faster} of \N{S:th_matched} Tidehunter pairs. The other \N{S:th_matched_p50_slower} are near ties. This is a descriptive count, not a universal RDMA advantage. TLS differs between the Tidehunter arms.
 
 \begin{table}[H]\centering\fitinput{tab-hitratio.tex}
-\caption{\carried. Estimated cache hit ratio for target mean $g$. Miss cost $L$ is the measured p50; hit cost $H=0.8$~\us\ is the original measured-hit approximation. The estimate $h=(L-g)/(L-H)$ uses medians as proxies for means, so miss tails make it optimistic. It is not a measured hit-ratio curve. \runs.}
+\caption{\carried. \ackB\  Estimated cache hit ratio for target mean $g$. Miss cost $L$ is the measured p50; hit cost $H=0.8$~\us\ is the original measured-hit approximation. The estimate $h=(L-g)/(L-H)$ uses medians as proxies for means, so miss tails make it optimistic. It is not a measured hit-ratio curve. \runs.}
 \end{table}
 This table stays unchanged for continuity. Its cold and miss inputs remain the original full-matrix controls; it is not a new SSD-read decomposition. A coordinator hit avoids the remote path. The achieved hit ratio depends on the workload and memory budget. No Sui KV hit-ratio claim follows from this synthetic campaign.
 
@@ -365,6 +370,7 @@ Rank & Item & Measured basis & Expected effect & How to verify & Decision\\\midr
 
 \clearpage
 \section{Provenance and limits}\label{sec:provenance}
+\begingroup\small
 \RWCtenProvenance
 
 Run 9 uses parent \texttt{bench-bb40628be5664257}, fleet \texttt{bench-41ecdf3f69fb47ec}. Exact launched-package hashes, dirty revision, VM names, UTC times, cleanup and estimated costs are in Appendix~\ref{app:rwc-floors}. The aborted first attempt contributes no results. No historical population is replaced; \path{rwc/generated/inputs-rwc.json} registers the real CSVs, number selectors and per-marker evidence, independently checked by \path{rwc/verify_rwc.py}.
@@ -379,12 +385,11 @@ The full-matrix section copies the seven versioned CSV inputs from the 7 Novembe
 
 The run-7 report and \path{APPLES-TO-APPLES.md} subtract run-6 memory timings from run-7 SSD timings. We do not carry that cross-fleet subtraction forward. Their observations do not create a measured component. The earlier brief's late-rate estimate included a partial final bucket and was biased low. The corrected \path{analysis-final-v2/output/} uses the last five complete one-second buckets and agrees in range with the report headline. The focused campaign's historical ``Deferred'' paragraph predates the successful direct-kernel fleet runs; later launch history supersedes it.
 
-\clearpage
 \textbf{Limits.} Runs 7 and 8 each have one client and five owners of the same VM class and region; equal class is not hardware parity. The run-7 random dataset has 65,536 keys. It does not cover authority-history misses. Small SSD-read populations are bimodal. Their p50 can change while their means remain similar. Profiles perturb calls, and some exported leaves are derived means with only count equality, not a proved per-call join. Their additive arithmetic is bookkeeping, not an exact physical partition. Native whole-call means in the read figure aggregate two per-repetition means; they are not one profiled call population. Full case metadata stays in the copied tables.
 
 No claim establishes physical NAND service per call, isolated wire time, significance, serializable transactions, permanent-loss tolerance, failover or production capacity. The authorized run-9 campaign supplied new measurements; document generation launches nothing. Native remains unchanged. Its six unqualified cold cases and the three failed event-write floor controls are retained, not hidden or zeroed. Preserve durability and security contracts.
 
-\textbf{Paper context.} A. Chursin et al., \emph{Tidehunter: Large-Value Storage With Minimal Data Relocation}, arXiv:2602.01873v2, Section 3.1. This brief studies a stricter write acknowledgement than that paper's default. The scope is synthetic calls; no mainnet KV latency claim follows.
+\endgroup
 
 \input{appendix-tables.tex}
 \input{rwc/appendix-rwc.tex}

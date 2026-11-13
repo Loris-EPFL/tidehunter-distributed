@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 import sys
 import uuid
 import stat
+import ack_contract as contracts
 
 
 def configure_runtime_environment(runtime):
@@ -290,14 +291,18 @@ class LocalMode:
                                     ("cpu.stat", "memory.current", "memory.events", "io.stat", "cpu.max", "memory.max")}
         return result
 
-    def backend_options(self, backend):
+    def backend_options(self, backend, ack_contract="synced"):
+        contract = contracts.selected(backend, ack_contract)
+        kwargs = {"ack_contract": contract} if contract != "synced" else {}
         if self.valkey is not None and self.valkey.backend == backend:
+            if getattr(self.valkey, "ack_contract", "synced") != contract:
+                raise RuntimeError("local Valkey acknowledgement contract differs")
             return self.valkey.backend_options
         if self.layout_backend != backend:
             raise RuntimeError("exact local external backend is not started")
         import cloud_layout
-        cfg = cloud_layout.node_config(self.layout_fleet, backend, -1)
-        return cloud_layout.backend_options(self.layout_fleet, backend, cfg["directory"])
+        cfg = cloud_layout.node_config(self.layout_fleet, backend, -1, **kwargs)
+        return cloud_layout.backend_options(self.layout_fleet, backend, cfg["directory"], **kwargs)
 
     def owned_processes(self, index, job, owner_case=None):
         role = "client" if index == -1 else f"storage-{index}"
@@ -381,6 +386,9 @@ class LocalMode:
             argv = [sys.executable, "-B", Path(cloud_layout.__file__), operation,
                     "--fleet-json", json.dumps(self.layout_fleet), "--backend", backend,
                     "--node-index", str(index)]
+            contract = contracts.selected(backend, request.get("ack_contract", "synced"))
+            if contract != "synced":
+                argv += ["--ack-contract", contract]
             if operation == "probe":
                 argv.extend(["--timeout", str(min(900, int(timeout)))])
                 if request.get("initialize"):
@@ -704,7 +712,9 @@ def main(argv=None):
                     controller.shared_native.clear()
                 external = ("tikv", "cassandra", "foundationdb", "garnet", "kvrocks")
                 desired = job["backend"] if job["backend"] in (*external, "valkey_tcp", "valkey_rdma") else None
-                block = (job["backend"], job["repeat"])
+                contract = contracts.selected(job["backend"], job.get("ack_contract", "synced"))
+                kwargs = {"ack_contract": contract} if contract != "synced" else {}
+                block = (job["backend"], job["repeat"], contract)
                 if block != active_backend:
                     if mode.valkey is not None:
                         try:
@@ -724,13 +734,13 @@ def main(argv=None):
                         try:
                             mode.valkey = local_dry_run_valkey.start_cluster(
                                 fixture / "valkey" / (desired + "-" + uuid.uuid4().hex),
-                                mode.runtime, desired, rdma_address="10.99.0.2")
+                                mode.runtime, desired, rdma_address="10.99.0.2", **kwargs)
                         except Exception:
                             cleanup_verified = False
                             raise
                     elif desired in external:
                         mode.layout_backend = desired
-                        controller.start_backend(desired)
+                        controller.start_backend(desired, **kwargs)
                     active_backend = block
                 controller.work_end = min(global_work_end, controller.clock() + args.case_timeout)
                 controller.run_case(job)

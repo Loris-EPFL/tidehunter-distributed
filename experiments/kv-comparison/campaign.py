@@ -19,6 +19,7 @@ import zipfile
 
 import local
 import analyze
+import ack_contract as contracts
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from portable_transport import (CASE_TRANSPORTS, runtime_backend, transport_for_case,
                                 validate_transport, select_backends, protocol_key, is_software)
@@ -221,7 +222,10 @@ def source_snapshot(output):
                                         "snapshot_sha256": digest(output / "source.zip")})
 
 
-def backend_options(kind, state, output, transport=None):
+def backend_options(kind, state, output, transport=None, ack_contract="synced"):
+    contract = contracts.selected(kind, ack_contract)
+    if state and state.get("ack_contract", "synced") != contract:
+        raise ValueError("local backend acknowledgement contract differs")
     nodes = state["nodes"] if state else 1
     if kind == "tikv":
         return {"pd_endpoints": ["127.0.0.1:2379"], "pd_api_endpoints": ["http://127.0.0.1:2379"],
@@ -231,26 +235,26 @@ def backend_options(kind, state, output, transport=None):
                 "required_replication_factor": nodes, "consistency": "quorum"}
     if kind == "foundationdb":
         return {"cluster_file": str(Path(state["directory"]) / "fdb.cluster"), "required_replication_factor": 1 if nodes == 1 else 2}
-    if kind in ("garnet", "kvrocks"):
+    if kind in ("garnet", "kvrocks", "valkey_rdma", "valkey_tcp"):
         if state and "backend_options" in state:
-            return copy.deepcopy(state["backend_options"])
-        import industry_service
-        return industry_service.options(kind, industry_service.local_endpoints())
-    if kind == "valkey_rdma":
-        if state and "backend_options" in state:
-            return copy.deepcopy(state["backend_options"])
-        import local_valkey_rdma
-        return local_valkey_rdma.options(nodes)
-    if kind == "valkey_tcp":
-        if state and "backend_options" in state:
-            return copy.deepcopy(state["backend_options"])
-        if state and state.get("paired_valkey"):
+            options = copy.deepcopy(state["backend_options"])
+        elif kind in ("garnet", "kvrocks"):
+            import industry_service
+            options = industry_service.options(kind, industry_service.local_endpoints())
+        elif kind == "valkey_rdma":
+            import local_valkey_rdma
+            options = local_valkey_rdma.options(nodes)
+        elif state and state.get("paired_valkey"):
             import local_valkey_rdma
             rdma = local_valkey_rdma.options(nodes)
-            return local_valkey_rdma.options_for_backend(kind, nodes, rdma["nodes"])
-        return {"nodes": [f"127.0.0.{21+i}:{6379+i}" for i in range(nodes)],
-                "cluster": nodes > 1, "required_replication_factor": 1,
-                "required_primary_nodes": nodes, "request_timeout_ms": 5000}
+            options = local_valkey_rdma.options_for_backend(kind, nodes, rdma["nodes"])
+        else:
+            options = {"nodes": [f"127.0.0.{21+i}:{6379+i}" for i in range(nodes)],
+                       "cluster": nodes > 1, "required_replication_factor": 1,
+                       "required_primary_nodes": nodes, "request_timeout_ms": 5000}
+        if contract != "synced":
+            options["ack_contract"] = contract
+        return options
     options = {"path": str(output / "database")}
     if kind in CASE_TRANSPORTS:
         transport = transport_for_case(kind) if transport is None else validate_transport(transport)
@@ -263,6 +267,8 @@ def backend_options(kind, state, output, transport=None):
 def build_config(base, job, state, output, seed, qualification, transport=None):
     config = copy.deepcopy(base)
     kind = job["backend"]
+    contract = contracts.selected(kind, job.get("ack_contract", "synced"))
+    kwargs = {"ack_contract": contract} if contract != "synced" else {}
     selected_transport = transport_for_case(kind) if kind in CASE_TRANSPORTS else None
     if transport is not None:
         if selected_transport is None:
@@ -271,7 +277,7 @@ def build_config(base, job, state, output, seed, qualification, transport=None):
         if protocol_key(selected_transport) != protocol_key(transport_for_case(kind)):
             raise ValueError("explicit transport provider/security differs from the selected research case")
     config["backend"] = {"kind": runtime_backend(kind),
-                         "options": backend_options(kind, state, output, selected_transport)}
+                         "options": backend_options(kind, state, output, selected_transport, **kwargs)}
     if kind == "native":
         config["backend"]["options"].update(
             durability="page_cache",
@@ -400,13 +406,18 @@ def run_one(args, spec, base, job, index):
                             "block_devices": local.command(["lsblk", "-J", "-o", "NAME,TYPE,SIZE,ROTA,MODEL,MOUNTPOINTS"])}}
     local.dump(run_dir / "receipt.json", receipt)
     try:
+        contract = contracts.selected(job["backend"], job.get("ack_contract", "synced"))
         prospective = {"nodes": (5 if job["backend"] in ("garnet", "kvrocks") else
                                  1 if spec["layout"] == "qualification" else
                                  5 if job["backend"] in ("valkey_tcp", "valkey_rdma") else 3),
                        "directory": str(state_dir),
                        "paired_valkey": job["backend"] == "valkey_tcp" and "valkey_rdma" in spec["backends"]} if external else None
+        if prospective is not None and contract != "synced":
+            prospective["ack_contract"] = contract
         if args.reuse_state:
             prospective = local.load(state_dir)
+            if prospective.get("ack_contract", "synced") != contract:
+                raise ValueError("reused backend acknowledgement contract differs")
             if (job["backend"] == "valkey_tcp" and "valkey_rdma" in spec["backends"]
                     and prospective.get("paired_valkey") is not True):
                 raise ValueError("paired Valkey comparison cannot reuse the ordinary TCP deployment")
@@ -440,7 +451,8 @@ def run_one(args, spec, base, job, index):
                 local.ready(state, 180)
             else:
                 local.start(argparse.Namespace(state=state_dir, backend=job["backend"], layout=spec["layout"], timeout=180,
-                                               paired_valkey=job["backend"] == "valkey_tcp" and "valkey_rdma" in spec["backends"]))
+                                               paired_valkey=job["backend"] == "valkey_tcp" and "valkey_rdma" in spec["backends"],
+                                               **({"ack_contract": contract} if contract != "synced" else {})))
                 state = local.load(state_dir)
         receipt["status"] = "running"
         local.dump(run_dir / "receipt.json", receipt)

@@ -51,6 +51,7 @@ import campaign
 import cloud_campaign
 import floors
 import cloud_layout
+import ack_contract as contracts
 import local
 import physical_storage
 import rdma_diagnostics
@@ -1413,7 +1414,9 @@ def owned_monitor_processes(config, index, job, owner_case=None):
         name = unit_name(config, owner_case if index >= 0 and owner_case is not None else job["case_id"], role) + ".service"
         processes.append({"role": role, "cgroup": "/system.slice/" + name})
     if job["backend"] in cloud_layout.BACKENDS:
-        deployment = cloud_layout.node_config(config["fleet"], job["backend"], index)
+        contract = contracts.selected(job["backend"], job.get("ack_contract", "synced"))
+        kwargs = {"ack_contract": contract} if contract != "synced" else {}
+        deployment = cloud_layout.node_config(config["fleet"], job["backend"], index, **kwargs)
         if deployment.get("native_valkey"):
             try:
                 identity = cloud_layout.valkey_service.evidence(deployment)[0]
@@ -2502,6 +2505,9 @@ def guest_operation(config, request, clients, *, local_mode=None):
         script = Path(config["repository_root"]) / "experiments/kv-comparison/cloud_layout.py"
         argv = [sys.executable, "-B", script, operation, "--fleet-json", json.dumps(config["fleet"]),
                 "--backend", backend, "--node-index", str(index)]
+        contract = contracts.selected(backend, request.get("ack_contract", "synced"))
+        if contract != "synced":
+            argv += ["--ack-contract", contract]
         if operation == "probe":
             argv += ["--timeout", str(request["timeout"])]
             if request.get("initialize"):
@@ -3190,10 +3196,14 @@ class Controller:
             "spec": self.monitor_spec(), "events": self.monitoring_events}
 
     def layout(self, backend, operation, index, **kwargs):
+        contract = getattr(self, "active_ack_contract", "synced")
+        if contract != "synced":
+            kwargs.setdefault("ack_contract", contract)
         return self.request(index, {"action": "layout", "backend": backend, "operation": operation, **kwargs},
                             case="startup", timeout=kwargs.get("timeout", 180))
 
-    def start_backend(self, backend):
+    def start_backend(self, backend, ack_contract="synced"):
+        self.active_ack_contract = contracts.selected(backend, ack_contract)
         self.active_backend = backend  # Retain partial start for finally cleanup.
         proofs = []
         for index in range(-1, len(self.config["fleet"]["nodes"])):
@@ -3236,14 +3246,18 @@ class Controller:
         # export fails, stop every exact-owned host, but preserve its data.
         for index in range(-1, len(self.config["fleet"]["nodes"])):
             try:
-                evidence = self.request(index, {"action": "layout", "backend": backend, "operation": "export"},
+                evidence = self.request(index, {"action": "layout", "backend": backend, "operation": "export",
+                                        **({"ack_contract": self.active_ack_contract}
+                                           if getattr(self, "active_ack_contract", "synced") != "synced" else {})},
                                         timeout=self.cleanup_timeout(deadline), export=True)
                 dump(deployment / f"host-{index}-export.json", evidence)
             except Exception as exc:
                 errors.append(f"host {index} export: {exc!r}")
         for index in range(-1, len(self.config["fleet"]["nodes"])):
             try:
-                stopped = self.request(index, {"action": "layout", "backend": backend, "operation": "stop"},
+                stopped = self.request(index, {"action": "layout", "backend": backend, "operation": "stop",
+                                       **({"ack_contract": self.active_ack_contract}
+                                          if getattr(self, "active_ack_contract", "synced") != "synced" else {})},
                                        timeout=self.cleanup_timeout(deadline), export=True)
                 dump(deployment / f"host-{index}-stop.json", stopped)
             except Exception as exc:
@@ -3256,7 +3270,9 @@ class Controller:
         # reset helper, which can prove only that its own containers are absent.
         for index in range(-1, len(self.config["fleet"]["nodes"])):
             try:
-                reset = self.request(index, {"action": "layout", "backend": backend, "operation": "reset-data"},
+                reset = self.request(index, {"action": "layout", "backend": backend, "operation": "reset-data",
+                                     **({"ack_contract": self.active_ack_contract}
+                                        if getattr(self, "active_ack_contract", "synced") != "synced" else {})},
                                      timeout=self.cleanup_timeout(deadline), export=True)
                 dump(deployment / f"host-{index}-reset.json", reset)
                 if (reset.get("status") != "reset" or reset.get("data_empty") is not True
@@ -4308,16 +4324,18 @@ class Controller:
             if not self.monitoring_complete:
                 raise InfrastructureError("case monitoring selection failed; refusing measurement")
             backend = job["backend"]
+            contract = contracts.selected(backend, job.get("ack_contract", "synced"))
+            contract_options = {"ack_contract": contract} if contract != "synced" else {}
             budget = {"cpus": self.config["fleet"]["client_cpus"], "memory_mib": self.config["fleet"]["client_memory_mib"]}
             if backend in cloud_layout.BACKENDS:
                 if self.local_mode is not None:
-                    options = self.local_mode.backend_options(backend)
+                    options = self.local_mode.backend_options(backend, **contract_options)
                     if backend == "foundationdb":
-                        cfg = cloud_layout.node_config(self.local_mode.layout_fleet, backend, -1)
+                        cfg = cloud_layout.node_config(self.local_mode.layout_fleet, backend, -1, **contract_options)
                         budget = cfg["client_budget"]
                 else:
-                    cfg = cloud_layout.node_config(self.config["fleet"], backend, -1)
-                    options = cloud_layout.backend_options(self.config["fleet"], backend, cfg["directory"])
+                    cfg = cloud_layout.node_config(self.config["fleet"], backend, -1, **contract_options)
+                    options = cloud_layout.backend_options(self.config["fleet"], backend, cfg["directory"], **contract_options)
                     budget = cfg["client_budget"]
                     if backend == "foundationdb" and not Path(options["cluster_file"]).is_file():
                         raise InfrastructureError("generated local FoundationDB cluster file missing")
@@ -4363,6 +4381,8 @@ class Controller:
                         publish_synced(target, source.read_bytes())
                     bindings.append({"path": str(target.relative_to(directory)), "sha256": digest(target)})
                 receipt["owner_durability_receipts"] = bindings
+            if contract != "synced":
+                options = dict(options, ack_contract=contract)
             seconds = min(self.config["spec"]["case_deadline_seconds"], int(self.remaining()))
             config = cloud_campaign.make_run_config(job, directory, options, self.config["source_revision"], seconds)
             if job.get("case_kind") != "hybrid_put":
@@ -4629,6 +4649,7 @@ class Controller:
                         or summary.get("backend") != manifest.get("backend_info")
                         or manifest.get("raw_samples_complete") is not True):
                     raise ValueError("terminal manifest/summary schema, backend, status or raw writer completeness differs")
+                analyze.admit_ack_contract(backend, summary["backend"], job.get("ack_contract", "synced"))
                 observed_counts = campaign.verify_timing_result(directory / "result", admitted, allow_partial=True)
                 receipt["validated_timing_rows_by_phase"] = observed_counts
                 receipt["planned_timing_rows_by_phase"] = {
@@ -5130,11 +5151,12 @@ class Controller:
                         shutil.rmtree(database)
                     self.shared_native.clear()
                 desired = backend if backend in cloud_layout.BACKENDS else None
-                block = (backend, job["repeat"])
+                contract = contracts.selected(backend, job.get("ack_contract", "synced"))
+                block = (backend, job["repeat"], contract)
                 if block != active_block:
                     self.stop_backend()
                     if desired:
-                        self.start_backend(desired)
+                        self.start_backend(desired, **({"ack_contract": contract} if contract != "synced" else {}))
                     active_block = block
                 case_failed = False
                 try:

@@ -1,0 +1,18 @@
+{
+  "sources": {
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/puts.csv": "ffb4f6ba132dc973ecb0cac278221f45fc6fa00a397ce409ec1a9f8f843420c4",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/reads.csv": "5a34ec5a1977df684a4fbede9a24c881750f502458b1eeb18c3fa5827f1309d9",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/puts.csv": "cd190a77513c5d07b1767d7439206a4cc9a2ba8c343f589b993c15f8bb737ed0",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/reads.csv": "be80bda7e46e1837d21b63fe69c40b234fedb0f23f4f2c15a339c11e90ca8616",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/run13-comparison.csv": "d04f72c9f85a37c1ab2c331aaf7df727902483aab0f1d176dd20641c240cd577",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/combined-launch-20261113-firstput1/analysis/output/combined-kv-evidence.json": "becbe37071bcfd469975a9e8ab93a969c4a749f053b6712391ecf0ad3db86b88",
+    "/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261112-nvmeoffix4/analysis/output/run13-evidence.json": "264ed515cd3f08c758aae244a689632928551cc928725165c983411c5b3b232d",
+    "/home/hybr1d/Desktop/PDM/TideHunter/tidehunter-sharded-wal/docs/research/supervisor-brief-2026-11-10/populations.csv": "843b934587f81113af71b187bba218a7b3bd2211bd67c4f82481a087d04e3f6c"
+  },
+  "outputs": {
+    "contract-values.csv": "2491d8c8ec66ef83cbee93d16493a28b57e42c1c441ed9f7ad7720ccb07f545f",
+    "tab-contract-a.tex": "e14b65ac82eb863774c75ef3d35980cd3cc8691fe3ad57fd5e98108ed134dcf2",
+    "tab-contract-b-controls.tex": "76454d3661b96f77de178b3d34c73567d0f37305babcbaac47ff38ec75513019",
+    "tab-contract-indicative.tex": "6cbffd95a4716985fedc9151ac39c549eb100906d2fdd063068fff5d28882d79"
+  }
+}

@@ -11,6 +11,7 @@ PY=/home/hybr1d/Desktop/PDM/TideHunter/.venv/bin/python
 RUN=/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-rwcompact2
 RUN10=/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/focused-launch-20261110-fabricab2
 $PY -B build_run8_inputs.py
+$PY -B build_contract_inputs.py
 $PY -B make_tables.py
 $PY -B plot_final.py
 $PY -B rwc/build_rwc_inputs.py --output "$RUN/analysis2" \
@@ -124,3 +125,66 @@ The retained data require these explicit corrections, recorded in `validation.js
 7. FoundationDB has five storage-role hosts plus a separate transaction/log host. The per-node table counts storage nodes, not total persistence devices.
 
 Document generation launches no infrastructure or production benchmark. The selected second attempts supplied runs 9 and 10; their aborted first attempts supply no final measurements. This document work changes no production Rust code. Cleanup follows campaign receipts; costs are explicitly list-price estimates, not invoices.
+
+## Acknowledgement-class update (13 November 2026)
+
+The hard 56-page limit stays unchanged. `acknowledgement-contracts.tex` defines
+Class A (page-cache acknowledgement), Class B (synced before acknowledgement),
+and unverified device sync. `contract-results.tex` adds same-fleet, one-owner
+Class A Native/leased pairs, separate Class B controls, and one explicit
+non-ranking historical Valkey scale table. No retained value changes.
+
+Run `build_contract_inputs.py` before `make_tables.py`. The builder reads the
+combined fleet and run-13 analysis CSVs in the parent workspace. It writes
+`contract-values.csv` with the exact source path, column, case ID and operation
+for every new numeric cell; `contract-inputs.json` pins the inputs and outputs.
+The existing `B:<table>:<label>:<field>|<format>` number language supplies all
+new `\N{...}` values. No new number syntax or hand-entered latency is used.
+
+`verify_brief.py` calls the independent `verify_contracts.py` checker. It checks
+original source values, hashes, formatted PDF claims, same-fleet Class A pairs,
+and the unmeasured cell. It imports no generator. It also runs on its own:
+
+```sh
+$PY -B verify_contracts.py
+```
+
+New numeric columns: `puts.csv` and `reads.csv`: `p50_us`, `p99_us`, `p999_us`;
+the sustained row also uses `calls_per_second`, `mean_inflight_calls`,
+`calls_ge_5ms`. `run13-comparison.csv`: `first_call_us`, `run13_first_call_us`.
+`combined-kv-evidence.json`: `cases`, `measured_calls`.
+`run13-evidence.json`: `compared_cells` (checked equal to completed cases).
+`populations.csv`: `api_p50_us`, with `label=valkey_rdma`, `cohort=primary_rf1`,
+the exact operation/size, and `point-mixed` at one caller or
+`write-concurrent`/`read-concurrent` at sixteen callers.
+Configuration labels come from `value_size`, `concurrency`, `repetition`,
+`contract`, `tier`, `history_persistence`, `lease_ahead`, `polled_writes` and
+`media_expected`. Historical dates/topology stay in `historical-topology.csv`;
+new revision, fleet and limits are in the named focused campaign narrative.
+
+Only content checks for this addition are new. Historical numeric, figure and
+case-count pins remain unchanged. The LaTeX MCP validator does not resolve
+cross-file labels; the established `latexmk` build remains definitive.
+
+The current PDF has 56 pages. Changed contract pages and compact provenance
+were visually inspected; no clipping was found on those pages.
+`contract-validation.json` records the independent new-value checks.
+`validation.json` binds the current PDF and records full acceptance:
+`verify_brief.py` passes. On 13 November the source pins of
+`experiments/kv-comparison/cloud_campaign.py` and
+`benchmarks/kv-research/src/runner.rs` in `inputs.json` were updated to the
+current files (owner decision), because the harness changed after the brief
+was built. No data pin changed. `source-pin-impact.json` verifies that the
+changed harness source still generates the retained design counts and matrix
+digests, with no numeric change.
+`validation-pre-contracts.json` preserves the prior PDF's acceptance only.
+Run-9 and run-10 validation files bind the current PDF and pass.
+
+The indicative table also retains three separate 1 KiB, one-caller memory
+read rows from run 13: live interrupt-driven, live polled, and owner RPC.
+They reuse `reads.csv:p50_us` and the same historical Valkey
+`populations.csv:api_p50_us` cell. Every read row says “from memory” or
+“from device”. The new table's row-count check changed from eight to eleven;
+no historical count or numeric pin changed.
+`contract-file-manifest.json` lists all scoped files written or regenerated
+during this assignment, with hashes; regenerated files can be byte-identical.

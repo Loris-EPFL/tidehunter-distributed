@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Node-local RF1 external stores. No AWS access or remote process orchestration."""
+import ack_contract as contracts
 import argparse
 import hashlib
 import ipaddress
@@ -84,7 +85,9 @@ def valkey_control_endpoints(fleet):
 
 
 
-def backend_options(fleet, backend, root):
+def backend_options(fleet, backend, root, ack_contract="synced"):
+    import ack_contract as contracts
+    contracts.selected(backend, ack_contract)
     validate_fleet(fleet)
     if len(fleet["nodes"]) != 5:
         raise ValueError("external store backends require five owner hosts")
@@ -110,9 +113,14 @@ def backend_options(fleet, backend, root):
                    "required_primary_nodes": 5, "request_timeout_ms": 5000}
         if paired and backend == "valkey_tcp":
             options["client"] = "libvalkey"
+        if ack_contract != "synced":
+            options["ack_contract"] = ack_contract
         return options
     if backend in ("garnet", "kvrocks"):
-        return industry_service.options(backend, [x["address"] + ":6379" for x in fleet["nodes"]])
+        options = industry_service.options(backend, [x["address"] + ":6379" for x in fleet["nodes"]])
+        if ack_contract != "synced":
+            options["ack_contract"] = ack_contract
+        return options
     if backend == "foundationdb":
         if not Path(root).is_absolute():
             raise ValueError("cluster file root must be absolute")
@@ -121,7 +129,9 @@ def backend_options(fleet, backend, root):
     raise ValueError("unsupported backend")
 
 
-def node_config(fleet, backend, index):
+def node_config(fleet, backend, index, ack_contract="synced"):
+    import ack_contract as contracts
+    contracts.selected(backend, ack_contract)
     validate_fleet(fleet)
     if len(fleet["nodes"]) != 5:
         raise ValueError("external store backends require five owner hosts")
@@ -223,12 +233,12 @@ def node_config(fleet, backend, index):
     elif backend in ("valkey_tcp", "valkey_rdma") and not coordinator:
         if not paired_valkey(fleet, backend):
             add(f"valkey{index}", "valkey_tcp",
-                local.valkey_server_args(address, 6379, 16379, True, memory * 3 // 4))
+                local.valkey_server_args(address, 6379, 16379, True, memory * 3 // 4, ack_contract))
     elif backend in ("garnet", "kvrocks") and not coordinator:
         if backend == "garnet":
             add(f"garnet{index}", backend, industry_service.garnet_args(address, 6379, memory))
         else:
-            files["kvrocks.conf"] = industry_service.kvrocks_config(address, 6379, memory)
+            files["kvrocks.conf"] = industry_service.kvrocks_config(address, 6379, memory, ack_contract)
             add(f"kvrocks{index}", backend, ["-c", "/config/kvrocks.conf"], entrypoint="kvrocks")
             # The image healthcheck hardcodes port 6666; lifecycle probes the configured 6379 via RESP.
             containers[-1]["run_argv"][2:2] = ["--no-healthcheck"]
@@ -253,7 +263,7 @@ def node_config(fleet, backend, index):
         metadata = valkey_service.identity(runtime)
         if not coordinator:
             data = str(directory / "data")
-            args = local.valkey_server_args(address, 6379, 16379, True, memory * 3 // 4)
+            args = local.valkey_server_args(address, 6379, 16379, True, memory * 3 // 4, ack_contract)
             args = [str(runtime / "bin/valkey-server") if x == "valkey-server" else
                     x.replace("/data", data) for x in args]
             args += ["--rdma-bind", str(ipaddress.IPv4Address(host["rdma_address"])), "--rdma-port", "6380"]
@@ -264,6 +274,8 @@ def node_config(fleet, backend, index):
     invocation = [sys.executable, str(Path(__file__).resolve())]
     arguments = ["--fleet-json", json.dumps(fleet, sort_keys=True, separators=(",", ":")),
                  "--backend", backend, "--node-index", str(index)]
+    if ack_contract != "synced":
+        arguments += ["--ack-contract", ack_contract]
     actions = {action: [*invocation, action, *arguments]
                for action in ("prepare", "start", "probe", "stop", "export", "reset-data")}
     actions["bootstrap-probe"] = [*actions["probe"], "--timeout", "300"]
@@ -273,6 +285,7 @@ def node_config(fleet, backend, index):
             "labels": labels, "files": files, "containers": containers, "actions": actions,
             "native_valkey": native_valkey,
             "paired_valkey": paired_valkey(fleet, backend),
+            **({"ack_contract": ack_contract} if ack_contract != "synced" else {}),
             "qualification_only": fleet.get("qualification_only", False),
             **({"provider": fleet["provider"]} if "provider" in fleet else {}),
             "budget": {"cpus": cpus, "memory_mib": memory},
@@ -280,21 +293,21 @@ def node_config(fleet, backend, index):
                               "memory_mib": fleet["client_memory_mib"] - control_memory} if coordinator else None}
 
 
-def build_plan(fleet, backend):
-    nodes = [node_config(fleet, backend, i) for i in range(-1, 5)]
+def build_plan(fleet, backend, ack_contract="synced"):
+    nodes = [node_config(fleet, backend, i, ack_contract) for i in range(-1, 5)]
     return {"schema_version": 1, "backend": backend, "replication_factor": 1,
             "qualification_only": fleet.get("qualification_only", False),
             "physical_storage_hosts": None if fleet.get("qualification_only") else 5,
-            "nodes": nodes, "backend_options": backend_options(fleet, backend, nodes[0]["directory"]),
+            "nodes": nodes, "backend_options": backend_options(fleet, backend, nodes[0]["directory"], ack_contract),
             "lifecycle": {"order": "prepare all; start coordinator; start stores (Cassandra sequential with local probes); coordinator probe --initialize; probe all; export all; stop all; optional reset-data only after every host stopped",
                           "timeout_seconds": 300, "cleanup": "exact label-checked containers only; reset-data is separate and retains configs/exports"},
-            "ack_policy": {"tikv": "RF1 raft-kv/Raft Engine, apply-unpersisted limit=0; v8.5.4 source synchronizes raft writes before persistence notification",
+            "ack_policy": (contracts.acknowledgement(backend, ack_contract) if ack_contract != "synced" else {"tikv": "RF1 raft-kv/Raft Engine, apply-unpersisted limit=0; v8.5.4 source synchronizes raft writes before persistence notification",
                            "cassandra": "commitlog_sync=batch, durable_writes=true, QUORUM at RF1",
                            "foundationdb": "single SSD, transaction log durable commit; serializable transaction semantics",
                            "valkey_tcp": "RF1 AOF appendfsync always, no-appendfsync-on-rewrite no; noeviction; RAM-resident reads",
                            "valkey_rdma": "RF1 AOF appendfsync always, no-appendfsync-on-rewrite no; noeviction; RAM-resident reads",
                            "garnet": "RF1 hybrid-log storage tier; AOF commit per operation and commit-wait",
-                           "kvrocks": "RF1 RocksDB WAL enabled, write_options.sync=yes"}[backend]}
+                           "kvrocks": "RF1 RocksDB WAL enabled, write_options.sync=yes"}[backend])}
 
 
 def command(argv, timeout=30, include_stderr=False):
@@ -809,7 +822,7 @@ def probe_once(fleet, config, cluster=False):
         save(directory / "probe-attempt.json", proof)
         data_dirs = ({x["address"] + ":6379": str(Path(fleet["data_root"]) / backend / f"node-{x['index']}" / "data")
                       for x in fleet["nodes"]} if config.get("paired_valkey") else "/data")
-        proof["coverage"] = local.admit_valkey(observed["nodes"], endpoints, True, complete=complete, data_dir=data_dirs)
+        proof["coverage"] = local.admit_valkey(observed["nodes"], endpoints, True, complete=complete, data_dir=data_dirs, ack_contract=config.get("ack_contract", "synced"))
         if backend == "valkey_rdma" and complete:
             for node in observed["nodes"]:
                 endpoint = node["endpoint"]
@@ -834,10 +847,10 @@ def probe_once(fleet, config, cluster=False):
     elif backend in ("garnet", "kvrocks"):
         complete = config["index"] == -1 or cluster
         endpoints = (backend_options(fleet, backend, directory)["nodes"] if complete else [config["address"] + ":6379"])
-        observed = industry_service.evidence(backend, endpoints, complete=complete)
+        observed = industry_service.evidence(backend, endpoints, complete=complete, ack_contract=config.get("ack_contract", "synced"))
         proof.update(observed)
         save(directory / "probe-attempt.json", proof)
-        proof["coverage"] = industry_service.admit(backend, observed["nodes"], endpoints, complete=complete)
+        proof["coverage"] = industry_service.admit(backend, observed["nodes"], endpoints, complete=complete, ack_contract=config.get("ack_contract", "synced"))
     else:
         status = json.loads(execute(config, "/usr/bin/fdbcli", "-C", "/config/fdb.cluster", "--timeout", "10", "--exec", "status json"))
         proof["status"] = status
@@ -1036,18 +1049,19 @@ def main(argv=None):
     source.add_argument("--fleet-json", help="inline fleet object for self-contained plan action argv")
     parser.add_argument("--backend", choices=BACKENDS, required=True)
     parser.add_argument("--node-index", type=int, default=-1)
+    parser.add_argument("--ack-contract", choices=("synced", "page_cache", "os_buffered", "periodic_sync"), default="synced")
     parser.add_argument("--root", type=Path, help="backend-options cluster-file directory (defaults to coordinator directory)")
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--initialize", action="store_true", help="coordinator probe only, after all storage nodes started")
     parser.add_argument("--cluster", action="store_true", help="require full ring for Cassandra storage probes")
     args = parser.parse_args(argv)
     fleet = json.loads(args.fleet.read_text() if args.fleet else args.fleet_json)
-    config = node_config(fleet, args.backend, args.node_index)
+    config = node_config(fleet, args.backend, args.node_index, args.ack_contract)
     if args.action == "plan":
-        result = build_plan(fleet, args.backend)
+        result = build_plan(fleet, args.backend, args.ack_contract)
     elif args.action == "backend-options":
-        root = args.root or node_config(fleet, args.backend, -1)["directory"]
-        result = backend_options(fleet, args.backend, root)
+        root = args.root or node_config(fleet, args.backend, -1, args.ack_contract)["directory"]
+        result = backend_options(fleet, args.backend, root, args.ack_contract)
     elif args.action == "probe":
         result = probe(fleet, config, args.timeout, args.initialize, args.cluster)
     else:

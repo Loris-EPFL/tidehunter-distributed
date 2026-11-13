@@ -2,7 +2,8 @@
 //! The upstream cluster client hardcodes TCP; never use it for this transport.
 
 use crate::backend::{
-    BackendInfo, BackendResult, BackendTransportError, BatchAtomicity, KvBackend, unsupported,
+    AckContract, BackendInfo, BackendResult, BackendTransportError, BatchAtomicity, KvBackend,
+    unsupported,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -32,6 +33,8 @@ struct Options {
     required_primary_nodes: usize,
     request_timeout_ms: u64,
     client: Option<String>,
+    #[serde(default)]
+    ack_contract: AckContract,
 }
 fn invalid(s: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
     io::Error::new(io::ErrorKind::InvalidInput, s.into()).into()
@@ -39,6 +42,7 @@ fn invalid(s: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
 impl Options {
     fn parse(v: &Value) -> BackendResult<Self> {
         let o: Self = serde_json::from_value(v.clone())?;
+        o.ack_contract.validate_for("valkey_rdma")?;
         let n = if o.cluster { 5 } else { 1 };
         if o.required_replication_factor != 1
             || o.required_primary_nodes != n
@@ -602,7 +606,7 @@ fn text(r: Response) -> BackendResult<String> {
 fn fields(s: &str) -> BTreeMap<&str, &str> {
     s.lines().filter_map(|l| l.trim().split_once(':')).collect()
 }
-fn config(r: Response) -> BackendResult<BTreeMap<String, String>> {
+fn config(r: Response, ack_contract: AckContract) -> BackendResult<BTreeMap<String, String>> {
     let Response::Array(a) = r else {
         return Err(invalid("expected CONFIG GET array"));
     };
@@ -619,12 +623,16 @@ fn config(r: Response) -> BackendResult<BTreeMap<String, String>> {
     }
     for (k, v) in [
         ("appendonly", "yes"),
-        ("appendfsync", "always"),
+        ("appendfsync", ack_contract.valkey_appendfsync()?),
         ("no-appendfsync-on-rewrite", "no"),
         ("maxmemory-policy", "noeviction"),
     ] {
         if map.get(k).map(String::as_str) != Some(v) {
-            return Err(invalid(format!("CONFIG {k} must be {v}")));
+            return Err(invalid(format!(
+                "ack_contract {} requires CONFIG {k}={v}; observed {:?}",
+                ack_contract.as_str(),
+                map.get(k)
+            )));
         }
     }
     Ok(map)
@@ -812,17 +820,20 @@ impl ValkeyRdmaBackend {
             {
                 return Err(invalid("cluster mode mismatch"));
             }
-            configs.push(config(command(
-                &mut c,
-                &[
-                    "CONFIG",
-                    "GET",
-                    "appendonly",
-                    "appendfsync",
-                    "no-appendfsync-on-rewrite",
-                    "maxmemory-policy",
-                ],
-            )?)?);
+            configs.push(config(
+                command(
+                    &mut c,
+                    &[
+                        "CONFIG",
+                        "GET",
+                        "appendonly",
+                        "appendfsync",
+                        "no-appendfsync-on-rewrite",
+                        "maxmemory-policy",
+                    ],
+                )?,
+                o.ack_contract,
+            )?);
             let p = text(command(&mut c, &["INFO", "persistence"])?)?;
             persistence.push(
                 fields(&p)
@@ -889,14 +900,14 @@ impl ValkeyRdmaBackend {
             name: if rdma { "valkey_rdma" } else { "valkey_tcp" }.into(),
             server_version: "9.0.7".into(),
             client_version: format!("bundled libvalkey 0.2.1, source checkout {COMMIT}; linked artifacts operator-built"),
-            acknowledgement: "SET success; appendonly=yes, appendfsync=always, no-appendfsync-on-rewrite=no observed; RF1, no replica acknowledgement".into(),
+            acknowledgement: o.ack_contract.acknowledgement().unwrap_or("SET success; appendonly=yes, appendfsync=always, no-appendfsync-on-rewrite=no observed; RF1, no replica acknowledgement").into(),
             consistency: "primary-routed static slot map; topology redirects fail, no retries".into(),
             replication_factor: 1,
             measurement_boundary: "upstream libvalkey blocking command via tokio blocking pool through materialized reply; Valkey GET reads RAM, not NVMe WAL".into(),
             get_many_strategy: if o.cluster { "MGET split by hash slot, pipelined per primary concurrently; input order, duplicate keys and misses preserved" } else { "native MGET preserving input order, duplicate keys and misses" }.into(),
             batch_atomicity: BatchAtomicity::Unsupported,
             topology: json!({"cluster":o.cluster,"primary_count":o.nodes.len(),"endpoints":o.nodes,"node_ids":node_ids,"slot_count":if o.cluster {Some(16384)} else {None},"cluster_nodes_views":maps,"routing":"static CLUSTER NODES slot map linked by CLUSTER MYID; MOVED/ASK fail"}),
-            configuration: json!({"transport":if rdma {"upstream libvalkey VALKEY_CONN_RDMA, RDMA-CM RC"} else {"upstream libvalkey VALKEY_CONN_TCP"},"source_commit":COMMIT,"source_attestation":"client checkout commit checked at build; linked artifacts and server source provenance operator asserted","server_build_ids":server_builds,"request_timeout_ms":o.request_timeout_ms,"persistent_connections_per_primary":POOL_SIZE,"progress":"tokio spawn_blocking, per-connection mutex","pool_repair":{"policy":"a connection poisoned by an incomplete pipeline or in sticky error is replaced before its next request","attempts_per_request":REPLACEMENT_ATTEMPTS,"no_poison_before_first_byte":true,"counters":"client_pool in read observations and manifest run.client_pool_final"},"node_config":configs,"persistence":persistence,"replica_reads":false,"client_retries":0,"hardware_path_attested":false,"mutation_uncertainty":"timeout or transport failure does not imply rollback"})
+            configuration: json!({"ack_contract":o.ack_contract,"transport":if rdma {"upstream libvalkey VALKEY_CONN_RDMA, RDMA-CM RC"} else {"upstream libvalkey VALKEY_CONN_TCP"},"source_commit":COMMIT,"source_attestation":"client checkout commit checked at build; linked artifacts and server source provenance operator asserted","server_build_ids":server_builds,"request_timeout_ms":o.request_timeout_ms,"persistent_connections_per_primary":POOL_SIZE,"progress":"tokio spawn_blocking, per-connection mutex","pool_repair":{"policy":"a connection poisoned by an incomplete pipeline or in sticky error is replaced before its next request","attempts_per_request":REPLACEMENT_ATTEMPTS,"no_poison_before_first_byte":true,"counters":"client_pool in read observations and manifest run.client_pool_final"},"node_config":configs,"persistence":persistence,"replica_reads":false,"client_retries":0,"hardware_path_attested":false,"mutation_uncertainty":"timeout or transport failure does not imply rollback"}),
         };
         Ok(Self {
             nodes,
@@ -1585,5 +1596,65 @@ mod tests {
         v["nodes"] = json!(["127.0.0.1:16379"]);
         v["required_replication_factor"] = json!(2);
         assert!(validate_options(&v).is_err());
+    }
+    fn live_config(fsync: &str) -> Response {
+        Response::Array(
+            [
+                "appendonly",
+                "yes",
+                "appendfsync",
+                fsync,
+                "no-appendfsync-on-rewrite",
+                "no",
+                "maxmemory-policy",
+                "noeviction",
+            ]
+            .into_iter()
+            .map(|value| Response::Bytes(value.as_bytes().to_vec()))
+            .collect(),
+        )
+    }
+
+    #[test]
+    fn contracts_parse_for_rdma_and_paired_tcp_and_check_live_settings() {
+        let mut input = json!({"nodes":["127.0.0.1:16379"],"cluster":false,
+            "required_replication_factor":1,"required_primary_nodes":1,"request_timeout_ms":1000});
+        assert_eq!(
+            Options::parse(&input).unwrap().ack_contract,
+            AckContract::Synced
+        );
+        assert!(config(live_config("everysec"), AckContract::default()).is_err());
+        for (contract, fsync) in [
+            (AckContract::Synced, "always"),
+            (AckContract::OsBuffered, "no"),
+            (AckContract::PeriodicSync, "everysec"),
+        ] {
+            input["ack_contract"] = json!(contract);
+            assert!(validate_options(&input).is_ok());
+            input["client"] = json!("libvalkey");
+            assert!(validate_tcp_options(&input).is_ok());
+            input.as_object_mut().unwrap().remove("client");
+            for actual in ["always", "no", "everysec"] {
+                let result = config(live_config(actual), contract);
+                assert_eq!(result.is_ok(), actual == fsync);
+                if let Err(error) = result {
+                    assert!(error.to_string().contains(contract.as_str()));
+                }
+            }
+            for index in [1, 5, 7] {
+                let Response::Array(mut fields) = live_config(fsync) else {
+                    unreachable!()
+                };
+                fields[index] = Response::Bytes(b"invalid".to_vec());
+                assert!(config(Response::Array(fields), contract).is_err());
+            }
+        }
+        for invalid_contract in ["page_cache", "invalid"] {
+            input["ack_contract"] = json!(invalid_contract);
+            assert!(validate_options(&input).is_err());
+            input["client"] = json!("libvalkey");
+            assert!(validate_tcp_options(&input).is_err());
+            input.as_object_mut().unwrap().remove("client");
+        }
     }
 }

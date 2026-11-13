@@ -47,9 +47,9 @@ pub fn validate_options(
             { Err("backend valkey_rdma is unavailable; enable Cargo feature valkey-rdma".into()) }
         }
         #[cfg(feature = "garnet")]
-        "garnet" => industry::validate_options(options),
+        "garnet" => industry::validate_options(options, industry::Store::Garnet),
         #[cfg(feature = "kvrocks")]
-        "kvrocks" => industry::validate_options(options),
+        "kvrocks" => industry::validate_options(options, industry::Store::Kvrocks),
         kind if matches!(kind, "garnet" | "kvrocks") => Err(format!("backend {kind} is unavailable; enable Cargo feature {kind}").into()),
         "tidehunter" => tidehunter::validate_options(options),
         #[cfg(feature = "rocksdb")]

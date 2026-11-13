@@ -404,11 +404,11 @@
     "rwc10/data/campaign_cases.csv": "a0bb6e39db31c7f50ea587c43f49fd05475187249e9031b5e10269b2925227cd",
     "rwc10/data/fabric_ab.md": "0827d4dd91964cd1bcb0e89b88e06cec6893483e451d3291da8591977062d2be",
     "rwc10/generated/provenance.json": "e3263f50543f6e30a9f80528206a412b346fa44a8a8002bc806ae316856920b2",
-    "figures/rwc10-warm.pdf": "8d8dd8b74c8b8bcf1b00ce5b3b1769b030d007fa1edbd6572840167046c872a1",
-    "figures/rwc10-gap.pdf": "4231976f3526c772efaa47d2cef80e49597f707775b96299995e0063fea4a9a7",
-    "figures/rwc10-cpu.pdf": "97094ace9c8ada1306378b7689116dfa851f65c71a89f231ec1117cf33ab1ed6",
-    "figures/rwc10-cold.pdf": "ac8798a70fd895a8d577ebf1a661dc7f280f80370f0c52cfe22b798e23058643",
-    "figures/rwc10-ladder.pdf": "e2f46ec7ad212dc82c004f2ce0bf0cec0c4450afe2175cf88f7a6aa953cf506c",
+    "figures/rwc10-warm.pdf": "78b56673e65705b548dfe69c1f90e20c3a00c84539817f3779123f075e89c752",
+    "figures/rwc10-gap.pdf": "15b137fae11d239b4e4824a30dbec41874a6b3c61823b1b7f48d644690260724",
+    "figures/rwc10-cpu.pdf": "585a2d1946e08e7975a8939cc56b4090abaa1d7ae4bbfab9a8a6aeed80454566",
+    "figures/rwc10-cold.pdf": "cf06a296f55feb617dd4afe7770b8c69b5cb8b5a083f1ba43db455833eeea8b0",
+    "figures/rwc10-ladder.pdf": "5d382c771f2b7ffc7fefd64bd0579cc175562c4332160b484e85316d4c5a678a",
     "rwc10/generated/figure-evidence.json": "259b4e8c9eace4887476c5412fb6ef2203c9de019bc646a8f11b9687efc6f395"
   },
   "number_sources": {

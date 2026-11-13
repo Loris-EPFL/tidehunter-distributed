@@ -246,12 +246,14 @@ class EvidenceAdmission(unittest.TestCase):
                             analyze.stable_configuration(later, "valkey_tcp"))
 
 
-    def native_valkey_fixture(self, root, kind="valkey_tcp", generation=1):
+    def native_valkey_fixture(self, root, kind="valkey_tcp", generation=1, ack_contract="synced"):
         import local
         import local_valkey_rdma
         from test_valkey_lifecycle import evidence
 
         nodes, controls = evidence()
+        for node in nodes:
+            node["effective_config"]["appendfsync"] = analyze.contracts.valkey_fsync(ack_contract)
         ids = [f"{generation * 100 + i:040x}" for i in range(5)]
         for node in nodes:
             for i, identity in enumerate(ids):
@@ -265,17 +267,20 @@ class EvidenceAdmission(unittest.TestCase):
         directory = f"/tmp/owned-{generation}"
         runtime = "/opt/valkey"
         owner = f"{generation:032x}"
-        options = local_valkey_rdma.options_for_backend(kind, 5, rdma)
+        options = local_valkey_rdma.options_for_backend(kind, 5, rdma, ack_contract=ack_contract)
         state = {"owner": owner, "backend": kind, "layout": "full", "nodes": 5,
                  "directory": directory, "runtime": runtime, "physical_hosts": 1, "independent_disks": False,
                  "paired_valkey": True, "control_endpoints": controls, "rdma_endpoints": rdma,
                  "backend_options": options, "services": []}
+        if ack_contract != "synced":
+            state["ack_contract"] = ack_contract
         records = []
         for i, node in enumerate(nodes):
             data = f"{directory}/node-{i}/data"
             node["effective_config"]["dir"] = data
             node["effective_config"]["cluster-config-file"] = f"{data}/nodes.conf"
-            args = local.valkey_server_args(f"127.0.0.{21+i}", 6379+i, 16379+i, True, 1024)
+            args = local.valkey_server_args(f"127.0.0.{21+i}", 6379+i, 16379+i, True, 1024,
+                                           ack_contract=ack_contract)
             args = [f"{runtime}/bin/valkey-server" if x == "valkey-server" else x.replace("/data", data) for x in args]
             args += ["--rdma-bind", "10.1.2.3", "--rdma-port", str(6380+i)]
             unit = f"kvcloud-valkey-{owner[:20]}-{i}"
@@ -295,7 +300,8 @@ class EvidenceAdmission(unittest.TestCase):
         dirs = {endpoint: f"{directory}/node-{i}/data" for i, endpoint in enumerate(controls)}
         observed = {"nodes": nodes, "runtime": records, "source_commit": source,
                     "transport": "RDMA-CM RC" if kind == "valkey_rdma" else "TCP",
-                    "coverage": local.admit_valkey(nodes, controls, True, data_dir=dirs)}
+                    "coverage": local.admit_valkey(nodes, controls, True, data_dir=dirs,
+                                                  ack_contract=ack_contract)}
         observed["rdma_qualification" if kind == "valkey_rdma" else "tcp_qualification"] = {
             "status": "passed", "endpoints": options["nodes"], "operations": ["PING", "SET", "GET", "DEL"]}
         topology = {"cluster": True, "primary_count": 5, "endpoints": options["nodes"], "node_ids": ids,
@@ -310,9 +316,14 @@ class EvidenceAdmission(unittest.TestCase):
                    "persistence": [node["info_persistence"] for node in nodes],
                    "transport": ("upstream libvalkey VALKEY_CONN_RDMA, RDMA-CM RC" if kind == "valkey_rdma"
                                  else "upstream libvalkey VALKEY_CONN_TCP")}}
-        config = {"backend": {"kind": kind, "options": options}, "namespace": f"run-{generation}",
+        if ack_contract != "synced":
+            backend["acknowledgement"] = analyze.contracts.acknowledgement(kind, ack_contract)
+            backend["configuration"]["ack_contract"] = ack_contract
+        config = {"backend": {"kind": kind, "options": dict(options)}, "namespace": f"run-{generation}",
                   "seed": 17, "dataset": {}, "workload": {}, "execution": {"mode": "closed_loop"},
                   "phases": {"measurement_operations": 1}, "limits": {}}
+        if ack_contract != "synced":
+            config["backend"]["options"]["ack_contract"] = ack_contract
         deployment = {"topology": state, "observed": observed}
         (root / "deployment").mkdir(parents=True)
         (root / "result").mkdir()
@@ -354,6 +365,72 @@ class EvidenceAdmission(unittest.TestCase):
             self.assertEqual(analyze.boundary(first), analyze.boundary(second))
             self.assertEqual(len(analyze.analyze([first, second])["per_run_accounting"]), 2)
             self.assertEqual(len(analyze.analyze([first])["per_run_accounting"]), 1)
+
+    def test_external_ack_contracts_use_live_settings_and_never_pool(self):
+        for kind, contract in ((kind, contract) for kind in ("valkey_tcp", "valkey_rdma")
+                               for contract in ("periodic_sync", "os_buffered")):
+            with self.subTest(kind=kind, contract=contract), tempfile.TemporaryDirectory() as directory:
+                synced, relaxed = Path(directory) / "synced", Path(directory) / "relaxed"
+                synced.mkdir()
+                relaxed.mkdir()
+                self.native_valkey_fixture(synced, kind=kind)
+                deployment, backend, config = self.native_valkey_fixture(
+                    relaxed, kind=kind, generation=2, ack_contract=contract)
+                self.assertNotIn("ack_contract", analyze.boundary(synced)["backend"])
+                selected = analyze.boundary(relaxed)["backend"]
+                self.assertEqual(selected["ack_contract"], contract)
+                self.assertEqual(selected["acknowledgement"],
+                                 analyze.contracts.acknowledgement(kind, contract))
+                with self.assertRaisesRegex(ValueError, "different workload"):
+                    analyze.analyze([synced, relaxed])
+                with self.assertRaisesRegex(ValueError, "selected acknowledgement"):
+                    analyze.admit_native_valkey(relaxed, deployment, backend, config)
+                deployment["observed"]["nodes"][0]["effective_config"]["appendfsync"] = "always"
+                with self.assertRaises(ValueError):
+                    analyze.admit_native_valkey(
+                        relaxed, deployment, backend, config, ack_contract=contract)
+
+    def test_nonpaired_valkey_checks_live_fsync_and_job_deployment_contract(self):
+        for contract in ("synced", "periodic_sync", "os_buffered"):
+            with self.subTest(contract=contract), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                deployment, _, _ = self.native_valkey_fixture(root, ack_contract=contract)
+                deployment["topology"]["paired_valkey"] = False
+                deployment["observed"]["nodes"][0]["effective_config"]["appendfsync"] = (
+                    "everysec" if contract == "synced" else "always")
+                (root / "deployment/deployment.json").write_text(json.dumps(deployment))
+                with self.assertRaisesRegex(ValueError, "live appendfsync"):
+                    analyze.boundary(root)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.native_valkey_fixture(root, ack_contract="periodic_sync")
+            receipt = json.loads((root / "receipt.json").read_text())
+            receipt["job"] = {"ack_contract": "synced"}
+            (root / "receipt.json").write_text(json.dumps(receipt))
+            with self.assertRaisesRegex(ValueError, "reported backend ack_contract"):
+                analyze.boundary(root)
+
+    def test_reported_external_contract_is_required_and_must_match_selection(self):
+        for selected, reported in (("periodic_sync", None), ("os_buffered", "periodic_sync"),
+                                   ("synced", "os_buffered")):
+            with self.subTest(selected=selected, reported=reported), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.native_valkey_fixture(root, ack_contract=selected)
+                for filename, field in (("manifest.json", "backend_info"), ("summary.json", "backend")):
+                    path = root / "result" / filename
+                    data = json.loads(path.read_text())
+                    configuration = data[field]["configuration"]
+                    configuration.pop("ack_contract", None)
+                    if reported is not None:
+                        configuration["ack_contract"] = reported
+                    path.write_text(json.dumps(data))
+                receipt = json.loads((root / "receipt.json").read_text())
+                for filename in ("manifest.json", "summary.json"):
+                    receipt["artifacts_sha256"][filename] = hashlib.sha256(
+                        (root / "result" / filename).read_bytes()).hexdigest()
+                (root / "receipt.json").write_text(json.dumps(receipt))
+                with self.assertRaisesRegex(ValueError, "reported backend ack_contract"):
+                    analyze.boundary(root)
 
     def test_native_valkey_rejects_missing_or_inconsistent_runtime_and_ownership(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -496,6 +573,28 @@ class EvidenceAdmission(unittest.TestCase):
                 with self.subTest(kind=kind, candidate=candidate, core=core):
                     with self.assertRaises(ValueError):
                         analyze.admit_industry_observation(kind, candidate, core)
+
+    def test_kvrocks_relaxed_contract_requires_unsynced_enabled_live_wal(self):
+        import industry_service
+
+        deployment, backend = self.industry_fixture("kvrocks")
+        nodes = deployment["observed"]["nodes"]
+        endpoints = deployment["observed"]["coverage"]["primary_endpoints"]
+        for node in nodes:
+            node["effective_config"]["rocksdb.write_options.sync"] = "no"
+        deployment["observed"]["coverage"] = industry_service.admit(
+            "kvrocks", nodes, endpoints, ack_contract="page_cache")
+        self.assertEqual(analyze.admit_industry_observation(
+            "kvrocks", deployment, backend, ack_contract="page_cache"), deployment["observed"]["coverage"])
+        with self.assertRaises(ValueError):
+            analyze.admit_industry_observation("kvrocks", deployment, backend)
+        for key, value in (("rocksdb.write_options.sync", "yes"),
+                           ("rocksdb.write_options.disable_wal", "yes")):
+            changed = copy.deepcopy(deployment)
+            changed["observed"]["nodes"][0]["effective_config"][key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                analyze.admit_industry_observation(
+                    "kvrocks", changed, backend, ack_contract="page_cache")
 
     def test_industry_launch_proof_is_required_and_bound_to_containers(self):
         import industry_service

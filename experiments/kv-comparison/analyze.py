@@ -10,6 +10,7 @@ import re
 from pathlib import Path
 import sys
 
+import ack_contract as contracts
 import floors
 import local
 
@@ -1655,11 +1656,14 @@ def valkey_view(text, identities, self_id):
     return [owners[i] for i in range(16384)]
 
 
-def admit_native_valkey(run, deployment, backend, config):
+def admit_native_valkey(run, deployment, backend, config, ack_contract="synced"):
     """Admit the local native exporter, including its independently captured proof."""
     import local_valkey_rdma
 
     state = deployment["topology"]
+    contract = contracts.selected(backend["name"], ack_contract)
+    if state.get("ack_contract", "synced") != contract:
+        raise ValueError("native Valkey selected acknowledgement contract differs")
     owner = json.loads((run / "deployment/owner.json").read_text())
     services = json.loads((run / "deployment/services.json").read_text())
     observed = deployment["observed"]
@@ -1672,7 +1676,7 @@ def admit_native_valkey(run, deployment, backend, config):
             len(set(controls)) != count or len(set(rdma)) != count or
             len(state["services"]) != count or len(services) != count):
         raise ValueError("native Valkey inventory mismatch")
-    options = local_valkey_rdma.options_for_backend(state["backend"], count, rdma)
+    options = local_valkey_rdma.options_for_backend(state["backend"], count, rdma, ack_contract=contract)
     if (state["backend_options"] != options or
             config["backend"].get("options") != options or
             controls != [f"127.0.0.{21+i}:{6379+i}" for i in range(count)]):
@@ -1700,7 +1704,8 @@ def admit_native_valkey(run, deployment, backend, config):
     roles = []
     for i, (service, exported, ready) in enumerate(zip(state["services"], services, runtime)):
         data = str(Path(state["directory"]) / f"node-{i}" / "data")
-        argv = local.valkey_server_args(f"127.0.0.{21+i}", 6379+i, 16379+i, cluster, 1024)
+        argv = local.valkey_server_args(f"127.0.0.{21+i}", 6379+i, 16379+i, cluster, 1024,
+                                       ack_contract=contract)
         argv = [str(Path(state["runtime"]) / "bin/valkey-server") if x == "valkey-server"
                 else x.replace("/data", data) for x in argv]
         argv += ["--rdma-bind", address, "--rdma-port", str(6380+i)]
@@ -1746,7 +1751,8 @@ def admit_native_valkey(run, deployment, backend, config):
                       "memory_swap_max_bytes": 0, "memlock": "unlimited"})
     dirs = {endpoint: str(Path(state["directory"]) / f"node-{i}" / "data") for i, endpoint in enumerate(controls)}
     try:
-        coverage = local.admit_valkey(observed["nodes"], controls, cluster, data_dir=dirs)
+        coverage = local.admit_valkey(observed["nodes"], controls, cluster, data_dir=dirs,
+                                     ack_contract=contract)
         if coverage != observed["coverage"]:
             raise ValueError("native Valkey recorded coverage differs")
         core_settings = client["node_config"]
@@ -1869,8 +1875,8 @@ def host_capacity(meminfo):
 
 
 
-def admit_industry_observation(kind, deployment, backend):
-    """Reconstruct RF1 slot and durable-setting proof from the raw observations."""
+def admit_industry_observation(kind, deployment, backend, ack_contract="synced"):
+    """Reconstruct RF1 slot and selected acknowledgement proof from live settings."""
     import industry_service
 
     topology = deployment.get("topology", {})
@@ -1886,7 +1892,7 @@ def admit_industry_observation(kind, deployment, backend):
     if not isinstance(endpoints, list) or len(endpoints) != 5 or len(set(endpoints)) != 5:
         raise ValueError("missing industry primary endpoint inventory")
     try:
-        reconstructed = industry_service.admit(kind, nodes, endpoints)
+        reconstructed = industry_service.admit(kind, nodes, endpoints, ack_contract=ack_contract)
     except (KeyError, TypeError, ValueError, RuntimeError) as exc:
         raise ValueError(f"invalid industry primary/slot/durability evidence: {exc}") from exc
     if reconstructed != coverage:
@@ -1956,6 +1962,14 @@ def requested_nvmeof_route(receipt):
     return route
 
 
+def admit_ack_contract(kind, backend, expected="synced"):
+    """Require the backend receipt to attest the selected acknowledgement contract."""
+    observed = contracts.selected(kind, backend.get("configuration", {}).get("ack_contract", "synced"))
+    if observed != contracts.selected(kind, expected):
+        raise ValueError("reported backend ack_contract differs from the selected acknowledgement contract")
+    return observed
+
+
 def boundary(run):
     receipt = json.loads((run / "receipt.json").read_text())
     if receipt.get("status") != "completed" or receipt.get("claim_boundary") == "API qualification only":
@@ -1980,9 +1994,17 @@ def boundary(run):
         raise ValueError(f"{run}: manifest lacks observed effective BackendInfo")
     deployment_path = run / "deployment/deployment.json"
     deployment = json.loads(deployment_path.read_text()) if deployment_path.exists() else None
+    expected_contract = contracts.selected(config["backend"]["kind"], receipt.get("job", {}).get(
+        "ack_contract", (deployment or {}).get("topology", {}).get("ack_contract", "synced")))
+    contract = admit_ack_contract(config["backend"]["kind"], backend, expected_contract)
+    if contracts.selected(config["backend"]["kind"], config["backend"].get("options", {}).get(
+            "ack_contract", "synced")) != contract:
+        raise ValueError(f"{run}: executable ack_contract differs from the reported backend contract")
     if config["backend"]["kind"] in ("tikv", "cassandra", "foundationdb", "valkey_tcp", "valkey_rdma", "garnet", "kvrocks"):
         if not deployment:
             raise ValueError(f"{run}: missing actual external deployment/replication proof")
+        if deployment["topology"].get("ack_contract", "synced") != contract:
+            raise ValueError(f"{run}: deployment selected acknowledgement contract differs from the job")
         observed, nodes = deployment["observed"], deployment["topology"]["nodes"]
         expected_rf = (1 if config["backend"]["kind"] in ("valkey_tcp", "valkey_rdma", "garnet", "kvrocks") else
                        (1 if nodes == 1 else 2) if config["backend"]["kind"] == "foundationdb" else nodes)
@@ -2004,13 +2026,19 @@ def boundary(run):
                     or len(set(coverage.get("primary_endpoints", []))) != nodes
                     or coverage.get("slot_count") != (0 if nodes == 1 else 16384)):
                 raise ValueError(f"{run}: incomplete Valkey RF1 primary/slot ownership proof")
+            if any(node.get("effective_config", {}).get("appendfsync") != contracts.valkey_fsync(contract)
+                   for node in observed["nodes"]):
+                raise ValueError(f"{run}: Valkey live appendfsync differs from the selected acknowledgement contract")
         elif config["backend"]["kind"] in ("garnet", "kvrocks"):
-            admit_industry_observation(config["backend"]["kind"], deployment, backend)
+            admit_industry_observation(config["backend"]["kind"], deployment, backend,
+                                       ack_contract=contract)
         elif len(observed["nodes"]) != nodes:
             raise ValueError(f"{run}: incomplete Cassandra member observations")
     # Dynamic per-run namespaces/storage roots are not compared. Retain raw originals and
     # compare all semantic info plus the admitted topology/resource budget instead.
     guarantee = {key: backend[key] for key in required - {"configuration", "topology"}}
+    if contract != "synced":
+        guarantee["ack_contract"] = contract
     if config["backend"]["kind"] == "foundationdb":
         guarantee["native_client_runtime"] = {
             key: value for key, value in json.loads((run.parent / "fdb-client.json").read_text()).items()
@@ -2019,7 +2047,8 @@ def boundary(run):
     native = (deployment and config["backend"]["kind"] in ("valkey_tcp", "valkey_rdma")
               and deployment["topology"].get("paired_valkey") is True)
     if native:
-        deployment_budget, stable_valkey, valkey_settings = admit_native_valkey(run, deployment, backend, config)
+        deployment_budget, stable_valkey, valkey_settings = admit_native_valkey(
+            run, deployment, backend, config, ack_contract=contract)
         guarantee["observed_topology"] = stable_valkey
         guarantee["deployment_effective_configuration"] = valkey_settings
     else:

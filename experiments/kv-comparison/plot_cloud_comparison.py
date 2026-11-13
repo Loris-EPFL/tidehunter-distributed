@@ -16,6 +16,7 @@ from pathlib import Path
 import statistics
 import textwrap
 
+import ack_contract
 from cloud_campaign import BACKENDS, comparison_backend
 
 
@@ -53,7 +54,8 @@ BASE_CAPTION = (
     "No pooled quantiles or confidence/significance claims. Successful latency is conditional on operation/outcome. "
     "RF1 does not equalize consistency, durability, security, or transaction semantics. "
     "Primary RF1 only: native uses value_wal_barrier and TH explicit caches are off; other cohorts use their stated settings. "
-    "Valkey GET remains RAM-resident, including cold OS; appendfsync always acknowledges AOF writes, not value-WAL reads. "
+    "Valkey GET remains RAM-resident, including cold OS; AOF writes are not value-WAL reads. "
+    "Synced Valkey uses appendfsync always; periodic_sync uses everysec; os_buffered uses no. Neither relaxed mode proves a per-case page-cache write; Valkey page_cache is unsupported. "
     "Garnet's SSD hybrid log is distinct from its AOF; Kvrocks uses RocksDB WAL and SST files with compaction. "
     "Engine and OS caches and background work can affect reads and writes; no per-API disk incidence is implied. "
     "Live SPDK target file I/O bypasses the target OS page cache; device/controller caches remain. "
@@ -147,11 +149,16 @@ class Dataset:
         ids, contracts, implementation_contracts = set(), {}, {}
         logical_data_contracts = {}
         tiers = self.durability_tiers = {}
+        self.ack_contracts = {}
         for case in self.cases:
             job = case["job"]
             case_id = case["case_id"]
             runtime_backend = job["backend"]
             backend = comparison_backend(job)
+            contract_ack = ack_contract.selected(runtime_backend, job.get("ack_contract", "synced"))
+            if self.ack_contracts.setdefault(backend, contract_ack) != contract_ack:
+                raise ValueError(f"{backend}: ack_contract changes within one dataset; "
+                                 "plot each selected acknowledgement contract from a separate comparison document")
             if backend not in STYLES:
                 raise ValueError(f"unknown backend {backend}; add an explicit style")
             route = job.get("nvmeof_route")
@@ -166,7 +173,7 @@ class Dataset:
             if case_id in ids or job.get("case_id") != case_id:
                 raise ValueError("duplicate or inconsistent case identity")
             ids.add(case_id)
-            key = (backend, job["cohort"], job["profile"], job["value_size"], job["repeat"])
+            key = (backend, job["cohort"], job["profile"], job["value_size"], contract_ack, job["repeat"])
             if key in self.index:
                 raise ValueError("duplicate backend/cohort/profile/size/repeat identity")
             self.index[key] = case
@@ -186,6 +193,7 @@ class Dataset:
                 raise ValueError("job and observed backend differ")
             implementation = {name: job[name] for name in
                               ("native_wal_geometry", "owner_read_resident_first", "durability_tier") if name in job}
+            implementation["ack_contract"] = contract_ack
             if "nvmeof_route" in job:
                 implementation["nvmeof_route"] = job["nvmeof_route"]
             if backend == "native":
@@ -203,7 +211,7 @@ class Dataset:
                     ("directness", "mapped_wal_eviction", "target_cache", "page_cache_policy")}
             if job["cohort"] == "native_write_regression":
                 implementation["write_path"] = job.get("write_path")
-            implementation_cell = (backend, job["cohort"], job["profile"], job["value_size"])
+            implementation_cell = (backend, job["cohort"], job["profile"], job["value_size"], contract_ack)
             if implementation_cell in implementation_contracts and implementation_contracts[implementation_cell] != implementation:
                 raise ValueError("backend implementation contract changed between repetitions")
             implementation_contracts[implementation_cell] = implementation
@@ -212,7 +220,7 @@ class Dataset:
                 raise ValueError(f"{backend}: durability tier changes within one dataset; "
                                  "plot each tier from its own comparison document")
             contract = {name: value for name, value in job.items()
-                        if name not in ("backend", "case_id", "repeat", "native_wal_geometry", "owner_read_resident_first", "nvmeof_route", "nvmeof_target", "durability_tier")}
+                        if name not in ("backend", "case_id", "repeat", "native_wal_geometry", "owner_read_resident_first", "nvmeof_route", "nvmeof_target", "durability_tier", "ack_contract")}
             for identity_field in ("read_tier", "sealed_dataset"):
                 if isinstance(contract.get(identity_field), dict):
                     contract[identity_field] = {k: v for k, v in contract[identity_field].items()
@@ -271,9 +279,13 @@ class Dataset:
                               "otherwise minimum two; no one-repeat fallback"),
         }
 
+    def cell_key(self, cell):
+        return cell + (self.ack_contracts.get(cell[0], "synced"),)
+
     def completed_repeats(self, cell):
+        key_cell = self.cell_key(cell)
         return {key[-1] for key, case in self.index.items()
-                if key[:-1] == cell and case["status"] == "completed"}
+                if key[:-1] == key_cell and case["status"] == "completed"}
 
     def matched_repeats(self, cells):
         """No per-backend downselection: every point in a figure shares repeats."""
@@ -304,7 +316,7 @@ def metric_value(case, metric, operation=None, outcome="success", percentile="p9
 def aggregate_point(dataset, cell, repeats, metric, operation=None, outcome="success", percentile="p99"):
     observations = []
     for repeat in repeats:
-        case = dataset.index.get(cell + (repeat,))
+        case = dataset.index.get(dataset.cell_key(cell) + (repeat,))
         if case is None or case["status"] != "completed":
             return None, "failed or missing matched case"
         value, samples = metric_value(case, metric, operation, outcome, percentile)
@@ -317,6 +329,7 @@ def aggregate_point(dataset, cell, repeats, metric, operation=None, outcome="suc
     if len(values) < dataset.minimum_common_repeats:
         return None, f"fewer than {dataset.minimum_common_repeats} matched observations; not a comparative point"
     return {"backend": cell[0], "cohort": cell[1], "profile": cell[2], "value_bytes": cell[3],
+            "ack_contract": dataset.ack_contracts.get(cell[0], "synced"),
             "operation": operation, "outcome": outcome if operation else "whole_workload",
             "metric": metric, "percentile": percentile if metric in TIMINGS else None,
             "repeats": repeats, "observations": observations, "median": statistics.median(values),
@@ -332,6 +345,7 @@ def case_identity(case):
         source = {}
     return {"case_id": case["case_id"], "backend": comparison_backend(job),
             "runtime_backend": job["backend"], "durability_tier": job.get("durability_tier"),
+            "ack_contract": ack_contract.selected(job["backend"], job.get("ack_contract", "synced")),
             "requested_nvmeof_route": job.get("nvmeof_route"),
             "requested_nvmeof_target": job.get("nvmeof_target"),
             "source_id": source.get("source_id"), "data_id": source.get("data_id")}
@@ -592,7 +606,8 @@ def build_figures(dataset):
                     unavailable.append({
                         "backend": series["backend"],
                         "reason": f"Fewer than {dataset.minimum_common_repeats} completed cold-OS repeats required by planned mode",
-                        "case_ids": [case["case_id"] for key, case in dataset.index.items() if key[:-1] == cell]})
+                        "case_ids": [case["case_id"] for key, case in dataset.index.items()
+                                     if key[:-1] == dataset.cell_key(cell)]})
             spec = dict(spec, series=available)
         cells = list(dict.fromkeys(cell for series in spec["series"] for cell in series["cells"]))
         try:
@@ -605,7 +620,7 @@ def build_figures(dataset):
         if spec["name"].startswith("registered-fullset-"):
             for cell in cells:
                 for repeat in repeats:
-                    case = dataset.index[cell + (repeat,)]
+                    case = dataset.index[dataset.cell_key(cell) + (repeat,)]
                     proof = case.get("read_path_qualification")
                     if (not isinstance(proof, dict) or proof.get("qualified") is not True
                             or proof.get("hardware_read_required") is not True):
@@ -650,11 +665,22 @@ def build_figures(dataset):
                         used.update(item["case_id"] for item in point["observations"])
                 if points:
                     plotted["series"].append({key: value for key, value in source.items() if key not in ("cells", "x")} | {"points": points})
+                    plotted["series"][-1]["ack_contract"] = dataset.ack_contracts[source["backend"]]
+                    if dataset.ack_contracts[source["backend"]] != "synced":
+                        plotted["series"][-1]["label"] += f" ({dataset.ack_contracts[source['backend']]} ack)"
             plotted["status"] = "available" if plotted["series"] else "unavailable"
             if not plotted["series"]:
                 plotted["reason"] = "No complete matched operation/outcome timing population; not plotted as zero"
             result["panels"].append(plotted)
         result["case_ids"] = sorted(used)
+        result["ack_contract_by_backend"] = {
+            backend: dataset.ack_contracts[backend] for backend in
+            dict.fromkeys(series["backend"] for panel in result["panels"] for series in panel["series"])}
+        external_contracts = [f"{backend}={contract}" for backend, contract in
+                              result["ack_contract_by_backend"].items()
+                              if backend in ("valkey_tcp", "valkey_rdma", "kvrocks")]
+        if external_contracts:
+            result["caption"] += "Selected external ack_contract: " + ", ".join(external_contracts) + ". "
         result["caption"] += BASE_CAPTION
         if spec["name"] == "cold-os-cache":
             result["unavailable_systems"] = unavailable
@@ -788,7 +814,7 @@ def render(figures, coverage_data, output):
 
 
 def export_data(figures, coverage_data, output):
-    fields = ["figure", "panel", "series", "backend", "runtime_backend", "durability_tier", "requested_nvmeof_route", "requested_nvmeof_target",
+    fields = ["figure", "panel", "series", "backend", "runtime_backend", "ack_contract", "durability_tier", "requested_nvmeof_route", "requested_nvmeof_target",
               "source_id", "data_id", "cohort", "profile", "value_bytes", "x", "operation", "outcome",
               "metric", "percentile", "unit", "median", "observed_min", "observed_max", "repeat", "case_id", "value",
               "timed_sample_count_or_denominator", "repetition_mode", "independent_repetitions",
@@ -836,6 +862,7 @@ def main():
     used = set().union(*(set(figure["case_ids"]) for figure in figures))
     manifest = {"schema_version": 1, "input": str(args.input), "input_sha256": hashlib.sha256(raw).hexdigest(),
                 **dataset.repetition_metadata(), "durability_tier_by_backend": dataset.durability_tiers,
+                "ack_contract_by_backend": dataset.ack_contracts,
                 "units": "plot-data.csv retains exact source ns; latency figures convert ns / 1000 to µs; MiB = 2^20 bytes",
                 "figures": figures, "omitted_figures": omitted, "coverage": coverage_data,
                 "case_evidence": evidence_appendix(dataset),

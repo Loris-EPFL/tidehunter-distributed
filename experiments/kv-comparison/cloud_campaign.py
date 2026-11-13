@@ -13,6 +13,7 @@ import re
 import uuid
 import sys
 
+import ack_contract
 import analyze
 from cloud_layout import OWNER_HOST_COUNTS
 import local
@@ -1927,6 +1928,11 @@ def make_run_config(job, case_root, options, source_revision, deadline_seconds=1
         raise ValueError("absolute case root required")
     maximum = job["keys"] + job["warmup_operations"] + job["measurement_operations"] + 4096
     options = dict(options)
+    contract = ack_contract.selected(job["backend"], job.get("ack_contract", "synced"))
+    if "ack_contract" in options and ack_contract.selected(job["backend"], options["ack_contract"]) != contract:
+        raise ValueError("backend options ack_contract differs from the planned case")
+    if contract != "synced":
+        options["ack_contract"] = contract
     if job.get("diagnostics", {}).get("valkey_profile_limit"):
         if job["backend"] not in ("valkey_tcp", "valkey_rdma"):
             raise ValueError("Valkey client diagnostics require a Valkey backend")
@@ -2918,6 +2924,7 @@ def summarize_case(directory, *, local_mode=False):
     receipt = json.loads((directory / "receipt.json").read_text())
     job = receipt["job"]
     value = {"case_id": job["case_id"], "job": job, "status": receipt.get("status"),
+             "ack_contract": ack_contract.selected(job["backend"], job.get("ack_contract", "synced")),
              "error": receipt.get("error"), "measurement_evidence": receipt.get("measurement_evidence"),
              "counter_evidence": receipt.get("counter_evidence")}
     if "case_kind" in job:
@@ -3177,6 +3184,11 @@ def summarize_case(directory, *, local_mode=False):
         raise ValueError("actual executable differs from admitted release binary")
     if manifest.get("backend_info") != summary.get("backend"):
         raise ValueError("manifest and summary disagree about the executed backend")
+    value["ack_contract"] = analyze.admit_ack_contract(
+        job["backend"], summary.get("backend", {}), job.get("ack_contract", "synced"))
+    if ack_contract.selected(job["backend"], normalized["backend"].get("options", {}).get(
+            "ack_contract", "synced")) != value["ack_contract"]:
+        raise ValueError("executable ack_contract differs from the reported backend contract")
     if receipt.get("status") == "completed" and job.get("case_kind") in ("interference", "write_wait_diagnostic"):
         marker_name = ("interference" if job["case_kind"] == "interference"
                        else "write_wait_metrics" if job["write_wait_diagnostics"]["enabled"] else None)
@@ -3383,7 +3395,7 @@ def qualify_history_prewarm(row, baseline, root):
 def write_csv_report(root, results):
     planned_repeats = sorted({row["job"]["repeat"] for row in results})
     repetition_mode = "single" if len(planned_repeats) == 1 else "multiple"
-    fields = ["case_id", "status", "backend", "durability_tier", "native_durability", "nvmeof_target", "requested_target_cache", "cohort", "profile", "repeat",
+    fields = ["case_id", "status", "backend", "ack_contract", "durability_tier", "native_durability", "nvmeof_target", "requested_target_cache", "cohort", "profile", "repeat",
               "planned_independent_repetitions", "repetition_mode", "timing_stddev_scope", "value_bytes", "keys",
               "concurrency", "offered_ops_per_second", "observed_calls", "planned_calls",
               "measurement_rows_complete", "successful_calls", "unsuccessful_calls", "elapsed_seconds",
@@ -3408,6 +3420,7 @@ def write_csv_report(root, results):
         for result in results:
             job, metrics = result["job"], result.get("metrics", {})
             row = {key: job.get(key) for key in ("backend", "cohort", "profile", "repeat", "keys", "concurrency", "offered_ops_per_second")}
+            row["ack_contract"] = ack_contract.selected(job["backend"], job.get("ack_contract", "synced"))
             row["durability_tier"] = durability_tier(job)
             row["native_durability"] = job.get("native_durability") if job["backend"] == "native" else None
             row["backend"] = comparison_backend(job)
@@ -3446,6 +3459,9 @@ def write_csv_report(root, results):
             if "read_path_qualification" in result:
                 row["read_path_qualification"] = json.dumps(result["read_path_qualification"], sort_keys=True)
             backend = result.get("backend", {})
+            if backend:
+                row["ack_contract"] = analyze.admit_ack_contract(
+                    job["backend"], backend, job.get("ack_contract", "synced"))
             row.update({key: backend.get(key) for key in ("acknowledgement", "consistency",
                        "replication_factor", "measurement_boundary", "get_many_strategy", "batch_atomicity")})
             row.update(observed_topology=analyze.canonical(backend.get("topology")),
@@ -3667,8 +3683,8 @@ def report(root):
             "API-call latency for get_many is the complete ordered group, not latency per key.",
             "OS-cache eviction does not evict engine caches; qualified device intervals, when available, are retained separately.",
             "Live SPDK target direct-file I/O bypasses the target OS page cache; device and controller caches may remain.",
-            "TideHunter native owner acknowledgement is a page-cache write with background fsync; compare only to matching native page-cache cases, not synchronous Valkey writes.",
-            "Valkey GET is memory-resident even after OS-cache eviction; AOF always is write acknowledgment, not a value-WAL-backed read.",
+            "TideHunter native owner acknowledgement is a page-cache write with background fsync; compare only to a matching page-cache acknowledgement contract.",
+            "Valkey GET is memory-resident even after OS-cache eviction; AOF is write acknowledgment, not a value-WAL-backed read. Synced uses appendfsync always; periodic_sync uses everysec; os_buffered uses no. Neither relaxed mode proves a per-case page-cache write; Valkey page_cache is unsupported.",
             "No Sui checkpoint/application or sustainable infinite-aging claim."]}
     if focused_ids:
         value["focused_coverage"] = {

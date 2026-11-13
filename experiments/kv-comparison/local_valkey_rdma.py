@@ -9,6 +9,7 @@ import uuid
 
 import local
 import valkey_service
+import ack_contract as contracts
 
 
 def options(count):
@@ -25,6 +26,8 @@ def options(count):
 
 def validate_state(state):
     count = 1 if state["layout"] == "qualification" else 5
+    contract = contracts.selected(state["backend"], state.get("ack_contract", "synced"))
+    kwargs = {"ack_contract": contract} if contract != "synced" else {}
     if state["nodes"] != count or len(state["services"]) != count:
         raise ValueError("local Valkey RDMA primary inventory differs")
     runtime = Path(state["runtime"]).resolve(strict=True)
@@ -36,12 +39,12 @@ def validate_state(state):
     address = str(ipaddress.IPv4Address(endpoints[0].rsplit(":", 1)[0]))
     if ipaddress.IPv4Address(address).is_loopback or endpoints != [f"{address}:{6380+i}" for i in range(count)]:
         raise ValueError("local Valkey RDMA endpoint mapping differs")
-    selected = options_for_backend(state["backend"], count, endpoints)
+    selected = options_for_backend(state["backend"], count, endpoints, **kwargs)
     if state["backend_options"] != selected:
         raise ValueError("local Valkey selected client settings differ")
     for i, service in enumerate(state["services"]):
         data = Path(state["directory"]) / f"node-{i}" / "data"
-        argv = local.valkey_server_args(f"127.0.0.{21+i}", 6379+i, 16379+i, count > 1, 1024)
+        argv = local.valkey_server_args(f"127.0.0.{21+i}", 6379+i, 16379+i, count > 1, 1024, **kwargs)
         argv = [str(runtime / "bin/valkey-server") if x == "valkey-server" else x.replace("/data", str(data)) for x in argv]
         argv += ["--rdma-bind", address, "--rdma-port", str(6380+i)]
         expected = {"runtime": str(runtime), "unit": f"kvcloud-valkey-{state['owner'][:20]}-{i}", "args": argv,
@@ -52,13 +55,16 @@ def validate_state(state):
     return state
 
 
-def options_for_backend(backend, count, rdma_endpoints):
+def options_for_backend(backend, count, rdma_endpoints, ack_contract="synced"):
+    contracts.selected(backend, ack_contract)
     nodes = (rdma_endpoints if backend == "valkey_rdma" else
              [f"127.0.0.{21+i}:{6379+i}" for i in range(count)])
     result = {"nodes": nodes, "cluster": count > 1, "required_replication_factor": 1,
               "required_primary_nodes": count, "request_timeout_ms": 5000}
     if backend == "valkey_tcp":
         result["client"] = "libvalkey"
+    if ack_contract != "synced":
+        result["ack_contract"] = ack_contract
     return result
 
 
@@ -84,7 +90,9 @@ def probe(state):
     proof.update({"image": None, "transport": "RDMA-CM RC" if rdma else "TCP", "cluster_bus": "TCP control network",
                   "source_commit": valkey_service.identity(Path(state["runtime"]))["source_commit"], "runtime": runtime})
     dirs = {endpoint: str(Path(state["directory"]) / f"node-{i}" / "data") for i, endpoint in enumerate(endpoints)}
-    proof["coverage"] = local.admit_valkey(proof["nodes"], endpoints, state["nodes"] > 1, data_dir=dirs)
+    contract = contracts.selected(state["backend"], state.get("ack_contract", "synced"))
+    kwargs = {"ack_contract": contract} if contract != "synced" else {}
+    proof["coverage"] = local.admit_valkey(proof["nodes"], endpoints, state["nodes"] > 1, data_dir=dirs, **kwargs)
     for node in proof["nodes"]:
         endpoint = node["endpoint"]
         if local.valkey_cli(execute, endpoint, "PING").strip() != "PONG":
@@ -110,10 +118,13 @@ def probe(state):
 
 
 def start(args):
+    contract = contracts.selected(args.backend, getattr(args, "ack_contract", "synced"))
+    kwargs = {"ack_contract": contract} if contract != "synced" else {}
     directory = args.state.resolve()
     if (directory / "owner.json").exists():
         state = local.load(directory)
-        if state["backend"] != args.backend or state["layout"] != args.layout:
+        if (state["backend"] != args.backend or state["layout"] != args.layout
+                or state.get("ack_contract", "synced") != contract):
             raise ValueError("existing local Valkey ownership mismatch")
         local.ready(state, args.timeout)
         return
@@ -121,7 +132,7 @@ def start(args):
         raise ValueError("refusing nonempty unowned local directory")
     count = 1 if args.layout == "qualification" else 5
     rdma_options = options(count)
-    selected = options_for_backend(args.backend, count, rdma_options["nodes"])
+    selected = options_for_backend(args.backend, count, rdma_options["nodes"], **kwargs)
     runtime = Path(os.environ["VALKEY_RDMA_RUNTIME"]).resolve(strict=True)
     metadata = valkey_service.identity(runtime)
     address = rdma_options["nodes"][0].rsplit(":", 1)[0]
@@ -134,7 +145,7 @@ def start(args):
     for i in range(count):
         data = directory / f"node-{i}" / "data"
         data.mkdir(parents=True)
-        argv = local.valkey_server_args(f"127.0.0.{21+i}", 6379+i, 16379+i, count > 1, 1024)
+        argv = local.valkey_server_args(f"127.0.0.{21+i}", 6379+i, 16379+i, count > 1, 1024, **kwargs)
         argv = [str(runtime / "bin/valkey-server") if x == "valkey-server" else x.replace("/data", str(data)) for x in argv]
         argv += ["--rdma-bind", address, "--rdma-port", str(6380+i)]
         services.append({"runtime": str(runtime), "unit": f"kvcloud-valkey-{owner[:20]}-{i}", "args": argv,
@@ -145,6 +156,8 @@ def start(args):
              "physical_hosts": 1, "independent_disks": False, "runtime": str(runtime), "services": services,
              "control_endpoints": controls, "rdma_endpoints": rdma_options["nodes"], "backend_options": selected,
              "paired_valkey": True, "created_at_unix": time.time()}
+    if contract != "synced":
+        state["ack_contract"] = contract
     local.dump(directory / "owner.json", state)
     try:
         for service in services:

@@ -18,6 +18,7 @@ import local_dry_run_targets
 import local_valkey_rdma
 import valkey_cloud
 import valkey_reproduction
+import ack_contract as contracts
 import valkey_service
 
 
@@ -143,8 +144,11 @@ def _owned_endpoint(fixture, process, endpoint):
 
 
 class Cluster(_Processes):
-    """Five transient services with AOF always and exact admitted cgroups."""
-    def __init__(self, directory, runtime, backend, rdma_address='10.99.0.1', timeout=120):
+    """Five transient services with exact admitted cgroups and AOF policy."""
+    def __init__(self, directory, runtime, backend, rdma_address='10.99.0.1', timeout=120,
+                 ack_contract='synced'):
+        self.ack_contract = contracts.selected(backend, ack_contract)
+        kwargs = {'ack_contract': self.ack_contract} if self.ack_contract != 'synced' else {}
         if backend not in ('valkey_tcp', 'valkey_rdma'):
             raise ValueError('unsupported Valkey backend')
         if not 1 <= timeout <= 300:
@@ -158,7 +162,7 @@ class Cluster(_Processes):
         # The owner token is created before any unit is attempted.
         self.controls = [f'127.0.0.{21+i}:{6379+i}' for i in range(5)]
         self.rdma_endpoints = [f'{address}:{6380+i}' for i in range(5)]
-        self.backend_options = local_valkey_rdma.options_for_backend(backend, 5, self.rdma_endpoints)
+        self.backend_options = local_valkey_rdma.options_for_backend(backend, 5, self.rdma_endpoints, **kwargs)
         self.state = {'runtime': str(self.runtime), 'control_endpoints': self.controls,
                       'rdma_endpoints': self.rdma_endpoints}
         ports = [(f'127.0.0.{21+i}', 6379+i) for i in range(5)]
@@ -168,7 +172,7 @@ class Cluster(_Processes):
             for i in range(5):
                 data = root / f'node-{i}' / 'data'
                 data.mkdir(parents=True)
-                argv = local.valkey_server_args(f'127.0.0.{21+i}', 6379+i, 16379+i, True, 1024)
+                argv = local.valkey_server_args(f'127.0.0.{21+i}', 6379+i, 16379+i, True, 1024, **kwargs)
                 argv = [str(self.runtime / 'bin/valkey-server') if x == 'valkey-server'
                         else x.replace('/data', str(data)) for x in argv]
                 argv += ['--rdma-bind', address, '--rdma-port', str(6380+i)]
@@ -232,7 +236,8 @@ class Cluster(_Processes):
         proof = local.valkey_evidence(execute, self.controls, True)
         directories = {endpoint: str(self.directory / f'node-{i}' / 'data')
                        for i, endpoint in enumerate(self.controls)}
-        proof['coverage'] = local.admit_valkey(proof['nodes'], self.controls, True, data_dir=directories)
+        kwargs = {'ack_contract': self.ack_contract} if self.ack_contract != 'synced' else {}
+        proof['coverage'] = local.admit_valkey(proof['nodes'], self.controls, True, data_dir=directories, **kwargs)
         for node in proof['nodes']:
             endpoint = node['endpoint']
             own = next(line.split() for line in node['cluster_nodes'].splitlines()
@@ -254,8 +259,9 @@ class Cluster(_Processes):
         return proof
 
 
-def start_cluster(directory, runtime, backend, *, rdma_address='10.99.0.1', timeout=120):
-    return Cluster(directory, runtime, backend, rdma_address, timeout)
+def start_cluster(directory, runtime, backend, *, rdma_address='10.99.0.1', timeout=120,
+                  ack_contract='synced'):
+    return Cluster(directory, runtime, backend, rdma_address, timeout, ack_contract)
 
 
 def run_native_controls(directory, runtime, *, rdma_address='10.99.0.1', fraction=0.001,
