@@ -1321,3 +1321,26 @@ Sui: cell r01 (owner RPC verbs, `original_default`, owner tier `native`) failed;
 Cause (found after the run from the archive and the sealed package): `gcp_sui.py` prepared the owners of every cell with the key-space shapes of the packaged local verification, which ran only the `harness` contract. Under `original_default` the Sui node selects other shapes (for example 1,024 mutexes instead of 1 and another `max_dirty_keys` in several key spaces). The owner reported its shape in the status reply, the client compared it with its own and rejected it. The local `original_default` replay did not show this because a local run prepares its owners from the shapes of its own native replay. The error text named no cause, and the owner logs of the failed cell were not exported.
 
 Both archives are preserved and SHA-256 verified: KV `ee959ac44360e06875481c72a5c39946f262c86d3c77e2e13dec7547cedce39e`; partial Sui `5b010718b26314e708045760bd7bd9430d666142e29dd76da29b3bac6244f36b`. Evidence: `checkpoint-work/contracts-launch-20261113-a1/analysis/output/`, `results-top/`, `fleet-output/`. No Sui hardware result exists. A further cloud run requires new authorization.
+
+### Run A2 result (`sui_nvmeof_with_contracts`, revision `89075fb`, 13 November 2026)
+
+Fleet `bench-e3ed4d9031e54995`; two VMs created at 13:18:45 and 13:19:36 UTC, deleted by 13:41:24 UTC. Instances, disks and placement policy verified absent; `cleanup_verified: true`. Compute upper bound `$2.48`, excluding storage and network. No replacement fleet launched.
+
+KV: 34 of 34 cases, the same case IDs as Run A, all measured calls successful. Parallel preparation of scalar puts halved the 64 KiB 16-caller put p50 on the leased and on the owner RPC route, and the same cases show a longer tail. Values, cycle and the open tail defect: `PERFORMANCE_PLAN_2026-11-10.md`, "Run A2".
+
+Sui r01 (owner RPC verbs, `original_default`, owner tier `native`): **complete, the first Sui replay on hardware.** The remote database opened (the Run A failure is fixed), 1,776 checkpoints replayed, the native and remote checkpoint digests are equal (`EhUPyfwLGDEKH5Ssg3nFbVAHwi4XA87xNKvnFEo3ZJb6`) and the state audit is equal.
+
+| r01, one replay of 1,776 checkpoints | Native | Distributed, owner RPC verbs |
+|---|---:|---:|
+| Sampled checkpoints per second (250 ms resolution) | 603 over 2.94 s | 528 over 3.36 s |
+| First to last execution start | 3.00 s | 3.54 s |
+| Execution start spacing p50 / p95 / p99 | 1.40 / 2.39 / 3.22 ms | 1.43 / 2.57 / 3.47 ms |
+| Elapsed with startup | 9.16 s | 5.14 s |
+
+The window is about 3 s and is not steady state; one replay, no repetition. Elapsed time with startup is dominated by startup and must not be compared.
+
+Sui r02 (live NVMe-oF, `original_default`): failed before owner readiness; r03 and r04 did not run. Every storage node stopped with `No such file or directory (os error 2)` and named no path. Cause 1 (proved from the source and the owner logs, which this revision exports): `cloud_node.py` checks that the live-target state directory is absent and never creates it; the target manager requires it. Cause 2 (found by source review, not reached on hardware): all 15 owner processes of the two-VM layout use one initiator host NQN, and each target manager creates the configfs host entry exclusively, so the second owner on a VM would fail. Cause 3 (found by source review, reproduced with the validator): the Sui deployment set the live in-flight byte budget to 16 MiB; with the 8 MiB batch limit the coordinator requires 16,789,517 bytes, so the coordinator open of r02 and r04 would fail after owner start. The KV leased cases use one owner process per VM and the KV controller creates the state directory, so they meet none of the three conditions. No earlier local gate covered them: the local replay uses the software provider and does not start the kernel NVMe target path.
+
+Corrections after the run (not in revision `89075fb`, not run on hardware): `cloud_node.py` creates each private state directory before the process start; every owner gets its own initiator NQN and host ID, carried in the owner launch and in the coordinator configuration (`LiveClientConfig.owner_identities`); the coordinator manifest pins that map (`AuthorityManifest.live_nvme_owner_identities`, an optional field that is not written when empty, so existing manifests are byte-identical; a changed map fails the reopen as a changed identity does); the Sui live byte budget follows the validator formula (16,793,600 bytes); target start errors name the operation and the path. New gate before a package is sealed: the built storage-node binary validates the generated coordinator and owner configurations of 16 variants (both contracts, both owner WAL layouts, both routes, two-VM and six-VM layouts; 240 owner files) and the admission rejects any resource shared by two owners. Hardware is still needed for the kernel target, RDMA commissioning and the replay itself.
+
+Both archives are preserved and SHA-256 verified: KV `43236d8fa3cc8cfa6bbb35b326d65187ffc4a33ab6a702d5fa100fa5b7229917`; partial Sui `f6414ae9ed26c6e97e7b2c86d4afe0f2557a58cd4116132f148fcddd129a14b1`. Evidence: `checkpoint-work/contracts-launch-20261113-a2/analysis/`, `results-top/`, `sui-extract/`. A further cloud run requires new authorization.

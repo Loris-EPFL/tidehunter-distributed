@@ -997,6 +997,51 @@ Implemented, no hardware result yet. Change 1: the owner thread drains the queue
 
 Native page cache at 64 KiB with 16 callers is 155 µs per put: its writers prepare in parallel and copy into a mapped file. The distributed class P result is 11 times that; the cycle above accounts for the difference in structure, not in device speed.
 
+### Run A2: parallel preparation on hardware (13 November 2026, one fleet, 34 of 34 cases)
+
+Fleet `bench-e3ed4d9031e54995`, revision `89075fb`, the same 34 cases as Run A. All measured calls succeeded. One repetition per case, another fleet than Run A: differences below about 13% are inside the fleet-to-fleet spread. Data: `checkpoint-work/contracts-launch-20261113-a2/analysis/output/` and `analysis/cycle-output.txt` in the parent workspace.
+
+| Put 64 KiB, 16 callers | Run A p50 µs | Run A2 p50 µs | Run A puts/s | Run A2 puts/s | Run A p99.9 µs | Run A2 p99.9 µs |
+|---|---:|---:|---:|---:|---:|---:|
+| Leased NVMe-oF, P | 1,758 | 755 | 8,383 | 17,296 | 8,177 | 22,718 |
+| Leased NVMe-oF, S | 2,156 | 1,212 | 7,026 | 10,591 | 2,722 | 25,510 |
+| Leased NVMe-oF, P, timeline copy | 1,781 | 735 | 8,284 | 10,855 | 13,527 | 86,535 |
+| Leased NVMe-oF, S, timeline copy | 2,170 | 1,223 | 7,038 | 10,942 | 2,600 | 23,340 |
+| Owner RPC verbs, S | 3,847 | 1,693 | 4,020 | 9,223 | 5,209 | 3,419 |
+| Native barrier, S (reference) | 2,718 | 2,907 | 6,052 | not recomputed | 3,548 | 3,491 |
+| Native page cache, P (reference) | 155 | 167 | 42,832 | not recomputed | 411 | 466 |
+
+Other cases: 1 KiB puts, all reads and the sustained cases changed by less than about 15% in either direction, except owner RPC 1 KiB with 16 callers (289 to 189 µs p50). 64 KiB puts with 1 caller were 8% to 13% slower on every route, including native page cache; this run cannot separate that from the fleet.
+
+The cycle changed as intended. Groups now hold 5 to 11 puts instead of 16, the preparation of the next group overlaps the write in flight, and the time without a write in flight fell from about 1,117 µs to 16 to 19 µs per cycle. Cycle about 700 µs in both classes; payload about 680 MiB/s over the case in both classes.
+
+| Write interval of one group, p50 µs | P | S |
+|---|---:|---:|
+| Encode the frame (copy and two CRC passes) | 65 | 69 |
+| `io_uring` submit | 16 | 15 |
+| Wait for completion | 279 | 536 |
+| Whole interval | 355 | 627 |
+
+The wait for completion is now the largest part and the write worker is busy almost all the time: one group in flight at a time is the next limit (candidate 2). Kernel, link and device are not separated inside the wait.
+
+**Defect: longer tail.** The 64 KiB 16-caller leased cases have 16 to 64 calls of 17 to 87 ms. Each cluster is one whole group that waits in the write worker before the group build (`worker_dequeued -> live_group_build_started`). Run A had one such cluster in each page-cache case and none in the synced cases; Run A2 has 1 to 4 per case. In the page-cache timeline case these calls hold 47% of the summed call time, and its rate is 10,855 puts/s against 17,296 in the copy without a timeline. No result of this run supports a tail-latency claim for 64 KiB.
+
+Cause (from the write timelines of both runs; no code change yet): the write worker handles the coordinator checkpoint on the same ordered queue and the same single control slot as lease adoption and lease-ahead. Six of the seven clusters end 5 to 12 µs after a `CheckpointPosition` request could be submitted: the checkpoint command waited for a pending lease control exchange and the puts behind it could not pass (`remote_db.rs:5346-5373`, `5660-5699`; `tcp/reactor.rs:2189-2225`). The 87 ms cluster ends when a position proof that ran for 180 ms retired: the writes used up the leased extent while the proof held the control slot, and the runway check uses the largest configured frame (4 MiB) although the queued frame was 1 MiB (`tcp/live_client.rs:424-442`). On the owner the position request is an exclusive barrier that holds the inventory lock during WAL and root persistence (`tcp/control.rs:492-538`, `2256-2269`). Checkpoints are triggered by work (about 1,024 batches or 64 MiB), not by time; Run A2 had three checkpoint generations in the page-cache timeline case and Run A four. [INFERENCE] The higher write rate makes it more likely that a checkpoint meets unfinished lease control work and that writes use up the extent during a proof. Not proved: why one control exchange takes 17 to 37 ms; the owner timeline of these cases has no records. Excluded by counters: extent-switch waits, grant misses, history spills and full queues are all zero. No wrong value, error or unknown mutation.
+
+This contradicts the principle of the paper (sections 3.1 and 3.3): snapshot work and `fsync` run in the background and a write never waits for them. The position proof is needed for recovery; the wait of the puts is not, because a position covers a fixed prefix that later puts cannot change.
+
+Implemented 13 November, not measured on hardware, not committed:
+
+- Step A (scheduling): the write worker keeps at most one parked checkpoint or position command and lets only later puts pass it; the extent runway check uses the size of the frame in hand; lease-ahead is requested before a proof; a bounded trace records every control request (kind, target, submit and completion time), and the owner timeline now records lease, adoption and position requests.
+- Step B (concurrency): the position proof has its own bounded request slot on the same session; one shared predicate classifies it as stream work in both owner schedulers, so lease, lease-ahead and adoption run during a proof while seal, fence and retirement wait for it; the owner validates and clones the log under the inventory lock and releases the lock before the sync; `persist_wal_through` syncs data and namespace with no lock, then installs the root under the persistence mutex after it re-reads the current root and merges monotonically. A cut of an owner RPC log must be at or below the owner's completed writes. The proof installs the durable root and does not publish the receipt frontier; a read below the proved cut obtains its own receipt barrier.
+- No wire format, persisted format or acknowledgement contract changed. An independent static review found no defect. Tests cover the paused proof with adoption, lease-ahead and extent switches, both proof completion orders, six crash points in both tiers with adoption interleaved, lifecycle exclusion in both schedulers (each exclusion removed once to prove that its test fails), slot deadlines, failure and shutdown.
+
+Workstation fixture (regular file, 64 KiB, 16 callers, 4,096 calls, 8 MiB extents, three interleaved repetitions per arm; functional evidence only): calls of 5 ms or more, page-cache tier 541 to 590 before, 499 to 506 after A, 515 to 520 after B; synced tier 95 to 224, 48 to 64, 49 to 80. Checkpoints committed per case rose with B (11 to 18, and 17 to 29). The fixture does not reproduce the hardware pause: its tails come with 33 extent switches and 17 to 31 extent-switch waits per case, which the hardware cases did not have (2 switches, no wait). B shows no tail reduction on this fixture and more switch waits than A (about 31 against 21, page-cache tier); the cause is not attributed. Only a hardware run with the new control trace can show whether the 17 to 87 ms pauses are gone.
+
+Second workstation fixture with a geometry closer to the hardware cases (128 MiB extents, 256 MiB WAL files, checkpoint about every 1,024 batches or 64 MiB, 8,192 puts, three interleaved repetitions per arm, host not idle; functional evidence only). Page-cache tier, calls of 5 ms or more: 128 to 144 before, 58 to 63 after A, 61 to 62 after B; largest call 167 to 180 ms, 158 to 189 ms and 131 to 156 ms. Checkpoints committed inside the workload: 3 before, 1 to 2 after A, 7 after B. Synced tier: 58 to 96, 28 to 56 and 32 to 86 calls; largest call 69 to 84 ms in every arm. **The long pauses remain on the workstation after B.** One traced run after B (not part of the comparison; tracing changed the timing strongly) shows a whole group of 16 puts that waits 168 ms before the group build while a position proof (241 ms) and a lease-ahead request (241 ms) are in flight together and end together. In that run the largest tails (1.47 s) are at the extent switch and in the queue of the write worker while a lease-ahead request takes 1.49 s.
+
+Reading [INFERENCE]: B lets the lease-ahead request start during a proof, but the grant itself can be slow on this fixture. A grant takes the persistence mutex and, when the extent starts a new WAL file, syncs that file and the directory (`storage.rs`, `lease_live_extent_impl`); the fixture starts a new WAL file every second extent, the hardware cases never did (10 GiB WAL files), and the hardware cases had no extent-switch wait. Both syncs also go through one file system on one laptop SSD. So this fixture measures the cost of a grant under a concurrent sync, not the defect seen on hardware, and it does not show that the hardware pause is gone. Open follow-up, not started: keep the next WAL file created and synced in the background before it is needed, as the original engine keeps a buffer of pre-allocated maps (paper, section 3.1), so that a grant never waits for a file sync; and request lease-ahead early enough for the measured grant time.
+
 ## Regression reference
 Compare each new run against this table and investigate a regression. Match fleet, route, workload, size, concurrency, cache and durability. Fleet-to-fleet spread is about 13%; do not subtract separate fleets.
 
